@@ -4,6 +4,7 @@
 #[doc(hidden)]
 pub use ctor;
 
+pub mod bignum;
 pub mod buffer;
 pub mod crc32;
 pub mod crypto;
