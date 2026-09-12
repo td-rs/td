@@ -7,8 +7,8 @@
 //! [`TestsRunner::run_all`] on the [`default_runner`] — the same model as the
 //! C++ `TEST()` macro plus a `run_all()` binary entry.
 //!
-//! Crates other than tdutils that use [`crate::td_test!`] must add `ctor` and
-//! `paste` to their own dependencies.
+//! Crates other than tdutils that use [`crate::td_test!`] must add `ctor`
+//! to their own dependencies.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -523,6 +523,11 @@ fn as_time(seconds: f64) -> String {
 /// and registers it, before `main`, on the [`default_runner`] under
 /// `"Test_<test_case_name>_<test_name>"`.
 ///
+/// The C++ `Test_<case>_<name>` class maps to the nested module
+/// `<case>::<name>::Test` — no identifier concatenation (and thus no
+/// proc-macro helper crate) is needed; the registered name matches the C++
+/// `TEST_NAME` stringification exactly.
+///
 /// ```
 /// tdutils::td_test!(Http, host, {
 ///     // body of Test::run
@@ -531,26 +536,29 @@ fn as_time(seconds: f64) -> String {
 #[macro_export]
 macro_rules! td_test {
     ($test_case:ident, $test_name:ident, $body:block) => {
-        $crate::paste::paste! {
+        #[doc = concat!("tdlib test `Test_", stringify!($test_case), "_", stringify!($test_name), "`.")]
+        #[allow(non_snake_case, non_camel_case_types)]
+        pub mod $test_case {
             #[doc = concat!("tdlib test `Test_", stringify!($test_case), "_", stringify!($test_name), "`.")]
-            #[allow(nonstandard_style)]
-            struct [<Test_ $test_case _ $test_name>];
+            #[allow(non_snake_case, non_camel_case_types)]
+            pub mod $test_name {
+                pub struct Test;
 
-            impl $crate::tests::Test for [<Test_ $test_case _ $test_name>] {
-                fn run(&mut self) $body
-            }
+                impl $crate::tests::Test for Test {
+                    fn run(&mut self) $body
+                }
 
-            #[doc(hidden)]
-            #[allow(nonstandard_style)]
-            #[$crate::ctor::ctor]
-            fn [<register_test_ $test_case _ $test_name>]() {
-                $crate::tests::default_runner()
-                    .lock()
-                    .expect("default test runner poisoned")
-                    .add_test(
-                        concat!("Test_", stringify!($test_case), "_", stringify!($test_name)),
-                        || Box::new([<Test_ $test_case _ $test_name>]),
-                    );
+                #[doc(hidden)]
+                #[$crate::ctor::ctor]
+                fn register() {
+                    $crate::tests::default_runner()
+                        .lock()
+                        .expect("default test runner poisoned")
+                        .add_test(
+                            concat!("Test_", stringify!($test_case), "_", stringify!($test_name)),
+                            || Box::new(Test),
+                        );
+                }
             }
         }
     };
