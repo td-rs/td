@@ -7,6 +7,9 @@ Differential-testing harness against the C++ oracle:
 - `cpp_dump/` — S04 verification oracle: a standalone C++ program that decodes
   the same embedded blobs the way the C++ tests do; `cpp_dump/verify.sh`
   byte-compares its output against `vectors/`.
+- `tl_oracle/` — S06 verification oracle: compiles td's unmodified
+  `tl-parser.c` and diffs its token stream against the Rust tdtl lexer
+  (`tl-token-dump`) for all five schemes; `tl_oracle/verify.sh`.
 - `recorder/` — wraps the C++ client, logs requests/results/updates of real
   sessions (S73).
 - `replayer/` — feeds the corpus to `tdjson` and diffs outputs (S74).
