@@ -45,4 +45,6 @@ jobs:
       - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          arguments: --workspace --all-features check
+          # The action prepends its default `check` subcommand; passing it here
+          # makes cargo-deny parse `check` as a WHICH check-name and fail.
+          arguments: --workspace --all-features
