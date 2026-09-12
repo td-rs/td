@@ -4,4 +4,5 @@
 #[doc(hidden)]
 pub use ctor;
 
+pub mod status;
 pub mod tests;
