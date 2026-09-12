@@ -20,9 +20,9 @@
 //!   length, the bytes, and zero padding up to a multiple of 4 counting the
 //!   length byte;
 //! - the var-value map is write-local: it only ever stores the numeric ids
-//!   assigned in [`TloWriter::write_args`], so `BTreeMap<CTId, i64>`
+//!   assigned in `TloWriter::write_args`, so `BTreeMap<CTId, i64>`
 //!   replaces the C `struct tree_var_value *` treap keyed by field-node
-//!   pointer (variable identity is the field-node id, as in [`program`]).
+//!   pointer (variable identity is the field-node id, as in `program`).
 
 use std::collections::BTreeMap;
 
