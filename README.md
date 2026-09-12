@@ -12,6 +12,9 @@ The execution plan is `RUST_REWRITE_PLAN.md` at the root of the C++ repo
 
 - [x] S01 — cargo workspace skeleton
 - [x] S02 — CI skeleton: fmt + clippy `-D warnings` + `cargo test --workspace` + cargo-deny (verified locally; GitHub remote/first CI run pending)
+- [x] S03 — TL schemes imported from tdlib `d1085f9ce`, pinned by hash
+- [x] S04 — golden vectors extracted from C++ `test/data.cpp` into `conformance/vectors/`, byte-verified against td's own `base64.cpp`
+- [x] S05 — tdlib test harness (`td/utils/tests`) ported to `tdutils` (runner, timing, ctor registration, regression tester, stage barriers)
 
 ## Checks (CI parity)
 
