@@ -351,7 +351,8 @@ impl RunnerContext {
     }
 
     fn set_regression_tester(&self, tester: Box<dyn RegressionTester>) {
-        self.state.lock().expect("context poisoned").regression_tester = Some(tester);
+        let mut state = self.state.lock().expect("context poisoned");
+        state.regression_tester = Some(tester);
     }
 
     fn save_db(&self) {
