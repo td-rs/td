@@ -67,22 +67,17 @@ jobs:
       - run: cargo test -Zbuild-std=std --workspace --locked --target x86_64-unknown-linux-gnu --lib --bins --tests
 
   miri:
-    # Advisory for now (continue-on-error): the S05 test harness registers
-    # tests through the `ctor` crate, whose section-function ABI hack modern
-    # Miri reports as UB at tdutils/src/tests.rs:552 (fn declared -> usize,
-    # invoked with a () return place). Known ctor-vs-Miri ecosystem issue;
-    # everything after ctor registration is still checked. Flip to gating
-    # when the harness changes registration or ctor ships a Miri-clean path.
-    continue-on-error: true
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    env:
+      # The harness tests write temp files (regression tester); grant the
+      # real host filesystem instead of Miri's isolated one.
+      MIRIFLAGS: -Zmiri-disable-isolation
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: nightly-2026-09-01
           components: miri
-      # tdutils only for now — widen as crates land. If fs-touching tests
-      # later trip Miri's isolation, adjust via MIRIFLAGS rather than dropping
-      # the job.
+      # tdutils only for now — widen as crates land.
       - run: cargo miri test -p tdutils --locked

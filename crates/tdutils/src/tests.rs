@@ -5,17 +5,16 @@
 //! stage barriers, and the file-backed regression tester. Tests are registered
 //! statically with [`crate::td_test!`] and run by binaries that call
 //! [`TestsRunner::run_all`] on the [`default_runner`] — the same model as the
-//! C++ `TEST()` macro plus a `run_all()` binary entry.
-//!
-//! Crates other than tdutils that use [`crate::td_test!`] must add `ctor`
-//! to their own dependencies.
+//! C++ `TEST()` macro plus a `run_all()` binary entry. Registration happens
+//! before `main` via the platform's C constructor section, with no extra
+//! dependencies.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -41,46 +40,33 @@ pub trait Test: Send {
 }
 
 /// Context visible to a running test through [`with_context`] — the port of
-/// `td::TestContext`.
+/// `td::TestContext`. `name` returns an owned string like the C++
+/// `virtual CSlice name()`.
 pub trait TestContext {
-    fn name(&self) -> &str;
+    fn name(&self) -> String;
 
     fn verify(&self, data: &str) -> TestStatus;
 }
 
-// The stack stores pointers whose pointee lifetime is erased; ContextGuard
-// pops a pointer before the context it points to can die, and everything
-// stays on one thread.
-type ErasedContextPtr = *const (dyn TestContext + 'static);
-
 thread_local! {
-    static CONTEXT_STACK: RefCell<Vec<ErasedContextPtr>> = const { RefCell::new(Vec::new()) };
+    static CONTEXT_STACK: RefCell<Vec<Arc<RunnerContext>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Runs `f` with the innermost [`TestContext`] of the current thread, if any.
 pub fn with_context<R>(f: impl FnOnce(&dyn TestContext) -> R) -> Option<R> {
-    CONTEXT_STACK.with(|stack| {
-        let stack = stack.borrow();
-        let context = *stack.last()?;
-        // SAFETY: pointers are pushed only by ContextGuard, which lives on the
-        // same thread for exactly as long as the context it points to; any
-        // call made from inside that scope sees a live context.
-        Some(f(unsafe { &*context }))
-    })
+    // The stack only ever holds clones of the runner's `Arc`d context, so
+    // the borrow ends before `f` runs — `f` may itself push or pop contexts.
+    let context = CONTEXT_STACK.with(|stack| stack.borrow().last().cloned())?;
+    Some(f(context.as_ref()))
 }
 
 struct ContextGuard {
-    _context: ErasedContextPtr,
+    _context: Arc<RunnerContext>,
 }
 
 impl ContextGuard {
-    fn new(context: &dyn TestContext) -> Self {
-        // SAFETY: identical fat-pointer layouts; only the (compile-time,
-        // erased) pointee lifetime differs, and push/pop pairing in this
-        // guard guarantees the pointer is never used after the context dies.
-        let context =
-            unsafe { std::mem::transmute::<*const dyn TestContext, ErasedContextPtr>(context) };
-        CONTEXT_STACK.with(|stack| stack.borrow_mut().push(context));
+    fn new(context: Arc<RunnerContext>) -> Self {
+        CONTEXT_STACK.with(|stack| stack.borrow_mut().push(context.clone()));
         Self { _context: context }
     }
 }
@@ -331,6 +317,51 @@ impl State {
     }
 }
 
+/// The context-visible half of a running [`TestsRunner`]: the running
+/// test's name and the regression tester. Held via `Arc` so the thread-local
+/// context stack never borrows from the runner itself — the runner keeps
+/// mutating through `&mut self` while a test runs, which would invalidate
+/// any pointer derived from `&self` of the runner (Miri/stacked-borrows
+/// rejects that, correctly). Interior state sits behind a `Mutex` (not
+/// `RefCell`) so `TestsRunner` stays `Send` for the process-wide
+/// [`default_runner`].
+#[derive(Default)]
+struct ContextState {
+    name: String,
+    regression_tester: Option<Box<dyn RegressionTester>>,
+}
+
+struct RunnerContext {
+    state: Mutex<ContextState>,
+}
+
+impl RunnerContext {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(ContextState::default()),
+        }
+    }
+
+    fn set_name(&self, name: String) {
+        self.state.lock().expect("context poisoned").name = name;
+    }
+
+    fn clear_name(&self) {
+        self.state.lock().expect("context poisoned").name.clear();
+    }
+
+    fn set_regression_tester(&self, tester: Box<dyn RegressionTester>) {
+        self.state.lock().expect("context poisoned").regression_tester = Some(tester);
+    }
+
+    fn save_db(&self) {
+        let state = self.state.lock().expect("context poisoned");
+        if let Some(tester) = state.regression_tester.as_ref() {
+            tester.save_db();
+        }
+    }
+}
+
 /// Port of `td::TestsRunner`.
 pub struct TestsRunner {
     stress_flag: bool,
@@ -338,7 +369,7 @@ pub struct TestsRunner {
     offset: String,
     tests: Vec<(String, TestEntry)>,
     state: State,
-    regression_tester: Option<Box<dyn RegressionTester>>,
+    context: Arc<RunnerContext>,
 }
 
 impl TestsRunner {
@@ -349,7 +380,7 @@ impl TestsRunner {
             offset: String::new(),
             tests: Vec::new(),
             state: State::new(),
-            regression_tester: None,
+            context: Arc::new(RunnerContext::new()),
         }
     }
 
@@ -394,7 +425,7 @@ impl TestsRunner {
     }
 
     pub fn set_regression_tester(&mut self, regression_tester: Box<dyn RegressionTester>) {
-        self.regression_tester = Some(regression_tester);
+        self.context.set_regression_tester(regression_tester);
     }
 
     pub fn run_all(&mut self) {
@@ -405,7 +436,7 @@ impl TestsRunner {
     /// step-based test). Returns true while there is (potentially) more to
     /// run — forever, in stress mode.
     pub fn run_all_step(&mut self) -> bool {
-        let _context_guard = ContextGuard::new(self);
+        let _context_guard = ContextGuard::new(self.context.clone());
         if self.state.it == self.state.end {
             self.state.end = self.tests.len();
             self.state.it = 0;
@@ -433,6 +464,7 @@ impl TestsRunner {
                 eprintln!("Run test name = \"{name}\"");
                 self.state.start = Instant::now();
                 self.state.is_running = true;
+                self.context.set_name(name);
 
                 debug_assert!(self.tests[self.state.it].1.test.is_none());
                 let creator = &self.tests[self.state.it].1.creator;
@@ -448,9 +480,8 @@ impl TestsRunner {
 
             let passed = self.state.start.elapsed();
             eprintln!("{}", as_time(passed.as_secs_f64()));
-            if let Some(regression_tester) = &self.regression_tester {
-                regression_tester.save_db();
-            }
+            self.context.save_db();
+            self.context.clear_name();
             self.state.is_running = false;
             self.state.it += 1;
         }
@@ -469,25 +500,27 @@ impl Default for TestsRunner {
     }
 }
 
-impl TestContext for TestsRunner {
-    fn name(&self) -> &str {
+impl TestContext for RunnerContext {
+    fn name(&self) -> String {
+        let state = self.state.lock().expect("context poisoned");
         assert!(
-            self.state.is_running,
+            !state.name.is_empty(),
             "TestsRunner::name() called while no test is running"
         );
-        &self.tests[self.state.it].0
+        state.name.clone()
     }
 
     fn verify(&self, data: &str) -> TestStatus {
-        let Some(regression_tester) = &self.regression_tester else {
+        let state = self.state.lock().expect("context poisoned");
+        let Some(regression_tester) = state.regression_tester.as_ref() else {
             eprintln!("{data}");
             eprintln!(
                 "Cannot verify and save <{}> answer. Use --regression <regression_db> option",
-                self.name()
+                state.name
             );
             return Ok(());
         };
-        regression_tester.verify_test(&format!("{}_default", self.name()), data)
+        regression_tester.verify_test(&format!("{}_default", state.name), data)
     }
 }
 
@@ -549,16 +582,61 @@ macro_rules! td_test {
                 }
 
                 #[doc(hidden)]
-                #[$crate::ctor::ctor]
-                fn register() {
-                    $crate::tests::default_runner()
-                        .lock()
-                        .expect("default test runner poisoned")
-                        .add_test(
-                            concat!("Test_", stringify!($test_case), "_", stringify!($test_name)),
-                            || Box::new(Test),
-                        );
-                }
+                #[allow(dead_code)] // referenced by the C runtime, not Rust
+                #[used]
+                // Register before `main` through the platform's C
+                // constructor section — the same pre-main mechanism as the
+                // C++ static registrar objects of td/utils/tests.h. The
+                // entry must be a plain `extern "C" fn()` pointer: that is
+                // the ABI loaders (and Miri's loader emulation) use to call
+                // these entries. (`ctor` wrapped the body in an
+                // `extern "C" fn() -> usize` shim, which Miri correctly
+                // rejects as an ABI mismatch.) Targets without a constructor
+                // section (e.g. wasm, until S82) simply don't register.
+                #[cfg_attr(
+                    any(
+                        target_os = "linux",
+                        target_os = "android",
+                        target_os = "freebsd",
+                        target_os = "netbsd",
+                        target_os = "openbsd",
+                        target_os = "dragonfly",
+                        target_os = "illumos",
+                        target_os = "solaris",
+                        target_os = "haiku",
+                        target_os = "emscripten",
+                    ),
+                    unsafe(link_section = ".init_array")
+                )]
+                #[cfg_attr(
+                    target_vendor = "apple",
+                    unsafe(link_section = "__DATA,__mod_init_func")
+                )]
+                #[cfg_attr(
+                    all(target_os = "windows", target_env = "msvc"),
+                    unsafe(link_section = ".CRT$XCU")
+                )]
+                #[cfg_attr(
+                    all(target_os = "windows", target_env = "gnu"),
+                    unsafe(link_section = ".ctors")
+                )]
+                static __REGISTER: extern "C" fn() = {
+                    extern "C" fn register() {
+                        $crate::tests::default_runner()
+                            .lock()
+                            .expect("default test runner poisoned")
+                            .add_test(
+                                concat!(
+                                    "Test_",
+                                    stringify!($test_case),
+                                    "_",
+                                    stringify!($test_name)
+                                ),
+                                || Box::new(Test),
+                            );
+                    }
+                    register
+                };
             }
         }
     };
@@ -858,7 +936,8 @@ mod smoke {
 
 #[cfg(test)]
 mod ctor_smoke_tests {
-    // Registered before main by the ctor generated in `td_test!`.
+    // Registered before main by the constructor-section entry generated in
+    // `td_test!`.
     crate::td_test!(Smoke, ctor_registration, {});
 
     #[test]
