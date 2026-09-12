@@ -6,6 +6,7 @@ pub use ctor;
 
 pub mod buffer;
 pub mod crc32;
+pub mod crypto;
 pub mod json;
 pub mod logging;
 pub mod random;
