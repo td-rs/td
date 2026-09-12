@@ -5,6 +5,8 @@
 pub use ctor;
 
 pub mod buffer;
+pub mod crc32;
 pub mod logging;
+pub mod random;
 pub mod status;
 pub mod tests;
