@@ -25,6 +25,13 @@ allow = [
   "CC0-1.0",
 ]
 
+# Our own tdtl crate is a faithful port of td's tl-parser.c, which is
+# GPL-2.0-or-later (tgl/tlc derivative) — build-time tooling only, never
+# linked into shipped artifacts. Dependencies must stay permissive.
+[[licenses.exceptions]]
+crate = "tdtl"
+allow = ["GPL-2.0-or-later"]
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
