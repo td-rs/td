@@ -1,0 +1,17 @@
+# conformance: differential-testing tooling against the C++ td oracle (plan S04+).
+# Standalone crate, excluded from the main workspace on purpose (see root Cargo.toml).
+
+[package]
+name = "td-conformance"
+version = "0.1.0"
+edition = "2024"
+license = "BSL-1.0"
+publish = false
+description = "Golden vectors and differential harness for the td Rust rewrite"
+
+[dependencies]
+sha2 = "0.10"
+
+[[bin]]
+name = "extract-test-data"
+path = "src/main.rs"

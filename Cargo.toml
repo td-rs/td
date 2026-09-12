@@ -15,7 +15,8 @@ members = [
     "crates/tl-codegen",
     "crates/tdtl",
 ]
-# These dirs grow their own manifests in later steps (S73/S78/S79); exclude until then.
+# conformance is a standalone crate since S04 (extract-test-data); fuzz and bench
+# grow their own manifests in later steps (S78/S79). All are built separately.
 exclude = ["conformance", "fuzz", "bench"]
 
 [workspace.package]
