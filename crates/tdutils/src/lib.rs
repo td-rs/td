@@ -11,5 +11,6 @@ pub mod crypto;
 pub mod json;
 pub mod logging;
 pub mod random;
+pub mod rsa;
 pub mod status;
 pub mod tests;
