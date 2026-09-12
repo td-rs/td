@@ -1,0 +1,7 @@
+# Pinned toolchain for rustup users and CI (= the MSRV declared in clippy.toml).
+# Every CI job passes its toolchain explicitly, so this file mainly serves
+# local rustup users and documents the pin; Main CI additionally tests current
+# stable, so bumping this pin is always a deliberate, visible change.
+# The nix shells from README.md are unaffected (nix rustc ignores this file).
+[toolchain]
+channel = "1.95"

@@ -1,0 +1,73 @@
+# Memory / concurrency error detection. Expensive checks kept off PRs:
+#   - ASan + LeakSanitizer over the whole workspace
+#   - TSan with instrumented std (build-std; without it TSan misses
+#     synchronization inside std and reports false positives)
+#   - Miri on tdutils (the only crate with unsafe-heavy code today)
+#
+# The nightly is pinned by date for reproducibility — bump it deliberately.
+# No rust-cache: every run is a clean, from-scratch build.
+name: Sanitizers
+
+on:
+  push:
+    branches: [master]
+  schedule:
+    - cron: "30 3 * * *" # nightly, after Main CI
+  workflow_dispatch:
+
+concurrency:
+  group: sanitizers-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  asan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: -Zsanitizer=address -Cdebug-assertions -Coverflow-checks
+      # detect_leaks=1: LeakSanitizer ships inside ASan on Linux.
+      ASAN_OPTIONS: detect_leaks=1:detect_stack_use_after_return=1:abort_on_error=1
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly-2026-09-01
+      - run: cargo test --workspace --locked --target x86_64-unknown-linux-gnu
+
+  tsan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: -Zsanitizer=thread
+      TSAN_OPTIONS: halt_on_error=1
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly-2026-09-01
+          components: rust-src
+      # Mostly green today (little concurrency code yet); becomes the real
+      # gate for the tdactor port (S07+).
+      - run: cargo test -Zbuild-std=std --workspace --locked --target x86_64-unknown-linux-gnu
+
+  miri:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: nightly-2026-09-01
+          components: miri
+      # tdutils only for now — widen as crates land. If fs-touching tests
+      # later trip Miri's isolation, adjust via MIRIFLAGS rather than dropping
+      # the job.
+      - run: cargo miri test -p tdutils --locked

@@ -1,46 +1,92 @@
-# S02 — CI skeleton: fmt + clippy -D warnings + test + cargo-deny.
-# One job per check so failures are isolated. Commands mirror the local
-# equivalents run via nix (see README) — keep them in sync when adding checks.
+# Fast PR validation: fmt + clippy -D warnings + test + docs + conformance build
+# + cargo-deny. One job per check so failures are isolated.
+# Also reusable (workflow_call): Main CI runs this exact suite on master pushes
+# via main.yml, so PR and master validation cannot drift apart.
+# Commands mirror the local nix equivalents in README.md — keep them in sync
+# when adding checks.
 name: CI
 
 on:
-  push:
-    branches: [master]
   pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+# A new push to the same PR supersedes its older runs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   fmt:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.95"
           components: rustfmt
       - run: cargo fmt --all --check
 
   clippy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: "1.95"
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --locked
 
+  docs:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  # conformance is a standalone crate (excluded from the workspace, own
+  # Cargo.lock) — build it here so it cannot rot behind the workspace checks.
+  # The oracle verification against the C++ td repo runs in main.yml.
+  conformance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+      - run: cargo build --locked --manifest-path conformance/Cargo.toml
+
   deny:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - uses: EmbarkStudios/cargo-deny-action@v2

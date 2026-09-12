@@ -1,0 +1,205 @@
+# Performance tracking, kept off PRs:
+#   - clean-environment release-build and debug-test metrics (CPU time, wall
+#     time, peak RSS) captured on a pinned runner image
+#   - regression gate against the committed baseline (.github/perf-baseline.json):
+#     fails on build/test CPU time > +30% or build RSS > +50%, warns at >= +10%
+#   - benchmarks once bench/ grows its manifest (plan S79; criterion baselines
+#     land with it)
+#
+# Triggers: after Main CI succeeds on master (workflow_run), weekly, or manual.
+# Baseline refresh: Actions -> Performance -> Run workflow with update_baseline
+# checked — commits the freshly captured metrics as the new baseline. Do this
+# after deliberate toolchain bumps or accepted performance changes; the gate
+# warns (and fails open) while the baseline toolchain differs from the current
+# one, so stale baselines cannot silently pass.
+#
+# No rust-cache: metrics from a clean build only.
+name: Performance
+
+on:
+  workflow_run:
+    workflows: [Main CI]
+    types: [completed]
+  schedule:
+    - cron: "0 4 * * 0" # Sundays, after the nightly Main CI + Sanitizers
+  workflow_dispatch:
+    inputs:
+      update_baseline:
+        description: "Commit the captured metrics as the new perf baseline"
+        type: boolean
+        default: false
+
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  # When triggered via workflow_run, fail loudly instead of silently skipping
+  # if Main CI did not succeed — the performance gate must never look green
+  # behind a red correctness run.
+  gate:
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion != 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: |
+          echo "Main CI run #${{ github.event.workflow_run.run_number }} concluded: ${{ github.event.workflow_run.conclusion }} — not running performance checks."
+          exit 1
+
+  metrics:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    # contents: write is needed only by the guarded baseline-commit step below.
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Benchmark the exact commit Main CI validated, not master HEAD.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+      - name: Measure release build
+        run: /usr/bin/time -v -o build.time cargo build --workspace --release --locked
+      - name: Measure debug test
+        run: /usr/bin/time -v -o test.time cargo test --workspace --locked
+
+      - name: Collect metrics
+        run: |
+          python3 - <<'EOF'
+          import datetime, json, os, re, subprocess
+
+          def parse_time_v(path):
+              entry = {}
+              for line in open(path):
+                  if "Elapsed (wall clock) time" in line:
+                      secs = 0.0
+                      for part in re.findall(r"[\d.]+", line.split(":", 3)[-1]):
+                          secs = secs * 60 + float(part)  # h:mm:ss.cc or m:ss.cc
+                      entry["wall_seconds"] = round(secs, 2)
+                  elif "User time (seconds)" in line:
+                      entry["cpu_seconds"] = round(float(line.rsplit(":", 1)[1]), 2)
+                  elif "System time (seconds)" in line:
+                      entry["cpu_seconds"] = round(entry.get("cpu_seconds", 0) + float(line.rsplit(":", 1)[1]), 2)
+                  elif "Maximum resident set size" in line:
+                      entry["max_rss_kb"] = int(line.rsplit(":", 1)[1])
+              return entry
+
+          metrics = {
+              "comment": "Perf baseline captured on a GitHub ubuntu-24.04 runner; regenerate via the Performance workflow (update_baseline).",
+              "generated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+              "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
+              "runner": "ubuntu-24.04",
+              "toolchain": subprocess.check_output(["rustc", "-V"], text=True).strip(),
+              "build": parse_time_v("build.time"),
+              "test": parse_time_v("test.time"),
+          }
+          with open("metrics.json", "w") as f:
+              json.dump(metrics, f, indent=2)
+              f.write("\n")
+
+          summary = [
+              "## Performance metrics",
+              "",
+              f"commit `{metrics['commit'][:12]}`, {metrics['toolchain']}",
+              "",
+              "| phase | CPU s | wall s | peak RSS MB |",
+              "|---|---|---|---|",
+          ]
+          for phase in ("build", "test"):
+              m = metrics[phase]
+              summary.append(f"| {phase} | {m['cpu_seconds']} | {m['wall_seconds']} | {m['max_rss_kb'] / 1024:.0f} |")
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "/dev/null")
+          with open(summary_path, "a") as f:
+              f.write("\n".join(summary) + "\n")
+          EOF
+      - uses: actions/upload-artifact@v4
+        with:
+          name: perf-metrics
+          path: metrics.json
+          if-no-files-found: error
+
+      - name: Compare against baseline
+        run: |
+          python3 - <<'EOF'
+          import json, os, sys
+
+          if not os.path.exists(".github/perf-baseline.json"):
+              print("::warning::No perf baseline committed yet — skipping the regression gate. Refresh via Performance -> Run workflow -> update_baseline.")
+              sys.exit(0)
+
+          baseline = json.load(open(".github/perf-baseline.json"))
+          current = json.load(open("metrics.json"))
+
+          if baseline.get("toolchain") != current.get("toolchain"):
+              print(f"::warning::Baseline toolchain ({baseline.get('toolchain')}) differs from current ({current.get('toolchain')}) — numbers are not comparable; refresh the baseline.")
+
+          # metric path -> (fail ratio, warn ratio)
+          gates = {
+              "build.cpu_seconds": (1.30, 1.10),
+              "build.max_rss_kb": (1.50, 1.10),
+              "test.cpu_seconds": (1.30, 1.10),
+          }
+          failed = False
+          for path, (fail_at, warn_at) in gates.items():
+              phase, key = path.split(".")
+              base_v, cur_v = baseline[phase][key], current[phase][key]
+              ratio = cur_v / base_v if base_v else float("inf")
+              verdict = "OK"
+              if ratio > fail_at:
+                  verdict = "FAIL"
+                  failed = True
+              elif ratio >= warn_at:
+                  verdict = "WARN"
+                  print(f"::warning title=Perf regression?::{path}: {base_v} -> {cur_v} ({ratio:.2f}x baseline)")
+              print(f"{path:24s} baseline={base_v:>10} current={cur_v:>10} ratio={ratio:.2f}x [{verdict}]")
+
+          sys.exit(1 if failed else 0)
+          EOF
+
+      - name: Commit new baseline
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.update_baseline == true
+        run: |
+          if [ ! -f metrics.json ]; then
+            echo "no metrics.json — nothing to commit"; exit 1
+          fi
+          cp metrics.json .github/perf-baseline.json
+          git config user.name "td-rs-ci"
+          git config user.email "actions@users.noreply.github.com"
+          git add .github/perf-baseline.json
+          git commit -m "chore: update perf baseline from CI run"
+          git push
+
+  bench:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+      - name: Run benchmarks
+        run: |
+          if [ -f bench/Cargo.toml ]; then
+            cargo bench --manifest-path bench/Cargo.toml --locked
+          else
+            echo "bench/Cargo.toml not present yet (plan S79); skipping."
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-results
+          path: bench/target/criterion/
+          if-no-files-found: ignore

@@ -1,0 +1,67 @@
+# Release validation: on v* tags (or manual dispatch) — full-platform release
+# builds and tests from a clean environment, plus cargo-deny on the exact tag.
+# Uploads the tdjson cdylib per platform; the glob is a no-op until the cdylib
+# is wired up (plan S82 makes these the release deliverables).
+#
+# No rust-cache: release artifacts must come from from-scratch builds.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  build-test:
+    name: release (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+      - run: cargo test --workspace --release --locked
+      - run: cargo build --workspace --all-targets --release --locked
+      - name: Collect tdjson artifacts
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          found=0
+          for f in target/release/libtdjson.so target/release/tdjson.dll target/release/libtdjson.dylib; do
+            if [ -f "$f" ]; then cp "$f" artifacts/; found=1; fi
+          done
+          # cdylib not wired up yet (plan S82); empty artifact is expected until then.
+          if [ "$found" -eq 0 ]; then echo "no tdjson cdylib yet (plan S82); uploading nothing"; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tdjson-${{ matrix.os }}
+          path: artifacts/
+          if-no-files-found: ignore
+
+  deny:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          # The action prepends its default `check` subcommand; passing it here
+          # makes cargo-deny parse `check` as a WHICH check-name and fail.
+          arguments: --workspace --all-features

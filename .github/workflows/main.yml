@@ -1,0 +1,146 @@
+# Main-branch validation: everything PR CI covers (reused via workflow_call)
+# plus the checks too slow or environment-heavy for every PR:
+#   - platform matrix (Linux x64/arm64, macOS arm64 + Intel cross-check, Windows x64)
+#   - current-stable compatibility (default elsewhere is the pinned 1.95)
+#   - wasm32 advisory check (the dependency choices exist to keep wasm buildable; S82 makes it a target)
+#   - bounded stress soak of the release test suite
+#   - conformance verification against the C++ td oracle (pinned to the schemes commit, S03)
+#
+# Jobs in this file never use Swatinem/rust-cache: every run is a clean build
+# by construction, so caching can never hide a from-scratch build problem.
+# (PR CI in ci.yml is the cached fast path.)
+#
+# Toolchain pins (update deliberately, both here and in rust-toolchain.toml):
+#   - default jobs: 1.95   (= clippy.toml MSRV)
+#   - stable job:   stable (early-warning for future Rust releases)
+name: Main CI
+
+on:
+  push:
+    branches: [master]
+  schedule:
+    - cron: "0 3 * * *" # nightly, UTC
+  workflow_dispatch:
+
+concurrency:
+  group: main-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  core:
+    # The full PR suite (fmt/clippy/test/docs/conformance/deny), reused from
+    # ci.yml so master and PR validation run identical commands.
+    uses: ./.github/workflows/ci.yml
+
+  stable:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - run: cargo test --workspace --locked
+
+  matrix:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # GitHub-hosted macOS runners are arm64-only now (macos-13 retired,
+        # macos-14 sunsets Nov 2026); Intel macOS is covered by the
+        # x86_64-apple-darwin cross-check step on the macos-15 leg.
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-15, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+      - name: Test (debug)
+        run: cargo test --workspace --locked
+      - name: Build all targets (release)
+        run: cargo build --workspace --all-targets --release --locked
+      - name: Cross-check x86_64-apple-darwin
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add x86_64-apple-darwin
+          cargo check --workspace --locked --target x86_64-apple-darwin
+
+  wasm:
+    # Advisory only for now (continue-on-error): wasm ships in S82, but the
+    # dependency plan (RustCrypto instead of OpenSSL) exists precisely to keep
+    # it buildable — catch unix-only accidental dependencies early. Flip this
+    # to a gating job when S82 lands.
+    continue-on-error: true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+          targets: wasm32-unknown-unknown
+      - run: cargo check --workspace --locked --target wasm32-unknown-unknown
+
+  stress:
+    # Bounded soak: keep re-running the release test suite for 10 minutes to
+    # exercise global state, ctor registration and destructors repeatedly.
+    # Grows into the harness `--stress` flag (S05 port) as stateful tests land.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+      - run: cargo test --workspace --locked --release --no-run
+      - name: Soak (10 minutes)
+        shell: bash
+        run: |
+          set +e
+          passes=0
+          end=$((SECONDS + 600))
+          while [ "$SECONDS" -lt "$end" ]; do
+            if ! cargo test --workspace --locked --release --quiet; then set -e; exit 1; fi
+            passes=$((passes + 1))
+            echo "== stress pass $passes =="
+          done
+          set -e
+          echo "soak window elapsed after $passes clean passes"
+
+  conformance-verify:
+    # Byte-verifies conformance/vectors against the C++ oracle (S04), and once
+    # S06 is committed also the tdtl lexer token stream against td's own
+    # tl-parser (guarded skip until then). The td checkout is pinned to the
+    # same commit the TL schemes were imported from (S03).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: tdlib/td
+          ref: d1085f9ce
+          path: td-cpp
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+      - name: Verify golden vectors vs C++ dump oracle (S04)
+        run: conformance/cpp_dump/verify.sh "$GITHUB_WORKSPACE/td-cpp"
+      - name: Verify tdtl lexer vs tl-parser oracle (S06)
+        run: |
+          if [ -x conformance/tl_oracle/verify.sh ]; then
+            conformance/tl_oracle/verify.sh "$GITHUB_WORKSPACE/td-cpp"
+          else
+            echo "skipped: conformance/tl_oracle/verify.sh not committed yet (S06 in progress)"
+          fi
