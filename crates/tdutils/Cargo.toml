@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+aes = "0.8"
 crc32fast = "1"
 ctor = "0.4"
 getrandom = "0.3"

@@ -62,14 +62,15 @@ pub fn md5_bytes(data: &[u8]) -> Vec<u8> {
 
 /// `td::hmac_sha256(key, message, dest)`.
 pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts any key length");
+    // Disambiguate from `KeyInit::new_from_slice` (also in scope for AES).
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(message);
     mac.finalize().into_bytes().into()
 }
 
 /// `td::hmac_sha512(key, message, dest)`.
 pub fn hmac_sha512(key: &[u8], message: &[u8]) -> [u8; 64] {
-    let mut mac = Hmac::<Sha512>::new_from_slice(key).expect("HMAC accepts any key length");
+    let mut mac = <Hmac<Sha512> as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(message);
     mac.finalize().into_bytes().into()
 }
@@ -170,6 +171,452 @@ pub fn crc16(data: &[u8]) -> u16 {
         crc = u32::from(table[t]) ^ (crc << 8);
     }
     crc as u16
+}
+
+// ---------------------------------------------------------------------------
+// AES (S24): ECB, CBC, CTR and the hand-rolled IGE of `crypto.cpp`
+// ---------------------------------------------------------------------------
+
+use aes::Aes256;
+use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+
+const AES_BLOCK_SIZE: usize = 16;
+
+/// `td::AesState` — AES-256 in ECB mode (the MTProto building block).
+pub struct AesState {
+    cipher: Aes256,
+    encrypt: bool,
+}
+
+impl AesState {
+    pub fn new() -> Self {
+        // Key is replaced by `init` before any use, mirroring the C++ class
+        // whose `impl_` is null until `init`.
+        Self {
+            cipher: Aes256::new_from_slice(&[0u8; 32]).expect("AES-256 key size is fixed"),
+            encrypt: true,
+        }
+    }
+
+    /// `td::AesState::init(key, encrypt)`.
+    pub fn init(&mut self, key: &[u8], encrypt: bool) {
+        assert_eq!(key.len(), 32, "AES key must be 256-bit");
+        self.cipher = Aes256::new_from_slice(key).expect("32-byte key checked above");
+        self.encrypt = encrypt;
+    }
+
+    /// `td::AesState::encrypt(src, dst, size)` — ECB, block-aligned.
+    pub fn encrypt(&mut self, src: &[u8], dst: &mut [u8]) {
+        assert!(
+            src.len().is_multiple_of(AES_BLOCK_SIZE),
+            "ECB needs whole blocks"
+        );
+        assert!(dst.len() >= src.len());
+        assert!(self.encrypt, "encrypt() on a decrypt state");
+        for (chunk, out) in src
+            .chunks_exact(AES_BLOCK_SIZE)
+            .zip(dst.chunks_exact_mut(AES_BLOCK_SIZE))
+        {
+            let mut block = aes::Block::clone_from_slice(chunk);
+            self.cipher.encrypt_block(&mut block);
+            out.copy_from_slice(&block);
+        }
+    }
+
+    /// `td::AesState::decrypt(src, dst, size)` — ECB, block-aligned.
+    pub fn decrypt(&mut self, src: &[u8], dst: &mut [u8]) {
+        assert!(
+            src.len().is_multiple_of(AES_BLOCK_SIZE),
+            "ECB needs whole blocks"
+        );
+        assert!(dst.len() >= src.len());
+        assert!(!self.encrypt, "decrypt() on an encrypt state");
+        for (chunk, out) in src
+            .chunks_exact(AES_BLOCK_SIZE)
+            .zip(dst.chunks_exact_mut(AES_BLOCK_SIZE))
+        {
+            let mut block = aes::Block::clone_from_slice(chunk);
+            self.cipher.decrypt_block(&mut block);
+            out.copy_from_slice(&block);
+        }
+    }
+}
+
+impl Default for AesState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `td::AesCtrState` — streaming AES-256-CTR with the 128-bit big-endian
+/// counter seeded by the IV. The keystream is byte-continuous across calls,
+/// like OpenSSL's EVP CTR `num` state.
+pub struct AesCtrState {
+    cipher: Aes256,
+    counter: [u8; AES_BLOCK_SIZE],
+    keystream: [u8; AES_BLOCK_SIZE],
+    /// Bytes of the current keystream block already consumed; the next block
+    /// is generated when this reaches `AES_BLOCK_SIZE`.
+    used: usize,
+}
+
+impl AesCtrState {
+    pub fn new() -> Self {
+        Self {
+            cipher: Aes256::new_from_slice(&[0u8; 32]).expect("AES-256 key size is fixed"),
+            counter: [0u8; AES_BLOCK_SIZE],
+            keystream: [0u8; AES_BLOCK_SIZE],
+            used: AES_BLOCK_SIZE,
+        }
+    }
+
+    /// `td::AesCtrState::init(key, iv)`.
+    pub fn init(&mut self, key: &[u8], iv: &[u8]) {
+        assert_eq!(key.len(), 32, "AES key must be 256-bit");
+        assert_eq!(iv.len(), AES_BLOCK_SIZE, "CTR IV must be 128-bit");
+        self.cipher = Aes256::new_from_slice(key).expect("32-byte key checked above");
+        self.counter.copy_from_slice(iv);
+        self.used = AES_BLOCK_SIZE;
+    }
+
+    fn next_keystream_block(&mut self) {
+        // First block encrypts the counter as-is (AES(iv)); the 128-bit
+        // big-endian increment happens after use, like OpenSSL's CTR.
+        let mut block = aes::Block::clone_from_slice(&self.counter);
+        self.cipher.encrypt_block(&mut block);
+        self.keystream.copy_from_slice(&block);
+        for byte in self.counter.iter_mut().rev() {
+            *byte = byte.wrapping_add(1);
+            if *byte != 0 {
+                break;
+            }
+        }
+        self.used = 0;
+    }
+
+    fn advance(&mut self, src: &[u8], dst: &mut [u8]) {
+        assert!(dst.len() >= src.len());
+        let mut offset = 0;
+        while offset < src.len() {
+            if self.used == AES_BLOCK_SIZE {
+                self.next_keystream_block();
+            }
+            let n = (src.len() - offset).min(AES_BLOCK_SIZE - self.used);
+            for i in 0..n {
+                dst[offset + i] = src[offset + i] ^ self.keystream[self.used + i];
+            }
+            self.used += n;
+            offset += n;
+        }
+    }
+
+    /// `td::AesCtrState::encrypt`.
+    pub fn encrypt(&mut self, src: &[u8], dst: &mut [u8]) {
+        self.advance(src, dst);
+    }
+
+    /// `td::AesCtrState::decrypt` (CTR is an involution).
+    pub fn decrypt(&mut self, src: &[u8], dst: &mut [u8]) {
+        self.advance(src, dst);
+    }
+}
+
+impl Default for AesCtrState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `td::AesIgeState` — the IGE mode of `crypto.cpp`, byte-exact port of
+/// `AesIgeStateImpl` (CBC-encrypt of XOR-chained blocks; the iv is 32 bytes:
+/// `encrypted_iv_` then `plaintext_iv_`).
+pub struct AesIgeState {
+    cipher: Aes256,
+    decrypt: bool,
+    encrypted_iv: [u8; AES_BLOCK_SIZE],
+    plaintext_iv: [u8; AES_BLOCK_SIZE],
+}
+
+impl AesIgeState {
+    pub fn new() -> Self {
+        Self {
+            cipher: Aes256::new_from_slice(&[0u8; 32]).expect("AES-256 key size is fixed"),
+            decrypt: true,
+            encrypted_iv: [0u8; AES_BLOCK_SIZE],
+            plaintext_iv: [0u8; AES_BLOCK_SIZE],
+        }
+    }
+
+    /// `td::AesIgeState::init(key, iv, encrypt)`.
+    pub fn init(&mut self, key: &[u8], iv: &[u8], encrypt: bool) {
+        assert_eq!(key.len(), 32, "AES key must be 256-bit");
+        assert_eq!(iv.len(), 32, "IGE IV must be 256-bit");
+        self.cipher = Aes256::new_from_slice(key).expect("32-byte key checked above");
+        self.decrypt = !encrypt;
+        self.encrypted_iv.copy_from_slice(&iv[..AES_BLOCK_SIZE]);
+        self.plaintext_iv.copy_from_slice(&iv[AES_BLOCK_SIZE..]);
+    }
+
+    /// `td::AesIgeStateImpl::encrypt` — standard IGE. The C++ processes
+    /// 31-block chunks, but the mode is chunk-transparent (the CBC chain
+    /// resumes from the last *output* block), so one pass is equivalent.
+    pub fn encrypt(&mut self, from: &[u8], to: &mut [u8]) {
+        assert!(
+            from.len().is_multiple_of(AES_BLOCK_SIZE),
+            "IGE needs whole blocks"
+        );
+        assert!(to.len() >= from.len());
+        assert!(!self.decrypt, "encrypt() on a decrypt state");
+        let out = &mut to[..from.len()];
+        let block_count = from.len() / AES_BLOCK_SIZE;
+        if block_count == 0 {
+            return;
+        }
+
+        let mut data_xored = vec![[0u8; AES_BLOCK_SIZE]; block_count];
+        for (i, chunk) in from.chunks_exact(AES_BLOCK_SIZE).enumerate() {
+            data_xored[i].copy_from_slice(chunk);
+        }
+        // The original plaintext blocks: the C++ xors the output with
+        // `data[i - 1]`, not the already-modified `data_xored[i - 1]`.
+        let data = data_xored.clone();
+        if block_count > 1 {
+            for (byte, plaintext_iv) in data_xored[1].iter_mut().zip(self.plaintext_iv) {
+                *byte ^= plaintext_iv;
+            }
+            for i in 2..block_count {
+                for j in 0..AES_BLOCK_SIZE {
+                    data_xored[i][j] ^= data[i - 2][j];
+                }
+            }
+        }
+
+        // C++ updates plaintext_iv_ to the last *plaintext* block, so save it
+        // before the CBC pass overwrites the data.
+        let mut last_plaintext = [0u8; AES_BLOCK_SIZE];
+        last_plaintext.copy_from_slice(&from[from.len() - AES_BLOCK_SIZE..]);
+
+        // CBC encrypt in place over data_xored, chained from encrypted_iv.
+        let mut chain = self.encrypted_iv;
+        for block in &mut data_xored {
+            for (b, c) in block.iter_mut().zip(chain) {
+                *b ^= c;
+            }
+            let mut aes_block = aes::Block::clone_from_slice(block);
+            self.cipher.encrypt_block(&mut aes_block);
+            block.copy_from_slice(&aes_block);
+            chain = *block;
+        }
+
+        // y[i] = C[i] ^ x[i-1], with x[-1] = plaintext_iv.
+        for (byte, plaintext_iv) in data_xored[0].iter_mut().zip(self.plaintext_iv) {
+            *byte ^= plaintext_iv;
+        }
+        for i in 1..block_count {
+            for j in 0..AES_BLOCK_SIZE {
+                data_xored[i][j] ^= data[i - 1][j];
+            }
+        }
+        self.plaintext_iv = last_plaintext;
+        self.encrypted_iv = data_xored[block_count - 1];
+        for (block, chunk) in data_xored.iter().zip(out.chunks_exact_mut(AES_BLOCK_SIZE)) {
+            chunk.copy_from_slice(block);
+        }
+    }
+
+    /// `td::AesIgeStateImpl::decrypt`.
+    pub fn decrypt(&mut self, from: &[u8], to: &mut [u8]) {
+        assert!(
+            from.len().is_multiple_of(AES_BLOCK_SIZE),
+            "IGE needs whole blocks"
+        );
+        assert!(to.len() >= from.len());
+        assert!(self.decrypt, "decrypt() on an encrypt state");
+        for (in_block, out_block) in from
+            .chunks_exact(AES_BLOCK_SIZE)
+            .zip(to[..from.len()].chunks_exact_mut(AES_BLOCK_SIZE))
+        {
+            let mut block = [0u8; AES_BLOCK_SIZE];
+            for ((byte, plaintext_iv), in_byte) in
+                block.iter_mut().zip(self.plaintext_iv).zip(in_block)
+            {
+                *byte = plaintext_iv ^ *in_byte;
+            }
+            let mut aes_block = aes::Block::clone_from_slice(&block);
+            self.cipher.decrypt_block(&mut aes_block);
+            block.copy_from_slice(&aes_block);
+            for (byte, encrypted_iv) in block.iter_mut().zip(self.encrypted_iv) {
+                *byte ^= encrypted_iv;
+            }
+            out_block.copy_from_slice(&block);
+            self.plaintext_iv = block;
+            self.encrypted_iv.copy_from_slice(in_block);
+        }
+    }
+}
+
+impl Default for AesIgeState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// `td::aes_ige_encrypt(key, iv, from, to)` — updates `iv` in place.
+pub fn aes_ige_encrypt(aes_key: &[u8], aes_iv: &mut [u8], from: &[u8], to: &mut [u8]) {
+    assert_eq!(aes_iv.len(), 32, "IGE IV must be 256-bit");
+    let mut state = AesIgeState::new();
+    state.init(aes_key, aes_iv, true);
+    state.encrypt(from, to);
+    aes_iv[..AES_BLOCK_SIZE].copy_from_slice(&state.encrypted_iv);
+    aes_iv[AES_BLOCK_SIZE..].copy_from_slice(&state.plaintext_iv);
+}
+
+/// `td::aes_ige_decrypt(key, iv, from, to)` — updates `iv` in place.
+pub fn aes_ige_decrypt(aes_key: &[u8], aes_iv: &mut [u8], from: &[u8], to: &mut [u8]) {
+    assert_eq!(aes_iv.len(), 32, "IGE IV must be 256-bit");
+    let mut state = AesIgeState::new();
+    state.init(aes_key, aes_iv, false);
+    state.decrypt(from, to);
+    aes_iv[..AES_BLOCK_SIZE].copy_from_slice(&state.encrypted_iv);
+    aes_iv[AES_BLOCK_SIZE..].copy_from_slice(&state.plaintext_iv);
+}
+
+/// `td::aes_cbc_encrypt(key, iv, from, to)` — updates `iv` in place.
+pub fn aes_cbc_encrypt(aes_key: &[u8], aes_iv: &mut [u8], from: &[u8], to: &mut [u8]) {
+    assert!(to.len() >= from.len());
+    assert!(
+        from.len().is_multiple_of(AES_BLOCK_SIZE),
+        "CBC needs whole blocks"
+    );
+    assert_eq!(aes_iv.len(), AES_BLOCK_SIZE, "CBC IV must be 128-bit");
+    assert_eq!(aes_key.len(), 32, "AES key must be 256-bit");
+    if from.is_empty() {
+        return;
+    }
+    let cipher = Aes256::new_from_slice(aes_key).expect("32-byte key checked above");
+    let mut chain = [0u8; AES_BLOCK_SIZE];
+    chain.copy_from_slice(aes_iv);
+    for (chunk, out) in from
+        .chunks_exact(AES_BLOCK_SIZE)
+        .zip(to[..from.len()].chunks_exact_mut(AES_BLOCK_SIZE))
+    {
+        let mut block = [0u8; AES_BLOCK_SIZE];
+        for i in 0..AES_BLOCK_SIZE {
+            block[i] = chunk[i] ^ chain[i];
+        }
+        let mut aes_block = aes::Block::clone_from_slice(&block);
+        cipher.encrypt_block(&mut aes_block);
+        block.copy_from_slice(&aes_block);
+        out.copy_from_slice(&block);
+        chain = block;
+    }
+    aes_iv.copy_from_slice(&to[from.len() - AES_BLOCK_SIZE..from.len()]);
+}
+
+/// `td::aes_cbc_decrypt(key, iv, from, to)` — updates `iv` in place to the
+/// last *input* block, then decrypts (the C++ saves the incoming iv first).
+pub fn aes_cbc_decrypt(aes_key: &[u8], aes_iv: &mut [u8], from: &[u8], to: &mut [u8]) {
+    assert!(to.len() >= from.len());
+    assert!(
+        from.len().is_multiple_of(AES_BLOCK_SIZE),
+        "CBC needs whole blocks"
+    );
+    assert_eq!(aes_iv.len(), AES_BLOCK_SIZE, "CBC IV must be 128-bit");
+    assert_eq!(aes_key.len(), 32, "AES key must be 256-bit");
+    if from.is_empty() {
+        return;
+    }
+    let cipher = Aes256::new_from_slice(aes_key).expect("32-byte key checked above");
+    let mut chain = [0u8; AES_BLOCK_SIZE];
+    chain.copy_from_slice(aes_iv);
+    aes_iv.copy_from_slice(&from[from.len() - AES_BLOCK_SIZE..]);
+    let mut prev_cipher = [0u8; AES_BLOCK_SIZE];
+    for (i, (chunk, out)) in from
+        .chunks_exact(AES_BLOCK_SIZE)
+        .zip(to[..from.len()].chunks_exact_mut(AES_BLOCK_SIZE))
+        .enumerate()
+    {
+        if i != 0 {
+            chain = prev_cipher;
+        }
+        let mut block = aes::Block::clone_from_slice(chunk);
+        cipher.decrypt_block(&mut block);
+        let mut plain = [0u8; AES_BLOCK_SIZE];
+        plain.copy_from_slice(&block);
+        for j in 0..AES_BLOCK_SIZE {
+            plain[j] ^= chain[j];
+        }
+        out.copy_from_slice(&plain);
+        prev_cipher.copy_from_slice(chunk);
+    }
+}
+
+/// `td::AesCbcState` — streaming CBC with the key/iv stored in the state.
+pub struct AesCbcState {
+    key: [u8; 32],
+    iv: [u8; AES_BLOCK_SIZE],
+    is_encrypt: bool,
+    inited: bool,
+}
+
+impl AesCbcState {
+    /// `td::AesCbcState(key256, iv128)`.
+    pub fn new(key256: &[u8], iv128: &[u8]) -> Self {
+        assert_eq!(key256.len(), 32, "AES key must be 256-bit");
+        assert_eq!(iv128.len(), AES_BLOCK_SIZE, "CBC IV must be 128-bit");
+        let mut key = [0u8; 32];
+        key.copy_from_slice(key256);
+        let mut iv = [0u8; AES_BLOCK_SIZE];
+        iv.copy_from_slice(iv128);
+        Self {
+            key,
+            iv,
+            is_encrypt: false,
+            inited: false,
+        }
+    }
+
+    /// `td::AesCbcState::encrypt`.
+    pub fn encrypt(&mut self, from: &[u8], to: &mut [u8]) {
+        if from.is_empty() {
+            return;
+        }
+        assert!(to.len() >= from.len());
+        assert!(
+            from.len().is_multiple_of(AES_BLOCK_SIZE),
+            "CBC needs whole blocks"
+        );
+        if !self.inited {
+            self.is_encrypt = true;
+            self.inited = true;
+        } else {
+            assert!(self.is_encrypt, "mixed encrypt/decrypt use");
+        }
+        let mut iv = self.iv;
+        aes_cbc_encrypt(&self.key, &mut iv, from, to);
+        self.iv = iv;
+    }
+
+    /// `td::AesCbcState::decrypt`.
+    pub fn decrypt(&mut self, from: &[u8], to: &mut [u8]) {
+        if from.is_empty() {
+            return;
+        }
+        assert!(to.len() >= from.len());
+        assert!(
+            from.len().is_multiple_of(AES_BLOCK_SIZE),
+            "CBC needs whole blocks"
+        );
+        if !self.inited {
+            self.is_encrypt = false;
+            self.inited = true;
+        } else {
+            assert!(!self.is_encrypt, "mixed encrypt/decrypt use");
+        }
+        let mut iv = self.iv;
+        aes_cbc_decrypt(&self.key, &mut iv, from, to);
+        self.iv = iv;
+    }
 }
 
 #[cfg(test)]
@@ -375,5 +822,243 @@ mod tests {
             out.push(DIGITS[(byte & 0xf) as usize] as char);
         }
         out
+    }
+
+    /// The C++ deterministic stream: `seed = seed * 123457567 + 987651241`,
+    /// output byte `(seed >> 23) & 255` (u32 wrapping).
+    struct DeterministicBytes {
+        seed: u32,
+    }
+
+    impl DeterministicBytes {
+        fn new(seed: u32) -> Self {
+            Self { seed }
+        }
+
+        fn fill(&mut self, out: &mut [u8]) {
+            for byte in out {
+                self.seed = self
+                    .seed
+                    .wrapping_mul(123_457_567)
+                    .wrapping_add(987_651_241);
+                *byte = ((self.seed >> 23) & 255) as u8;
+            }
+        }
+    }
+
+    /// Port of `TEST(Crypto, Aes)`.
+    #[test]
+    fn aes_ecb_roundtrip() {
+        let mut rnd = Xorshift128plus::from_seed(123);
+        let mut key = [0u8; 32];
+        rnd.bytes(&mut key);
+        let mut plaintext = [0u8; 16];
+        rnd.bytes(&mut plaintext);
+        let mut encrypted = [0u8; 16];
+        let mut decrypted = [0u8; 16];
+
+        let mut encryptor = AesState::new();
+        encryptor.init(&key, true);
+        let mut decryptor = AesState::new();
+        decryptor.init(&key, false);
+
+        encryptor.encrypt(&plaintext, &mut encrypted);
+        decryptor.decrypt(&encrypted, &mut decrypted);
+
+        assert_eq!(decrypted, plaintext);
+        assert_ne!(decrypted, encrypted);
+        assert_eq!(crc32fast::hash(&encrypted), 178_892_237);
+    }
+
+    /// Port of `TEST(Crypto, AesCtrState)`.
+    #[test]
+    fn aes_ctr_state_matches_cpp() {
+        let answers1 = [
+            0u32,
+            1_141_589_763,
+            596_296_607,
+            3_673_001_485,
+            2_302_125_528,
+            330_967_191,
+            2_047_392_231,
+            3_537_459_563,
+            307_747_798,
+            2_149_598_133,
+        ];
+        let answers2 = [
+            0u32,
+            2_053_451_992,
+            1_384_063_362,
+            3_266_188_502,
+            2_893_295_118,
+            780_356_167,
+            1_904_947_434,
+            2_043_402_406,
+            472_080_809,
+            1_807_109_488,
+        ];
+        let lengths = [
+            0usize, 1, 31, 32, 33, 9999, 10000, 10001, 999_999, 1_000_001,
+        ];
+
+        for (i, length) in lengths.iter().enumerate() {
+            let mut generator = DeterministicBytes::new(*length as u32);
+            let mut s = vec![0u8; *length];
+            generator.fill(&mut s);
+            let mut key = [0u8; 32];
+            generator.fill(&mut key);
+            let mut iv = [0u8; 16];
+            generator.fill(&mut iv);
+
+            let mut state = AesCtrState::new();
+            state.init(&key, &iv);
+            let mut t = vec![0u8; *length];
+            let mut pos = 0;
+            for chunk in crate::random::rand_split(&vec![0u8; *length]) {
+                let len = chunk.len();
+                state.encrypt(&s[pos..pos + len], &mut t[pos..pos + len]);
+                pos += len;
+            }
+            assert_eq!(crc32fast::hash(&t), answers1[i], "length {length}");
+
+            state.init(&key, &iv);
+            pos = 0;
+            for chunk in crate::random::rand_split(&vec![0u8; *length]) {
+                let len = chunk.len();
+                // In-place decrypt via a scratch copy (C++ decrypts in
+                // place; the copy keeps Rust's aliasing rules satisfied).
+                let scratch = t[pos..pos + len].to_vec();
+                state.decrypt(&scratch, &mut t[pos..pos + len]);
+                pos += len;
+            }
+            assert_eq!(s, t, "decrypt roundtrip length {length}");
+
+            iv.fill(0xFF);
+            state.init(&key, &iv);
+            pos = 0;
+            for chunk in crate::random::rand_split(&vec![0u8; *length]) {
+                let len = chunk.len();
+                state.encrypt(&s[pos..pos + len], &mut t[pos..pos + len]);
+                pos += len;
+            }
+            assert_eq!(crc32fast::hash(&t), answers2[i], "0xFF iv length {length}");
+        }
+    }
+
+    /// Port of `TEST(Crypto, AesIgeState)`.
+    #[test]
+    fn aes_ige_state_matches_cpp() {
+        let answers1 = [
+            0u32,
+            2_045_698_207,
+            2_423_540_300,
+            525_522_475,
+            1_545_267_325,
+            724_143_417,
+        ];
+        let lengths = [0usize, 16, 32, 256, 1024, 65536];
+
+        for (i, length) in lengths.iter().enumerate() {
+            let mut generator = DeterministicBytes::new(*length as u32);
+            let mut s = vec![0u8; *length];
+            generator.fill(&mut s);
+            let mut key = [0u8; 32];
+            generator.fill(&mut key);
+            let mut iv = [0u8; 32];
+            generator.fill(&mut iv);
+
+            let mut state = AesIgeState::new();
+            state.init(&key, &iv, true);
+            let mut t = vec![0u8; *length];
+            let mut iv_copy = iv;
+            let mut u = vec![0u8; *length];
+            let mut pos = 0;
+            for chunk in crate::random::rand_split(&vec![0u8; *length / 16]) {
+                let len = 16 * chunk.len();
+                state.encrypt(&s[pos..pos + len], &mut t[pos..pos + len]);
+                aes_ige_encrypt(
+                    &key,
+                    &mut iv_copy,
+                    &s[pos..pos + len],
+                    &mut u[pos..pos + len],
+                );
+                pos += len;
+            }
+
+            assert_eq!(crc32fast::hash(&t), answers1[i], "state length {length}");
+            assert_eq!(crc32fast::hash(&u), answers1[i], "one-shot length {length}");
+
+            state.init(&key, &iv, false);
+            iv_copy = iv;
+            pos = 0;
+            for chunk in crate::random::rand_split(&vec![0u8; *length / 16]) {
+                let len = 16 * chunk.len();
+                let scratch = t[pos..pos + len].to_vec();
+                state.decrypt(&scratch, &mut t[pos..pos + len]);
+                let scratch = u[pos..pos + len].to_vec();
+                aes_ige_decrypt(&key, &mut iv_copy, &scratch, &mut u[pos..pos + len]);
+                pos += len;
+            }
+            assert_eq!(s, t, "state decrypt length {length}");
+            assert_eq!(s, u, "one-shot decrypt length {length}");
+        }
+    }
+
+    /// Port of `TEST(Crypto, AesCbcState)`.
+    #[test]
+    fn aes_cbc_state_matches_cpp() {
+        let answers1 = [
+            0u32,
+            3_617_355_989,
+            3_449_188_102,
+            186_999_968,
+            4_244_808_847,
+            2_626_031_206,
+        ];
+        let lengths = [0usize, 16, 32, 256, 1024, 65536];
+
+        for (i, length) in lengths.iter().enumerate() {
+            let mut generator = DeterministicBytes::new(*length as u32);
+            let mut s = vec![0u8; *length];
+            generator.fill(&mut s);
+            let mut key = [0u8; 32];
+            generator.fill(&mut key);
+            let mut iv = [0u8; 16];
+            generator.fill(&mut iv);
+
+            let mut state = AesCbcState::new(&key, &iv);
+            let mut t = vec![0u8; *length];
+            let mut iv_copy = iv;
+            let mut u = vec![0u8; *length];
+            let mut pos = 0;
+            for chunk in crate::random::rand_split(&vec![0u8; *length / 16]) {
+                let len = 16 * chunk.len();
+                state.encrypt(&s[pos..pos + len], &mut t[pos..pos + len]);
+                aes_cbc_encrypt(
+                    &key,
+                    &mut iv_copy,
+                    &s[pos..pos + len],
+                    &mut u[pos..pos + len],
+                );
+                pos += len;
+            }
+
+            assert_eq!(crc32fast::hash(&t), answers1[i], "state length {length}");
+            assert_eq!(crc32fast::hash(&u), answers1[i], "one-shot length {length}");
+
+            let mut state = AesCbcState::new(&key, &iv);
+            iv_copy = iv;
+            pos = 0;
+            for chunk in crate::random::rand_split(&vec![0u8; *length / 16]) {
+                let len = 16 * chunk.len();
+                let scratch = t[pos..pos + len].to_vec();
+                state.decrypt(&scratch, &mut t[pos..pos + len]);
+                let scratch = u[pos..pos + len].to_vec();
+                aes_cbc_decrypt(&key, &mut iv_copy, &scratch, &mut u[pos..pos + len]);
+                pos += len;
+            }
+            assert_eq!(s, t, "state decrypt length {length}");
+            assert_eq!(s, u, "one-shot decrypt length {length}");
+        }
     }
 }
