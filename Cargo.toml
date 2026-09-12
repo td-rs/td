@@ -1,0 +1,25 @@
+# td-rs: Rust rewrite of TDLib as a drop-in replacement behind the existing C ABI.
+# Plan: RUST_REWRITE_PLAN.md in the C++ repo (../td). One green commit per plan step.
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/tdutils",
+    "crates/tdactor",
+    "crates/tdnet",
+    "crates/tddb",
+    "crates/tdmtproto",
+    "crates/tde2e",
+    "crates/tdclient",
+    "crates/tdjson",
+    "crates/tl-codegen",
+    "crates/tdtl",
+]
+# These dirs grow their own manifests in later steps (S73/S78/S79); exclude until then.
+exclude = ["conformance", "fuzz", "bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "BSL-1.0"
+publish = false

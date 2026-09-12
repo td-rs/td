@@ -1,0 +1,2 @@
+# Workspace formatting rules (enforced in CI by S02).
+max_width = 100
