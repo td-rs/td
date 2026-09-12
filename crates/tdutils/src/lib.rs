@@ -8,6 +8,7 @@ pub mod bignum;
 pub mod buffer;
 pub mod crc32;
 pub mod crypto;
+pub mod ed25519;
 pub mod json;
 pub mod logging;
 pub mod random;
