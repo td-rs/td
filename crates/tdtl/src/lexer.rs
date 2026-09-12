@@ -70,6 +70,32 @@ pub const FLAG_NAMESPACE_DOT: i32 = 1;
 /// `flags |= 2`).
 pub const FLAG_MAGIC_HASH: i32 = 2;
 
+/// Snapshot of the lexer state for parser backtracking, mirroring the C
+/// `save_parse`/`load_parse` pair: it copies `struct parse` (position, line
+/// tracking, current token) but not `curch` — `load_state` recomputes `curch`
+/// from the restored position, exactly like the C `load_parse` does.
+#[derive(Debug, Clone, Copy)]
+pub struct ParseState {
+    pos: usize,
+    line: i32,
+    line_pos: i32,
+    lex: CurLex,
+}
+
+/// The current token's byte range in the source; `None` where the C code
+/// would see a null/invalid `parse.lex.ptr` (error, eof, or no token yet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lexeme {
+    pub start: usize,
+    pub len: usize,
+}
+
+impl Lexeme {
+    pub fn as_range(&self) -> std::ops::Range<usize> {
+        self.start..self.start + self.len
+    }
+}
+
 /// Lexer state, bundling the C globals `struct parse parse; char curch;`.
 pub struct Lexer {
     text: Vec<u8>,
@@ -128,6 +154,57 @@ impl Lexer {
     /// The full source text.
     pub fn text(&self) -> &[u8] {
         &self.text
+    }
+
+    /// Consumes the lexer, returning the source text (parse trees reference
+    /// it by offset, so the program builder needs to keep it alive).
+    pub fn into_text(self) -> Vec<u8> {
+        self.text
+    }
+
+    /// The current token's byte range; `None` for `Error`/`Eof`/`None`, where
+    /// the C `parse.lex.ptr` is null or `(void *)-1`.
+    pub fn lexeme(&self) -> Option<Lexeme> {
+        if self.lex.len == 0 || matches!(self.lex.ty, LexType::Error | LexType::Eof | LexType::None)
+        {
+            None
+        } else {
+            Some(Lexeme {
+                start: self.lex.start,
+                len: self.lex.len,
+            })
+        }
+    }
+
+    /// Mirrors `save_parse`.
+    pub fn save_state(&self) -> ParseState {
+        ParseState {
+            pos: self.pos,
+            line: self.line,
+            line_pos: self.line_pos,
+            lex: self.lex,
+        }
+    }
+
+    /// Mirrors `load_parse`: restores the snapshot and reloads `curch` from
+    /// `text[pos]` (the C `pos > len` guard reads as 0 here, as does any
+    /// out-of-range position, which only arises for empty input).
+    pub fn load_state(&mut self, state: ParseState) {
+        self.pos = state.pos;
+        self.line = state.line;
+        self.line_pos = state.line_pos;
+        self.lex = state.lex;
+        self.curch = if (self.pos as isize) > self.len as isize {
+            0
+        } else {
+            self.text.get(self.pos).copied().unwrap_or(0)
+        };
+    }
+
+    /// Records a parse error the way the C `parse_error` does; used by the
+    /// parser stage during backtracking probes.
+    pub fn error(&mut self, msg: &str) {
+        self.parse_error(msg);
     }
 
     /// The current token's bytes; empty for `Error`/`Eof`/`None`.

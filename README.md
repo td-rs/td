@@ -15,6 +15,8 @@ The execution plan is `RUST_REWRITE_PLAN.md` at the root of the C++ repo
 - [x] S03 — TL schemes imported from tdlib `d1085f9ce`, pinned by hash
 - [x] S04 — golden vectors extracted from C++ `test/data.cpp` into `conformance/vectors/`, byte-verified against td's own `base64.cpp`
 - [x] S05 — tdlib test harness (`td/utils/tests`) ported to `tdutils` (runner, timing, ctor registration, regression tester, stage barriers)
+- [x] S06 — tl-parser lexer ported to `tdtl`, token-identical to the C original for all five schemes
+- [x] S07 — tl-parser parser ported to `tdtl` (parse tree + scheme program with CRC32 constructor ids); scheme dump identical to the C oracle for all five schemes (td_api: 753 types / 2192 ctors / 1022 funcs)
 
 ## Checks (CI parity)
 

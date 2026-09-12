@@ -127,9 +127,10 @@ jobs:
           echo "soak window elapsed after $passes clean passes"
 
   conformance-verify:
-    # Byte-verifies conformance/vectors against the C++ oracle (S04), and once
-    # S06 is committed also the tdtl lexer token stream against td's own
-    # tl-parser (guarded skip until then). The td checkout is pinned to the
+    # Byte-verifies conformance/vectors against the C++ oracle (S04), the
+    # tdtl lexer token stream against td's own tl-parser (S06), and the tdtl
+    # scheme program dump — types/constructors/functions with their ids —
+    # against the same tl-parser (S07). The td checkout is pinned to the
     # same commit the TL schemes were imported from (S03).
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -152,4 +153,11 @@ jobs:
             conformance/tl_oracle/verify.sh "$GITHUB_WORKSPACE/td-cpp"
           else
             echo "skipped: conformance/tl_oracle/verify.sh not committed yet (S06 in progress)"
+          fi
+      - name: Verify tdtl scheme program vs tl-parser oracle (S07)
+        run: |
+          if [ -x conformance/tl_oracle/verify_scheme.sh ]; then
+            conformance/tl_oracle/verify_scheme.sh "$GITHUB_WORKSPACE/td-cpp"
+          else
+            echo "skipped: conformance/tl_oracle/verify_scheme.sh not committed yet (S07 in progress)"
           fi
