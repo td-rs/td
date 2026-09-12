@@ -334,6 +334,20 @@ impl<T> Result<T> {
         }
     }
 
+    /// `std::result::Result::unwrap` — takes the value, panicking on error.
+    pub fn unwrap(self) -> T {
+        self.move_as_ok()
+    }
+
+    /// `std::result::Result::unwrap_or_else` — takes the value, or maps the
+    /// error through `f`.
+    pub fn unwrap_or_else(self, f: impl FnOnce(Status) -> T) -> T {
+        match self {
+            Self::Ok(value) => value,
+            Self::Err(status) => f(status),
+        }
+    }
+
     /// `td::Result::move_as_ok_unsafe()` — takes the value without checking.
     pub fn move_as_ok_unsafe(self) -> T {
         match self {
