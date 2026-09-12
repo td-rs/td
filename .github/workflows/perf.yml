@@ -39,6 +39,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  RUSTUP_TOOLCHAIN: "1.95"
 
 jobs:
   # When triggered via workflow_run, fail loudly instead of silently skipping

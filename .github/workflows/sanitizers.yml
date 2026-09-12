@@ -26,6 +26,10 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   RUST_BACKTRACE: "1"
+  # Required: RUSTUP_TOOLCHAIN is the only override that beats the repo's
+  # rust-toolchain.toml (1.95). Without it rustup would route the sanitizer
+  # flags to the pinned stable toolchain and fail.
+  RUSTUP_TOOLCHAIN: nightly-2026-09-01
 
 jobs:
   asan:

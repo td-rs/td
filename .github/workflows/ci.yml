@@ -22,6 +22,9 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  # RUSTUP_TOOLCHAIN beats rust-toolchain.toml, so CI's pin is explicit and
+  # cannot be silently changed by editing the file.
+  RUSTUP_TOOLCHAIN: "1.95"
 
 jobs:
   fmt:
