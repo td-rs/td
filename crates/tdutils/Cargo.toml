@@ -8,3 +8,4 @@ publish.workspace = true
 [dependencies]
 ctor = "0.4"
 sha2 = "0.10"
+tracing = "0.1"
