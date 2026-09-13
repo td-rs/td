@@ -169,7 +169,7 @@ fn call_after_destruct() {
     let delivered = Arc::new(AtomicUsize::new(0));
 
     struct Slave {
-        master: tdactor::ActorId,
+        master: tdactor::ActorId<Master>,
         teardown: Arc<AtomicBool>,
     }
     impl Actor for Slave {
@@ -183,7 +183,7 @@ fn call_after_destruct() {
     }
 
     struct Master {
-        slave: Option<ActorOwn>,
+        slave: Option<ActorOwn<Slave>>,
         dropped: Arc<AtomicBool>,
         delivered: Arc<AtomicUsize>,
         teardown: Arc<AtomicBool>,
@@ -193,7 +193,7 @@ fn call_after_destruct() {
             self.slave = Some(create_actor(
                 "Slave",
                 Slave {
-                    master: self.actor_id(),
+                    master: self.actor_id_of::<Master>(),
                     teardown: self.teardown.clone(),
                 },
             ));
@@ -240,7 +240,7 @@ fn later_aaabbb() {
     let sb: Arc<Mutex<String>> = Arc::default();
     struct LaterSlave {
         // Held only for its Drop (sends the hangup to the parent).
-        _parent: ActorShared,
+        _parent: ActorShared<LaterMaster>,
         sb: Arc<Mutex<String>>,
     }
     impl Actor for LaterSlave {
@@ -255,7 +255,7 @@ fn later_aaabbb() {
     }
 
     struct LaterMaster {
-        children: Vec<ActorOwn>,
+        children: Vec<ActorOwn<LaterSlave>>,
         cnt: usize,
         sb: Arc<Mutex<String>>,
     }
@@ -265,7 +265,7 @@ fn later_aaabbb() {
                 self.children.push(create_actor(
                     "LaterSlave",
                     LaterSlave {
-                        _parent: ActorShared::new(self.actor_id(), u64::MAX),
+                        _parent: self.actor_shared_of::<LaterMaster>(u64::MAX),
                         sb: self.sb.clone(),
                     },
                 ));
@@ -348,7 +348,7 @@ fn send_from_other_threads() {
 fn link_token() {
     struct LinkSlave {
         // Held only for its Drop (sends the hangup with token 123 back).
-        _parent: ActorShared,
+        _parent: ActorShared<LinkMaster>,
     }
     impl Actor for LinkSlave {
         fn raw_event(&mut self, raw: Raw) {
@@ -357,14 +357,14 @@ fn link_token() {
     }
 
     struct LinkMaster {
-        child: Option<ActorOwn>,
+        child: Option<ActorOwn<LinkSlave>>,
     }
     impl Actor for LinkMaster {
         fn start_up(&mut self) {
             self.child = Some(create_actor(
                 "LinkSlave",
                 LinkSlave {
-                    _parent: ActorShared::new(self.actor_id(), 123),
+                    _parent: self.actor_shared_of::<LinkMaster>(123),
                 },
             ));
             self.yield_();
@@ -476,7 +476,7 @@ fn simple_migrate() {
     }
 
     struct Sender {
-        target: tdactor::ActorId,
+        target: tdactor::ActorId<Migrator>,
     }
     impl Actor for Sender {
         fn start_up(&mut self) {

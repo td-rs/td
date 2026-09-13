@@ -7,7 +7,7 @@
 //! context, which is only valid while a handler is running. This is
 //! equivalent: an actor's methods only ever run inside `Scheduler::do_event`.
 
-use crate::actor_id::ActorId;
+use crate::actor_id::{ActorId, ActorShared};
 use crate::event::Raw;
 use crate::scheduler::Scheduler;
 
@@ -122,8 +122,36 @@ pub trait Actor: Send + 'static {
         Scheduler::instance().get_link_token(Scheduler::current_actor())
     }
 
-    /// This actor's own [`ActorId`] — the port of C++ `Actor::actor_id()`.
+    /// This actor's own [`ActorId`] (the untyped form) — the port of C++
+    /// `Actor::actor_id()`.
     fn actor_id(&self) -> ActorId {
         Scheduler::current_actor()
+    }
+
+    /// This actor's own id with the type marker `A` — the port of C++
+    /// `Actor::actor_id(this)`, where `this` names the concrete type. `A`
+    /// must be the actor's type or one of its supertraits (the marker is
+    /// inert; see the `actor_id` module docs). `Self: Sized` keeps the trait
+    /// dyn-compatible; inside an actor method `Self` is the concrete type.
+    fn actor_id_of<A: ?Sized>(&self) -> ActorId<A>
+    where
+        Self: Sized,
+    {
+        Scheduler::current_actor().cast::<A>()
+    }
+
+    /// A shared reference to this actor with the given link token — the port
+    /// of C++ `Actor::actor_shared(this, token)`.
+    fn actor_shared_of<A: ?Sized>(&self, token: u64) -> ActorShared<A>
+    where
+        Self: Sized,
+    {
+        ActorShared::new(self.actor_id_of::<A>(), token)
+    }
+
+    /// This actor's name — the port of C++ `Actor::get_name()`. Returns an
+    /// owned string (the id the name borrows from is thread-local).
+    fn get_name(&self) -> String {
+        Scheduler::current_actor().get_name().to_owned()
     }
 }

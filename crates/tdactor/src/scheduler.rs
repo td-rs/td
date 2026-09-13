@@ -57,7 +57,6 @@ const IDLE_POLL: Duration = Duration::from_secs(10);
 /// Port of C++ `ActorInfo` (the `mailbox_`, `is_running_` and timeout parts;
 /// the atomic `sched_id_` lives in the `IdSlot` shared with [`ActorId`]).
 pub(crate) struct ActorInfo {
-    pub name: String,
     pub actor: RefCell<Option<Box<dyn Actor>>>,
     pub mailbox: RefCell<VecDeque<Event>>,
     pub is_running: Cell<bool>,
@@ -71,9 +70,8 @@ pub(crate) struct ActorInfo {
 }
 
 impl ActorInfo {
-    fn new<A: Actor>(name: &str, actor: A) -> Self {
+    fn new<A: Actor>(actor: A) -> Self {
         Self {
-            name: String::from(name),
             actor: RefCell::new(Some(Box::new(actor))),
             mailbox: RefCell::new(VecDeque::new()),
             is_running: Cell::new(false),
@@ -82,12 +80,6 @@ impl ActorInfo {
             timeout_gen: Cell::new(0),
             deadline: Cell::new(None),
         }
-    }
-}
-
-impl std::fmt::Display for ActorInfo {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.name)
     }
 }
 
@@ -234,7 +226,7 @@ impl SchedulerState {
     // ---- actor registration (Scheduler.h template part) ----
 
     /// `Scheduler::create_actor`: register on the current scheduler.
-    pub fn create_actor<A: Actor>(&self, name: &str, actor: A) -> ActorOwn {
+    pub fn create_actor<A: Actor>(&self, name: &str, actor: A) -> ActorOwn<A> {
         self.register_actor_impl(name, actor, self.sched_id)
     }
 
@@ -244,17 +236,17 @@ impl SchedulerState {
         name: &str,
         sched_id: i32,
         actor: A,
-    ) -> ActorOwn {
+    ) -> ActorOwn<A> {
         self.register_actor_impl(name, actor, sched_id)
     }
 
     /// `Scheduler::register_actor` (the `Deleter::Destroy` overload: the
     /// scheduler owns the actor).
-    pub fn register_actor<A: Actor>(&self, name: &str, sched_id: i32, actor: A) -> ActorOwn {
+    pub fn register_actor<A: Actor>(&self, name: &str, sched_id: i32, actor: A) -> ActorOwn<A> {
         self.register_actor_impl(name, actor, sched_id)
     }
 
-    fn register_actor_impl<A: Actor>(&self, name: &str, actor: A, sched_id: i32) -> ActorOwn {
+    fn register_actor_impl<A: Actor>(&self, name: &str, actor: A, sched_id: i32) -> ActorOwn<A> {
         assert!(
             self.has_guard.get(),
             "create_actor requires a scheduler guard"
@@ -270,8 +262,10 @@ impl SchedulerState {
             self.sched_count
         );
 
-        let slot = crate::actor_id::IdSlot::new(Box::new(ActorInfo::new(name, actor)), sched_id);
-        let id = ActorId::new(slot);
+        let slot = crate::actor_id::IdSlot::new(Box::new(ActorInfo::new(actor)), sched_id, name);
+        // The allocation is type-independent (the "session-unique id" of the
+        // plan); the typed `ActorId<A>` is a pure marker added on the way out.
+        let id: ActorId = ActorId::new(slot);
         self.actor_count.set(self.actor_count.get() + 1);
 
         if sched_id != self.sched_id {
@@ -282,7 +276,7 @@ impl SchedulerState {
             self.info(id.clone()).in_pending.set(true);
             self.send_later(id.clone(), Event::start());
         }
-        ActorOwn::new(id)
+        ActorOwn::new(id.cast::<A>())
     }
 
     // ---- sending (Scheduler.cpp send paths) ----
@@ -1041,12 +1035,22 @@ impl ConcurrentScheduler {
 
     /// `ConcurrentScheduler::create_actor_unsafe`: create an actor on any
     /// scheduler, before [`start`](Self::start).
-    pub fn create_actor_unsafe<A: Actor>(&self, sched_id: i32, name: &str, actor: A) -> ActorOwn {
+    pub fn create_actor_unsafe<A: Actor>(
+        &self,
+        sched_id: i32,
+        name: &str,
+        actor: A,
+    ) -> ActorOwn<A> {
         self.register_actor_unsafe(sched_id, name, actor)
     }
 
     /// `ConcurrentScheduler::register_actor_unsafe`.
-    pub fn register_actor_unsafe<A: Actor>(&self, sched_id: i32, name: &str, actor: A) -> ActorOwn {
+    pub fn register_actor_unsafe<A: Actor>(
+        &self,
+        sched_id: i32,
+        name: &str,
+        actor: A,
+    ) -> ActorOwn<A> {
         let state = self.state_for(sched_id);
         let _guard = SchedulerGuard::new(state, true);
         state.create_actor(name, actor)

@@ -3,8 +3,9 @@
 //! S31 — the scheduler: one OS thread per scheduler (each running a
 //! `current_thread` tokio runtime), per-actor mailboxes, the ready/pending
 //! queues, the timeout heap, cross-scheduler routing and actor migration.
-//! Typed `ActorId<A>` and the `send_closure` message machinery land with
-//! S32/S33; until then actors communicate through [`Raw`] events.
+//! S32 adds the typed `ActorId<A>`/`ActorOwn<A>`/`ActorShared<A>` markers;
+//! the `send_closure` message machinery follows in S33 — until then actors
+//! communicate through [`Raw`] events.
 //!
 //! ```
 //! use std::sync::{Arc, Mutex};
@@ -22,7 +23,7 @@
 //! }
 //!
 //! struct Driver {
-//!     target: tdactor::ActorId,
+//!     target: tdactor::ActorId<Counter>,
 //! }
 //!
 //! impl Actor for Driver {
@@ -52,19 +53,19 @@ pub use event::{Event, EventType, Raw};
 pub use scheduler::{ConcurrentScheduler, Scheduler, SchedulerGuard, SchedulerPtr, SchedulerState};
 
 /// Create an actor on the current scheduler — the free `td::create_actor`.
-pub fn create_actor<A: Actor>(name: &str, actor: A) -> ActorOwn {
+pub fn create_actor<A: Actor>(name: &str, actor: A) -> ActorOwn<A> {
     Scheduler::instance().create_actor(name, actor)
 }
 
 /// Create an actor on the given scheduler — the free
 /// `td::create_actor_on_scheduler`.
-pub fn create_actor_on_scheduler<A: Actor>(name: &str, sched_id: i32, actor: A) -> ActorOwn {
+pub fn create_actor_on_scheduler<A: Actor>(name: &str, sched_id: i32, actor: A) -> ActorOwn<A> {
     Scheduler::instance().create_actor_on_scheduler(name, sched_id, actor)
 }
 
 /// Register an actor on the given scheduler (the owning overload) — the free
 /// `td::register_actor`.
-pub fn register_actor<A: Actor>(name: &str, sched_id: i32, actor: A) -> ActorOwn {
+pub fn register_actor<A: Actor>(name: &str, sched_id: i32, actor: A) -> ActorOwn<A> {
     Scheduler::instance().register_actor(name, sched_id, actor)
 }
 
