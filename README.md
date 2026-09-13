@@ -19,6 +19,7 @@ The execution plan is `RUST_REWRITE_PLAN.md` at the root of the C++ repo
 - [x] S07 — tl-parser parser ported to `tdtl` (parse tree + scheme program with CRC32 constructor ids); scheme dump identical to the C oracle for all five schemes (td_api: 753 types / 2192 ctors / 1022 funcs)
 - [x] S08 — `.tlo` serialization (`write_types`) ported to `tdtl`; byte-identical to td's own tl-parser output (`tl-parser -e`) for all five schemes, incl. combinator argument trees
 - [x] S09 — `tl_writer_rust` part 1: the td_api data model generates from build.rs (3205 structs + 211 enums + the `Function` umbrella, serde derives, `Box` indirection on recursive types) and compiles; counts match the C-oracle scheme counts (753/2192/1022)
+- [x] S10 — TL binary store: primitives, TL string framing (all three length forms), bare/boxed vectors, the flags word with auto-OR'd `?true` bits, conditional fields, bare/boxed objects; telegram_api model generated into `tdmtproto`, byte-identical to td's generated C++ `TlStorerUnsafe` on the oracle sample set (`conformance/tl_store_oracle`); generated round-trip + malformed-input tests included
 
 ## Checks (CI parity)
 

@@ -1,8 +1,9 @@
 //! Port of `td/telegram`: client logic, managers, td_api query/update
 //! handling. The td_api data model is generated at build time from the
-//! pinned scheme (S09).
+//! pinned scheme (S09, store in S10).
 
-#[allow(dead_code, clippy::large_enum_variant)]
+// Generated code keeps C++-identical case-preserved names (`aiComposeTone`).
+#[allow(dead_code, non_camel_case_types, clippy::large_enum_variant)]
 pub mod td_api {
     include!(concat!(env!("OUT_DIR"), "/td_api.rs"));
 }
@@ -27,8 +28,8 @@ mod tests {
     #[test]
     fn model_is_constructible_and_debug_prints() {
         let content =
-            td_api::MessageContent::MessageChatDeletePhoto(td_api::MessageChatDeletePhoto);
-        assert!(format!("{content:?}").contains("MessageChatDeletePhoto"));
+            td_api::MessageContent::messageChatDeletePhoto(td_api::messageChatDeletePhoto);
+        assert!(format!("{content:?}").contains("messageChatDeletePhoto"));
         let text = td_api::FormattedText {
             text: "hi".to_owned(),
             entities: Vec::new(),
@@ -40,7 +41,7 @@ mod tests {
     #[test]
     fn internally_tagged_enum_round_trips() {
         let content =
-            td_api::MessageContent::MessageChatDeletePhoto(td_api::MessageChatDeletePhoto);
+            td_api::MessageContent::messageChatDeletePhoto(td_api::messageChatDeletePhoto);
         let json = serde_json::to_string(&content).unwrap();
         assert_eq!(json, r#"{"@type":"messageChatDeletePhoto"}"#);
         let back: td_api::MessageContent = serde_json::from_str(&json).unwrap();

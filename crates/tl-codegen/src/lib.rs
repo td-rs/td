@@ -3,9 +3,9 @@
 //! (`scheme/sha256sums.txt` records the provenance), so generated code is a
 //! pure function of this crate.
 //!
-//! S09 emits the Rust data model (structs/enums + serde derives); binary
-//! serialization (S10/S11), td_api JSON (S12) and the remaining schemes'
-//! writers (S13) layer on the same [`model::SchemeModel`].
+//! S09 emits the Rust data model (structs/enums + serde derives); S10 adds
+//! the TL binary `store` implementations; td_api JSON (S12) and the
+//! remaining schemes' writers (S13) layer on the same [`model::SchemeModel`].
 
 pub mod model;
 pub mod rust_writer;
@@ -13,13 +13,38 @@ pub mod rust_writer;
 use tdtl::TlProgram;
 
 pub const TD_API_TL: &str = include_str!("../scheme/td_api.tl");
+pub const TELEGRAM_API_TL: &str = include_str!("../scheme/telegram_api.tl");
 
-/// Generates the td_api Rust module (S09): structs/enums + serde derives.
+/// Generates the td_api Rust module: structs/enums + serde derives + binary
+/// store.
 pub fn generate_td_api_rust() -> String {
-    let program =
-        TlProgram::parse(TD_API_TL.as_bytes().to_vec()).expect("embedded td_api.tl must parse");
+    generate(
+        TD_API_TL,
+        &rust_writer::WriterOpts {
+            umbrella: "Function",
+            serde: true,
+            source: "td_api.tl (tdlib d1085f9ce)",
+        },
+    )
+}
+
+/// Generates the telegram_api Rust module: structs/enums + binary store
+/// (no serde — telegram_api has no JSON surface).
+pub fn generate_telegram_api_rust() -> String {
+    generate(
+        TELEGRAM_API_TL,
+        &rust_writer::WriterOpts {
+            umbrella: "Function",
+            serde: false,
+            source: "telegram_api.tl (tdlib d1085f9ce)",
+        },
+    )
+}
+
+fn generate(scheme: &str, opts: &rust_writer::WriterOpts) -> String {
+    let program = TlProgram::parse(scheme.as_bytes().to_vec()).expect("scheme must parse");
     let m = model::SchemeModel::build(&program);
-    rust_writer::write_rust(&program, &m, "Function", "td_api.tl (tdlib d1085f9ce)")
+    rust_writer::write_rust(&program, &m, opts)
 }
 
 #[cfg(test)]
@@ -37,35 +62,75 @@ mod tests {
     }
 
     #[test]
+    fn telegram_api_counts_match_the_c_oracle() {
+        // Fixed by the S07 differential dump: 627 types / 1669 ctors / 819
+        // functions.
+        let program = TlProgram::parse(TELEGRAM_API_TL.as_bytes().to_vec()).unwrap();
+        assert_eq!(program.total_types, 627);
+        assert_eq!(program.total_ctors, 1669);
+        assert_eq!(program.total_funcs, 819);
+    }
+
+    #[test]
     fn generated_model_counts_are_consistent() {
-        let program = TlProgram::parse(TD_API_TL.as_bytes().to_vec()).unwrap();
-        let m = model::SchemeModel::build(&program);
-        let enums = m
-            .type_kinds
-            .iter()
-            .filter(|k| matches!(k, model::TypeKind::Enum { ctors } if !ctors.is_empty()))
-            .count();
-        let struct_kinds = m
-            .type_kinds
-            .iter()
-            .filter(|k| matches!(k, model::TypeKind::Struct { .. }))
-            .count();
-        // 753 = 2 meta (#, Type) + 8 builtin simple types + enums + structs.
-        assert_eq!(2 + 8 + enums + struct_kinds, program.total_types);
-        let code = generate_td_api_rust();
-        // One struct per non-builtin ctor (which includes every single-ctor
-        // type) plus one per function; one enum per multi-ctor type plus the
-        // Function umbrella.
-        assert_eq!(
-            code.matches("pub struct ").count(),
-            (program.total_ctors - 9) + program.total_funcs
-        );
-        assert_eq!(code.matches("pub enum ").count(), enums + 1); // + Function
+        for (scheme, tl) in [("td_api", TD_API_TL), ("telegram_api", TELEGRAM_API_TL)] {
+            let program = TlProgram::parse(tl.as_bytes().to_vec()).unwrap();
+            let m = model::SchemeModel::build(&program);
+            let enums = m
+                .type_kinds
+                .iter()
+                .filter(|k| matches!(k, model::TypeKind::Enum { ctors } if !ctors.is_empty()))
+                .count();
+            let struct_kinds = m
+                .type_kinds
+                .iter()
+                .filter(|k| matches!(k, model::TypeKind::Struct { .. }))
+                .count();
+            let prims = m
+                .type_kinds
+                .iter()
+                .filter(|k| matches!(k, model::TypeKind::Prim(_)))
+                .count();
+            let vectors = m
+                .type_kinds
+                .iter()
+                .filter(|k| matches!(k, model::TypeKind::Vector))
+                .count();
+            let meta = m
+                .type_kinds
+                .iter()
+                .filter(|k| matches!(k, model::TypeKind::Enum { ctors } if ctors.is_empty()))
+                .count();
+            assert_eq!(
+                prims + vectors + meta + enums + struct_kinds,
+                program.total_types,
+                "{scheme} type accounting"
+            );
+            let code = match scheme {
+                "td_api" => generate_td_api_rust(),
+                _ => generate_telegram_api_rust(),
+            };
+            // One struct per non-builtin ctor (which includes every
+            // single-ctor type) plus one per function; one enum per
+            // multi-ctor type plus the Function umbrella. The support
+            // module's `tl::Reader` adds exactly one more struct.
+            assert_eq!(
+                code.matches("pub struct ").count(),
+                (program.total_ctors - 9) + program.total_funcs + 1,
+                "{scheme} struct count"
+            );
+            assert_eq!(
+                code.matches("pub enum ").count(),
+                enums + 1,
+                "{scheme} enum count"
+            ); // + Function
+        }
     }
 
     #[test]
     fn generated_code_has_no_name_collisions() {
         // write_rust asserts uniqueness while emitting; just make it run.
         let _ = generate_td_api_rust();
+        let _ = generate_telegram_api_rust();
     }
 }

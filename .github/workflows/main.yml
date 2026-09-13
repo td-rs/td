@@ -130,10 +130,11 @@ jobs:
     # Byte-verifies conformance/vectors against the C++ oracle (S04), the
     # tdtl lexer token stream against td's own tl-parser (S06), the tdtl
     # scheme program dump — types/constructors/functions with their ids —
-    # against the same tl-parser (S07), and the tdtl .tlo serialization —
-    # incl. the combinator argument trees — against td's write_types (S08).
-    # The td checkout is pinned to the same commit the TL schemes were
-    # imported from (S03).
+    # against the same tl-parser (S07), the tdtl .tlo serialization —
+    # incl. the combinator argument trees — against td's write_types (S08),
+    # and the tl-codegen telegram_api binary store against td's generated
+    # C++ TlStorerUnsafe (S10). The td checkout is pinned to the same commit
+    # the TL schemes were imported from (S03).
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -169,4 +170,11 @@ jobs:
             conformance/tl_oracle/verify_tlo.sh "$GITHUB_WORKSPACE/td-cpp"
           else
             echo "skipped: conformance/tl_oracle/verify_tlo.sh not committed yet (S08 in progress)"
+          fi
+      - name: Verify tl-codegen binary store vs td generated C++ (S10)
+        run: |
+          if [ -x conformance/tl_store_oracle/verify.sh ]; then
+            conformance/tl_store_oracle/verify.sh "$GITHUB_WORKSPACE/td-cpp"
+          else
+            echo "skipped: conformance/tl_store_oracle/verify.sh not committed yet (S10 in progress)"
           fi

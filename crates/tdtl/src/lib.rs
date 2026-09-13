@@ -19,5 +19,5 @@ pub mod tlo;
 
 pub use lexer::{CurLex, FLAG_MAGIC_HASH, FLAG_NAMESPACE_DOT, LexType, Lexer};
 pub use program::{
-    Act, CTData, CTNode, CType, TlConstructor, TlParseError, TlProgram, TlType, TlVar,
+    Act, CTData, CTId, CTNode, CType, TlConstructor, TlParseError, TlProgram, TlType, TlVar,
 };

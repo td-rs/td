@@ -185,6 +185,9 @@ version = "0.1.0"
 [[package]]
 name = "tdmtproto"
 version = "0.1.0"
+dependencies = [
+ "tl-codegen",
+]
 
 [[package]]
 name = "tdnet"
