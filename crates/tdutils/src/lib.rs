@@ -7,6 +7,7 @@ pub mod crc32;
 pub mod crypto;
 pub mod ed25519;
 pub mod gzip;
+pub mod http_url;
 pub mod json;
 pub mod logging;
 pub mod mpmc_queue;

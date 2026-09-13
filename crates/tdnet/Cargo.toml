@@ -7,8 +7,13 @@ publish.workspace = true
 
 [dependencies]
 tdutils = { path = "../tdutils" }
+reqwest = { version = "0.12", default-features = false, features = ["deflate", "gzip", "rustls-tls"] }
 tokio = { version = "1", features = ["net", "rt", "sync", "macros", "time"] }
 parking_lot = "0.12"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "time"] }
+
+[[bench]]
+name = "bench_http"
+harness = false

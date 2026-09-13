@@ -7,10 +7,14 @@
 //! [`dns::idn_to_ascii`].
 //!
 //! S46 — the UDP layer: [`udp::BufferedUdp`] (`td/net/Udp.h`).
+//!
+//! S48 — the HTTP layer: [`wget::wget`] (`td/net/Wget.h`) and [`http_query`].
 
 pub mod dns;
+pub mod http_query;
 pub mod tcp;
 pub mod udp;
+pub mod wget;
 
 pub use dns::{GetHostByName, NativeResolver, Options, Resolver, idn_to_ascii};
 pub use tcp::{AcceptCallback, TcpListener, connect};
