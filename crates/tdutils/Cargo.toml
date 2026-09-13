@@ -9,7 +9,9 @@ publish.workspace = true
 aes = "0.8"
 base64 = "0.22"
 crc32fast = "1"
+crossbeam-channel = "0.5"
 ed25519-dalek = { version = "2", features = ["rand_core", "pem"] }
+flate2 = "1"
 getrandom = "0.3"
 hmac = "0.12"
 md-5 = "0.10"
@@ -23,5 +25,6 @@ rand_core = "0.6"
 rsa = "0.9"
 sha1 = "0.10"
 sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt", "time"] }
 tracing = "0.1"
 x25519-dalek = "2"
