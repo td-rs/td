@@ -27,6 +27,7 @@ pub fn generate_td_api_rust() -> String {
             umbrella: "Function",
             serde: true,
             json: true,
+            samples_feature: None,
             source: "td_api.tl (tdlib d1085f9ce)",
         },
     )
@@ -41,6 +42,7 @@ pub fn generate_telegram_api_rust() -> String {
             umbrella: "Function",
             serde: false,
             json: false,
+            samples_feature: Some("conformance-samples"),
             source: "telegram_api.tl (tdlib d1085f9ce)",
         },
     )
@@ -55,6 +57,7 @@ pub fn generate_secret_api_rust() -> String {
             umbrella: "Function",
             serde: false,
             json: false,
+            samples_feature: Some("conformance-samples"),
             source: "secret_api.tl (tdlib d1085f9ce)",
         },
     )
@@ -69,6 +72,7 @@ pub fn generate_mtproto_api_rust() -> String {
             umbrella: "Function",
             serde: false,
             json: false,
+            samples_feature: Some("conformance-samples"),
             source: "mtproto_api.tl (tdlib d1085f9ce)",
         },
     )
@@ -83,6 +87,7 @@ pub fn generate_e2e_api_rust() -> String {
             umbrella: "Function",
             serde: false,
             json: false,
+            samples_feature: Some("conformance-samples"),
             source: "e2e_api.tl (tdlib d1085f9ce)",
         },
     )
@@ -187,7 +192,8 @@ mod tests {
             // single-ctor type) plus one per function; one enum per
             // multi-ctor type plus the Function umbrella. The support
             // module's `tl::Reader` adds exactly one more struct; the JSON
-            // runtime (td_api only) adds the `tl_json::Json` enum.
+            // runtime (td_api only) adds the `tl_json::Json` and `Object`
+            // enums.
             // Builtin ctors = those owned by Prim/Vector types (the count
             // differs per scheme).
             let builtin_ctors: usize = m
@@ -199,7 +205,7 @@ mod tests {
                 })
                 .map(|(_, t)| t.constructors.len())
                 .sum();
-            let json_enums = if scheme == "td_api" { 1 } else { 0 };
+            let json_enums = if scheme == "td_api" { 2 } else { 0 };
             assert_eq!(
                 code.matches("pub struct ").count(),
                 (program.total_ctors - builtin_ctors) + program.total_funcs + 1,
