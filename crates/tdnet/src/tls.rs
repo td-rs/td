@@ -19,7 +19,6 @@
 //!   reasoning as the S46 `BufferedUdp` port).
 //! * `SslCtx::init_openssl` has no rustls counterpart.
 
-use std::io::BufReader;
 use std::sync::Arc;
 
 use tokio::net::TcpStream;
@@ -95,12 +94,13 @@ impl SslCtx {
 
 /// The C++ `SSL_CTX_load_verify_locations` path, PEM-encoded.
 fn load_cert_file(cert_file: &str) -> Result<rustls::RootCertStore> {
+    use rustls::pki_types::pem::PemObject;
+
     let invalid_file = || Status::error_message("Failed to set custom certificate file");
-    let Ok(file) = std::fs::File::open(cert_file) else {
+    let Ok(iter) = rustls::pki_types::CertificateDer::pem_file_iter(cert_file) else {
         return Result::Err(invalid_file());
     };
-    let parsed: std::result::Result<Vec<_>, _> =
-        rustls_pemfile::certs(&mut BufReader::new(file)).collect();
+    let parsed: std::result::Result<Vec<_>, _> = iter.collect();
     let Ok(certs) = parsed else {
         return Result::Err(invalid_file());
     };
