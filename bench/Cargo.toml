@@ -1,0 +1,18 @@
+# Standalone crate (excluded from the workspace like conformance and fuzz):
+# the S37 actor-runtime performance gate. `cargo build -p bench_actor` inside
+# bench/, or let bench/actor-gate.sh drive the build and the ≤2× C++ verdict.
+
+[package]
+name = "bench"
+version = "0.1.0"
+edition = "2024"
+license = "BSL-1.0"
+publish = false
+
+[[bin]]
+name = "bench_actor"
+path = "src/bench_actor.rs"
+
+[dependencies]
+tdactor = { path = "../crates/tdactor" }
+tdutils = { path = "../crates/tdutils" }

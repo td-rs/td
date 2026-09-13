@@ -298,6 +298,20 @@ impl<T: Send + 'static> Actor for FutureActor<T> {
     }
 }
 
+impl<T: Send + 'static> Drop for FutureActor<T> {
+    /// The port of the C++ ownership shape: `~FutureActor` is `= default`
+    /// there because the registration dies with the `ObjectPool`; here the
+    /// actor object owns its registration slot, so a future destroyed before
+    /// its result arrived (e.g. dropped mid-wait) stops the actor first.
+    /// No-op after [`FutureActor::close`]/[`FutureActor::move_as_result`],
+    /// which already stopped it (`is_alive` is false then).
+    fn drop(&mut self) {
+        if self.self_id.is_alive() {
+            self.do_stop();
+        }
+    }
+}
+
 /// The states of [`PromiseActor`] — C++ `PromiseActor<T>::State`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PromiseActorState {

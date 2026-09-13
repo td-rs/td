@@ -113,10 +113,72 @@ impl<A: ?Sized> ActorId<A> {
         self.slot.is_none()
     }
 
+    /// The slot address, for identity comparisons on the scheduler thread
+    /// (the C++ compares `ActorId` pointer values). `None` for an empty id.
+    #[inline]
+    pub(crate) fn slot_ptr(&self) -> Option<NonNull<IdSlot>> {
+        self.slot
+    }
+
+    /// An owning id for a slot the scheduler keeps registered — the C++
+    /// `ActorId(ActorImpl *)` shape, adapted to the owning Rust id: takes a
+    /// reference (`ref_cnt + 1`) so the returned id drops cleanly. Used on
+    /// the hot path to rebuild an id from an intrusive list node (once per
+    /// mailbox flush, not per hop).
+    #[inline]
+    pub(crate) fn id_from_slot(slot: NonNull<IdSlot>) -> Self {
+        // SAFETY: the slot is registered (the caller — the scheduler — owns
+        // a reference), so it is alive and the count has room.
+        let s = unsafe { slot.as_ref() };
+        s.ref_cnt.fetch_add(1, Ordering::Relaxed);
+        Self {
+            slot: Some(slot),
+            marker: PhantomData,
+        }
+    }
     /// Whether the actor is still alive. Safe to call from any thread.
+    #[inline]
     pub fn is_alive(&self) -> bool {
         self.slot
             .is_some_and(|s| self.slot_of(s).alive.load(Ordering::Acquire))
+    }
+
+    /// C++ `ActorId::get_actor_unsafe()`: direct access to the actor object.
+    /// `None` for an empty id or a destroyed actor; otherwise the borrow
+    /// follows the C++ raw-pointer contract — valid only on the actor's
+    /// scheduler thread, only while the actor is not mid-dispatch (its body
+    /// `RefCell` is already borrowed then), and re-typed through the inert
+    /// `A` marker exactly like the C++ `static_cast`. A wrong marker is UB.
+    ///
+    /// This is what `bench_actor`'s tail-call variant uses to bypass the
+    /// event machinery entirely (C++ `next_actor.get_actor_unsafe()`).
+    ///
+    /// # Safety
+    ///
+    /// The caller must satisfy the thread and re-entrancy contract above and
+    /// must not have `A` name a type the actor is not.
+    // The whole point of this API is the C++ raw-pointer shape: `&self` in,
+    // `&mut A` out, with the aliasing contract carried by the documented
+    // safety obligations instead of the borrow checker.
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn get_actor_unsafe(&self) -> Option<&mut A>
+    where
+        A: Sized,
+    {
+        if !self.is_alive() {
+            return None;
+        }
+        let info = unsafe { &*self.info_ptr() };
+        // SAFETY: the borrow flag is deliberately bypassed — C++ hands out
+        // the actor pointer unconditionally, and the `bench_actor` tail-call
+        // path re-enters the dispatched actor's slot mid-dispatch (the ring
+        // wraps within one event). The access is still single-threaded (the
+        // actor's own scheduler thread), the same contract as C++.
+        let slot: &mut crate::scheduler::ActorSlot = unsafe { &mut *info.actor.as_ptr() };
+        let actor: &mut dyn Actor = slot.as_mut().expect("alive actor without a body");
+        // SAFETY: the marker `A` names the real actor type; see the module
+        // docs and the typed dispatch in `promise.rs` (the C++ static_cast).
+        Some(unsafe { &mut *(actor as *mut dyn Actor as *mut A) })
     }
 
     /// The actor's name — the port of C++ `ActorId::get_name()`. Safe to call

@@ -1,5 +1,6 @@
 //! Port of `td/utils`: Status, Buffer, logging, crypto, time, JSON, concurrency.
 
+pub mod benchmark;
 pub mod bignum;
 pub mod buffer;
 pub mod byte_flow;
