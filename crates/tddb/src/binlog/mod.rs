@@ -14,6 +14,7 @@ use crate::db_key::DbKey;
 use tdutils::status::Result;
 use tdutils::status::Status;
 
+pub mod concurrent;
 pub mod event;
 pub mod events_processor;
 pub mod reader;
@@ -226,6 +227,20 @@ impl Binlog {
         }
         self.do_add_event(event);
         self.lazy_flush();
+
+        if self.state == State::Run {
+            let fd_size = self.fd_size;
+            let need_reindex = |min_size: i64, rate: i64| {
+                fd_size > min_size && fd_size / rate > self.processor.total_raw_events_size()
+            };
+            if need_reindex(50000, 5)
+                || need_reindex(100000, 4)
+                || need_reindex(300000, 3)
+                || need_reindex(500000, 2)
+            {
+                self.do_reindex();
+            }
+        }
     }
 
     /// `Binlog::do_add_event`
@@ -315,6 +330,56 @@ impl Binlog {
     /// `Binlog::lazy_flush` — this subset writes through on every event, so
     /// only the sync bookkeeping remains.
     fn lazy_flush(&mut self) {}
+
+    /// `Binlog::do_reindex` — compactify: replay live events into `path.new`,
+    /// then atomically replace the old file. Encryption events are not part
+    /// of this subset yet (change_key lands with the encryption slice).
+    fn do_reindex(&mut self) {
+        self.flush();
+        assert_eq!(self.state, State::Run);
+        self.state = State::Reindex;
+
+        let new_path = format!("{}.new", self.path);
+        let new_file = match OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&new_path)
+        {
+            Ok(file) => file,
+            Err(err) => {
+                tracing::error!("Can't open new binlog for regenerate: {err}");
+                self.state = State::Run;
+                return;
+            }
+        };
+        let old_file = std::mem::replace(self.file.as_mut().unwrap(), new_file);
+        self.fd_size = 0;
+        self.fd_events = 0;
+
+        // NB: clone, as in C++ ("no move is actually happens")
+        let mut live = Vec::new();
+        self.processor.for_each(|event| live.push(event.clone()));
+        for event in live {
+            self.do_event(event);
+        }
+        self.flush();
+
+        // finish reindex: unlink old, rename new
+        drop(old_file);
+        if let Err(err) = std::fs::remove_file(&self.path) {
+            panic!("Failed to unlink old binlog: {err}");
+        }
+        if let Err(err) = std::fs::rename(&new_path, &self.path) {
+            panic!("Failed to rename binlog: {err}");
+        }
+        let real_size = std::fs::metadata(&self.path)
+            .map(|m| m.len() as i64)
+            .unwrap_or(-1);
+        assert_eq!(self.fd_size, real_size, "reindexed binlog size mismatch");
+
+        self.state = State::Run;
+    }
 
     /// `Binlog::close`
     pub fn close(&mut self, need_sync: bool) -> Status {
@@ -686,5 +751,54 @@ mod cpp_conformance_tests {
         );
         assert_eq!(binlog.peek_next_event_id(), 6);
         binlog.close(false).ensure();
+    }
+}
+
+#[cfg(test)]
+mod reindex_tests {
+    use super::*;
+
+    fn db_path(name: &str) -> String {
+        format!("{}/tests/data/{name}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// Bloat-driven reindex (C++ add_event thresholds): one live event kept
+    /// rewritten until the file compacts itself.
+    #[test]
+    fn binlog_reindex_compacts_on_bloat() {
+        let path = db_path("test_binlog_reindex");
+        let _ = destroy(&path);
+
+        let mut binlog = Binlog::new();
+        binlog
+            .init(&path, &mut |_| {}, DbKey::empty(), DbKey::empty())
+            .ensure();
+        let id = binlog.add(1, &[b'x'; 1000]);
+        let mut last = Vec::new();
+        for i in 0..200usize {
+            last = vec![b'y'; 1000];
+            last[0] = (i % 251) as u8;
+            binlog.rewrite(id, 1, &last);
+        }
+        binlog.sync();
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size < 10_000, "reindex must compact the file, got {size}");
+        assert_eq!(binlog.peek_next_event_id(), id + 201);
+        binlog.close(true).ensure();
+
+        let mut binlog = Binlog::new();
+        let mut replay = Vec::new();
+        binlog
+            .init(
+                &path,
+                &mut |e| replay.push((e.id, e.get_data().to_vec())),
+                DbKey::empty(),
+                DbKey::empty(),
+            )
+            .ensure();
+        assert_eq!(replay.len(), 1);
+        assert_eq!(replay[0].0, id);
+        assert_eq!(replay[0].1, last);
+        let _ = destroy(&path);
     }
 }
