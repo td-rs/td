@@ -8,3 +8,9 @@ publish.workspace = true
 [dependencies]
 tdutils = { path = "../tdutils" }
 tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
+loom = { version = "0.7", optional = true }
+
+[features]
+# Model-checks the `IdSlot` reference-counting protocol (S36): run with
+# `cargo test -p tdactor --features loom --release --lib`.
+loom = ["dep:loom"]

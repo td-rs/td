@@ -36,11 +36,21 @@
 //! or one of its supertraits; the only place a wrong marker can hurt is the
 //! typed dispatch built in S33, which will be the actual unsafe boundary.
 
+use self::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 use std::cell::UnsafeCell;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+
+/// The atomics of [`IdSlot`]: plain `std` atomics normally, loom's modelable
+/// ones under the `loom` feature (the `IdSlot` protocol — `ref_cnt`/`alive` —
+/// is the concurrency surface verified at S36; see the module below).
+mod atomic {
+    #[cfg(feature = "loom")]
+    pub use loom::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+    #[cfg(not(feature = "loom"))]
+    pub use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+}
 
 use crate::actor::Actor;
 use crate::event::Event;
@@ -56,6 +66,12 @@ pub(crate) struct IdSlot {
     ref_cnt: AtomicUsize,
     alive: AtomicBool,
     sched: AtomicI32,
+    /// Double-free detector: swapped to `true` by the last `ActorId::drop`
+    /// right before the free. A second swap observing `true` is a protocol
+    /// bug (two last-references) — the assert fires in every debug build and
+    /// under the loom model, where the raw `Box::from_raw` double free would
+    /// be silent UB.
+    freed: AtomicBool,
     name: Box<str>,
     info: UnsafeCell<*mut ActorInfo>,
 }
@@ -73,6 +89,7 @@ impl IdSlot {
             ref_cnt: AtomicUsize::new(1),
             alive: AtomicBool::new(true),
             sched: AtomicI32::new(sched_id),
+            freed: AtomicBool::new(false),
             name: name.into(),
             info: UnsafeCell::new(Box::into_raw(info)),
         })
@@ -231,6 +248,10 @@ impl<A: ?Sized> Drop for ActorId<A> {
         if let Some(s) = self.slot {
             let slot = self.slot_of(s);
             if slot.ref_cnt.fetch_sub(1, Ordering::AcqRel) == 1 {
+                assert!(
+                    !slot.freed.swap(true, Ordering::AcqRel),
+                    "IdSlot double free: two ActorId drops observed the last reference"
+                );
                 // SAFETY: last reference; the slot's `info` Box was already
                 // freed by `SchedulerState::destroy_actor` if the actor died,
                 // and an actor with zero id copies cannot be alive.
@@ -501,5 +522,57 @@ impl<A: ?Sized> From<&ActorOwn<A>> for ActorRef {
             id: own.get().erase(),
             token: 0,
         }
+    }
+}
+/// Loom model of the [`IdSlot`] protocol (S36 "loom check"): the scheduler
+/// thread may kill the actor while a foreign thread holds a reference and
+/// checks liveness. The free protocol is verified on both sides:
+/// *exactly once* — the `freed` swap in `ActorId::drop` asserts no second
+/// last-reference under any interleaving (a raw double `Box::from_raw` would
+/// be silent UB the model cannot see); *at least once* — RAII plus
+/// `handle.join()` structurally guarantees every spawned drop ran before the
+/// model closure returns. A leak would have to be a missing drop, which the
+/// model's structure rules out.
+#[cfg(all(test, feature = "loom"))]
+mod loom_tests {
+    use super::{ActorId, IdSlot};
+    use crate::scheduler::{ActorInfo, ActorSlot};
+
+    #[test]
+    fn slot_freed_after_last_ref_despite_death_race() {
+        loom::model(|| {
+            let slot = IdSlot::new(Box::new(ActorInfo::new(ActorSlot::Empty, false)), 0, "loom");
+            let id: ActorId = ActorId::new(slot);
+            let foreign = id.clone();
+            let handle = loom::thread::Builder::new()
+                .spawn(move || {
+                    // The foreign send path: an acquire load of `alive`, then
+                    // the reference is dropped.
+                    let _alive = foreign.is_alive();
+                    drop(foreign);
+                })
+                .expect("loom thread");
+            // The owning scheduler thread publishes death; the local copy
+            // keeps the slot alive until it is dropped below.
+            id.mark_dead();
+            drop(id);
+            handle.join().expect("loom thread panicked");
+        });
+    }
+
+    #[test]
+    fn slot_outlives_all_local_copies() {
+        loom::model(|| {
+            let slot = IdSlot::new(Box::new(ActorInfo::new(ActorSlot::Empty, false)), 0, "loom");
+            let id: ActorId = ActorId::new(slot);
+            let clone = id.clone();
+            // Two local copies on one thread: the slot is freed by the drop
+            // that observes ref_cnt == 1, not by the first one out.
+            drop(clone);
+            assert!(id.is_alive());
+            id.mark_dead();
+            assert!(!id.is_alive());
+            drop(id);
+        });
     }
 }
