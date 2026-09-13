@@ -263,22 +263,30 @@ static MAX_LOG_FILE_SIZE: AtomicI64 = AtomicI64::new(10 << 20);
 /// back to the default interface on an empty path). Returns whether the file
 /// was opened successfully.
 pub fn set_file_path(file_path: &str) -> bool {
-    try_set_file_path(file_path).is_ok()
-}
-
-/// The same switch with the `FileLog::init` error surfaced (the
-/// `Logging::set_current_stream(logStreamFile)` path in the tdclient layer).
-pub fn try_set_file_path(file_path: &str) -> std::result::Result<(), String> {
     let mut file_log = FILE_LOG.write().unwrap();
     if file_path.is_empty() {
         *file_log = None;
-        return Ok(());
+        return true;
     }
-    let log = FileLog::init(
+    match FileLog::init(
         file_path.to_string(),
         MAX_LOG_FILE_SIZE.load(Ordering::Relaxed),
-    )?;
-    *file_log = Some(Arc::new(log));
+    ) {
+        Ok(log) => {
+            *file_log = Some(Arc::new(log));
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// `Logging::set_current_stream(logStreamFile)`: install a file sink with an
+/// explicit threshold. An empty path fails with `FileLog::init`'s error
+/// ("Log file path must be non-empty") — the empty-path reset only happens
+/// in `Log::set_file_path` above.
+pub fn install_file_log(file_path: &str, rotate_threshold: i64) -> std::result::Result<(), String> {
+    let log = FileLog::init(file_path.to_string(), rotate_threshold)?;
+    *FILE_LOG.write().unwrap() = Some(Arc::new(log));
     Ok(())
 }
 

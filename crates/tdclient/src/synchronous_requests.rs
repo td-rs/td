@@ -22,41 +22,43 @@ pub fn make_error(code: i32, message: &str) -> Object {
     })
 }
 
-/// `td::Logging::log_tags` — the default tag names, in the C++ order.
-static LOG_TAGS: &[&str] = &[
-    "td_init",
-    "update_file",
-    "connections",
-    "binlog",
-    "proxy",
-    "net_query",
-    "td_requests",
-    "dc",
-    "file_loader",
-    "mtproto",
-    "raw_mtproto",
-    "fd",
-    "actor",
-    "sqlite",
-    "notifications",
-    "get_difference",
-    "file_gc",
-    "config_recoverer",
-    "dns_resolver",
-    "file_references",
+/// `td::Logging::log_tags` — the default tags with their C++ verbosity
+/// defaults (`int VERBOSITY_NAME(tag) = ...` scattered across the modules),
+/// in the sorted order the C++ `std::map` iterates (`get_tags()`).
+static LOG_TAGS: &[(&str, i32)] = &[
+    ("actor", 4 + 10),
+    ("binlog", 4 + 8),
+    ("config_recoverer", 3),
+    ("connections", 3),
+    ("dc", 4 + 2),
+    ("dns_resolver", 4),
+    ("fd", 4 + 9),
+    ("file_gc", 3),
+    ("file_loader", 4),
+    ("file_references", 3),
+    ("get_difference", 3),
+    ("mtproto", 4 + 7),
+    ("net_query", 3),
+    ("notifications", 3),
+    ("proxy", 4),
+    ("raw_mtproto", 4 + 10),
+    ("sqlite", 4 + 10),
+    ("td_init", 4 + 3),
+    ("td_requests", 3),
+    ("update_file", 3),
 ];
 
-/// `td::Logging` per-tag verbosity levels (`std::map<Slice, int *>` over the
-/// same tags; the C++ stores pointers into the tag globals, here the values
-/// live in one map). The levels are stored and reported; per-tag filtering
-/// in the `tdutils` log macros is a later step (S69+ logging wiring).
+/// `td::Logging` per-tag verbosity levels (the C++ `std::map<Slice, int *>`
+/// over the tag globals; here the values live in one map). The levels are
+/// stored and reported; per-tag filtering in the `tdutils` log macros is a
+/// later step (S69+ logging wiring).
 static TAG_VERBOSITY: Mutex<Vec<i32>> = Mutex::new(Vec::new());
 
 fn tag_verbosity() -> &'static Mutex<Vec<i32>> {
     let levels = TAG_VERBOSITY.lock().unwrap();
     if levels.is_empty() {
         drop(levels);
-        *TAG_VERBOSITY.lock().unwrap() = vec![5; LOG_TAGS.len()];
+        *TAG_VERBOSITY.lock().unwrap() = LOG_TAGS.iter().map(|(_, level)| *level).collect();
     }
     &TAG_VERBOSITY
 }
@@ -196,7 +198,7 @@ pub fn run_request(function: Function) -> Object {
             verbosity_level: tdutils::logging::get_verbosity_level(),
         }),
         Function::getLogTags(_) => Object::logTags(td_api::LogTags {
-            tags: LOG_TAGS.iter().map(|tag| (*tag).to_string()).collect(),
+            tags: LOG_TAGS.iter().map(|(tag, _)| (*tag).to_string()).collect(),
         }),
         Function::setLogTagVerbosityLevel(request) => {
             match set_tag_verbosity_level(&request.tag, request.new_verbosity_level) {
@@ -237,9 +239,8 @@ fn set_current_stream(stream: td_api::LogStream) -> std::result::Result<(), Stri
             if file_stream.max_file_size <= 0 {
                 return Err("Max log file size must be positive".to_string());
             }
-            tdutils::logging::set_max_file_size(file_stream.max_file_size);
             // redirect_stderr is not ported (see FileLog in tdutils).
-            tdutils::logging::try_set_file_path(&file_stream.path)
+            tdutils::logging::install_file_log(&file_stream.path, file_stream.max_file_size)
         }
         td_api::LogStream::logStreamEmpty(_) => {
             tdutils::logging::set_file_path("");
@@ -271,7 +272,7 @@ fn set_tag_verbosity_level(tag: &str, new_verbosity_level: i32) -> std::result::
     if tag.is_empty() {
         return Err("Log tag must be non-empty".to_string());
     }
-    let index = match LOG_TAGS.iter().position(|known| *known == tag) {
+    let index = match LOG_TAGS.iter().position(|(known, _)| *known == tag) {
         Some(index) => index,
         None => return Err("Log tag is not found".to_string()),
     };
@@ -284,7 +285,7 @@ fn get_tag_verbosity_level(tag: &str) -> std::result::Result<i32, String> {
     if tag.is_empty() {
         return Err("Log tag must be non-empty".to_string());
     }
-    let index = match LOG_TAGS.iter().position(|known| *known == tag) {
+    let index = match LOG_TAGS.iter().position(|(known, _)| *known == tag) {
         Some(index) => index,
         None => return Err("Log tag is not found".to_string()),
     };
@@ -418,12 +419,15 @@ mod tests {
             panic!("expected logTags");
         };
         assert_eq!(tags.tags.len(), 20);
-        assert_eq!(tags.tags[0], "td_init");
-        assert_eq!(tags.tags[19], "file_references");
+        // The sorted order of the C++ `std::map<Slice, int *>` iteration.
+        assert_eq!(tags.tags[0], "actor");
+        assert_eq!(tags.tags[19], "update_file");
+        assert_eq!(tags.tags[11], "mtproto");
     }
 
     #[test]
     fn log_tag_verbosity_validation_matches_cpp() {
+        let _lock = LOG_TEST_LOCK.lock().unwrap();
         let function = Function::setLogTagVerbosityLevel(td_api::setLogTagVerbosityLevel {
             tag: "nope".to_string(),
             new_verbosity_level: 3,
@@ -431,6 +435,15 @@ mod tests {
         assert_eq!(
             run_request(function).to_json(),
             r#"{"@type":"error","code":400,"message":"Log tag is not found"}"#
+        );
+        // The C++ per-module default (`int VERBOSITY_NAME(mtproto) =
+        // VERBOSITY_NAME(DEBUG) + 7`).
+        let function = Function::getLogTagVerbosityLevel(td_api::getLogTagVerbosityLevel {
+            tag: "mtproto".to_string(),
+        });
+        assert_eq!(
+            run_request(function).to_json(),
+            r#"{"@type":"logVerbosityLevel","verbosity_level":11}"#
         );
         let function = Function::setLogTagVerbosityLevel(td_api::setLogTagVerbosityLevel {
             tag: String::new(),
