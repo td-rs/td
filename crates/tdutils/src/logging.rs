@@ -405,7 +405,7 @@ pub fn append_message(level: i32, message: &str, file_name: &str, line_num: u32,
 
 /// The `LOG(level)` stream of C++ becomes a macro with a `format!`-style
 /// message; the level is spelled out (`log_error!`, ...) and custom levels
-/// use [`vlog!`].
+/// use [`crate::vlog!`].
 #[macro_export]
 macro_rules! log_impl {
     ($level:expr, $comment:expr, $($arg:tt)*) => {{

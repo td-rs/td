@@ -3,7 +3,8 @@
 //! A [`Status`] is either `OK` or an error carrying an [`ErrorType`], a
 //! 23-bit error code and a message. [`Result`] wraps `std::result::Result`
 //! with tdlib's move/prefix/suffix API on top, and the `TRY_STATUS` /
-//! `TRY_RESULT` macros are provided as [`try_status!`] / [`try_result!`].
+//! `TRY_RESULT` macros are provided as [`crate::try_status!`] /
+//! [`crate::try_result!`].
 
 use std::borrow::Cow;
 use std::fmt;
@@ -239,7 +240,7 @@ impl fmt::Debug for Status {
 }
 
 /// `td::Result<T>`: the value or a [`Status`], with tdlib's move-oriented
-/// accessors on top. Kept as an enum so the [`try_result!`] macro can match
+/// accessors on top. Kept as an enum so the [`crate::try_result!`] macro can match
 /// on it directly.
 #[derive(Debug)]
 pub enum Result<T> {

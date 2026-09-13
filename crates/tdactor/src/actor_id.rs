@@ -4,7 +4,7 @@
 //! In C++, an `ActorId` is a refcounted weak pointer into an `ObjectPool` of
 //! `ActorInfo`s, and the pool slot stays alive while weak references exist
 //! (this is what makes `is_alive()` and sends-from-any-thread safe). The Rust
-//! port uses one refcounted [`IdSlot`] per actor:
+//! port uses one refcounted `IdSlot` per actor:
 //!
 //! - `ref_cnt` — number of live `ActorId` copies; the slot is freed when it
 //!   reaches zero (an actor is always referenced by its scheduler lists while
@@ -23,7 +23,7 @@
 //!   thread may dereference it);
 //! - `name` — the actor's name, immutable after creation, for `get_name()`.
 //!
-//! This is why [`IdSlot`] is `Send + Sync` while `ActorInfo` itself is not.
+//! This is why `IdSlot` is `Send + Sync` while `ActorInfo` itself is not.
 //!
 //! # The type parameter
 //!

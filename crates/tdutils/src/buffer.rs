@@ -1,7 +1,7 @@
 //! Port of `td/utils/buffer.h` + `td/utils/buffer.cpp`: tdlib's buffer layer.
 //!
 //! The same single-writer/multi-reader discipline as in C++ is kept: a
-//! [`BufferRaw`] is one allocation shared by exactly one writer (via
+//! `BufferRaw` is one allocation shared by exactly one writer (via
 //! [`BufferWriterPtr`]) and any number of readers (via [`BufferReaderPtr`]).
 //! The writer exclusively owns `[0, begin)` and `[end, data_size)`, readers
 //! only ever read `[begin, end)`, and `begin` is frozen once the first reader

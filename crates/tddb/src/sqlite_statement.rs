@@ -1,7 +1,7 @@
 //! Port of `td/db/SqliteStatement`: a prepared statement driven through the
 //! sqlite C API, with tdlib's state machine (`Start`/`HaveRow`/`Finish`),
 //! unchecked typed `view_*` accessors, and error mapping through the shared
-//! [`crate::sqlite_db::RawSqliteDb`] (including corrupted-db deletion).
+//! `RawSqliteDb` (including corrupted-db deletion).
 
 use std::ffi::CStr;
 use std::sync::Arc;
