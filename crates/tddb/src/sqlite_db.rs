@@ -11,8 +11,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rusqlite::OpenFlags;
+use rusqlite::ffi;
 
 use crate::db_key::DbKey;
+use crate::sqlite_statement::SqliteStatement;
 use tdutils::status::Result;
 use tdutils::status::Status;
 use tdutils::{try_result, try_status};
@@ -45,10 +47,11 @@ pub fn destroy(path: &str) -> Status {
     error
 }
 
-/// Status → Result<()> for the `try_result!` macro.
-fn status_to_result(status: Status) -> Result<()> {
+/// Status → Result for the `try_result!` macro (the Status itself as payload
+/// keeps the binding non-unit; discard it as `_stepped`).
+fn status_to_result(status: Status) -> Result<Status> {
     if status.is_ok() {
-        Result::Ok(())
+        Result::Ok(status)
     } else {
         Result::Err(status)
     }
@@ -135,15 +138,13 @@ impl RawSqliteDb {
         &self.path
     }
 
-    fn conn(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
+    pub(crate) fn conn(&self) -> std::sync::MutexGuard<'_, rusqlite::Connection> {
         self.conn.lock().unwrap()
     }
 
     /// `RawSqliteDb::last_error`: on `SQLITE_CORRUPT` mark the database as
     /// destroyed and delete it, exactly like the C++ implementation.
-    // Used from S39 (SqliteStatement error mapping), as in C++ get_statement.
-    #[allow(dead_code)]
-    fn last_error(&self) -> Status {
+    pub(crate) fn last_error(&self) -> Status {
         // SAFETY: the connection handle is valid for as long as `self` is.
         let code = unsafe { rusqlite::ffi::sqlite3_errcode(self.conn().handle()) };
         if code == rusqlite::ffi::SQLITE_CORRUPT {
@@ -280,35 +281,92 @@ impl SqliteDb {
 
     /// `SqliteDb::has_table`
     pub fn has_table(&self, table: &str) -> Result<bool> {
-        let stmt =
-            format!("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='{table}'");
-        try_result!(cnt, self.query_row_i32(&stmt));
+        try_result!(
+            stmt,
+            self.get_statement(&format!(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='{table}'"
+            ))
+        );
+        let mut stmt = stmt;
+        try_result!(_stepped, status_to_result(stmt.step()));
+        assert!(stmt.has_row());
+        let cnt = stmt.view_int32(0);
         Result::Ok(cnt == 1)
     }
 
     /// `SqliteDb::get_pragma`
     pub fn get_pragma(&self, name: &str) -> Result<String> {
-        self.query_row_string(&format!("PRAGMA {name}"))
+        try_result!(stmt, self.get_statement(&format!("PRAGMA {name}")));
+        let mut stmt = stmt;
+        try_result!(_stepped, status_to_result(stmt.step()));
+        assert!(stmt.has_row());
+        let res = String::from_utf8_lossy(stmt.view_blob(0)).into_owned();
+        try_result!(_stepped, status_to_result(stmt.step()));
+        assert!(!stmt.can_step());
+        Result::Ok(res)
     }
 
     /// `SqliteDb::get_pragma_string`
     pub fn get_pragma_string(&self, name: &str) -> Result<String> {
-        self.query_row_string(&format!("PRAGMA {name}"))
+        try_result!(stmt, self.get_statement(&format!("PRAGMA {name}")));
+        let mut stmt = stmt;
+        try_result!(_stepped, status_to_result(stmt.step()));
+        assert!(stmt.has_row());
+        let res = String::from_utf8_lossy(stmt.view_string(0)).into_owned();
+        try_result!(_stepped, status_to_result(stmt.step()));
+        assert!(!stmt.can_step());
+        Result::Ok(res)
     }
 
     /// `SqliteDb::user_version`
     pub fn user_version(&self) -> Result<i32> {
-        let raw = self.raw();
-        match raw
-            .conn()
-            .query_row("PRAGMA user_version", [], |row| row.get::<_, i32>(0))
-        {
-            Ok(version) => Result::Ok(version),
-            Err(err) => Result::from_status(Status::error_message(&format!(
-                "PRAGMA user_version failed for database \"{}\": {err}",
-                raw.path()
-            ))),
+        try_result!(get_version_stmt, self.get_statement("PRAGMA user_version"));
+        let mut get_version_stmt = get_version_stmt;
+        try_result!(_stepped, status_to_result(get_version_stmt.step()));
+        if !get_version_stmt.has_row() {
+            return Result::from_status(Status::error_message(&format!(
+                "PRAGMA user_version failed for database \"{}\"",
+                self.raw().path()
+            )));
         }
+        Result::Ok(get_version_stmt.view_int32(0))
+    }
+
+    /// `SqliteDb::get_statement`
+    pub fn get_statement(&self, statement: &str) -> Result<SqliteStatement> {
+        let raw = self.raw();
+        // Rust strings are not NUL-terminated; sqlite needs one (the C++
+        // code passes size + 1 over a NUL-terminated CSlice).
+        let Ok(c_statement) = std::ffi::CString::new(statement) else {
+            return Result::from_status(Status::error_message(&format!(
+                "Failed to prepare SQLite statement = {statement:?}: statement contains NUL"
+            )));
+        };
+        // SAFETY: the connection (kept alive by the Arc inside the returned
+        // statement) and the statement string outlive the prepare call.
+        let rc = unsafe {
+            let mut stmt: *mut ffi::sqlite3_stmt = std::ptr::null_mut();
+            let rc = ffi::sqlite3_prepare_v2(
+                raw.conn().handle(),
+                c_statement.as_ptr(),
+                c_statement.as_bytes_with_nul().len() as i32,
+                &mut stmt,
+                std::ptr::null_mut(),
+            );
+            (rc, stmt)
+        };
+        let (rc, stmt) = rc;
+        if rc != ffi::SQLITE_OK {
+            return Result::from_status(Status::error_message(&format!(
+                "Failed to prepare SQLite statement = {statement:?}: {}",
+                raw.last_error()
+            )));
+        }
+        assert!(
+            !stmt.is_null(),
+            "prepare returned no statement: {statement:?}"
+        );
+        Result::Ok(SqliteStatement::new(stmt, self.raw().clone()))
     }
 
     /// `SqliteDb::set_user_version`
@@ -470,32 +528,6 @@ impl SqliteDb {
         );
         Result::Ok(new_db)
     }
-
-    // -- internal single-row query helpers (replaced by SqliteStatement in S39)
-
-    fn query_row_i32(&self, sql: &str) -> Result<i32> {
-        let raw = self.raw();
-        match raw.conn().query_row(sql, [], |row| row.get::<_, i32>(0)) {
-            Ok(value) => Result::Ok(value),
-            Err(err) => Result::from_status(last_error_for(&err, raw.path())),
-        }
-    }
-
-    fn query_row_string(&self, sql: &str) -> Result<String> {
-        let raw = self.raw();
-        // sqlite3_column_blob semantics: accept TEXT as well as BLOB.
-        match raw
-            .conn()
-            .query_row(sql, [], |row| row.get::<_, rusqlite::types::Value>(0))
-        {
-            Ok(value) => Result::Ok(match value {
-                rusqlite::types::Value::Text(text) => text,
-                rusqlite::types::Value::Blob(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                other => panic!("unexpected value type: {other:?}"),
-            }),
-            Err(err) => Result::from_status(last_error_for(&err, raw.path())),
-        }
-    }
 }
 
 /// `SqliteDb::do_open_with_key`
@@ -545,6 +577,7 @@ fn do_open_with_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sqlite_statement::Datatype;
 
     fn db_path(name: &str) -> String {
         format!("{}/tests/data/{name}", env!("CARGO_MANIFEST_DIR"))
@@ -562,7 +595,9 @@ mod tests {
     }
 
     /// tdlib test `TEST(DB, sqlite_encryption)`. The `SqliteKeyValue` usage
-    /// (S42) is replaced by direct table statements; everything else,
+    /// (S42) is replaced by the same table with the same BLOB schema accessed
+    /// through `SqliteStatement` (`REPLACE INTO` / `SELECT v ... WHERE k = ?1`
+    /// with `bind_blob`, exactly what SqliteKeyValue issues); everything else,
     /// including both rekey directions, is a faithful port.
     #[test]
     fn sqlite_encryption() {
@@ -574,12 +609,21 @@ mod tests {
         let tomato = DbKey::raw_key(vec![b'a'; 32]);
 
         let kv_set = |db: &SqliteDb| -> Status {
-            try_status!(db.exec("CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT)"));
-            db.exec("INSERT OR REPLACE INTO kv VALUES('a', 'b')")
+            try_status!(db.exec("CREATE TABLE IF NOT EXISTS kv (k BLOB PRIMARY KEY, v BLOB)"));
+            let mut stmt = match db.get_statement("REPLACE INTO kv (k, v) VALUES (?1, ?2)") {
+                Result::Ok(stmt) => stmt,
+                Result::Err(status) => return status,
+            };
+            try_status!(stmt.bind_blob(1, b"a"));
+            try_status!(stmt.bind_blob(2, b"b"));
+            stmt.step()
         };
         let kv_get = |db: &SqliteDb| -> String {
-            db.query_row_string("SELECT v FROM kv WHERE k = 'a'")
-                .unwrap()
+            let mut stmt = db.get_statement("SELECT v FROM kv WHERE k = ?1").unwrap();
+            stmt.bind_blob(1, b"a").ensure();
+            stmt.step().ensure();
+            assert!(stmt.has_row());
+            String::from_utf8_lossy(stmt.view_blob(0)).into_owned()
         };
 
         {
@@ -647,13 +691,13 @@ mod tests {
         )
         .unwrap();
         let db = SqliteDb::open_with_key(&path, true, &cucumber, None).unwrap();
-        // The sample databases store kv keys as BLOBs (SqliteKeyValue binds
-        // with bind_blob), so match with a blob literal like the C++ test.
-        assert_eq!(
-            db.query_row_string("SELECT v FROM kv WHERE k = x'68656C6C6F'")
-                .unwrap(),
-            "world"
-        );
+        // kv.get("hello"), exactly as the C++ test reads the sample: the
+        // statement from SqliteKeyValue::get with bind_blob(1, "hello").
+        let mut stmt = db.get_statement("SELECT v FROM kv WHERE k = ?1").unwrap();
+        stmt.bind_blob(1, b"hello").ensure();
+        stmt.step().ensure();
+        assert!(stmt.has_row());
+        assert_eq!(String::from_utf8_lossy(stmt.view_blob(0)), "world");
         assert_eq!(db.user_version().unwrap(), 123);
         let _ = destroy(&path);
     }
@@ -705,5 +749,64 @@ mod tests {
         for suffix in ["", "-journal", "-wal", "-shm"] {
             assert!(!Path::new(&format!("{path}{suffix}")).exists());
         }
+    }
+
+    #[test]
+    fn statement_state_machine_and_bindings() {
+        let path = db_path("test_sqlite_db_stmt");
+        let _ = destroy(&path);
+        let db = SqliteDb::open_with_key(&path, true, &DbKey::empty(), None).unwrap();
+        db.exec("CREATE TABLE t(i INTEGER, j INTEGER, b BLOB, s TEXT, n INTEGER)")
+            .ensure();
+
+        {
+            let mut stmt = db
+                .get_statement("INSERT INTO t VALUES (?1, ?2, ?3, ?4, ?5)")
+                .unwrap();
+            assert!(!stmt.has_row());
+            assert!(stmt.can_step());
+            stmt.bind_int32(1, 42).ensure();
+            stmt.bind_int64(2, 4_000_000_000_i64).ensure();
+            stmt.bind_blob(3, b"\x01\x02\x03").ensure();
+            stmt.bind_string(4, "hello").ensure();
+            stmt.bind_null(5).ensure();
+            stmt.step().ensure();
+            assert!(!stmt.has_row());
+            assert!(!stmt.can_step());
+            // step after finish is an error until reset
+            assert!(stmt.step().is_error());
+            stmt.reset();
+            assert!(stmt.can_step());
+            // re-step executes the insert again
+            stmt.step().ensure();
+            assert_eq!(
+                stmt.explain().unwrap(),
+                "Explain query INSERT INTO t VALUES (?1, ?2, ?3, ?4, ?5)"
+            );
+        }
+
+        {
+            let mut stmt = db.get_statement("SELECT i, j, b, s, n FROM t").unwrap();
+            // two inserted rows
+            stmt.step().ensure();
+            assert!(stmt.has_row());
+            assert_eq!(stmt.view_datatype(0), Datatype::Integer);
+            assert_eq!(stmt.view_int32(0), 42);
+            assert_eq!(stmt.view_int64(1), 4_000_000_000_i64);
+            assert_eq!(stmt.view_datatype(2), Datatype::Blob);
+            assert_eq!(stmt.view_blob(2), b"\x01\x02\x03");
+            assert_eq!(stmt.view_datatype(3), Datatype::Text);
+            assert_eq!(stmt.view_string(3), b"hello");
+            assert_eq!(stmt.view_datatype(4), Datatype::Null);
+            stmt.step().ensure();
+            assert!(stmt.has_row());
+            stmt.step().ensure();
+            assert!(!stmt.has_row());
+            assert!(!stmt.can_step());
+        }
+
+        // prepare failure is a typed error through last_error
+        assert!(db.get_statement("SELECT * FROM no_such_table").is_error());
+        let _ = destroy(&path);
     }
 }

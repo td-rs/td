@@ -2,5 +2,6 @@
 
 pub mod db_key;
 pub mod sqlite_db;
+pub mod sqlite_statement;
 
 pub use db_key::DbKey;
