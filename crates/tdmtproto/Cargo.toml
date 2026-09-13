@@ -11,6 +11,7 @@ publish.workspace = true
 conformance-samples = []
 
 [dependencies]
+base64 = "0.22"
 tdutils = { path = "../tdutils" }
 
 [build-dependencies]

@@ -5,12 +5,17 @@
 //!
 //! S53 adds the runtime framing layer: [`message_id`], [`packet_info`],
 //! [`auth_key`] and [`auth_data`] (salts, msg_id/seq_no rules, duplicate
-//! checkers).
+//! checkers). S54 adds the stream transports ([`transport`]) with their
+//! secret ([`proxy_secret`]) and [`utils`] (hex/base64 helpers).
 
 pub mod auth_data;
 pub mod auth_key;
 pub mod message_id;
 pub mod packet_info;
+pub mod proxy_secret;
+pub mod transport;
+pub mod transport_type;
+pub mod utils;
 
 // Generated code keeps C++-identical case-preserved names (`srp_B`, `M1`).
 #[allow(
