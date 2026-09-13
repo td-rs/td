@@ -31,7 +31,7 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
 
 use crate::actor::Actor;
-use crate::actor_id::{ActorId, ActorOwn};
+use crate::actor_id::ActorOwn;
 use crate::scheduler::Scheduler;
 
 use tdutils::promise::Promise;
