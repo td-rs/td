@@ -3,9 +3,12 @@
 //! S31 — the scheduler: one OS thread per scheduler (each running a
 //! `current_thread` tokio runtime), per-actor mailboxes, the ready/pending
 //! queues, the timeout heap, cross-scheduler routing and actor migration.
-//! S32 adds the typed `ActorId<A>`/`ActorOwn<A>`/`ActorShared<A>` markers;
-//! the `send_closure` message machinery follows in S33 — until then actors
-//! communicate through [`Raw`] events.
+//! S32 adds the typed `ActorId<A>`/`ActorOwn<A>`/`ActorShared<A>` markers.
+//! S34 adds the promise/future machinery (`PromiseActor`/`FutureActor`/the
+//! `send_promise_*` RPC) together with the `immediate_closure` subset of the
+//! `send_closure` machinery it needs; the full per-actor message-enum
+//! dispatch (S33) still follows — actors otherwise communicate through
+//! [`Raw`] events.
 //!
 //! ```
 //! use std::sync::{Arc, Mutex};
@@ -45,11 +48,17 @@
 pub mod actor;
 pub mod actor_id;
 pub mod event;
+pub mod promise;
 pub mod scheduler;
 
 pub use actor::Actor;
 pub use actor_id::{ActorId, ActorOwn, ActorRef, ActorShared};
 pub use event::{Event, EventType, Raw};
+pub use promise::{
+    EventFull, FutureActor, FutureActorState, PromiseActor, PromiseFuture, create_event_promise,
+    create_event_promise_ok_fail, create_promise_from_promise_actor, promise_send_closure,
+    send_promise_immediately, send_promise_later,
+};
 pub use scheduler::{ConcurrentScheduler, Scheduler, SchedulerGuard, SchedulerPtr, SchedulerState};
 
 /// Create an actor on the current scheduler — the free `td::create_actor`.

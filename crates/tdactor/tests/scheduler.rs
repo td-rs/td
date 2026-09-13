@@ -2,10 +2,12 @@
 //! and `actors_main.cpp`): `SendLater`, `simple_hand_yield`, `do_after_stop`,
 //! `call_after_destruct`, `later`, `send_from_other_threads`, `link_token`,
 //! `simple_migrate`, plus a timeout test for the `set_timeout_*` machinery.
+//! The promise tests (`promise`, `FastPromise`) live in `promise.rs` (S34).
 //!
-//! The tests that need Promises (`promise`, `MultiPromise`, `FastPromise`,
-//! `MultiPromiseSendClosureLater`), `SleepActor` (`always_wait_for_mailbox`)
-//! or file descriptors (`open_close`) follow in S33–S35.
+//! The tests that still follow in S33/S35: `MultiPromise`,
+//! `MultiPromiseSendClosureLater` (S33 closures),
+//! `always_wait_for_mailbox` (S35 `SleepActor`) and file-descriptor
+//! `open_close`.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
