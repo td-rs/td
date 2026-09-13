@@ -266,18 +266,24 @@ impl Default for Alarm {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that mutate the global clock offset
+    /// (`jump_in_future`) against those measuring `now()` deltas. The C++
+    /// test runner is sequential, so the global `time_diff` is safe there;
+    /// Rust's parallel test threads are not.
+    static CLOCK_GATE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
     #[test]
     fn time_is_monotonic_and_non_negative() {
         let a = now();
         std::thread::sleep(Duration::from_millis(5));
         let b = now();
-        assert!(b > a, "now() advances");
+        assert!(b > a, "now() advances: {a} -> {b}");
         assert!(a >= 0.0);
-        assert_eq!(
-            now_cached(),
-            now_cached(),
-            "cached clock is stable per call"
-        );
+        // `now_cached` is currently just `now()` (same as C++), so it reads
+        // real time and must advance too.
+        let c = now_cached();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(now_cached() > c, "now_cached() advances: {c}");
     }
 
     #[test]
@@ -308,6 +314,7 @@ mod tests {
 
     #[test]
     fn jump_in_future_advances_the_clock() {
+        let _gate = CLOCK_GATE.lock();
         let target = now() + 100.0;
         jump_in_future(target);
         assert!(now() >= target);
@@ -325,9 +332,9 @@ mod tests {
         relax_timeout_at(&mut timeout, 0.0);
         assert_eq!(timeout, 3.0, "zero is a no-op");
     }
-
     #[test]
     fn timer_measures_elapsed() {
+        let _gate = CLOCK_GATE.lock();
         let mut timer = Timer::new();
         std::thread::sleep(Duration::from_millis(20));
         let elapsed = timer.elapsed();
@@ -341,6 +348,29 @@ mod tests {
         timer.resume();
         std::thread::sleep(Duration::from_millis(20));
         assert!(timer.elapsed() > paused_at, "resumed timer advances");
+    }
+    /// Port of `benchmark/bench_empty` (an empty `main`) as a sanity gate:
+    /// an empty workload must measure as (near-)zero, i.e. the clock/timer
+    /// plumbing itself adds no measurable cost.
+    #[test]
+    fn bench_empty_sanity() {
+        let _gate = CLOCK_GATE.lock();
+        let timer = Timer::new();
+        for _ in 0..1_000_000 {
+            std::hint::black_box(());
+        }
+        let elapsed = timer.elapsed();
+        assert!(elapsed >= 0.0);
+        assert!(elapsed < 1.0, "empty benchmark took {elapsed}s");
+
+        let start = now();
+        let end = now();
+        assert!(end >= start);
+        assert!(
+            end - start < 1.0,
+            "two now() calls differ by {}s",
+            end - start
+        );
     }
 
     #[tokio::test]

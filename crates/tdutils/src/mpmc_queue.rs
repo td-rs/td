@@ -167,41 +167,57 @@ mod tests {
         let run = std::sync::Arc::new(Stage::default());
         let check = std::sync::Arc::new(Stage::default());
         let value = std::sync::Arc::new(OneValue::<String>::new());
+        // The C++ test captures these by reference; the stage barriers order
+        // the cross-thread accesses. Shared state mirrors that.
+        let from = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
+        let to = std::sync::Arc::new(parking_lot::Mutex::new(String::new()));
+        let set_status = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let get_status = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let mut threads = Vec::new();
         for id in 0..2 {
             let run = run.clone();
             let check = check.clone();
             let value = value.clone();
+            let from = from.clone();
+            let to = to.clone();
+            let set_status = set_status.clone();
+            let get_status = get_status.clone();
             threads.push(std::thread::spawn(move || {
-                let mut from = String::new();
-                let mut set_status = false;
-                let mut to = String::new();
-                let mut get_status = false;
                 for round in 1..100_000u64 {
                     if id == 0 {
                         value.reset();
-                        to = String::new();
-                        from = String::new();
+                        *to.lock() = String::new();
+                        *from.lock() = String::new();
                     }
                     run.wait(round * 2);
                     if id == 0 {
-                        from = String::from("hello");
-                        set_status = value.set_value(from.clone()).is_ok();
+                        *from.lock() = String::from("hello");
+                        let taken = std::mem::take(&mut *from.lock());
+                        match value.set_value(taken) {
+                            Ok(()) => set_status.store(true, std::sync::atomic::Ordering::Release),
+                            Err(v) => {
+                                *from.lock() = v;
+                                set_status.store(false, std::sync::atomic::Ordering::Release);
+                            }
+                        }
                     } else {
-                        to = value.get_value().unwrap_or_default();
-                        get_status = !to.is_empty();
+                        *to.lock() = value.get_value().unwrap_or_default();
+                        get_status
+                            .store(!to.lock().is_empty(), std::sync::atomic::Ordering::Release);
                     }
                     check.wait(round * 2);
                     if id == 0 {
-                        if set_status {
-                            assert!(get_status);
-                            assert!(from.is_empty(), "set moved the value");
-                            assert_eq!(to, "hello");
+                        let set_ok = set_status.load(std::sync::atomic::Ordering::Acquire);
+                        let get_ok = get_status.load(std::sync::atomic::Ordering::Acquire);
+                        if set_ok {
+                            assert!(get_ok);
+                            assert!(from.lock().is_empty(), "set moved the value");
+                            assert_eq!(*to.lock(), "hello");
                         } else {
-                            assert!(!get_status);
-                            assert_eq!(from, "hello");
-                            assert!(to.is_empty());
+                            assert!(!get_ok);
+                            assert_eq!(*from.lock(), "hello");
+                            assert!(to.lock().is_empty());
                         }
                     }
                 }
@@ -233,39 +249,44 @@ mod tests {
         let q = std::sync::Arc::new(MpmcQueue::<usize>::new(5));
         let mut received_vec = Vec::with_capacity(2);
         for _ in 0..2 {
-            received_vec.push(std::sync::Mutex::new(Vec::new()));
+            received_vec.push(parking_lot::Mutex::new(Vec::new()));
         }
         let received = std::sync::Arc::new(received_vec);
 
-        let mut threads = Vec::new();
+        let mut consumers = Vec::new();
         for thread_id in 0..2 {
             let q = q.clone();
             let received = received.clone();
-            threads.push(std::thread::spawn(move || {
+            consumers.push(std::thread::spawn(move || {
                 loop {
                     let item = q.pop(thread_id);
                     if item == 0 {
                         return;
                     }
-                    received[thread_id].lock().unwrap().push(item);
+                    received[thread_id].lock().push(item);
                 }
             }));
         }
+        let mut producers = Vec::new();
         for producer in 0..2 {
             let q = q.clone();
-            threads.push(std::thread::spawn(move || {
+            producers.push(std::thread::spawn(move || {
                 for i in 0..1000 {
                     q.push(producer * 1000 + i + 1, 0);
                 }
             }));
         }
-        for thread in threads {
+        for thread in producers {
             thread.join().unwrap();
         }
-        assert_eq!(
-            received[0].lock().unwrap().len() + received[1].lock().unwrap().len(),
-            2000
-        );
+        // One 0 sentinel per consumer (the C++ `multi_thread` protocol).
+        for _ in 0..2 {
+            q.push(0, 0);
+        }
+        for thread in consumers {
+            thread.join().unwrap();
+        }
+        assert_eq!(received[0].lock().len() + received[1].lock().len(), 2000);
     }
 
     /// Port of `TEST(MpmcQueue, multi_thread)`: 10 producers × 10 consumers,
@@ -285,7 +306,7 @@ mod tests {
         let q = std::sync::Arc::new(MpmcQueue::<Data>::new(21));
         let mut received_vec = Vec::with_capacity(CONSUMERS);
         for _ in 0..CONSUMERS {
-            received_vec.push(std::sync::Mutex::new(Vec::new()));
+            received_vec.push(parking_lot::Mutex::new(Vec::new()));
         }
         let received = std::sync::Arc::new(received_vec);
 
@@ -299,7 +320,7 @@ mod tests {
                     if item.value == 0 {
                         return;
                     }
-                    received[thread_id].lock().unwrap().push(item);
+                    received[thread_id].lock().push(item);
                 }
             }));
         }
@@ -333,7 +354,7 @@ mod tests {
         let mut all = Vec::new();
         for data in received.iter() {
             let mut per_producer = [0usize; PRODUCERS];
-            for item in data.lock().unwrap().iter() {
+            for item in data.lock().iter() {
                 all.push(*item);
                 assert!(item.value > per_producer[item.from], "per-producer order");
                 per_producer[item.from] = item.value;
