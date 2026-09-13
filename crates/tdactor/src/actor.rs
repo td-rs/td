@@ -99,8 +99,9 @@ pub trait Actor: Send + 'static {
         Scheduler::instance().set_actor_timeout_in(Scheduler::current_actor(), timeout);
     }
 
-    /// Set a timeout `timeout_at` seconds from now — the port of C++
-    /// `Actor::set_timeout_at`.
+    /// Set a timeout at absolute `timeout_at` seconds on the adjusted
+    /// monotonic clock (the [`tdutils::time::now`] base) — the port of C++
+    /// `Actor::set_timeout_at`. Past values fire on the next pump.
     fn set_timeout_at(&mut self, timeout_at: f64) {
         Scheduler::instance().set_actor_timeout_at(Scheduler::current_actor(), timeout_at);
     }

@@ -9,6 +9,10 @@
 //! `send_closure` machinery it needs; the full per-actor message-enum
 //! dispatch (S33) still follows — actors otherwise communicate through
 //! [`Raw`] events.
+//! S35 adds the timeout utilities — the one-shot [`Timeout`], the keyed
+//! [`MultiTimeout`] and [`SleepActor`] ([`timeout`]) plus the
+//! [`AlarmManager`] ([`alarm_manager`]) — together with the free
+//! `send_closure_immediately`/`send_closure_later` sends.
 //!
 //! ```
 //! use std::sync::{Arc, Mutex};
@@ -47,9 +51,11 @@
 
 pub mod actor;
 pub mod actor_id;
+pub mod alarm_manager;
 pub mod event;
 pub mod promise;
 pub mod scheduler;
+pub mod timeout;
 
 pub use actor::Actor;
 pub use actor_id::{ActorId, ActorOwn, ActorRef, ActorShared};
@@ -59,7 +65,9 @@ pub use promise::{
     create_event_promise_ok_fail, create_promise_from_promise_actor, promise_send_closure,
     send_promise_immediately, send_promise_later,
 };
+pub use alarm_manager::AlarmManager;
 pub use scheduler::{ConcurrentScheduler, Scheduler, SchedulerGuard, SchedulerPtr, SchedulerState};
+pub use timeout::{MultiTimeout, SleepActor, Timeout};
 
 /// Create an actor on the current scheduler — the free `td::create_actor`.
 pub fn create_actor<A: Actor>(name: &str, actor: A) -> ActorOwn<A> {
@@ -83,9 +91,23 @@ pub fn register_actor<A: Actor>(name: &str, sched_id: i32, actor: A) -> ActorOwn
 pub fn send_event(actor_ref: impl Into<ActorRef>, event: Event) {
     Scheduler::instance().send_immediately(actor_ref, event);
 }
-
 /// Send an event through the mailbox — the free `td::send_event_later`
 /// (`Scheduler::send_later`).
 pub fn send_event_later(actor_ref: impl Into<ActorRef>, event: Event) {
     Scheduler::instance().send_later(actor_ref, event);
+}
+/// Send a closure to an actor, running it inline when possible — the free
+/// `td::send_closure` half (`Scheduler::send_closure_immediately`; the full
+/// macro machinery is S33).
+pub fn send_closure_immediately(
+    actor_ref: impl Into<ActorRef>,
+    closure: crate::event::ActorThunk,
+) {
+    Scheduler::instance().send_closure_immediately(actor_ref.into(), closure);
+}
+
+/// Send a closure to an actor through the mailbox — the free
+/// `td::send_closure_later` half (`Scheduler::send_closure_later`).
+pub fn send_closure_later(actor_ref: impl Into<ActorRef>, closure: crate::event::ActorThunk) {
+    Scheduler::instance().send_closure_later(actor_ref.into(), closure);
 }

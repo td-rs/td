@@ -575,13 +575,20 @@ impl SchedulerState {
             "do_stop_actor on the dispatched actor is UB in Rust (use stop())"
         );
         let saved = EVENT_CTX.with(|ctx| ctx.replace(EventContext::default()));
-        // The C++ keeps its EventGuard (is_running = true) across the
-        // destruction: sends to this actor from its own teardown/Drop land in
-        // the mailbox (cleared by destroy_actor) instead of dispatching
-        // inline. destroy_actor frees the ActorInfo, so afterwards only the
-        // context restore remains (no list fixup — the actor is unlinked).
-        self.enter_actor(id.clone());
-        self.do_event(id.clone(), Event::stop());
+        // C++ `do_stop_actor` dispatches `Event::stop` only for actors with
+        // `need_start_up()` (started, owned ones). A borrowed actor
+        // (`Deleter::None`, the member-actor idiom) is unregistered without
+        // dispatching: its memory belongs to the owner, which may already be
+        // gone — the teardown order in `clear()` is arbitrary and the
+        // member's registration outlives the member itself.
+        let need_stop_event = !matches!(
+            &*self.info(id.clone()).actor.borrow(),
+            ActorSlot::Borrowed(_)
+        );
+        if need_stop_event {
+            self.enter_actor(id.clone());
+            self.do_event(id.clone(), Event::stop());
+        }
         self.destroy_actor(id.clone());
         EVENT_CTX.with(|ctx| {
             *ctx.borrow_mut() = saved;
@@ -737,15 +744,22 @@ impl SchedulerState {
     }
 
     pub(crate) fn set_actor_timeout_in(&self, id: ActorId, timeout: f64) {
-        // C++ clamps to [0, 1e10] then converts to an absolute time.
-        self.set_actor_timeout_at(id, timeout.clamp(0.0, 1e10));
+        // C++ `Scheduler::set_actor_timeout_in`: clamp to [0, 1e10], then a
+        // plain `set_actor_timeout_at` with the absolute deadline.
+        self.set_actor_timeout_at(id, tdutils::time::now() + timeout.clamp(0.0, 1e10));
     }
 
+    /// `timeout_at` is absolute — seconds on the adjusted monotonic clock
+    /// ([`crate::time_now`] base), exactly like C++
+    /// `Scheduler::set_actor_timeout_at(ActorInfo, Timestamp)`. Past values
+    /// fire on the next pump; future values are capped at +1e10 s (the C++
+    /// `Timestamp::in(1e10, ...)` clamp, also keeping `Instant` in range).
     pub(crate) fn set_actor_timeout_at(&self, id: ActorId, timeout_at: f64) {
         let info = self.info(id.clone());
         let generation = info.timeout_gen.get() + 1;
         info.timeout_gen.set(generation);
-        let at = Instant::now() + Duration::from_secs_f64(timeout_at.max(0.0));
+        let at = Instant::now()
+            + Duration::from_secs_f64((timeout_at - tdutils::time::now()).clamp(0.0, 1e10));
         info.deadline.set(Some(at));
         self.timeouts
             .borrow_mut()
