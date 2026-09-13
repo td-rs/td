@@ -11,6 +11,7 @@ base64 = "0.22"
 crc32fast = "1"
 ctor = "0.4"
 ed25519-dalek = { version = "2", features = ["rand_core", "pem"] }
+flate2 = "1"
 getrandom = "0.3"
 hmac = "0.12"
 md-5 = "0.10"
