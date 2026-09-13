@@ -30,15 +30,7 @@ use crate::http_query::HttpQuery;
 use tdutils::http_url::{HttpUrl, parse_url};
 use tdutils::status::{Result, Status};
 
-/// `SslCtx::VerifyPeer`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum VerifyPeer {
-    /// Validate the server certificate chain (the C++ default).
-    #[default]
-    On,
-    /// Accept any certificate (`SslCtx::VerifyPeer::Off`).
-    Off,
-}
+pub use crate::tls::VerifyPeer;
 
 /// `Wget` constructor parameters.
 #[derive(Clone, Debug)]

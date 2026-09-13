@@ -13,6 +13,9 @@
 //! S49 — the proxy layer: [`proxy::socks5_connect`] and
 //! [`proxy::http_proxy_connect`] (`td/net/Socks5`, `td/net/HttpProxy`).
 //!
+//! S50 — the TLS layer: [`tls::SslCtx`] + [`tls::connect`]
+//! (`td/net/SslCtx`, `td/net/SslStream`).
+//!
 //! S51 — the fake-TLS layer: [`tls_init::connect`] (`td/mtproto/TlsInit`).
 
 mod transparent;
@@ -21,6 +24,7 @@ pub mod dns;
 pub mod http_query;
 pub mod proxy;
 pub mod tcp;
+pub mod tls;
 pub mod tls_init;
 pub mod udp;
 pub mod wget;
