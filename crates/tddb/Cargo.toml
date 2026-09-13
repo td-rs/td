@@ -6,3 +6,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# vendored OpenSSL: SQLCipher's codec needs it, and the workspace must build
+# without system-wide OpenSSL (NixOS, CI).
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl", "trace"] }
+tdutils = { path = "../tdutils" }
+tracing = "0.1"
