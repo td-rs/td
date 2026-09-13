@@ -2149,7 +2149,7 @@ pub mod tl_json {
 
     // ---- typed reads (td's tl_json.h from_json overloads) -----------------
 
-    /// td's to_integer<int32>: leading `-`, digits until a non-digit, all
+    /// td's `to_integer<int32>`: leading `-`, digits until a non-digit, all
     /// arithmetic in the unsigned domain with td's negation dance — the
     /// i64 value truncated to the low 32 bits is bit-identical to running
     /// C++'s algorithm in 32-bit width.
