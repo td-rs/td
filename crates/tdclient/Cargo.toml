@@ -6,7 +6,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+libc = "0.2.189"
 serde = { version = "1", features = ["derive"] }
+tddb = { path = "../tddb" }
 tdutils = { path = "../tdutils" }
 
 [build-dependencies]
