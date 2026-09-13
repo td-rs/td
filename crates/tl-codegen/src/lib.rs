@@ -16,26 +16,28 @@ pub const TD_API_TL: &str = include_str!("../scheme/td_api.tl");
 pub const TELEGRAM_API_TL: &str = include_str!("../scheme/telegram_api.tl");
 
 /// Generates the td_api Rust module: structs/enums + serde derives + binary
-/// store.
+/// store + the td-exact JSON methods (S12).
 pub fn generate_td_api_rust() -> String {
     generate(
         TD_API_TL,
         &rust_writer::WriterOpts {
             umbrella: "Function",
             serde: true,
+            json: true,
             source: "td_api.tl (tdlib d1085f9ce)",
         },
     )
 }
 
 /// Generates the telegram_api Rust module: structs/enums + binary store
-/// (no serde — telegram_api has no JSON surface).
+/// (no serde/JSON — telegram_api has no JSON surface).
 pub fn generate_telegram_api_rust() -> String {
     generate(
         TELEGRAM_API_TL,
         &rust_writer::WriterOpts {
             umbrella: "Function",
             serde: false,
+            json: false,
             source: "telegram_api.tl (tdlib d1085f9ce)",
         },
     )
@@ -113,7 +115,9 @@ mod tests {
             // One struct per non-builtin ctor (which includes every
             // single-ctor type) plus one per function; one enum per
             // multi-ctor type plus the Function umbrella. The support
-            // module's `tl::Reader` adds exactly one more struct.
+            // module's `tl::Reader` adds exactly one more struct; the JSON
+            // runtime (td_api only) adds the `tl_json::Json` enum.
+            let json_enums = if scheme == "td_api" { 1 } else { 0 };
             assert_eq!(
                 code.matches("pub struct ").count(),
                 (program.total_ctors - 9) + program.total_funcs + 1,
@@ -121,9 +125,9 @@ mod tests {
             );
             assert_eq!(
                 code.matches("pub enum ").count(),
-                enums + 1,
+                enums + 1 + json_enums,
                 "{scheme} enum count"
-            ); // + Function
+            ); // + Function + Json
         }
     }
 

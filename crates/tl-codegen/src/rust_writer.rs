@@ -86,6 +86,9 @@ pub struct WriterOpts {
     pub umbrella: &'static str,
     /// Emit serde derives (td_api only — the other schemes have no JSON).
     pub serde: bool,
+    /// Emit the td_api JSON methods (`to_json*`/`from_json*`, S12) — td_api
+    /// only; the other schemes have no JSON surface.
+    pub json: bool,
     /// Provenance comment.
     pub source: &'static str,
 }
@@ -99,6 +102,9 @@ pub fn write_rust(p: &TlProgram, m: &SchemeModel, opts: &WriterOpts) -> String {
         out.push_str("use serde::{Deserialize, Serialize};\n\n");
     }
     out.push_str(SUPPORT_MODULE);
+    if opts.json {
+        out.push_str(JSON_SUPPORT_MODULE);
+    }
 
     let mut emitted_names = BTreeSet::new();
 
@@ -303,7 +309,7 @@ fn emit_samples_and_tests(out: &mut String, p: &TlProgram, m: &SchemeModel, opts
         match &m.type_kinds[tid] {
             TypeKind::Struct { ctor } => {
                 let name = m.type_name(p, tid);
-                emit_roundtrip_test(out, p, *ctor, &name, true, &name);
+                emit_roundtrip_test(out, p, *ctor, &name, true, &name, opts.json);
             }
             TypeKind::Enum { ctors } => {
                 let target = class_name(&p.types[tid].id);
@@ -313,7 +319,7 @@ fn emit_samples_and_tests(out: &mut String, p: &TlProgram, m: &SchemeModel, opts
                     // declaration in the read dispatch — not round-trippable.
                     if seen.insert(p.ctors[c].name) {
                         let name = capitalize(&p.ctors[c].id);
-                        emit_roundtrip_test(out, p, c, &target, false, &name);
+                        emit_roundtrip_test(out, p, c, &target, false, &name, opts.json);
                     }
                 }
             }
@@ -325,7 +331,7 @@ fn emit_samples_and_tests(out: &mut String, p: &TlProgram, m: &SchemeModel, opts
         for &f in &m.functions {
             if seen.insert(p.ctors[f].name) {
                 let name = capitalize(&p.ctors[f].id);
-                emit_roundtrip_test(out, p, f, opts.umbrella, false, &name);
+                emit_roundtrip_test(out, p, f, opts.umbrella, false, &name, opts.json);
             }
         }
     }
@@ -380,6 +386,52 @@ fn __malformed_inputs_do_not_panic() {{
     }}
 }}
 "#
+    ));
+
+    if !opts.json {
+        return;
+    }
+
+    // ---- malformed JSON seeds --------------------------------------------
+    out.push_str(&format!(
+        r#"#[cfg(test)]
+#[test]
+fn __malformed_json_does_not_panic() {{
+    // JSON-side twin of the binary seeds: parser edge cases (truncated
+    // strings/objects, bad escapes, lone surrogates, depth bomb, trailing
+    // garbage, empty and well-formed-but-wrong inputs). Every from_json
+    // path must return Ok or Err — never panic.
+    let deep = "[".repeat(200);
+    let seeds = [
+        "",
+        " ",
+        "{{",
+        "}}",
+        "nul",
+        "tru",
+        "{{\"@type\":",
+        "{{\"@type\"}}",
+        "{{\"@type\":\"{first_fn_name}\"}} x",
+        "[1,]",
+        "[,]",
+        "\"\\ud800\"",
+        "\"\\uZZZZ\"",
+        "\"\\q\"",
+        "\"unterminated",
+        "999e",
+        "-",
+        "{{\"@type\":42}}",
+        "{{@type:\"x\"}}",
+        deep.as_str(),
+    ];
+    for seed in &seeds {{
+        let _ = {first_fn}::from_json(seed);
+        let _ = {first_enum}::from_json(seed);
+        let _ = {first_struct}::from_json(seed);
+    }}
+}}
+"#,
+        first_fn_name = p.ctors[m.functions[0]].id
     ));
 }
 
@@ -468,7 +520,8 @@ fn sample_expr(
 }
 
 /// Emits one round-trip test: build a depth-3 sample, store, parse, compare.
-/// Single-ctor types additionally round-trip the bare (unboxed) form.
+/// Single-ctor types additionally round-trip the bare (unboxed) form; JSON
+/// schemes (td_api) also round-trip to_json → from_json.
 fn emit_roundtrip_test(
     out: &mut String,
     _p: &TlProgram,
@@ -476,6 +529,7 @@ fn emit_roundtrip_test(
     target: &str,
     bare: bool,
     name: &str,
+    json: bool,
 ) {
     out.push_str("#[cfg(test)]\n#[test]\n#[allow(non_snake_case)]\n");
     // Single-ctor types round-trip the struct directly; enum variants and
@@ -503,6 +557,13 @@ fn emit_roundtrip_test(
             "\x20       let mut out = Vec::new();\n\
              \x20       v.store(&mut out);\n\
              \x20       let w = {target}::parse_bare(&out).expect(\"{name} bare parse\");\n\
+             \x20       assert_eq!(v, w);\n"
+        ));
+    }
+    if json {
+        out.push_str(&format!(
+            "\x20       let j = v.to_json();\n\
+             \x20       let w = {target}::from_json(&j).expect(\"{name} json parse\");\n\
              \x20       assert_eq!(v, w);\n"
         ));
     }
@@ -608,7 +669,402 @@ fn emit_struct(
         var_counter: 0,
     }
     .emit_fields(out, p, fields);
-    out.push_str("    }\n}\n\n");
+    out.push_str("    }\n");
+    if opts.json {
+        emit_struct_json(out, p, m, opts, c, fields);
+    }
+    out.push_str("}\n\n");
+}
+
+/// Emits the S12 JSON methods for one constructor struct: `to_json_into`
+/// (td's generated `to_json` + `json_encode` in one compact write) and the
+/// `from_json` trio mirroring td's `from_json`/`tl_json.h` leniency.
+///
+/// Format rules (all matching td's `tl_json_converter.cpp` output):
+/// `{"@type":"ctor","field":value,...}` with no spaces; the `flags:#` word
+/// is never serialized; int64 fields are quoted decimal strings while int53
+/// are plain numbers; doubles use 6 fixed decimals; bytes are standard
+/// base64; strings escape non-ASCII as lowercase `\uXXXX` (surrogate pairs
+/// above the BMP); vectors are arrays (a direct `vector<int64>` quotes its
+/// elements, deeper int64s do not).
+///
+/// Divergence from C++, deliberate: td's nullable `object_ptr` fields are
+/// omitted when null; the Rust model materializes a default object instead,
+/// so object fields are always emitted. Binary store/parse (S10/S11) never
+/// encodes null either — nullability becomes observable only with the
+/// dynamic JSON layer (S16/S68).
+fn emit_struct_json(
+    out: &mut String,
+    p: &TlProgram,
+    m: &SchemeModel,
+    opts: &WriterOpts,
+    c: usize,
+    fields: &[Field],
+) {
+    out.push_str(
+        "\n    pub fn to_json(&self) -> String {\n        let mut out = String::new();\n        self.to_json_into(&mut out);\n        out\n    }\n\n",
+    );
+    out.push_str("    pub fn to_json_into(&self, out: &mut String) {\n");
+    out.push_str(&format!(
+        "        out.push_str(\"{{\\\"@type\\\":\\\"{}\\\"\");\n",
+        p.ctors[c].id
+    ));
+    JsonStoreWriter {
+        depth: 2,
+        var_counter: 0,
+    }
+    .emit_fields(out, fields);
+    out.push_str("        out.push('}');\n    }\n");
+
+    out.push_str(
+        "\n    pub fn from_json(input: &str) -> Result<Self, String> {\n        \
+         let root = tl_json::parse_json(input)?;\n        Self::from_json_value(&root)\n    }\n\n",
+    );
+    out.push_str(
+        "    /// td's default-constructible `from_json(object_ptr<T>&)` path: any\n\
+         \x20   /// object is accepted and `@type` is ignored — only the fields read.\n",
+    );
+    // Unit structs construct with `Self` (clippy: default_constructed_unit_structs).
+    let null_default = if fields.is_empty() {
+        "Self"
+    } else {
+        "Self::default()"
+    };
+    out.push_str(&format!(
+        "    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {{\n        \
+         match v {{\n            \
+         tl_json::Json::Null => Result::Ok({null_default}),\n            \
+         tl_json::Json::Object(o) => Self::from_json_object(o),\n            \
+         other => Result::Err(format!(\"Expected Object, but receive {{}}\", other.type_name())),\n        \
+         }}\n    }}\n\n",
+    ));
+    if fields.is_empty() {
+        out.push_str(
+            "    fn from_json_object(_o: &tl_json::Object) -> Result<Self, String> {\n        \
+             Result::Ok(Self)\n    }\n",
+        );
+        return;
+    }
+    out.push_str(
+        "    fn from_json_object(o: &tl_json::Object) -> Result<Self, String> {\n        \
+         let mut value = Self::default();\n",
+    );
+    JsonLoadWriter {
+        m,
+        opts,
+        depth: 2,
+        var_counter: 0,
+    }
+    .emit_fields(out, p, fields);
+    out.push_str("        Result::Ok(value)\n    }\n");
+}
+
+/// Emits the S12 JSON methods for one enum: to_json dispatches to the
+/// variant's `to_json_into` (td's `downcast_call`); from_json extracts
+/// `@type` — a constructor name string or a numeric id (td's
+/// `tl_constructor_from_string` + `TlDowncastHelper`) — and dispatches to
+/// the variant's field reader. First declaration wins on duplicate wire ids
+/// (same rule as the binary `read`).
+fn emit_enum_json(out: &mut String, p: &TlProgram, ctors: &[usize]) {
+    out.push_str(
+        "\n    pub fn to_json(&self) -> String {\n        let mut out = String::new();\n        self.to_json_into(&mut out);\n        out\n    }\n\n",
+    );
+    out.push_str("    pub fn to_json_into(&self, out: &mut String) {\n        match self {\n");
+    for &c in ctors {
+        let variant = capitalize(&p.ctors[c].id);
+        out.push_str(&format!(
+            "            Self::{variant}(v) => v.to_json_into(out),\n"
+        ));
+    }
+    out.push_str("        }\n    }\n");
+    out.push_str(
+        "\n    pub fn from_json(input: &str) -> Result<Self, String> {\n        \
+         let root = tl_json::parse_json(input)?;\n        Self::from_json_value(&root)\n    }\n\n",
+    );
+    out.push_str(
+        "    /// td's `from_json(object_ptr<T>&, JsonValue)`: null yields the\n\
+         \x20   /// default variant (C++ keeps a null pointer — see the model note),\n\
+         \x20   /// an object's `@type` (name or numeric id) selects the variant.\n",
+    );
+    out.push_str(
+        "    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {\n        \
+         let o = match v {\n            \
+         tl_json::Json::Null => return Result::Ok(Self::default()),\n            \
+         tl_json::Json::Object(o) => o,\n            \
+         other => return Result::Err(format!(\"Expected Object, but receive {}\", other.type_name())),\n        \
+         };\n        \
+         let ty = match tl_json::field(o, \"@type\") {\n            \
+         Some(ty) => ty,\n            \
+         None => return Result::Err(\"Can't find field \\\"@type\\\"\".to_owned()),\n        \
+         };\n        \
+         match ty {\n            \
+         tl_json::Json::String(s) => match s.as_str() {\n",
+    );
+    for &c in ctors {
+        let variant = capitalize(&p.ctors[c].id);
+        out.push_str(&format!(
+            "                \"{}\" => Result::Ok(Self::{variant}(self::{variant}::from_json_object(o)?)),\n",
+            p.ctors[c].id
+        ));
+    }
+    out.push_str(
+        "                _ => Result::Err(format!(\"Unknown class \\\"{s}\\\"\")),\n\
+         \x20           },\n            \
+         tl_json::Json::Number(n) => match tl_json::to_integer_i32(n) {\n",
+    );
+    let mut seen = BTreeSet::new();
+    for &c in ctors {
+        if !seen.insert(p.ctors[c].name) {
+            continue;
+        }
+        let variant = capitalize(&p.ctors[c].id);
+        out.push_str(&format!(
+            "                self::{variant}::ID => Result::Ok(Self::{variant}(self::{variant}::from_json_object(o)?)),\n"
+        ));
+    }
+    out.push_str(
+        "                id => Result::Err(format!(\"Unknown constructor 0x{:x}\", id as u32)),\n\
+         \x20           },\n            \
+         other => Result::Err(format!(\"Expected String or Integer, but receive {}\", other.type_name())),\n        \
+         }\n    }\n",
+    );
+}
+
+/// Emits the to_json field statements — each is `,"name":` followed by the
+/// value in td's exact encoding. The `flags:#` word is never serialized;
+/// conditional fields are emitted unconditionally (td's writer gates only
+/// object null-ness, never the flag bit).
+struct JsonStoreWriter {
+    depth: usize,
+    var_counter: usize,
+}
+
+impl JsonStoreWriter {
+    fn indent(&self) -> String {
+        " ".repeat(self.depth * 4)
+    }
+
+    fn emit_fields(&mut self, out: &mut String, fields: &[Field]) {
+        for f in fields {
+            if let FieldType::Prim(Prim::Nat) = f.ty {
+                // The flags word has no JSON representation (td's tl_simple
+                // drops it from the arg list entirely).
+                continue;
+            }
+            out.push_str(&format!(
+                "{}out.push_str(\",{}:\");\n",
+                self.indent(),
+                json_key(&f.name)
+            ));
+            let expr = format!("self.{}", field_ident(&f.name));
+            self.emit_value(out, &expr, &f.ty);
+        }
+    }
+
+    /// Emits the statements writing `expr` (a place expression) as JSON.
+    fn emit_value(&mut self, out: &mut String, expr: &str, ty: &FieldType) {
+        let ind = self.indent();
+        let call = |e: &str| {
+            if e.starts_with('*') {
+                format!("({e})")
+            } else {
+                e.to_owned()
+            }
+        };
+        match ty {
+            FieldType::Prim(prim) => {
+                // Strings/bytes take &str/&[u8]; references auto-deref at
+                // the call, so vector elements pass the reference itself
+                // and fields pass `&self.x`.
+                let refe = |e: &str| match e.strip_prefix('*') {
+                    Some(stripped) => stripped.to_owned(),
+                    None => format!("&{e}"),
+                };
+                let (f, arg) = match prim {
+                    Prim::Nat | Prim::Int32 => ("num32", expr.to_owned()),
+                    Prim::Int53 => ("num64", expr.to_owned()),
+                    // td's JsonInt64: quoted decimal string.
+                    Prim::Int64 => ("num64q", expr.to_owned()),
+                    Prim::Double => ("double", expr.to_owned()),
+                    Prim::Bool | Prim::True => ("boolean", expr.to_owned()),
+                    Prim::String => ("str", refe(expr)),
+                    Prim::Bytes => ("bytes", refe(expr)),
+                };
+                out.push_str(&format!("{ind}tl_json::{f}(out, {arg});\n"));
+            }
+            FieldType::Vector { inner, .. } => {
+                // Note: a *direct* vector<int64> quotes its elements only
+                // via the innermost Int64 prim arm — exactly td's
+                // JsonVectorInt64 rule (deeper int64s stay plain numbers).
+                out.push_str(&format!("{ind}out.push('[');\n"));
+                let var = format!("__v{}", self.var_counter);
+                self.var_counter += 1;
+                // `&self.f` iterates fields; `*var` element places (nested
+                // vectors) iterate the reference itself.
+                let iter = match expr.strip_prefix('*') {
+                    Some(stripped) => stripped.to_owned(),
+                    None => format!("&{expr}"),
+                };
+                out.push_str(&format!(
+                    "{ind}let mut __first = true;\n{ind}for {var} in {iter} {{\n"
+                ));
+                self.depth += 1;
+                out.push_str(&format!(
+                    "{}if !__first {{\n{}    out.push(',');\n{}}}\n{}__first = false;\n",
+                    self.indent(),
+                    self.indent(),
+                    self.indent(),
+                    self.indent()
+                ));
+                self.emit_value(out, &format!("*{var}"), inner);
+                self.depth -= 1;
+                out.push_str(&format!("{ind}}}\n{ind}out.push(']');\n"));
+            }
+            FieldType::Conditional { inner, .. } => {
+                // Emitted unconditionally — see emit_fields.
+                self.emit_value(out, expr, inner);
+            }
+            FieldType::Boxed(_) | FieldType::Bare(_) => {
+                out.push_str(&format!("{ind}{}.to_json_into(out);\n", call(expr)));
+            }
+            FieldType::Function => {
+                out.push_str(&format!("{ind}{}.to_json_into(out);\n", call(expr)));
+            }
+        }
+    }
+}
+
+/// A JSON object key: TL field names are already td's wire names, quoted
+/// verbatim (td's `jo(arg.name, …)`).
+fn json_key(name: &str) -> String {
+    format!("\\\"{name}\\\"")
+}
+
+/// The `tl_json::read_*` function for a (possibly flag-gated) primitive —
+/// the readers that can be passed as function items into `read_vector`.
+fn prim_reader_fn(ty: &FieldType) -> Option<&'static str> {
+    match ty {
+        FieldType::Conditional { inner, .. } => prim_reader_fn(inner),
+        FieldType::Prim(prim) => Some(match prim {
+            Prim::Nat | Prim::Int32 => "read_i32",
+            Prim::Int53 | Prim::Int64 => "read_i64",
+            Prim::Double => "read_f64",
+            Prim::Bool | Prim::True => "read_bool",
+            Prim::String => "read_string",
+            Prim::Bytes => "read_bytes",
+        }),
+        _ => None,
+    }
+}
+
+/// Emits the from_json field statements: `tl_json::field` is td's
+/// `extract_field` (first match wins, missing → keep the default).
+struct JsonLoadWriter<'a> {
+    m: &'a SchemeModel,
+    opts: &'a WriterOpts,
+    depth: usize,
+    var_counter: usize,
+}
+
+impl JsonLoadWriter<'_> {
+    fn indent(&self) -> String {
+        " ".repeat(self.depth * 4)
+    }
+
+    fn emit_fields(&mut self, out: &mut String, p: &TlProgram, fields: &[Field]) {
+        for f in fields {
+            if let FieldType::Prim(Prim::Nat) = f.ty {
+                continue;
+            }
+            let ind = self.indent();
+            let target = format!("value.{}", field_ident(&f.name));
+            let var = format!("__j{}", self.var_counter);
+            self.var_counter += 1;
+            let elem_var = format!("__e{}", self.var_counter);
+            self.var_counter += 1;
+            out.push_str(&format!(
+                "{ind}if let Some({var}) = tl_json::field(o, \"{}\") {{\n",
+                f.name
+            ));
+            self.depth += 1;
+            // Top-level expressions already carry their own `?` (boxing
+            // consumes it inside `Box::new(..?)`).
+            let expr = self.read_expr(p, &var, &elem_var, &f.ty, false);
+            out.push_str(&format!("{}{target} = {expr};\n", self.indent()));
+            self.depth -= 1;
+            out.push_str(&format!("{ind}}}\n"));
+        }
+    }
+
+    /// The expression converting a `&Json` named `var` into a field value;
+    /// `elem` names the closure parameter of the enclosing vector level.
+    /// At the top level the expression carries its own `?`; inside a vector
+    /// closure it is the closure's tail (a plain `Result`), so boxing
+    /// re-wraps into `Result::Ok(..?..)`.
+    fn read_expr(
+        &mut self,
+        p: &TlProgram,
+        var: &str,
+        elem: &str,
+        ty: &FieldType,
+        closure: bool,
+    ) -> String {
+        // Result-returning forms get their `?` only at the top level.
+        let q = if closure { "" } else { "?" };
+        match ty {
+            FieldType::Prim(prim) => format!(
+                "tl_json::read_{}({var}){q}",
+                match prim {
+                    Prim::Nat | Prim::Int32 => "i32",
+                    Prim::Int53 | Prim::Int64 => "i64",
+                    Prim::Double => "f64",
+                    Prim::Bool | Prim::True => "bool",
+                    Prim::String => "string",
+                    Prim::Bytes => "bytes",
+                }
+            ),
+            FieldType::Vector { inner, .. } => {
+                // Single-function readers pass the function item itself —
+                // a `|e| f(e)` closure trips clippy's redundant_closure in
+                // the generated code. Boxed readers keep the closure (their
+                // body re-wraps the `?`).
+                if let Some(f) = prim_reader_fn(inner) {
+                    return format!("tl_json::read_vector({var}, tl_json::{f}){q}");
+                }
+                if let FieldType::Boxed(t) | FieldType::Bare(t) = &**inner {
+                    let name = self.m.type_name(p, *t);
+                    if !self.m.cyclic[*t] {
+                        return format!("tl_json::read_vector({var}, {name}::from_json_value){q}");
+                    }
+                }
+                let inner_elem = format!("__e{}", self.var_counter);
+                self.var_counter += 1;
+                let inner_expr = self.read_expr(p, elem, &inner_elem, inner, true);
+                format!("tl_json::read_vector({var}, |{elem}| {inner_expr}){q}")
+            }
+            FieldType::Conditional { inner, .. } => self.read_expr(p, var, elem, inner, closure),
+            FieldType::Boxed(t) | FieldType::Bare(t) => {
+                let name = self.m.type_name(p, *t);
+                if self.m.cyclic[*t] {
+                    if closure {
+                        format!("Result::Ok(Box::new({name}::from_json_value({var})?))")
+                    } else {
+                        format!("Box::new({name}::from_json_value({var})?)")
+                    }
+                } else {
+                    format!("{name}::from_json_value({var}){q}")
+                }
+            }
+            FieldType::Function => {
+                let name = self.opts.umbrella;
+                if closure {
+                    format!("Result::Ok(Box::new({name}::from_json_value({var})?))")
+                } else {
+                    format!("Box::new({name}::from_json_value({var})?)")
+                }
+            }
+        }
+    }
 }
 
 fn emit_enum(
@@ -667,7 +1123,11 @@ fn emit_enum(
         ));
     }
     out.push_str("            _ => Result::Err(\"Unknown constructor\"),\n");
-    out.push_str("        }\n    }\n}\n\n");
+    out.push_str("        }\n    }\n");
+    if opts.json {
+        emit_enum_json(out, p, ctors);
+    }
+    out.push_str("}\n\n");
     // Manual Default: the breaking (min-rank) ctor — derived Default would
     // recurse forever on cyclic types, and `#[default]` only works on unit
     // variants. The rank argument makes the whole Default graph acyclic.
@@ -1223,6 +1683,586 @@ pub mod tl {
             let payload_end = payload_at + len;
             self.pos += advance + aligned;
             Ok(&self.buf[payload_at..payload_end])
+        }
+    }
+}
+
+"#;
+
+/// The S12 JSON runtime: a td-exact compact serializer and lenient parser
+/// mirroring `tdutils/td/utils/JsonBuilder.{h,cpp}`, `td/tl/tl_json.h` and
+/// `tdutils/td/utils/base64.cpp`. The generated `to_json_into`/`from_json`
+/// calls are thin wrappers over these primitives.
+const JSON_SUPPORT_MODULE: &str = r#"/// td_api JSON runtime — the Rust analogue of td's JsonBuilder + tl_json.h
+/// (S12). Semantics are fixed by the differential oracle against td's own
+/// generated `td_api_json_*.cpp` (`conformance/tl_json_oracle`).
+pub mod tl_json {
+    /// td's JsonValue (`Null/Number/Boolean/String/Array/Object`); numbers
+    /// keep their raw source text, exactly like td's slice-backed values.
+    pub enum Json {
+        Null,
+        Bool(bool),
+        Number(String),
+        String(String),
+        Array(Vec<Json>),
+        Object(Object),
+    }
+
+    /// Field order is preserved; `field` scans in order, first match wins —
+    /// td's `JsonObject::extract_field` on its vector of pairs.
+    pub type Object = Vec<(String, Json)>;
+
+    impl Json {
+        /// td's `JsonValue::get_type_name` strings.
+        pub fn type_name(&self) -> &'static str {
+            match self {
+                Json::Null => "Null",
+                Json::Bool(_) => "Boolean",
+                Json::Number(_) => "Number",
+                Json::String(_) => "String",
+                Json::Array(_) => "Array",
+                Json::Object(_) => "Object",
+            }
+        }
+    }
+
+    pub fn field<'a>(o: &'a Object, name: &str) -> Option<&'a Json> {
+        o.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+    }
+
+    // ---- serialization (td's JsonBuilder, compact mode) -------------------
+
+    pub fn num32(out: &mut String, v: i32) {
+        out.push_str(&v.to_string());
+    }
+
+    pub fn num64(out: &mut String, v: i64) {
+        out.push_str(&v.to_string());
+    }
+
+    /// td's JsonInt64: int64 fields serialize as quoted decimal strings.
+    pub fn num64q(out: &mut String, v: i64) {
+        out.push('"');
+        num64(out, v);
+        out.push('"');
+    }
+
+    /// td's StringBuilder `<<` on double: fixed 6 decimals (iostreams with
+    /// classic locale); C++ prints nan/inf as bare words, so map NaN's sign
+    /// bit the way glibc does ("nan"/"-nan").
+    pub fn double(out: &mut String, v: f64) {
+        if v.is_nan() {
+            out.push_str(if v.is_sign_negative() { "-nan" } else { "nan" });
+            return;
+        }
+        use std::fmt::Write as _;
+        let _ = write!(out, "{v:.6}");
+    }
+
+    pub fn boolean(out: &mut String, v: bool) {
+        out.push_str(if v { "true" } else { "false" });
+    }
+
+    /// td's JsonString: ASCII printable literal; short escapes for
+    /// `"`/`\`/`\b\f\n\r\t`; other controls and ALL non-ASCII as lowercase
+    /// `\uXXXX` (surrogate pairs above the BMP); DEL passes through raw.
+    pub fn str(out: &mut String, s: &str) {
+        out.push('"');
+        for c in s.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                '\u{0008}' => out.push_str("\\b"),
+                '\u{000c}' => out.push_str("\\f"),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => escape_one(out, c as u32),
+                c if (c as u32) < 0x80 => out.push(c),
+                c => {
+                    let cp = c as u32;
+                    if cp < 0x10000 {
+                        escape_one(out, cp);
+                    } else {
+                        // td's JsonChar: encoded as a UTF-16 surrogate pair.
+                        escape_one(out, 0xD7C0 + (cp >> 10));
+                        escape_one(out, 0xDC00 + (cp & 0x3FF));
+                    }
+                }
+            }
+        }
+        out.push('"');
+    }
+
+    fn escape_one(out: &mut String, c: u32) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        out.push_str("\\u");
+        out.push(HEX[(c >> 12) as usize] as char);
+        out.push(HEX[((c >> 8) & 15) as usize] as char);
+        out.push(HEX[((c >> 4) & 15) as usize] as char);
+        out.push(HEX[(c & 15) as usize] as char);
+    }
+
+    /// Bytes as standard-alphabet base64 with `=` padding (td's base64_encode).
+    pub fn bytes(out: &mut String, b: &[u8]) {
+        out.push('"');
+        encode_b64(out, b);
+        out.push('"');
+    }
+
+    const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    pub fn encode_b64(out: &mut String, input: &[u8]) {
+        for chunk in input.chunks(3) {
+            let left = chunk.len();
+            let mut c = (chunk[0] as u32) << 16;
+            out.push(B64[(c >> 18) as usize] as char);
+            if left != 1 {
+                c |= (chunk[1] as u32) << 8;
+            }
+            out.push(B64[((c >> 12) & 63) as usize] as char);
+            if left == 3 {
+                c |= chunk[2] as u32;
+            }
+            if left != 1 {
+                out.push(B64[((c >> 6) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+            if left == 3 {
+                out.push(B64[(c & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+
+    /// td's base64_decode: padding dropped (0–2 `=`), standard alphabet,
+    /// non-canonical trailing bits rejected.
+    pub fn decode_b64(b64: &str) -> Result<Vec<u8>, String> {
+        let mut s = b64.as_bytes();
+        let mut padding = 0;
+        while !s.is_empty() && s[s.len() - 1] == b'=' {
+            s = &s[..s.len() - 1];
+            padding += 1;
+        }
+        if padding >= 3 {
+            return Err("Wrong string padding".to_owned());
+        }
+        if (s.len() + padding) & 3 != 0 {
+            return Err("Wrong padding length".to_owned());
+        }
+        let val = |c: u8| -> Option<u32> {
+            B64.iter().position(|&x| x == c).map(|i| i as u32)
+        };
+        let mut out = Vec::with_capacity(s.len() / 4 * 3 + 2);
+        let mut i = 0;
+        while i < s.len() {
+            let left = (s.len() - i).min(4);
+            let mut c: u32 = 0;
+            for t in 0..left {
+                let v = val(s[i]).ok_or_else(|| "Wrong character in the string".to_owned())?;
+                i += 1;
+                c |= v << ((3 - t) * 6);
+            }
+            out.push((c >> 16) as u8);
+            if left == 2 {
+                if c & 0xFFFF != 0 {
+                    return Err("Wrong padding in the string".to_owned());
+                }
+            } else {
+                out.push((c >> 8) as u8);
+                if left == 3 {
+                    if c & 0xFF != 0 {
+                        return Err("Wrong padding in the string".to_owned());
+                    }
+                } else {
+                    out.push(c as u8);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    // ---- parsing (td's json_decode / do_json_decode) ----------------------
+
+    /// td's `json_decode`: whole input must be one value (trailing
+    /// whitespace then end), nesting depth capped at 100.
+    pub fn parse_json(input: &str) -> Result<Json, String> {
+        let mut p = Parser {
+            b: input.as_bytes(),
+            pos: 0,
+        };
+        let v = p.value(100)?;
+        p.skip_ws();
+        if p.pos != p.b.len() {
+            return Err("Expected string end".to_owned());
+        }
+        Ok(v)
+    }
+
+    struct Parser<'a> {
+        b: &'a [u8],
+        pos: usize,
+    }
+
+    impl Parser<'_> {
+        fn skip_ws(&mut self) {
+            while self.pos < self.b.len()
+                && matches!(self.b[self.pos], b' ' | b'\t' | b'\r' | b'\n')
+            {
+                self.pos += 1;
+            }
+        }
+
+        fn peek(&self) -> u8 {
+            if self.pos < self.b.len() {
+                self.b[self.pos]
+            } else {
+                0
+            }
+        }
+
+        fn try_lit(&mut self, lit: &str) -> bool {
+            if self.b[self.pos..].starts_with(lit.as_bytes()) {
+                self.pos += lit.len();
+                true
+            } else {
+                false
+            }
+        }
+
+        fn value(&mut self, depth: i32) -> Result<Json, String> {
+            if depth < 0 {
+                return Err("Too big object depth".to_owned());
+            }
+            self.skip_ws();
+            match self.peek() {
+                b'f' => {
+                    if self.try_lit("false") {
+                        Ok(Json::Bool(false))
+                    } else {
+                        Err("Token starts with 'f' -- false expected".to_owned())
+                    }
+                }
+                b't' => {
+                    if self.try_lit("true") {
+                        Ok(Json::Bool(true))
+                    } else {
+                        Err("Token starts with 't' -- true expected".to_owned())
+                    }
+                }
+                b'n' => {
+                    if self.try_lit("null") {
+                        Ok(Json::Null)
+                    } else {
+                        Err("Token starts with 'n' -- null expected".to_owned())
+                    }
+                }
+                b'"' => self.string().map(Json::String),
+                b'[' => {
+                    self.pos += 1;
+                    self.skip_ws();
+                    let mut res = Vec::new();
+                    if self.try_lit("]") {
+                        return Ok(Json::Array(res));
+                    }
+                    loop {
+                        if self.pos == self.b.len() {
+                            return Err("Unexpected string end".to_owned());
+                        }
+                        res.push(self.value(depth - 1)?);
+                        self.skip_ws();
+                        if self.try_lit("]") {
+                            break;
+                        }
+                        if self.try_lit(",") {
+                            self.skip_ws();
+                            continue;
+                        }
+                        if self.pos == self.b.len() {
+                            return Err("Unexpected string end".to_owned());
+                        }
+                        return Err("Unexpected symbol while parsing JSON Array".to_owned());
+                    }
+                    Ok(Json::Array(res))
+                }
+                b'{' => {
+                    self.pos += 1;
+                    self.skip_ws();
+                    if self.try_lit("}") {
+                        return Ok(Json::Object(Vec::new()));
+                    }
+                    let mut fields = Vec::new();
+                    loop {
+                        if self.pos == self.b.len() {
+                            return Err("Unexpected string end".to_owned());
+                        }
+                        let key = self.string()?;
+                        self.skip_ws();
+                        if !self.try_lit(":") {
+                            return Err("':' expected".to_owned());
+                        }
+                        let v = self.value(depth - 1)?;
+                        fields.push((key, v));
+                        self.skip_ws();
+                        if self.try_lit("}") {
+                            break;
+                        }
+                        if self.try_lit(",") {
+                            self.skip_ws();
+                            continue;
+                        }
+                        if self.pos == self.b.len() {
+                            return Err("Unexpected string end".to_owned());
+                        }
+                        return Err("Unexpected symbol while parsing JSON Object".to_owned());
+                    }
+                    Ok(Json::Object(fields))
+                }
+                b'-' | b'+' | b'.' | b'0'..=b'9' => {
+                    let start = self.pos;
+                    while self.pos < self.b.len()
+                        && matches!(
+                            self.b[self.pos],
+                            b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9'
+                        )
+                    {
+                        self.pos += 1;
+                    }
+                    Ok(Json::Number(
+                        String::from_utf8_lossy(&self.b[start..self.pos]).into_owned(),
+                    ))
+                }
+                0 => Err("Unexpected string end".to_owned()),
+                c if (1..127).contains(&c) => {
+                    Err(format!("Unexpected symbol '{}'", c as char))
+                }
+                _ => Err("Unexpected symbol".to_owned()),
+            }
+        }
+
+        /// td's json_string_decode: escapes b/f/n/r/t/u (case-insensitive
+        /// hex), `\u` surrogate pairs, any other escaped char passes through
+        /// verbatim. Lone surrogates would build invalid UTF-8 in C++; a
+        /// Rust String cannot hold them, so they become U+FFFD.
+        fn string(&mut self) -> Result<String, String> {
+            if self.peek() != b'"' {
+                return Err("Opening '\"' expected".to_owned());
+            }
+            self.pos += 1;
+            let mut buf: Vec<u8> = Vec::new();
+            loop {
+                if self.pos == self.b.len() {
+                    return Err("Closing '\"' not found".to_owned());
+                }
+                let c = self.b[self.pos];
+                self.pos += 1;
+                match c {
+                    b'"' => return Ok(String::from_utf8_lossy(&buf).into_owned()),
+                    b'\\' => {
+                        if self.pos == self.b.len() {
+                            return Err("Closing '\"' not found".to_owned());
+                        }
+                        let e = self.b[self.pos];
+                        self.pos += 1;
+                        match e {
+                            b'b' => buf.push(0x08),
+                            b'f' => buf.push(0x0C),
+                            b'n' => buf.push(b'\n'),
+                            b'r' => buf.push(b'\r'),
+                            b't' => buf.push(b'\t'),
+                            b'u' => {
+                                let cp = self.unicode_escape()?;
+                                let mut tmp = [0u8; 4];
+                                buf.extend_from_slice(
+                                    char::from_u32(cp)
+                                        .unwrap_or('\u{FFFD}')
+                                        .encode_utf8(&mut tmp)
+                                        .as_bytes(),
+                                );
+                            }
+                            other => buf.push(other),
+                        }
+                    }
+                    _ => buf.push(c),
+                }
+            }
+        }
+
+        /// The `\uXXXX` tail after the backslash-u, including td's surrogate
+        /// pair combination (second escape consumed only if it is one too).
+        fn unicode_escape(&mut self) -> Result<u32, String> {
+            let num = self.hex4()?;
+            if (0xD7FF..0xE000).contains(&num)
+                && self.pos + 6 <= self.b.len()
+                && self.b[self.pos] == b'\\'
+                && self.b[self.pos + 1] == b'u'
+            {
+                let save = self.pos;
+                self.pos += 2;
+                let num2 = self.hex4()?;
+                if (0xD7FF..0xE000).contains(&num2) {
+                    return Ok((((num & 0x3FF) << 10) | (num2 & 0x3FF)) + 0x10000);
+                }
+                self.pos = save;
+            }
+            Ok(num)
+        }
+
+        fn hex4(&mut self) -> Result<u32, String> {
+            if self.pos + 4 > self.b.len() {
+                return Err("\\u has less than 4 symbols".to_owned());
+            }
+            let mut num: u32 = 0;
+            for _ in 0..4 {
+                match hex_to_int(self.b[self.pos]) {
+                    Some(d) => {
+                        num = num * 16 + d;
+                        self.pos += 1;
+                    }
+                    None => return Err("Invalid \\u -- not hex digit".to_owned()),
+                }
+            }
+            Ok(num)
+        }
+    }
+
+    /// td's hex_to_int: digits and both hex letter cases.
+    fn hex_to_int(c: u8) -> Option<u32> {
+        match c {
+            b'0'..=b'9' => Some((c - b'0') as u32),
+            b'a'..=b'f' => Some((c - b'a' + 10) as u32),
+            b'A'..=b'F' => Some((c - b'A' + 10) as u32),
+            _ => None,
+        }
+    }
+
+    // ---- typed reads (td's tl_json.h from_json overloads) -----------------
+
+    /// td's to_integer<int32>: leading `-`, digits until a non-digit, all
+    /// arithmetic in the unsigned domain with td's negation dance — the
+    /// i64 value truncated to the low 32 bits is bit-identical to running
+    /// C++'s algorithm in 32-bit width.
+    pub fn to_integer_i32(s: &str) -> i32 {
+        to_integer_i64(s) as i32
+    }
+
+    pub fn to_integer_i64(s: &str) -> i64 {
+        let b = s.as_bytes();
+        let mut i = 0;
+        let mut negative = false;
+        if i < b.len() && b[i] == b'-' {
+            negative = true;
+            i += 1;
+        }
+        let mut v: u64 = 0;
+        while i < b.len() && b[i].is_ascii_digit() {
+            v = v
+                .wrapping_mul(10)
+                .wrapping_add((b[i] - b'0') as u64);
+            i += 1;
+        }
+        if v > i64::MAX as u64 {
+            v = v.wrapping_neg();
+            negative = !negative;
+            if v > i64::MAX as u64 {
+                return i64::MIN;
+            }
+        }
+        if negative {
+            (v as i64).wrapping_neg()
+        } else {
+            v as i64
+        }
+    }
+
+    fn integer_err(s: &str) -> String {
+        format!("Can't parse as an integer string \"{s}\"")
+    }
+
+    /// td's from_json(int32&): Number or String parsed strictly
+    /// (`(PSLICE() << res) == str`), Null keeps the default.
+    pub fn read_i32(v: &Json) -> Result<i32, String> {
+        match v {
+            Json::Number(n) | Json::String(n) => {
+                let r = to_integer_i32(n);
+                if r.to_string() == *n {
+                    Ok(r)
+                } else {
+                    Err(integer_err(n))
+                }
+            }
+            Json::Null => Ok(0),
+            other => Err(format!("Expected Number, but receive {}", other.type_name())),
+        }
+    }
+
+    pub fn read_i64(v: &Json) -> Result<i64, String> {
+        match v {
+            Json::Number(n) | Json::String(n) => {
+                let r = to_integer_i64(n);
+                if r.to_string() == *n {
+                    Ok(r)
+                } else {
+                    Err(integer_err(n))
+                }
+            }
+            Json::Null => Ok(0),
+            other => Err(format!(
+                "Expected String or Number, but receive {}",
+                other.type_name()
+            )),
+        }
+    }
+
+    /// td's from_json(bool&): Boolean, or any int form (non-zero wins),
+    /// with the inner int error swallowed into the Boolean message.
+    pub fn read_bool(v: &Json) -> Result<bool, String> {
+        match v {
+            Json::Bool(b) => Ok(*b),
+            Json::Null => Ok(false),
+            Json::Number(_) | Json::String(_) => read_i32(v)
+                .map(|x| x != 0)
+                .map_err(|_| format!("Expected Boolean, but receive {}", v.type_name())),
+            other => Err(format!("Expected Boolean, but receive {}", other.type_name())),
+        }
+    }
+
+    /// td's from_json(double&): Number only; unparsable text reads as 0.0
+    /// (C++ to_double via strtod never errors).
+    pub fn read_f64(v: &Json) -> Result<f64, String> {
+        match v {
+            Json::Number(n) => Ok(n.parse::<f64>().unwrap_or(0.0)),
+            Json::Null => Ok(0.0),
+            other => Err(format!("Expected Number, but receive {}", other.type_name())),
+        }
+    }
+
+    pub fn read_string(v: &Json) -> Result<String, String> {
+        match v {
+            Json::String(s) => Ok(s.clone()),
+            Json::Null => Ok(String::new()),
+            other => Err(format!("Expected String, but receive {}", other.type_name())),
+        }
+    }
+
+    pub fn read_bytes(v: &Json) -> Result<Vec<u8>, String> {
+        match v {
+            Json::String(s) => decode_b64(s),
+            Json::Null => Ok(Vec::new()),
+            other => Err(format!("Expected String, but receive {}", other.type_name())),
+        }
+    }
+
+    pub fn read_vector<T>(
+        v: &Json,
+        f: impl Fn(&Json) -> Result<T, String>,
+    ) -> Result<Vec<T>, String> {
+        match v {
+            Json::Array(a) => a.iter().map(f).collect(),
+            Json::Null => Ok(Vec::new()),
+            other => Err(format!("Expected Array, but receive {}", other.type_name())),
         }
     }
 }
