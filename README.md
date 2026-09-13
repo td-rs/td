@@ -48,6 +48,7 @@ The execution plan is `RUST_REWRITE_PLAN.md` at the root of the C++ repo
 - [x] S42 — `SqliteKeyValue` with Safe and Async wrappers
 - [x] S43 — `SeqKeyValue` and `TQueue`
 - [x] S44 — `TdDb` schema skeleton with inline migrations
+- [x] S47 — DNS resolver + cache: `GetHostByNameActor` ported to `tdnet::dns` as `GetHostByName` (per-family affirmative/negative result caches with `ok_timeout`/`error_timeout`, in-flight query coalescing via per-caller oneshot waiters, ordered resolver-chain fallback) with `NativeResolver` (`IPAddress::init_host_port` on `spawn_blocking`: bracketed IPv6 literals parsed directly, `AF_UNSPEC` `getaddrinfo` with the C++ `best_info` family walk) and a verbatim port of `idn_to_ascii`/punycode (`td/utils/port/IPAddress.cpp`, incl. its non-RFC bias arithmetic — pinned by the C++ `tdutils/test/misc.cpp` vectors); `ResolverType::Google` waits for S48's HTTP client. Found and dodged a Rust coercion trap: `&Box<dyn Any>` coerces to `&dyn Any` *of the box*, silently breaking panic-payload downcasts — pass the box by value
 
 ## Checks (CI parity)
 
