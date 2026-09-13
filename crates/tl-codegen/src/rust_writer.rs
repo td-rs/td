@@ -209,12 +209,22 @@ fn emit_samples_and_tests(out: &mut String, p: &TlProgram, m: &SchemeModel, opts
          \x20   /// (no inlining), which overflows the default test-thread stack for\n\
          \x20   /// deep scheme types (e.g. td_api chatEvent).\n\
          \x20   pub fn __stack<F: FnOnce() + Send + 'static>(f: F) {\n\
-         \x20       std::thread::Builder::new()\n\
+         \x20       let joined = std::thread::Builder::new()\n\
          \x20           .stack_size(64 * 1024 * 1024)\n\
          \x20           .spawn(f)\n\
          \x20           .expect(\"spawn test thread\")\n\
-         \x20           .join()\n\
-         \x20           .expect(\"test thread panicked\");\n\
+         \x20           .join();\n\
+         \x20       // Re-panic with the original payload: `.expect` on the join\n\
+         \x20       // result would print `Any { .. }` and lose the assert message.\n\
+         \x20       if let Err(payload) = joined {\n\
+         \x20           if let Some(s) = payload.downcast_ref::<String>() {\n\
+         \x20               panic!(\"{s}\");\n\
+         \x20           }\n\
+         \x20           if let Some(s) = payload.downcast_ref::<&'static str>() {\n\
+         \x20               panic!(\"{s}\");\n\
+         \x20           }\n\
+         \x20           std::panic::resume_unwind(payload);\n\
+         \x20       }\n\
          \x20   }\n\n",
     );
     for &tid in p.type_ids.values() {

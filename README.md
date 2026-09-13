@@ -20,6 +20,7 @@ The execution plan is `RUST_REWRITE_PLAN.md` at the root of the C++ repo
 - [x] S08 — `.tlo` serialization (`write_types`) ported to `tdtl`; byte-identical to td's own tl-parser output (`tl-parser -e`) for all five schemes, incl. combinator argument trees
 - [x] S09 — `tl_writer_rust` part 1: the td_api data model generates from build.rs (3205 structs + 211 enums + the `Function` umbrella, serde derives, `Box` indirection on recursive types) and compiles; counts match the C-oracle scheme counts (753/2192/1022)
 - [x] S10 — TL binary store: primitives, TL string framing (all three length forms), bare/boxed vectors, the flags word with auto-OR'd `?true` bits, conditional fields, bare/boxed objects; telegram_api model generated into `tdmtproto`, byte-identical to td's generated C++ `TlStorerUnsafe` on the oracle sample set (`conformance/tl_store_oracle`); generated round-trip + malformed-input tests included
+- [x] S11 — TL binary parse: bounds-checked `tl::Reader` mirroring td's `TlBufferParser` ("Not enough data to read", "Bool expected", "Wrong vector length", negative-`#` rejection, string `\0`→space + UTF-8 truncation, raw bytes); per-ctor store→parse round-trip tests over every type and function of both generated schemes (boxed + bare), malformed-input seeds that must error and never panic, and depth-capped sample synthesizers with proven termination (landed with the S10 commit; this step marks completion and preserves test panic payloads across the big-stack wrapper)
 
 ## Checks (CI parity)
 
