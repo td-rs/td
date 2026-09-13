@@ -930,7 +930,9 @@ impl ChainBufferReader {
         }
     }
 
-    fn from_iterators(
+    /// `ChainBufferReader(begin, end, sync_flag)` — used by
+    /// `ByteFlowInplaceBase` to window the parent's chain.
+    pub fn from_iterators(
         begin: ChainBufferIterator,
         end: ChainBufferIterator,
         sync_flag: bool,
