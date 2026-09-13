@@ -13,76 +13,19 @@
 //!   proxy sent beyond the handshake reply) becomes an explicit
 //!   post-handshake probe — same contract, same "Proxy has sent too many
 //!   data" error.
-//! * EOF mid-handshake surfaces as "Connection closed" (the C++
-//!   `can_close_local` → "Connection closed" path); other I/O errors keep
-//!   their OS message.
 //! * `Callback::on_connected` (a stats hook between authentication and the
 //!   target-address request) has no Rust consumer yet and is a no-op.
 //! * HTTP CONNECT keeps the C++ host formatting verbatim — `<ip>:<port>`
 //!   with no IPv6 brackets — so IPv6 targets are as malformed here as they
 //!   are upstream.
 
-use std::io;
 use std::net::SocketAddr;
-use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use tdutils::status::{Result, Status};
 
-/// The C++ `set_timeout_in(10)` whole-exchange timeout.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-fn status_from_io(error: &std::io::Error) -> Status {
-    match error.raw_os_error() {
-        Some(code) => Status::posix_error(code, &tdutils::status::strerror_safe(code)),
-        None => Status::error_message(&format!("{error}")),
-    }
-}
-
-/// One exact read, mirrored onto the C++ "wait until the reply is fully in
-/// the buffer" poll points. EOF mid-reply is the C++ `can_close_local` →
-/// "Connection closed" path.
-async fn read_exact_into(stream: &mut TcpStream, buf: &mut Vec<u8>, n: usize) -> Status {
-    let start = buf.len();
-    buf.resize(start + n, 0);
-    match stream.read_exact(&mut buf[start..]).await {
-        Ok(_) => Status::ok(),
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-            Status::error_message("Connection closed")
-        }
-        Err(e) => status_from_io(&e),
-    }
-}
-
-async fn write_all(stream: &mut TcpStream, data: &[u8]) -> Status {
-    match stream.write_all(data).await {
-        Ok(()) => Status::ok(),
-        Err(e) => status_from_io(&e),
-    }
-}
-
-/// The C++ `tear_down` "unread buffered bytes" check: after a completed
-/// handshake the proxy must not have sent anything beyond the reply.
-async fn reject_early_data(stream: &mut TcpStream) -> Status {
-    let mut probe = [0u8; 16];
-    match stream.try_read(&mut probe) {
-        Ok(0) => Status::error_message("Connection closed"),
-        Ok(_) => Status::error_message("Proxy has sent too many data"),
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Status::ok(),
-        Err(e) => status_from_io(&e),
-    }
-}
-
-/// The C++ `set_timeout_in(10)` whole-exchange timeout, with the exact
-/// `timeout_expired` error string.
-async fn with_timeout(fut: impl Future<Output = Status>) -> Status {
-    match tokio::time::timeout(CONNECT_TIMEOUT, fut).await {
-        Ok(status) => status,
-        Err(_) => Status::error_message("Connection timeout expired"),
-    }
-}
+use crate::transparent::{read_exact_into, read_some, reject_early_data, with_timeout, write_all};
 
 fn base64_encode(data: &[u8]) -> String {
     const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -116,7 +59,10 @@ pub async fn socks5_connect(
     username: &str,
     password: &str,
 ) -> Result<TcpStream> {
-    let status = with_timeout(socks5_handshake(&mut stream, target, username, password)).await;
+    tdutils::try_result!(
+        status,
+        with_timeout(socks5_handshake(&mut stream, target, username, password)).await
+    );
     if status.is_error() {
         return Result::from_status(status);
     }
@@ -223,14 +169,17 @@ pub async fn http_proxy_connect(
     password: &str,
 ) -> Result<TcpStream> {
     let mut leftover = Vec::new();
-    let status = with_timeout(http_handshake(
-        &mut stream,
-        target,
-        username,
-        password,
-        &mut leftover,
-    ))
-    .await;
+    tdutils::try_result!(
+        status,
+        with_timeout(http_handshake(
+            &mut stream,
+            target,
+            username,
+            password,
+            &mut leftover,
+        ))
+        .await
+    );
     if status.is_error() {
         return Result::from_status(status);
     }
@@ -307,17 +256,6 @@ async fn http_handshake(
         };
         leftover.extend_from_slice(&buf[terminator + 1..]);
         return Status::ok();
-    }
-}
-
-async fn read_some(stream: &mut TcpStream, buf: &mut Vec<u8>, chunk: &mut [u8]) -> Status {
-    match stream.read(chunk).await {
-        Ok(0) => Status::error_message("Connection closed"),
-        Ok(n) => {
-            buf.extend_from_slice(&chunk[..n]);
-            Status::ok()
-        }
-        Err(e) => status_from_io(&e),
     }
 }
 
