@@ -14,6 +14,9 @@ use tdtl::TlProgram;
 
 pub const TD_API_TL: &str = include_str!("../scheme/td_api.tl");
 pub const TELEGRAM_API_TL: &str = include_str!("../scheme/telegram_api.tl");
+pub const SECRET_API_TL: &str = include_str!("../scheme/secret_api.tl");
+pub const MTPROTO_API_TL: &str = include_str!("../scheme/mtproto_api.tl");
+pub const E2E_API_TL: &str = include_str!("../scheme/e2e_api.tl");
 
 /// Generates the td_api Rust module: structs/enums + serde derives + binary
 /// store + the td-exact JSON methods (S12).
@@ -39,6 +42,48 @@ pub fn generate_telegram_api_rust() -> String {
             serde: false,
             json: false,
             source: "telegram_api.tl (tdlib d1085f9ce)",
+        },
+    )
+}
+
+/// Generates the secret_api Rust module (S13): structs/enums + binary
+/// store/parse — the secret-chat layer scheme.
+pub fn generate_secret_api_rust() -> String {
+    generate(
+        SECRET_API_TL,
+        &rust_writer::WriterOpts {
+            umbrella: "Function",
+            serde: false,
+            json: false,
+            source: "secret_api.tl (tdlib d1085f9ce)",
+        },
+    )
+}
+
+/// Generates the mtproto_api Rust module (S13): structs/enums + binary
+/// store/parse — the MTProto service-layer scheme.
+pub fn generate_mtproto_api_rust() -> String {
+    generate(
+        MTPROTO_API_TL,
+        &rust_writer::WriterOpts {
+            umbrella: "Function",
+            serde: false,
+            json: false,
+            source: "mtproto_api.tl (tdlib d1085f9ce)",
+        },
+    )
+}
+
+/// Generates the e2e_api Rust module (S13): structs/enums + binary
+/// store/parse — the tde2e encrypted-storage scheme.
+pub fn generate_e2e_api_rust() -> String {
+    generate(
+        E2E_API_TL,
+        &rust_writer::WriterOpts {
+            umbrella: "Function",
+            serde: false,
+            json: false,
+            source: "e2e_api.tl (tdlib d1085f9ce)",
         },
     )
 }
@@ -74,8 +119,31 @@ mod tests {
     }
 
     #[test]
+    fn remaining_schemes_match_the_c_oracle_dumps() {
+        // Counts fixed by the S07 differential dump (tl-scheme-dump vs the
+        // C oracle's dump_scheme over the pinned schemes).
+        for (tl, types, ctors, funcs) in [
+            (SECRET_API_TL, 20, 94, 1),
+            (MTPROTO_API_TL, 33, 40, 8),
+            (E2E_API_TL, 36, 48, 1),
+        ] {
+            let program = TlProgram::parse(tl.as_bytes().to_vec()).unwrap();
+            assert_eq!(program.total_types, types);
+            assert_eq!(program.total_ctors, ctors);
+            assert_eq!(program.total_funcs, funcs);
+        }
+    }
+
+    #[test]
     fn generated_model_counts_are_consistent() {
-        for (scheme, tl) in [("td_api", TD_API_TL), ("telegram_api", TELEGRAM_API_TL)] {
+        let schemes: &[(&str, &str)] = &[
+            ("td_api", TD_API_TL),
+            ("telegram_api", TELEGRAM_API_TL),
+            ("secret_api", SECRET_API_TL),
+            ("mtproto_api", MTPROTO_API_TL),
+            ("e2e_api", E2E_API_TL),
+        ];
+        for &(scheme, tl) in schemes {
             let program = TlProgram::parse(tl.as_bytes().to_vec()).unwrap();
             let m = model::SchemeModel::build(&program);
             let enums = m
@@ -110,17 +178,31 @@ mod tests {
             );
             let code = match scheme {
                 "td_api" => generate_td_api_rust(),
-                _ => generate_telegram_api_rust(),
+                "telegram_api" => generate_telegram_api_rust(),
+                "secret_api" => generate_secret_api_rust(),
+                "mtproto_api" => generate_mtproto_api_rust(),
+                _ => generate_e2e_api_rust(),
             };
             // One struct per non-builtin ctor (which includes every
             // single-ctor type) plus one per function; one enum per
             // multi-ctor type plus the Function umbrella. The support
             // module's `tl::Reader` adds exactly one more struct; the JSON
             // runtime (td_api only) adds the `tl_json::Json` enum.
+            // Builtin ctors = those owned by Prim/Vector types (the count
+            // differs per scheme).
+            let builtin_ctors: usize = m
+                .type_kinds
+                .iter()
+                .zip(program.types.iter())
+                .filter(|(k, _)| {
+                    matches!(k, model::TypeKind::Prim(_)) || matches!(k, model::TypeKind::Vector)
+                })
+                .map(|(_, t)| t.constructors.len())
+                .sum();
             let json_enums = if scheme == "td_api" { 1 } else { 0 };
             assert_eq!(
                 code.matches("pub struct ").count(),
-                (program.total_ctors - 9) + program.total_funcs + 1,
+                (program.total_ctors - builtin_ctors) + program.total_funcs + 1,
                 "{scheme} struct count"
             );
             assert_eq!(
@@ -136,5 +218,8 @@ mod tests {
         // write_rust asserts uniqueness while emitting; just make it run.
         let _ = generate_td_api_rust();
         let _ = generate_telegram_api_rust();
+        let _ = generate_secret_api_rust();
+        let _ = generate_mtproto_api_rust();
+        let _ = generate_e2e_api_rust();
     }
 }

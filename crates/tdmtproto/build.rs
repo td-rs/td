@@ -1,5 +1,6 @@
-//! Generates the telegram_api Rust module into OUT_DIR (S10). The scheme is
-//! embedded in the tl-codegen crate; regeneration is keyed on its sources.
+//! Generates the wire-scheme Rust modules into OUT_DIR (S10 telegram_api,
+//! S13 secret_api + mtproto_api). The schemes are embedded in the
+//! tl-codegen crate; regeneration is keyed on its sources.
 
 use std::path::Path;
 
@@ -10,7 +11,12 @@ fn main() {
         "cargo:rerun-if-changed={}",
         generator.join("scheme").display()
     );
-    let code = tl_codegen::generate_telegram_api_rust();
     let out_dir = std::env::var("OUT_DIR").unwrap();
-    std::fs::write(Path::new(&out_dir).join("telegram_api.rs"), code).unwrap();
+    let out_dir = Path::new(&out_dir);
+    let code = tl_codegen::generate_telegram_api_rust();
+    std::fs::write(out_dir.join("telegram_api.rs"), code).unwrap();
+    let code = tl_codegen::generate_secret_api_rust();
+    std::fs::write(out_dir.join("secret_api.rs"), code).unwrap();
+    let code = tl_codegen::generate_mtproto_api_rust();
+    std::fs::write(out_dir.join("mtproto_api.rs"), code).unwrap();
 }

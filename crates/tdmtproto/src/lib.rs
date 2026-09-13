@@ -1,6 +1,7 @@
 //! Port of `td/mtproto`: transports, KDF/IGE encryption, auth key, session,
-//! multi-DC. The telegram_api data model with TL binary store is generated
-//! at build time from the pinned scheme (S10).
+//! multi-DC. The wire-scheme data models with TL binary store are generated
+//! at build time from the pinned schemes (S10 telegram_api, S13
+//! secret_api + mtproto_api).
 
 // Generated code keeps C++-identical case-preserved names (`srp_B`, `M1`).
 #[allow(
@@ -13,17 +14,53 @@ pub mod telegram_api {
     include!(concat!(env!("OUT_DIR"), "/telegram_api.rs"));
 }
 
+#[allow(
+    dead_code,
+    non_camel_case_types,
+    non_snake_case,
+    clippy::large_enum_variant
+)]
+pub mod secret_api {
+    include!(concat!(env!("OUT_DIR"), "/secret_api.rs"));
+}
+
+#[allow(
+    dead_code,
+    non_camel_case_types,
+    non_snake_case,
+    clippy::large_enum_variant
+)]
+pub mod mtproto_api {
+    include!(concat!(env!("OUT_DIR"), "/mtproto_api.rs"));
+}
+
 #[cfg(test)]
 mod tests {
-    use super::telegram_api;
+    use super::{mtproto_api, secret_api, telegram_api};
 
     #[test]
     fn generated_counts_match_the_c_oracle() {
         // Fixed by the S07 differential dump against td's own tl-parser:
-        // 627 types / 1669 ctors / 819 functions.
+        // 627 types / 1669 ctors / 819 functions. Structs = non-builtin
+        // ctors + functions; enums = multi-ctor types + the umbrella.
         assert_eq!(telegram_api::SCHEME_TYPES, 627);
         assert_eq!(telegram_api::SCHEME_CTORS, 1669);
         assert_eq!(telegram_api::SCHEME_FUNCTIONS, 819);
+        assert_eq!(telegram_api::GENERATED_STRUCTS, 2479);
+        assert_eq!(telegram_api::GENERATED_ENUMS, 245);
+
+        // S13: the secret-chat and MTProto service schemes.
+        assert_eq!(secret_api::SCHEME_TYPES, 20);
+        assert_eq!(secret_api::SCHEME_CTORS, 94);
+        assert_eq!(secret_api::SCHEME_FUNCTIONS, 1);
+        assert_eq!(secret_api::GENERATED_STRUCTS, 86);
+        assert_eq!(secret_api::GENERATED_ENUMS, 9);
+
+        assert_eq!(mtproto_api::SCHEME_TYPES, 33);
+        assert_eq!(mtproto_api::SCHEME_CTORS, 40);
+        assert_eq!(mtproto_api::SCHEME_FUNCTIONS, 8);
+        assert_eq!(mtproto_api::GENERATED_STRUCTS, 43);
+        assert_eq!(mtproto_api::GENERATED_ENUMS, 6);
     }
 
     #[test]

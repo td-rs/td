@@ -177,6 +177,9 @@ version = "0.1.0"
 [[package]]
 name = "tde2e"
 version = "0.1.0"
+dependencies = [
+ "tl-codegen",
+]
 
 [[package]]
 name = "tdjson"

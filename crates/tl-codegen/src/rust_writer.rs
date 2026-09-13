@@ -62,6 +62,11 @@ fn field_ident(name: &str) -> String {
     // suffixes it too (`self_`).
     if name == "self" {
         "self_".to_owned()
+    } else if name == "_" {
+        // Anonymous multiplicity args (`int128 4*[ int ]`): legal C++
+        // identifiers (`_`), invalid Rust. The only anonymous args in the
+        // pinned schemes are the int128/int256 word arrays.
+        "words".to_owned()
     } else if is_keyword(name) {
         format!("r#{name}")
     } else {
@@ -182,12 +187,21 @@ pub fn write_rust(p: &TlProgram, m: &SchemeModel, opts: &WriterOpts) -> String {
             _ => 0,
         })
         .sum();
-    // Every non-builtin ctor (total_ctors - 9) and every function get a
-    // struct; multi-ctor types additionally get an enum.
+    // Every non-builtin ctor and every function get a struct; multi-ctor
+    // types additionally get an enum. The builtin count is the ctors owned
+    // by primitive/Vector types — schemes declare different subsets of them
+    // (mtproto_api has 5, telegram_api 9), so it is computed, not assumed.
+    let builtin_ctors: usize = m
+        .type_kinds
+        .iter()
+        .zip(p.types.iter())
+        .filter(|(k, _)| matches!(k, TypeKind::Prim(_)) || matches!(k, TypeKind::Vector))
+        .map(|(_, t)| t.constructors.len())
+        .sum();
     let structs = struct_kinds + enum_ctors + p.total_funcs;
     assert_eq!(
         struct_kinds + enum_ctors,
-        p.total_ctors - BUILTIN_CTORS,
+        p.total_ctors - builtin_ctors,
         "ctor accounting"
     );
     out.push_str(&format!(
@@ -569,11 +583,6 @@ fn emit_roundtrip_test(
     }
     out.push_str("    });\n}\n\n");
 }
-
-/// Constructors of built-in simple types (double, string, int32/int, int53,
-/// int64/long, bytes, boolFalse, boolTrue, true, false, vector) — no Rust
-/// structs for these.
-const BUILTIN_CTORS: usize = 9;
 
 /// Derives shared by every generated type. Structs additionally derive
 /// `Default` (their fields are plain values); enums get a manual `Default`
