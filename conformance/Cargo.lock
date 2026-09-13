@@ -881,11 +881,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "tdactor"
+version = "0.1.0"
+dependencies = [
+ "tdutils",
+ "tokio",
+]
+
+[[package]]
 name = "tdclient"
 version = "0.1.0"
 dependencies = [
  "libc",
  "serde",
+ "tdactor",
  "tddb",
  "tdutils",
  "tl-codegen",

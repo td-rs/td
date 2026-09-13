@@ -104,10 +104,14 @@ thread_local! {
 /// `ClientJson.cpp:store_string`.
 pub fn store_string(string: String) -> *const c_char {
     CURRENT_OUTPUT.with(|output| {
-        *output.borrow_mut() = string;
-        // A `String`'s buffer is NUL-terminated; the pointer stays valid
-        // until the next store on this thread (the C ABI contract).
-        output.borrow().as_ptr() as *const c_char
+        let mut output = output.borrow_mut();
+        output.clear();
+        output.push_str(&string);
+        // A Rust `String` is not NUL-terminated (the C++ `std::string`
+        // c_str is) — terminate explicitly; the buffer stays valid until
+        // the next store on this thread (the C ABI contract).
+        output.push('\0');
+        output.as_ptr() as *const c_char
     })
 }
 
@@ -160,11 +164,6 @@ impl ClientJson {
         let (function, extra) = to_request(request);
         let object = Client::execute(Request { id: 0, function });
         from_response(&object, &extra, 0)
-    }
-
-    /// `ClientJson::close`.
-    pub fn close(&self) {
-        self.client.close();
     }
 
     fn format_response(&self, response: Response, client_id_override: i32) -> Option<String> {
@@ -325,10 +324,22 @@ mod tests {
     fn legacy_client_send_receive_preserves_extra() {
         let client = ClientJson::new();
         client.send(r#"{"@type":"getOption","name":"version","@extra":{"n":2}}"#);
-        let response = client.receive(1.0).unwrap();
+        // The startup updates (updateOption version/commit_hash + the auth
+        // state) precede the answer, like the C++.
+        let mut response = None;
+        for _ in 0..8 {
+            match client.receive(0.3) {
+                Some(received) if received.starts_with(r#"{"@type":"optionValueString""#) => {
+                    response = Some(received);
+                    break;
+                }
+                Some(_) => continue,
+                None => break,
+            }
+        }
         assert_eq!(
-            response,
-            r#"{"@type":"optionValueString","value":"1.8.67","@extra":{"n":2}}"#
+            response.as_deref(),
+            Some(r#"{"@type":"optionValueString","value":"1.8.67","@extra":{"n":2}}"#)
         );
     }
 
@@ -336,10 +347,22 @@ mod tests {
     fn new_api_send_receive_round_trips_with_client_id() {
         let client_id = create_client_id();
         send(client_id, r#"{"@type":"getOption","name":"version"}"#);
-        let response = receive(1.0).unwrap();
+        let mut response = None;
+        for _ in 0..8 {
+            match receive(0.3) {
+                Some(received) if received.starts_with(r#"{"@type":"optionValueString""#) => {
+                    response = Some(received);
+                    break;
+                }
+                Some(_) => continue,
+                None => break,
+            }
+        }
         assert_eq!(
             response,
-            format!(r#"{{"@type":"optionValueString","value":"1.8.67","@client_id":{client_id}}}"#)
+            Some(format!(
+                r#"{{"@type":"optionValueString","value":"1.8.67","@client_id":{client_id}}}"#
+            ))
         );
     }
 

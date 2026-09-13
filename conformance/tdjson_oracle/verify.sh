@@ -41,17 +41,14 @@ RUST_BIN="${CARGO_TARGET_DIR:-$RS_ROOT/conformance/target}/release/tdjson-oracle
 LD_LIBRARY_PATH="$TD_BUILD" "$WORK/dump_tdjson" >"$WORK/c.raw" 2>/dev/null
 "$RUST_BIN" >"$WORK/rs.raw"
 
-# Documented interim normalizations, applied to BOTH sides:
-# 1. The C++ client emits its startup state as updateOption and the initial
-#    updateAuthorizationState updates before answering requests; the Rust Td
-#    actor lands in S70. Drop those lines until then.
-# 2. Client ids come from the C++ process-wide MultiImpl::create_id counter,
-#    which the legacy client also consumes (the Rust counter is per-manager
-#    until the S70 port). Normalize the number.
+# Documented interim normalization, applied to BOTH sides: the C++ reports
+# its build's git hash for the commit_hash option while the Rust port
+# reports "unknown" until a build-script probe exists (S79). The startup
+# updateOption/updateAuthorizationState updates and the @client_id numbers
+# now match exactly (the S70 Td startup state and the process-wide id
+# counter).
 normalize() {
-  grep -v '"@type":"updateOption"' |
-    grep -v '"@type":"updateAuthorizationState"' |
-    sed 's/"@client_id":[0-9]*/"@client_id":X/'
+  sed 's/"commit_hash","value":{"@type":"optionValueString","value":"[^"]*"/"commit_hash","value":{"@type":"optionValueString","value":"<git>"/'
 }
 normalize <"$WORK/c.raw" >"$WORK/c.txt"
 normalize <"$WORK/rs.raw" >"$WORK/rs.txt"

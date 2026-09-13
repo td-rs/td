@@ -69,15 +69,15 @@ pub unsafe extern "C" fn td_json_client_execute(
     store_string(client_json::execute(unsafe { cstr(request) }))
 }
 
-/// Destroys the TDLib client instance.
+/// Destroys the TDLib client instance (the C++ `delete`: the close +
+/// drain lives in `~Client::Impl`).
 ///
 /// # Safety
 /// `client` must come from [`td_json_client_create`] and must not be used
 /// afterwards.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn td_json_client_destroy(client: *mut c_void) {
-    let client = unsafe { Box::from_raw(client as *mut ClientJson) };
-    client.close();
+    drop(unsafe { Box::from_raw(client as *mut ClientJson) });
 }
 
 // ---------- log management (td_log.cpp) ----------
@@ -276,10 +276,20 @@ mod tests {
             let client = td_json_client_create();
             let request = c"{\"@type\":\"getOption\",\"name\":\"version\"}";
             td_json_client_send(client, request.as_ptr());
-            let response = td_json_client_receive(client, 1.0);
-            assert!(!response.is_null());
+            // The eager startup state precedes the answer (and arrives even
+            // without the send).
+            let mut response = None;
+            for _ in 0..8 {
+                let received = td_json_client_receive(client, 1.0);
+                assert!(!received.is_null());
+                let received = cstr(received);
+                if received.starts_with(r#"{"@type":"optionValueString""#) {
+                    response = Some(received);
+                    break;
+                }
+            }
             assert_eq!(
-                cstr(response),
+                response.expect("the getOption answer"),
                 r#"{"@type":"optionValueString","value":"1.8.67"}"#
             );
             td_json_client_destroy(client);
@@ -303,10 +313,19 @@ mod tests {
             let client_id = td_create_client_id();
             let request = c"{\"@type\":\"getOption\",\"name\":\"version\"}";
             td_send(client_id, request.as_ptr());
-            let response = td_receive(1.0);
-            assert!(!response.is_null());
+            // The startup updates precede the answer, like the C++.
+            let mut response = None;
+            for _ in 0..8 {
+                let received = td_receive(1.0);
+                assert!(!received.is_null());
+                let received = cstr(received);
+                if received.starts_with(r#"{"@type":"optionValueString""#) {
+                    response = Some(received);
+                    break;
+                }
+            }
             assert_eq!(
-                cstr(response),
+                response.expect("the getOption answer"),
                 format!(
                     r#"{{"@type":"optionValueString","value":"1.8.67","@client_id":{client_id}}}"#
                 )

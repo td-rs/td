@@ -1783,6 +1783,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "tdactor",
  "tddb",
  "tdutils",
  "tl-codegen",
