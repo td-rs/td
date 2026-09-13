@@ -1782,6 +1782,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tdutils",
  "tl-codegen",
 ]
 
@@ -1806,6 +1807,10 @@ dependencies = [
 [[package]]
 name = "tdjson"
 version = "0.1.0"
+dependencies = [
+ "tdclient",
+ "tdutils",
+]
 
 [[package]]
 name = "tdmtproto"

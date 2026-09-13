@@ -1,6 +1,16 @@
 //! Port of `td/telegram`: client logic, managers, td_api query/update
 //! handling. The td_api data model is generated at build time from the
 //! pinned scheme (S09, store in S10).
+//!
+//! Track H: S67 adds the C ABI crate (`tdjson`), S68 the JSON client
+//! plumbing ([`client_json`]) and the synchronous request set
+//! ([`synchronous_requests`]); the full ClientManager port is S70, the
+//! Options manager S69.
+
+pub mod client;
+pub mod client_json;
+pub mod option_manager;
+pub mod synchronous_requests;
 
 // Generated code keeps C++-identical case-preserved names (`aiComposeTone`)
 // in types, fields and the JSON dispatch helpers alike.

@@ -7,8 +7,8 @@
 
 use std::cell::Cell;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// `VERBOSITY_NAME(PLAIN)`: no header is added for this level.
@@ -128,6 +128,178 @@ pub fn process_fatal_error(message: &str) -> ! {
         callback(0, message);
     }
     std::process::abort();
+}
+
+/// `td::FileLog` — the file sink with size-based rotation (the Rust port of
+/// `td/utils/FileLog.cpp`). Interior mutability because `LogInterface::append`
+/// takes `&self`; the C++ poll-time `fd_` becomes a `Mutex<Option<File>>`.
+///
+/// Divergence: the C++ `redirect_stderr` flag (duplicating the file
+/// descriptor onto stderr) is not ported — mutating the host process's fds
+/// from a library is not expressible safely in portable Rust; the default
+/// interface's stderr/tracing emission is simply left alone.
+#[derive(Debug)]
+pub struct FileLog {
+    path: String,
+    rotate_threshold: AtomicI64,
+    size: AtomicI64,
+    file: Mutex<Option<std::fs::File>>,
+}
+
+impl FileLog {
+    /// `td::FileLog::init`: open the path for appending (creating it when
+    /// missing), remember the current size and the rotation threshold.
+    pub fn init(path: String, rotate_threshold: i64) -> std::result::Result<Self, String> {
+        if path.is_empty() {
+            return Err("Log file path must be non-empty".to_string());
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|error| error.to_string())?;
+        let size = file.metadata().map(|m| m.len() as i64).unwrap_or(0);
+        Ok(Self {
+            path,
+            rotate_threshold: AtomicI64::new(rotate_threshold),
+            size: AtomicI64::new(size),
+            file: Mutex::new(Some(file)),
+        })
+    }
+
+    /// `td::FileLog::set_rotate_threshold`.
+    pub fn set_rotate_threshold(&self, rotate_threshold: i64) {
+        self.rotate_threshold
+            .store(rotate_threshold, Ordering::Relaxed);
+    }
+
+    /// `td::FileLog::get_rotate_threshold`.
+    pub fn get_rotate_threshold(&self) -> i64 {
+        self.rotate_threshold.load(Ordering::Relaxed)
+    }
+
+    /// `td::FileLog::do_after_rotation`: close and reopen the file, then
+    /// recover the size of what already existed on disk.
+    fn do_after_rotation(&self) {
+        *self.file.lock().unwrap() = None;
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            Ok(file) => {
+                self.size.store(
+                    file.metadata().map(|m| m.len() as i64).unwrap_or(0),
+                    Ordering::Relaxed,
+                );
+                *self.file.lock().unwrap() = Some(file);
+            }
+            Err(error) => {
+                process_fatal_error(&format!("{error} in {} at {}", file!(), line!()));
+            }
+        }
+    }
+}
+
+impl LogInterface for FileLog {
+    /// `td::FileLog::do_append`: rotate when the threshold has been exceeded
+    /// (the C++ checks before writing, `size_ > rotate_threshold_`), write
+    /// the slice, and warn about slow writes like the C++.
+    fn do_append(&self, log_level: i32, slice: &str) {
+        let start_time = std::time::Instant::now();
+        if self.size.load(Ordering::Relaxed) > self.rotate_threshold.load(Ordering::Relaxed) {
+            if let Err(error) = std::fs::rename(&self.path, format!("{}.old", self.path)) {
+                process_fatal_error(&format!("{error} in {} at {}", file!(), line!()));
+            }
+            self.do_after_rotation();
+        }
+        let mut file = self.file.lock().unwrap();
+        let file = match file.as_mut() {
+            Some(file) => file,
+            None => {
+                process_fatal_error(&format!("File isn't opened in {} at {}", file!(), line!()));
+            }
+        };
+        use std::io::Write as _;
+        if let Err(error) = file.write_all(slice.as_bytes()) {
+            process_fatal_error(&format!("{error} in {} at {}", file!(), line!()));
+        }
+        self.size.fetch_add(slice.len() as i64, Ordering::Relaxed);
+        let total_time = start_time.elapsed().as_secs_f64();
+        if total_time >= 0.1 && log_level >= 1 {
+            let thread_id = get_thread_id();
+            let pad = if (0..10).contains(&thread_id) {
+                " "
+            } else {
+                ""
+            };
+            let warning = format!(
+                "[ 2][t{pad}{thread_id}] !!! Previous logging took {total_time} seconds !!!\n"
+            );
+            let _ = file.write_all(warning.as_bytes());
+        }
+    }
+
+    fn after_rotation(&self) {
+        if !self.path.is_empty() {
+            self.do_after_rotation();
+        }
+    }
+
+    fn get_file_paths(&self) -> Vec<String> {
+        vec![self.path.clone(), format!("{}.old", self.path)]
+    }
+}
+
+/// The active file sink (`td::Log::log_file_path` state from Log.cpp), plus
+/// the rotation threshold shared with `set_file_path` (default 10 MB). An
+/// `Arc` behind a read lock — writers clone the `Arc` so that logging never
+/// serializes on the global lock, and a rotation from another thread stays
+/// visible.
+static FILE_LOG: RwLock<Option<Arc<FileLog>>> = RwLock::new(None);
+static MAX_LOG_FILE_SIZE: AtomicI64 = AtomicI64::new(10 << 20);
+
+/// `td::Log::set_file_path`: switch the active sink to the given file (or
+/// back to the default interface on an empty path). Returns whether the file
+/// was opened successfully.
+pub fn set_file_path(file_path: &str) -> bool {
+    try_set_file_path(file_path).is_ok()
+}
+
+/// The same switch with the `FileLog::init` error surfaced (the
+/// `Logging::set_current_stream(logStreamFile)` path in the tdclient layer).
+pub fn try_set_file_path(file_path: &str) -> std::result::Result<(), String> {
+    let mut file_log = FILE_LOG.write().unwrap();
+    if file_path.is_empty() {
+        *file_log = None;
+        return Ok(());
+    }
+    let log = FileLog::init(
+        file_path.to_string(),
+        MAX_LOG_FILE_SIZE.load(Ordering::Relaxed),
+    )?;
+    *file_log = Some(Arc::new(log));
+    Ok(())
+}
+
+/// The active file sink's `(path, rotate_threshold)` — the data behind
+/// `Logging::get_current_stream()`'s `logStreamFile` answer.
+pub fn file_log_info() -> Option<(String, i64)> {
+    FILE_LOG
+        .read()
+        .unwrap()
+        .as_ref()
+        .map(|log| (log.path.clone(), log.get_rotate_threshold()))
+}
+
+/// `td::Log::set_max_file_size`: clamp to at least 1 and apply to the active
+/// file sink.
+pub fn set_max_file_size(max_file_size: i64) {
+    let size = max_file_size.max(1);
+    MAX_LOG_FILE_SIZE.store(size, Ordering::Relaxed);
+    if let Some(file_log) = FILE_LOG.read().unwrap().as_ref() {
+        file_log.set_rotate_threshold(size);
+    }
 }
 
 thread_local! {
@@ -277,6 +449,19 @@ pub fn prepare_message(
 /// colors and emits the same line as a `tracing` event.
 pub struct DefaultLog;
 
+/// `td::NullLog` — the `logStreamEmpty` sink: discards every message.
+pub struct NullLog;
+
+impl LogInterface for NullLog {
+    fn do_append(&self, _log_level: i32, _slice: &str) {}
+}
+
+/// `td::null_log` / the `&null_log` sentinel of `Logging::get_current_stream`.
+pub fn null_log_interface() -> &'static dyn LogInterface {
+    static NULL_LOG: NullLog = NullLog;
+    &NULL_LOG
+}
+
 impl DefaultLog {
     fn write_stderr(log_level: i32, slice: &str) {
         let (color, no_color): (&str, &str) = match log_level {
@@ -321,7 +506,27 @@ pub fn default_log_interface() -> &'static dyn LogInterface {
     &DEFAULT_LOG_INTERFACE
 }
 
+/// What `set_log_interface` was last pointed at — the `Logging::get_current_stream`
+/// answer needs this identity (`log_interface == default_log_interface` etc.);
+/// comparing trait-object pointers is unreliable across codegen units
+/// (duplicated vtables in debug builds).
+static INTERFACE_TAG: AtomicI32 = AtomicI32::new(0);
+
+/// 0 = the default interface, 1 = the null log, 2 = a custom interface.
+pub fn current_interface_tag() -> i32 {
+    INTERFACE_TAG.load(Ordering::Relaxed)
+}
+
 pub fn set_log_interface(interface: Option<&'static dyn LogInterface>) {
+    let tag = match interface {
+        None => 0,
+        Some(interface) => {
+            let data_ptr = interface as *const dyn LogInterface as *const ();
+            let null_ptr = null_log_interface() as *const dyn LogInterface as *const ();
+            if data_ptr == null_ptr { 1 } else { 2 }
+        }
+    };
+    INTERFACE_TAG.store(tag, Ordering::Relaxed);
     *LOG_INTERFACE.write().unwrap() = interface.unwrap_or_else(default_log_interface);
 }
 
@@ -400,7 +605,14 @@ impl Drop for ScopedDisableLog {
 pub fn append_message(level: i32, message: &str, file_name: &str, line_num: u32, comment: &str) {
     let options = &LOG_OPTIONS;
     let message = prepare_message(options, level, message, file_name, line_num, comment);
-    log_interface().append(level, &message);
+    // The active sink: the file log when a path was set, the interface
+    // otherwise — the C++ current-stream semantics (Log.cpp set_file_path).
+    let file_log = FILE_LOG.read().unwrap().clone();
+    if let Some(file_log) = file_log {
+        file_log.append(level, &message);
+    } else {
+        log_interface().append(level, &message);
+    }
 }
 
 /// The `LOG(level)` stream of C++ becomes a macro with a `format!`-style
@@ -711,5 +923,77 @@ mod tests {
         let default =
             &DEFAULT_LOG_INTERFACE as &dyn LogInterface as *const dyn LogInterface as *const ();
         assert!(std::ptr::eq(active, default));
+    }
+
+    /// A fresh per-test directory for the file-log tests (parallel-safe even
+    /// without the test lock).
+    fn temp_log_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tdutils-filelog-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn file_log_init_rejects_empty_path() {
+        let _lock = lock_tests();
+        assert_eq!(
+            FileLog::init(String::new(), 100).unwrap_err(),
+            "Log file path must be non-empty"
+        );
+    }
+
+    #[test]
+    fn file_log_rotates_when_threshold_exceeded() {
+        let _lock = lock_tests();
+        let dir = temp_log_dir();
+        let path = dir.join("log.txt");
+        let log = FileLog::init(path.to_string_lossy().to_string(), 8).unwrap();
+        assert_eq!(log.get_rotate_threshold(), 8);
+        log.append(INFO, "hello world"); // 11 bytes > 8 -> the next append rotates
+        log.append(INFO, "next line");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body, "next line");
+        let old = std::fs::read_to_string(dir.join("log.txt.old")).unwrap();
+        assert_eq!(old, "hello world");
+        let paths = log.get_file_paths();
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].ends_with("log.txt"));
+        assert!(paths[1].ends_with("log.txt.old"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn set_file_path_switches_the_active_sink() {
+        let _lock = lock_tests();
+        let dir = temp_log_dir();
+        let path = dir.join("global.txt");
+        let path_str = path.to_string_lossy().to_string();
+        set_verbosity_level(INFO);
+        assert!(set_file_path(&path_str));
+        log_impl!(INFO, "", "to the file");
+        assert!(set_file_path("")); // back to the default interface
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            body.contains("to the file"),
+            "file log must receive the line"
+        );
+        set_verbosity_level(DEBUG + 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn set_max_file_size_clamps_and_updates_the_sink() {
+        let _lock = lock_tests();
+        let dir = temp_log_dir();
+        let path = dir.join("sized.txt");
+        assert!(set_file_path(path.to_string_lossy().as_ref()));
+        set_max_file_size(0); // clamped to 1
+        set_max_file_size(1 << 20);
+        assert!(set_file_path(""));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
