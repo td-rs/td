@@ -10,9 +10,13 @@
 # ints-as-strings, numeric @type ids, unknown fields) into byte-identical
 # binary stores, with the same error messages on malformed input.
 #
-# The C++ oracle compiles td's checked-in generated td_api_json_*.cpp and
-# td_api_*.cpp plus the minimal tdutils runtime against the unmodified td
-# sources. Usage: ./verify.sh [td-repo-root] (default: ../../../td).
+# The C++ oracle compiles td's generated td_api_json_*.cpp and td_api_*.cpp
+# plus the minimal tdutils runtime. Those files are NOT checked into td's
+# repo — td/generate/auto/ is gitignored build output — so they are
+# regenerated on demand by conformance/generate_td_auto from the pinned
+# checkout's own sources.
+#
+# Usage: ./verify.sh [td-repo-root] (default: ../../../td).
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
@@ -23,10 +27,10 @@ RS_ROOT="$SCRIPT_DIR/../.."
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-[ -f "$GENERATED_DIR/td_api_json_0.cpp" ] || {
-  echo "not found: $GENERATED_DIR/td_api_json_0.cpp (pass the td repo root)" >&2
-  exit 1
-}
+if [ ! -f "$GENERATED_DIR/td_api_json_0.cpp" ]; then
+  echo "== td/generate/auto absent: regenerating from the pinned td sources =="
+  "$SCRIPT_DIR/../generate_td_auto/generate.sh" "$TD_ROOT" "$WORK"
+fi
 
 echo "== building the C++ oracle from td's generated td_api_json =="
 # -w: generated code trips warnings; only behavior matters here.
