@@ -17,11 +17,15 @@
 //! (`td/net/SslCtx`, `td/net/SslStream`).
 //!
 //! S51 — the fake-TLS layer: [`tls_init::connect`] (`td/mtproto/TlsInit`).
+//!
+//! S52 — the net-query dispatch core (`td/telegram/net/{DcId,NetQuery,
+//! NetActor,NetQueryDispatcher,NetQueryDelayer}`): [`net_query`].
 
 mod transparent;
 
 pub mod dns;
 pub mod http_query;
+pub mod net_query;
 pub mod proxy;
 pub mod tcp;
 pub mod tls;
