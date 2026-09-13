@@ -132,9 +132,11 @@ jobs:
     # scheme program dump — types/constructors/functions with their ids —
     # against the same tl-parser (S07), the tdtl .tlo serialization —
     # incl. the combinator argument trees — against td's write_types (S08),
-    # and the tl-codegen telegram_api binary store against td's generated
-    # C++ TlStorerUnsafe (S10). The td checkout is pinned to the same commit
-    # the TL schemes were imported from (S03).
+    # the tl-codegen telegram_api binary store against td's generated
+    # C++ TlStorerUnsafe (S10), the td_api JSON converter output (S12), and
+    # the replay gate: every constructor sample of all four wire schemes
+    # fetched and re-stored by td's generated code (S15). The td checkout
+    # is pinned to the same commit the TL schemes were imported from (S03).
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -177,4 +179,18 @@ jobs:
             conformance/tl_store_oracle/verify.sh "$GITHUB_WORKSPACE/td-cpp"
           else
             echo "skipped: conformance/tl_store_oracle/verify.sh not committed yet (S10 in progress)"
+          fi
+      - name: Verify td_api JSON vs td generated converter (S12)
+        run: |
+          if [ -x conformance/tl_json_oracle/verify.sh ]; then
+            conformance/tl_json_oracle/verify.sh "$GITHUB_WORKSPACE/td-cpp"
+          else
+            echo "skipped: conformance/tl_json_oracle/verify.sh not committed yet (S12 in progress)"
+          fi
+      - name: Replay differential codegen gate over all wire schemes (S15)
+        run: |
+          if [ -x conformance/tl_replay_oracle/verify.sh ]; then
+            conformance/tl_replay_oracle/verify.sh "$GITHUB_WORKSPACE/td-cpp"
+          else
+            echo "skipped: conformance/tl_replay_oracle/verify.sh not committed yet (S15 in progress)"
           fi

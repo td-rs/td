@@ -94,6 +94,10 @@ pub struct WriterOpts {
     /// Emit the td_api JSON methods (`to_json*`/`from_json*`, S12) — td_api
     /// only; the other schemes have no JSON surface.
     pub json: bool,
+    /// Also compile the sample synthesizers outside `cfg(test)`, behind this
+    /// cargo feature of the including crate — the S15 replay oracle bins
+    /// build with it (`conformance-samples`).
+    pub samples_feature: Option<&'static str>,
     /// Provenance comment.
     pub source: &'static str,
 }
@@ -221,7 +225,12 @@ pub fn write_rust(p: &TlProgram, m: &SchemeModel, opts: &WriterOpts) -> String {
 /// `SchemeModel::build`).
 fn emit_samples_and_tests(out: &mut String, p: &TlProgram, m: &SchemeModel, opts: &WriterOpts) {
     // ---- samples ---------------------------------------------------------
-    out.push_str("#[cfg(test)]\n#[allow(non_snake_case, dead_code)]\npub mod samples {\n");
+    let samples_cfg = match opts.samples_feature {
+        Some(feature) => format!("#[cfg(any(test, feature = \"{feature}\"))]\n"),
+        None => "#[cfg(test)]\n".to_owned(),
+    };
+    out.push_str(&samples_cfg);
+    out.push_str("#[allow(non_snake_case, dead_code)]\npub mod samples {\n");
     out.push_str("    use super::*;\n\n");
     out.push_str(
         "    /// Runs a test body on a thread with a large stack: the depth-3\n\
@@ -315,6 +324,50 @@ fn emit_samples_and_tests(out: &mut String, p: &TlProgram, m: &SchemeModel, opts
     for &f in &m.functions {
         let name = capitalize(&p.ctors[f].id);
         emit_sample_builder(out, p, m, opts, f, &name);
+    }
+
+    // ---- S15 replay dump --------------------------------------------------
+    // One `<tag> <T|F> <ctor-id> <hex>` line per sample (depths 1 and 3);
+    // the C++ replay oracle fetches each blob with td's own parser and
+    // re-stores it — the bytes must come back identical.
+    if opts.samples_feature.is_some() {
+        out.push_str(
+            "    fn __hex(bytes: &[u8]) -> String {\n        \
+             let mut s = String::with_capacity(bytes.len() * 2);\n        \
+             for b in bytes {\n            s.push_str(std::format!(\"{b:02x}\").as_str());\n        }\n        \
+             s\n    }\n\n",
+        );
+        out.push_str(
+            "    /// S15 replay oracle dump: prints one line per sample; the\n\
+             \x20   /// kind is T for types (stored boxed) and F for functions.\n    \
+             pub fn __replay_dump(tag: &str) {\n",
+        );
+        for &tid in p.type_ids.values() {
+            match &m.type_kinds[tid] {
+                TypeKind::Struct { ctor } => {
+                    emit_replay_lines(out, p, *ctor, true, &m.type_name(p, tid));
+                }
+                TypeKind::Enum { ctors } if !ctors.is_empty() => {
+                    let target = class_name(&p.types[tid].id);
+                    let mut seen = BTreeSet::new();
+                    for &c in ctors {
+                        if seen.insert(p.ctors[c].name) {
+                            emit_replay_lines(out, p, c, false, &target);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        {
+            let mut seen = BTreeSet::new();
+            for &f in &m.functions {
+                if seen.insert(p.ctors[f].name) {
+                    emit_replay_lines(out, p, f, false, opts.umbrella);
+                }
+            }
+        }
+        out.push_str("    }\n");
     }
     out.push_str("}\n\n");
 
@@ -449,6 +502,29 @@ fn __malformed_json_does_not_panic() {{
     ));
 }
 
+/// Emits the two replay lines (depths 1 and 3) for one sample: structs
+/// store boxed via their own method; enum variants and functions wrap in
+/// the target enum and dispatch through its `store`.
+fn emit_replay_lines(out: &mut String, p: &TlProgram, c: usize, bare: bool, target: &str) {
+    let name = capitalize(&p.ctors[c].id);
+    let kind = if target == "Function" { "F" } else { "T" };
+    for depth in [1, 3] {
+        // Single-ctor types name their sample builder after the type
+        // (`s_Int128`), enum variants and functions after the ctor.
+        let sample = if bare {
+            format!("s_{target}({depth})")
+        } else {
+            format!("{target}::{name}(s_{name}({depth}))")
+        };
+        let store = if bare { "store_boxed" } else { "store" };
+        out.push_str(&format!(
+            "        {{\n            let mut out = Vec::new();\n            {sample}.{store}(&mut out);\n            std::println!(\"{{tag}} {kind} {} {} {{}}\", __hex(&out));\n        }}\n",
+            p.ctors[c].name as i32,
+            p.ctors[c].id
+        ));
+    }
+}
+
 /// Emits `samples::s_<StructName>(depth)` for one constructor struct.
 fn emit_sample_builder(
     out: &mut String,
@@ -515,6 +591,11 @@ fn sample_expr(
                 "if {depth} == 0 {{ Vec::new() }} else {{ vec![{}] }}",
                 sample_expr(p, m, opts, fields, inner, &format!("{depth} - 1"))
             )
+        }
+        FieldType::FixedArray { len, inner } => {
+            // The element expr is a primitive literal (int words) — Copy,
+            // so the repeat form builds all N elements.
+            format!("[{}; {len}]", sample_expr(p, m, opts, fields, inner, depth))
         }
         FieldType::Conditional { inner, .. } => sample_expr(p, m, opts, fields, inner, depth),
         FieldType::Boxed(t) | FieldType::Bare(t) => {
@@ -929,6 +1010,10 @@ impl JsonStoreWriter {
                 self.depth -= 1;
                 out.push_str(&format!("{ind}}}\n{ind}out.push(']');\n"));
             }
+            FieldType::FixedArray { .. } => {
+                // td_api has no fixed arrays; the wire schemes have no JSON.
+                unreachable!("fixed arrays have no JSON form");
+            }
             FieldType::Conditional { inner, .. } => {
                 // Emitted unconditionally — see emit_fields.
                 self.emit_value(out, expr, inner);
@@ -1032,6 +1117,10 @@ impl JsonLoadWriter<'_> {
                     Prim::Bytes => "bytes",
                 }
             ),
+            FieldType::FixedArray { .. } => {
+                // td_api has no fixed arrays; the wire schemes have no JSON.
+                unreachable!("fixed arrays have no JSON form");
+            }
             FieldType::Vector { inner, .. } => {
                 // Single-function readers pass the function item itself —
                 // a `|e| f(e)` closure trips clippy's redundant_closure in
@@ -1151,6 +1240,9 @@ fn rust_field_type(p: &TlProgram, m: &SchemeModel, opts: &WriterOpts, ty: &Field
     match ty {
         FieldType::Prim(prim) => prim.rust_type().to_owned(),
         FieldType::Vector { inner, .. } => format!("Vec<{}>", rust_field_type(p, m, opts, inner)),
+        FieldType::FixedArray { len, inner } => {
+            format!("[{}; {len}]", rust_field_type(p, m, opts, inner))
+        }
         FieldType::Conditional { inner, .. } => rust_field_type(p, m, opts, inner),
         // The umbrella is self-referential (invokeWithLayer holds a
         // Function), so it always sits behind a Box — td's BaseObject ptr.
@@ -1305,6 +1397,23 @@ impl StoreWriter<'_> {
                     call(expr)
                 ));
                 // Same deref-vs-reborrow rule as the string arm above.
+                let iter = if expr.starts_with('*') {
+                    format!("&*{expr}")
+                } else {
+                    format!("&{expr}")
+                };
+                out.push_str(&format!("{ind}for {var} in {iter} {{\n"));
+                self.depth += 1;
+                self.emit_value(out, &format!("*{var}"), inner);
+                self.depth -= 1;
+                out.push_str(&format!("{ind}}}\n"));
+            }
+            FieldType::FixedArray { inner, .. } => {
+                // Fixed `N*[T]` (int128/256/512 words): exactly N elements,
+                // no count word — td's std::array<T, N>.
+                let n = self.var_counter;
+                self.var_counter += 1;
+                let var = format!("__v{n}");
                 let iter = if expr.starts_with('*') {
                     format!("&*{expr}")
                 } else {
@@ -1482,6 +1591,19 @@ impl ReadWriter<'_> {
                 self.depth -= 1;
                 out.push_str(&format!("{ind}}};\n"));
                 format!("__v{n}")
+            }
+            FieldType::FixedArray { len, inner } => {
+                // Exactly N elements; the array literal spells every read.
+                // Multiplicity arrays over non-primitives don't exist in the
+                // pinned schemes (int128/256/512 words only), so no prelude
+                // handling is needed here.
+                assert!(
+                    matches!(**inner, FieldType::Prim(_)),
+                    "fixed array over a non-primitive type"
+                );
+                let elem = self.emit_read(out, p, inner);
+                let elems = vec![elem; *len as usize].join(", ");
+                format!("[{elems}]")
             }
             FieldType::Boxed(t) | FieldType::Bare(t) => {
                 // Boxed references go through the target type's id-checked

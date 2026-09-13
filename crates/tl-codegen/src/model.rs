@@ -80,6 +80,13 @@ pub enum FieldType {
         boxed: bool,
         inner: Box<FieldType>,
     },
+    /// A fixed-multiplicity array `N*[ T ]` (int128/int256/int512's word
+    /// arrays): exactly N elements on the wire with NO count word — td's
+    /// `std::array<T, N>`, unlike the variable `vector<T>`.
+    FixedArray {
+        len: i64,
+        inner: Box<FieldType>,
+    },
     Boxed(usize),
     Bare(usize),
     /// `flags_var.N?T`: stored only when bit N of the referenced `#` field
@@ -100,9 +107,9 @@ impl FieldType {
     pub fn object_type(&self) -> Option<usize> {
         match self {
             FieldType::Prim(_) | FieldType::Function => None,
-            FieldType::Vector { inner, .. } | FieldType::Conditional { inner, .. } => {
-                inner.object_type()
-            }
+            FieldType::Vector { inner, .. }
+            | FieldType::FixedArray { inner, .. }
+            | FieldType::Conditional { inner, .. } => inner.object_type(),
             FieldType::Boxed(t) | FieldType::Bare(t) => Some(*t),
         }
     }
@@ -496,15 +503,26 @@ fn field_type(p: &TlProgram, node: usize, ids: &BTreeMap<CTId, usize>) -> FieldT
     let n = &p.ct[node];
     match n.act {
         Act::Array => {
-            // `# [ t ]` (declaration position): the multiplicity var is the
-            // left child, the element list the right one.
+            // `N*[ t ]` / `# [ t ]` (declaration position): the multiplicity
+            // is the left child, the element list the right one. A literal
+            // N (Act::NatConst, value in type_flags) is a fixed-size array
+            // with no count word on the wire; a nat var keeps the variable
+            // vector form (count read from the referenced `#` field).
+            let mult = &p.ct[n.left.expect("array without multiplicity")];
             let list = n.right.expect("array without elements");
             assert!(p.ct[list].ty == CType::ListItem);
             let elem = p.ct[list].left.expect("array element field without type");
             let inner = field_type(p, elem, ids);
-            FieldType::Vector {
-                boxed: false,
-                inner: Box::new(inner),
+            if mult.ty == CType::NumValue {
+                FieldType::FixedArray {
+                    len: mult.type_flags,
+                    inner: Box::new(inner),
+                }
+            } else {
+                FieldType::Vector {
+                    boxed: false,
+                    inner: Box::new(inner),
+                }
             }
         }
         Act::Arg => {
