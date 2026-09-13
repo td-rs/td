@@ -1,0 +1,5 @@
+# Allowlist for known-public strings. The fake-TLS test secret is copied
+# verbatim from tdlib's public test suite (test/mtproto.cpp).
+[allowlist]
+description = "Upstream tdlib public test vectors"
+regexes = ['''0123456789secret''']
