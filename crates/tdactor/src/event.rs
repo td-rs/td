@@ -10,10 +10,10 @@
 //! - `Timeout` — some timeout has expired
 //! - `Hangup` — hang up called
 //! - `Raw` — just pass 8 bytes (the C++ `union Raw` is used for convenience)
-//! - `Custom` — run an `FnOnce(&mut dyn Actor)` thunk (the C++
-//!   `immediate_closure` subset, landed with S34 for the promise machinery;
-//!   the `delayed_closure`/per-actor-message-enum half of the closure
-//!   machinery stays with S33)
+//! - `Custom` — run an `FnOnce(&mut dyn Actor)` thunk: the payload of both
+//!   closure halves of the C++ `send_closure` machinery (the
+//!   `immediate_closure`/`delayed_closure` events; S34 promise RPC and the
+//!   S33 message-enum dispatch in `crate::messages`)
 //!
 //! Events also carry a `link_token` (the token of the `ActorShared` they were
 //! sent through, if any), which the scheduler exposes to the running actor via
