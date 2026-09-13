@@ -27,11 +27,11 @@
 //!   uses a `BinaryHeap` with per-actor timeout generations (lazy deletion).
 //!   Semantics are identical; the constant factors are checked at S37.
 //! - `ActorContext`/`need_context` (log tags) is not ported yet — it lands
-//!   with the logging wiring (S36/S67).
-//! - `Event::Custom` carries the immediate-closure subset landed with S34
-//!   (`send_closure_immediately`/`send_closure_later` thunks); the
-//!   `delayed_closure`/message-enum machinery (S33) is still missing, so
-//!   `start_migrate`/`finish_migrate` per-event hooks are currently no-ops.
+//!   with the logging wiring (S67).
+//! - `Event::Custom` carries closures (the S34 immediate-closure subset and
+//!   the S33 message-enum machinery); `start_migrate`/`finish_migrate`
+//!   per-event hooks are currently no-ops until custom events carry
+//!   migration hooks.
 
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::cmp::Reverse;
@@ -97,10 +97,15 @@ pub(crate) struct ActorInfo {
     pub timeout_gen: Cell<u64>,
     /// The live deadline, if a timeout is armed (`in_heap` + heap key in C++).
     pub deadline: Cell<Option<Instant>>,
+    /// Whether the actor was registered for a `start_up` (C++
+    /// `ActorTraits::need_start_up`: true for owned actors, false for the
+    /// by-pointer registrations). `do_stop_actor` only runs `tear_down` for
+    /// such actors — an actor that never starts never tears down.
+    pub need_start_up: bool,
 }
 
 impl ActorInfo {
-    fn new(actor: ActorSlot) -> Self {
+    pub(crate) fn new(actor: ActorSlot, need_start_up: bool) -> Self {
         Self {
             actor: RefCell::new(actor),
             mailbox: RefCell::new(VecDeque::new()),
@@ -109,6 +114,7 @@ impl ActorInfo {
             in_pending: Cell::new(false),
             timeout_gen: Cell::new(0),
             deadline: Cell::new(None),
+            need_start_up,
         }
     }
 }
@@ -310,7 +316,8 @@ impl SchedulerState {
         sched_id: i32,
     ) -> ActorOwn<A> {
         // C++ sends Event::start to owned actors only (need_start_up is false
-        // for borrowed ones; see `register_actor_ptr`).
+        // for borrowed ones; see `register_actor_ptr`). The flag is recorded
+        // on the ActorInfo: `do_stop_actor` tears down only what started.
         let need_start_up = matches!(actor, ActorSlot::Owned(_));
         assert!(
             self.has_guard.get(),
@@ -327,7 +334,11 @@ impl SchedulerState {
             self.sched_count
         );
 
-        let slot = crate::actor_id::IdSlot::new(Box::new(ActorInfo::new(actor)), sched_id, name);
+        let slot = crate::actor_id::IdSlot::new(
+            Box::new(ActorInfo::new(actor, need_start_up)),
+            sched_id,
+            name,
+        );
         // The allocation is type-independent (the "session-unique id" of the
         // plan); the typed `ActorId<A>` is a pure marker added on the way out.
         let id: ActorId = ActorId::new(slot);
@@ -591,15 +602,16 @@ impl SchedulerState {
         );
         let saved = EVENT_CTX.with(|ctx| ctx.replace(EventContext::default()));
         // C++ `do_stop_actor` dispatches `Event::stop` only for actors with
-        // `need_start_up()` (started, owned ones). A borrowed actor
-        // (`Deleter::None`, the member-actor idiom) is unregistered without
-        // dispatching: its memory belongs to the owner, which may already be
-        // gone — the teardown order in `clear()` is arbitrary and the
-        // member's registration outlives the member itself.
-        let need_stop_event = !matches!(
-            &*self.info(id.clone()).actor.borrow(),
-            ActorSlot::Borrowed(_)
-        );
+        // `need_start_up()` (`ActorTraits<T>`): an actor that never started
+        // never tears down (Scheduler.cpp do_stop_actor). The flag lives in
+        // the `ActorInfo` and is read before `destroy_actor` frees it; it
+        // gates both the `enter_actor` and its guard-stack pop — an actor
+        // that never entered must not pop (the stack belongs to the
+        // enclosing dispatch). The C++ keeps its EventGuard (is_running =
+        // true) across the destruction: sends to this actor from its own
+        // teardown/Drop land in the mailbox (cleared by destroy_actor)
+        // instead of dispatching inline.
+        let need_stop_event = self.info(id.clone()).need_start_up;
         if need_stop_event {
             self.enter_actor(id.clone());
             self.do_event(id.clone(), Event::stop());
@@ -608,7 +620,7 @@ impl SchedulerState {
         // `enter_actor` pushed the cleared context it installed; pop it and
         // put back the caller's context (there is no `exit_actor` here — the
         // actor is destroyed and must not be re-queued). A skipped
-        // `enter_actor` (Borrowed) pushed nothing, so it pops nothing.
+        // `enter_actor` pushed nothing, so it pops nothing.
         if need_stop_event {
             let entered = EVENT_CTX_SAVED
                 .with(|stack| stack.borrow_mut().pop().expect("unbalanced actor guard"));
@@ -963,11 +975,26 @@ impl SchedulerState {
         self.yield_flag.set(true);
     }
 
-    /// `Scheduler::clear`: stop every remaining actor (runs `tear_down`).
+    /// `Scheduler::clear`: stop every remaining actor (runs `tear_down` for
+    /// actors that ever had `start_up`).
+    ///
+    /// Like the C++ `Scheduler::clear`, this installs a scheduler guard for
+    /// the sweep, so `tear_down`/`Drop` code can still call
+    /// `Scheduler::instance()` — sends during close are dropped via
+    /// `close_flag` instead of delivered. Skipped when a guard is already
+    /// held (clear from inside a live `run`); the C++ would CHECK-fail there.
     fn clear(&self) {
         if self.close_flag.swap(true, Ordering::AcqRel) {
             return;
         }
+        let _guard = if !self.has_guard.get() {
+            Some(SchedulerGuard::from_raw(
+                self as *const SchedulerState,
+                true,
+            ))
+        } else {
+            None
+        };
         loop {
             let next = if let Some(id) = self.ready.borrow_mut().pop_front() {
                 self.info(id.clone()).in_ready.set(false);
@@ -985,6 +1012,15 @@ impl SchedulerState {
                 None => break,
             }
         }
+        // The C++ releases the whole `actor_info_pool_` here; every actor
+        // was in ready/pending (actors mid-dispatch hold a guard and clear
+        // is their last stop). A nonzero count is a leak.
+        debug_assert_eq!(
+            self.actor_count.get(),
+            0,
+            "Scheduler::clear left {} actors alive",
+            self.actor_count.get()
+        );
     }
 }
 
@@ -1096,6 +1132,9 @@ pub struct ConcurrentScheduler {
     send_state: Box<SchedulerState>,
     runtime: tokio::runtime::Runtime,
     threads: Vec<std::thread::JoinHandle<()>>,
+    /// Clones of the worker schedulers' inbound senders, so `finish` can wake
+    /// them (C++ `ConcurrentScheduler::on_finish` wakes all `schedulers_`).
+    worker_wakeups: Vec<tokio::sync::mpsc::UnboundedSender<Inbound>>,
     finished: Arc<AtomicBool>,
     state: Cell<ConcurrentSchedulerState>,
 }
@@ -1129,6 +1168,7 @@ impl ConcurrentScheduler {
             outbound.push(tx.clone());
             inbounds.push(rx);
         }
+        let worker_wakeups: Vec<_> = outbound.iter().skip(1).cloned().collect();
         let mut schedulers = Vec::with_capacity(additional_thread_count);
         for i in 0..=additional_thread_count {
             let tx = outbound[i].clone();
@@ -1168,6 +1208,7 @@ impl ConcurrentScheduler {
             send_state,
             runtime,
             threads: Vec::new(),
+            worker_wakeups,
             finished,
             state: Cell::new(ConcurrentSchedulerState::Start),
         }
@@ -1296,6 +1337,12 @@ impl ConcurrentScheduler {
         }
         self.finished.store(true, Ordering::Relaxed);
         self.wakeup();
+        // C++ on_finish wakes every scheduler, so workers blocked on their
+        // inbound queue notice `finished` immediately instead of after the
+        // 10 s idle poll.
+        for tx in &self.worker_wakeups {
+            let _ = tx.send(Inbound::Wakeup);
+        }
         for handle in self.threads.drain(..) {
             let _ = handle.join();
         }
@@ -1323,5 +1370,59 @@ fn scheduler_thread(state: SchedulerState, finished: Arc<AtomicBool>) {
     drop(_guard);
     unsafe {
         drop(Box::from_raw(ptr));
+    }
+}
+// Runs on the std atomics only: under the `loom` feature the IdSlot
+// primitives must stay inside a loom model, and this test drives a real
+// scheduler.
+#[cfg(all(test, not(feature = "loom")))]
+mod lifecycle_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+    /// C++ `Scheduler::do_stop_actor` runs `tear_down` only for actors that
+    /// ever had a start (`need_start_up`): a borrowed actor (the by-pointer
+    /// `register_actor` overload, C++ `Deleter::None`) is unregistered and
+    /// its owner drops it — no `tear_down`, no hangup-driven double stop.
+    #[test]
+    fn borrowed_actor_never_gets_tear_down() {
+        struct Borrowed {
+            torn_down: Arc<AtomicBool>,
+            dropped: Arc<AtomicBool>,
+        }
+        impl Actor for Borrowed {
+            fn tear_down(&mut self) {
+                self.torn_down.store(true, AtomicOrdering::SeqCst);
+            }
+        }
+        impl Drop for Borrowed {
+            fn drop(&mut self) {
+                self.dropped.store(true, AtomicOrdering::SeqCst);
+            }
+        }
+
+        let sched = ConcurrentScheduler::new(0);
+        let torn_down = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        {
+            let mut boxed = Box::new(Borrowed {
+                torn_down: torn_down.clone(),
+                dropped: dropped.clone(),
+            });
+            {
+                let _guard = SchedulerGuard::new(&sched.main, true);
+                let own = unsafe { sched.main.register_actor_ptr("borrowed", 0, &mut *boxed) };
+                drop(own); // hangup → stop → do_stop_actor → destroy (no tear_down)
+            }
+            // The scheduler only unregistered the actor; the owner still
+            // holds it and drops it here.
+            assert!(!dropped.load(AtomicOrdering::SeqCst));
+        }
+        assert!(dropped.load(AtomicOrdering::SeqCst), "owner drops it");
+        assert!(
+            !torn_down.load(AtomicOrdering::SeqCst),
+            "an actor that never started never tears down"
+        );
     }
 }
