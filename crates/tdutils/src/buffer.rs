@@ -1148,11 +1148,15 @@ impl ChainBufferWriter {
 
     /// `td::ChainBufferWriter::extract_reader()`.
     pub fn extract_reader(&mut self) -> ChainBufferReader {
-        let head = match self.head.raw() {
-            Some(_) => clone_chain_node(&self.head),
+        // C++ moves `head_` into the returned reader (`std::move(head_)`):
+        // the writer must release its pin on the chain, or every consumed
+        // node stays alive through its `next` link for the writer's whole
+        // lifetime (a second extract is an error, as in C++).
+        let head = std::mem::replace(&mut self.head, ChainBufferNodeReaderPtr::null());
+        match head.raw() {
+            Some(_) => ChainBufferReader::from_head(head),
             None => panic!("extract_reader on an empty writer"),
-        };
-        ChainBufferReader::from_head(head)
+        }
     }
 
     fn empty(&self) -> bool {

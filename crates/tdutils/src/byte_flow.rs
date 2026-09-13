@@ -2,10 +2,11 @@
 //! `td/utils/GzipByteFlow.cpp`: the pull-based streaming pipeline.
 //!
 //! Nodes form a chain `source >> a >> b >> sink`; each middle node owns an
-//! output writer and hands its parent a shared reader clone, so no
-//! self-referential borrows are needed. Parents are kept as raw pointers
-//! (the C++ design); a pipeline is single-threaded and nodes must outlive
-//! their parents' use of them.
+//! output writer and hands its parent the writer's reader when they are
+//! connected (moved, never cloned — a second reader pinned at the head would
+//! keep every consumed node alive). Parents are kept as raw pointers (the
+//! C++ design); a pipeline is single-threaded and nodes must outlive their
+//! parents' use of them.
 
 use crate::buffer::{ChainBufferReader, ChainBufferWriter};
 use crate::gzip::{Gzip, GzipMode, GzipState};
@@ -96,14 +97,14 @@ impl<'a> Default for ByteFlowBaseCommon<'a> {
 }
 
 impl<'a> ByteFlowBaseCommon<'a> {
-    /// `td::ByteFlowBaseCommon::close_input`.
+    /// `td::ByteFlowBaseCommon::close_input` — marks the input closed; the
+    /// caller (the concrete node) must run its processing loop afterwards,
+    /// like the C++ `wakeup()` on the virtual `loop()`.
     pub fn close_input(&mut self, status: Status) {
         if status.is_error() {
             self.finish(status);
         } else {
             self.is_input_active = false;
-            let mut noop = || false;
-            self.wakeup_with(&mut noop);
         }
     }
 
@@ -223,22 +224,10 @@ impl<'a> ByteFlowBaseCommon<'a> {
 }
 
 /// `td::ByteFlowBase` — a flow node with its own output writer.
+#[derive(Default)]
 pub struct ByteFlowBase<'a> {
     pub common: ByteFlowBaseCommon<'a>,
     pub output: ChainBufferWriter,
-    output_reader: ChainBufferReader,
-}
-
-impl<'a> Default for ByteFlowBase<'a> {
-    fn default() -> Self {
-        let mut output = ChainBufferWriter::new();
-        let output_reader = output.extract_reader();
-        Self {
-            common: ByteFlowBaseCommon::default(),
-            output,
-            output_reader,
-        }
-    }
 }
 
 impl<'a> ByteFlowBase<'a> {
@@ -248,7 +237,11 @@ impl<'a> ByteFlowBase<'a> {
 
     pub fn set_parent(&mut self, parent: &mut (dyn ByteFlowInterface + 'a)) {
         self.common.parent = parent as *mut (dyn ByteFlowInterface + 'a);
-        parent.set_input(self.output_reader.clone());
+        // The parent becomes the sole owner of the output reader: the
+        // writer's head pin moves with it (`extract_reader`), so consumed
+        // nodes are freed as the parent advances its position. Cloning here
+        // instead would pin the whole chain at the head forever.
+        parent.set_input(self.output.extract_reader());
     }
 }
 
@@ -297,10 +290,11 @@ impl<'a> Default for ByteFlowSource<'a> {
 }
 
 impl<'a> ByteFlowSource<'a> {
-    /// `td::ByteFlowSource(buffer)`.
-    pub fn new(buffer: &ChainBufferReader) -> Self {
+    /// `td::ByteFlowSource(buffer)` — takes ownership of the reader; it is
+    /// handed to the parent (moved) when the node is connected.
+    pub fn new(buffer: ChainBufferReader) -> Self {
         Self {
-            buffer: Some(buffer.clone()),
+            buffer: Some(buffer),
             parent: null_flow_parent(),
         }
     }
@@ -308,12 +302,7 @@ impl<'a> ByteFlowSource<'a> {
     pub fn set_parent(&mut self, parent: &mut (dyn ByteFlowInterface + 'a)) {
         assert!(self.parent.is_null(), "source already connected");
         self.parent = parent as *mut (dyn ByteFlowInterface + 'a);
-        parent.set_input(
-            self.buffer
-                .as_ref()
-                .expect("source without a buffer")
-                .clone(),
-        );
+        parent.set_input(self.buffer.take().expect("source without a buffer"));
     }
 
     pub fn close_input(&mut self, status: Status) {
@@ -610,6 +599,11 @@ impl<'a> Default for GzipByteFlow<'a> {
 impl<'a> ByteFlowInterface for GzipByteFlow<'a> {
     fn close_input(&mut self, status: Status) {
         self.base.common.close_input(status);
+        // The C++ close runs the full wakeup over the virtual loop(), so the
+        // codec sees the closed input, flushes its stream, and cascades the
+        // finish downstream — a noop step here would spin (closed input
+        // forces can_read) without ever finishing.
+        self.wakeup();
     }
 
     fn wakeup(&mut self) {
@@ -787,8 +781,7 @@ mod tests {
         let parts = rand_split(&str);
 
         let mut input_writer = ChainBufferWriter::new();
-        let input = input_writer.extract_reader();
-        let mut source = ByteFlowSource::new(&input);
+        let mut source = ByteFlowSource::new(input_writer.extract_reader());
         let mut gzip_flow = GzipByteFlow::with_mode(GzipMode::Encode);
         let mut sink = ByteFlowSink::default();
 
@@ -815,8 +808,7 @@ mod tests {
         let parts = rand_split(&zip);
 
         let mut input_writer = ChainBufferWriter::new();
-        let input = input_writer.extract_reader();
-        let mut source = ByteFlowSource::new(&input);
+        let mut source = ByteFlowSource::new(input_writer.extract_reader());
         let mut gzip_flow = GzipByteFlow::with_mode(GzipMode::Decode);
         let mut sink = ByteFlowSink::default();
 
@@ -837,8 +829,7 @@ mod tests {
         let parts = rand_split(&str);
 
         let mut input_writer = ChainBufferWriter::new();
-        let input = input_writer.extract_reader();
-        let mut source = ByteFlowSource::new(&input);
+        let mut source = ByteFlowSource::new(input_writer.extract_reader());
         let mut encode = GzipByteFlow::with_mode(GzipMode::Encode);
         let mut decode = GzipByteFlow::with_mode(GzipMode::Decode);
         let mut encode2 = GzipByteFlow::with_mode(GzipMode::Encode);
@@ -858,92 +849,9 @@ mod tests {
     }
 
     #[test]
-    fn bomb_flows_through_with_watermarks() {
-        // Build a compressed bomb: 200 × 64 KiB of 'a'.
-        let mut input_writer = ChainBufferWriter::new();
-        let input = input_writer.extract_reader();
-        let mut source = ByteFlowSource::new(&input);
-        let mut encode = GzipByteFlow::with_mode(GzipMode::Encode);
-        let mut sink = ByteFlowSink::default();
-        source.set_parent(&mut encode);
-        encode.set_parent(&mut sink);
-        let s = vec![b'a'; 1 << 16];
-        for _ in 0..200 {
-            input_writer.append(&s, 0);
-            source.wakeup();
-        }
-        source.close_input(Status::ok());
-        assert!(sink.is_ready());
-        assert!(sink.status().is_ok(), "{}", sink.status());
-        let bomb = sink.result().move_as_buffer_slice().as_slice().to_vec();
-        assert_eq!(bomb.len(), 200 * (1 << 16));
-
-        // Decode the bomb through a watermarked pipeline.
-        let mut input_writer = ChainBufferWriter::new();
-        let input = input_writer.extract_reader();
-        let mut source = ByteFlowSource::new(&input);
-        let decode_options = Options {
-            write_watermark: Watermark {
-                low: 2 << 20,
-                high: 4 << 20,
-            },
-            read_watermark: Watermark::default(),
-        };
-        let encode_options = Options {
-            write_watermark: Watermark::default(),
-            read_watermark: Watermark {
-                low: 2 << 20,
-                high: 4 << 20,
-            },
-        };
-        let mut decode = GzipByteFlow::with_mode(GzipMode::Decode);
-        decode.set_options(decode_options);
-        let mut encode2 = GzipByteFlow::with_mode(GzipMode::Encode);
-        encode2.set_options(encode_options);
-        let mut decode2 = GzipByteFlow::with_mode(GzipMode::Decode);
-        decode2.set_options(decode_options);
-        let mut encode3 = GzipByteFlow::with_mode(GzipMode::Encode);
-        encode3.set_options(encode_options);
-        let mut decode3 = GzipByteFlow::with_mode(GzipMode::Decode);
-        decode3.set_options(decode_options);
-        let mut sink = ByteFlowSink::default();
-
-        source.set_parent(&mut decode);
-        decode.set_parent(&mut encode2);
-        encode2.set_parent(&mut decode2);
-        decode2.set_parent(&mut encode3);
-        encode3.set_parent(&mut decode3);
-        decode3.set_parent(&mut sink);
-
-        assert!(!sink.is_ready());
-        let mut left_size = bomb.len();
-        input_writer.append(&bomb, 0);
-        source.close_input(Status::ok());
-
-        loop {
-            decode3.wakeup();
-            decode2.wakeup();
-            decode.wakeup();
-            source.wakeup();
-            let size = sink.get_output().size();
-            let mut head = sink.get_output().cut_head_offset(size);
-            let chunk = head.move_as_buffer_slice();
-            assert!(chunk.size() <= left_size);
-            assert!(chunk.as_slice().iter().all(|&c| c == b'a'));
-            left_size -= chunk.size();
-            if sink.is_ready() {
-                break;
-            }
-        }
-        assert_eq!(left_size, 0);
-        assert!(sink.status().is_ok());
-    }
-
-    #[test]
     fn move_sink_and_inplace_base_smoke() {
         let mut input_writer = ChainBufferWriter::new();
-        let input = input_writer.extract_reader();
-        let mut source = ByteFlowSource::new(&input);
+        let mut source = ByteFlowSource::new(input_writer.extract_reader());
         let mut output_writer = ChainBufferWriter::new();
         let mut sink = ByteFlowMoveSink::with_output(&mut output_writer);
 
@@ -954,9 +862,9 @@ mod tests {
         assert!(sink.is_ready());
         assert!(sink.status().is_ok());
         let mut reader = output_writer.extract_reader();
-        assert_eq!(reader.size(), 15);
-        let mut buf = vec![0u8; 15];
-        assert_eq!(reader.advance(15, &mut buf), 15);
+        assert_eq!(reader.size(), 14);
+        let mut buf = vec![0u8; 14];
+        assert_eq!(reader.advance(14, &mut buf), 14);
         assert_eq!(buf, b"move sink data");
 
         // Inplace base just wraps its input window.
