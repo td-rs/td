@@ -43,15 +43,22 @@ env:
 
 jobs:
   # When triggered via workflow_run, fail loudly instead of silently skipping
-  # if Main CI did not succeed — the performance gate must never look green
-  # behind a red correctness run.
+  # if Main CI failed — the performance gate must never look green behind a
+  # red correctness run. A *cancelled* Main CI is benign: cancel-in-progress
+  # means a newer push superseded it, and that newer run will trigger
+  # Performance again for its own commit.
   gate:
     if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion != 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - run: |
-          echo "Main CI run #${{ github.event.workflow_run.run_number }} concluded: ${{ github.event.workflow_run.conclusion }} — not running performance checks."
+          conclusion="${{ github.event.workflow_run.conclusion }}"
+          if [ "$conclusion" = "cancelled" ]; then
+            echo "Main CI run #${{ github.event.workflow_run.run_number }} was cancelled (superseded by a newer run) — Performance will run for the newer commit."
+            exit 0
+          fi
+          echo "Main CI run #${{ github.event.workflow_run.run_number }} concluded: $conclusion — not running performance checks."
           exit 1
 
   metrics:
