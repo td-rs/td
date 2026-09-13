@@ -12,6 +12,8 @@
 
 pub mod auth_data;
 pub mod auth_key;
+pub mod dh_callback;
+pub mod dh_handshake;
 pub mod http_transport;
 pub mod kdf;
 pub mod message_id;

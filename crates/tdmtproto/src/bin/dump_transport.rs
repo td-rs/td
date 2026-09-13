@@ -7,13 +7,16 @@ use std::fs;
 use std::io::Write as _;
 
 use tdmtproto::auth_key::AuthKey;
+use tdmtproto::dh_handshake::DhHandshake;
 use tdmtproto::http_transport::HttpTransport;
+use tdmtproto::mtproto_api::tl;
 use tdmtproto::packet::{self, ReadResult};
 use tdmtproto::packet_info::{PacketInfo, PacketType};
 use tdmtproto::proxy_secret::ProxySecret;
 use tdmtproto::transport::IStreamTransport;
 use tdmtproto::transport::tcp::{IntermediateTransport, ObfuscatedTransport};
 use tdmtproto::utils;
+use tdutils::bignum::{BigNum, BigNumContext};
 use tdutils::buffer::{BufferSlice, BufferWriter, ChainBufferReader, ChainBufferWriter};
 use tdutils::status::Result;
 
@@ -100,7 +103,9 @@ fn main() {
         "--obfuscated-write-file" => {
             // --obfuscated-write-file <path> <count> <secret-hex>
             assert_eq!(args.len(), 5);
-            let secret = ProxySecret::from_binary(&utils::hex_decode(args[4].as_bytes()).unwrap(), false).unwrap();
+            let secret =
+                ProxySecret::from_binary(&utils::hex_decode(args[4].as_bytes()).unwrap(), false)
+                    .unwrap();
             let mut transport = ObfuscatedTransport::new(2, secret);
             let mut output = ChainBufferWriter::new();
             transport.init(ChainBufferReader::null(), &mut output);
@@ -271,6 +276,57 @@ fn main() {
             // --crypto-read-server <frame-hex> <version 1|2> — the
             // server-side read (X=0).
             crypto_read_impl(&args, 0);
+        }
+        "--dh-gen" => {
+            // --dh-gen <g-int> <prime-hex> <b-hex> <g_a-hex>
+            assert_eq!(args.len(), 6);
+            let g_int: i32 = args[2].parse().unwrap();
+            let prime = utils::hex_decode(args[3].as_bytes()).unwrap();
+            let b = utils::hex_decode(args[4].as_bytes()).unwrap();
+            let g_a = utils::hex_decode(args[5].as_bytes()).unwrap();
+
+            let mut ctx = BigNumContext::new();
+            let mut g = BigNum::new();
+            g.set_value(g_int as u32);
+            let prime_bn = BigNum::from_binary(&prime);
+            let b_bn = BigNum::from_binary(&b);
+            let g_b = BigNum::mod_exp(&g, &b_bn, &prime_bn, &mut ctx).to_binary(-1);
+
+            let mut state = Vec::new();
+            tl::__i32(&mut state, 1 | 2); // HasConfig | HasGA
+            tl::__string(&mut state, &prime);
+            tl::__string(&mut state, &b);
+            tl::__i32(&mut state, g_int);
+            tl::__string(&mut state, &g_b);
+            tl::__string(&mut state, &g_a);
+
+            let mut r = tl::Reader::new(&state);
+            let mut handshake = DhHandshake::parse(&mut r).unwrap();
+            println!("d:g_b:{}", hex_out(&handshake.get_g_b()));
+            println!(
+                "d:g_ab:{}",
+                hex_out(&handshake.get_g_ab().to_binary(2048 / 8))
+            );
+            let (key_id, key) = handshake.gen_key();
+            println!("d:key:{}", hex_out(&key));
+            println!("d:key_id:{key_id}");
+            struct NoCallback;
+            impl tdmtproto::dh_callback::DhCallback for NoCallback {
+                fn is_good_prime(&self, _prime_str: &[u8]) -> i32 {
+                    -1
+                }
+                fn add_good_prime(&self, _prime_str: &[u8]) {}
+                fn add_bad_prime(&self, _prime_str: &[u8]) {}
+            }
+            let status = handshake.run_checks(true, &NoCallback);
+            println!(
+                "d:check:{}",
+                if status.is_ok() {
+                    "ok"
+                } else {
+                    status.message()
+                }
+            );
         }
         "--read-file" => {
             // --read-file <path> [padded 0|1]

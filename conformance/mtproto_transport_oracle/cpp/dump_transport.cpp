@@ -8,13 +8,17 @@
 // the *other* side's padded frames.
 //
 #include "td/mtproto/AuthKey.h"
+#include "td/mtproto/DhHandshake.h"
 #include "td/mtproto/KDF.h"
 #include "td/mtproto/TcpTransport.h"
 #include "td/mtproto/Transport.h"
 
 #include "td/utils/as.h"
 #include "td/utils/Storer.h"
+#include "td/utils/BigNum.h"
+#include "td/utils/Storer.h"
 #include "td/utils/UInt.h"
+#include "td/utils/tl_parsers.h"
 
 #include "td/utils/buffer.h"
 #include "td/utils/common.h"
@@ -63,6 +67,24 @@ static void set_packet_info(td::mtproto::PacketInfo &packet_info, int version) {
   packet_info.type = td::mtproto::PacketInfo::Common;
   packet_info.salt = 0x0102030405060708ull;
   packet_info.session_id = 0x1112131415161718ull;
+}
+
+static void append_tl_string(std::string &out, const std::string &data) {
+  size_t len = data.size();
+  if (len < 254) {
+    out += static_cast<char>(len);
+  } else {
+    out += static_cast<char>(0xfe);
+    out += static_cast<char>(len & 255);
+    out += static_cast<char>((len >> 8) & 255);
+    out += static_cast<char>((len >> 16) & 255);
+  }
+  out += data;
+  // TL strings are zero-padded to a 4-byte boundary (td's TlStorer does the
+  // same); without it every later field in the hand-built state misaligns.
+  while (out.size() % 4 != 0) {
+    out += static_cast<char>(0);
+  }
 }
 
 int main(int argc, char **argv) {
@@ -392,6 +414,49 @@ int main(int argc, char **argv) {
                 static_cast<unsigned long long>(packet_info.salt),
                 static_cast<unsigned long long>(packet_info.session_id),
                 static_cast<unsigned long long>(packet_info.message_id.get()), packet_info.seq_no);
+    return 0;
+  }
+  if (command == "--dh-gen") {
+    // --dh-gen <g-int> <prime-hex> <b-hex> <g_a-hex>
+    CHECK(argc == 6);
+    int g_int = std::atoi(argv[2]);
+    auto prime = td::hex_decode(Slice(argv[3])).move_as_ok();
+    auto b = td::hex_decode(Slice(argv[4])).move_as_ok();
+    auto g_a = td::hex_decode(Slice(argv[5])).move_as_ok();
+
+    // The stored state carries g_b, so compute it first (g^b mod p).
+    td::BigNumContext ctx;
+    td::BigNum g;
+    g.set_value(static_cast<td::uint32>(g_int));
+    td::BigNum prime_bn = td::BigNum::from_binary(prime);
+    td::BigNum b_bn = td::BigNum::from_binary(b);
+    td::BigNum g_b_bn;
+    td::BigNum::mod_exp(g_b_bn, g, b_bn, prime_bn, ctx);
+    auto g_b = g_b_bn.to_binary();
+
+    std::string state;
+    td::int32 flags = 1 | 2;  // HasConfig | HasGA
+    state.append(reinterpret_cast<const char *>(&flags), 4);
+    append_tl_string(state, prime);
+    append_tl_string(state, b);
+    td::int32 g_int_le = g_int;
+    state.append(reinterpret_cast<const char *>(&g_int_le), 4);
+    append_tl_string(state, g_b);
+    append_tl_string(state, g_a);
+
+    td::TlParser parser(state);
+    td::mtproto::DhHandshake handshake;
+    handshake.parse(parser);
+    CHECK(parser.get_error() == nullptr);
+
+    std::printf("d:g_b:%s\n", td::hex_encode(handshake.get_g_b()).c_str());
+    auto g_ab = handshake.get_g_ab().to_binary(2048 / 8);
+    std::printf("d:g_ab:%s\n", td::hex_encode(g_ab).c_str());
+    auto key = handshake.gen_key();
+    std::printf("d:key:%s\n", td::hex_encode(key.second).c_str());
+    std::printf("d:key_id:%lld\n", static_cast<long long>(key.first));
+    auto status = handshake.run_checks(true, nullptr);
+    std::printf("d:check:%s\n", status.is_ok() ? "ok" : status.message().c_str());
     return 0;
   }
   if (command == "--read-file") {

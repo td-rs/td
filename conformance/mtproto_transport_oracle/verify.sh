@@ -214,4 +214,21 @@ for side in cpp rust; do
 done
 diff -u "$WORK/cpp-crypto-rand.txt" "$WORK/rust-crypto-rand.txt"
 
-echo "S54+S55+S56+S57 transport oracle: ALL GREEN"
+echo "== S59 DH vectors =="
+# The Telegram prime with fixed b and g_a = g^7 mod p; both sides restore
+# the same stored state and must derive the same g_b, g_ab, key and key id.
+DH_PRIME="c71caeb9c6b1c9048e6c522f70f13f73980d40238e3e21c14934d037563d930f48198a0aa7c14058229493d22530f4dbfa336f6e0ac925139543aed44cce7c3720fd51f69458705ac68cd4fe6b6b13abdc9746512969328454f18faf8c595f642477fe96bb2a941d5bcd1d4ac8cc49880708fa9b378e3c4f3a9060bee67cf9a4a4a695811051907e162753b56b0f6b410dba74d8a84b2a14b3144e0ef1284754fd17ed950d5965b4b9dd46582db1178d169c6bc465b0d6ff9ca3928fef5b9ae4e418fc15e83ebea0f87fa9ff5eed70050ded2849f47bf959d956850ce929851f0d8115f635b105ee2e4e15d04b2454bf6f4fadf034b10403119cd8e3b92fcc5b"
+DH_B="4242424242424242424242424242424242424242424242424242424242424242"
+# g_a = 3^7 mod p, computed independently with python
+DH_GA=$(python3 - "$DH_PRIME" <<'EOF'
+import sys
+p = int(sys.argv[1], 16)
+ga = pow(3, 7, p)
+print(f"{ga:0512x}")
+EOF
+)
+"$WORK/dump_transport_cpp" --dh-gen 3 "$DH_PRIME" "$DH_B" "$DH_GA" >>"$WORK/cpp-dh.txt"
+"$DUMP_RUST" --dh-gen 3 "$DH_PRIME" "$DH_B" "$DH_GA" >>"$WORK/rust-dh.txt"
+diff -u "$WORK/cpp-dh.txt" "$WORK/rust-dh.txt"
+
+echo "S54+S55+S56+S57+S59 transport oracle: ALL GREEN"
