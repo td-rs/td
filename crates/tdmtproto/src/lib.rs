@@ -18,6 +18,7 @@ pub mod message_id;
 pub mod packet;
 pub mod packet_info;
 pub mod proxy_secret;
+pub mod rsa;
 pub mod tls_reader_byte_flow;
 pub mod transport;
 pub mod transport_type;
