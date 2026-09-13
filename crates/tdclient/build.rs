@@ -6,7 +6,9 @@ use std::path::Path;
 
 fn main() {
     let generator = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tl-codegen");
-    println!("cargo:rerun-if-changed={}", generator.join("src").display());
+    for source in ["src/lib.rs", "src/model.rs", "src/rust_writer.rs"] {
+        println!("cargo:rerun-if-changed={}", generator.join(source).display());
+    }
     println!(
         "cargo:rerun-if-changed={}",
         generator.join("scheme").display()

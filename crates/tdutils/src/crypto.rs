@@ -319,6 +319,26 @@ impl AesCtrState {
     pub fn decrypt(&mut self, src: &[u8], dst: &mut [u8]) {
         self.advance(src, dst);
     }
+
+    /// `encrypt(payload, payload)` — the in-place form C++ uses everywhere
+    /// (transports encrypt their buffers in place). Not expressible as
+    /// `encrypt(&x, &mut x)` in safe Rust.
+    pub fn encrypt_in_place(&mut self, data: &mut [u8]) {
+        // SAFETY: `advance` reads `src[i]` and writes the same `data[i]`;
+        // both borrows target one allocation and the loop indexes them in
+        // lockstep, so aliasing is sound — the raw-pointer round trip is only
+        // needed to satisfy the borrow checker.
+        let ptr = data.as_mut_ptr();
+        let len = data.len();
+        unsafe {
+            self.advance(std::slice::from_raw_parts(ptr, len), data);
+        }
+    }
+
+    /// `decrypt(payload, payload)` — same in-place form.
+    pub fn decrypt_in_place(&mut self, data: &mut [u8]) {
+        self.encrypt_in_place(data);
+    }
 }
 
 impl Default for AesCtrState {

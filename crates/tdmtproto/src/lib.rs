@@ -6,13 +6,16 @@
 //! S53 adds the runtime framing layer: [`message_id`], [`packet_info`],
 //! [`auth_key`] and [`auth_data`] (salts, msg_id/seq_no rules, duplicate
 //! checkers). S54 adds the stream transports ([`transport`]) with their
-//! secret ([`proxy_secret`]) and [`utils`] (hex/base64 helpers).
+//! secret ([`proxy_secret`]) and [`utils`] (hex/base64 helpers). S55 adds
+//! the obfuscated transport (AES-CTR header + optional TLS emulation) with
+//! the [`tls_reader_byte_flow`].
 
 pub mod auth_data;
 pub mod auth_key;
 pub mod message_id;
 pub mod packet_info;
 pub mod proxy_secret;
+pub mod tls_reader_byte_flow;
 pub mod transport;
 pub mod transport_type;
 pub mod utils;

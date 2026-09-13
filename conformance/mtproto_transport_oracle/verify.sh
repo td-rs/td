@@ -44,6 +44,34 @@ for entry in cc:
 sys.exit("openssl -isystem path not found in compile_commands.json")
 EOF
 )
+# The matching OpenSSL `out` (libcrypto.so/libssl.so) is a sibling store
+# path of the `-dev` include dir (nix multi-output derivations get distinct
+# hashes, so match by version). Loops instead of `ls | head` — a SIGPIPE in
+# a pipeline kills the script under `set -euo pipefail`.
+OPENSSL_VER=$(basename "$(dirname "$OPENSSL_INC")" | sed 's/.*-openssl-\([0-9.]*\)-dev$/\1/')
+for candidate in /nix/store/*-openssl-"$OPENSSL_VER"/lib; do
+  case "$candidate" in
+    *-dev*) ;;
+    *)
+      # Several multi-platform builds coexist in the store; take an x86-64 one.
+      if file -L "$candidate/libcrypto.so.3" 2>/dev/null | grep -q "x86-64"; then
+        OPENSSL_LIB="$candidate"
+        break
+      fi
+      ;;
+  esac
+done
+for candidate in /nix/store/*-zlib-*/lib; do
+  case "$candidate" in
+    *-dev*|*-static*) ;;
+    *)
+      if file -L "$candidate/libz.so.1" 2>/dev/null | grep -q "x86-64"; then
+        ZLIB_LIB="$candidate"
+        break
+      fi
+      ;;
+  esac
+done
 
 echo "== building the C++ transport oracle against td sources + libtdutils.a =="
 $CXX -std=c++17 -O1 -w \
@@ -54,13 +82,17 @@ $CXX -std=c++17 -O1 -w \
   "$TD_ROOT/td/mtproto/TcpTransport.cpp" \
   "$TD_ROOT/td/mtproto/TlsReaderByteFlow.cpp" \
   "$TD_ROOT/td/mtproto/HttpTransport.cpp" \
+  "$TD_ROOT/td/mtproto/Transport.cpp" \
+  "$TD_ROOT/td/mtproto/KDF.cpp" \
+  "$TD_ROOT/td/mtproto/DhHandshake.cpp" \
   "$TD_ROOT/td/mtproto/ProxySecret.cpp" \
   "$TD_ROOT/tdnet/td/net/HttpReader.cpp" \
   "$TD_ROOT/tdnet/td/net/HttpQuery.cpp" \
   "$TD_ROOT/tdnet/td/net/HttpHeaderCreator.cpp" \
+  "$TD_ROOT/tdnet/td/net/HttpFile.cpp" \
   "$TD_ROOT/tdnet/td/net/HttpChunkedByteFlow.cpp" \
   "$TD_ROOT/tdnet/td/net/HttpContentLengthByteFlow.cpp" \
-  "$TDUTILS_A" -lcrypto -lssl -lpthread
+  "$TDUTILS_A" -L"$OPENSSL_LIB" -L"$ZLIB_LIB" -lcrypto -lssl -lz -lpthread
 
 echo "== building the Rust mirror =="
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$RS_ROOT/target}" \
@@ -75,7 +107,9 @@ run_matrix() {
   local dump="$1" out="$2"
   : >"$out"
   local payload
-  for payload in "" "41" "41424344" "30313233343536373839616263646566" "$(printf '61%.0s' $(seq 1 60))"; do
+  # Payloads must be 4-byte aligned — the MTProto layer guarantees it, and
+  # the C++ CHECKs `size % 4 == 0` in write_prepare_inplace.
+  for payload in "" "41424344" "30313233343536373839616263646566" "$(printf '61%.0s' $(seq 1 60))"; do
     for qa in 0 1; do
       "$dump" --abridged-write "$payload" "$qa" >>"$out"
       local frame
@@ -106,4 +140,25 @@ diff -u "$WORK/cpp-reads-cpp.txt" "$WORK/rust-reads-cpp.txt"
 "$WORK/dump_transport_cpp" --read-file "$WORK/rust-padded.bin" 1 >"$WORK/cpp-reads-rust.txt"
 diff -u "$WORK/rust-reads-rust.txt" "$WORK/cpp-reads-rust.txt"
 
-echo "S54 transport oracle: ALL GREEN"
+echo "== S55 obfuscated transport interop =="
+# Classic 16-byte secret, dd-prefixed (random padding), ee-prefixed
+# (TLS emulation). Each side generates streams, the other side decrypts
+# them — the reads of one stream must agree byte-for-byte.
+SECRETS=(
+  "0102030405060708090a0b0c0d0e0f10"
+  "dd0102030405060708090a0b0c0d0e0f10"
+  "ee0102030405060708090a0b0c0d0e0f107777772e676f6f676c652e636f6d"
+)
+for secret in "${SECRETS[@]}"; do
+  "$WORK/dump_transport_cpp" --obfuscated-write-file "$WORK/cpp-obf.bin" 40 "$secret"
+  "$WORK/dump_transport_cpp" --obfuscated-read-file "$WORK/cpp-obf.bin" "$secret" >"$WORK/cpp-obf.txt"
+  "$DUMP_RUST" --obfuscated-read-file "$WORK/cpp-obf.bin" "$secret" >"$WORK/rust-reads-cpp-obf.txt"
+  diff -u "$WORK/cpp-obf.txt" "$WORK/rust-reads-cpp-obf.txt"
+
+  "$DUMP_RUST" --obfuscated-write-file "$WORK/rust-obf.bin" 40 "$secret"
+  "$DUMP_RUST" --obfuscated-read-file "$WORK/rust-obf.bin" "$secret" >"$WORK/rust-obf.txt"
+  "$WORK/dump_transport_cpp" --obfuscated-read-file "$WORK/rust-obf.bin" "$secret" >"$WORK/cpp-reads-rust-obf.txt"
+  diff -u "$WORK/rust-obf.txt" "$WORK/cpp-reads-rust-obf.txt"
+done
+
+echo "S54+S55 transport oracle: ALL GREEN"
