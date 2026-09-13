@@ -11,6 +11,7 @@ publish.workspace = true
 conformance-samples = []
 
 [dependencies]
+tdutils = { path = "../tdutils" }
 
 [build-dependencies]
 tl-codegen = { path = "../tl-codegen" }
