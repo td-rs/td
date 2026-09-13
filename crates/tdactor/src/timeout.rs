@@ -16,7 +16,7 @@
 //!   construction, is instead cleaned up here.
 //! - C++ callbacks receive `(void *data, int64 key)` with `data` pointing at
 //!   the owning actor (`set_callback_data(this)`); a sound Rust callback
-//!   captures the owner's [`ActorId`] (or other `Send + 'static` state)
+//!   captures the owner's `ActorId` (or other `Send + 'static` state)
 //!   instead — see [`crate::alarm_manager`] for the canonical translation.
 //! - The C++ timeout queue is a `KHeap<double>` + `std::set<Item>` with
 //!   decrease-key `fix`; this port is a `BinaryHeap` + `HashMap` with lazy

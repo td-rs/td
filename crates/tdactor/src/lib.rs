@@ -101,7 +101,7 @@ pub fn send_event_later(actor_ref: impl Into<ActorRef>, event: Event) {
 /// Send a raw thunk inline-when-idle — the free `td::send_closure` half
 /// kept for the pre-S33 call sites (`Scheduler::send_closure_immediately`);
 /// typed dispatch is [`send_closure`]/[`send_closure_later`] from
-/// [`messages`](crate::messages).
+/// [`messages`].
 pub fn send_thunk_immediately(actor_ref: impl Into<ActorRef>, closure: crate::event::ActorThunk) {
     Scheduler::instance().send_closure_immediately(actor_ref.into(), closure);
 }
