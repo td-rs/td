@@ -17,10 +17,10 @@
 //!   C++ (the `ActorRef(ActorOwn&&)` conversion releases it): the promise is
 //!   one-shot, and a promise dropped unfulfilled delivers
 //!   [`FutureActor::HANGUP_ERROR_CODE`] to the future.
-//! - The typed dispatch here is the closure subset of the S33 `send_closure`
-//!   machinery (`Event::custom` thunks). The downcast trusts the `ActorId<A>`
-//!   marker exactly like the C++ `static_cast` in `send_closure`; the
-//!   full message-enum/macro machinery stays with S33.
+//! - The typed dispatch here is the closure subset of the `send_closure`
+//!   machinery (`Event::custom` thunks); the handler downcast goes through
+//!   the checked `messages::downcast` (S33), which panics on a lying
+//!   `ActorId<A>` marker where C++'s `static_cast` was UB.
 //! - `promise_send_closure` takes a closure `FnOnce(&mut A, Result<T>)`
 //!   instead of C++ `(method_pointer, args...)` — bound arguments are
 //!   captured by the closure.
@@ -380,12 +380,12 @@ impl<T: Send + 'static> PromiseActor<T> {
             Scheduler::instance().send_closure_immediately(
                 ActorRef::from(id),
                 Box::new(move |actor: &mut dyn Actor| {
-                    // SAFETY: future_id is an ActorOwn<FutureActor<T>> (set by
+                    // `future_id` is an ActorOwn<FutureActor<T>> (set by
                     // init_promise_future), so the actor behind `id` is a
-                    // FutureActor<T> — the C++ static_cast in send_closure. A
-                    // wrong marker here is UB, exactly like C++.
+                    // FutureActor<T>; `downcast` verifies it instead of
+                    // trusting the marker the way the C++ static_cast did.
                     let future: &mut FutureActor<T> =
-                        unsafe { &mut *(actor as *mut dyn Actor as *mut FutureActor<T>) };
+                        crate::messages::downcast::<FutureActor<T>>(actor);
                     event_fn(future);
                 }),
             );
@@ -505,9 +505,9 @@ where
     Scheduler::instance().send_closure_immediately(
         ActorRef::from(actor_id),
         Box::new(move |actor: &mut dyn Actor| {
-            // SAFETY: the ActorId<A> marker names the actor's real type; see
-            // the module docs (the C++ static_cast in send_closure).
-            let callee = unsafe { &mut *(actor as *mut dyn Actor as *mut A) };
+            // The ActorId<A> marker names the actor's real type;
+            // `downcast` verifies it (the C++ static_cast trusted it).
+            let callee = crate::messages::downcast::<A>(actor);
             handler(callee, promise);
         }),
     );
@@ -527,8 +527,8 @@ where
     Scheduler::instance().send_closure_later(
         ActorRef::from(actor_id),
         Box::new(move |actor: &mut dyn Actor| {
-            // SAFETY: same as send_promise_immediately.
-            let callee = unsafe { &mut *(actor as *mut dyn Actor as *mut A) };
+            // Same as send_promise_immediately: `downcast` verifies.
+            let callee = crate::messages::downcast::<A>(actor);
             handler(callee, promise);
         }),
     );
@@ -550,8 +550,8 @@ where
         Scheduler::instance().send_closure_immediately(
             ActorRef::from(actor_id),
             Box::new(move |actor: &mut dyn Actor| {
-                // SAFETY: same as send_promise_immediately.
-                let callee = unsafe { &mut *(actor as *mut dyn Actor as *mut A) };
+                // Same as send_promise_immediately: `downcast` verifies.
+                let callee = crate::messages::downcast::<A>(actor);
                 handler(callee, result);
             }),
         );

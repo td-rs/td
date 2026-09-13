@@ -129,7 +129,8 @@ thread_local! {
     /// scheduler, in which case sends always route through the channels.
     static CURRENT_SCHEDULER: Cell<*const SchedulerState> = const { Cell::new(std::ptr::null()) };
 
-    /// The context of the event being dispatched (`event_context_ptr_`).
+    /// The context of the dispatch currently running on this thread —
+    /// `Scheduler::event_context_ptr_` in C++.
     static EVENT_CTX: RefCell<EventContext> = const {
         RefCell::new(EventContext {
             actor: None,
@@ -138,6 +139,11 @@ thread_local! {
             link_token: 0,
         })
     };
+    /// Saved contexts of the enclosing dispatches — the C++ `EventGuard`
+    /// save/restore chain. Inline sends during a dispatch nest guards
+    /// (actor A's handler running actor B's closure directly), so the
+    /// context must be restored, not cleared, on exit.
+    static EVENT_CTX_SAVED: RefCell<Vec<EventContext>> = const { RefCell::new(Vec::new()) };
 }
 
 /// One heap entry of the timeout queue: the deadline, the actor and the
@@ -476,22 +482,32 @@ impl SchedulerState {
     }
 
     /// The beginning of the C++ `EventGuard`: marks the actor running and
-    /// installs the event context.
+    /// installs the event context. Inline sends during a dispatch nest
+    /// guards, so the enclosing context is pushed to `EVENT_CTX_SAVED` and
+    /// popped by [`Self::exit_actor`] — the C++ `EventGuard` save/restore.
     fn enter_actor(&self, id: ActorId) {
         let info = self.info(id.clone());
         info.is_running.set(true);
         self.remove_from_lists(id.clone());
-        EVENT_CTX.with(|ctx| {
+        let saved = EVENT_CTX.with(|ctx| {
             let mut ctx = ctx.borrow_mut();
-            ctx.actor = Some(id);
-            ctx.dest = 0;
-            ctx.flags = 0;
-            ctx.link_token = 0;
+            std::mem::replace(
+                &mut *ctx,
+                EventContext {
+                    actor: Some(id),
+                    dest: 0,
+                    flags: 0,
+                    link_token: 0,
+                },
+            )
         });
+        EVENT_CTX_SAVED.with(|stack| stack.borrow_mut().push(saved));
     }
 
-    /// The end of the C++ `EventGuard` destructor: re-queues the actor and
-    /// honors the `Stop`/`Migrate` flags set during the run.
+    /// The end of the C++ `EventGuard` destructor: re-queues the actor,
+    /// honors the `Stop`/`Migrate` flags set during the run, and restores the
+    /// enclosing dispatch's event context (nested guards are the
+    /// `send_closure`-inline fast path).
     fn exit_actor(&self, id: ActorId) {
         let info = self.info(id.clone());
         let mailbox_empty = info.mailbox.borrow().is_empty();
@@ -507,11 +523,10 @@ impl SchedulerState {
             let ctx = ctx.borrow();
             (ctx.flags, ctx.dest)
         });
+        let saved =
+            EVENT_CTX_SAVED.with(|stack| stack.borrow_mut().pop().expect("unbalanced actor guard"));
         EVENT_CTX.with(|ctx| {
-            let mut ctx = ctx.borrow_mut();
-            ctx.actor = None;
-            ctx.flags = 0;
-            ctx.link_token = 0;
+            *ctx.borrow_mut() = saved;
         });
         if flags & FLAG_STOP != 0 {
             self.do_stop_actor(id);
@@ -583,6 +598,12 @@ impl SchedulerState {
         self.enter_actor(id.clone());
         self.do_event(id.clone(), Event::stop());
         self.destroy_actor(id.clone());
+        // `enter_actor` pushed the cleared context it installed; pop it and
+        // put back the caller's context (there is no `exit_actor` here — the
+        // actor is destroyed and must not be re-queued).
+        let entered =
+            EVENT_CTX_SAVED.with(|stack| stack.borrow_mut().pop().expect("unbalanced actor guard"));
+        debug_assert!(entered.actor.is_none());
         EVENT_CTX.with(|ctx| {
             *ctx.borrow_mut() = saved;
         });

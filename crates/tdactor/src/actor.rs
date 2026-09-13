@@ -7,6 +7,8 @@
 //! context, which is only valid while a handler is running. This is
 //! equivalent: an actor's methods only ever run inside `Scheduler::do_event`.
 
+use std::any::Any;
+
 use crate::actor_id::{ActorId, ActorShared};
 use crate::event::Raw;
 use crate::scheduler::Scheduler;
@@ -22,7 +24,12 @@ use crate::scheduler::Scheduler;
 /// - C++ `do_stop()` is not exposed: it destroys the actor while its own
 ///   method runs, which is UB in Rust. Destruction happens in
 ///   `SchedulerState::destroy_actor` after `tear_down`.
-pub trait Actor: Send + 'static {
+///
+/// The `Any` supertrait powers the S33 message dispatch: the `&mut dyn
+/// Actor` event payload is upcast to `&mut dyn Any` and downcast to the
+/// concrete callee — a checked replacement for the C++ `static_cast` in the
+/// `send_closure` machinery (see `messages`).
+pub trait Actor: Send + Any {
     /// The port of C++ `start_up`: by default just yields.
     fn start_up(&mut self) {
         self.yield_();
