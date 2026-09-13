@@ -22,8 +22,9 @@
 use crate::actor::Actor;
 
 /// A `Custom` event payload: a one-shot thunk the scheduler runs on the
-/// destination actor (the C++ `Event::immediate_closure`).
-pub(crate) type ActorThunk = Box<dyn FnOnce(&mut dyn Actor) + Send>;
+/// destination actor (the C++ `Event::immediate_closure`); public because the
+/// free `send_closure_*` half of the S33 machinery hands these around.
+pub type ActorThunk = Box<dyn FnOnce(&mut dyn Actor) + Send>;
 
 /// The predefined event kinds, in the same order as C++ `Event::Type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

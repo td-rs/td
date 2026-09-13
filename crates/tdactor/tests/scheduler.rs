@@ -6,9 +6,10 @@
 //!
 //! The S33 `send_closure` tests (`SendLater` via messages,
 //! `simple_pass_event_arguments`, `PingPong`, `main`) live in
-//! `send_closure.rs`. Still following in S35: `MultiPromise`,
-//! `MultiPromiseSendClosureLater` (both need the S35 `SleepActor`),
-//! `always_wait_for_mailbox` and file-descriptor `open_close`.
+//! `send_closure.rs`; the S35 timeout suites (`MultiPromise`,
+//! `MultiPromiseSendClosureLater`, `always_wait_for_mailbox`,
+//! `stop_in_teardown`) in `multipromise.rs` and `timeout.rs`. Still
+//! following: the file-descriptor `open_close` test.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

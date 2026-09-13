@@ -17,6 +17,8 @@
 //! when the destination is idle and otherwise queues it;
 //! [`send_closure_later`] always queues.
 
+use std::marker::PhantomData;
+
 use crate::actor::Actor;
 use crate::actor_id::ActorRef;
 use crate::event::ActorThunk;
@@ -71,6 +73,60 @@ where
 fn make_thunk<M: ActorMessage>(message: M) -> ActorThunk {
     Box::new(move |actor: &mut dyn Actor| {
         M::dispatch(message, downcast::<M::Actor>(actor));
+    })
+}
+/// `td::send_lambda`: run a closure on the destination actor — the untyped
+/// cousin of [`send_closure`] (C++ `Scheduler::send_lambda`), for handlers
+/// that don't warrant a message variant. Inline right away when the actor is
+/// idle, otherwise through its mailbox.
+pub fn send_lambda<A, F>(actor_ref: impl Into<ActorRef>, handler: F)
+where
+    A: Actor,
+    F: FnOnce(&mut A) + Send + 'static,
+{
+    Scheduler::instance().send_closure_immediately(actor_ref.into(), make_lambda_thunk(handler));
+}
+
+/// `td::send_lambda` through the destination's mailbox — the
+/// [`send_lambda`] counterpart of [`send_closure_later`].
+pub fn send_lambda_later<A, F>(actor_ref: impl Into<ActorRef>, handler: F)
+where
+    A: Actor,
+    F: FnOnce(&mut A) + Send + 'static,
+{
+    Scheduler::instance().send_closure_later(actor_ref.into(), make_lambda_thunk(handler));
+}
+
+/// A closure packaged as an [`ActorMessage`] — the adapter behind
+/// [`send_lambda`] / [`send_lambda_later`].
+struct ClosureMessage<A: Actor, F: FnOnce(&mut A) + Send + 'static> {
+    handler: F,
+    _marker: PhantomData<fn() -> A>,
+}
+
+impl<A, F> ActorMessage for ClosureMessage<A, F>
+where
+    A: Actor,
+    F: FnOnce(&mut A) + Send + 'static,
+{
+    type Actor = A;
+
+    fn dispatch(self, actor: &mut Self::Actor) {
+        (self.handler)(actor);
+    }
+}
+
+fn make_lambda_thunk<A, F>(handler: F) -> ActorThunk
+where
+    A: Actor,
+    F: FnOnce(&mut A) + Send + 'static,
+{
+    Box::new(move |actor: &mut dyn Actor| {
+        ClosureMessage::<A, F> {
+            handler,
+            _marker: PhantomData,
+        }
+        .dispatch(downcast::<A>(actor));
     })
 }
 

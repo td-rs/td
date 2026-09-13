@@ -433,7 +433,12 @@ fn init_promise_future<T: Send + 'static>(
     // scheduler, and (ActorTraits<FutureActor<T>>::need_start_up == false)
     // without a start event.
     let own = unsafe {
-        Scheduler::instance().register_actor_ptr("FutureActor", -1, future as *mut FutureActor<T>)
+        Scheduler::instance().register_actor_ptr(
+            "FutureActor",
+            -1,
+            future as *mut FutureActor<T>,
+            false,
+        )
     };
     future.self_id = own.get().erase();
     promise.future_id = own;

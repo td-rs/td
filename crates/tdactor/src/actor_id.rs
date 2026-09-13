@@ -358,6 +358,17 @@ impl<A: ?Sized> std::fmt::Debug for ActorOwn<A> {
     }
 }
 
+/// The C++ `ActorShared()` default: an empty shared reference (no hangup on
+/// drop).
+impl<A: ?Sized> Default for ActorShared<A> {
+    fn default() -> Self {
+        Self {
+            id: ActorId::empty_id(),
+            token: 0,
+        }
+    }
+}
+
 /// A shared actor reference with a link token — the port of C++
 /// `ActorShared<ActorType>`. Events sent through it carry the token, which
 /// routes `Event::hangup()` to `Actor::hangup_shared` and is visible inside

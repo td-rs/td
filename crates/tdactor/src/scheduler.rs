@@ -35,7 +35,7 @@
 
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -97,6 +97,12 @@ pub(crate) struct ActorInfo {
     pub timeout_gen: Cell<u64>,
     /// The live deadline, if a timeout is armed (`in_heap` + heap key in C++).
     pub deadline: Cell<Option<Instant>>,
+    /// C++ `ActorTraits<T>::need_start_up`: whether `Event::start` /
+    /// `Event::stop` are dispatched for this actor (`do_stop_actor` runs
+    /// `tear_down` only for started actors). Owned registrations default to
+    /// `true`; pointer registrations pass it explicitly (the S34
+    /// `FutureActor` uses `false`, the `MultiPromiseActor` `true`).
+    pub need_start_up: Cell<bool>,
 }
 
 impl ActorInfo {
@@ -109,6 +115,7 @@ impl ActorInfo {
             in_pending: Cell::new(false),
             timeout_gen: Cell::new(0),
             deadline: Cell::new(None),
+            need_start_up: Cell::new(true),
         }
     }
 }
@@ -193,8 +200,10 @@ pub struct SchedulerState {
     actor_count: Cell<i32>,
     /// Actors with pending mailbox events, in dispatch order (`ready_actors_`).
     ready: RefCell<VecDeque<ActorId>>,
-    /// Idle actors (`pending_actors_`).
-    pending: RefCell<HashSet<ActorId>>,
+    /// Idle actors (`pending_actors_`) — FIFO, like the C++ intrusive list:
+    /// registration order decides which idle actor runs first, and tests
+    /// (`MultiPromiseSendClosureLater`) rely on it.
+    pending: RefCell<VecDeque<ActorId>>,
     /// The timeout heap (`timeout_queue_`).
     timeouts: RefCell<BinaryHeap<TimeoutEntry>>,
     /// Events for actors that are migrating to this scheduler but have not
@@ -239,7 +248,7 @@ impl SchedulerState {
             sched_count,
             actor_count: Cell::new(0),
             ready: RefCell::new(VecDeque::new()),
-            pending: RefCell::new(HashSet::new()),
+            pending: RefCell::new(VecDeque::new()),
             timeouts: RefCell::new(BinaryHeap::new()),
             pending_events: RefCell::new(HashMap::new()),
             close_flag: AtomicBool::new(false),
@@ -263,7 +272,7 @@ impl SchedulerState {
 
     /// `Scheduler::create_actor`: register on the current scheduler.
     pub fn create_actor<A: Actor>(&self, name: &str, actor: A) -> ActorOwn<A> {
-        self.register_actor_impl(name, ActorSlot::Owned(Box::new(actor)), self.sched_id)
+        self.register_actor_impl(name, ActorSlot::Owned(Box::new(actor)), self.sched_id, true)
     }
 
     /// `Scheduler::create_actor_on_scheduler`.
@@ -273,20 +282,21 @@ impl SchedulerState {
         sched_id: i32,
         actor: A,
     ) -> ActorOwn<A> {
-        self.register_actor_impl(name, ActorSlot::Owned(Box::new(actor)), sched_id)
+        self.register_actor_impl(name, ActorSlot::Owned(Box::new(actor)), sched_id, true)
     }
 
     /// `Scheduler::register_actor` (the `Deleter::Destroy` overload: the
     /// scheduler owns the actor).
     pub fn register_actor<A: Actor>(&self, name: &str, sched_id: i32, actor: A) -> ActorOwn<A> {
-        self.register_actor_impl(name, ActorSlot::Owned(Box::new(actor)), sched_id)
+        self.register_actor_impl(name, ActorSlot::Owned(Box::new(actor)), sched_id, true)
     }
 
     /// `Scheduler::register_actor(name, actor_ptr)` — the C++ `Deleter::None`
     /// overload: the scheduler runs but does not own the actor; the caller
-    /// drops it after the actor is destroyed. Like C++
-    /// `ActorTraits<FutureActor<T>>::need_start_up = false`, no `Event::start`
-    /// is sent for actors registered this way.
+    /// drops it after the actor is destroyed. `need_start_up` mirrors the C++
+    /// `ActorTraits<T>` flag: `false` sends no `Event::start` (and
+    /// `do_stop_actor` skips `tear_down`), `true` starts the actor like an
+    /// owned registration (the `MultiPromiseActor` member-actor idiom).
     ///
     /// # Safety
     ///
@@ -299,8 +309,14 @@ impl SchedulerState {
         name: &str,
         sched_id: i32,
         actor: *mut A,
+        need_start_up: bool,
     ) -> ActorOwn<A> {
-        self.register_actor_impl(name, ActorSlot::Borrowed(actor as *mut dyn Actor), sched_id)
+        self.register_actor_impl(
+            name,
+            ActorSlot::Borrowed(actor as *mut dyn Actor),
+            sched_id,
+            need_start_up,
+        )
     }
 
     fn register_actor_impl<A: Actor>(
@@ -308,10 +324,11 @@ impl SchedulerState {
         name: &str,
         actor: ActorSlot,
         sched_id: i32,
+        need_start_up: bool,
     ) -> ActorOwn<A> {
-        // C++ sends Event::start to owned actors only (need_start_up is false
-        // for borrowed ones; see `register_actor_ptr`).
-        let need_start_up = matches!(actor, ActorSlot::Owned(_));
+        // C++ sends Event::start for `need_start_up` actors and `do_stop_actor`
+        // dispatches `Event::stop` (the `tear_down`) for exactly the same set.
+        let need_start_up = need_start_up || matches!(actor, ActorSlot::Owned(_));
         assert!(
             self.has_guard.get(),
             "create_actor requires a scheduler guard"
@@ -327,7 +344,9 @@ impl SchedulerState {
             self.sched_count
         );
 
-        let slot = crate::actor_id::IdSlot::new(Box::new(ActorInfo::new(actor)), sched_id, name);
+        let info = ActorInfo::new(actor);
+        info.need_start_up.set(need_start_up);
+        let slot = crate::actor_id::IdSlot::new(Box::new(info), sched_id, name);
         // The allocation is type-independent (the "session-unique id" of the
         // plan); the typed `ActorId<A>` is a pure marker added on the way out.
         let id: ActorId = ActorId::new(slot);
@@ -337,7 +356,7 @@ impl SchedulerState {
             self.send_later(id.clone(), Event::start());
             self.do_migrate_actor(id.clone(), sched_id);
         } else {
-            self.pending.borrow_mut().insert(id.clone());
+            self.pending.borrow_mut().push_back(id.clone());
             self.info(id.clone()).in_pending.set(true);
             if need_start_up {
                 self.send_later(id.clone(), Event::start());
@@ -440,7 +459,7 @@ impl SchedulerState {
         let info = self.info(id.clone());
         if !info.is_running.get() {
             if info.in_pending.get() {
-                self.pending.borrow_mut().remove(&id);
+                self.pending.borrow_mut().retain(|x| *x != id);
                 info.in_pending.set(false);
                 self.ready.borrow_mut().push_back(id.clone());
                 info.in_ready.set(true);
@@ -512,7 +531,7 @@ impl SchedulerState {
         let info = self.info(id.clone());
         let mailbox_empty = info.mailbox.borrow().is_empty();
         if mailbox_empty {
-            self.pending.borrow_mut().insert(id.clone());
+            self.pending.borrow_mut().push_back(id.clone());
             info.in_pending.set(true);
         } else {
             self.ready.borrow_mut().push_back(id.clone());
@@ -590,20 +609,26 @@ impl SchedulerState {
             "do_stop_actor on the dispatched actor is UB in Rust (use stop())"
         );
         let saved = EVENT_CTX.with(|ctx| ctx.replace(EventContext::default()));
-        // The C++ keeps its EventGuard (is_running = true) across the
-        // destruction: sends to this actor from its own teardown/Drop land in
-        // the mailbox (cleared by destroy_actor) instead of dispatching
-        // inline. destroy_actor frees the ActorInfo, so afterwards only the
-        // context restore remains (no list fixup — the actor is unlinked).
-        self.enter_actor(id.clone());
-        self.do_event(id.clone(), Event::stop());
+        // C++ `do_stop_actor` dispatches `Event::stop` only for actors with
+        // `need_start_up()` (`ActorTraits<T>`): started actors get a matching
+        // `tear_down`; unstarted ones (the `FutureActor` idiom) are
+        // unregistered without dispatching. `MultiPromiseActor` is the
+        // borrowed-but-started combination its tests depend on.
+        let need_stop_event = self.info(id.clone()).need_start_up.get();
+        if need_stop_event {
+            self.enter_actor(id.clone());
+            self.do_event(id.clone(), Event::stop());
+        }
         self.destroy_actor(id.clone());
-        // `enter_actor` pushed the cleared context it installed; pop it and
-        // put back the caller's context (there is no `exit_actor` here — the
-        // actor is destroyed and must not be re-queued).
-        let entered =
-            EVENT_CTX_SAVED.with(|stack| stack.borrow_mut().pop().expect("unbalanced actor guard"));
-        debug_assert!(entered.actor.is_none());
+        // Only the `need_stop_event` path pushed a guard context (via
+        // `enter_actor`); pop it and put back the caller's context (there is
+        // no `exit_actor` here — the actor is destroyed and must not be
+        // re-queued).
+        if need_stop_event {
+            let entered = EVENT_CTX_SAVED
+                .with(|stack| stack.borrow_mut().pop().expect("unbalanced actor guard"));
+            debug_assert!(entered.actor.is_none());
+        }
         EVENT_CTX.with(|ctx| {
             *ctx.borrow_mut() = saved;
         });
@@ -690,7 +715,7 @@ impl SchedulerState {
         let info = self.info(id.clone());
         let mailbox_empty = info.mailbox.borrow().is_empty();
         if mailbox_empty {
-            self.pending.borrow_mut().insert(id.clone());
+            self.pending.borrow_mut().push_back(id.clone());
             info.in_pending.set(true);
         } else {
             self.ready.borrow_mut().push_back(id.clone());
@@ -707,7 +732,7 @@ impl SchedulerState {
     fn remove_from_lists(&self, id: ActorId) {
         let info = self.info(id.clone());
         if info.in_pending.get() {
-            self.pending.borrow_mut().remove(&id);
+            self.pending.borrow_mut().retain(|x| *x != id);
             info.in_pending.set(false);
         }
         if info.in_ready.get() {
@@ -758,15 +783,22 @@ impl SchedulerState {
     }
 
     pub(crate) fn set_actor_timeout_in(&self, id: ActorId, timeout: f64) {
-        // C++ clamps to [0, 1e10] then converts to an absolute time.
-        self.set_actor_timeout_at(id, timeout.clamp(0.0, 1e10));
+        // C++ `Scheduler::set_actor_timeout_in`: clamp to [0, 1e10], then a
+        // plain `set_actor_timeout_at` with the absolute deadline.
+        self.set_actor_timeout_at(id, tdutils::time::now() + timeout.clamp(0.0, 1e10));
     }
 
+    /// `timeout_at` is absolute — seconds on the adjusted monotonic clock
+    /// ([`crate::time_now`] base), exactly like C++
+    /// `Scheduler::set_actor_timeout_at(ActorInfo, Timestamp)`. Past values
+    /// fire on the next pump; future values are capped at +1e10 s (the C++
+    /// `Timestamp::in(1e10, ...)` clamp, also keeping `Instant` in range).
     pub(crate) fn set_actor_timeout_at(&self, id: ActorId, timeout_at: f64) {
         let info = self.info(id.clone());
         let generation = info.timeout_gen.get() + 1;
         info.timeout_gen.set(generation);
-        let at = Instant::now() + Duration::from_secs_f64(timeout_at.max(0.0));
+        let at = Instant::now()
+            + Duration::from_secs_f64((timeout_at - tdutils::time::now()).clamp(0.0, 1e10));
         info.deadline.set(Some(at));
         self.timeouts
             .borrow_mut()
@@ -956,9 +988,8 @@ impl SchedulerState {
                 self.info(id.clone()).in_ready.set(false);
                 Some(id)
             } else {
-                let next_pending = self.pending.borrow().iter().next().cloned();
+                let next_pending = self.pending.borrow_mut().pop_front();
                 if let Some(id) = next_pending.as_ref() {
-                    self.pending.borrow_mut().remove(id);
                     self.info(id.clone()).in_pending.set(false);
                 }
                 next_pending
