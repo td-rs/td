@@ -167,6 +167,10 @@ pub fn write_rust(p: &TlProgram, m: &SchemeModel, opts: &WriterOpts) -> String {
         m.safe_function,
     );
 
+    if opts.json {
+        emit_object_umbrella(&mut out, p, m, opts);
+    }
+
     out.push_str(&format!(
         "pub const SCHEME_TYPES: usize = {};\n\
          pub const SCHEME_CTORS: usize = {};\n\
@@ -849,6 +853,114 @@ fn emit_struct_json(
     out.push_str("        Result::Ok(value)\n    }\n");
 }
 
+/// Emits the `Object` umbrella (S16): one variant per non-builtin
+/// constructor — td's `object_ptr<Object>` JSON surface. `to_json_into` is
+/// td's generated `to_json(const Object&)` switch; `from_json` mirrors
+/// `tl_constructor_from_string(Object)` + downcast (name or numeric id).
+/// No serde derives: this is the dynamic layer — `to_json`/`from_json` are
+/// its only conversions (serde's internally-tagged derive over ~2200
+/// variants would cost far more compile time than the whole module).
+fn emit_object_umbrella(out: &mut String, p: &TlProgram, m: &SchemeModel, opts: &WriterOpts) {
+    let mut variants: Vec<(String, String, usize)> = Vec::new(); // (variant, struct, ctor)
+    for &tid in p.type_ids.values() {
+        match &m.type_kinds[tid] {
+            TypeKind::Struct { ctor } => {
+                variants.push((capitalize(&p.ctors[*ctor].id), m.type_name(p, tid), *ctor));
+            }
+            TypeKind::Enum { ctors } if !ctors.is_empty() => {
+                for &c in ctors {
+                    let name = capitalize(&p.ctors[c].id);
+                    variants.push((name.clone(), name, c));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut seen = BTreeSet::new();
+    for (variant, _, _) in &variants {
+        assert!(
+            seen.insert(variant.clone()),
+            "duplicate Object umbrella variant {variant}"
+        );
+    }
+
+    out.push_str("#[derive(Clone, Debug, PartialEq)]\n");
+    out.push_str("pub enum Object {\n");
+    for (variant, struct_name, _) in &variants {
+        out.push_str(&format!("    {variant}({struct_name}),\n"));
+    }
+    out.push_str("}\n\n");
+    out.push_str("impl Object {\n");
+    out.push_str(
+        "\n    pub fn to_json(&self) -> String {\n        let mut out = String::new();\n        self.to_json_into(&mut out);\n        out\n    }\n\n",
+    );
+    out.push_str("    pub fn to_json_into(&self, out: &mut String) {\n        match self {\n");
+    for (variant, _, _) in &variants {
+        out.push_str(&format!(
+            "            Self::{variant}(v) => v.to_json_into(out),\n"
+        ));
+    }
+    out.push_str("        }\n    }\n");
+    out.push_str(
+        "\n    /// td's Object-level request surface: an object's `@type`\n\
+         \x20   /// (name or numeric id) selects the constructor. Null has no\n\
+         \x20   /// Object representation (td's null maps to a null pointer).\n",
+    );
+    out.push_str(
+        "    pub fn from_json(input: &str) -> Result<Self, String> {\n        \
+         let root = tl_json::parse_json(input)?;\n        Self::from_json_value(&root)\n    }\n\n",
+    );
+    // Per-variant constructor helpers (see emit_enum_json: the dispatch
+    // match arms must be plain calls — inline construction over ~2200
+    // variants measures a 141 MB debug stack frame).
+    for (variant, struct_name, _) in &variants {
+        out.push_str(&format!(
+            "    fn __json_new_{variant}(o: &tl_json::Object) -> Result<Self, String> {{\n        \
+             Result::Ok(Self::{variant}(self::{struct_name}::from_json_object(o)?))\n    }}\n"
+        ));
+    }
+    out.push_str(
+        "    pub fn from_json_value(v: &tl_json::Json) -> Result<Self, String> {\n        \
+         let o = match v {\n            \
+         tl_json::Json::Object(o) => o,\n            \
+         other => return Result::Err(format!(\"Expected Object, but receive {}\", other.type_name())),\n        \
+         };\n        \
+         let ty = match tl_json::field(o, \"@type\") {\n            \
+         Some(ty) => ty,\n            \
+         None => return Result::Err(\"Can't find field \\\"@type\\\"\".to_owned()),\n        \
+         };\n        \
+         match ty {\n            \
+         tl_json::Json::String(s) => match s.as_str() {\n",
+    );
+    for (variant, _, c) in &variants {
+        out.push_str(&format!(
+            "                \"{}\" => Self::__json_new_{variant}(o),\n",
+            p.ctors[*c].id
+        ));
+    }
+    out.push_str(
+        "                _ => Result::Err(format!(\"Unknown class \\\"{s}\\\"\")),\n\
+         \x20           },\n            \
+         tl_json::Json::Number(n) => match tl_json::to_integer_i32(n) {\n",
+    );
+    let mut seen_ids = BTreeSet::new();
+    for (variant, struct_name, c) in &variants {
+        if !seen_ids.insert(p.ctors[*c].name) {
+            continue;
+        }
+        out.push_str(&format!(
+            "                self::{struct_name}::ID => Self::__json_new_{variant}(o),\n"
+        ));
+    }
+    out.push_str(
+        "                id => Result::Err(format!(\"Unknown constructor 0x{:x}\", id as u32)),\n\
+         \x20           },\n            \
+         other => Result::Err(format!(\"Expected String or Integer, but receive {}\", other.type_name())),\n        \
+         }\n    }\n}\n\n",
+    );
+    let _ = opts;
+}
+
 /// Emits the S12 JSON methods for one enum: to_json dispatches to the
 /// variant's `to_json_into` (td's `downcast_call`); from_json extracts
 /// `@type` — a constructor name string or a numeric id (td's
@@ -871,6 +983,19 @@ fn emit_enum_json(out: &mut String, p: &TlProgram, ctors: &[usize]) {
         "\n    pub fn from_json(input: &str) -> Result<Self, String> {\n        \
          let root = tl_json::parse_json(input)?;\n        Self::from_json_value(&root)\n    }\n\n",
     );
+    // Per-variant constructor helpers: each arm of the dispatch match must
+    // be a plain call. Inline `Self::V(self::V::from_json_object(o)?)`
+    // arms give the dispatch fn one unmerged temporary per variant — fine
+    // for small enums, but the ~2200-variant Object umbrella and the
+    // 1000+ function umbrella reach multi-megabyte (measured: 141 MB)
+    // debug stack frames that overflow any thread.
+    for &c in ctors {
+        let variant = capitalize(&p.ctors[c].id);
+        out.push_str(&format!(
+            "    fn __json_new_{variant}(o: &tl_json::Object) -> Result<Self, String> {{\n        \
+             Result::Ok(Self::{variant}(self::{variant}::from_json_object(o)?))\n    }}\n"
+        ));
+    }
     out.push_str(
         "    /// td's `from_json(object_ptr<T>&, JsonValue)`: null yields the\n\
          \x20   /// default variant (C++ keeps a null pointer — see the model note),\n\
@@ -893,7 +1018,7 @@ fn emit_enum_json(out: &mut String, p: &TlProgram, ctors: &[usize]) {
     for &c in ctors {
         let variant = capitalize(&p.ctors[c].id);
         out.push_str(&format!(
-            "                \"{}\" => Result::Ok(Self::{variant}(self::{variant}::from_json_object(o)?)),\n",
+            "                \"{}\" => Self::__json_new_{variant}(o),\n",
             p.ctors[c].id
         ));
     }
@@ -909,7 +1034,7 @@ fn emit_enum_json(out: &mut String, p: &TlProgram, ctors: &[usize]) {
         }
         let variant = capitalize(&p.ctors[c].id);
         out.push_str(&format!(
-            "                self::{variant}::ID => Result::Ok(Self::{variant}(self::{variant}::from_json_object(o)?)),\n"
+            "                self::{variant}::ID => Self::__json_new_{variant}(o),\n"
         ));
     }
     out.push_str(

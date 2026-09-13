@@ -42,6 +42,17 @@ static void dump(const char *name, const T &obj) {
   printf("%s:%s\n", name, json_encode<std::string>(td::ToJson(obj)).c_str());
 }
 
+// S16: the same sample through td's Object-level dynamic surface — the
+// generated `to_json(const Object&)` switch that serializes responses.
+template <class T>
+static void dump2(const char *name, T obj) {
+  dump(name, obj);
+  td_api::object_ptr<T> owned = td_api::make_object<T>(std::move(obj));
+  printf("%s:obj:%s\n", name,
+         json_encode<std::string>(td::ToJson(static_cast<const td_api::Object &>(*owned)))
+             .c_str());
+}
+
 static void dump_parse(const char *name, const std::string &json) {
   std::string buf = json;  // json_decode unescapes in place
   auto value = json_decode(MutableSlice(buf));
@@ -62,24 +73,24 @@ int main() {
   // ---- to_json samples ---------------------------------------------------
   {
     td_api::ok obj;
-    dump("ok", obj);
+    dump2("ok", std::move(obj));
   }
   {
     td_api::error obj;
     obj.code_ = -42;
     obj.message_ = "line1\n\"quoted\" \\ \x01 é中😀 tab\tend";
-    dump("error", obj);
+    dump2("error", std::move(obj));
   }
   {
     td_api::minithumbnail obj;
     obj.width_ = 640;
     obj.height_ = 360;
     obj.data_ = std::string("\x00\x01\xff tl", 6);
-    dump("minithumbnail", obj);
+    dump2("minithumbnail", std::move(obj));
   }
   {
     td_api::minithumbnail obj;
-    dump("minithumbnail_empty", obj);
+    dump2("minithumbnail_empty", std::move(obj));
   }
   {
     td_api::formattedText obj;
@@ -89,7 +100,7 @@ int main() {
     entity->length_ = 3;
     entity->type_ = td_api::make_object<td_api::textEntityTypeBold>();
     obj.entities_.push_back(std::move(entity));
-    dump("formattedText", obj);
+    dump2("formattedText", std::move(obj));
   }
   {
     td_api::file obj;
@@ -102,7 +113,7 @@ int main() {
     obj.local_->downloaded_size_ = 4096;
     obj.remote_ = td_api::make_object<td_api::remoteFile>();
     obj.remote_->unique_id_ = "AQID";
-    dump("file", obj);
+    dump2("file", std::move(obj));
   }
   {
     td_api::messageForwardInfo obj;
@@ -120,26 +131,26 @@ int main() {
     obj.source_->date_ = 7;
     obj.source_->is_outgoing_ = true;
     obj.public_service_announcement_type_ = "psa";
-    dump("messageForwardInfo", obj);
+    dump2("messageForwardInfo", std::move(obj));
   }
   {
     td_api::emojiStatusCustomEmojis obj;
     obj.custom_emoji_ids_ = {0, -1, 0x123456789abcdef0ll, 9223372036854775807ll};
-    dump("emojiStatusCustomEmojis", obj);
+    dump2("emojiStatusCustomEmojis", std::move(obj));
   }
   {
     td_api::location obj;
     obj.latitude_ = 1.5;
     obj.longitude_ = -2.25;
     obj.horizontal_accuracy_ = 0.0;
-    dump("location", obj);
+    dump2("location", std::move(obj));
   }
   {
     td_api::location obj;
     obj.latitude_ = 1e-7;
     obj.longitude_ = -0.0;
     obj.horizontal_accuracy_ = 123456.78125;
-    dump("location_edges", obj);
+    dump2("location_edges", std::move(obj));
   }
   {
     td_api::poll obj;
@@ -162,7 +173,7 @@ int main() {
     obj.close_date_ = 0;
     obj.is_closed_ = false;
     obj.vote_restriction_reason_ = td_api::make_object<td_api::pollVoteRestrictionReasonClosed>();
-    dump("poll", obj);
+    dump2("poll", std::move(obj));
   }
 
   // ---- from_json samples (parse → binary store / error) ------------------

@@ -2,8 +2,14 @@
 //! handling. The td_api data model is generated at build time from the
 //! pinned scheme (S09, store in S10).
 
-// Generated code keeps C++-identical case-preserved names (`aiComposeTone`).
-#[allow(dead_code, non_camel_case_types, clippy::large_enum_variant)]
+// Generated code keeps C++-identical case-preserved names (`aiComposeTone`)
+// in types, fields and the JSON dispatch helpers alike.
+#[allow(
+    dead_code,
+    non_camel_case_types,
+    non_snake_case,
+    clippy::large_enum_variant
+)]
 pub mod td_api {
     include!(concat!(env!("OUT_DIR"), "/td_api.rs"));
 }
@@ -58,5 +64,36 @@ mod tests {
         assert_eq!(json, r#"{"text":"hi","entities":[]}"#);
         let back: td_api::FormattedText = serde_json::from_str(&json).unwrap();
         assert_eq!(back, text);
+    }
+
+    #[test]
+    fn object_umbrella_dynamic_round_trip() {
+        // S16: the dynamic surface — td's to_json(const Object&) switch and
+        // tl_constructor_from_string(Object), by name and by numeric id.
+        let value = td_api::Object::error(td_api::Error {
+            code: 400,
+            message: "Bad Request: test".to_owned(),
+        });
+        let json = value.to_json();
+        assert_eq!(
+            json,
+            r#"{"@type":"error","code":400,"message":"Bad Request: test"}"#
+        );
+        assert_eq!(td_api::Object::from_json(&json).unwrap(), value);
+        let numeric = format!(
+            r#"{{"@type":{},"code":404,"message":"nf"}}"#,
+            td_api::Error::ID
+        );
+        assert_eq!(
+            td_api::Object::from_json(&numeric).unwrap(),
+            td_api::Object::error(td_api::Error {
+                code: 404,
+                message: "nf".to_owned()
+            })
+        );
+        assert_eq!(
+            td_api::Object::from_json(r#"{"@type":"nope"}"#).unwrap_err(),
+            "Unknown class \"nope\""
+        );
     }
 }

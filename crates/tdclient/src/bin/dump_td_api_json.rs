@@ -1,6 +1,7 @@
-//! S12 verification: builds the same td_api samples as the C++ oracle
+//! S12/S16 verification: builds the same td_api samples as the C++ oracle
 //! (`conformance/tl_json_oracle/dump_json.cpp`) from the tl-codegen-
-//! generated model, prints their `to_json`, then parses the same request
+//! generated model, prints their `to_json` plus the Object-umbrella
+//! (`to_json(const Object&)`) form of each, then parses the same request
 //! JSONs through `Function::from_json` (accept/reject + error message —
 //! td_api has no C++ binary store to diff against). verify.sh diffs the
 //! two outputs byte for byte.
@@ -15,6 +16,14 @@ fn dump(name: &str, json: &str) {
     println!("{name}:{json}");
 }
 
+/// S16: the sample's own to_json plus the same value through the Object
+/// umbrella — the dynamic response-side surface (td's generated
+/// `to_json(const Object&)` switch).
+fn dump2(name: &str, json: &str, object: td_api::Object) {
+    dump(name, json);
+    println!("{name}:obj:{}", object.to_json());
+}
+
 fn dump_parse(name: &str, json: &str) {
     match td_api::Function::from_json(json) {
         Ok(_) => println!("{name}:ok"),
@@ -24,14 +33,14 @@ fn dump_parse(name: &str, json: &str) {
 
 fn main() {
     // ---- to_json samples --------------------------------------------------
-    dump("ok", &td_api::Ok.to_json());
+    dump2("ok", &td_api::Ok.to_json(), td_api::Object::ok(td_api::Ok));
 
     {
         let obj = td_api::Error {
             code: -42,
             message: "line1\n\"quoted\" \\ \u{1} é中😀 tab\tend".to_owned(),
         };
-        dump("error", &obj.to_json());
+        dump2("error", &obj.to_json(), td_api::Object::error(obj));
     }
 
     {
@@ -40,11 +49,16 @@ fn main() {
             height: 360,
             data: vec![0x00, 0x01, 0xff, b' ', b't', b'l'],
         };
-        dump("minithumbnail", &obj.to_json());
+        dump2(
+            "minithumbnail",
+            &obj.to_json(),
+            td_api::Object::minithumbnail(obj),
+        );
     }
-    dump(
+    dump2(
         "minithumbnail_empty",
         &td_api::Minithumbnail::default().to_json(),
+        td_api::Object::minithumbnail(td_api::Minithumbnail::default()),
     );
 
     {
@@ -56,7 +70,11 @@ fn main() {
                 r#type: td_api::TextEntityType::textEntityTypeBold(td_api::textEntityTypeBold),
             }],
         };
-        dump("formattedText", &obj.to_json());
+        dump2(
+            "formattedText",
+            &obj.to_json(),
+            td_api::Object::formattedText(obj),
+        );
     }
 
     {
@@ -75,7 +93,7 @@ fn main() {
                 ..Default::default()
             },
         };
-        dump("file", &obj.to_json());
+        dump2("file", &obj.to_json(), td_api::Object::file(obj));
     }
 
     {
@@ -96,14 +114,22 @@ fn main() {
             },
             public_service_announcement_type: "psa".to_owned(),
         };
-        dump("messageForwardInfo", &obj.to_json());
+        dump2(
+            "messageForwardInfo",
+            &obj.to_json(),
+            td_api::Object::messageForwardInfo(obj),
+        );
     }
 
     {
         let obj = td_api::EmojiStatusCustomEmojis {
             custom_emoji_ids: vec![0, -1, 0x1234_5678_9abc_def0, i64::MAX],
         };
-        dump("emojiStatusCustomEmojis", &obj.to_json());
+        dump2(
+            "emojiStatusCustomEmojis",
+            &obj.to_json(),
+            td_api::Object::emojiStatusCustomEmojis(obj),
+        );
     }
 
     {
@@ -112,7 +138,7 @@ fn main() {
             longitude: -2.25,
             horizontal_accuracy: 0.0,
         };
-        dump("location", &obj.to_json());
+        dump2("location", &obj.to_json(), td_api::Object::location(obj));
     }
     {
         let obj = td_api::Location {
@@ -120,7 +146,11 @@ fn main() {
             longitude: -0.0,
             horizontal_accuracy: 123456.78125,
         };
-        dump("location_edges", &obj.to_json());
+        dump2(
+            "location_edges",
+            &obj.to_json(),
+            td_api::Object::location(obj),
+        );
     }
 
     {
@@ -152,7 +182,7 @@ fn main() {
                     td_api::pollVoteRestrictionReasonClosed,
                 ),
         };
-        dump("poll", &obj.to_json());
+        dump2("poll", &obj.to_json(), td_api::Object::poll(obj));
     }
 
     // ---- from_json samples (parse → binary store / error) ------------------
