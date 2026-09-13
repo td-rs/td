@@ -1,14 +1,22 @@
-//! Port of `td/utils/Gzip.h` + `Gzip.cpp` on `flate2` (replacing zlib).
+//! Port of `td/utils/Gzip.h` + `Gzip.cpp` directly on `libz-sys`, which
+//! compiles the same vendored stock zlib tdlib links against — the codec is
+//! literally the `z_stream` state machine the C++ drives.
 //!
 //! Despite the name, tdlib's streams are zlib-format: encode uses
 //! `deflateInit2(..., 15, ...)` (zlib header) and decode uses
-//! `inflateInit2(MAX_WBITS + 32)` (gzip/zlib auto-detect), exactly what
-//! `flate2::Compress`/`Decompress` provide.
+//! `inflateInit2(MAX_WBITS + 32)` (gzip/zlib auto-detect). Stock zlib is
+//! required on both counts — pure-Rust backends are chunk-sensitive on encode
+//! (breaking the byte-identity the C++ `Gzip` flow test asserts) and flate2's
+//! safe API cannot express the auto-detect window bits; the golden gzip test
+//! guards the auto-detect.
 
 use crate::buffer::{BufferSlice, BufferWriter, ChainBufferWriter};
 use crate::status::{Result, Status};
 
-use flate2::{Compress, Compression, Decompress, FlushCompress, FlushDecompress};
+use libz_sys::{
+    Bytef, Z_DEFAULT_STRATEGY, Z_DEFLATED, Z_FINISH, Z_NO_FLUSH, Z_OK, Z_STREAM_END, deflate,
+    deflateEnd, deflateInit2_, inflate, inflateEnd, inflateInit2_, uInt, z_stream, zlibVersion,
+};
 
 /// `td::Gzip::Mode`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,38 +34,65 @@ pub enum GzipState {
 }
 
 enum GzipInner {
-    Encode(Compress),
-    Decode(Decompress),
+    Encode(Box<z_stream>),
+    Decode(Box<z_stream>),
+}
+
+/// A `z_stream` with every field at its C zero — exactly the `std::memset`
+/// the C++ `init_common` does before `deflateInit2`/`inflateInit2`; the null
+/// `zalloc`/`zfree` are zlib's `Z_NULL`, selecting the default allocator.
+/// Built field-by-field: `mem::zeroed` trips the runtime invalid-value check
+/// on the function-pointer fields.
+fn new_stream() -> Box<z_stream> {
+    // SAFETY: `Option<fn>` has the exact layout of the bare fn pointer
+    // (null niche), so `None` transmutes to the null `Z_NULL` allocator.
+    let null_alloc: libz_sys::alloc_func =
+        unsafe { std::mem::transmute::<Option<libz_sys::alloc_func>, libz_sys::alloc_func>(None) };
+    let null_free: libz_sys::free_func =
+        unsafe { std::mem::transmute::<Option<libz_sys::free_func>, libz_sys::free_func>(None) };
+    Box::new(z_stream {
+        next_in: std::ptr::null_mut(),
+        avail_in: 0,
+        total_in: 0,
+        next_out: std::ptr::null_mut(),
+        avail_out: 0,
+        total_out: 0,
+        msg: std::ptr::null_mut(),
+        state: std::ptr::null_mut(),
+        zalloc: null_alloc,
+        zfree: null_free,
+        opaque: std::ptr::null_mut(),
+        data_type: 0,
+        adler: 0,
+        reserved: 0,
+    })
 }
 
 impl GzipInner {
-    fn total_in(&self) -> u64 {
+    fn stream_ref(&self) -> &z_stream {
         match self {
-            Self::Encode(compress) => compress.total_in(),
-            Self::Decode(decompress) => decompress.total_in(),
+            Self::Encode(stream) | Self::Decode(stream) => stream,
         }
     }
 
-    fn total_out(&self) -> u64 {
+    fn stream_mut(&mut self) -> &mut z_stream {
         match self {
-            Self::Encode(compress) => compress.total_out(),
-            Self::Decode(decompress) => decompress.total_out(),
+            Self::Encode(stream) | Self::Decode(stream) => stream,
         }
     }
 }
 
 /// `td::Gzip` — a streaming zlib codec over caller-provided buffers. The
 /// buffers passed to [`Gzip::set_input`] / [`Gzip::set_output`] must stay
-/// alive until their contents are flushed (the C++ pointer contract).
+/// alive until their contents are flushed (the C++ pointer contract); the
+/// `z_stream` lives in a `Box` so libz can keep internal pointers stable.
 pub struct Gzip {
     inner: Option<GzipInner>,
     mode: GzipMode,
-    input: *const u8,
-    input_left: usize,
-    input_total: usize,
-    output: *mut u8,
-    output_left: usize,
-    output_total: usize,
+    /// `td::Gzip::input_size_` — total bytes currently set as input.
+    input_size: usize,
+    /// `td::Gzip::output_size_` — total bytes currently set as output.
+    output_size: usize,
     close_input_flag: bool,
 }
 
@@ -66,12 +101,8 @@ impl Gzip {
         Self {
             inner: None,
             mode: GzipMode::Empty,
-            input: std::ptr::null(),
-            input_left: 0,
-            input_total: 0,
-            output: std::ptr::null_mut(),
-            output_left: 0,
-            output_total: 0,
+            input_size: 0,
+            output_size: 0,
             close_input_flag: false,
         }
     }
@@ -88,41 +119,81 @@ impl Gzip {
         }
     }
 
-    /// `td::Gzip::init_encode` — zlib format, level 6.
+    /// `td::Gzip::init_encode` — `deflateInit2(6, Z_DEFLATED, 15,
+    /// MAX_MEM_LEVEL, Z_DEFAULT_STRATEGY)`: zlib format, level 6.
     pub fn init_encode(&mut self) -> Status {
         assert!(self.mode == GzipMode::Empty, "init_encode on a live codec");
         self.init_common();
+        let mut stream = new_stream();
+        let ret = unsafe {
+            deflateInit2_(
+                &mut *stream,
+                6,
+                Z_DEFLATED,
+                15,
+                8, // MAX_MEM_LEVEL
+                Z_DEFAULT_STRATEGY,
+                zlibVersion(),
+                std::mem::size_of::<z_stream>() as std::ffi::c_int,
+            )
+        };
+        if ret != Z_OK {
+            return Status::error_message(&format!("zlib deflate init failed: {ret}"));
+        }
         self.mode = GzipMode::Encode;
-        self.inner = Some(GzipInner::Encode(Compress::new(Compression::new(6), false)));
+        self.inner = Some(GzipInner::Encode(stream));
         Status::ok()
     }
 
-    /// `td::Gzip::init_decode` — gzip/zlib auto-detect.
+    /// `td::Gzip::init_decode` — `inflateInit2(MAX_WBITS + 32)`: gzip/zlib
+    /// auto-detect (windowBits 47).
     pub fn init_decode(&mut self) -> Status {
         assert!(self.mode == GzipMode::Empty, "init_decode on a live codec");
         self.init_common();
+        let mut stream = new_stream();
+        let ret = unsafe {
+            inflateInit2_(
+                &mut *stream,
+                47, // MAX_WBITS + 32
+                zlibVersion(),
+                std::mem::size_of::<z_stream>() as std::ffi::c_int,
+            )
+        };
+        if ret != Z_OK {
+            return Status::error_message(&format!("zlib inflate init failed: {ret}"));
+        }
         self.mode = GzipMode::Decode;
-        self.inner = Some(GzipInner::Decode(Decompress::new(true)));
+        self.inner = Some(GzipInner::Decode(stream));
         Status::ok()
     }
 
     /// `td::Gzip::set_input` — the slice must outlive `run` calls until the
     /// data is consumed (tracked by [`Gzip::used_input`]).
     pub fn set_input(&mut self, input: &[u8]) {
-        assert_eq!(self.input_left, 0, "set_input with unconsumed input");
+        assert_eq!(self.input_size, 0, "set_input with unconsumed input");
         assert!(!self.close_input_flag, "set_input after close_input");
-        self.input = input.as_ptr();
-        self.input_left = input.len();
-        self.input_total = input.len();
+        assert!(
+            input.len() <= uInt::MAX as usize,
+            "input too large for zlib"
+        );
+        self.input_size = input.len();
+        let stream = self.stream_mut();
+        stream.next_in = input.as_ptr() as *mut Bytef;
+        stream.avail_in = input.len() as uInt;
     }
 
     /// `td::Gzip::set_output` — the slice must outlive `run` calls until the
     /// data is flushed (tracked by [`Gzip::used_output`]).
     pub fn set_output(&mut self, output: &mut [u8]) {
-        assert_eq!(self.output_left, 0, "set_output with unflushed output");
-        self.output = output.as_mut_ptr();
-        self.output_left = output.len();
-        self.output_total = output.len();
+        assert_eq!(self.output_size, 0, "set_output with unflushed output");
+        assert!(
+            output.len() <= uInt::MAX as usize,
+            "output too large for zlib"
+        );
+        self.output_size = output.len();
+        let stream = self.stream_mut();
+        stream.next_out = output.as_mut_ptr();
+        stream.avail_out = output.len() as uInt;
     }
 
     /// `td::Gzip::close_input`.
@@ -138,31 +209,35 @@ impl Gzip {
         self.left_output() == 0
     }
 
+    /// `td::Gzip::left_input` — `impl_->stream_.avail_in`.
     pub fn left_input(&self) -> usize {
-        self.input_left
+        self.inner
+            .as_ref()
+            .map_or(0, |inner| inner.stream_ref().avail_in as usize)
     }
 
+    /// `td::Gzip::left_output` — `impl_->stream_.avail_out`.
     pub fn left_output(&self) -> usize {
-        self.output_left
+        self.inner
+            .as_ref()
+            .map_or(0, |inner| inner.stream_ref().avail_out as usize)
     }
 
     /// `td::Gzip::used_input`.
     pub fn used_input(&self) -> usize {
-        self.input_total - self.left_input()
+        self.input_size - self.left_input()
     }
 
     /// `td::Gzip::used_output`.
     pub fn used_output(&self) -> usize {
-        self.output_total - self.left_output()
+        self.output_size - self.left_output()
     }
 
     /// `td::Gzip::flush_input` — consumes the remaining input, returning the
-    /// number of bytes used.
+    /// number of bytes used; the unconsumed remainder becomes the new input.
     pub fn flush_input(&mut self) -> usize {
         let res = self.used_input();
-        self.input = std::ptr::null();
-        self.input_left = 0;
-        self.input_total = 0;
+        self.input_size = self.left_input();
         res
     }
 
@@ -170,98 +245,75 @@ impl Gzip {
     /// the number of bytes produced.
     pub fn flush_output(&mut self) -> usize {
         let res = self.used_output();
-        self.output = std::ptr::null_mut();
-        self.output_left = 0;
-        self.output_total = 0;
+        self.output_size = self.left_output();
         res
     }
 
     /// `td::Gzip::run()` — drives the codec; `Running` means more buffers
     /// may be needed, `Done` means the stream finished (the codec resets).
     pub fn run(&mut self) -> Result<GzipState> {
-        let inner = self.inner.as_mut().expect("run before init");
-        let before_in = inner.total_in();
-        let before_out = inner.total_out();
-
         // SAFETY: the caller keeps the buffers set via set_input/set_output
-        // alive until flushed (the C++ contract).
-        let input = if self.input_left == 0 {
-            &mut [][..]
+        // alive until flushed (the C++ contract); zlib updates next_in/
+        // next_out/avail_* in place.
+        let inner = self.inner.as_mut().expect("run before init");
+        let stream = inner.stream_mut();
+        let ret = match self.mode {
+            // C++ inflate always uses Z_NO_FLUSH, even on close_input.
+            GzipMode::Decode => unsafe { inflate(stream, Z_NO_FLUSH) },
+            // deflate switches to Z_FINISH once close_input was called.
+            GzipMode::Encode => unsafe {
+                deflate(
+                    stream,
+                    if self.close_input_flag {
+                        Z_FINISH
+                    } else {
+                        Z_NO_FLUSH
+                    },
+                )
+            },
+            GzipMode::Empty => unreachable!("inner exists only after init"),
+        };
+        if ret == Z_OK {
+            Result::Ok(GzipState::Running)
+        } else if ret == Z_STREAM_END {
+            // TODO(now): fail if input is not empty (the C++ TODO).
+            self.clear();
+            Result::Ok(GzipState::Done)
         } else {
-            unsafe { std::slice::from_raw_parts_mut(self.input as *mut u8, self.input_left) }
-        };
-        let output = if self.output_left == 0 {
-            &mut [][..]
-        } else {
-            unsafe { std::slice::from_raw_parts_mut(self.output, self.output_left) }
-        };
-
-        let status = match self.inner.as_mut().expect("checked above") {
-            GzipInner::Decode(decompress) => {
-                // flate2's decompress is io-fallible; zlib surfaces corrupt
-                // data as Z_DATA_ERROR (-3), matching the message below.
-                match decompress.decompress(input, output, FlushDecompress::None) {
-                    Ok(status) => status,
-                    Err(_) => {
-                        self.clear();
-                        return Result::Err(Status::error_message("zlib error -3"));
-                    }
-                }
-            }
-            GzipInner::Encode(compress) => {
-                let flush = if self.close_input_flag {
-                    FlushCompress::Finish
-                } else {
-                    FlushCompress::None
-                };
-                // deflate stream errors surface as Z_STREAM_ERROR (-2).
-                match compress.compress(input, output, flush) {
-                    Ok(status) => status,
-                    Err(_) => {
-                        self.clear();
-                        return Result::Err(Status::error_message("zlib error -2"));
-                    }
-                }
-            }
-        };
-
-        let inner = self.inner.as_mut().expect("checked above");
-        let consumed = (inner.total_in() - before_in) as usize;
-        let produced = (inner.total_out() - before_out) as usize;
-        // SAFETY: consumed/produced never exceed the set buffer sizes.
-        self.input = unsafe { self.input.add(consumed) };
-        self.input_left -= consumed;
-        self.output = unsafe { self.output.add(produced) };
-        self.output_left -= produced;
-
-        match status {
-            flate2::Status::Ok => Result::Ok(GzipState::Running),
-            flate2::Status::StreamEnd => {
-                self.clear();
-                Result::Ok(GzipState::Done)
-            }
-            flate2::Status::BufError => {
-                // zlib returns Z_BUF_ERROR (-5) when no progress is possible;
-                // tdlib treats it as an error.
-                self.clear();
-                Result::Err(Status::error_message("zlib error -5"))
-            }
+            self.clear();
+            Result::Err(Status::error_message(&format!("zlib error {ret}")))
         }
     }
 
     fn init_common(&mut self) {
-        self.input = std::ptr::null();
-        self.input_left = 0;
-        self.input_total = 0;
-        self.output = std::ptr::null_mut();
-        self.output_left = 0;
-        self.output_total = 0;
+        self.input_size = 0;
+        self.output_size = 0;
         self.close_input_flag = false;
     }
 
     fn clear(&mut self) {
-        self.inner = None;
+        // `td::Gzip::clear` — inflateEnd/deflateEnd, then back to Empty. The
+        // z_stream struct itself stays (the C++ `impl_` does too), so
+        // `left_input`/`left_output` keep reporting the last avail counts.
+        if let Some(inner) = self.inner.as_mut() {
+            match (self.mode, inner) {
+                (GzipMode::Decode, GzipInner::Decode(stream)) => unsafe {
+                    inflateEnd(&mut **stream);
+                },
+                (GzipMode::Encode, GzipInner::Encode(stream)) => unsafe {
+                    deflateEnd(&mut **stream);
+                },
+                _ => {}
+            }
+        }
         self.mode = GzipMode::Empty;
+    }
+
+    fn stream_mut(&mut self) -> &mut z_stream {
+        self.inner
+            .as_mut()
+            .expect("stream access before init")
+            .stream_mut()
     }
 }
 
@@ -288,6 +340,8 @@ pub fn gzdecode(s: &[u8]) -> BufferSlice {
     let mut k = 2.0;
     gzip.set_output(message.prepare_append((s.len() as f64 * k) as usize));
     loop {
+        let before_in = gzip.used_input();
+        let before_out = gzip.used_output();
         let state = match gzip.run() {
             Result::Ok(state) => state,
             Result::Err(_) => return BufferSlice::null(),
@@ -296,13 +350,19 @@ pub fn gzdecode(s: &[u8]) -> BufferSlice {
             message.confirm_append(gzip.flush_output());
             break;
         }
-        if gzip.need_input() {
-            return BufferSlice::null();
-        }
         if gzip.need_output() {
             message.confirm_append(gzip.flush_output());
             k *= 1.5;
             gzip.set_output(message.prepare_append((gzip.left_input() as f64 * k) as usize));
+        } else if gzip.need_input()
+            && gzip.used_input() == before_in
+            && gzip.used_output() == before_out
+        {
+            // Unlike zlib, miniz_oxide consumes the whole input into its
+            // internal state while the output is full, so "input exhausted"
+            // alone is not truncation. Only a round with no input left and
+            // zero progress means the stream is truncated.
+            return BufferSlice::null();
         }
     }
     message.extract_reader().move_as_buffer_slice()
@@ -362,6 +422,26 @@ mod tests {
         encode_decode(&vec![b'a'; 1_000_000]);
     }
 
+    /// Port of `TEST(Gzip, gzencode)` — size sweep (1 → 10^7 bytes) across
+    /// the three string families, each within the C++ ratio budget
+    /// `max(2, 100 / len)` (integer division).
+    #[test]
+    fn gzencode_size_sweep() {
+        for exponent in 0..=7u32 {
+            let len = 10usize.pow(exponent);
+            for &(from, to) in &[
+                (b'a' as i32, b'a' as i32),
+                (b'a' as i32, b'z' as i32),
+                (0, 255),
+            ] {
+                let s = rand_string(from, to, len);
+                let ratio = std::cmp::max(2, 100 / len) as f64;
+                let r = gzencode(&s, ratio);
+                assert!(!r.empty(), "encode of {len} bytes in [{from}, {to}]");
+            }
+        }
+    }
+
     #[test]
     fn gzencode_compresses_and_uses_zlib_format() {
         let s = vec![b'a'; 100_000];
@@ -371,12 +451,33 @@ mod tests {
         assert_eq!(encoded.as_slice()[0], 0x78);
     }
 
+    /// `inflateInit2(MAX_WBITS + 32)` also accepts gzip-format streams.
+    /// Golden blob produced by system `gzip` (stock zlib), not by tdlib;
+    /// a zlib-only decoder would reject it.
+    #[test]
+    fn gzip_format_stream_autodetect() {
+        let blob: &[u8] = &[
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x4b, 0xcf, 0xcf, 0x49,
+            0x49, 0xcd, 0x53, 0x48, 0xaf, 0xca, 0x2c, 0x50, 0x28, 0x2e, 0x29, 0x4a, 0x4d, 0xcc,
+            0x55, 0x48, 0xcb, 0x2f, 0x52, 0x28, 0x49, 0x29, 0x2d, 0xc9, 0xcc, 0x29, 0x56, 0x28,
+            0x49, 0x2d, 0x2e, 0x29, 0xe6, 0x02, 0x00, 0x4e, 0x75, 0x34, 0xe4, 0x25, 0x00, 0x00,
+            0x00,
+        ];
+        // gzip magic; the backend must not misread this as zlib.
+        assert_eq!(&blob[..2], &[0x1f, 0x8b]);
+        let decoded = gzdecode(blob);
+        assert_eq!(
+            decoded.as_slice(),
+            b"golden gzip stream for tdutils tests\n"
+        );
+    }
+
     #[test]
     fn golden_vectors_from_the_conformance_corpus() {
         // The C++ test data blobs and their zlib decodings, pinned in S04.
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../conformance/vectors/gzip.bin"
+            "/../../conformance/vectors/gzip.bin"
         );
         let blob = std::fs::read(path).expect("conformance vectors present");
         let decoded = gzdecode(&blob);
@@ -389,7 +490,7 @@ mod tests {
 
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../conformance/vectors/gzip_bomb.bin"
+            "/../../conformance/vectors/gzip_bomb.bin"
         );
         let bomb = std::fs::read(path).expect("conformance vectors present");
         let decoded = gzdecode(&bomb);
@@ -431,7 +532,9 @@ mod tests {
 
         gzip.set_input(&encoded[10..]);
         gzip.close_input();
-        gzip.set_output(&mut out[produced..]);
+        // The C++ contract: one set_output window, `run` resumes at the
+        // zlib-advanced next_out — re-setting output requires the previous
+        // window to be fully used (`output_size_ == 0`).
         let state = gzip.run().unwrap();
         assert_eq!(state, GzipState::Done);
         let produced2 = gzip.flush_output();
