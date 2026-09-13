@@ -288,3 +288,8 @@ impl Drop for SqliteStatement {
         unsafe { ffi::sqlite3_finalize(self.stmt) };
     }
 }
+
+// SAFETY: the stmt pointer is only used under the crate's mutexes against a
+// SQLITE_THREADSAFE=1 (serialized) connection, which internally serializes
+// every call on a connection — the same contract C++ tdlib relies on.
+unsafe impl Send for SqliteStatement {}
