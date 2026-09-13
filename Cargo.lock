@@ -1020,6 +1020,7 @@ dependencies = [
 name = "tdnet"
 version = "0.1.0"
 dependencies = [
+ "parking_lot",
  "tdutils",
  "tokio",
 ]

@@ -2,7 +2,12 @@
 //!
 //! S45 — the TCP layer: [`tcp::TcpListener`] (`td/net/TcpListener`) and
 //! [`tcp::connect`] (the client half of `SocketFd::open`).
+//!
+//! S47 — the DNS layer: [`dns::GetHostByName`] (`td::GetHostByNameActor`) and
+//! [`dns::idn_to_ascii`].
 
+pub mod dns;
 pub mod tcp;
 
+pub use dns::{GetHostByName, NativeResolver, Options, Resolver, idn_to_ascii};
 pub use tcp::{AcceptCallback, TcpListener, connect};

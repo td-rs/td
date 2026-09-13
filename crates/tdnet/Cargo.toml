@@ -7,7 +7,8 @@ publish.workspace = true
 
 [dependencies]
 tdutils = { path = "../tdutils" }
-tokio = { version = "1", features = ["net", "rt"] }
+tokio = { version = "1", features = ["net", "rt", "sync"] }
+parking_lot = "0.12"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "time"] }
