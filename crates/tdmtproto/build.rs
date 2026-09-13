@@ -9,7 +9,10 @@ fn main() {
     // Per-file rerun-if-changed: a directory mtime does not change when a
     // file inside it is edited.
     for source in ["src/lib.rs", "src/model.rs", "src/rust_writer.rs"] {
-        println!("cargo:rerun-if-changed={}", generator.join(source).display());
+        println!(
+            "cargo:rerun-if-changed={}",
+            generator.join(source).display()
+        );
     }
     println!(
         "cargo:rerun-if-changed={}",

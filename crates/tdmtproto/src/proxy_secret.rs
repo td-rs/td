@@ -34,10 +34,7 @@ impl ProxySecret {
     }
 
     /// `ProxySecret::from_binary`.
-    pub fn from_binary(
-        mut raw_unchecked_secret: &[u8],
-        truncate_if_needed: bool,
-    ) -> Result<Self> {
+    pub fn from_binary(mut raw_unchecked_secret: &[u8], truncate_if_needed: bool) -> Result<Self> {
         if raw_unchecked_secret.len() > 17 + MAX_DOMAIN_LENGTH {
             if truncate_if_needed {
                 raw_unchecked_secret = &raw_unchecked_secret[..17 + MAX_DOMAIN_LENGTH];
@@ -109,7 +106,10 @@ mod tests {
         assert!(!secret.emulate_tls());
         assert_eq!(secret.get_proxy_secret(), &[1u8; 16]);
         // hex form is the canonical encoding.
-        assert_eq!(secret.get_encoded_secret(), b"01010101010101010101010101010101");
+        assert_eq!(
+            secret.get_encoded_secret(),
+            b"01010101010101010101010101010101"
+        );
         let parsed = ProxySecret::from_link(&secret.get_encoded_secret(), false).unwrap();
         assert_eq!(parsed, secret);
     }

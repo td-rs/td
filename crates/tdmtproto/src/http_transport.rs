@@ -70,7 +70,12 @@ impl IStreamTransport for HttpTransport {
         false
     }
 
-    fn write(&mut self, mut message: BufferWriter, quick_ack: bool, output: &mut ChainBufferWriter) {
+    fn write(
+        &mut self,
+        mut message: BufferWriter,
+        quick_ack: bool,
+        output: &mut ChainBufferWriter,
+    ) {
         assert!(self.can_write());
         assert!(!quick_ack);
         /*
@@ -126,7 +131,7 @@ impl IStreamTransport for HttpTransport {
         if self.secret.is_empty() {
             96
         } else {
-            (self.secret.len() + 1) / 2 * 4 + 156
+            self.secret.len().div_ceil(2) * 4 + 156
         }
     }
 

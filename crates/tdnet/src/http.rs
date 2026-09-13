@@ -140,7 +140,11 @@ impl HttpContentLengthByteFlow {
 
     /// One pass; `Ok(0)` once the whole content has been consumed, otherwise
     /// the expected additional input size (the C++ `set_need_size` value).
-    pub fn feed(&mut self, input: &mut ChainBufferReader, output: &mut ChainBufferWriter) -> Result<usize> {
+    pub fn feed(
+        &mut self,
+        input: &mut ChainBufferReader,
+        output: &mut ChainBufferWriter,
+    ) -> Result<usize> {
         let mut ready_size = input.size();
         if ready_size > self.len {
             ready_size = self.len;
@@ -196,7 +200,11 @@ impl HttpChunkedByteFlow {
 
     /// One pass; `Ok(0)` once the terminating zero-length chunk has been
     /// consumed, otherwise the expected additional input size.
-    pub fn feed(&mut self, input: &mut ChainBufferReader, output: &mut ChainBufferWriter) -> Result<usize> {
+    pub fn feed(
+        &mut self,
+        input: &mut ChainBufferReader,
+        output: &mut ChainBufferWriter,
+    ) -> Result<usize> {
         if self.state == ChunkedState::ReadChunkLength {
             match find_boundary(input.clone(), b"\r\n", &mut self.search_pos) {
                 Some(pos) => {
@@ -265,7 +273,11 @@ impl Default for HttpChunkedByteFlow {
 /// `td::find_boundary(range, boundary, already_read)`: scans `range` (owned,
 /// the caller passes a clone) from `already_read` for `boundary`; on success
 /// `already_read` is the boundary's start offset.
-pub fn find_boundary(mut range: ChainBufferReader, boundary: &[u8], already_read: &mut usize) -> Option<usize> {
+pub fn find_boundary(
+    mut range: ChainBufferReader,
+    boundary: &[u8],
+    already_read: &mut usize,
+) -> Option<usize> {
     range.advance(*already_read, &mut []);
     assert!(boundary.len() <= 74, "boundary too long");
 
@@ -380,9 +392,9 @@ pub struct HttpReader {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReaderState {
-    ReadHeaders,
-    ReadContent,
-    ReadContentChunked,
+    Headers,
+    Content,
+    ContentChunked,
 }
 
 /// `HttpReader::MAX_CONTENT_SIZE` / `MAX_TOTAL_HEADERS_LENGTH`.
@@ -392,7 +404,7 @@ const MAX_TOTAL_HEADERS_LENGTH: usize = 1 << 18;
 impl HttpReader {
     pub fn new() -> Self {
         Self {
-            state: ReaderState::ReadHeaders,
+            state: ReaderState::Headers,
             headers_read_length: 0,
             content_length: -1,
             transfer_encoding: Vec::new(),
@@ -405,10 +417,14 @@ impl HttpReader {
 
     /// `HttpReader::read_next(query)`: 0 when a complete query was parsed,
     /// otherwise the expected additional input size.
-    pub fn read_next(&mut self, input: &mut ChainBufferReader, query: &mut HttpQuery) -> Result<usize> {
+    pub fn read_next(
+        &mut self,
+        input: &mut ChainBufferReader,
+        query: &mut HttpQuery,
+    ) -> Result<usize> {
         loop {
             match self.state {
-                ReaderState::ReadHeaders => {
+                ReaderState::Headers => {
                     query.container.clear();
                     match find_boundary(input.clone(), b"\r\n\r\n", &mut self.headers_read_length) {
                         Some(_) => {
@@ -437,10 +453,10 @@ impl HttpReader {
                             if self.transfer_encoding.is_empty() {
                                 self.content_length_flow =
                                     HttpContentLengthByteFlow::new(self.content_length as usize);
-                                self.state = ReaderState::ReadContent;
+                                self.state = ReaderState::Content;
                             } else if self.transfer_encoding == b"chunked" {
                                 self.chunked_flow = HttpChunkedByteFlow::new();
-                                self.state = ReaderState::ReadContentChunked;
+                                self.state = ReaderState::ContentChunked;
                             } else {
                                 return Result::Err(Status::error(
                                     501,
@@ -460,7 +476,7 @@ impl HttpReader {
                         }
                     }
                 }
-                ReaderState::ReadContent => {
+                ReaderState::Content => {
                     let need = match self.content_length_flow.feed(input, &mut self.content) {
                         Result::Ok(need) => need,
                         Result::Err(status) => return Result::Err(status),
@@ -468,14 +484,14 @@ impl HttpReader {
                     if need != 0 {
                         return Result::Ok(need);
                     }
-                    self.state = ReaderState::ReadHeaders;
+                    self.state = ReaderState::Headers;
                     query
                         .container
                         .push(self.content.extract_reader().move_as_buffer_slice());
                     self.content = ChainBufferWriter::new();
                     return Result::Ok(0);
                 }
-                ReaderState::ReadContentChunked => {
+                ReaderState::ContentChunked => {
                     let need = match self.chunked_flow.feed(input, &mut self.content) {
                         Result::Ok(need) => need,
                         Result::Err(status) => return Result::Err(status),
@@ -483,7 +499,7 @@ impl HttpReader {
                     if need != 0 {
                         return Result::Ok(need);
                     }
-                    self.state = ReaderState::ReadHeaders;
+                    self.state = ReaderState::Headers;
                     query
                         .container
                         .push(self.content.extract_reader().move_as_buffer_slice());
@@ -585,14 +601,19 @@ impl HttpReader {
     }
 
     /// `HttpReader::process_header` — the client-side subset.
-    fn process_header(&mut self, header_name: &[u8], header_value: &[u8], query: &mut HttpQuery) -> Result<()> {
+    fn process_header(
+        &mut self,
+        header_name: &[u8],
+        header_value: &[u8],
+        query: &mut HttpQuery,
+    ) -> Result<()> {
         let header_name = to_lower(header_name);
         let header_value = to_lower(header_value);
         query
             .headers
             .push((header_name.clone(), header_value.clone()));
         if header_name == b"content-length" {
-            let content_length = lenient_to_integer(&header_value) as i64;
+            let content_length = lenient_to_integer(&header_value);
             if content_length > MAX_CONTENT_SIZE as i64 {
                 return Result::Err(Status::error(400, "Bad Request: Content-Length is too big"));
             }

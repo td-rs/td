@@ -72,9 +72,7 @@ fn calc_crypto_size2(
     use_random_padding: bool,
 ) -> usize {
     let raw_size = header_size - encrypted_header_size;
-    let encrypted_size = |data_size: usize| {
-        (encrypted_header_size + data_size + 12 + 15) & !15
-    };
+    let encrypted_size = |data_size: usize| (encrypted_header_size + data_size + 12 + 15) & !15;
     if use_random_padding {
         let rand_data_size = random::secure_uint32() as usize & 0xff;
         return raw_size + encrypted_size(data_size + rand_data_size);
@@ -86,7 +84,7 @@ fn calc_crypto_size2(
             return raw_size + size;
         }
     }
-    encrypted_size = (encrypted_size - 1280 + 447) / 448 * 448 + 1280;
+    encrypted_size = (encrypted_size - 1280).div_ceil(448) * 448 + 1280;
     raw_size + encrypted_size
 }
 
@@ -253,16 +251,22 @@ fn read_crypto_impl(
     let real_message_key: [u8; 16];
 
     if packet_info.version == 1 {
-        is_length_bad |= packet_info.check_mod4 && message_data_length % 4 != 0;
+        is_length_bad |= packet_info.check_mod4 && !message_data_length.is_multiple_of(4);
         let expected_size = calc_crypto_size(header_size, encrypted_header_size, data_size);
         is_length_bad |= expected_size != message.len();
-        let check_size = data_size * usize::from(!is_length_bad) + tail_size * usize::from(is_length_bad);
+        let check_size =
+            data_size * usize::from(!is_length_bad) + tail_size * usize::from(is_length_bad);
         // The C++ part runs from encrypt_begin to `header->data + check_size`.
-        let (ack, key) = calc_message_ack_and_key(&message[encrypt_begin..header_size + check_size]);
+        let (ack, key) =
+            calc_message_ack_and_key(&message[encrypt_begin..header_size + check_size]);
         packet_info.message_ack = ack;
         real_message_key = key;
     } else {
-        let (ack, key) = calc_message_key2(auth_key, x, &message[encrypt_begin..encrypt_begin + to_decrypt_len]);
+        let (ack, key) = calc_message_key2(
+            auth_key,
+            x,
+            &message[encrypt_begin..encrypt_begin + to_decrypt_len],
+        );
         packet_info.message_ack = ack;
         real_message_key = key;
     }
@@ -280,7 +284,7 @@ fn read_crypto_impl(
     }
 
     if packet_info.version == 2 {
-        if packet_info.check_mod4 && message_data_length % 4 != 0 {
+        if packet_info.check_mod4 && !message_data_length.is_multiple_of(4) {
             return Result::Err(Status::error_message(&format!(
                 "Invalid MTProto message: invalid length (not divisible by four) [total_size = {}] [message_data_length = {}]",
                 message.len(),
@@ -295,7 +299,7 @@ fn read_crypto_impl(
             )));
         }
         let pad_size = tail_size - data_size;
-        if pad_size < 12 || pad_size > 1024 {
+        if !(12..=1024).contains(&pad_size) {
             return Result::Err(Status::error_message(&format!(
                 "Invalid MTProto message: invalid length (invalid padding length) [padding_size = {}] [total_size = {}] [message_data_length = {}]",
                 pad_size,
@@ -419,7 +423,9 @@ fn write_crypto_impl(
     let pad_size = padded_size - header_size - data.len();
     {
         let slice = packet.as_mutable_slice();
-        random::secure_bytes(&mut slice[header_size + data.len()..header_size + data.len() + pad_size]);
+        random::secure_bytes(
+            &mut slice[header_size + data.len()..header_size + data.len() + pad_size],
+        );
     }
 
     let message_key: [u8; 16];
@@ -437,7 +443,11 @@ fn write_crypto_impl(
         let to_encrypt_len = padded_size - encrypt_begin;
         let (ack, key) = {
             let slice = packet.as_slice();
-            calc_message_key2(auth_key, x, &slice[encrypt_begin..encrypt_begin + to_encrypt_len])
+            calc_message_key2(
+                auth_key,
+                x,
+                &slice[encrypt_begin..encrypt_begin + to_encrypt_len],
+            )
         };
         packet_info.message_ack = ack;
         message_key = key;
@@ -630,7 +640,11 @@ mod tests {
                 let to = std::slice::from_raw_parts_mut(ptr, len);
                 aes_ige_decrypt(&aes_key, &mut iv, from, to);
             }
-            assert_eq!(data, original, "IGE self-inversion failed at len {len}: {:02x?}", data);
+            assert_eq!(
+                data, original,
+                "IGE self-inversion failed at len {len}: {:02x?}",
+                data
+            );
         }
     }
 
@@ -648,10 +662,7 @@ mod tests {
         // The message key is SHA-1(salt + session_id + body)[4..20] — the
         // python-verified value for the fixed test inputs.
         let message_key = &packet.as_slice()[8..24];
-        assert_eq!(
-            hex_dump(message_key),
-            "9359f7137654affa4af19b6085cde021"
-        );
+        assert_eq!(hex_dump(message_key), "9359f7137654affa4af19b6085cde021");
 
         // Decrypt with the server-side key (X=0) and check the plaintext.
         let (aes_key, aes_iv) = kdf(auth_key.key(), message_key.try_into().unwrap(), 0);
@@ -705,7 +716,9 @@ mod tests {
         let mut frame = packet.as_slice().to_vec();
         let same_id = AuthKey::new(0x0f0e0d0c0b0a0908, (0..=255).map(|i| 255 - i).collect());
         let mut read_info = packet_info(2);
-        let err = read(&mut frame, 0, &same_id, &mut read_info).error().clone();
+        let err = read(&mut frame, 0, &same_id, &mut read_info)
+            .error()
+            .clone();
         assert!(err.message().contains("message_key mismatch"));
     }
 
@@ -747,7 +760,9 @@ mod tests {
         let packet = write(&body(), &auth_key, &mut write_info, 0, 0);
         let mut frame = packet.as_slice()[..20].to_vec();
         let mut read_info = packet_info(2);
-        let err = read(&mut frame, 0, &auth_key, &mut read_info).error().clone();
+        let err = read(&mut frame, 0, &auth_key, &mut read_info)
+            .error()
+            .clone();
         assert!(err.message().contains("too small"));
     }
 

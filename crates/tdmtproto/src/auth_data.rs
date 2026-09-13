@@ -94,7 +94,12 @@ impl<const MAX_SIZE: usize> Default for MessageIdDuplicateChecker<MAX_SIZE> {
 
 impl<const MAX_SIZE: usize> MessageIdDuplicateChecker<MAX_SIZE> {
     pub fn check(&mut self, message_id: MessageId) -> Status {
-        check_message_id_duplicates(&mut self.saved_message_ids, MAX_SIZE, &mut self.end_pos, message_id)
+        check_message_id_duplicates(
+            &mut self.saved_message_ids,
+            MAX_SIZE,
+            &mut self.end_pos,
+            message_id,
+        )
     }
 }
 
@@ -381,8 +386,11 @@ impl AuthData {
             return;
         }
         self.future_salts = salts;
-        self.future_salts
-            .sort_by(|a, b| b.valid_since.partial_cmp(&a.valid_since).unwrap_or(std::cmp::Ordering::Equal));
+        self.future_salts.sort_by(|a, b| {
+            b.valid_since
+                .partial_cmp(&a.valid_since)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         self.update_salt(now);
     }
 
@@ -446,7 +454,10 @@ impl AuthData {
         // Client must check that msg_id has even parity for messages from client to server, and odd parity for messages
         // from server to client.
         if message_id.get() & 1 == 0 {
-            return (Status::error_message(&format!("Receive invalid {message_id}")), false);
+            return (
+                Status::error_message(&format!("Receive invalid {message_id}")),
+                false,
+            );
         }
 
         let status = self.duplicate_checker.check(message_id);
@@ -454,9 +465,7 @@ impl AuthData {
             return (status, false);
         }
 
-        tdutils::log_debug!(
-            "Receive packet in {message_id} from session {session_id} at {now}"
-        );
+        tdutils::log_debug!("Receive packet in {message_id} from session {session_id} at {now}");
         let time_difference_was_updated =
             self.update_server_time_difference((message_id.get() >> 32) as u32 as f64 - now);
 
@@ -464,7 +473,8 @@ impl AuthData {
         // ignored (recall that msg_id approximately equals unixtime * 2^32). This is especially important for the server.
         // The client would also find this useful (to protect from a replay attack), but only if it is certain of its time
         // (for example, if its time has been synchronized with that of the server).
-        if self.server_time_difference_was_updated && !self.is_valid_inbound_msg_id(message_id, now) {
+        if self.server_time_difference_was_updated && !self.is_valid_inbound_msg_id(message_id, now)
+        {
             return (
                 Status::error_message(&format!("Ignore too old or too new {message_id}")),
                 time_difference_was_updated,

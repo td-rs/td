@@ -15,7 +15,7 @@ use tdutils::buffer::{
     BufferBuilder, BufferSlice, BufferWriter, ChainBufferReader, ChainBufferWriter,
 };
 use tdutils::byte_flow::{AesCtrByteFlow, ByteFlowInterface, ByteFlowSink};
-use tdutils::crypto::{sha256, AesCtrState};
+use tdutils::crypto::{AesCtrState, sha256};
 use tdutils::random;
 use tdutils::status::Result;
 
@@ -46,14 +46,13 @@ pub trait IStreamTransport {
 pub fn create_transport(transport_type: TransportType) -> Box<dyn IStreamTransport> {
     match transport_type.type_ {
         TransportTypeEnum::Tcp => Box::new(tcp::OldTransport::new()),
-        TransportTypeEnum::ObfuscatedTcp => {
-            Box::new(tcp::ObfuscatedTransport::new(transport_type.dc_id, transport_type.secret))
-        }
-        TransportTypeEnum::Http => {
-            Box::new(crate::http_transport::HttpTransport::new(
-                transport_type.secret.get_raw_secret().to_vec(),
-            ))
-        }
+        TransportTypeEnum::ObfuscatedTcp => Box::new(tcp::ObfuscatedTransport::new(
+            transport_type.dc_id,
+            transport_type.secret,
+        )),
+        TransportTypeEnum::Http => Box::new(crate::http_transport::HttpTransport::new(
+            transport_type.secret.get_raw_secret().to_vec(),
+        )),
     }
 }
 
@@ -114,7 +113,7 @@ pub mod tcp {
         /// appends a random 0..16-byte tail.
         pub fn write_prepare_inplace(&self, message: &mut BufferWriter, quick_ack: bool) {
             let mut size = message.size();
-            assert!(size % 4 == 0);
+            assert!(size.is_multiple_of(4));
             assert!(size < (1 << 24));
             if quick_ack {
                 size |= 1usize << 31;
@@ -195,7 +194,12 @@ pub mod tcp {
             true
         }
 
-        fn write(&mut self, mut message: BufferWriter, quick_ack: bool, output: &mut ChainBufferWriter) {
+        fn write(
+            &mut self,
+            mut message: BufferWriter,
+            quick_ack: bool,
+            output: &mut ChainBufferWriter,
+        ) {
             self.impl_.write_prepare_inplace(&mut message, quick_ack);
             output.append_buffer_slice(message.as_buffer_slice());
         }
@@ -445,7 +449,11 @@ pub mod tcp {
         /// `ObfuscatedTransport::do_write_tls(BufferBuilder&&)`: wraps one
         /// builder into a TLS application-data record (and the fake
         /// ChangeCipherSpec prefix for the very first packet).
-        fn do_write_tls_builder(&mut self, mut builder: BufferBuilder, output: &mut ChainBufferWriter) {
+        fn do_write_tls_builder(
+            &mut self,
+            mut builder: BufferBuilder,
+            output: &mut ChainBufferWriter,
+        ) {
             if !self.header.is_empty() {
                 builder.prepend(&self.header);
                 self.header.clear();
@@ -491,7 +499,12 @@ pub mod tcp {
             true
         }
 
-        fn write(&mut self, mut message: BufferWriter, quick_ack: bool, output: &mut ChainBufferWriter) {
+        fn write(
+            &mut self,
+            mut message: BufferWriter,
+            quick_ack: bool,
+            output: &mut ChainBufferWriter,
+        ) {
             self.impl_.write_prepare_inplace(&mut message, quick_ack);
             {
                 let slice = message.as_slice();
@@ -499,8 +512,9 @@ pub mod tcp {
                 // SAFETY: in-place AES-CTR over the writer's own buffer —
                 // the C++ `output_state_.encrypt(message.as_slice(),
                 // message.as_mutable_slice())`.
-                self.output_state
-                    .encrypt_in_place(unsafe { std::slice::from_raw_parts_mut(slice.as_ptr() as *mut u8, len) });
+                self.output_state.encrypt_in_place(unsafe {
+                    std::slice::from_raw_parts_mut(slice.as_ptr() as *mut u8, len)
+                });
             }
             if self.secret.emulate_tls() {
                 self.do_write_tls(message, output);
@@ -582,7 +596,10 @@ mod tests {
         let frame = written_frame(b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c", false);
         assert_eq!(frame.len(), 4 + 12);
         assert_eq!(u32::from_le_bytes(frame[..4].try_into().unwrap()), 12);
-        assert_eq!(&frame[4..], b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c");
+        assert_eq!(
+            &frame[4..],
+            b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c"
+        );
     }
 
     #[test]

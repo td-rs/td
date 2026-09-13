@@ -20,7 +20,10 @@ impl<'a> TlsReaderByteFlow<'a> {
     }
 
     /// `TlsReaderByteFlow::loop`.
-    fn step(common: &mut ByteFlowBaseCommon<'_>, output: &mut tdutils::buffer::ChainBufferWriter) -> bool {
+    fn step(
+        common: &mut ByteFlowBaseCommon<'_>,
+        output: &mut tdutils::buffer::ChainBufferWriter,
+    ) -> bool {
         let input_size = common.input().expect("tls reader input").size();
         if input_size < 5 {
             common.set_need_size(5);

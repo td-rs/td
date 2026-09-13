@@ -17,7 +17,7 @@ pub fn hex_encode(data: &[u8]) -> Vec<u8> {
 
 /// `td::hex_decode`.
 pub fn hex_decode(hex: &[u8]) -> Result<Vec<u8>> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Result::Err(Status::error_message("Wrong hex string length"));
     }
     fn from_hex_char(c: u8) -> Option<u8> {
