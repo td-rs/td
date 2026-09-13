@@ -9,13 +9,18 @@
 //! S46 — the UDP layer: [`udp::BufferedUdp`] (`td/net/Udp.h`).
 //!
 //! S48 — the HTTP layer: [`wget::wget`] (`td/net/Wget.h`) and [`http_query`].
+//!
+//! S49 — the proxy layer: [`proxy::socks5_connect`] and
+//! [`proxy::http_proxy_connect`] (`td/net/Socks5`, `td/net/HttpProxy`).
 
 pub mod dns;
 pub mod http_query;
+pub mod proxy;
 pub mod tcp;
 pub mod udp;
 pub mod wget;
 
 pub use dns::{GetHostByName, NativeResolver, Options, Resolver, idn_to_ascii};
+pub use proxy::{http_proxy_connect, socks5_connect};
 pub use tcp::{AcceptCallback, TcpListener, connect};
 pub use udp::{BufferedUdp, UdpMessage};
