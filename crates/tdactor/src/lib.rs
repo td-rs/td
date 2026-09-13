@@ -6,9 +6,9 @@
 //! S32 adds the typed `ActorId<A>`/`ActorOwn<A>`/`ActorShared<A>` markers.
 //! S34 adds the promise/future machinery (`PromiseActor`/`FutureActor`/the
 //! `send_promise_*` RPC) together with the `immediate_closure` subset of the
-//! `send_closure` machinery it needs; the full per-actor message-enum
-//! dispatch (S33) still follows — actors otherwise communicate through
-//! [`Raw`] events.
+//! `send_closure` machinery it needs. S33 completes the machinery with the
+//! per-actor message-enum dispatch: declare handlers with
+//! [`actor_messages!`] and send with [`send_closure`]/[`send_closure_later`].
 //!
 //! ```
 //! use std::sync::{Arc, Mutex};
@@ -48,12 +48,14 @@
 pub mod actor;
 pub mod actor_id;
 pub mod event;
+pub mod messages;
 pub mod promise;
 pub mod scheduler;
 
 pub use actor::Actor;
 pub use actor_id::{ActorId, ActorOwn, ActorRef, ActorShared};
 pub use event::{Event, EventType, Raw};
+pub use messages::{ActorMessage, send_closure, send_closure_later};
 pub use promise::{
     EventFull, FutureActor, FutureActorState, PromiseActor, PromiseFuture, create_event_promise,
     create_event_promise_ok_fail, create_promise_from_promise_actor, promise_send_closure,

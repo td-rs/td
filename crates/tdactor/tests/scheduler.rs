@@ -4,10 +4,11 @@
 //! `simple_migrate`, plus a timeout test for the `set_timeout_*` machinery.
 //! The promise tests (`promise`, `FastPromise`) live in `promise.rs` (S34).
 //!
-//! The tests that still follow in S33/S35: `MultiPromise`,
-//! `MultiPromiseSendClosureLater` (S33 closures),
-//! `always_wait_for_mailbox` (S35 `SleepActor`) and file-descriptor
-//! `open_close`.
+//! The S33 `send_closure` tests (`SendLater` via messages,
+//! `simple_pass_event_arguments`, `PingPong`, `main`) live in
+//! `send_closure.rs`. Still following in S35: `MultiPromise`,
+//! `MultiPromiseSendClosureLater` (both need the S35 `SleepActor`),
+//! `always_wait_for_mailbox` and file-descriptor `open_close`.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
