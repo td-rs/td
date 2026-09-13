@@ -456,11 +456,16 @@ impl AesIgeState {
             .chunks_exact(AES_BLOCK_SIZE)
             .zip(to[..from.len()].chunks_exact_mut(AES_BLOCK_SIZE))
         {
+            // The C++ `encrypted.load(in)` copies the ciphertext block
+            // before the in-place write below; `in_block` may alias
+            // `out_block`, so reading it after the write would give the
+            // decrypted bytes instead of the ciphertext.
+            let mut encrypted = [0u8; AES_BLOCK_SIZE];
+            encrypted.copy_from_slice(in_block);
+
             let mut block = [0u8; AES_BLOCK_SIZE];
-            for ((byte, plaintext_iv), in_byte) in
-                block.iter_mut().zip(self.plaintext_iv).zip(in_block)
-            {
-                *byte = plaintext_iv ^ *in_byte;
+            for (i, byte) in block.iter_mut().enumerate() {
+                *byte = self.plaintext_iv[i] ^ encrypted[i];
             }
             let mut aes_block = aes::Block::clone_from_slice(&block);
             self.cipher.decrypt_block(&mut aes_block);
@@ -470,7 +475,7 @@ impl AesIgeState {
             }
             out_block.copy_from_slice(&block);
             self.plaintext_iv = block;
-            self.encrypted_iv.copy_from_slice(in_block);
+            self.encrypted_iv = encrypted;
         }
     }
 }

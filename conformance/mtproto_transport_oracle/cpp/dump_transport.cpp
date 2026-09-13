@@ -7,10 +7,13 @@
 // byte-identical (verify.sh diffs them), and each side additionally reads
 // the *other* side's padded frames.
 //
+#include "td/mtproto/AuthKey.h"
+#include "td/mtproto/KDF.h"
 #include "td/mtproto/TcpTransport.h"
 #include "td/mtproto/Transport.h"
 
 #include "td/utils/as.h"
+#include "td/utils/Storer.h"
 #include "td/utils/UInt.h"
 
 #include "td/utils/buffer.h"
@@ -40,6 +43,26 @@ static std::string read_file(Slice path) {
   CHECK(read == data.size());
   std::fclose(f);
   return data;
+}
+
+static std::string make_auth_key() {
+  std::string key(256, '\0');
+  for (int i = 0; i < 256; i++) {
+    key[static_cast<size_t>(i)] = static_cast<char>(i);
+  }
+  return key;
+}
+
+static td::mtproto::AuthKey get_auth_key() {
+  return td::mtproto::AuthKey(0x0f0e0d0c0b0a0908ull, make_auth_key());
+}
+
+static void set_packet_info(td::mtproto::PacketInfo &packet_info, int version) {
+  packet_info.version = version;
+  packet_info.no_crypto_flag = false;
+  packet_info.type = td::mtproto::PacketInfo::Common;
+  packet_info.salt = 0x0102030405060708ull;
+  packet_info.session_id = 0x1112131415161718ull;
 }
 
 int main(int argc, char **argv) {
@@ -249,6 +272,126 @@ int main(int argc, char **argv) {
       return 0;
     }
     std::printf("h:ok:%s:%d\n", td::hex_encode(message.as_slice()).c_str(), error_code);
+    return 0;
+  }
+  if (command == "--crypto-write") {
+    // --crypto-write <body-hex> <version 1|2> [random-pad 0|1]
+    CHECK(argc == 4 || argc == 5);
+    auto body = td::hex_decode(Slice(argv[2])).move_as_ok();
+    int version = std::atoi(argv[3]);
+    auto auth_key = get_auth_key();
+    td::mtproto::PacketInfo packet_info;
+    set_packet_info(packet_info, version);
+    if (argc == 5) {
+      packet_info.use_random_padding = std::atoi(argv[4]) != 0;
+    }
+    auto packet = td::mtproto::Transport::write(td::create_storer(body), auth_key, &packet_info);
+    std::printf("c:w:%s\n", td::hex_encode(packet.as_slice()).c_str());
+    return 0;
+  }
+  if (command == "--crypto-read-server") {
+    // --crypto-read-server <frame-hex> <version 1|2>
+    // Server-side read (X=0): the client's own read uses X=8, so only the
+    // server can decrypt client-written frames.
+    CHECK(argc == 4);
+    auto frame = td::hex_decode(Slice(argv[2])).move_as_ok();
+    int version = std::atoi(argv[3]);
+    auto auth_key = get_auth_key();
+    CHECK(frame.size() >= 40);
+    td::uint64 auth_key_id = td::as<td::uint64>(frame.data());
+    td::UInt128 message_key = td::as<td::UInt128>(frame.data() + 8);
+    CHECK(auth_key_id == auth_key.id());
+
+    size_t to_decrypt_len = (frame.size() - 24) & ~15u;
+    std::string to_decrypt = frame.substr(24);
+    td::UInt256 aes_key;
+    td::UInt256 aes_iv;
+    if (version == 1) {
+      td::mtproto::KDF(auth_key.key(), message_key, 0, &aes_key, &aes_iv);
+    } else {
+      td::mtproto::KDF2(auth_key.key(), message_key, 0, &aes_key, &aes_iv);
+    }
+    td::aes_ige_decrypt(td::as_slice(aes_key), td::as_mutable_slice(aes_iv), to_decrypt, to_decrypt);
+
+    td::UInt128 expected;
+    if (version == 1) {
+      // The v1 message key covers the *decrypted* salt + session + msg_id
+      // + seq_no + message_data_length + payload — the first
+      // 16 + (message_data_length + 16) bytes of to_decrypt (the same
+      // span td's write_crypto_impl hashed at [encrypt_begin,
+      // header->data + data_size) before encrypting it).
+      td::uint32 v1_message_data_length = td::as<td::uint32>(to_decrypt.data() + 28);
+      size_t v1_data_size = v1_message_data_length + 16;
+      auto part = to_decrypt.substr(0, 16 + v1_data_size);
+      td::UInt<160> sha1_raw;
+      td::sha1(part, sha1_raw.raw);
+      expected = td::as<td::UInt128>(sha1_raw.raw + 4);
+    } else {
+      auto msg_key_input = auth_key.key().substr(88, 32) + to_decrypt;
+      td::UInt<256> sha256_raw;
+      td::sha256(msg_key_input, td::MutableSlice(sha256_raw.raw, sizeof(sha256_raw.raw)));
+      expected = td::as<td::UInt128>(sha256_raw.raw + 8);
+    }
+    if (expected != message_key) {
+      std::printf("c:r:error:Invalid MTProto message: message_key mismatch [found = %s] [expected = %s]\n",
+                  td::hex_encode(td::as_slice(message_key)).c_str(),
+                  td::hex_encode(td::as_slice(expected)).c_str());
+      return 0;
+    }
+
+    td::uint32 message_data_length = td::as<td::uint32>(to_decrypt.data() + 28);
+    size_t data_size = static_cast<size_t>(message_data_length) + 16;
+    if (message_data_length % 4 != 0) {
+      std::printf("c:r:error:Invalid MTProto message: invalid length (not divisible by four)\n");
+      return 0;
+    }
+    if (to_decrypt.size() - 16 < message_data_length) {
+      std::printf("c:r:error:Invalid MTProto message: invalid length (message_data_length is too big)\n");
+      return 0;
+    }
+    if (version == 2) {
+      size_t pad_size = to_decrypt.size() - data_size;
+      if (pad_size < 12 || pad_size > 1024) {
+        std::printf("c:r:error:Invalid MTProto message: invalid length (invalid padding length)\n");
+        return 0;
+      }
+    } else {
+      size_t expected_size = 24 + ((16 + data_size + 15) & ~15u);
+      if (expected_size != frame.size()) {
+        std::printf("c:r:error:Invalid MTProto message: invalid length\n");
+        return 0;
+      }
+    }
+    td::uint64 salt = td::as<td::uint64>(to_decrypt.data());
+    td::uint64 session_id = td::as<td::uint64>(to_decrypt.data() + 8);
+    td::uint64 msg_id = td::as<td::uint64>(to_decrypt.data() + 16);
+    td::uint32 seq_no = td::as<td::uint32>(to_decrypt.data() + 24);
+    std::printf("c:r:ok:%s:%llx:%llx:%llx:%u\n",
+                td::hex_encode(td::Slice(to_decrypt).substr(16, data_size)).c_str(),
+                static_cast<unsigned long long>(salt), static_cast<unsigned long long>(session_id),
+                static_cast<unsigned long long>(msg_id), seq_no);
+    return 0;
+  }
+  if (command == "--crypto-read") {
+    // --crypto-read <frame-hex> <version 1|2>
+    CHECK(argc == 4);
+    auto frame = td::hex_decode(Slice(argv[2])).move_as_ok();
+    int version = std::atoi(argv[3]);
+    auto auth_key = get_auth_key();
+    td::mtproto::PacketInfo packet_info;
+    set_packet_info(packet_info, version);
+    auto r_res = td::mtproto::Transport::read(frame, 0, auth_key, &packet_info);
+    if (r_res.is_error()) {
+      std::printf("c:r:error:%s\n", r_res.error().message().c_str());
+      return 0;
+    }
+    auto res = r_res.move_as_ok();
+    CHECK(res.type() == td::mtproto::Transport::ReadResult::Packet);
+    auto packet = res.packet();
+    std::printf("c:r:ok:%s:%llx:%llx:%llx:%d\n", td::hex_encode(packet).c_str(),
+                static_cast<unsigned long long>(packet_info.salt),
+                static_cast<unsigned long long>(packet_info.session_id),
+                static_cast<unsigned long long>(packet_info.message_id.get()), packet_info.seq_no);
     return 0;
   }
   if (command == "--read-file") {

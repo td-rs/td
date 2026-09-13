@@ -13,7 +13,9 @@
 pub mod auth_data;
 pub mod auth_key;
 pub mod http_transport;
+pub mod kdf;
 pub mod message_id;
+pub mod packet;
 pub mod packet_info;
 pub mod proxy_secret;
 pub mod tls_reader_byte_flow;

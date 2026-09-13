@@ -180,4 +180,38 @@ for resp in "$RESP_CONTENT_LENGTH" "$RESP_CHUNKED"; do
 done
 diff -u "$WORK/cpp-http-read.txt" "$WORK/rust-http-read.txt"
 
-echo "S54+S55+S56 transport oracle: ALL GREEN"
+echo "== S57 packet crypto vectors =="
+# A valid body: msg_id=1, seq_no=0, length=4, payload aabb (the length field
+# must agree with the actual payload).
+# v2 message keys cover the random padding, so v2 writes are never
+# deterministic — the write diff covers v1 prefixes only; v2 is verified
+# through the read direction and the random-pad cross-reads below.
+BODY="0100000000000000000000000400000061616262"
+for body in "" "aabbccdd" "$BODY"; do
+  # v1 pads with random bytes; only whole ciphertext blocks before the
+  # pad block are deterministic (auth_key_id + msg_key + encrypted
+  # salt/session + whole 16-byte blocks of the body).
+  prefix_len=$((2 * (40 + ((${#body} / 2) & ~15))))
+  "$WORK/dump_transport_cpp" --crypto-write "$body" 1 | cut -c1-"$prefix_len" >>"$WORK/cpp-crypto.txt"
+  "$DUMP_RUST" --crypto-write "$body" 1 | cut -c1-"$prefix_len" >>"$WORK/rust-crypto.txt"
+done
+diff -u "$WORK/cpp-crypto.txt" "$WORK/rust-crypto.txt"
+for version in 1 2; do
+  frame_cpp=$("$WORK/dump_transport_cpp" --crypto-write "$BODY" "$version" | cut -c5-)
+  "$WORK/dump_transport_cpp" --crypto-read-server "$frame_cpp" "$version" >>"$WORK/cpp-crypto-read.txt"
+  "$DUMP_RUST" --crypto-read-server "$frame_cpp" "$version" >>"$WORK/rust-crypto-read.txt"
+  frame_rust=$("$DUMP_RUST" --crypto-write "$BODY" "$version" | cut -c5-)
+  "$WORK/dump_transport_cpp" --crypto-read-server "$frame_rust" "$version" >>"$WORK/cpp-crypto-read.txt"
+  "$DUMP_RUST" --crypto-read-server "$frame_rust" "$version" >>"$WORK/rust-crypto-read.txt"
+done
+diff -u "$WORK/cpp-crypto-read.txt" "$WORK/rust-crypto-read.txt"
+# Random padding (v2 only): each side generates, both sides decrypt.
+for side in cpp rust; do
+  dump="$WORK/dump_transport_cpp"; [ "$side" = rust ] && dump="$DUMP_RUST"
+  frame=$("$dump" --crypto-write "$BODY" 2 1 | cut -c5-)
+  "$WORK/dump_transport_cpp" --crypto-read-server "$frame" 2 >>"$WORK/cpp-crypto-rand.txt"
+  "$DUMP_RUST" --crypto-read-server "$frame" 2 >>"$WORK/rust-crypto-rand.txt"
+done
+diff -u "$WORK/cpp-crypto-rand.txt" "$WORK/rust-crypto-rand.txt"
+
+echo "S54+S55+S56+S57 transport oracle: ALL GREEN"

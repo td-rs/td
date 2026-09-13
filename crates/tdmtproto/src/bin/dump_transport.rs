@@ -6,7 +6,10 @@
 use std::fs;
 use std::io::Write as _;
 
+use tdmtproto::auth_key::AuthKey;
 use tdmtproto::http_transport::HttpTransport;
+use tdmtproto::packet::{self, ReadResult};
+use tdmtproto::packet_info::{PacketInfo, PacketType};
 use tdmtproto::proxy_secret::ProxySecret;
 use tdmtproto::transport::IStreamTransport;
 use tdmtproto::transport::tcp::{IntermediateTransport, ObfuscatedTransport};
@@ -16,6 +19,33 @@ use tdutils::status::Result;
 
 fn hex_out(data: &[u8]) -> String {
     String::from_utf8(utils::hex_encode(data)).expect("hex is ASCII")
+}
+
+/// `--crypto-read[{-server}] <frame-hex> <version 1|2>`.
+fn crypto_read_impl(args: &[String], x: usize) {
+    assert_eq!(args.len(), 4);
+    let mut frame = utils::hex_decode(args[2].as_bytes()).unwrap();
+    let version: i32 = args[3].parse().unwrap();
+    let key: Vec<u8> = (0..=255).collect();
+    let auth_key = AuthKey::new(0x0f0e0d0c0b0a0908, key);
+    let mut pi = PacketInfo::new();
+    pi.version = version;
+    pi.no_crypto_flag = false;
+    pi.type_ = PacketType::Common;
+    match packet::read_with_x(&mut frame, 0, &auth_key, &mut pi, x) {
+        Result::Err(status) => println!("c:r:error:{}", status.message()),
+        Result::Ok(ReadResult::Packet { offset, len }) => {
+            println!(
+                "c:r:ok:{}:{:x}:{:x}:{:x}:{}",
+                hex_out(&frame[offset..offset + len]),
+                pi.salt,
+                pi.session_id,
+                pi.message_id.get(),
+                pi.seq_no
+            );
+        }
+        Result::Ok(_) => println!("c:r:error:unexpected read result"),
+    }
 }
 
 fn main() {
@@ -212,6 +242,35 @@ fn main() {
                 Result::Ok(wait) if wait != 0 => println!("h:wait:{wait}"),
                 Result::Ok(_) => println!("h:ok:{}:{error_code}", hex_out(message.as_slice())),
             }
+        }
+        "--crypto-write" => {
+            // --crypto-write <body-hex> <version 1|2> [random-pad 0|1]
+            assert!(args.len() == 4 || args.len() == 5);
+            let body = utils::hex_decode(args[2].as_bytes()).unwrap();
+            let version: i32 = args[3].parse().unwrap();
+            let key: Vec<u8> = (0..=255).collect();
+            let auth_key = AuthKey::new(0x0f0e0d0c0b0a0908, key);
+            let mut pi = PacketInfo::new();
+            pi.version = version;
+            pi.no_crypto_flag = false;
+            pi.type_ = PacketType::Common;
+            pi.salt = 0x0102030405060708;
+            pi.session_id = 0x1112131415161718;
+            if args.len() == 5 {
+                pi.use_random_padding = args[4] == "1";
+            }
+            let packet = packet::write(&body, &auth_key, &mut pi, 0, 0);
+            println!("c:w:{}", hex_out(packet.as_slice()));
+        }
+        "--crypto-read" => {
+            // --crypto-read <frame-hex> <version 1|2> — the client-side read
+            // (X=8).
+            crypto_read_impl(&args, 8);
+        }
+        "--crypto-read-server" => {
+            // --crypto-read-server <frame-hex> <version 1|2> — the
+            // server-side read (X=0).
+            crypto_read_impl(&args, 0);
         }
         "--read-file" => {
             // --read-file <path> [padded 0|1]
