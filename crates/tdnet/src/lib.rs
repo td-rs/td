@@ -1,4 +1,4 @@
-//! Port of `td/net` on tokio: TCP/UDP, DNS, HTTP, proxies, fake-TLS (MTProxy).
+//! Port of `td/net` on tokio: TCP/UDP, DNS, HTTP, proxies, fake-TLS (MTProto).
 //!
 //! S45 — the TCP layer: [`tcp::TcpListener`] (`td/net/TcpListener`) and
 //! [`tcp::connect`] (the client half of `SocketFd::open`).
@@ -20,10 +20,16 @@
 //!
 //! S52 — the net-query dispatch core (`td/telegram/net/{DcId,NetQuery,
 //! NetActor,NetQueryDispatcher,NetQueryDelayer}`): [`net_query`].
+//!
+//! S56 — the HTTP framing pieces for the MTProto HTTP transport: [`http`]
+//! (`HttpQuery`/`HttpHeaderCreator`/`HttpReader` + the content decoders) —
+//! the C++ `HttpTransport` drives raw HTTP over the DC socket, outside
+//! S48's reqwest-based `wget`.
 
 mod transparent;
 
 pub mod dns;
+pub mod http;
 pub mod http_query;
 pub mod net_query;
 pub mod proxy;

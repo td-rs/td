@@ -12,6 +12,7 @@
 
 pub mod auth_data;
 pub mod auth_key;
+pub mod http_transport;
 pub mod message_id;
 pub mod packet_info;
 pub mod proxy_secret;

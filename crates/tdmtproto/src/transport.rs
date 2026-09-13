@@ -50,8 +50,9 @@ pub fn create_transport(transport_type: TransportType) -> Box<dyn IStreamTranspo
             Box::new(tcp::ObfuscatedTransport::new(transport_type.dc_id, transport_type.secret))
         }
         TransportTypeEnum::Http => {
-            // S56: the HTTP transport lands with the HTTP reader.
-            panic!("Http transport is implemented in S56")
+            Box::new(crate::http_transport::HttpTransport::new(
+                transport_type.secret.get_raw_secret().to_vec(),
+            ))
         }
     }
 }

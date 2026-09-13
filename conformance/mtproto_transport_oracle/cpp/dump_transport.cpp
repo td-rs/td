@@ -1,5 +1,5 @@
 //
-// S54/S55 verification tool: differential transport-framing oracle.
+// S54 verification tool: differential transport-framing oracle.
 //
 // Exercises td's own IntermediateTransport (abridged framing and its
 // padded variant) with the exact same scenarios as the Rust mirror binary
@@ -8,6 +8,7 @@
 // the *other* side's padded frames.
 //
 #include "td/mtproto/TcpTransport.h"
+#include "td/mtproto/Transport.h"
 
 #include "td/utils/as.h"
 #include "td/utils/UInt.h"
@@ -196,6 +197,58 @@ int main(int argc, char **argv) {
       }
       std::printf("o:ok:%s:%u\n", td::hex_encode(message.as_slice()).c_str(), quick_ack);
     }
+    return 0;
+  }
+  if (command == "--http-write") {
+    // --http-write <payload-hex> [secret-hex]
+    CHECK(argc == 3 || argc == 4);
+    std::string secret = argc == 4 ? td::hex_decode(Slice(argv[3])).move_as_ok() : "";
+    td::mtproto::TransportType type{td::mtproto::TransportType::Http, 0, td::mtproto::ProxySecret::from_raw(secret)};
+    auto transport = td::mtproto::create_transport(std::move(type));
+    td::ChainBufferWriter output_writer;
+    td::ChainBufferReader input;
+    transport->init(&input, &output_writer);
+    auto payload = td::hex_decode(Slice(argv[2])).move_as_ok();
+    td::BufferWriter message(payload, transport->max_prepend_size(), transport->max_append_size());
+    transport->write(std::move(message), false);
+    auto reader = output_writer.extract_reader();
+    std::string all;
+    while (reader.size() > 0) {
+      auto slice = reader.prepare_read();
+      all.append(slice.data(), slice.size());
+      reader.confirm_read(slice.size());
+    }
+    std::printf("h:w:%s\n", td::hex_encode(all).c_str());
+    return 0;
+  }
+  if (command == "--http-read") {
+    // --http-read <frame-hex> [secret-hex]
+    CHECK(argc == 3 || argc == 4);
+    std::string secret = argc == 4 ? td::hex_decode(Slice(argv[3])).move_as_ok() : "";
+    td::mtproto::TransportType type{td::mtproto::TransportType::Http, 0, td::mtproto::ProxySecret::from_raw(secret)};
+    auto transport = td::mtproto::create_transport(std::move(type));
+    auto frame = td::hex_decode(Slice(argv[2])).move_as_ok();
+    td::ChainBufferWriter input_writer;
+    input_writer.append(frame);
+    auto response_input = input_writer.extract_reader();
+    td::ChainBufferWriter output_writer;
+    transport->init(&response_input, &output_writer);
+    // Flip turn to Read with a dummy write (the transport starts in Write).
+    td::BufferWriter dummy(td::Slice(), transport->max_prepend_size(), transport->max_append_size());
+    transport->write(std::move(dummy), false);
+    td::BufferSlice message;
+    td::uint32 quick_ack = 0;
+    td::int32 error_code = 0;
+    auto r_wait = transport->read_next(&message, &quick_ack, &error_code);
+    if (r_wait.is_error()) {
+      std::printf("h:error:%s\n", r_wait.error().message().c_str());
+      return 0;
+    }
+    if (r_wait.ok() != 0) {
+      std::printf("h:wait:%zu\n", r_wait.ok());
+      return 0;
+    }
+    std::printf("h:ok:%s:%d\n", td::hex_encode(message.as_slice()).c_str(), error_code);
     return 0;
   }
   if (command == "--read-file") {

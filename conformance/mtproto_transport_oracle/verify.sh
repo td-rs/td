@@ -161,4 +161,23 @@ for secret in "${SECRETS[@]}"; do
   diff -u "$WORK/rust-obf.txt" "$WORK/cpp-reads-rust-obf.txt"
 done
 
-echo "S54+S55 transport oracle: ALL GREEN"
+echo "== S56 HTTP transport vectors =="
+# Empty secret, plain host and host|authorization; the POST frames must be
+# byte-identical.
+for secret in "" "686f73742e6578616d706c65" "686f73742e6578616d706c657c757365723a70617373"; do
+  for payload in "" "41" "41424344"; do
+    "$WORK/dump_transport_cpp" --http-write "$payload" "$secret" >>"$WORK/cpp-http.txt"
+    "$DUMP_RUST" --http-write "$payload" "$secret" >>"$WORK/rust-http.txt"
+  done
+done
+diff -u "$WORK/cpp-http.txt" "$WORK/rust-http.txt"
+# The read direction: fixed content-length and chunked responses.
+RESP_CONTENT_LENGTH="485454502f312e3120323030204f4b0d0a436f6e74656e742d4c656e6774683a20340d0a0d0a41424344"
+RESP_CHUNKED="485454502f312e3120323030204f4b0d0a5472616e736665722d456e636f64696e673a206368756e6b65640d0a0d0a343b616263640d0a303b0d0a"
+for resp in "$RESP_CONTENT_LENGTH" "$RESP_CHUNKED"; do
+  "$WORK/dump_transport_cpp" --http-read "$resp" "" >>"$WORK/cpp-http-read.txt"
+  "$DUMP_RUST" --http-read "$resp" "" >>"$WORK/rust-http-read.txt"
+done
+diff -u "$WORK/cpp-http-read.txt" "$WORK/rust-http-read.txt"
+
+echo "S54+S55+S56 transport oracle: ALL GREEN"

@@ -6,11 +6,13 @@
 use std::fs;
 use std::io::Write as _;
 
+use tdmtproto::http_transport::HttpTransport;
 use tdmtproto::proxy_secret::ProxySecret;
 use tdmtproto::transport::IStreamTransport;
 use tdmtproto::transport::tcp::{IntermediateTransport, ObfuscatedTransport};
 use tdmtproto::utils;
 use tdutils::buffer::{BufferSlice, BufferWriter, ChainBufferReader, ChainBufferWriter};
+use tdutils::status::Result;
 
 fn hex_out(data: &[u8]) -> String {
     String::from_utf8(utils::hex_encode(data)).expect("hex is ASCII")
@@ -154,6 +156,61 @@ fn main() {
                     break;
                 }
                 println!("o:ok:{}:{quick_ack}", hex_out(message.as_slice()));
+            }
+        }
+        "--http-write" => {
+            // --http-write <payload-hex> [secret-hex]
+            assert!(args.len() == 3 || args.len() == 4);
+            let secret = if args.len() == 4 {
+                utils::hex_decode(args[3].as_bytes()).unwrap()
+            } else {
+                Vec::new()
+            };
+            let mut transport = HttpTransport::new(secret);
+            let mut output = ChainBufferWriter::new();
+            transport.init(ChainBufferReader::null(), &mut output);
+            let payload = utils::hex_decode(args[2].as_bytes()).unwrap();
+            let message = BufferWriter::from_slice_with_reserve(
+                &payload,
+                transport.max_prepend_size(),
+                transport.max_append_size(),
+            );
+            transport.write(message, false, &mut output);
+            let mut reader = output.extract_reader();
+            let mut all = vec![0u8; reader.size()];
+            let all_len = all.len();
+            assert_eq!(reader.advance(all_len, &mut all), all_len);
+            println!("h:w:{}", hex_out(&all));
+        }
+        "--http-read" => {
+            // --http-read <frame-hex> [secret-hex]
+            assert!(args.len() == 3 || args.len() == 4);
+            let secret = if args.len() == 4 {
+                utils::hex_decode(args[3].as_bytes()).unwrap()
+            } else {
+                Vec::new()
+            };
+            let mut transport = HttpTransport::new(secret);
+            let data = utils::hex_decode(args[2].as_bytes()).unwrap();
+            let mut writer = ChainBufferWriter::new();
+            writer.append(&data, 0);
+            let input = writer.extract_reader();
+            let mut output = ChainBufferWriter::new();
+            transport.init(input, &mut output);
+            // Flip turn to Read with a dummy write (the transport starts in Write).
+            let dummy = BufferWriter::from_slice_with_reserve(
+                &[],
+                transport.max_prepend_size(),
+                transport.max_append_size(),
+            );
+            transport.write(dummy, false, &mut output);
+            let mut message = BufferSlice::null();
+            let mut quick_ack = 0;
+            let mut error_code = 0;
+            match transport.read_next(&mut message, &mut quick_ack, &mut error_code) {
+                Result::Err(status) => println!("h:error:{}", status.message()),
+                Result::Ok(wait) if wait != 0 => println!("h:wait:{wait}"),
+                Result::Ok(_) => println!("h:ok:{}:{error_code}", hex_out(message.as_slice())),
             }
         }
         "--read-file" => {
