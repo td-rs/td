@@ -28,7 +28,9 @@
 //!   Semantics are identical; the constant factors are checked at S37.
 //! - `ActorContext`/`need_context` (log tags) is not ported yet — it lands
 //!   with the logging wiring (S36/S67).
-//! - `Event::Custom` and the closure machinery arrive with S33, so
+//! - `Event::Custom` carries the immediate-closure subset landed with S34
+//!   (`send_closure_immediately`/`send_closure_later` thunks); the
+//!   `delayed_closure`/message-enum machinery (S33) is still missing, so
 //!   `start_migrate`/`finish_migrate` per-event hooks are currently no-ops.
 
 use std::cell::{Cell, RefCell, UnsafeCell};
@@ -54,10 +56,38 @@ const FLAG_MIGRATE: u32 = 2;
 /// `Timestamp::in(10000)` in `Scheduler::get_timeout`.
 const IDLE_POLL: Duration = Duration::from_secs(10);
 
+/// The actor storage behind [`ActorInfo`]: either the scheduler owns the actor
+/// (C++ `Deleter::Destroy`) or the caller does (C++ `Deleter::None`, the
+/// by-pointer `register_actor` overload — `PromiseFuture`'s `FutureActor`).
+pub(crate) enum ActorSlot {
+    Empty,
+    Owned(Box<dyn Actor>),
+    Borrowed(*mut dyn Actor),
+}
+
+impl ActorSlot {
+    /// `ActorInfo::get_actor_unsafe()`: the live actor, if any.
+    fn as_mut(&mut self) -> Option<&mut dyn Actor> {
+        match self {
+            Self::Empty => None,
+            Self::Owned(boxed) => Some(boxed.as_mut()),
+            // SAFETY: a borrowed actor is valid until its destruction (the
+            // `register_actor_ptr` contract, identical to C++ `Deleter::None`).
+            Self::Borrowed(ptr) => {
+                if ptr.is_null() {
+                    None
+                } else {
+                    Some(unsafe { &mut **ptr })
+                }
+            }
+        }
+    }
+}
+
 /// Port of C++ `ActorInfo` (the `mailbox_`, `is_running_` and timeout parts;
 /// the atomic `sched_id_` lives in the `IdSlot` shared with [`ActorId`]).
 pub(crate) struct ActorInfo {
-    pub actor: RefCell<Option<Box<dyn Actor>>>,
+    pub actor: RefCell<ActorSlot>,
     pub mailbox: RefCell<VecDeque<Event>>,
     pub is_running: Cell<bool>,
     pub in_ready: Cell<bool>,
@@ -70,9 +100,9 @@ pub(crate) struct ActorInfo {
 }
 
 impl ActorInfo {
-    fn new<A: Actor>(actor: A) -> Self {
+    fn new(actor: ActorSlot) -> Self {
         Self {
-            actor: RefCell::new(Some(Box::new(actor))),
+            actor: RefCell::new(actor),
             mailbox: RefCell::new(VecDeque::new()),
             is_running: Cell::new(false),
             in_ready: Cell::new(false),
@@ -227,7 +257,7 @@ impl SchedulerState {
 
     /// `Scheduler::create_actor`: register on the current scheduler.
     pub fn create_actor<A: Actor>(&self, name: &str, actor: A) -> ActorOwn<A> {
-        self.register_actor_impl(name, actor, self.sched_id)
+        self.register_actor_impl(name, ActorSlot::Owned(Box::new(actor)), self.sched_id)
     }
 
     /// `Scheduler::create_actor_on_scheduler`.
@@ -237,16 +267,45 @@ impl SchedulerState {
         sched_id: i32,
         actor: A,
     ) -> ActorOwn<A> {
-        self.register_actor_impl(name, actor, sched_id)
+        self.register_actor_impl(name, ActorSlot::Owned(Box::new(actor)), sched_id)
     }
 
     /// `Scheduler::register_actor` (the `Deleter::Destroy` overload: the
     /// scheduler owns the actor).
     pub fn register_actor<A: Actor>(&self, name: &str, sched_id: i32, actor: A) -> ActorOwn<A> {
-        self.register_actor_impl(name, actor, sched_id)
+        self.register_actor_impl(name, ActorSlot::Owned(Box::new(actor)), sched_id)
     }
 
-    fn register_actor_impl<A: Actor>(&self, name: &str, actor: A, sched_id: i32) -> ActorOwn<A> {
+    /// `Scheduler::register_actor(name, actor_ptr)` — the C++ `Deleter::None`
+    /// overload: the scheduler runs but does not own the actor; the caller
+    /// drops it after the actor is destroyed. Like C++
+    /// `ActorTraits<FutureActor<T>>::need_start_up = false`, no `Event::start`
+    /// is sent for actors registered this way.
+    ///
+    /// # Safety
+    ///
+    /// `actor` must point to a valid `A` that outlives the registration: the
+    /// scheduler may run the actor's methods through it at any time after this
+    /// call, and stops dereferencing it once the actor is destroyed
+    /// (`do_stop_actor`, a hangup-driven `stop`, or scheduler teardown).
+    pub(crate) unsafe fn register_actor_ptr<A: Actor>(
+        &self,
+        name: &str,
+        sched_id: i32,
+        actor: *mut A,
+    ) -> ActorOwn<A> {
+        self.register_actor_impl(name, ActorSlot::Borrowed(actor as *mut dyn Actor), sched_id)
+    }
+
+    fn register_actor_impl<A: Actor>(
+        &self,
+        name: &str,
+        actor: ActorSlot,
+        sched_id: i32,
+    ) -> ActorOwn<A> {
+        // C++ sends Event::start to owned actors only (need_start_up is false
+        // for borrowed ones; see `register_actor_ptr`).
+        let need_start_up = matches!(actor, ActorSlot::Owned(_));
         assert!(
             self.has_guard.get(),
             "create_actor requires a scheduler guard"
@@ -274,7 +333,9 @@ impl SchedulerState {
         } else {
             self.pending.borrow_mut().insert(id.clone());
             self.info(id.clone()).in_pending.set(true);
-            self.send_later(id.clone(), Event::start());
+            if need_start_up {
+                self.send_later(id.clone(), Event::start());
+            }
         }
         ActorOwn::new(id.cast::<A>())
     }
@@ -291,6 +352,26 @@ impl SchedulerState {
     /// mailbox.
     pub fn send_later(&self, actor_ref: impl Into<ActorRef>, event: Event) {
         self.send_later_impl(actor_ref.into(), event);
+    }
+
+    /// `Scheduler::send_closure_immediately` — the send half of C++
+    /// `send_closure`: run the closure inline when the destination is idle
+    /// (not running, empty mailbox), otherwise through the mailbox.
+    pub(crate) fn send_closure_immediately(
+        &self,
+        actor_ref: ActorRef,
+        closure: crate::event::ActorThunk,
+    ) {
+        self.send_immediately_impl(actor_ref, Event::custom(closure));
+    }
+
+    /// `Scheduler::send_closure_later`: always through the mailbox.
+    pub(crate) fn send_closure_later(
+        &self,
+        actor_ref: ActorRef,
+        closure: crate::event::ActorThunk,
+    ) {
+        self.send_later_impl(actor_ref, Event::custom(closure));
     }
 
     fn send_later_impl(&self, actor_ref: ActorRef, mut event: Event) {
@@ -371,8 +452,8 @@ impl SchedulerState {
     fn do_event(&self, id: ActorId, event: Event) {
         EVENT_CTX.with(|ctx| ctx.borrow_mut().link_token = event.link_token);
         let info = self.info(id);
-        let mut actor = info.actor.borrow_mut();
-        let actor = actor.as_mut().expect("dispatched to a dead actor").as_mut();
+        let mut slot = info.actor.borrow_mut();
+        let actor = slot.as_mut().expect("dispatched to a dead actor");
         match event.ty {
             EventType::Start => actor.start_up(),
             EventType::Stop => actor.tear_down(),
@@ -386,6 +467,10 @@ impl SchedulerState {
                 }
             }
             EventType::Raw => actor.raw_event(crate::event::Raw(event.raw)),
+            EventType::Custom => {
+                let closure = event.custom.expect("custom event without payload");
+                closure(actor)
+            }
             EventType::NoType => unreachable!("empty event dispatched"),
         }
     }
@@ -469,22 +554,37 @@ impl SchedulerState {
 
     // ---- lifecycle (do_stop_actor, destroy, migration) ----
 
-    /// `Scheduler::do_stop_actor`: run `tear_down` and destroy the actor.
-    fn do_stop_actor(&self, id: ActorId) {
+    /// `Scheduler::do_stop_actor` — the path behind C++ `Actor::do_stop()`:
+    /// run `tear_down` and destroy the actor synchronously, callable from any
+    /// actor on this scheduler (unlike `stop()`, which only flags the
+    /// currently dispatched actor). The C++ version wraps the teardown in its
+    /// own `EventGuard` whose destructor restores the outer event context;
+    /// the whole context is saved and restored here.
+    ///
+    /// C++ would crash on a dead actor; Rust returns silently in release and
+    /// asserts in debug. Destroying the currently dispatched actor (`do_stop`
+    /// on `self`) is UB in Rust and rejected.
+    pub(crate) fn do_stop_actor(&self, id: ActorId) {
         debug_assert!(!id.sched().1, "stopping a migrating actor");
-        self.enter_actor(id.clone());
-        self.do_event(id.clone(), Event::stop());
+        if !id.is_alive() {
+            debug_assert!(false, "do_stop_actor on a dead actor");
+            return;
+        }
+        debug_assert!(
+            EVENT_CTX.with(|ctx| ctx.borrow().actor.as_ref() != Some(&id)),
+            "do_stop_actor on the dispatched actor is UB in Rust (use stop())"
+        );
+        let saved = EVENT_CTX.with(|ctx| ctx.replace(EventContext::default()));
         // The C++ keeps its EventGuard (is_running = true) across the
         // destruction: sends to this actor from its own teardown/Drop land in
         // the mailbox (cleared by destroy_actor) instead of dispatching
         // inline. destroy_actor frees the ActorInfo, so afterwards only the
-        // context cleanup remains (no list fixup — the actor is unlinked).
+        // context restore remains (no list fixup — the actor is unlinked).
+        self.enter_actor(id.clone());
+        self.do_event(id.clone(), Event::stop());
         self.destroy_actor(id.clone());
         EVENT_CTX.with(|ctx| {
-            let mut ctx = ctx.borrow_mut();
-            ctx.actor = None;
-            ctx.flags = 0;
-            ctx.link_token = 0;
+            *ctx.borrow_mut() = saved;
         });
     }
 
@@ -499,7 +599,9 @@ impl SchedulerState {
         info.timeout_gen.set(info.timeout_gen.get() + 1);
         info.deadline.set(None);
         // Drop the actor first (C++ destroys the actor before the mailbox).
-        let _ = info.actor.borrow_mut().take();
+        // An Owned box is freed here; a Borrowed actor (Deleter::None) is
+        // only unregistered — its owner drops it.
+        let _ = std::mem::replace(&mut *info.actor.borrow_mut(), ActorSlot::Empty);
         info.mailbox.borrow_mut().clear();
         id.mark_dead();
         // SAFETY: `mark_dead` published alive=false; no thread dereferences

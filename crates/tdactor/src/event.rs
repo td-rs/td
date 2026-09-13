@@ -10,12 +10,20 @@
 //! - `Timeout` — some timeout has expired
 //! - `Hangup` — hang up called
 //! - `Raw` — just pass 8 bytes (the C++ `union Raw` is used for convenience)
-//! - `Custom` — send `CustomEvent` (added with S33, together with
-//!   `CustomEvent` and the closure machinery)
+//! - `Custom` — run an `FnOnce(&mut dyn Actor)` thunk (the C++
+//!   `immediate_closure` subset, landed with S34 for the promise machinery;
+//!   the `delayed_closure`/per-actor-message-enum half of the closure
+//!   machinery stays with S33)
 //!
 //! Events also carry a `link_token` (the token of the `ActorShared` they were
 //! sent through, if any), which the scheduler exposes to the running actor via
 //! `Actor::get_link_token` and uses to pick `hangup` vs `hangup_shared`.
+
+use crate::actor::Actor;
+
+/// A `Custom` event payload: a one-shot thunk the scheduler runs on the
+/// destination actor (the C++ `Event::immediate_closure`).
+pub(crate) type ActorThunk = Box<dyn FnOnce(&mut dyn Actor) + Send>;
 
 /// The predefined event kinds, in the same order as C++ `Event::Type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +35,7 @@ pub enum EventType {
     Timeout,
     Hangup,
     Raw,
+    Custom,
 }
 
 /// Raw event payload — the `Event::Raw` union in C++ (`void *`, `uint32` and
@@ -71,6 +80,7 @@ pub struct Event {
     pub(crate) ty: EventType,
     pub(crate) link_token: u64,
     pub(crate) raw: u64,
+    pub(crate) custom: Option<ActorThunk>,
 }
 
 impl Event {
@@ -106,6 +116,19 @@ impl Event {
             ty: EventType::Raw,
             link_token: 0,
             raw: raw.0,
+            custom: None,
+        }
+    }
+
+    /// Run a closure on the destination actor (`Actor` method called by the
+    /// scheduler, inline or through the mailbox) — the C++
+    /// `Event::immediate_closure` (the `send_closure` thunk).
+    pub fn custom(closure: ActorThunk) -> Self {
+        Self {
+            ty: EventType::Custom,
+            link_token: 0,
+            raw: 0,
+            custom: Some(closure),
         }
     }
 
@@ -119,6 +142,7 @@ impl Event {
             ty,
             link_token: 0,
             raw: 0,
+            custom: None,
         }
     }
 }

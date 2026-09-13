@@ -101,7 +101,7 @@ impl<A: ?Sized> ActorId<A> {
         }
     }
 
-    fn empty_id() -> Self {
+    pub(crate) fn empty_id() -> Self {
         Self {
             slot: None,
             marker: PhantomData,
@@ -325,6 +325,15 @@ impl<A: ?Sized> ActorOwn<A> {
     /// Releases ownership without sending `hangup` — the C++ `release()`.
     pub fn release(mut self) -> ActorId<A> {
         std::mem::replace(&mut self.id, ActorId::empty_id())
+    }
+}
+
+/// The C++ `ActorOwn()` default: an empty own.
+impl<A: ?Sized> Default for ActorOwn<A> {
+    fn default() -> Self {
+        Self {
+            id: ActorId::empty_id(),
+        }
     }
 }
 
