@@ -6,3 +6,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+tdutils = { path = "../tdutils" }
+tokio = { version = "1", features = ["net", "rt"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "time"] }
