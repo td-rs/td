@@ -47,6 +47,7 @@ The execution plan is `RUST_REWRITE_PLAN.md` at the root of the C++ repo
 - [x] S42 — `SqliteKeyValue` with Safe and Async wrappers
 - [x] S43 — `SeqKeyValue` and `TQueue`
 - [x] S44 — `TdDb` schema skeleton with inline migrations
+- [x] S45 — TCP client/server on tokio: `tdnet::tcp::TcpListener` (`td/net/TcpListener` — sync `open`, log-and-continue accept loop, the 5-second bind retry as `serve_with_backoff`) plus `connect` (the client half of `SocketFd::open`); accepted sockets are `tokio::net::TcpStream`s and the C++ `send_closure(Callback::accept, fd)` dispatch is an async `AcceptCallback` trait until S33 (Track F, first step)
 
 ## Checks (CI parity)
 
