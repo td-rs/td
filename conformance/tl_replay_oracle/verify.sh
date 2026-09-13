@@ -20,10 +20,10 @@ RS_ROOT="$SCRIPT_DIR/../.."
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 
-[ -f "$TELEGRAM_DIR/telegram_api_0.cpp" ] || {
-  echo "not found: $TELEGRAM_DIR/telegram_api_0.cpp (pass the td repo root)" >&2
-  exit 1
-}
+if [ ! -f "$TELEGRAM_DIR/telegram_api_0.cpp" ]; then
+  echo "== td/generate/auto absent: regenerating from the pinned td sources =="
+  "$SCRIPT_DIR/../generate_td_auto/generate.sh" "$TD_ROOT" "$WORK"
+fi
 
 echo "== building the C++ replay oracle from td's generated schemes =="
 # -w: generated code trips warnings; only behavior matters here.
