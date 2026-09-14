@@ -273,9 +273,12 @@ jobs:
           TD_BOT_TOKEN: ${{ secrets.TD_BOT_TOKEN }}
           TD_BOT_USERNAME: ${{ secrets.TD_BOT_USERNAME }}
           TD_API_HASH: ${{ secrets.TD_API_HASH }}
-          TD_PEER_STATE: ${{ secrets.TD_PEER_STATE }}
+          # The secret holds the base64 state; verify_s76.sh/bot_maker take
+          # the DECODED FILE PATH in TD_PEER_STATE (default /tmp/s66_state.bin).
+          TD_PEER_STATE_B64: ${{ secrets.TD_PEER_STATE }}
+          TD_PEER_STATE: /tmp/s66_state.bin
         run: |
-          printf '%s' "$TD_PEER_STATE" | base64 -d > /tmp/s66_state.bin
+          printf '%s' "$TD_PEER_STATE_B64" | base64 -d > "$TD_PEER_STATE"
           conformance/recorder/verify_s76.sh "$GITHUB_WORKSPACE/td-cpp"
 
 

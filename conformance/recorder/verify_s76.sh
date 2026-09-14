@@ -87,16 +87,24 @@ run_side rs "$WORK/rs.txt"
 # token makes both logins real and repeatable. The commit_hash interim
 # normalization rides along from the offline gate.
 normalize() {
-  sed 's/"commit_hash","value":{"@type":"optionValueString","value":"[^"]*"/"commit_hash","value":{"@type":"optionValueString","value":"<git>"/' |
-    python3 - "$WORK" <<'PY'
+  # The masker runs as `python3 -c "$(cat <<'PY' ...)"` on purpose: a
+  # `sed | python3 - <<'PY'` pipeline would hand the heredoc (not the
+  # stream) to python's stdin — sed dies of SIGPIPE and, under
+  # pipefail, the script exits 141 with no message.
+  python3 -c "$(cat <<'PY'
 import json
+import re
 import sys
 
 work = sys.argv[1]
 
-# The two runs are separate live sessions: the timestamps differ, the
-# server-assigned message ids/dates differ, and the runner's UTC offset
-# can differ between the record and the replay hosts.
+# The S76 normalization: the two runs are separate live sessions, so the
+# timestamps and the server-assigned message ids/dates differ; the bot
+# token makes both logins real and repeatable. The commit_hash interim
+# normalization rides along from the offline gate.
+COMMIT_HASH_RE = re.compile(
+    r'("commit_hash","value":\{"@type":"optionValueString","value":")[^"]*"'
+)
 MASKED_OPTION_VALUES = {"authorization_date", "utc_time_offset"}
 MASKED_KEYS = {
     "last_read_inbox_message_id",
@@ -130,6 +138,7 @@ for line in sys.stdin:
     line = line.strip()
     if not line:
         continue
+    line = COMMIT_HASH_RE.sub('\\1<git>"', line)
     record = json.loads(line)
     masked = mask(record)
     if not masked:
@@ -142,6 +151,7 @@ for line in sys.stdin:
             )
     print(json.dumps(out, separators=(",", ":"), ensure_ascii=False))
 PY
+)" "$WORK"
 }
 
 normalize <"$WORK/c.txt" >"$WORK/c.norm"
