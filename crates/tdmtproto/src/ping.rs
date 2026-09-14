@@ -73,7 +73,12 @@ impl SessionConnectionCallback for PingPongSession {
     fn on_server_time_difference_updated(&mut self, _force: bool) {}
     fn on_new_session_created(&mut self, _unique_id: u64, _first_message_id: MessageId) {}
     fn on_session_failed(&mut self, _status: Status) {}
-    fn on_container_sent(&mut self, _container_message_id: MessageId, _message_ids: Vec<MessageId>) {}
+    fn on_container_sent(
+        &mut self,
+        _container_message_id: MessageId,
+        _message_ids: Vec<MessageId>,
+    ) {
+    }
     fn on_pong(&mut self, _ping_time: f64, _pong_time: f64, _current_time: f64) -> Status {
         self.pong_cnt += 1;
         if self.pong_cnt == 1 {
