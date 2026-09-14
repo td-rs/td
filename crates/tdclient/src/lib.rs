@@ -10,11 +10,13 @@
 pub mod auth_manager;
 pub mod client;
 pub mod client_json;
+pub mod global;
 pub mod misc;
 pub mod option_manager;
 pub mod requests;
 pub mod synchronous_requests;
 pub mod td;
+pub mod time_zone_manager;
 pub mod updates_manager;
 
 // Generated code keeps C++-identical case-preserved names (`aiComposeTone`)

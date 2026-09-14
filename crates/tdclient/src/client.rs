@@ -837,7 +837,9 @@ mod tests {
             function: version_request(),
         });
         let mut answer = None;
-        for _ in 0..8 {
+        // Generous budget: the full-workspace run loads every core, and the
+        // pooled scheduler may take a while to pump under contention.
+        for _ in 0..60 {
             match client.receive(0.3) {
                 Some(response) if response.request_id == 1 => {
                     answer = Some(response);

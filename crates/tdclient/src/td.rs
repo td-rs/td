@@ -20,10 +20,12 @@ use tdactor::{Actor, ActorOwn, actor_messages};
 use tddb::td_db::{OpenedDatabase, Parameters as DbParameters, TdDb};
 
 use crate::auth_manager::AuthManager;
+use crate::global::Global;
 use crate::option_manager::OptionManager;
 use crate::requests;
 use crate::synchronous_requests;
 use crate::td_api::{self, Function, Object};
+use crate::time_zone_manager::TimeZoneManager;
 
 #[cfg(target_endian = "big")]
 compile_error!("TDLib requires little-endian platform");
@@ -87,7 +89,14 @@ pub struct Td {
     /// `Td::option_manager_` — created by `init` over the db config pmc;
     /// `None` during `WaitParameters` exactly like the C++.
     pub(crate) option_manager: Option<OptionManager>,
-    pub(crate) db: Option<TdDb>,
+    /// The `G()` shared context; owns the database (`Global::td_db_`).
+    pub(crate) global: Global,
+    /// The C++ `init_managers` registration order starts here; managers
+    /// accumulate in their C++ positions as their steps land. The first
+    /// consumer (PhoneNumberManager's `getPhoneNumberInfo`) reads it via
+    /// `G()->time_zone_manager()`.
+    #[allow(dead_code)]
+    pub(crate) time_zone_manager: TimeZoneManager,
     pub(crate) auth_manager: AuthManager,
     /// `Td::stop_cnt_` — the hangup and the close completion each drop one.
     stop_cnt: i32,
@@ -108,7 +117,8 @@ impl Td {
             parameters: None,
             header_options: HeaderOptions::default(),
             option_manager: None,
-            db: None,
+            global: Global::new(),
+            time_zone_manager: TimeZoneManager::default(),
             auth_manager: AuthManager::new(),
             stop_cnt: 2,
         }
@@ -250,16 +260,19 @@ impl Td {
             return self.finish_set_parameters();
         }
 
-        self.db = Some(opened_database.database);
+        self.global.init(opened_database.database);
 
         // init_options_and_network, the M.1 subset: the OptionManager over
         // the db config pmc (StateManager/ConnectionCreator/ConfigManager/
-        // OnlineManager arrive with their steps).
+        // OnlineManager arrive with their steps). `global.init` above
+        // already loaded the server time difference, so the constructor's
+        // opening `unix_time` update (OptionManager.cpp:59) is corrected.
         {
-            let db = self.db.as_mut().expect("db just set");
-            let config_pmc = db.take_config_pmc();
-            let mut option_manager = OptionManager::new(db.parameters().is_test_dc);
-            option_manager.attach_pmc(config_pmc);
+            let config_pmc = self.global.td_db().take_config_pmc();
+            let is_test_dc = self.global.is_test_dc();
+            let unix_time = self.global.unix_time();
+            let mut option_manager = OptionManager::new(is_test_dc);
+            option_manager.attach_pmc(config_pmc, unix_time);
             self.option_manager = Some(option_manager);
         }
         self.flush_option_updates();
@@ -307,8 +320,7 @@ impl Td {
         self.auth_manager
             .set_api_credentials(parameters.api_id, parameters.api_hash.clone());
         {
-            let db = self.db.as_mut().expect("db set");
-            let binlog_pmc = db.binlog_pmc();
+            let binlog_pmc = self.global.binlog_pmc();
             let auth_str = binlog_pmc.get("auth");
             match auth_str.as_str() {
                 "ok" => {
@@ -362,7 +374,7 @@ impl Td {
             let Some(option_manager) = self.option_manager.as_ref() else {
                 break;
             };
-            let value = option_manager.get_option_value(&name);
+            let value = option_manager.get_option_value(&name, self.global.unix_time());
             self.send_result(request_id, requests::option_value_to_object(value));
         }
 
@@ -426,6 +438,7 @@ impl Td {
         if self.state == State::WaitParameters {
             self.state = State::Close;
             self.close_flag = 4;
+            self.global.set_close_flag();
             self.clear_requests();
             self.send_update(Object::updateAuthorizationState(
                 td_api::updateAuthorizationState {
@@ -437,6 +450,7 @@ impl Td {
         } else {
             self.state = State::Close;
             self.close_flag = 1;
+            self.global.set_close_flag();
             self.auth_manager.on_closing(self.destroy_flag);
             self.flush_auth_updates();
             // updates_manager_->timeout_expired() (save PTS and QTS) and the
@@ -461,9 +475,7 @@ impl Td {
         // result_handlers_ / StateManager — with the net step.
         self.clear_requests();
 
-        if let Some(db) = &mut self.db {
-            db.close_all(self.destroy_flag);
-        }
+        self.global.close_all(self.destroy_flag);
         self.option_manager = None;
 
         self.close_flag = 4;
