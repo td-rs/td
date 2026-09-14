@@ -153,7 +153,7 @@ async fn establish(rsa: Rsa, (ip, hs_dc): (&'static str, i32)) -> Result<DcState
 }
 
 /// Validates a persisted key with an encrypted ping-pong against its DC.
-async fn ping_dc(rsa: Rsa, state: &mut DcState) -> Result<f64> {
+async fn ping_dc(_rsa: Rsa, state: &mut DcState) -> Result<f64> {
     let stream = TcpStream::connect((state.ip, 443)).await.unwrap();
     let transport_type = TransportType::new(
         TransportTypeEnum::Tcp,
