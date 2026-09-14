@@ -148,6 +148,28 @@ impl SessionConnectionCallback for AuthCallback {
                 }
             };
             self.phone_code_hash = msg.phone_code_hash;
+            let type_name = match &msg.r#type {
+                telegram_api::auth_SentCodeType::auth_sentCodeTypeApp(t) => {
+                    format!("app length={}", t.length)
+                }
+                telegram_api::auth_SentCodeType::auth_sentCodeTypeSms(t) => {
+                    format!("sms length={}", t.length)
+                }
+                telegram_api::auth_SentCodeType::auth_sentCodeTypeCall(t) => {
+                    format!("call length={}", t.length)
+                }
+                telegram_api::auth_SentCodeType::auth_sentCodeTypeFlashCall(t) => {
+                    format!("flashcall pattern={}", t.pattern)
+                }
+                telegram_api::auth_SentCodeType::auth_sentCodeTypeMissedCall(t) => {
+                    format!("missed_call length={} prefix={}", t.length, t.prefix)
+                }
+                telegram_api::auth_SentCodeType::auth_sentCodeTypeEmailCode(t) => {
+                    format!("email length={}", t.length)
+                }
+                other => format!("other: {other:?}"),
+            };
+            eprintln!("sentCode type: {type_name}, hash={}", self.phone_code_hash);
             print!("Enter the code from Telegram/SMS: ");
             std::io::stdout().flush().unwrap();
             let mut code = String::new();
@@ -205,9 +227,9 @@ impl SessionConnectionCallback for AuthCallback {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let handshake_only = args.len() == 2 && args[1] == "--handshake";
-    if !handshake_only && args.len() != 4 {
+    if !handshake_only && args.len() != 4 && args.len() != 5 && args.len() != 8 {
         eprintln!(
-            "usage: mtproto_auth <phone> <api_id> <api_hash>\n       mtproto_auth --handshake (live key creation only)"
+            "usage: mtproto_auth <phone> <api_id> <api_hash> [port]\n       mtproto_auth --handshake (live key creation only)"
         );
         std::process::exit(2);
     }
@@ -233,20 +255,35 @@ fn main() {
         .unwrap();
     runtime.block_on(async {
         // 1. Connect + handshake on the test DC (149.154.167.40 = test DC 2).
-        // Known issue (S66): plain TCP advances through resPQ (the server's
-        // RSA fingerprint list matches the embedded test-DC key) and
-        // req_DH_params, then the DC answers transport error -444.
-        // ObfuscatedTcp variants (raw dc 2 and 10002) are ignored outright.
-        // Candidates: dc_id expected in p_q_inner_data_dc by the test
-        // server, client clock, or a required transport tweak.
-        let stream = TcpStream::connect(("149.154.167.40", 443)).await.unwrap();
-        let transport_type = TransportType::new(TransportTypeEnum::Tcp, 2, ProxySecret::default());
+        // The p_q_inner_data_dc `dc` field must be 10002 (10000 + 2: test
+        // DC2, main keys) — the value td's own live test uses
+        // (test/mtproto.cpp get_default_dc_id). Any other value (2, -2)
+        // makes the server answer transport error -444; the transport-level
+        // dc (obfuscation header) is unrelated to the rejection.
+        // DC selection: <ip> <handshake-dc> <transport-dc> <port> as the
+        // last four args, defaulting to test DC 2 (10002). Test DC list:
+        // 1 = 149.154.175.10, 2 = 149.154.167.40, 3 = 149.154.175.117.
+        let (dc_ip, hs_dc, tx_dc, port) = if args.len() >= 8 {
+            (
+                args[args.len() - 4].clone(),
+                args[args.len() - 3].parse().unwrap(),
+                args[args.len() - 2].parse().unwrap(),
+                args[args.len() - 1].parse().unwrap(),
+            )
+        } else if let Some(p) = args.last().and_then(|a| a.parse::<u16>().ok()) {
+            ("149.154.167.40".to_string(), 10002, 10002, p)
+        } else {
+            ("149.154.167.40".to_string(), 10002, 10002, 443)
+        };
+        let stream = TcpStream::connect((dc_ip.as_str(), port)).await.unwrap();
+        let transport_type =
+            TransportType::new(TransportTypeEnum::Tcp, tx_dc, ProxySecret::default());
         let mut context = Context {
             rsa: RsaInterface {
                 rsa: Rsa::from_pem_public_key(TEST_DC_KEY).unwrap(),
             },
         };
-        let mut handshake = AuthKeyHandshake::new(2, 0);
+        let mut handshake = AuthKeyHandshake::new(hs_dc, 0);
         let raw_connection =
             match run_handshake(stream, transport_type, &mut context, 30.0, &mut handshake).await {
                 Result::Ok(connection) => connection,
@@ -292,22 +329,49 @@ fn main() {
         };
         {
             let mut query = Vec::new();
-            telegram_api::auth_sendCode {
-                phone_number: phone.clone(),
-                api_id,
-                api_hash: api_hash.clone(),
-                settings: telegram_api::CodeSettings {
-                    flags: 0,
-                    allow_flashcall: false,
-                    current_number: false,
-                    allow_app_hash: false,
-                    allow_missed_call: false,
-                    allow_firebase: false,
-                    unknown_number: false,
-                    logout_tokens: Vec::new(),
-                    token: String::new(),
-                    app_sandbox: false,
-                },
+            // Every API query rides in invokeWithLayer{initConnection{...}}
+            // — without it the DC answers RPC_ERROR CONNECTION_NOT_INITED.
+            // Layer 229 = td 1.8.67 (td/telegram/Version.h MTPROTO_LAYER).
+            telegram_api::invokeWithLayer {
+                layer: 229,
+                query: Box::new(telegram_api::Function::initConnection(
+                    telegram_api::initConnection {
+                        flags: 0,
+                        api_id,
+                        device_model: "td-rs".to_string(),
+                        system_version: "linux".to_string(),
+                        app_version: "0.1.0".to_string(),
+                        system_lang_code: "en".to_string(),
+                        lang_pack: String::new(),
+                        lang_code: "en".to_string(),
+                        proxy: telegram_api::InputClientProxy {
+                            address: String::new(),
+                            port: 0,
+                        },
+                        params: Box::new(telegram_api::JSONValue::jsonNull(
+                            telegram_api::jsonNull {},
+                        )),
+                        query: Box::new(telegram_api::Function::auth_sendCode(
+                            telegram_api::auth_sendCode {
+                                phone_number: phone.clone(),
+                                api_id,
+                                api_hash: api_hash.clone(),
+                                settings: telegram_api::CodeSettings {
+                                    flags: 0,
+                                    allow_flashcall: false,
+                                    current_number: false,
+                                    allow_app_hash: false,
+                                    allow_missed_call: false,
+                                    allow_firebase: false,
+                                    unknown_number: false,
+                                    logout_tokens: Vec::new(),
+                                    token: String::new(),
+                                    app_sandbox: false,
+                                },
+                            },
+                        )),
+                    },
+                )),
             }
             .store_boxed(&mut query);
             callback.pending_query = Some(query);
