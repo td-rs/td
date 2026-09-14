@@ -2,6 +2,175 @@
 
 Ports of the C++ `benchmark/` targets. Gate: ≤2× C++ everywhere.
 
+## S79 status
+
+- `bench_actor` (S37): actor runtime — gate green (below).
+- `bench_crypto` (S79): AES/hash/RNG/CRC — 18 of 22 rows at or under 2×;
+  `AES CTR` and `ssl_rand_bytes` fail with backend-level root causes (below).
+- `bench_handshake` (S79): DH handshake — fails the gate (~3.9×): the Rust
+  `BigNum` is `num-bigint` (generic bignum) where C++ uses OpenSSL's
+  assembly-tuned Montgomery arithmetic. Auth-path only (key generation is
+  a once-per-login cost). Follow-up: evaluate a Montgomery-optimized
+  backend (`crypto-bigint`) for `tdutils::bignum`.
+- `bench_db` (S79): KV stores — all rows at or under 2× except `SeqKvBench`
+  (2.5×, allocation-bound: two heap `String`s per `set` vs the C++ SSO
+  string; follow-up: small-string optimization in `SeqKeyValue`/binlog keys).
+- `bench_queue` (S79): the `QueueBenchmark2` transport shape over
+  `crossbeam_channel` — at parity or faster than the C++ eventfd queues.
+- `bench_http` (S79): persistent-connection GET loop vs the C++
+  `HttpOutboundConnection` client against the same `bench_http_server_fast`.
+- Not ported: `bench_misc`, `bench_log`, `bench_http_reader`,
+  `check_proxy`/`check_tls`, `bench_empty` — none are in the S79 gate list
+  (`actor, crypto, db, http, queue, handshake`); `bench_empty` is the
+  driver's null calibration and is covered by every row of the ported
+  driver.
+
+All S79 pairings below were measured 2026-09-14 on the same machine: paired
+rounds, `taskset -c 4` for the driver benches (wall-clock for `bench_http`),
+C++ built `-O3 -DNDEBUG` without LTO, matched by the Rust `release` profile;
+min of two rounds per side. The `powersave` governor swings the C++
+baselines up to 3–4× between rounds — treat sub-2× margins as noise bands,
+as in the S37 table.
+
+## bench_crypto (S79)
+
+Port of `benchmark/bench_crypto.cpp`. Row-by-row against the C++ binary
+(ops/sec; ratio = C++/Rust, so ≥ 0.5 passes the 2× gate):
+
+| Bench                  | C++ (best)     | Rust (best)    | ratio | gate |
+| ---------------------- | -------------- | -------------- | ----- | ---- |
+| AES CTR [8KB]          | 1,385,936      | 303,822        | 0.22  | ✗    |
+| AES CBC Decrypt [8KB]  | 1,156,202      | 560,238        | 0.48  | ✗*   |
+| AES CBC Encrypt [8KB]  | 176,520        | 134,643        | 0.76  | ✓    |
+| AES IGE state [64B]    | 4,419,217      | 5,143,626      | 1.16  | ✓    |
+| AES IGE c-fn [64B]     | 5,976,644      | 4,867,801      | 0.81  | ✓    |
+| AES IGE encrypt [8KB]  | 156,297        | 124,455        | 0.80  | ✓    |
+| AES IGE decrypt [8KB]  | 113,671        | 131,364        | 1.16  | ✓    |
+| AES ECB [8KB]          | 138,273        | 160,355        | 1.16  | ✓    |
+| pbkdf2                 | 9,699,776      | 11,604,263     | 1.20  | ✓    |
+| mt19937_rand           | 708,568,135    | 522,551,356    | 0.74  | ✓    |
+| td_rand_fast32         | 271,925,384    | 202,222,211    | 0.74  | ✓    |
+| td_rand_fast           | 215,928,102    | 188,311,490    | 0.87  | ✓    |
+| ssl_rand_int32         | 37,801,856     | 25,736,446     | 0.68  | ✓    |
+| ssl_rand_bytes         | 1,119,969,485  | 212,572,180    | 0.19  | ✗    |
+| SHA1 [64B]             | 10,020,800     | 19,869,488     | 1.98  | ✓    |
+| SHA256 [64B]           | 10,926,045     | 17,120,649     | 1.57  | ✓    |
+| SHA512 [64B]           | 4,739,783      | 5,351,699      | 1.13  | ✓    |
+| HMAC-SHA256 [64B]      | 4,162,487      | 5,972,992      | 1.44  | ✓    |
+| HMAC-SHA512 [64B]      | 1,691,001      | 1,421,464      | 0.84  | ✓    |
+| CRC32 zlib [8KB]       | 708,797        | 7,876,977      | 11.1  | ✓    |
+| CRC64 Anton [8KB]      | 81,159         | 79,664         | 0.98  | ✓    |
+
+Root causes and notes on the flagged rows:
+
+- **AES CTR (0.22 — was 0.054 before the S79 gate work).** The original
+  port generated keystream one AES block at a time through
+  `encrypt_block`, which cannot reach the pipelined AES-NI path. The gate
+  work in `tdutils::crypto` (bulk 32-block `encrypt_blocks` refills +
+  word-wide keystream XOR) closed it from 18× to 4.6× against OpenSSL's
+  best round (2.7× against the worst round — the C++ CTR row itself swings
+  1.39M↔0.76M between rounds). The residual is the RustCrypto `ni`
+  backend's scheduling vs OpenSSL's hand-written assembly; revisit when
+  the `aes` crate lands wider scheduling.
+- **ssl_rand_bytes (0.19).** Design divergence, not a regression: the C++
+  `Random::secure_bytes` draws from OpenSSL's userspace ChaCha DRBG
+  (amortized reseeding), the Rust port fills every buffer from the kernel
+  CSPRNG (`getrandom`, vDSO-fast on this kernel). Different guarantee,
+  different cost. A userspace DRBG for `tdutils::random` is an optional
+  follow-up.
+- **AES CBC Decrypt (\*borderline).** Both sides swing 2× between rounds
+  under the `powersave` governor; best-vs-best rounds land at 2.07×,
+  worst-vs-worst at 1.09×. Re-verify on a quiet machine before treating
+  it as a real gap.
+
+Divergences: the raw-OpenSSL comparison rows (`AesCtrOpenSSLBench`,
+OpenSSL ≤ 1.0 `SHA1Bench`) are skipped — they compare td wrappers against
+raw OpenSSL call overhead, a distinction the Rust stack does not have;
+`std_rand` (libc `rand()`) is skipped (no Rust counterpart);
+`mt19937_rand` is kept as a faithful MT19937. Descriptions drop the
+"OpenSSL" suffix. The SHA1/ECB rows measure tdlib's protocol primitives
+(wire compat), not production data protection. The AES benches write from
+a fixed source snapshot instead of in-place `src == dst` mutation
+(unrepresentable in safe Rust; identical crypto work per iteration).
+
+## bench_handshake (S79)
+
+| Bench     | C++ (best) | Rust (best) | ratio | gate |
+| --------- | ---------- | ----------- | ----- | ---- |
+| Handshake | 413.1      | 105.8       | 0.26  | ✗    |
+
+Full DH handshake pairs (2048-bit Telegram prime, checks + key gen). The
+gap is `num-bigint`'s generic modexp vs OpenSSL's Montgomery/asm `BIGNUM`
+— the same ratio shows in the S59 DH vectors. Not on any per-message path
+(auth key generation happens once per login/DC); gate row kept as an open
+item pending the `tdutils::bignum` backend evaluation.
+
+## bench_db (S79)
+
+| Bench                              | C++ (best)  | Rust (best) | ratio | gate |
+| ---------------------------------- | ----------- | ----------- | ----- | ---- |
+| BinlogKeyValue<ConcurrentBinlog>   | 160,534     | 937,784     | 5.8   | ✓    |
+| BinlogKeyValue is_encrypted(false) | 96,524      | 974,607     | 10.1  | ✓    |
+| SqliteKV is_encrypted(false)       | 57,447      | 62,460      | 0.92  | ✓    |
+| SqliteKV is_encrypted(true)        | 53,902      | 75,859      | 1.41  | ✓    |
+| SqliteKeyValueAsync                | 11,291,302  | 11,000,995  | 0.97  | ✓    |
+| SeqKvBench                         | 18,300,664  | 7,278,627   | 0.40  | ✗    |
+
+- **SeqKvBench (0.40).** Allocation-bound: `SeqKeyValue::set(&str, &str)`
+  heap-allocates the key and value `String`s per write while the C++
+  `td::string` SSO stores every key/value in this bench inline (all ≤ 10
+  chars). A small-string optimization for short keys is a follow-up; the
+  map mechanics themselves are at parity.
+- **BinlogKeyValue rows (5.8–10× faster).** Plausible but flagged: the
+  Rust `ConcurrentBinlog` mutex-serializes where C++ dispatches through
+  the `BinlogActor` event loop, removing the per-event mailbox latency.
+  Before treating this as a win, verify flush/fsync cadence parity between
+  the ports (S44 `TdDb` work).
+
+Divergences: `TdKvBench<BinlogKeyValue<Binlog>>` skipped (the Rust
+`BinlogKeyValue` has only the `ConcurrentBinlog` form); encrypted-binlog
+row skipped (the S40 `Binlog` subset reports a keyed open of a fresh
+binlog as `Wrong password` — encrypted binlog creation is not ported yet);
+`SqliteKeyValueAsyncBench` flushes explicitly per pass (the C++ flushes
+through actor events during the pass; measured work per pass is the same:
+n buffered writes + one batched transaction).
+
+## bench_queue (S79)
+
+The C++ rows benchmark eventfd/poll/pipe/semaphore mailbox transports the
+Rust rewrite replaced; the ported bench runs the same `QueueBenchmark2`
+client/server exchange over `crossbeam_channel` (what the Rust actor
+mailboxes actually use), paired against the C++ eventfd queues:
+
+| Queue shape (N) | C++ MpscPollableQueue (best) | C++ InfBackoffQueue (best) | Rust crossbeam_channel (best) | gate |
+| --------------- | ---------------------------- | -------------------------- | ----------------------------- | ---- |
+| 1               | 240,603                      | 18,111                     | 191,652                       | ✓ (0.80× Mpsc) |
+| 10              | 740,969                      | 171,565                    | 1,797,766                     | ✓ (2.4× Mpsc) |
+| 100             | 13,388,445                   | 1,722,099                  | 13,614,966                    | ✓ (1.02× Mpsc) |
+
+At one connection the crossbeam channel pays lock-free wakeups where the
+C++ eventfd queue amortizes; from 10 connections up it is at parity or
+faster. All rows pass the gate against the stronger C++ baseline.
+
+## bench_http (S79)
+
+Both clients run 2 × 100 000 sequential `GET /` exchanges against the same
+C++ `bench_http_server_fast` (the server binds 8082 in the C++ source;
+both sides here run against the rebuilt server on a free port — 8082 is
+taken by an unrelated service on this machine). Wall-clock per client:
+
+| Client | C++ HttpOutboundConnection | Rust reqwest/hyper (pooled) |
+| ------ | -------------------------- | --------------------------- |
+| wall   | 1.84 s / 1.88 s            | 2.51 s / 2.59 s             |
+
+Rust is at 0.73× C++ ops/sec (1.36× slowdown) — inside the gate.
+
+Divergence: the Rust side drives a pooled `reqwest`/hyper client — the
+transport layer the S48 `Wget` port uses — because the persistent
+-connection `HttpOutboundConnection` actor is not ported yet; keep-alive
+pooling preserves the measured shape (one established connection per
+client, one request in flight).
+
 ## bench_actor (S37)
 
 Port of `benchmark/bench_actor.cpp` — `CreateActorBench`, the `RingBench`

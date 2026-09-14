@@ -11,10 +11,37 @@ publish = false
 [dependencies]
 tdactor = { path = "../crates/tdactor" }
 tdutils = { path = "../crates/tdutils" }
+tdmtproto = { path = "../crates/tdmtproto" }
+tddb = { path = "../crates/tddb" }
+crossbeam-channel = "0.5"
+reqwest = { version = "0.12", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
+crc32fast = "1"
+base64 = "0.22"
 
 [[bin]]
 name = "bench_actor"
 path = "src/bin/bench_actor.rs"
+
+[[bin]]
+name = "bench_crypto"
+path = "src/bin/bench_crypto.rs"
+
+[[bin]]
+name = "bench_handshake"
+path = "src/bin/bench_handshake.rs"
+
+[[bin]]
+name = "bench_db"
+path = "src/bin/bench_db.rs"
+
+[[bin]]
+name = "bench_queue"
+path = "src/bin/bench_queue.rs"
+
+[[bin]]
+name = "bench_http"
+path = "src/bin/bench_http.rs"
 
 [profile.release]
 # Keep the default opt-level 3; match the C++ Release build (no LTO on either

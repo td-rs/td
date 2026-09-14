@@ -248,25 +248,55 @@ impl Default for AesState {
     }
 }
 
+/// `dst[i] = src[i] ^ ks[i]` in 8-byte words — the word loop auto-vectorizes,
+/// where the byte-wise form dominated the profile after the bulk refill
+/// landed (the S79 CTR gate).
+fn xor_keystream(src: &[u8], ks: &[u8], dst: &mut [u8]) {
+    let n = src.len().min(ks.len());
+    assert!(dst.len() >= n);
+    let mut i = 0;
+    while i + 8 <= n {
+        let s = u64::from_le_bytes(src[i..i + 8].try_into().unwrap());
+        let k = u64::from_le_bytes(ks[i..i + 8].try_into().unwrap());
+        dst[i..i + 8].copy_from_slice(&(s ^ k).to_le_bytes());
+        i += 8;
+    }
+    while i < n {
+        dst[i] = src[i] ^ ks[i];
+        i += 1;
+    }
+}
+
 /// `td::AesCtrState` — streaming AES-256-CTR with the 128-bit big-endian
 /// counter seeded by the IV. The keystream is byte-continuous across calls,
 /// like OpenSSL's EVP CTR `num` state.
+///
+/// Keystream is generated [`KEYSTREAM_BLOCKS`] blocks at a time: the bulk
+/// `encrypt_blocks` slice call reaches the aes crate's pipelined AES-NI
+/// path, which the per-block `encrypt_block` loop cannot (the S79 CTR gate
+/// measured the per-block form at ~0.6 GB/s vs OpenSSL's ~11 GB/s).
 pub struct AesCtrState {
     cipher: Aes256,
     counter: [u8; AES_BLOCK_SIZE],
-    keystream: [u8; AES_BLOCK_SIZE],
-    /// Bytes of the current keystream block already consumed; the next block
-    /// is generated when this reaches `AES_BLOCK_SIZE`.
+    keystream: [u8; KEYSTREAM_SIZE],
+    /// Bytes of the current keystream run already consumed; the next run is
+    /// generated when this reaches `KEYSTREAM_SIZE`.
     used: usize,
 }
+
+/// Keystream blocks per bulk refill (32 × 16 = 512 bytes) — wide enough to
+/// amortize the refill over the CTR transport packets; the aes crate's ni
+/// backend takes its 8-block parallel path per chunk of the slice.
+const KEYSTREAM_BLOCKS: usize = 32;
+const KEYSTREAM_SIZE: usize = KEYSTREAM_BLOCKS * AES_BLOCK_SIZE;
 
 impl AesCtrState {
     pub fn new() -> Self {
         Self {
             cipher: Aes256::new_from_slice(&[0u8; 32]).expect("AES-256 key size is fixed"),
             counter: [0u8; AES_BLOCK_SIZE],
-            keystream: [0u8; AES_BLOCK_SIZE],
-            used: AES_BLOCK_SIZE,
+            keystream: [0u8; KEYSTREAM_SIZE],
+            used: KEYSTREAM_SIZE,
         }
     }
 
@@ -276,20 +306,30 @@ impl AesCtrState {
         assert_eq!(iv.len(), AES_BLOCK_SIZE, "CTR IV must be 128-bit");
         self.cipher = Aes256::new_from_slice(key).expect("32-byte key checked above");
         self.counter.copy_from_slice(iv);
-        self.used = AES_BLOCK_SIZE;
+        self.used = KEYSTREAM_SIZE;
     }
 
-    fn next_keystream_block(&mut self) {
-        // First block encrypts the counter as-is (AES(iv)); the 128-bit
-        // big-endian increment happens after use, like OpenSSL's CTR.
-        let mut block = aes::Block::clone_from_slice(&self.counter);
-        self.cipher.encrypt_block(&mut block);
-        self.keystream.copy_from_slice(&block);
+    fn increment_counter(&mut self) {
+        // The 128-bit big-endian increment happens after use, like OpenSSL's
+        // CTR.
         for byte in self.counter.iter_mut().rev() {
             *byte = byte.wrapping_add(1);
             if *byte != 0 {
                 break;
             }
+        }
+    }
+
+    fn refill_keystream(&mut self) {
+        let mut blocks: [aes::Block; KEYSTREAM_BLOCKS] =
+            std::array::from_fn(|_| aes::Block::clone_from_slice(&[0u8; AES_BLOCK_SIZE]));
+        for block in blocks.iter_mut() {
+            block.copy_from_slice(&self.counter);
+            self.increment_counter();
+        }
+        self.cipher.encrypt_blocks(&mut blocks);
+        for (i, block) in blocks.iter().enumerate() {
+            self.keystream[i * AES_BLOCK_SIZE..(i + 1) * AES_BLOCK_SIZE].copy_from_slice(block);
         }
         self.used = 0;
     }
@@ -298,13 +338,15 @@ impl AesCtrState {
         assert!(dst.len() >= src.len());
         let mut offset = 0;
         while offset < src.len() {
-            if self.used == AES_BLOCK_SIZE {
-                self.next_keystream_block();
+            if self.used == KEYSTREAM_SIZE {
+                self.refill_keystream();
             }
-            let n = (src.len() - offset).min(AES_BLOCK_SIZE - self.used);
-            for i in 0..n {
-                dst[offset + i] = src[offset + i] ^ self.keystream[self.used + i];
-            }
+            let n = (src.len() - offset).min(KEYSTREAM_SIZE - self.used);
+            xor_keystream(
+                &src[offset..offset + n],
+                &self.keystream[self.used..self.used + n],
+                &mut dst[offset..offset + n],
+            );
             self.used += n;
             offset += n;
         }
