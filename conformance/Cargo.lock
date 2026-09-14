@@ -896,6 +896,7 @@ dependencies = [
  "serde",
  "tdactor",
  "tddb",
+ "tdmtproto",
  "tdutils",
  "tl-codegen",
 ]
@@ -917,6 +918,13 @@ version = "0.1.0"
 dependencies = [
  "tdclient",
  "tdutils",
+]
+
+[[package]]
+name = "tdmtproto"
+version = "0.1.0"
+dependencies = [
+ "tl-codegen",
 ]
 
 [[package]]
