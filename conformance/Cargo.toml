@@ -13,6 +13,7 @@ description = "Golden vectors and differential harness for the td Rust rewrite"
 rsa = "0.9"
 sha2 = "0.10"
 tdmtproto = { path = "../crates/tdmtproto" }
+tdnet = { path = "../crates/tdnet" }
 tdutils = { path = "../crates/tdutils" }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "time"] }
 
