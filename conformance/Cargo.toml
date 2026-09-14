@@ -11,7 +11,13 @@ description = "Golden vectors and differential harness for the td Rust rewrite"
 
 [dependencies]
 sha2 = "0.10"
+tdclient = { path = "../crates/tdclient" }
+tdjson = { path = "../crates/tdjson" }
 
 [[bin]]
 name = "extract-test-data"
 path = "src/main.rs"
+
+[[bin]]
+name = "tdjson-oracle"
+path = "src/bin/tdjson_oracle.rs"
