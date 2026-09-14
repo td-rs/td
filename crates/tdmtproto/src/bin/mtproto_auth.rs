@@ -279,7 +279,7 @@ fn main() {
         // 1 = 149.154.175.10, 2 = 149.154.167.40, 3 = 149.154.175.117.
         // A PHONE_MIGRATE_X answer auto-reconnects to test DC X (fresh
         // handshake — auth keys do not cross DCs), like tdlib's dispatcher.
-        let (mut dc_ip, mut hs_dc, mut tx_dc, mut port) = if args.len() >= 8 {
+        let (mut dc_ip, mut hs_dc, mut tx_dc, port) = if args.len() >= 8 {
             (
                 args[args.len() - 4].clone(),
                 args[args.len() - 3].parse().unwrap(),
