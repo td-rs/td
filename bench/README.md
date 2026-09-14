@@ -36,9 +36,10 @@ cargo build --release --bin soak
   assembly-tuned Montgomery arithmetic. Auth-path only (key generation is
   a once-per-login cost). Follow-up: evaluate a Montgomery-optimized
   backend (`crypto-bigint`) for `tdutils::bignum`.
-- `bench_db` (S79): KV stores — all rows at or under 2× except `SeqKvBench`
-  (2.5×, allocation-bound: two heap `String`s per `set` vs the C++ SSO
-  string; follow-up: small-string optimization in `SeqKeyValue`/binlog keys).
+- `bench_db` (S79): KV stores — all rows at or under 2×. `SeqKvBench`
+  initially read 2.5× but the gap was the benchmark's own `format!`
+  heap allocations; stack formatting (`itoa`) closed it to parity
+  (see the table note).
 - `bench_queue` (S79): the `QueueBenchmark2` transport shape over
   `crossbeam_channel` — at parity or faster than the C++ eventfd queues.
 - `bench_http` (S79): persistent-connection GET loop vs the C++
@@ -138,13 +139,16 @@ item pending the `tdutils::bignum` backend evaluation.
 | SqliteKV is_encrypted(false)       | 57,447      | 62,460      | 0.92  | ✓    |
 | SqliteKV is_encrypted(true)        | 53,902      | 75,859      | 1.41  | ✓    |
 | SqliteKeyValueAsync                | 11,291,302  | 11,000,995  | 0.97  | ✓    |
-| SeqKvBench                         | 18,300,664  | 7,278,627   | 0.40  | ✗    |
+| SeqKvBench                         | 18,300,664  | 29,732,495  | 0.62  | ✓    |
 
-- **SeqKvBench (0.40).** Allocation-bound: `SeqKeyValue::set(&str, &str)`
-  heap-allocates the key and value `String`s per write while the C++
-  `td::string` SSO stores every key/value in this bench inline (all ≤ 10
-  chars). A small-string optimization for short keys is a follow-up; the
-  map mechanics themselves are at parity.
+- **SeqKvBench — closed by benchmark fairness, not container change.** The
+  first measurement (7.3M ops, 0.40) was dominated by the bench's own two
+  `format!` heap allocations per write; the C++ `PSLICE() << i` equivalent
+  formats into SSO-backed stack storage with zero heap traffic. Switching
+  the Rust row to stack formatting (`itoa`, the `PSLICE` analog) lifted it
+  to 21.6–29.7M ops — at parity or faster than C++. The residual internal
+  cost is `SeqKeyValue`'s `String` map storage (no SSO in safe Rust); a
+  small-string optimization remains an optional follow-up.
 - **BinlogKeyValue rows (5.8–10× faster).** Plausible but flagged: the
   Rust `ConcurrentBinlog` mutex-serializes where C++ dispatches through
   the `BinlogActor` event loop, removing the per-event mailbox latency.

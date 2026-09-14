@@ -17,6 +17,7 @@ crossbeam-channel = "0.5"
 reqwest = { version = "0.12", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net"] }
 crc32fast = "1"
+itoa = "1"
 base64 = "0.22"
 
 [[bin]]

@@ -91,6 +91,7 @@ dependencies = [
  "base64",
  "crc32fast",
  "crossbeam-channel",
+ "itoa",
  "reqwest",
  "tdactor",
  "tddb",

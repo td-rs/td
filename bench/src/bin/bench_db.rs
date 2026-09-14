@@ -262,8 +262,15 @@ impl Benchmark for SeqKvBench {
         "SeqKvBench".into()
     }
     fn run(&mut self, n: usize) {
+        // The C++ row's `PSLICE() << i` formats into SSO-backed stack
+        // storage with zero heap traffic; `itoa` is the matching
+        // stack-formatted equivalent so the measured gap is the container,
+        // not the benchmark's own `format!` allocations.
+        let mut key_buf = itoa::Buffer::new();
+        let mut value_buf = itoa::Buffer::new();
         for i in 0..n {
-            self.kv.set(&format!("{}", i % 10), &format!("{}", i));
+            self.kv
+                .set(key_buf.format((i % 10) as u64), value_buf.format(i as u64));
         }
     }
 }
