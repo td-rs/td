@@ -37,6 +37,7 @@
 //! typed dispatch built in S33, which will be the actual unsafe boundary.
 
 use self::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::alloc::Layout;
 use std::cell::UnsafeCell;
 use std::hash::{Hash, Hasher};
 use std::marker::PhantomData;
@@ -72,8 +73,38 @@ pub(crate) struct IdSlot {
     /// under the loom model, where the raw `Box::from_raw` double free would
     /// be silent UB.
     freed: AtomicBool,
-    name: Box<str>,
+    /// The actor's debug name, stored inline (truncated to 31 bytes) — the
+    /// C++ copies the name into its pool block too; a boxed string here was
+    /// an extra malloc per registration (the S37 CreateActor gate).
+    name: ActorName,
+    /// The block's allocation layout — the block is freed raw by the last
+    /// `ActorId` drop (see [`SlotBlock`](Self::allocate_block)).
+    block_layout: Layout,
     info: UnsafeCell<*mut ActorInfo>,
+}
+
+/// A small inline string — [`IdSlot::name`] (see the field docs).
+pub(crate) struct ActorName {
+    buf: [u8; 31],
+    len: u8,
+}
+
+impl ActorName {
+    fn new(name: &str) -> Self {
+        let bytes = name.as_bytes();
+        let len = bytes.len().min(31);
+        let mut buf = [0; 31];
+        buf[..len].copy_from_slice(&bytes[..len]);
+        Self {
+            buf,
+            len: len as u8,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        // SAFETY: the bytes were copied from a `&str` prefix.
+        unsafe { std::str::from_utf8_unchecked(&self.buf[..self.len as usize]) }
+    }
 }
 
 // SAFETY: `ref_cnt`, `alive` and `sched` are atomics, `name` is immutable
@@ -83,16 +114,58 @@ pub(crate) struct IdSlot {
 unsafe impl Send for IdSlot {}
 unsafe impl Sync for IdSlot {}
 
+/// The single allocation behind a registered actor — the C++ ObjectPool's
+/// one block: `[IdSlot | ActorInfo | actor storage]`, carved with a raw
+/// layout so the concrete `A`'s object lives inside it too. The S37
+/// CreateActor gate measured the three separate mallocs of the earlier
+/// design (slot+info, actor, name) against this shape; the slot sits at
+/// offset 0, so its pointer doubles as the block base for the final free.
+///
+/// Lifecycle: `destroy_actor` drops the actor and the `ActorInfo` in place
+/// when the actor dies; the block itself lives until the last `ActorId`
+/// copy drops (the slot outlives the actor — sends to a dead actor are
+/// no-ops that need the atomics) and is then freed with the layout stored
+/// in the slot.
 impl IdSlot {
-    pub(crate) fn new(info: Box<ActorInfo>, sched_id: i32, name: &str) -> Box<Self> {
-        Box::new(Self {
-            ref_cnt: AtomicUsize::new(1),
-            alive: AtomicBool::new(true),
-            sched: AtomicI32::new(sched_id),
-            freed: AtomicBool::new(false),
-            name: name.into(),
-            info: UnsafeCell::new(Box::into_raw(info)),
-        })
+    /// Allocate the block and write the slot (the caller writes the
+    /// `ActorInfo` and the actor object into the returned pointers).
+    pub(crate) fn allocate_block<A: Actor>(
+        sched_id: i32,
+        name: &str,
+    ) -> (*mut IdSlot, *mut ActorInfo, *mut A) {
+        let (layout, info_offset) = Layout::new::<IdSlot>()
+            .extend(Layout::new::<ActorInfo>())
+            .expect("slot + info layout");
+        let (total, actor_offset) = layout
+            .extend(Layout::new::<A>())
+            .expect("slot + info + actor layout");
+        // SAFETY: the layout has nonzero size (IdSlot is not a ZST) and the
+        // block is written before it is shared.
+        let block = unsafe { std::alloc::alloc(total) };
+        if block.is_null() {
+            std::alloc::handle_alloc_error(total);
+        }
+        // SAFETY: freshly allocated memory, not yet aliased; the slot is
+        // written here, the rest by the caller.
+        unsafe {
+            std::ptr::write(
+                block.cast::<IdSlot>(),
+                IdSlot {
+                    ref_cnt: AtomicUsize::new(1),
+                    alive: AtomicBool::new(true),
+                    sched: AtomicI32::new(sched_id),
+                    freed: AtomicBool::new(false),
+                    name: ActorName::new(name),
+                    block_layout: total,
+                    info: UnsafeCell::new(block.add(info_offset).cast()),
+                },
+            );
+            (
+                block.cast(),
+                block.add(info_offset).cast(),
+                block.add(actor_offset).cast(),
+            )
+        }
     }
 }
 
@@ -109,9 +182,9 @@ pub struct ActorId<A: ?Sized = dyn Actor> {
 }
 
 impl<A: ?Sized> ActorId<A> {
-    pub(crate) fn new(slot: Box<IdSlot>) -> Self {
-        // ref_cnt starts at 1 for this copy.
-        let ptr = Box::into_raw(slot);
+    pub(crate) fn from_raw_block(ptr: *mut IdSlot) -> Self {
+        // ref_cnt starts at 1 inside the freshly written slot; the slot is
+        // the block's first field, so the pointer is also the block base.
         Self {
             slot: NonNull::new(ptr),
             marker: PhantomData,
@@ -141,7 +214,7 @@ impl<A: ?Sized> ActorId<A> {
     /// string for an empty id.
     pub fn get_name(&self) -> &str {
         match self.slot {
-            Some(s) => &self.slot_of(s).name,
+            Some(s) => self.slot_of(s).name.as_str(),
             None => "",
         }
     }
@@ -160,6 +233,16 @@ impl<A: ?Sized> ActorId<A> {
             slot,
             marker: PhantomData,
         }
+    }
+
+    /// Coerce a shared reference to the erased id form — the borrowed half of
+    /// [`ActorRef`] (the S37 hot path: `send_closure(&id, ...)` takes no
+    /// refcount). The type parameter is a zero-sized `PhantomData` marker, so
+    /// `ActorId<A>` and `ActorId<dyn Actor>` share the representation and the
+    /// cast is sound.
+    pub(crate) fn erase_ref(&self) -> &ActorId<dyn Actor> {
+        // SAFETY: see the docs — the only data is the slot pointer.
+        unsafe { &*(self as *const ActorId<A> as *const ActorId<dyn Actor>) }
     }
 
     /// Re-type this id to another marker type `B` — the port of the C++
@@ -214,6 +297,34 @@ impl<A: ?Sized> ActorId<A> {
         unsafe { *self.slot().info.get() }
     }
 
+    /// The raw slot pointer (null for an empty id) — the S37 hot-path form:
+    /// the dispatch context stores this instead of an owned copy, so the
+    /// inline dispatch pays no refcount. The pointed-to slot stays alive via
+    /// the copies owned by the scheduler lists and the senders (the same
+    /// protocol as the C++ `ActorId` pool index).
+    pub(crate) fn slot_ptr(&self) -> *const IdSlot {
+        self.slot.map_or(std::ptr::null(), |s| s.as_ptr())
+    }
+
+    /// Rebuild an owned `ActorId` from a live slot pointer (the reverse of
+    /// [`slot_ptr`](Self::slot_ptr)) — used by `Scheduler::current_actor`,
+    /// which must hand out an owning copy.
+    ///
+    /// # Safety
+    ///
+    /// `slot` must point at a live `IdSlot` whose actor is the one being
+    /// dispatched on this thread.
+    pub(crate) unsafe fn from_slot_ptr(slot: NonNull<IdSlot>) -> Self {
+        // SAFETY: the caller guarantees a live slot (see the fn docs).
+        unsafe { slot.as_ref() }
+            .ref_cnt
+            .fetch_add(1, Ordering::AcqRel);
+        Self {
+            slot: Some(slot),
+            marker: PhantomData,
+        }
+    }
+
     fn slot(&self) -> &IdSlot {
         self.slot_of(self.slot.expect("empty ActorId"))
     }
@@ -252,11 +363,15 @@ impl<A: ?Sized> Drop for ActorId<A> {
                     !slot.freed.swap(true, Ordering::AcqRel),
                     "IdSlot double free: two ActorId drops observed the last reference"
                 );
-                // SAFETY: last reference; the slot's `info` Box was already
-                // freed by `SchedulerState::destroy_actor` if the actor died,
-                // and an actor with zero id copies cannot be alive.
+                // SAFETY: last reference. The block's `ActorInfo` half (and
+                // the actor inside it) were dropped in place by
+                // `destroy_actor` if the actor died (an actor with zero id
+                // copies cannot be alive); what remains is the slot itself,
+                // dropped here, and the block, freed with its stored layout.
                 unsafe {
-                    drop(Box::from_raw(s.as_ptr()));
+                    let layout = slot.block_layout;
+                    std::ptr::drop_in_place(s.as_ptr());
+                    std::alloc::dealloc(s.as_ptr() as *mut u8, layout);
                 }
             }
         }
@@ -465,61 +580,81 @@ impl<A: ?Sized> std::fmt::Debug for ActorShared<A> {
 /// The send-side view of an actor reference — the port of C++ `ActorRef`: an
 /// id plus an optional link token, constructible from any of the reference
 /// types (of any marker type).
+///
+/// A send-time actor reference is either a *borrowed* [`ActorId`] (the hot
+/// path: `send_closure(&id, ...)` pays no refcount — the caller's owned copy
+/// outlives the synchronous send, and the C++ `ActorId` is a plain value
+/// with no such cost at all) or an owned one, when the caller hands over an
+/// id by value.
 #[derive(Clone, Debug)]
-pub struct ActorRef {
-    pub(crate) id: ActorId<dyn Actor>,
+pub struct ActorRef<'a> {
+    id: ActorRefId<'a>,
     pub(crate) token: u64,
 }
 
-impl ActorRef {
+#[derive(Clone, Debug)]
+enum ActorRefId<'a> {
+    Owned(ActorId<dyn Actor>),
+    Borrowed(&'a ActorId<dyn Actor>),
+}
+
+impl ActorRef<'_> {
     pub(crate) fn with_token(mut self, token: u64) -> Self {
         self.token = token;
         self
     }
+
+    /// The target id, borrowed (either variant).
+    pub(crate) fn id(&self) -> &ActorId<dyn Actor> {
+        match &self.id {
+            ActorRefId::Owned(id) => id,
+            ActorRefId::Borrowed(id) => id,
+        }
+    }
 }
 
-impl<A: ?Sized> From<ActorId<A>> for ActorRef {
+impl<'a, A: ?Sized> From<ActorId<A>> for ActorRef<'a> {
     fn from(id: ActorId<A>) -> Self {
         Self {
-            id: id.erase(),
+            id: ActorRefId::Owned(id.erase()),
             token: 0,
         }
     }
 }
 
-impl<A: ?Sized> From<&ActorId<A>> for ActorRef {
-    fn from(id: &ActorId<A>) -> Self {
+impl<'a, A: ?Sized> From<&'a ActorId<A>> for ActorRef<'a> {
+    fn from(id: &'a ActorId<A>) -> Self {
         Self {
-            id: id.clone().erase(),
+            id: ActorRefId::Borrowed(id.erase_ref()),
             token: 0,
         }
     }
 }
 
-impl<A: ?Sized> From<ActorShared<A>> for ActorRef {
+impl<'a, A: ?Sized> From<ActorShared<A>> for ActorRef<'a> {
     fn from(shared: ActorShared<A>) -> Self {
         let token = shared.token();
         let id = shared.release();
         Self {
-            id: id.erase(),
+            id: ActorRefId::Owned(id.erase()),
             token,
         }
     }
 }
 
-impl<A: ?Sized> From<&ActorShared<A>> for ActorRef {
-    fn from(shared: &ActorShared<A>) -> Self {
+impl<'a, A: ?Sized> From<&'a ActorShared<A>> for ActorRef<'a> {
+    fn from(shared: &'a ActorShared<A>) -> Self {
         Self {
-            id: shared.get().erase(),
+            id: ActorRefId::Borrowed(shared.id.erase_ref()),
             token: shared.token(),
         }
     }
 }
 
-impl<A: ?Sized> From<&ActorOwn<A>> for ActorRef {
-    fn from(own: &ActorOwn<A>) -> Self {
+impl<'a, A: ?Sized> From<&'a ActorOwn<A>> for ActorRef<'a> {
+    fn from(own: &'a ActorOwn<A>) -> Self {
         Self {
-            id: own.get().erase(),
+            id: ActorRefId::Borrowed(own.id.erase_ref()),
             token: 0,
         }
     }
@@ -536,13 +671,27 @@ impl<A: ?Sized> From<&ActorOwn<A>> for ActorRef {
 #[cfg(all(test, feature = "loom"))]
 mod loom_tests {
     use super::{ActorId, IdSlot};
+    use crate::actor::Actor;
     use crate::scheduler::{ActorInfo, ActorSlot};
+
+    struct Dummy;
+
+    impl Actor for Dummy {}
+
+    fn make_id() -> ActorId {
+        let (slot_ptr, info_ptr, _actor_ptr) = IdSlot::allocate_block::<Dummy>(0, "loom");
+        // SAFETY: freshly allocated; the info is written before the slot is
+        // shared.
+        unsafe {
+            std::ptr::write(info_ptr, ActorInfo::new(ActorSlot::Empty, false));
+        }
+        ActorId::from_raw_block(slot_ptr)
+    }
 
     #[test]
     fn slot_freed_after_last_ref_despite_death_race() {
         loom::model(|| {
-            let slot = IdSlot::new(Box::new(ActorInfo::new(ActorSlot::Empty, false)), 0, "loom");
-            let id: ActorId = ActorId::new(slot);
+            let id = make_id();
             let foreign = id.clone();
             let handle = loom::thread::Builder::new()
                 .spawn(move || {
@@ -563,8 +712,7 @@ mod loom_tests {
     #[test]
     fn slot_outlives_all_local_copies() {
         loom::model(|| {
-            let slot = IdSlot::new(Box::new(ActorInfo::new(ActorSlot::Empty, false)), 0, "loom");
-            let id: ActorId = ActorId::new(slot);
+            let id = make_id();
             let clone = id.clone();
             // Two local copies on one thread: the slot is freed by the drop
             // that observes ref_cnt == 1, not by the first one out.

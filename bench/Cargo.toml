@@ -1,0 +1,22 @@
+# Bench crate — ports of the C++ `benchmark/` targets (S37 first: bench_actor).
+# Own manifest, excluded from the workspace (built and run separately, like
+# `conformance/`).
+[package]
+name = "bench"
+version = "0.1.0"
+edition = "2024"
+license = "BSL-1.0"
+publish = false
+
+[dependencies]
+tdactor = { path = "../crates/tdactor" }
+tdutils = { path = "../crates/tdutils" }
+
+[[bin]]
+name = "bench_actor"
+path = "src/bin/bench_actor.rs"
+
+[profile.release]
+# Keep the default opt-level 3; match the C++ Release build (no LTO on either
+# side) so the S37 gate compares like for like.
+lto = false

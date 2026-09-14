@@ -33,43 +33,52 @@ pub trait ActorMessage: Send + 'static {
     fn dispatch(self, actor: &mut Self::Actor);
 }
 
-/// Checked downcast from the event's `&mut dyn Actor` to the concrete callee
-/// — the sound replacement of the C++ `static_cast` in
-/// `ImmediateClosure::run`. `Actor: Any` + trait upcasting make this total:
-/// a message sent to the wrong actor is a loud panic, not UB.
+/// Downcast from the event's `&mut dyn Actor` to the concrete callee —
+/// the replacement of the C++ `static_cast` in `ImmediateClosure::run`.
+///
+/// Checked in debug builds, a blind cast in release: the S37 gate measured
+/// the `TypeId` check on every inline dispatch hop, where the C++ pays
+/// nothing for its blind cast (the ring send_immediate benchmark — the
+/// check plus its panic branch kept the dispatch from inlining). The check
+/// still runs in every debug build and test, so a wrong-actor message is
+/// caught during development; in release, sending to a lying `ActorId`
+/// marker is UB — exactly the C++ `static_cast` semantics this port
+/// mirrors (the marker names the actor's real type by protocol).
 pub(crate) fn downcast<A: Actor>(actor: &mut dyn Actor) -> &mut A {
-    let any: &mut dyn std::any::Any = actor;
-    any.downcast_mut::<A>().unwrap_or_else(|| {
-        panic!(
-            "send_closure type mismatch: the event was not addressed to a {}",
-            std::any::type_name::<A>()
-        )
-    })
+    debug_assert!(
+        (actor as &dyn std::any::Any).type_id() == std::any::TypeId::of::<A>(),
+        "send_closure type mismatch: the event was not addressed to a {}",
+        std::any::type_name::<A>()
+    );
+    // SAFETY: `A` is the actor's real type (the `ActorId` marker protocol;
+    // asserted above in debug builds). The cast drops the vtable, exactly
+    // like the C++ `static_cast`.
+    unsafe { &mut *(actor as *mut dyn Actor as *mut A) }
 }
 
 /// `td::send_closure`: run `message`'s handler on the destination actor —
 /// inline right away when the actor is idle on this scheduler, otherwise
 /// through its mailbox (the port of `Scheduler::send_closure_immediately`).
-pub fn send_closure<M, R>(actor_ref: R, message: M)
+pub fn send_closure<'a, M, R>(actor_ref: R, message: M)
 where
     M: ActorMessage,
-    R: Into<ActorRef>,
+    R: Into<ActorRef<'a>>,
 {
     Scheduler::instance().send_closure_immediately(actor_ref.into(), make_thunk(message));
 }
 
 /// `td::send_closure_later`: like [`send_closure`], but always through the
 /// destination's mailbox.
-pub fn send_closure_later<M, R>(actor_ref: R, message: M)
+pub fn send_closure_later<'a, M, R>(actor_ref: R, message: M)
 where
     M: ActorMessage,
-    R: Into<ActorRef>,
+    R: Into<ActorRef<'a>>,
 {
     Scheduler::instance().send_closure_later(actor_ref.into(), make_thunk(message));
 }
 
 fn make_thunk<M: ActorMessage>(message: M) -> ActorThunk {
-    Box::new(move |actor: &mut dyn Actor| {
+    ActorThunk::new(move |actor: &mut dyn Actor| {
         M::dispatch(message, downcast::<M::Actor>(actor));
     })
 }

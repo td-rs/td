@@ -30,7 +30,7 @@ use tdutils::status::{Result, Status};
 
 use crate::actor::Actor;
 use crate::actor_id::{ActorId, ActorOwn, ActorRef};
-use crate::event::Event;
+use crate::event::{ActorThunk, Event};
 use crate::scheduler::Scheduler;
 
 /// The port of C++ `EventFull`: an event addressed to an actor, with the
@@ -311,9 +311,6 @@ enum PromiseActorState {
 /// [`FutureActor::HANGUP_ERROR_CODE`].
 pub struct PromiseActor<T: Send + 'static> {
     future_id: ActorOwn<FutureActor<T>>,
-    /// Kept for C++ layout fidelity: the C++ `event_` is cleared by `init`/
-    /// `is_hangup` but never assigned (always empty).
-    event: EventFull,
     state: PromiseActorState,
 }
 
@@ -339,7 +336,6 @@ impl<T: Send + 'static> PromiseActor<T> {
             self.state = PromiseActorState::Hangup;
             let own = std::mem::take(&mut self.future_id);
             let _ = own.release(); // the future is already gone: no hangup
-            self.event.clear();
             return true;
         }
         false
@@ -368,7 +364,6 @@ impl<T: Send + 'static> PromiseActor<T> {
 
     fn init(&mut self) {
         self.state = PromiseActorState::Waiting;
-        self.event.clear();
     }
 
     fn send_to_future(&mut self, event_fn: impl FnOnce(&mut FutureActor<T>) + Send + 'static) {
@@ -379,7 +374,7 @@ impl<T: Send + 'static> PromiseActor<T> {
             let id = own.release();
             Scheduler::instance().send_closure_immediately(
                 ActorRef::from(id),
-                Box::new(move |actor: &mut dyn Actor| {
+                ActorThunk::from_boxed(Box::new(move |actor: &mut dyn Actor| {
                     // `future_id` is an ActorOwn<FutureActor<T>> (set by
                     // init_promise_future), so the actor behind `id` is a
                     // FutureActor<T>; `downcast` verifies it instead of
@@ -387,7 +382,7 @@ impl<T: Send + 'static> PromiseActor<T> {
                     let future: &mut FutureActor<T> =
                         crate::messages::downcast::<FutureActor<T>>(actor);
                     event_fn(future);
-                }),
+                })),
             );
         }
     }
@@ -398,7 +393,6 @@ impl<T: Send + 'static> Default for PromiseActor<T> {
     fn default() -> Self {
         Self {
             future_id: ActorOwn::default(),
-            event: EventFull::default(),
             state: PromiseActorState::Hangup,
         }
     }
@@ -504,12 +498,12 @@ where
     let promise = pf.move_promise();
     Scheduler::instance().send_closure_immediately(
         ActorRef::from(actor_id),
-        Box::new(move |actor: &mut dyn Actor| {
+        ActorThunk::from_boxed(Box::new(move |actor: &mut dyn Actor| {
             // The ActorId<A> marker names the actor's real type;
             // `downcast` verifies it (the C++ static_cast trusted it).
             let callee = crate::messages::downcast::<A>(actor);
             handler(callee, promise);
-        }),
+        })),
     );
     pf.move_future()
 }
@@ -526,11 +520,11 @@ where
     let promise = pf.move_promise();
     Scheduler::instance().send_closure_later(
         ActorRef::from(actor_id),
-        Box::new(move |actor: &mut dyn Actor| {
+        ActorThunk::from_boxed(Box::new(move |actor: &mut dyn Actor| {
             // Same as send_promise_immediately: `downcast` verifies.
             let callee = crate::messages::downcast::<A>(actor);
             handler(callee, promise);
-        }),
+        })),
     );
     pf.move_future()
 }
@@ -549,11 +543,11 @@ where
     move |result: Result<T>| {
         Scheduler::instance().send_closure_immediately(
             ActorRef::from(actor_id),
-            Box::new(move |actor: &mut dyn Actor| {
+            ActorThunk::from_boxed(Box::new(move |actor: &mut dyn Actor| {
                 // Same as send_promise_immediately: `downcast` verifies.
                 let callee = crate::messages::downcast::<A>(actor);
                 handler(callee, result);
-            }),
+            })),
         );
     }
 }

@@ -90,23 +90,28 @@ pub fn register_actor<A: Actor>(name: &str, sched_id: i32, actor: A) -> ActorOwn
 
 /// Send an event, running the handler inline when possible — the free
 /// `td::send_event` (`Scheduler::send_immediately`).
-pub fn send_event(actor_ref: impl Into<ActorRef>, event: Event) {
+pub fn send_event<'a>(actor_ref: impl Into<ActorRef<'a>>, event: Event) {
     Scheduler::instance().send_immediately(actor_ref, event);
 }
 /// Send an event through the mailbox — the free `td::send_event_later`
 /// (`Scheduler::send_later`).
-pub fn send_event_later(actor_ref: impl Into<ActorRef>, event: Event) {
+pub fn send_event_later<'a>(actor_ref: impl Into<ActorRef<'a>>, event: Event) {
     Scheduler::instance().send_later(actor_ref, event);
 }
 /// Send a raw thunk inline-when-idle — the free `td::send_closure` half
 /// kept for the pre-S33 call sites (`Scheduler::send_closure_immediately`);
 /// typed dispatch is [`send_closure`]/[`send_closure_later`] from
-/// [`messages`].
-pub fn send_thunk_immediately(actor_ref: impl Into<ActorRef>, closure: crate::event::ActorThunk) {
+/// [`messages`]. Boxed closures are passed through
+/// [`ActorThunk::from_boxed`](crate::event::ActorThunk::from_boxed) (see the
+/// scheduler method docs for why the parameter is concrete).
+pub fn send_thunk_immediately<'a>(
+    actor_ref: impl Into<ActorRef<'a>>,
+    closure: crate::event::ActorThunk,
+) {
     Scheduler::instance().send_closure_immediately(actor_ref.into(), closure);
 }
 
 /// Send a raw thunk through the mailbox (`Scheduler::send_closure_later`).
-pub fn send_thunk_later(actor_ref: impl Into<ActorRef>, closure: crate::event::ActorThunk) {
+pub fn send_thunk_later<'a>(actor_ref: impl Into<ActorRef<'a>>, closure: crate::event::ActorThunk) {
     Scheduler::instance().send_closure_later(actor_ref.into(), closure);
 }

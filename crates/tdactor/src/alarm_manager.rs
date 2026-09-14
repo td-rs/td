@@ -29,6 +29,7 @@ use tdutils::status::Status;
 
 use crate::actor::Actor;
 use crate::actor_id::{ActorId, ActorRef, ActorShared};
+use crate::event::ActorThunk;
 use crate::scheduler::Scheduler;
 use crate::timeout::MultiTimeout;
 
@@ -110,13 +111,13 @@ impl Actor for AlarmManager {
             // `send_closure_later(alarm_manager_id, &AlarmManager::on_alarm_timeout, alarm_id)`.
             Scheduler::instance().send_closure_later(
                 ActorRef::from(manager.clone()),
-                Box::new(move |actor| {
+                ActorThunk::from_boxed(Box::new(move |actor| {
                     // SAFETY: the `ActorId<AlarmManager>` marker names the
                     // actor's real type — the C++ `static_cast` in
                     // `send_closure` (see the promise module docs).
                     let manager = unsafe { &mut *(actor as *mut dyn Actor as *mut Self) };
                     manager.on_alarm_timeout(alarm_id);
-                }),
+                })),
             );
         }));
     }

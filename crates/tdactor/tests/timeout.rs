@@ -10,6 +10,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use tdactor::event::ActorThunk;
 use tdactor::{
     Actor, ActorId, ActorOwn, ActorRef, ActorShared, AlarmManager, ConcurrentScheduler,
     MultiTimeout, Scheduler, SleepActor, Timeout,
@@ -45,12 +46,12 @@ where
 {
     tdactor::send_thunk_later(
         ActorRef::from(id),
-        Box::new(move |actor| {
+        ActorThunk::from_boxed(Box::new(move |actor| {
             // SAFETY: the `ActorId<A>` marker names the actor's real type (the
             // C++ `static_cast` in `send_closure`).
             let actor = unsafe { &mut *(actor as *mut dyn Actor as *mut A) };
             handler(actor);
-        }),
+        })),
     );
 }
 

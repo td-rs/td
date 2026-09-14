@@ -35,16 +35,16 @@
 
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::time::Instant;
 
 use crate::actor::Actor;
-use crate::actor_id::{ActorId, ActorOwn, ActorRef};
+use crate::actor_id::{ActorId, ActorOwn, ActorRef, IdSlot};
 use crate::event::{Event, EventType};
 
 /// The `EventContext::Stop` flag of the C++ scheduler.
@@ -61,7 +61,17 @@ const IDLE_POLL: Duration = Duration::from_secs(10);
 /// by-pointer `register_actor` overload — `PromiseFuture`'s `FutureActor`).
 pub(crate) enum ActorSlot {
     Empty,
-    Owned(Box<dyn Actor>),
+    /// The actor object lives inside the `IdSlot` block allocation, right
+    /// after the `ActorInfo` (the C++ `ActorInfo<T>` actor storage — one
+    /// malloc per actor, the S37 CreateActor gate). The fn-pointer pair
+    /// rebuilds the trait object and drops the concrete `A`; raw-pointer
+    /// unsizing is not expressible as a method, so the concrete type is
+    /// erased here at registration time.
+    OwnedInline {
+        ptr: *mut (),
+        as_mut: unsafe fn(*mut ()) -> *mut (dyn Actor + 'static),
+        drop: unsafe fn(*mut ()),
+    },
     Borrowed(*mut dyn Actor),
 }
 
@@ -70,7 +80,9 @@ impl ActorSlot {
     fn as_mut(&mut self) -> Option<&mut dyn Actor> {
         match self {
             Self::Empty => None,
-            Self::Owned(boxed) => Some(boxed.as_mut()),
+            // SAFETY: the actor is live until `destroy_actor` drops it in
+            // place (the block outlives it).
+            Self::OwnedInline { ptr, as_mut, .. } => Some(unsafe { &mut *as_mut(*ptr) }),
             // SAFETY: a borrowed actor is valid until its destruction (the
             // `register_actor_ptr` contract, identical to C++ `Deleter::None`).
             Self::Borrowed(ptr) => {
@@ -82,6 +94,27 @@ impl ActorSlot {
             }
         }
     }
+
+    /// The trait-object rebuild for `OwnedInline` — `*mut A` unsized to the
+    /// erased object pointer (the vtable travels with the metadata).
+    unsafe fn as_mut_actor<A: Actor>(p: *mut ()) -> *mut (dyn Actor + 'static) {
+        p as *mut A as *mut (dyn Actor + 'static)
+    }
+
+    /// The in-place drop for `OwnedInline`.
+    unsafe fn drop_actor<A: Actor>(p: *mut ()) {
+        // SAFETY: `p` points at a live, initialized `A` that is dropped
+        // exactly once, here.
+        unsafe { std::ptr::drop_in_place(p as *mut A) };
+    }
+}
+
+/// The registration input of [`SchedulerState::register_actor_impl`]: the
+/// actor object by value (owned by the scheduler) or by pointer (the C++
+/// `Deleter::None` overload).
+enum RegisterActor<A: Actor> {
+    Owned(A),
+    Borrowed(*mut dyn Actor),
 }
 
 /// Port of C++ `ActorInfo` (the `mailbox_`, `is_running_` and timeout parts;
@@ -92,6 +125,10 @@ pub(crate) struct ActorInfo {
     pub is_running: Cell<bool>,
     pub in_ready: Cell<bool>,
     pub in_pending: Cell<bool>,
+    /// Position in the scheduler's `pending` vector (valid while `in_pending`;
+    /// kept updated on `swap_remove` — the `KHeap`-style index of the S37
+    /// intrusive-list replacement).
+    pub pending_index: Cell<usize>,
     /// Incremented on every timeout set/cancel; heap entries with a stale
     /// generation are dropped lazily (the `KHeap::fix`/`erase` replacement).
     pub timeout_gen: Cell<u64>,
@@ -112,6 +149,7 @@ impl ActorInfo {
             is_running: Cell::new(false),
             in_ready: Cell::new(false),
             in_pending: Cell::new(false),
+            pending_index: Cell::new(0),
             timeout_gen: Cell::new(0),
             deadline: Cell::new(None),
             need_start_up,
@@ -121,35 +159,45 @@ impl ActorInfo {
 
 /// The event context of the currently dispatched event — the port of C++
 /// `Scheduler::EventContext` + `event_context_ptr_`.
-#[derive(Default)]
 struct EventContext {
-    actor: Option<ActorId>,
+    /// The slot of the dispatched actor, as a raw pointer (null when none):
+    /// the context *borrows* the caller's owned copy instead of cloning, so
+    /// the inline dispatch pays no refcount (the S37 hot path).
+    actor: *const IdSlot,
     dest: i32,
     flags: u32,
     link_token: u64,
 }
 
-thread_local! {
-    /// The scheduler of the current thread (`Scheduler::scheduler_` in C++).
-    /// Set by [`SchedulerGuard`]; foreign threads may point it at the send
-    /// scheduler, in which case sends always route through the channels.
-    static CURRENT_SCHEDULER: Cell<*const SchedulerState> = const { Cell::new(std::ptr::null()) };
-
-    /// The context of the dispatch currently running on this thread —
-    /// `Scheduler::event_context_ptr_` in C++.
-    static EVENT_CTX: RefCell<EventContext> = const {
-        RefCell::new(EventContext {
-            actor: None,
+impl Default for EventContext {
+    fn default() -> Self {
+        Self {
+            actor: std::ptr::null(),
             dest: 0,
             flags: 0,
             link_token: 0,
-        })
+        }
+    }
+}
+
+/// The per-thread scheduler pointer — the only thread-local on the hot path
+/// (the S37 profile measured `thread::local::LocalKey::with` at over a third
+/// of each inline hop; the dispatch context itself moved into
+/// [`SchedulerState`], which is single-thread-owned, so the inline dispatch
+/// pays exactly one thread-local access: `Scheduler::instance()`).
+struct SchedulerTls {
+    /// The scheduler of the current thread (`Scheduler::scheduler_` in C++).
+    /// Set by [`SchedulerGuard`]; foreign threads may point it at the send
+    /// scheduler, in which case sends always route through the channels.
+    scheduler: Cell<*const SchedulerState>,
+}
+
+thread_local! {
+    static TLS: SchedulerTls = const {
+        SchedulerTls {
+            scheduler: Cell::new(std::ptr::null()),
+        }
     };
-    /// Saved contexts of the enclosing dispatches — the C++ `EventGuard`
-    /// save/restore chain. Inline sends during a dispatch nest guards
-    /// (actor A's handler running actor B's closure directly), so the
-    /// context must be restored, not cleared, on exit.
-    static EVENT_CTX_SAVED: RefCell<Vec<EventContext>> = const { RefCell::new(Vec::new()) };
 }
 
 /// One heap entry of the timeout queue: the deadline, the actor and the
@@ -199,8 +247,12 @@ pub struct SchedulerState {
     actor_count: Cell<i32>,
     /// Actors with pending mailbox events, in dispatch order (`ready_actors_`).
     ready: RefCell<VecDeque<ActorId>>,
-    /// Idle actors (`pending_actors_`).
-    pending: RefCell<HashSet<ActorId>>,
+    /// Idle actors (`pending_actors_`). A vector with `swap_remove` and a
+    /// per-actor index in [`ActorInfo::pending_index`] — O(1) pointer work on
+    /// every dispatch enter/exit, the intrusive-list equivalent (the S37
+    /// profile showed the `HashSet` insert alone taking a quarter of each
+    /// inline hop; the hash wasn't the cost, the table insert was).
+    pending: RefCell<Vec<ActorId>>,
     /// The timeout heap (`timeout_queue_`).
     timeouts: RefCell<BinaryHeap<TimeoutEntry>>,
     /// Events for actors that are migrating to this scheduler but have not
@@ -221,6 +273,15 @@ pub struct SchedulerState {
     /// across awaits (the scheduler thread runs a single, non-`Send` task on
     /// a `current_thread` runtime, so nothing else can touch it).
     inbound: UnsafeCell<Option<UnboundedReceiver<Inbound>>>,
+    /// The context of the dispatch currently running on this scheduler —
+    /// `Scheduler::event_context_ptr_` in C++. Each dispatch guard installs
+    /// its own frame-local `EventContext` and swaps the pointer (the C++
+    /// `EventGuard` save/restore chain): nested inline dispatches stack
+    /// through the call stack, so no heap, no `RefCell`, and no thread-local
+    /// on the hot path. An `AtomicPtr` so the state stays `Send + Sync`
+    /// (the state moves to the worker threads); only the scheduler's own
+    /// thread ever touches it — the same invariant as `inbound`.
+    ctx: AtomicPtr<EventContext>,
     /// A clone of this scheduler's own sender, for `wakeup()`.
     wakeup_tx: UnboundedSender<Inbound>,
     /// The main scheduler's inbound sender — `finish()` wakes the main pump so
@@ -245,7 +306,7 @@ impl SchedulerState {
             sched_count,
             actor_count: Cell::new(0),
             ready: RefCell::new(VecDeque::new()),
-            pending: RefCell::new(HashSet::new()),
+            pending: RefCell::new(Vec::new()),
             timeouts: RefCell::new(BinaryHeap::new()),
             pending_events: RefCell::new(HashMap::new()),
             close_flag: AtomicBool::new(false),
@@ -253,6 +314,7 @@ impl SchedulerState {
             has_guard: Cell::new(false),
             outbound,
             inbound: UnsafeCell::new(Some(inbound)),
+            ctx: AtomicPtr::new(std::ptr::null_mut()),
             wakeup_tx,
             main_wakeup,
             finished,
@@ -260,16 +322,54 @@ impl SchedulerState {
     }
 
     /// `ActorInfo` of a live actor. Only valid on the actor's scheduler thread
-    /// (single-threaded access; the same invariant as C++).
-    fn info(&self, id: ActorId) -> &ActorInfo {
+    /// (single-threaded access; the same invariant as C++). Takes `&ActorId`:
+    /// the caller always holds a copy (the scheduler's ready/pending lists or
+    /// the event's own id), so no refcount bump is needed on the hot path.
+    fn info(&self, id: &ActorId) -> &ActorInfo {
         unsafe { &*id.info_ptr() }
+    }
+
+    /// Run `f` against the current dispatch's event context — valid only
+    /// inside a dispatch guard (the C++ `Scheduler::event_context()`).
+    ///
+    /// # Safety of the pointer discipline
+    ///
+    /// `ctx` always points at a live, frame-local `EventContext` of an
+    /// enclosing dispatch on this scheduler's thread (or is null outside
+    /// any dispatch — debug-asserted here). Each context object has exactly
+    /// one guard frame deriving `&mut` from the pointer at a time: while a
+    /// nested dispatch runs, the pointer targets the inner frame's context,
+    /// so the outer one is never aliased.
+    fn with_ctx<R>(&self, f: impl FnOnce(&mut EventContext) -> R) -> R {
+        // SAFETY: only the scheduler's own thread touches `ctx` (the
+        // `inbound` invariant), and the dispatch guard keeps the pointee
+        // alive for the duration.
+        let ptr = self.ctx.load(Ordering::Relaxed);
+        debug_assert!(!ptr.is_null(), "no dispatch context on this thread");
+        // SAFETY: see the function docs.
+        f(unsafe { &mut *ptr })
+    }
+
+    /// Install a fresh guard context, returning the enclosing one (the C++
+    /// `EventGuard` save half).
+    fn install_ctx(&self, ctx: &EventContext) -> *const EventContext {
+        self.ctx.swap(
+            ctx as *const EventContext as *mut EventContext,
+            Ordering::Relaxed,
+        )
+    }
+
+    /// Restore the enclosing guard context (the C++ `EventGuard` restore
+    /// half).
+    fn restore_ctx(&self, prev: *const EventContext) {
+        self.ctx.store(prev.cast_mut(), Ordering::Relaxed);
     }
 
     // ---- actor registration (Scheduler.h template part) ----
 
     /// `Scheduler::create_actor`: register on the current scheduler.
     pub fn create_actor<A: Actor>(&self, name: &str, actor: A) -> ActorOwn<A> {
-        self.register_actor_impl(name, ActorSlot::Owned(Box::new(actor)), self.sched_id)
+        self.register_actor_impl(name, RegisterActor::Owned(actor), self.sched_id)
     }
 
     /// `Scheduler::create_actor_on_scheduler`.
@@ -279,13 +379,13 @@ impl SchedulerState {
         sched_id: i32,
         actor: A,
     ) -> ActorOwn<A> {
-        self.register_actor_impl(name, ActorSlot::Owned(Box::new(actor)), sched_id)
+        self.register_actor_impl(name, RegisterActor::Owned(actor), sched_id)
     }
 
     /// `Scheduler::register_actor` (the `Deleter::Destroy` overload: the
     /// scheduler owns the actor).
     pub fn register_actor<A: Actor>(&self, name: &str, sched_id: i32, actor: A) -> ActorOwn<A> {
-        self.register_actor_impl(name, ActorSlot::Owned(Box::new(actor)), sched_id)
+        self.register_actor_impl(name, RegisterActor::Owned(actor), sched_id)
     }
 
     /// `Scheduler::register_actor(name, actor_ptr)` — the C++ `Deleter::None`
@@ -306,19 +406,19 @@ impl SchedulerState {
         sched_id: i32,
         actor: *mut A,
     ) -> ActorOwn<A> {
-        self.register_actor_impl(name, ActorSlot::Borrowed(actor as *mut dyn Actor), sched_id)
+        self.register_actor_impl(
+            name,
+            RegisterActor::Borrowed(actor as *mut dyn Actor),
+            sched_id,
+        )
     }
 
     fn register_actor_impl<A: Actor>(
         &self,
         name: &str,
-        actor: ActorSlot,
+        actor: RegisterActor<A>,
         sched_id: i32,
     ) -> ActorOwn<A> {
-        // C++ sends Event::start to owned actors only (need_start_up is false
-        // for borrowed ones; see `register_actor_ptr`). The flag is recorded
-        // on the ActorInfo: `do_stop_actor` tears down only what started.
-        let need_start_up = matches!(actor, ActorSlot::Owned(_));
         assert!(
             self.has_guard.get(),
             "create_actor requires a scheduler guard"
@@ -334,22 +434,42 @@ impl SchedulerState {
             self.sched_count
         );
 
-        let slot = crate::actor_id::IdSlot::new(
-            Box::new(ActorInfo::new(actor, need_start_up)),
-            sched_id,
-            name,
-        );
+        // One allocation: `[IdSlot | ActorInfo | actor]` — the C++ ObjectPool
+        // block shape (the S37 CreateActor gate). The actor object is written
+        // into the block; borrowed actors leave their storage empty.
+        let (slot_ptr, info_ptr, actor_storage) =
+            crate::actor_id::IdSlot::allocate_block::<A>(sched_id, name);
+        // C++ sends Event::start to owned actors only (need_start_up is false
+        // for borrowed ones; see `register_actor_ptr`). The flag is recorded
+        // on the ActorInfo: `do_stop_actor` tears down only what started.
+        let (actor_slot, need_start_up) = match actor {
+            RegisterActor::Owned(a) => {
+                // SAFETY: `actor_storage` is fresh block memory, unaliased;
+                // the actor is written exactly once, here.
+                unsafe { std::ptr::write(actor_storage, a) };
+                (
+                    ActorSlot::OwnedInline {
+                        ptr: actor_storage as *mut (),
+                        as_mut: ActorSlot::as_mut_actor::<A>,
+                        drop: ActorSlot::drop_actor::<A>,
+                    },
+                    true,
+                )
+            }
+            RegisterActor::Borrowed(p) => (ActorSlot::Borrowed(p), false),
+        };
+        // SAFETY: `info_ptr` is fresh block memory, unaliased.
+        unsafe { std::ptr::write(info_ptr, ActorInfo::new(actor_slot, need_start_up)) };
         // The allocation is type-independent (the "session-unique id" of the
         // plan); the typed `ActorId<A>` is a pure marker added on the way out.
-        let id: ActorId = ActorId::new(slot);
+        let id: ActorId = ActorId::from_raw_block(slot_ptr);
         self.actor_count.set(self.actor_count.get() + 1);
 
         if sched_id != self.sched_id {
             self.send_later(id.clone(), Event::start());
             self.do_migrate_actor(id.clone(), sched_id);
         } else {
-            self.pending.borrow_mut().insert(id.clone());
-            self.info(id.clone()).in_pending.set(true);
+            self.insert_pending(&id);
             if need_start_up {
                 self.send_later(id.clone(), Event::start());
             }
@@ -361,19 +481,24 @@ impl SchedulerState {
 
     /// `Scheduler::send_immediately` / free `send_event`: runs the handler
     /// inline when possible, otherwise queues it.
-    pub fn send_immediately(&self, actor_ref: impl Into<ActorRef>, event: Event) {
+    pub fn send_immediately<'a>(&self, actor_ref: impl Into<ActorRef<'a>>, event: Event) {
         self.send_immediately_impl(actor_ref.into(), event);
     }
 
     /// `Scheduler::send_later` / free `send_event_later`: always through the
     /// mailbox.
-    pub fn send_later(&self, actor_ref: impl Into<ActorRef>, event: Event) {
+    pub fn send_later<'a>(&self, actor_ref: impl Into<ActorRef<'a>>, event: Event) {
         self.send_later_impl(actor_ref.into(), event);
     }
 
     /// `Scheduler::send_closure_immediately` — the send half of C++
     /// `send_closure`: run the closure inline when the destination is idle
     /// (not running, empty mailbox), otherwise through the mailbox.
+    ///
+    /// The parameter is concrete, not generic: boxed-closure call sites must
+    /// coerce through [`ActorThunk::from_boxed`] (the coercion is what
+    /// generalizes the closure's argument lifetime; a generic `Into` bound
+    /// would move the coercion behind a trait obligation and lose it).
     pub(crate) fn send_closure_immediately(
         &self,
         actor_ref: ActorRef,
@@ -391,9 +516,9 @@ impl SchedulerState {
         self.send_later_impl(actor_ref, Event::custom(closure));
     }
 
-    fn send_later_impl(&self, actor_ref: ActorRef, mut event: Event) {
+    fn send_later_impl(&self, actor_ref: ActorRef<'_>, mut event: Event) {
         event.link_token = actor_ref.token;
-        let id = actor_ref.id;
+        let id = actor_ref.id();
         if id.empty() || !id.is_alive() || self.close_flag.load(Ordering::Relaxed) {
             return;
         }
@@ -402,20 +527,23 @@ impl SchedulerState {
             if migrating {
                 self.pending_events
                     .borrow_mut()
-                    .entry(id)
+                    .entry(id.clone())
                     .or_default()
                     .push(event);
             } else {
                 self.add_to_mailbox(id, event);
             }
         } else {
-            let _ = self.outbound[sched as usize].send(Inbound::Event { id, event });
+            let _ = self.outbound[sched as usize].send(Inbound::Event {
+                id: id.clone(),
+                event,
+            });
         }
     }
 
-    fn send_immediately_impl(&self, actor_ref: ActorRef, mut event: Event) {
+    fn send_immediately_impl(&self, actor_ref: ActorRef<'_>, mut event: Event) {
         event.link_token = actor_ref.token;
-        let id = actor_ref.id;
+        let id = actor_ref.id();
         if id.empty() || !id.is_alive() || self.close_flag.load(Ordering::Relaxed) {
             return;
         }
@@ -425,7 +553,7 @@ impl SchedulerState {
                 // C++ `get_actor_sched_id_to_send_immediately`: run inline iff
                 // not running and the mailbox is empty.
                 let can_immediately = {
-                    let info = self.info(id.clone());
+                    let info = self.info(id);
                     !info.is_running.get() && info.mailbox.borrow().is_empty()
                 };
                 if can_immediately {
@@ -436,25 +564,33 @@ impl SchedulerState {
             } else {
                 self.pending_events
                     .borrow_mut()
-                    .entry(id)
+                    .entry(id.clone())
                     .or_default()
                     .push(event);
             }
         } else {
-            let _ = self.outbound[sched as usize].send(Inbound::Event { id, event });
+            let _ = self.outbound[sched as usize].send(Inbound::Event {
+                id: id.clone(),
+                event,
+            });
         }
     }
 
     /// `Scheduler::add_to_mailbox`: queue the event and move an idle actor to
     /// the ready queue.
-    fn add_to_mailbox(&self, id: ActorId, event: Event) {
-        let info = self.info(id.clone());
+    fn add_to_mailbox(&self, id: &ActorId, event: Event) {
+        let info = self.info(id);
         if !info.is_running.get() {
             if info.in_pending.get() {
-                self.pending.borrow_mut().remove(&id);
-                info.in_pending.set(false);
-                self.ready.borrow_mut().push_back(id.clone());
-                info.in_ready.set(true);
+                // The pending copy moves into the ready list — no refcount
+                // touch (the caller's own copy keeps the slot alive).
+                if let Some(copy) = self.take_pending(id) {
+                    self.ready.borrow_mut().push_back(copy);
+                    info.in_ready.set(true);
+                } else {
+                    self.ready.borrow_mut().push_back(id.clone());
+                    info.in_ready.set(true);
+                }
             } else if !info.in_ready.get() {
                 self.ready.borrow_mut().push_back(id.clone());
                 info.in_ready.set(true);
@@ -465,9 +601,10 @@ impl SchedulerState {
 
     // ---- dispatch (EventGuard + do_event) ----
 
-    /// `Scheduler::do_event`.
-    fn do_event(&self, id: ActorId, event: Event) {
-        EVENT_CTX.with(|ctx| ctx.borrow_mut().link_token = event.link_token);
+    /// `Scheduler::do_event`. The caller installs the event's link token in
+    /// the guard context — the inline dispatch writes it once, with the
+    /// context, instead of paying a separate thread-local write here.
+    fn do_event(&self, id: &ActorId, event: Event) {
         let info = self.info(id);
         let mut slot = info.actor.borrow_mut();
         let actor = slot.as_mut().expect("dispatched to a dead actor");
@@ -486,84 +623,106 @@ impl SchedulerState {
             EventType::Raw => actor.raw_event(crate::event::Raw(event.raw)),
             EventType::Custom => {
                 let closure = event.custom.expect("custom event without payload");
-                closure(actor)
+                closure.run(actor)
             }
             EventType::NoType => unreachable!("empty event dispatched"),
         }
     }
 
-    /// The beginning of the C++ `EventGuard`: marks the actor running and
-    /// installs the event context. Inline sends during a dispatch nest
-    /// guards, so the enclosing context is pushed to `EVENT_CTX_SAVED` and
-    /// popped by [`Self::exit_actor`] — the C++ `EventGuard` save/restore.
-    fn enter_actor(&self, id: ActorId) {
-        let info = self.info(id.clone());
+    /// The beginning of the C++ `EventGuard` (minus the context install,
+    /// which the guard frame does): marks the actor running and unlinks it
+    /// from the pending list, handing the list's copy back to the guard so
+    /// it can be re-queued by move — no refcount touch on the hot path.
+    fn enter_actor(&self, id: &ActorId) -> Option<ActorId> {
+        let info = self.info(id);
         info.is_running.set(true);
-        self.remove_from_lists(id.clone());
-        let saved = EVENT_CTX.with(|ctx| {
-            let mut ctx = ctx.borrow_mut();
-            std::mem::replace(
-                &mut *ctx,
-                EventContext {
-                    actor: Some(id),
-                    dest: 0,
-                    flags: 0,
-                    link_token: 0,
-                },
-            )
-        });
-        EVENT_CTX_SAVED.with(|stack| stack.borrow_mut().push(saved));
+        self.take_pending(id)
     }
 
-    /// The end of the C++ `EventGuard` destructor: re-queues the actor,
-    /// honors the `Stop`/`Migrate` flags set during the run, and restores the
-    /// enclosing dispatch's event context (nested guards are the
-    /// `send_closure`-inline fast path).
-    fn exit_actor(&self, id: ActorId) {
-        let info = self.info(id.clone());
+    /// The end of the C++ `EventGuard` destructor: re-queues the actor —
+    /// moving the guard's list copy back instead of cloning — clears
+    /// `is_running`, and returns the `Stop`/`Migrate` flags, restoring the
+    /// enclosing context in the same `TLS.with` that reads them (one
+    /// thread-local access for both). The restore must happen *before* the
+    /// flags are honored — `do_stop_actor` asserts it is not stopping the
+    /// dispatched actor.
+    fn exit_actor(
+        &self,
+        id: &ActorId,
+        list_copy: Option<ActorId>,
+        prev_ctx: *const EventContext,
+    ) -> (u32, i32) {
+        let info = self.info(id);
         let mailbox_empty = info.mailbox.borrow().is_empty();
         if mailbox_empty {
-            self.pending.borrow_mut().insert(id.clone());
-            info.in_pending.set(true);
+            match list_copy {
+                Some(copy) => self.put_pending(copy),
+                None => self.insert_pending(id),
+            }
         } else {
-            self.ready.borrow_mut().push_back(id.clone());
+            match list_copy {
+                Some(copy) => self.ready.borrow_mut().push_back(copy),
+                None => self.ready.borrow_mut().push_back(id.clone()),
+            }
             info.in_ready.set(true);
         }
         info.is_running.set(false);
-        let (flags, dest) = EVENT_CTX.with(|ctx| {
-            let ctx = ctx.borrow();
-            (ctx.flags, ctx.dest)
-        });
-        let saved =
-            EVENT_CTX_SAVED.with(|stack| stack.borrow_mut().pop().expect("unbalanced actor guard"));
-        EVENT_CTX.with(|ctx| {
-            *ctx.borrow_mut() = saved;
-        });
+        // SAFETY: the guard frame installed its own context before the
+        // dispatch; the pointer is valid until this restore.
+        let ctx = unsafe { &*self.ctx.load(Ordering::Relaxed) };
+        let out = (ctx.flags, ctx.dest);
+        self.restore_ctx(prev_ctx);
+        out
+    }
+
+    /// Honor the `Stop`/`Migrate` flags after the guard's context was
+    /// restored (the C++ EventGuard destructor tail).
+    fn honor_flags(&self, id: &ActorId, flags: u32, dest: i32) {
         if flags & FLAG_STOP != 0 {
-            self.do_stop_actor(id);
+            self.do_stop_actor(id.clone());
         } else if flags & FLAG_MIGRATE != 0 {
-            self.do_migrate_actor(id, dest);
+            self.do_migrate_actor(id.clone(), dest);
         }
     }
 
     /// A single-event inline dispatch — the C++ `EventGuard` around
-    /// `send_immediately_impl`'s inline path.
-    fn run_event_guarded(&self, id: ActorId, event: Event) {
-        self.enter_actor(id.clone());
-        self.do_event(id.clone(), event);
-        self.exit_actor(id);
+    /// `send_immediately_impl`'s inline path: a frame-local context swapped
+    /// into the thread local for the duration of the dispatch. The id is
+    /// borrowed from the caller's `ActorRef` — the inline path takes no
+    /// refcount.
+    fn run_event_guarded(&self, id: &ActorId, event: Event) {
+        // The link token is installed with the context — the inline dispatch
+        // pays no separate context write in `do_event`.
+        let ctx = EventContext {
+            actor: id.slot_ptr(),
+            dest: 0,
+            flags: 0,
+            link_token: event.link_token,
+        };
+        let prev = self.install_ctx(&ctx);
+        let list_copy = self.enter_actor(id);
+        self.do_event(id, event);
+        let (flags, dest) = self.exit_actor(id, list_copy, prev);
+        self.honor_flags(id, flags, dest);
     }
 
     /// `Scheduler::flush_mailbox`: drain the mailbox under one guard, until it
     /// is empty or the actor asked to stop/migrate.
     fn flush_mailbox(&self, id: ActorId) {
-        let info = self.info(id.clone());
+        let info = self.info(&id);
         let mailbox_len = info.mailbox.borrow().len();
         debug_assert_ne!(mailbox_len, 0, "flushing an empty mailbox");
-        self.enter_actor(id.clone());
+        let ctx = EventContext {
+            actor: id.slot_ptr(),
+            dest: 0,
+            flags: 0,
+            link_token: 0,
+        };
+        let prev = self.install_ctx(&ctx);
+        self.enter_actor(&id);
         let mut processed = 0;
         while processed < mailbox_len {
-            let flags = EVENT_CTX.with(|ctx| ctx.borrow().flags);
+            let flags = self.with_ctx(|ctx| ctx.flags);
             if flags != 0 {
                 break;
             }
@@ -573,9 +732,30 @@ impl SchedulerState {
                 .pop_front()
                 .expect("mailbox emptied under guard");
             processed += 1;
-            self.do_event(id.clone(), event);
+            // Each mailbox event carries its own link token; the inline
+            // dispatch installs it with the guard context instead.
+            self.with_ctx(|ctx| ctx.link_token = event.link_token);
+            self.do_event(&id, event);
         }
-        self.exit_actor(id);
+        // The caller (`run_mailbox`) handed over the ready-list copy; pass
+        // it back by move on exit. The flag-honoring id is cloned on the
+        // (rare) Stop/Migrate path only.
+        let flags = self.with_ctx(|ctx| ctx.flags);
+        let info = self.info(&id);
+        let mailbox_empty = info.mailbox.borrow().is_empty();
+        let honor_id = if flags != 0 { Some(id.clone()) } else { None };
+        if mailbox_empty {
+            self.put_pending(id);
+        } else {
+            self.ready.borrow_mut().push_back(id);
+            info.in_ready.set(true);
+        }
+        info.is_running.set(false);
+        let dest = self.with_ctx(|ctx| ctx.dest);
+        self.restore_ctx(prev);
+        if let Some(honor_id) = honor_id {
+            self.honor_flags(&honor_id, flags, dest);
+        }
     }
 
     // ---- lifecycle (do_stop_actor, destroy, migration) ----
@@ -585,7 +765,7 @@ impl SchedulerState {
     /// actor on this scheduler (unlike `stop()`, which only flags the
     /// currently dispatched actor). The C++ version wraps the teardown in its
     /// own `EventGuard` whose destructor restores the outer event context;
-    /// the whole context is saved and restored here.
+    /// the frame-local context swap is the same save/restore here.
     ///
     /// C++ would crash on a dead actor; Rust returns silently in release and
     /// asserts in debug. Destroying the currently dispatched actor (`do_stop`
@@ -596,61 +776,65 @@ impl SchedulerState {
             debug_assert!(false, "do_stop_actor on a dead actor");
             return;
         }
+        let current = self.ctx.load(Ordering::Relaxed);
         debug_assert!(
-            EVENT_CTX.with(|ctx| ctx.borrow().actor.as_ref() != Some(&id)),
+            current.is_null() || unsafe { (*current).actor != id.slot_ptr() },
             "do_stop_actor on the dispatched actor is UB in Rust (use stop())"
         );
-        let saved = EVENT_CTX.with(|ctx| ctx.replace(EventContext::default()));
         // C++ `do_stop_actor` dispatches `Event::stop` only for actors with
         // `need_start_up()` (`ActorTraits<T>`): an actor that never started
         // never tears down (Scheduler.cpp do_stop_actor). The flag lives in
-        // the `ActorInfo` and is read before `destroy_actor` frees it; it
-        // gates both the `enter_actor` and its guard-stack pop — an actor
-        // that never entered must not pop (the stack belongs to the
-        // enclosing dispatch). The C++ keeps its EventGuard (is_running =
-        // true) across the destruction: sends to this actor from its own
-        // teardown/Drop land in the mailbox (cleared by destroy_actor)
-        // instead of dispatching inline.
-        let need_stop_event = self.info(id.clone()).need_start_up;
+        // the `ActorInfo` and is read before `destroy_actor` frees it. The
+        // C++ keeps its EventGuard (is_running = true) across the
+        // destruction: sends to this actor from its own teardown/Drop land
+        // in the mailbox (cleared by destroy_actor) instead of dispatching
+        // inline — the guard context is installed here for the same reason.
+        let stop_ctx = EventContext {
+            actor: id.slot_ptr(),
+            dest: 0,
+            flags: 0,
+            link_token: 0,
+        };
+        let prev = self.install_ctx(&stop_ctx);
+        let need_stop_event = self.info(&id).need_start_up;
         if need_stop_event {
-            self.enter_actor(id.clone());
-            self.do_event(id.clone(), Event::stop());
+            // The pending-list copy is dropped here: `destroy_actor`'s
+            // `remove_from_lists` has nothing left to unlink, and the owned
+            // `id` keeps the slot alive through the teardown.
+            let _list_copy = self.enter_actor(&id);
+            self.do_event(&id, Event::stop());
         }
-        self.destroy_actor(id.clone());
-        // `enter_actor` pushed the cleared context it installed; pop it and
-        // put back the caller's context (there is no `exit_actor` here — the
-        // actor is destroyed and must not be re-queued). A skipped
-        // `enter_actor` pushed nothing, so it pops nothing.
-        if need_stop_event {
-            let entered = EVENT_CTX_SAVED
-                .with(|stack| stack.borrow_mut().pop().expect("unbalanced actor guard"));
-            debug_assert!(entered.actor.is_none());
-        }
-        EVENT_CTX.with(|ctx| {
-            *ctx.borrow_mut() = saved;
-        });
+        self.destroy_actor(id);
+        self.restore_ctx(prev);
     }
 
     /// `Scheduler::destroy_actor` + the pool release: drop the actor and free
     /// its `ActorInfo` after publishing death.
     fn destroy_actor(&self, id: ActorId) {
         let info_ptr = id.info_ptr();
-        self.remove_from_lists(id.clone());
+        self.remove_from_lists(&id);
         self.actor_count.set(self.actor_count.get() - 1);
         debug_assert!(self.actor_count.get() >= 0);
         let info = unsafe { &*info_ptr };
         info.timeout_gen.set(info.timeout_gen.get() + 1);
         info.deadline.set(None);
         // Drop the actor first (C++ destroys the actor before the mailbox).
-        // An Owned box is freed here; a Borrowed actor (Deleter::None) is
-        // only unregistered — its owner drops it.
-        let _ = std::mem::replace(&mut *info.actor.borrow_mut(), ActorSlot::Empty);
+        // An OwnedInline actor is dropped in place (its block memory is
+        // freed by the last ActorId drop); a Borrowed actor (Deleter::None)
+        // is only unregistered — its owner drops it.
+        let old = std::mem::replace(&mut *info.actor.borrow_mut(), ActorSlot::Empty);
+        if let ActorSlot::OwnedInline { ptr, drop, .. } = old {
+            // SAFETY: the actor is live, and dropped exactly once here.
+            unsafe { drop(ptr) };
+        }
         info.mailbox.borrow_mut().clear();
         id.mark_dead();
         // SAFETY: `mark_dead` published alive=false; no thread dereferences
-        // the ActorInfo after that, so freeing is sound.
+        // the ActorInfo after that. It is dropped in place — the block it
+        // lives in (co-located with the `IdSlot`) is freed by the last
+        // `ActorId` drop.
         unsafe {
-            drop(Box::from_raw(info_ptr));
+            std::ptr::drop_in_place(info_ptr);
         }
     }
 
@@ -660,9 +844,8 @@ impl SchedulerState {
         if dest == self.sched_id {
             return;
         }
-        EVENT_CTX.with(|ctx| {
-            let mut ctx = ctx.borrow_mut();
-            debug_assert_eq!(ctx.actor.as_ref(), Some(&id), "migrate outside of dispatch");
+        self.with_ctx(|ctx| {
+            debug_assert_eq!(ctx.actor, id.slot_ptr(), "migrate outside of dispatch");
             ctx.flags |= FLAG_MIGRATE;
             ctx.dest = dest;
         });
@@ -681,7 +864,7 @@ impl SchedulerState {
     fn start_migrate_actor(&self, id: ActorId, dest: i32) {
         self.actor_count.set(self.actor_count.get() - 1);
         {
-            let info = self.info(id.clone());
+            let info = self.info(&id);
             info.actor
                 .borrow_mut()
                 .as_mut()
@@ -691,8 +874,8 @@ impl SchedulerState {
             // until custom events (S33) carry migration hooks.
         }
         id.start_migrate(dest);
-        self.remove_from_lists(id.clone());
-        let info = self.info(id.clone());
+        self.remove_from_lists(&id);
+        let info = self.info(&id);
         info.timeout_gen.set(info.timeout_gen.get() + 1);
         info.deadline.set(None);
     }
@@ -707,36 +890,84 @@ impl SchedulerState {
         );
         id.finish_migrate();
         if let Some(events) = self.pending_events.borrow_mut().remove(&id) {
-            self.info(id.clone()).mailbox.borrow_mut().extend(events);
+            self.info(&id).mailbox.borrow_mut().extend(events);
         }
-        let info = self.info(id.clone());
+        let info = self.info(&id);
         let mailbox_empty = info.mailbox.borrow().is_empty();
-        if mailbox_empty {
-            self.pending.borrow_mut().insert(id.clone());
-            info.in_pending.set(true);
-        } else {
-            self.ready.borrow_mut().push_back(id.clone());
-            info.in_ready.set(true);
-        }
         info.actor
             .borrow_mut()
             .as_mut()
             .expect("migrated a dead actor")
             .on_finish_migrate();
+        if mailbox_empty {
+            // The migrated-in copy moves into the pending list — no
+            // refcount touch.
+            self.put_pending(id);
+        } else {
+            self.ready.borrow_mut().push_back(id);
+            info.in_ready.set(true);
+        }
     }
 
-    /// Unlink the actor from the ready/pending lists.
-    fn remove_from_lists(&self, id: ActorId) {
-        let info = self.info(id.clone());
-        if info.in_pending.get() {
-            self.pending.borrow_mut().remove(&id);
-            info.in_pending.set(false);
+    /// Unlink the actor from the ready/pending lists (the destroy/migrate
+    /// paths — the list copies are dropped here).
+    fn remove_from_lists(&self, id: &ActorId) {
+        if self.info(id).in_pending.get() {
+            // The taken copy is dropped: the actor is leaving this scheduler
+            // for good.
+            let _removed = self.take_pending(id);
         }
+        let info = self.info(id);
         if info.in_ready.get() {
             // O(n) where the C++ intrusive list is O(1); revisit at S37.
-            self.ready.borrow_mut().retain(|x| *x != id);
+            self.ready.borrow_mut().retain(|x| *x != *id);
             info.in_ready.set(false);
         }
+    }
+
+    /// Mark the actor idle: push it onto the `pending` vector and record its
+    /// position (the O(1) replacement for the `HashSet` insert — see the
+    /// `pending` field docs). The clone form; the hot dispatch path moves its
+    /// own copy through [`put_pending`](Self::put_pending)/[`take_pending`]
+    /// instead.
+    fn insert_pending(&self, id: &ActorId) {
+        let info = self.info(id);
+        debug_assert!(!info.in_pending.get(), "insert_pending twice");
+        info.in_pending.set(true);
+        let mut pending = self.pending.borrow_mut();
+        info.pending_index.set(pending.len());
+        pending.push(id.clone());
+    }
+
+    /// [`insert_pending`](Self::insert_pending) with an owned copy — the
+    /// dispatch moves the list copy back with no refcount touch.
+    fn put_pending(&self, id: ActorId) {
+        let info = self.info(&id);
+        debug_assert!(!info.in_pending.get(), "put_pending twice");
+        info.in_pending.set(true);
+        let mut pending = self.pending.borrow_mut();
+        info.pending_index.set(pending.len());
+        pending.push(id);
+    }
+
+    /// Unmark the idle actor: `swap_remove` it from the `pending` vector,
+    /// fix the position of the element that took its place, and hand the
+    /// taken copy to the caller (which moves it back on exit, into the ready
+    /// list, or drops it).
+    fn take_pending(&self, id: &ActorId) -> Option<ActorId> {
+        let info = self.info(id);
+        if !info.in_pending.get() {
+            return None;
+        }
+        info.in_pending.set(false);
+        let mut pending = self.pending.borrow_mut();
+        let idx = info.pending_index.get();
+        let removed = pending.swap_remove(idx);
+        debug_assert_eq!(&removed, id, "pending index out of sync");
+        if idx < pending.len() {
+            self.info(&pending[idx]).pending_index.set(idx);
+        }
+        Some(removed)
     }
 
     // ---- actor proxies called from the Actor trait ----
@@ -746,19 +977,17 @@ impl SchedulerState {
     }
 
     pub(crate) fn stop_actor(&self, id: ActorId) {
-        EVENT_CTX.with(|ctx| {
-            let mut ctx = ctx.borrow_mut();
-            debug_assert_eq!(ctx.actor.as_ref(), Some(&id), "stop outside of dispatch");
+        self.with_ctx(|ctx| {
+            debug_assert_eq!(ctx.actor, id.slot_ptr(), "stop outside of dispatch");
             ctx.flags |= FLAG_STOP;
         });
     }
 
     pub(crate) fn get_link_token(&self, id: ActorId) -> u64 {
-        EVENT_CTX.with(|ctx| {
-            let ctx = ctx.borrow();
+        self.with_ctx(|ctx| {
             debug_assert_eq!(
-                ctx.actor.as_ref(),
-                Some(&id),
+                ctx.actor,
+                id.slot_ptr(),
                 "get_link_token outside of dispatch"
             );
             ctx.link_token
@@ -768,7 +997,7 @@ impl SchedulerState {
     // ---- timeouts ----
 
     pub(crate) fn get_actor_timeout(&self, id: ActorId) -> Option<f64> {
-        let info = self.info(id);
+        let info = self.info(&id);
         info.deadline.get().map(|at| {
             let now = Instant::now();
             if at <= now {
@@ -791,7 +1020,7 @@ impl SchedulerState {
     /// fire on the next pump; future values are capped at +1e10 s (the C++
     /// `Timestamp::in(1e10, ...)` clamp, also keeping `Instant` in range).
     pub(crate) fn set_actor_timeout_at(&self, id: ActorId, timeout_at: f64) {
-        let info = self.info(id.clone());
+        let info = self.info(&id);
         let generation = info.timeout_gen.get() + 1;
         info.timeout_gen.set(generation);
         let at = Instant::now()
@@ -803,7 +1032,7 @@ impl SchedulerState {
     }
 
     pub(crate) fn cancel_actor_timeout(&self, id: ActorId) {
-        let info = self.info(id.clone());
+        let info = self.info(&id);
         if info.deadline.get().is_some() {
             info.timeout_gen.set(info.timeout_gen.get() + 1);
             info.deadline.set(None);
@@ -815,7 +1044,7 @@ impl SchedulerState {
     fn next_timeout(&self) -> Option<Instant> {
         let mut heap = self.timeouts.borrow_mut();
         while let Some(TimeoutEntry(Reverse(at), id, generation)) = heap.peek() {
-            let info = self.info(id.clone());
+            let info = self.info(id);
             if info.timeout_gen.get() == *generation {
                 return Some(*at);
             }
@@ -846,7 +1075,7 @@ impl SchedulerState {
             let Some(TimeoutEntry(_, id, generation)) = entry else {
                 break;
             };
-            let info = self.info(id.clone());
+            let info = self.info(&id);
             if info.timeout_gen.get() == generation {
                 info.deadline.set(None);
                 self.send_immediately_impl(ActorRef::from(id), Event::timeout());
@@ -997,13 +1226,15 @@ impl SchedulerState {
         };
         loop {
             let next = if let Some(id) = self.ready.borrow_mut().pop_front() {
-                self.info(id.clone()).in_ready.set(false);
+                self.info(&id).in_ready.set(false);
                 Some(id)
             } else {
-                let next_pending = self.pending.borrow().iter().next().cloned();
+                // Pop from the end of the pending vector (order is
+                // irrelevant during close — sends are dropped via
+                // `close_flag`); the popped element's flag is cleared.
+                let next_pending = self.pending.borrow_mut().pop();
                 if let Some(id) = next_pending.as_ref() {
-                    self.pending.borrow_mut().remove(id);
-                    self.info(id.clone()).in_pending.set(false);
+                    self.info(id).in_pending.set(false);
                 }
                 next_pending
             };
@@ -1042,8 +1273,8 @@ impl Scheduler {
     }
 
     pub(crate) fn try_instance() -> Option<&'static SchedulerState> {
-        CURRENT_SCHEDULER.with(|current| {
-            let ptr = current.get();
+        TLS.with(|tls| {
+            let ptr = tls.scheduler.get();
             if ptr.is_null() {
                 None
             } else {
@@ -1054,12 +1285,18 @@ impl Scheduler {
 
     /// The actor currently being dispatched, for the `Actor` trait proxies.
     pub(crate) fn current_actor() -> ActorId {
-        EVENT_CTX.with(|ctx| {
-            ctx.borrow()
-                .actor
-                .clone()
-                .expect("no actor is being dispatched")
-        })
+        let state = Self::instance();
+        // SAFETY: only the scheduler's own thread touches `ctx` (see the
+        // field docs).
+        let ptr = state.ctx.load(Ordering::Relaxed);
+        debug_assert!(!ptr.is_null(), "no dispatch context on this thread");
+        let actor = unsafe { (*ptr).actor };
+        if actor.is_null() {
+            panic!("no actor is being dispatched");
+        }
+        // SAFETY: the dispatch's own id copy keeps the slot alive; the
+        // returned copy takes its own reference.
+        unsafe { ActorId::from_slot_ptr(std::ptr::NonNull::new_unchecked(actor.cast_mut())) }
     }
 }
 
@@ -1084,14 +1321,14 @@ impl SchedulerGuard {
         } else {
             None
         };
-        let prev = CURRENT_SCHEDULER.with(|current| current.replace(ptr));
+        let prev = TLS.with(|tls| tls.scheduler.replace(ptr));
         Self { prev, locked_state }
     }
 }
 
 impl Drop for SchedulerGuard {
     fn drop(&mut self) {
-        CURRENT_SCHEDULER.with(|current| current.set(self.prev));
+        TLS.with(|tls| tls.scheduler.set(self.prev));
         if let Some(ptr) = self.locked_state {
             let state = unsafe { &*ptr };
             state.has_guard.set(false);
