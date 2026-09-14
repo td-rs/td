@@ -87,6 +87,9 @@ struct AuthCallback {
     /// the Rust callback queues instead and the driver pumps it after the
     /// flush returns.
     pending_query: Option<Vec<u8>>,
+    /// Set when the DC answers RPC_ERROR 303 *_MIGRATE_X: the number lives
+    /// on test DC X and the whole flow must be redone there.
+    migrate_dc: Option<i32>,
 }
 
 impl SessionConnectionCallback for AuthCallback {
@@ -203,6 +206,17 @@ impl SessionConnectionCallback for AuthCallback {
 
     fn on_message_result_error(&mut self, _message_id: MessageId, code: i32, message: String) {
         eprintln!("RPC error {code}: {message}");
+        // 303 = *_MIGRATE_X (PHONE_/NETWORK_/FILE_): the tail digit is the
+        // DC the number belongs to.
+        if code == 303 {
+            if let Some(dc) = message
+                .rsplit('_')
+                .next()
+                .and_then(|t| t.parse::<i32>().ok())
+            {
+                self.migrate_dc = Some(dc);
+            }
+        }
     }
 
     fn on_message_failed(&mut self, _message_id: MessageId, status: Status) {
@@ -263,7 +277,9 @@ fn main() {
         // DC selection: <ip> <handshake-dc> <transport-dc> <port> as the
         // last four args, defaulting to test DC 2 (10002). Test DC list:
         // 1 = 149.154.175.10, 2 = 149.154.167.40, 3 = 149.154.175.117.
-        let (dc_ip, hs_dc, tx_dc, port) = if args.len() >= 8 {
+        // A PHONE_MIGRATE_X answer auto-reconnects to test DC X (fresh
+        // handshake — auth keys do not cross DCs), like tdlib's dispatcher.
+        let (mut dc_ip, mut hs_dc, mut tx_dc, mut port) = if args.len() >= 8 {
             (
                 args[args.len() - 4].clone(),
                 args[args.len() - 3].parse().unwrap(),
@@ -275,121 +291,144 @@ fn main() {
         } else {
             ("149.154.167.40".to_string(), 10002, 10002, 443)
         };
-        let stream = TcpStream::connect((dc_ip.as_str(), port)).await.unwrap();
-        let transport_type =
-            TransportType::new(TransportTypeEnum::Tcp, tx_dc, ProxySecret::default());
-        let mut context = Context {
-            rsa: RsaInterface {
-                rsa: Rsa::from_pem_public_key(TEST_DC_KEY).unwrap(),
-            },
-        };
-        let mut handshake = AuthKeyHandshake::new(hs_dc, 0);
-        let raw_connection =
-            match run_handshake(stream, transport_type, &mut context, 30.0, &mut handshake).await {
-                Result::Ok(connection) => connection,
-                Result::Err(status) => {
-                    eprintln!("handshake failed: {}", status.message());
-                    std::process::exit(1);
-                }
+        loop {
+            let stream = TcpStream::connect((dc_ip.as_str(), port)).await.unwrap();
+            let transport_type =
+                TransportType::new(TransportTypeEnum::Tcp, tx_dc, ProxySecret::default());
+            let mut context = Context {
+                rsa: RsaInterface {
+                    rsa: Rsa::from_pem_public_key(TEST_DC_KEY).unwrap(),
+                },
             };
-        let auth_key = handshake.release_auth_key();
-        println!(
-            "auth key created: id={:016x}, time_diff={:.3}, salt={}",
-            auth_key.id(),
-            handshake.get_server_time_diff(),
-            handshake.get_server_salt()
-        );
+            let mut handshake = AuthKeyHandshake::new(hs_dc, 0);
+            let raw_connection =
+                match run_handshake(stream, transport_type, &mut context, 30.0, &mut handshake)
+                    .await
+                {
+                    Result::Ok(connection) => connection,
+                    Result::Err(status) => {
+                        eprintln!("handshake failed: {}", status.message());
+                        std::process::exit(1);
+                    }
+                };
+            let auth_key = handshake.release_auth_key();
+            println!(
+                "auth key created: id={:016x}, time_diff={:.3}, salt={}",
+                auth_key.id(),
+                handshake.get_server_time_diff(),
+                handshake.get_server_salt()
+            );
 
-        // 2. AuthData + session.
-        let mut auth_data = AuthData::new();
-        auth_data.set_main_auth_key(auth_key);
-        auth_data.set_use_pfs(false);
-        auth_data.reset_server_time_difference(handshake.get_server_time_diff());
-        auth_data.set_server_salt(handshake.get_server_salt() as i64, tdutils::time::now());
-        let mut session_id = 0u64;
-        while session_id == 0 {
-            session_id = random::secure_uint64();
-        }
-        auth_data.set_session_id(session_id);
-
-        if handshake_only {
-            println!("gate S66 step 1 (live handshake against the test DC): OK");
-            return;
-        }
-
-        let mut connection = SessionConnection::new(SessionMode::Tcp, raw_connection, auth_data);
-
-        // 3. auth.sendCode once the session is up (queued through the
-        //    pending-query path of the callback).
-        let mut callback = AuthCallback {
-            phone: phone.clone(),
-            phone_code_hash: String::new(),
-            logged_in: false,
-            pending_query: None,
-        };
-        {
-            let mut query = Vec::new();
-            // Every API query rides in invokeWithLayer{initConnection{...}}
-            // — without it the DC answers RPC_ERROR CONNECTION_NOT_INITED.
-            // Layer 229 = td 1.8.67 (td/telegram/Version.h MTPROTO_LAYER).
-            telegram_api::invokeWithLayer {
-                layer: 229,
-                query: Box::new(telegram_api::Function::initConnection(
-                    telegram_api::initConnection {
-                        flags: 0,
-                        api_id,
-                        device_model: "td-rs".to_string(),
-                        system_version: "linux".to_string(),
-                        app_version: "0.1.0".to_string(),
-                        system_lang_code: "en".to_string(),
-                        lang_pack: String::new(),
-                        lang_code: "en".to_string(),
-                        proxy: telegram_api::InputClientProxy {
-                            address: String::new(),
-                            port: 0,
-                        },
-                        params: Box::new(telegram_api::JSONValue::jsonNull(
-                            telegram_api::jsonNull {},
-                        )),
-                        query: Box::new(telegram_api::Function::auth_sendCode(
-                            telegram_api::auth_sendCode {
-                                phone_number: phone.clone(),
-                                api_id,
-                                api_hash: api_hash.clone(),
-                                settings: telegram_api::CodeSettings {
-                                    flags: 0,
-                                    allow_flashcall: false,
-                                    current_number: false,
-                                    allow_app_hash: false,
-                                    allow_missed_call: false,
-                                    allow_firebase: false,
-                                    unknown_number: false,
-                                    logout_tokens: Vec::new(),
-                                    token: String::new(),
-                                    app_sandbox: false,
-                                },
-                            },
-                        )),
-                    },
-                )),
+            // 2. AuthData + session.
+            let mut auth_data = AuthData::new();
+            auth_data.set_main_auth_key(auth_key);
+            auth_data.set_use_pfs(false);
+            auth_data.reset_server_time_difference(handshake.get_server_time_diff());
+            auth_data.set_server_salt(handshake.get_server_salt() as i64, tdutils::time::now());
+            let mut session_id = 0u64;
+            while session_id == 0 {
+                session_id = random::secure_uint64();
             }
-            .store_boxed(&mut query);
-            callback.pending_query = Some(query);
-        }
-        connection.set_online(true, true);
+            auth_data.set_session_id(session_id);
 
-        // Drive the session; the callback re-sends its pending query after
-        // each flush.
-        let result = drive_auth_session(&mut connection, &mut callback).await;
-        if result.is_error() {
-            eprintln!("session error: {}", result.message());
-            std::process::exit(1);
-        }
-        if !callback.logged_in {
+            if handshake_only {
+                println!("gate S66 step 1 (live handshake against the test DC): OK");
+                return;
+            }
+
+            let mut connection =
+                SessionConnection::new(SessionMode::Tcp, raw_connection, auth_data);
+
+            // 3. auth.sendCode once the session is up (queued through the
+            //    pending-query path of the callback).
+            let mut callback = AuthCallback {
+                phone: phone.clone(),
+                phone_code_hash: String::new(),
+                logged_in: false,
+                pending_query: None,
+                migrate_dc: None,
+            };
+            {
+                let mut query = Vec::new();
+                // Every API query rides in invokeWithLayer{initConnection{...}}
+                // — without it the DC answers RPC_ERROR CONNECTION_NOT_INITED.
+                // Layer 229 = td 1.8.67 (td/telegram/Version.h MTPROTO_LAYER).
+                telegram_api::invokeWithLayer {
+                    layer: 229,
+                    query: Box::new(telegram_api::Function::initConnection(
+                        telegram_api::initConnection {
+                            flags: 0,
+                            api_id,
+                            device_model: "td-rs".to_string(),
+                            system_version: "linux".to_string(),
+                            app_version: "0.1.0".to_string(),
+                            system_lang_code: "en".to_string(),
+                            lang_pack: String::new(),
+                            lang_code: "en".to_string(),
+                            proxy: telegram_api::InputClientProxy {
+                                address: String::new(),
+                                port: 0,
+                            },
+                            params: Box::new(telegram_api::JSONValue::jsonNull(
+                                telegram_api::jsonNull {},
+                            )),
+                            query: Box::new(telegram_api::Function::auth_sendCode(
+                                telegram_api::auth_sendCode {
+                                    phone_number: phone.clone(),
+                                    api_id,
+                                    api_hash: api_hash.clone(),
+                                    settings: telegram_api::CodeSettings {
+                                        flags: 0,
+                                        allow_flashcall: false,
+                                        current_number: false,
+                                        allow_app_hash: false,
+                                        allow_missed_call: false,
+                                        allow_firebase: false,
+                                        unknown_number: false,
+                                        logout_tokens: Vec::new(),
+                                        token: String::new(),
+                                        app_sandbox: false,
+                                    },
+                                },
+                            )),
+                        },
+                    )),
+                }
+                .store_boxed(&mut query);
+                callback.pending_query = Some(query);
+            }
+            connection.set_online(true, true);
+
+            // Drive the session; the callback re-sends its pending query after
+            // each flush.
+            let result = drive_auth_session(&mut connection, &mut callback).await;
+            if result.is_error() {
+                eprintln!("session error: {}", result.message());
+                std::process::exit(1);
+            }
+            if callback.logged_in {
+                println!("gate S66: OK");
+                return;
+            }
+            if let Some(dc) = callback.migrate_dc.take() {
+                eprintln!("auto-migrating to test DC {dc}");
+                let (ip, hs, tx) = match dc {
+                    1 => ("149.154.175.10", 10001, 10001),
+                    2 => ("149.154.167.40", 10002, 10002),
+                    3 => ("149.154.175.117", 10003, 10003),
+                    other => {
+                        eprintln!("no known test endpoint for DC {other}");
+                        std::process::exit(1);
+                    }
+                };
+                dc_ip = ip.to_string();
+                hs_dc = hs;
+                tx_dc = tx;
+                continue;
+            }
             eprintln!("session closed before authorization");
             std::process::exit(1);
         }
-        println!("gate S66: OK");
     });
 }
 
@@ -402,6 +441,12 @@ async fn drive_auth_session(
 ) -> Status {
     loop {
         let wakeup_at = connection.flush(callback).await;
+        // The DC told us the number lives elsewhere — hand control back to
+        // main for a full reconnect (fresh handshake: auth keys do not
+        // cross DCs).
+        if callback.migrate_dc.is_some() {
+            return Status::ok();
+        }
         if let Some(query) = callback.pending_query.take() {
             let message_id = connection.send_query(
                 BufferSlice::from_slice_bytes(&query),
@@ -412,6 +457,9 @@ async fn drive_auth_session(
             );
             eprintln!("sent query {message_id}");
             let wakeup_at = connection.flush(callback).await;
+            if callback.migrate_dc.is_some() {
+                return Status::ok();
+            }
             if wakeup_at == 0.0 {
                 return Status::ok();
             }
