@@ -170,28 +170,27 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             }
         }
 
-        // -- interim: the auth set is validated and routed in the C++ shape,
-        //    but the network query layer lands with the ConfigManager step
-        //    (every one of these needs auth.* NetQueries, logOut's local
-        //    guards included). --
+        // -- the auth set (S76): the real `AuthManager` handlers over the
+        //    walking-skeleton bridge. logOut and the password-recovery
+        //    helpers keep their interim bodies until their managers land. --
         Function::setAuthenticationPhoneNumber(request) => {
-            // CLEAN_INPUT_STRING, then `AuthManager::set_phone_number`.
-            let _ = crate::misc::clean_input_string(&request.phone_number);
-            td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+            td.set_authentication_phone_number(id, request.phone_number);
         }
         Function::checkAuthenticationCode(request) => {
-            let _ = crate::misc::clean_input_string(&request.code);
-            td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+            td.check_authentication_code(id, request.code);
         }
         Function::checkAuthenticationPassword(request) => {
-            let _ = crate::misc::clean_input_string(&request.password);
-            td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+            td.check_authentication_password(id, request.password);
         }
         Function::logOut(_) => {
             // `AuthManager::log_out` — the local guards need the sender for
             // the query part; both arrive with the net step.
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
+
+        // -- the walking-skeleton messaging set (S76) --
+        Function::getMe(_) => td.get_me(id),
+        Function::sendMessage(request) => td.on_send_message(id, request),
         Function::setDatabaseEncryptionKey(_) => {
             // `G()->td_db()->get_binlog()->change_key(...)` — the binlog
             // re-key lands with the TdDb binlog-close wiring.
