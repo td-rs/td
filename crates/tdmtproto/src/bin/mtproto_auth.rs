@@ -157,9 +157,9 @@ impl AuthCallback {
             phone_number: self.phone.clone(),
             phone_code_hash: self.phone_code_hash.clone(),
             phone_code: code.to_string(),
-            email_verification: telegram_api::EmailVerification::emailVerificationCode(
+            email_verification: Some(telegram_api::EmailVerification::emailVerificationCode(
                 telegram_api::emailVerificationCode::default(),
-            ),
+            )),
         });
         self.pending_query = Some(wrap_query(self.api_id, sign_in));
     }
@@ -188,7 +188,7 @@ fn wrap_query(api_id: i32, query: telegram_api::Function) -> Vec<u8> {
     let mut out = Vec::new();
     telegram_api::invokeWithLayer {
         layer: 229,
-        query: Box::new(telegram_api::Function::initConnection(
+        query: Some(Box::new(telegram_api::Function::initConnection(
             telegram_api::initConnection {
                 flags: 0,
                 api_id,
@@ -198,14 +198,16 @@ fn wrap_query(api_id: i32, query: telegram_api::Function) -> Vec<u8> {
                 system_lang_code: "en".to_string(),
                 lang_pack: String::new(),
                 lang_code: "en".to_string(),
-                proxy: telegram_api::InputClientProxy {
+                proxy: Some(telegram_api::InputClientProxy {
                     address: String::new(),
                     port: 0,
-                },
-                params: Box::new(telegram_api::JSONValue::jsonNull(telegram_api::jsonNull {})),
-                query: Box::new(query),
+                }),
+                params: Some(Box::new(telegram_api::JSONValue::jsonNull(
+                    telegram_api::jsonNull {},
+                ))),
+                query: Some(Box::new(query)),
             },
-        )),
+        ))),
     }
     .store_boxed(&mut out);
     out
@@ -218,7 +220,7 @@ fn describe_update(data: &[u8]) -> String {
             U::updatesTooLong(_) => "updatesTooLong".to_string(),
             U::updateShort(m) => {
                 let mut inner = Vec::new();
-                m.update.store(&mut inner);
+                m.update.unwrap_or_default().store(&mut inner);
                 let ctor = i32::from_le_bytes(inner[..4].try_into().unwrap());
                 format!("updateShort date={} inner=0x{ctor:08x}", m.date)
             }
@@ -320,7 +322,10 @@ impl SessionConnectionCallback for AuthCallback {
                 }
             };
             self.phone_code_hash = msg.phone_code_hash;
-            let type_name = match &msg.r#type {
+            let default_ty = telegram_api::auth_SentCodeType::auth_sentCodeTypeSms(
+                telegram_api::auth_sentCodeTypeSms { length: 5 },
+            );
+            let type_name = match msg.r#type.as_ref().unwrap_or(&default_ty) {
                 telegram_api::auth_SentCodeType::auth_sentCodeTypeApp(t) => {
                     format!("app length={}", t.length)
                 }
@@ -361,7 +366,9 @@ impl SessionConnectionCallback for AuthCallback {
                     return Status::ok();
                 }
             };
-            match msg.user {
+            match msg.user.unwrap_or(telegram_api::User::userEmpty(
+                telegram_api::userEmpty::default(),
+            )) {
                 telegram_api::User::user(u) => {
                     println!(
                         "AUTHORIZED user_id={} username={:?} name={:?} {:?} phone={:?}",
@@ -393,7 +400,7 @@ impl SessionConnectionCallback for AuthCallback {
             }
             let check = match (&msg.current_algo, self.password.as_deref()) {
                 (
-                    telegram_api::PasswordKdfAlgo::passwordKdfAlgoSHA256SHA256PBKDF2HMACSHA512iter100000SHA256ModPow(algo),
+                    Some(telegram_api::PasswordKdfAlgo::passwordKdfAlgoSHA256SHA256PBKDF2HMACSHA512iter100000SHA256ModPow(algo)),
                     Some(password),
                 ) => calc_input_check_password_srp(
                     password.as_bytes(),
@@ -413,7 +420,9 @@ impl SessionConnectionCallback for AuthCallback {
             };
             let query =
                 telegram_api::Function::auth_checkPassword(telegram_api::auth_checkPassword {
-                    password: telegram_api::InputCheckPasswordSRP::inputCheckPasswordSRP(check),
+                    password: Some(telegram_api::InputCheckPasswordSRP::inputCheckPasswordSRP(
+                        check,
+                    )),
                 });
             self.pending_query = Some(wrap_query(self.api_id, query));
             return Status::ok();
@@ -814,7 +823,7 @@ async fn run_authorize_leg(
         phone_number: phone.to_string(),
         api_id,
         api_hash: api_hash.to_string(),
-        settings: telegram_api::CodeSettings {
+        settings: Some(telegram_api::CodeSettings {
             flags: 0,
             allow_flashcall: false,
             current_number: false,
@@ -825,7 +834,7 @@ async fn run_authorize_leg(
             logout_tokens: Vec::new(),
             token: String::new(),
             app_sandbox: false,
-        },
+        }),
     });
     callback.pending_query = Some(wrap_query(api_id, send_code));
 

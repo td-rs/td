@@ -1783,6 +1783,7 @@ name = "tdclient"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "parking_lot",
  "serde",
  "serde_json",
  "tdactor",
@@ -1790,6 +1791,7 @@ dependencies = [
  "tdmtproto",
  "tdutils",
  "tl-codegen",
+ "tokio",
  "tracing",
 ]
 

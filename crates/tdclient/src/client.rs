@@ -468,7 +468,7 @@ impl Impl {
                 Some(Object::updateAuthorizationState(update))
                     if matches!(
                         update.authorization_state,
-                        td_api::AuthorizationState::authorizationStateClosed(_)
+                        Some(td_api::AuthorizationState::authorizationStateClosed(_))
                     )
             )
         {
@@ -498,8 +498,10 @@ impl Impl {
                 request_id: 0,
                 object: Some(Object::updateAuthorizationState(
                     td_api::updateAuthorizationState {
-                        authorization_state: td_api::AuthorizationState::authorizationStateClosed(
-                            td_api::authorizationStateClosed,
+                        authorization_state: Some(
+                            td_api::AuthorizationState::authorizationStateClosed(
+                                td_api::authorizationStateClosed,
+                            ),
                         ),
                     },
                 )),
@@ -749,7 +751,7 @@ mod tests {
         assert!(matches!(
             &responses[2].object,
             Some(Object::updateAuthorizationState(u))
-                if matches!(u.authorization_state, td_api::AuthorizationState::authorizationStateWaitTdlibParameters(_))
+                if matches!(u.authorization_state, Some(td_api::AuthorizationState::authorizationStateWaitTdlibParameters(_)))
         ));
         let answer = responses
             .iter()
@@ -788,7 +790,10 @@ mod tests {
             let is_closed = matches!(
                 &response.object,
                 Some(Object::updateAuthorizationState(u))
-                    if matches!(u.authorization_state, td_api::AuthorizationState::authorizationStateClosed(_))
+                    if matches!(
+                        u.authorization_state,
+                        Some(td_api::AuthorizationState::authorizationStateClosed(_))
+                    )
             );
             if is_closed {
                 closed = Some(response);

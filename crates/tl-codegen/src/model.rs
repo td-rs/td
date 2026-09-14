@@ -157,9 +157,15 @@ pub struct SchemeModel {
     /// `Box<_>` — the Rust analogue of td's `object_ptr` indirection, which
     /// C++ needs for the very same recursive types.
     pub cyclic: Vec<bool>,
+    /// Per type: the fixed word types (int128/int256/int512) — embedded
+    /// values in td's C++ model, never nullable object_ptr.
+    pub is_word_type: Vec<bool>,
 }
 
 impl SchemeModel {
+    /// The Rust name of a scheme type: the id with non-alphanumerics
+    /// replaced by `_` (td's `gen_class_name`), case preserved — so Rust
+    /// names are one-to-one with the C++ classes.
     /// The Rust name of a scheme type: the id with non-alphanumerics
     /// replaced by `_` (td's `gen_class_name`), case preserved — so Rust
     /// names are one-to-one with the C++ classes.
@@ -224,6 +230,11 @@ impl SchemeModel {
             safe_function,
             breaking_ctor,
             cyclic,
+            is_word_type: p
+                .types
+                .iter()
+                .map(|t| matches!(t.id.as_str(), "Int128" | "Int256" | "Int512"))
+                .collect(),
         }
     }
 }
