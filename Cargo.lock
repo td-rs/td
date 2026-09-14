@@ -1790,6 +1790,7 @@ dependencies = [
  "tdmtproto",
  "tdutils",
  "tl-codegen",
+ "tracing",
 ]
 
 [[package]]

@@ -1,5 +1,5 @@
 //! Port of `td/telegram/OptionManager.{h,cpp}` (S69): the string-keyed
-//! option store — `TsSeqKeyValue` in-memory + SQLite config pmc mirror —
+//! option store — `TsSeqKeyValue` in-memory + the binlog config pmc —
 //! with the `setOption` validation table, the constructor default table,
 //! the premium-derived limits and `getCurrentState`.
 //!
@@ -18,8 +18,8 @@
 
 use crate::td_api;
 use crate::td_api::OptionValue;
+use tddb::binlog_key_value::BinlogKeyValue;
 use tddb::seq_key_value::SeqKeyValue;
-use tddb::sqlite_key_value::SqliteKeyValue;
 
 /// The API version, hardcoded like `OptionManager.cpp` ("1.8.67" — pinned
 /// to the reference C++ version for JSON parity).
@@ -215,10 +215,12 @@ fn is_internal_option(name: &str) -> bool {
 /// pre-init getters + the queued `updateOption` broadcasts.
 pub struct OptionManager {
     options: SeqKeyValue,
-    option_pmc: Option<SqliteKeyValue>,
+    option_pmc: Option<BinlogKeyValue>,
     is_test_dc: bool,
     is_td_inited: bool,
-    pending_get_options: Vec<String>,
+    /// The queued pre-init `getOption` requests (the C++
+    /// `pending_get_options_`), with their request ids.
+    pending_get_options: Vec<(u64, String)>,
     pending_updates: Vec<td_api::Object>,
 }
 
@@ -244,18 +246,18 @@ impl OptionManager {
         manager
     }
 
-    /// The pmc load path (the C++ `option_pmc_->for_each` in the
-    /// constructor; split out because the pmc is created by TdDb before the
-    /// manager). Skips `utc_time_offset`, which is always recomputed.
-    pub fn load_pmc(&mut self, pmc: &mut SqliteKeyValue) {
+    /// `OptionManager` constructor pmc replay (the C++
+    /// `option_pmc_->for_each` over `get_config_pmc()`): replay persisted
+    /// options into the store, then keep the pmc handle for future writes.
+    /// Skips `utc_time_offset`, which is always recomputed.
+    pub fn attach_pmc(&mut self, pmc: BinlogKeyValue) {
         for (name, value) in pmc.get_all() {
-            let name = String::from_utf8_lossy(&name).to_string();
             if name == "utc_time_offset" {
                 continue;
             }
-            let value = String::from_utf8_lossy(&value).to_string();
             self.set_option(&name, &value);
         }
+        self.option_pmc = Some(pmc);
     }
 
     /// `OptionManager::set_option` (the internal Slice form): write the
@@ -273,9 +275,9 @@ impl OptionManager {
         }
         if let Some(pmc) = &mut self.option_pmc {
             if value.is_empty() {
-                pmc.erase(name.as_bytes());
+                pmc.erase(name);
             } else {
-                pmc.set(name.as_bytes(), value.as_bytes());
+                pmc.set(name, value);
             }
         }
         // The C++ also calls on_option_updated(name) here — all its manager
@@ -820,7 +822,7 @@ impl OptionManager {
             let str_value = format!("I{value}");
             options.set(name, &str_value);
             if let Some(pmc) = pmc.as_mut() {
-                pmc.set(name.as_bytes(), str_value.as_bytes());
+                pmc.set(name, &str_value);
             }
             if !is_internal_option(name) {
                 updates.push(td_api::Object::updateOption(td_api::updateOption {
@@ -1100,12 +1102,22 @@ impl OptionManager {
         }
     }
 
-    /// `OptionManager::on_td_inited`: replay the pending pre-init getters.
-    /// The deferred responses land with the Td actor (S70); the names are
-    /// re-served here so the queue semantics stay.
-    pub fn on_td_inited(&mut self) {
+    /// `OptionManager::is_td_inited`.
+    pub fn is_td_inited(&self) -> bool {
+        self.is_td_inited
+    }
+
+    /// `OptionManager::get_option(name, promise)` pre-init arm: the getter
+    /// waits until `on_td_inited`.
+    pub fn queue_get_option(&mut self, request_id: u64, name: String) {
+        self.pending_get_options.push((request_id, name));
+    }
+
+    /// `OptionManager::on_td_inited`: mark inited and return the pending
+    /// pre-init getters for the Td actor to answer.
+    pub fn on_td_inited(&mut self) -> Vec<(u64, String)> {
         self.is_td_inited = true;
-        self.pending_get_options.clear();
+        std::mem::take(&mut self.pending_get_options)
     }
 
     /// The queued `updateOption` broadcasts, drained by the Td actor.

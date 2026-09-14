@@ -201,7 +201,7 @@ impl MultiTd {
     fn create(&mut self, td_id: i32, callback: Box<dyn TdCallback>) {
         debug_assert!(!self.tds.contains_key(&td_id), "double client create");
         self.tds
-            .insert(td_id, create_actor("Td", Td::new(callback, false)));
+            .insert(td_id, create_actor("Td", Td::new(callback)));
     }
 
     fn send(&mut self, client_id: i32, request_id: u64, request: Function) {
@@ -779,16 +779,23 @@ mod tests {
         manager.send(client_id, 1, version_request());
         let _ = drain(&manager, 8);
         manager.close(client_id);
-        let closed = drain(&manager, 4)
-            .into_iter()
-            .find(|response| {
-                matches!(
-                    &response.object,
-                    Some(Object::updateAuthorizationState(u))
-                        if matches!(u.authorization_state, td_api::AuthorizationState::authorizationStateClosed(_))
-                )
-            })
-            .expect("the synthesized closed update");
+        // The real Closed update is consumed silently by `receive` (it
+        // releases the client), the drain must skip the null responses and
+        // the trailing Closing update to reach the synthesized one.
+        let mut closed = None;
+        for _ in 0..8 {
+            let response = manager.receive(0.3);
+            let is_closed = matches!(
+                &response.object,
+                Some(Object::updateAuthorizationState(u))
+                    if matches!(u.authorization_state, td_api::AuthorizationState::authorizationStateClosed(_))
+            );
+            if is_closed {
+                closed = Some(response);
+                break;
+            }
+        }
+        let closed = closed.expect("the synthesized closed update");
         assert_eq!(closed.client_id, client_id);
         assert_eq!(closed.request_id, 0);
     }
@@ -800,7 +807,20 @@ mod tests {
         manager.send(client_id, 1, version_request());
         let _ = drain(&manager, 8);
         manager.close(client_id);
-        let _ = drain(&manager, 4);
+        // Drain through the full close sequence: the real Closing update,
+        // the swallowed Closed (a null response that releases the client),
+        // and the notification's synthesized closed. Afterwards the client
+        // is erased and sends answer 500 "Request aborted" (Client.cpp:515).
+        for _ in 0..8 {
+            let response = manager.receive(0.3);
+            if matches!(
+                &response.object,
+                Some(Object::updateAuthorizationState(u))
+                    if matches!(u.authorization_state, td_api::AuthorizationState::authorizationStateClosed(_))
+            ) {
+                break;
+            }
+        }
         manager.send(client_id, 2, version_request());
         let response = manager.receive(0.3);
         assert_eq!(

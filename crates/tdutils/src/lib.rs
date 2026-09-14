@@ -17,3 +17,4 @@ pub mod rsa;
 pub mod status;
 pub mod tests;
 pub mod time;
+pub mod utf8;
