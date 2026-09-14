@@ -12,6 +12,7 @@
 
 pub mod auth_data;
 pub mod auth_key;
+pub mod connection_manager;
 pub mod dh_callback;
 pub mod dh_handshake;
 pub mod handshake;
@@ -21,9 +22,13 @@ pub mod kdf;
 pub mod message_id;
 pub mod packet;
 pub mod packet_info;
+pub mod persistence;
+pub mod ping;
 pub mod proxy_secret;
 pub mod raw_connection;
 pub mod rsa;
+pub mod session;
+pub mod session_connection;
 pub mod tls_reader_byte_flow;
 pub mod transport;
 pub mod transport_type;

@@ -226,10 +226,12 @@ impl RawConnection {
     }
 
     fn fail(&mut self, status: Status) -> Status {
-        if let Some(stats) = self.stats_callback.as_deref_mut() {
-            if status.code() != 2 {
-                stats.on_error();
-            }
+        if let Some(stats) = self
+            .stats_callback
+            .as_deref_mut()
+            .filter(|_| status.code() != 2)
+        {
+            stats.on_error();
         }
         self.has_error = true;
         status
@@ -317,10 +319,10 @@ impl RawConnection {
                 ReadResult::Packet { offset, len } => {
                     // If a packet was successfully decrypted, then it is ok
                     // to assume that the connection is alive.
-                    if !auth_key.empty() {
-                        if let Some(stats) = self.stats_callback.as_deref_mut() {
-                            stats.on_pong();
-                        }
+                    if let (false, Some(stats)) =
+                        (auth_key.empty(), self.stats_callback.as_deref_mut())
+                    {
+                        stats.on_pong();
                     }
                     let packet = packet.from_slice(&packet.as_slice()[offset..offset + len]);
                     let status = callback.on_raw_packet(&packet_info, packet);
@@ -354,10 +356,8 @@ impl RawConnection {
             }
         }
         self.output_writer = ChainBufferWriter::new();
-        if written > 0 {
-            if let Some(stats) = self.stats_callback.as_deref_mut() {
-                stats.on_write(written as u64);
-            }
+        if let Some(stats) = self.stats_callback.as_deref_mut().filter(|_| written > 0) {
+            stats.on_write(written as u64);
         }
         Status::ok()
     }

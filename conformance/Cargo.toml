@@ -28,3 +28,6 @@ path = "src/bin/mock_dc.rs"
 name = "handshake_client"
 path = "src/bin/handshake_client.rs"
 
+[[bin]]
+name = "auth_data_rw"
+path = "src/bin/auth_data_rw.rs"

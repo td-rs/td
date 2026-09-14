@@ -739,11 +739,8 @@ pub fn pq_factorize_u64(pq: u64) -> u64 {
         }
         i += 1;
     }
-    if g != 0 {
-        let other = pq / g;
-        if other < g {
-            g = other;
-        }
+    if let Some(other) = pq.checked_div(g).filter(|&other| other < g) {
+        g = other;
     }
     g
 }
@@ -820,7 +817,7 @@ pub fn pq_factorize(pq_str: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     }
 
     let p = pq_factorize_u64(pq);
-    if p == 0 || pq % p != 0 {
+    if p == 0 || !pq.is_multiple_of(p) {
         return None;
     }
     // as_big_endian_string: trim leading zero bytes (the high end of the LE
