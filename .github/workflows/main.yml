@@ -194,3 +194,24 @@ jobs:
           else
             echo "skipped: conformance/tl_replay_oracle/verify.sh not committed yet (S15 in progress)"
           fi
+
+  fuzz-smoke:
+    # Bounded fuzz smoke of the parsing-heavy components (S78): each target
+    # runs 60 s with coverage instrumentation via cargo-fuzz on nightly.
+    # The S78 release gate is a one-week clean run per target; this job only
+    # catches regressions quickly. Targets live in fuzz/fuzz_targets (the
+    # crate is excluded from the workspace and builds standalone).
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Fuzz smoke (60 s per target)
+        run: |
+          cd fuzz
+          for target in td_api_json json_value binlog_event mtproto_packet tl_scheme_text transport_frame; do
+            cargo fuzz run "$target" -- -max_total_time=60
+          done

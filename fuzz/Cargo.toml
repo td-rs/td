@@ -1,0 +1,60 @@
+# Fuzz targets (S78), one per parsing-heavy component that exists so far:
+# the td_api JSON request parser, the raw tdutils JSON parser, the binlog
+# event reader, the MTProto packet parser and the TL scheme text parser.
+# URL / HTML / entities / secret-chat targets arrive with their Track I
+# components.
+#
+# Own manifest, excluded from the workspace (like `conformance` and
+# `bench`). Build: `cargo build` here compiles the libFuzzer runtime from
+# `libfuzzer-sys`; the real corpus runs use cargo-fuzz on nightly in CI
+# (`cargo fuzz run <target> -- -max_total_time=...`), which adds the
+# coverage instrumentation on top of these same targets.
+[package]
+name = "td-fuzz"
+version = "0.1.0"
+edition = "2024"
+license = "BSL-1.0"
+publish = false
+
+[dependencies]
+libfuzzer-sys = "0.4"
+tdclient = { path = "../crates/tdclient" }
+tddb = { path = "../crates/tddb" }
+tdmtproto = { path = "../crates/tdmtproto" }
+tdtl = { path = "../crates/tdtl" }
+tdutils = { path = "../crates/tdutils" }
+
+[[bin]]
+name = "td_api_json"
+path = "fuzz_targets/td_api_json.rs"
+doc = false
+
+[[bin]]
+name = "json_value"
+path = "fuzz_targets/json_value.rs"
+doc = false
+
+[[bin]]
+name = "binlog_event"
+path = "fuzz_targets/binlog_event.rs"
+doc = false
+
+[[bin]]
+name = "mtproto_packet"
+path = "fuzz_targets/mtproto_packet.rs"
+doc = false
+
+[[bin]]
+name = "tl_scheme_text"
+path = "fuzz_targets/tl_scheme_text.rs"
+doc = false
+
+[[bin]]
+name = "transport_frame"
+path = "fuzz_targets/transport_frame.rs"
+doc = false
+
+# Panic = bug: the parsers must report errors, never crash (the tdlib
+# parsers guarantee no-throw on any input).
+[profile.release]
+panic = "abort"
