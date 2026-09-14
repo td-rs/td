@@ -108,14 +108,62 @@ pub fn tl_parse_lex(lexer: &mut Lexer) -> Option<TreeNode> {
     if lexer.lex.ty == LexType::Error {
         return None;
     }
-    TreeParser { lex: lexer }.parse_program()
+    let steps_left = BASE_PARSE_STEPS + STEPS_PER_BYTE * lexer.text().len();
+    TreeParser {
+        lex: lexer,
+        depth: 0,
+        steps_left,
+    }
+    .parse_program()
 }
+
+/// Recursion cap for the mutually recursive term/expr/subexpr/args descent.
+/// The C tl-parser overflows its stack on inputs like `k(` — the
+/// frozen-EOF stale token re-enters the cycle with zero input progress —
+/// so the port rejects over-deep nesting instead (the same documented
+/// divergence class as the loop progress guards). Real schemes nest only
+/// a handful of levels deep.
+const MAX_PARSE_DEPTH: usize = 512;
+
+/// Backtracking budget: the C parser's try-each-alternative recursion is
+/// exponential on adversarial inputs (a 418-byte fuzz case parses for
+/// tens of seconds), while real schemes spend a small linear number of
+/// steps. Past the budget the port reports a parse error instead.
+const BASE_PARSE_STEPS: usize = 100_000;
+const STEPS_PER_BYTE: usize = 1_000;
 
 struct TreeParser<'a> {
     lex: &'a mut Lexer,
+    depth: usize,
+    steps_left: usize,
 }
 
 impl TreeParser<'_> {
+    /// Enter one level of recursive descent; `false` (an error is already
+    /// recorded) means the depth or backtracking budget is exhausted.
+    fn enter(&mut self) -> bool {
+        if self.steps_left == 0 {
+            self.lex.error("The scheme is too complex to parse");
+            return false;
+        }
+        self.steps_left -= 1;
+        self.depth += 1;
+        if self.depth > MAX_PARSE_DEPTH {
+            self.lex.error("Maximum nesting depth exceeded");
+            self.depth -= 1;
+            return false;
+        }
+        true
+    }
+
+    fn parse_term(&mut self) -> Option<TreeNode> {
+        if !self.enter() {
+            return None;
+        }
+        let r = self.parse_term_descend();
+        self.depth -= 1;
+        r
+    }
     /// `EXPECT(s)` — `true` on success (token consumed), `false` on failure.
     fn expect(&mut self, s: &str) -> bool {
         let ok = match self.lex.lexeme() {
@@ -253,7 +301,7 @@ impl TreeParser<'_> {
         }
     }
 
-    fn parse_term(&mut self) -> Option<TreeNode> {
+    fn parse_term_descend(&mut self) -> Option<TreeNode> {
         let save = self.lex.save_state();
         let mut t = self.node(TreeType::Term);
         while self.lex_char(b'%') {
@@ -345,10 +393,22 @@ impl TreeParser<'_> {
     }
 
     fn parse_subexpr(&mut self) -> Option<TreeNode> {
+        if !self.enter() {
+            return None;
+        }
+        let r = self.parse_subexpr_descend();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_subexpr_descend(&mut self) -> Option<TreeNode> {
         let save = self.lex.save_state();
         let mut t = self.node(TreeType::Subexpr);
         let mut was_term = false;
         let mut cc = 0;
+        // Progress guard as in `parse_expr`: a repeatable stale `+` keeps
+        // this loop turning without consuming input.
+        let mut last_pos = self.lex.pos();
         loop {
             let s = self.parse_nat_const();
             if let Some(s) = s {
@@ -368,6 +428,13 @@ impl TreeParser<'_> {
                 self.fail(save);
                 return None;
             }
+            let pos = self.lex.pos();
+            if pos == last_pos {
+                self.lex.error("Can not parse subexpression");
+                self.fail(save);
+                return None;
+            }
+            last_pos = pos;
         }
         if cc == 0 {
             self.fail(save);
@@ -378,9 +445,23 @@ impl TreeParser<'_> {
     }
 
     fn parse_expr(&mut self) -> Option<TreeNode> {
+        if !self.enter() {
+            return None;
+        }
+        let r = self.parse_expr_descend();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_expr_descend(&mut self) -> Option<TreeNode> {
         let save = self.lex.save_state();
         let mut t = self.node(TreeType::Expr);
         let mut cc = 0;
+        // Progress guard (the C tl-parser spins forever here on a stale
+        // zero-length identifier at frozen EOF — see
+        // `parse_partial_type_app_decl`): every accepted subexpr must
+        // consume at least one byte.
+        let mut last_pos = self.lex.pos();
         loop {
             match self.parse_subexpr() {
                 Some(s) => {
@@ -395,6 +476,13 @@ impl TreeParser<'_> {
                     return Some(t);
                 }
             }
+            let pos = self.lex.pos();
+            if pos == last_pos {
+                self.lex.error("Can not parse expression");
+                self.fail(save);
+                return None;
+            }
+            last_pos = pos;
         }
     }
 
@@ -723,6 +811,9 @@ impl TreeParser<'_> {
             self.fail(save);
             return None;
         }
+        // Progress guard: parse_args can succeed without consuming at the
+        // frozen-EOF stale token (same C-parser spin class).
+        let mut last_pos = self.lex.pos();
         loop {
             if self.lex_char(b']') {
                 break;
@@ -734,6 +825,13 @@ impl TreeParser<'_> {
                     return None;
                 }
             }
+            let pos = self.lex.pos();
+            if pos == last_pos {
+                self.lex.error("Can not parse args");
+                self.fail(save);
+                return None;
+            }
+            last_pos = pos;
         }
         if !self.expect("]") {
             self.fail(save);
@@ -751,12 +849,20 @@ impl TreeParser<'_> {
         }
         loop {
             // As in parse_opt_args: the var-ident nodes are children.
+            // Progress guard as in `parse_expr` — a var-ident can succeed
+            // without consuming on the frozen-EOF stale token.
+            let last_pos = self.lex.pos();
             match self.parse_var_ident_opt() {
                 Some(s) => t.children.push(s),
                 None => {
                     self.fail(save);
                     return None;
                 }
+            }
+            if self.lex.pos() == last_pos {
+                self.lex.error("Can not parse args");
+                self.fail(save);
+                return None;
             }
             if self.lex_char(b':') {
                 break;
@@ -794,6 +900,15 @@ impl TreeParser<'_> {
     }
 
     fn parse_args(&mut self) -> Option<TreeNode> {
+        if !self.enter() {
+            return None;
+        }
+        let r = self.parse_args_descend();
+        self.depth -= 1;
+        r
+    }
+
+    fn parse_args_descend(&mut self) -> Option<TreeNode> {
         let save = self.lex.save_state();
         let mut t = self.node(TreeType::Args);
         if let Some(s) = self.parse_args1() {
@@ -822,12 +937,19 @@ impl TreeParser<'_> {
         loop {
             // The var-ident nodes are children (PARSE_TRY_PES adds them);
             // tl_parse_opt_args reads them back by index.
+            // Progress guard as in `parse_expr`.
+            let last_pos = self.lex.pos();
             match self.parse_var_ident() {
                 Some(s) => t.children.push(s),
                 None => {
                     self.fail(save);
                     return None;
                 }
+            }
+            if self.lex.pos() == last_pos {
+                self.lex.error("Can not parse opt args");
+                self.fail(save);
+                return None;
             }
             if self.lex_char(b':') {
                 break;
@@ -920,6 +1042,9 @@ impl TreeParser<'_> {
             }
             Some(t)
         } else {
+            // Progress guard as in `parse_expr`: subexpr can succeed without
+            // consuming on the frozen-EOF stale token.
+            let mut last_pos = self.lex.pos();
             loop {
                 if self.lex_char(b';') {
                     return Some(t);
@@ -931,6 +1056,13 @@ impl TreeParser<'_> {
                         return None;
                     }
                 }
+                let pos = self.lex.pos();
+                if pos == last_pos {
+                    self.lex.error("Can not parse result type");
+                    self.fail(save);
+                    return None;
+                }
+                last_pos = pos;
             }
         }
     }
@@ -967,12 +1099,19 @@ impl TreeParser<'_> {
             if self.lex_char(b'=') {
                 break;
             }
+            // Progress guard as in `parse_expr`.
+            let last_pos = self.lex.pos();
             match self.parse_args() {
                 Some(s) => t.children.push(s),
                 None => {
                     self.fail(save);
                     return None;
                 }
+            }
+            if self.lex.pos() == last_pos {
+                self.lex.error("Can not parse combinator declaration");
+                self.fail(save);
+                return None;
             }
         }
         if !self.expect("=") {
@@ -1133,6 +1272,63 @@ impl TreeParser<'_> {
                 self.fail(save);
                 return None;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_input_is_a_valid_empty_program() {
+        let mut lexer = Lexer::new(Vec::new());
+        assert!(tl_parse_lex(&mut lexer).is_some());
+    }
+
+    /// The S78 fuzz findings: inputs where the C tl-parser's backtracking
+    /// loops spin forever (a stale zero-length identifier at the frozen-EOF
+    /// position lets a sub-parse succeed without consuming input). The
+    /// port's progress guards (a documented divergence — see
+    /// `parse_partial_type_app_decl` and `parse_expr`) must reject every
+    /// one of them; a regression here hangs this test.
+    #[test]
+    fn degenerate_programs_fail_fast() {
+        for input in [
+            &b"J"[..],
+            b"J<",
+            b"J+",
+            b"J.",
+            b"J;",
+            b"J=",
+            b"J%",
+            b"J4",
+            b"J{",
+            b"J[",
+            b"k(k",
+            b"k(",
+            b"a(a",
+            b"a(a:",
+            b"a{a",
+            b"a<a",
+            b"a = a<a",
+            b"a:",
+            b"x#",
+            b"#;",
+            b"aa",
+            b"---",
+            b"===",
+            b"New",
+            b"Empty",
+            b"Final",
+            b"J ? = ;",
+        ] {
+            let mut lexer = Lexer::new(input.to_vec());
+            assert!(
+                tl_parse_lex(&mut lexer).is_none(),
+                "{:?} must not parse",
+                input
+            );
         }
     }
 }
