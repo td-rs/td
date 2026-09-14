@@ -21,11 +21,9 @@ pub fn user_object(user: &telegram_api::user, is_self: bool) -> td_api::User {
         editable_username: user.username.clone(),
         ..Default::default()
     });
-    let language_code = if user.lang_code.is_empty() {
-        "en".to_string()
-    } else {
-        user.lang_code.clone()
-    };
+    // C++ emits the stored `language_code` verbatim (default empty — it
+    // only ever updates from a non-empty wire lang_code).
+    let language_code = user.lang_code.clone();
     let r#type = if user.bot {
         td_api::UserType::userTypeBot(td_api::userTypeBot {
             can_be_edited: !user.bot_nochats,
