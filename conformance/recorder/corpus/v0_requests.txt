@@ -1,0 +1,8 @@
+{"@type":"getOption","name":"version","@extra":[1,2]}
+{"@type":"getOption","name":"version"}
+{"@type":"getOption","name":"database_directory"}
+{"@type":"setOption","name":"x_v0_flag","value":{"@type":"optionValueBoolean","value":true}}
+{"@type":"getAuthorizationState"}
+{"@type":"getMe"}
+{"@type":"testReturnError","error":{"@type":"error","code":418,"message":"teapot"}}
+{"@type":"getOption","name":"message_caption_length_max"}

@@ -44,3 +44,7 @@ path = "src/bin/handshake_client.rs"
 [[bin]]
 name = "auth_data_rw"
 path = "src/bin/auth_data_rw.rs"
+
+[[bin]]
+name = "recorder-replayer"
+path = "src/bin/recorder_replayer.rs"

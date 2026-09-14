@@ -7,11 +7,13 @@
 //! ([`synchronous_requests`]); the full ClientManager port is S70, the
 //! Options manager S69.
 
+pub mod auth_manager;
 pub mod client;
 pub mod client_json;
 pub mod option_manager;
 pub mod synchronous_requests;
 pub mod td;
+pub mod updates_manager;
 
 // Generated code keeps C++-identical case-preserved names (`aiComposeTone`)
 // in types, fields and the JSON dispatch helpers alike.
