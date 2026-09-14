@@ -41,11 +41,14 @@ pub(crate) fn parse_tl_string(parser: &mut &[u8]) -> Result<Vec<u8>> {
     Result::Ok(bytes)
 }
 
-/// `td::BinlogKeyValue<ConcurrentBinlog>`
+/// `td::BinlogKeyValue<ConcurrentBinlog>`. Keys and values are byte strings
+/// (the C++ std::string): the sqlite encryption key is arbitrary binary and
+/// must survive replay untouched, so the &str accessors are UTF-8
+/// conveniences over the raw [`Self::set_raw`]/[`Self::get_raw`] core.
 pub struct BinlogKeyValue {
     binlog: Option<Arc<ConcurrentBinlog>>,
     // key -> (value, event_id)
-    map: HashMap<String, (String, u64)>,
+    map: HashMap<Vec<u8>, (Vec<u8>, u64)>,
     magic: i32,
 }
 
@@ -56,10 +59,10 @@ impl Default for BinlogKeyValue {
 }
 
 /// Serialize `BinlogKeyValue::Event{key, value}` exactly like the C++ Storer.
-fn event_to_bytes(key: &str, value: &str) -> Vec<u8> {
+fn event_to_bytes(key: &[u8], value: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    store_tl_string(&mut out, key.as_bytes());
-    store_tl_string(&mut out, value.as_bytes());
+    store_tl_string(&mut out, key);
+    store_tl_string(&mut out, value);
     out
 }
 
@@ -76,17 +79,50 @@ impl BinlogKeyValue {
         self.magic
     }
 
-    fn parse_event(data: &[u8]) -> Result<(String, String)> {
+    /// `BinlogKeyValue::set_magic`.
+    pub fn set_magic(&mut self, magic: i32) {
+        self.magic = magic;
+    }
+
+    /// `BinlogKeyValue::external_init_begin` — prepare for a replay driven
+    /// by an external owner (several pmcs may share one binlog file, each
+    /// consuming only the events written with its own magic).
+    pub fn external_init_begin(&mut self, magic: i32) {
+        self.magic = magic;
+        self.map.clear();
+    }
+
+    /// `BinlogKeyValue::external_init_handle` — consume one replayed event.
+    pub fn external_init_handle(&mut self, event: &BinlogEvent) {
+        match Self::parse_event(event.get_data()) {
+            Result::Ok((key, value)) => {
+                if key.is_empty() {
+                    tracing::error!("Have event with empty key");
+                    return;
+                }
+                self.map.insert(key, (value, event.id));
+            }
+            Result::Err(status) => {
+                panic!("Failed to parse BinlogKeyValue event: {status}")
+            }
+        }
+    }
+
+    /// `BinlogKeyValue::external_init_finish` — attach to the shared binlog
+    /// after the replay. The events were already routed by the owner's
+    /// callback, so unlike `init` no second replay happens.
+    pub fn external_init_finish(&mut self, binlog: Arc<ConcurrentBinlog>) {
+        self.binlog = Some(binlog);
+    }
+
+    fn parse_event(data: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         let mut parser = data;
         try_result!(key, parse_tl_string(&mut parser));
         try_result!(value, parse_tl_string(&mut parser));
         if !parser.is_empty() {
             return Result::from_status(Status::error_message("Extra data in event"));
         }
-        Result::Ok((
-            String::from_utf8_lossy(&key).into_owned(),
-            String::from_utf8_lossy(&value).into_owned(),
-        ))
+        Result::Ok((key, value))
     }
 
     /// `BinlogKeyValue::init`
@@ -126,21 +162,26 @@ impl BinlogKeyValue {
     /// `BinlogKeyValue::set` — returns the sequence number, or 0 if the value
     /// is unchanged.
     pub fn set(&mut self, key: &str, value: &str) -> u64 {
+        self.set_raw(key.as_bytes(), value.as_bytes())
+    }
+
+    /// The raw byte-string form of `set`.
+    pub fn set_raw(&mut self, key: &[u8], value: &[u8]) -> u64 {
         assert!(!key.is_empty());
         let Some(binlog) = self.binlog.clone() else {
             panic!("BinlogKeyValue is not initialized");
         };
         let entry = self
             .map
-            .entry(key.to_string())
-            .or_insert_with(|| (String::new(), 0));
+            .entry(key.to_vec())
+            .or_insert_with(|| (Vec::new(), 0));
         if entry.1 != 0 && entry.0 == value {
             return 0;
         }
         let seq_no = binlog.next_event_id();
         let rewrite = entry.1 != 0;
         let event_id = if rewrite { entry.1 } else { seq_no };
-        entry.0 = value.to_string();
+        entry.0 = value.to_vec();
         entry.1 = event_id;
 
         binlog.add_raw_event(
@@ -164,7 +205,7 @@ impl BinlogKeyValue {
         let Some(binlog) = self.binlog.clone() else {
             panic!("BinlogKeyValue is not initialized");
         };
-        let Some((_, event_id)) = self.map.remove(key) else {
+        let Some((_, event_id)) = self.map.remove(key.as_bytes()) else {
             return 0;
         };
         let seq_no = binlog.next_event_id();
@@ -182,11 +223,17 @@ impl BinlogKeyValue {
 
     /// `BinlogKeyValue::isset`
     pub fn isset(&self, key: &str) -> bool {
-        self.map.contains_key(key)
+        self.map.contains_key(key.as_bytes())
     }
 
     /// `BinlogKeyValue::get` — empty string when the key is missing.
     pub fn get(&self, key: &str) -> String {
+        String::from_utf8_lossy(&self.get_raw(key.as_bytes())).into_owned()
+    }
+
+    /// The raw byte-string form of `get` (values may be non-UTF-8, e.g. the
+    /// sqlite encryption key).
+    pub fn get_raw(&self, key: &[u8]) -> Vec<u8> {
         self.map
             .get(key)
             .map(|(v, _)| v.clone())
@@ -196,7 +243,10 @@ impl BinlogKeyValue {
     /// `BinlogKeyValue::for_each`
     pub fn for_each(&self, mut func: impl FnMut(&str, &str)) {
         for (key, (value, _)) in &self.map {
-            func(key, value);
+            func(
+                &String::from_utf8_lossy(key),
+                &String::from_utf8_lossy(value),
+            );
         }
     }
 
@@ -204,7 +254,12 @@ impl BinlogKeyValue {
     pub fn get_all(&self) -> HashMap<String, String> {
         self.map
             .iter()
-            .map(|(k, (v, _))| (k.clone(), v.clone()))
+            .map(|(k, (v, _))| {
+                (
+                    String::from_utf8_lossy(k).into_owned(),
+                    String::from_utf8_lossy(v).into_owned(),
+                )
+            })
             .collect()
     }
 

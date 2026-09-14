@@ -7,10 +7,14 @@
 
 use std::sync::Arc;
 
+use crate::binlog::concurrent::ConcurrentBinlog;
+use crate::binlog::event::BinlogEvent;
+use crate::binlog_key_value::BinlogKeyValue;
 use crate::db_key::DbKey;
 use crate::sqlite_connection_safe::SqliteConnectionSafe;
 use crate::sqlite_db::SqliteDb;
 use crate::sqlite_key_value::SqliteKeyValue;
+use tdutils::random;
 use tdutils::status::Result;
 use tdutils::status::Status;
 use tdutils::try_status;
@@ -44,9 +48,13 @@ const MESSAGE_DB_INDEX_COUNT_OLD: i32 = 9;
 const MESSAGE_SEARCH_FILTER_CALL: i32 = 10;
 const MESSAGE_SEARCH_FILTER_MISSED_CALL: i32 = 11;
 
-/// `TdDb::Parameters` (the database-relevant subset)
+/// `TdDb::Parameters`
 #[derive(Clone, Debug)]
 pub struct Parameters {
+    pub encryption_key: DbKey,
+    pub database_directory: String,
+    pub files_directory: String,
+    pub is_test_dc: bool,
     pub use_file_database: bool,
     pub use_chat_info_database: bool,
     pub use_message_database: bool,
@@ -55,6 +63,10 @@ pub struct Parameters {
 impl Default for Parameters {
     fn default() -> Self {
         Parameters {
+            encryption_key: DbKey::empty(),
+            database_directory: String::new(),
+            files_directory: String::new(),
+            is_test_dc: false,
             use_file_database: true,
             use_chat_info_database: true,
             use_message_database: true,
@@ -62,11 +74,127 @@ impl Default for Parameters {
     }
 }
 
+/// `LogEvent::HandlerType::BinlogPmcMagic` (logevent/LogEvent.h).
+pub const BINLOG_PMC_MAGIC: i32 = 0x4327;
+/// `LogEvent::HandlerType::ConfigPmcMagic` (logevent/LogEvent.h).
+pub const CONFIG_PMC_MAGIC: i32 = 0x1f18;
+
+/// `TdDb::OpenedDatabase` — the database plus the open metadata the Td actor
+/// consumes (`since_last_open`; the per-manager binlog event vectors arrive
+/// with the managers that own them).
+pub struct OpenedDatabase {
+    pub database: TdDb,
+    pub since_last_open: i64,
+}
+
+/// `get_binlog_path` — `{database_directory}td{_test}.binlog`.
+fn get_binlog_path(parameters: &Parameters) -> String {
+    format!(
+        "{}td{}.binlog",
+        parameters.database_directory,
+        if parameters.is_test_dc { "_test" } else { "" }
+    )
+}
+
+/// `get_sqlite_path` — `{database_directory}db{_test}.sqlite`.
+fn get_sqlite_path(parameters: &Parameters) -> String {
+    format!(
+        "{}db{}.sqlite",
+        parameters.database_directory,
+        if parameters.is_test_dc { "_test" } else { "" }
+    )
+}
+
+/// `TdDb::check_parameters`: default directory, the use-database cascade,
+/// and directory preparation (`mkpath` + `realpath`; the 0750 mode is a
+/// documented divergence — mkdir modes are not portable).
+fn check_parameters(parameters: &mut Parameters) -> Status {
+    if parameters.database_directory.is_empty() {
+        parameters.database_directory = ".".to_string();
+    }
+    if parameters.use_message_database && !parameters.use_chat_info_database {
+        parameters.use_chat_info_database = true;
+    }
+    if parameters.use_chat_info_database && !parameters.use_file_database {
+        parameters.use_file_database = true;
+    }
+
+    fn prepare_dir(dir: &str) -> Result<String> {
+        let mut dir = dir.to_string();
+        if !dir.ends_with(std::path::MAIN_SEPARATOR) {
+            dir.push(std::path::MAIN_SEPARATOR);
+        }
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            return Result::from_status(Status::error_message(&format!(
+                "Failed to create directory: {error}"
+            )));
+        }
+        let real_dir = match std::fs::canonicalize(&dir) {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(error) => {
+                return Result::from_status(Status::error_message(&format!(
+                    "Failed to get realpath: {error}"
+                )));
+            }
+        };
+        if real_dir.is_empty() {
+            return Result::from_status(Status::error_message(
+                "Failed to get realpath for empty path",
+            ));
+        }
+        let mut real_dir = real_dir;
+        if !real_dir.ends_with(std::path::MAIN_SEPARATOR) {
+            real_dir.push(std::path::MAIN_SEPARATOR);
+        }
+        Result::Ok(real_dir)
+    }
+
+    let original_database_directory = parameters.database_directory.clone();
+    match prepare_dir(&original_database_directory) {
+        Result::Ok(dir) => parameters.database_directory = dir,
+        Result::Err(error) => {
+            tracing::warn!("Invalid database directory");
+            return Status::error(
+                400,
+                &format!(
+                    "Can't init database in the directory \"{original_database_directory}\": {}",
+                    error.message()
+                ),
+            );
+        }
+    }
+
+    if parameters.files_directory.is_empty() {
+        parameters.files_directory = parameters.database_directory.clone();
+    } else {
+        let original_files_directory = parameters.files_directory.clone();
+        match prepare_dir(&original_files_directory) {
+            Result::Ok(dir) => parameters.files_directory = dir,
+            Result::Err(error) => {
+                tracing::warn!("Invalid files directory");
+                return Status::error(
+                    400,
+                    &format!(
+                        "Can't init files directory \"{original_files_directory}\": {}",
+                        error.message()
+                    ),
+                );
+            }
+        }
+    }
+
+    Status::ok()
+}
+
 /// `TdDb` — the schema skeleton: owns the safe connection and the file
 /// key-value table; manager-specific handles attach in later steps.
 pub struct TdDb {
+    parameters: Option<Parameters>,
     sql_connection: Option<Arc<SqliteConnectionSafe>>,
     files_kv: Option<SqliteKeyValue>,
+    binlog_pmc: Option<BinlogKeyValue>,
+    config_pmc: Option<BinlogKeyValue>,
+    binlog: Option<Arc<ConcurrentBinlog>>,
 }
 
 fn add_media_indices(db: &SqliteDb, begin: i32, end: i32) -> Status {
@@ -257,8 +385,12 @@ fn init_file_db(db: &SqliteDb, version: &mut i32) -> Status {
 impl TdDb {
     pub fn new() -> TdDb {
         TdDb {
+            parameters: None,
             sql_connection: None,
             files_kv: None,
+            binlog_pmc: None,
+            config_pmc: None,
+            binlog: None,
         }
     }
 
@@ -335,6 +467,174 @@ impl TdDb {
         self.files_kv = Some(files_kv);
 
         Status::ok()
+    }
+
+    /// `TdDb::get_binlog_pmc` — the pmc holding the auth state and the
+    /// other non-option key-value state.
+    pub fn binlog_pmc(&mut self) -> &mut BinlogKeyValue {
+        self.binlog_pmc
+            .as_mut()
+            .expect("TdDb is not initialized: binlog pmc is missing")
+    }
+
+    /// `TdDb::get_config_pmc` — the option store.
+    pub fn config_pmc(&mut self) -> &mut BinlogKeyValue {
+        self.config_pmc
+            .as_mut()
+            .expect("TdDb is not initialized: config pmc is missing")
+    }
+
+    /// Move the config pmc out to its long-lived owner (the OptionManager);
+    /// the underlying binlog handle stays shared through the `Arc`.
+    pub fn take_config_pmc(&mut self) -> BinlogKeyValue {
+        self.config_pmc
+            .take()
+            .expect("TdDb is not initialized: config pmc is missing")
+    }
+
+    /// The parameters the database was opened with (`TdDb::parameters_`).
+    pub fn parameters(&self) -> &Parameters {
+        self.parameters
+            .as_ref()
+            .expect("TdDb is not initialized: parameters are missing")
+    }
+
+    pub fn use_file_database(&self) -> bool {
+        self.parameters().use_file_database
+    }
+
+    /// `TdDb::open` — the C++ `open_impl` in-process (the database-
+    /// scheduler hop is a documented divergence until the network actors
+    /// land): open the shared `td[._test].binlog` with both pmcs routed by
+    /// magic, derive the sqlite key, then init the sqlite schema.
+    pub fn open(mut parameters: Parameters) -> Result<OpenedDatabase> {
+        let check_status = check_parameters(&mut parameters);
+        if check_status.is_error() {
+            return Result::from_status(check_status);
+        }
+
+        let binlog_path = get_binlog_path(&parameters);
+        let sqlite_path = get_sqlite_path(&parameters);
+
+        // `init_binlog`: the mtime of an existing binlog gives
+        // `since_last_open`.
+        let mut since_last_open: i64 = 0;
+        let since = std::fs::metadata(&binlog_path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|mtime| std::time::SystemTime::now().duration_since(mtime).ok())
+            .map(|elapsed| elapsed.as_secs_f64());
+        if let Some(since) = since {
+            if since >= 86400.0 {
+                tracing::warn!("Binlog wasn't opened for {since} seconds");
+            }
+            if since > 0.0 && since < 1e12 {
+                since_last_open = since as i64;
+            }
+        }
+
+        let mut binlog_pmc = BinlogKeyValue::new();
+        let mut config_pmc = BinlogKeyValue::new();
+        binlog_pmc.external_init_begin(BINLOG_PMC_MAGIC);
+        config_pmc.external_init_begin(CONFIG_PMC_MAGIC);
+
+        // The combined replay callback: each pmc consumes only the events
+        // written with its own magic; the rest waits for its owner.
+        let mut binlog = ConcurrentBinlog::new();
+        {
+            let binlog_pmc = &mut binlog_pmc;
+            let config_pmc = &mut config_pmc;
+            let callback = |event: &BinlogEvent| match event.type_ {
+                BINLOG_PMC_MAGIC => binlog_pmc.external_init_handle(event),
+                CONFIG_PMC_MAGIC => config_pmc.external_init_handle(event),
+                _ => {}
+            };
+            let init_status = binlog.init(
+                &binlog_path,
+                callback,
+                parameters.encryption_key.clone(),
+                DbKey::empty(),
+            );
+            if let Result::Err(init_status) = init_status {
+                return Result::from_status(init_status);
+            }
+        }
+        let binlog = Arc::new(binlog);
+        binlog_pmc.external_init_finish(binlog.clone());
+        config_pmc.external_init_finish(binlog.clone());
+
+        // Destroy an sqlite database from a previous (never authorized) run.
+        if parameters.use_file_database && binlog_pmc.get("auth").is_empty() {
+            tracing::info!("Destroy SQLite database, because wasn't authorized yet");
+            let _ = crate::sqlite_db::destroy(&sqlite_path);
+        }
+
+        // The sqlite key is a random 32-byte secret living in the binlog
+        // pmc; encryption follows the binlog key. The value is arbitrary
+        // binary, so it goes through the raw (non-UTF-8) accessors.
+        let encrypt_sqlite = !parameters.encryption_key.is_empty();
+        let mut new_sqlite_key = DbKey::empty();
+        let mut old_sqlite_key = DbKey::empty();
+        let mut sqlite_key = binlog_pmc.get_raw(b"sqlite_key");
+        if encrypt_sqlite {
+            if sqlite_key.is_empty() {
+                sqlite_key = vec![b' '; 32];
+                random::secure_bytes(&mut sqlite_key);
+                binlog_pmc.set_raw(b"sqlite_key", &sqlite_key);
+                if parameters.use_file_database {
+                    binlog_pmc.force_sync(None);
+                }
+            }
+            new_sqlite_key = DbKey::raw_key(sqlite_key);
+        } else if !sqlite_key.is_empty() {
+            old_sqlite_key = DbKey::raw_key(sqlite_key);
+            // drop_sqlite_key: the Rust sqlite port re-keys on open, so the
+            // pmc erase happens right away (the C++ erases after the re-key
+            // succeeds).
+            binlog_pmc.erase("sqlite_key");
+        }
+
+        let mut db = TdDb::new();
+        db.parameters = Some(parameters.clone());
+        let mut init_status =
+            db.init_sqlite(&sqlite_path, &parameters, &new_sqlite_key, &old_sqlite_key);
+        if init_status.is_error() {
+            // C++ destroys the bad database and retries once.
+            tracing::error!("Destroy bad SQLite database because of {init_status}");
+            let _ = crate::sqlite_db::destroy(&sqlite_path);
+            init_status =
+                db.init_sqlite(&sqlite_path, &parameters, &new_sqlite_key, &old_sqlite_key);
+            if init_status.is_error() {
+                return Result::from_status(init_status);
+            }
+        }
+        db.binlog_pmc = Some(binlog_pmc);
+        db.config_pmc = Some(config_pmc);
+        db.binlog = Some(binlog);
+
+        Result::Ok(OpenedDatabase {
+            database: db,
+            since_last_open,
+        })
+    }
+
+    /// `TdDb::close_all` — drop the pmc views, then close (or destroy) the
+    /// binlog and the sqlite connection.
+    pub fn close_all(&mut self, destroy_flag: bool) {
+        self.binlog_pmc.take();
+        self.config_pmc.take();
+        if let Some(binlog) = self.binlog.take() {
+            if destroy_flag {
+                binlog.close_and_destroy(None);
+            } else {
+                binlog.close(None);
+            }
+        }
+        self.files_kv.take();
+        if let Some(connection) = self.sql_connection.take() {
+            connection.close();
+        }
+        self.parameters = None;
     }
 
     pub fn close(&mut self) {

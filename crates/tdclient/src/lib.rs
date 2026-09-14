@@ -10,7 +10,9 @@
 pub mod auth_manager;
 pub mod client;
 pub mod client_json;
+pub mod misc;
 pub mod option_manager;
+pub mod requests;
 pub mod synchronous_requests;
 pub mod td;
 pub mod updates_manager;

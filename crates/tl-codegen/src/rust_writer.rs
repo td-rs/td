@@ -970,6 +970,33 @@ fn emit_object_umbrella(out: &mut String, p: &TlProgram, m: &SchemeModel, opts: 
          other => Result::Err(format!(\"Expected String or Integer, but receive {}\", other.type_name())),\n        \
          }\n    }\n}\n\n",
     );
+    // `Update::try_from_object` — the update-typed view C++ carries through
+    // `td_api::updates` and `Td::send_update` (`object_ptr<Update>`); the
+    // rewrap is variant-for-variant over the `Update` type's constructors.
+    if let Some(&update_ctor) = p
+        .type_ids
+        .values()
+        .find(|&&tid| class_name(&p.types[tid].id) == "Update")
+    {
+        let update_variants: Vec<String> = match &m.type_kinds[update_ctor] {
+            TypeKind::Struct { ctor } => vec![capitalize(&p.ctors[*ctor].id)],
+            TypeKind::Enum { ctors } => ctors.iter().map(|&c| capitalize(&p.ctors[c].id)).collect(),
+            _ => Vec::new(),
+        };
+        out.push_str("impl Update {\n");
+        out.push_str(
+            "    #[allow(clippy::result_large_err)] // the Err carries the rejected Object, like the C++ ptr\n",
+        );
+        out.push_str(
+            "    pub fn try_from_object(value: Object) -> Result<Update, Object> {\n        match value {\n",
+        );
+        for variant in update_variants {
+            out.push_str(&format!(
+                "            Object::{variant}(v) => Result::Ok(Update::{variant}(v)),\n"
+            ));
+        }
+        out.push_str("            other => Result::Err(other),\n        }\n    }\n}\n\n");
+    }
     let _ = opts;
 }
 
@@ -1371,6 +1398,22 @@ fn emit_enum(
     out.push_str(&format!(
         "    fn default() -> Self {{\n        Self::{default_variant}(Default::default())\n    }}\n}}\n\n"
     ));
+    // `From<{name}> for Object` — every td_api type participates in the
+    // dynamic `Object` umbrella; the rewrap is variant-for-variant. The
+    // Function umbrella (opts.umbrella) is not an Object.
+    if opts.json && name != opts.umbrella {
+        out.push_str(&format!("impl From<{name}> for Object {{\n"));
+        out.push_str("    fn from(value: ");
+        out.push_str(name);
+        out.push_str(") -> Object {\n        match value {\n");
+        for &c in ctors {
+            let variant = capitalize(&p.ctors[c].id);
+            out.push_str(&format!(
+                "            {name}::{variant}(v) => Object::{variant}(v),\n"
+            ));
+        }
+        out.push_str("        }\n    }\n}\n\n");
+    }
 }
 
 fn rust_field_type(p: &TlProgram, m: &SchemeModel, opts: &WriterOpts, ty: &FieldType) -> String {

@@ -10,6 +10,7 @@ libc = "0.2.189"
 serde = { version = "1", features = ["derive"] }
 tdactor = { path = "../tdactor" }
 tddb = { path = "../tddb" }
+tracing = "0.1"
 tdmtproto = { path = "../tdmtproto" }
 tdutils = { path = "../tdutils" }
 

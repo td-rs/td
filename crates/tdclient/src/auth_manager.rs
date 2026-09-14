@@ -751,6 +751,16 @@ impl AuthManager {
         self.state
     }
 
+    /// `AuthManager::get_current_authorization_state_object` (cpp:442-448) —
+    /// the bare `AuthorizationState`, `None` in `State::None`.
+    pub fn get_current_authorization_state_object(&self) -> Option<td_api::AuthorizationState> {
+        if self.state == State::None {
+            None
+        } else {
+            Some(self.get_authorization_state_object().authorization_state)
+        }
+    }
+
     /// The queued `updateAuthorizationState` broadcasts (drained by Td).
     pub fn take_updates(&mut self) -> Vec<Object> {
         std::mem::take(&mut self.pending_updates)
@@ -1018,26 +1028,58 @@ impl AuthManager {
         self.terms_of_service = None;
     }
 
-    /// The binlog `"auth"` key restore (constructor, cpp:336-362).
+    /// The binlog `"auth"` key restore (constructor, cpp:336-366). Every
+    /// branch lands in `update_state`, i.e. queues the matching
+    /// `updateAuthorizationState` exactly like the C++ constructor.
     pub fn restore_from_pmc(&mut self, auth_value: &str, is_bot: bool, phone_number: String) {
         match auth_value {
             "ok" => {
-                self.state = State::Ok;
                 self.is_bot = is_bot;
                 self.phone_number = phone_number;
+                // The C++ checks UserManager::load_my_id() here and falls
+                // back to a getMe query; the my_id restore arrives with the
+                // UserManager step.
+                self.update_state(State::Ok);
             }
             "logout" => {
-                self.state = State::LoggingOut;
                 self.phone_number = phone_number;
+                self.update_state(State::LoggingOut);
             }
             "destroy" => {
-                self.state = State::DestroyingKeys;
                 self.phone_number = phone_number;
+                self.update_state(State::DestroyingKeys);
             }
             _ => {
                 self.update_state(State::WaitPhoneNumber);
             }
         }
+    }
+}
+
+/// The bare-`AuthorizationState` → `Object` rewrap (the variants carry the
+/// same payload structs under the same names).
+pub(crate) fn authorization_state_to_object(state: td_api::AuthorizationState) -> Object {
+    use td_api::AuthorizationState as A;
+    match state {
+        A::authorizationStateWaitTdlibParameters(v) => {
+            Object::authorizationStateWaitTdlibParameters(v)
+        }
+        A::authorizationStateWaitPhoneNumber(v) => Object::authorizationStateWaitPhoneNumber(v),
+        A::authorizationStateWaitPremiumPurchase(v) => {
+            Object::authorizationStateWaitPremiumPurchase(v)
+        }
+        A::authorizationStateWaitEmailAddress(v) => Object::authorizationStateWaitEmailAddress(v),
+        A::authorizationStateWaitEmailCode(v) => Object::authorizationStateWaitEmailCode(v),
+        A::authorizationStateWaitCode(v) => Object::authorizationStateWaitCode(v),
+        A::authorizationStateWaitOtherDeviceConfirmation(v) => {
+            Object::authorizationStateWaitOtherDeviceConfirmation(v)
+        }
+        A::authorizationStateWaitRegistration(v) => Object::authorizationStateWaitRegistration(v),
+        A::authorizationStateWaitPassword(v) => Object::authorizationStateWaitPassword(v),
+        A::authorizationStateReady(v) => Object::authorizationStateReady(v),
+        A::authorizationStateLoggingOut(v) => Object::authorizationStateLoggingOut(v),
+        A::authorizationStateClosing(v) => Object::authorizationStateClosing(v),
+        A::authorizationStateClosed(v) => Object::authorizationStateClosed(v),
     }
 }
 
@@ -1439,9 +1481,10 @@ mod tests {
         assert!(manager.is_authorized());
         assert!(manager.is_bot());
         assert_eq!(manager.get_state(), State::Ok);
-        assert!(
-            manager.take_updates().is_empty(),
-            "restore does not broadcast"
-        );
+        // The C++ constructor lands in update_state, i.e. queues the matching
+        // updateAuthorizationState for the Td actor to broadcast.
+        let updates = manager.take_updates();
+        assert_eq!(updates.len(), 1);
+        assert!(matches!(&updates[0], Object::updateAuthorizationState(_)));
     }
 }
