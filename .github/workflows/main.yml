@@ -210,8 +210,9 @@ jobs:
         with:
           tool: cargo-fuzz
       - name: Fuzz smoke (60 s per target)
+        # cargo-fuzz resolves fuzz/Cargo.toml relative to the cwd, so it
+        # must run from the repo root, not from inside fuzz/.
         run: |
-          cd fuzz
           for target in td_api_json json_value binlog_event mtproto_packet tl_scheme_text transport_frame; do
             cargo fuzz run "$target" -- -max_total_time=60
           done
