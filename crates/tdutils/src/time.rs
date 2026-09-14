@@ -46,6 +46,17 @@ pub fn now_cached() -> f64 {
     now()
 }
 
+/// `td::Clocks::system` (`td/utils/port/Clocks.cpp`) — the wall clock in
+/// seconds since the Unix epoch (unlike `now`, it follows system time
+/// changes; this is the clock the persisted time differences are anchored
+/// against).
+pub fn system() -> f64 {
+    match std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH) {
+        Ok(duration) => duration.as_secs_f64(),
+        Err(error) => -error.duration().as_secs_f64(),
+    }
+}
+
 /// `td::Time::jump_in_future(at)` — advances the adjusted clock so that
 /// `now() >= at`.
 pub fn jump_in_future(at: f64) {

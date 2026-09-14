@@ -222,6 +222,10 @@ pub struct OptionManager {
     /// `pending_get_options_`), with their request ids.
     pending_get_options: Vec<(u64, String)>,
     pending_updates: Vec<td_api::Object>,
+    /// `last_sent_server_time_difference_` (OptionManager.h:95) — the
+    /// `unix_time` notification is suppressed while the difference moved
+    /// less than 0.5 since the last sent update.
+    last_sent_server_time_difference: f64,
 }
 
 impl OptionManager {
@@ -236,6 +240,7 @@ impl OptionManager {
             is_td_inited: false,
             pending_get_options: Vec::new(),
             pending_updates: Vec::new(),
+            last_sent_server_time_difference: 1e100,
         };
         manager.set_option_integer(
             "utc_time_offset",
@@ -249,8 +254,11 @@ impl OptionManager {
     /// `OptionManager` constructor pmc replay (the C++
     /// `option_pmc_->for_each` over `get_config_pmc()`): replay persisted
     /// options into the store, then keep the pmc handle for future writes.
-    /// Skips `utc_time_offset`, which is always recomputed.
-    pub fn attach_pmc(&mut self, pmc: BinlogKeyValue) {
+    /// Skips `utc_time_offset`, which is always recomputed. `unix_time` is
+    /// the Global-corrected time for the constructor's opening
+    /// `send_unix_time_update()` (OptionManager.cpp:59).
+    pub fn attach_pmc(&mut self, pmc: BinlogKeyValue, unix_time: i32) {
+        self.send_unix_time_update(unix_time);
         for (name, value) in pmc.get_all() {
             if name == "utc_time_offset" {
                 continue;
@@ -258,6 +266,32 @@ impl OptionManager {
             self.set_option(&name, &value);
         }
         self.option_pmc = Some(pmc);
+    }
+
+    /// `OptionManager::on_update_server_time_difference`
+    /// (OptionManager.cpp:431-438): re-send the `unix_time` option only
+    /// when the difference moved by 0.5 or more.
+    pub fn on_update_server_time_difference(
+        &mut self,
+        server_time_difference: f64,
+        unix_time: i32,
+    ) {
+        if (server_time_difference - self.last_sent_server_time_difference).abs() < 0.5 {
+            return;
+        }
+        self.send_unix_time_update(unix_time);
+    }
+
+    /// `OptionManager::send_unix_time_update` (OptionManager.cpp:426-429);
+    /// the corrected time arrives from the Global instead of `G()`.
+    fn send_unix_time_update(&mut self, unix_time: i32) {
+        self.pending_updates
+            .push(td_api::Object::updateOption(td_api::updateOption {
+                name: "unix_time".to_string(),
+                value: OptionValue::optionValueInteger(td_api::optionValueInteger {
+                    value: unix_time as i64,
+                }),
+            }));
     }
 
     /// `OptionManager::set_option` (the internal Slice form): write the
@@ -388,8 +422,9 @@ impl OptionManager {
     /// `OptionManager::get_option(name, promise)`: the store lookup with the
     /// async/live special cases. The ConfigManager/NotificationManager/
     /// OnlineManager branches report the interim values until their
-    /// managers land (S70+/Wave 1).
-    pub fn get_option_value(&self, name: &str) -> OptionValue {
+    /// managers land (S70+/Wave 1). `unix_time` is the Global-corrected
+    /// `G()->unix_time()` for the live option.
+    pub fn get_option_value(&self, name: &str, unix_time: i32) -> OptionValue {
         match name {
             "can_ignore_sensitive_content_restrictions"
             | "ignore_sensitive_content_restrictions" => {
@@ -405,9 +440,8 @@ impl OptionManager {
                 OptionValue::optionValueEmpty(td_api::optionValueEmpty)
             }
             "unix_time" => OptionValue::optionValueInteger(td_api::optionValueInteger {
-                // G()->unix_time(): server-time-corrected; without a session
-                // this is the local clock. TODO (S64+).
-                value: tdutils::time::now() as i64,
+                // `get_unix_time_option_value_object` → `G()->unix_time()`.
+                value: unix_time as i64,
             }),
             _ => Self::get_option_value_object(&self.get_option(name)),
         }
@@ -1138,8 +1172,9 @@ impl OptionManager {
     }
 
     /// `OptionManager::get_current_state`: common + online + unix_time +
-    /// every non-internal store entry.
-    pub fn get_current_state(&self, updates: &mut Vec<td_api::Object>) {
+    /// every non-internal store entry. `unix_time` is the Global-corrected
+    /// time.
+    pub fn get_current_state(&self, updates: &mut Vec<td_api::Object>, unix_time: i32) {
         Self::get_common_state(updates);
 
         // `td_->online_manager_->is_online()` — TODO (Wave 1), interim false.
@@ -1150,7 +1185,7 @@ impl OptionManager {
         updates.push(td_api::Object::updateOption(td_api::updateOption {
             name: "unix_time".to_string(),
             value: OptionValue::optionValueInteger(td_api::optionValueInteger {
-                value: tdutils::time::now() as i64,
+                value: unix_time as i64,
             }),
         }));
 
@@ -1400,10 +1435,11 @@ mod tests {
         manager.set_option_boolean("x_b", true);
         manager.set_option_integer("x_i", -5);
         manager.set_option_string("x_s", "text");
-        assert_eq!(manager.get_option_value("x_b"), boolean(true));
-        assert_eq!(manager.get_option_value("x_i"), integer(-5));
-        assert_eq!(manager.get_option_value("x_s"), string("text"));
-        assert_eq!(manager.get_option_value("x_missing"), empty());
+        assert_eq!(manager.get_option_value("x_b", 0), boolean(true));
+        assert_eq!(manager.get_option_value("x_i", 0), integer(-5));
+        assert_eq!(manager.get_option_value("x_s", 0), string("text"));
+        assert_eq!(manager.get_option_value("x_missing", 0), empty());
+        assert_eq!(manager.get_option_value("unix_time", 777), integer(777));
     }
 
     #[test]
@@ -1430,7 +1466,7 @@ mod tests {
             .set_option_from_api("x_user_opt", &integer(3))
             .unwrap();
         let mut updates = Vec::new();
-        manager.get_current_state(&mut updates);
+        manager.get_current_state(&mut updates, 777);
         let names: Vec<&str> = updates
             .iter()
             .filter_map(|update| match update {

@@ -264,12 +264,15 @@ impl Td {
 
         // init_options_and_network, the M.1 subset: the OptionManager over
         // the db config pmc (StateManager/ConnectionCreator/ConfigManager/
-        // OnlineManager arrive with their steps).
+        // OnlineManager arrive with their steps). `global.init` above
+        // already loaded the server time difference, so the constructor's
+        // opening `unix_time` update (OptionManager.cpp:59) is corrected.
         {
             let config_pmc = self.global.td_db().take_config_pmc();
             let is_test_dc = self.global.is_test_dc();
+            let unix_time = self.global.unix_time();
             let mut option_manager = OptionManager::new(is_test_dc);
-            option_manager.attach_pmc(config_pmc);
+            option_manager.attach_pmc(config_pmc, unix_time);
             self.option_manager = Some(option_manager);
         }
         self.flush_option_updates();
@@ -371,7 +374,7 @@ impl Td {
             let Some(option_manager) = self.option_manager.as_ref() else {
                 break;
             };
-            let value = option_manager.get_option_value(&name);
+            let value = option_manager.get_option_value(&name, self.global.unix_time());
             self.send_result(request_id, requests::option_value_to_object(value));
         }
 

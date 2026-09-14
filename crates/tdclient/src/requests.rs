@@ -98,8 +98,9 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
         }
         Function::getCurrentState(_) => {
             let mut updates = Vec::new();
+            let unix_time = td.global.unix_time();
             if let Some(option_manager) = td.option_manager.as_mut() {
-                option_manager.get_current_state(&mut updates);
+                option_manager.get_current_state(&mut updates, unix_time);
             }
 
             if let Some(authorization_state) =
@@ -140,9 +141,10 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 // the manager.
                 return td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
             };
+            let unix_time = td.global.unix_time();
             let action = if option_manager.is_td_inited() {
                 Action::Answer(option_value_to_object(
-                    option_manager.get_option_value(&name),
+                    option_manager.get_option_value(&name, unix_time),
                 ))
             } else {
                 option_manager.queue_get_option(id, name);

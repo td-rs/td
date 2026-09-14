@@ -8,6 +8,7 @@
 //! the state a first run reaches before its first successful reload.
 
 use crate::global::Global;
+use crate::option_manager::OptionManager;
 use crate::td_api;
 
 /// `TimeZoneManager::TimeZone` — stored as
@@ -145,18 +146,21 @@ impl TimeZoneManager {
     }
 
     /// `TimeZoneManager::load_time_zones` — the pmc-backed lazy load; sets
-    /// `is_loaded` even on an empty store, like the C++.
+    /// `is_loaded` even on an empty store, and resets to a default list on
+    /// a parse failure (including the loaded flag — the next call retries),
+    /// like the C++. Read through `get_raw`: the blob is binary and must
+    /// survive byte-exact.
     pub fn load_time_zones(&mut self, global: &mut Global) {
         if self.time_zones.is_loaded {
             return;
         }
         self.time_zones.is_loaded = true;
 
-        let log_event_string = global.binlog_pmc().get(Self::database_key());
+        let log_event_string = global.binlog_pmc().get_raw(Self::database_key().as_bytes());
         if log_event_string.is_empty() {
             return;
         }
-        match TimeZoneList::parse(&mut log_event_string.as_bytes()) {
+        match TimeZoneList::parse(&mut log_event_string.as_slice()) {
             Ok(time_zones) => self.time_zones = time_zones,
             Err(status) => {
                 tracing::error!("Failed to parse time zones from binlog: {status}");
@@ -197,6 +201,24 @@ impl TimeZoneManager {
             self.save_time_zones(global);
         }
         self.time_zones.is_loaded = true;
+    }
+
+    /// `TimeZoneManager::get_time_zone_offset` (TimeZoneManager.cpp:113-121):
+    /// the stored offset for the id, falling back to the `utc_time_offset`
+    /// option (C++ default 0) for unknown ids.
+    pub fn get_time_zone_offset(
+        &mut self,
+        global: &mut Global,
+        option_manager: &OptionManager,
+        time_zone_id: &str,
+    ) -> i32 {
+        self.load_time_zones(global);
+        for time_zone in &self.time_zones.time_zones {
+            if time_zone.id == time_zone_id {
+                return time_zone.utc_offset;
+            }
+        }
+        option_manager.get_option_integer("utc_time_offset", 0) as i32
     }
 }
 
@@ -314,6 +336,79 @@ mod tests {
             global.close_all(false);
         }
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Corrupt (non-UTF-8, malformed) pmc data resets the list — including
+    /// `is_loaded`, so the next call retries — and never panics on the
+    /// byte-exact read.
+    #[test]
+    fn corrupt_saved_data_resets_the_list() {
+        let dir = std::env::temp_dir().join(format!("td-rs-tz-corrupt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let parameters = tddb::td_db::Parameters {
+            database_directory: dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let opened = tddb::td_db::TdDb::open(parameters).unwrap();
+        let mut global = Global::new();
+        global.init(opened.database);
+        global
+            .binlog_pmc()
+            .set_raw(b"time_zones", &[0xFF, 0xFE, 0x00, 0x01, 0x02]);
+
+        let mut manager = TimeZoneManager::default();
+        manager.load_time_zones(&mut global);
+        assert!(manager.time_zones.time_zones.is_empty());
+        assert!(!manager.time_zones.is_loaded);
+        global.close_all(false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `get_time_zone_offset`: the stored offset for a known id, the
+    /// `utc_time_offset` option (default 0) for an unknown one.
+    #[test]
+    fn offset_lookup_falls_back_to_the_option() {
+        let dir = std::env::temp_dir().join(format!("td-rs-tz-offset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let parameters = tddb::td_db::Parameters {
+            database_directory: dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let opened = tddb::td_db::TdDb::open(parameters).unwrap();
+        let mut global = Global::new();
+        global.init(opened.database);
+        let mut manager = TimeZoneManager::default();
+        manager.on_get_time_zones(
+            &mut global,
+            vec![TimeZone {
+                id: "Europe/Kyiv".to_string(),
+                name: "Kyiv".to_string(),
+                utc_offset: 7200,
+            }],
+            7,
+        );
+
+        let option_manager = crate::option_manager::OptionManager::new(false);
+        assert_eq!(
+            manager.get_time_zone_offset(&mut global, &option_manager, "Europe/Kyiv"),
+            7200
+        );
+        assert_eq!(
+            manager.get_time_zone_offset(&mut global, &option_manager, "Mars/Olympus"),
+            0
+        );
+        let mut option_manager = crate::option_manager::OptionManager::new(false);
+        option_manager.set_option_integer("utc_time_offset", -18000);
+        assert_eq!(
+            manager.get_time_zone_offset(&mut global, &option_manager, "Mars/Olympus"),
+            -18000
+        );
+        global.close_all(false);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
