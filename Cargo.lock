@@ -1785,6 +1785,7 @@ dependencies = [
  "serde_json",
  "tdactor",
  "tddb",
+ "tdmtproto",
  "tdutils",
  "tl-codegen",
 ]

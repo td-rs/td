@@ -13,6 +13,7 @@ pub mod client_json;
 pub mod option_manager;
 pub mod synchronous_requests;
 pub mod td;
+pub mod updates_manager;
 
 // Generated code keeps C++-identical case-preserved names (`aiComposeTone`)
 // in types, fields and the JSON dispatch helpers alike.
