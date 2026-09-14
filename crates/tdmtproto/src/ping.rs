@@ -134,6 +134,9 @@ pub async fn run_ping(
             auth_data.clear_seq_no();
             let mut connection =
                 SessionConnection::new(SessionMode::Tcp, raw_connection, auth_data);
+            // The C++ PingActor runs the session online so the health ping
+            // repeats at rtt cadence; offline defaults would wait 30 s+.
+            connection.set_online(true, false);
             let mut state = PingPongSession::new();
             loop {
                 let wakeup_at = connection.flush(&mut state).await;
