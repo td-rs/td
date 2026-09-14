@@ -31,11 +31,10 @@ cargo build --release --bin soak
 - `bench_actor` (S37): actor runtime — gate green (below).
 - `bench_crypto` (S79): AES/hash/RNG/CRC — 18 of 22 rows at or under 2×;
   `AES CTR` and `ssl_rand_bytes` fail with backend-level root causes (below).
-- `bench_handshake` (S79): DH handshake — fails the gate (~3.9×): the Rust
-  `BigNum` is `num-bigint` (generic bignum) where C++ uses OpenSSL's
-  assembly-tuned Montgomery arithmetic. Auth-path only (key generation is
-  a once-per-login cost). Follow-up: evaluate a Montgomery-optimized
-  backend (`crypto-bigint`) for `tdutils::bignum`.
+- `bench_handshake` (S79): DH handshake — still outside the gate (~3.1×,
+  closed from ~3.9× by the `crypto-bigint` Montgomery fast path in
+  `tdutils::bignum`; see the bench_handshake section). Auth-path only
+  (key generation is a once-per-login cost).
 - `bench_db` (S79): KV stores — all rows at or under 2×. `SeqKvBench`
   initially read 2.5× but the gap was the benchmark's own `format!`
   heap allocations; stack formatting (`itoa`) closed it to parity
@@ -122,13 +121,18 @@ a fixed source snapshot instead of in-place `src == dst` mutation
 
 | Bench     | C++ (best) | Rust (best) | ratio | gate |
 | --------- | ---------- | ----------- | ----- | ---- |
-| Handshake | 413.1      | 105.8       | 0.26  | ✗    |
+| Handshake | 413.1      | 132.3       | 0.32  | ✗    |
 
 Full DH handshake pairs (2048-bit Telegram prime, checks + key gen). The
-gap is `num-bigint`'s generic modexp vs OpenSSL's Montgomery/asm `BIGNUM`
-— the same ratio shows in the S59 DH vectors. Not on any per-message path
-(auth key generation happens once per login/DC); gate row kept as an open
-item pending the `tdutils::bignum` backend evaluation.
+S79 gate work moved `BigNum::mod_exp` for odd moduli onto
+`crypto-bigint`'s Montgomery `MontyForm` (32-limb working width for
+≤ 2,048-bit moduli, 64-limb above), byte-exact against num-bigint on
+random cross-checks and the S59 known-answer vectors — that lifted the
+row from 57–105 to 132 ops/s. The residual is crypto-bigint's
+constant-time 32-limb scheduling vs OpenSSL's hand-written assembly; not
+on any per-message path (auth key generation happens once per
+login/DC). A wider vartime window or asm backend remains an open
+follow-up.
 
 ## bench_db (S79)
 

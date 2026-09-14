@@ -7,6 +7,47 @@ use num_bigint::{BigInt, BigUint, Sign};
 use num_integer::Integer;
 use num_traits::{One, ToPrimitive, Zero};
 
+/// Limb budget of the Montgomery fast path (4,096-bit operands).
+const MONT_LIMBS: usize = 64;
+
+/// `base^exponent mod modulus` through `crypto-bigint`'s Montgomery
+/// `MontyForm`, zero-padding each operand into the `LIMBS`-limb budget
+/// (`from_le_slice` wants exactly that many bytes). The modulus must be
+/// odd — callers gate on that. Written as per-width functions because
+/// `MontyParams::new` needs `Concat`/`Split` bounds a generic `LIMBS`
+/// cannot name.
+macro_rules! montgomery_modpow_fn {
+    ($name:ident, $LIMBS:literal) => {
+        fn $name(base: &BigInt, exponent: &BigInt, modulus: &BigInt) -> BigInt {
+            let to_padded = |value: &BigUint| -> Vec<u8> {
+                let mut out = vec![0u8; $LIMBS * 8];
+                let bytes = value.to_bytes_le();
+                out[..bytes.len()].copy_from_slice(&bytes);
+                out
+            };
+            let params = crypto_bigint::modular::MontyParams::<$LIMBS>::new(
+                crypto_bigint::Odd::new(crypto_bigint::Uint::<$LIMBS>::from_le_slice(&to_padded(
+                    modulus.magnitude(),
+                )))
+                .unwrap(),
+            );
+            let reduced = crypto_bigint::modular::MontyForm::<$LIMBS>::new(
+                &crypto_bigint::Uint::<$LIMBS>::from_le_slice(&to_padded(
+                    (base % modulus).magnitude(),
+                )),
+                params,
+            )
+            .pow(&crypto_bigint::Uint::<$LIMBS>::from_le_slice(&to_padded(
+                exponent.magnitude(),
+            )))
+            .retrieve();
+            BigUint::from_bytes_le(&reduced.to_le_bytes()).into()
+        }
+    };
+}
+montgomery_modpow_fn!(montgomery_modpow_32, 32);
+montgomery_modpow_fn!(montgomery_modpow_64, 64);
+
 /// `td::BigNumContext` — no-op scratch context kept for API parity.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BigNumContext;
@@ -266,9 +307,36 @@ impl BigNum {
     }
 
     /// `td::BigNum::mod_exp(r, a, p, m, context)`.
+    ///
+    /// Montgomery fast path (`crypto-bigint`) for the DH-shaped inputs —
+    /// odd modulus with base/exponent/modulus within the 4,096-bit limb
+    /// budget, base pre-reduced. That is exactly the `g^x mod p` shape of
+    /// the handshake (S59/S60), where the S79 gate measured num-bigint's
+    /// generic `modpow` at ~3.9× slower than OpenSSL's Montgomery
+    /// arithmetic. Everything else falls back to `modpow` verbatim. The
+    /// vartime form matches the C++ (tdlib never sets `BN_FLG_CONSTTIME`).
     pub fn mod_exp(a: &BigNum, p: &BigNum, m: &BigNum, _context: &mut BigNumContext) -> Self {
+        let eligible = m.value.bits() <= (MONT_LIMBS * 64) as u64
+            && p.value.bits() <= (MONT_LIMBS * 64) as u64
+            && a.value.bits() <= (MONT_LIMBS * 64) as u64
+            && !m.value.is_zero()
+            && m.value.bit(0);
+        if !eligible {
+            return Self {
+                value: a.value.modpow(&p.value, &m.value),
+            };
+        }
+        // The Montgomery working width must match the modulus width: the
+        // limb count drives every multiplication, so a 2,048-bit prime in a
+        // 4,096-bit budget pays ~4x for nothing (the first S79 cut). 32
+        // limbs covers the Telegram primes; 64 is the fallback for larger.
+        if m.value.bits() <= 2048 {
+            return Self {
+                value: montgomery_modpow_32(&a.value, &p.value, &m.value),
+            };
+        }
         Self {
-            value: a.value.modpow(&p.value, &m.value),
+            value: montgomery_modpow_64(&a.value, &p.value, &m.value),
         }
     }
 
@@ -392,6 +460,34 @@ mod tests {
         };
         let a = BigNum::from_hex(&"a1b2c3d4".repeat(16)).unwrap();
         let b = BigNum::from_hex(&"e5f6a7b8".repeat(16)).unwrap();
+
+        // The Montgomery fast path must agree with num-bigint's modpow
+        // byte-exactly on random inputs before the DH-shaped cases below.
+        let mut seed = 0x5eed_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for case in 0..24 {
+            let modulus = BigNum::from_binary(
+                &(0..64)
+                    .map(|_| (next() & 0xff) as u8)
+                    .chain([1u8]) // odd
+                    .collect::<Vec<u8>>(),
+            );
+            let base =
+                BigNum::from_binary(&(0..32).map(|_| (next() & 0xff) as u8).collect::<Vec<u8>>());
+            let exponent =
+                BigNum::from_binary(&(0..32).map(|_| (next() & 0xff) as u8).collect::<Vec<u8>>());
+            let fast = BigNum::mod_exp(&base, &exponent, &modulus, &mut context);
+            let reference = base.value.modpow(&exponent.value, &modulus.value);
+            assert_eq!(
+                fast.value, reference,
+                "Montgomery fast path diverged on case {case}"
+            );
+        }
 
         let a_public = BigNum::mod_exp(&g, &a, &p, &mut context);
         let b_public = BigNum::mod_exp(&g, &b, &p, &mut context);

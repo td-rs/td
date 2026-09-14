@@ -19,6 +19,7 @@ num-bigint = "0.4"
 num-integer = "0.1"
 num-prime = "0.4"
 num-traits = "0.2"
+crypto-bigint = "0.6"
 pbkdf2 = "0.12"
 pkcs8 = { version = "0.10", features = ["pem", "std"] }
 rand_core = "0.6"
