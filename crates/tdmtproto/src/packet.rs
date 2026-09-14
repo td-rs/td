@@ -727,7 +727,7 @@ mod tests {
         let auth_key = auth_key();
         let mut read_info = packet_info(2);
         assert!(matches!(
-            read(&mut vec![0u8; 4], 0, &auth_key, &mut read_info).unwrap(),
+            read(&mut [0u8; 4], 0, &auth_key, &mut read_info).unwrap(),
             ReadResult::Nop
         ));
         let mut quick = Vec::new();

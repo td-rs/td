@@ -586,7 +586,7 @@ mod tests {
         let all_len = all.len();
         assert_eq!(reader.advance(all_len, &mut all), all_len);
         // The magic must precede any packet.
-        assert_eq!(&all[..4], &0xeeeeee_eeu32.to_le_bytes());
+        assert_eq!(&all[..4], &0xeeee_eeeeu32.to_le_bytes());
         all[4..].to_vec()
     }
 
@@ -686,7 +686,7 @@ mod tests {
         message.as_mutable_slice().copy_from_slice(b"ABCD");
         transport.write_prepare_inplace(&mut message, false);
         let header = u32::from_le_bytes(message.as_slice()[..4].try_into().unwrap());
-        assert!(header >= 4 && header <= 4 + 15);
+        assert!((4..=4 + 15).contains(&header));
         assert_eq!(&message.as_slice()[4..8], b"ABCD");
     }
 }
