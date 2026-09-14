@@ -13,7 +13,7 @@ use rsa::{RsaPrivateKey, RsaPublicKey};
 use tdmtproto::kdf::tmp_kdf;
 use tdmtproto::mtproto_api::{self, Int128};
 use tdutils::bignum::{BigNum, BigNumContext};
-use tdutils::crypto::{aes_ige_decrypt, aes_ige_encrypt, sha1, sha256};
+use tdutils::crypto::{sha1, sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -86,7 +86,11 @@ fn parse_client_packet(packet: &[u8]) -> Vec<u8> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    assert_eq!(args.len(), 4, "usage: mock_dc <port> <public.pem> <private.pem>");
+    assert_eq!(
+        args.len(),
+        4,
+        "usage: mock_dc <port> <public.pem> <private.pem>"
+    );
     let port: u16 = args[1].parse().unwrap();
 
     // Generate the RSA keypair and write the PEMs for the clients.
@@ -102,9 +106,8 @@ fn main() {
         rsa.get_fingerprint()
     };
 
-    let prime = BigNum::from_binary(
-        &tdmtproto::utils::hex_decode(TG_PRIME_HEX.as_bytes()).unwrap(),
-    );
+    let prime =
+        BigNum::from_binary(&tdmtproto::utils::hex_decode(TG_PRIME_HEX.as_bytes()).unwrap());
     let mut ctx = BigNumContext::new();
     let mut g = BigNum::new();
     g.set_value(3);
@@ -229,8 +232,12 @@ fn main() {
         // 4. server_DH_params_ok
         let mut inner = Vec::new();
         mtproto_api::Server_DH_inner_data {
-            nonce: Int128 { words: words128(&nonce) },
-            server_nonce: Int128 { words: words128(&SERVER_NONCE) },
+            nonce: Int128 {
+                words: words128(&nonce),
+            },
+            server_nonce: Int128 {
+                words: words128(&SERVER_NONCE),
+            },
             g: 3,
             dh_prime: prime.to_binary(-1),
             g_a: g_a.clone(),
@@ -246,8 +253,12 @@ fn main() {
         tdutils::crypto::aes_ige_encrypt_in_place(&tmp_key, &mut tmp_iv, &mut answer);
         let mut resp = Vec::new();
         mtproto_api::Server_DH_Params {
-            nonce: Int128 { words: words128(&nonce) },
-            server_nonce: Int128 { words: words128(&SERVER_NONCE) },
+            nonce: Int128 {
+                words: words128(&nonce),
+            },
+            server_nonce: Int128 {
+                words: words128(&SERVER_NONCE),
+            },
             encrypted_answer: answer,
         }
         .store_boxed(&mut resp);
@@ -256,7 +267,11 @@ fn main() {
         // 5. set_client_DH_params
         let packet = read_frame(&mut stream).await;
         let body = parse_client_packet(&packet);
-        assert_eq!(i32_at(&body, 0), 0xf504_5f1fu32 as i32, "set_client_DH_params id");
+        assert_eq!(
+            i32_at(&body, 0),
+            0xf504_5f1fu32 as i32,
+            "set_client_DH_params id"
+        );
         let nonce_in: [u8; 16] = body[4..20].try_into().unwrap();
         let server_nonce_in: [u8; 16] = body[20..36].try_into().unwrap();
         assert_eq!(nonce_in, nonce, "nonce");
@@ -268,7 +283,11 @@ fn main() {
         tdutils::crypto::aes_ige_decrypt_in_place(&tmp_key, &mut tmp_iv, &mut data);
         // SHA1(inner) + client_DH_inner_data#6643b654 nonce server_nonce
         // retry_id g_b + 0..15 bytes of padding.
-        assert_eq!(i32_at(&data, 20), 0x6643_b654u32 as i32, "client_DH_inner_data id");
+        assert_eq!(
+            i32_at(&data, 20),
+            0x6643_b654u32 as i32,
+            "client_DH_inner_data id"
+        );
         let nonce_in: [u8; 16] = data[24..40].try_into().unwrap();
         let server_nonce_in: [u8; 16] = data[40..56].try_into().unwrap();
         assert_eq!(nonce_in, nonce, "nonce");
@@ -294,8 +313,12 @@ fn main() {
         // 6. dh_gen_ok
         let mut resp = Vec::new();
         mtproto_api::dh_gen_ok {
-            nonce: Int128 { words: words128(&nonce) },
-            server_nonce: Int128 { words: words128(&SERVER_NONCE) },
+            nonce: Int128 {
+                words: words128(&nonce),
+            },
+            server_nonce: Int128 {
+                words: words128(&SERVER_NONCE),
+            },
             new_nonce_hash1: Int128 {
                 words: words128(new_nonce_hash1[4..20].try_into().unwrap()),
             },

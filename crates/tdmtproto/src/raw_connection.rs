@@ -1,8 +1,9 @@
-//! Port of `td/mtproto/RawConnection.{h,cpp}` (S62) on tokio: the socket +
-//! transport pair. The C++ poll-driven `flush` loop becomes an async
-//! read/write driver; the per-packet state machines stay synchronous. The
-//! C++ `PollableFd` readiness subscription is replaced by awaiting socket
-//! readiness between flushes (the same collapse as S45's async
+//! Port of `td/mtproto/RawConnection.{h,cpp}` (lands with S60 — the
+//! handshake's transport — and exercised in full by S62 sessions) on tokio:
+//! the socket + transport pair. The C++ poll-driven `flush` loop becomes an
+//! async read/write driver; the per-packet state machines stay synchronous.
+//! The C++ `PollableFd` readiness subscription is replaced by awaiting
+//! socket readiness between flushes (the same collapse as S45's async
 //! `AcceptCallback`).
 
 use std::collections::HashMap;
@@ -128,7 +129,10 @@ impl RawConnection {
         if quick_ack_token != 0 && self.transport.support_quick_ack() {
             assert!(packet_info.message_ack & (1 << 31) != 0);
             let message_ack = packet_info.message_ack;
-            let token = self.quick_ack_to_token.entry(message_ack).or_insert(quick_ack_token);
+            let token = self
+                .quick_ack_to_token
+                .entry(message_ack)
+                .or_insert(quick_ack_token);
             if *token == quick_ack_token {
                 use_quick_ack = true;
             } else {
@@ -137,7 +141,8 @@ impl RawConnection {
         }
 
         let packet_size = packet.size();
-        self.transport.write(packet, use_quick_ack, &mut self.output_writer);
+        self.transport
+            .write(packet, use_quick_ack, &mut self.output_writer);
         packet_size
     }
 
@@ -260,14 +265,14 @@ impl RawConnection {
             let mut packet = BufferSlice::null();
             let mut quick_ack = 0;
             let mut error_code = 0;
-            let wait_size = match self.transport.read_next(
-                &mut packet,
-                &mut quick_ack,
-                &mut error_code,
-            ) {
-                Result::Ok(size) => size,
-                Result::Err(status) => return status,
-            };
+            let wait_size =
+                match self
+                    .transport
+                    .read_next(&mut packet, &mut quick_ack, &mut error_code)
+                {
+                    Result::Ok(size) => size,
+                    Result::Err(status) => return status,
+                };
             if wait_size != 0 {
                 if wait_size > MAX_PACKET_SIZE {
                     return Status::error_message(&format!(

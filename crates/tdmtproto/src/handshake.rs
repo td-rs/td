@@ -99,7 +99,11 @@ impl AuthKeyHandshake {
     pub fn new(dc_id: i32, expires_in: i32) -> Self {
         Self {
             state: HandshakeState::Start,
-            mode: if expires_in == 0 { Mode::Main } else { Mode::Temp },
+            mode: if expires_in == 0 {
+                Mode::Main
+            } else {
+                Mode::Temp
+            },
             dc_id,
             expires_in,
             expires_at: 0.0,
@@ -179,11 +183,9 @@ impl AuthKeyHandshake {
         context: &mut dyn AuthKeyHandshakeContext,
     ) -> Status {
         let status = match self.state {
-            HandshakeState::ResPQ => self.on_res_pq(
-                message,
-                callback,
-                context.get_public_rsa_key_interface(),
-            ),
+            HandshakeState::ResPQ => {
+                self.on_res_pq(message, callback, context.get_public_rsa_key_interface())
+            }
             HandshakeState::ServerDHParams => {
                 self.on_server_dh_params(message, callback, context.get_dh_callback())
             }
@@ -309,7 +311,8 @@ impl AuthKeyHandshake {
 
             let mut data_with_hash = Vec::with_capacity(data.len() + 32);
             data_with_hash.extend_from_slice(&data);
-            data_with_hash.extend_from_slice(&sha256(&[aes_key.as_slice(), data.as_slice()].concat()));
+            data_with_hash
+                .extend_from_slice(&sha256(&[aes_key.as_slice(), data.as_slice()].concat()));
 
             // reverse the data part (the C++ std::reverse over [begin, begin + data.size())).
             data_with_hash[..data.len()].reverse();
@@ -442,7 +445,11 @@ impl AuthKeyHandshake {
         encrypted_data[20..20 + data.len()].copy_from_slice(&data);
         random::secure_bytes(&mut encrypted_data[encrypted_data_size..]);
         let (tmp_aes_key, mut tmp_aes_iv) = tmp_kdf(&self.server_nonce, &self.new_nonce);
-        tdutils::crypto::aes_ige_encrypt_in_place(&tmp_aes_key, &mut tmp_aes_iv, &mut encrypted_data);
+        tdutils::crypto::aes_ige_encrypt_in_place(
+            &tmp_aes_key,
+            &mut tmp_aes_iv,
+            &mut encrypted_data,
+        );
 
         let mut query = Vec::new();
         mtproto_api::set_client_DH_params {

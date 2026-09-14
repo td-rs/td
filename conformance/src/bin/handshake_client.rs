@@ -7,9 +7,9 @@
 use tdmtproto::dh_callback::DhCallback;
 use tdmtproto::handshake::{AuthKeyHandshake, AuthKeyHandshakeContext};
 use tdmtproto::handshake_actor::run_handshake;
+use tdmtproto::proxy_secret::ProxySecret;
 use tdmtproto::rsa::{PublicRsaKeyInterface, Rsa, RsaKey};
 use tdmtproto::transport_type::{TransportType, TransportTypeEnum};
-use tdmtproto::proxy_secret::ProxySecret;
 use tdutils::status::{Result, Status};
 use tokio::net::TcpStream;
 
@@ -60,7 +60,11 @@ impl AuthKeyHandshakeContext for Context {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    assert_eq!(args.len(), 3, "usage: handshake_client <port> <public-key.pem>");
+    assert_eq!(
+        args.len(),
+        3,
+        "usage: handshake_client <port> <public-key.pem>"
+    );
     let port: u16 = args[1].parse().unwrap();
     let pem = std::fs::read_to_string(&args[2]).unwrap();
 
@@ -76,16 +80,15 @@ fn main() {
         .unwrap();
     runtime.block_on(async {
         let stream = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
-        let transport_type = TransportType::new(
-            TransportTypeEnum::Tcp,
-            2,
-            ProxySecret::default(),
-        );
+        let transport_type = TransportType::new(TransportTypeEnum::Tcp, 2, ProxySecret::default());
         match run_handshake(stream, transport_type, &mut context, 30.0, &mut handshake).await {
             Result::Ok(_connection) => {
                 println!("handshake:ok:key_id={}", handshake.get_auth_key().id());
                 println!("handshake:ok:salt={}", handshake.get_server_salt());
-                println!("handshake:ok:time_diff={:.3}", handshake.get_server_time_diff());
+                println!(
+                    "handshake:ok:time_diff={:.3}",
+                    handshake.get_server_time_diff()
+                );
             }
             Result::Err(status) => {
                 println!("handshake:error:{}", status.message());
