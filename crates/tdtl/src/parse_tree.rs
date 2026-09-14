@@ -465,6 +465,10 @@ impl TreeParser<'_> {
                 return None;
             }
         }
+        // Deliberate divergence from the C tl-parser (see
+        // `parse_partial_type_app_decl`): the subexpr loop must make
+        // forward progress or the parse fails, instead of hanging forever.
+        let mut last_pos = self.lex.pos();
         loop {
             match self.parse_subexpr() {
                 Some(s) => t.children.push(s),
@@ -473,6 +477,14 @@ impl TreeParser<'_> {
                     return None;
                 }
             }
+            let pos = self.lex.pos();
+            if pos == last_pos {
+                self.lex
+                    .error("Can not parse partial combinator application");
+                self.fail(save);
+                return None;
+            }
+            last_pos = pos;
             if self.lex_char(b';') {
                 break;
             }
@@ -517,6 +529,13 @@ impl TreeParser<'_> {
             }
             Some(t)
         } else {
+            // Deliberate divergence from the C tl-parser (matching
+            // `parse_partial_comb_app_decl`): require forward progress.
+            // The C `while (1) { parse_subexpr; if ';' break; }` loop spins
+            // forever appending tree nodes when the final token is a stale
+            // zero-length identifier — found by the S78 fuzz week on the
+            // 1-byte input "J" (the C parser hangs identically).
+            let mut last_pos = self.lex.pos();
             loop {
                 match self.parse_subexpr() {
                     Some(s) => t.children.push(s),
@@ -525,6 +544,13 @@ impl TreeParser<'_> {
                         return None;
                     }
                 }
+                let pos = self.lex.pos();
+                if pos == last_pos {
+                    self.lex.error("Can not parse partial type application");
+                    self.fail(save);
+                    return None;
+                }
+                last_pos = pos;
                 if self.lex_char(b';') {
                     break;
                 }

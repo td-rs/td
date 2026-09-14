@@ -39,6 +39,7 @@ while true; do
       mv ./crash-* "$ARTIFACTS/" 2>/dev/null || true
       mv ./leak-* "$ARTIFACTS/" 2>/dev/null || true
       mv ./oom-* "$ARTIFACTS/" 2>/dev/null || true
+      mv ./timeout-* "$ARTIFACTS/" 2>/dev/null || true
     fi
   done
 done
