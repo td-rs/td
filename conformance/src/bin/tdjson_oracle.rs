@@ -96,6 +96,8 @@ fn main() {
     // 4. The new execute.
     print(
         "td_execute",
-        Some(&client_json::execute(r#"{"@type":"getOption","name":"version"}"#)),
+        Some(&client_json::execute(
+            r#"{"@type":"getOption","name":"version"}"#,
+        )),
     );
 }

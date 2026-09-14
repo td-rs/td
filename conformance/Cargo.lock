@@ -878,6 +878,8 @@ dependencies = [
  "sha2",
  "tdclient",
  "tdjson",
+ "tdtl",
+ "tl-codegen",
 ]
 
 [[package]]

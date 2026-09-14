@@ -13,6 +13,8 @@ description = "Golden vectors and differential harness for the td Rust rewrite"
 sha2 = "0.10"
 tdclient = { path = "../crates/tdclient" }
 tdjson = { path = "../crates/tdjson" }
+tl-codegen = { path = "../crates/tl-codegen" }
+tdtl = { path = "../crates/tdtl" }
 
 [[bin]]
 name = "extract-test-data"
@@ -21,3 +23,7 @@ path = "src/main.rs"
 [[bin]]
 name = "tdjson-oracle"
 path = "src/bin/tdjson_oracle.rs"
+
+[[bin]]
+name = "td-api-parity"
+path = "src/bin/td_api_parity.rs"
