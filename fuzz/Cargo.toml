@@ -16,6 +16,9 @@ edition = "2024"
 license = "BSL-1.0"
 publish = false
 
+[package.metadata]
+cargo-fuzz = true
+
 [dependencies]
 libfuzzer-sys = "0.4"
 tdclient = { path = "../crates/tdclient" }

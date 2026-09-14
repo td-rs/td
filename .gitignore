@@ -2,3 +2,6 @@
 /target-clippy
 /conformance/target
 /conformance/target-clippy
+fuzz/corpus/
+fuzz/artifacts/
+fuzz/fuzz-week.log
