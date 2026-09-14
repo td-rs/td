@@ -7,7 +7,7 @@ use crate::kdf::{kdf, kdf2};
 use crate::message_id::MessageId;
 use crate::packet_info::{PacketInfo, PacketType};
 use tdutils::buffer::BufferWriter;
-use tdutils::crypto::{aes_ige_decrypt, aes_ige_encrypt, sha1, sha256};
+use tdutils::crypto::{sha1, sha256};
 use tdutils::random;
 use tdutils::status::{Result, Status};
 
@@ -233,12 +233,11 @@ fn read_crypto_impl(
 
     // In-place IGE decrypt over [encrypt_begin, end) — the C++
     // `aes_ige_decrypt(key, iv, to_decrypt, to_decrypt)`.
-    unsafe {
-        let from = std::slice::from_raw_parts(message.as_ptr().add(encrypt_begin), to_decrypt_len);
-        let to =
-            std::slice::from_raw_parts_mut(message.as_mut_ptr().add(encrypt_begin), to_decrypt_len);
-        aes_ige_decrypt(&aes_key, &mut aes_iv, from, to);
-    }
+    tdutils::crypto::aes_ige_decrypt_in_place(
+        &aes_key,
+        &mut aes_iv,
+        &mut message[encrypt_begin..encrypt_begin + to_decrypt_len],
+    );
 
     let tail_size = message.len() - header_size;
     if tail_size < prefix_size {
@@ -461,12 +460,11 @@ fn write_crypto_impl(
     // In-place IGE encrypt over [encrypt_begin, padded_size) — the C++
     // `aes_ige_encrypt(key, iv, to_encrypt, to_encrypt)`.
     let encrypt_len = padded_size - encrypt_begin;
-    unsafe {
-        let slice = packet.as_mutable_slice();
-        let from = std::slice::from_raw_parts(slice.as_ptr().add(encrypt_begin), encrypt_len);
-        let to = std::slice::from_raw_parts_mut(slice.as_mut_ptr().add(encrypt_begin), encrypt_len);
-        aes_ige_encrypt(&aes_key, &mut aes_iv, from, to);
-    }
+    tdutils::crypto::aes_ige_encrypt_in_place(
+        &aes_key,
+        &mut aes_iv,
+        &mut packet.as_mutable_slice()[encrypt_begin..encrypt_begin + encrypt_len],
+    );
 }
 
 fn write_crypto(
@@ -599,11 +597,7 @@ mod tests {
         let (aes_key, aes_iv) = kdf2(auth_key.key(), message_key.try_into().unwrap(), 0);
         let mut aes_iv = aes_iv;
         let mut frame = packet.as_slice().to_vec();
-        unsafe {
-            let from = std::slice::from_raw_parts(frame.as_ptr().add(24), frame.len() - 24);
-            let to = std::slice::from_raw_parts_mut(frame.as_mut_ptr().add(24), frame.len() - 24);
-            aes_ige_decrypt(&aes_key, &mut aes_iv, from, to);
-        }
+        tdutils::crypto::aes_ige_decrypt_in_place(&aes_key, &mut aes_iv, &mut frame[24..]);
         assert_eq!(&frame[24..32], &0x0102030405060708u64.to_le_bytes());
         assert_eq!(&frame[32..40], &0x1112131415161718u64.to_le_bytes());
         assert_eq!(&frame[40..40 + body().len()], body().as_slice());
@@ -626,20 +620,10 @@ mod tests {
             let mut data = (0..len as u8).collect::<Vec<u8>>();
             let original = data.clone();
             let mut iv = aes_iv;
-            unsafe {
-                let ptr = data.as_mut_ptr();
-                let from = std::slice::from_raw_parts(ptr, len);
-                let to = std::slice::from_raw_parts_mut(ptr, len);
-                aes_ige_encrypt(&aes_key, &mut iv, from, to);
-            }
+            tdutils::crypto::aes_ige_encrypt_in_place(&aes_key, &mut iv, &mut data);
             assert_ne!(data, original);
             let mut iv = aes_iv;
-            unsafe {
-                let ptr = data.as_mut_ptr();
-                let from = std::slice::from_raw_parts(ptr, len);
-                let to = std::slice::from_raw_parts_mut(ptr, len);
-                aes_ige_decrypt(&aes_key, &mut iv, from, to);
-            }
+            tdutils::crypto::aes_ige_decrypt_in_place(&aes_key, &mut iv, &mut data);
             assert_eq!(
                 data, original,
                 "IGE self-inversion failed at len {len}: {:02x?}",
@@ -668,11 +652,7 @@ mod tests {
         let (aes_key, aes_iv) = kdf(auth_key.key(), message_key.try_into().unwrap(), 0);
         let mut aes_iv = aes_iv;
         let mut frame = packet.as_slice().to_vec();
-        unsafe {
-            let from = std::slice::from_raw_parts(frame.as_ptr().add(24), frame.len() - 24);
-            let to = std::slice::from_raw_parts_mut(frame.as_mut_ptr().add(24), frame.len() - 24);
-            aes_ige_decrypt(&aes_key, &mut aes_iv, from, to);
-        }
+        tdutils::crypto::aes_ige_decrypt_in_place(&aes_key, &mut aes_iv, &mut frame[24..]);
         assert_eq!(&frame[24..32], &0x0102030405060708u64.to_le_bytes());
         assert_eq!(&frame[32..40], &0x1112131415161718u64.to_le_bytes());
         assert_eq!(&frame[40..60], body().as_slice());
