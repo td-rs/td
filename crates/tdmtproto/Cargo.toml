@@ -11,6 +11,10 @@ publish.workspace = true
 conformance-samples = []
 
 [dependencies]
+base64 = "0.22"
+tdnet = { path = "../tdnet" }
+tdutils = { path = "../tdutils" }
+tokio = { version = "1", features = ["io-util", "macros", "net", "time"] }
 
 [build-dependencies]
 tl-codegen = { path = "../tl-codegen" }

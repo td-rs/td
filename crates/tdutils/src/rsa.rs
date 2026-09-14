@@ -22,10 +22,6 @@ pub struct Rsa {
     e: BigNum,
 }
 
-/// The `mtproto_api::rsa_public_key` constructor id (CRC32 of the canonical
-/// string `rsa_public_key n:string e:string = RSAPublicKey`).
-const RSA_PUBLIC_KEY_CONSTRUCTOR: u32 = 0x7a19_cb76;
-
 impl Rsa {
     /// `td::mtproto::RSA::RSA(n, e)`.
     pub fn from_raw_parts(n: BigNum, e: BigNum) -> Self {
@@ -62,12 +58,14 @@ impl Rsa {
 
     /// `td::mtproto::RSA::get_fingerprint()` — the little-endian `i64` read
     /// from bytes `[12, 20)` of the SHA-1 of the TL-serialized
-    /// `rsa_public_key` (as tdlib computes it on little-endian platforms).
+    /// `rsa_public_key` fields (n and e strings only — tdlib 1.8.67's
+    /// generated `rsa_public_key::store` writes the fields without the
+    /// constructor id, so the fingerprint hashes no id; pinned by
+    /// `td/test/mtproto.cpp TEST(Mtproto, RSA)`).
     pub fn get_fingerprint(&self) -> i64 {
         let n_str = self.n.to_binary(-1);
         let e_str = self.e.to_binary(-1);
-        let mut buf = Vec::with_capacity(4 + 4 + n_str.len() + 4 + e_str.len());
-        buf.extend_from_slice(&RSA_PUBLIC_KEY_CONSTRUCTOR.to_le_bytes());
+        let mut buf = Vec::with_capacity(n_str.len() + e_str.len());
         append_tl_string(&mut buf, &n_str);
         append_tl_string(&mut buf, &e_str);
         let key_sha1 = sha1(&buf);
@@ -224,19 +222,19 @@ GwIDAQAB\n-----END PUBLIC KEY-----";
 
     #[test]
     fn parses_real_tdlib_keys_and_matches_fingerprints() {
-        // Fingerprint values produced by tdlib's own algorithm
-        // (tl_store of rsa_public_key, SHA-1, little-endian bytes [12, 20)).
+        // Fingerprint values produced by tdlib 1.8.67's algorithm (the
+        // generated rsa_public_key::store writes n/e strings without the
+        // constructor id; SHA-1, little-endian bytes [12, 20)).
         let test_dc = Rsa::from_pem_public_key(TEST_DC_KEY).unwrap();
-        assert_eq!(test_dc.get_fingerprint(), 0x9bf2_59d9_e76c_bb48u64 as i64);
+        assert_eq!(test_dc.get_fingerprint(), 0xb258_98df_208d_2603u64 as i64);
         assert_eq!(test_dc.size(), 256);
 
         let main_dc = Rsa::from_pem_public_key(MAIN_DC_KEY).unwrap();
-        // The publicly documented main-DC key fingerprint.
-        assert_eq!(main_dc.get_fingerprint(), 0xd86c_e0c2_d1bb_17b9u64 as i64);
+        assert_eq!(main_dc.get_fingerprint(), 0xd09d_1d85_de64_fd85u64 as i64);
 
         // SPKI ("PUBLIC KEY") form parses too.
         let spki = Rsa::from_pem_public_key(CRYPTO_TEST_PUBLIC_KEY).unwrap();
-        assert_eq!(spki.get_fingerprint(), 0x06df_e90b_6867_69dc);
+        assert_eq!(spki.get_fingerprint(), 0x47dd_241f_9bce_121eu64 as i64);
     }
 
     #[test]

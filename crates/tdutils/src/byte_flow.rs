@@ -9,6 +9,7 @@
 //! parents' use of them.
 
 use crate::buffer::{ChainBufferReader, ChainBufferWriter};
+use crate::crypto::AesCtrState;
 use crate::gzip::{Gzip, GzipMode, GzipState};
 use crate::status::{Result, Status};
 
@@ -167,6 +168,16 @@ impl<'a> ByteFlowBaseCommon<'a> {
 
     pub fn get_need_size_impl(&self) -> usize {
         self.need_size
+    }
+
+    /// The input reader — the C++ `protected: input_` member. Cross-crate
+    /// flow nodes (tdmtproto's TlsReaderByteFlow) need it to run their loop.
+    pub fn input(&self) -> Option<&ChainBufferReader> {
+        self.input.as_ref()
+    }
+
+    pub fn input_mut(&mut self) -> Option<&mut ChainBufferReader> {
+        self.input.as_mut()
     }
 
     pub fn reset_need_size_impl(&mut self) {
@@ -742,6 +753,116 @@ impl<'a> ByteFlowInterface for ByteFlowMoveSink<'a> {
 
     fn get_write_size(&mut self) -> usize {
         panic!("get_write_size on a ByteFlowMoveSink")
+    }
+}
+
+/// `td::AesCtrByteFlow` — an in-place AES-CTR flow node (S55, the
+/// obfuscated transport decrypts its incoming stream with it).
+pub struct AesCtrByteFlow<'a> {
+    base: ByteFlowInplaceBase<'a>,
+    state: AesCtrState,
+}
+
+impl<'a> AesCtrByteFlow<'a> {
+    pub fn new() -> Self {
+        Self {
+            base: ByteFlowInplaceBase::default(),
+            state: AesCtrState::new(),
+        }
+    }
+
+    /// `AesCtrByteFlow::init(key, iv)`.
+    pub fn init(&mut self, key: &[u8], iv: &[u8]) {
+        self.state.init(key, iv);
+    }
+
+    /// `AesCtrByteFlow::init(AesCtrState&&)`.
+    pub fn init_state(&mut self, state: AesCtrState) {
+        self.state = state;
+    }
+
+    /// `AesCtrByteFlow::move_aes_ctr_state()`.
+    pub fn move_aes_ctr_state(&mut self) -> AesCtrState {
+        std::mem::take(&mut self.state)
+    }
+}
+
+impl<'a> Default for AesCtrByteFlow<'a> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'a> ByteFlowInterface for AesCtrByteFlow<'a> {
+    fn close_input(&mut self, status: Status) {
+        self.base.common.close_input(status);
+        // The C++ close_input runs the virtual loop(); a noop step would
+        // spin on the closed input.
+        self.wakeup();
+    }
+
+    fn wakeup(&mut self) {
+        let state = &mut self.state;
+        let output = &mut self.base.output;
+        let common_ptr = &mut self.base.common as *mut ByteFlowBaseCommon<'a>;
+        let mut step = move || unsafe {
+            // SAFETY: `common_ptr` is valid for the whole wakeup call and
+            // the closure is only invoked from within it.
+            let common = &mut *common_ptr;
+            let mut result = false;
+            let (ptr, len) = {
+                let input = common.input.as_mut().expect("aes-ctr flow input");
+                let ready = input.prepare_read();
+                (ready.as_ptr(), ready.len())
+            };
+            if len != 0 {
+                // SAFETY: the reader window is stable until `confirm_read`
+                // below, and no other reader may access it (the single-writer
+                // discipline) — this is C++'s in-place `state_.encrypt(ready,
+                // ready)`.
+                state.encrypt_in_place(std::slice::from_raw_parts_mut(ptr as *mut u8, len));
+                common
+                    .input
+                    .as_mut()
+                    .expect("aes-ctr flow input")
+                    .confirm_read(len);
+                output.advance_end(len);
+                result = true;
+            }
+
+            if !common.is_input_active {
+                common.finish(Status::ok()); // End of input stream.
+            }
+            result
+        };
+        unsafe { &mut *common_ptr }.wakeup_with(&mut step);
+    }
+
+    fn set_parent(&mut self, parent: &mut dyn ByteFlowInterface) {
+        // SAFETY: the pipeline contract requires every parent to outlive the
+        // connection it is set on (the C++ raw-pointer discipline).
+        let parent: &mut (dyn ByteFlowInterface + 'a) = unsafe { std::mem::transmute(parent) };
+        self.base.set_parent(parent);
+    }
+
+    fn set_input(&mut self, input: ChainBufferReader) {
+        self.base.set_input(input);
+    }
+
+    fn get_need_size(&mut self) -> usize {
+        self.base.common.get_need_size_impl()
+    }
+
+    fn get_read_size(&mut self) -> usize {
+        self.base.common.get_read_size_impl()
+    }
+
+    fn get_write_size(&mut self) -> usize {
+        self.base.common.get_write_size_impl()
+    }
+
+    fn reset_need_size(&mut self) {
+        self.base.common.reset_need_size_impl();
     }
 }
 

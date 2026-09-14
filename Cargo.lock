@@ -1802,7 +1802,11 @@ version = "0.1.0"
 name = "tdmtproto"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "tdnet",
+ "tdutils",
  "tl-codegen",
+ "tokio",
 ]
 
 [[package]]

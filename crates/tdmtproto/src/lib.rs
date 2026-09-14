@@ -2,6 +2,29 @@
 //! multi-DC. The wire-scheme data models with TL binary store are generated
 //! at build time from the pinned schemes (S10 telegram_api, S13
 //! secret_api + mtproto_api).
+//!
+//! S53 adds the runtime framing layer: [`message_id`], [`packet_info`],
+//! [`auth_key`] and [`auth_data`] (salts, msg_id/seq_no rules, duplicate
+//! checkers). S54 adds the stream transports ([`transport`]) with their
+//! secret ([`proxy_secret`]) and [`utils`] (hex/base64 helpers). S55 adds
+//! the obfuscated transport (AES-CTR header + optional TLS emulation) with
+//! the [`tls_reader_byte_flow`].
+
+pub mod auth_data;
+pub mod auth_key;
+pub mod dh_callback;
+pub mod dh_handshake;
+pub mod http_transport;
+pub mod kdf;
+pub mod message_id;
+pub mod packet;
+pub mod packet_info;
+pub mod proxy_secret;
+pub mod rsa;
+pub mod tls_reader_byte_flow;
+pub mod transport;
+pub mod transport_type;
+pub mod utils;
 
 // Generated code keeps C++-identical case-preserved names (`srp_B`, `M1`).
 #[allow(

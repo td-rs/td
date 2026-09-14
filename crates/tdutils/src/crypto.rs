@@ -319,6 +319,26 @@ impl AesCtrState {
     pub fn decrypt(&mut self, src: &[u8], dst: &mut [u8]) {
         self.advance(src, dst);
     }
+
+    /// `encrypt(payload, payload)` — the in-place form C++ uses everywhere
+    /// (transports encrypt their buffers in place). Not expressible as
+    /// `encrypt(&x, &mut x)` in safe Rust.
+    pub fn encrypt_in_place(&mut self, data: &mut [u8]) {
+        // SAFETY: `advance` reads `src[i]` and writes the same `data[i]`;
+        // both borrows target one allocation and the loop indexes them in
+        // lockstep, so aliasing is sound — the raw-pointer round trip is only
+        // needed to satisfy the borrow checker.
+        let ptr = data.as_mut_ptr();
+        let len = data.len();
+        unsafe {
+            self.advance(std::slice::from_raw_parts(ptr, len), data);
+        }
+    }
+
+    /// `decrypt(payload, payload)` — same in-place form.
+    pub fn decrypt_in_place(&mut self, data: &mut [u8]) {
+        self.encrypt_in_place(data);
+    }
 }
 
 impl Default for AesCtrState {
@@ -436,11 +456,16 @@ impl AesIgeState {
             .chunks_exact(AES_BLOCK_SIZE)
             .zip(to[..from.len()].chunks_exact_mut(AES_BLOCK_SIZE))
         {
+            // The C++ `encrypted.load(in)` copies the ciphertext block
+            // before the in-place write below; `in_block` may alias
+            // `out_block`, so reading it after the write would give the
+            // decrypted bytes instead of the ciphertext.
+            let mut encrypted = [0u8; AES_BLOCK_SIZE];
+            encrypted.copy_from_slice(in_block);
+
             let mut block = [0u8; AES_BLOCK_SIZE];
-            for ((byte, plaintext_iv), in_byte) in
-                block.iter_mut().zip(self.plaintext_iv).zip(in_block)
-            {
-                *byte = plaintext_iv ^ *in_byte;
+            for (i, byte) in block.iter_mut().enumerate() {
+                *byte = self.plaintext_iv[i] ^ encrypted[i];
             }
             let mut aes_block = aes::Block::clone_from_slice(&block);
             self.cipher.decrypt_block(&mut aes_block);
@@ -450,7 +475,7 @@ impl AesIgeState {
             }
             out_block.copy_from_slice(&block);
             self.plaintext_iv = block;
-            self.encrypted_iv.copy_from_slice(in_block);
+            self.encrypted_iv = encrypted;
         }
     }
 }

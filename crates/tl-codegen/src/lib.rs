@@ -28,6 +28,7 @@ pub fn generate_td_api_rust() -> String {
             serde: true,
             json: true,
             samples_feature: None,
+            raw_strings: false,
             source: "td_api.tl (tdlib d1085f9ce)",
         },
     )
@@ -43,13 +44,15 @@ pub fn generate_telegram_api_rust() -> String {
             serde: false,
             json: false,
             samples_feature: Some("conformance-samples"),
+            raw_strings: false,
             source: "telegram_api.tl (tdlib d1085f9ce)",
         },
     )
 }
 
 /// Generates the secret_api Rust module (S13): structs/enums + binary
-/// store/parse — the secret-chat layer scheme.
+/// store/parse — the secret-chat layer scheme. Raw strings: the C++ parses
+/// this scheme with the unsanitizing `TlParser`.
 pub fn generate_secret_api_rust() -> String {
     generate(
         SECRET_API_TL,
@@ -58,13 +61,15 @@ pub fn generate_secret_api_rust() -> String {
             serde: false,
             json: false,
             samples_feature: Some("conformance-samples"),
+            raw_strings: true,
             source: "secret_api.tl (tdlib d1085f9ce)",
         },
     )
 }
 
 /// Generates the mtproto_api Rust module (S13): structs/enums + binary
-/// store/parse — the MTProto service-layer scheme.
+/// store/parse — the MTProto service-layer scheme. Raw strings: the C++
+/// parses this scheme with the unsanitizing `TlParser`.
 pub fn generate_mtproto_api_rust() -> String {
     generate(
         MTPROTO_API_TL,
@@ -73,13 +78,15 @@ pub fn generate_mtproto_api_rust() -> String {
             serde: false,
             json: false,
             samples_feature: Some("conformance-samples"),
+            raw_strings: true,
             source: "mtproto_api.tl (tdlib d1085f9ce)",
         },
     )
 }
 
 /// Generates the e2e_api Rust module (S13): structs/enums + binary
-/// store/parse — the tde2e encrypted-storage scheme.
+/// store/parse — the tde2e encrypted-storage scheme. Raw strings: the C++
+/// parses this scheme with the unsanitizing `TlParser`.
 pub fn generate_e2e_api_rust() -> String {
     generate(
         E2E_API_TL,
@@ -88,6 +95,7 @@ pub fn generate_e2e_api_rust() -> String {
             serde: false,
             json: false,
             samples_feature: Some("conformance-samples"),
+            raw_strings: true,
             source: "e2e_api.tl (tdlib d1085f9ce)",
         },
     )
@@ -102,6 +110,18 @@ fn generate(scheme: &str, opts: &rust_writer::WriterOpts) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mtproto_scheme_uses_raw_string_fields() {
+        // The mtproto/secret/e2e schemes are parsed by the unsanitizing
+        // C++ `TlParser`; binary string fields (pq, dh_prime, g_a) must be
+        // `Vec<u8>`, not the sanitizing `String`.
+        let code = generate_mtproto_api_rust();
+        assert!(code.contains("pub pq: Vec<u8>"), "pq is not raw bytes");
+        assert!(!code.contains("pub pq: String"));
+        let code = generate_telegram_api_rust();
+        assert!(code.contains("pub phone_number: String") || code.contains("phone_number: String"));
+    }
 
     #[test]
     fn td_api_counts_match_the_c_oracle() {

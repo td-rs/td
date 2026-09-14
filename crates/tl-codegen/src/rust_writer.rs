@@ -98,6 +98,12 @@ pub struct WriterOpts {
     /// cargo feature of the including crate — the S15 replay oracle bins
     /// build with it (`conformance-samples`).
     pub samples_feature: Option<&'static str>,
+    /// Parse `string` fields as raw bytes (`Vec<u8>` via `r.bytes()`, the
+    /// C++ `TlParser` path) instead of the sanitizing `r.string()` —
+    /// td applies `TlBufferParser` sanitization only to telegram_api; the
+    /// mtproto/secret/e2e schemes carry binary payloads (pq, dh_prime, g_a)
+    /// that must not be mangled (S60 fix).
+    pub raw_strings: bool,
     /// Provenance comment.
     pub source: &'static str,
 }
@@ -587,7 +593,13 @@ fn sample_expr(
             Prim::Int53 | Prim::Int64 => "0x1234_5678_9abc_def0i64".to_owned(),
             Prim::Double => "1.5f64".to_owned(),
             Prim::Bool | Prim::True => "true".to_owned(),
-            Prim::String => "\"tl-sample\".to_owned()".to_owned(),
+            Prim::String => {
+                if opts.raw_strings {
+                    "b\"tl-sample\".to_vec()".to_owned()
+                } else {
+                    "\"tl-sample\".to_owned()".to_owned()
+                }
+            }
             Prim::Bytes => "b\"tl\\x00\\x01\".to_vec()".to_owned(),
         },
         FieldType::Vector { inner, .. } => {
@@ -1363,7 +1375,13 @@ fn emit_enum(
 
 fn rust_field_type(p: &TlProgram, m: &SchemeModel, opts: &WriterOpts, ty: &FieldType) -> String {
     match ty {
-        FieldType::Prim(prim) => prim.rust_type().to_owned(),
+        FieldType::Prim(prim) => {
+            if opts.raw_strings && *prim == Prim::String {
+                "Vec<u8>".to_owned()
+            } else {
+                prim.rust_type().to_owned()
+            }
+        }
         FieldType::Vector { inner, .. } => format!("Vec<{}>", rust_field_type(p, m, opts, inner)),
         FieldType::FixedArray { len, inner } => {
             format!("[{}; {len}]", rust_field_type(p, m, opts, inner))
@@ -1680,7 +1698,13 @@ impl ReadWriter<'_> {
                 Prim::Int53 | Prim::Int64 => "r.i64()?".to_owned(),
                 Prim::Double => "r.f64()?".to_owned(),
                 Prim::Bool => "r.bool()?".to_owned(),
-                Prim::String => "r.string()?".to_owned(),
+                Prim::String => {
+                    if self.opts.raw_strings {
+                        "r.bytes()?".to_owned()
+                    } else {
+                        "r.string()?".to_owned()
+                    }
+                }
                 Prim::Bytes => "r.bytes()?".to_owned(),
                 Prim::True => unreachable!("?true read in the per-field walk"),
             },
@@ -1841,6 +1865,16 @@ pub mod tl {
 
         pub fn i32(&mut self) -> Result<i32, &'static str> {
             Ok(i32::from_le_bytes(self.take()?))
+        }
+
+        /// `TlParser::fetch_string_raw` — exactly `len` raw bytes with no
+        /// alignment padding (the `message` bodies of containers and the
+        /// session layer's `bytes` fields).
+        pub fn raw(&mut self, len: usize) -> Result<&'a [u8], &'static str> {
+            self.need(len)?;
+            let start = self.pos;
+            self.pos += len;
+            Ok(&self.buf[start..self.pos])
         }
 
         pub fn i64(&mut self) -> Result<i64, &'static str> {
