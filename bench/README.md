@@ -2,6 +2,30 @@
 
 Ports of the C++ `benchmark/` targets. Gate: ≤2× C++ everywhere.
 
+## soak (S80)
+
+`src/bin/soak.rs` — the S80 memory gate. Each tick runs one full
+actor-scheduler lifecycle (a fresh 8-actor ring registered, wired, run and
+torn down — the S37 CreateActor registration path), plus binlog-KV /
+in-memory-KV / buffer-builder churn with a binlog reopen cycle every 256
+ticks. RSS is sampled per tick; the gate compares the last quarter of the
+run against the warmup quarter: growth beyond 10% (+4 MiB slack) fails.
+
+Result (2026-09-14, 120 s, 2 384 ticks): RSS min 4.7 MiB / max 4.8 MiB,
+warmup quarter 4.7 MiB → final quarter 4.7 MiB — **flat, PASS**. The
+release build reaches a steady-state heap on the allocation-sensitive
+paths; there is no pathological growth. Longer soaks (`soak 3600`) and an
+allocator-backend comparison (the C++ side uses per-size pools; glibc's
+malloc already holds steady here) remain open follow-ups for the S81-era
+bindings workloads.
+
+```sh
+cd bench
+cargo build --release --bin soak
+./target/release/soak 120   # seconds
+```
+
+
 ## S79 status
 
 - `bench_actor` (S37): actor runtime — gate green (below).

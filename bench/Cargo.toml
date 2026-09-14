@@ -43,6 +43,10 @@ path = "src/bin/bench_queue.rs"
 name = "bench_http"
 path = "src/bin/bench_http.rs"
 
+[[bin]]
+name = "soak"
+path = "src/bin/soak.rs"
+
 [profile.release]
 # Keep the default opt-level 3; match the C++ Release build (no LTO on either
 # side) so the S37 gate compares like for like.
