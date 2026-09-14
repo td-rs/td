@@ -108,7 +108,7 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             {
                 updates.push(Object::updateAuthorizationState(
                     td_api::updateAuthorizationState {
-                        authorization_state,
+                        authorization_state: Some(authorization_state),
                     },
                 ));
             }
@@ -161,7 +161,10 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             let Some(option_manager) = td.option_manager.as_mut() else {
                 return td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
             };
-            match option_manager.set_option_from_api(&name, &request.value) {
+            let Some(value) = request.value.as_ref() else {
+                return td.send_error_impl(id, 400, "Expected to receive \"value\"");
+            };
+            match option_manager.set_option_from_api(&name, value) {
                 Ok(()) => {
                     td.flush_option_updates();
                     td.send_result(id, ok_object());
@@ -181,6 +184,9 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
         }
         Function::checkAuthenticationPassword(request) => {
             td.check_authentication_password(id, request.password);
+        }
+        Function::checkAuthenticationBotToken(request) => {
+            td.check_authentication_bot_token(id, request.token);
         }
         Function::logOut(_) => {
             // `AuthManager::log_out` — the local guards need the sender for

@@ -1304,23 +1304,23 @@ impl JsonLoadWriter<'_> {
             self.var_counter += 1;
             let elem_var = format!("__e{}", self.var_counter);
             self.var_counter += 1;
-            out.push_str(&format!(
-                "{ind}if let Some({var}) = tl_json::field(o, \"{}\") {{\n",
-                f.name
-            ));
-            self.depth += 1;
             // Top-level expressions already carry their own `?` (boxing
             // consumes it inside `Box::new(..?)`). Class fields wrap in
             // `Some` — an explicit JSON `null` stays `None`, td's
-            // object_ptr-from-null rule.
+            // object_ptr-from-null rule. The null check rides the `if let`
+            // condition (a nested `if` trips `clippy::collapsible_if` on
+            // the generated code).
             let object = is_object_field(self.m, &f.ty);
-            if object {
-                out.push_str(&format!(
-                    "{}if !matches!({var}, tl_json::Json::Null) {{\n",
-                    self.indent()
-                ));
-                self.depth += 1;
-            }
+            let null_guard = if object {
+                format!(" && !matches!({var}, tl_json::Json::Null)")
+            } else {
+                String::new()
+            };
+            out.push_str(&format!(
+                "{ind}if let Some({var}) = tl_json::field(o, \"{}\"){null_guard} {{\n",
+                f.name
+            ));
+            self.depth += 1;
             let expr = self.read_expr(p, &var, &elem_var, &f.ty, false);
             let expr = if object {
                 format!("Some({expr})")
@@ -1328,10 +1328,6 @@ impl JsonLoadWriter<'_> {
                 expr
             };
             out.push_str(&format!("{}{target} = {expr};\n", self.indent()));
-            if object {
-                self.depth -= 1;
-                out.push_str(&format!("{}}}\n", self.indent()));
-            }
             self.depth -= 1;
             out.push_str(&format!("{ind}}}\n"));
         }
