@@ -2,3 +2,5 @@
 /target-clippy
 /conformance/target
 /conformance/target-clippy
+/target-conformance/
+/conformance/target/

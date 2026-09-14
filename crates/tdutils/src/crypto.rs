@@ -506,6 +506,20 @@ pub fn aes_ige_decrypt(aes_key: &[u8], aes_iv: &mut [u8], from: &[u8], to: &mut 
     aes_iv[AES_BLOCK_SIZE..].copy_from_slice(&state.plaintext_iv);
 }
 
+/// `aes_ige_encrypt` with `from == to` — the C++ handshake call sites pass
+/// one `MutableSlice` as both arguments and mutate the blob in place.
+pub fn aes_ige_encrypt_in_place(aes_key: &[u8], aes_iv: &mut [u8], data: &mut [u8]) {
+    let input = data.to_vec();
+    aes_ige_encrypt(aes_key, aes_iv, &input, data);
+}
+
+/// `aes_ige_decrypt` with `from == to` — the C++ handshake call sites pass
+/// one `MutableSlice` as both arguments and mutate the blob in place.
+pub fn aes_ige_decrypt_in_place(aes_key: &[u8], aes_iv: &mut [u8], data: &mut [u8]) {
+    let input = data.to_vec();
+    aes_ige_decrypt(aes_key, aes_iv, &input, data);
+}
+
 /// `td::aes_cbc_encrypt(key, iv, from, to)` — updates `iv` in place.
 pub fn aes_cbc_encrypt(aes_key: &[u8], aes_iv: &mut [u8], from: &[u8], to: &mut [u8]) {
     assert!(to.len() >= from.len());
@@ -642,6 +656,186 @@ impl AesCbcState {
         aes_cbc_decrypt(&self.key, &mut iv, from, to);
         self.iv = iv;
     }
+}
+
+// ---- pq factorization (tdutils crypto.cpp, used by the S60 handshake) ----
+
+/// `pq_gcd` — the even-adjusted binary GCD of crypto.cpp.
+fn pq_gcd(mut a: u64, mut b: u64) -> u64 {
+    if a == 0 {
+        return b;
+    }
+    while a & 1 == 0 {
+        a >>= 1;
+    }
+    debug_assert!(b & 1 != 0);
+
+    loop {
+        if a > b {
+            a = (a - b) >> 1;
+            while a & 1 == 0 {
+                a >>= 1;
+            }
+        } else if b > a {
+            b = (b - a) >> 1;
+            while b & 1 == 0 {
+                b >>= 1;
+            }
+        } else {
+            return a;
+        }
+    }
+}
+
+/// `pq_add_mul` — returns `(c + a * b) % pq`.
+fn pq_add_mul(mut c: u64, mut a: u64, mut b: u64, pq: u64) -> u64 {
+    while b != 0 {
+        if b & 1 != 0 {
+            c += a;
+            if c >= pq {
+                c -= pq;
+            }
+        }
+        a += a;
+        if a >= pq {
+            a -= pq;
+        }
+        b >>= 1;
+    }
+    c
+}
+
+/// `pq_factorize(uint64)` — Pollard-Brent over 63-bit `pq`; returns 1 when
+/// the input is degenerate.
+pub fn pq_factorize_u64(pq: u64) -> u64 {
+    if pq <= 2 || pq > (1u64 << 63) {
+        return 1;
+    }
+    if pq & 1 == 0 {
+        return 2;
+    }
+    let mut g = 0;
+    let mut iter = 0;
+    let mut i = 0;
+    while i < 3 || iter < 1000 {
+        let q = (crate::random::fast(17, 32) as u64) % (pq - 1);
+        let mut x = (crate::random::fast_uint64()) % (pq - 1) + 1;
+        let mut y = x;
+        let lim = 1u64 << (i.min(5) + 18);
+        for j in 1..lim {
+            iter += 1;
+            x = pq_add_mul(q, x, x, pq);
+            let z = if x < y { pq + x - y } else { x - y };
+            g = pq_gcd(z, pq);
+            if g != 1 {
+                break;
+            }
+            if j & (j - 1) == 0 {
+                y = x;
+            }
+        }
+        if g > 1 && g < pq {
+            break;
+        }
+        i += 1;
+    }
+    if g != 0 {
+        let other = pq / g;
+        if other < g {
+            g = other;
+        }
+    }
+    g
+}
+
+/// `pq_factorize_big` — the BigNum Pollard variant for 64..128-bit `pq`.
+pub fn pq_factorize_big(pq_str: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let mut context = crate::bignum::BigNumContext::new();
+    let mut a = crate::bignum::BigNum::new();
+    let mut b: crate::bignum::BigNum;
+    let mut p = crate::bignum::BigNum::new();
+    let mut q: crate::bignum::BigNum;
+    let mut one = crate::bignum::BigNum::new();
+    one.set_value(1);
+
+    let pq = crate::bignum::BigNum::from_binary(pq_str);
+
+    let mut found = false;
+    let mut i = 0;
+    let mut iter = 0;
+    while !found && (i < 3 || iter < 1000) {
+        let t = crate::random::fast(17, 32);
+        a.set_value(crate::random::fast_uint32());
+        b = a.clone();
+
+        let lim = 1usize << (i + 23);
+        for j in 1..lim {
+            iter += 1;
+            a = crate::bignum::BigNum::mod_mul(&a, &a, &pq, &mut context);
+            a.add_word(t as u32);
+            if crate::bignum::BigNum::compare(&a, &pq) >= 0 {
+                a = crate::bignum::BigNum::sub(&a, &pq);
+            }
+            if crate::bignum::BigNum::compare(&a, &b) > 0 {
+                q = crate::bignum::BigNum::sub(&a, &b);
+            } else {
+                q = crate::bignum::BigNum::sub(&b, &a);
+            }
+            p = crate::bignum::BigNum::gcd(&q, &pq, &mut context);
+            if crate::bignum::BigNum::compare(&p, &one) != 0 {
+                found = true;
+                break;
+            }
+            if j & (j - 1) == 0 {
+                b = a.clone();
+            }
+        }
+        i += 1;
+    }
+
+    if found {
+        // found implies p divides pq, so the division cannot fail.
+        let (quotient, _) = crate::bignum::BigNum::div(&pq, &p, &mut context).unwrap();
+        q = quotient;
+        if crate::bignum::BigNum::compare(&p, &q) > 0 {
+            std::mem::swap(&mut p, &mut q);
+        }
+        Some((p.to_binary(-1), q.to_binary(-1)))
+    } else {
+        None
+    }
+}
+
+/// `pq_factorize(Slice)` — the dispatcher: small inputs use the u64 path,
+/// larger ones the BigNum path. Returns `None` on failure (the C++ -1).
+pub fn pq_factorize(pq_str: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let size = pq_str.len();
+    if size > 8 || (size == 8 && (pq_str[0] & 128) != 0) {
+        return pq_factorize_big(pq_str);
+    }
+
+    let mut pq: u64 = 0;
+    for &byte in pq_str {
+        pq = (pq << 8) | u64::from(byte);
+    }
+
+    let p = pq_factorize_u64(pq);
+    if p == 0 || pq % p != 0 {
+        return None;
+    }
+    // as_big_endian_string: trim leading zero bytes (the high end of the LE
+    // representation), then reverse to big-endian digits.
+    let mut p_bytes = p.to_le_bytes().to_vec();
+    while p_bytes.len() > 1 && *p_bytes.last().unwrap() == 0 {
+        p_bytes.pop();
+    }
+    p_bytes.reverse();
+    let mut q_bytes = (pq / p).to_le_bytes().to_vec();
+    while q_bytes.len() > 1 && *q_bytes.last().unwrap() == 0 {
+        q_bytes.pop();
+    }
+    q_bytes.reverse();
+    Some((p_bytes, q_bytes))
 }
 
 #[cfg(test)]

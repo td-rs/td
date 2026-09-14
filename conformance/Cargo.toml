@@ -10,8 +10,21 @@ publish = false
 description = "Golden vectors and differential harness for the td Rust rewrite"
 
 [dependencies]
+rsa = "0.9"
 sha2 = "0.10"
+tdmtproto = { path = "../crates/tdmtproto" }
+tdutils = { path = "../crates/tdutils" }
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt", "time"] }
 
 [[bin]]
 name = "extract-test-data"
 path = "src/main.rs"
+
+[[bin]]
+name = "mock_dc"
+path = "src/bin/mock_dc.rs"
+
+[[bin]]
+name = "handshake_client"
+path = "src/bin/handshake_client.rs"
+
