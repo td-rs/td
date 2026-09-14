@@ -821,7 +821,7 @@ mod tests {
             if matches!(
                 &response.object,
                 Some(Object::updateAuthorizationState(u))
-                    if matches!(u.authorization_state, td_api::AuthorizationState::authorizationStateClosed(_))
+                    if matches!(u.authorization_state, Some(td_api::AuthorizationState::authorizationStateClosed(_)))
             ) {
                 break;
             }

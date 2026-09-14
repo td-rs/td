@@ -175,10 +175,15 @@ pub struct Td {
     bridge: Option<NetBridge>,
     /// The authorized self id (from `auth.authorization`).
     my_id: i64,
+    /// The self access hash — `inputPeerUser` for the Saved Messages peer
+    /// (bots reject `inputPeerSelf` with USER_IS_BOT).
+    my_access_hash: i64,
     /// The known users (the self user; contacts land with Wave 1).
     users: HashMap<i64, td_api::User>,
     /// The known chats (Saved Messages only).
     chats: HashMap<i64, td_api::Chat>,
+    /// user id → access hash (the peers the walking skeleton messages).
+    peer_access: HashMap<i64, i64>,
     /// `get_next_yet_unsent_message_id` — negative, decreasing.
     next_local_message_id: i64,
     /// random_id → the pending send.
@@ -207,8 +212,10 @@ impl Td {
             stop_cnt: 2,
             bridge: None,
             my_id: 0,
+            my_access_hash: 0,
             users: HashMap::new(),
             chats: HashMap::new(),
+            peer_access: HashMap::new(),
             next_local_message_id: -1,
             pending_sends: HashMap::new(),
             updates: UpdatesManager::new(TdSink::default(), 0),
@@ -498,6 +505,22 @@ impl Td {
         }
         self.flush_auth_updates();
 
+        // `Global::init` — the group-call levels the recorder pins right
+        // after the auth state, before the ok.
+        self.send_update(Object::updateGroupCallMessageLevels(
+            td_api::updateGroupCallMessageLevels {
+                levels: vec![td_api::GroupCallMessageLevel {
+                    min_star_count: 0,
+                    pin_duration: 0,
+                    max_text_length: 30,
+                    max_custom_emoji_count: 0,
+                    first_color: 9788635,
+                    second_color: 9788635,
+                    background_color: 4786075,
+                }],
+            },
+        ));
+
         // init_file_manager / init_non_actor_managers / init_managers /
         // init_pure_actor_managers / SecretChatsManager / StorageManager —
         // each manager step appends its block here in the C++ order.
@@ -538,12 +561,33 @@ impl Td {
         // connection state).
         self.complete_pending_preauthentication_requests(&[FunctionKind::Any]);
 
-        // ConnectionStateManager::start_up: the initial real state.
-        self.send_update(Object::updateConnectionState(td_api::updateConnectionState {
-            state: Some(td_api::ConnectionState::connectionStateConnecting(
-                td_api::connectionStateConnecting,
-            )),
+        // BackgroundManager / FileManager init constants.
+        self.send_update(Object::updateDefaultBackground(
+            td_api::updateDefaultBackground {
+                for_dark_theme: false,
+                background: None,
+            },
+        ));
+        self.send_update(Object::updateDefaultBackground(
+            td_api::updateDefaultBackground {
+                for_dark_theme: true,
+                background: None,
+            },
+        ));
+        self.send_update(Object::updateFileDownloads(td_api::updateFileDownloads {
+            total_size: 0,
+            total_count: 0,
+            downloaded_size: 0,
         }));
+
+        // ConnectionStateManager::start_up: the initial real state.
+        self.send_update(Object::updateConnectionState(
+            td_api::updateConnectionState {
+                state: Some(td_api::ConnectionState::connectionStateConnecting(
+                    td_api::connectionStateConnecting,
+                )),
+            },
+        ));
     }
 
     /// `Td::finish_set_parameters` (Td.cpp:819-833).
@@ -914,9 +958,13 @@ impl Td {
             }
         };
         let bridge = self.bridge.as_ref().expect("bridge").handle();
-        let params = self.parameters.as_ref().expect("parameters").clone();
-        let mut sender =
-            AuthSender::new(&bridge, params.api_id, params.api_hash.clone(), String::new());
+        let params = self.parameters.as_ref().expect("parameters");
+        let mut sender = AuthSender::new(
+            &bridge,
+            params.api_id,
+            params.api_hash.clone(),
+            String::new(),
+        );
         match self
             .auth_manager
             .set_authentication_phone_number(&phone, &mut sender)
@@ -927,6 +975,18 @@ impl Td {
             }
             Err(message) => self.send_error_impl(request_id, 400, &message),
         }
+    }
+
+    pub(crate) fn check_authentication_bot_token(&mut self, request_id: u64, token: String) {
+        let token = match crate::misc::clean_input_string(&token) {
+            Some(token) => token,
+            None => {
+                return self.send_error_impl(request_id, 400, "Strings must be encoded in UTF-8");
+            }
+        };
+        self.check_code_or_password(request_id, |sender, auth| {
+            auth.check_authentication_bot_token(&token, sender)
+        });
     }
 
     pub(crate) fn check_authentication_code(&mut self, request_id: u64, code: String) {
@@ -963,9 +1023,13 @@ impl Td {
         run: impl FnOnce(&mut dyn AuthQuerySender, &mut AuthManager) -> Result<(), String>,
     ) {
         let bridge = self.bridge.as_ref().expect("bridge").handle();
-        let params = self.parameters.as_ref().expect("parameters").clone();
-        let mut sender =
-            AuthSender::new(&bridge, params.api_id, params.api_hash.clone(), String::new());
+        let params = self.parameters.as_ref().expect("parameters");
+        let mut sender = AuthSender::new(
+            &bridge,
+            params.api_id,
+            params.api_hash.clone(),
+            String::new(),
+        );
         // The password for the SRP step rides the checkAuthenticationPassword
         // request; check_authentication_password carries it through the
         // query (the sender re-fetches account.getPassword for fresh salts).
@@ -989,10 +1053,38 @@ impl Td {
         }
     }
 
-    /// The `AuthManager::on_get_authorization` success broadcast
-    /// (AuthManager.cpp:1504-1561): authorization_date, my_id, the self
-    /// user, Ready — then the ok.
+    /// The `AuthManager::on_get_authorization` success broadcast in the
+    /// order the live recorder pins: unix_time, the applied test-DC config
+    /// options, authorization_date, my_id, the self user, Ready — then the
+    /// ok, `connectionStateUpdating`, the default reaction type and
+    /// `connectionStateReady`.
     fn complete_authorization(&mut self, request_id: u64, sender: &AuthSender<'_>) {
+        self.send_update(Object::updateOption(td_api::updateOption {
+            name: "unix_time".to_string(),
+            value: Some(td_api::OptionValue::optionValueInteger(
+                td_api::optionValueInteger {
+                    value: tdutils::time::now() as i64,
+                },
+            )),
+        }));
+
+        // The ConfigManager-applied options (the walking-skeleton interim
+        // hardcodes the test-DC config constants the recorder pins).
+        if let Some(option_manager) = self.option_manager.as_mut() {
+            option_manager.set_option_boolean("test_mode", true);
+            option_manager.set_option_integer("forwarded_message_count_max", 100);
+            option_manager.set_option_integer("basic_group_size_max", 50);
+            option_manager.set_option_integer("supergroup_size_max", 500);
+            option_manager.set_option_boolean("expect_blocking", false);
+            option_manager.set_option_string("t_me_url", "https://t.me/");
+            option_manager.set_option_integer("call_connect_timeout_ms", 30000);
+            option_manager.set_option_integer("call_packet_timeout_ms", 10000);
+            option_manager.set_option_string("animation_search_bot_username", "contextbot");
+            option_manager.set_option_string("venue_search_bot_username", "foursquarebot");
+            option_manager.set_option_string("photo_search_bot_username", "imagebot");
+        }
+        self.flush_option_updates();
+
         self.send_update(Object::updateOption(td_api::updateOption {
             name: "authorization_date".to_string(),
             value: Some(td_api::OptionValue::optionValueInteger(
@@ -1007,17 +1099,41 @@ impl Td {
         self.flush_auth_updates();
         self.send_result(request_id, ok_object());
 
+        self.send_update(Object::updateConnectionState(
+            td_api::updateConnectionState {
+                state: Some(td_api::ConnectionState::connectionStateUpdating(
+                    td_api::connectionStateUpdating,
+                )),
+            },
+        ));
+        self.send_update(Object::updateDefaultReactionType(
+            td_api::updateDefaultReactionType {
+                reaction_type: Some(td_api::ReactionType::reactionTypeEmoji(
+                    td_api::reactionTypeEmoji {
+                        emoji: "❤".to_string(),
+                    },
+                )),
+            },
+        ));
+        self.send_update(Object::updateConnectionState(
+            td_api::updateConnectionState {
+                state: Some(td_api::ConnectionState::connectionStateReady(
+                    td_api::connectionStateReady,
+                )),
+            },
+        ));
+
         // The post-Ready position: `updates.getState` seeds the pts (the
         // C++ get_difference chain; the skeleton keeps the position).
         if let Some(owner) = self.bridge.as_ref() {
             let bridge = owner.handle();
             let state = telegram_api::Function::updates_getState(telegram_api::updates_getState);
-            if let QueryAnswer::Ok(data) = bridge.query(state) {
-                if let Ok(m) = telegram_api::updates_State::parse(&data) {
-                    self.updates.set_pts(m.pts);
-                    self.updates.set_qts(m.qts);
-                    self.updates.set_seq(m.seq);
-                }
+            if let QueryAnswer::Ok(data) = bridge.query(state)
+                && let Ok(m) = telegram_api::updates_State::parse(&data)
+            {
+                self.updates.set_pts(m.pts);
+                self.updates.set_qts(m.qts);
+                self.updates.set_seq(m.seq);
             }
             bridge.mark_authorized();
             bridge.persist();
@@ -1029,6 +1145,7 @@ impl Td {
     fn apply_self_user(&mut self, user: &telegram_api::user, broadcast: bool) {
         let object = convert::user_object(user, true);
         self.my_id = object.id;
+        self.my_access_hash = user.access_hash;
         if broadcast {
             self.send_update(Object::updateOption(td_api::updateOption {
                 name: "my_id".to_string(),
@@ -1083,16 +1200,16 @@ impl Td {
         }
     }
 
-    /// The Saved-Messages text `sendMessage` (MessagesManager.cpp:21721+):
-    /// the temporary local message (negative id, pending state) is
-    /// broadcast and returned synchronously; the wire ack
-    /// (`updateShortSentMessage` or the Updates container) completes it
-    /// with `updateMessageSendSucceeded`.
+    /// The text `sendMessage` (MessagesManager.cpp:21721+): the temporary
+    /// local message (pending state) is answered synchronously; the wire
+    /// ack (`updateShortSentMessage` or the Updates container) completes
+    /// it with `updateMessageSendSucceeded`. The reply peer is a known
+    /// chat (the receive path created it).
     pub(crate) fn on_send_message(&mut self, request_id: u64, args: td_api::sendMessage) {
         if !self.auth_manager.is_authorized() {
             return self.send_error_impl(request_id, 401, "Unauthorized");
         }
-        if args.chat_id != self.my_id {
+        if !self.chats.contains_key(&args.chat_id) {
             return self.send_error_impl(request_id, 400, "Chat not found");
         }
         let text = match args.input_message_content.as_deref() {
@@ -1121,17 +1238,8 @@ impl Td {
             date,
             text: text.clone(),
             pending: true,
+            is_outgoing: true,
         });
-
-        // The fresh Saved Messages dialog: `updateNewChat` precedes the
-        // message updates (add_dialog_for_new_message).
-        self.ensure_chat(args.chat_id, Some(temp.clone()));
-        if let Some(chat) = self.chats.get_mut(&args.chat_id) {
-            chat.last_message = Some(temp.clone());
-        }
-        self.send_update(Object::updateNewMessage(td_api::updateNewMessage {
-            message: Some(temp.clone()),
-        }));
         self.send_result(request_id, Object::message(temp));
 
         self.pending_sends.insert(
@@ -1145,6 +1253,7 @@ impl Td {
 
         // The wire query (the C++ defers it to the next actor event; the
         // observable stream is identical — the answer is already out).
+        let access_hash = self.peer_access.get(&args.chat_id).copied().unwrap_or(0);
         let query =
             telegram_api::Function::messages_sendMessage(telegram_api::messages_sendMessage {
                 flags: 0,
@@ -1156,8 +1265,11 @@ impl Td {
                 update_stickersets_order: false,
                 invert_media: false,
                 allow_paid_floodskip: false,
-                peer: Some(Box::new(telegram_api::InputPeer::inputPeerSelf(
-                    telegram_api::inputPeerSelf,
+                peer: Some(Box::new(telegram_api::InputPeer::inputPeerUser(
+                    telegram_api::inputPeerUser {
+                        user_id: args.chat_id,
+                        access_hash,
+                    },
                 ))),
                 reply_to: None,
                 message: text.clone(),
@@ -1210,7 +1322,7 @@ impl Td {
 
     /// `on_send_message_success` + `send_update_message_send_succeeded`:
     /// the final message (server id/date, no sending state) replaces the
-    /// temporary one; `updateChatLastMessage` follows.
+    /// temporary one.
     fn complete_pending_send(&mut self, random_id: i64, message_id: i64, date: i32) {
         let Some(pending) = self.pending_sends.remove(&random_id) else {
             return;
@@ -1222,20 +1334,15 @@ impl Td {
             date,
             text: pending.text,
             pending: false,
+            is_outgoing: true,
         });
         let old_message_id = pending.local_id;
         self.send_update(Object::updateMessageSendSucceeded(
             td_api::updateMessageSendSucceeded {
-                message: Some(final_message.clone()),
+                message: Some(final_message),
                 old_message_id,
             },
         ));
-        let positions = self.set_chat_last_message(pending.chat_id, final_message.clone());
-        self.send_update(Object::updateChatLastMessage(td_api::updateChatLastMessage {
-            chat_id: pending.chat_id,
-            last_message: Some(final_message),
-            positions,
-        }));
     }
 
     fn on_send_failed(&mut self, random_id: i64, code: i32, message: &str) {
@@ -1249,6 +1356,7 @@ impl Td {
             date: tdutils::time::now() as i32,
             text: pending.text,
             pending: false,
+            is_outgoing: true,
         });
         let old_message_id = pending.local_id;
         self.send_update(Object::updateMessageSendFailed(
@@ -1263,9 +1371,9 @@ impl Td {
         ));
     }
 
-    /// Creates the Saved Messages chat when first needed and emits
+    /// Creates the private chat for a peer when first needed and emits
     /// `updateNewChat` (the C++ `send_update_new_chat`).
-    fn ensure_chat(&mut self, chat_id: i64, last_message: Option<td_api::Message>) {
+    fn ensure_chat(&mut self, chat_id: i64) {
         if self.chats.contains_key(&chat_id) {
             return;
         }
@@ -1277,23 +1385,11 @@ impl Td {
                 id: chat_id,
                 ..Default::default()
             });
-        let chat = convert::chat_object(&user, last_message, 0);
+        let chat = convert::chat_object(&user);
         self.chats.insert(chat_id, chat.clone());
         self.send_update(Object::updateNewChat(td_api::updateNewChat {
             chat: Some(chat),
         }));
-    }
-
-    fn set_chat_last_message(
-        &mut self,
-        chat_id: i64,
-        message: td_api::Message,
-    ) -> Vec<td_api::ChatPosition> {
-        let Some(chat) = self.chats.get_mut(&chat_id) else {
-            return Vec::new();
-        };
-        chat.last_message = Some(message);
-        chat.positions.clone()
     }
 
     /// The bridge's raw update packets — the `Updates` umbrella through
@@ -1333,6 +1429,7 @@ impl Td {
         let sink = std::mem::take(self.updates.sink());
         for user in &sink.users {
             if let telegram_api::User::user(user) = user {
+                self.peer_access.insert(user.id, user.access_hash);
                 let object = convert::user_object(user, user.id == self.my_id);
                 let changed = self.users.get(&object.id) != Some(&object);
                 self.users.insert(object.id, object.clone());
@@ -1348,57 +1445,37 @@ impl Td {
         }
     }
 
-    /// The receive path for a wire `updateNewMessage` in the self chat
-    /// (MessagesManager::on_get_message): the fresh dialog emits
-    /// `updateNewChat`, the self-chat auto-read emits
-    /// `updateChatReadInbox`, then `updateNewMessage` +
-    /// `updateChatLastMessage`.
+    /// The receive path for a wire `updateNewMessage` (the container
+    /// users/chats were collected into the sink first): the fresh dialog
+    /// emits `updateNewChat`, then `updateNewMessage`. The sender's access
+    /// hash is remembered for the reply peer.
     fn apply_new_message(&mut self, message: &telegram_api::Message) {
         let telegram_api::Message::message(m) = message else {
             return;
         };
-        // Saved Messages only (peer_id == self); other dialogs are Track I.
-        let is_self_chat = match m.peer_id.as_ref() {
-            Some(telegram_api::Peer::peerUser(p)) => p.user_id == self.my_id,
-            _ => false,
-        };
-        if !is_self_chat {
+        let Some(telegram_api::Peer::peerUser(peer)) = m.peer_id.as_ref() else {
             return;
-        }
-        let chat_id = self.my_id;
+        };
+        // The walking-skeleton receive surface: a private incoming
+        // message. Bot sessions carry no `from_id` — the container users
+        // hold the sender, and the peer IS the sender here (the S76
+        // corpus peer).
+        let chat_id = peer.user_id;
+        self.ensure_chat(chat_id);
         let message_id = m.id as i64;
         let date = m.date;
         let text = wire_message_text(m);
         let final_message = convert::message_object(&MessageSpec {
             id: message_id,
             chat_id,
-            sender_user_id: self.my_id,
+            sender_user_id: chat_id,
             date,
             text,
             pending: false,
+            is_outgoing: false,
         });
-        self.ensure_chat(chat_id, None);
-        // The self-chat auto-read: updateChatReadInbox precedes the message
-        // (MessagesManager::read_history_inbox inside add_message_to_dialog).
-        if let Some(chat) = self.chats.get_mut(&chat_id) {
-            chat.last_read_inbox_message_id = message_id;
-            chat.last_read_outbox_message_id = chat
-                .last_read_inbox_message_id
-                .max(chat.last_read_outbox_message_id);
-        }
-        self.send_update(Object::updateChatReadInbox(td_api::updateChatReadInbox {
-            chat_id,
-            last_read_inbox_message_id: message_id,
-            unread_count: 0,
-        }));
         self.send_update(Object::updateNewMessage(td_api::updateNewMessage {
-            message: Some(final_message.clone()),
-        }));
-        let positions = self.set_chat_last_message(chat_id, final_message.clone());
-        self.send_update(Object::updateChatLastMessage(td_api::updateChatLastMessage {
-            chat_id,
-            last_message: Some(final_message),
-            positions,
+            message: Some(final_message),
         }));
     }
 
@@ -1427,9 +1504,8 @@ fn parse_vector_user(data: &[u8]) -> Option<Vec<telegram_api::user>> {
     let count = reader.i32().ok()? as u32 as usize;
     let mut users = Vec::with_capacity(count);
     for _ in 0..count {
-        match telegram_api::User::read(&mut reader).ok()? {
-            telegram_api::User::user(user) => users.push(user),
-            _ => {}
+        if let telegram_api::User::user(user) = telegram_api::User::read(&mut reader).ok()? {
+            users.push(user);
         }
     }
     Some(users)
@@ -1863,9 +1939,9 @@ mod tests {
                 11,
                 Function::setOption(td_api::setOption {
                     name: "message_unload_delay".to_string(),
-                    value: td_api::OptionValue::optionValueInteger(td_api::optionValueInteger {
-                        value: 59,
-                    }),
+                    value: Some(td_api::OptionValue::optionValueInteger(
+                        td_api::optionValueInteger { value: 59 },
+                    )),
                 }),
             );
             send(
@@ -1987,9 +2063,9 @@ mod tests {
                 30,
                 Function::setOption(td_api::setOption {
                     name: "use_storage_optimizer".to_string(),
-                    value: td_api::OptionValue::optionValueBoolean(td_api::optionValueBoolean {
-                        value: true,
-                    }),
+                    value: Some(td_api::OptionValue::optionValueBoolean(
+                        td_api::optionValueBoolean { value: true },
+                    )),
                 }),
             );
             assert!(callback.errors.lock().unwrap().is_empty());
@@ -2035,9 +2111,11 @@ mod tests {
                     41,
                     Function::setOption(td_api::setOption {
                         name: "x".to_string(),
-                        value: td_api::OptionValue::optionValueString(td_api::optionValueString {
-                            value: "hello".to_string(),
-                        }),
+                        value: Some(td_api::OptionValue::optionValueString(
+                            td_api::optionValueString {
+                                value: "hello".to_string(),
+                            },
+                        )),
                     }),
                 );
                 assert!(

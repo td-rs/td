@@ -1,7 +1,7 @@
 //! The S76 walking-skeleton session bridge: the live MTProto path behind
 //! the `Td` actor. The C++ runs the whole net stack as actors
-//! (`td/telegram/net/Session.{h,cpp}` + `SessionMultiProxy` + `DcAuthManager`
-//! + `MultiSequenceDispatcher`); those land with the Track I manager wave,
+//! (`td/telegram/net/Session.{h,cpp}`, `SessionMultiProxy`, `DcAuthManager`,
+//! `MultiSequenceDispatcher`); those land with the Track I manager wave,
 //! behind the S52 `SessionSink`/`TdSink` plug-in points. This module is the
 //! documented interim: one dedicated OS thread with its own tokio runtime
 //! driving a single [`SessionConnection`] per DC (the exact machinery the
@@ -55,8 +55,8 @@ MIIBCgKCAQEAyMEdY1aR+sCR3ZSJrtztKTKqigvO/vBfqACJLZtS7QMgCGXJ6XIR\n\
 yy7mx66W0/sOFa7/1mAZtEoIokDP3ShoqF4fVNb6XeqgQfaUHd8wJpDWHcR2OFwv\n\
 plUUI1PLTktZ9uW2WE23b+ixNwJjJGwBDJPQEQFBE+vfmH0JP503wr5INS1poWg/\n\
 j25sIWeYPHYeOrFp/eXaqhISP6G+q2IeTaWTXpwZj4LzXq5YOpk4bYEQ6mvRq7D1\n\
-aHWfYmlEGepfaYR8Q0YqvvhYtMte3ITnuJJs171+GDqpdKcSwHnd6FudwGO4pcCO\n\
-j4WcDuXc2CTHgH8gFTNhp/Y8/SpDOhvn4QIDAQAB\n\
+aHWfYmlEGepfaYR8Q0YqvvhYtMte3ITnuSJs171+GDqpdKcSwHnd6FudwGO4pcCO\n\
+j4WcDuXc2CTHgH8gFTNhp/Y8/SpDOhvn9QIDAQAB\n\
 -----END RSA PUBLIC KEY-----";
 
 /// The Telegram test DCs (the `p_q_inner_data_dc` field and the obfuscation
@@ -86,6 +86,7 @@ const STATE_MAGIC: &[u8; 4] = b"TRS1";
 
 /// The answer of a blocking [`NetBridge::query`]: the (already
 /// gzip-decompressed) result packet bytes, or the RPC error.
+#[derive(Clone)]
 pub enum QueryAnswer {
     Ok(Vec<u8>),
     Err(i32, String),
@@ -104,7 +105,7 @@ struct Shared {
 enum Command {
     Query {
         id: u64,
-        function: telegram_api::Function,
+        function: Box<telegram_api::Function>,
     },
     Migrate {
         dc: u8,
@@ -136,15 +137,25 @@ impl BridgeHandle {
             slots.map.insert(id, None);
             id
         };
-        if self.tx.send(Command::Query { id, function }).is_err() {
+        if self
+            .tx
+            .send(Command::Query {
+                id,
+                function: Box::new(function),
+            })
+            .is_err()
+        {
             return QueryAnswer::Err(500, "NETWORK_BRIDGE_CLOSED".to_string());
         }
         let mut slots = self.shared.slots.lock();
         let deadline = std::time::Instant::now() + QUERY_TIMEOUT;
         loop {
-            if let Some(answer) = slots.map.remove(&id) {
-                return answer
-                    .unwrap_or_else(|| QueryAnswer::Err(500, "NETWORK_BRIDGE_CLOSED".to_string()));
+            // The slot holds None while parked — only a completed `Some`
+            // answer removes it (a spurious condvar wake must not consume
+            // the placeholder).
+            if let Some(Some(answer)) = slots.map.get(&id).cloned() {
+                slots.map.remove(&id);
+                return answer;
             }
             let now = std::time::Instant::now();
             if now >= deadline {
@@ -456,6 +467,9 @@ async fn bridge_main(
     };
     let mut persisted: Option<Persisted> = load_persisted(&config.database_directory);
     let mut live: Option<Live> = None;
+    // The DC to open the next session on (the C++ starts on the default DC
+    // 2 and follows the USER_MIGRATE/PHONE_MIGRATE fixups).
+    let mut target_dc: u8 = persisted.as_ref().map(|(dc, _, _)| *dc).unwrap_or(2);
 
     loop {
         // 1. Wait for a command (the only wake source when no session is
@@ -502,12 +516,14 @@ async fn bridge_main(
                         &mut callback,
                         &mut persisted,
                         &mut live,
+                        target_dc,
                         id,
-                        function,
+                        *function,
                     )
                     .await;
                 }
                 Command::Migrate { dc } => {
+                    target_dc = dc;
                     close_live(&config, &mut callback, &mut persisted, &mut live);
                     // Keep the persisted key only when it belongs to the
                     // target DC.
@@ -540,11 +556,12 @@ async fn run_query(
     callback: &mut BridgeCallback,
     persisted: &mut Option<Persisted>,
     live: &mut Option<Live>,
+    target_dc: u8,
     id: u64,
     function: telegram_api::Function,
 ) {
     if live.is_none() {
-        match open_session(config, persisted.clone()).await {
+        match open_session(config, persisted.clone(), target_dc).await {
             Ok(session) => *live = Some(session),
             Err(error) => {
                 BridgeHandle::complete(&callback.shared, id, QueryAnswer::Err(500, error));
@@ -628,6 +645,7 @@ async fn establish(ip: &str, hs_dc: i32, tx_dc: i16) -> Result<(RawConnection, A
 async fn open_session(
     _config: &BridgeConfig,
     persisted: Option<Persisted>,
+    target_dc: u8,
 ) -> std::result::Result<Live, String> {
     if let Some((dc, wall_anchor, blob)) = persisted {
         let (key, _handshake, salt, time_diff, _session_id) = match load_auth_data(&blob) {
@@ -664,9 +682,9 @@ async fn open_session(
         });
     }
 
-    // Fresh key: connect to DC 2 first (the C++ starts on the default DC
-    // and migrates on PHONE_MIGRATE — the config main DC for the test set).
-    let dc = 2;
+    // Fresh key: the migrate commands steer the DC (the C++ starts on the
+    // default DC 2 and follows PHONE_MIGRATE/USER_MIGRATE).
+    let dc = target_dc;
     let (ip, hs_dc, tx_dc) = test_dc(dc);
     let (raw_connection, auth_key, time_diff, salt) = match establish(ip, hs_dc, tx_dc).await {
         Result::Ok(established) => established,
@@ -792,14 +810,15 @@ impl<'a> AuthSender<'a> {
         self.last_user.as_ref()
     }
 
-    /// One query through the bridge, with the PHONE/NETWORK_MIGRATE retry
-    /// (the `NetQueryDispatcher` 303 fixup for the auth flow).
+    /// One query through the bridge, with the PHONE/NETWORK/USER_MIGRATE
+    /// retry (the `NetQueryDispatcher` 303 fixup for the auth flow) and the
+    /// FLOOD_WAIT backoff (the C++ dispatcher sleeps and resends).
     fn invoke(
         &mut self,
         function: telegram_api::Function,
     ) -> std::result::Result<Vec<u8>, (i32, String)> {
-        let function = function;
-        for _ in 0..2 {
+        let mut attempts = 0;
+        loop {
             match self.bridge.query(function.clone()) {
                 QueryAnswer::Ok(data) => return Ok(data),
                 QueryAnswer::Err(code, message) => {
@@ -810,11 +829,24 @@ impl<'a> AuthSender<'a> {
                         std::thread::sleep(Duration::from_millis(100));
                         continue;
                     }
+                    if let Some(seconds) = message
+                        .strip_prefix("FLOOD_WAIT_")
+                        .and_then(|s| s.parse::<u64>().ok())
+                    {
+                        if attempts >= 2 {
+                            return Err((code, message));
+                        }
+                        attempts += 1;
+                        tracing::warn!(
+                            "auth query flood wait — sleeping {seconds}s before the retry"
+                        );
+                        std::thread::sleep(Duration::from_secs(seconds + 1));
+                        continue;
+                    }
                     return Err((code, message));
                 }
             }
         }
-        Err((500, "migrate loop exhausted".to_string()))
     }
 
     /// `account.getPassword` → the SRP answer for the stored password (the
@@ -838,6 +870,7 @@ fn migrate_target(message: &str) -> Option<u8> {
     message
         .strip_prefix("PHONE_MIGRATE_")
         .or_else(|| message.strip_prefix("NETWORK_MIGRATE_"))
+        .or_else(|| message.strip_prefix("USER_MIGRATE_"))
         .and_then(|n| n.parse().ok())
 }
 
@@ -941,6 +974,34 @@ impl AuthQuerySender for AuthSender<'_> {
                         }
                         other => Err(other.to_string()),
                     },
+                }
+            }
+            AuthNetQuery::BotToken { token } => {
+                let import = telegram_api::Function::auth_importBotAuthorization(
+                    telegram_api::auth_importBotAuthorization {
+                        flags: 0,
+                        api_id: self.api_id,
+                        api_hash: self.api_hash.clone(),
+                        bot_auth_token: token,
+                    },
+                );
+                match self.invoke(import) {
+                    Ok(data) => {
+                        let msg = telegram_api::auth_authorization::parse(&data)
+                            .map_err(|error| format!("auth.authorization: {error}"))?;
+                        let (user_id, user) = match &msg.user {
+                            Some(telegram_api::User::user(user)) => {
+                                (Some(user.id), Some(user.clone()))
+                            }
+                            _ => (None, None),
+                        };
+                        self.last_user = user;
+                        Ok(AuthNetResult::Authorization {
+                            user_id,
+                            terms_of_service: None,
+                        })
+                    }
+                    Err((_, message)) => Err(message),
                 }
             }
             AuthNetQuery::CheckPassword { password, .. } => {

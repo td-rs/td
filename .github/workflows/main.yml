@@ -219,11 +219,15 @@ jobs:
           fi
 
   recorder-live-corpus:
-    # S75's nightly recorder: records real test-DC sessions with the C++
-    # client and gates the replayer on the corpus. Requires the TD_API_ID /
-    # TD_API_HASH / TD_PHONE_NUMBER / TD_CODE secrets (the test-DC
-    # credentials); the job stays skipped until they are configured so a
-    # missing secret cannot fail the workflow.
+    # S76's nightly walking-skeleton gate: records a live test-DC session
+    # with the C++ client (bot-token login, getMe, the receive of a phone
+    # message and the reply send) and gates the Rust replayer on the same
+    # corpus — diffed modulo the documented nondeterminism. Requires the
+    # TD_BOT_TOKEN / TD_BOT_USERNAME / TD_API_HASH / TD_PEER_STATE secrets
+    # (a test-DC bot created once with the bot_maker tool — tokens are
+    # reusable, so no operator code provisioning is needed — and the S66
+    # phone-account persisted state, base64); the job stays skipped until
+    # they are configured so a missing secret cannot fail the workflow.
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     if: vars.TD_LIVE_CORPUS_ENABLED == 'true'
@@ -232,15 +236,16 @@ jobs:
         # `secrets` is not an allowed context in job-level `if:`; gate the
         # heavy steps on this output instead (actionlint finding).
         env:
-          TD_API_ID: ${{ secrets.TD_API_ID }}
+          TD_BOT_TOKEN: ${{ secrets.TD_BOT_TOKEN }}
+          TD_BOT_USERNAME: ${{ secrets.TD_BOT_USERNAME }}
           TD_API_HASH: ${{ secrets.TD_API_HASH }}
-          TD_PHONE_NUMBER: ${{ secrets.TD_PHONE_NUMBER }}
+          TD_PEER_STATE: ${{ secrets.TD_PEER_STATE }}
         run: |
-          if [ -n "$TD_API_ID" ] && [ -n "$TD_API_HASH" ] && [ -n "$TD_PHONE_NUMBER" ]; then
+          if [ -n "$TD_BOT_TOKEN" ] && [ -n "$TD_BOT_USERNAME" ] && [ -n "$TD_API_HASH" ] && [ -n "$TD_PEER_STATE" ]; then
             echo "ok=true" >> "$GITHUB_OUTPUT"
           else
             echo "ok=false" >> "$GITHUB_OUTPUT"
-            echo "skipped: TD_API_ID/TD_API_HASH/TD_PHONE_NUMBER secrets not configured"
+            echo "skipped: TD_BOT_TOKEN/TD_BOT_USERNAME/TD_API_HASH/TD_PEER_STATE secrets not configured"
           fi
       - uses: actions/checkout@v5
         if: steps.creds.outputs.ok == 'true'
@@ -262,18 +267,16 @@ jobs:
           cmake -S td-cpp -B td-cpp/TD_BUILD -DCMAKE_BUILD_TYPE=Release \
             -DTD_ENABLE_JNI=OFF -DTD_ENABLE_DOTNET=OFF -DTD_ENABLE_LTO=OFF
           cmake --build td-cpp/TD_BUILD -j"$(nproc)" --target tdjson
-      - name: Record a live test-DC session and gate the replayer
+      - name: Record a live test-DC session and gate the replayer (S76)
         if: steps.creds.outputs.ok == 'true'
         env:
-          TD_RECORD_LIVE: "1"
-          TD_API_ID: ${{ secrets.TD_API_ID }}
+          TD_BOT_TOKEN: ${{ secrets.TD_BOT_TOKEN }}
+          TD_BOT_USERNAME: ${{ secrets.TD_BOT_USERNAME }}
           TD_API_HASH: ${{ secrets.TD_API_HASH }}
-          TD_PHONE_NUMBER: ${{ secrets.TD_PHONE_NUMBER }}
+          TD_PEER_STATE: ${{ secrets.TD_PEER_STATE }}
         run: |
-          conformance/recorder/record_live.sh "$GITHUB_WORKSPACE/td-cpp"
-          conformance/recorder/verify.sh "$GITHUB_WORKSPACE/td-cpp"
-          conformance/recorder/verify.sh \
-            "$GITHUB_WORKSPACE/td-cpp" corpus/live_requests.txt
+          printf '%s' "$TD_PEER_STATE" | base64 -d > /tmp/s66_state.bin
+          conformance/recorder/verify_s76.sh "$GITHUB_WORKSPACE/td-cpp"
 
 
   fuzz-smoke:

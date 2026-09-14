@@ -610,6 +610,11 @@ pub enum AuthNetQuery {
         phone_code_hash: String,
         code: String,
     },
+    BotToken {
+        /// The bot token — `auth.importBotAuthorization` (reusable, unlike
+        /// phone codes — the S76 harness relies on exactly this).
+        token: String,
+    },
     LogOut,
     GetPassword,
     CheckPassword {
@@ -1004,6 +1009,34 @@ impl AuthManager {
             }
             other => Err(format!(
                 "Unexpected result for checkPassword: {:?}",
+                std::mem::discriminant(&other)
+            )),
+        }
+    }
+
+    /// `AuthManager::check_bot_token` (cpp:818-842): the bot login —
+    /// `auth.importBotAuthorization` over the sender. Reachable from any
+    /// pre-Ready state (the C++ queues it until the encryption key).
+    pub fn check_authentication_bot_token(
+        &mut self,
+        token: &str,
+        sender: &mut dyn AuthQuerySender,
+    ) -> Result<(), String> {
+        if token.is_empty() {
+            return Err("Bot token must be non-empty".to_string());
+        }
+        match sender.send(AuthNetQuery::BotToken {
+            token: token.to_string(),
+        })? {
+            AuthNetResult::Authorization {
+                user_id: Some(_), ..
+            } => {
+                self.state = State::Ok;
+                self.update_state(State::Ok);
+                Ok(())
+            }
+            other => Err(format!(
+                "Unexpected result for bot token: {:?}",
                 std::mem::discriminant(&other)
             )),
         }
