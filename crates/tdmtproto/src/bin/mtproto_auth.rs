@@ -85,8 +85,8 @@ struct AuthCallback {
     logged_in: bool,
     /// The C++ callback sends straight into the connection it is flushing;
     /// the Rust callback queues instead and the driver pumps it after the
-    /// flush returns.
-    pending_query: Option<Vec<u8>>,
+    /// flush returns. Shared with the stdin-reader thread.
+    pending_query: std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>>,
     /// Set when the DC answers RPC_ERROR 303 *_MIGRATE_X: the number lives
     /// on test DC X and the whole flow must be redone there.
     migrate_dc: Option<i32>,
@@ -175,24 +175,30 @@ impl SessionConnectionCallback for AuthCallback {
             eprintln!("sentCode type: {type_name}, hash={}", self.phone_code_hash);
             print!("Enter the code from Telegram/SMS: ");
             std::io::stdout().flush().unwrap();
-            let mut code = String::new();
-            std::io::stdin().read_line(&mut code).unwrap();
-            let code = code.trim().to_string();
+            // Read the code on a separate thread: blocking on stdin here
+            // would stall the flush loop, starve the session's pings and
+            // trip the ping timeout before the user finishes typing.
+            let phone = self.phone.clone();
+            let phone_code_hash = self.phone_code_hash.clone();
+            let pending_query = self.pending_query.clone();
+            std::thread::spawn(move || {
+                let mut code = String::new();
+                std::io::stdin().read_line(&mut code).unwrap();
+                let code = code.trim().to_string();
 
-            let mut query = Vec::new();
-            telegram_api::auth_signIn {
-                flags: 0,
-                phone_number: self.phone.clone(),
-                phone_code_hash: self.phone_code_hash.clone(),
-                phone_code: code,
-                email_verification: telegram_api::EmailVerification::emailVerificationCode(
-                    telegram_api::emailVerificationCode::default(),
-                ),
-            }
-            .store_boxed(&mut query);
-            // The callback cannot access the connection (it is being
-            // flushed); queue through a re-send after the flush returns.
-            self.pending_query = Some(query);
+                let mut query = Vec::new();
+                telegram_api::auth_signIn {
+                    flags: 0,
+                    phone_number: phone,
+                    phone_code_hash,
+                    phone_code: code,
+                    email_verification: telegram_api::EmailVerification::emailVerificationCode(
+                        telegram_api::emailVerificationCode::default(),
+                    ),
+                }
+                .store_boxed(&mut query);
+                *pending_query.lock().unwrap() = Some(query);
+            });
             return Status::ok();
         }
         if ctor == telegram_api::auth_authorization::ID {
@@ -345,7 +351,7 @@ fn main() {
                 phone: phone.clone(),
                 phone_code_hash: String::new(),
                 logged_in: false,
-                pending_query: None,
+                pending_query: std::sync::Arc::new(std::sync::Mutex::new(None)),
                 migrate_dc: None,
             };
             {
@@ -395,7 +401,7 @@ fn main() {
                     )),
                 }
                 .store_boxed(&mut query);
-                callback.pending_query = Some(query);
+                *callback.pending_query.lock().unwrap() = Some(query);
             }
             connection.set_online(true, true);
 
@@ -447,7 +453,12 @@ async fn drive_auth_session(
         if callback.migrate_dc.is_some() {
             return Status::ok();
         }
-        if let Some(query) = callback.pending_query.take() {
+        // A closed session must never be touched again (do_flush asserts).
+        if wakeup_at == 0.0 {
+            return Status::ok();
+        }
+        let queued = callback.pending_query.lock().unwrap().take();
+        if let Some(query) = queued {
             let message_id = connection.send_query(
                 BufferSlice::from_slice_bytes(&query),
                 false,
@@ -463,10 +474,6 @@ async fn drive_auth_session(
             if wakeup_at == 0.0 {
                 return Status::ok();
             }
-        } else if wakeup_at == 0.0 {
-            return Status::ok();
-        } else if callback.logged_in {
-            // Keep streaming updates until the process is killed.
         }
         tokio::select! {
             _ = connection.raw_connection().stream().readable() => {}
