@@ -137,8 +137,10 @@ jobs:
     # the replay gate: every constructor sample of all four wire schemes
     # fetched and re-stored by td's generated code (S15). The td checkout
     # is pinned to the same commit the TL schemes were imported from (S03).
+    # S68/S73/S74 additionally build the real libtdjson (cmake) — that is
+    # the long pole of the job's budget.
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - uses: actions/checkout@v5
@@ -150,6 +152,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.95"
+      - name: Build the C++ tdjson client (S68/S73 oracle)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gperf php-cli libssl-dev zlib1g-dev cmake
+          cmake -S td-cpp -B td-cpp/TD_BUILD -DCMAKE_BUILD_TYPE=Release \
+            -DTD_ENABLE_JNI=OFF -DTD_ENABLE_DOTNET=OFF -DTD_ENABLE_LTO=OFF
+          cmake --build td-cpp/TD_BUILD -j"$(nproc)" --target tdjson
       - name: Verify golden vectors vs C++ dump oracle (S04)
         run: conformance/cpp_dump/verify.sh "$GITHUB_WORKSPACE/td-cpp"
       - name: Verify tdtl lexer vs tl-parser oracle (S06)
@@ -194,3 +203,58 @@ jobs:
           else
             echo "skipped: conformance/tl_replay_oracle/verify.sh not committed yet (S15 in progress)"
           fi
+      - name: Verify the C ABI responses vs the real C++ td_json_client (S68)
+        run: |
+          if [ -x conformance/tdjson_oracle/verify.sh ]; then
+            conformance/tdjson_oracle/verify.sh "$GITHUB_WORKSPACE/td-cpp"
+          else
+            echo "skipped: conformance/tdjson_oracle/verify.sh not committed yet (S68 in progress)"
+          fi
+      - name: Replay the recorder corpus through the Rust client (S73/S74)
+        run: |
+          if [ -x conformance/recorder/verify.sh ]; then
+            conformance/recorder/verify.sh "$GITHUB_WORKSPACE/td-cpp"
+          else
+            echo "skipped: conformance/recorder/verify.sh not committed yet (S73 in progress)"
+          fi
+
+  recorder-live-corpus:
+    # S75's nightly recorder: records real test-DC sessions with the C++
+    # client and gates the replayer on the corpus. Requires the TD_API_ID /
+    # TD_API_HASH / TD_PHONE_NUMBER / TD_CODE secrets (the test-DC
+    # credentials); the job stays skipped until they are configured so a
+    # missing secret cannot fail the workflow.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    if: >-
+      vars.TD_LIVE_CORPUS_ENABLED == 'true' &&
+      secrets.TD_API_ID != '' && secrets.TD_API_HASH != '' &&
+      secrets.TD_PHONE_NUMBER != ''
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/checkout@v5
+        with:
+          repository: tdlib/td
+          ref: d1085f9cebc5a62379991ae1652673954f229c1f
+          path: td-cpp
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+      - name: Build the C++ tdjson client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gperf php-cli libssl-dev zlib1g-dev cmake
+          cmake -S td-cpp -B td-cpp/TD_BUILD -DCMAKE_BUILD_TYPE=Release \
+            -DTD_ENABLE_JNI=OFF -DTD_ENABLE_DOTNET=OFF -DTD_ENABLE_LTO=OFF
+          cmake --build td-cpp/TD_BUILD -j"$(nproc)" --target tdjson
+      - name: Record a live test-DC session and gate the replayer
+        env:
+          TD_RECORD_LIVE: "1"
+          TD_API_ID: ${{ secrets.TD_API_ID }}
+          TD_API_HASH: ${{ secrets.TD_API_HASH }}
+          TD_PHONE_NUMBER: ${{ secrets.TD_PHONE_NUMBER }}
+        run: |
+          conformance/recorder/record_live.sh "$GITHUB_WORKSPACE/td-cpp"
+          conformance/recorder/verify.sh "$GITHUB_WORKSPACE/td-cpp"
+          conformance/recorder/verify.sh \
+            "$GITHUB_WORKSPACE/td-cpp" corpus/live_requests.txt
