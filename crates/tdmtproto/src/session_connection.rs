@@ -736,9 +736,12 @@ impl SessionConnection {
 
     fn on_typed_packet(&mut self, info: &MsgInfo, constructor_id: i32, data: &[u8]) -> Status {
         use mtproto_api::*;
+        // `data` arrives with the constructor already consumed by
+        // on_slice_packet, so the bare (fields-only) parse is required —
+        // the boxed parse would re-check the consumed id and fail.
         macro_rules! parse {
             ($ty:ident) => {{
-                match $ty::parse(data) {
+                match $ty::parse_bare(data) {
                     Ok(m) => m,
                     Err(e) => return Status::error_message(e),
                 }
