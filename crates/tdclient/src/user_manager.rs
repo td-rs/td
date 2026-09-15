@@ -78,6 +78,14 @@ const USER_FULL_EXPIRE_TIME: f64 = 60.0;
 const MAX_ACTIVE_STORY_ID_RELOAD_TIME: f64 = 3600.0;
 /// `SecretChatLayer::Default` (SecretChatId.h).
 const SECRET_CHAT_DEFAULT_LAYER: i32 = 73;
+/// `MAX_NAME_LENGTH` (UserManager.h:872).
+const MAX_NAME_LENGTH: usize = 64;
+/// `ACCOUNT_UPDATE_FIRST_NAME`/`ACCOUNT_UPDATE_LAST_NAME`/
+/// `ACCOUNT_UPDATE_ABOUT` (UserManager.h:878-880) — the
+/// `account.updateProfile` flag matrix.
+const ACCOUNT_UPDATE_FIRST_NAME: i32 = 1 << 0;
+const ACCOUNT_UPDATE_LAST_NAME: i32 = 1 << 1;
+const ACCOUNT_UPDATE_ABOUT: i32 = 1 << 2;
 
 // telegram_api::user flag masks (telegram_api.h, the `user` class:
 // ACCESS_HASH_MASK = 1, FIRST_NAME_MASK = 2, ..., PHONE_MASK = 16,
@@ -5782,6 +5790,385 @@ impl UserManager {
         secret_chat_id.get()
     }
 
+    // ------------------------------------------------------------------
+    // M.4.12: profile-editing queries (UserManager.cpp:5882-6797) — the
+    // validation state machines and the local success appliers. Every
+    // `*_local` half answers what the C++ does before its net query; the
+    // `UpdateProfileQuery`/username/color/... senders ride the net step.
+
+    /// `UserManager::set_name` (UserManager.cpp:5882-5901) — returns the
+    /// `ACCOUNT_UPDATE_*` flags for the (net) query; `Ok(0)` is the C++
+    /// immediate `set_value`.
+    pub fn set_name_local(&mut self, first_name: &str, last_name: &str) -> Result<i32, Status> {
+        let new_first_name = crate::misc::clean_name(first_name, MAX_NAME_LENGTH);
+        let new_last_name = crate::misc::clean_name(last_name, MAX_NAME_LENGTH);
+        if new_first_name.is_empty() {
+            return Err(Status::error(400, "First name must be non-empty"));
+        }
+
+        let my_id = self.get_my_id();
+        let u = self.get_user(my_id);
+        let mut flags = 0;
+        if u.map(|u| u.first_name != new_first_name).unwrap_or(true) {
+            flags |= ACCOUNT_UPDATE_FIRST_NAME;
+        }
+        if u.map(|u| u.last_name != new_last_name).unwrap_or(true) {
+            flags |= ACCOUNT_UPDATE_LAST_NAME;
+        }
+        Ok(flags)
+    }
+
+    /// `UserManager::set_bio` (UserManager.cpp:5903-5917) — returns the
+    /// sanitized bio for the (net) query; `Ok(None)` is the C++
+    /// immediate `set_value`.
+    pub fn set_bio_local(&mut self, env: &UserEnv, bio: &str) -> Result<Option<String>, Status> {
+        let max_bio_length = env.options.get_option_integer("bio_length_max", 70).max(0) as usize;
+        let mut new_bio = crate::misc::strip_empty_characters(bio, max_bio_length, false);
+        crate::misc::replace_with_spaces(&mut new_bio, "\n");
+
+        let user_full = self.get_user_full(self.get_my_id());
+        if user_full
+            .map(|user_full| user_full.about == new_bio)
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+        Ok(Some(new_bio))
+    }
+
+    /// `UserManager::on_update_profile_success`
+    /// (UserManager.cpp:5923-5945); the group-call about fan-out is a
+    /// documented no-op until GroupCallManager lands.
+    pub fn on_update_profile_success(
+        &mut self,
+        env: &mut UserEnv,
+        flags: i32,
+        first_name: &str,
+        last_name: &str,
+        about: &str,
+    ) {
+        assert!(flags != 0);
+
+        let my_user_id = self.get_my_id();
+        {
+            let u = self.get_user(my_user_id);
+            let Some(u) = u else {
+                tdutils::log_error!("Doesn't receive info about me during update profile");
+                return;
+            };
+            if (flags & ACCOUNT_UPDATE_FIRST_NAME) != 0 && u.first_name != first_name {
+                tdutils::log_error!(
+                    "Wrong first name \"{}\", expected \"{}\"",
+                    u.first_name,
+                    first_name
+                );
+            }
+            if (flags & ACCOUNT_UPDATE_LAST_NAME) != 0 && u.last_name != last_name {
+                tdutils::log_error!(
+                    "Wrong last name \"{}\", expected \"{}\"",
+                    u.last_name,
+                    last_name
+                );
+            }
+        }
+
+        if (flags & ACCOUNT_UPDATE_ABOUT) != 0
+            && self.get_user_full_force(env, my_user_id, "on_update_profile_success")
+        {
+            let user_full = self.users_full.get_mut(&my_user_id.get()).unwrap();
+            user_full.about = about.to_owned();
+            user_full.is_changed = true;
+            self.update_user_full(env, my_user_id, "on_update_profile_success", false);
+            // GroupCallManager::on_update_dialog_about
+        }
+    }
+
+    /// `UserManager::set_username` (UserManager.cpp:6638-6643) — the
+    /// validation half.
+    pub fn set_username_local(&self, username: &str) -> Result<(), Status> {
+        if !username.is_empty() && !crate::misc::is_allowed_username(username) {
+            return Err(Status::error(400, "Username is invalid"));
+        }
+        Ok(())
+    }
+
+    /// `UserManager::toggle_username_is_active_impl`
+    /// (UserManager.cpp:6655-6666) — the optimistic local apply; the
+    /// `ToggleUsernameQuery` send rides the net step.
+    pub fn toggle_username_is_active_local(
+        &mut self,
+        env: &mut UserEnv,
+        username: &str,
+        is_active: bool,
+    ) -> Result<(), Status> {
+        let user_id = self.get_my_id();
+        let new_usernames = {
+            let u = self
+                .get_user(user_id)
+                .expect("toggle_username_is_active needs the forced me");
+            if !u.usernames.can_toggle(false, username) {
+                return Err(Status::error(400, "Wrong username specified"));
+            }
+            u.usernames.toggle(false, username, is_active)
+        };
+        self.on_update_user_usernames(env, user_id, new_usernames);
+        self.update_user(env, user_id, false, false);
+        Ok(())
+    }
+
+    /// `UserManager::reorder_usernames_impl`
+    /// (UserManager.cpp:6684-6699) — the optimistic local apply; the
+    /// `ReorderUsernamesQuery` send rides the net step.
+    pub fn reorder_usernames_local(
+        &mut self,
+        env: &mut UserEnv,
+        usernames: &[String],
+    ) -> Result<(), Status> {
+        let user_id = self.get_my_id();
+        let new_usernames = {
+            let u = self
+                .get_user(user_id)
+                .expect("reorder_usernames needs the forced me");
+            if !u.usernames.can_reorder_to(&usernames.to_vec()) {
+                return Err(Status::error(400, "Invalid username order specified"));
+            }
+            if usernames.len() <= 1 {
+                return Ok(());
+            }
+            u.usernames.reorder_to(usernames.to_vec())
+        };
+        self.on_update_user_usernames(env, user_id, new_usernames);
+        self.update_user(env, user_id, false, false);
+        Ok(())
+    }
+
+    /// `UserManager::on_update_username_is_active`
+    /// (UserManager.cpp:6701-6711); the `reload_user` fallback for a
+    /// stale local username is the net step.
+    pub fn on_update_username_is_active(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        username: &str,
+        is_active: bool,
+    ) {
+        let is_bot = self.is_user_bot_of(user_id);
+        let new_usernames = {
+            let u = self
+                .get_user(user_id)
+                .expect("the update flow forces the user");
+            if !u.usernames.can_toggle(is_bot, username) {
+                // reload_user(user_id, ...) — the net step
+                tdutils::log_info!("Need to reload {user_id:?} after the username toggle");
+                return;
+            }
+            u.usernames.toggle(is_bot, username, is_active)
+        };
+        self.on_update_user_usernames(env, user_id, new_usernames);
+        self.update_user(env, user_id, false, false);
+    }
+
+    /// `UserManager::on_update_active_usernames_order`
+    /// (UserManager.cpp:6713-6723); the `reload_user` fallback for a
+    /// stale local order is the net step.
+    pub fn on_update_active_usernames_order(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        usernames: Vec<String>,
+    ) {
+        let new_usernames = {
+            let u = self
+                .get_user(user_id)
+                .expect("the update flow forces the user");
+            if !u.usernames.can_reorder_to(&usernames) {
+                // reload_user(user_id, ...) — the net step
+                tdutils::log_info!("Need to reload {user_id:?} after the username reorder");
+                return;
+            }
+            u.usernames.reorder_to(usernames)
+        };
+        self.on_update_user_usernames(env, user_id, new_usernames);
+        self.update_user(env, user_id, false, false);
+    }
+
+    /// `UserManager::toggle_bot_username_is_active`
+    /// (UserManager.cpp:6725-6737) — the gates and the optimistic apply;
+    /// the `ToggleBotUsernameQuery` send rides the net step.
+    pub fn toggle_bot_username_is_active_local(
+        &mut self,
+        env: &mut UserEnv,
+        bot_user_id: UserId,
+        username: &str,
+        is_active: bool,
+    ) -> Result<(), Status> {
+        let bot_data = self.get_bot_data(bot_user_id)?;
+        if !bot_data.can_be_edited {
+            return Err(Status::error(400, "The bot can't be edited"));
+        }
+        let new_usernames = {
+            let u = self
+                .get_user(bot_user_id)
+                .expect("get_bot_data forced the bot");
+            if !u.usernames.can_toggle(true, username) {
+                return Err(Status::error(400, "Wrong username specified"));
+            }
+            u.usernames.toggle(true, username, is_active)
+        };
+        self.on_update_user_usernames(env, bot_user_id, new_usernames);
+        self.update_user(env, bot_user_id, false, false);
+        Ok(())
+    }
+
+    /// `UserManager::reorder_bot_usernames`
+    /// (UserManager.cpp:6739-6754) — the gates and the optimistic apply;
+    /// the `ReorderBotUsernamesQuery` send rides the net step.
+    pub fn reorder_bot_usernames_local(
+        &mut self,
+        env: &mut UserEnv,
+        bot_user_id: UserId,
+        usernames: &[String],
+    ) -> Result<(), Status> {
+        let bot_data = self.get_bot_data(bot_user_id)?;
+        if !bot_data.can_be_edited {
+            return Err(Status::error(400, "The bot can't be edited"));
+        }
+        let new_usernames = {
+            let u = self
+                .get_user(bot_user_id)
+                .expect("get_bot_data forced the bot");
+            if !u.usernames.can_reorder_to(&usernames.to_vec()) {
+                return Err(Status::error(400, "Invalid username order specified"));
+            }
+            if usernames.len() <= 1 {
+                return Ok(());
+            }
+            u.usernames.reorder_to(usernames.to_vec())
+        };
+        self.on_update_user_usernames(env, bot_user_id, new_usernames);
+        self.update_user(env, bot_user_id, false, false);
+        Ok(())
+    }
+
+    /// `UserManager::set_accent_color` (UserManager.cpp:6756-6765) —
+    /// returns the transformed arguments for the (net)
+    /// `UpdateColorQuery`; the id-derived default collapses to the
+    /// invalid marker.
+    pub fn set_accent_color_local(
+        &mut self,
+        accent_color_id: AccentColorId,
+        background_custom_emoji_id: CustomEmojiId,
+    ) -> Result<(AccentColorId, CustomEmojiId), Status> {
+        if !accent_color_id.is_valid() {
+            return Err(Status::error(
+                400,
+                "Invalid accent color identifier specified",
+            ));
+        }
+        let accent_color_id =
+            if accent_color_id == AccentColorId::from_peer_id(self.get_my_id().get()) {
+                AccentColorId::default()
+            } else {
+                accent_color_id
+            };
+        Ok((accent_color_id, background_custom_emoji_id))
+    }
+
+    /// `UserManager::on_update_accent_color_success`
+    /// (UserManager.cpp:6776-6788).
+    pub fn on_update_accent_color_success(
+        &mut self,
+        env: &mut UserEnv,
+        for_profile: bool,
+        accent_color_id: AccentColorId,
+        background_custom_emoji_id: CustomEmojiId,
+    ) {
+        let user_id = self.get_my_id();
+        if !self.get_user_force(env, user_id, "on_update_accent_color_success") {
+            return;
+        }
+        if for_profile {
+            self.on_update_user_profile_colors_impl(
+                user_id,
+                accent_color_id,
+                background_custom_emoji_id,
+            );
+        } else {
+            self.on_update_user_colors_impl(
+                user_id,
+                accent_color_id,
+                background_custom_emoji_id,
+                None,
+            );
+        }
+        self.update_user(env, user_id, false, false);
+    }
+
+    /// `UserManager::set_emoji_status` (UserManager.cpp:6924-6931) — the
+    /// premium gate; the recent-emoji-status registry and the
+    /// `UpdateEmojiStatusQuery` send ride their steps.
+    pub fn set_emoji_status_local(&self, env: &UserEnv) -> Result<(), Status> {
+        if !env.options.get_option_boolean("is_premium", false) {
+            return Err(Status::error(
+                400,
+                "The method is available only to Telegram Premium users",
+            ));
+        }
+        // add_recent_emoji_status — the recent registry, later step
+        Ok(())
+    }
+
+    /// `UserManager::on_set_emoji_status` (UserManager.cpp:6933-6941).
+    pub fn on_set_emoji_status(&mut self, env: &mut UserEnv, emoji_status: Option<EmojiStatus>) {
+        let user_id = self.get_my_id();
+        if self.get_user(user_id).is_some() {
+            self.on_update_user_emoji_status(env, user_id, emoji_status);
+            self.update_user(env, user_id, false, false);
+        }
+    }
+
+    /// `UserManager::on_set_user_emoji_status`
+    /// (UserManager.cpp:6568-6575) without the promise plumbing.
+    pub fn on_set_user_emoji_status(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        emoji_status: Option<EmojiStatus>,
+    ) {
+        self.on_update_user_emoji_status(env, user_id, emoji_status);
+        self.update_user(env, user_id, false, false);
+    }
+
+    /// `UserManager::on_set_birthdate` (UserManager.cpp:6790-6798)
+    /// without the promise plumbing.
+    pub fn on_set_birthdate(&mut self, env: &mut UserEnv, birthdate: Birthdate) {
+        let my_user_id = self.get_my_id();
+        if self.get_user_full_force(env, my_user_id, "on_set_birthdate") {
+            let user_full = self.users_full.get_mut(&my_user_id.get()).unwrap();
+            if user_full.birthdate != birthdate {
+                user_full.birthdate = birthdate;
+                user_full.is_changed = true;
+                self.update_user_full(env, my_user_id, "on_set_birthdate", false);
+            }
+        }
+    }
+
+    /// `UserManager::on_toggle_sponsored_messages`
+    /// (UserManager.cpp:6943-6953) without the promise plumbing; the
+    /// `main_profile_tab`/`personal_channel` appliers carry the
+    /// ProfileTab/ChannelId types into their subsystem steps.
+    pub fn on_toggle_sponsored_messages(&mut self, env: &mut UserEnv, sponsored_enabled: bool) {
+        let my_user_id = self.get_my_id();
+        if self.get_user_full_force(env, my_user_id, "on_toggle_sponsored_messages") {
+            let user_full = self.users_full.get_mut(&my_user_id.get()).unwrap();
+            if user_full.sponsored_enabled != sponsored_enabled {
+                user_full.sponsored_enabled = sponsored_enabled;
+                user_full.is_changed = true;
+                self.update_user_full(env, my_user_id, "on_toggle_sponsored_messages", false);
+            }
+        }
+    }
+
     // The read-projection helpers keep the on_get_user control flow flat.
     fn u_is_received(&self, user_id: UserId) -> bool {
         self.users
@@ -8495,6 +8882,299 @@ mod tests {
         um.take_updates();
         let id = um.get_secret_chat_id_object(sc_id, "test");
         assert_eq!(id, 67);
+        assert!(um.take_updates().is_empty());
+    }
+
+    // ----- M.4.12: profile-editing local halves -----
+
+    fn me_with_name(um: &mut UserManager, env: &mut UserEnv, first: &str, last: &str) -> UserId {
+        um.set_my_id(env, UserId::new(5));
+        let mut user = telegram_user(5, first, USER_ACCESS_HASH_MASK | (1 << 1)); // access_hash, first_name
+        if !last.is_empty() {
+            user.last_name = last.to_owned();
+            user.flags |= 1 << 2;
+        }
+        um.on_get_user(env, telegram_api::User::user(user), "test")
+    }
+
+    #[test]
+    fn set_name_and_bio_validate_and_compute_the_flag_matrix() {
+        let (mut temp, mut um) = test_env();
+        let user_id = me_with_name(&mut um, &mut temp.env(false), "Alice", "");
+
+        // The empty cleaned first name is the one hard error.
+        assert!(matches!(
+            um.set_name_local("   ", "Smith"),
+            Err(status) if status.message() == "First name must be non-empty"
+        ));
+
+        // Only the actually-changed fields carry their flag; cleaned
+        // whitespace collapses before the comparison.
+        assert_eq!(
+            um.set_name_local("  Alice  ", "Liddell").unwrap(),
+            ACCOUNT_UPDATE_LAST_NAME,
+            "the first name is unchanged after cleaning"
+        );
+        assert_eq!(
+            um.set_name_local("Alicia", "Liddell").unwrap(),
+            ACCOUNT_UPDATE_FIRST_NAME | ACCOUNT_UPDATE_LAST_NAME
+        );
+        let _ = user_id;
+
+        // bio: sanitized (strip + newline replacement) and compared
+        // against the stored about.
+        let env = &mut temp.env(false);
+        um.add_user_full(user_id).about = "curiouser".to_owned();
+        assert_eq!(um.set_bio_local(env, "curiouser").unwrap(), None);
+        let bio = um
+            .set_bio_local(env, "curiouser\nand\n\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            bio, "curiouser and",
+            "newlines collapse; trailing empties go away"
+        );
+    }
+
+    #[test]
+    fn on_update_profile_success_applies_the_about() {
+        let (mut temp, mut um) = test_env();
+        let user_id = me_with_name(&mut um, &mut temp.env(false), "Old", "");
+        let env = &mut temp.env(false);
+        um.add_user_full(user_id);
+
+        um.on_update_profile_success(
+            env,
+            ACCOUNT_UPDATE_FIRST_NAME | ACCOUNT_UPDATE_ABOUT,
+            "New",
+            "",
+            "the bio",
+        );
+        // The names are only cross-checked against the server answer
+        // (LOG_IF(ERROR) fires for the mismatch); they are NOT applied
+        // here — the user update carries them.
+        assert_eq!(um.get_user(user_id).unwrap().first_name, "Old");
+        assert_eq!(um.get_user_full(user_id).unwrap().about, "the bio");
+        let updates = um.take_updates();
+        assert!(
+            updates
+                .iter()
+                .any(|update| matches!(update, td_api::Update::updateUserFullInfo(f) if f.user_full_info.bio.text == "the bio")),
+            "the about change must emit updateUserFullInfo"
+        );
+    }
+
+    #[test]
+    fn username_toggle_and_reorder_apply_optimistically() {
+        let (mut temp, mut um) = test_env();
+        let env = &mut temp.env(false);
+        um.set_my_id(env, UserId::new(5));
+        let mut user = telegram_user(5, "Alice", USER_ACCESS_HASH_MASK | (1 << 1));
+        user.flags2 = 1; // usernames:flags2.0
+        user.usernames = vec![
+            telegram_api::Username {
+                flags: 0,
+                editable: true,
+                active: true,
+                username: "alice".to_owned(),
+            },
+            telegram_api::Username {
+                flags: 0,
+                editable: false,
+                active: true,
+                username: "wonder".to_owned(),
+            },
+        ];
+        um.on_get_user(env, telegram_api::User::user(user), "test");
+        um.take_updates();
+
+        // Toggle a non-editable username off (the editable one is
+        // protected for non-bots); the diff emits.
+        um.toggle_username_is_active_local(env, "wonder", false)
+            .unwrap();
+        assert!(
+            um.get_user(UserId::new(5))
+                .unwrap()
+                .usernames
+                .get_active_usernames()
+                .iter()
+                .all(|name| name != "wonder"),
+            "wonder must leave the active set"
+        );
+        assert!(
+            !um.take_updates().is_empty(),
+            "the change must emit updateUser"
+        );
+
+        // The editable username can't be toggled by a user.
+        assert!(matches!(
+            um.toggle_username_is_active_local(env, "alice", false),
+            Err(status) if status.message() == "Wrong username specified"
+        ));
+        assert!(matches!(
+            um.reorder_usernames_local(env, &["alice".to_owned(), "wonder".to_owned()]),
+            Err(status) if status.message() == "Invalid username order specified"
+        ));
+        um.take_updates();
+
+        // Reorder the remaining actives; the same order resolves at once.
+        um.reorder_usernames_local(env, &["alice".to_owned()])
+            .unwrap();
+        um.take_updates();
+
+        // The update-intake forms share the same rules.
+        um.on_update_active_usernames_order(env, UserId::new(5), vec!["alice".to_owned()]);
+        um.on_update_username_is_active(env, UserId::new(5), "wonder", true);
+        assert!(
+            um.get_user(UserId::new(5))
+                .unwrap()
+                .usernames
+                .get_active_usernames()
+                .contains(&"wonder".to_owned()),
+            "the update reactivates wonder"
+        );
+    }
+
+    #[test]
+    fn bot_username_ops_gate_on_the_editable_flag() {
+        let (mut temp, mut um) = test_env();
+        let env = &mut temp.env(false);
+
+        let mut bot = bot_user(7, 0);
+        bot.bot_can_edit = true;
+        // drop the legacy username so only the usernames vector matters
+        bot.username = String::new();
+        bot.flags &= !(1 << 3);
+        bot.usernames = vec![
+            telegram_api::Username {
+                flags: 0,
+                editable: true,
+                active: true,
+                username: "helper_bot".to_owned(),
+            },
+            telegram_api::Username {
+                flags: 0,
+                editable: false,
+                active: true,
+                username: "wonder_bot".to_owned(),
+            },
+        ];
+        bot.flags2 = 1; // usernames:flags2.0
+        let bot_id = um.on_get_user(env, telegram_api::User::user(bot), "test");
+
+        // The bot toggles a non-editable username optimistically; with a
+        // single active username even a bot couldn't drop its editable.
+        um.toggle_bot_username_is_active_local(env, bot_id, "wonder_bot", false)
+            .unwrap();
+        assert!(!um.take_updates().is_empty());
+        assert!(matches!(
+            um.toggle_bot_username_is_active_local(env, bot_id, "unknown", true),
+            Err(status) if status.message() == "Wrong username specified"
+        ));
+
+        // A non-editable bot is refused before anything else.
+        let plain_bot_id = um.on_get_user(env, telegram_api::User::user(bot_user(8, 0)), "test");
+        assert!(matches!(
+            um.reorder_bot_usernames_local(env, plain_bot_id, &[]),
+            Err(status) if status.message() == "The bot can't be edited"
+        ));
+        um.reorder_bot_usernames_local(env, bot_id, &["helper_bot".to_owned()])
+            .unwrap();
+    }
+
+    #[test]
+    fn accent_color_and_emoji_status_appliers_update_me() {
+        let (mut temp, mut um) = test_env();
+        let user_id = me_with_name(&mut um, &mut temp.env(false), "Alice", "");
+        let env = &mut temp.env(false);
+
+        // The invalid id is the hard error; the id-derived default
+        // collapses to the invalid marker.
+        assert!(matches!(
+            um.set_accent_color_local(AccentColorId::new(-1), CustomEmojiId::default()),
+            Err(status) if status.message() == "Invalid accent color identifier specified"
+        ));
+        let (collapsed, _) = um
+            .set_accent_color_local(AccentColorId::from_peer_id(5), CustomEmojiId::new(9))
+            .unwrap();
+        assert_eq!(collapsed, AccentColorId::default());
+        let (passed, emoji) = um
+            .set_accent_color_local(AccentColorId::new(3), CustomEmojiId::new(9))
+            .unwrap();
+        assert_eq!(passed.get(), 3);
+        assert_eq!(emoji.get(), 9);
+
+        // The success appliers mutate me and emit.
+        um.on_update_accent_color_success(env, false, AccentColorId::new(3), CustomEmojiId::new(9));
+        um.on_update_accent_color_success(env, true, AccentColorId::new(4), CustomEmojiId::new(10));
+        let u = um.get_user(user_id).unwrap();
+        assert_eq!(u.accent_color_id.get(), 3);
+        assert_eq!(u.background_custom_emoji_id.get(), 9);
+        assert_eq!(u.profile_accent_color_id.get(), 4);
+        assert_eq!(u.profile_background_custom_emoji_id.get(), 10);
+        assert!(!um.take_updates().is_empty());
+
+        // The emoji-status setter needs the premium option.
+        assert!(matches!(
+            um.set_emoji_status_local(env),
+            Err(status) if status.message().contains("Premium")
+        ));
+        env.options.set_option_boolean("is_premium", true);
+        um.set_emoji_status_local(env).unwrap();
+
+        let status = Some(EmojiStatus::from_telegram(
+            telegram_api::EmojiStatus::emojiStatus(telegram_api::emojiStatus {
+                document_id: 77,
+                ..Default::default()
+            }),
+        ));
+        um.on_set_emoji_status(env, status.clone());
+        um.on_set_user_emoji_status(env, user_id, status);
+        let updates = um.take_updates();
+        assert!(
+            updates.iter().any(
+                |update| matches!(update, td_api::Update::updateUser(u) if matches!(
+                    u.user.emoji_status.r#type,
+                    td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(_)
+                ))
+            ),
+            "the emoji status must surface in updateUser"
+        );
+    }
+
+    #[test]
+    fn birthdate_and_sponsored_appliers_write_the_full() {
+        let (mut temp, mut um) = test_env();
+        let user_id = me_with_name(&mut um, &mut temp.env(false), "Alice", "");
+        let env = &mut temp.env(false);
+        um.add_user_full(user_id);
+
+        let birthdate = Birthdate::new(5, 3, 1990);
+        um.on_set_birthdate(env, birthdate);
+        assert_eq!(um.get_user_full(user_id).unwrap().birthdate, birthdate);
+        let first_updates = um.take_updates();
+        assert!(first_updates
+            .iter()
+            .any(|update| matches!(update, td_api::Update::updateUserFullInfo(f) if f.user_full_info.birthdate.day == 5)));
+
+        // The same birthdate again is a silent no-op.
+        um.on_set_birthdate(env, birthdate);
+        assert!(um.take_updates().is_empty());
+
+        // Sponsored messages start disabled by default (the C++ field
+        // default); with premium me and the server-set true, the flag
+        // answers; flip it off and then silence.
+        um.add_user_full(user_id).sponsored_enabled = true;
+        um.users.get_mut(&user_id.get()).unwrap().is_premium = true;
+        assert!(
+            um.get_my_sponsored_enabled(),
+            "the flag answers while the full is loaded"
+        );
+        um.on_toggle_sponsored_messages(env, false);
+        assert!(!um.get_user_full(user_id).unwrap().sponsored_enabled);
+        assert!(!um.get_my_sponsored_enabled());
+        assert!(!um.take_updates().is_empty());
+        um.on_toggle_sponsored_messages(env, false);
         assert!(um.take_updates().is_empty());
     }
 }
