@@ -1,7 +1,9 @@
 //! Port of `td/telegram/misc.cpp`: `clean_input_string` — the
 //! server-parity string sanitizer applied to user-provided strings before
 //! they reach the handlers (UTF-8 check, control-character replacement,
-//! the 35 000-byte length clamp, and the directional-mark replacement).
+//! the 35 000-byte length clamp, and the directional-mark replacement) —
+//! plus the name/username/bio helpers the profile-editing surfaces share
+//! (`clean_name`, `strip_empty_characters`, `is_allowed_username`).
 
 use tdutils::utf8::{check_utf8, is_utf8_character_first_code_unit};
 
@@ -164,5 +166,334 @@ mod tests {
         // that reached the LENGTH_LIMIT - 3 watermark (the C++ `new_size--`).
         let ascii = "a".repeat(40000);
         assert_eq!(clean(&ascii).unwrap().len(), LENGTH_LIMIT - 4);
+    }
+}
+
+/// `td::is_space` (tdutils/misc.h:107).
+fn is_space(c: u8) -> bool {
+    matches!(c, b' ' | b'\t' | b'\r' | b'\n' | 0 | 0x0b)
+}
+
+/// `td::trim` (tdutils/misc.h:133) over the shared whitespace set.
+fn trim(s: &str) -> &str {
+    s.trim_matches(|c: char| is_space(c as u8))
+}
+
+/// `td::to_lower` (tdutils/misc.h:64-85) — ASCII-only.
+fn to_lower(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_uppercase() {
+                (c as u8 - b'A' + b'a') as char
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// `td::utf8_truncate` (tdutils/utf8.h:70): cut to `length` Unicode
+/// characters at a codepoint boundary.
+fn utf8_truncate(s: &str, length: usize) -> &str {
+    if s.len() > length {
+        let mut remaining = length;
+        for (i, b) in s.bytes().enumerate() {
+            if is_utf8_character_first_code_unit(b) {
+                if remaining == 0 {
+                    return &s[..i];
+                }
+                remaining -= 1;
+            }
+        }
+    }
+    s
+}
+
+/// `td::replace_with_spaces` (tdutils/misc.cpp:22-28) — a byte search,
+/// so only ASCII characters make sense here.
+pub fn replace_with_spaces(s: &mut String, characters: &str) {
+    // only b' ' is ever written, so the UTF-8 invariant is kept
+    for c in unsafe { s.as_mut_vec() } {
+        if characters.as_bytes().contains(c) {
+            *c = b' ';
+        }
+    }
+}
+
+/// `td::clean_name` (misc.cpp:24-46): strip empty characters, collapse
+/// space/nbsp/`\n` runs to single spaces and trim.
+pub fn clean_name(s: &str, max_length: usize) -> String {
+    let str = strip_empty_characters(s, max_length, false);
+    let bytes = str.as_bytes();
+    let mut new_len = 0usize;
+    let mut is_previous_space = false;
+    let mut out = vec![0u8; bytes.len()];
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] == b' ' || bytes[i] == b'\n' {
+            if !is_previous_space {
+                out[new_len] = b' ';
+                new_len += 1;
+                is_previous_space = true;
+            }
+            i += 1;
+            continue;
+        }
+        if bytes[i] == 0xC2 && i + 1 < bytes.len() && bytes[i + 1] == 0xA0 {
+            // &nbsp;
+            if !is_previous_space {
+                out[new_len] = b' ';
+                new_len += 1;
+                is_previous_space = true;
+            }
+            i += 2;
+            continue;
+        }
+        out[new_len] = bytes[i];
+        new_len += 1;
+        is_previous_space = false;
+        i += 1;
+    }
+    String::from_utf8_lossy(&out[..new_len])
+        .trim_matches(|c: char| is_space(c as u8))
+        .to_owned()
+}
+
+/// `td::strip_empty_characters` (misc.cpp:163-253): replace the
+/// known space-like Unicode sequences with plain spaces, drop
+/// leading/trailing "empty" characters and clamp to `max_length`
+/// Unicode characters.
+pub fn strip_empty_characters(s: &str, max_length: usize, strip_rtlo: bool) -> String {
+    // 3-byte UTF-8 space-like sequences, plus the U+F3xx
+    // supplementary-plane form handled by the 0xF3 arm.
+    const SPACE_CHARACTERS: [&[u8]; 19] = [
+        b"\xe1\x9a\x80", // U+1680
+        b"\xe1\xa0\x8e", // U+180E
+        b"\xe2\x80\x80", // U+2000
+        b"\xe2\x80\x81", // U+2001
+        b"\xe2\x80\x82", // U+2002
+        b"\xe2\x80\x83", // U+2003
+        b"\xe2\x80\x84", // U+2004
+        b"\xe2\x80\x85", // U+2005
+        b"\xe2\x80\x86", // U+2006
+        b"\xe2\x80\x87", // U+2007
+        b"\xe2\x80\x88", // U+2008
+        b"\xe2\x80\x89", // U+2009
+        b"\xe2\x80\x8a", // U+200A
+        b"\xe2\x80\xae", // U+202E
+        b"\xe2\x80\xaf", // U+202F
+        b"\xe2\x81\x9f", // U+205F
+        b"\xe2\xa0\x80", // U+2800
+        b"\xe3\x80\x80", // U+3000
+        b"\xef\xbf\xbc", // U+FFFC
+    ];
+    let can_be_first = |b: u8| SPACE_CHARACTERS.iter().any(|sc| sc[0] == b) || b == 0xF3;
+
+    let bytes = s.as_bytes();
+    // replace all occurrences of space characters with a space
+    let mut i = 0usize;
+    while i < bytes.len() && !can_be_first(bytes[i]) {
+        i += 1;
+    }
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    out.extend_from_slice(&bytes[..i]);
+    while i < bytes.len() {
+        if can_be_first(bytes[i]) && i + 3 <= bytes.len() {
+            if bytes[i] == 0xF3 {
+                if bytes[i + 1] == 0xA0 && (bytes[i + 2] & 0xFE) == 0x80 && i + 4 <= bytes.len() {
+                    out.push(b' ');
+                    i += 4;
+                    continue;
+                }
+            } else {
+                let mut found = false;
+                for space_ch in SPACE_CHARACTERS {
+                    if space_ch[0] == bytes[i]
+                        && space_ch[1] == bytes[i + 1]
+                        && space_ch[2] == bytes[i + 2]
+                    {
+                        if bytes[i + 2] != 0xAE
+                            || bytes[i + 1] != 0x80
+                            || bytes[i] != 0xE2
+                            || strip_rtlo
+                        {
+                            found = true;
+                        }
+                        break;
+                    }
+                }
+                if found {
+                    out.push(b' ');
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    let replaced = String::from_utf8_lossy(&out).into_owned();
+    let trimmed = utf8_truncate(trim(&replaced), max_length);
+    // check if there is some non-empty character, empty characters:
+    // ZERO WIDTH SPACE/NON-JOINER/JOINER, the LRM/RLM/RLTO marks, the
+    // BYTE ORDER MARK, the NO-BREAK SPACE
+    let bytes = trimmed.as_bytes();
+    let mut i = 0usize;
+    loop {
+        if i == bytes.len() {
+            // if all characters are empty, return an empty string
+            return String::new();
+        }
+        if bytes[i] == b' ' || bytes[i] == b'\n' {
+            i += 1;
+            continue;
+        }
+        if bytes[i] == 0xE2 && i + 2 < bytes.len() && bytes[i + 1] == 0x80 {
+            let next = bytes[i + 2];
+            if (0x8B..=0x8F).contains(&next) || next == 0xAE {
+                i += 3;
+                continue;
+            }
+        }
+        if bytes[i] == 0xEF && i + 2 < bytes.len() && bytes[i + 1] == 0xBB && bytes[i + 2] == 0xBF {
+            i += 3;
+            continue;
+        }
+        if bytes[i] == 0xC2 && i + 1 < bytes.len() && bytes[i + 1] == 0xA0 {
+            i += 2;
+            continue;
+        }
+        break;
+    }
+    trimmed.to_owned()
+}
+
+/// `td::is_valid_username` (misc.cpp:260-282).
+pub fn is_valid_username(username: &str) -> bool {
+    let bytes = username.as_bytes();
+    if bytes.is_empty() || bytes.len() > 32 {
+        return false;
+    }
+    if !is_alpha(bytes[0]) {
+        return false;
+    }
+    for &c in bytes {
+        if !is_alpha(c) && !c.is_ascii_digit() && c != b'_' {
+            return false;
+        }
+    }
+    if bytes[bytes.len() - 1] == b'_' {
+        return false;
+    }
+    for i in 1..bytes.len() {
+        if bytes[i - 1] == b'_' && bytes[i] == b'_' {
+            return false;
+        }
+    }
+    true
+}
+
+/// `td::is_alpha` (tdutils/misc.h:113): `c | 0x20` in `'a'..='z'`.
+fn is_alpha(c: u8) -> bool {
+    let c = c | 0x20;
+    c.is_ascii_lowercase()
+}
+
+/// `td::is_allowed_username` (misc.cpp:284-303): a valid username of at
+/// least 5 characters without the reserved prefixes.
+pub fn is_allowed_username(username: &str) -> bool {
+    if !is_valid_username(username) {
+        return false;
+    }
+    if username.len() < 5 {
+        return false;
+    }
+    let username_lowered = to_lower(username);
+    for prefix in [
+        "admin",
+        "telegram",
+        "support",
+        "security",
+        "settings",
+        "contacts",
+        "service",
+        "telegraph",
+    ] {
+        if username_lowered.starts_with(prefix) {
+            return false;
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod misc_helper_tests {
+    use super::{
+        clean_name, is_allowed_username, is_valid_username, replace_with_spaces,
+        strip_empty_characters,
+    };
+
+    #[test]
+    fn clean_name_collapses_and_trims() {
+        // misc.cpp:24-46 — space/`\n`/nbsp runs collapse to one space.
+        assert_eq!(clean_name("  Alice   Liddell\n\n", 64), "Alice Liddell");
+        assert_eq!(clean_name("a\u{a0}b", 64), "a b", "nbsp becomes a space");
+        assert_eq!(
+            clean_name("\u{a0}\u{1680}x", 64),
+            "x",
+            "leading empty characters go away"
+        );
+        assert_eq!(clean_name("", 64), "");
+    }
+
+    #[test]
+    fn strip_empty_replaces_and_clamps() {
+        // The fixed space-like table becomes plain spaces; the final
+        // trim drops the leading one, exactly like the C++ order.
+        assert_eq!(
+            strip_empty_characters("\u{2002}a\u{3000}b", 64, false),
+            "a b"
+        );
+        // U+202E (RTL override) is kept unless strip_rtlo; the
+        // converted leading space is trimmed either way.
+        assert_eq!(strip_empty_characters("\u{202e}a", 64, false), "\u{202e}a");
+        assert_eq!(strip_empty_characters("\u{202e}a", 64, true), "a");
+        // The clamp counts Unicode characters, not bytes.
+        assert_eq!(strip_empty_characters("абвгд", 3, false), "абв");
+        // All-empty input collapses to nothing.
+        assert_eq!(strip_empty_characters("\u{a0}\u{200b}", 64, false), "");
+    }
+
+    #[test]
+    fn username_validity_rules() {
+        // is_valid_username: alpha start, [A-Za-z0-9_], no trailing or
+        // doubled underscores, 1..=32 bytes.
+        assert!(is_valid_username("durov"));
+        assert!(is_valid_username("D_1x"));
+        assert!(!is_valid_username("1durov"), "must start with a letter");
+        assert!(!is_valid_username("a__b"), "doubled underscore");
+        assert!(!is_valid_username("ab_"), "trailing underscore");
+        assert!(!is_valid_username("ab-cd"), "dash is not allowed");
+        assert!(!is_valid_username(&"a".repeat(33)));
+        // is_allowed_username adds the 5-character floor and the
+        // reserved prefixes.
+        assert!(!is_allowed_username("abcd"), "too short");
+        assert!(!is_allowed_username("telegram_fan"), "reserved prefix");
+        assert!(
+            !is_allowed_username("TeLeGram"),
+            "reserved prefix, case-folded"
+        );
+        assert!(
+            !is_allowed_username("telegram2"),
+            "the prefix check is starts_with"
+        );
+        assert!(is_allowed_username("durov"));
+    }
+
+    #[test]
+    fn replace_with_spaces_hits_every_match() {
+        let mut s = "a\nb\nc".to_owned();
+        replace_with_spaces(&mut s, "\n");
+        assert_eq!(s, "a b c");
     }
 }
