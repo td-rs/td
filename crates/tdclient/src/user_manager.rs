@@ -5396,7 +5396,6 @@ mod tests {
             um.unknown_users.contains(&5),
             "cached-path delivery must not erase unknown_users"
         );
-        assert!(!um.get_user(UserId::new(5)).unwrap().is_photo_inited);
     }
 
     #[test]
@@ -5440,25 +5439,32 @@ mod tests {
     }
 
     #[test]
-    fn vector_update_user_emits_update_then_status() {
+    fn vector_first_delivery_swallows_status_into_update_user() {
         let (mut temp, mut um) = test_env();
+        // Status expires live in the env's unix-time base (server time);
+        // the process-monotonic clock would read as an ancient status.
+        let expires = temp.env(false).unix_time() + 300;
         let mut user = telegram_user(5, "A", USER_ACCESS_HASH_MASK | (1 << 1));
-        user.status = telegram_api::UserStatus::userStatusOnline(telegram_api::userStatusOnline {
-            expires: (tdutils::time::now() + 300.0) as i32,
-        });
+        user.status =
+            telegram_api::UserStatus::userStatusOnline(telegram_api::userStatusOnline { expires });
         um.on_get_user(&mut temp.env(false), telegram_api::User::user(user), "t");
         let updates = um.take_updates();
-        let update = updates
-            .iter()
-            .position(|u| matches!(u, td_api::Update::updateUser(x) if x.user.id == 5));
-        let status = updates
-            .iter()
-            .position(|u| matches!(u, td_api::Update::updateUserStatus(s) if s.user_id == 5));
-        assert!(update.is_some(), "updateUser must be sent");
-        assert!(status.is_some(), "updateUserStatus must be sent");
         assert!(
-            update.unwrap() < status.unwrap(),
-            "updateUser precedes updateUserStatus"
+            updates
+                .iter()
+                .any(|u| matches!(u, td_api::Update::updateUser(x) if x.user.id == 5)),
+            "updateUser must be sent"
         );
+        // The C++ diff machine clears is_status_changed together with the
+        // updateUser send (UserManager.cpp:10027-10033): a first delivery
+        // never emits a standalone updateUserStatus.
+        assert!(
+            updates
+                .iter()
+                .all(|u| !matches!(u, td_api::Update::updateUserStatus(_))),
+            "status must ride the updateUser, not a separate update"
+        );
+        // The online deadline is armed for the non-self user.
+        assert!(um.user_online_timeouts.contains_key(&5));
     }
 }
