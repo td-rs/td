@@ -140,6 +140,12 @@ for line in sys.stdin:
         continue
     line = COMMIT_HASH_RE.sub('\\1<git>"', line)
     record = json.loads(line)
+    # The `@wait` corpus markers are harness bookkeeping (the driver's
+    # wait-for-update primitive, and how the gate times the phone
+    # message) — their stream position races with the live updates, and
+    # the diff is about client-emitted records.
+    if '"@wait"' in record.get("request", ""):
+        continue
     masked = mask(record)
     if not masked:
         continue
