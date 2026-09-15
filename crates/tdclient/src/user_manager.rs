@@ -1614,6 +1614,23 @@ impl UserManager {
         self.my_id = Self::load_my_id(binlog_pmc);
     }
 
+    /// The constructor's `my_was_online_local` / `my_was_online_remote`
+    /// binlog-pmc restore (UserManager.cpp:2765-2771); the freeze-state
+    /// half of the block arrives with M.4.15. `is_online` is
+    /// `OnlineManager::is_online()` — `false` until its step lands.
+    pub fn init_my_online_status(
+        &mut self,
+        binlog_pmc: &mut BinlogKeyValue,
+        unix_time: i32,
+        is_online: bool,
+    ) {
+        self.was_online_local = binlog_pmc.get("my_was_online_local").parse().unwrap_or(0);
+        self.was_online_remote = binlog_pmc.get("my_was_online_remote").parse().unwrap_or(0);
+        if self.was_online_local >= unix_time && !is_online {
+            self.was_online_local = unix_time - 1;
+        }
+    }
+
     /// `UserManager::get_my_id`.
     pub fn get_my_id(&self) -> UserId {
         if !self.my_id.is_valid() {
@@ -3281,6 +3298,36 @@ impl UserManager {
         }
     }
 
+    /// The earliest armed deadline (the member MultiTimeouts' next firing
+    /// time), or `None` when nothing is armed — the Td actor's re-arm key.
+    pub(crate) fn next_deadline(&self) -> Option<f64> {
+        self.user_online_timeouts
+            .values()
+            .chain(self.user_emoji_status_timeouts.values())
+            .copied()
+            .min_by(f64::total_cmp)
+    }
+
+    /// Test-only: arm a user-online deadline with the given past
+    /// `was_online` — the td.rs actor-level sweep fixture (production
+    /// deadlines are armed by `update_user` itself).
+    #[cfg(test)]
+    pub(crate) fn seed_online_deadline_for_test(
+        &mut self,
+        user_id: UserId,
+        was_online: i32,
+        deadline: f64,
+    ) {
+        // the default User mirrors the C++ User() constructor (a deleted
+        // bot); the fixture is a regular cached user with a sent update
+        let u = self.users.entry(user_id.get()).or_default();
+        u.is_bot = false;
+        u.is_deleted = false;
+        u.is_update_user_sent = true;
+        u.was_online = was_online;
+        self.user_online_timeouts.insert(user_id.get(), deadline);
+    }
+
     /// `UserManager::update_user` (UserManager.cpp:9872-10082). The
     /// cross-manager notifications are documented no-ops (module docs).
     pub fn update_user(
@@ -3317,7 +3364,11 @@ impl UserManager {
             }
         }
         let is_name_changed = self.users.get(&user_id.get()).unwrap().is_name_changed;
-        let is_is_contact_changed = self.users.get(&user_id.get()).unwrap().is_is_contact_changed;
+        let is_is_contact_changed = self
+            .users
+            .get(&user_id.get())
+            .unwrap()
+            .is_is_contact_changed;
         let is_username_changed = self.take_user_flag(user_id, UserFlag::Username);
         if is_name_changed || is_username_changed || is_is_contact_changed {
             // update_contacts_hints — with the Contacts step; the C++ also
@@ -5013,6 +5064,224 @@ mod tests {
     }
 
     #[test]
+    fn status_object_covers_the_was_online_bands() {
+        let (mut temp, mut um) = test_env();
+        let env = &mut temp.env(false);
+
+        // bots report userStatusOnline forever
+        let mut bot = telegram_user(1, "Bot", USER_ACCESS_HASH_MASK | (1 << 1));
+        bot.bot = true;
+        um.on_get_user(env, telegram_api::User::user(bot), "t");
+        assert!(matches!(
+            um.get_user_status_object(env, UserId::new(1)),
+            td_api::UserStatus::userStatusOnline(s) if s.expires == i32::MAX
+        ));
+
+        um.on_get_user(
+            env,
+            telegram_api::User::user(telegram_user(2, "Band", USER_ACCESS_HASH_MASK | (1 << 1))),
+            "t",
+        );
+        um.take_updates();
+        let now = env.unix_time();
+        let check = |um: &mut UserManager, was_online: i32| {
+            um.users.get_mut(&2).unwrap().was_online = was_online;
+            um.get_user_status_object(env, UserId::new(2))
+        };
+        assert!(matches!(
+            check(&mut um, -6),
+            td_api::UserStatus::userStatusLastMonth(s) if s.by_my_privacy_settings
+        ));
+        assert!(matches!(
+            check(&mut um, -3),
+            td_api::UserStatus::userStatusLastMonth(s) if !s.by_my_privacy_settings
+        ));
+        assert!(matches!(
+            check(&mut um, -5),
+            td_api::UserStatus::userStatusLastWeek(s) if s.by_my_privacy_settings
+        ));
+        assert!(matches!(
+            check(&mut um, -2),
+            td_api::UserStatus::userStatusLastWeek(s) if !s.by_my_privacy_settings
+        ));
+        assert!(matches!(
+            check(&mut um, -4),
+            td_api::UserStatus::userStatusRecently(s) if s.by_my_privacy_settings
+        ));
+        assert!(matches!(
+            check(&mut um, -1),
+            td_api::UserStatus::userStatusRecently(s) if !s.by_my_privacy_settings
+        ));
+        assert!(matches!(
+            check(&mut um, 0),
+            td_api::UserStatus::userStatusEmpty(_)
+        ));
+        assert!(matches!(
+            check(&mut um, now + 300),
+            td_api::UserStatus::userStatusOnline(s) if s.expires == now + 300
+        ));
+        assert!(matches!(
+            check(&mut um, now - 300),
+            td_api::UserStatus::userStatusOffline(s) if s.was_online == now - 300
+        ));
+    }
+
+    #[test]
+    fn is_user_online_respects_the_tolerance() {
+        let (mut temp, mut um) = test_env();
+        let env = &mut temp.env(false);
+        um.on_get_user(
+            env,
+            telegram_api::User::user(telegram_user(3, "Tol", USER_ACCESS_HASH_MASK | (1 << 1))),
+            "t",
+        );
+        um.take_updates();
+        let now = env.unix_time();
+        um.users.get_mut(&3).unwrap().was_online = now - 30;
+        assert!(!um.is_user_online_of(env, UserId::new(3), 0, 0));
+        assert!(!um.is_user_online_of(env, UserId::new(3), 30, 0)); // the boundary is strict
+        assert!(um.is_user_online_of(env, UserId::new(3), 31, 0));
+        // a user still online ignores the tolerance
+        um.users.get_mut(&3).unwrap().was_online = now + 60;
+        assert!(um.is_user_online_of(env, UserId::new(3), 0, 0));
+        // an explicit unix_time overrides now
+        um.users.get_mut(&3).unwrap().was_online = 1000;
+        assert!(!um.is_user_online_of(env, UserId::new(3), 0, 2000));
+    }
+
+    #[test]
+    fn get_user_was_online_pairs_the_local_overrides() {
+        let (mut temp, mut um) = test_env();
+        let env = &mut temp.env(false);
+        um.my_id = UserId::new(7);
+        let mut me = telegram_user(7, "Me", USER_ACCESS_HASH_MASK | (1 << 1));
+        me.self_ = true;
+        um.on_get_user(env, telegram_api::User::user(me), "t");
+        um.take_updates();
+        let now = env.unix_time();
+
+        // self: the my_was_online_local override wins
+        um.users.get_mut(&7).unwrap().was_online = now - 300;
+        assert_eq!(um.get_user_was_online_of(UserId::new(7), now), now - 300);
+        um.my_was_online_local = now - 30;
+        assert_eq!(um.get_user_was_online_of(UserId::new(7), now), now - 30);
+        um.my_was_online_local = 0;
+
+        // others: local_was_online overrides only when larger, positive and
+        // still in the future
+        um.on_get_user(
+            env,
+            telegram_api::User::user(telegram_user(8, "Other", USER_ACCESS_HASH_MASK | (1 << 1))),
+            "t",
+        );
+        um.take_updates();
+        um.users.get_mut(&8).unwrap().was_online = now - 300;
+        assert_eq!(um.get_user_was_online_of(UserId::new(8), now), now - 300);
+        um.users.get_mut(&8).unwrap().local_was_online = now - 100; // past: ignored
+        assert_eq!(um.get_user_was_online_of(UserId::new(8), now), now - 300);
+        um.users.get_mut(&8).unwrap().local_was_online = now + 60; // future: wins
+        assert_eq!(um.get_user_was_online_of(UserId::new(8), now), now + 60);
+        um.users.get_mut(&8).unwrap().was_online = now + 120; // remote online beats local
+        assert_eq!(um.get_user_was_online_of(UserId::new(8), now), now + 120);
+    }
+
+    #[test]
+    fn is_user_status_exact_rejects_bots_deleted_and_unset() {
+        let (mut temp, mut um) = test_env();
+        let env = &mut temp.env(false);
+        assert!(!um.is_user_status_exact_of(UserId::new(9))); // unknown
+
+        um.on_get_user(
+            env,
+            telegram_api::User::user(telegram_user(9, "Exact", USER_ACCESS_HASH_MASK | (1 << 1))),
+            "t",
+        );
+        um.take_updates();
+        assert!(!um.is_user_status_exact_of(UserId::new(9))); // was_online == 0
+        um.users.get_mut(&9).unwrap().was_online = env.unix_time() - 60;
+        assert!(um.is_user_status_exact_of(UserId::new(9)));
+
+        let mut bot = telegram_user(10, "Bot", USER_ACCESS_HASH_MASK | (1 << 1));
+        bot.bot = true;
+        um.on_get_user(env, telegram_api::User::user(bot), "t");
+        um.take_updates();
+        um.users.get_mut(&10).unwrap().was_online = env.unix_time() - 60;
+        assert!(!um.is_user_status_exact_of(UserId::new(10))); // bots never exact
+
+        um.users.get_mut(&9).unwrap().is_deleted = true;
+        assert!(!um.is_user_status_exact_of(UserId::new(9))); // deleted never exact
+    }
+
+    #[test]
+    fn my_online_status_pmc_keys_round_trip() {
+        let (mut temp, mut um) = test_env();
+        um.my_id = UserId::new(7);
+        let unix_time = {
+            let env = &mut temp.env(false);
+            let mut me = telegram_user(7, "Me", USER_ACCESS_HASH_MASK | (1 << 1));
+            me.self_ = true;
+            um.on_get_user(env, telegram_api::User::user(me), "t");
+            um.take_updates();
+            env.unix_time()
+        };
+
+        // the local offline clamps to the stored was_online and persists
+        let past = unix_time - 500;
+        um.users.get_mut(&7).unwrap().was_online = past;
+        um.set_my_online_status(&mut temp.env(false), false, false, true);
+        assert_eq!(um.my_was_online_local, past);
+        assert_eq!(
+            temp.global.binlog_pmc().get("my_was_online_local"),
+            past.to_string()
+        );
+
+        // the local online persists unix_time + 300
+        um.set_my_online_status(&mut temp.env(false), true, false, true);
+        assert_eq!(um.my_was_online_local, unix_time + 300);
+
+        // the remote path clears the local override and stores was_online
+        um.set_my_online_status(&mut temp.env(false), false, false, false);
+        assert_eq!(um.my_was_online_local, 0);
+        assert_eq!(um.users.get(&7).unwrap().was_online, unix_time - 1);
+        assert_eq!(
+            temp.global.binlog_pmc().get("my_was_online_local"),
+            (unix_time - 1).to_string()
+        );
+
+        // an updateUserStatus for self persists my_was_online_remote
+        let remote = unix_time - 500;
+        um.on_update_user_online(
+            &mut temp.env(false),
+            UserId::new(7),
+            telegram_api::UserStatus::userStatusOffline(telegram_api::userStatusOffline {
+                was_online: remote,
+            }),
+        );
+        assert_eq!(
+            temp.global.binlog_pmc().get("my_was_online_remote"),
+            remote.to_string()
+        );
+
+        // a fresh manager restores both keys from the same binlog pmc
+        let mut restored = UserManager::new();
+        restored.init_my_online_status(temp.global.binlog_pmc(), unix_time, false);
+        assert_eq!(restored.was_online_local, um.was_online_local);
+        assert_eq!(restored.was_online_remote, remote);
+
+        // a stored future local time is clamped back when we are offline
+        temp.global
+            .binlog_pmc()
+            .set("my_was_online_local", &(unix_time + 60).to_string());
+        let mut clamped = UserManager::new();
+        clamped.init_my_online_status(temp.global.binlog_pmc(), unix_time, false);
+        assert_eq!(clamped.was_online_local, unix_time - 1);
+        // ... and kept when the OnlineManager says we are online
+        let mut online = UserManager::new();
+        online.init_my_online_status(temp.global.binlog_pmc(), unix_time, true);
+        assert_eq!(online.was_online_local, unix_time + 60);
+    }
+
+    #[test]
     fn on_get_user_full_applies_the_supported_fields() {
         let (mut temp, mut um) = test_env();
         // the user must exist first (the C++ get_user_force)
@@ -5100,7 +5369,10 @@ mod tests {
         assert!(!u.is_support);
         assert!(!u.need_apply_min_photo);
         assert_eq!(u.paid_message_star_count, 0);
-        assert!(!u.can_read_all_group_messages, "non-bot bot props are reset");
+        assert!(
+            !u.can_read_all_group_messages,
+            "non-bot bot props are reset"
+        );
     }
 
     #[test]
@@ -5184,6 +5456,9 @@ mod tests {
             .position(|u| matches!(u, td_api::Update::updateUserStatus(s) if s.user_id == 5));
         assert!(update.is_some(), "updateUser must be sent");
         assert!(status.is_some(), "updateUserStatus must be sent");
-        assert!(update.unwrap() < status.unwrap(), "updateUser precedes updateUserStatus");
+        assert!(
+            update.unwrap() < status.unwrap(),
+            "updateUser precedes updateUserStatus"
+        );
     }
 }
