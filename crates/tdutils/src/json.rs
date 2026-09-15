@@ -771,6 +771,12 @@ impl<'a> JsonParser<'a> {
         self.pos >= self.data.len()
     }
 
+    /// `td::Parser::ptr()` as a byte offset into the input — lets callers
+    /// slice out the raw text a skip-based walk just consumed.
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
     /// `td::Parser::peek_char` — 0 at the end.
     pub fn peek_char(&self) -> u8 {
         self.data.get(self.pos).copied().unwrap_or(0)

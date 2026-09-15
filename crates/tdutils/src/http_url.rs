@@ -115,6 +115,20 @@ pub fn url_decode(from: &str, decode_plus_sign_as_space: bool) -> String {
     String::from_utf8(to).unwrap_or_default()
 }
 
+/// `url_encode` from `td/utils/misc.cpp`: ASCII alphanumerics and `-._~`
+/// pass through, everything else becomes `%XX` with upper-case hex digits.
+pub fn url_encode(data: &str) -> String {
+    let mut result = String::with_capacity(data.len() * 3);
+    for &c in data.as_bytes() {
+        if c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~') {
+            result.push(c as char);
+        } else {
+            result += &format!("%{c:02X}");
+        }
+    }
+    result
+}
+
 fn is_hex(b: u8) -> bool {
     hex_to_int(b).is_some()
 }

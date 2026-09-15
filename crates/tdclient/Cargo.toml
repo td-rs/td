@@ -6,10 +6,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64 = "0.22"
 libc = "0.2.189"
 serde = { version = "1", features = ["derive"] }
 tdactor = { path = "../tdactor" }
 tddb = { path = "../tddb" }
+tdnet = { path = "../tdnet" }
 tracing = "0.1"
 tdmtproto = { path = "../tdmtproto" }
 tdutils = { path = "../tdutils" }
@@ -19,3 +21,4 @@ tl-codegen = { path = "../tl-codegen" }
 
 [dev-dependencies]
 serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt"] }

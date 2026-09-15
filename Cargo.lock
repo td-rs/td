@@ -1782,14 +1782,17 @@ dependencies = [
 name = "tdclient"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "libc",
  "serde",
  "serde_json",
  "tdactor",
  "tddb",
  "tdmtproto",
+ "tdnet",
  "tdutils",
  "tl-codegen",
+ "tokio",
  "tracing",
 ]
 
