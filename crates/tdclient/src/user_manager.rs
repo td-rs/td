@@ -22,6 +22,15 @@
 //!   in: unsaved users log to the binlog (`HandlerType::Users`), the
 //!   sqlite save retires the event, and reopen replays it; the C++'s
 //!   async-save window collapses onto the synchronous "common" kv write;
+//! - the secret-chat storage half (`SecretChatLogEvent` +
+//!   `on_binlog_secret_chat_event`, `HandlerType::SecretChatInfos`, the
+//!   `sc<id>` "common"-kv rows, the `on_update_secret_chat` intake, the
+//!   `update_secret_chat` diff machine, the `secret_chats_with_user`
+//!   index and the read getters) is in with the same synchronous-collapse
+//!   divergence; `create_new_secret_chat` (cpp:9845) stays unported — it
+//!   funnels through `SecretChatsManager` (Wave 3) and
+//!   `DialogManager::force_create_dialog` — and the `HandlerType::
+//!   SecretChats` (= 1) events route to that manager, not here;
 //! - cross-manager notifications (MessagesManager dialog title/photo
 //!   updates, StoryManager, ReactionManager, ContactsManager hints,
 //!   OnlineManager, ConfigManager) are documented no-ops in
@@ -498,6 +507,25 @@ fn parse_user_log_event(input: &[u8], ctx: &TimeCtx) -> Result<(UserId, User), &
     let user = User::parse_impl(&mut parser, ctx)?;
     parser.fetch_end()?;
     Ok((user_id, user))
+}
+
+/// `UserManager::SecretChatLogEvent` (UserManager.cpp:2692-2714), store
+/// side: the log-event version prefix, then the secret chat id, then the
+/// `SecretChat` store.
+fn store_secret_chat_log_event(out: &mut Vec<u8>, secret_chat_id: SecretChatId, c: &SecretChat) {
+    store_parse::store_log_event_version(out);
+    store_parse::store_i32(out, secret_chat_id.get());
+    c.store(out);
+}
+
+/// `UserManager::SecretChatLogEvent`, parse side (`log_event_parse` over
+/// the binlog event data / the `sc<id>` database value).
+fn parse_secret_chat_log_event(input: &[u8]) -> Result<(SecretChatId, SecretChat), &'static str> {
+    let mut parser = Parser::new_log_event(input)?;
+    let secret_chat_id = SecretChatId::new(parser.i32_()?);
+    let secret_chat = SecretChat::parse_impl(&mut parser)?;
+    parser.fetch_end()?;
+    Ok((secret_chat_id, secret_chat))
 }
 
 /// The `store_time` clock bundle (LogEventHelper.h:32-56): the writer
@@ -1384,6 +1412,7 @@ pub struct SecretChat {
 
     pub is_saved: bool,
     pub is_being_saved: bool,
+    pub log_event_id: u64,
 }
 
 impl Default for SecretChat {
@@ -1405,6 +1434,7 @@ impl Default for SecretChat {
             need_save_to_database: true,
             is_saved: false,
             is_being_saved: false,
+            log_event_id: 0,
         }
     }
 }
@@ -1442,8 +1472,16 @@ impl SecretChat {
 
     /// `log_event_parse(SecretChat)` (UserManager.cpp:2638-2666).
     pub fn parse_value(input: &[u8]) -> Result<SecretChat, &'static str> {
-        use store_parse::version;
         let mut parser = Parser::new_log_event(input)?;
+        let result = Self::parse_impl(&mut parser)?;
+        parser.fetch_end()?;
+        Ok(result)
+    }
+
+    /// The parser-position form `SecretChatLogEvent::parse` reaches
+    /// through (the id is parsed around it).
+    fn parse_impl(parser: &mut Parser) -> Result<SecretChat, &'static str> {
+        use store_parse::version;
         let [is_outbound, has_layer, has_initial_folder_id] = parser.parse_flags()?;
         let mut result = SecretChat::new();
         result.is_outbound = is_outbound;
@@ -1471,7 +1509,6 @@ impl SecretChat {
         if has_initial_folder_id {
             result.initial_folder_id = parser.i32_()?;
         }
-        parser.fetch_end()?;
         Ok(result)
     }
 }
@@ -1552,6 +1589,9 @@ pub struct UserManager {
     unknown_users: BTreeSet<i64>,
     unknown_secret_chats: BTreeSet<i32>,
     loaded_from_database_users: BTreeSet<i64>,
+    loaded_from_database_secret_chats: BTreeSet<i32>,
+    /// `secret_chats_with_user_` — per user, the secret chats with them.
+    secret_chats_with_user: BTreeMap<i64, Vec<i32>>,
 
     resolved_phone_numbers: BTreeMap<String, UserId>,
     restricted_user_ids: BTreeSet<i64>,
@@ -1901,6 +1941,505 @@ impl UserManager {
         u.log_event_id = event.id;
 
         self.update_user(env, user_id, true, false);
+    }
+
+    /// `UserManager::on_binlog_secret_chat_event` (UserManager.cpp:3490-3518):
+    /// the crash-window replay — restore the secret chat from its binlog
+    /// mirror and keep the event id so the save rewrites (not duplicates)
+    /// it.
+    pub fn on_binlog_secret_chat_event(
+        &mut self,
+        env: &mut UserEnv,
+        event: &tddb::binlog::event::BinlogEvent,
+    ) {
+        let binlog = env.global.td_db().binlog();
+        if !env.global.use_chat_info_database() {
+            binlog.erase(event.id);
+            return;
+        }
+
+        let parsed = parse_secret_chat_log_event(event.get_data());
+        let (secret_chat_id, secret_chat) = match parsed {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                tdutils::log_error!("Failed to load a secret chat from binlog: {error}");
+                binlog.erase(event.id);
+                return;
+            }
+        };
+        if self.have_secret_chat(secret_chat_id) || !secret_chat_id.is_valid() {
+            tdutils::log_error!("Skip adding already added {secret_chat_id:?}");
+            binlog.erase(event.id);
+            return;
+        }
+
+        let c = self.add_secret_chat(secret_chat_id);
+        *c = secret_chat;
+        let c = self.secret_chats.get_mut(&secret_chat_id.get()).unwrap();
+        c.log_event_id = event.id;
+
+        self.update_secret_chat(env, secret_chat_id, true, false);
+    }
+
+    // The secret-chat storage half (cpp:9609-9871 + the diff machine
+    // cpp:10084-10126 + the read getters cpp:5785-5838).
+
+    /// `UserManager::have_secret_chat` (UserManager.cpp:9609-9611).
+    pub fn have_secret_chat(&self, secret_chat_id: SecretChatId) -> bool {
+        self.secret_chats.contains_key(&secret_chat_id.get())
+    }
+
+    /// `UserManager::get_secret_chat` (UserManager.cpp:9613-9619).
+    pub fn get_secret_chat(&self, secret_chat_id: SecretChatId) -> Option<&SecretChat> {
+        self.secret_chats.get(&secret_chat_id.get())
+    }
+
+    /// `UserManager::add_secret_chat` (UserManager.cpp:9621-9628).
+    fn add_secret_chat(&mut self, secret_chat_id: SecretChatId) -> &mut SecretChat {
+        assert!(secret_chat_id.is_valid());
+        self.secret_chats.entry(secret_chat_id.get()).or_default()
+    }
+
+    /// `UserManager::have_secret_chat_force` (UserManager.cpp:9630-9632).
+    pub fn have_secret_chat_force(
+        &mut self,
+        env: &mut UserEnv,
+        secret_chat_id: SecretChatId,
+        source: &str,
+    ) -> bool {
+        self.get_secret_chat_force(env, secret_chat_id, source)
+    }
+
+    /// `UserManager::get_secret_chat_force` (UserManager.cpp:9634-9657) —
+    /// the cache hit also force-loads the chat's user; the miss falls
+    /// through the synchronous database load. Returns whether the secret
+    /// chat is now in the cache.
+    pub fn get_secret_chat_force(
+        &mut self,
+        env: &mut UserEnv,
+        secret_chat_id: SecretChatId,
+        source: &str,
+    ) -> bool {
+        if !secret_chat_id.is_valid() {
+            return false;
+        }
+        if let Some(c) = self.secret_chats.get(&secret_chat_id.get()) {
+            let user_id = c.user_id;
+            if !self.get_user_force(env, user_id, source) {
+                tdutils::log_error!("Can't find {user_id:?} from {secret_chat_id:?} from {source}");
+            }
+            return true;
+        }
+        if !env.global.use_chat_info_database() {
+            return false;
+        }
+        if self
+            .loaded_from_database_secret_chats
+            .contains(&secret_chat_id.get())
+        {
+            return false;
+        }
+
+        tdutils::log_info!("Trying to load {secret_chat_id:?} from database from {source}");
+        self.load_secret_chat_from_database(env, secret_chat_id, true);
+        self.secret_chats.contains_key(&secret_chat_id.get())
+    }
+
+    /// `UserManager::get_secret_chat_database_key` (UserManager.cpp:9701-9703).
+    fn get_secret_chat_database_key(secret_chat_id: SecretChatId) -> Vec<u8> {
+        format!("sc{}", secret_chat_id.get()).into_bytes()
+    }
+
+    /// `UserManager::save_secret_chat` (UserManager.cpp:9680-9699): while
+    /// the secret chat is unsaved, mirror it into the binlog
+    /// (`binlog_add` the first time, `binlog_rewrite` after) with the
+    /// SecretChatInfos handler type, then push the row into the "common"
+    /// kv.
+    fn save_secret_chat(
+        &mut self,
+        env: &mut UserEnv,
+        secret_chat_id: SecretChatId,
+        from_binlog: bool,
+    ) {
+        if !env.global.use_chat_info_database() {
+            return;
+        }
+        let need_save = match self.secret_chats.get(&secret_chat_id.get()) {
+            Some(c) => !c.is_saved,
+            None => return,
+        };
+        if need_save {
+            if !from_binlog {
+                let data = {
+                    let c = self.secret_chats.get(&secret_chat_id.get()).unwrap();
+                    let mut data = Vec::new();
+                    store_secret_chat_log_event(&mut data, secret_chat_id, c);
+                    data
+                };
+                let binlog = env.global.td_db().binlog();
+                let new_id = if self.secret_chats[&secret_chat_id.get()].log_event_id == 0 {
+                    binlog.add(tddb::td_db::LOG_EVENT_HANDLER_TYPE_SECRET_CHAT_INFOS, &data)
+                } else {
+                    binlog.rewrite(
+                        self.secret_chats[&secret_chat_id.get()].log_event_id,
+                        tddb::td_db::LOG_EVENT_HANDLER_TYPE_SECRET_CHAT_INFOS,
+                        &data,
+                    )
+                };
+                self.secret_chats
+                    .get_mut(&secret_chat_id.get())
+                    .unwrap()
+                    .log_event_id = new_id;
+            }
+
+            self.save_secret_chat_to_database(env, secret_chat_id);
+        }
+    }
+
+    /// `UserManager::save_secret_chat_to_database` + `_impl` +
+    /// `on_save_secret_chat_to_database` (UserManager.cpp:9709-9763)
+    /// collapsed onto the synchronous kv — the same divergence as
+    /// `save_user_to_database`: the C++ guards order against the async pmc
+    /// and cannot interleave here, and the write is infallible, so the
+    /// failure branch (`is_saved = false` + re-save) is unreachable.
+    fn save_secret_chat_to_database(&mut self, env: &mut UserEnv, secret_chat_id: SecretChatId) {
+        let value = {
+            let Some(c) = self.secret_chats.get_mut(&secret_chat_id.get()) else {
+                return;
+            };
+            if c.is_being_saved {
+                return;
+            }
+            c.is_being_saved = true;
+            c.is_saved = true;
+            let mut value = Vec::new();
+            c.store_value(&mut value);
+            value
+        };
+        env.global
+            .td_db()
+            .common_kv()
+            .set(&Self::get_secret_chat_database_key(secret_chat_id), &value);
+        let c = self.secret_chats.get_mut(&secret_chat_id.get()).unwrap();
+        c.is_being_saved = false;
+        // `on_save_secret_chat_to_database`: the row is durable, retire the
+        // binlog mirror.
+        if c.log_event_id != 0 {
+            let log_event_id = c.log_event_id;
+            env.global.td_db().binlog().erase(log_event_id);
+            c.log_event_id = 0;
+        }
+    }
+
+    /// `UserManager::load_secret_chat_from_database` + `_impl` +
+    /// `on_load_secret_chat_from_database` (UserManager.cpp:9766-9843)
+    /// collapsed onto the synchronous kv (the per-id promise queue exists
+    /// only to batch the async completions). A loaded-but-empty row means
+    /// the secret chat is simply absent; a raced in-memory secret chat
+    /// keeps the newer memory state, or retires the mirror when equal.
+    fn load_secret_chat_from_database(
+        &mut self,
+        env: &mut UserEnv,
+        secret_chat_id: SecretChatId,
+        force: bool,
+    ) {
+        if env.global.close_flag() && !force {
+            return;
+        }
+        if !self
+            .loaded_from_database_secret_chats
+            .insert(secret_chat_id.get())
+        {
+            return;
+        }
+        let value = env
+            .global
+            .td_db()
+            .common_kv()
+            .get(&Self::get_secret_chat_database_key(secret_chat_id));
+
+        // The chat that reaches the final user check (the C++ runs it for
+        // every branch where `c != nullptr` after the load, cpp:9838).
+        let mut loaded_user_id = None;
+        if let Some(c) = self.secret_chats.get_mut(&secret_chat_id.get()) {
+            // The C++ races an in-memory secret chat against the async
+            // load; here the only entry is a binlog-replayed secret chat:
+            // keep the newer memory state if it differs from the row, else
+            // retire the mirror.
+            let user_id = c.user_id;
+            let mut new_value = Vec::new();
+            c.store_value(&mut new_value);
+            if value == new_value {
+                if c.log_event_id != 0 {
+                    let log_event_id = c.log_event_id;
+                    env.global.td_db().binlog().erase(log_event_id);
+                    c.log_event_id = 0;
+                }
+            } else {
+                self.save_secret_chat_to_database(env, secret_chat_id);
+            }
+            loaded_user_id = Some(user_id);
+        } else if value.is_empty() {
+            return;
+        } else {
+            match SecretChat::parse_value(&value) {
+                Ok(secret_chat) => {
+                    let user_id = secret_chat.user_id;
+                    let c = self.add_secret_chat(secret_chat_id);
+                    *c = secret_chat;
+                    let c = self.secret_chats.get_mut(&secret_chat_id.get()).unwrap();
+                    c.is_saved = true;
+                    self.update_secret_chat(env, secret_chat_id, true, true);
+                    loaded_user_id = Some(user_id);
+                }
+                Err(error) => {
+                    tdutils::log_error!("Failed to load {secret_chat_id:?} from database: {error}");
+                    self.secret_chats.remove(&secret_chat_id.get());
+                }
+            }
+        }
+        // The C++'s `have_user_force` check — it force-loads the owner
+        // (database rows / special-user synthesis) exactly like this.
+        if let Some(user_id) = loaded_user_id
+            && !self.get_user_force(env, user_id, "on_load_secret_chat_from_database")
+        {
+            tdutils::log_error!("Can't find {user_id:?} from {secret_chat_id:?}");
+        }
+    }
+
+    /// `UserManager::on_update_secret_chat` (UserManager.cpp:4714-4766) —
+    /// the intake: applies the delta against the cached record with the
+    /// C++'s change-flag bookkeeping (`access_hash`/`ttl`/`date` dirty the
+    /// database value, the rest only the update), maintains the
+    /// `secret_chats_with_user` index, then runs the diff machine.
+    #[allow(clippy::too_many_arguments)] // the C++ intake has the same shape
+    pub fn on_update_secret_chat(
+        &mut self,
+        env: &mut UserEnv,
+        secret_chat_id: SecretChatId,
+        access_hash: i64,
+        user_id: UserId,
+        state: SecretChatState,
+        is_outbound: bool,
+        ttl: i32,
+        date: i32,
+        mut key_hash: String,
+        layer: i32,
+        initial_folder_id: i32,
+    ) {
+        tdutils::log_info!(
+            "Update {secret_chat_id:?} with {user_id:?} and access_hash {access_hash}"
+        );
+        // The access-hash delta needs no cross-field access; the user-id
+        // branch does (the `secret_chats_with_user` index), so it runs
+        // between the two field passes.
+        let old_user_id = {
+            let secret_chat = self.add_secret_chat(secret_chat_id);
+            if access_hash != secret_chat.access_hash {
+                secret_chat.access_hash = access_hash;
+                secret_chat.need_save_to_database = true;
+            }
+            let old_user_id = secret_chat.user_id;
+            if user_id.is_valid() && user_id != old_user_id {
+                secret_chat.user_id = user_id;
+                secret_chat.is_changed = true;
+                Some(old_user_id)
+            } else {
+                None
+            }
+        };
+        if let Some(old_user_id) = old_user_id {
+            if old_user_id.is_valid() {
+                tdutils::log_error!(
+                    "Secret chat user has changed from {old_user_id:?} to {user_id:?}"
+                );
+            }
+            // The C++ indexes through `operator[]` (creating empty lists);
+            // an absent list and an empty list are indistinguishable here.
+            self.secret_chats_with_user
+                .entry(old_user_id.get())
+                .or_default()
+                .retain(|&id| id != secret_chat_id.get());
+            self.secret_chats_with_user
+                .entry(user_id.get())
+                .or_default()
+                .push(secret_chat_id.get());
+        }
+        {
+            let secret_chat = self.add_secret_chat(secret_chat_id);
+            if state != SecretChatState::Unknown && state != secret_chat.state {
+                secret_chat.state = state;
+                secret_chat.is_changed = true;
+                secret_chat.is_state_changed = true;
+            }
+            if is_outbound != secret_chat.is_outbound {
+                secret_chat.is_outbound = is_outbound;
+                secret_chat.is_changed = true;
+            }
+
+            if ttl != -1 && ttl != secret_chat.ttl {
+                secret_chat.ttl = ttl;
+                secret_chat.need_save_to_database = true;
+                secret_chat.is_ttl_changed = true;
+            }
+            if date != 0 && date != secret_chat.date {
+                secret_chat.date = date;
+                secret_chat.need_save_to_database = true;
+            }
+            if !key_hash.is_empty() && key_hash != secret_chat.key_hash {
+                secret_chat.key_hash = std::mem::take(&mut key_hash);
+                secret_chat.is_changed = true;
+            }
+            if layer != 0 && layer != secret_chat.layer {
+                secret_chat.layer = layer;
+                secret_chat.is_changed = true;
+            }
+            if initial_folder_id != 0 && initial_folder_id != secret_chat.initial_folder_id {
+                secret_chat.initial_folder_id = initial_folder_id;
+                secret_chat.is_changed = true;
+            }
+        }
+
+        self.update_secret_chat(env, secret_chat_id, false, false);
+    }
+
+    /// `UserManager::update_secret_chat` (UserManager.cpp:10084-10126) —
+    /// the diff machine: fold `is_changed` into the save, notify the
+    /// MessagesManager/DialogManager consumers (documented no-ops until
+    /// those managers land), emit `updateSecretChat`, then save.
+    fn update_secret_chat(
+        &mut self,
+        env: &mut UserEnv,
+        secret_chat_id: SecretChatId,
+        from_binlog: bool,
+        from_database: bool,
+    ) {
+        if self
+            .secret_chats
+            .get(&secret_chat_id.get())
+            .unwrap()
+            .is_being_updated
+        {
+            tdutils::log_error!("Detected recursive update of {secret_chat_id:?}");
+        }
+        self.secret_chats
+            .get_mut(&secret_chat_id.get())
+            .unwrap()
+            .is_being_updated = true;
+        self.update_secret_chat_impl(env, secret_chat_id, from_binlog, from_database);
+        if let Some(c) = self.secret_chats.get_mut(&secret_chat_id.get()) {
+            c.is_being_updated = false;
+        }
+    }
+
+    fn update_secret_chat_impl(
+        &mut self,
+        env: &mut UserEnv,
+        secret_chat_id: SecretChatId,
+        from_binlog: bool,
+        from_database: bool,
+    ) {
+        {
+            let c = self.secret_chats.get_mut(&secret_chat_id.get()).unwrap();
+            c.need_save_to_database |= c.is_changed;
+            if c.need_save_to_database {
+                if !from_database {
+                    c.is_saved = false;
+                }
+                c.need_save_to_database = false;
+
+                // MessagesManager::force_create_dialog(DialogId(secret_chat_id))
+                // — with the MessagesManager step ("update secret chat").
+                if c.is_state_changed {
+                    // MessagesManager::on_update_secret_chat_state — with
+                    // its step.
+                    c.is_state_changed = false;
+                }
+                if c.is_ttl_changed {
+                    // MessagesManager::on_update_dialog_message_ttl — with
+                    // its step.
+                    c.is_ttl_changed = false;
+                }
+            }
+        }
+        let is_changed = self
+            .secret_chats
+            .get(&secret_chat_id.get())
+            .unwrap()
+            .is_changed;
+        if is_changed {
+            let secret_chat_object =
+                make_secret_chat_object(secret_chat_id, &self.secret_chats[&secret_chat_id.get()]);
+            self.send_update(td_api::Update::updateSecretChat(td_api::updateSecretChat {
+                secret_chat: secret_chat_object,
+            }));
+            let c = self.secret_chats.get_mut(&secret_chat_id.get()).unwrap();
+            c.is_changed = false;
+        }
+
+        if !from_database {
+            self.save_secret_chat(env, secret_chat_id, from_binlog);
+        }
+    }
+
+    /// `UserManager::for_each_secret_chat_with_user`
+    /// (UserManager.cpp:5764-5771).
+    pub fn for_each_secret_chat_with_user(&self, user_id: UserId) -> Vec<SecretChatId> {
+        self.secret_chats_with_user
+            .get(&user_id.get())
+            .map(|ids| ids.iter().map(|&id| SecretChatId::new(id)).collect())
+            .unwrap_or_default()
+    }
+
+    /// `UserManager::get_secret_chat_date` (UserManager.cpp:5785-5791).
+    pub fn get_secret_chat_date(&self, secret_chat_id: SecretChatId) -> i32 {
+        self.get_secret_chat(secret_chat_id)
+            .map(|c| c.date)
+            .unwrap_or(0)
+    }
+
+    /// `UserManager::get_secret_chat_ttl` (UserManager.cpp:5793-5799).
+    pub fn get_secret_chat_ttl(&self, secret_chat_id: SecretChatId) -> i32 {
+        self.get_secret_chat(secret_chat_id)
+            .map(|c| c.ttl)
+            .unwrap_or(0)
+    }
+
+    /// `UserManager::get_secret_chat_user_id` (UserManager.cpp:5801-5807).
+    pub fn get_secret_chat_user_id(&self, secret_chat_id: SecretChatId) -> UserId {
+        self.get_secret_chat(secret_chat_id)
+            .map(|c| c.user_id)
+            .unwrap_or_default()
+    }
+
+    /// `UserManager::get_secret_chat_is_outbound`
+    /// (UserManager.cpp:5809-5815).
+    pub fn get_secret_chat_is_outbound(&self, secret_chat_id: SecretChatId) -> bool {
+        self.get_secret_chat(secret_chat_id)
+            .map(|c| c.is_outbound)
+            .unwrap_or(false)
+    }
+
+    /// `UserManager::get_secret_chat_state` (UserManager.cpp:5817-5823).
+    pub fn get_secret_chat_state(&self, secret_chat_id: SecretChatId) -> SecretChatState {
+        self.get_secret_chat(secret_chat_id)
+            .map(|c| c.state)
+            .unwrap_or(SecretChatState::Unknown)
+    }
+
+    /// `UserManager::get_secret_chat_layer` (UserManager.cpp:5825-5831).
+    pub fn get_secret_chat_layer(&self, secret_chat_id: SecretChatId) -> i32 {
+        self.get_secret_chat(secret_chat_id)
+            .map(|c| c.layer)
+            .unwrap_or(0)
+    }
+
+    /// `UserManager::get_secret_chat_initial_folder_id`
+    /// (UserManager.cpp:5833-5839); `FolderId::main()` is `FolderId()`.
+    pub fn get_secret_chat_initial_folder_id(&self, secret_chat_id: SecretChatId) -> i32 {
+        self.get_secret_chat(secret_chat_id)
+            .map(|c| c.initial_folder_id)
+            .unwrap_or(0)
     }
 
     /// `UserManager::get_user_force_impl` (UserManager.cpp:5120-5139).
@@ -4719,6 +5258,410 @@ mod tests {
         assert_eq!(parsed.key_hash, "hash");
         assert_eq!(parsed.layer, 101);
         assert!(parsed.is_outbound);
+    }
+
+    #[test]
+    fn secret_chat_log_event_round_trips() {
+        // `SecretChatLogEvent` framing: version prefix, the int32 secret
+        // chat id (SecretChatId stores as `store_int`), then the record.
+        let mut secret_chat = SecretChat::new();
+        secret_chat.access_hash = -4242;
+        secret_chat.user_id = UserId::new(42);
+        secret_chat.state = SecretChatState::Closed;
+        secret_chat.ttl = 17;
+        secret_chat.date = 1700000001;
+        secret_chat.key_hash = String::new();
+        secret_chat.layer = SECRET_CHAT_DEFAULT_LAYER;
+        secret_chat.initial_folder_id = 1; // FolderId::archive()
+
+        let mut bytes = Vec::new();
+        store_secret_chat_log_event(&mut bytes, SecretChatId::new(7), &secret_chat);
+        let (secret_chat_id, parsed) = parse_secret_chat_log_event(&bytes).unwrap();
+        assert_eq!(secret_chat_id.get(), 7);
+        assert_eq!(parsed.access_hash, -4242);
+        assert_eq!(parsed.user_id.get(), 42);
+        assert_eq!(parsed.state, SecretChatState::Closed);
+        assert_eq!(parsed.ttl, 17);
+        assert_eq!(parsed.date, 1700000001);
+        assert_eq!(parsed.initial_folder_id, 1, "FolderId::archive");
+        // the default-layer chat omits the field and restores it
+        secret_chat.layer = 0;
+        secret_chat.initial_folder_id = 0;
+        let mut bytes = Vec::new();
+        store_secret_chat_log_event(&mut bytes, SecretChatId::new(7), &secret_chat);
+        let parsed = parse_secret_chat_log_event(&bytes).unwrap().1;
+        assert_eq!(parsed.layer, SECRET_CHAT_DEFAULT_LAYER);
+        assert_eq!(parsed.initial_folder_id, 0);
+    }
+
+    /// The M.4.10 intake: field deltas with the C++ change-flag matrix,
+    /// the `updateSecretChat` emission, the `secret_chats_with_user` index
+    /// maintenance and the read getters.
+    #[test]
+    fn on_update_secret_chat_intake_runs_the_diff_machine() {
+        let (mut temp, mut um) = test_env();
+        let secret_chat_id = SecretChatId::new(1);
+
+        // First delivery: everything is new (`is_changed` starts true on a
+        // fresh record), the diff machine emits and saves.
+        um.on_update_secret_chat(
+            &mut temp.env(false),
+            secret_chat_id,
+            777,
+            UserId::new(42),
+            SecretChatState::Waiting,
+            true,
+            60,
+            1700000000,
+            "khash".to_owned(),
+            101,
+            1,
+        );
+        let updates = um.take_updates();
+        assert_eq!(updates.len(), 1, "updateSecretChat on the first intake");
+        match &updates[0] {
+            td_api::Update::updateSecretChat(update) => {
+                assert_eq!(update.secret_chat.id, 1);
+                assert_eq!(update.secret_chat.user_id, 42);
+                assert!(
+                    matches!(
+                        update.secret_chat.state,
+                        td_api::SecretChatState::secretChatStatePending(_)
+                    ),
+                    "Waiting converts to secretChatStatePending"
+                );
+                assert!(update.secret_chat.is_outbound);
+                assert_eq!(update.secret_chat.layer, 101);
+            }
+            other => panic!("unexpected update {other:?}"),
+        }
+        let c = um.get_secret_chat(secret_chat_id).unwrap();
+        assert_eq!(c.access_hash, 777);
+        assert_eq!(c.ttl, 60);
+        assert_eq!(c.date, 1700000000);
+        assert_eq!(c.key_hash, "khash");
+        assert!(c.is_saved, "the synchronous save completed");
+        // the read getters
+        assert_eq!(um.get_secret_chat_date(secret_chat_id), 1700000000);
+        assert_eq!(um.get_secret_chat_ttl(secret_chat_id), 60);
+        assert_eq!(um.get_secret_chat_user_id(secret_chat_id).get(), 42);
+        assert!(um.get_secret_chat_is_outbound(secret_chat_id));
+        assert_eq!(
+            um.get_secret_chat_state(secret_chat_id),
+            SecretChatState::Waiting
+        );
+        assert_eq!(um.get_secret_chat_layer(secret_chat_id), 101);
+        assert_eq!(um.get_secret_chat_initial_folder_id(secret_chat_id), 1);
+        assert_eq!(
+            um.for_each_secret_chat_with_user(UserId::new(42)),
+            vec![secret_chat_id]
+        );
+
+        // Second delivery: state advances (Unknown sentinels are skipped —
+        // ttl -1, date 0, empty key_hash, layer 0, folder 0 keep theirs).
+        um.on_update_secret_chat(
+            &mut temp.env(false),
+            secret_chat_id,
+            777,
+            UserId::new(42),
+            SecretChatState::Active,
+            true,
+            -1,
+            0,
+            String::new(),
+            0,
+            0,
+        );
+        let updates = um.take_updates();
+        assert_eq!(updates.len(), 1, "the state change emits again");
+        let c = um.get_secret_chat(secret_chat_id).unwrap();
+        assert_eq!(c.state, SecretChatState::Active);
+        assert_eq!(c.ttl, 60, "ttl -1 is the keep-sentinel");
+        assert_eq!(c.date, 1700000000);
+        assert_eq!(c.layer, 101, "layer 0 is the keep-sentinel");
+        assert!(!c.is_state_changed, "consumed by the diff machine");
+        assert!(!c.is_changed);
+
+        // The user changed: the index moves the chat, the error path logs.
+        um.on_update_secret_chat(
+            &mut temp.env(false),
+            secret_chat_id,
+            777,
+            UserId::new(43),
+            SecretChatState::Active,
+            true,
+            -1,
+            0,
+            String::new(),
+            0,
+            0,
+        );
+        assert_eq!(um.take_updates().len(), 1);
+        assert!(
+            um.for_each_secret_chat_with_user(UserId::new(42))
+                .is_empty()
+        );
+        assert_eq!(
+            um.for_each_secret_chat_with_user(UserId::new(43)),
+            vec![secret_chat_id]
+        );
+
+        // A no-op delivery emits nothing.
+        um.on_update_secret_chat(
+            &mut temp.env(false),
+            secret_chat_id,
+            777,
+            UserId::new(43),
+            SecretChatState::Active,
+            true,
+            -1,
+            0,
+            String::new(),
+            0,
+            0,
+        );
+        assert!(um.take_updates().is_empty());
+
+        // The unknown-id getters fall back to the C++ defaults.
+        let missing = SecretChatId::new(99);
+        assert_eq!(um.get_secret_chat_date(missing), 0);
+        assert_eq!(um.get_secret_chat_ttl(missing), 0);
+        assert!(!um.get_secret_chat_user_id(missing).is_valid());
+        assert!(!um.get_secret_chat_is_outbound(missing));
+        assert_eq!(um.get_secret_chat_state(missing), SecretChatState::Unknown);
+        assert_eq!(um.get_secret_chat_layer(missing), 0);
+        assert_eq!(um.get_secret_chat_initial_folder_id(missing), 0);
+    }
+
+    /// The `sc<id>` row survives reopen and loads through
+    /// `get_secret_chat_force` — which also force-loads the chat's user.
+    #[test]
+    fn secret_chat_database_value_round_trips_across_reopen() {
+        let dir = std::env::temp_dir()
+            .join(format!(
+                "td-rs-m410-scrow-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let user_id = UserId::new(42);
+        let secret_chat_id = SecretChatId::new(1);
+
+        // Phase 1: the user and the secret chat save through the normal
+        // intake path (the binlog mirror retires once the row is durable).
+        {
+            let opened = tddb::td_db::TdDb::open(tddb::td_db::Parameters {
+                database_directory: dir.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+            let mut global = Global::new();
+            global.init(opened.database);
+            global.binlog_pmc().set("auth", "ok");
+            let mut options = OptionManager::new(global.is_test_dc());
+            let mut um = UserManager::new();
+            {
+                let mut env = UserEnv {
+                    global: &mut global,
+                    options: &mut options,
+                    auth_is_bot: false,
+                };
+                let mut user = telegram_user(42, "Owner", USER_ACCESS_HASH_MASK | (1 << 1));
+                user.access_hash = 4242;
+                um.on_get_user(&mut env, telegram_api::User::user(user), "test");
+                um.on_update_secret_chat(
+                    &mut env,
+                    secret_chat_id,
+                    777,
+                    user_id,
+                    SecretChatState::Active,
+                    false,
+                    60,
+                    1700000000,
+                    "khash".to_owned(),
+                    101,
+                    0,
+                );
+            }
+            assert!(!global.td_db().common_kv().get(b"sc1").is_empty());
+            let _ = um.take_updates(); // drain the updateUser/updateSecretChat pair
+            global.close_all(false);
+        }
+
+        // Phase 2: no binlog mirror at rest; the row loads through the
+        // force path and pulls the user row in with it. A second, unknown
+        // secret chat stays absent after its (empty) load.
+        {
+            let opened = tddb::td_db::TdDb::open(tddb::td_db::Parameters {
+                database_directory: dir.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(opened.secret_chat_events.is_empty(), "the mirror retired");
+            let mut global = Global::new();
+            global.init(opened.database);
+            let mut options = OptionManager::new(global.is_test_dc());
+            let mut um = UserManager::new();
+            {
+                let mut env = UserEnv {
+                    global: &mut global,
+                    options: &mut options,
+                    auth_is_bot: false,
+                };
+                assert!(um.get_secret_chat_force(&mut env, secret_chat_id, "test"));
+                let c = um.get_secret_chat(secret_chat_id).unwrap();
+                assert_eq!(c.user_id, user_id);
+                assert_eq!(c.access_hash, 777);
+                assert_eq!(c.state, SecretChatState::Active);
+                assert_eq!(c.ttl, 60);
+                assert_eq!(c.layer, 101);
+                assert_eq!(c.key_hash, "khash");
+                assert!(c.is_saved);
+                assert!(um.have_secret_chat_force(&mut env, secret_chat_id, "test"));
+                assert_eq!(um.get_user(user_id).unwrap().first_name, "Owner");
+                assert!(!um.get_secret_chat_force(&mut env, SecretChatId::new(2), "test"));
+                assert!(!um.have_secret_chat(SecretChatId::new(2)));
+            }
+            global.close_all(false);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The M.4.10 crash-window arc: a `SecretChatLogEvent` left in the
+    /// binlog (the C++ state between `binlog_add` and the async sqlite
+    /// flush) replays on reopen, re-saves to the "common" kv, and retires
+    /// its binlog mirror.
+    #[test]
+    fn secret_chat_log_event_replays_across_reopen() {
+        let dir = std::env::temp_dir()
+            .join(format!(
+                "td-rs-m410-sclog-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret_chat_id = SecretChatId::new(9);
+
+        // Phase 1: the binlog mirror was written, the sqlite row never
+        // landed.
+        {
+            let opened = tddb::td_db::TdDb::open(tddb::td_db::Parameters {
+                database_directory: dir.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+            let mut global = Global::new();
+            global.init(opened.database);
+            global.binlog_pmc().set("auth", "ok");
+            let mut secret_chat = SecretChat::new();
+            secret_chat.access_hash = 11;
+            secret_chat.user_id = UserId::new(42);
+            secret_chat.state = SecretChatState::Waiting;
+            secret_chat.ttl = 33;
+            secret_chat.date = 1700000002;
+            secret_chat.key_hash = "crash".to_owned();
+            secret_chat.is_outbound = true;
+            let mut data = Vec::new();
+            store_secret_chat_log_event(&mut data, secret_chat_id, &secret_chat);
+            global
+                .td_db()
+                .binlog()
+                .add(tddb::td_db::LOG_EVENT_HANDLER_TYPE_SECRET_CHAT_INFOS, &data);
+            // no sqlite write, straight to close — the crash
+            global.close_all(false);
+        }
+
+        // Phase 2: reopen — TdDb collected the SecretChatInfos event;
+        // replay restores the secret chat, emits updateSecretChat, saves
+        // the sqlite row and erases the mirror.
+        {
+            let opened = tddb::td_db::TdDb::open(tddb::td_db::Parameters {
+                database_directory: dir.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(
+                opened.secret_chat_events.len(),
+                1,
+                "the SecretChatInfos event replays"
+            );
+            let event = opened.secret_chat_events[0].clone();
+
+            let mut global = Global::new();
+            global.init(opened.database);
+            let mut options = OptionManager::new(global.is_test_dc());
+            let mut um = UserManager::new();
+            {
+                let mut env = UserEnv {
+                    global: &mut global,
+                    options: &mut options,
+                    auth_is_bot: false,
+                };
+                um.on_binlog_secret_chat_event(&mut env, &event);
+            }
+            let c = um
+                .get_secret_chat(secret_chat_id)
+                .expect("replayed secret chat");
+            assert_eq!(c.access_hash, 11);
+            assert_eq!(c.user_id.get(), 42);
+            assert_eq!(c.state, SecretChatState::Waiting);
+            assert_eq!(c.ttl, 33);
+            assert_eq!(c.key_hash, "crash");
+            assert!(c.is_outbound);
+            assert_eq!(c.log_event_id, 0, "the save retired the mirror");
+
+            let row = global.td_db().common_kv().get(b"sc9");
+            assert!(!row.is_empty(), "the replay saved the sqlite row");
+            let parsed = SecretChat::parse_value(&row).unwrap();
+            assert_eq!(parsed.state, SecretChatState::Waiting);
+            let updates = um.take_updates();
+            assert!(
+                updates.iter().any(
+                    |u| matches!(u, td_api::Update::updateSecretChat(u) if u.secret_chat.id == 9)
+                ),
+                "updateSecretChat on the replay"
+            );
+            global.close_all(false);
+        }
+
+        // Phase 3: reopen again — no SecretChatInfos events left; the row
+        // loads through the manager's database path.
+        {
+            let opened = tddb::td_db::TdDb::open(tddb::td_db::Parameters {
+                database_directory: dir.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(
+                opened.secret_chat_events.is_empty(),
+                "the mirror was retired"
+            );
+            let mut global = Global::new();
+            global.init(opened.database);
+            let mut options = OptionManager::new(global.is_test_dc());
+            let mut um = UserManager::new();
+            assert!(um.get_secret_chat_force(
+                &mut UserEnv {
+                    global: &mut global,
+                    options: &mut options,
+                    auth_is_bot: false,
+                },
+                secret_chat_id,
+                "test"
+            ));
+            assert_eq!(
+                um.get_secret_chat_state(secret_chat_id),
+                SecretChatState::Waiting
+            );
+            global.close_all(false);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

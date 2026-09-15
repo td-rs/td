@@ -263,6 +263,7 @@ impl Td {
         tracing::info!("Successfully inited database");
         let since_last_open = opened_database.since_last_open;
         let user_events = std::mem::take(&mut opened_database.user_events);
+        let secret_chat_events = std::mem::take(&mut opened_database.secret_chat_events);
 
         if self.state == State::Close {
             // Close asynchronously opened database
@@ -409,8 +410,9 @@ impl Td {
             self.send_result(request_id, requests::option_value_to_object(value));
         }
 
-        // process_binlog_events (Td.cpp:966-976): the users vector replays
-        // first (the other handlers arrive with their managers).
+        // process_binlog_events (Td.cpp:966-990): the users vector replays
+        // first, then the secret-chat infos vector (the other handlers
+        // arrive with their managers).
         {
             let global = &mut self.global;
             let options = self
@@ -424,6 +426,10 @@ impl Td {
             };
             for event in &user_events {
                 self.user_manager.on_binlog_user_event(&mut env, event);
+            }
+            for event in &secret_chat_events {
+                self.user_manager
+                    .on_binlog_secret_chat_event(&mut env, event);
             }
         }
         self.flush_user_updates();

@@ -82,6 +82,11 @@ pub const CONFIG_PMC_MAGIC: i32 = 0x1f18;
 /// user-cache log events the `UserManager` mirror writes while a user is
 /// unsaved (`UserLogEvent`). `SecretChats` = 1 arrives with its manager.
 pub const LOG_EVENT_HANDLER_TYPE_USERS: i32 = 2;
+/// `LogEvent::HandlerType::SecretChatInfos` (logevent/LogEvent.h:68) — the
+/// raw secret-chat-cache log events the `UserManager` mirror writes while a
+/// secret chat is unsaved (`SecretChatLogEvent`). Distinct from
+/// `SecretChats` = 1, which routes to the Wave-3 `SecretChatsManager`.
+pub const LOG_EVENT_HANDLER_TYPE_SECRET_CHAT_INFOS: i32 = 5;
 
 /// `TdDb::OpenedDatabase` — the database plus the open metadata the Td actor
 /// consumes (`since_last_open`; the per-manager binlog event vectors arrive
@@ -93,6 +98,10 @@ pub struct OpenedDatabase {
     /// with the Users handler type, in binlog order, for
     /// `UserManager::on_binlog_user_event`.
     pub user_events: Vec<BinlogEvent>,
+    /// The `secret_chat_events` replay vector (TdDb.cpp:79-87) — every
+    /// binlog event with the SecretChatInfos handler type, in binlog order,
+    /// for `UserManager::on_binlog_secret_chat_event`.
+    pub secret_chat_events: Vec<BinlogEvent>,
 }
 
 /// `get_binlog_path` — `{database_directory}td{_test}.binlog`.
@@ -592,18 +601,22 @@ impl TdDb {
         config_pmc.external_init_begin(CONFIG_PMC_MAGIC);
 
         // The combined replay callback: each pmc consumes only the events
-        // written with its own magic; the Users events collect for the
-        // user manager (the remaining handlers wait for their owners).
+        // written with its own magic; the Users and SecretChatInfos events
+        // collect for the user manager (the remaining handlers wait for
+        // their owners).
         let mut user_events: Vec<BinlogEvent> = Vec::new();
+        let mut secret_chat_events: Vec<BinlogEvent> = Vec::new();
         let mut binlog = ConcurrentBinlog::new();
         {
             let binlog_pmc = &mut binlog_pmc;
             let config_pmc = &mut config_pmc;
             let user_events = &mut user_events;
+            let secret_chat_events = &mut secret_chat_events;
             let callback = |event: &BinlogEvent| match event.type_ {
                 BINLOG_PMC_MAGIC => binlog_pmc.external_init_handle(event),
                 CONFIG_PMC_MAGIC => config_pmc.external_init_handle(event),
                 LOG_EVENT_HANDLER_TYPE_USERS => user_events.push(event.clone()),
+                LOG_EVENT_HANDLER_TYPE_SECRET_CHAT_INFOS => secret_chat_events.push(event.clone()),
                 _ => {}
             };
             let init_status = binlog.init(
@@ -673,6 +686,7 @@ impl TdDb {
             database: db,
             since_last_open,
             user_events,
+            secret_chat_events,
         })
     }
 
