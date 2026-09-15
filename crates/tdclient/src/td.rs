@@ -26,6 +26,7 @@ use crate::requests;
 use crate::synchronous_requests;
 use crate::td_api::{self, Function, Object};
 use crate::time_zone_manager::TimeZoneManager;
+use crate::user_manager::{UserEnv, UserManager};
 
 #[cfg(target_endian = "big")]
 compile_error!("TDLib requires little-endian platform");
@@ -98,6 +99,9 @@ pub struct Td {
     #[allow(dead_code)]
     pub(crate) time_zone_manager: TimeZoneManager,
     pub(crate) auth_manager: AuthManager,
+    /// `Td::user_manager_` — the user/secret-chat cache (created with Td,
+    /// loaded from the binlog pmc in `init` like the C++ constructor).
+    pub(crate) user_manager: UserManager,
     /// `Td::stop_cnt_` — the hangup and the close completion each drop one.
     stop_cnt: i32,
 }
@@ -120,6 +124,7 @@ impl Td {
             global: Global::new(),
             time_zone_manager: TimeZoneManager::default(),
             auth_manager: AuthManager::new(),
+            user_manager: UserManager::new(),
             stop_cnt: 2,
         }
     }
@@ -253,6 +258,7 @@ impl Td {
 
         tracing::info!("Successfully inited database");
         let since_last_open = opened_database.since_last_open;
+        let user_events = std::mem::take(&mut opened_database.user_events);
 
         if self.state == State::Close {
             // Close asynchronously opened database
@@ -325,8 +331,18 @@ impl Td {
             match auth_str.as_str() {
                 "ok" => {
                     let is_bot = binlog_pmc.get("auth_is_bot") == "true";
-                    // The C++ checks UserManager::load_my_id() here; the
-                    // my_id restore arrives with the UserManager step.
+                    // `UserManager::load_my_id()` + the my_id option
+                    // (AuthManager.cpp:342-348); the fallback
+                    // `send_get_me_query` needs the net step.
+                    let my_id = UserManager::load_my_id(binlog_pmc);
+                    if my_id.is_valid() {
+                        tracing::info!("Logged in as {my_id:?}");
+                        if let Some(option_manager) = self.option_manager.as_mut() {
+                            option_manager.set_option_integer("my_id", my_id.get());
+                        }
+                    } else {
+                        tdutils::log_error!("Restore unknown my_id");
+                    }
                     self.auth_manager
                         .restore_from_pmc("ok", is_bot, String::new());
                 }
@@ -359,7 +375,11 @@ impl Td {
 
         // init_file_manager / init_non_actor_managers / init_managers /
         // init_pure_actor_managers / SecretChatsManager / StorageManager —
-        // each manager step appends its block here in the C++ order.
+        // each manager step appends its block here in the C++ order. The
+        // UserManager constructor loads my_id from the binlog pmc
+        // (UserManager.cpp:2824 `my_id_ = load_my_id()`); the contacts /
+        // freeze-state pmc reads arrive with their steps.
+        self.user_manager.init_my_id(self.global.binlog_pmc());
 
         self.parameters = Some(parameters);
 
@@ -378,8 +398,24 @@ impl Td {
             self.send_result(request_id, requests::option_value_to_object(value));
         }
 
-        // process_binlog_events — the per-manager event vectors arrive with
-        // the managers that own them.
+        // process_binlog_events (Td.cpp:966-976): the users vector replays
+        // first (the other handlers arrive with their managers).
+        {
+            let global = &mut self.global;
+            let options = self
+                .option_manager
+                .as_mut()
+                .expect("option manager exists after init");
+            let mut env = UserEnv {
+                global,
+                options,
+                auth_is_bot: self.auth_manager.is_bot(),
+            };
+            for event in &user_events {
+                self.user_manager.on_binlog_user_event(&mut env, event);
+            }
+        }
+        self.flush_user_updates();
 
         // The init ping: country code pre-auth / get_difference post-auth —
         // both need the net step.
@@ -453,6 +489,7 @@ impl Td {
             self.global.set_close_flag();
             self.auth_manager.on_closing(self.destroy_flag);
             self.flush_auth_updates();
+            self.flush_user_updates();
             // updates_manager_->timeout_expired() (save PTS and QTS) and the
             // request-actor drain arrive with their steps.
         }
@@ -590,6 +627,14 @@ impl Td {
             for update in option_manager.take_updates() {
                 self.send_update(update);
             }
+        }
+    }
+
+    /// Drain the UserManager's queued `updateUser`-class broadcasts (the
+    /// C++ sends them straight to `Td::send_update` from the manager).
+    pub(crate) fn flush_user_updates(&mut self) {
+        for update in self.user_manager.take_updates() {
+            self.send_update(update.into());
         }
     }
 
