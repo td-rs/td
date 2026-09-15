@@ -8,7 +8,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use tdmtproto::transport::{IStreamTransport, create_transport};
+use tdmtproto::transport::create_transport;
 use tdmtproto::transport_type::{TransportType, TransportTypeEnum};
 use tdutils::buffer::{BufferSlice, BufferWriter, ChainBufferWriter};
 
@@ -40,7 +40,15 @@ fuzz_target!(|data: &[u8]| {
 
     // Drain: each read either consumes a frame, asks for more bytes or
     // reports a transport error — all three are fine; a panic is not.
+    // The `can_read` guard mirrors the C++ driver (`RawConnection::flush_read`:
+    // `while (transport_->can_read())`) — the HTTP transport flips the turn
+    // when a response completes, and read_next may only be called again after
+    // the next write. The iteration cap keeps a fixed, exhausted buffer from
+    // spinning (the real driver instead waits on the event loop).
     for _ in 0..64 {
+        if !transport.can_read() {
+            break;
+        }
         let mut message = BufferSlice::null();
         let mut quick_ack = 0u32;
         let mut error_code = 0i32;

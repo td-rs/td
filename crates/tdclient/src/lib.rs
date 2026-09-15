@@ -16,6 +16,8 @@ pub mod global;
 pub mod misc;
 pub mod option_manager;
 pub mod peer_color;
+pub mod query_combiner;
+pub mod query_merger;
 pub mod requests;
 pub mod restriction_reason;
 pub mod store_parse;

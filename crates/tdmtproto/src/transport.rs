@@ -689,4 +689,36 @@ mod tests {
         assert!((4..=4 + 15).contains(&header));
         assert_eq!(&message.as_slice()[4..8], b"ABCD");
     }
+
+    #[test]
+    fn http_transport_turn_flips_after_a_complete_response() {
+        // The S78 fuzz finding: the C++ driver (`RawConnection::flush_read`)
+        // guards its read loop with `while (transport_->can_read())`; the
+        // HTTP transport ends the read turn when a response completes, and a
+        // faithful caller must write the next query before reading again
+        // (`read_next` CHECKs `can_read()` for exactly this reason).
+        let mut output = ChainBufferWriter::new();
+        let mut transport = crate::http_transport::HttpTransport::new(Vec::new());
+        let mut message = BufferWriter::with_reserve(4, transport.max_prepend_size(), 0);
+        message.as_mutable_slice().copy_from_slice(b"ABCD");
+        transport.write(message, false, &mut output);
+        assert!(transport.can_read());
+
+        let mut writer = ChainBufferWriter::new();
+        writer.append(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nABCD", 0);
+        transport.init(writer.extract_reader(), &mut output);
+
+        let mut message = BufferSlice::null();
+        let mut quick_ack = 0;
+        let mut error_code = 0;
+        let wait = transport
+            .read_next(&mut message, &mut quick_ack, &mut error_code)
+            .unwrap();
+        assert_eq!(wait, 0);
+        assert_eq!(message.as_slice(), b"ABCD");
+        assert_eq!(error_code, 200);
+        // The response completed the turn: reading again is a caller bug.
+        assert!(!transport.can_read());
+        assert!(transport.can_write());
+    }
 }
