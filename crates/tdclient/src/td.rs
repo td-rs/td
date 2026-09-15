@@ -1042,7 +1042,12 @@ impl Td {
         match result {
             Ok(()) => {
                 if self.auth_manager.is_authorized() {
-                    self.complete_authorization(request_id, &sender);
+                    // The ConfigManager's `help.getConfig` step: the
+                    // config-derived options come from the live reply. A
+                    // failed fetch skips them, as in the C++ client when
+                    // the config has not arrived yet.
+                    let config = sender.get_config().ok();
+                    self.complete_authorization(request_id, &sender, config.as_ref());
                 } else {
                     // WaitRegistration / WaitPassword — updates then ok.
                     self.flush_auth_updates();
@@ -1058,7 +1063,12 @@ impl Td {
     /// options, authorization_date, my_id, the self user, Ready — then the
     /// ok, `connectionStateUpdating`, the default reaction type and
     /// `connectionStateReady`.
-    fn complete_authorization(&mut self, request_id: u64, sender: &AuthSender<'_>) {
+    fn complete_authorization(
+        &mut self,
+        request_id: u64,
+        sender: &AuthSender<'_>,
+        config: Option<&telegram_api::Config>,
+    ) {
         self.send_update(Object::updateOption(td_api::updateOption {
             name: "unix_time".to_string(),
             value: Some(td_api::OptionValue::optionValueInteger(
@@ -1068,17 +1078,37 @@ impl Td {
             )),
         }));
 
-        // The ConfigManager-applied options (the walking-skeleton interim
-        // hardcodes the test-DC config constants the recorder pins).
+        // The ConfigManager-applied options: the `help.getConfig`-derived
+        // subset in the C++ `process_config` emission order the recorder
+        // pins; the search-bot options are app-config sourced.
         if let Some(option_manager) = self.option_manager.as_mut() {
-            option_manager.set_option_boolean("test_mode", true);
-            option_manager.set_option_integer("forwarded_message_count_max", 100);
-            option_manager.set_option_integer("basic_group_size_max", 50);
-            option_manager.set_option_integer("supergroup_size_max", 500);
-            option_manager.set_option_boolean("expect_blocking", false);
-            option_manager.set_option_string("t_me_url", "https://t.me/");
-            option_manager.set_option_integer("call_connect_timeout_ms", 30000);
-            option_manager.set_option_integer("call_packet_timeout_ms", 10000);
+            if let Some(config) = config {
+                option_manager.set_option_boolean("test_mode", config.test_mode);
+                option_manager.set_option_integer(
+                    "forwarded_message_count_max",
+                    config.forwarded_count_max as i64,
+                );
+                option_manager
+                    .set_option_integer("basic_group_size_max", config.chat_size_max as i64);
+                option_manager
+                    .set_option_integer("supergroup_size_max", config.megagroup_size_max as i64);
+                option_manager.set_option_boolean("expect_blocking", config.blocked_mode);
+                if !config.me_url_prefix.is_empty() {
+                    let mut url = config.me_url_prefix.clone();
+                    if !url.ends_with('/') {
+                        url.push('/');
+                    }
+                    option_manager.set_option_string("t_me_url", &url);
+                }
+                option_manager.set_option_integer(
+                    "call_connect_timeout_ms",
+                    config.call_connect_timeout_ms as i64,
+                );
+                option_manager.set_option_integer(
+                    "call_packet_timeout_ms",
+                    config.call_packet_timeout_ms as i64,
+                );
+            }
             option_manager.set_option_string("animation_search_bot_username", "contextbot");
             option_manager.set_option_string("venue_search_bot_username", "foursquarebot");
             option_manager.set_option_string("photo_search_bot_username", "imagebot");

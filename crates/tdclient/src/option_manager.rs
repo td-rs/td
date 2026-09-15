@@ -290,9 +290,11 @@ impl OptionManager {
         self.pending_updates
             .push(td_api::Object::updateOption(td_api::updateOption {
                 name: "unix_time".to_string(),
-                value: OptionValue::optionValueInteger(td_api::optionValueInteger {
-                    value: unix_time as i64,
-                }),
+                value: Some(OptionValue::optionValueInteger(
+                    td_api::optionValueInteger {
+                        value: unix_time as i64,
+                    },
+                )),
             }));
     }
 
@@ -1183,7 +1185,9 @@ impl OptionManager {
         updates.push(td_api::Object::updateOption(td_api::updateOption {
             name: "unix_time".to_string(),
             value: Some(OptionValue::optionValueInteger(
-                td_api::optionValueInteger { value: unix_time as i64 },
+                td_api::optionValueInteger {
+                    value: unix_time as i64,
+                },
             )),
         }));
 

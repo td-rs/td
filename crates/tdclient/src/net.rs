@@ -864,6 +864,15 @@ impl<'a> AuthSender<'a> {
             _ => Err("unsupported password algorithm".to_string()),
         }
     }
+
+    /// `help.getConfig` — the config reply the recorder-pinned options are
+    /// applied from (the walking-skeleton stand-in for the C++
+    /// `ConfigManager::process_config` input).
+    pub(crate) fn get_config(&mut self) -> std::result::Result<telegram_api::Config, String> {
+        let query = telegram_api::Function::help_getConfig(telegram_api::help_getConfig);
+        let data = self.invoke(query).map_err(|(_, message)| message)?;
+        telegram_api::Config::parse(&data).map_err(|error| format!("help.config: {error}"))
+    }
 }
 
 fn migrate_target(message: &str) -> Option<u8> {
