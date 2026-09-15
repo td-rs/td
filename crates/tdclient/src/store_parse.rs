@@ -23,6 +23,7 @@ pub mod version {
     pub const ADD_ACCESS_HASH_TO_SECRET_CHAT: i32 = 5;
     pub const FIX_MIN_USERS: i32 = 10;
     pub const SUPPORT_64_BIT_IDS: i32 = 33;
+    pub const MAKE_PARTICIPANT_FLAGS_64_BIT: i32 = 46;
     pub const ADD_USER_FLAGS2: i32 = 48;
     /// `Version::Next` of tdlib 1.8.67 (`SupportEphemeralMessages` + 1).
     pub const NEXT: i32 = 62;
@@ -39,6 +40,10 @@ pub fn store_u32(out: &mut Vec<u8>, value: u32) {
 }
 
 pub fn store_i64(out: &mut Vec<u8>, value: i64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+pub fn store_u64(out: &mut Vec<u8>, value: u64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
@@ -164,6 +169,10 @@ impl<'a> Parser<'a> {
 
     pub fn i64_(&mut self) -> Result<i64, &'static str> {
         Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    pub fn u64_(&mut self) -> Result<u64, &'static str> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
 
     pub fn f64_(&mut self) -> Result<f64, &'static str> {
