@@ -540,19 +540,17 @@ impl OptionManager {
             'a' => {
                 set_boolean_option!("always_parse_markdown");
             }
-            'c' => {
-                if !is_bot {
-                    set_string_option!("connection_parameters", |value: &str| {
-                        // Must be a valid JSON object
-                        // (`get_json_value` + jsonValueObject check).
-                        match tdutils::json::json_decode(value) {
-                            tdutils::status::Result::Ok(json_value) => {
-                                json_value.ty() == tdutils::json::JsonValueType::Object
-                            }
-                            tdutils::status::Result::Err(_) => false,
+            'c' if !is_bot => {
+                set_string_option!("connection_parameters", |value: &str| {
+                    // Must be a valid JSON object
+                    // (`get_json_value` + jsonValueObject check).
+                    match tdutils::json::json_decode(value) {
+                        tdutils::status::Result::Ok(json_value) => {
+                            json_value.ty() == tdutils::json::JsonValueType::Object
                         }
-                    });
-                }
+                        tdutils::status::Result::Err(_) => false,
+                    }
+                });
             }
             'd' => {
                 if !is_bot {
@@ -600,41 +598,35 @@ impl OptionManager {
                     return Ok(());
                 }
             }
-            'l' => {
-                if !is_bot {
-                    set_string_option!("language_pack_database_path", |_| true);
-                    // LanguagePackManager::check_language_code_name — TODO
-                    // (Wave 2): accept any code for now.
-                    set_string_option!("language_pack_id", |_| true);
-                    // LanguagePackManager::check_language_pack_name — TODO.
-                    set_string_option!("localization_target", |_| true);
-                }
+            'l' if !is_bot => {
+                set_string_option!("language_pack_database_path", |_| true);
+                // LanguagePackManager::check_language_code_name — TODO
+                // (Wave 2): accept any code for now.
+                set_string_option!("language_pack_id", |_| true);
+                // LanguagePackManager::check_language_pack_name — TODO.
+                set_string_option!("localization_target", |_| true);
             }
             'm' => {
                 set_integer_option!("message_unload_delay", 60, 86400);
             }
-            'n' => {
-                if !is_bot {
-                    set_integer_option!(
-                        "notification_group_count_max",
-                        MIN_NOTIFICATION_GROUP_COUNT_MAX,
-                        MAX_NOTIFICATION_GROUP_COUNT_MAX
-                    );
-                    set_integer_option!(
-                        "notification_group_size_max",
-                        MIN_NOTIFICATION_GROUP_SIZE_MAX,
-                        MAX_NOTIFICATION_GROUP_SIZE_MAX
-                    );
-                }
+            'n' if !is_bot => {
+                set_integer_option!(
+                    "notification_group_count_max",
+                    MIN_NOTIFICATION_GROUP_COUNT_MAX,
+                    MAX_NOTIFICATION_GROUP_COUNT_MAX
+                );
+                set_integer_option!(
+                    "notification_group_size_max",
+                    MIN_NOTIFICATION_GROUP_SIZE_MAX,
+                    MAX_NOTIFICATION_GROUP_SIZE_MAX
+                );
             }
-            'o' => {
-                if name == "online" {
-                    if value_id != CONSTRUCTOR_BOOL && value_id != CONSTRUCTOR_EMPTY {
-                        return Err("Option \"online\" must have boolean value".to_string());
-                    }
-                    // OnlineManager::set_is_online — TODO (Wave 1).
-                    return Ok(());
+            'o' if name == "online" => {
+                if value_id != CONSTRUCTOR_BOOL && value_id != CONSTRUCTOR_EMPTY {
+                    return Err("Option \"online\" must have boolean value".to_string());
                 }
+                // OnlineManager::set_is_online — TODO (Wave 1).
+                return Ok(());
             }
             'p' => {
                 set_boolean_option!("prefer_ipv6");

@@ -214,6 +214,23 @@ impl Global {
         self.is_test_dc
     }
 
+    /// `Global::use_chat_info_database()`.
+    pub fn use_chat_info_database(&self) -> bool {
+        self.db
+            .as_ref()
+            .map(|db| db.parameters().use_chat_info_database)
+            .unwrap_or(false)
+    }
+
+    /// `Global::use_sqlite_pmc()` — gated on the file database exactly like
+    /// the C++ (`TdDb::use_sqlite_pmc`).
+    pub fn use_sqlite_pmc(&self) -> bool {
+        self.db
+            .as_ref()
+            .map(|db| db.use_file_database())
+            .unwrap_or(false)
+    }
+
     /// `Global::get_server_time_difference()`.
     pub fn get_server_time_difference(&self) -> f64 {
         self.server_time_difference
