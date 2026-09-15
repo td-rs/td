@@ -15,15 +15,26 @@
 //!   direct calls — there are no manager actors to await yet;
 //! - the ConfigManager is an inline manager: its network queries are held
 //!   in `pending_config_queries` until the dispatcher lands (the net step)
-//!   and its expire timer rides the Td's own actor timeout slot.
+//!   and its expire timer rides the Td's own actor timeout slot; the
+//!   ConfigRecoverer rides with it — created at the manager's `start_up`,
+//!   its dispatched fetches parked until their executors, its wakeup
+//!   sharing the same timeout slot.
 
 use std::collections::BTreeSet;
 
 use tdactor::{Actor, ActorOwn, actor_messages};
 use tddb::td_db::{OpenedDatabase, Parameters as DbParameters, TdDb};
+use tdmtproto::telegram_api;
+use tdutils::status::Status;
 
 use crate::auth_manager::AuthManager;
-use crate::config_manager::{ConfigActions, ConfigManager, ConfigQuery, ConfigQueryResult};
+use crate::config_manager::{
+    ConfigActions, ConfigManager, ConfigQuery, ConfigQueryResult, StoredDcOption,
+};
+use crate::config_recoverer::{
+    ConfigRecoverer, RecovererActions, RecovererConnectionState, RecovererDcOption, RecovererEnv,
+    RecovererNetType, SimpleConfigResult, load_dc_options_update,
+};
 use crate::global::Global;
 use crate::option_manager::OptionManager;
 use crate::requests;
@@ -100,6 +111,24 @@ pub struct Td {
     /// The ConfigManager's in-flight network queries — `NetQuery`s once
     /// the dispatcher wiring lands.
     pub(crate) pending_config_queries: Vec<ConfigQuery>,
+    /// The C++ `ConfigManager::config_recoverer_` — created right after
+    /// the ConfigManager's `start_up` (ConfigManager.cpp:866-868) and
+    /// dropped with it at `ConfigManager::hangup` (ConfigManager.cpp:894).
+    pub(crate) config_recoverer: Option<ConfigRecoverer>,
+    /// The recoverer's dispatched fetches, parked until their executors
+    /// land: the async dispatch needs a runtime on the actor thread, which
+    /// arrives with the net step (results come back through the
+    /// `RecovererSimpleConfigResult`/`RecovererFullConfigResult` messages,
+    /// which tests and the executors alike deliver).
+    pub(crate) pending_recoverer_fetches: Vec<RecovererFetch>,
+    /// The recoverer's armed wakeup (`set_timeout_at` source, sharing the
+    /// single Td timeout slot with the config expire time — the earliest
+    /// wins, and the fired timeout re-loops both state machines).
+    recoverer_wakeup_at: f64,
+    /// Tests pin the recoverer's clocks here (the production driver reads
+    /// the process clock; the loop's gates are real-time seconds).
+    #[cfg(test)]
+    recoverer_clock: Option<(f64, f64)>,
     /// The `G()` shared context; owns the database (`Global::td_db_`).
     pub(crate) global: Global,
     /// The C++ `init_managers` registration order starts here; managers
@@ -111,6 +140,18 @@ pub struct Td {
     pub(crate) auth_manager: AuthManager,
     /// `Td::stop_cnt_` — the hangup and the close completion each drop one.
     stop_cnt: i32,
+}
+
+/// A parked recoverer fetch — the C++ `get_simple_config_*` /
+/// `get_full_config` actor handles the Td holds until the executors' async
+/// dispatch lands with the net step (the executors themselves are
+/// [`crate::config_recoverer::fetch_simple_config`] and
+/// [`crate::config_recoverer::fetch_full_config`]; the M.3.7.4
+/// mini-session's spec rides the full arm).
+#[allow(dead_code)]
+pub(crate) enum RecovererFetch {
+    Simple(crate::config_recoverer::SimpleConfigFetch),
+    Full(crate::config_recoverer::FullConfigFetch),
 }
 
 impl Td {
@@ -130,6 +171,11 @@ impl Td {
             option_manager: None,
             config_manager: None,
             pending_config_queries: Vec::new(),
+            config_recoverer: None,
+            pending_recoverer_fetches: Vec::new(),
+            recoverer_wakeup_at: 0.0,
+            #[cfg(test)]
+            recoverer_clock: None,
             global: Global::new(),
             time_zone_manager: TimeZoneManager::default(),
             auth_manager: AuthManager::new(),
@@ -394,6 +440,20 @@ impl Td {
         };
         self.apply_config_actions(start_up_actions);
 
+        // `ConfigManager::start_up` also creates the ConfigRecoverer and
+        // replays the saved `dc_options_update` into it
+        // (ConfigManager.cpp:866-868). The C++ recoverer actor registers
+        // its StateCallback with the StateManager in its own `start_up`
+        // (ConfigManager.cpp:799-821); the StateManager lands with the net
+        // step, so the callback legs are the Td's `on_recoverer_*`
+        // forwarders until then.
+        let environment = self.recoverer_env();
+        let saved_options = load_dc_options_update(self.global.binlog_pmc());
+        let mut recoverer = ConfigRecoverer::new();
+        let recoverer_actions = recoverer.on_dc_options_update(saved_options, &environment);
+        self.config_recoverer = Some(recoverer);
+        self.apply_recoverer_actions(recoverer_actions);
+
         self.parameters = Some(parameters);
 
         // `OptionManager::on_td_inited` (Td.cpp:943): the pending pre-init
@@ -519,6 +579,15 @@ impl Td {
         self.option_manager = None;
         self.config_manager = None;
         self.pending_config_queries.clear();
+        // The C++ `ConfigManager::hangup` drops `config_recoverer_`
+        // (ConfigManager.cpp:892-896): the close releases the parent share
+        // and cancels the in-flight queries with it, then the dropped
+        // handle stops the actor — the parked fetches die with it.
+        if let Some(mut recoverer) = self.config_recoverer.take() {
+            recoverer.hangup();
+        }
+        self.pending_recoverer_fetches.clear();
+        self.recoverer_wakeup_at = 0.0;
 
         self.close_flag = 4;
         self.on_closed();
@@ -681,16 +750,199 @@ impl Td {
         if !tdactor::Scheduler::in_scheduler_context() {
             return;
         }
-        let expire_time = self
+        let mut expire_time = self
             .config_manager
             .as_ref()
             .map(ConfigManager::expire_time)
             .unwrap_or(0.0);
+        // The recoverer's wakeup shares the Td's single timeout slot: the
+        // earliest deadline wins (the C++ actors each carry their own
+        // timer), and the fired timeout re-loops both.
+        if self.recoverer_wakeup_at != 0.0
+            && (expire_time == 0.0 || self.recoverer_wakeup_at < expire_time)
+        {
+            expire_time = self.recoverer_wakeup_at;
+        }
         if expire_time == 0.0 {
             self.cancel_timeout();
         } else {
             self.set_timeout_at(expire_time);
         }
+    }
+
+    /// The `G()` reads the recoverer steps need, gathered per call (the C++
+    /// recoverer reads them through the global directly). The loop's
+    /// clocks and `Session::is_high_loaded()` arrive here too: both come
+    /// from the real clock now (nearly equal, like the C++
+    /// `Time::now()`/`now_cached()` mix), and the handshake-actor pool
+    /// that drives the high-load flag lands with the net step.
+    pub(crate) fn recoverer_env(&self) -> RecovererEnv {
+        let option_manager = self.option_manager.as_ref();
+        #[cfg(test)]
+        let (now, now_cached) = self
+            .recoverer_clock
+            .unwrap_or_else(|| (tdutils::time::now(), tdutils::time::now_cached()));
+        #[cfg(not(test))]
+        let (now, now_cached) = (tdutils::time::now(), tdutils::time::now_cached());
+        RecovererEnv {
+            unix_time: self.global.unix_time(),
+            my_phone_number: option_manager
+                .map(|options| options.get_option_string("my_phone_number", ""))
+                .unwrap_or_default(),
+            expect_blocking: option_manager
+                .map(|options| options.get_option_boolean("expect_blocking", true))
+                .unwrap_or(true),
+            now,
+            now_cached,
+            is_high_loaded: false,
+            is_test_dc: self.global.is_test_dc(),
+            prefer_ipv6: option_manager
+                .map(|options| options.get_option_boolean("prefer_ipv6", false))
+                .unwrap_or(false),
+            dc_txt_domain_name: option_manager
+                .map(|options| options.get_option_string("dc_txt_domain_name", ""))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The recoverer's C++ side effects, executed by the Td: the DNS time
+    /// difference write, the dispatched fetches (parked until their
+    /// executors land), the ConnectionCreator fan-out (M.3.9.1) and the
+    /// wakeup timer mirror.
+    pub(crate) fn apply_recoverer_actions(&mut self, actions: RecovererActions) {
+        if let Some(diff) = actions.dns_time_difference {
+            self.global.update_dns_time_difference(diff);
+        }
+        if let Some(fetch) = actions.fetch_simple_config {
+            self.pending_recoverer_fetches
+                .push(RecovererFetch::Simple(fetch));
+        }
+        if let Some(fetch) = actions.fetch_full_config {
+            self.pending_recoverer_fetches
+                .push(RecovererFetch::Full(fetch));
+        }
+        if !actions.connection_creator_dc_options.is_empty() {
+            // `ConnectionCreator::on_dc_options` after a full config
+            // (ConfigManager.cpp:632) — the fan-out target is an M.3.9.1
+            // step; the options are carried in the action for it.
+            tracing::trace!(
+                "ConnectionCreator::on_dc_options ({} options) — the net step",
+                actions.connection_creator_dc_options.len()
+            );
+        }
+        if let Some(at) = actions.wakeup_at {
+            self.recoverer_wakeup_at = at;
+        }
+        self.sync_config_timeout();
+    }
+
+    /// A simple-config fetch result — the C++ fetch actor's promise
+    /// (`ConfigRecoverer::on_simple_config`, ConfigManager.cpp:566-588)
+    /// followed by its `hangup_shared` share release. Tests drive the
+    /// recoverer loop through it; the net step's async dispatch delivers
+    /// here.
+    pub(crate) fn on_recoverer_simple_config_result(
+        &mut self,
+        result: Result<SimpleConfigResult, Status>,
+    ) {
+        let environment = self.recoverer_env();
+        let Some(recoverer) = self.config_recoverer.as_mut() else {
+            return;
+        };
+        if !recoverer.simple_config_query_active() {
+            // No dispatched query — accepting the delivery would
+            // double-release the query's ref-count share below.
+            return;
+        }
+        let actions = recoverer.on_simple_config(result, &environment);
+        if recoverer.hangup_shared() {
+            self.config_recoverer = None;
+        }
+        self.apply_recoverer_actions(actions);
+    }
+
+    /// A full-config fetch result — `ConfigRecoverer::on_full_config`
+    /// (ConfigManager.cpp:626-639) with the same share release.
+    pub(crate) fn on_recoverer_full_config_result(
+        &mut self,
+        result: Result<telegram_api::Config, Status>,
+    ) {
+        let environment = self.recoverer_env();
+        let Some(recoverer) = self.config_recoverer.as_mut() else {
+            return;
+        };
+        if !recoverer.full_config_query_active() {
+            return;
+        }
+        let actions = recoverer.on_full_config(result, &environment);
+        if recoverer.hangup_shared() {
+            self.config_recoverer = None;
+        }
+        self.apply_recoverer_actions(actions);
+    }
+
+    /// The recoverer's `StateCallback::on_state` leg
+    /// (ConfigManager.cpp:804-807): only a plain `Connecting` counts as a
+    /// connecting problem. The StateManager itself lands with the net
+    /// step — it drives these three forwarders (the C++ registers the
+    /// callback at the recoverer's `start_up`, ConfigManager.cpp:820).
+    #[allow(dead_code)] // the StateManager registration is a net-step wiring
+    pub(crate) fn on_recoverer_connection_state(&mut self, state: RecovererConnectionState) {
+        let environment = self.recoverer_env();
+        let Some(recoverer) = self.config_recoverer.as_mut() else {
+            return;
+        };
+        let actions = recoverer.on_connection_state(state, &environment);
+        self.apply_recoverer_actions(actions);
+    }
+
+    /// The recoverer's `StateCallback::on_network` leg
+    /// (ConfigManager.cpp:808-811) — every `NetType` but `None` means the
+    /// network is up.
+    #[allow(dead_code)] // the StateManager registration is a net-step wiring
+    pub(crate) fn on_recoverer_net_type(&mut self, net_type: RecovererNetType, generation: u32) {
+        let environment = self.recoverer_env();
+        let Some(recoverer) = self.config_recoverer.as_mut() else {
+            return;
+        };
+        let actions = recoverer.on_net_type(net_type, generation, &environment);
+        self.apply_recoverer_actions(actions);
+    }
+
+    /// The recoverer's `StateCallback::on_online` leg
+    /// (ConfigManager.cpp:812-815).
+    #[allow(dead_code)] // the StateManager registration is a net-step wiring
+    pub(crate) fn on_recoverer_online(&mut self, online_flag: bool) {
+        let environment = self.recoverer_env();
+        let Some(recoverer) = self.config_recoverer.as_mut() else {
+            return;
+        };
+        let actions = recoverer.on_online(online_flag, &environment);
+        self.apply_recoverer_actions(actions);
+    }
+
+    /// `ConfigManager::on_dc_options_update` (ConfigManager.cpp:1012-1020)
+    /// — the Updates `updateDcOptions` fan-in (UpdatesManager.cpp:4539):
+    /// persist the update, expire the config, and feed the recoverer (the
+    /// C++ forwards the same options unconditionally, so an empty update
+    /// clears the recoverer's set too).
+    #[allow(dead_code)] // the UpdatesManager fan-in arrives with its step
+    pub(crate) fn on_dc_options_update(&mut self, dc_options: &[telegram_api::DcOption]) {
+        let recoverer_options: Vec<RecovererDcOption> = dc_options
+            .iter()
+            .filter_map(StoredDcOption::from_telegram)
+            .map(|stored| RecovererDcOption::from_stored(&stored))
+            .collect();
+        if let Some(config_manager) = self.config_manager.as_mut() {
+            config_manager.on_dc_options_update(self.global.binlog_pmc(), dc_options);
+        }
+        let environment = self.recoverer_env();
+        let actions = self
+            .config_recoverer
+            .as_mut()
+            .map(|recoverer| recoverer.on_dc_options_update(recoverer_options, &environment))
+            .unwrap_or_default();
+        self.apply_recoverer_actions(actions);
     }
 
     /// The `OptionManager::get_option` ConfigManager branch for the two
@@ -990,6 +1242,15 @@ actor_messages! {
         /// when a pending query completes; tests drive the config flow
         /// through it.
         ConfigQueryResult { query: ConfigQuery, result: ConfigQueryResult, } => on_config_query_result(query, result),
+        /// A completed recoverer simple-config fetch — the C++ fetch
+        /// actor's promise delivery (`ConfigRecoverer::on_simple_config`).
+        /// Tests drive the recoverer loop through it; the parked fetch's
+        /// live executor (the net step) delivers here.
+        RecovererSimpleConfigResult { result: Result<SimpleConfigResult, Status>, } => on_recoverer_simple_config_result(result),
+        /// A completed recoverer full-config fetch —
+        /// `ConfigRecoverer::on_full_config`; the M.3.7.4 executor is the
+        /// production sender.
+        RecovererFullConfigResult { result: Result<telegram_api::Config, Status>, } => on_recoverer_full_config_result(result),
     }
 }
 
@@ -1007,7 +1268,9 @@ impl Actor for Td {
 
     /// The ConfigManager's expire timer rides the Td's actor timeout slot
     /// (the C++ manager is its own actor with its own timer): the fired
-    /// timeout re-requests the expired config.
+    /// timeout re-requests the expired config, then re-runs the
+    /// recoverer's loop (the tdactor `timeout_expired` default calls
+    /// `loop`).
     fn timeout_expired(&mut self) {
         let close_flag = self.close_flag != 0;
         let actions = self
@@ -1016,6 +1279,14 @@ impl Actor for Td {
             .map(|config_manager| config_manager.on_timeout(close_flag))
             .unwrap_or_default();
         self.apply_config_actions(actions);
+
+        let environment = self.recoverer_env();
+        let actions = self
+            .config_recoverer
+            .as_mut()
+            .map(|recoverer| recoverer.loop_(&environment))
+            .unwrap_or_default();
+        self.apply_recoverer_actions(actions);
     }
 
     fn tear_down(&mut self) {
@@ -1737,6 +2008,218 @@ mod tests {
             );
             scheduler.finish();
         });
+    }
+
+    /// The M.3.7.5 wiring gate: a no-config Td creates the recoverer at
+    /// init, the StateCallback legs drive its loop, the dispatched fetches
+    /// park, and the canned results apply — the recovered dc options land
+    /// and a full config is accepted (the plan's integration verify).
+    #[test]
+    fn recoverer_loop_applies_canned_results() {
+        let callback = CollectCallback::default();
+        let dir = temp_db_dir("recoverer-loop");
+        let db_dir = dir.clone();
+        let mut td = Td::new(Box::new(CollectCallback {
+            responses: callback.responses.clone(),
+            errors: callback.errors.clone(),
+        }));
+        let Function::setTdlibParameters(parameters) = set_tdlib_parameters(db_dir, false) else {
+            unreachable!("setTdlibParameters helper");
+        };
+        td.on_set_tdlib_parameters(20, parameters);
+
+        // The recoverer exists; the empty saved update left no options.
+        assert!(
+            td.config_recoverer
+                .as_ref()
+                .expect("recoverer at init")
+                .dc_options()
+                .is_empty()
+        );
+
+        // Network up: no connecting problem yet, so nothing dispatches.
+        td.on_recoverer_net_type(RecovererNetType::WiFi, 0);
+        assert!(td.pending_recoverer_fetches.is_empty());
+
+        // A plain Connecting is the connecting problem; the wakeup arms at
+        // the max-connecting delay, the fetch waits for the gate.
+        td.on_recoverer_connection_state(RecovererConnectionState::Connecting);
+        assert!(td.recoverer_wakeup_at > 0.0);
+        assert!(td.pending_recoverer_fetches.is_empty());
+
+        // Pin the loop clock past the gates but under the offline success
+        // window (the M.3.7.2 anchoring: now()+300, so the delivered
+        // configs' expiry stamps stay in the future); the floor keeps the
+        // `as i32` dates exact for the dns-difference assert.
+        let anchor = (tdutils::time::now() + 300.0).floor();
+        td.recoverer_clock = Some((anchor, anchor));
+        td.on_recoverer_connection_state(RecovererConnectionState::Connecting);
+        assert!(
+            td.config_recoverer
+                .as_ref()
+                .unwrap()
+                .simple_config_query_active()
+        );
+        assert!(matches!(
+            td.pending_recoverer_fetches.last(),
+            Some(RecovererFetch::Simple(_))
+        ));
+
+        // The canned simple config lands: the http date feeds the dns
+        // difference, the rule's endpoint becomes the recovered options,
+        // the query share releases, and the loop dispatches the
+        // full-config fetch over them.
+        let expires = td.global.unix_time() + 1000;
+        td.on_recoverer_simple_config_result(Ok(SimpleConfigResult {
+            r_http_date: Ok(anchor as i32 + 1000),
+            r_config: Ok(telegram_api::help_ConfigSimple {
+                date: anchor as i32,
+                expires,
+                rules: vec![telegram_api::AccessPointRule {
+                    phone_prefix_rules: String::new(),
+                    dc_id: 2,
+                    ips: vec![telegram_api::IpPort::ipPort(telegram_api::ipPort {
+                        ipv4: 0x0909_0909,
+                        port: 443,
+                    })],
+                }],
+            }),
+        }));
+        let recoverer = td.config_recoverer.as_ref().unwrap();
+        assert!(!recoverer.simple_config_query_active());
+        assert_eq!(recoverer.dc_options().len(), 1);
+        assert_eq!(recoverer.dc_options()[0].ip_address, "9.9.9.9");
+        // The even alternation turn reads the http date: anchor+1000
+        // against the pinned env clock.
+        assert_eq!(td.global.get_dns_time_difference(), 1000.0);
+        assert!(matches!(
+            td.pending_recoverer_fetches.last(),
+            Some(RecovererFetch::Full(_))
+        ));
+        assert!(recoverer.full_config_query_active());
+
+        // The canned full config lands: accepted (the ConnectionCreator
+        // fan-out is carried for M.3.9.1), the query share releases, and
+        // no further fetch dispatches.
+        let parked = td.pending_recoverer_fetches.len();
+        td.on_recoverer_full_config_result(Ok(telegram_api::Config {
+            this_dc: 2,
+            date: anchor as i32,
+            expires,
+            dc_options: vec![telegram_api::DcOption {
+                flags: 0,
+                ipv6: false,
+                media_only: false,
+                tcpo_only: false,
+                cdn: false,
+                r#static: false,
+                this_port_only: false,
+                id: 2,
+                ip_address: "149.154.167.51".to_string(),
+                port: 443,
+                secret: Vec::new(),
+            }],
+            ..Default::default()
+        }));
+        let recoverer = td.config_recoverer.as_ref().unwrap();
+        assert!(!recoverer.full_config_query_active());
+        assert_eq!(td.pending_recoverer_fetches.len(), parked);
+        assert!(td.recoverer_wakeup_at > 0.0);
+
+        // A stray delivery without a dispatched query is a no-op — the
+        // share release must not run.
+        let parked = td.pending_recoverer_fetches.len();
+        td.on_recoverer_simple_config_result(Err(Status::error(500, "stray")));
+        assert_eq!(td.pending_recoverer_fetches.len(), parked);
+
+        // The close drops the recoverer with the manager
+        // (ConfigManager.cpp:892-896).
+        td.close_impl(false);
+        assert!(td.config_recoverer.is_none());
+        assert!(td.pending_recoverer_fetches.is_empty());
+        assert_eq!(td.recoverer_wakeup_at, 0.0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `ConfigManager::on_dc_options_update` through the Td: the update
+    /// persists, the config expires now, and the recoverer's set follows
+    /// (an empty update clears it) — the Updates `updateDcOptions` fan-in
+    /// parity (ConfigManager.cpp:1012-1020).
+    #[test]
+    fn dc_options_update_feeds_the_recoverer() {
+        let callback = CollectCallback::default();
+        let dir = temp_db_dir("recoverer-dc-options");
+        let db_dir = dir.clone();
+        let mut td = Td::new(Box::new(CollectCallback {
+            responses: callback.responses.clone(),
+            errors: callback.errors.clone(),
+        }));
+        let Function::setTdlibParameters(parameters) = set_tdlib_parameters(db_dir.clone(), false)
+        else {
+            unreachable!("setTdlibParameters helper");
+        };
+        td.on_set_tdlib_parameters(21, parameters);
+
+        let option = telegram_api::DcOption {
+            flags: 0,
+            ipv6: false,
+            media_only: false,
+            tcpo_only: false,
+            cdn: false,
+            r#static: false,
+            this_port_only: false,
+            id: 2,
+            ip_address: "149.154.175.50".to_string(),
+            port: 443,
+            secret: Vec::new(),
+        };
+        td.on_dc_options_update(std::slice::from_ref(&option));
+        assert!(
+            !td.global
+                .binlog_pmc()
+                .get_raw(b"dc_options_update")
+                .is_empty()
+        );
+        let recoverer = td.config_recoverer.as_ref().unwrap();
+        assert_eq!(recoverer.dc_options().len(), 1);
+        assert_eq!(recoverer.dc_options()[0].ip_address, "149.154.175.50");
+        assert!(td.config_manager.as_ref().unwrap().expire_time() > 0.0);
+
+        td.close_impl(false);
+
+        // The saved update replays into a fresh Td's recoverer at init
+        // (ConfigManager.cpp:866-868).
+        let mut second = Td::new(Box::new(CollectCallback::default()));
+        let Function::setTdlibParameters(parameters) = set_tdlib_parameters(db_dir.clone(), false)
+        else {
+            unreachable!("setTdlibParameters helper");
+        };
+        second.on_set_tdlib_parameters(22, parameters);
+        assert_eq!(
+            second.config_recoverer.as_ref().unwrap().dc_options().len(),
+            1
+        );
+
+        // An empty update clears both the pmc entry and the set.
+        second.on_dc_options_update(&[]);
+        assert!(
+            second
+                .global
+                .binlog_pmc()
+                .get_raw(b"dc_options_update")
+                .is_empty()
+        );
+        assert!(
+            second
+                .config_recoverer
+                .as_ref()
+                .unwrap()
+                .dc_options()
+                .is_empty()
+        );
+
+        second.close_impl(false);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn send_config_result(
