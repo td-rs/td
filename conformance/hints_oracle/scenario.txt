@@ -1,0 +1,112 @@
+# M.4.4 Hints differential scenario: every line is answered by BOTH the C++
+# oracle and the Rust driver; outputs must be byte-identical.
+# latin + prefix searches
+add 1 Alice
+add 2 Alina
+add 3 Bob
+add 4 Bob Marley
+size
+has_key 1
+has_key 9
+key_to_string 1
+key_to_string 9
+search 10 0 ali
+search 10 0 ALI
+search 10 0 bob
+search 10 0 bob mar
+search 10 0 marley bob
+search 10 0 bob alice
+search 10 0 zzz
+search 1 0 ali
+search 0 0 ali
+search -1 0 ali
+search 3 1 ali
+search 10 1
+search 10 0
+search 2 1
+words Alice
+words Bob_Marley Jr.
+words user123
+words  ..!!
+words
+words Владимир Путин
+# renames and removes
+add 1 Alicia
+search 10 0 alic
+search 10 0 alice
+add 1 Alice
+search 10 0 alic
+add 2
+search 10 0 ali
+has_key 2
+size
+# cyrillic + transliteration both ways
+add 5 privet
+search 10 0 привет
+search 10 0 прив
+add 6 привет
+search 10 0 privet
+search 10 0 priv
+search 10 0 poka
+add 7 poka
+add 8 пока
+search 10 0 poka
+search 10 0 пока
+search 10 0 pok
+# complex rules: shch / yo / jo / ts
+add 9 shchuka
+search 10 0 щука
+add 10 щука
+search 10 0 shchuka
+search 10 0 schuka
+search 10 0 щ
+add 11 joice
+search 10 0 джойс
+add 12 джойс
+search 10 0 joice
+search 10 0 Joyce
+# greek with combining marks vs precomposed
+add 13 Ωμέγα
+add 14 Ωμέγα
+search 10 0 ωμεγα
+search 10 0 ωμέ
+# CJK and fullwidth (range-table path, code >= 1280)
+add 15 東京タワー
+search 10 0 東京
+search 10 0 tower
+add 16 ａｂｃ
+search 10 0 ａｂ
+search 10 0 abc
+words ａｂｃ
+# diacritics folding
+add 17 José
+search 10 0 jose
+search 10 0 josé
+add 18 Halo′
+search 10 0 halo
+# emoji and punctuation-heavy names
+add 19 🙂 hello!
+search 10 0 hello
+search 10 0 🙂
+words 🙂 hello!
+# ratings
+search 10 0 p
+rating 5 -3
+rating 6 2
+search 10 0 p
+search 10 0 po
+rating 7 -10
+search 1 0 p
+search 3 1 p
+search 2 1
+# duplicate adds are a no-op
+add 5 privet
+size
+search 10 0 privet
+# remove everything, count stays consistent
+add 5
+add 6
+add 7
+add 8
+size
+search 10 1

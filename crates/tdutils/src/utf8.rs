@@ -2,7 +2,10 @@
 //! Telegram layer leans on (`check_utf8` allows the C++ "read the NUL
 //! terminator past the end" shape — out-of-bounds reads are modeled as
 //! reading 0, which reproduces both the accept-at-exact-EOF and the
-//! reject-truncated-multibyte outcomes).
+//! reject-truncated-multibyte outcomes), plus the search-word splitter used
+//! by `Hints` (M.4.4).
+
+use crate::unicode::{prepare_search_character, remove_diacritics};
 
 /// `td::is_utf8_character_first_code_unit` (utf8.h).
 #[inline]
@@ -74,6 +77,93 @@ pub fn check_utf8(s: &[u8]) -> bool {
 
         return false;
     }
+}
+
+/// `td::next_utf8_unsafe` (utf8.cpp): decode one code point from the front of
+/// `bytes`, returning it with the number of bytes consumed. Like the C++, the
+/// continuation bytes are masked without validation; the C++ "unsafe" reads
+/// past the slice end become panics here (every caller iterates a full
+/// buffer, as the C++ end-based loops do).
+pub fn next_utf8_unsafe(bytes: &[u8]) -> (u32, usize) {
+    let a = bytes[0];
+    if a & 0x80 == 0 {
+        (a as u32, 1)
+    } else if a & 0x20 == 0 {
+        (((a & 0x1f) as u32) << 6 | (bytes[1] & 0x3f) as u32, 2)
+    } else if a & 0x10 == 0 {
+        (
+            ((a & 0x0f) as u32) << 12 | ((bytes[1] & 0x3f) as u32) << 6 | (bytes[2] & 0x3f) as u32,
+            3,
+        )
+    } else if a & 0x08 == 0 {
+        (
+            ((a & 0x07) as u32) << 18
+                | ((bytes[1] & 0x3f) as u32) << 12
+                | ((bytes[2] & 0x3f) as u32) << 6
+                | (bytes[3] & 0x3f) as u32,
+            4,
+        )
+    } else {
+        // C++ UNREACHABLE().
+        panic!("next_utf8_unsafe: invalid leading byte {a:#x}");
+    }
+}
+
+/// `td::append_utf8_character` (utf8.cpp): append the UTF-8 encoding of
+/// `code` to `out`.
+pub fn append_utf8_character(out: &mut Vec<u8>, code: u32) {
+    if code <= 0x7f {
+        out.push(code as u8);
+    } else if code <= 0x7ff {
+        out.push((0xc0 | (code >> 6)) as u8);
+        out.push((0x80 | (code & 0x3f)) as u8);
+    } else if code <= 0xffff {
+        out.push((0xe0 | (code >> 12)) as u8);
+        out.push((0x80 | ((code >> 6) & 0x3f)) as u8);
+        out.push((0x80 | (code & 0x3f)) as u8);
+    } else {
+        out.push((0xf0 | (code >> 18)) as u8);
+        out.push((0x80 | ((code >> 12) & 0x3f)) as u8);
+        out.push((0x80 | ((code >> 6) & 0x3f)) as u8);
+        out.push((0x80 | (code & 0x3f)) as u8);
+    }
+}
+
+/// `td::utf8_get_search_words` (utf8.cpp): split into lowercased search words
+/// — punctuation and symbols become word separators (`prepare_search_character`
+/// maps them to `' '` or `0`), diacritics are stripped, and casing is folded.
+pub fn utf8_get_search_words(s: &str) -> Vec<String> {
+    let bytes = s.as_bytes();
+    let mut words: Vec<Vec<u8>> = Vec::new();
+    let mut in_word = false;
+    let mut word: Vec<u8> = Vec::new();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        let (code, used) = next_utf8_unsafe(&bytes[pos..]);
+        pos += used;
+
+        let code = prepare_search_character(code);
+        if code == 0 {
+            continue;
+        }
+        if code == b' ' as u32 {
+            if in_word {
+                words.push(std::mem::take(&mut word));
+                in_word = false;
+            }
+        } else {
+            in_word = true;
+            let code = remove_diacritics(code);
+            append_utf8_character(&mut word, code);
+        }
+    }
+    if in_word {
+        words.push(word);
+    }
+    words
+        .into_iter()
+        .map(|word| String::from_utf8(word).expect("search words are valid UTF-8 for a &str input"))
+        .collect()
 }
 
 #[cfg(test)]

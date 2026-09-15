@@ -54,6 +54,7 @@ pub mod actor_id;
 pub mod alarm_manager;
 pub mod event;
 pub mod messages;
+pub mod multi_promise;
 pub mod promise;
 pub mod scheduler;
 pub mod timeout;
@@ -63,6 +64,9 @@ pub use actor_id::{ActorId, ActorOwn, ActorRef, ActorShared};
 pub use alarm_manager::AlarmManager;
 pub use event::{Event, EventType, Raw};
 pub use messages::{ActorMessage, send_closure, send_closure_later};
+pub use multi_promise::{
+    MultiPromise, MultiPromiseActor, MultiPromiseActorSafe, MultiPromiseInterface,
+};
 pub use promise::{
     EventFull, FutureActor, FutureActorState, PromiseActor, PromiseFuture, create_event_promise,
     create_event_promise_ok_fail, create_promise_from_promise_actor, promise_send_closure,
