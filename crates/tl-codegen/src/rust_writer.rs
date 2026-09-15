@@ -1504,7 +1504,12 @@ impl StoreWriter<'_> {
                     .map(|(_, e)| e.clone())
                     .unwrap_or_else(|| format!("self.{}", field_ident(&fields[*flags_field].name)));
                 out.push_str(&format!(
-                    "{}if {} & {} != 0 {{\n",
+                    // Parenthesized: `cap` is an OR-chain (`self.flags |
+                    // (bool << bit) | …`), and without the parens `&`
+                    // binds per-operator-precedence into the last term —
+                    // `(flags | bools) != 0` — storing every conditional
+                    // field whenever any bit is set.
+                    "{}if ({}) & {} != 0 {{\n",
                     self.indent(),
                     cap,
                     bit_mask(*bit)
