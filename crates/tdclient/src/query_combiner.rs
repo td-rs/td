@@ -60,7 +60,12 @@ impl QueryCombiner {
     }
 
     /// C++ `QueryCombiner::add_query`.
-    pub fn add_query(&mut self, query_id: i64, send_query: Promise<Promise<()>>, promise: Promise<()>) {
+    pub fn add_query(
+        &mut self,
+        query_id: i64,
+        send_query: Promise<Promise<()>>,
+        promise: Promise<()>,
+    ) {
         let query = self.queries.entry(query_id).or_insert_with(QueryInfo::new);
         if !promise.is_empty() {
             query.promises.push(promise);

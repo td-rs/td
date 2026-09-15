@@ -28,7 +28,9 @@ struct QueryInfo {
 
 impl QueryInfo {
     fn new() -> Self {
-        Self { promises: Vec::new() }
+        Self {
+            promises: Vec::new(),
+        }
     }
 }
 
