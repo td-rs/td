@@ -883,6 +883,18 @@ impl ConfigRecoverer {
         &self.dc_options
     }
 
+    /// `!simple_config_query_.empty()` — the driver's delivery guard: a
+    /// result without a dispatched query would double-release the query's
+    /// ref-count share at `hangup_shared`.
+    pub fn simple_config_query_active(&self) -> bool {
+        self.simple_config_query_active
+    }
+
+    /// `!full_config_query_.empty()` — the full-config delivery guard.
+    pub fn full_config_query_active(&self) -> bool {
+        self.full_config_query_active
+    }
+
     /// `on_dc_options_update` (ConfigManager.cpp:505-509) — ends in the
     /// loop, like the C++.
     pub fn on_dc_options_update(

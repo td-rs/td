@@ -237,8 +237,9 @@ impl StoredDcOption {
     }
 
     /// The C++ `DcOption(const telegram_api::dcOption &)` + the
-    /// `is_valid` filter at the DcOptions constructor.
-    fn from_telegram(option: &telegram_api::DcOption) -> Option<Self> {
+    /// `is_valid` filter at the DcOptions constructor (the Td's recoverer
+    /// feed routes through it too).
+    pub(crate) fn from_telegram(option: &telegram_api::DcOption) -> Option<Self> {
         if !(1..=MAX_RAW_DC_ID).contains(&option.id) {
             return None;
         }
