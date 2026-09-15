@@ -1272,6 +1272,14 @@ impl Scheduler {
         Self::try_instance().expect("no scheduler in the current thread context")
     }
 
+    /// Whether a scheduler exists on the current thread. The per-actor
+    /// timer methods ([`crate::Actor::set_timeout_at`] and friends) panic
+    /// outside a scheduler; callers that mirror state into them (and that
+    /// must stay usable in direct-call tests) check this first.
+    pub fn in_scheduler_context() -> bool {
+        Self::try_instance().is_some()
+    }
+
     pub(crate) fn try_instance() -> Option<&'static SchedulerState> {
         TLS.with(|tls| {
             let ptr = tls.scheduler.get();

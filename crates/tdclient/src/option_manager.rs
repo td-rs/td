@@ -15,11 +15,25 @@
 //!   interim local values until those managers land.
 //! - `set_option`'s `updateOption` broadcasts are queued in
 //!   [`OptionManager::take_updates`] for the Td actor (S70) to drain.
+//! - The ConfigManager branches of `get_option`/`set_option` (the
+//!   `*_sensitive_content_restrictions` names) are routed through the
+//!   ConfigManager by the `requests` dispatch (like the C++
+//!   `send_closure_later`); `set_option_from_api` returns the
+//!   [`SetOptionAction`] that triggers the handoff.
 
 use crate::td_api;
 use crate::td_api::OptionValue;
 use tddb::binlog_key_value::BinlogKeyValue;
 use tddb::seq_key_value::SeqKeyValue;
+
+/// The `set_option_from_api` outcomes: the store write completed, or the
+/// ConfigManager must take over (the C++ `OptionManager::set_option`
+/// `send_closure_later` to `ConfigManager::set_content_settings`).
+#[derive(Debug, PartialEq, Eq)]
+pub enum SetOptionAction {
+    Done,
+    SetContentSettings { value: bool },
+}
 
 /// The API version, hardcoded like `OptionManager.cpp` ("1.8.67" — pinned
 /// to the reference C++ version for JSON parity).
@@ -347,6 +361,15 @@ impl OptionManager {
         self.options.isset(name)
     }
 
+    /// The whole in-memory store, sorted — the snapshot tests read the
+    /// store the way the C++ `TsSeqKeyValue::foreach` would.
+    #[cfg(test)]
+    pub fn all_options(&self) -> Vec<(String, String)> {
+        let mut all: Vec<(String, String)> = self.options.get_all().into_iter().collect();
+        all.sort();
+        all
+    }
+
     /// The raw encoded value (`get_option` returns a Slice in the C++).
     pub fn get_option(&self, name: &str) -> String {
         self.options.get(name)
@@ -420,16 +443,20 @@ impl OptionManager {
     }
 
     /// `OptionManager::get_option(name, promise)`: the store lookup with the
-    /// async/live special cases. The ConfigManager/NotificationManager/
-    /// OnlineManager branches report the interim values until their
-    /// managers land (S70+/Wave 1). `unix_time` is the Global-corrected
-    /// `G()->unix_time()` for the live option.
+    /// async/live special cases. The ConfigManager branch for the
+    /// `*_sensitive_content_restrictions` names is intercepted by the
+    /// `requests` dispatch first (the C++ `send_closure_later`); the
+    /// remaining NotificationManager/OnlineManager branches report the
+    /// interim values until their managers land (Wave 1). `unix_time` is
+    /// the Global-corrected `G()->unix_time()` for the live option.
     pub fn get_option_value(&self, name: &str, unix_time: i32) -> OptionValue {
         match name {
             "can_ignore_sensitive_content_restrictions"
             | "ignore_sensitive_content_restrictions" => {
-                // ConfigManager::get_content_settings — TODO (Wave 1).
-                OptionValue::optionValueEmpty(td_api::optionValueEmpty)
+                // Routed through ConfigManager::get_content_settings by the
+                // getOption dispatch; this arm answers the plain store
+                // value for any non-td_api caller.
+                Self::get_option_value_object(&self.get_option(name))
             }
             "disable_contact_registered_notifications" => {
                 // NotificationManager — TODO (Wave 1).
@@ -455,7 +482,7 @@ impl OptionManager {
         &mut self,
         name: &str,
         value: &OptionValue,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<SetOptionAction, String> {
         let is_bot = false;
         let value_id = value_constructor_id(value);
 
@@ -468,7 +495,7 @@ impl OptionManager {
                     match value {
                         OptionValue::optionValueEmpty(_) => {
                             self.set_option_empty(name);
-                            return Ok(());
+                            return Ok(SetOptionAction::Done);
                         }
                         OptionValue::optionValueInteger(v) => {
                             if v.value < $min || v.value > $max {
@@ -478,7 +505,7 @@ impl OptionManager {
                                 ));
                             }
                             self.set_option_integer(name, v.value);
-                            return Ok(());
+                            return Ok(SetOptionAction::Done);
                         }
                         _ => {
                             return Err(format!(
@@ -495,11 +522,11 @@ impl OptionManager {
                     match value {
                         OptionValue::optionValueEmpty(_) => {
                             self.set_option_empty(name);
-                            return Ok(());
+                            return Ok(SetOptionAction::Done);
                         }
                         OptionValue::optionValueBoolean(v) => {
                             self.set_option_boolean(name, v.value);
-                            return Ok(());
+                            return Ok(SetOptionAction::Done);
                         }
                         _ => {
                             return Err(format!("Option \"{name}\" must have boolean value"));
@@ -514,7 +541,7 @@ impl OptionManager {
                     match value {
                         OptionValue::optionValueEmpty(_) => {
                             self.set_option_empty(name);
-                            return Ok(());
+                            return Ok(SetOptionAction::Done);
                         }
                         OptionValue::optionValueString(v) => {
                             if v.value.is_empty() {
@@ -526,7 +553,7 @@ impl OptionManager {
                                     "Option \"{name}\" can't have specified value"
                                 ));
                             }
-                            return Ok(());
+                            return Ok(SetOptionAction::Done);
                         }
                         _ => {
                             return Err(format!("Option \"{name}\" must have string value"));
@@ -540,19 +567,17 @@ impl OptionManager {
             'a' => {
                 set_boolean_option!("always_parse_markdown");
             }
-            'c' => {
-                if !is_bot {
-                    set_string_option!("connection_parameters", |value: &str| {
-                        // Must be a valid JSON object
-                        // (`get_json_value` + jsonValueObject check).
-                        match tdutils::json::json_decode(value) {
-                            tdutils::status::Result::Ok(json_value) => {
-                                json_value.ty() == tdutils::json::JsonValueType::Object
-                            }
-                            tdutils::status::Result::Err(_) => false,
+            'c' if !is_bot => {
+                set_string_option!("connection_parameters", |value: &str| {
+                    // Must be a valid JSON object
+                    // (`get_json_value` + jsonValueObject check).
+                    match tdutils::json::json_decode(value) {
+                        tdutils::status::Result::Ok(json_value) => {
+                            json_value.ty() == tdutils::json::JsonValueType::Object
                         }
-                    });
-                }
+                        tdutils::status::Result::Err(_) => false,
+                    }
+                });
             }
             'd' => {
                 if !is_bot {
@@ -572,7 +597,7 @@ impl OptionManager {
                     // Any value; erases the binlog pmc notification ids.
                     // TODO (TdDb binlog pmc, S44 wiring): the C++ erases
                     // "notification_id_current"/"notification_group_id_current".
-                    return Ok(());
+                    return Ok(SetOptionAction::Done);
                 }
             }
             'i' => {
@@ -596,45 +621,43 @@ impl OptionManager {
                                 .to_string(),
                         );
                     }
-                    // ConfigManager::set_content_settings — TODO (Wave 1).
-                    return Ok(());
+                    // ConfigManager::set_content_settings — the setOption
+                    // answers when the account.setContentSettings query
+                    // completes (requests.rs hands the action off).
+                    let value = value_id == CONSTRUCTOR_BOOL
+                        && matches!(value, OptionValue::optionValueBoolean(v) if v.value);
+                    return Ok(SetOptionAction::SetContentSettings { value });
                 }
             }
-            'l' => {
-                if !is_bot {
-                    set_string_option!("language_pack_database_path", |_| true);
-                    // LanguagePackManager::check_language_code_name — TODO
-                    // (Wave 2): accept any code for now.
-                    set_string_option!("language_pack_id", |_| true);
-                    // LanguagePackManager::check_language_pack_name — TODO.
-                    set_string_option!("localization_target", |_| true);
-                }
+            'l' if !is_bot => {
+                set_string_option!("language_pack_database_path", |_| true);
+                // LanguagePackManager::check_language_code_name — TODO
+                // (Wave 2): accept any code for now.
+                set_string_option!("language_pack_id", |_| true);
+                // LanguagePackManager::check_language_pack_name — TODO.
+                set_string_option!("localization_target", |_| true);
             }
             'm' => {
                 set_integer_option!("message_unload_delay", 60, 86400);
             }
-            'n' => {
-                if !is_bot {
-                    set_integer_option!(
-                        "notification_group_count_max",
-                        MIN_NOTIFICATION_GROUP_COUNT_MAX,
-                        MAX_NOTIFICATION_GROUP_COUNT_MAX
-                    );
-                    set_integer_option!(
-                        "notification_group_size_max",
-                        MIN_NOTIFICATION_GROUP_SIZE_MAX,
-                        MAX_NOTIFICATION_GROUP_SIZE_MAX
-                    );
-                }
+            'n' if !is_bot => {
+                set_integer_option!(
+                    "notification_group_count_max",
+                    MIN_NOTIFICATION_GROUP_COUNT_MAX,
+                    MAX_NOTIFICATION_GROUP_COUNT_MAX
+                );
+                set_integer_option!(
+                    "notification_group_size_max",
+                    MIN_NOTIFICATION_GROUP_SIZE_MAX,
+                    MAX_NOTIFICATION_GROUP_SIZE_MAX
+                );
             }
-            'o' => {
-                if name == "online" {
-                    if value_id != CONSTRUCTOR_BOOL && value_id != CONSTRUCTOR_EMPTY {
-                        return Err("Option \"online\" must have boolean value".to_string());
-                    }
-                    // OnlineManager::set_is_online — TODO (Wave 1).
-                    return Ok(());
+            'o' if name == "online" => {
+                if value_id != CONSTRUCTOR_BOOL && value_id != CONSTRUCTOR_EMPTY {
+                    return Err("Option \"online\" must have boolean value".to_string());
                 }
+                // OnlineManager::set_is_online — TODO (Wave 1).
+                return Ok(SetOptionAction::Done);
             }
             'p' => {
                 set_boolean_option!("prefer_ipv6");
@@ -678,7 +701,7 @@ impl OptionManager {
                         self.set_option_string(name, &v.value);
                     }
                 }
-                return Ok(());
+                return Ok(SetOptionAction::Done);
             }
             _ => {}
         }

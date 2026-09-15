@@ -98,7 +98,7 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
         }
         Function::getCurrentState(_) => {
             let mut updates = Vec::new();
-            let unix_time = td.global.unix_time();
+            let unix_time = td.get_unix_time();
             if let Some(option_manager) = td.option_manager.as_mut() {
                 option_manager.get_current_state(&mut updates, unix_time);
             }
@@ -130,6 +130,15 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             let Some(name) = crate::misc::clean_input_string(&request.name) else {
                 return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
             };
+            // `OptionManager::get_option` (cpp:758-800): the ConfigManager
+            // branch for the content-settings names (is_bot is false until
+            // the AuthManager net step).
+            if !(td.auth_manager.is_authorized() && td.auth_manager.is_bot())
+                && (name == "can_ignore_sensitive_content_restrictions"
+                    || name == "ignore_sensitive_content_restrictions")
+            {
+                return td.get_option_content_settings(id, name);
+            }
             #[allow(clippy::large_enum_variant)] // function-local control flow
             enum Action {
                 Queued,
@@ -162,18 +171,30 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 return td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
             };
             match option_manager.set_option_from_api(&name, &request.value) {
-                Ok(()) => {
+                Ok(crate::option_manager::SetOptionAction::Done) => {
                     td.flush_option_updates();
                     td.send_result(id, ok_object());
+                }
+                // `OptionManager::set_option` (cpp:969-983): the setOption
+                // answers when the account.setContentSettings query
+                // completes.
+                Ok(crate::option_manager::SetOptionAction::SetContentSettings { value }) => {
+                    td.set_content_settings_option(id, value);
                 }
                 Err(error) => td.send_error_impl(id, 400, &error),
             }
         }
+        Function::getApplicationConfig(_) => {
+            // `CHECK_IS_USER` — bots are rejected; is_bot is false until
+            // the AuthManager net step, so the request reaches the manager.
+            td.get_application_config(id);
+        }
 
         // -- interim: the auth set is validated and routed in the C++ shape,
-        //    but the network query layer lands with the ConfigManager step
-        //    (every one of these needs auth.* NetQueries, logOut's local
-        //    guards included). --
+        //    but the network query layer lands with the net step (every one
+        //    of these needs auth.* NetQueries, logOut's local guards
+        //    included; the ConfigManager's own queries are held by the Td
+        //    from this step on). --
         Function::setAuthenticationPhoneNumber(request) => {
             // CLEAN_INPUT_STRING, then `AuthManager::set_phone_number`.
             let _ = crate::misc::clean_input_string(&request.phone_number);
@@ -218,5 +239,19 @@ pub(crate) fn option_value_to_object(value: td_api::OptionValue) -> Object {
         V::optionValueBoolean(v) => Object::optionValueBoolean(v),
         V::optionValueInteger(v) => Object::optionValueInteger(v),
         V::optionValueString(v) => Object::optionValueString(v),
+    }
+}
+
+/// The `JsonValue` → `Object` rewrap (the Object umbrella flattens the
+/// JSON constructors, so the polymorphic type has no single variant).
+pub(crate) fn json_value_to_object(value: td_api::JsonValue) -> Object {
+    use td_api::JsonValue as V;
+    match value {
+        V::jsonValueNull(v) => Object::jsonValueNull(v),
+        V::jsonValueBoolean(v) => Object::jsonValueBoolean(v),
+        V::jsonValueNumber(v) => Object::jsonValueNumber(v),
+        V::jsonValueString(v) => Object::jsonValueString(v),
+        V::jsonValueArray(v) => Object::jsonValueArray(v),
+        V::jsonValueObject(v) => Object::jsonValueObject(v),
     }
 }
