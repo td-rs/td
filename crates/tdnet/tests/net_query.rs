@@ -71,6 +71,7 @@ fn make_query(dc_id: DcId) -> NetQuery {
         -100_000, // a dummy tl constructor
         vec![1, 2, 3],
         10,
+        60,
     )
 }
 
@@ -146,6 +147,7 @@ fn routes_by_type_and_resolves_main_dc() {
             tl,
             Vec::new(),
             10,
+            60,
         );
         dispatcher.dispatch(query);
     }
@@ -346,6 +348,7 @@ fn dispatch_ttl_exhaustion() {
         -100_000,
         Vec::new(),
         0,
+        60,
     );
     dispatcher2.dispatch(query);
     let results = drain_td(&td2);
