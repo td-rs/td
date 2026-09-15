@@ -89,10 +89,7 @@ pub fn next_utf8_unsafe(bytes: &[u8]) -> (u32, usize) {
     if a & 0x80 == 0 {
         (a as u32, 1)
     } else if a & 0x20 == 0 {
-        (
-            ((a & 0x1f) as u32) << 6 | (bytes[1] & 0x3f) as u32,
-            2,
-        )
+        (((a & 0x1f) as u32) << 6 | (bytes[1] & 0x3f) as u32, 2)
     } else if a & 0x10 == 0 {
         (
             ((a & 0x0f) as u32) << 12 | ((bytes[1] & 0x3f) as u32) << 6 | (bytes[2] & 0x3f) as u32,

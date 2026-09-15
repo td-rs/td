@@ -61,49 +61,53 @@ impl Actor for TestQueryMerger {
     fn start_up(&mut self) {
         let test_id = self.actor_id_of::<Self>();
         let state = self.state.clone();
-        let merge_function: MergeFunction = Box::new(move |query_ids: Vec<i64>, promise: Promise<()>| {
-            let mut st = state.lock().unwrap();
-            assert!(!query_ids.is_empty());
-            assert!(query_ids.len() <= MAX_MERGED_QUERY_COUNT);
-            // The C++ test also asserts batch == min(queued, 3): it can,
-            // because add_query processes synchronously inside the caller.
-            // The message-driven port keeps FIFO order but test-side pushes
-            // may run ahead of batch formation, so only the order, the
-            // distinctness and the concurrency cap are asserted.
-            let mut seen = HashSet::new();
-            for &query_id in &query_ids {
-                assert!(seen.insert(query_id), "duplicate id {query_id} in one batch");
-                let next = st
-                    .next_query_ids
-                    .pop_front()
-                    .expect("batch id must be the oldest queued add");
-                assert_eq!(query_id, next);
-            }
-            st.current_query_count += 1;
-            assert!(st.current_query_count <= MAX_CONCURRENT_QUERY_COUNT);
-            drop(st);
-
-            let completion = PromiseCreator::lambda_result({
-                let state = state.clone();
-                let query_ids = query_ids.clone();
-                move |result: Result<()>| {
-                    let mut st = state.lock().unwrap();
-                    for &query_id in &query_ids {
-                        assert!(
-                            st.pending_query_ids.remove(&query_id),
-                            "completed query {query_id} was not pending"
-                        );
-                    }
-                    st.current_query_count -= 1;
-                    drop(st);
-                    let mut promise = promise;
-                    promise.set_result(result);
+        let merge_function: MergeFunction =
+            Box::new(move |query_ids: Vec<i64>, promise: Promise<()>| {
+                let mut st = state.lock().unwrap();
+                assert!(!query_ids.is_empty());
+                assert!(query_ids.len() <= MAX_MERGED_QUERY_COUNT);
+                // The C++ test also asserts batch == min(queued, 3): it can,
+                // because add_query processes synchronously inside the caller.
+                // The message-driven port keeps FIFO order but test-side pushes
+                // may run ahead of batch formation, so only the order, the
+                // distinctness and the concurrency cap are asserted.
+                let mut seen = HashSet::new();
+                for &query_id in &query_ids {
+                    assert!(
+                        seen.insert(query_id),
+                        "duplicate id {query_id} in one batch"
+                    );
+                    let next = st
+                        .next_query_ids
+                        .pop_front()
+                        .expect("batch id must be the oldest queued add");
+                    assert_eq!(query_id, next);
                 }
+                st.current_query_count += 1;
+                assert!(st.current_query_count <= MAX_CONCURRENT_QUERY_COUNT);
+                drop(st);
+
+                let completion = PromiseCreator::lambda_result({
+                    let state = state.clone();
+                    let query_ids = query_ids.clone();
+                    move |result: Result<()>| {
+                        let mut st = state.lock().unwrap();
+                        for &query_id in &query_ids {
+                            assert!(
+                                st.pending_query_ids.remove(&query_id),
+                                "completed query {query_id} was not pending"
+                            );
+                        }
+                        st.current_query_count -= 1;
+                        drop(st);
+                        let mut promise = promise;
+                        promise.set_result(result);
+                    }
+                });
+                create_actor("CompleteMergeQuery", SleepActor::new(0.02, completion)).release();
+                // the C++ merge function ends with `this->yield()`
+                send_closure(&test_id, TestMessage::Merged { dummy: 0 });
             });
-            create_actor("CompleteMergeQuery", SleepActor::new(0.02, completion)).release();
-            // the C++ merge function ends with `this->yield()`
-            send_closure(&test_id, TestMessage::Merged { dummy: 0 });
-        });
 
         self.merger = Some(create_actor(
             "QueryMerger",
@@ -159,7 +163,7 @@ impl TestQueryMerger {
                 send_closure(&test_id, TestMessage::QueryCompleted { dummy: 0 });
             });
             send_closure(
-                &self.merger_id(),
+                self.merger_id(),
                 QueryMergerMessage::AddQuery { query_id, promise },
             );
         }

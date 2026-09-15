@@ -111,11 +111,11 @@ fn search_words_split_and_fold() {
         utf8_get_search_words("Bob_Marley Jr."),
         vec!["bob".to_owned(), "marley".to_owned(), "jr".to_owned()]
     );
+    assert_eq!(utf8_get_search_words("user123"), vec!["user123".to_owned()]);
     assert_eq!(
-        utf8_get_search_words("user123"),
-        vec!["user123".to_owned()]
+        utf8_get_search_words("Владимир Путин"),
+        vec!["владимир".to_owned(), "путин".to_owned()]
     );
-    assert_eq!(utf8_get_search_words("Владимир Путин"), vec!["владимир".to_owned(), "путин".to_owned()]);
     // Precomposed é folds to e; the combining-acute form drops the mark —
     // both spellings produce the same word.
     assert_eq!(utf8_get_search_words("José"), vec!["jose".to_owned()]);
