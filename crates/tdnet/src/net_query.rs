@@ -184,6 +184,7 @@ pub struct NetQuery {
     answer: Vec<u8>,
     error: Option<Status>,
     dispatch_ttl: u32,
+    total_timeout_limit: i32,
     resend_count: u32,
     callback: Option<Box<dyn NetQueryCallback>>,
 }
@@ -201,6 +202,7 @@ impl NetQuery {
         tl_constructor: i32,
         query: Vec<u8>,
         dispatch_ttl: u32,
+        total_timeout_limit: i32,
     ) -> Self {
         Self {
             id,
@@ -214,6 +216,7 @@ impl NetQuery {
             answer: Vec::new(),
             error: None,
             dispatch_ttl,
+            total_timeout_limit,
             resend_count: 0,
             callback: None,
         }
@@ -249,6 +252,14 @@ impl NetQuery {
 
     pub fn dispatch_ttl(&self) -> u32 {
         self.dispatch_ttl
+    }
+
+    /// `total_timeout_limit()` — the per-query total-timeout budget the
+    /// C++ `NetQueryDelayer`/`SequenceDispatcher` enforce. The creator
+    /// default is 60 (8 for bots); callers like the ConfigManager raise
+    /// it to 24 hours.
+    pub fn total_timeout_limit(&self) -> i32 {
+        self.total_timeout_limit
     }
 
     pub fn resend_count(&self) -> u32 {
@@ -702,6 +713,7 @@ fn dangling_query() -> NetQuery {
         0,
         Vec::new(),
         0,
+        60,
     )
 }
 

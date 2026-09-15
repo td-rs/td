@@ -13,21 +13,27 @@
 //!   order;
 //! - the close machine collapses the actor-refcount ladder (2→3→4→5) into
 //!   direct calls — there are no manager actors to await yet;
-//! - the ConfigManager is an inline manager: its network queries are held
-//!   in `pending_config_queries` until the dispatcher lands (the net step)
-//!   and its expire timer rides the Td's own actor timeout slot; the
-//!   ConfigRecoverer rides with it — created at the manager's `start_up`,
-//!   its dispatched fetches parked until their executors, its wakeup
-//!   sharing the same timeout slot.
+//! - the ConfigManager is an inline manager: its network queries dispatch
+//!   through the client-side NetQueryDispatcher (M.3.8.1) with the parked
+//!   completions awaiting M.3.8.2's routing, and its expire timer rides
+//!   the Td's own actor timeout slot; the ConfigRecoverer rides with it —
+//!   created at the manager's `start_up`, its dispatched fetches parked
+//!   until their executors, its wakeup sharing the same timeout slot.
 
 use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 
 use tdactor::{Actor, ActorOwn, actor_messages};
 use tddb::td_db::{OpenedDatabase, Parameters as DbParameters, TdDb};
 use tdmtproto::telegram_api;
+use tdnet::net_query::NetQueryDispatcher;
 use tdutils::status::Status;
 
 use crate::auth_manager::AuthManager;
+use crate::config_dispatch::{
+    CompletedNetQueries, ConfigQueryCallback, SentNetQueries, TdConfigSink, TdSessionSink,
+    build_config_net_query,
+};
 use crate::config_manager::{
     ConfigActions, ConfigManager, ConfigQuery, ConfigQueryResult, StoredDcOption,
 };
@@ -105,12 +111,21 @@ pub struct Td {
     /// `None` during `WaitParameters` exactly like the C++.
     pub(crate) option_manager: Option<OptionManager>,
     /// `Td::config_manager_` — created by `init_options_and_network`; its
-    /// network queries and expire timer are hosted by the Td until the
-    /// dispatcher lands (the net step).
+    /// expire timer rides the Td's actor timeout slot and its queries
+    /// dispatch through the client-side dispatcher (M.3.8.1).
     pub(crate) config_manager: Option<ConfigManager>,
-    /// The ConfigManager's in-flight network queries — `NetQuery`s once
-    /// the dispatcher wiring lands.
-    pub(crate) pending_config_queries: Vec<ConfigQuery>,
+    /// The client-side `NetQueryDispatcher` (`Td.cpp:914-919`), created in
+    /// `init`; the ConfigManager queries and the `pingProxy` main-DC read
+    /// go through it.
+    pub(crate) net_query_dispatcher: Option<NetQueryDispatcher>,
+    /// Queries that passed the dispatcher's DC-init gate, parked with
+    /// their resolved DC by `TdSessionSink` until the Track-G session step
+    /// routes them to real sessions.
+    pub(crate) sent_net_queries: SentNetQueries,
+    /// Completed ConfigManager queries — `(token, NetQuery)` parked by
+    /// `ConfigQueryCallback` (token 0 = the callback-less `TdSink`
+    /// stand-in); M.3.8.2 routes them into `on_config_query_result`.
+    pub(crate) completed_config_queries: CompletedNetQueries,
     /// The C++ `ConfigManager::config_recoverer_` — created right after
     /// the ConfigManager's `start_up` (ConfigManager.cpp:866-868) and
     /// dropped with it at `ConfigManager::hangup` (ConfigManager.cpp:894).
@@ -170,7 +185,9 @@ impl Td {
             header_options: HeaderOptions::default(),
             option_manager: None,
             config_manager: None,
-            pending_config_queries: Vec::new(),
+            net_query_dispatcher: None,
+            sent_net_queries: Arc::new(Mutex::new(Vec::new())),
+            completed_config_queries: Arc::new(Mutex::new(Vec::new())),
             config_recoverer: None,
             pending_recoverer_fetches: Vec::new(),
             recoverer_wakeup_at: 0.0,
@@ -379,9 +396,19 @@ impl Td {
             header_options.is_emulator = option_manager.get_option_boolean("is_emulator", false);
         }
 
-        // VLOG "Create NetQueryDispatcher" — the client-side dispatcher
-        // wiring lands with the ConfigManager step; pending pingProxy
-        // requests complete there too.
+        // VLOG "Create NetQueryDispatcher" (Td.cpp:914-919): the
+        // client-side dispatcher over the session/td sinks — the
+        // ConfigManager queries dispatch through it below; the pending
+        // pingProxy requests complete once their main-DC reads go through
+        // it.
+        self.net_query_dispatcher = Some(NetQueryDispatcher::new(
+            Box::new(TdSessionSink {
+                sent: self.sent_net_queries.clone(),
+            }),
+            Box::new(TdConfigSink {
+                completed: self.completed_config_queries.clone(),
+            }),
+        ));
 
         // VLOG "Create AuthManager" (Td.cpp:923-926) + the constructor pmc
         // restore (AuthManager.cpp:337-366).
@@ -571,14 +598,23 @@ impl Td {
             self.close_flag = 2;
         }
 
-        // G()->net_query_creator().stop_check() / dispatcher stop /
-        // result_handlers_ / StateManager — with the net step.
+        // G()->net_query_creator().stop_check() / result_handlers_ /
+        // StateManager — with the net step.
         self.clear_requests();
+
+        // `net_query_dispatcher_->stop()` (the Td.cpp:664 close path):
+        // in-flight queries abort with "Request aborted" through their
+        // callbacks (M.3.8.2 routes the completions); the parked buffers
+        // drop with the close.
+        if let Some(dispatcher) = self.net_query_dispatcher.take() {
+            dispatcher.stop();
+        }
+        self.sent_net_queries.lock().unwrap().clear();
+        self.completed_config_queries.lock().unwrap().clear();
 
         self.global.close_all(self.destroy_flag);
         self.option_manager = None;
         self.config_manager = None;
-        self.pending_config_queries.clear();
         // The C++ `ConfigManager::hangup` drops `config_recoverer_`
         // (ConfigManager.cpp:892-896): the close releases the parent share
         // and cancels the in-flight queries with it, then the dropped
@@ -738,7 +774,9 @@ impl Td {
         for (id, value) in actions.app_config_answers {
             self.send_result(id, requests::json_value_to_object(value));
         }
-        self.pending_config_queries.extend(actions.queries);
+        for query in actions.queries {
+            self.dispatch_config_query(query);
+        }
         self.sync_config_timeout();
     }
 
@@ -986,10 +1024,30 @@ impl Td {
         self.apply_config_actions(actions);
     }
 
-    /// `NetQueryDispatcher::get_main_dc_id()` — the dispatcher lands with
-    /// the net step; the main DC is 1 until then.
+    /// `NetQueryDispatcher::get_main_dc_id()` — read through the
+    /// dispatcher like the C++ (`pingProxy` does the same); 1 before
+    /// `init` creates the dispatcher.
     fn get_main_dc_id(&self) -> i32 {
-        1
+        self.net_query_dispatcher
+            .as_ref()
+            .map_or(1, |dispatcher| dispatcher.get_main_dc_id().get_value())
+    }
+
+    /// `NetQueryDispatcher::dispatch_with_callback` for one ConfigManager
+    /// query — the C++ dispatch sites (ConfigManager.cpp:1027, :957, :986,
+    /// :1002) with the `actor_shared(this, token)` payload carried by the
+    /// callback.
+    pub(crate) fn dispatch_config_query(&mut self, query: ConfigQuery) {
+        let Some(dispatcher) = self.net_query_dispatcher.as_ref() else {
+            // The queries only originate from the ConfigManager after
+            // `init` creates the dispatcher; nothing to dispatch into
+            // pre-init.
+            return;
+        };
+        let is_bot = self.auth_manager.is_bot();
+        let (net_query, token) = build_config_net_query(&query, dispatcher.next_query_id(), is_bot);
+        let callback = ConfigQueryCallback::new(token, self.completed_config_queries.clone());
+        dispatcher.dispatch_with_callback(net_query, Box::new(callback));
     }
 
     /// `G()->unix_time()` — the server-time-corrected wall clock; the value
@@ -2253,13 +2311,16 @@ mod tests {
         };
         td.on_set_tdlib_parameters(20, parameters);
         assert_eq!(td.state, State::Run);
-        assert_eq!(
-            td.pending_config_queries,
-            vec![ConfigQuery::GetConfig {
-                dc_id: 1,
-                reopen_sessions: false,
-            }]
-        );
+        // The start-up GetConfig went through the dispatcher; without a
+        // session-inited DC the slice's DC gate completes it with the C++
+        // "No such dc" error through the token-8 callback.
+        assert!(td.sent_net_queries.lock().unwrap().is_empty());
+        {
+            let completed = td.completed_config_queries.lock().unwrap();
+            assert_eq!(completed.len(), 1);
+            assert_eq!(completed[0].0, 8);
+            assert_eq!(completed[0].1.error().message(), "No such dc DcId{1}");
+        }
         td.close_impl(false);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2279,7 +2340,12 @@ mod tests {
             unreachable!("setTdlibParameters helper");
         };
         td.on_set_tdlib_parameters(20, parameters);
-        let query = td.pending_config_queries[0].clone();
+        // The dispatched query kind the config flow drives — the start-up
+        // GetConfig (the only in-flight query after init).
+        let query = ConfigQuery::GetConfig {
+            dc_id: 1,
+            reopen_sessions: false,
+        };
 
         let config = telegram_api::Config {
             this_dc: 1,

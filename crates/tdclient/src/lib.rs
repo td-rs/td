@@ -10,6 +10,7 @@
 pub mod auth_manager;
 pub mod client;
 pub mod client_json;
+pub mod config_dispatch;
 pub mod config_manager;
 pub mod config_recoverer;
 pub mod global;
