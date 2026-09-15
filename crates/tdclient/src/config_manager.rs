@@ -806,6 +806,12 @@ impl ConfigManager {
         self.expire_time
     }
 
+    /// `config_sent_cnt_` — the in-flight `help.getConfig` count; the
+    /// M.3.8.2 routing tests assert the completion decrement through it.
+    pub fn config_sent_cnt(&self) -> i32 {
+        self.config_sent_cnt
+    }
+
     /// The C++ `on_result` tokens 8/9 — `help.getConfig`.
     #[allow(clippy::too_many_arguments)] // the C++ handler has the same shape
     pub fn on_get_config_result(
