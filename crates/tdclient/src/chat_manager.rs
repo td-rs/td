@@ -22,7 +22,9 @@
 //!   created-public-dialogs step — its only consumer — because it converts the
 //!   td_api `PublicChatType` surface.
 
-use crate::store_parse::{Parser, store_u64, version};
+use crate::global::Global;
+use crate::misc::strip_empty_characters;
+use crate::store_parse::{Parser, store_i32, store_string, store_u64, version};
 use crate::td_api;
 use tdmtproto::telegram_api;
 
@@ -272,9 +274,9 @@ impl AdministratorRights {
     const CAN_MANAGE_RANKS: u64 = 1 << 52;
     const CAN_MANAGE_LINKED_PEERS: u64 = 1 << 53;
     const CAN_MANAGE_WELCOME_MESSAGES: u64 = 1 << 54;
-    const IS_ANONYMOUS: u64 = 1 << 13;
+    pub(crate) const IS_ANONYMOUS: u64 = 1 << 13;
 
-    const ALL_ADMINISTRATOR_RIGHTS: u64 = Self::CAN_CHANGE_INFO_AND_SETTINGS
+    pub(crate) const ALL_ADMINISTRATOR_RIGHTS: u64 = Self::CAN_CHANGE_INFO_AND_SETTINGS
         | Self::CAN_POST_MESSAGES
         | Self::CAN_EDIT_MESSAGES
         | Self::CAN_DELETE_MESSAGES
@@ -296,11 +298,15 @@ impl AdministratorRights {
     /// The C++ `friend class DialogParticipantStatus` constructor: the raw
     /// flags masked to the server-known set (DialogParticipantStatus embeds
     /// the rights in its own flag word, M.5.3).
-    #[allow(dead_code)] // becomes a real call site with M.5.3
-    fn from_flags(flags: u64) -> AdministratorRights {
+    pub(crate) fn from_flags(flags: u64) -> AdministratorRights {
         AdministratorRights {
             flags: flags & (Self::ALL_ADMINISTRATOR_RIGHTS | Self::IS_ANONYMOUS),
         }
+    }
+
+    /// The raw flag word (the C++ friend access from `DialogParticipantStatus`).
+    pub(crate) const fn flags(&self) -> u64 {
+        self.flags
     }
 
     /// `AdministratorRights(const telegram_api::chatAdminRights &, ChannelType)`.
@@ -639,13 +645,13 @@ pub struct RestrictedRights {
 
 impl RestrictedRights {
     const CAN_SEND_MESSAGES: u64 = 1 << 16;
-    const LEGACY_CAN_SEND_MEDIA: u64 = 1 << 17;
-    const CAN_SEND_AUDIOS: u64 = 1 << 32;
-    const CAN_SEND_DOCUMENTS: u64 = 1 << 33;
-    const CAN_SEND_PHOTOS: u64 = 1 << 34;
-    const CAN_SEND_VIDEOS: u64 = 1 << 35;
-    const CAN_SEND_VIDEO_NOTES: u64 = 1 << 36;
-    const CAN_SEND_VOICE_NOTES: u64 = 1 << 37;
+    pub(crate) const LEGACY_CAN_SEND_MEDIA: u64 = 1 << 17;
+    pub(crate) const CAN_SEND_AUDIOS: u64 = 1 << 32;
+    pub(crate) const CAN_SEND_DOCUMENTS: u64 = 1 << 33;
+    pub(crate) const CAN_SEND_PHOTOS: u64 = 1 << 34;
+    pub(crate) const CAN_SEND_VIDEOS: u64 = 1 << 35;
+    pub(crate) const CAN_SEND_VIDEO_NOTES: u64 = 1 << 36;
+    pub(crate) const CAN_SEND_VOICE_NOTES: u64 = 1 << 37;
     const CAN_SEND_STICKERS: u64 = 1 << 18;
     const CAN_SEND_ANIMATIONS: u64 = 1 << 19;
     const CAN_SEND_GAMES: u64 = 1 << 20;
@@ -660,13 +666,13 @@ impl RestrictedRights {
     const CAN_SEND_REACTIONS: u64 = 1 << 39;
     const CAN_MANAGE_LINKED_PEERS: u64 = 1 << 40;
 
-    const ALL_ADMIN_PERMISSION_RIGHTS: u64 = Self::CAN_CHANGE_INFO_AND_SETTINGS
+    pub(crate) const ALL_ADMIN_PERMISSION_RIGHTS: u64 = Self::CAN_CHANGE_INFO_AND_SETTINGS
         | Self::CAN_INVITE_USERS
         | Self::CAN_PIN_MESSAGES
         | Self::CAN_MANAGE_TOPICS
         | Self::CAN_MANAGE_LINKED_PEERS;
 
-    const ALL_RESTRICTED_RIGHTS: u64 = Self::CAN_SEND_MESSAGES
+    pub(crate) const ALL_RESTRICTED_RIGHTS: u64 = Self::CAN_SEND_MESSAGES
         | Self::CAN_SEND_STICKERS
         | Self::CAN_SEND_ANIMATIONS
         | Self::CAN_SEND_GAMES
@@ -684,11 +690,15 @@ impl RestrictedRights {
         | Self::CAN_SEND_REACTIONS;
 
     /// The C++ `friend class DialogParticipantStatus` constructor (M.5.3).
-    #[allow(dead_code)] // becomes a real call site with M.5.3
-    fn from_flags(flags: u64) -> RestrictedRights {
+    pub(crate) fn from_flags(flags: u64) -> RestrictedRights {
         RestrictedRights {
             flags: flags & Self::ALL_RESTRICTED_RIGHTS,
         }
+    }
+
+    /// The raw flag word (the C++ friend access from `DialogParticipantStatus`).
+    pub(crate) const fn flags(&self) -> u64 {
+        self.flags
     }
 
     /// `RestrictedRights(const telegram_api::chatBannedRights &, ChannelType)`.
@@ -1004,6 +1014,667 @@ impl RestrictedRights {
                 | Self::CAN_SEND_VOICE_NOTES;
         }
         Ok(RestrictedRights { flags })
+    }
+}
+
+/// The `DialogParticipantStatus::Type` discriminator stored in bits 28-30 of
+/// the flag word (`TYPE_SIZE` = 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+enum StatusType {
+    Creator = 0,
+    Administrator = 1,
+    Member = 2,
+    Restricted = 3,
+    Left = 4,
+    Banned = 5,
+}
+
+/// `td::DialogParticipantStatus` (DialogParticipant.h:360): the bit-packed
+/// member-status record. The rights of an administrator, member or restricted
+/// member live in `flags_` (the same word the type and the `HAS_*` markers
+/// occupy); `until_date_` is only meaningful for member/restricted/banned and
+/// `rank_` for creator/administrator statuses.
+///
+/// The byte format (DialogParticipant.h:656-697, pinned against the compiled
+/// C++ by `conformance/chat_participant_status_oracle`):
+/// - a `uint64` flag word: the rights flags OR-ed with the type at bits 28-30,
+///   `HAS_UNTIL_DATE` (bit 31) when `until_date_ > 0` and `HAS_RANK` (bit 14)
+///   when the rank is non-empty;
+/// - the `int32` until date and the TL-framed rank, only when flagged;
+/// - the *parse* side branches on the log-event version: writers older than
+///   `MakeParticipantFlags64Bit` (46) used a `uint32` flag word (the
+///   64-bit-only restricted-media bits cannot appear), and any legacy
+///   `LEGACY_CAN_SEND_MEDIA` bit expands into the six per-media bits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DialogParticipantStatus {
+    type_: StatusType,
+    until_date_: i32,
+    flags_: u64,
+    rank_: String,
+}
+
+impl DialogParticipantStatus {
+    const HAS_RANK: u64 = 1 << 14;
+    const CAN_BE_EDITED: u64 = 1 << 15;
+    const IS_MEMBER: u64 = 1 << 27;
+    const TYPE_SHIFT: u32 = 28;
+    const TYPE_SIZE: u64 = 3;
+    const HAS_UNTIL_DATE: u64 = 1 << 31;
+
+    fn new(
+        type_: StatusType,
+        flags: u64,
+        until_date: i32,
+        rank: String,
+    ) -> DialogParticipantStatus {
+        DialogParticipantStatus {
+            type_,
+            until_date_: until_date,
+            flags_: flags,
+            rank_: strip_empty_characters(&rank, 16, false),
+        }
+    }
+
+    /// `DialogParticipantStatus::fix_until_date`: an unreachable or negative
+    /// date means "forever" (0).
+    fn fix_until_date(date: i32) -> i32 {
+        if date == i32::MAX || date < 0 {
+            0
+        } else {
+            date
+        }
+    }
+
+    fn get_administrator_rights(&self) -> AdministratorRights {
+        AdministratorRights::from_flags(self.flags_)
+    }
+
+    fn get_restricted_rights(&self) -> RestrictedRights {
+        RestrictedRights::from_flags(self.flags_)
+    }
+
+    /// `DialogParticipantStatus::Creator`.
+    pub fn creator(is_member: bool, is_anonymous: bool, rank: String) -> DialogParticipantStatus {
+        DialogParticipantStatus::new(
+            StatusType::Creator,
+            AdministratorRights::ALL_ADMINISTRATOR_RIGHTS
+                | RestrictedRights::ALL_RESTRICTED_RIGHTS
+                | (u64::from(is_member) * Self::IS_MEMBER)
+                | (u64::from(is_anonymous) * AdministratorRights::IS_ANONYMOUS),
+            0,
+            rank,
+        )
+    }
+
+    /// `DialogParticipantStatus::Administrator` — empty rights degrade to a
+    /// plain member.
+    pub fn administrator(
+        administrator_rights: AdministratorRights,
+        rank: String,
+        can_be_edited: bool,
+    ) -> DialogParticipantStatus {
+        let flags = administrator_rights.flags();
+        if flags == 0 {
+            return DialogParticipantStatus::member(0, rank);
+        }
+        let flags = flags | (u64::from(can_be_edited) * Self::CAN_BE_EDITED);
+        DialogParticipantStatus::new(
+            StatusType::Administrator,
+            Self::IS_MEMBER
+                | (RestrictedRights::ALL_RESTRICTED_RIGHTS
+                    & !RestrictedRights::ALL_ADMIN_PERMISSION_RIGHTS)
+                | flags,
+            0,
+            rank,
+        )
+    }
+
+    /// `DialogParticipantStatus::Member`.
+    pub fn member(member_until_date: i32, rank: String) -> DialogParticipantStatus {
+        DialogParticipantStatus::new(
+            StatusType::Member,
+            Self::IS_MEMBER | RestrictedRights::ALL_RESTRICTED_RIGHTS,
+            member_until_date,
+            rank,
+        )
+    }
+
+    /// `DialogParticipantStatus::Restricted` — unrestricted rights or a
+    /// broadcast degrade to a plain member (or `Left` without the member bit).
+    pub fn restricted(
+        restricted_rights: RestrictedRights,
+        is_member: bool,
+        restricted_until_date: i32,
+        channel_type: ChannelType,
+        rank: String,
+    ) -> DialogParticipantStatus {
+        let flags = restricted_rights.flags();
+        if flags == RestrictedRights::ALL_RESTRICTED_RIGHTS
+            || channel_type == ChannelType::Broadcast
+        {
+            return if is_member {
+                DialogParticipantStatus::member(0, rank)
+            } else {
+                DialogParticipantStatus::left()
+            };
+        }
+        let flags = flags | (u64::from(is_member) * Self::IS_MEMBER);
+        DialogParticipantStatus::new(
+            StatusType::Restricted,
+            flags,
+            Self::fix_until_date(restricted_until_date),
+            rank,
+        )
+    }
+
+    /// `DialogParticipantStatus::Left`.
+    pub fn left() -> DialogParticipantStatus {
+        DialogParticipantStatus::new(
+            StatusType::Left,
+            RestrictedRights::ALL_RESTRICTED_RIGHTS,
+            0,
+            String::new(),
+        )
+    }
+
+    /// `DialogParticipantStatus::Banned`.
+    pub fn banned(banned_until_date: i32, rank: String) -> DialogParticipantStatus {
+        DialogParticipantStatus::new(
+            StatusType::Banned,
+            0,
+            Self::fix_until_date(banned_until_date),
+            rank,
+        )
+    }
+
+    /// `DialogParticipantStatus::GroupAdministrator` — the legacy
+    /// basic-group admin rights.
+    pub fn group_administrator(
+        is_current_user_creator: bool,
+        rank: String,
+    ) -> DialogParticipantStatus {
+        DialogParticipantStatus::administrator(
+            AdministratorRights::from_bools(
+                false,
+                true,
+                true,
+                false,
+                false,
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                true,
+                ChannelType::Unknown,
+            ),
+            rank,
+            is_current_user_creator,
+        )
+    }
+
+    /// `DialogParticipantStatus::ChannelAdministrator` — the legacy
+    /// supergroup/channel admin rights.
+    pub fn channel_administrator(
+        is_current_user_creator: bool,
+        is_megagroup: bool,
+    ) -> DialogParticipantStatus {
+        let rights = if is_megagroup {
+            AdministratorRights::from_bools(
+                false,
+                true,
+                true,
+                false,
+                false,
+                true,
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                ChannelType::Megagroup,
+            )
+        } else {
+            AdministratorRights::from_bools(
+                false,
+                true,
+                false,
+                true,
+                true,
+                true,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                ChannelType::Broadcast,
+            )
+        };
+        DialogParticipantStatus::administrator(rights, String::new(), is_current_user_creator)
+    }
+
+    pub fn has_all_administrator_rights(&self, administrator_rights: AdministratorRights) -> bool {
+        let flags = administrator_rights.flags()
+            & (AdministratorRights::ALL_ADMINISTRATOR_RIGHTS | AdministratorRights::IS_ANONYMOUS);
+        (self.get_administrator_rights().flags() & flags) == flags
+    }
+
+    /// `DialogParticipantStatus::get_effective_restricted_rights`.
+    pub fn get_effective_restricted_rights(&self) -> RestrictedRights {
+        RestrictedRights::from_bools(
+            self.can_send_messages(),
+            self.can_send_audios(),
+            self.can_send_documents(),
+            self.can_send_photos(),
+            self.can_send_videos(),
+            self.can_send_video_notes(),
+            self.can_send_voice_notes(),
+            self.can_send_stickers(),
+            self.can_send_animations(),
+            self.can_send_games(),
+            self.can_use_inline_bots(),
+            self.can_add_web_page_previews(),
+            self.can_send_polls(),
+            self.can_change_info_and_settings(),
+            self.can_invite_users(),
+            self.can_pin_messages(),
+            self.can_create_topics(),
+            self.can_edit_rank(),
+            self.can_send_reactions(),
+            self.can_manage_linked_peers(),
+            ChannelType::Unknown,
+        )
+    }
+
+    /// `DialogParticipantStatus::apply_restrictions` — the effective flag
+    /// word after the group default restrictions; the until date and rank are
+    /// dropped exactly like the C++.
+    pub fn apply_restrictions(
+        &self,
+        default_restrictions: RestrictedRights,
+        is_booster: bool,
+        is_bot: bool,
+    ) -> DialogParticipantStatus {
+        let mut flags = self.flags_;
+        match self.type_ {
+            StatusType::Creator => {
+                // the creator can do anything and isn't affected by restrictions
+            }
+            StatusType::Administrator => {
+                // administrators aren't affected by restrictions, but if everyone
+                // can invite users, pin messages or change info, they also can
+                if !is_bot {
+                    flags |= default_restrictions.flags()
+                        & RestrictedRights::ALL_ADMIN_PERMISSION_RIGHTS;
+                }
+            }
+            StatusType::Member | StatusType::Restricted | StatusType::Left => {
+                if !is_booster {
+                    // members and restricted are affected by default restrictions
+                    // unless they are supergroup boosters
+                    flags &=
+                        !RestrictedRights::ALL_RESTRICTED_RIGHTS | default_restrictions.flags();
+                }
+                if is_bot {
+                    // bots must be explicitly granted administrator rights to use them
+                    flags &= !RestrictedRights::ALL_ADMIN_PERMISSION_RIGHTS;
+                }
+            }
+            StatusType::Banned => {
+                // banned can do nothing even if restrictions allows them to do that
+            }
+        }
+        DialogParticipantStatus::new(self.type_, flags, 0, String::new())
+    }
+
+    /// `DialogParticipantStatus::update_restrictions` — unrestricts when the
+    /// restriction time has expired; called before every privilege check.
+    pub fn update_restrictions(&mut self, global: &Global) {
+        if self.until_date_ != 0 && global.unix_time() > self.until_date_ {
+            self.until_date_ = 0;
+            if self.type_ == StatusType::Restricted {
+                self.type_ = if self.is_member() {
+                    StatusType::Member
+                } else {
+                    StatusType::Left
+                };
+                self.flags_ |= RestrictedRights::ALL_RESTRICTED_RIGHTS;
+            } else if self.type_ == StatusType::Banned || self.type_ == StatusType::Member {
+                self.type_ = StatusType::Left;
+            } else {
+                debug_assert!(false, "unreachable status type in update_restrictions");
+            }
+        }
+    }
+
+    pub fn can_manage_dialog(&self) -> bool {
+        self.get_administrator_rights().can_manage_dialog()
+    }
+
+    pub fn can_change_info_and_settings_as_administrator(&self) -> bool {
+        self.get_administrator_rights()
+            .can_change_info_and_settings()
+    }
+
+    pub fn can_change_info_and_settings(&self) -> bool {
+        self.get_administrator_rights()
+            .can_change_info_and_settings()
+            || self.get_restricted_rights().can_change_info_and_settings()
+    }
+
+    pub fn can_post_messages(&self) -> bool {
+        self.get_administrator_rights().can_post_messages()
+    }
+
+    pub fn can_edit_messages(&self) -> bool {
+        self.get_administrator_rights().can_edit_messages()
+    }
+
+    pub fn can_delete_messages(&self) -> bool {
+        self.get_administrator_rights().can_delete_messages()
+    }
+
+    pub fn can_invite_users(&self) -> bool {
+        self.get_administrator_rights().can_invite_users()
+            || self.get_restricted_rights().can_invite_users()
+    }
+
+    /// `DialogParticipantStatus::can_manage_invite_links` — invite links can
+    /// only be managed by an administrator explicitly granted the right.
+    pub fn can_manage_invite_links(&self) -> bool {
+        self.get_administrator_rights().can_invite_users()
+    }
+
+    pub fn can_restrict_members(&self) -> bool {
+        self.get_administrator_rights().can_restrict_members()
+    }
+
+    pub fn can_pin_messages(&self) -> bool {
+        self.get_administrator_rights().can_pin_messages()
+            || self.get_restricted_rights().can_pin_messages()
+    }
+
+    /// `DialogParticipantStatus::can_edit_topics` — topics can be edited only
+    /// by an administrator explicitly granted the right.
+    pub fn can_edit_topics(&self) -> bool {
+        self.get_administrator_rights().can_manage_topics()
+    }
+
+    /// `DialogParticipantStatus::can_pin_topics` — topics can be pinned only
+    /// by an administrator explicitly granted the right.
+    pub fn can_pin_topics(&self) -> bool {
+        self.get_administrator_rights().can_manage_topics()
+    }
+
+    pub fn can_create_topics(&self) -> bool {
+        self.get_administrator_rights().can_manage_topics()
+            || self.get_restricted_rights().can_manage_topics()
+    }
+
+    pub fn can_promote_members(&self) -> bool {
+        self.get_administrator_rights().can_promote_members()
+    }
+
+    pub fn can_manage_calls(&self) -> bool {
+        self.get_administrator_rights().can_manage_calls()
+    }
+
+    pub fn can_post_stories(&self) -> bool {
+        self.get_administrator_rights().can_post_stories()
+    }
+
+    pub fn can_edit_stories(&self) -> bool {
+        self.get_administrator_rights().can_edit_stories()
+    }
+
+    pub fn can_delete_stories(&self) -> bool {
+        self.get_administrator_rights().can_delete_stories()
+    }
+
+    pub fn can_manage_direct_messages(&self) -> bool {
+        self.get_administrator_rights().can_manage_direct_messages()
+    }
+
+    pub fn can_manage_ranks(&self) -> bool {
+        self.get_administrator_rights().can_manage_ranks()
+    }
+
+    pub fn can_manage_linked_peers(&self) -> bool {
+        self.get_administrator_rights().can_manage_linked_peers()
+            || self.get_restricted_rights().can_manage_linked_peers()
+    }
+
+    pub fn can_manage_welcome_messages(&self) -> bool {
+        self.get_administrator_rights()
+            .can_manage_welcome_messages()
+    }
+
+    pub fn can_be_edited(&self) -> bool {
+        (self.flags_ & Self::CAN_BE_EDITED) != 0
+    }
+
+    pub fn toggle_can_be_edited(&mut self) {
+        self.flags_ ^= Self::CAN_BE_EDITED;
+    }
+
+    pub fn can_send_messages(&self) -> bool {
+        self.get_restricted_rights().can_send_messages()
+    }
+
+    pub fn can_send_audios(&self) -> bool {
+        self.get_restricted_rights().can_send_audios()
+    }
+
+    pub fn can_send_documents(&self) -> bool {
+        self.get_restricted_rights().can_send_documents()
+    }
+
+    pub fn can_send_photos(&self) -> bool {
+        self.get_restricted_rights().can_send_photos()
+    }
+
+    pub fn can_send_videos(&self) -> bool {
+        self.get_restricted_rights().can_send_videos()
+    }
+
+    pub fn can_send_video_notes(&self) -> bool {
+        self.get_restricted_rights().can_send_video_notes()
+    }
+
+    pub fn can_send_voice_notes(&self) -> bool {
+        self.get_restricted_rights().can_send_voice_notes()
+    }
+
+    pub fn can_send_stickers(&self) -> bool {
+        self.get_restricted_rights().can_send_stickers()
+    }
+
+    pub fn can_send_animations(&self) -> bool {
+        self.get_restricted_rights().can_send_animations()
+    }
+
+    pub fn can_send_games(&self) -> bool {
+        self.get_restricted_rights().can_send_games()
+    }
+
+    pub fn can_use_inline_bots(&self) -> bool {
+        self.get_restricted_rights().can_use_inline_bots()
+    }
+
+    pub fn can_add_web_page_previews(&self) -> bool {
+        self.get_restricted_rights().can_add_web_page_previews()
+    }
+
+    pub fn can_send_polls(&self) -> bool {
+        self.get_restricted_rights().can_send_polls()
+    }
+
+    pub fn can_edit_rank(&self) -> bool {
+        self.get_restricted_rights().can_edit_rank()
+    }
+
+    pub fn can_send_reactions(&self) -> bool {
+        self.get_restricted_rights().can_send_reactions()
+    }
+
+    pub fn set_is_member(&mut self, is_member: bool) {
+        if is_member {
+            self.flags_ |= Self::IS_MEMBER;
+        } else {
+            self.flags_ &= !Self::IS_MEMBER;
+        }
+    }
+
+    pub fn is_member(&self) -> bool {
+        (self.flags_ & Self::IS_MEMBER) != 0
+    }
+
+    pub fn is_left(&self) -> bool {
+        (self.flags_ & Self::IS_MEMBER) == 0
+    }
+
+    pub fn is_creator(&self) -> bool {
+        self.type_ == StatusType::Creator
+    }
+
+    pub fn is_administrator(&self) -> bool {
+        self.type_ == StatusType::Administrator || self.type_ == StatusType::Creator
+    }
+
+    pub fn is_administrator_member(&self) -> bool {
+        self.type_ == StatusType::Administrator
+            || (self.type_ == StatusType::Creator && self.is_member())
+    }
+
+    pub fn is_restricted(&self) -> bool {
+        self.type_ == StatusType::Restricted
+    }
+
+    pub fn is_banned(&self) -> bool {
+        self.type_ == StatusType::Banned
+    }
+
+    pub fn get_until_date(&self) -> i32 {
+        self.until_date_
+    }
+
+    pub fn is_anonymous(&self) -> bool {
+        self.get_administrator_rights().is_anonymous()
+    }
+
+    pub fn get_rank(&self) -> &str {
+        &self.rank_
+    }
+
+    /// `DialogParticipantStatus::set_rank` — true when the rank changed.
+    pub fn set_rank(&mut self, rank: String) -> bool {
+        if self.rank_ != rank {
+            self.rank_ = rank;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// `DialogParticipantStatus::store` (DialogParticipant.h:656) — the bare
+    /// record body; the log-event version prefix is the caller's framing.
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let mut stored_flags = self.flags_ | ((self.type_ as i32) as u64) << Self::TYPE_SHIFT;
+        if self.until_date_ > 0 {
+            stored_flags |= Self::HAS_UNTIL_DATE;
+        }
+        if !self.rank_.is_empty() {
+            stored_flags |= Self::HAS_RANK;
+        }
+        store_u64(out, stored_flags);
+        if self.until_date_ > 0 {
+            store_i32(out, self.until_date_);
+        }
+        if !self.rank_.is_empty() {
+            store_string(out, &self.rank_);
+        }
+    }
+
+    /// `DialogParticipantStatus::parse` (DialogParticipant.h:676) — the
+    /// versioned reader: writers before `MakeParticipantFlags64Bit` used a
+    /// `uint32` flag word, and a legacy `LEGACY_CAN_SEND_MEDIA` bit expands
+    /// into the six per-media bits. Unknown type discriminants (6, 7) are
+    /// rejected; the C++ would silently produce a garbage status.
+    pub fn parse_impl(parser: &mut Parser<'_>) -> Result<DialogParticipantStatus, &'static str> {
+        let mut stored_flags = if parser.version() >= version::MAKE_PARTICIPANT_FLAGS_64_BIT {
+            parser.u64_()?
+        } else {
+            u64::from(parser.u32_()?)
+        };
+        let mut until_date = 0;
+        if (stored_flags & Self::HAS_UNTIL_DATE) != 0 {
+            until_date = parser.i32_()?;
+            stored_flags &= !Self::HAS_UNTIL_DATE;
+        }
+        let mut rank = String::new();
+        if (stored_flags & Self::HAS_RANK) != 0 {
+            rank = parser.string()?;
+            stored_flags &= !Self::HAS_RANK;
+        }
+        let type_ = match (stored_flags >> Self::TYPE_SHIFT) & ((1u64 << Self::TYPE_SIZE) - 1) {
+            0 => StatusType::Creator,
+            1 => StatusType::Administrator,
+            2 => StatusType::Member,
+            3 => StatusType::Restricted,
+            4 => StatusType::Left,
+            5 => StatusType::Banned,
+            _ => return Err("Invalid DialogParticipantStatus type"),
+        };
+        stored_flags -= ((type_ as i32) as u64) << Self::TYPE_SHIFT;
+
+        let mut flags = stored_flags;
+        if (flags & RestrictedRights::LEGACY_CAN_SEND_MEDIA) != 0 {
+            flags |= RestrictedRights::CAN_SEND_AUDIOS
+                | RestrictedRights::CAN_SEND_DOCUMENTS
+                | RestrictedRights::CAN_SEND_PHOTOS
+                | RestrictedRights::CAN_SEND_VIDEOS
+                | RestrictedRights::CAN_SEND_VIDEO_NOTES
+                | RestrictedRights::CAN_SEND_VOICE_NOTES;
+        }
+        Ok(DialogParticipantStatus {
+            type_,
+            until_date_: until_date,
+            flags_: flags,
+            rank_: rank,
+        })
+    }
+}
+
+impl Default for DialogParticipantStatus {
+    /// The C++ `DialogParticipantStatus()` convention: a forever-banned
+    /// status without a rank.
+    fn default() -> DialogParticipantStatus {
+        DialogParticipantStatus::banned(0, String::new())
     }
 }
 
@@ -2010,5 +2681,749 @@ mod tests {
             AdministratorRights::from_flags(AdministratorRights::CAN_MANAGE_DIALOG)
         );
         parser.fetch_end().unwrap();
+    }
+
+    // ---- DialogParticipantStatus (M.5.3) ----
+
+    fn status_store_hex(status: &DialogParticipantStatus) -> String {
+        let mut out = Vec::new();
+        crate::store_parse::store_log_event_version(&mut out);
+        status.store(&mut out);
+        out.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn status_round_trip(status: &DialogParticipantStatus) -> DialogParticipantStatus {
+        let mut out = Vec::new();
+        crate::store_parse::store_log_event_version(&mut out);
+        status.store(&mut out);
+        let mut parser = Parser::new_log_event(&out).unwrap();
+        let parsed = DialogParticipantStatus::parse_impl(&mut parser).unwrap();
+        parser.fetch_end().unwrap();
+        parsed
+    }
+
+    /// The `DialogParticipantStatus` predicate matrix, in the fixed order of
+    /// `conformance/chat_participant_status_oracle/probe.cpp`'s `matrix()`.
+    fn status_matrix(status: &DialogParticipantStatus) -> String {
+        let preds = [
+            status.is_creator(),
+            status.is_administrator(),
+            status.is_administrator_member(),
+            status.is_member(),
+            status.is_left(),
+            status.is_restricted(),
+            status.is_banned(),
+            status.can_manage_dialog(),
+            status.can_change_info_and_settings(),
+            status.can_post_messages(),
+            status.can_edit_messages(),
+            status.can_delete_messages(),
+            status.can_invite_users(),
+            status.can_restrict_members(),
+            status.can_pin_messages(),
+            status.can_manage_invite_links(),
+            status.can_promote_members(),
+            status.can_manage_calls(),
+            status.can_post_stories(),
+            status.can_edit_stories(),
+            status.can_delete_stories(),
+            status.can_manage_direct_messages(),
+            status.can_manage_ranks(),
+            status.can_manage_linked_peers(),
+            status.can_manage_welcome_messages(),
+            status.can_edit_topics(),
+            status.can_pin_topics(),
+            status.can_create_topics(),
+            status.can_be_edited(),
+            status.can_send_messages(),
+            status.can_send_audios(),
+            status.can_send_documents(),
+            status.can_send_photos(),
+            status.can_send_videos(),
+            status.can_send_video_notes(),
+            status.can_send_voice_notes(),
+            status.can_send_stickers(),
+            status.can_send_animations(),
+            status.can_send_games(),
+            status.can_use_inline_bots(),
+            status.can_add_web_page_previews(),
+            status.can_send_polls(),
+            status.can_edit_rank(),
+            status.can_send_reactions(),
+            status.has_all_administrator_rights(AdministratorRights::from_bools(
+                false,
+                true,
+                true,
+                false,
+                false,
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                true,
+                ChannelType::Unknown,
+            )),
+        ];
+        preds.iter().map(|p| if *p { '1' } else { '0' }).collect()
+    }
+
+    fn admin_full() -> AdministratorRights {
+        AdministratorRights::from_bools(
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            ChannelType::Unknown,
+        )
+    }
+
+    fn admin_edited() -> AdministratorRights {
+        AdministratorRights::from_bools(
+            false,
+            true,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            ChannelType::Unknown,
+        )
+    }
+
+    fn restricted_member_rights() -> RestrictedRights {
+        RestrictedRights::from_bools(
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            ChannelType::Megagroup,
+        )
+    }
+
+    fn restricted_non_member_rights() -> RestrictedRights {
+        RestrictedRights::from_bools(
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            ChannelType::Megagroup,
+        )
+    }
+
+    /// All samples of the C++ oracle, as the oracle constructs them.
+    fn oracle_samples() -> Vec<(&'static str, DialogParticipantStatus)> {
+        vec![
+            (
+                "creator_member",
+                DialogParticipantStatus::creator(true, false, String::new()),
+            ),
+            (
+                "creator_member_anon_rank",
+                DialogParticipantStatus::creator(true, true, "admin".to_owned()),
+            ),
+            (
+                "creator_non_member",
+                DialogParticipantStatus::creator(false, false, String::new()),
+            ),
+            (
+                "administrator_full",
+                DialogParticipantStatus::administrator(admin_full(), "boss".to_owned(), false),
+            ),
+            (
+                "administrator_min",
+                DialogParticipantStatus::administrator(
+                    AdministratorRights::default(),
+                    "x".to_owned(),
+                    true,
+                ),
+            ),
+            (
+                "administrator_edited",
+                DialogParticipantStatus::administrator(admin_edited(), "ed".to_owned(), true),
+            ),
+            (
+                "member_until",
+                DialogParticipantStatus::member(123456, "rank".to_owned()),
+            ),
+            (
+                "member_plain",
+                DialogParticipantStatus::member(0, String::new()),
+            ),
+            (
+                "restricted_member",
+                DialogParticipantStatus::restricted(
+                    restricted_member_rights(),
+                    true,
+                    1000,
+                    ChannelType::Megagroup,
+                    "r".to_owned(),
+                ),
+            ),
+            (
+                "restricted_non_member",
+                DialogParticipantStatus::restricted(
+                    restricted_non_member_rights(),
+                    false,
+                    0,
+                    ChannelType::Megagroup,
+                    String::new(),
+                ),
+            ),
+            (
+                "restricted_all_broadcast",
+                DialogParticipantStatus::restricted(
+                    RestrictedRights::restrict_all(),
+                    true,
+                    0,
+                    ChannelType::Broadcast,
+                    String::new(),
+                ),
+            ),
+            (
+                "restricted_none_megagroup",
+                DialogParticipantStatus::restricted(
+                    RestrictedRights::restrict_all(),
+                    true,
+                    0,
+                    ChannelType::Megagroup,
+                    String::new(),
+                ),
+            ),
+            ("left", DialogParticipantStatus::left()),
+            (
+                "banned_until",
+                DialogParticipantStatus::banned(2000, "ban".to_owned()),
+            ),
+            (
+                "banned_default",
+                DialogParticipantStatus::banned(0, String::new()),
+            ),
+            (
+                "banned_max",
+                DialogParticipantStatus::banned(i32::MAX, String::new()),
+            ),
+            (
+                "group_admin",
+                DialogParticipantStatus::group_administrator(true, "gadm".to_owned()),
+            ),
+            (
+                "channel_admin_megagroup",
+                DialogParticipantStatus::channel_administrator(true, true),
+            ),
+            (
+                "channel_admin_broadcast",
+                DialogParticipantStatus::channel_administrator(false, false),
+            ),
+        ]
+    }
+
+    /// The stored bytes of every sample, pinned against the compiled C++
+    /// (`conformance/chat_participant_status_oracle`): the 61 log-event
+    /// version prefix plus the bare record body.
+    #[test]
+    fn status_store_bytes_match_the_cpp_probe() {
+        let expected = [
+            ("creator_member", "3d000000df1ffd0fff017f00"),
+            (
+                "creator_member_anon_rank",
+                "3d000000df7ffd0fff017f000561646d696e0000",
+            ),
+            ("creator_non_member", "3d000000df1ffd07ff017f00"),
+            (
+                "administrator_full",
+                "3d000000df67fd18ff007f0004626f7373000000",
+            ),
+            ("administrator_min", "3d0000000050fd2fff01000001780000"),
+            ("administrator_edited", "3d00000004c4fd18ff00000002656400"),
+            (
+                "member_until",
+                "3d0000000050fdafff01000040e201000472616e6b000000",
+            ),
+            ("member_plain", "3d0000000010fd2fff010000"),
+            (
+                "restricted_member",
+                "3d000000004005b800000000e803000001720000",
+            ),
+            ("restricted_non_member", "3d0000000000003100000000"),
+            ("restricted_all_broadcast", "3d0000000010fd2fff010000"),
+            ("restricted_none_megagroup", "3d0000000000003800000000"),
+            ("left", "3d0000000010fd47ff010000"),
+            ("banned_until", "3d000000004000d000000000d00700000362616e"),
+            ("banned_default", "3d0000000000005000000000"),
+            ("banned_max", "3d0000000000005000000000"),
+            ("group_admin", "3d000000d9c6fd18ff005000046761646d000000"),
+            ("channel_admin_megagroup", "3d000000d98cfd18ff001000"),
+            ("channel_admin_broadcast", "3d0000004e04fd18ff000f00"),
+        ];
+        let samples = oracle_samples();
+        assert_eq!(samples.len(), expected.len());
+        for ((name, status), (exp_name, exp_hex)) in samples.iter().zip(expected) {
+            assert_eq!(*name, exp_name);
+            assert_eq!(status_store_hex(status), exp_hex, "stored bytes of {name}");
+        }
+    }
+
+    /// Store → parse → re-store must reproduce the bytes for every sample
+    /// (the versioned framing survives the round trip), matching the C++
+    /// oracle's own `rt:` self-consistency lines.
+    #[test]
+    fn status_round_trips_through_the_versioned_framing() {
+        for (name, status) in oracle_samples() {
+            let parsed = status_round_trip(&status);
+            assert_eq!(parsed, status, "round trip of {name}");
+            assert_eq!(
+                status_store_hex(&parsed),
+                status_store_hex(&status),
+                "round-trip bytes of {name}"
+            );
+        }
+    }
+
+    /// The predicate matrix of every sample, pinned against the C++ oracle's
+    /// `pred:` lines (digit order = `status_matrix`).
+    #[test]
+    fn status_predicate_matrix_matches_the_cpp_probe() {
+        let expected = [
+            (
+                "creator_member",
+                "111100011111111111111111111101111111111111111",
+                0,
+                false,
+                0,
+            ),
+            (
+                "creator_member_anon_rank",
+                "111100011111111111111111111101111111111111111",
+                0,
+                true,
+                5,
+            ),
+            (
+                "administrator_full",
+                "011100011111111111111111100001111111111111111",
+                0,
+                true,
+                4,
+            ),
+            (
+                "administrator_min",
+                "000100001000101000000001000101111111111111110",
+                0,
+                false,
+                1,
+            ),
+            (
+                "administrator_edited",
+                "011100010010000000000000000011111111111111110",
+                0,
+                false,
+                2,
+            ),
+            (
+                "member_until",
+                "000100001000101000000001000101111111111111110",
+                123456,
+                false,
+                4,
+            ),
+            (
+                "member_plain",
+                "000100001000101000000001000101111111111111110",
+                0,
+                false,
+                0,
+            ),
+            (
+                "restricted_member",
+                "000101000000000000000000000001000000100000000",
+                1000,
+                false,
+                1,
+            ),
+            (
+                "restricted_non_member",
+                "000011001000000000000000000000000000000000000",
+                0,
+                false,
+                0,
+            ),
+            (
+                "restricted_all_broadcast",
+                "000100001000101000000001000101111111111111110",
+                0,
+                false,
+                0,
+            ),
+            (
+                "restricted_none_megagroup",
+                "000101000000000000000000000000000000000000000",
+                0,
+                false,
+                0,
+            ),
+            (
+                "left",
+                "000010001000101000000001000101111111111111110",
+                0,
+                false,
+                0,
+            ),
+            (
+                "banned_until",
+                "000010100000000000000000000000000000000000000",
+                2000,
+                false,
+                3,
+            ),
+            (
+                "banned_default",
+                "000010100000000000000000000000000000000000000",
+                0,
+                false,
+                0,
+            ),
+            (
+                "group_admin",
+                "011100011001111101000010100011111111111111111",
+                0,
+                false,
+                4,
+            ),
+            (
+                "channel_admin_megagroup",
+                "011100011001111100000010011111111111111111110",
+                0,
+                false,
+                0,
+            ),
+            (
+                "channel_admin_broadcast",
+                "011100010111010000111100000001111111111111110",
+                0,
+                false,
+                0,
+            ),
+        ];
+        let samples = oracle_samples();
+        for (name, status) in samples {
+            // creator_non_member and banned_max have no oracle pred row
+            let Some((_, exp_matrix, exp_until, exp_anon, exp_rank_len)) =
+                expected.iter().find(|(n, ..)| *n == name)
+            else {
+                continue;
+            };
+            assert_eq!(
+                status_matrix(&status),
+                *exp_matrix,
+                "predicate matrix of {name}"
+            );
+            assert_eq!(status.get_until_date(), *exp_until, "until of {name}");
+            assert_eq!(status.is_anonymous(), *exp_anon, "anon of {name}");
+            assert_eq!(status.get_rank().len(), *exp_rank_len, "rank len of {name}");
+        }
+    }
+
+    /// A writer older than `MakeParticipantFlags64Bit` used a `uint32` flag
+    /// word: version 30 with `Member | IS_MEMBER | CAN_SEND_MESSAGES` must
+    /// parse as a member able to send messages, and re-store in the modern
+    /// framing byte-identically to the C++ oracle.
+    #[test]
+    fn status_legacy_version_parse_reads_u32_flags() {
+        let mut legacy = Vec::new();
+        legacy.extend_from_slice(&30i32.to_le_bytes());
+        let legacy_flags: u32 = (2 << 28) | (1 << 27) | (1 << 16);
+        legacy.extend_from_slice(&legacy_flags.to_le_bytes());
+        let mut parser = Parser::new_log_event(&legacy).unwrap();
+        let parsed = DialogParticipantStatus::parse_impl(&mut parser).unwrap();
+        parser.fetch_end().unwrap();
+        assert_eq!(
+            status_matrix(&parsed),
+            "000100000000000000000000000001000000000000000"
+        );
+        assert_eq!(status_store_hex(&parsed), "3d0000000000012800000000");
+    }
+
+    /// The `effective:` oracle sample: a restricted member with the media
+    /// rights set survives the store → parse → re-store cycle.
+    #[test]
+    fn status_effective_restricted_rights_match_the_cpp_probe() {
+        let status = DialogParticipantStatus::restricted(
+            RestrictedRights::from_bools(
+                false,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                ChannelType::Megagroup,
+            ),
+            true,
+            3000,
+            ChannelType::Megagroup,
+            "eff".to_owned(),
+        );
+        assert_eq!(
+            status_store_hex(&status),
+            "3d000000004000b93f000000b80b000003656666"
+        );
+        assert_eq!(status_round_trip(&status), status);
+    }
+
+    /// `DialogParticipantStatus()` — a forever-banned status without a rank
+    /// (the C++ default-constructed convention).
+    #[test]
+    fn status_default_is_forever_banned() {
+        let status = DialogParticipantStatus::default();
+        assert_eq!(status, DialogParticipantStatus::banned(0, String::new()));
+        assert!(status.is_banned());
+        assert_eq!(status.get_until_date(), 0);
+        assert_eq!(status.get_rank(), "");
+    }
+
+    /// `DialogParticipantStatus::update_restrictions` transitions: expired
+    /// restricted members become members (non-members leave), expired
+    /// banned/member become left, future and forever dates stay put.
+    #[test]
+    fn status_update_restrictions_transitions() {
+        use crate::global::Global;
+        let dir = std::env::temp_dir()
+            .join(format!("td-rs-m53-status-{}", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let opened = tddb::td_db::TdDb::open(tddb::td_db::Parameters {
+            database_directory: dir,
+            use_file_database: true,
+            use_chat_info_database: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut global = Global::new();
+        global.init(opened.database);
+        let now = global.unix_time();
+        let future = now + 100_000;
+
+        let mut restricted_member = DialogParticipantStatus::restricted(
+            restricted_member_rights(),
+            true,
+            1000,
+            ChannelType::Megagroup,
+            "r".to_owned(),
+        );
+        restricted_member.update_restrictions(&global);
+        assert!(restricted_member.is_member());
+        assert_eq!(restricted_member.get_until_date(), 0);
+        assert!(
+            restricted_member.can_send_stickers(),
+            "full rights after unrestriction"
+        );
+        assert!(restricted_member.can_send_audios());
+        assert_eq!(restricted_member.get_rank(), "r");
+
+        let mut restricted_non_member = DialogParticipantStatus::restricted(
+            restricted_non_member_rights(),
+            false,
+            1000,
+            ChannelType::Megagroup,
+            String::new(),
+        );
+        restricted_non_member.update_restrictions(&global);
+        assert!(restricted_non_member.is_left());
+        assert_eq!(restricted_non_member.get_until_date(), 0);
+
+        let mut banned = DialogParticipantStatus::banned(1000, String::new());
+        banned.update_restrictions(&global);
+        assert!(banned.is_left());
+        assert_eq!(banned.get_until_date(), 0);
+
+        let mut member = DialogParticipantStatus::member(1000, String::new());
+        member.update_restrictions(&global);
+        // the C++ flips the type to Left but keeps the IS_MEMBER bit, so
+        // is_left() stays false for an expired member (a faithful quirk)
+        assert!(!member.is_banned() && !member.is_restricted() && !member.is_administrator());
+        assert!(member.is_member());
+        assert_eq!(member.get_until_date(), 0);
+
+        let mut not_expired = DialogParticipantStatus::banned(future, String::new());
+        not_expired.update_restrictions(&global);
+        assert!(not_expired.is_banned());
+        assert_eq!(not_expired.get_until_date(), future);
+
+        let mut forever = DialogParticipantStatus::banned(0, String::new());
+        forever.update_restrictions(&global);
+        assert!(forever.is_banned());
+        assert_eq!(forever.get_until_date(), 0);
+
+        // creator statuses are unreachable here; the C++ UNREACHABLE is a
+        // debug assertion on the expired-creator path.
+    }
+
+    /// `DialogParticipantStatus::apply_restrictions`: the default-restriction
+    /// matrix (boosters and bots diverge) and the administrator/banned arms.
+    #[test]
+    fn status_apply_restrictions_matrix() {
+        let only_messages = RestrictedRights::from_bools(
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            ChannelType::Megagroup,
+        );
+
+        let member = DialogParticipantStatus::member(0, String::new());
+        let applied = member.apply_restrictions(only_messages, false, false);
+        assert_eq!(applied.get_until_date(), 0);
+        assert_eq!(applied.get_rank(), "");
+        assert!(applied.is_member());
+        assert!(applied.can_send_messages());
+        assert!(!applied.can_send_stickers());
+        assert!(!applied.can_send_audios());
+
+        // boosters keep their full member rights
+        let booster = member.apply_restrictions(only_messages, true, false);
+        assert!(booster.can_send_stickers());
+        assert!(booster.can_send_audios());
+
+        // bots lose the admin-permission rights
+        let bot = member.apply_restrictions(only_messages, false, true);
+        assert!(bot.can_send_messages());
+        assert!(!bot.can_change_info_and_settings());
+        assert!(!bot.can_invite_users());
+        assert!(!bot.can_pin_messages());
+
+        // administrators gain the group-wide admin-permission rights unless bot
+        let invite_everyone = RestrictedRights::from_bools(
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            ChannelType::Megagroup,
+        );
+        let admin = DialogParticipantStatus::administrator(admin_edited(), String::new(), false);
+        let applied = admin.apply_restrictions(invite_everyone, false, false);
+        assert!(applied.can_invite_users());
+        let applied_bot = admin.apply_restrictions(invite_everyone, false, true);
+        assert!(!applied_bot.can_invite_users());
+
+        // banned can do nothing even if the restrictions allow it
+        let banned = DialogParticipantStatus::banned(0, String::new());
+        let applied = banned.apply_restrictions(only_messages, false, false);
+        assert!(applied.is_banned());
+        assert!(!applied.can_send_messages());
     }
 }
