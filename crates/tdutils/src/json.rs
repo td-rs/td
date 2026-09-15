@@ -72,6 +72,13 @@ impl JsonObject {
             .map(|(_, value)| value)
     }
 
+    /// Read-only iteration over the fields, in insertion order.
+    pub fn iter_fields(&self) -> impl Iterator<Item = (&str, &JsonValue)> {
+        self.field_values
+            .iter()
+            .map(|(field, value)| (field.as_str(), value))
+    }
+
     /// `JsonObject::extract_field`: moves the field out, `Null` when absent
     /// (a successful extraction leaves `Null` behind, like the C++ move).
     pub fn extract_field(&mut self, name: &str) -> JsonValue {
