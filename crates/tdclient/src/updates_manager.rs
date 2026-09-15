@@ -83,6 +83,12 @@ pub trait UpdatesSink {
     fn on_new_channel_message(&mut self, message: telegram_api::Message, pts: i32, pts_count: i32);
     fn on_delete_messages(&mut self, messages: Vec<i32>, pts: i32, pts_count: i32);
     fn on_message_id(&mut self, id: i32, random_id: i64);
+    /// `UpdatesManager::on_update(updateConfig)` — re-request the server
+    /// config (ConfigManager::request_config(false)).
+    fn on_update_config(&mut self) {}
+    /// `UpdatesManager::on_update(updateDcOptions)` — hand the pending dc
+    /// options to the ConfigManager.
+    fn on_dc_options_update(&mut self, _dc_options: Vec<telegram_api::DcOption>) {}
     /// A gap was detected — the C++ schedules `getDifference`.
     fn on_gap(&mut self);
 }
@@ -237,6 +243,12 @@ impl<S: UpdatesSink> UpdatesManager<S> {
             }
             telegram_api::Update::updateMessageID(u) => {
                 self.sink.on_message_id(u.id, u.random_id);
+            }
+            telegram_api::Update::updateConfig(_) => {
+                self.sink.on_update_config();
+            }
+            telegram_api::Update::updateDcOptions(u) => {
+                self.sink.on_dc_options_update(u.dc_options);
             }
             other => {
                 tdutils::log_error!("Unsupported update in apply_pts_update: {:?}", other);

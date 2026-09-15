@@ -8,11 +8,14 @@
 //! Divergences (each arrives with its Wave-1 step):
 //! - the database opens synchronously in the actor; the C++ hops to a
 //!   database scheduler (the schedulers arrive with the net wiring step);
-//! - `init` creates only the managers that exist (options, auth); every
-//!   manager step appends its wiring here, mirroring the C++ `Td::init`
+//! - `init` creates only the managers that exist (options, config, auth);
+//!   every manager step appends its wiring here, mirroring the C++ `Td::init`
 //!   order;
 //! - the close machine collapses the actor-refcount ladder (2→3→4→5) into
-//!   direct calls — there are no manager actors to await yet.
+//!   direct calls — there are no manager actors to await yet;
+//! - the ConfigManager is an inline manager: its network queries are held
+//!   in `pending_config_queries` until the dispatcher lands (the net step)
+//!   and its expire timer rides the Td's own actor timeout slot.
 
 use std::collections::BTreeSet;
 
@@ -20,6 +23,7 @@ use tdactor::{Actor, ActorOwn, actor_messages};
 use tddb::td_db::{OpenedDatabase, Parameters as DbParameters, TdDb};
 
 use crate::auth_manager::AuthManager;
+use crate::config_manager::{ConfigActions, ConfigManager, ConfigQuery, ConfigQueryResult};
 use crate::global::Global;
 use crate::option_manager::OptionManager;
 use crate::requests;
@@ -89,6 +93,13 @@ pub struct Td {
     /// `Td::option_manager_` — created by `init` over the db config pmc;
     /// `None` during `WaitParameters` exactly like the C++.
     pub(crate) option_manager: Option<OptionManager>,
+    /// `Td::config_manager_` — created by `init_options_and_network`; its
+    /// network queries and expire timer are hosted by the Td until the
+    /// dispatcher lands (the net step).
+    pub(crate) config_manager: Option<ConfigManager>,
+    /// The ConfigManager's in-flight network queries — `NetQuery`s once
+    /// the dispatcher wiring lands.
+    pub(crate) pending_config_queries: Vec<ConfigQuery>,
     /// The `G()` shared context; owns the database (`Global::td_db_`).
     pub(crate) global: Global,
     /// The C++ `init_managers` registration order starts here; managers
@@ -117,6 +128,8 @@ impl Td {
             parameters: None,
             header_options: HeaderOptions::default(),
             option_manager: None,
+            config_manager: None,
+            pending_config_queries: Vec::new(),
             global: Global::new(),
             time_zone_manager: TimeZoneManager::default(),
             auth_manager: AuthManager::new(),
@@ -262,11 +275,14 @@ impl Td {
 
         self.global.init(opened_database.database);
 
-        // init_options_and_network, the M.1 subset: the OptionManager over
-        // the db config pmc (StateManager/ConnectionCreator/ConfigManager/
-        // OnlineManager arrive with their steps). `global.init` above
-        // already loaded the server time difference, so the constructor's
-        // opening `unix_time` update (OptionManager.cpp:59) is corrected.
+        // init_options_and_network, the M.1 + ConfigManager subset: the
+        // OptionManager over the db config pmc, then the ConfigManager
+        // (StateManager/ConnectionCreator/OnlineManager arrive with their
+        // steps; the ConfigManager's start_up — the post-init config fetch —
+        // runs after the auth restore below, like the C++ actor start).
+        // `global.init` above already loaded the server time difference, so
+        // the constructor's opening `unix_time` update (OptionManager.cpp:59)
+        // is corrected.
         {
             let config_pmc = self.global.td_db().take_config_pmc();
             let is_test_dc = self.global.is_test_dc();
@@ -276,6 +292,12 @@ impl Td {
             self.option_manager = Some(option_manager);
         }
         self.flush_option_updates();
+
+        // VLOG "Create ConfigManager" (Td.cpp:1070-1072).
+        {
+            let app_config = self.global.binlog_pmc().get_raw(b"app_config");
+            self.config_manager = Some(ConfigManager::new(&app_config));
+        }
 
         // we need to process td_api::setOption before managers are created,
         // because their initialization may be affected by the options
@@ -361,16 +383,34 @@ impl Td {
         // init_pure_actor_managers / SecretChatsManager / StorageManager —
         // each manager step appends its block here in the C++ order.
 
+        // `ConfigManager::start_up` (runs when the C++ manager actor
+        // starts, i.e. after the auth restore): the post-init config fetch
+        // — a fresh start or a non-bot restart requests `help.getConfig`.
+        let start_up_actions = {
+            self.config_manager
+                .as_mut()
+                .expect("config manager just set")
+                .start_up(self.global.binlog_pmc(), self.auth_manager.is_bot())
+        };
+        self.apply_config_actions(start_up_actions);
+
         self.parameters = Some(parameters);
 
         // `OptionManager::on_td_inited` (Td.cpp:943): the pending pre-init
-        // getters are answered now.
+        // getters are answered now — the content-settings names go through
+        // the ConfigManager branch of the C++ `OptionManager::get_option`.
         let pending_get_options = self
             .option_manager
             .as_mut()
             .map(|om| om.on_td_inited())
             .unwrap_or_default();
         for (request_id, name) in pending_get_options {
+            if name == "can_ignore_sensitive_content_restrictions"
+                || name == "ignore_sensitive_content_restrictions"
+            {
+                self.get_option_content_settings(request_id, name);
+                continue;
+            }
             let Some(option_manager) = self.option_manager.as_ref() else {
                 break;
             };
@@ -477,6 +517,8 @@ impl Td {
 
         self.global.close_all(self.destroy_flag);
         self.option_manager = None;
+        self.config_manager = None;
+        self.pending_config_queries.clear();
 
         self.close_flag = 4;
         self.on_closed();
@@ -591,6 +633,193 @@ impl Td {
                 self.send_update(update);
             }
         }
+    }
+
+    /// Complete the requests a ConfigManager call produced and hold its
+    /// follow-up queries. The C++ manager actor sends each result itself;
+    /// the inline manager returns them here. The updateOption broadcasts
+    /// queued by the manager's option writes go out before the answers,
+    /// like the C++ `send_update` calls during the handlers.
+    pub(crate) fn apply_config_actions(&mut self, actions: ConfigActions) {
+        if actions.refresh_premium_options
+            && let Some(option_manager) = self.option_manager.as_mut()
+        {
+            option_manager.update_premium_options();
+        }
+        self.flush_option_updates();
+
+        for id in actions.ok_ids {
+            self.send_result(id, ok_object());
+        }
+        for (id, error) in actions.errors {
+            self.send_error_impl(id, error.code(), error.message());
+        }
+        for (id, name) in actions.get_option_answers {
+            // The C++ wrap_promise answers the raw store value (the async
+            // get_option would route back into the ConfigManager).
+            let value = self
+                .option_manager
+                .as_ref()
+                .map(|option_manager| {
+                    OptionManager::get_option_value_object(&option_manager.get_option(&name))
+                })
+                .unwrap_or_else(|| td_api::OptionValue::optionValueEmpty(td_api::optionValueEmpty));
+            self.send_result(id, requests::option_value_to_object(value));
+        }
+        for (id, value) in actions.app_config_answers {
+            self.send_result(id, requests::json_value_to_object(value));
+        }
+        self.pending_config_queries.extend(actions.queries);
+        self.sync_config_timeout();
+    }
+
+    /// Mirror the ConfigManager's expire time into the Td's own actor
+    /// timeout slot (the C++ manager actor carries its own timer). The
+    /// timer methods panic outside a scheduler, so the direct-call tests
+    /// skip the mirroring.
+    fn sync_config_timeout(&mut self) {
+        if !tdactor::Scheduler::in_scheduler_context() {
+            return;
+        }
+        let expire_time = self
+            .config_manager
+            .as_ref()
+            .map(ConfigManager::expire_time)
+            .unwrap_or(0.0);
+        if expire_time == 0.0 {
+            self.cancel_timeout();
+        } else {
+            self.set_timeout_at(expire_time);
+        }
+    }
+
+    /// The `OptionManager::get_option` ConfigManager branch for the two
+    /// content-settings names (cpp:770-787): refresh the content settings,
+    /// then answer from the store. Unauthorized clients and bots answer
+    /// immediately.
+    pub(crate) fn get_option_content_settings(&mut self, id: u64, name: String) {
+        let Some(config_manager) = self.config_manager.as_mut() else {
+            // Unreachable through the request gate: the manager exists
+            // before the getters are answered.
+            return self.send_error_impl(id, 500, "TDLib function is not implemented yet");
+        };
+        let actions = config_manager.get_content_settings(
+            Some((id, name)),
+            self.auth_manager.is_authorized(),
+            self.auth_manager.is_bot(),
+            self.close_flag != 0,
+        );
+        self.apply_config_actions(actions);
+    }
+
+    /// The `OptionManager::set_option` ConfigManager branch for
+    /// `ignore_sensitive_content_restrictions` (cpp:969-983): the setOption
+    /// answers when the `account.setContentSettings` query completes.
+    pub(crate) fn set_content_settings_option(&mut self, id: u64, value: bool) {
+        let Some(config_manager) = self.config_manager.as_mut() else {
+            return self.send_error_impl(id, 500, "TDLib function is not implemented yet");
+        };
+        let actions = config_manager.set_content_settings(value, Some(id), self.close_flag != 0);
+        self.apply_config_actions(actions);
+    }
+
+    /// `Requests::on_request(getApplicationConfig)` →
+    /// `ConfigManager::get_app_config`.
+    pub(crate) fn get_application_config(&mut self, id: u64) {
+        let Some(config_manager) = self.config_manager.as_mut() else {
+            return self.send_error_impl(id, 500, "TDLib function is not implemented yet");
+        };
+        let actions =
+            config_manager.get_app_config(id, self.auth_manager.is_bot(), self.close_flag != 0);
+        self.apply_config_actions(actions);
+    }
+
+    /// `NetQueryDispatcher::get_main_dc_id()` — the dispatcher lands with
+    /// the net step; the main DC is 1 until then.
+    fn get_main_dc_id(&self) -> i32 {
+        1
+    }
+
+    /// `G()->unix_time()` — the server-time-corrected wall clock; the value
+    /// comes from the Global hub inited at `Td::init` (before this, without
+    /// a session the server difference is just the local default).
+    pub(crate) fn get_unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    /// A completed ConfigManager query — the C++ `ConfigManager::on_result`
+    /// token dispatch. The net step calls this when a pending query
+    /// completes; tests drive the config flow through it.
+    pub(crate) fn on_config_query_result(&mut self, query: ConfigQuery, result: ConfigQueryResult) {
+        let close_flag = self.close_flag != 0;
+        let is_authorized = self.auth_manager.is_authorized();
+        let is_bot = self.auth_manager.is_bot();
+        let is_test_dc = self.global.is_test_dc();
+        let main_dc_id = self.get_main_dc_id();
+        let Some(config_manager) = self.config_manager.as_mut() else {
+            return;
+        };
+        let actions = {
+            let pmc = self.global.binlog_pmc();
+            let option_manager = self
+                .option_manager
+                .as_mut()
+                .expect("option manager set in Run");
+            match (query, result) {
+                (
+                    ConfigQuery::GetConfig {
+                        dc_id: _,
+                        reopen_sessions,
+                    },
+                    ConfigQueryResult::GetConfig(r_config),
+                ) => config_manager.on_get_config_result(
+                    pmc,
+                    r_config,
+                    reopen_sessions,
+                    close_flag,
+                    option_manager,
+                    is_test_dc,
+                    is_authorized,
+                    is_bot,
+                    main_dc_id,
+                ),
+                (
+                    ConfigQuery::GetAppConfig { .. },
+                    ConfigQueryResult::GetAppConfig(r_app_config),
+                ) => config_manager.on_get_app_config_result(
+                    pmc,
+                    r_app_config,
+                    close_flag,
+                    option_manager,
+                    is_authorized,
+                    is_bot,
+                ),
+                (
+                    ConfigQuery::GetContentSettings,
+                    ConfigQueryResult::GetContentSettings(r_content_settings),
+                ) => config_manager.on_get_content_settings_result(
+                    r_content_settings,
+                    option_manager,
+                    is_bot,
+                    close_flag,
+                ),
+                (
+                    ConfigQuery::SetContentSettings { sensitive_enabled },
+                    ConfigQueryResult::SetContentSettings(r_set),
+                ) => config_manager.on_set_content_settings_result(
+                    r_set,
+                    sensitive_enabled,
+                    option_manager,
+                    is_bot,
+                    close_flag,
+                ),
+                _ => {
+                    tracing::error!("Mismatched config query result");
+                    return;
+                }
+            }
+        };
+        self.apply_config_actions(actions);
     }
 
     /// `Td::send_result` (Td.cpp:1399-1414).
@@ -756,6 +985,11 @@ actor_messages! {
         Request { request_id: u64, function: Function, } => request(request_id, function),
         Close => close_impl(false),
         Destroy => close_impl(true),
+        /// A completed ConfigManager query — the C++
+        /// `ConfigManager::on_result` dispatch. The net step calls this
+        /// when a pending query completes; tests drive the config flow
+        /// through it.
+        ConfigQueryResult { query: ConfigQuery, result: ConfigQueryResult, } => on_config_query_result(query, result),
     }
 }
 
@@ -769,6 +1003,19 @@ impl Actor for Td {
     fn hangup(&mut self) {
         self.close_impl(false);
         self.dec_stop_cnt();
+    }
+
+    /// The ConfigManager's expire timer rides the Td's actor timeout slot
+    /// (the C++ manager is its own actor with its own timer): the fired
+    /// timeout re-requests the expired config.
+    fn timeout_expired(&mut self) {
+        let close_flag = self.close_flag != 0;
+        let actions = self
+            .config_manager
+            .as_mut()
+            .map(|config_manager| config_manager.on_timeout(close_flag))
+            .unwrap_or_default();
+        self.apply_config_actions(actions);
     }
 
     fn tear_down(&mut self) {
@@ -958,6 +1205,7 @@ mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
     use tdactor::{ConcurrentScheduler, create_actor};
+    use tdmtproto::telegram_api;
 
     #[derive(Default)]
     struct CollectCallback {
@@ -1489,5 +1737,249 @@ mod tests {
             );
             scheduler.finish();
         });
+    }
+
+    fn send_config_result(
+        actor: &ActorOwn<Td>,
+        scheduler: &mut ConcurrentScheduler,
+        query: ConfigQuery,
+        result: ConfigQueryResult,
+    ) {
+        let send_ptr = scheduler.send_scheduler();
+        {
+            let _guard = send_ptr.guard(false);
+            tdactor::send_closure_later(actor, TdMessage::ConfigQueryResult { query, result });
+        }
+        let _ = scheduler.run_main(0.01);
+    }
+
+    /// The ConfigManager step gate, white-box: `setTdlibParameters` runs the
+    /// init sequence and dispatches the post-init config fetch
+    /// (`ConfigManager::start_up` → `help.getConfig`).
+    #[test]
+    fn post_init_config_fetch_is_dispatched() {
+        let callback = CollectCallback::default();
+        let dir = temp_db_dir("config-fetch");
+        let db_dir = dir.clone();
+        let mut td = Td::new(Box::new(CollectCallback {
+            responses: callback.responses.clone(),
+            errors: callback.errors.clone(),
+        }));
+        let Function::setTdlibParameters(parameters) = set_tdlib_parameters(db_dir, false) else {
+            unreachable!("setTdlibParameters helper");
+        };
+        td.on_set_tdlib_parameters(20, parameters);
+        assert_eq!(td.state, State::Run);
+        assert_eq!(
+            td.pending_config_queries,
+            vec![ConfigQuery::GetConfig {
+                dc_id: 1,
+                reopen_sessions: false,
+            }]
+        );
+        td.close_impl(false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Feeding the post-init `GetConfig` result applies the server config to
+    /// the options and broadcasts the `updateOption` updates.
+    #[test]
+    fn config_result_applies_options_and_broadcasts() {
+        let callback = CollectCallback::default();
+        let dir = temp_db_dir("config-apply");
+        let db_dir = dir.clone();
+        let mut td = Td::new(Box::new(CollectCallback {
+            responses: callback.responses.clone(),
+            errors: callback.errors.clone(),
+        }));
+        let Function::setTdlibParameters(parameters) = set_tdlib_parameters(db_dir, false) else {
+            unreachable!("setTdlibParameters helper");
+        };
+        td.on_set_tdlib_parameters(20, parameters);
+        let query = td.pending_config_queries[0].clone();
+
+        let config = telegram_api::Config {
+            this_dc: 1,
+            date: 1000,
+            expires: 2000,
+            test_mode: false,
+            webfile_dc_id: 4,
+            tmp_sessions: 100,
+            edit_time_limit: 172800,
+            suggested_lang_code: "en".to_string(),
+            lang_pack_version: 5,
+            caption_length_max: 5000,
+            message_length_max: 50000,
+            me_url_prefix: "https://t.me".to_string(),
+            ..Default::default()
+        };
+        td.on_config_query_result(query, ConfigQueryResult::GetConfig(Ok(config)));
+
+        let responses = callback.responses.lock().unwrap();
+        let option_updates: Vec<(String, td_api::OptionValue)> = responses
+            .iter()
+            .filter_map(|(id, object)| {
+                if *id != 0 {
+                    return None;
+                }
+                let Object::updateOption(update) = object else {
+                    return None;
+                };
+                Some((update.name.clone(), update.value.clone()))
+            })
+            .collect();
+        // Drop the guard before close: the close path pushes its final
+        // notification through the same callback lock.
+        drop(responses);
+        // The main-DC-gated non-internal option lands.
+        assert!(option_updates.iter().any(|(name, value)| {
+            name == "suggested_language_pack_id"
+                && matches!(value, td_api::OptionValue::optionValueString(v) if v.value == "en")
+        }));
+        // The internal options (session_count, webfile_dc_id,
+        // edit_time_limit) are stored but not broadcast, like the C++.
+        for internal_name in ["session_count", "webfile_dc_id", "edit_time_limit"] {
+            assert!(
+                !option_updates.iter().any(|(name, _)| name == internal_name),
+                "{internal_name} must not broadcast"
+            );
+        }
+        // The clamped caption limit broadcasts.
+        assert!(option_updates.iter().any(|(name, value)| {
+            name == "message_caption_length_max"
+                && matches!(value, td_api::OptionValue::optionValueInteger(v) if v.value == 5000)
+        }));
+
+        td.close_impl(false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// getOption for the content-settings names routes through the
+    /// ConfigManager and answers from the store immediately while
+    /// unauthorized (the C++ `get_content_settings` Unit shortcut).
+    #[test]
+    fn get_option_content_settings_answers_in_run() {
+        let callback = CollectCallback::default();
+        let dir = temp_db_dir("content-get");
+        let db_dir = dir.clone();
+        run_actor_with(&callback, move |actor, callback, scheduler| {
+            send(actor, scheduler, 70, set_tdlib_parameters(db_dir, false));
+            assert!(
+                responses_of(callback, 70)
+                    .iter()
+                    .any(|object| matches!(object, Object::ok(_)))
+            );
+
+            for name in [
+                "ignore_sensitive_content_restrictions",
+                "can_ignore_sensitive_content_restrictions",
+            ] {
+                send(
+                    actor,
+                    scheduler,
+                    71,
+                    Function::getOption(td_api::getOption {
+                        name: name.to_string(),
+                    }),
+                );
+                assert!(
+                    responses_of(callback, 71)
+                        .iter()
+                        .any(|object| matches!(object, Object::optionValueEmpty(_))),
+                    "{name} answers the empty store value"
+                );
+            }
+            scheduler.finish();
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// setOption("ignore_sensitive_content_restrictions") without the
+    /// `can_ignore` permission fails with the C++ error.
+    #[test]
+    fn set_option_content_settings_requires_can_ignore() {
+        let callback = CollectCallback::default();
+        let dir = temp_db_dir("content-set");
+        let db_dir = dir.clone();
+        run_actor_with(&callback, move |actor, callback, scheduler| {
+            send(actor, scheduler, 80, set_tdlib_parameters(db_dir, false));
+            assert!(
+                responses_of(callback, 80)
+                    .iter()
+                    .any(|object| matches!(object, Object::ok(_)))
+            );
+
+            send(
+                actor,
+                scheduler,
+                81,
+                Function::setOption(td_api::setOption {
+                    name: "ignore_sensitive_content_restrictions".to_string(),
+                    value: td_api::OptionValue::optionValueBoolean(td_api::optionValueBoolean {
+                        value: true,
+                    }),
+                }),
+            );
+            let error = error_of(callback, 81);
+            assert_eq!(
+                (error.code, error.message.as_str()),
+                (
+                    400,
+                    "Option \"ignore_sensitive_content_restrictions\" can't be changed by the user"
+                )
+            );
+            scheduler.finish();
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// getApplicationConfig queues the app-config fetch; feeding the result
+    /// answers the request with the converted JSON object.
+    #[test]
+    fn get_application_config_answers_the_app_config() {
+        let callback = CollectCallback::default();
+        let dir = temp_db_dir("app-config");
+        let db_dir = dir.clone();
+        run_actor_with(&callback, move |actor, callback, scheduler| {
+            send(actor, scheduler, 90, set_tdlib_parameters(db_dir, false));
+            assert!(
+                responses_of(callback, 90)
+                    .iter()
+                    .any(|object| matches!(object, Object::ok(_)))
+            );
+
+            send(
+                actor,
+                scheduler,
+                91,
+                Function::getApplicationConfig(td_api::getApplicationConfig),
+            );
+            // The query is pending — no response yet.
+            assert!(responses_of(callback, 91).is_empty());
+
+            let config = Box::new(telegram_api::JSONValue::jsonObject(
+                telegram_api::jsonObject {
+                    value: vec![Box::new(telegram_api::JSONObjectValue {
+                        key: "k".to_string(),
+                        value: Box::new(telegram_api::JSONValue::jsonNumber(
+                            telegram_api::jsonNumber { value: 1.5 },
+                        )),
+                    })],
+                },
+            ));
+            send_config_result(
+                actor,
+                scheduler,
+                ConfigQuery::GetAppConfig { hash: 0 },
+                ConfigQueryResult::GetAppConfig(Ok(
+                    crate::config_manager::AppConfigQueryResult::Config { hash: 7, config },
+                )),
+            );
+            assert!(responses_of(callback, 91).iter().any(
+                |object| matches!(object, Object::jsonValueObject(v) if v.members.len() == 1)
+            ));
+            scheduler.finish();
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
