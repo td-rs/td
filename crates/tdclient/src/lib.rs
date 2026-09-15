@@ -13,6 +13,7 @@ pub mod client_json;
 pub mod config_dispatch;
 pub mod config_manager;
 pub mod config_recoverer;
+pub mod config_result;
 pub mod global;
 pub mod misc;
 pub mod option_manager;

@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use tdactor::{Actor, ActorOwn, actor_messages};
 use tddb::td_db::{OpenedDatabase, Parameters as DbParameters, TdDb};
 use tdmtproto::telegram_api;
-use tdnet::net_query::NetQueryDispatcher;
+use tdnet::net_query::{NetQuery, NetQueryDispatcher};
 use tdutils::status::Status;
 
 use crate::auth_manager::AuthManager;
@@ -41,6 +41,7 @@ use crate::config_recoverer::{
     ConfigRecoverer, RecovererActions, RecovererConnectionState, RecovererDcOption, RecovererEnv,
     RecovererNetType, SimpleConfigResult, load_dc_options_update,
 };
+use crate::config_result;
 use crate::global::Global;
 use crate::option_manager::OptionManager;
 use crate::requests;
@@ -602,13 +603,27 @@ impl Td {
         // StateManager — with the net step.
         self.clear_requests();
 
-        // `net_query_dispatcher_->stop()` (the Td.cpp:664 close path):
-        // in-flight queries abort with "Request aborted" through their
-        // callbacks (M.3.8.2 routes the completions); the parked buffers
-        // drop with the close.
+        // `net_query_dispatcher_->stop()` (the Td.cpp:664 close path): the
+        // stop flag aborts every still-dispatched query with
+        // Global::request_aborted_error() (NetQueryDispatcher.cpp:49-55).
+        // M.3.8.2 close-drop: the DC-gate-passed queries abort through
+        // their callbacks into the completions buffer, then every parked
+        // completion routes through the token dispatch — failing the
+        // manager's pending promise queues (ConfigManager.cpp:1130)
+        // before the buffers and the manager drop. The C++ delivers these
+        // asynchronously after clear; the collapsed-actor form routes
+        // them directly. Client-visible sends no-op — `clear_requests`
+        // already ran, like the C++.
         if let Some(dispatcher) = self.net_query_dispatcher.take() {
             dispatcher.stop();
         }
+        for (_, mut net_query) in std::mem::take(&mut *self.sent_net_queries.lock().unwrap()) {
+            net_query.set_error(config_result::request_aborted_error());
+            if let Some(mut callback) = net_query.move_callback() {
+                callback.on_result(net_query);
+            }
+        }
+        self.drain_config_net_query_completions();
         self.sent_net_queries.lock().unwrap().clear();
         self.completed_config_queries.lock().unwrap().clear();
 
@@ -1130,6 +1145,36 @@ impl Td {
             }
         };
         self.apply_config_actions(actions);
+    }
+
+    /// M.3.8.2 — the net half of `ConfigManager::on_result`
+    /// (ConfigManager.cpp:1040-1140): a completed `NetQuery` and its
+    /// `actor_shared` link token reconstruct the dispatched query (the
+    /// token↔request-constructor match is the C++ provenance the link
+    /// token provides), decode via the `fetch_result` port, and feed the
+    /// token dispatch above. Mismatched pairs warn and drop.
+    pub(crate) fn on_config_net_query_result(&mut self, token: u64, net_query: NetQuery) {
+        debug_assert!(net_query.is_ready(), "completion of an unanswered query");
+        let Some(query) = config_result::reconstruct_config_query(token, &net_query) else {
+            tracing::warn!(
+                "Config query completion with token {token} does not match its request bytes"
+            );
+            return;
+        };
+        let mut net_query = net_query;
+        let result = config_result::decode_config_query_result(&query, &mut net_query);
+        self.on_config_query_result(query, result);
+    }
+
+    /// M.3.8.2 — drain the dispatcher's parked completions
+    /// (token, NetQuery) in dispatch order; the close path runs this for
+    /// the dispatcher-stop aborts, the actor flow once the callback
+    /// delivery is wired there.
+    pub(crate) fn drain_config_net_query_completions(&mut self) {
+        let completions = std::mem::take(&mut *self.completed_config_queries.lock().unwrap());
+        for (token, net_query) in completions {
+            self.on_config_net_query_result(token, net_query);
+        }
     }
 
     /// `Td::send_result` (Td.cpp:1399-1414).
@@ -2341,13 +2386,16 @@ mod tests {
         };
         td.on_set_tdlib_parameters(20, parameters);
         // The dispatched query kind the config flow drives — the start-up
-        // GetConfig (the only in-flight query after init).
+        // GetConfig (the only in-flight query after init). Feed its answer
+        // through the parked completion (the M.3.8.2 routing path), so the
+        // in-flight count and the completion stay paired.
         let query = ConfigQuery::GetConfig {
             dc_id: 1,
             reopen_sessions: false,
         };
 
         let config = telegram_api::Config {
+            flags: 4, // flags.2 carries the lang fields on the wire
             this_dc: 1,
             date: 1000,
             expires: 2000,
@@ -2362,7 +2410,26 @@ mod tests {
             me_url_prefix: "https://t.me".to_string(),
             ..Default::default()
         };
-        td.on_config_query_result(query, ConfigQueryResult::GetConfig(Ok(config)));
+        let mut answer = Vec::new();
+        config.store_boxed(&mut answer);
+        let (mut net_query, token) = build_config_net_query(
+            &query,
+            td.net_query_dispatcher.as_ref().unwrap().next_query_id(),
+            false,
+        );
+        net_query.set_ok(answer);
+        {
+            let mut completions = td.completed_config_queries.lock().unwrap();
+            completions.clear();
+            completions.push((token, net_query));
+        }
+        td.drain_config_net_query_completions();
+        // The ok config triggers the C++ follow-up app-config reload
+        // (process_config → reload_app_config) — a fresh GetAppConfig
+        // dispatch parks its own DC-gate completion.
+        assert_eq!(td.completed_config_queries.lock().unwrap().len(), 1);
+        td.drain_config_net_query_completions();
+        assert!(td.completed_config_queries.lock().unwrap().is_empty());
 
         let responses = callback.responses.lock().unwrap();
         let option_updates: Vec<(String, td_api::OptionValue)> = responses
@@ -2400,6 +2467,163 @@ mod tests {
         }));
 
         td.close_impl(false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M.3.8.2: dispatching the parked queries registers them by net query
+    /// id, and a completed `help.getConfig` NetQuery routes by that id —
+    /// token-checked — through the drain into the option-broadcast path.
+    #[test]
+    fn net_query_completions_route_by_dispatch_id() {
+        let callback = CollectCallback::default();
+        let dir = temp_db_dir("config-net-route");
+        let db_dir = dir.clone();
+        let mut td = Td::new(Box::new(CollectCallback {
+            responses: callback.responses.clone(),
+            errors: callback.errors.clone(),
+        }));
+        let Function::setTdlibParameters(parameters) = set_tdlib_parameters(db_dir, false) else {
+            unreachable!("setTdlibParameters helper");
+        };
+        td.on_set_tdlib_parameters(20, parameters);
+        assert_eq!(td.config_manager.as_ref().unwrap().config_sent_cnt(), 1);
+
+        // The start-up GetConfig dispatched through the M.3.8.1 dispatcher
+        // and parked its DC-gate error completion; replace it with the
+        // session-delivered ok answer (the exact NetQuery the dispatch
+        // layer built).
+        let query = ConfigQuery::GetConfig {
+            dc_id: 1,
+            reopen_sessions: false,
+        };
+        let config = telegram_api::Config {
+            flags: 4, // flags.2 carries the lang fields on the wire
+            this_dc: 1,
+            date: 1000,
+            expires: 2000,
+            test_mode: false,
+            webfile_dc_id: 4,
+            tmp_sessions: 100,
+            edit_time_limit: 172800,
+            suggested_lang_code: "en".to_string(),
+            lang_pack_version: 5,
+            caption_length_max: 5000,
+            message_length_max: 50000,
+            me_url_prefix: "https://t.me".to_string(),
+            ..Default::default()
+        };
+        let mut answer = Vec::new();
+        config.store_boxed(&mut answer);
+        let (mut net_query, token) = build_config_net_query(
+            &query,
+            td.net_query_dispatcher.as_ref().unwrap().next_query_id(),
+            false,
+        );
+        net_query.set_ok(answer);
+        {
+            let mut completions = td.completed_config_queries.lock().unwrap();
+            completions.clear();
+            completions.push((token, net_query));
+        }
+        td.drain_config_net_query_completions();
+
+        // The ok config triggers the C++ follow-up app-config reload
+        // (process_config → reload_app_config, config_manager.rs) — a
+        // fresh GetAppConfig dispatch parks its own DC-gate completion
+        // with the token-1 callback.
+        {
+            let completions = td.completed_config_queries.lock().unwrap();
+            assert_eq!(completions.len(), 1);
+            assert_eq!(completions[0].0, 1, "the app-config reload token");
+        }
+        td.drain_config_net_query_completions();
+        assert!(td.completed_config_queries.lock().unwrap().is_empty());
+        assert_eq!(td.config_manager.as_ref().unwrap().config_sent_cnt(), 0);
+        let responses = callback.responses.lock().unwrap();
+        assert!(responses.iter().any(|(id, object)| {
+            *id == 0
+                && matches!(
+                    object,
+                    Object::updateOption(update) if update.name == "message_caption_length_max"
+                )
+        }));
+        drop(responses);
+        td.close_impl(false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A completion whose token does not match its request bytes is
+    /// dropped with a warning — the manager state stays untouched.
+    #[test]
+    fn token_request_mismatch_completion_is_dropped() {
+        let callback = CollectCallback::default();
+        let dir = temp_db_dir("config-net-unknown");
+        let db_dir = dir.clone();
+        let mut td = Td::new(Box::new(CollectCallback {
+            responses: callback.responses.clone(),
+            errors: callback.errors.clone(),
+        }));
+        let Function::setTdlibParameters(parameters) = set_tdlib_parameters(db_dir, false) else {
+            unreachable!("setTdlibParameters helper");
+        };
+        td.on_set_tdlib_parameters(20, parameters);
+        assert_eq!(td.config_manager.as_ref().unwrap().config_sent_cnt(), 1);
+
+        // Token 1 (help.getAppConfig) over help.getConfig request bytes —
+        // the provenance check fails and the completion drops.
+        let query = ConfigQuery::GetConfig {
+            dc_id: 1,
+            reopen_sessions: false,
+        };
+        let (mut net_query, _) = build_config_net_query(&query, 999, false);
+        net_query.set_error(crate::config_result::request_aborted_error());
+        td.on_config_net_query_result(1, net_query);
+        assert_eq!(td.config_manager.as_ref().unwrap().config_sent_cnt(), 1);
+
+        td.close_impl(false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M.3.8.2 close-drop: the dispatcher-stop abort (the exact completion
+    /// `Td::clear` feeds every still-in-flight query) routes through the
+    /// token dispatch — the in-flight `config_sent_cnt` returns to zero —
+    /// and `close` leaves the parked buffers empty, mirroring the
+    /// dispatcher stop at `Td::clear` (Td.cpp:663).
+    #[test]
+    fn close_routes_request_aborted_through_the_dispatch() {
+        let callback = CollectCallback::default();
+        let dir = temp_db_dir("config-net-close");
+        let db_dir = dir.clone();
+        let mut td = Td::new(Box::new(CollectCallback {
+            responses: callback.responses.clone(),
+            errors: callback.errors.clone(),
+        }));
+        let Function::setTdlibParameters(parameters) = set_tdlib_parameters(db_dir, false) else {
+            unreachable!("setTdlibParameters helper");
+        };
+        td.on_set_tdlib_parameters(20, parameters);
+        assert_eq!(td.config_manager.as_ref().unwrap().config_sent_cnt(), 1);
+
+        // The start-up GetConfig is the one in-flight query; the abort
+        // completion the close path produces for it.
+        let query = ConfigQuery::GetConfig {
+            dc_id: 1,
+            reopen_sessions: false,
+        };
+        let (mut net_query, token) = build_config_net_query(&query, 1, false);
+        net_query.set_error(crate::config_result::request_aborted_error());
+        {
+            let mut completions = td.completed_config_queries.lock().unwrap();
+            completions.clear();
+            completions.push((token, net_query));
+        }
+        td.drain_config_net_query_completions();
+        assert!(td.completed_config_queries.lock().unwrap().is_empty());
+        assert_eq!(td.config_manager.as_ref().unwrap().config_sent_cnt(), 0);
+
+        td.close_impl(false);
+        assert!(td.completed_config_queries.lock().unwrap().is_empty());
+        assert!(td.sent_net_queries.lock().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
