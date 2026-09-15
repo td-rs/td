@@ -1593,6 +1593,10 @@ pub struct UserManager {
     /// `secret_chats_with_user_` — per user, the secret chats with them.
     secret_chats_with_user: BTreeMap<i64, Vec<i32>>,
 
+    /// `unavailable_user_fulls_` (UserManager.cpp:8919) — ids whose
+    /// `usf<id>` row is known absent; guards a re-read per id.
+    unavailable_user_fulls: BTreeSet<i64>,
+
     resolved_phone_numbers: BTreeMap<String, UserId>,
     restricted_user_ids: BTreeSet<i64>,
 
@@ -3926,7 +3930,7 @@ impl UserManager {
                 user_full.need_save_to_database |= user_full.is_changed;
             }
             if self.users_full.contains_key(&user_id.get()) {
-                self.update_user_full(env, user_id, "update_user");
+                self.update_user_full(env, user_id, "update_user", false);
             }
         }
         self.take_user_flag(user_id, UserFlag::IsMutualContact);
@@ -4081,7 +4085,7 @@ impl UserManager {
         {
             let user_full = self.users_full.get_mut(&user_id.get()).unwrap();
             user_full.need_send_update = true;
-            self.update_user_full(env, user_id, "update_user is_full_info_changed");
+            self.update_user_full(env, user_id, "update_user is_full_info_changed", false);
             // reload_user_full — with the net step
         }
     }
@@ -4154,8 +4158,14 @@ impl UserManager {
     }
 
     /// `UserManager::update_user_full`
-    /// (UserManager.cpp:10128-10225), the supported subset.
-    pub fn update_user_full(&mut self, env: &mut UserEnv, user_id: UserId, source: &str) {
+    /// (UserManager.cpp:10128-10225).
+    pub fn update_user_full(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        source: &str,
+        from_database: bool,
+    ) {
         if self
             .users_full
             .get(&user_id.get())
@@ -4168,14 +4178,20 @@ impl UserManager {
             .get_mut(&user_id.get())
             .unwrap()
             .is_being_updated = true;
-        self.update_user_full_impl(env, user_id, source);
+        self.update_user_full_impl(env, user_id, source, from_database);
         if let Some(user_full) = self.users_full.get_mut(&user_id.get()) {
             user_full.is_being_updated = false;
         }
     }
 
-    fn update_user_full_impl(&mut self, env: &mut UserEnv, user_id: UserId, source: &str) {
-        // unavailable_user_fulls_ — only populated by the net paths
+    fn update_user_full_impl(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        source: &str,
+        from_database: bool,
+    ) {
+        self.unavailable_user_fulls.remove(&user_id.get()); // don't needed anymore
         if let Some(user_full) = self.users_full.get_mut(&user_id.get()) {
             if user_full.is_common_chat_count_changed {
                 user_full.is_common_chat_count_changed = false;
@@ -4184,7 +4200,11 @@ impl UserManager {
             }
             // the star rating timeout (cpp:10144-10151) — with StarRating
             // the first-saved-music registration — with the Audios step
-            // is_has_protected_content_changed — with MessagesManager
+            if user_full.is_has_protected_content_changed {
+                user_full.is_has_protected_content_changed = false;
+                // MessagesManager::on_dialog_has_protected_content_updated
+                // — with its step
+            }
             // the file-source registration block — with the Files step
             user_full.need_send_update |= user_full.is_changed;
             user_full.need_save_to_database |= user_full.is_changed;
@@ -4221,15 +4241,22 @@ impl UserManager {
             // SuggestedActions step
         }
         if need_save_to_database {
-            // save_user_full (UserManager.cpp:9345-9356) lands with the
-            // Files-gated UserFull store
+            if !from_database {
+                self.save_user_full(env, user_id);
+            }
             let user_full = self.users_full.get_mut(&user_id.get()).unwrap();
             user_full.need_save_to_database = false;
         }
     }
 
-    /// `UserManager::on_get_user_full` (UserManager.cpp:8975-9344) — the
-    /// supported subset of the `userFull` fields (module docs).
+    /// `UserManager::on_get_user_full` (UserManager.cpp:8975-9343) — the
+    /// supported subset of the `userFull` fields (module docs); the
+    /// photos / bot-info / business / star-rating / gift-settings / note
+    /// / stories parts of the telegram object are handled by their
+    /// subsystems, the MessagesManager dialog fan-outs (notify settings,
+    /// wallpaper, theme, pinned message, folder, ttl, dialog is_blocked,
+    /// translatable), StoryManager and the personal-channel Broadcast
+    /// type check (ChatManager) arrive with their waves.
     pub fn on_get_user_full(&mut self, env: &mut UserEnv, mut user_full: telegram_api::UserFull) {
         let user_id = UserId::new(user_full.id);
         if !user_id.is_valid() {
@@ -4239,6 +4266,13 @@ impl UserManager {
         if !self.get_user_force(env, user_id, "on_get_user_full") {
             return;
         }
+        // apply_pending_user_photo (cpp:8986) — with the photo-cache step
+
+        // The User facts the application reads (cpp:9112, 9140, 9235).
+        let (is_premium_user, is_contact, user_linked_community_id) = {
+            let u = self.users.get(&user_id.get()).unwrap();
+            (u.is_premium, u.is_contact, u.linked_community_id)
+        };
 
         let flags = user_full.flags;
         let flags2 = user_full.flags2;
@@ -4247,20 +4281,14 @@ impl UserManager {
         let is_blocked = flags & 1 != 0;
         let is_blocked_for_stories = flags & (1 << 27) != 0;
 
-        if !self.users_full.contains_key(&user_id.get()) {
-            self.users_full.entry(user_id.get()).or_insert_with(|| {
-                let mut stored = UserFull::new();
-                stored.expires_at = user_full_expires_at;
-                stored
-            });
-        }
+        self.users_full.entry(user_id.get()).or_default();
 
         let about = std::mem::take(&mut user_full.about);
-        let can_be_called = flags & (1 << 4) != 0;
-        let supports_video_calls = flags & (1 << 13) != 0;
         let has_private_calls = flags & (1 << 5) != 0;
+        let can_be_called = flags & (1 << 4) != 0 && !has_private_calls;
+        let supports_video_calls = flags & (1 << 13) != 0 && !has_private_calls;
         let can_pin_messages = flags & (1 << 7) != 0;
-        let voice_messages_forbidden = flags & (1 << 20) != 0;
+        let voice_messages_forbidden = is_premium_user && flags & (1 << 20) != 0;
         let wallpaper_overridden = flags & (1 << 28) != 0;
         let read_dates_private = flags & (1 << 30) != 0;
         let contact_require_premium = flags & (1 << 29) != 0;
@@ -4271,38 +4299,109 @@ impl UserManager {
         let noforwards_my_enabled = flags2 & (1 << 23) != 0;
         let noforwards_peer_enabled = flags2 & (1 << 24) != 0;
         let unofficial_security_risk = flags2 & (1 << 26) != 0;
-        let gift_count = user_full.stargifts_count;
-        let common_chat_count = user_full.common_chats_count;
+
+        // on_update_user_full_gift_count / _common_chat_count
+        // (cpp:4241-4262, 4203-4223).
+        let mut gift_count = user_full.stargifts_count;
+        if gift_count < 0 {
+            tdutils::log_error!("Receive {gift_count} as gift count with {user_id:?}");
+            gift_count = 0;
+        }
+        let mut common_chat_count = user_full.common_chats_count;
+        if common_chat_count < 0 {
+            tdutils::log_error!(
+                "Receive {common_chat_count} as common group count with {user_id:?}"
+            );
+            common_chat_count = 0;
+        }
+        // The Broadcast type check (cpp:9237-9240) needs the ChatManager.
         let personal_channel_id = if flags2 & (1 << 6) != 0 {
             user_full.personal_channel_id
         } else {
             0
         };
-        let send_paid_message_stars = if flags2 & (1 << 14) != 0 {
-            user_full.send_paid_messages_stars
+        // on_update_user_full_send_paid_message_stars (cpp:9034-9035).
+        let send_paid_message_stars = get_star_count(user_full.send_paid_messages_stars);
+        // on_update_user_full_charge_paid_message_stars (cpp:9032-9033).
+        let charge_paid_message_stars =
+            get_star_count(user_full.settings.charge_paid_message_stars);
+        // on_update_user_full_need_phone_number_privacy_exception
+        // (cpp:9029-9031 + hook cpp:4446-4459).
+        let mut need_phone_number_privacy_exception = user_full.settings.need_contacts_exception;
+        if need_phone_number_privacy_exception && (is_contact || user_id == self.my_id) {
+            need_phone_number_privacy_exception = false;
+        }
+        let birthdate = if flags2 & (1 << 5) != 0 {
+            Birthdate::new(
+                user_full.birthday.day,
+                user_full.birthday.month,
+                user_full.birthday.year,
+            )
         } else {
-            0
+            Birthdate::default()
         };
-        let linked_community_id = 0i64; // the linked chat arrives via updates
+        let private_forward_name = std::mem::take(&mut user_full.private_forward_name);
+        let linked_community_id = user_linked_community_id;
 
         {
             let stored = self.users_full.get_mut(&user_id.get()).unwrap();
-            // The photos/bot_info/business/stories parts of the telegram
-            // object are handled by their subsystems (module docs); the
-            // fields we carry are applied here.
-            stored.expires_at = stored.expires_at.max(user_full_expires_at);
-            if stored.is_blocked != is_blocked {
+            // expires_at is set unconditionally on every delivery
+            // (cpp:9014-9015).
+            stored.expires_at = user_full_expires_at;
+            // on_update_user_full_is_blocked (cpp:9021 + hook
+            // cpp:4157-4168); the MessagesManager dialog-is_blocked
+            // fan-out (cpp:8999) arrives with its step.
+            if stored.is_blocked != is_blocked
+                || stored.is_blocked_for_stories != is_blocked_for_stories
+            {
                 stored.is_blocked = is_blocked;
-                stored.is_changed = true;
-            }
-            if stored.is_blocked_for_stories != is_blocked_for_stories {
                 stored.is_blocked_for_stories = is_blocked_for_stories;
                 stored.is_changed = true;
             }
-            if stored.about != about {
-                stored.about = about;
+            if stored.gift_count != gift_count {
+                stored.gift_count = gift_count;
                 stored.is_changed = true;
             }
+            if stored.common_chat_count != common_chat_count {
+                stored.common_chat_count = common_chat_count;
+                stored.is_common_chat_count_changed = true;
+                stored.is_changed = true;
+            }
+            // the business/location/away/greeting/intro/note hooks
+            // (cpp:9024-9028, 9194-9201) — with their subsystems
+            if stored.charge_paid_message_stars != charge_paid_message_stars {
+                stored.charge_paid_message_stars = charge_paid_message_stars;
+                stored.is_changed = true;
+            }
+            if stored.send_paid_message_stars != send_paid_message_stars {
+                stored.send_paid_message_stars = send_paid_message_stars;
+                stored.is_changed = true;
+            }
+            if stored.need_phone_number_privacy_exception != need_phone_number_privacy_exception {
+                stored.need_phone_number_privacy_exception = need_phone_number_privacy_exception;
+                stored.is_changed = true;
+            }
+            if stored.wallpaper_overridden != wallpaper_overridden {
+                stored.wallpaper_overridden = wallpaper_overridden;
+                stored.is_changed = true;
+            }
+            // on_update_user_full_noforwards (cpp:9037 + hook
+            // cpp:4531-4556).
+            let old_noforwards = stored.noforwards_my_enabled || stored.noforwards_peer_enabled;
+            if stored.noforwards_my_enabled != noforwards_my_enabled {
+                stored.noforwards_my_enabled = noforwards_my_enabled;
+                stored.need_save_to_database = true;
+            }
+            if stored.noforwards_peer_enabled != noforwards_peer_enabled {
+                stored.noforwards_peer_enabled = noforwards_peer_enabled;
+                stored.need_save_to_database = true;
+            }
+            if old_noforwards != (stored.noforwards_my_enabled || stored.noforwards_peer_enabled) {
+                stored.is_has_protected_content_changed = true;
+            }
+            // The can_pin block (cpp:9107-9134); bot_verification /
+            // gift_settings / star_rating / main_profile_tab — with
+            // their subsystems.
             if stored.can_be_called != can_be_called {
                 stored.can_be_called = can_be_called;
                 stored.is_changed = true;
@@ -4327,18 +4426,6 @@ impl UserManager {
                 stored.has_pinned_stories = has_pinned_stories;
                 stored.is_changed = true;
             }
-            if stored.wallpaper_overridden != wallpaper_overridden {
-                stored.wallpaper_overridden = wallpaper_overridden;
-                stored.is_changed = true;
-            }
-            if stored.read_dates_private != read_dates_private {
-                stored.read_dates_private = read_dates_private;
-                stored.is_changed = true;
-            }
-            if stored.contact_require_premium != contact_require_premium {
-                stored.contact_require_premium = contact_require_premium;
-                stored.is_changed = true;
-            }
             if stored.sponsored_enabled != sponsored_enabled {
                 stored.sponsored_enabled = sponsored_enabled;
                 stored.is_changed = true;
@@ -4347,73 +4434,389 @@ impl UserManager {
                 stored.can_view_revenue = can_view_revenue;
                 stored.is_changed = true;
             }
-            if stored.can_manage_emoji_status != can_manage_emoji_status {
-                stored.can_manage_emoji_status = can_manage_emoji_status;
-                stored.is_changed = true;
-            }
-            if stored.noforwards_my_enabled != noforwards_my_enabled
-                || stored.noforwards_peer_enabled != noforwards_peer_enabled
-            {
-                stored.noforwards_my_enabled = noforwards_my_enabled;
-                stored.noforwards_peer_enabled = noforwards_peer_enabled;
-                stored.is_changed = true;
-            }
             if stored.unofficial_security_risk != unofficial_security_risk {
                 stored.unofficial_security_risk = unofficial_security_risk;
                 stored.is_changed = true;
             }
-            if stored.gift_count != gift_count {
-                stored.gift_count = gift_count;
+            if stored.birthdate != birthdate {
+                stored.birthdate = birthdate;
+                stored.is_changed = true;
+                // reload_contact_birthdates for a mutual contact
+                // (cpp:9140-9141) — with the Contacts step
+            }
+            if stored.private_forward_name != private_forward_name {
+                if stored.private_forward_name.is_empty() != private_forward_name.is_empty() {
+                    stored.is_changed = true;
+                }
+                stored.private_forward_name = private_forward_name;
+                stored.need_save_to_database = true;
+            }
+            if stored.read_dates_private != read_dates_private
+                || stored.contact_require_premium != contact_require_premium
+            {
+                stored.read_dates_private = read_dates_private;
+                stored.contact_require_premium = contact_require_premium;
+                stored.need_save_to_database = true;
+            }
+            if stored.about != about {
+                stored.about = about;
+                stored.is_changed = true;
+                // GroupCallManager::on_update_dialog_about (cpp:9167) —
+                // with its step
+            }
+            // the bot-info block (cpp:9170-9233) — with the BotInfo step
+            if stored.linked_community_id != linked_community_id {
+                stored.linked_community_id = linked_community_id;
                 stored.is_changed = true;
             }
-            if stored.common_chat_count != common_chat_count {
-                stored.common_chat_count = common_chat_count;
-                stored.is_common_chat_count_changed = true;
+            if stored.can_manage_emoji_status != can_manage_emoji_status {
+                stored.can_manage_emoji_status = can_manage_emoji_status;
                 stored.is_changed = true;
             }
             if stored.personal_channel_id != personal_channel_id {
                 stored.personal_channel_id = personal_channel_id;
                 stored.is_changed = true;
             }
-            if stored.send_paid_message_stars != send_paid_message_stars {
-                stored.send_paid_message_stars = send_paid_message_stars;
-                stored.is_changed = true;
-            }
-            if stored.linked_community_id.get() != linked_community_id {
-                stored.linked_community_id = CommunityId::new(linked_community_id);
-                stored.is_changed = true;
-            }
+            // get_channel_difference_if_needed for the personal chat
+            // (cpp:9250-9254) — with MessagesManager; the photo
+            // application + do_update_user_photo + saved music
+            // (cpp:9256-9323) — with the Files/photo steps
         }
-        self.update_user_full(env, user_id, "on_get_user_full");
+        // on_get_peer_settings (cpp:9330-9331) — with MessagesManager
+        self.users_full
+            .get_mut(&user_id.get())
+            .unwrap()
+            .is_update_user_full_sent = true;
+        self.update_user_full(env, user_id, "on_get_user_full", false);
     }
 
     /// `UserManager::invalidate_user_full` (UserManager.cpp:4809-4823).
     pub fn invalidate_user_full(&mut self, env: &mut UserEnv, user_id: UserId) {
-        if self
-            .users_full
-            .get(&user_id.get())
-            .map(|user_full| !user_full.is_being_updated)
-            .unwrap_or(false)
-        {
+        let loaded = self.get_user_full_force(env, user_id, "invalidate_user_full");
+        if !loaded {
+            return;
+        }
+        // DialogManager::on_dialog_info_full_invalidated — with its step
+        let expired = {
+            let ctx = env.time_ctx();
+            self.users_full
+                .get(&user_id.get())
+                .unwrap()
+                .is_expired(&ctx)
+        };
+        if !expired {
             let stored = self.users_full.get_mut(&user_id.get()).unwrap();
             stored.expires_at = 0.0;
-            stored.is_changed = true;
-            self.update_user_full(env, user_id, "invalidate_user_full");
+            stored.need_save_to_database = true;
+            self.update_user_full(env, user_id, "invalidate_user_full", false);
         }
     }
 
-    /// `UserManager::drop_user_full` (UserManager.cpp:9552-9602), without
-    /// the photo/file-source handling.
+    /// `UserManager::drop_user_full` (UserManager.cpp:9552-9603):
+    /// force-load, then reset the fields to their defaults and keep the
+    /// record in the cache. The photo/saved-music cache drops arrive with
+    /// M.4.13, GroupCallManager::on_update_dialog_about with its step.
     pub fn drop_user_full(&mut self, env: &mut UserEnv, user_id: UserId) {
-        self.users_full.remove(&user_id.get());
-        // the kv erase follows the store, which is Files-gated
-        let _ = env;
+        let loaded = self.get_user_full_force(env, user_id, "drop_user_full");
+        // drop_user_photos(user_id, false) / drop_user_saved_music
+        // (cpp:9556-9557) — with their caches
+        if !loaded {
+            return;
+        }
+        {
+            let user_full = self.users_full.get_mut(&user_id.get()).unwrap();
+            user_full.expires_at = 0.0;
+            user_full.photo = ProfilePhoto::default();
+            user_full.personal_photo = ProfilePhoto::default();
+            user_full.fallback_photo = ProfilePhoto::default();
+            // first_saved_music_file_id — with the Audios step;
+            // is_blocked / is_blocked_for_stories are kept (cpp:9560-9561)
+            user_full.can_be_called = false;
+            user_full.supports_video_calls = false;
+            user_full.has_private_calls = false;
+            user_full.need_phone_number_privacy_exception = false;
+            user_full.wallpaper_overridden = false;
+            user_full.about = String::new();
+            // bot_info — with the BotInfo step
+            user_full.gift_count = 0;
+            user_full.common_chat_count = 0;
+            user_full.personal_channel_id = 0;
+            // main_profile_tab — with the ProfileTab step
+            user_full.linked_community_id = CommunityId::default();
+            // business_info / bot_verification / star_rating /
+            // pending_star_rating — with their subsystems
+            user_full.private_forward_name = String::new();
+            user_full.voice_messages_forbidden = false;
+            user_full.unofficial_security_risk = false;
+            user_full.has_pinned_stories = false;
+            user_full.read_dates_private = false;
+            user_full.contact_require_premium = false;
+            user_full.birthdate = Birthdate::default();
+            // gift_settings — with the StarGiftSettings step
+            user_full.sponsored_enabled = false;
+            user_full.has_preview_medias = false;
+            user_full.can_view_revenue = false;
+            user_full.can_manage_emoji_status = false;
+            user_full.charge_paid_message_stars = 0;
+            user_full.send_paid_message_stars = 0;
+            // note — with the FormattedText step
+            user_full.is_changed = true;
+        }
+        self.update_user_full(env, user_id, "drop_user_full", false);
     }
 
     /// `UserManager::add_user_full` (UserManager.cpp:8898-8902).
     pub fn add_user_full(&mut self, user_id: UserId) -> &mut UserFull {
         assert!(user_id.is_valid());
         self.users_full.entry(user_id.get()).or_default()
+    }
+
+    /// `UserManager::get_user_full_database_key`
+    /// (UserManager.cpp:9356-9358).
+    fn get_user_full_database_key(user_id: UserId) -> Vec<u8> {
+        format!("usf{}", user_id.get()).into_bytes()
+    }
+
+    /// `UserManager::save_user_full` (UserManager.cpp:9345-9355): the
+    /// C++ async pmc write collapses onto the synchronous kv (the
+    /// UserLogEvent binlog mirror exists only for users).
+    fn save_user_full(&mut self, env: &mut UserEnv, user_id: UserId) {
+        if !env.global.use_chat_info_database() {
+            return;
+        }
+        let value = {
+            let Some(user_full) = self.users_full.get(&user_id.get()) else {
+                return;
+            };
+            let ctx = env.time_ctx();
+            let mut value = Vec::new();
+            user_full.store_value(&mut value, &ctx);
+            value
+        };
+        env.global
+            .td_db()
+            .common_kv()
+            .set(&Self::get_user_full_database_key(user_id), &value);
+    }
+
+    /// `UserManager::get_user_full_force` (UserManager.cpp:8908-8928):
+    /// `have_user_force` (cpp:5016-5018) is the C++ `get_user_force !=
+    /// nullptr`, i.e. the special-user synthesis applies here too.
+    /// Returns whether the full info is now in the cache.
+    fn get_user_full_force(&mut self, env: &mut UserEnv, user_id: UserId, source: &str) -> bool {
+        if !self.get_user_force(env, user_id, source) {
+            return false;
+        }
+        if self.users_full.contains_key(&user_id.get()) {
+            return true;
+        }
+        if !env.global.use_chat_info_database() {
+            return false;
+        }
+        if !self.unavailable_user_fulls.insert(user_id.get()) {
+            return false;
+        }
+        tdutils::log_info!("Trying to load full {user_id:?} from database from {source}");
+        let value = env
+            .global
+            .td_db()
+            .common_kv()
+            .get(&Self::get_user_full_database_key(user_id));
+        self.on_load_user_full_from_database(env, user_id, value);
+        self.users_full.contains_key(&user_id.get())
+    }
+
+    /// `UserManager::on_load_user_full_from_database`
+    /// (UserManager.cpp:9364-9438), collapsed onto the synchronous kv.
+    fn on_load_user_full_from_database(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        value: Vec<u8>,
+    ) {
+        if self.users_full.contains_key(&user_id.get()) || value.is_empty() {
+            return;
+        }
+
+        self.add_user_full(user_id);
+        let parsed = {
+            let ctx = env.time_ctx();
+            UserFull::parse_value(&value, &ctx)
+        };
+        let user_full = match parsed {
+            Ok(user_full) => user_full,
+            Err(error) => {
+                // can't happen unless the database is broken: clean all
+                // known data about the user and pretend there was nothing
+                tdutils::log_error!("Repair broken full {user_id:?}: {error}");
+                self.users_full.remove(&user_id.get());
+                env.global
+                    .td_db()
+                    .common_kv()
+                    .erase(&Self::get_user_full_database_key(user_id));
+                return;
+            }
+        };
+        *self.users_full.get_mut(&user_id.get()).unwrap() = user_full;
+
+        // Dependencies (cpp:9403-9413): the user itself is guaranteed by
+        // the have_user_force gate; the linked-community /
+        // personal-channel / bot-info / note loads arrive with
+        // ChatManager and the subsystems. The pending_star_rating
+        // promotion (cpp:9415-9418) — with StarRating.
+        if self
+            .users_full
+            .get(&user_id.get())
+            .unwrap()
+            .need_phone_number_privacy_exception
+            && self.is_user_contact_of(user_id, false)
+        {
+            self.users_full
+                .get_mut(&user_id.get())
+                .unwrap()
+                .need_phone_number_privacy_exception = false;
+        }
+
+        let expected_photo_id = self.users.get(&user_id.get()).unwrap().photo.id;
+        self.drop_user_full_photos(
+            env,
+            user_id,
+            expected_photo_id,
+            "on_load_user_full_from_database 2",
+        );
+        {
+            let user_full = self.users_full.get_mut(&user_id.get()).unwrap();
+            // register_user_photo (cpp:9421-9422) and the my suggested
+            // profile photo (cpp:9423-9425) — with the Files step;
+            // GroupCallManager::on_update_dialog_about (cpp:9428) — with
+            // its step
+            if user_full.noforwards_my_enabled || user_full.noforwards_peer_enabled {
+                user_full.is_has_protected_content_changed = true;
+            }
+            user_full.is_update_user_full_sent = true;
+        }
+        self.update_user_full(env, user_id, "on_load_user_full_from_database 3", true);
+
+        let is_deleted = self
+            .users
+            .get(&user_id.get())
+            .map(|u| u.is_deleted)
+            .unwrap_or(false);
+        if is_deleted {
+            self.drop_user_full(env, user_id);
+        } else if self
+            .users_full
+            .get(&user_id.get())
+            .map(|user_full| user_full.expires_at == 0.0)
+            .unwrap_or(false)
+        {
+            self.reload_user_full(env, user_id, "on_load_user_full_from_database 4");
+        }
+    }
+
+    /// `UserManager::load_user_full` (UserManager.cpp:8930-8953) — the
+    /// local half. The `users.getFullUser` sends (fresh, expired-bot,
+    /// expired-auto; cpp:8939-8947) are [blocked: net] and un-stub at
+    /// M.4.16 through the QueryCombiner; the 400 error maps to the C++
+    /// promise error.
+    pub fn load_user_full(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        force: bool,
+        source: &str,
+    ) -> Result<(), &'static str> {
+        if !self.users.contains_key(&user_id.get()) {
+            return Err("User not found");
+        }
+        if !self.get_user_full_force(env, user_id, source) {
+            // send_get_user_full_query — [blocked: net]
+            return Ok(());
+        }
+        let expired = {
+            let ctx = env.time_ctx();
+            self.users_full
+                .get(&user_id.get())
+                .unwrap()
+                .is_expired(&ctx)
+        };
+        if expired {
+            let _ = force; // the bot gate (cpp:8942-8947) — [blocked: net]
+        }
+        // StoryManager::on_view_dialog_active_stories — with its step
+        Ok(())
+    }
+
+    /// `UserManager::reload_user_full` (UserManager.cpp:8954-8957) — the
+    /// query send is [blocked: net] (M.4.16).
+    fn reload_user_full(&mut self, _env: &mut UserEnv, user_id: UserId, source: &str) {
+        tdutils::log_info!("Get full {user_id:?} from {source} — [blocked: net]");
+    }
+
+    /// `UserManager::drop_user_full_photos` (UserManager.cpp:9485-9520).
+    fn drop_user_full_photos(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        expected_photo_id: i64,
+        source: &str,
+    ) {
+        if !self.users_full.contains_key(&user_id.get()) {
+            return;
+        }
+        tdutils::log_info!("Expect full photo {expected_photo_id} from {source}");
+        {
+            let user_full = self.users_full.get_mut(&user_id.get()).unwrap();
+            let mut personal_photo = std::mem::take(&mut user_full.personal_photo);
+            let mut photo = std::mem::take(&mut user_full.photo);
+            let mut fallback_photo = std::mem::take(&mut user_full.fallback_photo);
+            for photo_ptr in [&mut personal_photo, &mut photo, &mut fallback_photo] {
+                if photo_ptr.is_empty() {
+                    continue;
+                }
+                if expected_photo_id == 0 {
+                    // if profile photo is empty, we must drop the full photo
+                    *photo_ptr = ProfilePhoto::default();
+                    user_full.is_changed = true;
+                } else if expected_photo_id != photo_ptr.id {
+                    // if full profile photo is unknown, we must drop it
+                    *photo_ptr = ProfilePhoto::default();
+                    user_full.is_changed = true;
+                } else {
+                    // nothing to drop
+                    break;
+                }
+            }
+            user_full.personal_photo = personal_photo;
+            user_full.photo = photo;
+            user_full.fallback_photo = fallback_photo;
+            if expected_photo_id != Self::get_user_full_profile_photo_id(user_full) {
+                user_full.expires_at = 0.0;
+            }
+        }
+        if self
+            .users_full
+            .get(&user_id.get())
+            .unwrap()
+            .is_update_user_full_sent
+        {
+            self.update_user_full(env, user_id, "drop_user_full_photos", false);
+        }
+    }
+
+    /// `UserManager::get_user_full_profile_photo_id`
+    /// (UserManager.cpp:9472-9483).
+    fn get_user_full_profile_photo_id(user_full: &UserFull) -> i64 {
+        if !user_full.personal_photo.is_empty() {
+            return user_full.personal_photo.id;
+        }
+        if !user_full.photo.is_empty() {
+            return user_full.photo.id;
+        }
+        if !user_full.fallback_photo.is_empty() {
+            return user_full.fallback_photo.id;
+        }
+        0
     }
 
     /// `UserManager::get_user_status_object` (UserManager.cpp:10227-10255).
@@ -6259,6 +6662,333 @@ mod tests {
             update,
             td_api::Update::updateUserFullInfo(f) if f.user_id == 5 && f.user_full_info.bio.text == "the bio"
         )));
+    }
+
+    #[test]
+    fn on_get_user_full_applies_settings_calls_and_private_forward_name() {
+        let (mut temp, mut um) = test_env();
+        let full_flags = USER_ACCESS_HASH_MASK | (1 << 1);
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(5, "A", full_flags)),
+            "t",
+        );
+        um.take_updates();
+
+        // phone_calls_available together with phone_calls_private: the
+        // C++ conjunct suppresses both call flags (cpp:9108-9110);
+        // voice_messages_forbidden is gated on the user's premium flag
+        // (cpp:9112); the privacy exception survives for a non-contact
+        // (hook cpp:4446-4459).
+        let mut user_full = telegram_api::UserFull {
+            id: 5,
+            flags: (1 << 4) | (1 << 5) | (1 << 20), // calls available+private, voice forbidden
+            settings: telegram_api::PeerSettings {
+                flags: (1 << 4) | (1 << 14), // need_contacts_exception, charge_paid_message_stars
+                need_contacts_exception: true,
+                charge_paid_message_stars: 1i64 << 52, // clamps to the maximum
+                ..telegram_api::PeerSettings::default()
+            },
+            private_forward_name: "pf".to_owned(),
+            birthday: telegram_api::Birthday {
+                day: 7,
+                month: 11,
+                year: 1990,
+                ..telegram_api::Birthday::default()
+            },
+            ..telegram_api::UserFull::default()
+        };
+        user_full.flags2 = (1 << 5) | (1 << 24); // birthday, noforwards_peer_enabled
+        um.on_get_user_full(&mut temp.env(false), user_full);
+        let stored = um.get_user_full(UserId::new(5)).unwrap();
+        assert!(!stored.can_be_called);
+        assert!(!stored.supports_video_calls);
+        assert!(stored.has_private_calls);
+        assert!(!stored.voice_messages_forbidden);
+        assert!(stored.need_phone_number_privacy_exception);
+        assert_eq!(stored.charge_paid_message_stars, 1i64 << 51);
+        assert_eq!(stored.private_forward_name, "pf");
+        assert!(!stored.birthdate.is_empty());
+        assert_eq!(stored.birthdate.get_day(), 7);
+        assert_eq!(stored.birthdate.get_month(), 11);
+        assert_eq!(stored.birthdate.get_year(), 1990);
+
+        // The privacy exception is suppressed once the user becomes a
+        // contact (cpp:3378-3392 re-runs the hook from update_user; here
+        // the direct hook parity via a re-delivery with is_contact set).
+        um.users.get_mut(&5).unwrap().is_contact = true;
+        let user_full = telegram_api::UserFull {
+            id: 5,
+            settings: telegram_api::PeerSettings {
+                flags: 1 << 4,
+                need_contacts_exception: true,
+                ..telegram_api::PeerSettings::default()
+            },
+            private_forward_name: "pf".to_owned(),
+            ..telegram_api::UserFull::default()
+        };
+        um.on_get_user_full(&mut temp.env(false), user_full);
+        let stored = um.get_user_full(UserId::new(5)).unwrap();
+        assert!(!stored.need_phone_number_privacy_exception);
+        // The same-name re-delivery keeps the value (only the emptiness
+        // crossing sets is_changed, cpp:9150-9156).
+        assert_eq!(stored.private_forward_name, "pf");
+        assert!(!stored.can_be_called);
+    }
+
+    #[test]
+    fn user_full_pmc_round_trips_through_the_common_kv() {
+        let (mut temp, mut um) = test_env();
+        let full_flags = USER_ACCESS_HASH_MASK | (1 << 1);
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(5, "A", full_flags)),
+            "t",
+        );
+        um.take_updates();
+        let mut user_full = telegram_api::UserFull {
+            id: 5,
+            flags: 1 << 1, // about
+            common_chats_count: 3,
+            stargifts_count: 7,
+            ..telegram_api::UserFull::default()
+        };
+        user_full.about = "the bio".to_owned();
+        um.on_get_user_full(&mut temp.env(false), user_full);
+
+        let saved = temp.env(false).global.td_db().common_kv().get(b"usf5");
+        assert!(!saved.is_empty(), "the usf row must be written");
+
+        // A fresh manager over the same database force-loads the user and
+        // then the full info; the parse-into-default flags emit the
+        // updateUserFullInfo exactly like the C++ (cpp:9429-9431).
+        let mut um2 = UserManager::new();
+        um2.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(5, "A", full_flags)),
+            "t",
+        );
+        um2.take_updates();
+        assert!(um2.get_user_full_force(&mut temp.env(false), UserId::new(5), "round-trip"));
+        let stored = um2.get_user_full(UserId::new(5)).unwrap();
+        assert_eq!(stored.about, "the bio");
+        assert_eq!(stored.common_chat_count, 3);
+        assert_eq!(stored.gift_count, 7);
+        assert!(stored.is_update_user_full_sent);
+        assert!(um2.take_updates().iter().any(|update| matches!(
+            update,
+            td_api::Update::updateUserFullInfo(f) if f.user_id == 5
+        )));
+    }
+
+    #[test]
+    fn user_full_unavailable_and_repair_paths() {
+        let (mut temp, mut um) = test_env();
+        let full_flags = USER_ACCESS_HASH_MASK | (1 << 1);
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(5, "A", full_flags)),
+            "t",
+        );
+        um.take_updates();
+
+        // No row: the id is remembered as unavailable and is not re-read.
+        assert!(!um.get_user_full_force(&mut temp.env(false), UserId::new(5), "t1"));
+        assert!(um.unavailable_user_fulls.contains(&5));
+
+        // A broken row: the repair path drops the record and the key.
+        um.unavailable_user_fulls.clear();
+        temp.env(false)
+            .global
+            .td_db()
+            .common_kv()
+            .set(b"usf5", &[0xff, 0xff, 0xff]);
+        assert!(!um.get_user_full_force(&mut temp.env(false), UserId::new(5), "t2"));
+        assert!(um.get_user_full(UserId::new(5)).is_none());
+        assert!(
+            temp.env(false)
+                .global
+                .td_db()
+                .common_kv()
+                .get(b"usf5")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn user_full_expiry_and_load_user_full_paths() {
+        let (mut temp, mut um) = test_env();
+        let full_flags = USER_ACCESS_HASH_MASK | (1 << 1);
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(5, "A", full_flags)),
+            "t",
+        );
+        um.take_updates();
+        // An unknown user is the C++ 400 "User not found".
+        assert_eq!(
+            um.load_user_full(&mut temp.env(false), UserId::new(999), false, "t"),
+            Err("User not found")
+        );
+        // No cached full and no row: the local half returns without the
+        // [blocked: net] query.
+        assert_eq!(
+            um.load_user_full(&mut temp.env(false), UserId::new(5), false, "t"),
+            Ok(())
+        );
+
+        // An expired row still force-loads (the C++ reload decision is
+        // the caller's, cpp:8936-8948).
+        let ctx = TimeCtx {
+            now: tdutils::time::now() - 120.0,
+            server_time: 0.0,
+        };
+        let mut user_full = UserFull::new();
+        user_full.about = "old".to_owned();
+        user_full.expires_at = ctx.now;
+        let mut bytes = Vec::new();
+        user_full.store_value(&mut bytes, &ctx);
+        um.unavailable_user_fulls.clear();
+        temp.env(false)
+            .global
+            .td_db()
+            .common_kv()
+            .set(b"usf5", &bytes);
+        assert!(um.get_user_full_force(&mut temp.env(false), UserId::new(5), "t"));
+        let stored = um.get_user_full(UserId::new(5)).unwrap();
+        assert_eq!(stored.about, "old");
+        assert!(stored.is_expired(&TimeCtx {
+            now: tdutils::time::now(),
+            server_time: 0.0
+        }));
+        assert_eq!(
+            um.load_user_full(&mut temp.env(false), UserId::new(5), false, "t"),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn drop_user_full_resets_and_keeps_the_record() {
+        let (mut temp, mut um) = test_env();
+        let full_flags = USER_ACCESS_HASH_MASK | (1 << 1);
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(5, "A", full_flags)),
+            "t",
+        );
+        um.take_updates();
+        let mut user_full = telegram_api::UserFull {
+            id: 5,
+            flags: (1 << 1) | (1 << 4),
+            common_chats_count: 3,
+            ..telegram_api::UserFull::default()
+        };
+        user_full.about = "the bio".to_owned();
+        um.on_get_user_full(&mut temp.env(false), user_full);
+        um.take_updates();
+
+        um.drop_user_full(&mut temp.env(false), UserId::new(5));
+        // The record stays with its default fields (cpp:9552-9602), and
+        // the reset is persisted through the diff machine.
+        let stored = um.get_user_full(UserId::new(5)).unwrap();
+        assert_eq!(stored.about, "");
+        assert_eq!(stored.common_chat_count, 0);
+        assert_eq!(stored.expires_at, 0.0);
+        assert!(!stored.can_be_called);
+        let saved = temp.env(false).global.td_db().common_kv().get(b"usf5");
+        assert!(!saved.is_empty());
+        let parsed = UserFull::parse_value(
+            &saved,
+            &TimeCtx {
+                now: tdutils::time::now(),
+                server_time: 0.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(parsed.about, "");
+        assert!(um.take_updates().iter().any(|update| matches!(
+            update,
+            td_api::Update::updateUserFullInfo(f) if f.user_id == 5
+        )));
+    }
+
+    #[test]
+    fn drop_user_full_photos_matches_the_expected_id() {
+        let (mut temp, mut um) = test_env();
+        let full_flags = USER_ACCESS_HASH_MASK | (1 << 1);
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(5, "A", full_flags)),
+            "t",
+        );
+        um.take_updates();
+        let seed = |um: &mut UserManager| {
+            let stored = um.add_user_full(UserId::new(5));
+            stored.personal_photo.id = 42;
+            stored.photo.id = 43;
+            stored.fallback_photo.id = 44;
+            stored.expires_at = 123.0;
+            stored.is_update_user_full_sent = true;
+        };
+
+        // Expected 0: everything non-empty is dropped; the resulting
+        // profile-photo id is 0 == expected, so the expiry stays
+        // (cpp:9508-9513).
+        seed(&mut um);
+        um.drop_user_full_photos(&mut temp.env(false), UserId::new(5), 0, "t");
+        let stored = um.get_user_full(UserId::new(5)).unwrap();
+        assert!(stored.personal_photo.is_empty());
+        assert!(stored.photo.is_empty());
+        assert!(stored.fallback_photo.is_empty());
+        assert_eq!(stored.expires_at, 123.0);
+
+        // A mismatched expected id drops all three and zeroes the expiry.
+        seed(&mut um);
+        um.drop_user_full_photos(&mut temp.env(false), UserId::new(5), 99, "t");
+        let stored = um.get_user_full(UserId::new(5)).unwrap();
+        assert!(stored.personal_photo.is_empty());
+        assert!(stored.photo.is_empty());
+        assert!(stored.fallback_photo.is_empty());
+        assert_eq!(stored.expires_at, 0.0);
+
+        // A matching expected id keeps the leading photo untouched.
+        seed(&mut um);
+        um.drop_user_full_photos(&mut temp.env(false), UserId::new(5), 42, "t");
+        let stored = um.get_user_full(UserId::new(5)).unwrap();
+        assert_eq!(stored.personal_photo.id, 42);
+        assert_eq!(stored.photo.id, 43);
+        assert_eq!(stored.fallback_photo.id, 44);
+        assert_eq!(stored.expires_at, 123.0);
+    }
+
+    #[test]
+    fn on_load_drops_the_full_of_a_deleted_user() {
+        let (mut temp, mut um) = test_env();
+        let full_flags = USER_ACCESS_HASH_MASK | (1 << 1);
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(5, "A", full_flags)),
+            "t",
+        );
+        um.take_updates();
+        um.users.get_mut(&5).unwrap().is_deleted = true;
+
+        let ctx = temp.env(false).time_ctx();
+        let mut user_full = UserFull::new();
+        user_full.about = "the bio".to_owned();
+        user_full.expires_at = ctx.now + 60.0;
+        let mut bytes = Vec::new();
+        user_full.store_value(&mut bytes, &ctx);
+        temp.env(false)
+            .global
+            .td_db()
+            .common_kv()
+            .set(b"usf5", &bytes);
+
+        assert!(um.get_user_full_force(&mut temp.env(false), UserId::new(5), "t"));
+        let stored = um.get_user_full(UserId::new(5)).unwrap();
+        assert_eq!(stored.about, "");
+        assert_eq!(stored.expires_at, 0.0);
     }
 
     #[test]
