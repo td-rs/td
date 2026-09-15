@@ -37,6 +37,15 @@
 //!   `update_user` until those managers land;
 //! - the network-backed paths (`reload_user`, `load_user_full` queries,
 //!   `QueryMerger`/`QueryCombiner`) stay with the net step;
+//! - the read surface (cpp:5196-5880) ports the InputUser/InputPeer/
+//!   `inputEncryptedChat` construction, `get_bot_data` and the field
+//!   getters; the min-user fromMessage fallback (`user_messages_` +
+//!   `ChatManager::get_simple_input_peer`) lands with the message-users
+//!   registry step, `get_user_default_permissions`/`get_secret_chat_
+//!   default_permissions` and `get_bot_commands` carry
+//!   `RestrictedRights`/`BotCommands` from `DialogParticipant.h` into
+//!   the ChatManager slice, and `reload_user`/`send_get_me_query` are
+//!   the net step;
 //! - the current codegen cannot express nullable td_api fields (the
 //!   nullability modeling lands with the S76 codegen merge), so
 //!   `get_user_object`/`get_user_full_info_object` emit the C++-empty
@@ -59,6 +68,7 @@ use crate::td_api;
 use crate::usernames::Usernames;
 use tddb::binlog_key_value::BinlogKeyValue;
 use tdmtproto::telegram_api;
+use tdutils::status::Status;
 
 /// `User::CACHE_VERSION` (UserManager.h:633).
 const USER_CACHE_VERSION: u32 = 4;
@@ -1515,6 +1525,25 @@ impl SecretChat {
 
 /// The shared-context slice every manager method needs — the `Td *td_` of
 /// the C++, narrowed to the pieces the user manager touches.
+/// `td::UserManager::BotData` (UserManager.h:261-276).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BotData {
+    pub username: String,
+    pub can_be_edited: bool,
+    pub can_join_groups: bool,
+    pub can_read_all_group_messages: bool,
+    pub has_main_app: bool,
+    pub has_bot_forum_view: bool,
+    pub can_bot_create_topics: bool,
+    pub can_manage_bots: bool,
+    pub is_inline: bool,
+    pub is_guestchat: bool,
+    pub is_business: bool,
+    pub is_guard: bool,
+    pub need_location: bool,
+    pub can_be_added_to_attach_menu: bool,
+}
+
 pub struct UserEnv<'a> {
     pub global: &'a mut Global,
     pub options: &'a mut OptionManager,
@@ -3755,14 +3784,32 @@ impl UserManager {
         user_id: UserId,
         access_rights: AccessRights,
     ) -> bool {
+        self.have_input_peer_user_for(
+            self.get_user(user_id),
+            user_id,
+            access_rights,
+            env.auth_is_bot,
+        )
+    }
+
+    /// `UserManager::have_input_peer_user(const User *, ...)`
+    /// (UserManager.cpp:5271-5286); the `user_messages_` registry branch
+    /// lands with the message-users step.
+    fn have_input_peer_user_for(
+        &self,
+        u: Option<&User>,
+        user_id: UserId,
+        access_rights: AccessRights,
+        auth_is_bot: bool,
+    ) -> bool {
         if user_id == self.my_id {
             return true;
         }
-        let Some(u) = self.get_user(user_id) else {
-            return env.auth_is_bot && user_id.is_valid();
+        let Some(u) = u else {
+            return auth_is_bot && user_id.is_valid();
         };
         if u.access_hash == -1 || u.is_min_access_hash {
-            return env.auth_is_bot && user_id.is_valid();
+            return auth_is_bot && user_id.is_valid();
         }
         match access_rights {
             AccessRights::Know | AccessRights::Read => true,
@@ -4941,25 +4988,11 @@ impl UserManager {
             td_api::UserType::userTypeRegular(td_api::userTypeRegular)
         };
 
-        let emoji_status = match &u.last_sent_emoji_status {
-            Some(status) if status.get_custom_emoji_id().is_valid() => td_api::EmojiStatus {
-                r#type: td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
-                    td_api::emojiStatusTypeCustomEmoji {
-                        custom_emoji_id: status.get_custom_emoji_id().get(),
-                    },
-                ),
-                expiration_date: status.get_until_date(),
-            },
-            // collectible emoji statuses carry no custom emoji id in the
-            // reduced payload; the upgraded-gift form lands with the
-            // Gifts step (the C++ emits emojiStatusUpgradedGift here)
-            _ => td_api::EmojiStatus {
-                r#type: td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
-                    td_api::emojiStatusTypeCustomEmoji { custom_emoji_id: 0 },
-                ),
-                expiration_date: 0,
-            },
-        };
+        let emoji_status = u
+            .last_sent_emoji_status
+            .as_ref()
+            .map(make_emoji_status_object)
+            .unwrap_or_else(empty_emoji_status_object);
         let restricts_new_chats = u.contact_require_premium && !u.is_mutual_contact;
         let have_access = self.have_input_peer_user(env, user_id, AccessRights::Know);
         td_api::User {
@@ -5219,6 +5252,536 @@ impl UserManager {
         // updates arrive with the UserFull store and the Contacts step
     }
 
+    // ------------------------------------------------------------------
+    // M.4.11: the read surface (UserManager.cpp:5196-5880) — InputUser/
+    // InputPeer/inputEncryptedChat construction, bot data and the field
+    // getters. `None`/`Err` stand-ins keep the C++ `nullptr`/400 surfaces.
+
+    /// `UserManager::get_input_user` (UserManager.cpp:5206-5232). The
+    /// min-user fallback through the `user_messages_` registry arrives
+    /// with the message-users step — until then the C++ bot branch and
+    /// the 400 errors below it are the reachable outcomes.
+    pub fn get_input_user(
+        &self,
+        env: &UserEnv,
+        user_id: UserId,
+    ) -> Result<telegram_api::InputUser, Status> {
+        if user_id == self.my_id {
+            return Ok(telegram_api::InputUser::inputUserSelf(
+                telegram_api::inputUserSelf {},
+            ));
+        }
+        let u = self.get_user(user_id);
+        let inaccessible = match u {
+            None => true,
+            Some(u) => u.access_hash == -1 || u.is_min_access_hash,
+        };
+        if inaccessible {
+            if env.auth_is_bot && user_id.is_valid() {
+                return Ok(telegram_api::InputUser::inputUser(
+                    telegram_api::inputUser {
+                        user_id: user_id.get(),
+                        access_hash: 0,
+                    },
+                ));
+            }
+            return Err(match u {
+                None => Status::error(400, "User not found"),
+                Some(_) => Status::error(400, "Have no access to the user"),
+            });
+        }
+        Ok(telegram_api::InputUser::inputUser(
+            telegram_api::inputUser {
+                user_id: user_id.get(),
+                access_hash: u.map(|u| u.access_hash).unwrap(),
+            },
+        ))
+    }
+
+    /// `UserManager::get_input_users` (UserManager.cpp:5234-5243).
+    pub fn get_input_users(
+        &self,
+        env: &UserEnv,
+        user_ids: &[UserId],
+    ) -> Result<Vec<telegram_api::InputUser>, Status> {
+        let mut input_users = Vec::with_capacity(user_ids.len());
+        for user_id in user_ids {
+            input_users.push(self.get_input_user(env, *user_id)?);
+        }
+        Ok(input_users)
+    }
+
+    /// `UserManager::get_input_user_force` (UserManager.cpp:5245-5252).
+    pub fn get_input_user_force(&self, env: &UserEnv, user_id: UserId) -> telegram_api::InputUser {
+        assert!(user_id.is_valid());
+        self.get_input_user(env, user_id).unwrap_or_else(|_| {
+            telegram_api::InputUser::inputUser(telegram_api::inputUser {
+                user_id: user_id.get(),
+                access_hash: 0,
+            })
+        })
+    }
+
+    /// `UserManager::get_input_users_force` (UserManager.cpp:5254-5265).
+    pub fn get_input_users_force(
+        &self,
+        env: &UserEnv,
+        user_ids: &[UserId],
+    ) -> Vec<telegram_api::InputUser> {
+        user_ids
+            .iter()
+            .filter_map(|user_id| self.get_input_user(env, *user_id).ok())
+            .collect()
+    }
+
+    /// `UserManager::get_input_peer_user` (UserManager.cpp:5302-5325);
+    /// `None` is the C++ `nullptr`. In the force branch the only
+    /// reachable fallback (without the `user_messages_` registry) is the
+    /// bot one, which `have_input_peer_user_for` already admitted.
+    pub fn get_input_peer_user(
+        &self,
+        env: &UserEnv,
+        user_id: UserId,
+        access_rights: AccessRights,
+    ) -> Option<telegram_api::InputPeer> {
+        if user_id == self.my_id {
+            return Some(telegram_api::InputPeer::inputPeerSelf(
+                telegram_api::inputPeerSelf {},
+            ));
+        }
+        let u = self.get_user(user_id);
+        if !self.have_input_peer_user_for(u, user_id, access_rights, env.auth_is_bot) {
+            return None;
+        }
+        let inaccessible = match u {
+            None => true,
+            Some(u) => u.access_hash == -1 || u.is_min_access_hash,
+        };
+        let access_hash = if inaccessible {
+            0
+        } else {
+            u.map(|u| u.access_hash).unwrap()
+        };
+        Some(telegram_api::InputPeer::inputPeerUser(
+            telegram_api::inputPeerUser {
+                user_id: user_id.get(),
+                access_hash,
+            },
+        ))
+    }
+
+    /// `UserManager::have_input_encrypted_peer` (UserManager.cpp:5327-5343).
+    pub fn have_input_encrypted_peer(
+        &self,
+        secret_chat_id: SecretChatId,
+        access_rights: AccessRights,
+    ) -> bool {
+        match self.get_secret_chat(secret_chat_id) {
+            None => false,
+            Some(secret_chat) => match access_rights {
+                AccessRights::Know | AccessRights::Read => true,
+                AccessRights::Write => secret_chat.state == SecretChatState::Active,
+            },
+        }
+    }
+
+    /// `UserManager::get_input_encrypted_chat` (UserManager.cpp:5345-5353);
+    /// `None` is the C++ `nullptr`.
+    pub fn get_input_encrypted_chat(
+        &self,
+        secret_chat_id: SecretChatId,
+        access_rights: AccessRights,
+    ) -> Option<telegram_api::InputEncryptedChat> {
+        let secret_chat = self.get_secret_chat(secret_chat_id)?;
+        if !self.have_input_encrypted_peer(secret_chat_id, access_rights) {
+            return None;
+        }
+        Some(telegram_api::InputEncryptedChat {
+            chat_id: secret_chat_id.get(),
+            access_hash: secret_chat.access_hash,
+        })
+    }
+
+    /// `UserManager::get_bot_data` (UserManager.cpp:5403-5435).
+    pub fn get_bot_data(&self, user_id: UserId) -> Result<BotData, Status> {
+        let Some(u) = self.get_user(user_id) else {
+            return Err(Status::error(400, "Bot not found"));
+        };
+        if !u.is_bot {
+            return Err(Status::error(400, "User is not a bot"));
+        }
+        if u.is_deleted {
+            return Err(Status::error(400, "Bot is deleted"));
+        }
+        if !u.is_received {
+            return Err(Status::error(400, "Bot is inaccessible"));
+        }
+        Ok(BotData {
+            username: u.usernames.get_first_username().to_owned(),
+            can_be_edited: u.can_be_edited_bot,
+            can_join_groups: u.can_join_groups,
+            can_read_all_group_messages: u.can_read_all_group_messages,
+            has_main_app: u.has_main_app,
+            has_bot_forum_view: u.has_bot_forum_view,
+            can_bot_create_topics: u.can_bot_create_topics,
+            can_manage_bots: u.can_manage_bots,
+            is_inline: u.is_inline_bot,
+            is_guestchat: u.is_guestchat_bot,
+            is_business: u.is_business_bot,
+            is_guard: u.is_guard_bot,
+            need_location: u.need_location_bot,
+            can_be_added_to_attach_menu: u.can_be_added_to_attach_menu,
+        })
+    }
+
+    /// `UserManager::get_user_dialog_photo` (UserManager.cpp:5484-5492);
+    /// its `apply_pending_user_photo` call is the M.4.13 photo cache
+    /// (empty until then). `None` is the C++ `nullptr`.
+    pub fn get_user_dialog_photo(&self, user_id: UserId) -> Option<&ProfilePhoto> {
+        let u = self.get_user(user_id)?;
+        Some(&u.photo)
+    }
+
+    /// `UserManager::get_secret_chat_dialog_photo`
+    /// (UserManager.cpp:5494-5500).
+    pub fn get_secret_chat_dialog_photo(
+        &self,
+        secret_chat_id: SecretChatId,
+    ) -> Option<&ProfilePhoto> {
+        let c = self.get_secret_chat(secret_chat_id)?;
+        self.get_user_dialog_photo(c.user_id)
+    }
+
+    /// `UserManager::get_user_accent_color_id_object`
+    /// (UserManager.cpp:5502-5509) — the ThemeManager stand-in resolves
+    /// invalid ids to the id-derived default (the `get_user_object`
+    /// precedent).
+    pub fn get_user_accent_color_id_object_of(&self, user_id: UserId) -> i32 {
+        match self.get_user(user_id) {
+            Some(u) if u.accent_color_id.is_valid() => u.accent_color_id.get(),
+            _ => AccentColorId::from_peer_id(user_id.get()).get(),
+        }
+    }
+
+    /// `UserManager::get_secret_chat_accent_color_id_object`
+    /// (UserManager.cpp:5511-5517) — the C++ answers 5 for an unknown
+    /// secret chat.
+    pub fn get_secret_chat_accent_color_id_object_of(&self, secret_chat_id: SecretChatId) -> i32 {
+        let Some(c) = self.get_secret_chat(secret_chat_id) else {
+            return 5;
+        };
+        self.get_user_accent_color_id_object_of(c.user_id)
+    }
+
+    /// `UserManager::get_user_background_custom_emoji_id`
+    /// (UserManager.cpp:5519-5526).
+    pub fn get_user_background_custom_emoji_id_of(&self, user_id: UserId) -> CustomEmojiId {
+        self.get_user(user_id)
+            .map(|u| u.background_custom_emoji_id)
+            .unwrap_or_default()
+    }
+
+    /// `UserManager::get_secret_chat_background_custom_emoji_id`
+    /// (UserManager.cpp:5528-5534).
+    pub fn get_secret_chat_background_custom_emoji_id_of(
+        &self,
+        secret_chat_id: SecretChatId,
+    ) -> CustomEmojiId {
+        let Some(c) = self.get_secret_chat(secret_chat_id) else {
+            return CustomEmojiId::default();
+        };
+        self.get_user_background_custom_emoji_id_of(c.user_id)
+    }
+
+    /// `UserManager::get_user_upgraded_gift_colors_object`
+    /// (UserManager.cpp:5536-5543); `None` is the C++ `nullptr`.
+    pub fn get_user_upgraded_gift_colors_object_of(
+        &self,
+        user_id: UserId,
+    ) -> Option<td_api::UpgradedGiftColors> {
+        let u = self.get_user(user_id)?;
+        u.peer_color_collectible
+            .as_ref()
+            .map(|collectible| collectible.get_upgraded_gift_colors_object())
+    }
+
+    /// `UserManager::get_secret_chat_upgraded_gift_colors_object`
+    /// (UserManager.cpp:5545-5552).
+    pub fn get_secret_chat_upgraded_gift_colors_object_of(
+        &self,
+        secret_chat_id: SecretChatId,
+    ) -> Option<td_api::UpgradedGiftColors> {
+        let c = self.get_secret_chat(secret_chat_id)?;
+        self.get_user_upgraded_gift_colors_object_of(c.user_id)
+    }
+
+    /// `UserManager::get_user_profile_accent_color_id_object`
+    /// (UserManager.cpp:5554-5561) — the ThemeManager stand-in passes
+    /// the stored id through; unknown users answer -1 like the C++.
+    pub fn get_user_profile_accent_color_id_object_of(&self, user_id: UserId) -> i32 {
+        match self.get_user(user_id) {
+            Some(u) => u.profile_accent_color_id.get(),
+            None => -1,
+        }
+    }
+
+    /// `UserManager::get_secret_chat_profile_accent_color_id_object`
+    /// (UserManager.cpp:5563-5569).
+    pub fn get_secret_chat_profile_accent_color_id_object_of(
+        &self,
+        secret_chat_id: SecretChatId,
+    ) -> i32 {
+        let Some(c) = self.get_secret_chat(secret_chat_id) else {
+            return -1;
+        };
+        self.get_user_profile_accent_color_id_object_of(c.user_id)
+    }
+
+    /// `UserManager::get_user_profile_background_custom_emoji_id`
+    /// (UserManager.cpp:5571-5578).
+    pub fn get_user_profile_background_custom_emoji_id_of(&self, user_id: UserId) -> CustomEmojiId {
+        self.get_user(user_id)
+            .map(|u| u.profile_background_custom_emoji_id)
+            .unwrap_or_default()
+    }
+
+    /// `UserManager::get_secret_chat_profile_background_custom_emoji_id`
+    /// (UserManager.cpp:5580-5586).
+    pub fn get_secret_chat_profile_background_custom_emoji_id_of(
+        &self,
+        secret_chat_id: SecretChatId,
+    ) -> CustomEmojiId {
+        let Some(c) = self.get_secret_chat(secret_chat_id) else {
+            return CustomEmojiId::default();
+        };
+        self.get_user_profile_background_custom_emoji_id_of(c.user_id)
+    }
+
+    /// `UserManager::get_user_title` (UserManager.cpp:5588-5600).
+    pub fn get_user_title_of(&self, user_id: UserId) -> String {
+        let Some(u) = self.get_user(user_id) else {
+            return String::new();
+        };
+        if u.last_name.is_empty() {
+            return u.first_name.clone();
+        }
+        if u.first_name.is_empty() {
+            return u.last_name.clone();
+        }
+        format!("{} {}", u.first_name, u.last_name)
+    }
+
+    /// `UserManager::get_secret_chat_title` (UserManager.cpp:5602-5607).
+    pub fn get_secret_chat_title_of(&self, secret_chat_id: SecretChatId) -> String {
+        let Some(c) = self.get_secret_chat(secret_chat_id) else {
+            return String::new();
+        };
+        self.get_user_title_of(c.user_id)
+    }
+
+    // `get_user_default_permissions`/`get_secret_chat_default_permissions`
+    // (UserManager.cpp:5609-5627) carry `RestrictedRights` from
+    // `DialogParticipant.h` — they land with the ChatManager slice.
+
+    /// `UserManager::get_user_emoji_status_object`
+    /// (UserManager.cpp:5629-5635); `None` is the C++ `nullptr`.
+    pub fn get_user_emoji_status_object_of(&self, user_id: UserId) -> Option<td_api::EmojiStatus> {
+        let u = self.get_user(user_id)?;
+        u.last_sent_emoji_status
+            .as_ref()
+            .map(make_emoji_status_object)
+    }
+
+    /// `UserManager::get_secret_chat_emoji_status_object`
+    /// (UserManager.cpp:5637-5644).
+    pub fn get_secret_chat_emoji_status_object_of(
+        &self,
+        secret_chat_id: SecretChatId,
+    ) -> Option<td_api::EmojiStatus> {
+        let c = self.get_secret_chat(secret_chat_id)?;
+        self.get_user_emoji_status_object_of(c.user_id)
+    }
+
+    /// `UserManager::get_user_has_protected_content_force`
+    /// (UserManager.cpp:5646-5652).
+    pub fn get_user_has_protected_content_force(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+    ) -> bool {
+        if self.get_user_full_force(env, user_id, "get_user_has_protected_content_force")
+            && let Some(user_full) = self.get_user_full(user_id)
+        {
+            return user_full.noforwards_my_enabled || user_full.noforwards_peer_enabled;
+        }
+        false
+    }
+
+    /// `UserManager::get_user_has_protected_content`
+    /// (UserManager.cpp:5654-5660).
+    pub fn get_user_has_protected_content_of(&self, user_id: UserId) -> bool {
+        self.get_user_full(user_id)
+            .map(|user_full| user_full.noforwards_my_enabled || user_full.noforwards_peer_enabled)
+            .unwrap_or(false)
+    }
+
+    /// `UserManager::get_user_has_protected_content_force_by_me`
+    /// (UserManager.cpp:5662-5668).
+    pub fn get_user_has_protected_content_force_by_me(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+    ) -> bool {
+        if self.get_user_full_force(env, user_id, "get_user_has_protected_content_force_by_me")
+            && let Some(user_full) = self.get_user_full(user_id)
+        {
+            return user_full.noforwards_my_enabled;
+        }
+        false
+    }
+
+    /// `UserManager::get_user_has_protected_content_force_by_other`
+    /// (UserManager.cpp:5670-5676).
+    pub fn get_user_has_protected_content_force_by_other(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+    ) -> bool {
+        if self.get_user_full_force(
+            env,
+            user_id,
+            "get_user_has_protected_content_force_by_other",
+        ) && let Some(user_full) = self.get_user_full(user_id)
+        {
+            return user_full.noforwards_peer_enabled;
+        }
+        false
+    }
+
+    /// `UserManager::get_user_stories_hidden` (UserManager.cpp:5678-5684).
+    pub fn get_user_stories_hidden_of(&self, user_id: UserId) -> bool {
+        self.get_user(user_id)
+            .map(|u| u.stories_hidden)
+            .unwrap_or(false)
+    }
+
+    /// `UserManager::can_poll_user_active_stories`
+    /// (UserManager.cpp:5686-5689) with the
+    /// `need_poll_user_active_stories` predicate (cpp:5691-5694) folded
+    /// in; `now` is the caller's `Time::now()`. The story-ids intake
+    /// keeps its reduced private stand-in.
+    pub fn can_poll_user_active_stories_of(&self, user_id: UserId, now: f64) -> bool {
+        let Some(u) = self.get_user(user_id) else {
+            return false;
+        };
+        let need_poll = user_id != self.my_id
+            && !self.is_user_contact_of(user_id, false)
+            && !self.is_user_bot_of(user_id)
+            && !self.is_user_support_of(user_id)
+            && !self.is_user_deleted_of(user_id)
+            && u.was_online != 0;
+        need_poll && now >= u.max_active_story_id_next_reload_time
+    }
+
+    /// `UserManager::get_user_about` (UserManager.cpp:5696-5702).
+    pub fn get_user_about(&mut self, env: &mut UserEnv, user_id: UserId) -> String {
+        if self.get_user_full_force(env, user_id, "get_user_about")
+            && let Some(user_full) = self.get_user_full(user_id)
+        {
+            return user_full.about.clone();
+        }
+        String::new()
+    }
+
+    /// `UserManager::get_secret_chat_about` (UserManager.cpp:5704-5710).
+    pub fn get_secret_chat_about(
+        &mut self,
+        env: &mut UserEnv,
+        secret_chat_id: SecretChatId,
+    ) -> String {
+        let Some(c) = self.get_secret_chat(secret_chat_id) else {
+            return String::new();
+        };
+        let user_id = c.user_id;
+        self.get_user_about(env, user_id)
+    }
+
+    /// `UserManager::get_user_private_forward_name`
+    /// (UserManager.cpp:5712-5718).
+    pub fn get_user_private_forward_name(&mut self, env: &mut UserEnv, user_id: UserId) -> String {
+        if self.get_user_full_force(env, user_id, "get_user_private_forward_name")
+            && let Some(user_full) = self.get_user_full(user_id)
+        {
+            return user_full.private_forward_name.clone();
+        }
+        String::new()
+    }
+
+    /// `UserManager::get_user_voice_messages_forbidden`
+    /// (UserManager.cpp:5720-5729) — the C++ gates on premium before
+    /// consulting the full.
+    pub fn get_user_voice_messages_forbidden_of(&self, user_id: UserId) -> bool {
+        if !self.is_user_premium_of(user_id) {
+            return false;
+        }
+        self.get_user_full(user_id)
+            .map(|user_full| user_full.voice_messages_forbidden)
+            .unwrap_or(false)
+    }
+
+    /// `UserManager::get_my_sponsored_enabled`
+    /// (UserManager.cpp:5731-5741) — non-premium users see sponsored
+    /// messages; the full's flag answers when it is loaded.
+    pub fn get_my_sponsored_enabled(&self) -> bool {
+        let user_id = self.my_id;
+        if !self.is_user_premium_of(user_id) {
+            return true;
+        }
+        self.get_user_full(user_id)
+            .map(|user_full| user_full.sponsored_enabled)
+            .unwrap_or(true)
+    }
+
+    /// `UserManager::get_user_read_dates_private`
+    /// (UserManager.cpp:5743-5749).
+    pub fn get_user_read_dates_private(&mut self, env: &mut UserEnv, user_id: UserId) -> bool {
+        if self.get_user_full_force(env, user_id, "get_user_read_dates_private")
+            && let Some(user_full) = self.get_user_full(user_id)
+        {
+            return user_full.read_dates_private;
+        }
+        false
+    }
+
+    /// `UserManager::get_user_first_username`
+    /// (UserManager.cpp:5773-5783) — an empty string for invalid or
+    /// unknown ids (the C++ returns an empty `Slice`).
+    pub fn get_user_first_username_of(&self, user_id: UserId) -> &str {
+        if !user_id.is_valid() {
+            return "";
+        }
+        self.get_user(user_id)
+            .map(|u| u.usernames.get_first_username())
+            .unwrap_or("")
+    }
+
+    /// `UserManager::get_secret_chat_id_object`
+    /// (UserManager.cpp:10502-10511).
+    pub fn get_secret_chat_id_object(&mut self, secret_chat_id: SecretChatId, source: &str) -> i32 {
+        if secret_chat_id.is_valid()
+            && self.get_secret_chat(secret_chat_id).is_none()
+            && !self.unknown_secret_chats.contains(&secret_chat_id.get())
+        {
+            tdutils::log_error!("Have no information about {secret_chat_id:?} from {source}");
+            self.unknown_secret_chats.insert(secret_chat_id.get());
+            let secret_chat = make_unknown_secret_chat_object(secret_chat_id);
+            self.send_update(td_api::Update::updateSecretChat(td_api::updateSecretChat {
+                secret_chat,
+            }));
+        }
+        secret_chat_id.get()
+    }
+
     // The read-projection helpers keep the on_get_user control flow flat.
     fn u_is_received(&self, user_id: UserId) -> bool {
         self.users
@@ -5243,6 +5806,31 @@ impl UserManager {
             .get(&user_id.get())
             .map(|u| u.was_online)
             .unwrap_or(0)
+    }
+}
+
+/// `EmojiStatus::get_emoji_status_object` — the reduced payload; the
+/// collectible upgraded-gift form lands with the Gifts step (the C++
+/// emits `emojiStatusUpgradedGift` there).
+fn make_emoji_status_object(status: &EmojiStatus) -> td_api::EmojiStatus {
+    td_api::EmojiStatus {
+        r#type: td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
+            td_api::emojiStatusTypeCustomEmoji {
+                custom_emoji_id: status.get_custom_emoji_id().get(),
+            },
+        ),
+        expiration_date: status.get_until_date(),
+    }
+}
+
+/// The forced-empty `emojiStatus` payload (the codegen cannot express
+/// null; module docs).
+fn empty_emoji_status_object() -> td_api::EmojiStatus {
+    td_api::EmojiStatus {
+        r#type: td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
+            td_api::emojiStatusTypeCustomEmoji { custom_emoji_id: 0 },
+        ),
+        expiration_date: 0,
     }
 }
 
@@ -7327,5 +7915,586 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ----- M.4.11: the read surface -----
+
+    fn received_user(id: i64) -> telegram_api::user {
+        telegram_user(
+            id,
+            "Alice",
+            USER_ACCESS_HASH_MASK | (1 << 1), // access_hash, first_name
+        )
+    }
+
+    fn bot_user(id: i64, extra_flags: i32) -> telegram_api::user {
+        let mut user = telegram_user(
+            id,
+            "HelperBot",
+            USER_ACCESS_HASH_MASK | (1 << 1) | extra_flags,
+        );
+        user.bot = true;
+        user.username = "helper_bot".to_owned(); // flags.3
+        user.flags |= 1 << 3;
+        user
+    }
+
+    #[test]
+    fn input_user_and_input_peer_follow_the_access_hash_rules() {
+        let (mut temp, mut um) = test_env();
+        let my_id = UserId::new(4242);
+        um.set_my_id(&mut temp.env(false), my_id);
+
+        // Self collapses to the inputUserSelf/inputPeerSelf pair.
+        assert!(matches!(
+            um.get_input_user(&temp.env(false), my_id),
+            Ok(telegram_api::InputUser::inputUserSelf(_))
+        ));
+        assert!(matches!(
+            um.get_input_peer_user(&temp.env(false), my_id, AccessRights::Write),
+            Some(telegram_api::InputPeer::inputPeerSelf(_))
+        ));
+
+        // A received user keeps its access hash for every right.
+        let user_id = um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(received_user(5)),
+            "test",
+        );
+        assert!(matches!(
+            um.get_input_user(&temp.env(false), user_id),
+            Ok(telegram_api::InputUser::inputUser(
+                telegram_api::inputUser {
+                    user_id: 5,
+                    access_hash: 123
+                }
+            ))
+        ));
+        for rights in [AccessRights::Know, AccessRights::Read, AccessRights::Write] {
+            assert!(matches!(
+                um.get_input_peer_user(&temp.env(false), user_id, rights),
+                Some(telegram_api::InputPeer::inputPeerUser(
+                    telegram_api::inputPeerUser {
+                        user_id: 5,
+                        access_hash: 123
+                    }
+                ))
+            ));
+        }
+
+        // A min user: 400 without the bot fallback, the zero-hash input
+        // with it; the input peer is refused for non-bots.
+        let mut min_user = received_user(6);
+        min_user.min = true;
+        let min_id = um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(min_user),
+            "test",
+        );
+        assert!(matches!(
+            um.get_input_user(&temp.env(false), min_id),
+            Err(status) if status.code() == 400
+        ));
+        assert!(
+            um.get_input_peer_user(&temp.env(false), min_id, AccessRights::Know)
+                .is_none()
+        );
+        assert!(matches!(
+            um.get_input_user(&temp.env(true), min_id),
+            Ok(telegram_api::InputUser::inputUser(
+                telegram_api::inputUser {
+                    user_id: 6,
+                    access_hash: 0
+                }
+            ))
+        ));
+        assert!(matches!(
+            um.get_input_peer_user(&temp.env(true), min_id, AccessRights::Write),
+            Some(telegram_api::InputPeer::inputPeerUser(_))
+        ));
+
+        // An unknown user: "User not found", and the force form falls
+        // back to the zero-hash input (the C++ CHECK keeps it valid).
+        let unknown = UserId::new(777);
+        assert!(matches!(
+            um.get_input_user(&temp.env(false), unknown),
+            Err(status) if status.code() == 400
+        ));
+        assert!(matches!(
+            um.get_input_user_force(&temp.env(false), unknown),
+            telegram_api::InputUser::inputUser(telegram_api::inputUser {
+                user_id: 777,
+                access_hash: 0
+            })
+        ));
+        assert!(
+            um.get_input_peer_user(&temp.env(false), unknown, AccessRights::Know)
+                .is_none()
+        );
+
+        // get_input_users propagates the first error; the force variant
+        // skips the failures instead.
+        assert!(
+            um.get_input_users(&temp.env(false), &[user_id, unknown])
+                .is_err()
+        );
+        let forced = um.get_input_users_force(&temp.env(false), &[user_id, unknown]);
+        assert_eq!(forced.len(), 1);
+    }
+
+    #[test]
+    fn input_encrypted_chat_requires_the_active_state() {
+        let (mut temp, mut um) = test_env();
+        let sc_id = SecretChatId::new(33);
+
+        // The waiting chat: Know/Read see it; Write does not.
+        um.on_update_secret_chat(
+            &mut temp.env(false),
+            sc_id,
+            111,
+            UserId::new(5),
+            SecretChatState::Waiting,
+            false,
+            60,
+            1700000000,
+            "khash".to_owned(),
+            SECRET_CHAT_DEFAULT_LAYER,
+            0,
+        );
+        assert!(um.have_input_encrypted_peer(sc_id, AccessRights::Know));
+        assert!(!um.have_input_encrypted_peer(sc_id, AccessRights::Write));
+        assert!(
+            um.get_input_encrypted_chat(sc_id, AccessRights::Read)
+                .is_some()
+        );
+        assert!(
+            um.get_input_encrypted_chat(sc_id, AccessRights::Write)
+                .is_none()
+        );
+
+        // Only the Active state admits Write, carrying the access hash.
+        um.on_update_secret_chat(
+            &mut temp.env(false),
+            sc_id,
+            4321,
+            UserId::new(5),
+            SecretChatState::Active,
+            false,
+            -1,
+            0,
+            String::new(),
+            0,
+            0,
+        );
+        assert!(matches!(
+            um.get_input_encrypted_chat(sc_id, AccessRights::Write),
+            Some(telegram_api::InputEncryptedChat {
+                chat_id: 33,
+                access_hash: 4321
+            })
+        ));
+
+        // An unknown secret chat is refused everywhere.
+        assert!(!um.have_input_encrypted_peer(SecretChatId::new(99), AccessRights::Know));
+        assert!(
+            um.get_input_encrypted_chat(SecretChatId::new(99), AccessRights::Know)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn get_bot_data_gates_and_surfaces() {
+        let (mut temp, mut um) = test_env();
+
+        // The four C++ error surfaces in order.
+        assert!(matches!(
+            um.get_bot_data(UserId::new(9)),
+            Err(status) if status.message() == "Bot not found"
+        ));
+        let plain_id = um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(received_user(5)),
+            "test",
+        );
+        assert!(matches!(
+            um.get_bot_data(plain_id),
+            Err(status) if status.message() == "User is not a bot"
+        ));
+
+        // A min bot is not received yet.
+        let mut min_bot = bot_user(6, 0);
+        min_bot.min = true;
+        let min_bot_id = um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(min_bot),
+            "test",
+        );
+        assert!(matches!(
+            um.get_bot_data(min_bot_id),
+            Err(status) if status.message() == "Bot is inaccessible"
+        ));
+
+        // A deleted bot is refused even when received.
+        um.users.get_mut(&plain_id.get()).unwrap().is_bot = true;
+        um.users.get_mut(&plain_id.get()).unwrap().is_deleted = true;
+        assert!(matches!(
+            um.get_bot_data(plain_id),
+            Err(status) if status.message() == "Bot is deleted"
+        ));
+
+        let bot_id = um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(bot_user(7, 0)),
+            "test",
+        );
+        let bot_data = um.get_bot_data(bot_id).unwrap();
+        assert_eq!(bot_data.username, "helper_bot");
+        assert!(bot_data.can_join_groups, "default: nochats unset");
+        assert!(!bot_data.can_be_edited);
+        assert!(!bot_data.is_inline);
+        assert!(!bot_data.need_location);
+        assert!(!bot_data.can_be_added_to_attach_menu);
+
+        // The inline placeholder rides the flags.19 bit; the attach-menu
+        // flag is a struct field (the intake reads `bot_attach_menu`).
+        let mut inline_bot = bot_user(8, 1 << 19);
+        inline_bot.bot_attach_menu = true;
+        let inline_id = um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(inline_bot),
+            "test",
+        );
+        let inline_data = um.get_bot_data(inline_id).unwrap();
+        assert!(inline_data.is_inline);
+        assert!(inline_data.can_be_added_to_attach_menu);
+    }
+
+    #[test]
+    fn golden_user_object_json_matches_the_cpp_field_order() {
+        let (mut temp, mut um) = test_env();
+
+        let mut user = received_user(5);
+        user.first_name = "Alice".to_owned();
+        user.last_name = "Liddell".to_owned(); // flags.2
+        user.flags |= 1 << 2;
+        user.username = "alice".to_owned(); // flags.3
+        user.flags |= 1 << 3;
+        user.phone = "42777".to_owned(); // flags.4
+        user.flags |= 1 << 4;
+        let user_id = um.on_get_user(&mut temp.env(false), telegram_api::User::user(user), "test");
+        let env = temp.env(false);
+        let json = um.get_user_object_of(&env, user_id).to_json();
+        // The S12 gate proved `to_json` byte-identical to td's converter;
+        // the pinned string below pins the get_user_object field mapping
+        // (UserManager.cpp:10301-10336) in the td_json order: int64 ids
+        // ride the td_json string form and the codegen-forced payloads
+        // (profile_photo, upgraded_gift_colors, emoji_status) stand in
+        // for the C++ nulls (module docs).
+        assert_eq!(
+            json,
+            r#"{"@type":"user","id":5,"first_name":"Alice","last_name":"Liddell","usernames":{"@type":"usernames","active_usernames":["alice"],"disabled_usernames":[],"editable_username":"alice","collectible_usernames":[]},"phone_number":"42777","status":{"@type":"userStatusEmpty"},"profile_photo":{"@type":"profilePhoto","id":"0","small":{"@type":"file","id":0,"size":0,"expected_size":0,"local":{"@type":"localFile","path":"","can_be_downloaded":false,"can_be_deleted":false,"is_downloading_active":false,"is_downloading_completed":false,"download_offset":0,"downloaded_prefix_size":0,"downloaded_size":0},"remote":{"@type":"remoteFile","id":"","unique_id":"","is_uploading_active":false,"is_uploading_completed":false,"uploaded_size":0}},"big":{"@type":"file","id":0,"size":0,"expected_size":0,"local":{"@type":"localFile","path":"","can_be_downloaded":false,"can_be_deleted":false,"is_downloading_active":false,"is_downloading_completed":false,"download_offset":0,"downloaded_prefix_size":0,"downloaded_size":0},"remote":{"@type":"remoteFile","id":"","unique_id":"","is_uploading_active":false,"is_uploading_completed":false,"uploaded_size":0}},"minithumbnail":{"@type":"minithumbnail","width":0,"height":0,"data":""},"has_animation":false,"is_personal":false},"accent_color_id":5,"background_custom_emoji_id":"0","upgraded_gift_colors":{"@type":"upgradedGiftColors","id":"0","model_custom_emoji_id":"0","symbol_custom_emoji_id":"0","light_theme_accent_color":0,"light_theme_colors":[],"dark_theme_accent_color":0,"dark_theme_colors":[]},"profile_accent_color_id":-1,"profile_background_custom_emoji_id":"0","emoji_status":{"@type":"emojiStatus","type":{"@type":"emojiStatusTypeCustomEmoji","custom_emoji_id":"0"},"expiration_date":0},"is_contact":false,"is_mutual_contact":false,"is_close_friend":false,"verification_status":{"@type":"verificationStatus","is_verified":false,"is_scam":false,"is_fake":false,"bot_verification_icon_custom_emoji_id":"0"},"is_premium":false,"is_support":false,"restriction_info":{"@type":"restrictionInfo","restriction_reason":"","has_sensitive_content":false},"active_story_state":{"@type":"activeStoryStateRead"},"restricts_new_chats":false,"paid_message_star_count":0,"have_access":true,"type":{"@type":"userTypeRegular"},"language_code":"","added_to_attachment_menu":false}"#
+        );
+    }
+
+    #[test]
+    fn golden_secret_chat_object_json_matches_the_cpp_field_order() {
+        let mut secret_chat = SecretChat::new();
+        secret_chat.user_id = UserId::new(5);
+        secret_chat.state = SecretChatState::Active;
+        secret_chat.is_outbound = true;
+        secret_chat.key_hash = "abc".to_owned();
+        secret_chat.layer = SECRET_CHAT_DEFAULT_LAYER;
+        let json = make_secret_chat_object(SecretChatId::new(33), &secret_chat).to_json();
+        // td_json carries byte fields in the base64 form.
+        assert_eq!(
+            json,
+            "{\"@type\":\"secretChat\",\"id\":33,\"user_id\":5,\"state\":{\"@type\":\"secretChatStateReady\"},\
+             \"is_outbound\":true,\"key_hash\":\"YWJj\",\"layer\":73}"
+        );
+        // The unknown-chat stand-in answers closed with zeroed fields
+        // (UserManager.cpp:10496-10500).
+        assert_eq!(
+            make_unknown_secret_chat_object(SecretChatId::new(34)).to_json(),
+            "{\"@type\":\"secretChat\",\"id\":34,\"user_id\":0,\"state\":{\"@type\":\"secretChatStateClosed\"},\
+             \"is_outbound\":false,\"key_hash\":\"\",\"layer\":0}"
+        );
+    }
+
+    #[test]
+    fn field_getters_cover_the_read_surface() {
+        let (mut temp, mut um) = test_env();
+
+        // Title composition.
+        let mut named = received_user(5);
+        named.first_name = "Alice".to_owned();
+        named.last_name = "Liddell".to_owned();
+        named.flags |= 1 << 2;
+        let both_id = um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(named),
+            "test",
+        );
+        assert_eq!(um.get_user_title_of(both_id), "Alice Liddell");
+
+        let mut first_only = received_user(6);
+        first_only.first_name = "Bob".to_owned();
+        let first_id = um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(first_only),
+            "test",
+        );
+        assert_eq!(um.get_user_title_of(first_id), "Bob");
+
+        let mut last_only = received_user(7);
+        last_only.first_name = String::new();
+        last_only.last_name = "Brown".to_owned();
+        last_only.flags = (last_only.flags | (1 << 2)) & !(1 << 1);
+        let last_id = um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(last_only),
+            "test",
+        );
+        assert_eq!(um.get_user_title_of(last_id), "Brown");
+        assert_eq!(um.get_user_title_of(UserId::new(1)), "");
+        assert_eq!(um.get_secret_chat_title_of(SecretChatId::new(3)), "");
+
+        // First username: the legacy username field feeds it; invalid
+        // and unknown ids answer empty.
+        assert_eq!(um.get_user_first_username_of(both_id), "");
+        let mut with_username = received_user(8);
+        with_username.username = "carol".to_owned();
+        with_username.flags |= 1 << 3;
+        let username_id = um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(with_username),
+            "test",
+        );
+        assert_eq!(um.get_user_first_username_of(username_id), "carol");
+        assert_eq!(um.get_user_first_username_of(UserId::new(0)), "");
+        assert_eq!(um.get_user_first_username_of(UserId::new(424242)), "");
+
+        // Accent colors: the stored id wins; the invalid id falls back
+        // to the id-derived default; unknown secret chats answer 5.
+        let accents = um.users.get_mut(&both_id.get()).unwrap();
+        accents.accent_color_id = AccentColorId::new(7);
+        accents.profile_accent_color_id = AccentColorId::new(9);
+        accents.background_custom_emoji_id = CustomEmojiId::new(11);
+        accents.profile_background_custom_emoji_id = CustomEmojiId::new(13);
+        assert_eq!(um.get_user_accent_color_id_object_of(both_id), 7);
+        assert_eq!(um.get_user_profile_accent_color_id_object_of(both_id), 9);
+        assert_eq!(um.get_user_background_custom_emoji_id_of(both_id).get(), 11);
+        assert_eq!(
+            um.get_user_profile_background_custom_emoji_id_of(both_id)
+                .get(),
+            13
+        );
+        assert_eq!(
+            um.get_user_accent_color_id_object_of(first_id),
+            AccentColorId::from_peer_id(first_id.get()).get()
+        );
+        assert_eq!(
+            um.get_user_profile_accent_color_id_object_of(UserId::new(1)),
+            -1
+        );
+        assert_eq!(
+            um.get_secret_chat_accent_color_id_object_of(SecretChatId::new(3)),
+            5
+        );
+        assert!(
+            um.get_secret_chat_background_custom_emoji_id_of(SecretChatId::new(3))
+                .get()
+                == 0
+        );
+
+        // Upgraded gift colors exist only with the collectible.
+        assert!(
+            um.get_user_upgraded_gift_colors_object_of(both_id)
+                .is_none()
+        );
+        um.users
+            .get_mut(&both_id.get())
+            .unwrap()
+            .peer_color_collectible = Some(crate::peer_color::PeerColorCollectible::default());
+        assert!(
+            um.get_user_upgraded_gift_colors_object_of(both_id)
+                .is_some()
+        );
+
+        // Emoji status object: None without one, the reduced payload with.
+        assert!(um.get_user_emoji_status_object_of(both_id).is_none());
+        um.users
+            .get_mut(&both_id.get())
+            .unwrap()
+            .last_sent_emoji_status = Some(EmojiStatus::from_telegram(
+            telegram_api::EmojiStatus::emojiStatus(telegram_api::emojiStatus {
+                document_id: 77,
+                ..Default::default()
+            }),
+        ));
+        let status_object = um.get_user_emoji_status_object_of(both_id).unwrap();
+        assert!(matches!(
+            status_object.r#type,
+            td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
+                td_api::emojiStatusTypeCustomEmoji {
+                    custom_emoji_id: 77
+                }
+            )
+        ));
+
+        // Stories and the poll predicate.
+        assert!(!um.get_user_stories_hidden_of(both_id));
+        um.users.get_mut(&both_id.get()).unwrap().stories_hidden = true;
+        assert!(um.get_user_stories_hidden_of(both_id));
+
+        // Dialog photos: present with the user, absent for strangers,
+        // and proxied through the secret chat's user.
+        assert!(um.get_user_dialog_photo(both_id).is_some());
+        assert!(um.get_user_dialog_photo(UserId::new(1)).is_none());
+        assert!(
+            um.get_secret_chat_dialog_photo(SecretChatId::new(3))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn can_poll_user_active_stories_follows_the_cpp_predicate() {
+        let (mut temp, mut um) = test_env();
+        um.set_my_id(&mut temp.env(false), UserId::new(4242));
+
+        let user_id = um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(received_user(5)),
+            "test",
+        );
+        // was_online == 0 disqualifies.
+        assert!(!um.can_poll_user_active_stories_of(user_id, 100.0));
+
+        {
+            let u = um.users.get_mut(&user_id.get()).unwrap();
+            u.was_online = 90;
+            u.max_active_story_id_next_reload_time = 50.0;
+        }
+        assert!(um.can_poll_user_active_stories_of(user_id, 100.0));
+        assert!(
+            !um.can_poll_user_active_stories_of(user_id, 49.0),
+            "gated on the reload time"
+        );
+
+        // Myself, a bot, support and deleted users never poll.
+        assert!(!um.can_poll_user_active_stories_of(UserId::new(4242), 100.0));
+        let bot_id = um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(bot_user(6, 0)),
+            "test",
+        );
+        um.users.get_mut(&bot_id.get()).unwrap().was_online = 90;
+        assert!(!um.can_poll_user_active_stories_of(bot_id, 100.0));
+        um.users.get_mut(&user_id.get()).unwrap().is_support = true;
+        assert!(!um.can_poll_user_active_stories_of(user_id, 100.0));
+        um.users.get_mut(&user_id.get()).unwrap().is_support = false;
+        um.users.get_mut(&user_id.get()).unwrap().is_deleted = true;
+        assert!(!um.can_poll_user_active_stories_of(user_id, 100.0));
+    }
+
+    #[test]
+    fn user_full_field_getters_force_and_plain_paths() {
+        let (mut temp, mut um) = test_env();
+
+        // Unknown users: the force-load fails and the answers are the
+        // C++ defaults.
+        let env = &mut temp.env(false);
+        assert_eq!(um.get_user_about(env, UserId::new(9)), "");
+        assert_eq!(um.get_user_private_forward_name(env, UserId::new(9)), "");
+        assert!(!um.get_user_read_dates_private(env, UserId::new(9)));
+        assert!(!um.get_user_has_protected_content_force(env, UserId::new(9)));
+
+        // A loaded user full answers every getter from the record.
+        let user_id = um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(received_user(5)),
+            "test",
+        );
+        let env = &mut temp.env(false);
+        {
+            let user_full = um.add_user_full(user_id);
+            user_full.about = "curiouser".to_owned();
+            user_full.private_forward_name = "via bob".to_owned();
+            user_full.read_dates_private = true;
+            user_full.noforwards_my_enabled = true;
+            user_full.voice_messages_forbidden = true;
+            user_full.sponsored_enabled = false;
+        }
+        assert_eq!(um.get_user_about(env, user_id), "curiouser");
+        assert_eq!(um.get_user_private_forward_name(env, user_id), "via bob");
+        assert!(um.get_user_read_dates_private(env, user_id));
+        assert!(um.get_user_has_protected_content_force(env, user_id));
+        assert!(um.get_user_has_protected_content_of(user_id));
+        assert!(um.get_user_has_protected_content_force_by_me(env, user_id));
+        assert!(!um.get_user_has_protected_content_force_by_other(env, user_id));
+
+        // Sponsored: non-premium me sees them; a premium me with the
+        // flag off does not.
+        assert!(um.get_my_sponsored_enabled());
+        um.set_my_id(env, user_id);
+        um.users.get_mut(&user_id.get()).unwrap().is_premium = true;
+        assert!(
+            !um.get_my_sponsored_enabled(),
+            "sponsored_enabled=false and premium"
+        );
+
+        // The premium gate also covers the voice-messages getter.
+        assert!(
+            um.get_user_voice_messages_forbidden_of(user_id),
+            "premium + flag"
+        );
+        um.users.get_mut(&user_id.get()).unwrap().is_premium = false;
+        assert!(!um.get_user_voice_messages_forbidden_of(user_id));
+    }
+
+    #[test]
+    fn secret_chat_id_object_registers_unknown_and_emits_once() {
+        let (mut temp, mut um) = test_env();
+        let env = &mut temp.env(false);
+
+        let id = um.get_secret_chat_id_object(SecretChatId::new(66), "test");
+        assert_eq!(id, 66);
+        let updates = um.take_updates();
+        assert_eq!(
+            updates.len(),
+            1,
+            "the unknown secret chat must emit exactly one updateSecretChat"
+        );
+        assert!(matches!(
+            &updates[0],
+            td_api::Update::updateSecretChat(u) if u.secret_chat.id == 66
+                && u.secret_chat.user_id == 0
+        ));
+        assert!(um.unknown_secret_chats.contains(&66));
+
+        // The registry suppresses the repeat; a known id never emits.
+        let id = um.get_secret_chat_id_object(SecretChatId::new(66), "test");
+        assert_eq!(id, 66);
+        assert!(um.take_updates().is_empty());
+
+        // A delivered secret chat answers without a new update (its own
+        // intake emission is consumed first).
+        let sc_id = SecretChatId::new(67);
+        um.on_update_secret_chat(
+            env,
+            sc_id,
+            1,
+            UserId::new(5),
+            SecretChatState::Active,
+            false,
+            60,
+            1700000000,
+            "khash".to_owned(),
+            SECRET_CHAT_DEFAULT_LAYER,
+            0,
+        );
+        um.take_updates();
+        let id = um.get_secret_chat_id_object(sc_id, "test");
+        assert_eq!(id, 67);
+        assert!(um.take_updates().is_empty());
     }
 }
