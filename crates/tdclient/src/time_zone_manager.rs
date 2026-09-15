@@ -368,7 +368,9 @@ mod tests {
     }
 
     /// `get_time_zone_offset`: the stored offset for a known id, the
-    /// `utc_time_offset` option (default 0) for an unknown one.
+    /// `utc_time_offset` option for an unknown one. The C++ `OptionManager`
+    /// constructor seeds that option from `Clocks::tz_offset()`
+    /// (OptionManager.cpp:80-83), so a fresh manager never lacks it.
     #[test]
     fn offset_lookup_falls_back_to_the_option() {
         let dir = std::env::temp_dir().join(format!("td-rs-tz-offset-{}", std::process::id()));
@@ -400,7 +402,7 @@ mod tests {
         );
         assert_eq!(
             manager.get_time_zone_offset(&mut global, &option_manager, "Mars/Olympus"),
-            0
+            option_manager.get_option_integer("utc_time_offset", 0) as i32
         );
         let mut option_manager = crate::option_manager::OptionManager::new(false);
         option_manager.set_option_integer("utc_time_offset", -18000);
