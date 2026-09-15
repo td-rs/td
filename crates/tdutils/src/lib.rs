@@ -7,6 +7,7 @@ pub mod crc32;
 pub mod crypto;
 pub mod ed25519;
 pub mod gzip;
+pub mod hints;
 pub mod http_url;
 pub mod json;
 pub mod logging;
@@ -17,4 +18,8 @@ pub mod rsa;
 pub mod status;
 pub mod tests;
 pub mod time;
+pub mod translit;
+pub mod unicode;
 pub mod utf8;
+
+mod unicode_tables;
