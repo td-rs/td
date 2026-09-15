@@ -26,9 +26,10 @@
 //!
 //! The recoverer itself (the `ConfigRecoverer` actor, ConfigManager.cpp:499-832)
 //! lands as an inline state machine in sub-steps: this file currently carries
-//! the recoverer state and the config application (M.3.7.1); the loop/state
-//! callbacks, the fetch orchestration, the full-config mini-session and the Td
-//! wiring follow in M.3.7.2-M.3.7.5.
+//! the recoverer state, the config application (M.3.7.1) and the `loop()`
+//! decision machine with the state callbacks and the ref-count/close
+//! semantics (M.3.7.2); the fetch orchestration, the full-config mini-session
+//! and the Td wiring follow in M.3.7.3-M.3.7.5.
 
 use std::sync::OnceLock;
 
@@ -582,9 +583,13 @@ pub fn load_dc_options_update(pmc: &BinlogKeyValue) -> Vec<RecovererDcOption> {
     }
 }
 
-/// The `G()` reads the config application makes per step, gathered by the
-/// driver (the C++ recoverer reads them through the global directly). The
-/// fetch-argument reads (`is_test_dc`, `prefer_ipv6`,
+/// The `G()` reads the recoverer makes per step, gathered by the driver
+/// (the C++ recoverer reads them through the global directly). The loop's
+/// clocks come through here too — injected, not read from
+/// [`tdutils::time`] — so the decision table is testable deterministically
+/// (the C++ mixes `Time::now()` and `Time::now_cached()` the same way; the
+/// driver fills both from the real clock, where they are almost equal).
+/// The fetch-argument reads (`is_test_dc`, `prefer_ipv6`,
 /// `dc_txt_domain_name`) land with the fetch orchestration (M.3.7.3).
 #[derive(Clone, Debug)]
 pub struct RecovererEnv {
@@ -595,35 +600,74 @@ pub struct RecovererEnv {
     /// `expect_blocking()` — `G()->get_option_boolean("expect_blocking", true)`,
     /// resolved by the driver.
     pub expect_blocking: bool,
+    /// `Time::now()` — the base of the high-load skip's
+    /// `set_timeout_in(Random::fast(200, 300))`.
+    pub now: f64,
+    /// `Time::now_cached()` — the clock every expiry check reads.
+    pub now_cached: f64,
+    /// `Session::is_high_loaded()` (net/Session.cpp:286) — at least 100
+    /// live `GenAuthKeyActor`s (net/Session.cpp:113-129); the driver
+    /// resolves it (always `false` until the handshake-actor pool of the
+    /// net step).
+    pub is_high_loaded: bool,
 }
 
 /// What one recoverer step asks its driver to do — the C++ side effects the
 /// inline recoverer cannot take itself (`G()` writes, actor creation, the
-/// timer). M.3.7.1 carries only the ConnectionCreator fan-out; the fetch
-/// and wakeup actions land with the loop (M.3.7.2/M.3.7.3).
+/// timer). M.3.7.2 adds the loop's wakeup and the two fetch decisions; the
+/// fetch specs (the simple-config turn rotation, the mini-session) ride
+/// these with M.3.7.3/M.3.7.4.
 #[derive(Debug, Default)]
 pub struct RecovererActions {
     /// `ConnectionCreator::on_dc_options(DcOptions(full_config->dc_options_))`
     /// after a full config (the fan-out lands with the net step; the
     /// options are carried for it).
     pub connection_creator_dc_options: Vec<telegram_api::DcOption>,
+    /// `set_timeout_at(wakeup_timestamp.at())` — the earliest future
+    /// deadline the loop wants to wake at. `None` leaves the currently
+    /// armed timer alone (the C++ only re-arms on a valid timestamp).
+    pub wakeup_at: Option<f64>,
+    /// The loop decided `need_simple_config` — the driver dispatches the
+    /// simple-config fetch (the turn rotation lands with M.3.7.3).
+    pub fetch_simple_config: bool,
+    /// The loop decided `need_full_config` — the option the unauthed
+    /// mini-session (M.3.7.4) connects to; already rotated past.
+    pub fetch_full_config: Option<RecovererDcOption>,
 }
 
 /// The `ConfigRecoverer` (ConfigManager.cpp:499-832) as an inline state
 /// machine on the Td actor, like the ConfigManager port. The C++ actor's
-/// `ref_cnt_`/promise plumbing is the driver's job here; the fetch results
-/// come back through [`ConfigRecoverer::on_full_config`].
+/// promise/actor plumbing is the driver's job here: the fetches are
+/// returned as [`RecovererActions`], the fetch results come back through
+/// [`ConfigRecoverer::on_full_config`] (and `on_simple_config`, M.3.7.3),
+/// and each query share of the C++ `ref_cnt_` is taken by the loop and
+/// released through [`ConfigRecoverer::hangup_shared`] /
+/// [`ConfigRecoverer::hangup`].
 pub struct ConfigRecoverer {
+    /// `is_connecting_`.
+    is_connecting: bool,
+    /// `connecting_since_` — seeded `Time::now()` in the constructor.
+    connecting_since: f64,
+
     /// `is_online_`.
     is_online: bool,
+
+    /// `has_network_`.
+    has_network: bool,
+    /// `has_network_since_` — written, never read by the C++ either.
+    has_network_since: f64,
+    /// `network_generation_` — the C++ compares but never assigns it
+    /// (ConfigManager.cpp:512-520, quirk kept).
+    network_generation: u32,
 
     /// `simple_config_` — the options of the last simple config.
     simple_config: Vec<RecovererDcOption>,
     /// `simple_config_expires_at_`.
-    #[allow(dead_code)] // read by the loop (M.3.7.2)
     simple_config_expires_at: f64,
     /// `simple_config_at_` (only logged in the C++).
     simple_config_at: f64,
+    /// `!simple_config_query_.empty()`.
+    simple_config_query_active: bool,
 
     /// `dc_options_update_`.
     dc_options_update: Vec<RecovererDcOption>,
@@ -631,21 +675,21 @@ pub struct ConfigRecoverer {
     /// `dc_options_` — `dc_options_update_` + `simple_config_`.
     dc_options: Vec<RecovererDcOption>,
     /// `dc_options_at_`.
-    #[allow(dead_code)] // read by the loop (M.3.7.2)
     dc_options_at: f64,
     /// `dc_options_i_`.
-    #[allow(dead_code)] // read by the loop (M.3.7.2)
     dc_options_i: usize,
 
     /// `full_config_`.
-    #[allow(dead_code)] // read by on_online/loop (M.3.7.2)
     full_config: Option<Box<telegram_api::Config>>,
     /// `full_config_expires_at_`.
-    #[allow(dead_code)] // read by the loop (M.3.7.2)
     full_config_expires_at: f64,
     /// `!full_config_query_.empty()`.
-    #[allow(dead_code)] // read by the loop (M.3.7.2)
     full_config_query_active: bool,
+
+    /// `ref_cnt_` — 1 is the parent's share, plus one per in-flight query.
+    ref_cnt: u32,
+    /// `close_flag_`.
+    close_flag: bool,
 }
 
 impl Default for ConfigRecoverer {
@@ -655,14 +699,19 @@ impl Default for ConfigRecoverer {
 }
 
 impl ConfigRecoverer {
-    /// The constructor — the C++ seeds `connecting_since_ = Time::now()`;
-    /// the connecting/network state lands with the callbacks (M.3.7.2).
+    /// The constructor — the C++ seeds `connecting_since_ = Time::now()`.
     pub fn new() -> Self {
         Self {
+            is_connecting: false,
+            connecting_since: tdutils::time::now(),
             is_online: false,
+            has_network: false,
+            has_network_since: 0.0,
+            network_generation: 0,
             simple_config: Vec::new(),
             simple_config_expires_at: 0.0,
             simple_config_at: 0.0,
+            simple_config_query_active: false,
             dc_options_update: Vec::new(),
             dc_options: Vec::new(),
             dc_options_at: 0.0,
@@ -670,6 +719,8 @@ impl ConfigRecoverer {
             full_config: None,
             full_config_expires_at: 0.0,
             full_config_query_active: false,
+            ref_cnt: 1,
+            close_flag: false,
         }
     }
 
@@ -678,17 +729,101 @@ impl ConfigRecoverer {
         self.simple_config_at
     }
 
+    /// `has_network_since_` (only written by the C++ too).
+    pub fn has_network_since(&self) -> f64 {
+        self.has_network_since
+    }
+
     /// `dc_options_` — the merged set (the update part first, then the
     /// simple config).
     pub fn dc_options(&self) -> &[RecovererDcOption] {
         &self.dc_options
     }
 
-    /// `on_dc_options_update` (ConfigManager.cpp:505-509) — the C++ tail
-    /// re-runs the loop; that call lands with M.3.7.2.
-    pub fn on_dc_options_update(&mut self, dc_options: Vec<RecovererDcOption>) {
+    /// `on_dc_options_update` (ConfigManager.cpp:505-509) — ends in the
+    /// loop, like the C++.
+    pub fn on_dc_options_update(
+        &mut self,
+        dc_options: Vec<RecovererDcOption>,
+        env: &RecovererEnv,
+    ) -> RecovererActions {
         self.dc_options_update = dc_options;
         self.update_dc_options();
+        self.loop_(env)
+    }
+
+    /// `on_network` (ConfigManager.cpp:512-520) — the state callback's
+    /// network leg. The generation guard keeps the C++ quirk:
+    /// `network_generation_` is compared but never assigned, so every call
+    /// with a generation other than the initial 0 re-stamps
+    /// `has_network_since_` while the network is up.
+    pub fn on_network(
+        &mut self,
+        has_network: bool,
+        network_generation: u32,
+        env: &RecovererEnv,
+    ) -> RecovererActions {
+        self.has_network = has_network;
+        if self.network_generation != network_generation && has_network {
+            self.has_network_since = env.now_cached;
+        }
+        self.loop_(env)
+    }
+
+    /// `on_online` (ConfigManager.cpp:521-536) — going online expires the
+    /// EMPTY configs immediately (their cached state is worthless after
+    /// reconnecting); an unchanged flag runs no loop, so the default
+    /// actions leave the armed timer alone.
+    pub fn on_online(&mut self, is_online: bool, env: &RecovererEnv) -> RecovererActions {
+        if self.is_online == is_online {
+            return RecovererActions::default();
+        }
+        self.is_online = is_online;
+        if is_online {
+            if self.simple_config.is_empty() {
+                self.simple_config_expires_at = 0.0;
+            }
+            if self.full_config.is_none() {
+                self.full_config_expires_at = 0.0;
+            }
+        }
+        self.loop_(env)
+    }
+
+    /// `on_connecting` (ConfigManager.cpp:537-544) — `connecting_since_` is
+    /// stamped on the rising edge only.
+    pub fn on_connecting(&mut self, is_connecting: bool, env: &RecovererEnv) -> RecovererActions {
+        tracing::trace!("On connecting {is_connecting}");
+        if is_connecting && !self.is_connecting {
+            self.connecting_since = env.now_cached;
+        }
+        self.is_connecting = is_connecting;
+        self.loop_(env)
+    }
+
+    /// The `StateCallback::on_state` forwarding
+    /// (ConfigManager.cpp:804-807) — only a plain `Connecting` counts as a
+    /// connecting problem (`ConnectingToProxy` deliberately does not);
+    /// registration with the StateManager lands with the wiring (M.3.7.5).
+    pub fn on_connection_state(
+        &mut self,
+        state: RecovererConnectionState,
+        env: &RecovererEnv,
+    ) -> RecovererActions {
+        self.on_connecting(state == RecovererConnectionState::Connecting, env)
+    }
+
+    /// The `StateCallback::on_network` forwarding
+    /// (ConfigManager.cpp:808-811) — every `NetType` but `None` means the
+    /// network is up.
+    pub fn on_net_type(
+        &mut self,
+        net_type: RecovererNetType,
+        network_generation: u32,
+        env: &RecovererEnv,
+    ) -> RecovererActions {
+        let has_network = !matches!(net_type, RecovererNetType::None);
+        self.on_network(has_network, network_generation, env)
     }
 
     /// `check_phone_number_rules` (ConfigManager.cpp:546-564).
@@ -769,8 +904,10 @@ impl ConfigRecoverer {
 
     /// `on_full_config` (ConfigManager.cpp:626-639) — the ConnectionCreator
     /// fan-out is carried as the action (the `send_closure` itself lands
-    /// with the net step, M.3.9.1); the C++ `loop()` tail lands with
-    /// M.3.7.2.
+    /// with the net step, M.3.9.1), and the C++ tail `loop()` re-runs
+    /// here. The query's ref-count share is NOT released inside: the
+    /// driver calls [`ConfigRecoverer::hangup_shared`] after the delivery,
+    /// like the C++ `GetConfigActor` death does.
     pub fn on_full_config(
         &mut self,
         r_full_config: Result<telegram_api::Config, Status>,
@@ -791,6 +928,10 @@ impl ConfigRecoverer {
                 self.full_config_expires_at = self.get_failed_config_expire_time(env);
             }
         }
+        let loop_actions = self.loop_(env);
+        actions.wakeup_at = loop_actions.wakeup_at;
+        actions.fetch_simple_config = loop_actions.fetch_simple_config;
+        actions.fetch_full_config = loop_actions.fetch_full_config;
         actions
     }
 
@@ -822,6 +963,144 @@ impl ConfigRecoverer {
         tdutils::time::now() + offline_delay + f64::from(expire_time)
     }
 
+    /// `max_connecting_delay` (ConfigManager.cpp:707-709).
+    fn max_connecting_delay(&self, env: &RecovererEnv) -> f64 {
+        if Self::expect_blocking(env) {
+            5.0
+        } else {
+            20.0
+        }
+    }
+
+    /// `loop()` (ConfigManager.cpp:711-797) — the decision machine. The
+    /// fetch dispatch is carried as actions: the simple-config turn
+    /// rotation lands with M.3.7.3, the unauthed mini-session with
+    /// M.3.7.4; each dispatch takes one query share of the ref count.
+    pub fn loop_(&mut self, env: &RecovererEnv) -> RecovererActions {
+        let mut actions = RecovererActions::default();
+        if self.close_flag {
+            return actions;
+        }
+        if env.is_high_loaded {
+            tracing::trace!("Skip config recoverer under high load");
+            // `set_timeout_in(Random::fast(200, 300))`.
+            actions.wakeup_at = Some(env.now + f64::from(tdutils::random::fast(200, 300)));
+            return actions;
+        }
+
+        tracing::trace!(
+            "{} in {} seconds",
+            if self.is_connecting {
+                "Failed to connect for"
+            } else {
+                "Successfully connected in"
+            },
+            env.now_cached - self.connecting_since
+        );
+
+        // The C++ `Timestamp wakeup_timestamp` + `check_timeout` lambda:
+        // a past (or never-set) timestamp means "expired"; a future one is
+        // folded into the wakeup, which keeps the EARLIEST deadline
+        // (`Timestamp::relax`, Time.h:84-90 — the wakeup must fire at the
+        // first expiry, not the last).
+        let mut wakeup_at = None;
+        let has_connecting_problem = self.is_connecting
+            && check_timeout(
+                &mut wakeup_at,
+                self.connecting_since + self.max_connecting_delay(env),
+                env.now_cached,
+            );
+        let is_valid_simple_config = !check_timeout(
+            &mut wakeup_at,
+            self.simple_config_expires_at,
+            env.now_cached,
+        );
+        if !is_valid_simple_config && !self.simple_config.is_empty() {
+            self.simple_config.clear();
+            self.update_dc_options();
+        }
+        let need_simple_config =
+            has_connecting_problem && !is_valid_simple_config && !self.simple_config_query_active;
+        let has_dc_options = !self.dc_options.is_empty();
+        let is_valid_full_config =
+            !check_timeout(&mut wakeup_at, self.full_config_expires_at, env.now_cached);
+        let need_full_config = has_connecting_problem
+            && has_dc_options
+            && !is_valid_full_config
+            && !self.full_config_query_active
+            && check_timeout(
+                &mut wakeup_at,
+                self.dc_options_at
+                    + if Self::expect_blocking(env) {
+                        5.0
+                    } else {
+                        10.0
+                    },
+                env.now_cached,
+            );
+
+        if need_simple_config {
+            // `ref_cnt_++` (cpp:750) — the query's share.
+            self.ref_cnt += 1;
+            self.simple_config_query_active = true;
+            actions.fetch_simple_config = true;
+            // The `simple_config_turn_` advance lands with M.3.7.3.
+        }
+
+        if need_full_config {
+            // `ref_cnt_++` (cpp:781) — the mini-session's share.
+            self.ref_cnt += 1;
+            self.full_config_query_active = true;
+            tracing::trace!("Ask full config with dc_options_i = {}", self.dc_options_i);
+            let option = self.dc_options[self.dc_options_i].clone();
+            actions.fetch_full_config = Some(option);
+            self.dc_options_i = (self.dc_options_i + 1) % self.dc_options.len();
+        }
+
+        if let Some(at) = wakeup_at {
+            tracing::trace!("Wakeup in {} seconds", at - env.now_cached);
+            actions.wakeup_at = Some(at);
+        }
+        actions
+    }
+
+    /// `hangup_shared` (ConfigManager.cpp:689-692) — one query share
+    /// released: the C++ share rides the holder actor, so the driver
+    /// calls this when a holder died — after delivering a query result
+    /// ([`ConfigRecoverer::on_full_config`] clears the slot itself) or on
+    /// an undelivered death (the M.3.7.4 timeout) — with the query's slot
+    /// cleared by then; a slot still marked active at
+    /// [`ConfigRecoverer::hangup`] would release its share twice.
+    /// Returns `try_stop`.
+    pub fn hangup_shared(&mut self) -> bool {
+        self.ref_cnt -= 1;
+        self.try_stop()
+    }
+
+    /// `hangup` (ConfigManager.cpp:693-698) — the parent closes the
+    /// recoverer: the in-flight queries are cancelled and release their
+    /// shares with it. Returns `try_stop`.
+    pub fn hangup(&mut self) -> bool {
+        self.ref_cnt -= 1;
+        self.close_flag = true;
+        if self.simple_config_query_active {
+            self.simple_config_query_active = false;
+            self.ref_cnt -= 1;
+        }
+        if self.full_config_query_active {
+            self.full_config_query_active = false;
+            self.ref_cnt -= 1;
+        }
+        self.try_stop()
+    }
+
+    /// `try_stop` (ConfigManager.cpp:701-705) — the recoverer stops when
+    /// its last share drops; the driver's `stop()` is dropping the state
+    /// machine (and unregistering the state callback).
+    fn try_stop(&self) -> bool {
+        self.ref_cnt == 0
+    }
+
     /// `update_dc_options` (ConfigManager.cpp:823-832) — the saved update
     /// first, then the simple config; any change resets the rotation.
     fn update_dc_options(&mut self) {
@@ -833,6 +1112,48 @@ impl ConfigRecoverer {
             self.dc_options_at = tdutils::time::now();
         }
     }
+}
+
+/// The loop's `check_timeout` lambda (ConfigManager.cpp:728-734): an
+/// expired (or never-set, `Timestamp::at(0)`) deadline answers `true`
+/// without entering the wakeup relax, which keeps the earliest valid
+/// deadline (`Timestamp::relax`, Time.h:84-90).
+fn check_timeout(wakeup_at: &mut Option<f64>, timestamp: f64, now_cached: f64) -> bool {
+    if timestamp < now_cached {
+        return true;
+    }
+    *wakeup_at = Some(match *wakeup_at {
+        Some(at) if at <= timestamp => at,
+        _ => timestamp,
+    });
+    false
+}
+
+/// `td::ConnectionState` (ConnectionState.h) as the recoverer's state
+/// callback sees it — only a plain `Connecting` counts as a connecting
+/// problem; `ConnectingToProxy` deliberately does not
+/// (ConfigManager.cpp:804-807).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecovererConnectionState {
+    WaitingForNetwork,
+    ConnectingToProxy,
+    Connecting,
+    Updating,
+    Ready,
+    Empty,
+}
+
+/// `td::NetType` (net/NetType.h) as the recoverer's network callback sees
+/// it — every variant but `None` means the network is up
+/// (ConfigManager.cpp:808-811).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecovererNetType {
+    Other,
+    WiFi,
+    Mobile,
+    MobileRoaming,
+    None,
+    Unknown,
 }
 
 #[cfg(test)]
@@ -1397,6 +1718,11 @@ mod tests {
             // form, no leading '+'), so the `+999` rules match it.
             my_phone_number: "999555123".to_string(),
             expect_blocking,
+            // A fixed clock: the loop's decision table is deterministic
+            // against it (tests move it by rebuilding the env).
+            now: 10_000.0,
+            now_cached: 10_000.0,
+            is_high_loaded: false,
         }
     }
 
@@ -1577,7 +1903,7 @@ mod tests {
         let saved = load_dc_options_update(&pmc);
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].ip_address, "10.0.0.1");
-        recoverer.on_dc_options_update(saved);
+        recoverer.on_dc_options_update(saved, &environment);
 
         // The replayed update is the update part; a later simple config
         // appends AFTER it (ConfigManager.cpp:823-827).
@@ -1623,5 +1949,422 @@ mod tests {
         addresses.sort();
         let expected: Vec<String> = (1..=3).map(|dc| ipv4_to_string(0x0a00_0000 + dc)).collect();
         assert_eq!(addresses, expected, "the shuffle must be a permutation");
+    }
+
+    /// A recoverer dc option built directly (the ip is a valid dotted
+    /// quad, so [`RecovererDcOption::is_valid`] holds).
+    fn dc_option(dc: i32, ip: &str) -> RecovererDcOption {
+        RecovererDcOption {
+            raw_dc_id: dc,
+            ip_address: ip.to_string(),
+            port: 443,
+            secret: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn need_simple_config_matches_the_cpp_table() {
+        // (is_connecting, since offset, blocking, expires offset,
+        //  query_active) -> fetch. Offsets run from the injected
+        //  now_cached = 10_000; the blocked connecting limit is 5 s, the
+        //  free one 20 s (cpp:707-709, 721-743).
+        let rows: Vec<(bool, f64, bool, f64, bool, bool)> = vec![
+            // Not connecting: never, however stale everything is.
+            (false, -600.0, true, -600.0, false, false),
+            // Connecting, but younger than the limit: not yet a problem.
+            (true, -1.0, true, -600.0, false, false),
+            (true, -19.0, false, -600.0, false, false),
+            // Connecting problem + invalid config: fetch — unless a query
+            // is already in flight.
+            (true, -6.0, true, -600.0, false, true),
+            (true, -21.0, false, -600.0, false, true),
+            (true, -6.0, true, -600.0, true, false),
+            // A valid config: no refetch.
+            (true, -6.0, true, 120.0, false, false),
+            (true, -21.0, false, 120.0, false, false),
+        ];
+        for (is_connecting, since, blocking, expires, query_active, want) in rows {
+            let environment = env(blocking);
+            let mut recoverer = ConfigRecoverer::new();
+            recoverer.is_connecting = is_connecting;
+            recoverer.connecting_since = 10_000.0 + since;
+            recoverer.simple_config_expires_at = 10_000.0 + expires;
+            recoverer.simple_config_query_active = query_active;
+            let actions = recoverer.loop_(&environment);
+            assert_eq!(
+                actions.fetch_simple_config, want,
+                "row {is_connecting}/{since}/{blocking}/{expires}/{query_active}"
+            );
+            assert_eq!(
+                recoverer.ref_cnt,
+                if want { 2 } else { 1 },
+                "each dispatch takes one query share"
+            );
+        }
+    }
+
+    #[test]
+    fn need_full_config_matches_the_cpp_table() {
+        // With dc options present (cpp:744-748): the full config is
+        // refetched only on a connecting problem with an invalid config,
+        // no query in flight, and dc options at least 5 s (blocked) /
+        // 10 s (free) old.
+        // (is_connecting, since offset, blocking, full expires offset,
+        //  query_active, dc_options_at offset) -> fetch.
+        let rows: Vec<(bool, f64, bool, f64, bool, f64, bool)> = vec![
+            // A still-valid full config: never.
+            (true, -6.0, true, 120.0, false, -600.0, false),
+            // Not a connecting problem: never.
+            (false, -1.0, true, -600.0, false, -600.0, false),
+            // Everything stale: fetch.
+            (true, -6.0, true, -600.0, false, -600.0, true),
+            (true, -21.0, false, -600.0, false, -600.0, true),
+            // A query is already in flight: never.
+            (true, -6.0, true, -600.0, true, -600.0, false),
+            // The dc options are too fresh (the 5/10 s gate): never.
+            (true, -6.0, true, -600.0, false, -2.0, false),
+            (true, -21.0, false, -600.0, false, -9.0, false),
+        ];
+        for (is_connecting, since, blocking, full_expires, query_active, dc_at, want) in rows {
+            let environment = env(blocking);
+            let mut recoverer = ConfigRecoverer::new();
+            recoverer.is_connecting = is_connecting;
+            recoverer.connecting_since = 10_000.0 + since;
+            recoverer.full_config_expires_at = 10_000.0 + full_expires;
+            recoverer.full_config_query_active = query_active;
+            recoverer.dc_options_update = vec![dc_option(1, "1.1.1.1"), dc_option(2, "2.2.2.2")];
+            recoverer.update_dc_options();
+            recoverer.dc_options_at = 10_000.0 + dc_at;
+
+            let actions = recoverer.loop_(&environment);
+            assert_eq!(
+                actions.fetch_full_config.is_some(),
+                want,
+                "row {is_connecting}/{since}/{blocking}/{full_expires}/{query_active}/{dc_at}"
+            );
+            // The simple side of the same row: a connecting problem with
+            // the (never-set, hence invalid) empty simple config refetches
+            // too, taking its own share.
+            let connecting_limit = if blocking { 5.0 } else { 20.0 };
+            let problem = is_connecting && since <= -connecting_limit;
+            assert_eq!(actions.fetch_simple_config, problem);
+            assert_eq!(recoverer.ref_cnt, 1 + u32::from(problem) + u32::from(want));
+        }
+    }
+
+    #[test]
+    fn full_config_fetches_rotate_the_dc_options() {
+        // cpp:783-790 — the options are handed out round-robin, starting
+        // at the current `dc_options_i_`.
+        let environment = env(true);
+        let mut recoverer = ConfigRecoverer::new();
+        recoverer.is_connecting = true;
+        recoverer.connecting_since = 9_000.0;
+        recoverer.full_config_expires_at = 9_000.0;
+        recoverer.dc_options_update = vec![dc_option(1, "1.1.1.1"), dc_option(2, "2.2.2.2")];
+        recoverer.update_dc_options();
+        recoverer.dc_options_at = 9_000.0;
+        recoverer.dc_options_i = 1;
+
+        let actions = recoverer.loop_(&environment);
+        assert_eq!(
+            actions
+                .fetch_full_config
+                .as_ref()
+                .map(|o| o.ip_address.as_str()),
+            Some("2.2.2.2")
+        );
+        assert_eq!(recoverer.dc_options_i, 0, "wrapped modulo the set size");
+
+        // After the delivery frees the slot, the next fetch takes the
+        // first option.
+        recoverer.full_config_query_active = false;
+        let actions = recoverer.loop_(&environment);
+        assert_eq!(
+            actions
+                .fetch_full_config
+                .as_ref()
+                .map(|o| o.ip_address.as_str()),
+            Some("1.1.1.1")
+        );
+        assert_eq!(recoverer.dc_options_i, 1);
+    }
+
+    #[test]
+    fn wakeup_is_the_earliest_future_deadline() {
+        // `Timestamp::relax` keeps the EARLIEST future deadline (the
+        // m37-draft folded the latest — a real divergence from the C++).
+        let environment = env(true);
+        let mut recoverer = ConfigRecoverer::new();
+        // A connecting problem (the limit long expired), a valid simple
+        // config at +120, an invalid full config, and the dc gate due at
+        // +3: the wakeup is the gate.
+        recoverer.is_connecting = true;
+        recoverer.connecting_since = 9_990.0;
+        recoverer.simple_config_expires_at = 10_120.0;
+        recoverer.full_config_expires_at = 9_900.0;
+        recoverer.dc_options_update = vec![dc_option(1, "1.1.1.1")];
+        recoverer.update_dc_options();
+        recoverer.dc_options_at = 9_998.0;
+        let actions = recoverer.loop_(&environment);
+        assert_eq!(actions.wakeup_at, Some(10_003.0));
+        assert!(actions.fetch_full_config.is_none(), "the gate holds it");
+
+        // The gate passed: the fetch fires and the wakeup falls back to
+        // the simple-config expiry.
+        recoverer.dc_options_at = 9_994.0;
+        let actions = recoverer.loop_(&environment);
+        assert!(actions.fetch_full_config.is_some());
+        assert_eq!(actions.wakeup_at, Some(10_120.0));
+
+        // Every deadline expired: nothing to re-arm (the C++ leaves the
+        // previously set timeout running).
+        recoverer.simple_config_expires_at = 9_500.0;
+        recoverer.full_config_query_active = true;
+        let actions = recoverer.loop_(&environment);
+        assert_eq!(actions.wakeup_at, None);
+    }
+
+    #[test]
+    fn high_load_skips_the_loop_for_a_while() {
+        // cpp:715-719 — everything stale, but under high load the machine
+        // only re-arms itself 200..300 s out and fetches nothing.
+        let mut environment = env(true);
+        environment.is_high_loaded = true;
+        let mut recoverer = ConfigRecoverer::new();
+        recoverer.is_connecting = true;
+        recoverer.connecting_since = 9_000.0;
+        recoverer.simple_config_expires_at = 9_000.0;
+        let actions = recoverer.loop_(&environment);
+        assert!(!actions.fetch_simple_config);
+        assert!(actions.fetch_full_config.is_none());
+        let wakeup = actions.wakeup_at.expect("the skip re-arms itself");
+        assert!((10_200.0..=10_300.0).contains(&wakeup), "wakeup {wakeup}");
+        assert_eq!(recoverer.ref_cnt, 1, "no share is taken");
+    }
+
+    #[test]
+    fn a_closed_recoverer_loops_into_nothing() {
+        // cpp:712-714 — after the close, the loop arms nothing and issues
+        // nothing, however stale the state.
+        let environment = env(true);
+        let mut recoverer = ConfigRecoverer::new();
+        recoverer.is_connecting = true;
+        recoverer.connecting_since = 9_000.0;
+        recoverer.simple_config_expires_at = 9_000.0;
+        assert!(recoverer.hangup());
+
+        let actions = recoverer.loop_(&environment);
+        assert_eq!(actions.wakeup_at, None);
+        assert!(!actions.fetch_simple_config);
+        assert!(actions.fetch_full_config.is_none());
+
+        // The state callbacks still run their bodies; the loop tail is the
+        // same no-op.
+        let actions = recoverer.on_connecting(true, &environment);
+        assert_eq!(actions.wakeup_at, None);
+    }
+
+    #[test]
+    fn hangup_folds_the_in_flight_query_releases() {
+        // cpp:693-698 — closing cancels both queries and releases their
+        // shares together with the parent's.
+        let environment = env(true);
+        let mut recoverer = ConfigRecoverer::new();
+        recoverer.is_connecting = true;
+        recoverer.connecting_since = 9_000.0;
+        recoverer.simple_config_expires_at = 9_000.0;
+        recoverer.dc_options_update = vec![dc_option(1, "1.1.1.1"), dc_option(2, "2.2.2.2")];
+        recoverer.update_dc_options();
+        recoverer.dc_options_at = 9_000.0;
+        recoverer.full_config_expires_at = 9_000.0;
+        let actions = recoverer.loop_(&environment);
+        assert!(actions.fetch_simple_config && actions.fetch_full_config.is_some());
+        assert_eq!(recoverer.ref_cnt, 3, "parent + one share per query");
+
+        assert!(recoverer.hangup());
+        assert_eq!(recoverer.ref_cnt, 0);
+        assert!(!recoverer.simple_config_query_active);
+        assert!(!recoverer.full_config_query_active);
+    }
+
+    #[test]
+    fn query_shares_release_one_by_one() {
+        // cpp:689-692 — a delivered or failed query releases exactly its
+        // own share; the parent's keeps the recoverer alive.
+        //
+        // The injected clock anchors at the live monotonic clock +300 s:
+        // past the 5 s dc gate, below the success expiry the Ok delivery
+        // arms (`time::now()` is process-monotonic, not wall-clock), so
+        // the fresh full config reads valid and the loop tail re-issues
+        // nothing.
+        let clock = tdutils::time::now();
+        let mut environment = env(true);
+        environment.now = clock + 300.0;
+        environment.now_cached = clock + 300.0;
+        let mut recoverer = ConfigRecoverer::new();
+        recoverer.is_connecting = true;
+        recoverer.connecting_since = clock - 9_000.0;
+        recoverer.simple_config_expires_at = clock - 1_000.0;
+        recoverer.dc_options_update = vec![dc_option(1, "1.1.1.1")];
+        recoverer.update_dc_options();
+        recoverer.dc_options_at = clock - 600.0;
+        recoverer.full_config_expires_at = clock - 1_000.0;
+        recoverer.loop_(&environment);
+        assert_eq!(recoverer.ref_cnt, 3);
+
+        // The full-config delivery succeeds, so its fresh expiry holds
+        // and the loop tail issues no replacement fetch.
+        recoverer.on_full_config(Ok(telegram_api::Config::default()), &environment);
+        assert!(!recoverer.hangup_shared(), "the parent share remains");
+        assert_eq!(recoverer.ref_cnt, 2);
+
+        // The simple-config holder dies undelivered: the slot clears with
+        // the holder, then the share releases.
+        recoverer.simple_config_query_active = false;
+        assert!(!recoverer.hangup_shared());
+        assert_eq!(recoverer.ref_cnt, 1);
+
+        // The last share is the parent's close.
+        assert!(recoverer.hangup());
+    }
+
+    #[test]
+    fn going_online_expires_only_empty_configs() {
+        // cpp:527-533.
+        let environment = env(true);
+        let mut recoverer = ConfigRecoverer::new();
+        // A simple config WITH options keeps its expiry; an absent full
+        // config is expired at once.
+        recoverer.simple_config = vec![dc_option(2, "9.9.9.9")];
+        recoverer.simple_config_expires_at = 10_050.0;
+        recoverer.full_config_expires_at = 10_050.0;
+        recoverer.on_online(true, &environment);
+        assert_eq!(recoverer.simple_config_expires_at, 10_050.0);
+        assert_eq!(recoverer.full_config_expires_at, 0.0);
+
+        // An empty simple config is expired too.
+        let mut recoverer = ConfigRecoverer::new();
+        recoverer.simple_config_expires_at = 10_050.0;
+        recoverer.on_online(true, &environment);
+        assert_eq!(recoverer.simple_config_expires_at, 0.0);
+
+        // An unchanged flag runs no loop: the default actions arm nothing
+        // (cpp:522-524 returns before loop()).
+        let actions = recoverer.on_online(true, &environment);
+        assert_eq!(actions.wakeup_at, None);
+        assert!(!actions.fetch_simple_config);
+    }
+
+    #[test]
+    fn on_network_stamp_keeps_the_generation_quirk() {
+        // cpp:512-518 — `network_generation_` is never assigned, so any
+        // generation but the initial 0 re-stamps on EVERY call while the
+        // network is up; generation 0 never does, nor a down network.
+        let mut environment = env(true);
+        let mut recoverer = ConfigRecoverer::new();
+        recoverer.on_network(true, 7, &environment);
+        assert_eq!(recoverer.has_network_since(), 10_000.0);
+
+        environment.now_cached = 11_000.0;
+        recoverer.on_network(true, 7, &environment);
+        assert_eq!(
+            recoverer.has_network_since(),
+            11_000.0,
+            "the same generation still stamps"
+        );
+
+        environment.now_cached = 12_000.0;
+        recoverer.on_network(false, 7, &environment);
+        assert_eq!(recoverer.has_network_since(), 11_000.0);
+        recoverer.on_network(true, 0, &environment);
+        assert_eq!(recoverer.has_network_since(), 11_000.0);
+    }
+
+    #[test]
+    fn connecting_since_stamps_on_the_rising_edge_only() {
+        // cpp:539-541.
+        let mut environment = env(true);
+        let mut recoverer = ConfigRecoverer::new();
+        recoverer.on_connecting(true, &environment);
+        assert_eq!(recoverer.connecting_since, 10_000.0);
+
+        environment.now_cached = 11_000.0;
+        recoverer.on_connecting(true, &environment);
+        assert_eq!(
+            recoverer.connecting_since, 10_000.0,
+            "staying true keeps it"
+        );
+        recoverer.on_connecting(false, &environment);
+        assert_eq!(recoverer.connecting_since, 10_000.0);
+
+        environment.now_cached = 12_000.0;
+        recoverer.on_connecting(true, &environment);
+        assert_eq!(recoverer.connecting_since, 12_000.0, "re-rising re-stamps");
+    }
+
+    #[test]
+    fn the_state_callback_forwards_only_a_plain_connecting_state() {
+        // cpp:804-807 — ConnectingToProxy is deliberately not a connecting
+        // problem.
+        let environment = env(true);
+        for (state, is_connecting) in [
+            (RecovererConnectionState::WaitingForNetwork, false),
+            (RecovererConnectionState::ConnectingToProxy, false),
+            (RecovererConnectionState::Connecting, true),
+            (RecovererConnectionState::Updating, false),
+            (RecovererConnectionState::Ready, false),
+            (RecovererConnectionState::Empty, false),
+        ] {
+            let mut recoverer = ConfigRecoverer::new();
+            recoverer.on_connection_state(state, &environment);
+            assert_eq!(recoverer.is_connecting, is_connecting, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn the_network_callback_treats_every_net_type_but_none_as_up() {
+        // cpp:808-811.
+        let environment = env(true);
+        for (net_type, has_network) in [
+            (RecovererNetType::Other, true),
+            (RecovererNetType::WiFi, true),
+            (RecovererNetType::Mobile, true),
+            (RecovererNetType::MobileRoaming, true),
+            (RecovererNetType::Unknown, true),
+            (RecovererNetType::None, false),
+        ] {
+            let mut recoverer = ConfigRecoverer::new();
+            recoverer.on_net_type(net_type, 1, &environment);
+            assert_eq!(recoverer.has_network, has_network, "{net_type:?}");
+            assert_eq!(
+                recoverer.has_network_since() == 10_000.0,
+                has_network,
+                "only an up network stamps {net_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_expired_simple_config_is_cleared_and_rebuilt() {
+        // cpp:739-742 — an invalid simple config with options is dropped
+        // and the merged set rebuilt (the update part survives, the
+        // rotation resets).
+        let environment = env(true);
+        let mut recoverer = ConfigRecoverer::new();
+        recoverer.dc_options_update = vec![dc_option(1, "1.1.1.1")];
+        recoverer.simple_config = vec![dc_option(2, "2.2.2.2")];
+        recoverer.update_dc_options();
+        assert_eq!(recoverer.dc_options().len(), 2);
+        recoverer.dc_options_i = 1;
+        recoverer.simple_config_expires_at = 9_000.0;
+        recoverer.is_connecting = true;
+        recoverer.connecting_since = 9_000.0;
+
+        let actions = recoverer.loop_(&environment);
+        assert!(actions.fetch_simple_config, "the clear goes with a refetch");
+        assert_eq!(recoverer.dc_options().len(), 1);
+        assert_eq!(recoverer.dc_options()[0].ip_address, "1.1.1.1");
+        assert_eq!(recoverer.dc_options_i, 0, "the rebuild resets the rotation");
     }
 }
