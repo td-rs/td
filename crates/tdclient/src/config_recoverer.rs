@@ -28,22 +28,38 @@
 //! lands as an inline state machine in sub-steps: this file currently carries
 //! the recoverer state, the config application (M.3.7.1), the `loop()`
 //! decision machine with the state callbacks and the ref-count/close
-//! semantics (M.3.7.2), and the simple-config fetch orchestration — the
+//! semantics (M.3.7.2), the simple-config fetch orchestration — the
 //! fetcher rotation, `on_simple_config` with the dns-time alternation
-//! (M.3.7.3); the full-config mini-session and the Td wiring follow in
-//! M.3.7.4-M.3.7.5.
+//! (M.3.7.3) — and the full-config mini-session: the pmc key/salt
+//! store, the recovery RSA context, the session header and the unauthed
+//! `help.getConfig` executor (M.3.7.4); the Td wiring follows in
+//! M.3.7.5.
 
 use std::sync::OnceLock;
 
+use tokio::net::TcpStream;
+
 use base64::Engine as _;
 use tddb::binlog_key_value::BinlogKeyValue;
+use tdmtproto::auth_data::{AuthData, ServerSalt, parse_server_salt, store_server_salt};
+use tdmtproto::auth_key::AuthKey;
+use tdmtproto::dh_callback::DhCallback;
+use tdmtproto::handshake::{AuthKeyHandshake, AuthKeyHandshakeContext};
+use tdmtproto::handshake_actor::run_handshake;
+use tdmtproto::message_id::MessageId;
 use tdmtproto::proxy_secret::ProxySecret;
+use tdmtproto::raw_connection::RawConnection;
+use tdmtproto::rsa::{PublicRsaKeyInterface, RsaKey};
+use tdmtproto::session_connection::{SessionConnection, SessionConnectionCallback, SessionMode};
 use tdmtproto::telegram_api;
+use tdmtproto::transport_type::{TransportType, TransportTypeEnum};
 use tdnet::http_query::HttpQuery;
 use tdnet::wget::{VerifyPeer, WgetParams, wget};
+use tdutils::buffer::BufferSlice;
 use tdutils::http_date::parse_http_date;
 use tdutils::http_url::url_encode;
 use tdutils::json::{JsonValue, JsonValueType, json_decode};
+use tdutils::random;
 use tdutils::rsa::Rsa;
 use tdutils::status::Status;
 
@@ -715,9 +731,9 @@ pub struct SimpleConfigFetch {
 
 /// What one recoverer step asks its driver to do — the C++ side effects the
 /// inline recoverer cannot take itself (`G()` writes, actor creation, the
-/// timer). The loop's wakeup and the two fetch decisions ride these (the
-/// simple-config fetch carries the turn rotation; the unauthed mini-session
-/// spec lands with M.3.7.4).
+/// timer). The loop's wakeup and the two fetch decisions ride these —
+/// the simple-config fetch carries the turn rotation, the full-config
+/// fetch the mini-session spec.
 #[derive(Debug, Default)]
 pub struct RecovererActions {
     /// `ConnectionCreator::on_dc_options(DcOptions(full_config->dc_options_))`
@@ -733,13 +749,25 @@ pub struct RecovererActions {
     /// [`fetch_simple_config`] and feeds the result back through
     /// [`ConfigRecoverer::on_simple_config`].
     pub fetch_simple_config: Option<SimpleConfigFetch>,
-    /// The loop decided `need_full_config` — the option the unauthed
-    /// mini-session (M.3.7.4) connects to; already rotated past.
-    pub fetch_full_config: Option<RecovererDcOption>,
+    /// The loop decided `need_full_config` — the unauthed mini-session
+    /// ([`fetch_full_config`], M.3.7.4) to run; already rotated past.
+    pub fetch_full_config: Option<FullConfigFetch>,
     /// `G()->update_dns_time_difference(diff)` after a simple config
     /// (the http date and the config date alternate as the source,
     /// ConfigManager.cpp:578-582).
     pub dns_time_difference: Option<f64>,
+}
+
+/// One pending full-config fetch — the C++
+/// `full_config_query_ = get_full_config(option, &promise, ...)`
+/// (ConfigManager.cpp:781-784). Only the option rides the action; the
+/// executor's other arguments (the test-ness, the header options, the
+/// server time difference, the pmc) are `G()` reads the driver resolves
+/// (M.3.7.5).
+#[derive(Clone, Debug)]
+pub struct FullConfigFetch {
+    /// `dc_options_.dc_options[dc_options_i_]`.
+    pub option: RecovererDcOption,
 }
 
 /// The `ConfigRecoverer` (ConfigManager.cpp:499-832) as an inline state
@@ -1219,7 +1247,7 @@ impl ConfigRecoverer {
             self.full_config_query_active = true;
             tracing::trace!("Ask full config with dc_options_i = {}", self.dc_options_i);
             let option = self.dc_options[self.dc_options_i].clone();
-            actions.fetch_full_config = Some(option);
+            actions.fetch_full_config = Some(FullConfigFetch { option });
             self.dc_options_i = (self.dc_options_i + 1) % self.dc_options.len();
         }
 
@@ -1320,6 +1348,673 @@ pub enum RecovererNetType {
     MobileRoaming,
     None,
     Unknown,
+}
+
+// ---- get_full_config (ConfigManager.cpp:325-497, M.3.7.4) -------------------
+//
+// The C++ builds a one-query mini-session out of three local classes around
+// the full `Session` actor: `SimpleAuthData` (a pmc-backed
+// `AuthDataShared`), a `SessionCallback` (the raw-connection source and
+// result dispatcher) and a `GetConfigActor` (the promise owner with the
+// 10-second actor timeout). The port has no `Session` actor yet (it lands
+// with the net step), so the mini-session is one async executor over the
+// Track-G `SessionConnection`, with the C++ behaviors mapped as documented
+// on [`fetch_full_config`].
+
+/// `SimpleAuthData::auth_key_key` — the persisted recovery auth key, keyed
+/// by the raw dc id (ConfigManager.cpp:415-421).
+fn recovery_auth_key_key(raw_dc_id: i32) -> String {
+    format!("config_recovery_auth{raw_dc_id}")
+}
+
+/// `SimpleAuthData::future_salts_key` (ConfigManager.cpp:423-427).
+fn recovery_salt_key(raw_dc_id: i32) -> String {
+    format!("config_recovery_salt{raw_dc_id}")
+}
+
+/// The `SimpleAuthData::set_auth_key` pmc write — `td::serialize(AuthKey)`
+/// (ConfigManager.cpp:386-392).
+pub fn store_recovery_auth_key(pmc: &mut BinlogKeyValue, raw_dc_id: i32, auth_key: &AuthKey) {
+    let mut out = Vec::new();
+    auth_key.store(&mut out);
+    pmc.set_raw(recovery_auth_key_key(raw_dc_id).as_bytes(), &out);
+}
+
+/// The `SimpleAuthData::get_auth_key` pmc read (ConfigManager.cpp:377-385):
+/// an empty value is the C++ default-constructed (absent) key; a value that
+/// fails to parse is the C++ `unserialize(...).ensure()` crash degraded to
+/// the same absence.
+pub fn load_recovery_auth_key(pmc: &BinlogKeyValue, raw_dc_id: i32) -> Option<AuthKey> {
+    let raw = pmc.get_raw(recovery_auth_key_key(raw_dc_id).as_bytes());
+    if raw.is_empty() {
+        return None;
+    }
+    let mut reader = tdmtproto::mtproto_api::tl::Reader::new(&raw);
+    AuthKey::parse(&mut reader).ok()
+}
+
+/// The `SimpleAuthData::set_future_salts` pmc value —
+/// `td::serialize(vector<mtproto::ServerSalt>)`: an int32 count + the
+/// `store(ServerSalt)` triples (ConfigManager.cpp:404-410).
+pub fn store_recovery_salts(salts: &[ServerSalt]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&(salts.len() as i32).to_le_bytes());
+    for salt in salts {
+        store_server_salt(&mut out, salt);
+    }
+    out
+}
+
+/// The `SimpleAuthData::get_future_salts` pmc read
+/// (ConfigManager.cpp:412-421): truncated input degrades to the empty set
+/// (the C++ `unserialize(...).ensure()` would crash).
+pub fn load_recovery_salts(pmc: &BinlogKeyValue, raw_dc_id: i32) -> Vec<ServerSalt> {
+    let raw = pmc.get_raw(recovery_salt_key(raw_dc_id).as_bytes());
+    let mut res = Vec::new();
+    if raw.len() < 4 {
+        return res;
+    }
+    let count = i32::from_le_bytes(raw[..4].try_into().expect("length checked"));
+    let mut reader = tdmtproto::mtproto_api::tl::Reader::new(&raw[4..]);
+    for _ in 0..count.clamp(0, 1000) {
+        match parse_server_salt(&mut reader) {
+            Ok(salt) => res.push(salt),
+            Err(_) => return Vec::new(),
+        }
+    }
+    res
+}
+
+/// `PublicRsaKeySharedMain::create(is_test)`
+/// (net/PublicRsaKeySharedMain.cpp:22-58) — one pinned key per flavor; the
+/// fingerprint is the parsed key's own (`add_pem`).
+struct RecoveryRsa {
+    rsa: Rsa,
+    fingerprint: i64,
+}
+
+impl PublicRsaKeyInterface for RecoveryRsa {
+    fn get_rsa_key(&self, fingerprints: &[i64]) -> tdutils::status::Result<RsaKey> {
+        if fingerprints.contains(&self.fingerprint) {
+            tdutils::status::Result::Ok(RsaKey {
+                rsa: self.rsa.clone(),
+                fingerprint: self.fingerprint,
+            })
+        } else {
+            tdutils::status::Result::Err(Status::error_message(&format!(
+                "Unknown Main fingerprints {fingerprints:?}"
+            )))
+        }
+    }
+
+    fn drop_keys(&mut self) {}
+}
+
+/// The `PrimeCallback` of the Track-G probes (the C++
+/// `DhCallback`): accept the built-in prime, check others on the fly.
+struct RecoveryPrimeCallback;
+
+impl DhCallback for RecoveryPrimeCallback {
+    fn is_good_prime(&self, _prime_str: &[u8]) -> i32 {
+        -1 // run the full primality checks
+    }
+    fn add_good_prime(&self, _prime_str: &[u8]) {}
+    fn add_bad_prime(&self, _prime_str: &[u8]) {}
+}
+
+/// The `td::mtproto::AuthKeyHandshakeContext` of the recovery handshake:
+/// the built-in prime checks and the pinned `PublicRsaKeySharedMain` key.
+struct RecoveryContext {
+    rsa: RecoveryRsa,
+}
+
+impl AuthKeyHandshakeContext for RecoveryContext {
+    fn get_dh_callback(&self) -> &dyn DhCallback {
+        static CALLBACK: RecoveryPrimeCallback = RecoveryPrimeCallback;
+        &CALLBACK
+    }
+
+    fn get_public_rsa_key_interface(&mut self) -> &mut dyn PublicRsaKeyInterface {
+        &mut self.rsa
+    }
+}
+
+/// The `PublicRsaKeySharedMain` keys, `create(is_test)`
+/// (net/PublicRsaKeySharedMain.cpp:26-52).
+fn recovery_rsa(is_test: bool) -> RecoveryRsa {
+    // The test key (net/PublicRsaKeySharedMain.cpp:26-37).
+    const TEST_KEY: &str = "-----BEGIN RSA PUBLIC KEY-----\n\
+MIIBCgKCAQEAyMEdY1aR+sCR3ZSJrtztKTKqigvO/vBfqACJLZtS7QMgCGXJ6XIR\n\
+yy7mx66W0/sOFa7/1mAZtEoIokDP3ShoqF4fVNb6XeqgQfaUHd8wJpDWHcR2OFwv\n\
+plUUI1PLTktZ9uW2WE23b+ixNwJjJGwBDJPQEQFBE+vfmH0JP503wr5INS1poWg/\n\
+j25sIWeYPHYeOrFp/eXaqhISP6G+q2IeTaWTXpwZj4LzXq5YOpk4bYEQ6mvRq7D1\n\
+aHWfYmlEGepfaYR8Q0YqvvhYtMte3ITnuSJs171+GDqpdKcSwHnd6FudwGO4pcCO\n\
+j4WcDuXc2CTHgH8gFTNhp/Y8/SpDOhvn9QIDAQAB\n\
+-----END RSA PUBLIC KEY-----";
+    // The production key (net/PublicRsaKeySharedMain.cpp:40-52).
+    const MAIN_KEY: &str = "-----BEGIN RSA PUBLIC KEY-----\n\
+MIIBCgKCAQEA6LszBcC1LGzyr992NzE0ieY+BSaOW622Aa9Bd4ZHLl+TuFQ4lo4g\n\
+5nKaMBwK/BIb9xUfg0Q29/2mgIR6Zr9krM7HjuIcCzFvDtr+L0GQjae9H0pRB2OO\n\
+62cECs5HKhT5DZ98K33vmWiLowc621dQuwKWSQKjWf50XYFw42h21P2KXUGyp2y/\n\
++aEyZ+uVgLLQbRA1dEjSDZ2iGRy12Mk5gpYc397aYp438fsJoHIgJ2lgMv5h7WY9\n\
+t6N/byY9Nw9p21Og3AoXSL2q/2IJ1WRUhebgAdGVMlV1fkuOQoEzR7EdpqtQD9Cs\n\
+5+bfo3Nhmcyvk5ftB0WkJ9z6bNZ7yxrP8wIDAQAB\n\
+-----END RSA PUBLIC KEY-----";
+    let rsa = match Rsa::from_pem_public_key(if is_test { TEST_KEY } else { MAIN_KEY }) {
+        tdutils::status::Result::Ok(rsa) => rsa,
+        tdutils::status::Result::Err(status) => {
+            panic!("the pinned PublicRsaKeySharedMain key must parse: {status}")
+        }
+    };
+    let fingerprint = rsa.get_fingerprint();
+    RecoveryRsa { rsa, fingerprint }
+}
+
+// ---- the session header (MtprotoHeader.cpp:23-110) --------------------------
+
+/// The `MtprotoHeader::Options` subset the recovery session's header
+/// carries (MtprotoHeader.h) — the fields `HeaderStorer` writes for the
+/// default (non-anonymous) header the C++ `Session::start_up` puts on the
+/// auth data (Session.cpp:277-281). The driver fills them from the tdlib
+/// parameters (M.3.7.5).
+#[derive(Clone, Debug, Default)]
+pub struct RecoveryHeaderOptions {
+    pub api_id: i32,
+    pub device_model: String,
+    pub system_version: String,
+    pub application_version: String,
+    pub system_language_code: String,
+    pub language_pack: String,
+    pub language_code: String,
+    pub is_emulator: bool,
+    /// The Mtproto-type proxy (`server`, `port`) — the header carries an
+    /// `inputClientProxy` only for those.
+    pub mtproto_proxy: Option<(String, i32)>,
+    /// `options.parameters` — the raw JSON string of the tdlib parameters.
+    pub parameters: String,
+    pub tz_offset: f64,
+}
+
+/// `LanguagePackManager::is_custom_language_code`
+/// (LanguagePackManager.cpp:126-128).
+fn is_custom_language_code(language_code: &str) -> bool {
+    !language_code.is_empty() && language_code.starts_with('X')
+}
+
+/// The header's language fields (MtprotoHeader.cpp:56-67): an empty pack
+/// or a custom (`X`-prefixed) code clears both fields; an empty code with
+/// a real pack becomes "en".
+fn recovery_language_fields(language_pack: &str, language_code: &str) -> (String, String) {
+    if language_pack.is_empty() || is_custom_language_code(language_code) {
+        (String::new(), String::new())
+    } else if language_code.is_empty() {
+        (language_pack.to_string(), "en".to_string())
+    } else {
+        (language_pack.to_string(), language_code.to_string())
+    }
+}
+
+/// The `convert_json_value` half of `get_input_json_value`
+/// (JsonValue.cpp:101-134) — the JSON parser's value into the TL one. The
+/// number is lenient like `to_double` (0.0 on failure); the strings need
+/// no `clean_input_string` (the parser already yields valid UTF-8).
+fn json_value_to_tl(value: &JsonValue) -> telegram_api::JSONValue {
+    match value {
+        JsonValue::Null => telegram_api::JSONValue::jsonNull(telegram_api::jsonNull),
+        JsonValue::Boolean(value) => {
+            telegram_api::JSONValue::jsonBool(telegram_api::jsonBool { value: *value })
+        }
+        JsonValue::Number(value) => telegram_api::JSONValue::jsonNumber(telegram_api::jsonNumber {
+            value: value.parse().unwrap_or(0.0),
+        }),
+        JsonValue::String(value) => telegram_api::JSONValue::jsonString(telegram_api::jsonString {
+            value: value.clone(),
+        }),
+        JsonValue::Array(values) => telegram_api::JSONValue::jsonArray(telegram_api::jsonArray {
+            value: values
+                .iter()
+                .map(|value| Box::new(json_value_to_tl(value)))
+                .collect(),
+        }),
+        JsonValue::Object(object) => {
+            telegram_api::JSONValue::jsonObject(telegram_api::jsonObject {
+                value: object
+                    .iter_fields()
+                    .map(|(key, value)| {
+                        Box::new(telegram_api::JSONObjectValue {
+                            key: key.to_string(),
+                            value: Box::new(json_value_to_tl(value)),
+                        })
+                    })
+                    .collect(),
+            })
+        }
+    }
+}
+
+/// `MtprotoHeader::gen_header(options, /*is_anonymous=*/ false)`
+/// (MtprotoHeader.cpp:23-110) — the `invokeWithLayer{initConnection}`
+/// header every query of the recovery session carries; the fresh auth key
+/// always needs it (`AuthKey::have_header_`, AuthKey.h:120/127).
+///
+/// The tz rule (MtprotoHeader.cpp:81-107): the empty parameters are an
+/// empty object; a non-object value keeps its shape; an object gets
+/// `tz_offset` added or replaced.
+pub fn gen_recovery_header(options: &RecoveryHeaderOptions) -> Result<Vec<u8>, Status> {
+    let have_proxy = options.mtproto_proxy.is_some();
+    let mut flags = 0;
+    if have_proxy {
+        flags |= 1 << 0;
+    }
+    // `!is_anonymous` — the params box (MtprotoHeader.cpp:43-45).
+    flags |= 1 << 1;
+    if options.is_emulator {
+        flags |= 1 << 10;
+    }
+
+    let mut json_value = if options.parameters.is_empty() {
+        telegram_api::JSONValue::jsonObject(telegram_api::jsonObject { value: Vec::new() })
+    } else {
+        let parsed = match json_decode(&options.parameters) {
+            tdutils::status::Result::Ok(value) => value,
+            tdutils::status::Result::Err(status) => return Err(status),
+        };
+        json_value_to_tl(&parsed)
+    };
+    if let telegram_api::JSONValue::jsonObject(object) = &mut json_value {
+        let tz_offset = telegram_api::JSONValue::jsonNumber(telegram_api::jsonNumber {
+            value: options.tz_offset,
+        });
+        match object
+            .value
+            .iter_mut()
+            .find(|member| member.key == "tz_offset")
+        {
+            Some(member) => *member.value = tz_offset,
+            None => object.value.push(Box::new(telegram_api::JSONObjectValue {
+                key: "tz_offset".to_string(),
+                value: Box::new(tz_offset),
+            })),
+        }
+    }
+
+    // The language rule (MtprotoHeader.cpp:56-67).
+    let (lang_pack, lang_code) =
+        recovery_language_fields(&options.language_pack, &options.language_code);
+
+    let mut out = Vec::new();
+    telegram_api::invokeWithLayer {
+        layer: RECOVERY_MTPROTO_LAYER,
+        query: Box::new(telegram_api::Function::initConnection(
+            telegram_api::initConnection {
+                flags,
+                api_id: options.api_id,
+                device_model: options.device_model.clone(),
+                system_version: options.system_version.clone(),
+                app_version: options.application_version.clone(),
+                system_lang_code: options.system_language_code.clone(),
+                lang_pack,
+                lang_code,
+                proxy: match &options.mtproto_proxy {
+                    Some((address, port)) => telegram_api::InputClientProxy {
+                        address: address.clone(),
+                        port: *port,
+                    },
+                    None => telegram_api::InputClientProxy {
+                        address: String::new(),
+                        port: 0,
+                    },
+                },
+                params: Box::new(json_value),
+                query: Box::new(telegram_api::Function::help_getConfig(
+                    telegram_api::help_getConfig,
+                )),
+            },
+        )),
+    }
+    .store_boxed(&mut out);
+    Ok(out)
+}
+
+// ---- the mini-session pieces (ConfigManager.cpp:326-362 / 432-467) ----------
+
+/// The `GetConfigActor::on_result` parse — `fetch_result<help_getConfig>`
+/// (ConfigManager.cpp:432-434).
+fn parse_full_config(packet: &[u8]) -> Result<telegram_api::Config, Status> {
+    telegram_api::Config::parse(packet)
+        .map_err(|error| Status::error_message(&format!("Failed to parse help.config: {error}")))
+}
+
+/// The `SessionCallback::request_raw_connection` try gate
+/// (ConfigManager.cpp:337-357): the first two raw-connection requests go
+/// to the `ConnectionCreator`; every further one is delayed forever, so
+/// the session stalls until the actor timeout.
+pub fn request_raw_connection_allowed(tries: usize) -> bool {
+    tries <= 2
+}
+
+/// The session callback of the mini-session: it captures the answer to the
+/// one query, like the C++ `SessionCallback::on_result` handing the query
+/// to the dispatcher; the salt updates are persisted by the executor (the
+/// no-PFS `Session::on_server_salt_updated` branch, Session.cpp:612-618).
+struct FullConfigCallback {
+    request_id: MessageId,
+    answer: Option<Result<Vec<u8>, Status>>,
+    failed: bool,
+    closed: bool,
+    /// `on_server_salt_updated` fired.
+    salts_updated: bool,
+}
+
+impl SessionConnectionCallback for FullConfigCallback {
+    fn on_connected(&mut self) {}
+    fn on_closed(&mut self, _status: Status) {
+        self.closed = true;
+    }
+    fn on_server_salt_updated(&mut self) {
+        self.salts_updated = true;
+    }
+    fn on_server_time_difference_updated(&mut self, _force: bool) {}
+    fn on_new_session_created(&mut self, _unique_id: u64, _first_message_id: MessageId) {}
+    fn on_session_failed(&mut self, _status: Status) {}
+    fn on_container_sent(
+        &mut self,
+        _container_message_id: MessageId,
+        _message_ids: Vec<MessageId>,
+    ) {
+    }
+    fn on_pong(&mut self, _ping_time: f64, _pong_time: f64, _current_time: f64) -> Status {
+        Status::ok()
+    }
+    fn on_update(&mut self, _packet: BufferSlice) -> Status {
+        Status::ok()
+    }
+    fn on_message_ack(&mut self, _message_id: MessageId) {}
+    fn on_message_result_ok(
+        &mut self,
+        message_id: MessageId,
+        packet: BufferSlice,
+        _original_size: usize,
+    ) -> Status {
+        if message_id == self.request_id {
+            self.answer = Some(Ok(packet.as_slice().to_vec()));
+        }
+        Status::ok()
+    }
+    fn on_message_result_error(&mut self, message_id: MessageId, code: i32, message: String) {
+        if message_id == self.request_id {
+            self.answer = Some(Err(Status::error(code, &message)));
+        }
+    }
+    fn on_message_failed(&mut self, message_id: MessageId, _status: Status) {
+        if message_id == self.request_id {
+            self.failed = true;
+        }
+    }
+    fn on_message_info(
+        &mut self,
+        _message_id: MessageId,
+        _state: i32,
+        _answer_message_id: MessageId,
+        _answer_size: i32,
+        _source: i32,
+    ) {
+    }
+    fn on_destroy_auth_key(&mut self) -> Status {
+        Status::ok()
+    }
+}
+
+/// `MTPROTO_LAYER` (Version.h:13) — the layer the pinned scheme carries.
+const RECOVERY_MTPROTO_LAYER: i32 = 229;
+
+/// The `GetConfigActor::set_timeout_in(10)` budget (ConfigManager.cpp:466)
+/// — the whole mini-session, handshake included, fails with
+/// "Timeout expired" after it.
+pub const FULL_CONFIG_ACTOR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// `get_full_config` (ConfigManager.cpp:325-497) — the unauthed
+/// mini-session: the `SimpleAuthData` key store
+/// (`config_recovery_auth<raw_dc_id>` in the binlog pmc, a raw handshake
+/// when absent), one obfuscated-TCP connection to the option's endpoint
+/// and one `help.getConfig`, answered within the 10-second actor budget.
+/// Returns the config and the handshake's server time difference (the
+/// `SimpleAuthData::update_server_time_difference` write the caller
+/// forwards to `Global`, with the `force` flag).
+///
+/// Divergences from the C++ (all consequences of the `Session` actor
+/// landing with the net step):
+/// - The C++ session runs PFS with temp keys; the port runs the main key
+///   directly (`use_pfs = false`), so salt updates persist to the pmc (the
+///   no-PFS `Session::on_server_salt_updated` branch) where the C++
+///   recovery session's PFS updates hit the nop `SessionCallback`.
+/// - The C++ resends through the `Session`'s unbounded queue; the port
+///   resends the query once (a stale session salt is the expected cause).
+/// - A reconnection takes a fresh session id (the port's
+///   `SessionConnection` owns its auth data by value; the C++ session id
+///   survives reconnects).
+/// - The `query->total_timeout_limit_ = 60 * 60 * 24` budget
+///   (ConfigManager.cpp:462) has no port counterpart — the 10-second actor
+///   timeout dominates it anyway.
+///
+/// The lifecycle texts match the C++ promise errors: "Timeout expired"
+/// (`timeout_expired`) and "Failed" (a raw connection that cannot be
+/// established — the `hangup_shared`-with-token-1 path).
+pub async fn fetch_full_config(
+    option: &RecovererDcOption,
+    is_test_dc: bool,
+    header_options: &RecoveryHeaderOptions,
+    server_time_difference: f64,
+    pmc: &mut BinlogKeyValue,
+) -> Result<(telegram_api::Config, Option<(f64, bool)>), Status> {
+    fetch_full_config_impl(
+        option,
+        is_test_dc,
+        header_options,
+        server_time_difference,
+        pmc,
+        FULL_CONFIG_ACTOR_TIMEOUT,
+    )
+    .await
+}
+
+/// [`fetch_full_config`] with the actor budget injected (the tests shrink
+/// it).
+async fn fetch_full_config_impl(
+    option: &RecovererDcOption,
+    is_test_dc: bool,
+    header_options: &RecoveryHeaderOptions,
+    server_time_difference: f64,
+    pmc: &mut BinlogKeyValue,
+    timeout: std::time::Duration,
+) -> Result<(telegram_api::Config, Option<(f64, bool)>), Status> {
+    let raw_dc_id = option.raw_dc_id;
+    // The `GetConfigActor::start_up` int dc (ConfigManager.cpp:455-458):
+    // `+10000` on a test instance. Wire test-DC ids (10001+) are their own
+    // int dc — they cannot enter the recoverer's option set
+    // (`RecovererDcOption::is_valid` caps at 1000), but a direct call like
+    // the live smoke carries them.
+    let int_dc_id = if raw_dc_id > MAX_RECOVERER_DC_ID {
+        raw_dc_id
+    } else if is_test_dc {
+        raw_dc_id + 10000
+    } else {
+        raw_dc_id
+    };
+
+    // The `TransportType{ObfuscatedTcp, narrow_cast<int16>(raw_dc_id),
+    // option_.get_secret()}` of `SessionCallback::request_raw_connection`
+    // (ConfigManager.cpp:349-352).
+    let proxy_secret = if option.secret.is_empty() {
+        ProxySecret::default()
+    } else {
+        match ProxySecret::from_binary(&option.secret, false) {
+            tdutils::status::Result::Ok(secret) => secret,
+            tdutils::status::Result::Err(status) => return Err(status),
+        }
+    };
+    let transport_type = TransportType::new(
+        TransportTypeEnum::ObfuscatedTcp,
+        raw_dc_id as i16,
+        proxy_secret,
+    );
+
+    // The header every query of the session carries (`Session::start_up` →
+    // `AuthData::set_header`, Session.cpp:277-281).
+    let header = gen_recovery_header(header_options)?;
+
+    // `SimpleAuthData::get_auth_key` — the persisted key, or a fresh
+    // handshake on the first connection.
+    let mut key = load_recovery_auth_key(pmc, raw_dc_id);
+    let mut auth_time_difference: Option<(f64, bool)> = None;
+
+    // The one query: `NetQueryCreator::create_unauth(help_getConfig())`
+    // (ConfigManager.cpp:460) — a bare function; the invokeWithLayer
+    // wrapping rides the session header, like the C++.
+    let mut query = Vec::new();
+    telegram_api::help_getConfig.store_boxed(&mut query);
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    // `SessionCallback::request_raw_connection_cnt_`
+    // (ConfigManager.cpp:336-357).
+    let mut raw_connection_tries = 0usize;
+
+    'establish: loop {
+        // `SessionCallback::request_raw_connection` — the two-try gate,
+        // then delay forever (park until the actor timeout).
+        raw_connection_tries += 1;
+        if !request_raw_connection_allowed(raw_connection_tries) {
+            tokio::time::sleep_until(deadline).await;
+            return Err(Status::error_message("Timeout expired"));
+        }
+        // `ConnectionCreator::request_raw_connection_by_ip` — a raw
+        // connection that cannot be established kills the session
+        // (`GetConfigActor::hangup_shared` with token 1 → "Failed").
+        let stream =
+            match TcpStream::connect((option.ip_address.as_str(), option.port as u16)).await {
+                Ok(stream) => stream,
+                Err(_) => return Err(Status::error_message("Failed")),
+            };
+
+        // `Session::start_up`'s auth data (Session.cpp:249-267): the main
+        // key, the persisted salts (:253), the server time difference and
+        // a fresh session id.
+        let mut auth_data = AuthData::new();
+        auth_data.set_use_pfs(false);
+        let connection = if key.is_none() {
+            // `Session::on_handshake_ready` (Session.cpp:1408-1424): the
+            // fresh key and salt, persisted through `SimpleAuthData`
+            // (Session.cpp:909/965 and the no-PFS :612-618).
+            let mut context = RecoveryContext {
+                rsa: recovery_rsa(is_test_dc),
+            };
+            let mut handshake = AuthKeyHandshake::new(int_dc_id, 0);
+            let raw_connection = match run_handshake(
+                stream,
+                transport_type.clone(),
+                &mut context,
+                deadline
+                    .saturating_duration_since(tokio::time::Instant::now())
+                    .as_secs_f64(),
+                &mut handshake,
+            )
+            .await
+            {
+                tdutils::status::Result::Ok(connection) => connection,
+                tdutils::status::Result::Err(status) => return Err(status),
+            };
+            let auth_key = handshake.release_auth_key();
+            auth_time_difference = Some((handshake.get_server_time_diff(), true));
+            auth_data.set_main_auth_key(auth_key.clone());
+            auth_data.reset_server_time_difference(server_time_difference);
+            auth_data.set_server_salt(handshake.get_server_salt() as i64, tdutils::time::now());
+            store_recovery_auth_key(pmc, raw_dc_id, &auth_key);
+            let salts = auth_data.get_future_salts();
+            pmc.set_raw(
+                recovery_salt_key(raw_dc_id).as_bytes(),
+                &store_recovery_salts(&salts),
+            );
+            key = Some(auth_key);
+            raw_connection
+        } else {
+            auth_data.set_main_auth_key(key.clone().expect("the key is present"));
+            auth_data.reset_server_time_difference(server_time_difference);
+            auth_data.set_future_salts(load_recovery_salts(pmc, raw_dc_id), tdutils::time::now());
+            RawConnection::new(stream, transport_type.clone(), None)
+        };
+        auth_data.set_header(header.clone());
+        let mut session_id = 0u64;
+        while session_id == 0 {
+            session_id = random::secure_uint64();
+        }
+        auth_data.set_session_id(session_id);
+        auth_data.set_auth_flag(true);
+        let mut connection = SessionConnection::new(SessionMode::Tcp, connection, auth_data);
+
+        // `send_closure(session_, &Session::send, query)` — one query, one
+        // in-flight attempt plus the stale-salt resend, under the actor
+        // timeout.
+        let mut callback = FullConfigCallback {
+            request_id: MessageId::default(),
+            answer: None,
+            failed: false,
+            closed: false,
+            salts_updated: false,
+        };
+        let mut sent = false;
+        let mut resent_once = false;
+        loop {
+            if let Some(answer) = callback.answer.take() {
+                let packet = answer?;
+                let config = parse_full_config(&packet)?;
+                return Ok((config, auth_time_difference));
+            }
+            if callback.salts_updated {
+                callback.salts_updated = false;
+                // The no-PFS `Session::on_server_salt_updated` persist
+                // (Session.cpp:612-618).
+                let salts = connection.auth_data().get_future_salts();
+                pmc.set_raw(
+                    recovery_salt_key(raw_dc_id).as_bytes(),
+                    &store_recovery_salts(&salts),
+                );
+            }
+            if callback.closed {
+                // The connection died — `Session::on_closed` requests a
+                // new raw connection through the gate.
+                continue 'establish;
+            }
+            if callback.failed && !resent_once {
+                resent_once = true;
+                callback.failed = false;
+                sent = false;
+            }
+            if !sent {
+                callback.request_id = connection.send_query(
+                    BufferSlice::from_slice_bytes(&query),
+                    false,
+                    MessageId::default(),
+                    Vec::new(),
+                    false,
+                );
+                sent = true;
+            }
+            connection.flush(&mut callback).await;
+            if callback.answer.is_some() || callback.closed {
+                continue;
+            }
+            tokio::select! {
+                readable = connection.raw_connection().stream().readable() => {
+                    if readable.is_err() {
+                        continue 'establish;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return Err(Status::error_message("Timeout expired"));
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2241,7 +2936,7 @@ mod tests {
             actions
                 .fetch_full_config
                 .as_ref()
-                .map(|o| o.ip_address.as_str()),
+                .map(|fetch| fetch.option.ip_address.as_str()),
             Some("2.2.2.2")
         );
         assert_eq!(recoverer.dc_options_i, 0, "wrapped modulo the set size");
@@ -2254,7 +2949,7 @@ mod tests {
             actions
                 .fetch_full_config
                 .as_ref()
-                .map(|o| o.ip_address.as_str()),
+                .map(|fetch| fetch.option.ip_address.as_str()),
             Some("1.1.1.1")
         );
         assert_eq!(recoverer.dc_options_i, 1);
@@ -2815,5 +3510,464 @@ mod tests {
         assert!(actions.fetch_full_config.is_none());
         assert!(actions.wakeup_at.is_some());
         assert_eq!(actions.dns_time_difference, Some(50_000.0 - (clock + 60.0)));
+    }
+
+    // ---- the SimpleAuthData pmc key/salt store (M.3.7.4) ----
+
+    #[test]
+    fn the_recovery_auth_key_round_trips_through_the_pmc() {
+        let mut pmc = RecovererPmc::new("auth-key");
+        assert!(load_recovery_auth_key(&pmc, 2).is_none());
+
+        let auth_key = AuthKey::new(0x0f0e_0d0c_0b0a_0908, (0..=255).collect());
+        store_recovery_auth_key(&mut pmc, 2, &auth_key);
+        let loaded = load_recovery_auth_key(&pmc, 2).expect("the key loads");
+        assert_eq!(loaded.id(), auth_key.id());
+
+        // The keys are per-dc.
+        assert!(load_recovery_auth_key(&pmc, 1).is_none());
+    }
+
+    #[test]
+    fn the_recovery_salts_round_trip_through_the_pmc() {
+        let mut pmc = RecovererPmc::new("salts");
+        assert!(load_recovery_salts(&pmc, 2).is_empty());
+
+        let salts = [
+            ServerSalt {
+                salt: -123456789,
+                valid_since: 1_700_000_000.5,
+                valid_until: 1_700_003_000.0,
+            },
+            ServerSalt {
+                salt: 42,
+                valid_since: 1_700_003_000.0,
+                valid_until: f64::MAX,
+            },
+        ];
+        pmc.set_raw(
+            recovery_salt_key(2).as_bytes(),
+            &store_recovery_salts(&salts),
+        );
+        let loaded = load_recovery_salts(&pmc, 2);
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].salt, -123456789);
+        assert_eq!(loaded[0].valid_since, 1_700_000_000.5);
+        assert_eq!(loaded[0].valid_until, 1_700_003_000.0);
+        assert_eq!(loaded[1].salt, 42);
+
+        // The value is `td::serialize(vector<ServerSalt>)`: an int32 count
+        // + the (i64 salt, f64 valid_since, f64 valid_until) triples — 4 +
+        // 2 * 24 bytes.
+        let raw = store_recovery_salts(&salts);
+        assert_eq!(raw.len(), 4 + 2 * 24);
+        assert_eq!(&raw[0..4], &2i32.to_le_bytes());
+        assert_eq!(&raw[4..12], &(-123456789i64).to_le_bytes());
+        assert_eq!(&raw[12..20], &1_700_000_000.5f64.to_le_bytes());
+        assert_eq!(&raw[20..28], &1_700_003_000.0f64.to_le_bytes());
+        assert_eq!(&raw[28..36], &42i64.to_le_bytes());
+
+        // Truncated input degrades to the empty set (the C++
+        // `unserialize(...).ensure()` would crash).
+        pmc.set_raw(recovery_salt_key(3).as_bytes(), &[1, 2, 3]);
+        assert!(load_recovery_salts(&pmc, 3).is_empty());
+        // The salts are per-dc.
+        assert!(load_recovery_salts(&pmc, 1).is_empty());
+    }
+
+    // ---- the session header (MtprotoHeader.cpp:23-110) ----
+
+    fn recovery_header_fixture() -> RecoveryHeaderOptions {
+        RecoveryHeaderOptions {
+            api_id: 94575,
+            device_model: "device".to_string(),
+            system_version: "system".to_string(),
+            application_version: "app".to_string(),
+            system_language_code: "en".to_string(),
+            language_pack: "android".to_string(),
+            language_code: "de".to_string(),
+            is_emulator: false,
+            mtproto_proxy: None,
+            parameters: String::new(),
+            tz_offset: 0.0,
+        }
+    }
+
+    /// The header over an explicit [`telegram_api::invokeWithLayer`] store
+    /// — pinning the transformation (the flags, the language fields, the
+    /// parameters object), not the serialization itself.
+    fn stored_header(
+        flags: i32,
+        lang_pack: &str,
+        lang_code: &str,
+        params: telegram_api::JSONValue,
+        proxy: Option<(&str, i32)>,
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        telegram_api::invokeWithLayer {
+            layer: 229,
+            query: Box::new(telegram_api::Function::initConnection(
+                telegram_api::initConnection {
+                    flags,
+                    api_id: 94575,
+                    device_model: "device".to_string(),
+                    system_version: "system".to_string(),
+                    app_version: "app".to_string(),
+                    system_lang_code: "en".to_string(),
+                    lang_pack: lang_pack.to_string(),
+                    lang_code: lang_code.to_string(),
+                    proxy: match proxy {
+                        Some((address, port)) => telegram_api::InputClientProxy {
+                            address: address.to_string(),
+                            port,
+                        },
+                        None => telegram_api::InputClientProxy {
+                            address: String::new(),
+                            port: 0,
+                        },
+                    },
+                    params: Box::new(params),
+                    query: Box::new(telegram_api::Function::help_getConfig(
+                        telegram_api::help_getConfig,
+                    )),
+                },
+            )),
+        }
+        .store_boxed(&mut out);
+        out
+    }
+
+    fn tz_object(members: Vec<telegram_api::JSONObjectValue>) -> telegram_api::JSONValue {
+        telegram_api::JSONValue::jsonObject(telegram_api::jsonObject {
+            value: members.into_iter().map(Box::new).collect(),
+        })
+    }
+
+    fn tz_member(value: f64) -> telegram_api::JSONObjectValue {
+        telegram_api::JSONObjectValue {
+            key: "tz_offset".to_string(),
+            value: Box::new(telegram_api::JSONValue::jsonNumber(
+                telegram_api::jsonNumber { value },
+            )),
+        }
+    }
+
+    #[test]
+    fn the_recovery_header_pins_the_layer_and_the_stored_shape() {
+        let header = gen_recovery_header(&recovery_header_fixture()).expect("the header builds");
+        // `invokeWithLayer` (0xda9b0d0d) + `MTPROTO_LAYER` (Version.h:13).
+        assert_eq!(&header[0..4], &0xda9b_0d0du32.to_le_bytes());
+        assert_eq!(&header[4..8], &229i32.to_le_bytes());
+
+        // flags = 1 << 1 only (the params box; no proxy, no emulator), the
+        // options' fields verbatim, and the empty parameters carrying just
+        // tz_offset.
+        let expected = stored_header(
+            1 << 1,
+            "android",
+            "de",
+            tz_object(vec![tz_member(0.0)]),
+            None,
+        );
+        assert_eq!(header, expected);
+    }
+
+    #[test]
+    fn the_recovery_header_language_rules_match_the_cpp() {
+        // MtprotoHeader.cpp:56-67.
+        assert_eq!(
+            recovery_language_fields("android", "de"),
+            ("android".to_string(), "de".to_string())
+        );
+        // An empty code with a real pack becomes "en".
+        assert_eq!(
+            recovery_language_fields("android", ""),
+            ("android".to_string(), "en".to_string())
+        );
+        // An empty pack clears both fields.
+        assert_eq!(
+            recovery_language_fields("", "de"),
+            (String::new(), String::new())
+        );
+        // A custom (`X`-prefixed) code clears both fields too.
+        assert_eq!(
+            recovery_language_fields("android", "Xde"),
+            (String::new(), String::new())
+        );
+    }
+
+    #[test]
+    fn the_recovery_header_parameters_rules_match_the_cpp() {
+        // An existing tz_offset is replaced in place, the other members
+        // kept (MtprotoHeader.cpp:88-107).
+        let mut options = recovery_header_fixture();
+        options.parameters = r#"{"tz_offset": 99, "keep": true}"#.to_string();
+        options.tz_offset = 1.5;
+        let header = gen_recovery_header(&options).expect("the header builds");
+        let keep = telegram_api::JSONObjectValue {
+            key: "keep".to_string(),
+            value: Box::new(telegram_api::JSONValue::jsonBool(telegram_api::jsonBool {
+                value: true,
+            })),
+        };
+        let expected = stored_header(
+            1 << 1,
+            "android",
+            "de",
+            tz_object(vec![tz_member(1.5), keep]),
+            None,
+        );
+        assert_eq!(header, expected);
+
+        // A non-object value keeps its shape, without the tz injection;
+        // the emulator flag rides the flags word.
+        let mut options = recovery_header_fixture();
+        options.parameters = "[1, null]".to_string();
+        options.is_emulator = true;
+        let header = gen_recovery_header(&options).expect("the header builds");
+        let params = telegram_api::JSONValue::jsonArray(telegram_api::jsonArray {
+            value: vec![
+                Box::new(telegram_api::JSONValue::jsonNumber(
+                    telegram_api::jsonNumber { value: 1.0 },
+                )),
+                Box::new(telegram_api::JSONValue::jsonNull(telegram_api::jsonNull)),
+            ],
+        });
+        let expected = stored_header((1 << 1) | (1 << 10), "android", "de", params, None);
+        assert_eq!(header, expected);
+
+        // An Mtproto proxy sets flag 0 and carries inputClientProxy
+        // (MtprotoHeader.cpp:37-39, 68-72).
+        let mut options = recovery_header_fixture();
+        options.mtproto_proxy = Some(("proxy.example.com".to_string(), 934));
+        let header = gen_recovery_header(&options).expect("the header builds");
+        let expected = stored_header(
+            (1 << 0) | (1 << 1),
+            "android",
+            "de",
+            tz_object(vec![tz_member(0.0)]),
+            Some(("proxy.example.com", 934)),
+        );
+        assert_eq!(header, expected);
+    }
+
+    #[test]
+    fn the_recovery_header_rejects_invalid_parameters_json() {
+        let mut options = recovery_header_fixture();
+        options.parameters = "{\"broken\":".to_string();
+        assert!(gen_recovery_header(&options).is_err());
+    }
+
+    // ---- the SessionCallback try-count gate (ConfigManager.cpp:336-357) ----
+
+    #[test]
+    fn the_raw_connection_gate_allows_two_tries() {
+        assert!(request_raw_connection_allowed(1));
+        assert!(request_raw_connection_allowed(2));
+        assert!(!request_raw_connection_allowed(3));
+        assert!(!request_raw_connection_allowed(4));
+    }
+
+    // ---- the result routing (SessionCallback::on_result) ----
+
+    #[test]
+    fn full_config_results_route_by_message_id() {
+        let mut callback = FullConfigCallback {
+            request_id: MessageId::new(0x7500_0000_0000_0001),
+            answer: None,
+            failed: false,
+            closed: false,
+            salts_updated: false,
+        };
+
+        // A result for another message id is dropped (the C++ dispatcher's
+        // job).
+        let status = callback.on_message_result_ok(
+            MessageId::new(7),
+            BufferSlice::from_slice_bytes(b"other"),
+            5,
+        );
+        assert!(status.is_ok());
+        assert!(callback.answer.is_none());
+
+        // The query's own answer is captured.
+        let status = callback.on_message_result_ok(
+            callback.request_id,
+            BufferSlice::from_slice_bytes(b"config"),
+            6,
+        );
+        assert!(status.is_ok());
+        assert_eq!(callback.answer.take().unwrap().unwrap(), b"config".to_vec());
+
+        // An error for the query id becomes the answer's error.
+        callback.on_message_result_error(
+            callback.request_id,
+            401,
+            "AUTH_KEY_UNREGISTERED".to_string(),
+        );
+        let error = callback
+            .answer
+            .take()
+            .unwrap()
+            .expect_err("the error answer");
+        assert_eq!(error.message(), "AUTH_KEY_UNREGISTERED");
+
+        // A failure of another message id does not flag the resend.
+        callback.on_message_failed(MessageId::new(7), Status::ok());
+        assert!(!callback.failed);
+        callback.on_message_failed(callback.request_id, Status::ok());
+        assert!(callback.failed);
+
+        // The salt/closed flags route the executor's persist/reconnect.
+        callback.on_server_salt_updated();
+        assert!(callback.salts_updated);
+        assert!(!callback.closed);
+        callback.on_closed(Status::ok());
+        assert!(callback.closed);
+    }
+
+    // ---- the GetConfigActor lifecycle (ConfigManager.cpp:436-467) ----
+
+    fn persisted_key_pmc(name: &str, raw_dc_id: i32) -> RecovererPmc {
+        // A persisted key skips the handshake, so the lifecycle tests run
+        // against a plain connection.
+        let mut pmc = RecovererPmc::new(name);
+        let auth_key = AuthKey::new(0x0f0e_0d0c_0b0a_0908, (0..=255).collect());
+        store_recovery_auth_key(&mut pmc, raw_dc_id, &auth_key);
+        pmc
+    }
+
+    fn local_option(port: u16) -> RecovererDcOption {
+        RecovererDcOption {
+            raw_dc_id: 2,
+            ip_address: "127.0.0.1".to_string(),
+            port: port as i32,
+            secret: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn full_config_fetch_times_out_when_the_server_is_silent() {
+        // An in-process server that accepts and never answers — the
+        // 10-second actor budget (shrunk here) expires with the C++
+        // `timeout_expired` text.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let mut pmc = persisted_key_pmc("config-timeout", 2);
+        let option = local_option(addr.port());
+        let result = fetch_full_config_impl(
+            &option,
+            false,
+            &recovery_header_fixture(),
+            0.0,
+            &mut pmc,
+            std::time::Duration::from_millis(750),
+        )
+        .await;
+        let error = match result {
+            Err(status) => status,
+            Ok(_) => panic!("the fetch times out"),
+        };
+        assert_eq!(error.message(), "Timeout expired");
+    }
+
+    #[tokio::test]
+    async fn full_config_fetch_fails_when_the_connection_dies() {
+        // The server accepts once and dies with its listener, so the
+        // gate-allowed reconnect cannot establish — the C++
+        // `hangup_shared`-with-token-1 "Failed" path.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(listener);
+            drop(stream);
+        });
+
+        let mut pmc = persisted_key_pmc("config-failed", 2);
+        let option = local_option(addr.port());
+        let result = fetch_full_config_impl(
+            &option,
+            false,
+            &recovery_header_fixture(),
+            0.0,
+            &mut pmc,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        let error = match result {
+            Err(status) => status,
+            Ok(_) => panic!("the reconnect fails"),
+        };
+        assert_eq!(error.message(), "Failed");
+    }
+
+    #[test]
+    fn the_full_config_actor_timeout_is_ten_seconds() {
+        // ConfigManager.cpp:466 — `set_timeout_in(10)`.
+        assert_eq!(
+            FULL_CONFIG_ACTOR_TIMEOUT,
+            std::time::Duration::from_secs(10)
+        );
+    }
+
+    /// The optional live test-DC smoke (ConfigManager.cpp:325-497 against
+    /// the real network): a fresh handshake on the saved
+    /// [`RecovererDcOption`] endpoint, the persisted
+    /// `config_recovery_auth<raw_dc_id>` key reused WITHOUT a second
+    /// handshake, and a parsed `help.config`. Needs the network and the
+    /// public test credentials (`TD_RS_TEST_API_ID`; `help.getConfig` is
+    /// unauth): `cargo test -p tdclient -- --ignored fetch_full_config`.
+    #[ignore = "needs the network and TD_RS_TEST_API_ID"]
+    #[tokio::test]
+    async fn fetch_full_config_live_smoke() {
+        let Ok(api_id) = std::env::var("TD_RS_TEST_API_ID") else {
+            panic!("TD_RS_TEST_API_ID is not set");
+        };
+        let Ok(api_id) = api_id.parse::<i32>() else {
+            panic!("TD_RS_TEST_API_ID must be an integer");
+        };
+
+        let option = RecovererDcOption {
+            raw_dc_id: 10002,
+            ip_address: "149.154.167.40".to_string(),
+            port: 443,
+            secret: Vec::new(),
+        };
+        let mut options = recovery_header_fixture();
+        options.api_id = api_id;
+        let is_test_dc = option.raw_dc_id > 1000;
+
+        let mut pmc = RecovererPmc::new("live-smoke");
+        // First run: a fresh handshake persists the recovery auth key.
+        let (config, time_difference) =
+            fetch_full_config(&option, is_test_dc, &options, 0.0, &mut pmc)
+                .await
+                .expect("the live full config fetch");
+        assert!(
+            time_difference.is_some(),
+            "a fresh handshake reports the time diff"
+        );
+        assert!(config.date > 0);
+        assert!(
+            !config.dc_options.is_empty(),
+            "a real config carries options"
+        );
+        assert!(load_recovery_auth_key(&pmc, option.raw_dc_id).is_some());
+
+        // Second run: the persisted key is reused — no new handshake, no
+        // new time difference report.
+        let (config2, time_difference2) =
+            fetch_full_config(&option, is_test_dc, &options, 0.0, &mut pmc)
+                .await
+                .expect("the reused-key full config fetch");
+        assert!(time_difference2.is_none(), "no handshake, no time diff");
+        assert_eq!(config2.date, config.date);
+        assert!(!load_recovery_salts(&pmc, option.raw_dc_id).is_empty());
     }
 }
