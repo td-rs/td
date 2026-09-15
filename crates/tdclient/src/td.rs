@@ -144,6 +144,10 @@ impl Td {
         }
 
         self.run_request(request_id, function);
+        // A manager call inside the request may have armed or cancelled a
+        // user deadline (UserManager.cpp's member MultiTimeouts re-arm on
+        // every set/cancel) — point the actor timeout at the earliest one.
+        self.rearm_user_timeouts();
     }
 
     /// `Td::run_request` (Td.cpp:299-374) — the state gate.
@@ -380,6 +384,13 @@ impl Td {
         // (UserManager.cpp:2824 `my_id_ = load_my_id()`); the contacts /
         // freeze-state pmc reads arrive with their steps.
         self.user_manager.init_my_id(self.global.binlog_pmc());
+        if !self.auth_manager.is_bot() {
+            // UserManager.cpp:2765-2771 — the my_was_online pair restore;
+            // `is_online` is OnlineManager::is_online() until its step.
+            let unix_time = self.global.unix_time();
+            self.user_manager
+                .init_my_online_status(self.global.binlog_pmc(), unix_time, false);
+        }
 
         self.parameters = Some(parameters);
 
@@ -638,6 +649,16 @@ impl Td {
         }
     }
 
+    /// Point the actor timeout at the UserManager's earliest deadline, or
+    /// cancel it when nothing is armed (the member MultiTimeouts re-arm on
+    /// every set/cancel).
+    fn rearm_user_timeouts(&mut self) {
+        match self.user_manager.next_deadline() {
+            Some(timeout_at) => self.set_timeout_at(timeout_at),
+            None => self.cancel_timeout(),
+        }
+    }
+
     /// `Td::send_result` (Td.cpp:1399-1414).
     pub(crate) fn send_result(&mut self, id: u64, object: Object) {
         if id == 0 {
@@ -818,6 +839,26 @@ impl Actor for Td {
 
     fn tear_down(&mut self) {
         self.close();
+    }
+
+    /// The member `user_online_timeout_` / `user_emoji_status_timeout_`
+    /// fire here (their C++ callbacks hop back into the UserManager actor);
+    /// the sweep then re-arms at the next deadline, like the MultiTimeouts'
+    /// set/cancel re-arm.
+    fn timeout_expired(&mut self) {
+        {
+            let Some(options) = self.option_manager.as_mut() else {
+                return self.rearm_user_timeouts();
+            };
+            let mut env = UserEnv {
+                global: &mut self.global,
+                options,
+                auth_is_bot: self.auth_manager.is_bot(),
+            };
+            self.user_manager.tick_timeouts(&mut env);
+        }
+        self.flush_user_updates();
+        self.rearm_user_timeouts();
     }
 
     // No `loop_`: the pending-query poll arrives with the net step (the
@@ -1119,6 +1160,76 @@ mod tests {
             system_version: "Test".to_string(),
             application_version: "1.0".to_string(),
         })
+    }
+
+    /// Test-only Td message: arm a user-online deadline (the sweep-wiring
+    /// fixture — production deadlines are armed by the manager calls
+    /// themselves, which the net-free Td cannot yet reach).
+    struct FireOnlineDeadline {
+        user_id: i64,
+        was_online: i32,
+        deadline: f64,
+    }
+
+    impl tdactor::ActorMessage for FireOnlineDeadline {
+        type Actor = Td;
+
+        fn dispatch(self, td: &mut Td) {
+            td.user_manager.seed_online_deadline_for_test(
+                crate::user_manager::UserId::new(self.user_id),
+                self.was_online,
+                self.deadline,
+            );
+            td.rearm_user_timeouts();
+        }
+    }
+
+    #[test]
+    fn user_online_deadline_fires_through_the_td_actor() {
+        let callback = CollectCallback::default();
+        run_actor_with(&callback, |actor, _callback, scheduler| {
+            let dir = temp_db_dir("online-deadline");
+            send(
+                actor,
+                scheduler,
+                13,
+                set_tdlib_parameters(dir.clone(), false),
+            );
+            let send_ptr = scheduler.send_scheduler();
+            {
+                let _guard = send_ptr.guard(false);
+                tdactor::send_closure(
+                    actor,
+                    FireOnlineDeadline {
+                        user_id: 5,
+                        was_online: tdutils::time::system() as i32 - 120,
+                        deadline: tdutils::time::now() + 0.05,
+                    },
+                );
+            }
+            // The production pump pattern (`while run_main(0.01) {}`): the
+            // inbound dispatch arms the deadline and yields; the next pump
+            // waits for the armed actor timeout and fires the sweep.
+            let _ = scheduler.run_main(0.01);
+            let _ = scheduler.run_main(0.3);
+        });
+        let fired = callback
+            .responses
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(id, object)| {
+                *id == 0
+                    && matches!(
+                        object,
+                        Object::updateUserStatus(update) if update.user_id == 5
+                            && matches!(update.status, td_api::UserStatus::userStatusOffline(_))
+                    )
+            });
+        assert!(
+            fired,
+            "the expired online deadline must broadcast updateUserStatus"
+        );
     }
 
     #[test]
