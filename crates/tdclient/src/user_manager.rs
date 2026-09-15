@@ -1692,6 +1692,41 @@ impl UserManager {
         UserId::new(if is_test_dc { 2200583762 } else { 5434988373 })
     }
 
+    /// `UserManager::have_user_force` (UserManager.cpp:5016-5018) — the
+    /// boolean form of `get_user_force`; the bot-info/get_me call sites
+    /// land with the later M.4 slices.
+    pub fn have_user_force(&mut self, env: &mut UserEnv, user_id: UserId, source: &str) -> bool {
+        self.get_user_force(env, user_id, source)
+    }
+
+    /// `UserManager::add_service_notifications_user`
+    /// (UserManager.cpp:3023-3029).
+    pub fn add_service_notifications_user(&mut self, env: &mut UserEnv) -> UserId {
+        let user_id = Self::get_service_notifications_user_id();
+        if !self.have_user_force(env, user_id, "add_service_notifications_user") {
+            tdutils::log_fatal!("Failed to load service notification user");
+        }
+        user_id
+    }
+
+    /// `UserManager::add_anonymous_bot_user` (UserManager.cpp:3051-3057).
+    pub fn add_anonymous_bot_user(&mut self, env: &mut UserEnv) -> UserId {
+        let user_id = Self::get_anonymous_bot_user_id(env.global.is_test_dc());
+        if !self.have_user_force(env, user_id, "add_anonymous_bot_user") {
+            tdutils::log_fatal!("Failed to load anonymous bot user");
+        }
+        user_id
+    }
+
+    /// `UserManager::add_channel_bot_user` (UserManager.cpp:3059-3065).
+    pub fn add_channel_bot_user(&mut self, env: &mut UserEnv) -> UserId {
+        let user_id = Self::get_channel_bot_user_id(env.global.is_test_dc());
+        if !self.have_user_force(env, user_id, "add_channel_bot_user") {
+            tdutils::log_fatal!("Failed to load channel bot user");
+        }
+        user_id
+    }
+
     /// The special-user table of `get_user_force` (UserManager.cpp:5022-5025).
     fn is_special_user_id(user_id: UserId, is_test_dc: bool) -> bool {
         user_id == Self::get_service_notifications_user_id()
@@ -5466,5 +5501,158 @@ mod tests {
         );
         // The online deadline is armed for the non-self user.
         assert!(um.user_online_timeouts.contains_key(&5));
+    }
+
+    #[test]
+    fn system_user_ids_match_the_cpp_constants() {
+        // UserManager.cpp:3019-3049.
+        assert_eq!(
+            UserManager::get_service_notifications_user_id().get(),
+            777000
+        );
+        assert_eq!(
+            UserManager::get_verification_codes_bot_user_id().get(),
+            489000
+        );
+        for (is_test_dc, replies, anonymous, channel, anti_spam) in [
+            (false, 1271266957, 1087968824, 136817688, 5434988373),
+            (true, 708513, 552888, 936174, 2200583762),
+        ] {
+            assert_eq!(
+                UserManager::get_replies_bot_user_id(is_test_dc).get(),
+                replies
+            );
+            assert_eq!(
+                UserManager::get_anonymous_bot_user_id(is_test_dc).get(),
+                anonymous
+            );
+            assert_eq!(
+                UserManager::get_channel_bot_user_id(is_test_dc).get(),
+                channel
+            );
+            assert_eq!(
+                UserManager::get_anti_spam_bot_user_id(is_test_dc).get(),
+                anti_spam
+            );
+        }
+    }
+
+    #[test]
+    fn add_special_users_synthesize_the_canned_users() {
+        let (mut temp, mut um) = test_env();
+        let env = &mut temp.env(false);
+
+        let service_id = um.add_service_notifications_user(env);
+        assert_eq!(service_id.get(), 777000);
+        let service = um.get_user(service_id).unwrap();
+        assert_eq!(service.first_name, "Telegram");
+        assert!(service.is_verified);
+        assert!(service.is_support);
+        assert_eq!(service.phone_number, "42777");
+        assert!(
+            service.is_received,
+            "the synthesis goes through on_get_user"
+        );
+
+        let anonymous_id = um.add_anonymous_bot_user(env);
+        assert_eq!(anonymous_id.get(), 1087968824);
+        let anonymous = um.get_user(anonymous_id).unwrap();
+        assert_eq!(anonymous.first_name, "Group");
+        assert_eq!(
+            anonymous.usernames.get_first_username(),
+            "GroupAnonymousBot"
+        );
+        assert!(anonymous.is_bot);
+
+        let channel_id = um.add_channel_bot_user(env);
+        assert_eq!(channel_id.get(), 136817688);
+        let channel = um.get_user(channel_id).unwrap();
+        assert_eq!(channel.first_name, "Channel");
+        assert!(channel.is_bot);
+
+        // the second call is served from the cache
+        assert_eq!(um.add_service_notifications_user(env).get(), 777000);
+    }
+
+    #[test]
+    fn set_my_id_publishes_the_option_and_guards_mismatches() {
+        let (mut temp, mut um) = test_env();
+        um.init_my_id(temp.global.binlog_pmc());
+        assert!(!um.my_id.is_valid(), "a fresh database has no my id");
+
+        um.set_my_id(&mut temp.env(false), UserId::new(4242));
+        assert_eq!(um.get_my_id().get(), 4242);
+        assert_eq!(temp.global.binlog_pmc().get("my_id"), "4242");
+        assert_eq!(
+            temp.options.get_option_integer("my_id", 0),
+            4242,
+            "the C++ publishes the my_id option"
+        );
+
+        // a conflicting userSelf is ignored (UserManager.cpp:3001-3004)
+        um.set_my_id(&mut temp.env(false), UserId::new(7));
+        assert_eq!(um.get_my_id().get(), 4242);
+        assert_eq!(temp.global.binlog_pmc().get("my_id"), "4242");
+
+        // an invalid id is ignored (UserManager.cpp:3005-3008)
+        um.set_my_id(&mut temp.env(false), UserId::default());
+        assert_eq!(um.get_my_id().get(), 4242);
+    }
+
+    #[test]
+    fn my_id_restores_across_a_database_reopen() {
+        let dir = std::env::temp_dir()
+            .join(format!(
+                "td-rs-m48-myid-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Phase 1: a fresh database, then a userSelf arrival stores the id.
+        {
+            let opened = tddb::td_db::TdDb::open(tddb::td_db::Parameters {
+                database_directory: dir.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+            let mut global = Global::new();
+            global.init(opened.database);
+            // authorized marker travels in the binlog pmc — later reopens
+            // must not destroy the sqlite file
+            global.binlog_pmc().set("auth", "ok");
+            let mut options = OptionManager::new(global.is_test_dc());
+            let mut um = UserManager::new();
+            um.init_my_id(global.binlog_pmc());
+            assert!(!um.my_id.is_valid());
+            let mut env = UserEnv {
+                global: &mut global,
+                options: &mut options,
+                auth_is_bot: false,
+            };
+            um.set_my_id(&mut env, UserId::new(4242));
+            drop(options);
+            global.close_all(false);
+        }
+
+        // Phase 2: reopen — the binlog pmc restores my id.
+        {
+            let opened = tddb::td_db::TdDb::open(tddb::td_db::Parameters {
+                database_directory: dir.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+            let mut global = Global::new();
+            global.init(opened.database);
+            let mut um = UserManager::new();
+            um.init_my_id(global.binlog_pmc());
+            assert_eq!(um.get_my_id().get(), 4242);
+            global.close_all(false);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
