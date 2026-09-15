@@ -26,10 +26,12 @@
 //!
 //! The recoverer itself (the `ConfigRecoverer` actor, ConfigManager.cpp:499-832)
 //! lands as an inline state machine in sub-steps: this file currently carries
-//! the recoverer state, the config application (M.3.7.1) and the `loop()`
+//! the recoverer state, the config application (M.3.7.1), the `loop()`
 //! decision machine with the state callbacks and the ref-count/close
-//! semantics (M.3.7.2); the fetch orchestration, the full-config mini-session
-//! and the Td wiring follow in M.3.7.3-M.3.7.5.
+//! semantics (M.3.7.2), and the simple-config fetch orchestration — the
+//! fetcher rotation, `on_simple_config` with the dns-time alternation
+//! (M.3.7.3); the full-config mini-session and the Td wiring follow in
+//! M.3.7.4-M.3.7.5.
 
 use std::sync::OnceLock;
 
@@ -183,15 +185,17 @@ pub fn decode_config(input: &str) -> Result<telegram_api::help_ConfigSimple, Sta
     Ok(config)
 }
 
-/// The request half of a fetcher: what [`get_simple_config_impl`] sends.
-struct SimpleConfigRequest {
-    url: String,
+/// The request half of a fetcher: what [`get_simple_config_impl`] sends
+/// (and what the recoverer's fetch action pins for the driver).
+#[derive(Clone, Debug)]
+pub struct SimpleConfigRequest {
+    pub url: String,
     /// Extra headers before the shared `Host`/`User-Agent`.
-    headers: Vec<(String, String)>,
-    content: Vec<u8>,
-    content_type: String,
+    pub headers: Vec<(String, String)>,
+    pub content: Vec<u8>,
+    pub content_type: String,
     /// The `Host` header value (the C++ `host` argument).
-    host: &'static str,
+    pub host: &'static str,
 }
 
 /// `get_simple_config_azure`'s request (ConfigManager.cpp:151-160).
@@ -463,13 +467,91 @@ fn into_std<T>(result: tdutils::status::Result<T>) -> Result<T, Status> {
     }
 }
 
+// ---- The fetch rotation (ConfigManager.cpp:755-777, M.3.7.3) -------------
+
+/// The five simple-config fetchers the recoverer rotates over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SimpleConfigService {
+    GoogleDns,
+    MozillaDns,
+    Azure,
+    FirebaseRealtime,
+    FirebaseFirestore,
+}
+
+/// The `switch (simple_config_turn_ % 9)` in the recoverer `loop()`
+/// (ConfigManager.cpp:756-773): google on {0, 3, 7}, mozilla on {1, 4, 6},
+/// azure on 5, firestore on 2, realtime on 8.
+pub fn simple_config_service(turn: u32) -> SimpleConfigService {
+    match turn % 9 {
+        5 => SimpleConfigService::Azure,
+        2 => SimpleConfigService::FirebaseFirestore,
+        8 => SimpleConfigService::FirebaseRealtime,
+        0 | 3 | 7 => SimpleConfigService::GoogleDns,
+        1 | 4 | 6 => SimpleConfigService::MozillaDns,
+        _ => SimpleConfigService::MozillaDns,
+    }
+}
+
+/// The request each fetcher would send — the recoverer's fetch action
+/// carries it so the driver can execute (or pin) the request.
+fn simple_config_request(
+    service: SimpleConfigService,
+    domain_name: &str,
+    is_test: bool,
+) -> SimpleConfigRequest {
+    match service {
+        SimpleConfigService::GoogleDns => {
+            dns_request("dns.google/resolve", "dns.google", domain_name, is_test)
+        }
+        SimpleConfigService::MozillaDns => dns_request(
+            "mozilla.cloudflare-dns.com/dns-query",
+            "mozilla.cloudflare-dns.com",
+            domain_name,
+            is_test,
+        ),
+        SimpleConfigService::Azure => azure_request(is_test),
+        SimpleConfigService::FirebaseRealtime => firebase_realtime_request(),
+        SimpleConfigService::FirebaseFirestore => firebase_firestore_request(),
+    }
+}
+
+/// The rotation dispatch: one C++ `get_simple_config_*(promise,
+/// prefer_ipv6, dc_txt_domain_name, is_test_dc, scheduler_id)` call — the
+/// promise side is the driver feeding the result back through
+/// [`ConfigRecoverer::on_simple_config`].
+pub async fn fetch_simple_config(
+    service: SimpleConfigService,
+    prefer_ipv6: bool,
+    domain_name: &str,
+    is_test: bool,
+) -> Result<SimpleConfigResult, Status> {
+    match service {
+        SimpleConfigService::GoogleDns => {
+            get_simple_config_google_dns(prefer_ipv6, domain_name, is_test).await
+        }
+        SimpleConfigService::MozillaDns => {
+            get_simple_config_mozilla_dns(prefer_ipv6, domain_name, is_test).await
+        }
+        SimpleConfigService::Azure => {
+            get_simple_config_azure(prefer_ipv6, domain_name, is_test).await
+        }
+        SimpleConfigService::FirebaseRealtime => {
+            get_simple_config_firebase_realtime(prefer_ipv6, domain_name, is_test).await
+        }
+        SimpleConfigService::FirebaseFirestore => {
+            get_simple_config_firebase_firestore(prefer_ipv6, domain_name, is_test).await
+        }
+    }
+}
+
 // ---- The ConfigRecoverer state (ConfigManager.cpp:499-832, M.3.7.1) ------
 //
 // The C++ actor as an inline state machine on the Td actor, like the
 // ConfigManager port. M.3.7.1 carries the state fields and the config
-// application; the loop()/state callbacks (M.3.7.2), the fetch
-// orchestration (M.3.7.3), the full-config mini-session (M.3.7.4) and the
-// Td wiring (M.3.7.5) land on top.
+// application; the loop()/state callbacks (M.3.7.2) and the fetch
+// orchestration (M.3.7.3) land on top of it; the full-config mini-session
+// (M.3.7.4) and the Td wiring (M.3.7.5) follow.
 
 // ---- DcOption (td/telegram/net/DcOptions.h) -------------------------------
 
@@ -589,8 +671,6 @@ pub fn load_dc_options_update(pmc: &BinlogKeyValue) -> Vec<RecovererDcOption> {
 /// [`tdutils::time`] — so the decision table is testable deterministically
 /// (the C++ mixes `Time::now()` and `Time::now_cached()` the same way; the
 /// driver fills both from the real clock, where they are almost equal).
-/// The fetch-argument reads (`is_test_dc`, `prefer_ipv6`,
-/// `dc_txt_domain_name`) land with the fetch orchestration (M.3.7.3).
 #[derive(Clone, Debug)]
 pub struct RecovererEnv {
     /// `G()->unix_time()`.
@@ -601,7 +681,8 @@ pub struct RecovererEnv {
     /// resolved by the driver.
     pub expect_blocking: bool,
     /// `Time::now()` — the base of the high-load skip's
-    /// `set_timeout_in(Random::fast(200, 300))`.
+    /// `set_timeout_in(Random::fast(200, 300))` and of the dns-time
+    /// differences.
     pub now: f64,
     /// `Time::now_cached()` — the clock every expiry check reads.
     pub now_cached: f64,
@@ -610,13 +691,33 @@ pub struct RecovererEnv {
     /// resolves it (always `false` until the handshake-actor pool of the
     /// net step).
     pub is_high_loaded: bool,
+    /// `G()->is_test_dc()`.
+    pub is_test_dc: bool,
+    /// `G()->get_option_boolean("prefer_ipv6")`.
+    pub prefer_ipv6: bool,
+    /// `G()->get_option_string("dc_txt_domain_name")`.
+    pub dc_txt_domain_name: String,
+}
+
+/// One pending simple-config fetch — the C++
+/// `get_simple_config_*(promise, prefer_ipv6, dc_txt_domain_name, is_test,
+/// scheduler_id)` actor the loop dispatched (the `prefer_ipv6` transport
+/// flag rides the env into [`fetch_simple_config`]).
+#[derive(Clone, Debug)]
+pub struct SimpleConfigFetch {
+    /// The `simple_config_turn_` the fetch was issued on.
+    pub turn: u32,
+    /// The fetcher this turn selected.
+    pub service: SimpleConfigService,
+    /// The request the C++ actor would send (the pinned url/host/headers).
+    pub request: SimpleConfigRequest,
 }
 
 /// What one recoverer step asks its driver to do — the C++ side effects the
 /// inline recoverer cannot take itself (`G()` writes, actor creation, the
-/// timer). M.3.7.2 adds the loop's wakeup and the two fetch decisions; the
-/// fetch specs (the simple-config turn rotation, the mini-session) ride
-/// these with M.3.7.3/M.3.7.4.
+/// timer). The loop's wakeup and the two fetch decisions ride these (the
+/// simple-config fetch carries the turn rotation; the unauthed mini-session
+/// spec lands with M.3.7.4).
 #[derive(Debug, Default)]
 pub struct RecovererActions {
     /// `ConnectionCreator::on_dc_options(DcOptions(full_config->dc_options_))`
@@ -627,22 +728,28 @@ pub struct RecovererActions {
     /// deadline the loop wants to wake at. `None` leaves the currently
     /// armed timer alone (the C++ only re-arms on a valid timestamp).
     pub wakeup_at: Option<f64>,
-    /// The loop decided `need_simple_config` — the driver dispatches the
-    /// simple-config fetch (the turn rotation lands with M.3.7.3).
-    pub fetch_simple_config: bool,
+    /// The loop decided `need_simple_config` — the fetch this turn of the
+    /// rotation selected; the driver dispatches it through
+    /// [`fetch_simple_config`] and feeds the result back through
+    /// [`ConfigRecoverer::on_simple_config`].
+    pub fetch_simple_config: Option<SimpleConfigFetch>,
     /// The loop decided `need_full_config` — the option the unauthed
     /// mini-session (M.3.7.4) connects to; already rotated past.
     pub fetch_full_config: Option<RecovererDcOption>,
+    /// `G()->update_dns_time_difference(diff)` after a simple config
+    /// (the http date and the config date alternate as the source,
+    /// ConfigManager.cpp:578-582).
+    pub dns_time_difference: Option<f64>,
 }
 
 /// The `ConfigRecoverer` (ConfigManager.cpp:499-832) as an inline state
 /// machine on the Td actor, like the ConfigManager port. The C++ actor's
 /// promise/actor plumbing is the driver's job here: the fetches are
 /// returned as [`RecovererActions`], the fetch results come back through
-/// [`ConfigRecoverer::on_full_config`] (and `on_simple_config`, M.3.7.3),
-/// and each query share of the C++ `ref_cnt_` is taken by the loop and
-/// released through [`ConfigRecoverer::hangup_shared`] /
-/// [`ConfigRecoverer::hangup`].
+/// [`ConfigRecoverer::on_simple_config`] /
+/// [`ConfigRecoverer::on_full_config`], and each query share of the C++
+/// `ref_cnt_` is taken by the loop and released through
+/// [`ConfigRecoverer::hangup_shared`] / [`ConfigRecoverer::hangup`].
 pub struct ConfigRecoverer {
     /// `is_connecting_`.
     is_connecting: bool,
@@ -668,6 +775,12 @@ pub struct ConfigRecoverer {
     simple_config_at: f64,
     /// `!simple_config_query_.empty()`.
     simple_config_query_active: bool,
+    /// `simple_config_turn_` — the rotation index over the five fetchers.
+    simple_config_turn: u32,
+    /// `date_option_i_` — alternates the `update_dns_time_difference`
+    /// source between the http date and the config date
+    /// (ConfigManager.cpp:578-583).
+    date_option_i: usize,
 
     /// `dc_options_update_`.
     dc_options_update: Vec<RecovererDcOption>,
@@ -712,6 +825,8 @@ impl ConfigRecoverer {
             simple_config_expires_at: 0.0,
             simple_config_at: 0.0,
             simple_config_query_active: false,
+            simple_config_turn: 0,
+            date_option_i: 0,
             dc_options_update: Vec::new(),
             dc_options: Vec::new(),
             dc_options_at: 0.0,
@@ -827,7 +942,6 @@ impl ConfigRecoverer {
     }
 
     /// `check_phone_number_rules` (ConfigManager.cpp:546-564).
-    #[allow(dead_code)] // the non-test callers land with on_simple_config (M.3.7.3)
     fn check_phone_number_rules(phone_number: &str, rules: &str) -> bool {
         if rules.is_empty() || phone_number.is_empty() {
             return true;
@@ -851,10 +965,52 @@ impl ConfigRecoverer {
         found
     }
 
-    /// `do_on_simple_config` (ConfigManager.cpp:590-624). The actions stay
-    /// empty here; `on_simple_config` (M.3.7.3) merges its dns-time
-    /// difference action with this result.
-    #[allow(dead_code)] // the first non-test caller is on_simple_config (M.3.7.3)
+    /// `on_simple_config` (ConfigManager.cpp:566-588) — the fetch result
+    /// lands: the query slot is released and the dc-option rotation reset,
+    /// an outer error becomes the merged `r_http_date`+`r_config` error,
+    /// the dns-time difference source alternates (the http date first),
+    /// the config is applied, and the loop re-runs.
+    pub fn on_simple_config(
+        &mut self,
+        r_simple_config_result: Result<SimpleConfigResult, Status>,
+        env: &RecovererEnv,
+    ) -> RecovererActions {
+        self.simple_config_query_active = false;
+        self.dc_options_i = 0;
+
+        let cfg = match r_simple_config_result {
+            Ok(cfg) => cfg,
+            Err(error) => SimpleConfigResult {
+                r_http_date: Err(error.clone()),
+                r_config: Err(error),
+            },
+        };
+
+        let mut actions = RecovererActions::default();
+        // cpp:578-582 — the http date feeds the difference on the even
+        // alternation turns and whenever the config failed (the error
+        // path keeps the http date); otherwise the config date does.
+        if cfg.r_http_date.is_ok() && (self.date_option_i == 0 || cfg.r_config.is_err()) {
+            if let Ok(http_date) = cfg.r_http_date {
+                actions.dns_time_difference = Some(f64::from(http_date) - env.now);
+            }
+        } else if let Ok(config) = &cfg.r_config {
+            actions.dns_time_difference = Some(f64::from(config.date) - env.now);
+        }
+        self.date_option_i = (self.date_option_i + 1) % 2;
+
+        self.do_on_simple_config(cfg.r_config, env);
+        self.update_dc_options();
+        let loop_actions = self.loop_(env);
+        actions.wakeup_at = loop_actions.wakeup_at;
+        actions.fetch_simple_config = loop_actions.fetch_simple_config;
+        actions.fetch_full_config = loop_actions.fetch_full_config;
+        actions
+    }
+
+    /// `do_on_simple_config` (ConfigManager.cpp:590-624) — the config
+    /// application under [`ConfigRecoverer::on_simple_config`]; its own
+    /// actions stay empty.
     fn do_on_simple_config(
         &mut self,
         r_simple_config: Result<telegram_api::help_ConfigSimple, Status>,
@@ -973,8 +1129,8 @@ impl ConfigRecoverer {
     }
 
     /// `loop()` (ConfigManager.cpp:711-797) — the decision machine. The
-    /// fetch dispatch is carried as actions: the simple-config turn
-    /// rotation lands with M.3.7.3, the unauthed mini-session with
+    /// fetch dispatch is carried as actions: the simple-config fetch with
+    /// its turn rotation (M.3.7.3), the unauthed mini-session spec with
     /// M.3.7.4; each dispatch takes one query share of the ref count.
     pub fn loop_(&mut self, env: &RecovererEnv) -> RecovererActions {
         let mut actions = RecovererActions::default();
@@ -1043,8 +1199,18 @@ impl ConfigRecoverer {
             // `ref_cnt_++` (cpp:750) — the query's share.
             self.ref_cnt += 1;
             self.simple_config_query_active = true;
-            actions.fetch_simple_config = true;
-            // The `simple_config_turn_` advance lands with M.3.7.3.
+            let turn = self.simple_config_turn;
+            tracing::trace!("Ask simple config with turn {turn}");
+            // The rotation (cpp:756-773) picks the fetcher; the arguments
+            // (cpp:774-776) are the options the driver resolved into the
+            // env, plus the promise the fetch action stands in for.
+            let service = simple_config_service(turn);
+            actions.fetch_simple_config = Some(SimpleConfigFetch {
+                turn,
+                service,
+                request: simple_config_request(service, &env.dc_txt_domain_name, env.is_test_dc),
+            });
+            self.simple_config_turn += 1;
         }
 
         if need_full_config {
@@ -1723,6 +1889,9 @@ mod tests {
             now: 10_000.0,
             now_cached: 10_000.0,
             is_high_loaded: false,
+            is_test_dc: false,
+            prefer_ipv6: false,
+            dc_txt_domain_name: String::new(),
         }
     }
 
@@ -1992,7 +2161,8 @@ mod tests {
             recoverer.simple_config_query_active = query_active;
             let actions = recoverer.loop_(&environment);
             assert_eq!(
-                actions.fetch_simple_config, want,
+                actions.fetch_simple_config.is_some(),
+                want,
                 "row {is_connecting}/{since}/{blocking}/{expires}/{query_active}"
             );
             assert_eq!(
@@ -2047,7 +2217,7 @@ mod tests {
             // too, taking its own share.
             let connecting_limit = if blocking { 5.0 } else { 20.0 };
             let problem = is_connecting && since <= -connecting_limit;
-            assert_eq!(actions.fetch_simple_config, problem);
+            assert_eq!(actions.fetch_simple_config.is_some(), problem);
             assert_eq!(recoverer.ref_cnt, 1 + u32::from(problem) + u32::from(want));
         }
     }
@@ -2136,7 +2306,7 @@ mod tests {
         recoverer.connecting_since = 9_000.0;
         recoverer.simple_config_expires_at = 9_000.0;
         let actions = recoverer.loop_(&environment);
-        assert!(!actions.fetch_simple_config);
+        assert!(actions.fetch_simple_config.is_none());
         assert!(actions.fetch_full_config.is_none());
         let wakeup = actions.wakeup_at.expect("the skip re-arms itself");
         assert!((10_200.0..=10_300.0).contains(&wakeup), "wakeup {wakeup}");
@@ -2156,7 +2326,7 @@ mod tests {
 
         let actions = recoverer.loop_(&environment);
         assert_eq!(actions.wakeup_at, None);
-        assert!(!actions.fetch_simple_config);
+        assert!(actions.fetch_simple_config.is_none());
         assert!(actions.fetch_full_config.is_none());
 
         // The state callbacks still run their bodies; the loop tail is the
@@ -2179,7 +2349,7 @@ mod tests {
         recoverer.dc_options_at = 9_000.0;
         recoverer.full_config_expires_at = 9_000.0;
         let actions = recoverer.loop_(&environment);
-        assert!(actions.fetch_simple_config && actions.fetch_full_config.is_some());
+        assert!(actions.fetch_simple_config.is_some() && actions.fetch_full_config.is_some());
         assert_eq!(recoverer.ref_cnt, 3, "parent + one share per query");
 
         assert!(recoverer.hangup());
@@ -2253,7 +2423,7 @@ mod tests {
         // (cpp:522-524 returns before loop()).
         let actions = recoverer.on_online(true, &environment);
         assert_eq!(actions.wakeup_at, None);
-        assert!(!actions.fetch_simple_config);
+        assert!(actions.fetch_simple_config.is_none());
     }
 
     #[test]
@@ -2362,9 +2532,288 @@ mod tests {
         recoverer.connecting_since = 9_000.0;
 
         let actions = recoverer.loop_(&environment);
-        assert!(actions.fetch_simple_config, "the clear goes with a refetch");
+        assert!(
+            actions.fetch_simple_config.is_some(),
+            "the clear goes with a refetch"
+        );
         assert_eq!(recoverer.dc_options().len(), 1);
         assert_eq!(recoverer.dc_options()[0].ip_address, "1.1.1.1");
         assert_eq!(recoverer.dc_options_i, 0, "the rebuild resets the rotation");
+    }
+
+    // ---- the fetch orchestration (M.3.7.3) ---------------------------------
+
+    #[test]
+    fn simple_config_service_rotation_matches_the_cpp() {
+        // The `switch (simple_config_turn_ % 9)` (ConfigManager.cpp:756-773):
+        // google on {0, 3, 7}, mozilla on {1, 4, 6}, azure on 5,
+        // firestore on 2, realtime on 8 — checked across two full rounds.
+        let expected = [
+            SimpleConfigService::GoogleDns,         // 0
+            SimpleConfigService::MozillaDns,        // 1
+            SimpleConfigService::FirebaseFirestore, // 2
+            SimpleConfigService::GoogleDns,         // 3
+            SimpleConfigService::MozillaDns,        // 4
+            SimpleConfigService::Azure,             // 5
+            SimpleConfigService::MozillaDns,        // 6
+            SimpleConfigService::GoogleDns,         // 7
+            SimpleConfigService::FirebaseRealtime,  // 8
+        ];
+        for turn in 0..18u32 {
+            assert_eq!(
+                simple_config_service(turn),
+                expected[(turn % 9) as usize],
+                "turn {turn}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_loop_rotates_the_fetchers_with_pinned_requests() {
+        // One full rotation issued turn by turn: the loop hands out the
+        // fetch with its pinned request, the slot guards a duplicate, and
+        // the delivered failure releases the slot for the next turn. The
+        // injected clock anchors at the live monotonic clock, so the
+        // 5..7 s failure expiry the delivery arms stays valid and the
+        // loop tail refetches nothing (each turn is force-expired below,
+        // like a fired wakeup).
+        let clock = tdutils::time::now();
+        let mut environment = env(true);
+        environment.now = clock;
+        environment.now_cached = clock;
+        let mut recoverer = ConfigRecoverer::new();
+        recoverer.is_connecting = true;
+        recoverer.connecting_since = clock - 6.0; // past the 5 s blocked limit
+
+        let expected: [(SimpleConfigService, &str, &str); 9] = [
+            (
+                SimpleConfigService::GoogleDns,
+                "https://dns.google/resolve?name=apv3.stel.com&type=TXT",
+                "dns.google",
+            ),
+            (
+                SimpleConfigService::MozillaDns,
+                "https://mozilla.cloudflare-dns.com/dns-query?name=apv3.stel.com&type=TXT",
+                "mozilla.cloudflare-dns.com",
+            ),
+            (
+                SimpleConfigService::FirebaseFirestore,
+                "https://www.google.com/v1/projects/reserve-5a846/databases/(default)/documents/ipconfig/v3",
+                "firestore.googleapis.com",
+            ),
+            (
+                SimpleConfigService::GoogleDns,
+                "https://dns.google/resolve?name=apv3.stel.com&type=TXT",
+                "dns.google",
+            ),
+            (
+                SimpleConfigService::MozillaDns,
+                "https://mozilla.cloudflare-dns.com/dns-query?name=apv3.stel.com&type=TXT",
+                "mozilla.cloudflare-dns.com",
+            ),
+            (
+                SimpleConfigService::Azure,
+                "https://software-download.microsoft.com/prodv2/config.txt",
+                "tcdnb.azureedge.net",
+            ),
+            (
+                SimpleConfigService::MozillaDns,
+                "https://mozilla.cloudflare-dns.com/dns-query?name=apv3.stel.com&type=TXT",
+                "mozilla.cloudflare-dns.com",
+            ),
+            (
+                SimpleConfigService::GoogleDns,
+                "https://dns.google/resolve?name=apv3.stel.com&type=TXT",
+                "dns.google",
+            ),
+            (
+                SimpleConfigService::FirebaseRealtime,
+                "https://reserve-5a846.firebaseio.com/ipconfigv3.json",
+                "reserve-5a846.firebaseio.com",
+            ),
+        ];
+        for (turn, (service, url, host)) in expected.iter().enumerate() {
+            recoverer.simple_config_expires_at = clock - 1.0; // the fired wakeup
+            let actions = recoverer.loop_(&environment);
+            let fetch = actions.fetch_simple_config.expect("each turn dispatches");
+            assert_eq!(fetch.turn as usize, turn);
+            assert_eq!(fetch.service, *service, "turn {turn}");
+            assert_eq!(fetch.request.url, *url, "turn {turn}");
+            assert_eq!(fetch.request.host, *host, "turn {turn}");
+
+            // The in-flight fetch is not duplicated.
+            assert!(recoverer.loop_(&environment).fetch_simple_config.is_none());
+
+            // The delivered failure releases the slot; its failure expiry
+            // (real clock + 5..7 s) stays valid against the anchored
+            // clock, so nothing refetches until the next force-expire.
+            let actions = recoverer
+                .on_simple_config(Err(Status::error_message("HTTP error: 500")), &environment);
+            assert!(actions.fetch_simple_config.is_none());
+        }
+        assert_eq!(recoverer.simple_config_turn, 9);
+    }
+
+    #[test]
+    fn the_fetch_arguments_follow_the_env() {
+        // cpp:774-776 — the `dc_txt_domain_name` option, `is_test_dc()`
+        // and `prefer_ipv6` ride every dispatch: a custom TXT domain wins
+        // over the dns defaults, the test dc flips the azure flavor and
+        // the default dns domain.
+        let mut environment = env(true);
+        environment.is_test_dc = true;
+        environment.dc_txt_domain_name = "custom.example.com".to_string();
+        let mut recoverer = ConfigRecoverer::new();
+        recoverer.is_connecting = true;
+        recoverer.connecting_since = environment.now_cached - 6.0;
+        recoverer.simple_config_expires_at = 0.0;
+
+        // Turn 0 (google): the custom domain, url-encoded into the query.
+        let actions = recoverer.loop_(&environment);
+        let fetch = actions.fetch_simple_config.expect("turn 0");
+        assert_eq!(
+            fetch.request.url,
+            "https://dns.google/resolve?name=custom.example.com&type=TXT"
+        );
+
+        // Turn 1 (mozilla): the custom domain still wins — the test
+        // default only applies when the option is empty.
+        recoverer.simple_config_query_active = false;
+        recoverer.simple_config_expires_at = 0.0;
+        recoverer.simple_config_turn = 1;
+        let actions = recoverer.loop_(&environment);
+        let fetch = actions.fetch_simple_config.expect("turn 1");
+        assert_eq!(
+            fetch.request.url,
+            "https://mozilla.cloudflare-dns.com/dns-query?name=custom.example.com&type=TXT"
+        );
+
+        // Without the option, the test default domain is `tapv3.stel.com`.
+        let mut environment = env(true);
+        environment.is_test_dc = true;
+        let mut recoverer = ConfigRecoverer::new();
+        recoverer.is_connecting = true;
+        recoverer.connecting_since = environment.now_cached - 6.0;
+        recoverer.simple_config_expires_at = 0.0;
+        recoverer.simple_config_turn = 1;
+        let actions = recoverer.loop_(&environment);
+        let fetch = actions.fetch_simple_config.expect("turn 1, default domain");
+        assert_eq!(
+            fetch.request.url,
+            "https://mozilla.cloudflare-dns.com/dns-query?name=tapv3.stel.com&type=TXT"
+        );
+
+        // Turn 5 (azure): the test flavor of the static config.
+        recoverer.simple_config_query_active = false;
+        recoverer.simple_config_expires_at = 0.0;
+        recoverer.simple_config_turn = 5;
+        let actions = recoverer.loop_(&environment);
+        let fetch = actions.fetch_simple_config.expect("turn 5");
+        assert_eq!(
+            fetch.request.url,
+            "https://software-download.microsoft.com/testv2/config.txt"
+        );
+    }
+
+    #[test]
+    fn dns_time_difference_alternates_and_survives_errors() {
+        // cpp:578-583 — the http date feeds `update_dns_time_difference`
+        // while `date_option_i_` is 0 and whenever the config failed; the
+        // config date takes the odd successful turns; an outer error
+        // (both halves failed) updates nothing; the index advances
+        // either way. The fixed env clock makes every difference exact.
+        let environment = env(true); // now == now_cached == 10_000
+        let mut recoverer = ConfigRecoverer::new();
+        let config = |date: i32| SimpleConfigResult {
+            r_http_date: Ok(50_000),
+            r_config: Ok(telegram_api::help_ConfigSimple {
+                date,
+                expires: 200_000,
+                rules: Vec::new(),
+            }),
+        };
+
+        // Turn 0 (i = 0): the http date wins over the config date.
+        let actions = recoverer.on_simple_config(Ok(config(99_000)), &environment);
+        assert_eq!(actions.dns_time_difference, Some(40_000.0));
+        // Turn 1: the config date.
+        let actions = recoverer.on_simple_config(Ok(config(99_000)), &environment);
+        assert_eq!(actions.dns_time_difference, Some(89_000.0));
+        // Turn 2: back to the http date.
+        let actions = recoverer.on_simple_config(Ok(config(99_000)), &environment);
+        assert_eq!(actions.dns_time_difference, Some(40_000.0));
+
+        // A failed config keeps the http date at ANY alternation index
+        // (the index is 1 here).
+        let actions = recoverer.on_simple_config(
+            Ok(SimpleConfigResult {
+                r_http_date: Ok(50_000),
+                r_config: Err(Status::error_message("Decode failed")),
+            }),
+            &environment,
+        );
+        assert_eq!(actions.dns_time_difference, Some(40_000.0));
+
+        // A broken http date falls through to the config date — even at
+        // index 0 (the first conjunct already fails).
+        let mut fresh = ConfigRecoverer::new();
+        let actions = fresh.on_simple_config(
+            Ok(SimpleConfigResult {
+                r_http_date: Err(Status::error_message("Timezone must be GMT")),
+                r_config: Ok(telegram_api::help_ConfigSimple {
+                    date: 77_000,
+                    expires: 200_000,
+                    rules: Vec::new(),
+                }),
+            }),
+            &environment,
+        );
+        assert_eq!(actions.dns_time_difference, Some(67_000.0));
+
+        // An outer error updates nothing, but still advances the index.
+        let actions =
+            recoverer.on_simple_config(Err(Status::error_message("HTTP error: 500")), &environment);
+        assert_eq!(actions.dns_time_difference, None);
+        assert_eq!(
+            recoverer.date_option_i, 1,
+            "five deliveries leave the index at 1"
+        );
+    }
+
+    #[test]
+    fn on_simple_config_resets_the_slots_and_rebuilds() {
+        // cpp:566-588 — the delivery releases the query slot, resets the
+        // dc-option rotation, rebuilds the merged options (the update part
+        // first), and arms the wakeup instead of an immediate refetch.
+        // The injected clock anchors at the live monotonic clock + 60 s:
+        // past the 5 s dc gate, below every success expiry (the offline
+        // one included), so the fresh config reads valid.
+        let clock = tdutils::time::now();
+        let mut environment = env(true);
+        environment.now = clock + 60.0;
+        environment.now_cached = clock + 60.0;
+        let mut recoverer = ConfigRecoverer::new();
+        recoverer.dc_options_update = vec![dc_option(1, "1.1.1.1")];
+        recoverer.update_dc_options();
+        recoverer.dc_options_i = 3; // a rotated-out index
+        recoverer.simple_config_query_active = true;
+
+        let result = SimpleConfigResult {
+            r_http_date: Ok(50_000),
+            r_config: Ok(simple_config_with_rules("", 2, ip_port(0x0909_0909, 443))),
+        };
+        let actions = recoverer.on_simple_config(Ok(result), &environment);
+        assert!(!recoverer.simple_config_query_active);
+        assert_eq!(recoverer.dc_options_i, 0, "cpp:568 resets the rotation");
+        assert_eq!(recoverer.dc_options().len(), 2);
+        assert_eq!(recoverer.dc_options()[0].ip_address, "1.1.1.1");
+        assert_eq!(recoverer.dc_options()[1].ip_address, "9.9.9.9");
+
+        // The fresh success expiry holds: no refetch, the wakeup arms at
+        // the earliest deadline instead.
+        assert!(actions.fetch_simple_config.is_none());
+        assert!(actions.fetch_full_config.is_none());
+        assert!(actions.wakeup_at.is_some());
+        assert_eq!(actions.dns_time_difference, Some(50_000.0 - (clock + 60.0)));
     }
 }
