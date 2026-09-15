@@ -14,30 +14,73 @@ use tdutils::try_result;
 /// `BinlogKeyValue::MAGIC`
 pub const MAGIC: i32 = 0x2a28_0000;
 
-/// TL string format used by `td::store(string)`/`td::parse(string)`:
-/// `[length: i32][bytes][zero padding to 4-byte boundary]`.
+/// TL string format used by `td::store(string)`/`td::parse(string)`
+/// (`TlStorerUnsafe::store_string`, verified against the C++ with a
+/// compiler probe): `[1-byte len][bytes]` below 254, `0xfe`/`0xff` length
+/// forms above, zero padding to a 4-byte boundary.
 pub(crate) fn store_tl_string(out: &mut Vec<u8>, s: &[u8]) {
-    out.extend_from_slice(&(s.len() as i32).to_le_bytes());
+    let len = s.len();
+    let header = if len < 254 {
+        out.push(len as u8);
+        1
+    } else if len < (1 << 24) {
+        out.push(0xfe);
+        out.extend_from_slice(&(len as u32).to_le_bytes()[..3]);
+        4
+    } else if len < (1usize << 32) {
+        out.push(0xff);
+        out.extend_from_slice(&(len as u64).to_le_bytes()[..4]);
+        out.extend_from_slice(&[0, 0, 0]);
+        8
+    } else {
+        panic!("String size {len} is too big to be stored");
+    };
     out.extend_from_slice(s);
-    let pad = (4 - s.len() % 4) % 4;
+    let pad = (4 - (header + len) % 4) % 4;
     out.extend(std::iter::repeat_n(0u8, pad));
 }
 
+/// `TlParser::fetch_string` (the clean raw reader — the pmc's binary keys
+/// and values must survive replay byte-identically).
 pub(crate) fn parse_tl_string(parser: &mut &[u8]) -> Result<Vec<u8>> {
     if parser.len() < 4 {
         return Result::from_status(Status::error_message("Failed to parse string length"));
     }
-    let len = i32::from_le_bytes(parser[0..4].try_into().unwrap());
-    if len < 0 {
-        return Result::from_status(Status::error_message("Negative string length"));
-    }
-    let len = len as usize;
-    let padded = (len + 3) & !3;
-    if parser.len() < 4 + padded {
+    let first = parser[0];
+    let (result_len, header, aligned_len) = if first < 254 {
+        let len = first as usize;
+        (len, 4usize, (len >> 2) << 2)
+    } else if first == 254 {
+        if parser.len() < 4 {
+            return Result::from_status(Status::error_message("Failed to parse string length"));
+        }
+        let len = (parser[1] as usize) | ((parser[2] as usize) << 8) | ((parser[3] as usize) << 16);
+        (len, 4, ((len + 3) >> 2) << 2)
+    } else {
+        if parser.len() < 8 {
+            return Result::from_status(Status::error_message("Failed to parse string length"));
+        }
+        let mut len = 0u64;
+        for i in (1..8).rev() {
+            len = (len << 8) | parser[i] as u64;
+        }
+        if len > (usize::MAX - 3) as u64 {
+            return Result::from_status(Status::error_message("Too big string found"));
+        }
+        (len as usize, 8, ((len as usize + 3) >> 2) << 2)
+    };
+    if parser.len() < header + aligned_len {
         return Result::from_status(Status::error_message("String is too short"));
     }
-    let bytes = parser[4..4 + len].to_vec();
-    *parser = &parser[4 + padded..];
+    let begin = if first == 255 {
+        8
+    } else if first == 254 {
+        4
+    } else {
+        1
+    };
+    let bytes = parser[begin..begin + result_len].to_vec();
+    *parser = &parser[header + aligned_len..];
     Result::Ok(bytes)
 }
 
@@ -290,12 +333,14 @@ mod tests {
     fn tl_string_layout_matches_cxx() {
         let mut out = Vec::new();
         store_tl_string(&mut out, b"ab");
-        // [len:4][bytes:2][padding:2]
-        assert_eq!(out, vec![2, 0, 0, 0, b'a', b'b', 0, 0]);
+        // [len:1][bytes:2][padding:1] — the TL framing of
+        // `TlStorerUnsafe::store_string` (verified against the compiled
+        // C++ with a compiler probe).
+        assert_eq!(out, vec![2, b'a', b'b', 0]);
 
         let mut out = Vec::new();
         store_tl_string(&mut out, b"abcd");
-        assert_eq!(out, vec![4, 0, 0, 0, b'a', b'b', b'c', b'd']);
+        assert_eq!(out, vec![4, b'a', b'b', b'c', b'd', 0, 0, 0]);
 
         let mut parser = &out[..];
         let s = parse_tl_string(&mut parser).unwrap();
