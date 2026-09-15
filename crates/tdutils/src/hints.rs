@@ -233,7 +233,11 @@ fn delete_word(word: &[u8], key: i64, word_to_keys: &mut BTreeMap<Vec<u8>, Vec<i
 
 /// C++ `Hints::add_search_results` (private static): every key list whose
 /// word begins with `word` (the `lower_bound` + `begins_with` scan).
-fn add_search_results(results: &mut Vec<i64>, word: &[u8], word_to_keys: &BTreeMap<Vec<u8>, Vec<i64>>) {
+fn add_search_results(
+    results: &mut Vec<i64>,
+    word: &[u8],
+    word_to_keys: &BTreeMap<Vec<u8>, Vec<i64>>,
+) {
     for (w, keys) in word_to_keys.range(word.to_vec()..) {
         if !w.starts_with(word) {
             break;

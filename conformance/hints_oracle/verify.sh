@@ -28,18 +28,30 @@ TDUTILS="$TD_ROOT/tdutils/td/utils"
 g++ -std=c++17 -O2 -I "$WORK" -I "$TD_ROOT/tdutils" \
   "$SCRIPT_DIR/oracle.cpp" \
   "$TDUTILS/Hints.cpp" "$TDUTILS/translit.cpp" "$TDUTILS/unicode.cpp" \
-  "$TDUTILS/utf8.cpp" "$TDUTILS/logging.cpp" "$TDUTILS/StringBuilder.cpp" \
-  "$TDUTILS/Status.cpp" "$TDUTILS/misc.cpp" "$TDUTILS/Slice.cpp" \
+  "$TDUTILS/utf8.cpp" \
+  "$TDUTILS/logging.cpp" "$TDUTILS/Time.cpp" "$TDUTILS/Status.cpp" \
+  "$TDUTILS/TsCerr.cpp" "$TDUTILS/TsLog.cpp" "$TDUTILS/ExitGuard.cpp" \
+  "$TDUTILS/FlatHashTable.cpp" "$TDUTILS/filesystem.cpp" "$TDUTILS/PathView.cpp" \
+  "$TDUTILS/Random.cpp" "$TDUTILS/StackAllocator.cpp" "$TDUTILS/tl_parsers.cpp" \
+  "$TDUTILS/check.cpp" "$TDUTILS/StringBuilder.cpp" "$TDUTILS/Slice.cpp" \
+  "$TDUTILS/buffer.cpp" "$TDUTILS/misc.cpp" \
+  "$TDUTILS/port/"*.cpp "$TDUTILS/port/detail/NativeFd.cpp" \
+  "$TDUTILS/port/detail/ThreadIdGuard.cpp" \
   -o "$WORK/oracle"
 
 echo "== building the Rust driver =="
 env -u RUSTC_WRAPPER cargo build -q --manifest-path "$SCRIPT_DIR/../Cargo.toml" \
   --bin hints_driver
-DRIVER="$SCRIPT_DIR/../../target/debug/hints_driver"
+DRIVER="${CARGO_TARGET_DIR:-$SCRIPT_DIR/..}/target/debug/hints_driver"
 
 echo "== running both over the scenario =="
 "$WORK/oracle" < "$SCENARIO" > "$WORK/cpp.out"
 "$DRIVER" < "$SCENARIO" > "$WORK/rust.out"
 
-cmp "$WORK/cpp.out" "$WORK/rust.out"
+if ! cmp "$WORK/cpp.out" "$WORK/rust.out"; then
+  echo "MISMATCH:" >&2
+  diff "$WORK/cpp.out" "$WORK/rust.out" | head -40 >&2
+  exit 1
+fi
 echo "OK Hints oracle: $(wc -l < "$WORK/cpp.out") answers byte-identical"
+echo "S-M.4.4 Hints verification OK"

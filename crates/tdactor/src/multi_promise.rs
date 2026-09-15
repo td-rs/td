@@ -34,7 +34,7 @@ use crate::actor::Actor;
 use crate::actor_id::{ActorId, ActorOwn};
 use crate::create_actor;
 use crate::event::{Event, Raw};
-use crate::promise::{create_promise_from_promise_actor, EventFull, FutureActor, PromiseFuture};
+use crate::promise::{EventFull, FutureActor, PromiseFuture, create_promise_from_promise_actor};
 use crate::scheduler::Scheduler;
 
 /// The port of C++ `MultiPromiseInterface`: the fan-in surface shared by the
@@ -51,11 +51,17 @@ pub trait MultiPromiseInterface: Send {
     fn set_ignore_errors(&mut self, ignore_errors: bool);
 }
 
+/// The registered sub-query futures. `FutureActor`s are scheduler-registered
+/// by stable address (see `promise.rs` — "Rust cannot move a registered actor
+/// without breaking the registration pointer"), so they must stay boxed
+/// inside the vector.
+type Futures = Vec<Box<FutureActor<()>>>;
+
 /// The state shared between the actor and its safe handle — the C++ object's
 /// fields.
 struct State {
     promises: Vec<Promise<()>>,
-    futures: Vec<Box<FutureActor<()>>>,
+    futures: Futures,
     received_results: usize,
     ignore_errors: bool,
     result: Option<Result<()>>,
@@ -90,10 +96,7 @@ impl State {
         let promise = promise_future.move_promise();
         let mut future = promise_future.move_future();
 
-        future.set_event(EventFull::new(
-            actor_id.clone().erase(),
-            Event::raw(Raw(0)),
-        ));
+        future.set_event(EventFull::new(actor_id.clone().erase(), Event::raw(Raw(0))));
         self.futures.push(future);
         create_promise_from_promise_actor(promise)
     }
@@ -101,7 +104,7 @@ impl State {
     /// C++ `MultiPromiseActor::raw_event` body, split so no lock is held
     /// while futures are drained: returns the finished sub-queries'
     /// `FutureActor`s once all of them fired.
-    fn on_raw_event(&mut self) -> (bool, bool, Vec<Box<FutureActor<()>>>) {
+    fn on_raw_event(&mut self) -> (bool, bool, Futures) {
         self.received_results += 1;
         if self.received_results != self.futures.len() {
             return (false, self.ignore_errors, Vec::new());
@@ -138,7 +141,7 @@ fn deliver(promises: Vec<Promise<()>>, result: Result<()>) {
 /// Drained futures stop themselves (inside `move_as_result`); leftovers are
 /// `close()`d so their registration does not dangle (C++ `~FutureActor` did
 /// `do_stop`).
-fn drain_futures(ignore_errors: bool, futures: &mut Vec<Box<FutureActor<()>>>) -> Result<()> {
+fn drain_futures(ignore_errors: bool, futures: &mut [Box<FutureActor<()>>]) -> Result<()> {
     let mut outcome = Result::Ok(());
     let mut drained = 0usize;
     if !ignore_errors {
@@ -207,7 +210,10 @@ impl MultiPromiseActor {
             };
         }
         let actor_id = self.own.get();
-        self.state.lock().expect("state mutex").get_promise(actor_id)
+        self.state
+            .lock()
+            .expect("state mutex")
+            .get_promise(actor_id)
     }
 
     pub fn set_ignore_errors(&mut self, ignore_errors: bool) {
@@ -315,7 +321,10 @@ impl MultiPromiseActorSafe {
             .actor_id
             .clone()
             .expect("actor id was just created above");
-        self.state.lock().expect("state mutex").get_promise(actor_id)
+        self.state
+            .lock()
+            .expect("state mutex")
+            .get_promise(actor_id)
     }
 
     pub fn set_ignore_errors(&mut self, ignore_errors: bool) {

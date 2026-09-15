@@ -19,32 +19,32 @@ enum Direction {
 /// C++ `get_en_to_ru_simple_rules` (lowercase ASCII keys, noted per arm).
 fn en_to_ru_simple(code: u32) -> Option<&'static str> {
     Some(match code {
-        0x61 => "а",    // a
-        0x62 => "б",    // b
-        0x63 => "к",    // c
-        0x64 => "д",    // d
-        0x65 => "е",    // e
-        0x66 => "ф",    // f
-        0x67 => "г",    // g
-        0x68 => "х",    // h
-        0x69 => "и",    // i
-        0x6a => "й",    // j
-        0x6b => "к",    // k
-        0x6c => "л",    // l
-        0x6d => "м",    // m
-        0x6e => "н",    // n
-        0x6f => "о",    // o
-        0x70 => "п",    // p
-        0x71 => "к",    // q
-        0x72 => "р",    // r
-        0x73 => "с",    // s
-        0x74 => "т",    // t
-        0x75 => "у",    // u
-        0x76 => "в",    // v
-        0x77 => "в",    // w
-        0x78 => "кс",   // x
-        0x79 => "и",    // y
-        0x7a => "з",    // z
+        0x61 => "а",  // a
+        0x62 => "б",  // b
+        0x63 => "к",  // c
+        0x64 => "д",  // d
+        0x65 => "е",  // e
+        0x66 => "ф",  // f
+        0x67 => "г",  // g
+        0x68 => "х",  // h
+        0x69 => "и",  // i
+        0x6a => "й",  // j
+        0x6b => "к",  // k
+        0x6c => "л",  // l
+        0x6d => "м",  // m
+        0x6e => "н",  // n
+        0x6f => "о",  // o
+        0x70 => "п",  // p
+        0x71 => "к",  // q
+        0x72 => "р",  // r
+        0x73 => "с",  // s
+        0x74 => "т",  // t
+        0x75 => "у",  // u
+        0x76 => "в",  // v
+        0x77 => "в",  // w
+        0x78 => "кс", // x
+        0x79 => "и",  // y
+        0x7a => "з",  // z
         _ => return None,
     })
 }
@@ -111,8 +111,19 @@ fn ru_to_en_simple(code: u32) -> Option<&'static str> {
 }
 
 /// C++ `get_ru_to_en_complex_rules`.
-const RU_TO_EN_COMPLEX: &[(&str, &str)] =
-    &[("ий", "y"), ("ия", "ia"), ("кс", "x"), ("yo", "e"), ("jo", "e")];
+const RU_TO_EN_COMPLEX: &[(&str, &str)] = &[
+    ("ий", "y"),
+    ("ия", "ia"),
+    ("кс", "x"),
+    ("yo", "e"),
+    ("jo", "e"),
+];
+
+/// One direction's rule set: the per-codepoint simple table plus the whole-word complex rules.
+type TranslitRules = (
+    fn(u32) -> Option<&'static str>,
+    &'static [(&'static str, &'static str)],
+);
 
 /// C++ `add_word_transliterations`: push the whole-word simple-rule
 /// transliteration, then the greedy complex-rule walk (with partial-suffix
@@ -123,12 +134,11 @@ fn add_word_transliterations(
     allow_partial: bool,
     direction: Direction,
 ) {
-    let (simple, complex_rules): (fn(u32) -> Option<&'static str>, &[(&str, &str)]) =
-        if direction == Direction::EnToRu {
-            (en_to_ru_simple, EN_TO_RU_COMPLEX)
-        } else {
-            (ru_to_en_simple, RU_TO_EN_COMPLEX)
-        };
+    let (simple, complex_rules): TranslitRules = if direction == Direction::EnToRu {
+        (en_to_ru_simple, EN_TO_RU_COMPLEX)
+    } else {
+        (ru_to_en_simple, RU_TO_EN_COMPLEX)
+    };
     let bytes = word.as_bytes();
 
     let mut s: Vec<u8> = Vec::new();

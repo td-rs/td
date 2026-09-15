@@ -94,7 +94,12 @@ impl Actor for MultiPromiseSendClosureLaterTest {
             }
         }));
         let mut lock = self.mpa.get_promise();
-        send_closure_later(&delayed, DelayedCallMessage::OnCalled { step: self.step.clone() });
+        send_closure_later(
+            &delayed,
+            DelayedCallMessage::OnCalled {
+                step: self.step.clone(),
+            },
+        );
         lock.set_value(());
     }
 

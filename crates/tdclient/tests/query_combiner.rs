@@ -86,7 +86,7 @@ impl Driver {
             0 => {
                 // Two waiters on the same query id → exactly one send.
                 send_closure(
-                    &self.combiner_id(),
+                    self.combiner_id(),
                     QueryCombinerMessage::AddQuery {
                         query_id: 1,
                         send_query: send_query_to(self.slot.clone()),
@@ -94,7 +94,7 @@ impl Driver {
                     },
                 );
                 send_closure(
-                    &self.combiner_id(),
+                    self.combiner_id(),
                     QueryCombinerMessage::AddQuery {
                         query_id: 1,
                         // a promised add never uses the send_query promise
@@ -124,7 +124,7 @@ impl Driver {
                 );
                 // Error path: the combined query fails, the waiter gets it.
                 send_closure(
-                    &self.combiner_id(),
+                    self.combiner_id(),
                     QueryCombinerMessage::AddQuery {
                         query_id: 2,
                         send_query: send_query_to(self.slot.clone()),
@@ -155,7 +155,7 @@ impl Driver {
                 // opened (the C++ `next_query_time_` starts at construction;
                 // it only spaces sends AFTER each one).
                 send_closure(
-                    &self.delayed_combiner_id(),
+                    self.delayed_combiner_id(),
                     QueryCombinerMessage::AddQuery {
                         query_id: 8,
                         send_query: send_query_to(self.delayed_slot.clone()),
@@ -176,7 +176,7 @@ impl Driver {
                     .expect("promised query must send immediately");
                 fulfill.set_value(());
                 send_closure(
-                    &self.delayed_combiner_id(),
+                    self.delayed_combiner_id(),
                     QueryCombinerMessage::AddQuery {
                         query_id: 7,
                         send_query: send_query_to(self.delayed_slot.clone()),
@@ -259,7 +259,7 @@ impl Actor for ClosedDriver {
             QueryCombiner::new(0.01, Box::new(|| true)),
         ));
         send_closure(
-            &self.combiner.as_ref().expect("created above").get(),
+            self.combiner.as_ref().expect("created above").get(),
             QueryCombinerMessage::AddQuery {
                 query_id: 1,
                 send_query: send_query_to(self.slot.clone()),
