@@ -203,12 +203,32 @@ pub async fn wget(url: &str, params: WgetParams) -> Result<HttpQuery> {
 
         // Wget::on_ok: 2xx resolves, everything else is an error.
         if (200..300).contains(&code) {
-            Ok(HttpQuery {
+            let mut query = HttpQuery {
                 code: i32::from(code),
                 reason,
                 headers,
                 body,
-            })
+                args: Vec::new(),
+            };
+            // HttpReader::get_next ReadArgs: a JSON response body becomes
+            // query args (`parse_json_parameters`), like the C++ Wget's
+            // response parse. The size overflow (413) fails the exchange;
+            // parse errors are logged and the body is dropped, exactly like
+            // the C++ reader.
+            let content_type = query
+                .get_header("content-type")
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if content_type.contains("application/json") {
+                if let tdutils::status::Result::Err(status) = query.parse_json_parameters() {
+                    if status.code() == 413 {
+                        return Err(status);
+                    }
+                    tdutils::log_info!("{}", status.message());
+                }
+                query.body.clear();
+            }
+            Ok(query)
         } else {
             Err(Status::error_message(&format!("HTTP error: {code}")))
         }
