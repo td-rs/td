@@ -23,10 +23,18 @@
 //!   generation included.
 //! - The `domain_name` argument of the azure fetcher is unused there, as in
 //!   the C++.
+//!
+//! The recoverer itself (the `ConfigRecoverer` actor, ConfigManager.cpp:499-832)
+//! lands as an inline state machine in sub-steps: this file currently carries
+//! the recoverer state and the config application (M.3.7.1); the loop/state
+//! callbacks, the fetch orchestration, the full-config mini-session and the Td
+//! wiring follow in M.3.7.2-M.3.7.5.
 
 use std::sync::OnceLock;
 
 use base64::Engine as _;
+use tddb::binlog_key_value::BinlogKeyValue;
+use tdmtproto::proxy_secret::ProxySecret;
 use tdmtproto::telegram_api;
 use tdnet::http_query::HttpQuery;
 use tdnet::wget::{VerifyPeer, WgetParams, wget};
@@ -35,6 +43,8 @@ use tdutils::http_url::url_encode;
 use tdutils::json::{JsonValue, JsonValueType, json_decode};
 use tdutils::rsa::Rsa;
 use tdutils::status::Status;
+
+use crate::config_manager::{StoredDcOption, StoredDcOptions};
 
 /// `SimpleConfigResult` (ConfigManager.h:32) — `r_http_date` is the parsed
 /// response `date` header, `r_config` the extraction + [`decode_config`]
@@ -452,6 +462,379 @@ fn into_std<T>(result: tdutils::status::Result<T>) -> Result<T, Status> {
     }
 }
 
+// ---- The ConfigRecoverer state (ConfigManager.cpp:499-832, M.3.7.1) ------
+//
+// The C++ actor as an inline state machine on the Td actor, like the
+// ConfigManager port. M.3.7.1 carries the state fields and the config
+// application; the loop()/state callbacks (M.3.7.2), the fetch
+// orchestration (M.3.7.3), the full-config mini-session (M.3.7.4) and the
+// Td wiring (M.3.7.5) land on top.
+
+// ---- DcOption (td/telegram/net/DcOptions.h) -------------------------------
+
+/// `DcId::MAX_RAW_DC_ID` (net/DcId.h:20).
+pub const MAX_RECOVERER_DC_ID: i32 = 1000;
+
+/// The C++ `DcOption(DcId, IpPort)` (net/DcOptions.h:143-172) — the option
+/// flavor the recoverer keeps: a raw dc id with one IPv4 endpoint and the
+/// optional `ipPortSecret`. The always-set `ObfuscatedTcpOnly` flag and the
+/// absent `IPv6` one are implied (the simple config carries IPv4 only), so
+/// they are not stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecovererDcOption {
+    /// `dc_id_` — the raw id.
+    pub raw_dc_id: i32,
+    /// `ip_address_` — the dotted-quad address.
+    pub ip_address: String,
+    /// The port.
+    pub port: i32,
+    /// `secret_` — the `ipPortSecret` secret.
+    pub secret: Vec<u8>,
+}
+
+/// `IPAddress::ipv4_to_str` — the big-endian dotted quad.
+fn ipv4_to_string(ipv4: i32) -> String {
+    let ipv4 = ipv4 as u32;
+    format!(
+        "{}.{}.{}.{}",
+        ipv4 >> 24,
+        (ipv4 >> 16) & 0xff,
+        (ipv4 >> 8) & 0xff,
+        ipv4 & 0xff
+    )
+}
+
+impl RecovererDcOption {
+    /// The constructor + the `is_valid` filter (`ip_address_.is_valid() &&
+    /// dc_id_.is_exact()`): `None` is the invalid C++ option (a dc id
+    /// outside 1..=1000, or an `ipPortSecret` whose secret
+    /// `ProxySecret::from_binary` rejects — the C++ constructor then leaves
+    /// the address unparsed). Invalid options are dropped at the call
+    /// sites, like the C++ `if (option.is_valid())`.
+    pub fn from_ip_port(dc_id: i32, ip_port: &telegram_api::IpPort) -> Option<Self> {
+        if !(1..=MAX_RECOVERER_DC_ID).contains(&dc_id) {
+            return None;
+        }
+        let (ip_address, port, secret) = match ip_port {
+            telegram_api::IpPort::ipPort(ip_port) => {
+                (ipv4_to_string(ip_port.ipv4), ip_port.port, Vec::new())
+            }
+            telegram_api::IpPort::ipPortSecret(ip_port) => {
+                if ProxySecret::from_binary(&ip_port.secret, false).is_error() {
+                    return None;
+                }
+                (
+                    ipv4_to_string(ip_port.ipv4),
+                    ip_port.port,
+                    ip_port.secret.clone(),
+                )
+            }
+        };
+        Some(Self {
+            raw_dc_id: dc_id,
+            ip_address,
+            port,
+            secret,
+        })
+    }
+
+    /// The replayed `dc_options_update` options (the full `DcOption` flavor
+    /// stored by the ConfigManager) narrowed to the recoverer's subset.
+    pub fn from_stored(option: &StoredDcOption) -> Self {
+        Self {
+            raw_dc_id: option.raw_dc_id(),
+            ip_address: option.ip_address().to_string(),
+            port: option.port(),
+            secret: option.secret().to_vec(),
+        }
+    }
+
+    /// `DcOption::is_valid` — the constructor guarantees the dotted-quad
+    /// form, so only the dc id range and the address presence are left to
+    /// check.
+    pub fn is_valid(&self) -> bool {
+        (1..=MAX_RECOVERER_DC_ID).contains(&self.raw_dc_id) && !self.ip_address.is_empty()
+    }
+
+    /// `get_ip_address().ip_port()` — the `ip:port` connect string.
+    pub fn ip_address_port(&self) -> String {
+        format!("{}:{}", self.ip_address, self.port)
+    }
+}
+
+/// `ConfigManager::load_dc_options_update` (ConfigManager.cpp:1150-1157),
+/// yielding the recoverer's option subset.
+pub fn load_dc_options_update(pmc: &BinlogKeyValue) -> Vec<RecovererDcOption> {
+    let raw = pmc.get_raw(b"dc_options_update");
+    if raw.is_empty() {
+        return Vec::new();
+    }
+    match StoredDcOptions::parse(&raw) {
+        Ok(stored) => stored
+            .options()
+            .iter()
+            .map(RecovererDcOption::from_stored)
+            .collect(),
+        Err(error) => {
+            tracing::error!("Failed to parse dc_options_update: {error}");
+            Vec::new()
+        }
+    }
+}
+
+/// The `G()` reads the config application makes per step, gathered by the
+/// driver (the C++ recoverer reads them through the global directly). The
+/// fetch-argument reads (`is_test_dc`, `prefer_ipv6`,
+/// `dc_txt_domain_name`) land with the fetch orchestration (M.3.7.3).
+#[derive(Clone, Debug)]
+pub struct RecovererEnv {
+    /// `G()->unix_time()`.
+    pub unix_time: i32,
+    /// `G()->get_option_string("my_phone_number")`.
+    pub my_phone_number: String,
+    /// `expect_blocking()` — `G()->get_option_boolean("expect_blocking", true)`,
+    /// resolved by the driver.
+    pub expect_blocking: bool,
+}
+
+/// What one recoverer step asks its driver to do — the C++ side effects the
+/// inline recoverer cannot take itself (`G()` writes, actor creation, the
+/// timer). M.3.7.1 carries only the ConnectionCreator fan-out; the fetch
+/// and wakeup actions land with the loop (M.3.7.2/M.3.7.3).
+#[derive(Debug, Default)]
+pub struct RecovererActions {
+    /// `ConnectionCreator::on_dc_options(DcOptions(full_config->dc_options_))`
+    /// after a full config (the fan-out lands with the net step; the
+    /// options are carried for it).
+    pub connection_creator_dc_options: Vec<telegram_api::DcOption>,
+}
+
+/// The `ConfigRecoverer` (ConfigManager.cpp:499-832) as an inline state
+/// machine on the Td actor, like the ConfigManager port. The C++ actor's
+/// `ref_cnt_`/promise plumbing is the driver's job here; the fetch results
+/// come back through [`ConfigRecoverer::on_full_config`].
+pub struct ConfigRecoverer {
+    /// `is_online_`.
+    is_online: bool,
+
+    /// `simple_config_` — the options of the last simple config.
+    simple_config: Vec<RecovererDcOption>,
+    /// `simple_config_expires_at_`.
+    #[allow(dead_code)] // read by the loop (M.3.7.2)
+    simple_config_expires_at: f64,
+    /// `simple_config_at_` (only logged in the C++).
+    simple_config_at: f64,
+
+    /// `dc_options_update_`.
+    dc_options_update: Vec<RecovererDcOption>,
+
+    /// `dc_options_` — `dc_options_update_` + `simple_config_`.
+    dc_options: Vec<RecovererDcOption>,
+    /// `dc_options_at_`.
+    #[allow(dead_code)] // read by the loop (M.3.7.2)
+    dc_options_at: f64,
+    /// `dc_options_i_`.
+    #[allow(dead_code)] // read by the loop (M.3.7.2)
+    dc_options_i: usize,
+
+    /// `full_config_`.
+    #[allow(dead_code)] // read by on_online/loop (M.3.7.2)
+    full_config: Option<Box<telegram_api::Config>>,
+    /// `full_config_expires_at_`.
+    #[allow(dead_code)] // read by the loop (M.3.7.2)
+    full_config_expires_at: f64,
+    /// `!full_config_query_.empty()`.
+    #[allow(dead_code)] // read by the loop (M.3.7.2)
+    full_config_query_active: bool,
+}
+
+impl Default for ConfigRecoverer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConfigRecoverer {
+    /// The constructor — the C++ seeds `connecting_since_ = Time::now()`;
+    /// the connecting/network state lands with the callbacks (M.3.7.2).
+    pub fn new() -> Self {
+        Self {
+            is_online: false,
+            simple_config: Vec::new(),
+            simple_config_expires_at: 0.0,
+            simple_config_at: 0.0,
+            dc_options_update: Vec::new(),
+            dc_options: Vec::new(),
+            dc_options_at: 0.0,
+            dc_options_i: 0,
+            full_config: None,
+            full_config_expires_at: 0.0,
+            full_config_query_active: false,
+        }
+    }
+
+    /// `simple_config_at_` (only written by the C++ too).
+    pub fn simple_config_at(&self) -> f64 {
+        self.simple_config_at
+    }
+
+    /// `dc_options_` — the merged set (the update part first, then the
+    /// simple config).
+    pub fn dc_options(&self) -> &[RecovererDcOption] {
+        &self.dc_options
+    }
+
+    /// `on_dc_options_update` (ConfigManager.cpp:505-509) — the C++ tail
+    /// re-runs the loop; that call lands with M.3.7.2.
+    pub fn on_dc_options_update(&mut self, dc_options: Vec<RecovererDcOption>) {
+        self.dc_options_update = dc_options;
+        self.update_dc_options();
+    }
+
+    /// `check_phone_number_rules` (ConfigManager.cpp:546-564).
+    #[allow(dead_code)] // the non-test callers land with on_simple_config (M.3.7.3)
+    fn check_phone_number_rules(phone_number: &str, rules: &str) -> bool {
+        if rules.is_empty() || phone_number.is_empty() {
+            return true;
+        }
+        let mut found = false;
+        for prefix in rules.split(',') {
+            if prefix.is_empty() {
+                found = true;
+            } else if let Some(positive) = prefix.strip_prefix('+') {
+                if phone_number.starts_with(positive) {
+                    found = true;
+                }
+            } else if let Some(negative) = prefix.strip_prefix('-') {
+                if phone_number.starts_with(negative) {
+                    return false;
+                }
+            } else {
+                tracing::error!("Invalid prefix rule {prefix}");
+            }
+        }
+        found
+    }
+
+    /// `do_on_simple_config` (ConfigManager.cpp:590-624). The actions stay
+    /// empty here; `on_simple_config` (M.3.7.3) merges its dns-time
+    /// difference action with this result.
+    #[allow(dead_code)] // the first non-test caller is on_simple_config (M.3.7.3)
+    fn do_on_simple_config(
+        &mut self,
+        r_simple_config: Result<telegram_api::help_ConfigSimple, Status>,
+        env: &RecovererEnv,
+    ) -> RecovererActions {
+        match r_simple_config {
+            Ok(config) => {
+                tracing::trace!("Receive raw {config:?}");
+                if config.expires >= env.unix_time {
+                    let phone_number = &env.my_phone_number;
+                    self.simple_config.clear();
+                    for rule in &config.rules {
+                        if Self::check_phone_number_rules(phone_number, &rule.phone_prefix_rules)
+                            && (1..=MAX_RECOVERER_DC_ID).contains(&rule.dc_id)
+                        {
+                            for ip_port in &rule.ips {
+                                if let Some(option) =
+                                    RecovererDcOption::from_ip_port(rule.dc_id, ip_port)
+                                {
+                                    self.simple_config.push(option);
+                                }
+                            }
+                        }
+                    }
+                    tracing::trace!("Receive SimpleConfig {:?}", self.simple_config);
+                } else {
+                    tracing::trace!("Config has expired at {}", config.expires);
+                }
+
+                self.simple_config_expires_at = self.get_config_expire_time(env);
+                self.simple_config_at = tdutils::time::now_cached();
+                // The C++ Fisher-Yates: `swap(i, Random::fast(0, i))` for
+                // `i` in 1..n.
+                for i in 1..self.simple_config.len() {
+                    let j = tdutils::random::fast(0, i as i32) as usize;
+                    self.simple_config.swap(i, j);
+                }
+            }
+            Err(error) => {
+                tracing::trace!("Get SimpleConfig error {error}");
+                self.simple_config.clear();
+                self.simple_config_expires_at = self.get_failed_config_expire_time(env);
+            }
+        }
+        RecovererActions::default()
+    }
+
+    /// `on_full_config` (ConfigManager.cpp:626-639) — the ConnectionCreator
+    /// fan-out is carried as the action (the `send_closure` itself lands
+    /// with the net step, M.3.9.1); the C++ `loop()` tail lands with
+    /// M.3.7.2.
+    pub fn on_full_config(
+        &mut self,
+        r_full_config: Result<telegram_api::Config, Status>,
+        env: &RecovererEnv,
+    ) -> RecovererActions {
+        self.full_config_query_active = false;
+        let mut actions = RecovererActions::default();
+        match r_full_config {
+            Ok(config) => {
+                tracing::trace!("Receive {:?}", config.dc_options);
+                self.full_config_expires_at = self.get_config_expire_time(env);
+                actions.connection_creator_dc_options = config.dc_options.clone();
+                self.full_config = Some(Box::new(config));
+            }
+            Err(error) => {
+                tracing::trace!("Failed to get config: {error}");
+                self.full_config = None;
+                self.full_config_expires_at = self.get_failed_config_expire_time(env);
+            }
+        }
+        actions
+    }
+
+    /// `expect_blocking` (ConfigManager.cpp:641-643) — resolved into the
+    /// env by the driver.
+    fn expect_blocking(env: &RecovererEnv) -> bool {
+        env.expect_blocking
+    }
+
+    /// `get_config_expire_time` (ConfigManager.cpp:645-649).
+    fn get_config_expire_time(&self, env: &RecovererEnv) -> f64 {
+        let offline_delay = if self.is_online { 0.0 } else { 5.0 * 60.0 };
+        let expire_time = if Self::expect_blocking(env) {
+            tdutils::random::fast(2 * 60, 3 * 60)
+        } else {
+            tdutils::random::fast(20 * 60, 30 * 60)
+        };
+        tdutils::time::now() + offline_delay + f64::from(expire_time)
+    }
+
+    /// `get_failed_config_expire_time` (ConfigManager.cpp:651-655).
+    fn get_failed_config_expire_time(&self, env: &RecovererEnv) -> f64 {
+        let offline_delay = if self.is_online { 0.0 } else { 5.0 * 60.0 };
+        let expire_time = if Self::expect_blocking(env) {
+            tdutils::random::fast(5, 7)
+        } else {
+            tdutils::random::fast(15, 30)
+        };
+        tdutils::time::now() + offline_delay + f64::from(expire_time)
+    }
+
+    /// `update_dc_options` (ConfigManager.cpp:823-832) — the saved update
+    /// first, then the simple config; any change resets the rotation.
+    fn update_dc_options(&mut self) {
+        let mut new_dc_options = self.dc_options_update.clone();
+        new_dc_options.extend(self.simple_config.iter().cloned());
+        if new_dc_options != self.dc_options {
+            self.dc_options = new_dc_options;
+            self.dc_options_i = 0;
+            self.dc_options_at = tdutils::time::now();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -866,5 +1249,379 @@ mod tests {
             .await
             .expect_err("test configs are rejected");
         assert_eq!(error.code(), 400);
+    }
+
+    // ==== the recoverer state (M.3.7.1) ====
+
+    use tddb::db_key::DbKey;
+
+    /// A writable pmc over a temporary binlog file (the config_manager test
+    /// pattern): `BinlogKeyValue` panics on writes until a binlog is
+    /// attached.
+    struct RecovererPmc {
+        pmc: BinlogKeyValue,
+        path: String,
+    }
+
+    impl RecovererPmc {
+        fn new(name: &str) -> RecovererPmc {
+            let path = std::env::temp_dir()
+                .join(format!(
+                    "td-rs-recoverer-{name}-{}.binlog",
+                    std::process::id()
+                ))
+                .to_string_lossy()
+                .into_owned();
+            let _ = BinlogKeyValue::destroy(&path);
+            let mut pmc = BinlogKeyValue::new();
+            pmc.init(&path, DbKey::empty()).ensure();
+            RecovererPmc { pmc, path }
+        }
+    }
+
+    impl std::ops::Deref for RecovererPmc {
+        type Target = BinlogKeyValue;
+
+        fn deref(&self) -> &BinlogKeyValue {
+            &self.pmc
+        }
+    }
+
+    impl std::ops::DerefMut for RecovererPmc {
+        fn deref_mut(&mut self) -> &mut BinlogKeyValue {
+            &mut self.pmc
+        }
+    }
+
+    impl Drop for RecovererPmc {
+        fn drop(&mut self) {
+            self.pmc.close();
+            std::fs::remove_file(&self.path).ok();
+        }
+    }
+
+    #[test]
+    fn phone_number_rules_match_the_cpp() {
+        // Empty rules or an empty number accept everything.
+        assert!(ConfigRecoverer::check_phone_number_rules("", ""));
+        assert!(ConfigRecoverer::check_phone_number_rules("123", ""));
+        assert!(ConfigRecoverer::check_phone_number_rules("", "+999"));
+
+        // A positive prefix list: the number must begin with one of them.
+        assert!(ConfigRecoverer::check_phone_number_rules(
+            "999123",
+            "+999,+888"
+        ));
+        assert!(!ConfigRecoverer::check_phone_number_rules(
+            "777123",
+            "+999,+888"
+        ));
+
+        // An empty comma part matches everything.
+        assert!(ConfigRecoverer::check_phone_number_rules("777123", "+999,"));
+
+        // A negative prefix rejects immediately, even with a positive match.
+        assert!(!ConfigRecoverer::check_phone_number_rules(
+            "999123",
+            "+999,-999123"
+        ));
+
+        // Invalid (unprefixed) rules are logged and skipped.
+        assert!(!ConfigRecoverer::check_phone_number_rules(
+            "999123", "999,+888"
+        ));
+        assert!(ConfigRecoverer::check_phone_number_rules(
+            "888123", "999,+888"
+        ));
+    }
+
+    fn ip_port(ipv4: i32, port: i32) -> telegram_api::IpPort {
+        telegram_api::IpPort::ipPort(telegram_api::ipPort { ipv4, port })
+    }
+
+    #[test]
+    fn recoverer_dc_options_come_from_ip_ports() {
+        let option = RecovererDcOption::from_ip_port(2, &ip_port(0x0102_0304, 443)).expect("valid");
+        assert_eq!(option.ip_address, "1.2.3.4");
+        assert_eq!(option.ip_address_port(), "1.2.3.4:443");
+        assert_eq!(option.raw_dc_id, 2);
+        assert!(option.secret.is_empty());
+        assert!(option.is_valid());
+
+        // A dc id outside 1..=1000 is the invalid C++ option.
+        assert!(RecovererDcOption::from_ip_port(0, &ip_port(1, 443)).is_none());
+        assert!(RecovererDcOption::from_ip_port(1001, &ip_port(1, 443)).is_none());
+
+        // An unusable ipPortSecret is invalid, a usable one carries the
+        // secret.
+        let bad = telegram_api::IpPort::ipPortSecret(telegram_api::ipPortSecret {
+            ipv4: 0x0102_0304,
+            port: 8888,
+            secret: Vec::new(),
+        });
+        assert!(
+            RecovererDcOption::from_ip_port(2, &bad).is_none(),
+            "an empty secret makes the option invalid"
+        );
+        let good = telegram_api::IpPort::ipPortSecret(telegram_api::ipPortSecret {
+            ipv4: 0x0102_0304,
+            port: 8888,
+            secret: vec![0xdd; 16],
+        });
+        let option = RecovererDcOption::from_ip_port(2, &good).expect("valid");
+        assert_eq!(option.secret, vec![0xdd; 16]);
+        assert_eq!(option.port, 8888);
+    }
+
+    /// A `help.configSimple` with one `AccessPointRule` and one endpoint.
+    fn simple_config_with_rules(
+        phone_prefix_rules: &str,
+        dc_id: i32,
+        ip_port: telegram_api::IpPort,
+    ) -> telegram_api::help_ConfigSimple {
+        telegram_api::help_ConfigSimple {
+            date: 99_000,
+            expires: 200_000,
+            rules: vec![telegram_api::AccessPointRule {
+                phone_prefix_rules: phone_prefix_rules.to_string(),
+                dc_id,
+                ips: vec![ip_port],
+            }],
+        }
+    }
+
+    fn env(expect_blocking: bool) -> RecovererEnv {
+        RecovererEnv {
+            unix_time: 100_000,
+            // The option holds the digits-only phone (the Telegram API
+            // form, no leading '+'), so the `+999` rules match it.
+            my_phone_number: "999555123".to_string(),
+            expect_blocking,
+        }
+    }
+
+    #[test]
+    fn applies_a_good_simple_config() {
+        let mut recoverer = ConfigRecoverer::new();
+        let environment = env(true);
+        recoverer.is_online = true;
+
+        // A rule for +999 with two endpoints, a +888 rule, and an
+        // out-of-range dc id: only the options of the matching rules
+        // survive, then shuffled (checked as a permutation).
+        let config = telegram_api::help_ConfigSimple {
+            date: 99_000,
+            expires: 200_000,
+            rules: vec![
+                telegram_api::AccessPointRule {
+                    phone_prefix_rules: "+999".to_string(),
+                    dc_id: 2,
+                    ips: vec![ip_port(0x0909_0909, 443), ip_port(0x0909_090a, 5222)],
+                },
+                telegram_api::AccessPointRule {
+                    phone_prefix_rules: "+888".to_string(),
+                    dc_id: 3,
+                    ips: vec![ip_port(0x0808_0808, 443)],
+                },
+                telegram_api::AccessPointRule {
+                    phone_prefix_rules: "+999".to_string(),
+                    dc_id: 1001,
+                    ips: vec![ip_port(0x0707_0707, 443)],
+                },
+            ],
+        };
+        let applied_at = tdutils::time::now();
+        recoverer.do_on_simple_config(Ok(config), &environment);
+        recoverer.update_dc_options();
+
+        // The phone/dcid filters dropped the +888 rule and the dc 1001
+        // rule; the shuffle is a permutation of the two survivors.
+        assert_eq!(recoverer.dc_options().len(), 2);
+        let mut endpoints: Vec<(i32, i32)> = recoverer
+            .dc_options()
+            .iter()
+            .map(|option| (option.raw_dc_id, option.port))
+            .collect();
+        endpoints.sort_unstable();
+        assert_eq!(endpoints, vec![(2, 443), (2, 5222)]);
+
+        // The success expiry is the blocked-mode 2..3 minutes (online) —
+        // the lower bound anchors at a `now()` sampled before the call, the
+        // upper at one after (the draw can hit either endpoint).
+        assert!(
+            recoverer.simple_config_expires_at >= applied_at + 120.0
+                && recoverer.simple_config_expires_at <= tdutils::time::now() + 180.0
+        );
+    }
+
+    #[test]
+    fn an_expired_simple_config_is_rejected() {
+        let mut recoverer = ConfigRecoverer::new();
+        let environment = env(true);
+        recoverer.is_online = true;
+
+        // `expires` below the env unix time (100_000): the rules are not
+        // applied, but the expiry timestamp still advances (cpp:601/622).
+        let mut config = simple_config_with_rules("", 2, ip_port(0x0909_0909, 443));
+        config.expires = 99_999;
+        let applied_at = tdutils::time::now();
+        recoverer.do_on_simple_config(Ok(config), &environment);
+        recoverer.update_dc_options();
+        assert!(recoverer.dc_options().is_empty());
+        assert!(
+            recoverer.simple_config_expires_at >= applied_at + 120.0
+                && recoverer.simple_config_expires_at <= tdutils::time::now() + 180.0
+        );
+    }
+
+    #[test]
+    fn expire_time_clamps_in_both_modes() {
+        // (expect_blocking, online) -> (success window, failure window) in
+        // seconds (cpp:645-655): blocked 2-3 min / 5-7 s, free 20-30 min /
+        // 15-30 s; being offline adds the 5-minute delay.
+        for (expect_blocking, online, ok_lo, ok_hi, fail_lo, fail_hi) in [
+            (true, true, 120.0, 180.0, 5.0, 7.0),
+            (false, true, 1200.0, 1800.0, 15.0, 30.0),
+            (
+                true,
+                false,
+                300.0 + 120.0,
+                300.0 + 180.0,
+                300.0 + 5.0,
+                300.0 + 7.0,
+            ),
+        ] {
+            let environment = env(expect_blocking);
+            let mut recoverer = ConfigRecoverer::new();
+            recoverer.is_online = online;
+
+            let ok_before = tdutils::time::now();
+            recoverer.do_on_simple_config(
+                Ok(simple_config_with_rules("", 2, ip_port(0x0909_0909, 443))),
+                &environment,
+            );
+            assert!(
+                recoverer.simple_config_expires_at >= ok_before + ok_lo
+                    && recoverer.simple_config_expires_at <= tdutils::time::now() + ok_hi,
+                "success window [{ok_lo}, {ok_hi}]"
+            );
+
+            let fail_before = tdutils::time::now();
+            recoverer
+                .do_on_simple_config(Err(Status::error_message("HTTP error: 500")), &environment);
+            assert!(
+                recoverer.simple_config.is_empty(),
+                "a failure clears the options"
+            );
+            assert!(
+                recoverer.simple_config_expires_at >= fail_before + fail_lo
+                    && recoverer.simple_config_expires_at <= tdutils::time::now() + fail_hi,
+                "failure window [{fail_lo}, {fail_hi}]"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_config_sets_expiry_and_carries_the_options() {
+        let mut recoverer = ConfigRecoverer::new();
+        let environment = env(true);
+        recoverer.is_online = true;
+
+        // The full config answer carries the options to ConnectionCreator
+        // and arms the success expiry.
+        let full_config = telegram_api::Config {
+            dc_options: vec![telegram_api::DcOption {
+                id: 2,
+                ip_address: "9.9.9.9".to_string(),
+                port: 443,
+                ..telegram_api::DcOption::default()
+            }],
+            ..telegram_api::Config::default()
+        };
+        let ok_before = tdutils::time::now();
+        let actions = recoverer.on_full_config(Ok(full_config), &environment);
+        assert_eq!(actions.connection_creator_dc_options.len(), 1);
+        assert!(
+            recoverer.full_config_expires_at >= ok_before + 120.0
+                && recoverer.full_config_expires_at <= tdutils::time::now() + 180.0
+        );
+
+        // A failure clears the config and arms the 5..7 s window (blocked,
+        // online).
+        let fail_before = tdutils::time::now();
+        let actions =
+            recoverer.on_full_config(Err(Status::error_message("Timeout expired")), &environment);
+        assert!(actions.connection_creator_dc_options.is_empty());
+        assert!(
+            recoverer.full_config_expires_at >= fail_before + 5.0
+                && recoverer.full_config_expires_at <= tdutils::time::now() + 7.0
+        );
+    }
+
+    #[test]
+    fn the_saved_dc_options_update_replays_and_merges_first() {
+        let mut pmc = RecovererPmc::new("dc-options");
+        let stored = StoredDcOptions {
+            options: vec![StoredDcOption {
+                flags: 0,
+                raw_dc_id: 10,
+                ip: b"10.0.0.1".to_vec(),
+                port: 443,
+                secret: Vec::new(),
+            }],
+        };
+        pmc.set_raw(b"dc_options_update", &stored.store());
+
+        let mut recoverer = ConfigRecoverer::new();
+        let environment = env(true);
+        let saved = load_dc_options_update(&pmc);
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].ip_address, "10.0.0.1");
+        recoverer.on_dc_options_update(saved);
+
+        // The replayed update is the update part; a later simple config
+        // appends AFTER it (ConfigManager.cpp:823-827).
+        let config = simple_config_with_rules("", 2, ip_port(0x0909_0909, 443));
+        recoverer.do_on_simple_config(Ok(config), &environment);
+        recoverer.update_dc_options();
+        assert_eq!(recoverer.dc_options().len(), 2);
+        assert_eq!(recoverer.dc_options()[0].ip_address, "10.0.0.1");
+        assert_eq!(recoverer.dc_options()[1].ip_address, "9.9.9.9");
+
+        // A corrupt pmc value degrades to the empty set (the C++
+        // `log_event_parse(...).ensure()` would crash; the port logs).
+        pmc.set_raw(b"dc_options_update", &[1, 2, 3]);
+        assert!(load_dc_options_update(&pmc).is_empty());
+    }
+
+    #[test]
+    fn the_simple_config_shuffle_is_a_permutation() {
+        let mut recoverer = ConfigRecoverer::new();
+        let environment = env(true);
+        recoverer.is_online = true;
+
+        // Three rules for the right phone prefix → three options, shuffled.
+        let config = telegram_api::help_ConfigSimple {
+            date: 99_000,
+            expires: 200_000,
+            rules: (1..=3)
+                .map(|dc| telegram_api::AccessPointRule {
+                    phone_prefix_rules: String::new(),
+                    dc_id: dc,
+                    ips: vec![ip_port(0x0a00_0000 + dc, 443)],
+                })
+                .collect(),
+        };
+        recoverer.do_on_simple_config(Ok(config), &environment);
+        recoverer.update_dc_options();
+
+        let mut addresses: Vec<String> = recoverer
+            .dc_options()
+            .iter()
+            .map(|option| option.ip_address.clone())
+            .collect();
+        addresses.sort();
+        let expected: Vec<String> = (1..=3).map(|dc| ipv4_to_string(0x0a00_0000 + dc)).collect();
+        assert_eq!(addresses, expected, "the shuffle must be a permutation");
     }
 }

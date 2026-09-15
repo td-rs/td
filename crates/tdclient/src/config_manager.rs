@@ -16,9 +16,11 @@
 //! each call, and the pending promises are request ids.
 //!
 //! Divergences (all documented inline):
-//! - `ConfigRecoverer` (the DNS fallback for a missing config) does not
-//!   exist yet — the saved `dc_options_update` is only persisted, its
-//!   replay lands with the recoverer.
+//! - `ConfigRecoverer` (the DNS fallback for a missing config) lives in
+//!   [`crate::config_recoverer`] as an inline state machine driven by the
+//!   Td (M.3.7.1: the state + config application; the Td wiring —
+//!   including the saved `dc_options_update` replay into the recoverer —
+//!   lands with the recoverer wiring sub-step).
 //! - The expire timer rides the Td actor's single `set_timeout` slot; the
 //!   Td re-syncs it after every ConfigManager interaction (the C++ manager
 //!   is its own actor with its own timer).
@@ -206,14 +208,34 @@ const MAX_RAW_DC_ID: i32 = 1000;
 /// externality, `DcId::get_raw_id()`), ip string, port, secret.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredDcOption {
-    flags: i32,
-    raw_dc_id: i32,
-    ip: Vec<u8>,
-    port: i32,
-    secret: Vec<u8>,
+    pub(crate) flags: i32,
+    pub(crate) raw_dc_id: i32,
+    pub(crate) ip: Vec<u8>,
+    pub(crate) port: i32,
+    pub(crate) secret: Vec<u8>,
 }
 
 impl StoredDcOption {
+    /// The `raw_dc_id` field (the recoverer's option narrowing).
+    pub fn raw_dc_id(&self) -> i32 {
+        self.raw_dc_id
+    }
+
+    /// The `ip` field as the stored address string.
+    pub fn ip_address(&self) -> &str {
+        std::str::from_utf8(&self.ip).unwrap_or("")
+    }
+
+    /// The `port` field.
+    pub fn port(&self) -> i32 {
+        self.port
+    }
+
+    /// The `secret` field (empty without the `DC_OPTION_HAS_SECRET` flag).
+    pub fn secret(&self) -> &[u8] {
+        &self.secret
+    }
+
     /// The C++ `DcOption(const telegram_api::dcOption &)` + the
     /// `is_valid` filter at the DcOptions constructor.
     fn from_telegram(option: &telegram_api::DcOption) -> Option<Self> {
@@ -350,10 +372,15 @@ fn fetch_log_event_string(input: &[u8], pos: &mut usize) -> Result<Vec<u8>, &'st
 /// an int32 count followed by the stored options.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StoredDcOptions {
-    options: Vec<StoredDcOption>,
+    pub(crate) options: Vec<StoredDcOption>,
 }
 
 impl StoredDcOptions {
+    /// The stored options (the recoverer's replay reads them).
+    pub fn options(&self) -> &[StoredDcOption] {
+        &self.options
+    }
+
     pub fn store(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&(self.options.len() as i32).to_le_bytes());
