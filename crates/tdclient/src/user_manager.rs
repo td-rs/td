@@ -1530,6 +1530,7 @@ enum UserFlag {
     IsDeleted,
     IsPremium,
     Name,
+    Username,
     Photo,
     AccentColor,
     PhoneNumber,
@@ -2118,13 +2119,13 @@ impl UserManager {
             } else {
                 self.add_user(user_id);
             }
+            if self.unknown_users.remove(&user_id.get()) {
+                let u = self.users.get_mut(&user_id.get()).unwrap();
+                u.is_photo_inited = true;
+            }
         } else if is_deleted && !is_received && user_id == self.get_my_id() {
             // Ignore self as frozen min-user
             return user_id;
-        }
-        if self.unknown_users.remove(&user_id.get()) {
-            let u = self.users.get_mut(&user_id.get()).unwrap();
-            u.is_photo_inited = true;
         }
 
         if have_access_hash {
@@ -2143,8 +2144,8 @@ impl UserManager {
         }
 
         let mut is_verified = user.verified;
-        let is_premium = user.premium;
-        let is_support = user.support;
+        let mut is_premium = user.premium;
+        let mut is_support = user.support;
         let mut can_join_groups = !user.bot_nochats;
         let mut can_read_all_group_messages = user.bot_chat_history;
         let mut can_be_added_to_attach_menu = user.bot_attach_menu;
@@ -2162,14 +2163,14 @@ impl UserManager {
         let mut inline_query_placeholder = std::mem::take(&mut user.bot_inline_placeholder);
         let mut bot_active_users = user.bot_active_users;
         let mut need_location_bot = user.bot_inline_geo;
-        let need_apply_min_photo = user.apply_min_photo;
+        let mut need_apply_min_photo = user.apply_min_photo;
         let is_fake = user.fake;
         let stories_available =
             (user.flags2 & USER_STORIES_MAX_ID_MASK) != 0 && user.stories_max_id.max_id > 0;
         let stories_unavailable = user.stories_unavailable;
         let stories_hidden = user.stories_hidden;
         let contact_require_premium = user.contact_require_premium;
-        let paid_message_star_count = get_star_count(user.send_paid_messages_stars);
+        let mut paid_message_star_count = get_star_count(user.send_paid_messages_stars);
 
         if !is_bot
             && (!can_join_groups
@@ -2209,6 +2210,8 @@ impl UserManager {
         if is_deleted {
             // just in case
             is_verified = false;
+            is_premium = false;
+            is_support = false;
             is_bot = false;
             can_join_groups = false;
             can_read_all_group_messages = false;
@@ -2225,6 +2228,8 @@ impl UserManager {
             inline_query_placeholder = String::new();
             bot_active_users = 0;
             need_location_bot = false;
+            need_apply_min_photo = false;
+            paid_message_star_count = 0;
         }
 
         let bot_info_version = if is_bot { user.bot_info_version } else { -1 };
@@ -3311,7 +3316,14 @@ impl UserManager {
                 // update_is_translatable — with those steps
             }
         }
-        // update_contacts_hints — with the Contacts step
+        let is_name_changed = self.users.get(&user_id.get()).unwrap().is_name_changed;
+        let is_is_contact_changed = self.users.get(&user_id.get()).unwrap().is_is_contact_changed;
+        let is_username_changed = self.take_user_flag(user_id, UserFlag::Username);
+        if is_name_changed || is_username_changed || is_is_contact_changed {
+            // update_contacts_hints — with the Contacts step; the C++ also
+            // clears is_username_changed here, unconditionally of which of
+            // the three flags triggered the hints update
+        }
         if self.take_user_flag(user_id, UserFlag::IsContact) {
             let is_contact = self.is_user_contact_of(user_id, false);
             if let Some(user_full) = self.users_full.get_mut(&user_id.get()) {
@@ -3493,6 +3505,10 @@ impl UserManager {
             UserFlag::IsContact => {
                 let v = u.is_is_contact_changed;
                 (v, &mut u.is_is_contact_changed)
+            }
+            UserFlag::Username => {
+                let v = u.is_username_changed;
+                (v, &mut u.is_username_changed)
             }
             UserFlag::IsMutualContact => {
                 let v = u.is_is_mutual_contact_changed;
@@ -5048,5 +5064,126 @@ mod tests {
             update,
             td_api::Update::updateUser(u) if u.user.id == 5
         )));
+    }
+
+    // --- M.4.6 verification vectors (telegram_api::user → store mutations +
+    // --- emitted updates), per RUST_REWRITE_PLAN_USERMANAGER_M46.md §3.
+
+    #[test]
+    fn vector_user_empty_returns_the_id_without_touching_the_cache() {
+        let (mut temp, mut um) = test_env();
+        let user_id = um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::userEmpty(telegram_api::userEmpty { id: 5 }),
+            "t",
+        );
+        assert_eq!(user_id.get(), 5);
+        assert!(um.get_user(UserId::new(5)).is_none());
+    }
+
+    #[test]
+    fn vector_deleted_user_is_fully_sanitized() {
+        // C++ :3286-3310 resets the premium/support/min-photo/star family
+        // too, not only the bot-flag family.
+        let (mut temp, mut um) = test_env();
+        let mut user = telegram_user(5, "Ghost", USER_ACCESS_HASH_MASK | (1 << 1));
+        user.deleted = true;
+        user.premium = true;
+        user.support = true;
+        user.apply_min_photo = true;
+        user.send_paid_messages_stars = 100;
+        user.bot_chat_history = true;
+        um.on_get_user(&mut temp.env(false), telegram_api::User::user(user), "t");
+        let u = um.get_user(UserId::new(5)).unwrap();
+        assert!(u.is_deleted);
+        assert!(!u.is_premium);
+        assert!(!u.is_support);
+        assert!(!u.need_apply_min_photo);
+        assert_eq!(u.paid_message_star_count, 0);
+        assert!(!u.can_read_all_group_messages, "non-bot bot props are reset");
+    }
+
+    #[test]
+    fn vector_unknown_users_survives_a_cached_path_delivery() {
+        // C++ erases from unknown_users_ only on the add-user path
+        // (UserManager.cpp:3196-3199); an already-cached delivery must not.
+        let (mut temp, mut um) = test_env();
+        let full_flags = USER_ACCESS_HASH_MASK | (1 << 1);
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(5, "A", full_flags)),
+            "t",
+        );
+        um.unknown_users.insert(5);
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(5, "A", full_flags)),
+            "t",
+        );
+        assert!(
+            um.unknown_users.contains(&5),
+            "cached-path delivery must not erase unknown_users"
+        );
+        assert!(!um.get_user(UserId::new(5)).unwrap().is_photo_inited);
+    }
+
+    #[test]
+    fn vector_username_flag_is_consumed_by_update_user() {
+        // C++ clears is_username_changed in update_user where
+        // update_contacts_hints runs (UserManager.cpp:9889-9892).
+        let (mut temp, mut um) = test_env();
+        let mut user = telegram_user(5, "Alice", USER_ACCESS_HASH_MASK | (1 << 1) | (1 << 3)); // username
+        user.username = "alice".to_owned();
+        um.on_get_user(&mut temp.env(false), telegram_api::User::user(user), "t");
+        assert!(!um.get_user(UserId::new(5)).unwrap().usernames.is_empty());
+        assert!(!um.get_user(UserId::new(5)).unwrap().is_username_changed);
+    }
+
+    #[test]
+    fn vector_non_bot_with_bot_properties_is_sanitized() {
+        let (mut temp, mut um) = test_env();
+        let mut user = telegram_user(5, "Bot", USER_ACCESS_HASH_MASK | (1 << 1));
+        user.bot_chat_history = true; // can_read_all_group_messages
+        user.bot_inline_geo = true; // need_location_bot without inline bot
+        um.on_get_user(&mut temp.env(false), telegram_api::User::user(user), "t");
+        let u = um.get_user(UserId::new(5)).unwrap();
+        assert!(!u.can_read_all_group_messages);
+        assert!(!u.need_location_bot);
+    }
+
+    #[test]
+    fn vector_self_bot_active_users_is_throttled() {
+        let (mut temp, mut um) = test_env();
+        let mut user = telegram_user(77, "Me", USER_ACCESS_HASH_MASK | (1 << 1));
+        user.self_ = true;
+        user.bot_active_users = 10;
+        um.on_get_user(&mut temp.env(false), telegram_api::User::user(user), "t");
+        assert_eq!(um.get_user(UserId::new(77)).unwrap().bot_active_users, 10);
+        // A second delivery within the 600 s window is dropped.
+        let mut user = telegram_user(77, "Me", USER_ACCESS_HASH_MASK | (1 << 1));
+        user.self_ = true;
+        user.bot_active_users = 99;
+        um.on_get_user(&mut temp.env(false), telegram_api::User::user(user), "t");
+        assert_eq!(um.get_user(UserId::new(77)).unwrap().bot_active_users, 10);
+    }
+
+    #[test]
+    fn vector_update_user_emits_update_then_status() {
+        let (mut temp, mut um) = test_env();
+        let mut user = telegram_user(5, "A", USER_ACCESS_HASH_MASK | (1 << 1));
+        user.status = telegram_api::UserStatus::userStatusOnline(telegram_api::userStatusOnline {
+            expires: (tdutils::time::now() + 300.0) as i32,
+        });
+        um.on_get_user(&mut temp.env(false), telegram_api::User::user(user), "t");
+        let updates = um.take_updates();
+        let update = updates
+            .iter()
+            .position(|u| matches!(u, td_api::Update::updateUser(x) if x.user.id == 5));
+        let status = updates
+            .iter()
+            .position(|u| matches!(u, td_api::Update::updateUserStatus(s) if s.user_id == 5));
+        assert!(update.is_some(), "updateUser must be sent");
+        assert!(status.is_some(), "updateUserStatus must be sent");
+        assert!(update.unwrap() < status.unwrap(), "updateUser precedes updateUserStatus");
     }
 }
