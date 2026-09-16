@@ -994,6 +994,13 @@ impl Td {
         {
             expire_time = self.recoverer_wakeup_at;
         }
+        // The UserManager's deadlines share the same slot (M.4.x): the
+        // earliest of the three sources wins.
+        if let Some(user_deadline) = self.user_manager.next_deadline()
+            && (expire_time == 0.0 || user_deadline < expire_time)
+        {
+            expire_time = user_deadline;
+        }
         if expire_time == 0.0 {
             self.cancel_timeout();
         } else {
@@ -1358,14 +1365,13 @@ impl Td {
         }
     }
 
-    /// Point the actor timeout at the UserManager's earliest deadline, or
-    /// cancel it when nothing is armed (the member MultiTimeouts re-arm on
-    /// every set/cancel).
+    /// Point the actor timeout at the earliest armed deadline (the member
+    /// MultiTimeouts re-arm on every set/cancel). The slot is shared with
+    /// the ConfigManager expire time and the recoverer wakeup, so this
+    /// mirrors into `sync_config_timeout` — a no-op outside a scheduler,
+    /// like the other direct-call mirroring points.
     fn rearm_user_timeouts(&mut self) {
-        match self.user_manager.next_deadline() {
-            Some(timeout_at) => self.set_timeout_at(timeout_at),
-            None => self.cancel_timeout(),
-        }
+        self.sync_config_timeout();
     }
 
     /// `Td::send_result` (Td.cpp:1399-1414).
@@ -1560,11 +1566,12 @@ impl Actor for Td {
         self.dec_stop_cnt();
     }
 
-    /// The ConfigManager's expire timer rides the Td's actor timeout slot
-    /// (the C++ manager is its own actor with its own timer): the fired
-    /// timeout re-requests the expired config, then re-runs the
-    /// recoverer's loop (the tdactor `timeout_expired` default calls
-    /// `loop`).
+    /// The Td's single actor timeout slot multiplexes the ConfigManager
+    /// expire timer, the recoverer wakeup and the UserManager deadlines
+    /// (the C++ managers each carry their own timer): the fired timeout
+    /// re-requests the expired config, re-runs the recoverer's loop and
+    /// ticks the user timeouts; every arm/cancel point then re-arms the
+    /// slot at the earliest deadline through `sync_config_timeout`.
     fn timeout_expired(&mut self) {
         let close_flag = self.close_flag != 0;
         let actions = self
@@ -1581,17 +1588,7 @@ impl Actor for Td {
             .map(|recoverer| recoverer.loop_(&environment))
             .unwrap_or_default();
         self.apply_recoverer_actions(actions);
-    }
 
-    fn tear_down(&mut self) {
-        self.close();
-    }
-
-    /// The member `user_online_timeout_` / `user_emoji_status_timeout_`
-    /// fire here (their C++ callbacks hop back into the UserManager actor);
-    /// the sweep then re-arms at the next deadline, like the MultiTimeouts'
-    /// set/cancel re-arm.
-    fn timeout_expired(&mut self) {
         {
             let Some(options) = self.option_manager.as_mut() else {
                 return self.rearm_user_timeouts();
@@ -1605,6 +1602,10 @@ impl Actor for Td {
         }
         self.flush_user_updates();
         self.rearm_user_timeouts();
+    }
+
+    fn tear_down(&mut self) {
+        self.close();
     }
 
     // No `loop_`: the pending-query poll arrives with the net step (the
