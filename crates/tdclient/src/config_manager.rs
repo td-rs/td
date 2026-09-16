@@ -3666,4 +3666,179 @@ mod tests {
         assert!(!is_base64url(b"a+b"));
         assert!(!is_base64url(b"a/b"));
     }
+
+    /// A real `help.getAppConfig` answer, recorded 2026-09-15 from the
+    /// Telegram test DC 149.154.175.10 over the S66 scratch session (232
+    /// keys, hash 1231804985). The M.3.4 tests hand-build tiny objects;
+    /// this golden pins the exact option store the recorded bytes produce.
+    /// The FULL store is pinned, not a diff: about fifty recorded values
+    /// equal the `OptionManager::new` pre-seeded defaults, and a diff would
+    /// silently hide those writes.
+    #[test]
+    fn recorded_app_config_golden_snapshot() {
+        let mut pmc = TempPmc::new("recorded-app-config");
+        let mut options = options();
+        let mut manager = ConfigManager::new(b"");
+        manager.get_app_config(7, false, false);
+        let telegram_api::help_AppConfig::help_appConfig(answer) =
+            telegram_api::help_AppConfig::parse(include_bytes!(
+                "testdata/app_config_test_dc_2026-09-15.bin"
+            ))
+            .unwrap()
+        else {
+            panic!("not help.appConfig");
+        };
+        assert_eq!(answer.hash, 1231804985);
+        let actions = manager.on_get_app_config_result(
+            &mut pmc,
+            Ok(AppConfigQueryResult::Config {
+                hash: answer.hash,
+                config: answer.config,
+            }),
+            false,
+            &mut options,
+            false,
+            false,
+        );
+        assert!(actions.refresh_premium_options);
+        assert_eq!(actions.app_config_answers.len(), 1);
+
+        // Hand-checked anchors against the recorded JSON (the full table
+        // below carries the rest): the quote limit rename, the ton→cent
+        // division (10000000 nanogram / 10000000 = 1 cent), the usd rate
+        // scaling (1.319874 * 1e6), the dice aggregate and the cleaned
+        // Fragment prefix.
+        assert_eq!(
+            options.get_option("message_reply_quote_length_max"),
+            "I1024"
+        );
+        assert_eq!(
+            options.get_option("suggested_post_gram_cent_count_min"),
+            "I1"
+        );
+        assert_eq!(options.get_option("million_gram_to_usd_rate"), "I1319874");
+        assert_eq!(options.get_option("dice_emojis"), "S🎲");
+        assert_eq!(options.get_option("fragment_prefixes"), "S888");
+
+        let expected: Vec<(String, String)> =
+            include_str!("testdata/app_config_test_dc_2026-09-15.snapshot")
+                .lines()
+                .map(|line| {
+                    let (name, value) = line.split_once('\t').expect("tab-separated snapshot");
+                    (name.to_string(), value.to_string())
+                })
+                .collect();
+        assert_eq!(options.all_options(), expected);
+
+        // The filtered config persists with the hash — every consumed key
+        // is stripped; only the pass-through keys survive (the C++
+        // `new_values` reassignment).
+        let stored = AppConfig::parse(&pmc.get_raw(b"app_config")).unwrap();
+        assert_eq!(stored.version, APP_CONFIG_CURRENT_VERSION);
+        assert_eq!(stored.hash, 1231804985);
+        let telegram_api::JSONValue::jsonObject(object) = stored.config.as_ref() else {
+            panic!("stored config not an object");
+        };
+        let mut keys: Vec<&str> = object.value.iter().map(|kv| kv.key.as_str()).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "ios_disable_parallel_channel_reset",
+                "large_queue_max_active_operations_count",
+                "lite_app_options",
+                "lite_battery_min_pct",
+                "lite_device_class",
+                "premium_playmarket_direct_currency_list",
+                "rich_message_posting",
+                "small_queue_max_active_operations_count",
+                "stars_spend_topup_invoice_disabled",
+                "stickers_emoji_suggest_only_api",
+                "stories_all_hidden",
+                "translations_auto_enabled",
+                "translations_manual_enabled",
+                "youtube_pip",
+            ]
+        );
+        // The td_api answer carries the same filtered object.
+        let td_api::JsonValue::jsonValueObject(answer_object) = &actions.app_config_answers[0].1
+        else {
+            panic!("answer not an object");
+        };
+        assert_eq!(answer_object.members.len(), 14);
+    }
+
+    /// The recorded store drives the version-bump and NotModified paths:
+    /// a current-version store keeps its hash (conditional query, served
+    /// from the store on NotModified), an outdated stored version resets
+    /// it (unconditional query, NotModified fails like before the first
+    /// config).
+    #[test]
+    fn recorded_app_config_version_bump_refetches() {
+        let mut pmc = TempPmc::new("recorded-version-bump");
+        let mut options = options();
+        let mut manager = ConfigManager::new(b"");
+        let telegram_api::help_AppConfig::help_appConfig(answer) =
+            telegram_api::help_AppConfig::parse(include_bytes!(
+                "testdata/app_config_test_dc_2026-09-15.bin"
+            ))
+            .unwrap()
+        else {
+            panic!("not help.appConfig");
+        };
+        manager.on_get_app_config_result(
+            &mut pmc,
+            Ok(AppConfigQueryResult::Config {
+                hash: answer.hash,
+                config: answer.config,
+            }),
+            false,
+            &mut options,
+            false,
+            false,
+        );
+        let stored = pmc.get_raw(b"app_config");
+
+        // The current version preserves the hash — a conditional query.
+        let mut current = ConfigManager::new(&stored);
+        let actions = current.get_app_config(9, false, false);
+        assert_eq!(
+            actions.queries,
+            vec![ConfigQuery::GetAppConfig { hash: 1231804985 }]
+        );
+        let actions = current.on_get_app_config_result(
+            &mut BinlogKeyValue::new(),
+            Ok(AppConfigQueryResult::NotModified),
+            false,
+            &mut options,
+            false,
+            false,
+        );
+        assert!(actions.queries.is_empty());
+        assert_eq!(actions.app_config_answers.len(), 1);
+        let td_api::JsonValue::jsonValueObject(object) = &actions.app_config_answers[0].1 else {
+            panic!("answer not an object");
+        };
+        assert_eq!(object.members.len(), 14);
+
+        // A version bump (the stored layout is one commit behind) resets
+        // the store — the query goes out with hash 0 and a NotModified
+        // answer fails with the C++ 500.
+        let mut outdated = stored.clone();
+        outdated[0..4].copy_from_slice(&(APP_CONFIG_CURRENT_VERSION - 1).to_le_bytes());
+        let mut bumped = ConfigManager::new(&outdated);
+        let actions = bumped.get_app_config(10, false, false);
+        assert_eq!(actions.queries, vec![ConfigQuery::GetAppConfig { hash: 0 }]);
+        let actions = bumped.on_get_app_config_result(
+            &mut BinlogKeyValue::new(),
+            Ok(AppConfigQueryResult::NotModified),
+            false,
+            &mut options,
+            false,
+            false,
+        );
+        assert_eq!(actions.errors.len(), 1);
+        assert_eq!(actions.errors[0].0, 10);
+        assert_eq!(actions.errors[0].1.message(), "Receive unexpected response");
+    }
 }
