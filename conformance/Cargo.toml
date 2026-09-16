@@ -48,3 +48,7 @@ path = "src/bin/auth_data_rw.rs"
 [[bin]]
 name = "recorder-replayer"
 path = "src/bin/recorder_replayer.rs"
+
+[[bin]]
+name = "hints_driver"
+path = "src/bin/hints_driver.rs"
