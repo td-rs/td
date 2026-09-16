@@ -1,8 +1,10 @@
 # Fuzz targets (S78), one per parsing-heavy component that exists so far:
 # the td_api JSON request parser, the raw tdutils JSON parser, the binlog
-# event reader, the MTProto packet parser and the TL scheme text parser.
-# URL / HTML / entities / secret-chat targets arrive with their Track I
-# components.
+# event reader, the MTProto packet parser, the TL scheme text parser and
+# the UserManager database blobs (User/UserFull/SecretChat log events +
+# the EmojiStatus value parser). URL / HTML / entities targets arrive
+# with their Track I components; the photo.rs value-parser target arrives
+# with M.4.13.
 #
 # Own manifest, excluded from the workspace (like `conformance` and
 # `bench`). Build: `cargo build` here compiles the libFuzzer runtime from
@@ -55,6 +57,26 @@ doc = false
 [[bin]]
 name = "transport_frame"
 path = "fuzz_targets/transport_frame.rs"
+doc = false
+
+[[bin]]
+name = "user_log_event"
+path = "fuzz_targets/user_log_event.rs"
+doc = false
+
+[[bin]]
+name = "user_full"
+path = "fuzz_targets/user_full.rs"
+doc = false
+
+[[bin]]
+name = "secret_chat"
+path = "fuzz_targets/secret_chat.rs"
+doc = false
+
+[[bin]]
+name = "emoji_status"
+path = "fuzz_targets/emoji_status.rs"
 doc = false
 
 # Panic = bug: the parsers must report errors, never crash (the tdlib

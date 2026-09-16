@@ -228,9 +228,20 @@ impl<'a> Parser<'a> {
         Ok(bytes)
     }
 
+    /// `TlParser::get_left_len` — the bytes left in the input. The
+    /// vector readers gate counts against it before allocating, like the
+    /// C++ `parse(vector<T>&)` (`tl_helpers.h:170`).
+    pub fn left_len(&self) -> usize {
+        self.data.len() - self.pos
+    }
+
     pub fn string_vec(&mut self) -> Result<Vec<String>, &'static str> {
         let len = self.i32_()?;
-        if len < 0 {
+        // The C++ reads the size as uint32 and rejects anything above
+        // the input left (negatives wrap huge and fail the same gate);
+        // the length gate must run BEFORE the capacity allocation or a
+        // hostile `us`/`usf`/`sc` row can abort the process on start.
+        if len < 0 || self.left_len() < len as usize {
             return Err("Wrong vector length");
         }
         let mut values = Vec::with_capacity(len as usize);
@@ -242,7 +253,7 @@ impl<'a> Parser<'a> {
 
     pub fn i32_vec(&mut self) -> Result<Vec<i32>, &'static str> {
         let len = self.i32_()?;
-        if len < 0 {
+        if len < 0 || self.left_len() < len as usize {
             return Err("Wrong vector length");
         }
         let mut values = Vec::with_capacity(len as usize);
@@ -336,6 +347,37 @@ mod tests {
         assert_eq!(parser.string_vec().unwrap(), ["a", "b"]);
         assert_eq!(parser.i32_vec().unwrap(), [1, 2, 3]);
         parser.fetch_end().unwrap();
+    }
+
+    #[test]
+    fn vector_counts_gate_against_the_input_left() {
+        // `parse(vector<T>&)` (tl_helpers.h:170) rejects a count above
+        // the input left BEFORE allocating — a hostile `us`/`usf`/`sc`
+        // row must not be able to abort the process on start.
+        let mut out = Vec::new();
+        store_i32(&mut out, 1 << 30); // a billion elements claimed
+        store_i32(&mut out, 0); // one element's worth of input
+        let mut parser = Parser {
+            data: &out,
+            pos: 0,
+            version: version::NEXT,
+        };
+        assert_eq!(parser.string_vec(), Err("Wrong vector length"));
+        let mut parser = Parser {
+            data: &out,
+            pos: 0,
+            version: version::NEXT,
+        };
+        assert_eq!(parser.i32_vec(), Err("Wrong vector length"));
+        // Negative counts keep the pre-existing rejection (the C++
+        // uint32 wrap fails the same gate).
+        store_i32(&mut out, -1);
+        let mut parser = Parser {
+            data: &out,
+            pos: 0,
+            version: version::NEXT,
+        };
+        assert_eq!(parser.i32_vec(), Err("Wrong vector length"));
     }
 
     #[test]

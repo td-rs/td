@@ -511,15 +511,17 @@ impl Default for User {
 /// `UserManager::UserLogEvent` (UserManager.cpp:2668-2690), store side: the
 /// log-event version prefix, then the user id, then the `User` store —
 /// the same framing `get_log_event_storer` gives the C++ binlog writer.
-fn store_user_log_event(out: &mut Vec<u8>, user_id: UserId, u: &User, ctx: &TimeCtx) {
+/// Public for the S78 fuzz family (`user_log_event` target) and the
+/// byte-pinned tests.
+pub fn store_user_log_event(out: &mut Vec<u8>, user_id: UserId, u: &User, ctx: &TimeCtx) {
     store_parse::store_log_event_version(out);
     store_parse::store_i64(out, user_id.get());
     u.store(out, ctx);
 }
 
 /// `UserManager::UserLogEvent`, parse side (`log_event_parse` over the
-/// binlog event data).
-fn parse_user_log_event(input: &[u8], ctx: &TimeCtx) -> Result<(UserId, User), &'static str> {
+/// binlog event data). Public for the S78 fuzz family.
+pub fn parse_user_log_event(input: &[u8], ctx: &TimeCtx) -> Result<(UserId, User), &'static str> {
     let mut parser = Parser::new_log_event(input)?;
     let user_id = UserId::new(parser.i64_()?);
     let user = User::parse_impl(&mut parser, ctx)?;
@@ -529,16 +531,24 @@ fn parse_user_log_event(input: &[u8], ctx: &TimeCtx) -> Result<(UserId, User), &
 
 /// `UserManager::SecretChatLogEvent` (UserManager.cpp:2692-2714), store
 /// side: the log-event version prefix, then the secret chat id, then the
-/// `SecretChat` store.
-fn store_secret_chat_log_event(out: &mut Vec<u8>, secret_chat_id: SecretChatId, c: &SecretChat) {
+/// `SecretChat` store. Public for the S78 fuzz family and the
+/// byte-pinned tests.
+pub fn store_secret_chat_log_event(
+    out: &mut Vec<u8>,
+    secret_chat_id: SecretChatId,
+    c: &SecretChat,
+) {
     store_parse::store_log_event_version(out);
     store_parse::store_i32(out, secret_chat_id.get());
     c.store(out);
 }
 
 /// `UserManager::SecretChatLogEvent`, parse side (`log_event_parse` over
-/// the binlog event data / the `sc<id>` database value).
-fn parse_secret_chat_log_event(input: &[u8]) -> Result<(SecretChatId, SecretChat), &'static str> {
+/// the binlog event data / the `sc<id>` database value). Public for the
+/// S78 fuzz family.
+pub fn parse_secret_chat_log_event(
+    input: &[u8],
+) -> Result<(SecretChatId, SecretChat), &'static str> {
     let mut parser = Parser::new_log_event(input)?;
     let secret_chat_id = SecretChatId::new(parser.i32_()?);
     let secret_chat = SecretChat::parse_impl(&mut parser)?;
@@ -2549,7 +2559,16 @@ impl UserManager {
         if (!loaded || !is_received) && Self::is_special_user_id(user_id, env.global.is_test_dc()) {
             let user = self.make_special_user(env, user_id);
             self.on_get_user(env, user, "get_user_force");
-            loaded = self.users.contains_key(&user_id.get());
+            // `CHECK(u != nullptr && u->is_received)`
+            // (UserManager.cpp:5113) — the synthesis always parses.
+            loaded = self
+                .users
+                .get(&user_id.get())
+                .is_some_and(|u| u.is_received);
+            assert!(
+                loaded,
+                "the synthetic special user {user_id:?} must be received"
+            );
             // `reload_user` refreshes the special users from the server;
             // the query lands with the net step.
         }
@@ -4167,8 +4186,27 @@ impl UserManager {
             self.save_user(env, user_id, from_binlog);
         }
 
-        // The cache repair (`reload_user`, cpp:10065-10071) needs the
-        // users.getUsers query — the net step.
+        // The cache repair trigger (UserManager.cpp:10065-10071). The
+        // `reload_user` half needs the users.getUsers query — the net
+        // step; the one-shot `is_repaired` latch lands now so the C++
+        // no-retrigger invariant holds already (and stays held once the
+        // query sender arrives).
+        {
+            let needs_repair = {
+                let u = self.users.get(&user_id.get()).unwrap();
+                u.cache_version != USER_CACHE_VERSION && !u.is_repaired
+            };
+            if needs_repair
+                && self.have_input_peer_user(env, user_id, AccessRights::Read)
+                && !env.global.close_flag()
+            {
+                let u = self.users.get_mut(&user_id.get()).unwrap();
+                u.is_repaired = true;
+                tdutils::log_info!("Repairing cache of {user_id:?}");
+                // reload_user(user_id, Promise<Unit>(), "update_user") —
+                // [blocked: net]
+            }
+        }
 
         if self.take_user_flag(user_id, UserFlag::FullInfo)
             && self.users_full.contains_key(&user_id.get())
@@ -4305,6 +4343,15 @@ impl UserManager {
             (user_full.need_send_update, user_full.need_save_to_database)
         };
         if need_send_update {
+            // `CHECK(u == nullptr || u->is_update_user_sent)`
+            // (UserManager.cpp:10204) — the full object is only announced
+            // after the user object itself has been announced.
+            assert!(
+                self.users
+                    .get(&user_id.get())
+                    .is_none_or(|u| u.is_update_user_sent),
+                "updateUser must precede updateUserFullInfo for {user_id:?}"
+            );
             if !self
                 .users_full
                 .get(&user_id.get())
@@ -6632,6 +6679,70 @@ mod tests {
         assert!(parsed.stories_hidden);
         assert!(parsed.is_close_friend);
         assert_eq!(parsed.bot_info_version, -1);
+    }
+
+    #[test]
+    fn cache_version_mismatch_latches_the_repair_once() {
+        let (mut temp, mut um) = test_env();
+        let user_id = UserId::new(500);
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(
+                user_id.get(),
+                "Stale",
+                USER_ACCESS_HASH_MASK | (1 << 1),
+            )),
+            "test",
+        );
+        // Simulate a row written by an older cache version (the C++
+        // on_get_user stamps the current version; a blob migrated from a
+        // previous release parses back with the stored one).
+        um.users.get_mut(&user_id.get()).unwrap().cache_version = USER_CACHE_VERSION - 1;
+        um.users.get_mut(&user_id.get()).unwrap().is_repaired = false;
+
+        // The repair trigger (UserManager.cpp:10065-10071): one-shot.
+        um.update_user(&mut temp.env(false), user_id, false, false);
+        assert!(um.users.get(&user_id.get()).unwrap().is_repaired);
+
+        // The latch holds — a second update never re-triggers (and the
+        // parked `reload_user` sender cannot loop).
+        um.update_user(&mut temp.env(false), user_id, false, false);
+        assert!(um.users.get(&user_id.get()).unwrap().is_repaired);
+    }
+
+    #[test]
+    fn cache_version_repair_needs_read_access_and_a_live_td() {
+        let (mut temp, mut um) = test_env();
+
+        // A min user: `have_input_peer_user(Read)` is false without an
+        // access hash, so the trigger does not fire even though the
+        // version is stale.
+        let mut min_user = telegram_user(501, "Min", USER_ACCESS_HASH_MASK | (1 << 1));
+        min_user.min = true;
+        let user_id = um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(min_user),
+            "test",
+        );
+        um.users.get_mut(&user_id.get()).unwrap().cache_version = USER_CACHE_VERSION - 1;
+        um.update_user(&mut temp.env(false), user_id, false, false);
+        assert!(!um.users.get(&user_id.get()).unwrap().is_repaired);
+
+        // A closing Td holds the trigger off too.
+        let reachable_id = UserId::new(502);
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(
+                reachable_id.get(),
+                "Reachable",
+                USER_ACCESS_HASH_MASK | (1 << 1),
+            )),
+            "test",
+        );
+        um.users.get_mut(&reachable_id.get()).unwrap().cache_version = USER_CACHE_VERSION - 1;
+        temp.global.set_close_flag();
+        um.update_user(&mut temp.env(false), reachable_id, false, false);
+        assert!(!um.users.get(&reachable_id.get()).unwrap().is_repaired);
     }
 
     #[test]
