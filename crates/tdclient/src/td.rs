@@ -42,7 +42,9 @@ use crate::config_recoverer::{
     RecovererNetType, SimpleConfigResult, load_dc_options_update,
 };
 use crate::config_result;
+use crate::connection_creator::ConnectionCreator;
 use crate::global::Global;
+use crate::link_manager::LinkManager;
 use crate::option_manager::OptionManager;
 use crate::requests;
 use crate::synchronous_requests;
@@ -111,7 +113,11 @@ pub struct Td {
     /// `Td::option_manager_` — created by `init` over the db config pmc;
     /// `None` during `WaitParameters` exactly like the C++.
     pub(crate) option_manager: Option<OptionManager>,
-    /// `Td::config_manager_` — created by `init_options_and_network`; its
+    /// The C++ `Td::connection_creator_` (`Td.cpp:1049`) — the M.3.9.1
+    /// dc-options consumer slice; the connection machinery (the
+    /// `DcOptionsSet` orderings, the link loop) is the net step.
+    pub(crate) connection_creator: Option<ConnectionCreator>,
+    /// The C++ `Td::config_manager_` — created by `init_options_and_network`; its
     /// expire timer rides the Td's actor timeout slot and its queries
     /// dispatch through the client-side dispatcher (M.3.8.1).
     pub(crate) config_manager: Option<ConfigManager>,
@@ -153,6 +159,10 @@ pub struct Td {
     /// `G()->time_zone_manager()`.
     #[allow(dead_code)]
     pub(crate) time_zone_manager: TimeZoneManager,
+    /// The C++ `Td::link_manager_` (`make_unique` at `Td.cpp:1239`, the
+    /// `init_managers` block) — the M.3.9.1 autologin-token slice; the
+    /// link surface is Wave 2.
+    pub(crate) link_manager: Option<LinkManager>,
     pub(crate) auth_manager: AuthManager,
     /// `Td::stop_cnt_` — the hangup and the close completion each drop one.
     stop_cnt: i32,
@@ -185,6 +195,7 @@ impl Td {
             parameters: None,
             header_options: HeaderOptions::default(),
             option_manager: None,
+            connection_creator: None,
             config_manager: None,
             net_query_dispatcher: None,
             sent_net_queries: Arc::new(Mutex::new(Vec::new())),
@@ -196,6 +207,7 @@ impl Td {
             recoverer_clock: None,
             global: Global::new(),
             time_zone_manager: TimeZoneManager::default(),
+            link_manager: None,
             auth_manager: AuthManager::new(),
             stop_cnt: 2,
         }
@@ -341,9 +353,9 @@ impl Td {
 
         // init_options_and_network, the M.1 + ConfigManager subset: the
         // OptionManager over the db config pmc, then the ConfigManager
-        // (StateManager/ConnectionCreator/OnlineManager arrive with their
-        // steps; the ConfigManager's start_up — the post-init config fetch —
-        // runs after the auth restore below, like the C++ actor start).
+        // (StateManager/OnlineManager arrive with their steps; the
+        // ConfigManager's start_up — the post-init config fetch — runs
+        // after the auth restore below, like the C++ actor start).
         // `global.init` above already loaded the server time difference, so
         // the constructor's opening `unix_time` update (OptionManager.cpp:59)
         // is corrected.
@@ -356,6 +368,15 @@ impl Td {
             self.option_manager = Some(option_manager);
         }
         self.flush_option_updates();
+
+        // VLOG "Create ConnectionCreator" (Td.cpp:1049, before the
+        // ConfigManager): the `start_up` dc-options pmc replay runs now —
+        // an unparsable/empty store routes through `on_dc_options(empty)`,
+        // which persists the empty list and re-adds the defaults. The
+        // actor machinery around it is the net step.
+        let is_test_dc = self.global.is_test_dc();
+        self.connection_creator =
+            Some(ConnectionCreator::new(self.global.binlog_pmc(), is_test_dc));
 
         // VLOG "Create ConfigManager" (Td.cpp:1070-1072).
         {
@@ -456,6 +477,11 @@ impl Td {
         // init_file_manager / init_non_actor_managers / init_managers /
         // init_pure_actor_managers / SecretChatsManager / StorageManager —
         // each manager step appends its block here in the C++ order.
+
+        // `make_unique<LinkManager>` (Td.cpp:1239, the init_managers
+        // block) — the autologin-token slice (M.3.9.1); the link surface
+        // is Wave 2.
+        self.link_manager = Some(LinkManager::new());
 
         // `ConfigManager::start_up` (runs when the C++ manager actor
         // starts, i.e. after the auth restore): the post-init config fetch
@@ -629,6 +655,12 @@ impl Td {
 
         self.global.close_all(self.destroy_flag);
         self.option_manager = None;
+        // The C++ close clears the ConnectionCreator early
+        // (`G()->set_connection_creator({})`, Td.cpp:690) and the
+        // LinkManager with the managers (`reset_manager(link_manager_)`,
+        // Td.cpp:547) — the component slices drop with them.
+        self.connection_creator = None;
+        self.link_manager = None;
         self.config_manager = None;
         // The C++ `ConfigManager::hangup` drops `config_recoverer_`
         // (ConfigManager.cpp:892-896): the close releases the parent share
@@ -755,6 +787,29 @@ impl Td {
         }
     }
 
+    /// The `DcOptions(server_dc_options)` ctor filter plus the
+    /// `ConnectionCreator::on_dc_options` call both config fan-outs
+    /// deliver (ConfigManager.cpp:632, 1191): invalid options drop at the
+    /// ctor, the sort seed is the `my_id` option
+    /// (`G()->get_option_integer("my_id")`).
+    fn send_connection_creator_dc_options(&mut self, dc_options: &[telegram_api::DcOption]) {
+        let options = dc_options
+            .iter()
+            .filter_map(StoredDcOption::from_telegram)
+            .collect::<Vec<_>>();
+        let seed = self
+            .option_manager
+            .as_ref()
+            .map(|option_manager| option_manager.get_option_integer("my_id", 0))
+            .unwrap_or(0);
+        let is_test_dc = self.global.is_test_dc();
+        let Some(connection_creator) = self.connection_creator.as_mut() else {
+            tracing::trace!("ConnectionCreator::on_dc_options dropped — no creator");
+            return;
+        };
+        connection_creator.on_dc_options(options, seed, is_test_dc, self.global.binlog_pmc());
+    }
+
     /// Complete the requests a ConfigManager call produced and hold its
     /// follow-up queries. The C++ manager actor sends each result itself;
     /// the inline manager returns them here. The updateOption broadcasts
@@ -767,6 +822,16 @@ impl Td {
             option_manager.update_premium_options();
         }
         self.flush_option_updates();
+
+        // The process_config fan-outs (ConfigManager.cpp:1191/1196).
+        if let Some(dc_options) = &actions.connection_creator_dc_options {
+            self.send_connection_creator_dc_options(dc_options);
+        }
+        if let Some(autologin_token) = &actions.autologin_token
+            && let Some(link_manager) = self.link_manager.as_mut()
+        {
+            link_manager.update_autologin_token(autologin_token.clone());
+        }
 
         for id in actions.ok_ids {
             self.send_result(id, ok_object());
@@ -860,8 +925,9 @@ impl Td {
 
     /// The recoverer's C++ side effects, executed by the Td: the DNS time
     /// difference write, the dispatched fetches (parked until their
-    /// executors land), the ConnectionCreator fan-out (M.3.9.1) and the
-    /// wakeup timer mirror.
+    /// executors land), the ConnectionCreator fan-out (ConfigManager.cpp:632,
+    /// applied through the same M.3.9.1 consumer as `process_config`) and
+    /// the wakeup timer mirror.
     pub(crate) fn apply_recoverer_actions(&mut self, actions: RecovererActions) {
         if let Some(diff) = actions.dns_time_difference {
             self.global.update_dns_time_difference(diff);
@@ -874,14 +940,8 @@ impl Td {
             self.pending_recoverer_fetches
                 .push(RecovererFetch::Full(fetch));
         }
-        if !actions.connection_creator_dc_options.is_empty() {
-            // `ConnectionCreator::on_dc_options` after a full config
-            // (ConfigManager.cpp:632) — the fan-out target is an M.3.9.1
-            // step; the options are carried in the action for it.
-            tracing::trace!(
-                "ConnectionCreator::on_dc_options ({} options) — the net step",
-                actions.connection_creator_dc_options.len()
-            );
+        if let Some(dc_options) = &actions.connection_creator_dc_options {
+            self.send_connection_creator_dc_options(dc_options);
         }
         if let Some(at) = actions.wakeup_at {
             self.recoverer_wakeup_at = at;
@@ -1577,6 +1637,7 @@ pub fn send_request(actor: &ActorOwn<Td>, request_id: u64, function: Function) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config_manager::StoredDcOptions;
     use std::sync::{Arc, Mutex};
     use tdactor::{ConcurrentScheduler, create_actor};
     use tdmtproto::telegram_api;
@@ -2140,6 +2201,18 @@ mod tests {
                 .is_empty()
         );
 
+        // The ConnectionCreator's start_up replay on the fresh database
+        // (ConnectionCreator.cpp:1099-1106): the empty update persisted
+        // and the set holds the prod defaults only.
+        let creator = td.connection_creator.as_ref().expect("creator at init");
+        assert_eq!(creator.dc_options().len(), 33);
+        assert!(
+            StoredDcOptions::parse(&td.global.binlog_pmc().get_raw(b"dc_options"))
+                .expect("the empty update persisted")
+                .options
+                .is_empty()
+        );
+
         // Network up: no connecting problem yet, so nothing dispatches.
         td.on_recoverer_net_type(RecovererNetType::WiFi, 0);
         assert!(td.pending_recoverer_fetches.is_empty());
@@ -2201,9 +2274,11 @@ mod tests {
         ));
         assert!(recoverer.full_config_query_active());
 
-        // The canned full config lands: accepted (the ConnectionCreator
-        // fan-out is carried for M.3.9.1), the query share releases, and
-        // no further fetch dispatches.
+        // The canned full config lands: accepted, the query share
+        // releases, and no further fetch dispatches. The options ride the
+        // M.3.9.1 fan-out into the ConnectionCreator
+        // (ConfigManager.cpp:632): sorted, persisted, merged onto the
+        // defaults.
         let parked = td.pending_recoverer_fetches.len();
         td.on_recoverer_full_config_result(Ok(telegram_api::Config {
             this_dc: 2,
@@ -2228,6 +2303,19 @@ mod tests {
         assert!(!recoverer.full_config_query_active());
         assert_eq!(td.pending_recoverer_fetches.len(), parked);
         assert!(td.recoverer_wakeup_at > 0.0);
+        let creator = td.connection_creator.as_ref().expect("creator at init");
+        let stored = StoredDcOptions::parse(&td.global.binlog_pmc().get_raw(b"dc_options"))
+            .expect("the sorted update persisted");
+        assert_eq!(stored.options.len(), 1);
+        assert_eq!(stored.options[0].ip_address(), "149.154.167.51");
+        assert_eq!(stored.options[0].raw_dc_id(), 2);
+        // The prod defaults table (33 entries, dc2 two addresses) plus the
+        // sorted update.
+        assert_eq!(creator.dc_options().len(), 33 + 1);
+        assert_eq!(
+            creator.dc_options().last().expect("the merged update").ip,
+            b"149.154.167.51"
+        );
 
         // A stray delivery without a dispatched query is a no-op — the
         // share release must not run.
@@ -2236,9 +2324,12 @@ mod tests {
         assert_eq!(td.pending_recoverer_fetches.len(), parked);
 
         // The close drops the recoverer with the manager
-        // (ConfigManager.cpp:892-896).
+        // (ConfigManager.cpp:892-896) and the M.3.9.1 consumers with the
+        // net/managers (Td.cpp:690/547).
         td.close_impl(false);
         assert!(td.config_recoverer.is_none());
+        assert!(td.connection_creator.is_none());
+        assert!(td.link_manager.is_none());
         assert!(td.pending_recoverer_fetches.is_empty());
         assert_eq!(td.recoverer_wakeup_at, 0.0);
         let _ = std::fs::remove_dir_all(&dir);
@@ -2395,7 +2486,9 @@ mod tests {
         };
 
         let config = telegram_api::Config {
-            flags: 4, // flags.2 carries the lang fields on the wire
+            // flags.2 carries the lang fields, flags.16 the autologin
+            // token (conditional on the wire).
+            flags: 4 | (1 << 16),
             this_dc: 1,
             date: 1000,
             expires: 2000,
@@ -2408,6 +2501,23 @@ mod tests {
             caption_length_max: 5000,
             message_length_max: 50000,
             me_url_prefix: "https://t.me".to_string(),
+            dc_options: vec![
+                telegram_api::DcOption {
+                    id: 2,
+                    ip_address: "149.154.167.51".to_string(),
+                    port: 443,
+                    ..telegram_api::DcOption::default()
+                },
+                // The DcOptions ctor drops the invalid dc id
+                // (DcOptions.h:245-252).
+                telegram_api::DcOption {
+                    id: 0,
+                    ip_address: "1.2.3.4".to_string(),
+                    port: 443,
+                    ..telegram_api::DcOption::default()
+                },
+            ],
+            autologin_token: "token".to_string(),
             ..Default::default()
         };
         let mut answer = Vec::new();
@@ -2430,6 +2540,30 @@ mod tests {
         assert_eq!(td.completed_config_queries.lock().unwrap().len(), 1);
         td.drain_config_net_query_completions();
         assert!(td.completed_config_queries.lock().unwrap().is_empty());
+
+        // The M.3.9.1 fan-outs (ConfigManager.cpp:1191/1196): the
+        // DcOptions ctor dropped the invalid dc id, the ConnectionCreator
+        // sorted and persisted the update onto the defaults, and the
+        // token reached the LinkManager.
+        let stored = StoredDcOptions::parse(&td.global.binlog_pmc().get_raw(b"dc_options"))
+            .expect("the sorted update persisted");
+        assert_eq!(stored.options.len(), 1);
+        assert_eq!(stored.options[0].ip_address(), "149.154.167.51");
+        assert_eq!(
+            td.connection_creator
+                .as_ref()
+                .expect("creator at init")
+                .dc_options()
+                .len(),
+            34
+        );
+        assert_eq!(
+            td.link_manager
+                .as_ref()
+                .expect("link manager at init")
+                .autologin_token(),
+            "token"
+        );
 
         let responses = callback.responses.lock().unwrap();
         let option_updates: Vec<(String, td_api::OptionValue)> = responses

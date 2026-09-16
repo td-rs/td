@@ -737,9 +737,11 @@ pub struct SimpleConfigFetch {
 #[derive(Debug, Default)]
 pub struct RecovererActions {
     /// `ConnectionCreator::on_dc_options(DcOptions(full_config->dc_options_))`
-    /// after a full config (the fan-out lands with the net step; the
-    /// options are carried for it).
-    pub connection_creator_dc_options: Vec<telegram_api::DcOption>,
+    /// after a full config (ConfigManager.cpp:632) — `Some` exactly when
+    /// a full config arrived (an option-less config still carries
+    /// `Some(vec![])`); the Td runs the `DcOptions(server_dc_options)`
+    /// ctor filter and the consumer call (M.3.9.1).
+    pub connection_creator_dc_options: Option<Vec<telegram_api::DcOption>>,
     /// `set_timeout_at(wakeup_timestamp.at())` — the earliest future
     /// deadline the loop wants to wake at. `None` leaves the currently
     /// armed timer alone (the C++ only re-arms on a valid timestamp).
@@ -1115,7 +1117,7 @@ impl ConfigRecoverer {
             Ok(config) => {
                 tracing::trace!("Receive {:?}", config.dc_options);
                 self.full_config_expires_at = self.get_config_expire_time(env);
-                actions.connection_creator_dc_options = config.dc_options.clone();
+                actions.connection_creator_dc_options = Some(config.dc_options.clone());
                 self.full_config = Some(Box::new(config));
             }
             Err(error) => {
@@ -2742,7 +2744,13 @@ mod tests {
         };
         let ok_before = tdutils::time::now();
         let actions = recoverer.on_full_config(Ok(full_config), &environment);
-        assert_eq!(actions.connection_creator_dc_options.len(), 1);
+        assert_eq!(
+            actions
+                .connection_creator_dc_options
+                .as_ref()
+                .map(|options| options.len()),
+            Some(1)
+        );
         assert!(
             recoverer.full_config_expires_at >= ok_before + 120.0
                 && recoverer.full_config_expires_at <= tdutils::time::now() + 180.0
@@ -2753,7 +2761,7 @@ mod tests {
         let fail_before = tdutils::time::now();
         let actions =
             recoverer.on_full_config(Err(Status::error_message("Timeout expired")), &environment);
-        assert!(actions.connection_creator_dc_options.is_empty());
+        assert!(actions.connection_creator_dc_options.is_none());
         assert!(
             recoverer.full_config_expires_at >= fail_before + 5.0
                 && recoverer.full_config_expires_at <= tdutils::time::now() + 7.0
