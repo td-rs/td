@@ -625,8 +625,11 @@ impl Td {
         // The UserManager member actors (the C++ `get_is_premium_required_
         // to_contact_queries_` value member + its `set_merge_function`;
         // the Rust merger is an actor whose merge function messages the Td
-        // actor to build the input users and send the query).
-        {
+        // actor to build the input users and send the query). Both need the
+        // scheduler context — the direct-call tests run bare, leaving the
+        // merger unwired (its uncached consumers answer the "Request
+        // aborted" surface, like the C++ close state).
+        if tdactor::Scheduler::in_scheduler_context() {
             let td_id = self.actor_id_of::<Td>();
             let merger = tdactor::create_actor(
                 "GetIsPremiumRequiredToContactMerger",
@@ -646,8 +649,8 @@ impl Td {
             );
             self.user_manager.get_is_premium_required_to_contact_queries = Some(merger.get());
             self.premium_required_contact_merger = Some(merger);
+            self.user_manager.td_actor_id = Some(self.actor_id_of::<Td>());
         }
-        self.user_manager.td_actor_id = Some(self.actor_id_of::<Td>());
 
         self.parameters = Some(parameters);
 
@@ -1737,7 +1740,7 @@ struct MergePremiumRequiredContactQueries {
 impl tdactor::ActorMessage for MergePremiumRequiredContactQueries {
     type Actor = Td;
 
-    fn dispatch(self, td: &mut Td) {
+    fn dispatch(mut self, td: &mut Td) {
         let Some(options) = td.option_manager.as_mut() else {
             // the C++ TRY_STATUS_PROMISE(promise, G()->close_status())
             return self
