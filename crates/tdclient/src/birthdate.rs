@@ -1,8 +1,9 @@
 //! Port of `td/telegram/Birthdate.{h,cpp}` — the packed day/month/year
 //! date attached to user profiles, with the byte-exact database
-//! serialization (`store`/`parse` is the raw `int32`). The telegram and
-//! td_api conversions arrive with the Contacts step; only the packed form
-//! is needed by the user database today.
+//! serialization (`store`/`parse` is the raw `int32`). The td_api object
+//! conversion (`get_birthdate_object`) arrived with the Contacts step;
+//! the telegram `birthday` intake builds through `Birthdate::new` (the
+//! C++ `init`, which re-derives the year-0/absent rules).
 
 /// `td::Birthdate`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -59,6 +60,19 @@ impl Birthdate {
     pub fn parse_from(parser: &mut crate::store_parse::Parser) -> Result<Birthdate, &'static str> {
         Ok(Birthdate {
             birthdate: parser.i32_()?,
+        })
+    }
+
+    /// `Birthdate::get_birthdate_object` (Birthdate.cpp:37-42) — the
+    /// td_api form; `None` is the C++ `nullptr` for the empty date.
+    pub fn get_birthdate_object(&self) -> Option<crate::td_api::Birthdate> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(crate::td_api::Birthdate {
+            day: self.get_day(),
+            month: self.get_month(),
+            year: self.get_year(),
         })
     }
 }

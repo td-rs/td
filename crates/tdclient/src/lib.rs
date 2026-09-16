@@ -11,6 +11,7 @@ pub mod auth_manager;
 pub mod birthdate;
 pub mod client;
 pub mod client_json;
+pub mod contact;
 pub mod emoji_status;
 pub mod global;
 pub mod misc;
