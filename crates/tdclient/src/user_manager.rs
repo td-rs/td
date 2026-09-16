@@ -673,7 +673,7 @@ impl TimeCtx {
         }
     }
 
-    fn store_time(out: &mut Vec<u8>, time_at: f64, ctx: &TimeCtx) {
+    pub(crate) fn store_time(out: &mut Vec<u8>, time_at: f64, ctx: &TimeCtx) {
         if time_at == 0.0 {
             store_parse::store_f64(out, -1.0);
         } else {
@@ -683,7 +683,7 @@ impl TimeCtx {
         }
     }
 
-    fn parse_time(parser: &mut Parser, ctx: &TimeCtx) -> Result<f64, &'static str> {
+    pub(crate) fn parse_time(parser: &mut Parser, ctx: &TimeCtx) -> Result<f64, &'static str> {
         let time_left = parser.f64_()?;
         if time_left < -0.1 {
             return Ok(0.0);

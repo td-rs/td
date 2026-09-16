@@ -22,11 +22,24 @@
 //!   created-public-dialogs step — its only consumer — because it converts the
 //!   td_api `PublicChatType` surface.
 
+use crate::emoji_status::{CustomEmojiId, EmojiStatus};
 use crate::global::Global;
 use crate::misc::strip_empty_characters;
-use crate::store_parse::{Parser, store_i32, store_i64, store_string, store_u64, version};
+use crate::peer_color::AccentColorId;
+use crate::photo::{DialogPhoto, Photo};
+use crate::restriction_reason::{
+    RestrictionReason, get_restriction_reasons_from_legacy, parse_restriction_reasons,
+    store_restriction_reasons,
+};
+use crate::store_parse::{
+    Parser, store_f64, store_flags, store_i32, store_i64, store_string, store_u32, store_u64,
+    version,
+};
 use crate::td_api;
-use crate::user_manager::{SecretChatId, UserId};
+use crate::user_manager::{
+    CommunityId, FileId, SecretChatId, StoryId, TimeCtx, UserEnv, UserId, UserManager,
+};
+use crate::usernames::Usernames;
 use tdmtproto::telegram_api;
 
 /// `td::ChatId` (ChatId.h): `0 < id ≤ MAX_CHAT_ID`.
@@ -111,6 +124,23 @@ impl MessageId {
 
     pub fn get(self) -> i64 {
         self.0
+    }
+
+    /// `MessageId::is_valid` — the C++ classifies server/local/scheduled
+    /// ids; the stand-in accepts any non-zero id (all ids stored today are
+    /// server ids, whose encoding is always non-zero).
+    pub fn is_valid(self) -> bool {
+        self.0 != 0
+    }
+
+    /// The `MessageId` header `store` (MessageId.h:193-200) — the raw id
+    /// both ways, no version gate.
+    pub fn store(&self, out: &mut Vec<u8>) {
+        store_i64(out, self.0);
+    }
+
+    pub fn parse_impl(parser: &mut Parser<'_>) -> Result<MessageId, &'static str> {
+        Ok(MessageId(parser.i64_()?))
     }
 }
 
@@ -2149,9 +2179,9 @@ impl DialogParticipant {
         let dialog_id_ = if parser.version() >= version::SUPPORT_BANNED_CHANNELS {
             DialogId::parse_impl(parser)?
         } else {
-            DialogId::from_user_id(Self::parse_user_id(parser)?)
+            DialogId::from_user_id(parse_user_id(parser)?)
         };
-        let inviter_user_id_ = Self::parse_user_id(parser)?;
+        let inviter_user_id_ = parse_user_id(parser)?;
         let joined_date_ = parser.i32_()?;
         let status_ = DialogParticipantStatus::parse_impl(parser)?;
         Ok(DialogParticipant {
@@ -2161,15 +2191,15 @@ impl DialogParticipant {
             status_,
         })
     }
+}
 
-    /// The `td::UserId` header `parse`: `long` from `Support64BitIds`, `int32`
-    /// before.
-    fn parse_user_id(parser: &mut Parser<'_>) -> Result<UserId, &'static str> {
-        if parser.version() >= version::SUPPORT_64_BIT_IDS {
-            Ok(UserId::new(parser.i64_()?))
-        } else {
-            Ok(UserId::new(parser.i32_()? as i64))
-        }
+/// The `td::UserId` header `parse`: `long` from `Support64BitIds`, `int32`
+/// before. Shared by every record that inlines a `UserId`.
+fn parse_user_id(parser: &mut Parser<'_>) -> Result<UserId, &'static str> {
+    if parser.version() >= version::SUPPORT_64_BIT_IDS {
+        Ok(UserId::new(parser.i64_()?))
+    } else {
+        Ok(UserId::new(parser.i32_()? as i64))
     }
 }
 
@@ -2182,6 +2212,2521 @@ impl Default for DialogParticipant {
             joined_date_: 0,
             status_: DialogParticipantStatus::left(),
         }
+    }
+}
+
+/// `td::DialogAdministrator` (DialogAdministrator.h:21): one entry of a
+/// dialog's administrator list. The `td_api::chatAdministrator` builder
+/// stays with the M.5.36 read surface — it needs the UserManager's
+/// `get_user_id_object`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DialogAdministrator {
+    user_id_: UserId,
+    rank_: String,
+    is_creator_: bool,
+    can_be_edited_: bool,
+}
+
+impl DialogAdministrator {
+    /// `DialogAdministrator(UserId, const string &, bool, bool)`.
+    pub fn new(
+        user_id: UserId,
+        rank: String,
+        is_creator: bool,
+        can_be_edited: bool,
+    ) -> DialogAdministrator {
+        DialogAdministrator {
+            user_id_: user_id,
+            rank_: rank,
+            is_creator_: is_creator,
+            can_be_edited_: can_be_edited,
+        }
+    }
+
+    /// `DialogAdministrator(UserId, const DialogParticipantStatus &)
+    /// (DialogAdministrator.cpp:16-21)` — the CHECK narrows the status to an
+    /// administrator.
+    pub fn from_status(user_id: UserId, status: &DialogParticipantStatus) -> DialogAdministrator {
+        assert!(status.is_administrator(), "Status is not an administrator");
+        DialogAdministrator {
+            user_id_: user_id,
+            rank_: status.get_rank().to_owned(),
+            is_creator_: status.is_creator(),
+            can_be_edited_: status.can_be_edited(),
+        }
+    }
+
+    pub fn get_user_id(&self) -> UserId {
+        self.user_id_
+    }
+
+    pub fn get_rank(&self) -> &str {
+        &self.rank_
+    }
+
+    /// `DialogAdministrator::set_rank` — true when the rank changed.
+    pub fn set_rank(&mut self, rank: &str) -> bool {
+        if self.rank_ == rank {
+            return false;
+        }
+        self.rank_ = rank.to_owned();
+        true
+    }
+
+    pub fn is_creator(&self) -> bool {
+        self.is_creator_
+    }
+
+    pub fn can_be_edited(&self) -> bool {
+        self.can_be_edited_
+    }
+
+    /// `DialogAdministrator::store` (DialogAdministrator.h:60-73) — a flag
+    /// block over the rank presence, the creator and the editability, then
+    /// the user id and the optional rank.
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_rank = !self.rank_.is_empty();
+        store_flags(out, [has_rank, self.is_creator_, self.can_be_edited_]);
+        store_i64(out, self.user_id_.get());
+        if has_rank {
+            store_string(out, &self.rank_);
+        }
+    }
+
+    /// `DialogAdministrator::parse`.
+    pub fn parse_impl(parser: &mut Parser<'_>) -> Result<DialogAdministrator, &'static str> {
+        let [has_rank, is_creator_, can_be_edited_] = parser.parse_flags()?;
+        let user_id_ = parse_user_id(parser)?;
+        let rank_ = if has_rank {
+            parser.string()?
+        } else {
+            String::new()
+        };
+        Ok(DialogAdministrator {
+            user_id_,
+            rank_,
+            is_creator_,
+            can_be_edited_,
+        })
+    }
+}
+
+/// `td::BotCommand` (BotCommand.h:22) — a bot command as carried by
+/// `BotInfo` and the `BotCommands` wrapper. The `td_api`/`InputBotCommand`
+/// builders stay with their request steps.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BotCommand {
+    command_: String,
+    description_: String,
+    is_ephemeral_: bool,
+}
+
+impl BotCommand {
+    /// `BotCommand(string, string, bool)`.
+    pub fn new(command: String, description: String, is_ephemeral: bool) -> BotCommand {
+        BotCommand {
+            command_: command,
+            description_: description,
+            is_ephemeral_: is_ephemeral,
+        }
+    }
+
+    /// `explicit BotCommand(telegram_api::botCommand)` (BotCommand.cpp:112-117).
+    pub fn from_telegram(bot_command: telegram_api::BotCommand) -> BotCommand {
+        BotCommand {
+            command_: bot_command.command,
+            description_: bot_command.description,
+            is_ephemeral_: bot_command.ephemeral,
+        }
+    }
+
+    /// `BotCommand::is_ephemeral` — the flag byte of the C++ `==`/builders.
+    pub fn is_ephemeral(&self) -> bool {
+        self.is_ephemeral_
+    }
+
+    /// `BotCommand::store` (BotCommand.h:40-47) — the `is_ephemeral` flag
+    /// block, then the two strings.
+    pub fn store(&self, out: &mut Vec<u8>) {
+        store_flags(out, [self.is_ephemeral_]);
+        store_string(out, &self.command_);
+        store_string(out, &self.description_);
+    }
+
+    /// `BotCommand::parse` — the flag block only exists from
+    /// `SupportEphemeralMessages` (61).
+    pub fn parse_impl(parser: &mut Parser<'_>) -> Result<BotCommand, &'static str> {
+        let is_ephemeral_ = if parser.version() >= version::SUPPORT_EPHEMERAL_MESSAGES {
+            parser.parse_flags::<1>()?[0]
+        } else {
+            false
+        };
+        let command_ = parser.string()?;
+        let description_ = parser.string()?;
+        Ok(BotCommand {
+            command_,
+            description_,
+            is_ephemeral_,
+        })
+    }
+}
+
+/// `td::BotCommands` (BotCommand.h:67) — one bot's command list, as the
+/// full-info records and the `botInfoChanged` intake carry them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BotCommands {
+    bot_user_id_: UserId,
+    commands_: Vec<BotCommand>,
+}
+
+impl BotCommands {
+    /// `BotCommands::BotCommands(UserId, vector<botCommand>)`
+    /// (BotCommand.cpp:131-138).
+    pub fn from_telegram(
+        bot_user_id: UserId,
+        bot_commands: Vec<telegram_api::BotCommand>,
+    ) -> BotCommands {
+        BotCommands {
+            bot_user_id_: bot_user_id,
+            commands_: bot_commands
+                .into_iter()
+                .map(BotCommand::from_telegram)
+                .collect(),
+        }
+    }
+
+    pub fn get_bot_user_id(&self) -> UserId {
+        self.bot_user_id_
+    }
+
+    /// `BotCommands::store` (BotCommand.h:86-90) — the user id then the
+    /// counted vector.
+    pub fn store(&self, out: &mut Vec<u8>) {
+        store_i64(out, self.bot_user_id_.get());
+        store_i32(out, self.commands_.len() as i32);
+        for command in &self.commands_ {
+            command.store(out);
+        }
+    }
+
+    /// `BotCommands::parse` — the user id rides the `Support64BitIds` gate,
+    /// every command its own `SupportEphemeralMessages` one. The allocation
+    /// cap keeps a hostile count from aborting on start (the M.4.17 lesson);
+    /// an overcount still errors out on the first missing command.
+    pub fn parse_impl(parser: &mut Parser<'_>) -> Result<BotCommands, &'static str> {
+        let bot_user_id_ = parse_user_id(parser)?;
+        let count = parser.i32_()?;
+        let mut commands_ = Vec::with_capacity(count.clamp(0, 1_000_000) as usize);
+        for _ in 0..count {
+            commands_.push(BotCommand::parse_impl(parser)?);
+        }
+        Ok(BotCommands {
+            bot_user_id_,
+            commands_,
+        })
+    }
+
+    /// `BotCommands::update_all_bot_commands` (BotCommand.cpp:144-162) —
+    /// an empty list drops the bot's entry, a changed list replaces it
+    /// in place, a new bot appends; the result reports whether anything
+    /// changed.
+    pub fn update_all_bot_commands(
+        all_bot_commands: &mut Vec<BotCommands>,
+        bot_commands: BotCommands,
+    ) -> bool {
+        let is_from_bot =
+            |commands: &BotCommands| commands.bot_user_id_ == bot_commands.bot_user_id_;
+
+        if bot_commands.commands_.is_empty() {
+            let had_any = all_bot_commands.iter().any(is_from_bot);
+            all_bot_commands.retain(|commands| !is_from_bot(commands));
+            return had_any;
+        }
+        if let Some(existing) = all_bot_commands
+            .iter_mut()
+            .find(|commands| is_from_bot(commands))
+        {
+            if *existing != bot_commands {
+                *existing = bot_commands;
+                return true;
+            }
+            return false;
+        }
+        all_bot_commands.push(bot_commands);
+        true
+    }
+}
+
+/// `td::MinChannel` (MinChannel.h:23) — the degraded channel record the
+/// min-channel cache keeps (the C++ keeps min channels out of `channels_`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MinChannel {
+    pub title_: String,
+    pub photo_: DialogPhoto,
+    pub accent_color_id_: AccentColorId,
+    pub is_megagroup_: bool,
+}
+
+/// `StarManager::get_star_count` (StarManager.cpp) — the Telegram Star amount
+/// sanitizer. Only the clamp is ported here; the full StarManager is its own
+/// slice and this is its only in-slice caller.
+pub fn get_star_count(amount: i64, allow_negative: bool) -> i64 {
+    const MAX_AMOUNT: i64 = 1 << 51;
+    if amount < 0 {
+        if !allow_negative {
+            tdutils::log_error!("Receive Telegram Star amount = {amount}");
+            return 0;
+        }
+        if amount < -MAX_AMOUNT {
+            tdutils::log_error!("Receive Telegram Star amount = {amount}");
+            return -MAX_AMOUNT;
+        }
+    }
+    if amount > MAX_AMOUNT {
+        tdutils::log_error!("Receive Telegram Star amount = {amount}");
+        return MAX_AMOUNT;
+    }
+    amount
+}
+
+/// `td::StarSubscriptionPricing` (StarSubscriptionPricing.{h,cpp,hpp}).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StarSubscriptionPricing {
+    period_: i32,
+    amount_: i64,
+}
+
+impl StarSubscriptionPricing {
+    pub fn new(period: i32, amount: i64) -> StarSubscriptionPricing {
+        StarSubscriptionPricing {
+            period_: period,
+            amount_: amount,
+        }
+    }
+
+    /// `explicit StarSubscriptionPricing(telegram_api::object_ptr<starsSubscriptionPricing> &&)`
+    /// (StarSubscriptionPricing.cpp:13-19) — a null pointer leaves the
+    /// default record.
+    pub fn from_telegram(pricing: Option<telegram_api::StarsSubscriptionPricing>) -> Self {
+        let mut result = StarSubscriptionPricing::default();
+        if let Some(pricing) = pricing {
+            result.period_ = pricing.period;
+            result.amount_ = get_star_count(pricing.amount, false);
+        }
+        result
+    }
+
+    /// `explicit StarSubscriptionPricing(td_api::object_ptr<starSubscriptionPricing> &&)`
+    /// (StarSubscriptionPricing.cpp:21-29) — amounts above a billion are
+    /// dropped entirely.
+    pub fn from_td_api(pricing: Option<td_api::StarSubscriptionPricing>) -> Self {
+        let mut result = StarSubscriptionPricing::default();
+        if let Some(pricing) = pricing {
+            result.period_ = pricing.period;
+            result.amount_ = pricing.star_count;
+            if result.amount_ > 1_000_000_000 {
+                result.amount_ = 0;
+            }
+        }
+        result
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.period_ <= 0 || self.amount_ <= 0
+    }
+
+    pub fn get_period(&self) -> i32 {
+        self.period_
+    }
+
+    pub fn get_amount(&self) -> i64 {
+        self.amount_
+    }
+
+    /// `get_star_subscription_pricing_object`.
+    pub fn get_star_subscription_pricing_object(&self) -> Option<td_api::StarSubscriptionPricing> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(td_api::StarSubscriptionPricing {
+            period: self.period_,
+            star_count: self.amount_,
+        })
+    }
+
+    /// `get_input_stars_subscription_pricing` — the request-input form; its
+    /// senders land with the M.5.45 edit queries.
+    pub fn get_input_stars_subscription_pricing(
+        &self,
+    ) -> Option<telegram_api::StarsSubscriptionPricing> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(telegram_api::StarsSubscriptionPricing {
+            period: self.period_,
+            amount: self.amount_,
+        })
+    }
+
+    /// `store` (StarSubscriptionPricing.hpp:16-22) — the (empty) flag block,
+    /// then the period and the amount.
+    pub fn store(&self, out: &mut Vec<u8>) {
+        store_flags(out, []);
+        store_i32(out, self.period_);
+        store_i64(out, self.amount_);
+    }
+
+    /// `parse` (StarSubscriptionPricing.hpp:24-30).
+    pub fn parse_impl(parser: &mut Parser<'_>) -> Result<Self, &'static str> {
+        parser.parse_flags::<0>()?;
+        let period_ = parser.i32_()?;
+        let amount_ = parser.i64_()?;
+        Ok(StarSubscriptionPricing { period_, amount_ })
+    }
+}
+
+/// `td::DialogInviteLink` (DialogInviteLink.{h,cpp,hpp}) — one chat/channel
+/// invite link, as carried by `ChatFull`/`ChannelFull` and the invite-link
+/// update intakes. The `operator<<` log formatting is not ported.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DialogInviteLink {
+    invite_link_: String,
+    title_: String,
+    creator_user_id_: UserId,
+    pricing_: StarSubscriptionPricing,
+    date_: i32,
+    edit_date_: i32,
+    expire_date_: i32,
+    usage_limit_: i32,
+    usage_count_: i32,
+    expired_usage_count_: i32,
+    request_count_: i32,
+    creates_join_request_: bool,
+    is_revoked_: bool,
+    is_permanent_: bool,
+}
+
+impl DialogInviteLink {
+    /// `DialogInviteLink(telegram_api::object_ptr<ExportedChatInvite>, bool, bool, const char *)`
+    /// (DialogInviteLink.cpp:18-95). A null pointer or a
+    /// `chatInvitePublicJoinRequests` (which carries no link) yields the
+    /// default record; every malformed field of a `chatInviteExported` is
+    /// sanitized exactly like the C++ LOG(ERROR) repair path.
+    pub fn from_telegram(
+        exported_invite_ptr: Option<telegram_api::ExportedChatInvite>,
+        allow_truncated: bool,
+        expect_join_request: bool,
+        source: &str,
+    ) -> Self {
+        let Some(exported_invite) = exported_invite_ptr else {
+            return DialogInviteLink::default();
+        };
+        let telegram_api::ExportedChatInvite::chatInviteExported(exported_invite) = exported_invite
+        else {
+            // `CHECK(get_id() == chatInvitePublicJoinRequests::ID)`, then
+            // only a LOG(ERROR) — the record stays default.
+            if !expect_join_request {
+                tdutils::log_error!("Receive from {source} chatInvitePublicJoinRequests");
+            }
+            return DialogInviteLink::default();
+        };
+
+        let mut invite_link = DialogInviteLink {
+            invite_link_: exported_invite.link,
+            title_: exported_invite.title,
+            creator_user_id_: UserId::new(exported_invite.admin_id),
+            pricing_: StarSubscriptionPricing::from_telegram(Some(
+                exported_invite.subscription_pricing,
+            )),
+            date_: exported_invite.date,
+            expire_date_: exported_invite.expire_date,
+            usage_limit_: exported_invite.usage_limit,
+            usage_count_: exported_invite.usage,
+            expired_usage_count_: exported_invite.subscription_expired,
+            edit_date_: exported_invite.start_date,
+            request_count_: exported_invite.requested,
+            creates_join_request_: exported_invite.request_needed,
+            is_revoked_: exported_invite.revoked,
+            is_permanent_: exported_invite.permanent,
+        };
+
+        let full_source = format!("invite link {} from {}", invite_link.invite_link_, source);
+        if !Self::is_valid_invite_link(&invite_link.invite_link_, allow_truncated) {
+            tdutils::log_error!("Unsupported {full_source}");
+        }
+        if !invite_link.creator_user_id_.is_valid() {
+            tdutils::log_error!("Receive invalid creator of invite link {full_source}");
+            invite_link.creator_user_id_ = UserId::default();
+        }
+        if invite_link.date_ != 0 && invite_link.date_ < 1_000_000_000 {
+            tdutils::log_error!("Receive wrong date as a creation date of {full_source}");
+            invite_link.date_ = 0;
+        }
+        if invite_link.expire_date_ != 0 && invite_link.expire_date_ < 1_000_000_000 {
+            tdutils::log_error!("Receive wrong date as an expire date of {full_source}");
+            invite_link.expire_date_ = 0;
+        }
+        if invite_link.usage_limit_ < 0 {
+            tdutils::log_error!("Receive wrong usage limit for {full_source}");
+            invite_link.usage_limit_ = 0;
+        }
+        if invite_link.usage_count_ < 0 {
+            tdutils::log_error!("Receive wrong usage count for {full_source}");
+            invite_link.usage_count_ = 0;
+        }
+        if invite_link.expired_usage_count_ < 0 {
+            tdutils::log_error!("Receive wrong expired usage count for {full_source}");
+            invite_link.expired_usage_count_ = 0;
+        }
+        if invite_link.edit_date_ != 0 && invite_link.edit_date_ < 1_000_000_000 {
+            tdutils::log_error!("Receive wrong date as an edit date of {full_source}");
+            invite_link.edit_date_ = 0;
+        }
+        if invite_link.request_count_ < 0 {
+            tdutils::log_error!("Receive wrong pending join request count for {full_source}");
+            invite_link.request_count_ = 0;
+        }
+
+        if invite_link.is_permanent_
+            && (!invite_link.title_.is_empty()
+                || invite_link.expire_date_ > 0
+                || invite_link.usage_limit_ > 0
+                || invite_link.edit_date_ > 0
+                || invite_link.request_count_ > 0)
+        {
+            tdutils::log_error!("Receive wrong permanent {full_source}");
+            invite_link.title_.clear();
+            invite_link.expire_date_ = 0;
+            invite_link.usage_limit_ = 0;
+            invite_link.edit_date_ = 0;
+            invite_link.request_count_ = 0;
+        }
+        if invite_link.creates_join_request_ && invite_link.usage_limit_ > 0 {
+            tdutils::log_error!("Receive wrong permanent {full_source}");
+            invite_link.usage_limit_ = 0;
+        }
+        invite_link
+    }
+
+    /// `DialogInviteLink::is_valid_invite_link` (DialogInviteLink.cpp:97-102).
+    /// The LinkManager URL stack it consults (`get_dialog_invite_link_hash`)
+    /// lands with the LinkManager slice — in this slice the check only gates
+    /// a LOG(ERROR) (DialogInviteLink.cpp:48), so it is a documented
+    /// always-valid stand-in.
+    pub fn is_valid_invite_link(invite_link: &str, allow_truncated: bool) -> bool {
+        let _ = (invite_link, allow_truncated);
+        true
+    }
+
+    /// `is_valid`.
+    pub fn is_valid(&self) -> bool {
+        !self.invite_link_.is_empty() && self.creator_user_id_.is_valid() && self.date_ > 0
+    }
+
+    pub fn is_permanent(&self) -> bool {
+        self.is_permanent_
+    }
+
+    pub fn get_invite_link(&self) -> &str {
+        &self.invite_link_
+    }
+
+    pub fn get_creator_user_id(&self) -> UserId {
+        self.creator_user_id_
+    }
+
+    /// `get_chat_invite_link_object` (DialogInviteLink.cpp:104-115) — `None`
+    /// where the C++ returns a null object.
+    pub fn get_chat_invite_link_object(
+        &self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+    ) -> Option<td_api::ChatInviteLink> {
+        if !self.is_valid() {
+            return None;
+        }
+        Some(td_api::ChatInviteLink {
+            invite_link: self.invite_link_.clone(),
+            name: self.title_.clone(),
+            creator_user_id: user_manager.get_user_id_object(
+                env,
+                self.creator_user_id_,
+                "get_chat_invite_link_object",
+            ),
+            date: self.date_,
+            edit_date: self.edit_date_,
+            expiration_date: self.expire_date_,
+            // The C++ passes a possibly-null object_ptr; the generated Rust
+            // field is a plain struct, so an empty pricing serializes with
+            // its zero fields instead of null.
+            subscription_pricing: self
+                .pricing_
+                .get_star_subscription_pricing_object()
+                .unwrap_or_default(),
+            member_limit: self.usage_limit_,
+            member_count: self.usage_count_,
+            expired_member_count: self.expired_usage_count_,
+            pending_join_request_count: self.request_count_,
+            creates_join_request: self.creates_join_request_,
+            is_primary: self.is_permanent_,
+            is_revoked: self.is_revoked_,
+        })
+    }
+
+    /// `store` (DialogInviteLink.hpp:17-68).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_expire_date = self.expire_date_ != 0;
+        let has_usage_limit = self.usage_limit_ != 0;
+        let has_usage_count = self.usage_count_ != 0;
+        let has_edit_date = self.edit_date_ != 0;
+        let has_request_count = self.request_count_ != 0;
+        let has_title = !self.title_.is_empty();
+        let has_pricing = !self.pricing_.is_empty();
+        let has_expired_usage_count = self.expired_usage_count_ != 0;
+        store_flags(
+            out,
+            [
+                self.is_revoked_,
+                self.is_permanent_,
+                has_expire_date,
+                has_usage_limit,
+                has_usage_count,
+                has_edit_date,
+                has_request_count,
+                self.creates_join_request_,
+                has_title,
+                has_pricing,
+                has_expired_usage_count,
+            ],
+        );
+        store_string(out, &self.invite_link_);
+        store_i64(out, self.creator_user_id_.get());
+        store_i32(out, self.date_);
+        if has_expire_date {
+            store_i32(out, self.expire_date_);
+        }
+        if has_usage_limit {
+            store_i32(out, self.usage_limit_);
+        }
+        if has_usage_count {
+            store_i32(out, self.usage_count_);
+        }
+        if has_edit_date {
+            store_i32(out, self.edit_date_);
+        }
+        if has_request_count {
+            store_i32(out, self.request_count_);
+        }
+        if has_title {
+            store_string(out, &self.title_);
+        }
+        if has_pricing {
+            self.pricing_.store(out);
+        }
+        if has_expired_usage_count {
+            store_i32(out, self.expired_usage_count_);
+        }
+    }
+
+    /// `parse` (DialogInviteLink.hpp:70-124), including the trailing
+    /// `creates_join_request` usage-limit reset.
+    pub fn parse_impl(parser: &mut Parser<'_>) -> Result<Self, &'static str> {
+        let [
+            is_revoked_,
+            is_permanent_,
+            has_expire_date,
+            has_usage_limit,
+            has_usage_count,
+            has_edit_date,
+            has_request_count,
+            creates_join_request_,
+            has_title,
+            has_pricing,
+            has_expired_usage_count,
+        ] = parser.parse_flags()?;
+        let invite_link_ = parser.string()?;
+        let creator_user_id_ = parse_user_id(parser)?;
+        let date_ = parser.i32_()?;
+        let expire_date_ = if has_expire_date { parser.i32_()? } else { 0 };
+        let usage_limit_ = if has_usage_limit { parser.i32_()? } else { 0 };
+        let usage_count_ = if has_usage_count { parser.i32_()? } else { 0 };
+        let edit_date_ = if has_edit_date { parser.i32_()? } else { 0 };
+        let request_count_ = if has_request_count { parser.i32_()? } else { 0 };
+        let title_ = if has_title {
+            parser.string()?
+        } else {
+            String::new()
+        };
+        let pricing_ = if has_pricing {
+            StarSubscriptionPricing::parse_impl(parser)?
+        } else {
+            StarSubscriptionPricing::default()
+        };
+        let expired_usage_count_ = if has_expired_usage_count {
+            parser.i32_()?
+        } else {
+            0
+        };
+        let mut invite_link = DialogInviteLink {
+            invite_link_,
+            title_,
+            creator_user_id_,
+            pricing_,
+            date_,
+            edit_date_,
+            expire_date_,
+            usage_limit_,
+            usage_count_,
+            expired_usage_count_,
+            request_count_,
+            creates_join_request_,
+            is_revoked_,
+            is_permanent_,
+        };
+        if creates_join_request_ {
+            invite_link.usage_limit_ = 0;
+        }
+        Ok(invite_link)
+    }
+}
+
+/// `td::MissingInvitee` (MissingInvitee.{h,cpp}) — one entry of a failed
+/// members add. The td_api builders take the UserManager like the C++.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MissingInvitee {
+    user_id_: UserId,
+    premium_would_allow_invite_: bool,
+    premium_required_for_pm_: bool,
+}
+
+impl MissingInvitee {
+    /// `explicit MissingInvitee(telegram_api::object_ptr<missingInvitee> &&)`
+    /// (MissingInvitee.cpp:17-21).
+    pub fn from_telegram(invitee: telegram_api::MissingInvitee) -> Self {
+        MissingInvitee {
+            user_id_: UserId::new(invitee.user_id),
+            premium_would_allow_invite_: invitee.premium_would_allow_invite,
+            premium_required_for_pm_: invitee.premium_required_for_pm,
+        }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.user_id_.is_valid()
+    }
+
+    pub fn get_user_id(&self) -> UserId {
+        self.user_id_
+    }
+
+    /// `get_failed_to_add_member_object` (MissingInvitee.cpp:23-29).
+    pub fn get_failed_to_add_member_object(
+        &self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+    ) -> td_api::FailedToAddMember {
+        td_api::FailedToAddMember {
+            user_id: user_manager.get_user_id_object(
+                env,
+                self.user_id_,
+                "get_failed_to_add_member_object",
+            ),
+            premium_would_allow_invite: self.premium_would_allow_invite_,
+            premium_required_to_send_messages: self.premium_required_for_pm_,
+        }
+    }
+}
+
+/// `td::MissingInvitees` (MissingInvitee.{h,cpp}).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MissingInvitees {
+    missing_invitees_: Vec<MissingInvitee>,
+}
+
+impl MissingInvitees {
+    /// `explicit MissingInvitees(vector<object_ptr<missingInvitee>> &&)`
+    /// (MissingInvitee.cpp:36-44) — invalid entries are logged and dropped.
+    pub fn from_telegram(invitees: Vec<telegram_api::MissingInvitee>) -> Self {
+        let mut missing_invitees = Vec::new();
+        for invitee in invitees {
+            let invitee = MissingInvitee::from_telegram(invitee);
+            if !invitee.is_valid() {
+                tdutils::log_error!("Receive invalid missing invitee");
+                continue;
+            }
+            missing_invitees.push(invitee);
+        }
+        MissingInvitees {
+            missing_invitees_: missing_invitees,
+        }
+    }
+
+    /// `get_failed_to_add_members_object` (MissingInvitee.cpp:46-52).
+    pub fn get_failed_to_add_members_object(
+        &self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+    ) -> td_api::FailedToAddMembers {
+        td_api::FailedToAddMembers {
+            failed_to_add_members: self
+                .missing_invitees_
+                .iter()
+                .map(|invitee| invitee.get_failed_to_add_member_object(user_manager, env))
+                .collect(),
+        }
+    }
+}
+
+/// `get_verification_status_object` (VerificationStatus.cpp:11-18) — `None`
+/// where the C++ returns a null object. The C++ `Td *td` parameter is unused.
+pub fn get_verification_status_object(
+    is_verified: bool,
+    is_scam: bool,
+    is_fake: bool,
+    bot_verification_custom_emoji_id: CustomEmojiId,
+) -> Option<td_api::VerificationStatus> {
+    if !is_verified && !is_scam && !is_fake && !bot_verification_custom_emoji_id.is_valid() {
+        return None;
+    }
+    Some(td_api::VerificationStatus {
+        is_verified,
+        is_scam,
+        is_fake,
+        bot_verification_icon_custom_emoji_id: bot_verification_custom_emoji_id.get(),
+    })
+}
+
+/// The `ChatId` header `parse`: `long` from `Support64BitIds`, `int32`
+/// before; the header `store` is always `store_long`.
+fn parse_chat_id(parser: &mut Parser<'_>) -> Result<ChatId, &'static str> {
+    if parser.version() >= version::SUPPORT_64_BIT_IDS {
+        Ok(ChatId::new(parser.i64_()?))
+    } else {
+        Ok(ChatId::new(parser.i32_()? as i64))
+    }
+}
+
+/// The `ChannelId` header `parse`, symmetric to [`parse_chat_id`].
+fn parse_channel_id(parser: &mut Parser<'_>) -> Result<ChannelId, &'static str> {
+    if parser.version() >= version::SUPPORT_64_BIT_IDS {
+        Ok(ChannelId::new(parser.i64_()?))
+    } else {
+        Ok(ChannelId::new(parser.i32_()? as i64))
+    }
+}
+
+/// `td::Location` (Location.h:20-134) — the geolocation record. Only the
+/// value semantics and the persistence land here; the constructors and the
+/// object builders need the geo-point accessors and land with their
+/// consumers.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Location {
+    is_empty_: bool,
+    latitude_: f64,
+    longitude_: f64,
+    horizontal_accuracy_: f64,
+    access_hash_: i64,
+}
+
+impl Default for Location {
+    fn default() -> Self {
+        Location {
+            is_empty_: true,
+            latitude_: 0.0,
+            longitude_: 0.0,
+            horizontal_accuracy_: 0.0,
+            access_hash_: 0,
+        }
+    }
+}
+
+impl Location {
+    /// `Location::empty` — the C++ `is_empty_` flag.
+    pub fn is_empty(&self) -> bool {
+        self.is_empty_
+    }
+
+    /// `Location::store` (Location.h:80-99).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_access_hash = self.access_hash_ != 0;
+        let has_horizontal_accuracy = self.horizontal_accuracy_ > 0.0;
+        store_flags(
+            out,
+            [self.is_empty_, has_access_hash, has_horizontal_accuracy],
+        );
+        store_f64(out, self.latitude_);
+        store_f64(out, self.longitude_);
+        if has_access_hash {
+            store_i64(out, self.access_hash_);
+        }
+        if has_horizontal_accuracy {
+            store_f64(out, self.horizontal_accuracy_);
+        }
+    }
+
+    /// `Location::parse` (Location.h:101-134).
+    pub fn parse_impl(parser: &mut Parser<'_>) -> Result<Self, &'static str> {
+        let [is_empty_, has_access_hash, has_horizontal_accuracy] = parser.parse_flags()?;
+        let latitude_ = parser.f64_()?;
+        let longitude_ = parser.f64_()?;
+        let access_hash_ = if has_access_hash { parser.i64_()? } else { 0 };
+        let horizontal_accuracy_ = if has_horizontal_accuracy {
+            parser.f64_()?
+        } else {
+            0.0
+        };
+        Ok(Location {
+            is_empty_,
+            latitude_,
+            longitude_,
+            horizontal_accuracy_,
+            access_hash_,
+        })
+    }
+}
+
+/// `td::DialogLocation` (DialogLocation.{h,cpp}) — a chat/channel location
+/// with its textual address. The constructors need the geo-point accessors
+/// and land with the channel-location intake (M.5.25/M.5.26).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DialogLocation {
+    location_: Location,
+    address_: String,
+}
+
+impl DialogLocation {
+    /// `DialogLocation::empty` (DialogLocation.cpp).
+    pub fn empty(&self) -> bool {
+        self.location_.is_empty() && self.address_.is_empty()
+    }
+
+    /// `get_address`.
+    pub fn get_address(&self) -> &str {
+        &self.address_
+    }
+
+    /// `store` (DialogLocation.h:51-55).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        self.location_.store(out);
+        store_string(out, &self.address_);
+    }
+
+    /// `parse` (DialogLocation.h:57-62).
+    pub fn parse_impl(parser: &mut Parser<'_>) -> Result<Self, &'static str> {
+        let location_ = Location::parse_impl(parser)?;
+        let address_ = parser.string()?;
+        Ok(DialogLocation {
+            location_,
+            address_,
+        })
+    }
+}
+
+/// `td::ProfileTab` (ProfileTab.h:19) — the main profile tab of a
+/// channel. The `get_profile_tab`/`get_input_profile_tab` conversions and
+/// the td_api builders land with the M.5.39/M.5.40 setter steps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProfileTab {
+    #[default]
+    Default,
+    Posts,
+    Gifts,
+    Media,
+    Files,
+    Music,
+    Voice,
+    Links,
+    Gifs,
+}
+
+impl ProfileTab {
+    /// The persisted form: `store(static_cast<int32>)` via the generic enum
+    /// store. A value outside the enumeration can only come from a corrupt
+    /// database — the C++ keeps it as the raw int; here it falls back to
+    /// `Default`.
+    pub fn from_raw(value: i32) -> ProfileTab {
+        match value {
+            0 => ProfileTab::Default,
+            1 => ProfileTab::Posts,
+            2 => ProfileTab::Gifts,
+            3 => ProfileTab::Media,
+            4 => ProfileTab::Files,
+            5 => ProfileTab::Music,
+            6 => ProfileTab::Voice,
+            7 => ProfileTab::Links,
+            8 => ProfileTab::Gifs,
+            _ => {
+                tdutils::log_error!("Receive invalid ProfileTab {value}");
+                ProfileTab::Default
+            }
+        }
+    }
+
+    pub fn as_raw(self) -> i32 {
+        self as i32
+    }
+}
+
+/// `td::BotVerification` (BotVerification.{h,cpp,hpp}) — the verification
+/// stamp a bot puts on a channel. The td_api builder needs the entity
+/// parser (MessageEntity step) and lands with the channel-full intake.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BotVerification {
+    bot_user_id_: UserId,
+    icon_: CustomEmojiId,
+    description_: String,
+}
+
+impl BotVerification {
+    /// `BotVerification(telegram_api::object_ptr<botVerification> &&)`
+    /// (BotVerification.cpp:18-25).
+    pub fn from_telegram(bot_verification: telegram_api::BotVerification) -> Self {
+        BotVerification {
+            bot_user_id_: UserId::new(bot_verification.bot_id),
+            icon_: CustomEmojiId::new(bot_verification.icon),
+            description_: bot_verification.description,
+        }
+    }
+
+    /// `BotVerification::get_bot_verification` (BotVerification.cpp:27-38) —
+    /// `None` for a null pointer and for an invalid record (the C++ logs
+    /// and returns nullptr).
+    pub fn get_bot_verification(
+        bot_verification: Option<telegram_api::BotVerification>,
+    ) -> Option<Self> {
+        let bot_verification = BotVerification::from_telegram(bot_verification?);
+        if !bot_verification.is_valid() {
+            tdutils::log_error!("Receive invalid bot verification");
+            return None;
+        }
+        Some(bot_verification)
+    }
+
+    /// `is_valid` (BotVerification.h:33-35).
+    pub fn is_valid(&self) -> bool {
+        self.bot_user_id_.is_valid() && self.icon_.is_valid()
+    }
+
+    /// `store` (BotVerification.hpp:17-23) — the (empty) flag block, then
+    /// the bot user id, the icon and the description.
+    pub fn store(&self, out: &mut Vec<u8>) {
+        store_flags(out, []);
+        store_i64(out, self.bot_user_id_.get());
+        store_i64(out, self.icon_.get());
+        store_string(out, &self.description_);
+    }
+
+    /// `parse` (BotVerification.hpp:25-31).
+    pub fn parse_impl(parser: &mut Parser<'_>) -> Result<Self, &'static str> {
+        parser.parse_flags::<0>()?;
+        let bot_user_id_ = parse_user_id(parser)?;
+        let icon_ = CustomEmojiId::new(parser.i64_()?);
+        let description_ = parser.string()?;
+        Ok(BotVerification {
+            bot_user_id_,
+            icon_,
+            description_,
+        })
+    }
+}
+
+/// `ChatManager::Chat` (ChatManager.h:444-497) — one basic group.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Chat {
+    pub title: String,
+    pub photo: DialogPhoto,
+    pub participant_count: i32,
+    pub date: i32,
+    pub version: i32,
+    pub default_permissions_version: i32,
+    pub pinned_message_version: i32,
+    pub migrated_to_channel_id: ChannelId,
+
+    pub status: DialogParticipantStatus,
+    pub default_permissions: RestrictedRights,
+
+    pub cache_version: u32,
+
+    pub is_active: bool,
+    pub noforwards: bool,
+
+    pub is_title_changed: bool,
+    pub is_photo_changed: bool,
+    pub is_default_permissions_changed: bool,
+    pub is_status_changed: bool,
+    pub is_is_active_changed: bool,
+    pub is_noforwards_changed: bool,
+    pub is_being_updated: bool,
+    /// have new changes that need to be sent to the client and database
+    pub is_changed: bool,
+    /// have new changes that need only to be saved to the database
+    pub need_save_to_database: bool,
+    pub is_update_basic_group_sent: bool,
+
+    /// whether cached value is rechecked
+    pub is_repaired: bool,
+
+    /// is current chat version being saved/is saved to the database
+    pub is_saved: bool,
+    pub is_being_saved: bool,
+
+    /// true, if the chat was received from the server and not the database
+    pub is_received_from_server: bool,
+
+    pub log_event_id: u64,
+}
+
+impl Chat {
+    pub const CACHE_VERSION: u32 = 5;
+
+    pub fn new() -> Chat {
+        Chat {
+            title: String::new(),
+            photo: DialogPhoto::default(),
+            participant_count: 0,
+            date: 0,
+            version: -1,
+            default_permissions_version: -1,
+            pinned_message_version: -1,
+            migrated_to_channel_id: ChannelId::default(),
+            status: DialogParticipantStatus::banned(0, String::new()),
+            default_permissions: RestrictedRights::restrict_all(),
+            cache_version: 0,
+            is_active: false,
+            noforwards: false,
+            is_title_changed: true,
+            is_photo_changed: true,
+            is_default_permissions_changed: true,
+            is_status_changed: true,
+            is_is_active_changed: true,
+            is_noforwards_changed: true,
+            is_being_updated: false,
+            is_changed: true,
+            need_save_to_database: true,
+            is_update_basic_group_sent: false,
+            is_repaired: false,
+            is_saved: false,
+            is_being_saved: false,
+            is_received_from_server: false,
+            log_event_id: 0,
+        }
+    }
+
+    /// `Chat::store` (ChatManager.cpp:1830-1872) with the photo persistence
+    /// deferred (`has_photo` forced `false`, the User::store convention).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_photo = false; // DIVERGENCE(Files step): photo.small_file_id.is_valid()
+        let use_new_rights = true;
+        let has_default_permissions_version = self.default_permissions_version != -1;
+        let has_pinned_message_version = self.pinned_message_version != -1;
+        let has_cache_version = self.cache_version != 0;
+        store_flags(
+            out,
+            [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                self.is_active,
+                has_photo,
+                use_new_rights,
+                has_default_permissions_version,
+                has_pinned_message_version,
+                has_cache_version,
+                self.noforwards,
+            ],
+        );
+
+        store_string(out, &self.title);
+        // if (has_photo) { store(photo, storer); } — Files step
+        store_i32(out, self.participant_count);
+        store_i32(out, self.date);
+        store_i64(out, self.migrated_to_channel_id.get());
+        store_i32(out, self.version);
+        self.status.store(out);
+        self.default_permissions.store(out);
+        if has_default_permissions_version {
+            store_i32(out, self.default_permissions_version);
+        }
+        if has_pinned_message_version {
+            store_i32(out, self.pinned_message_version);
+        }
+        if has_cache_version {
+            store_u32(out, self.cache_version);
+        }
+    }
+
+    /// `Chat::parse` (ChatManager.cpp:1874-1957), including the legacy
+    /// rights reconstruction and the double administrator-rank downgrade.
+    pub fn parse_value(input: &[u8]) -> Result<Chat, &'static str> {
+        let mut parser = Parser::new_log_event(input)?;
+        let chat = Chat::parse_impl(&mut parser)?;
+        parser.fetch_end()?;
+        Ok(chat)
+    }
+
+    pub fn parse_impl(parser: &mut Parser<'_>) -> Result<Chat, &'static str> {
+        let [
+            left,
+            kicked,
+            is_creator,
+            is_administrator,
+            everyone_is_administrator,
+            can_edit,
+            is_active,
+            has_photo,
+            use_new_rights,
+            has_default_permissions_version,
+            has_pinned_message_version,
+            has_cache_version,
+            noforwards,
+        ] = parser.parse_flags()?;
+        if has_photo {
+            return Err("Chat photo needs the FileManager format (Files step)");
+        }
+
+        let mut chat = Chat::new();
+        chat.is_active = is_active;
+        chat.noforwards = noforwards;
+        chat.title = parser.string()?;
+        // if (has_photo) { parse(photo, parser); } — rejected above
+        chat.participant_count = parser.i32_()?;
+        chat.date = parser.i32_()?;
+        chat.migrated_to_channel_id = parse_channel_id(parser)?;
+        chat.version = parser.i32_()?;
+        if use_new_rights {
+            chat.status = DialogParticipantStatus::parse_impl(parser)?;
+            chat.default_permissions = RestrictedRights::parse_impl(parser)?;
+            if chat.status.is_administrator() && !chat.status.is_creator() {
+                chat.status = DialogParticipantStatus::group_administrator(
+                    false,
+                    chat.status.get_rank().to_owned(),
+                );
+            }
+        } else {
+            if can_edit != (is_creator || is_administrator || everyone_is_administrator) {
+                tdutils::log_error!("Have wrong can_edit flag");
+            }
+
+            if kicked || !is_active {
+                chat.status = DialogParticipantStatus::banned(0, String::new());
+            } else if left {
+                chat.status = DialogParticipantStatus::left();
+            } else if is_creator {
+                chat.status = DialogParticipantStatus::creator(true, false, String::new());
+            } else if is_administrator && !everyone_is_administrator {
+                chat.status = DialogParticipantStatus::group_administrator(false, String::new());
+            } else {
+                chat.status = DialogParticipantStatus::member(0, String::new());
+            }
+            chat.default_permissions = RestrictedRights::from_bools(
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                everyone_is_administrator,
+                everyone_is_administrator,
+                everyone_is_administrator,
+                false,
+                false,
+                true,
+                true,
+                ChannelType::Unknown,
+            );
+        }
+        if has_default_permissions_version {
+            chat.default_permissions_version = parser.i32_()?;
+        }
+        if has_pinned_message_version {
+            chat.pinned_message_version = parser.i32_()?;
+        }
+        if has_cache_version {
+            chat.cache_version = parser.u32_()?;
+        }
+
+        if !tdutils::utf8::check_utf8(chat.title.as_bytes()) {
+            tdutils::log_error!("Have invalid chat title");
+            chat.title.clear();
+            chat.cache_version = 0;
+        }
+
+        if chat.status.is_administrator() && !chat.status.is_creator() {
+            chat.status = DialogParticipantStatus::group_administrator(false, String::new());
+        }
+        Ok(chat)
+    }
+}
+
+impl Default for Chat {
+    fn default() -> Self {
+        Chat::new()
+    }
+}
+
+/// `ChatManager::ChatFull` (ChatManager.h:499-545) — one basic group's
+/// full info.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChatFull {
+    pub version: i32,
+    pub creator_user_id: UserId,
+    pub participants: Vec<DialogParticipant>,
+
+    pub photo: Photo,
+    pub registered_photo_file_ids: Vec<FileId>,
+    pub file_source_id: FileSourceId,
+
+    pub description: String,
+
+    pub invite_link: DialogInviteLink,
+
+    pub bot_commands: Vec<BotCommands>,
+
+    pub can_set_username: bool,
+
+    pub is_being_updated: bool,
+    /// have new changes that need to be sent to the client and database
+    pub is_changed: bool,
+    /// have new changes that need only to be sent to the client
+    pub need_send_update: bool,
+    /// have new changes that need only to be saved to the database
+    pub need_save_to_database: bool,
+    pub is_update_chat_full_sent: bool,
+}
+
+impl ChatFull {
+    pub fn new() -> ChatFull {
+        ChatFull {
+            version: -1,
+            creator_user_id: UserId::default(),
+            participants: Vec::new(),
+            photo: Photo::default(),
+            registered_photo_file_ids: Vec::new(),
+            file_source_id: FileSourceId::default(),
+            description: String::new(),
+            invite_link: DialogInviteLink::default(),
+            bot_commands: Vec::new(),
+            can_set_username: false,
+            is_being_updated: false,
+            is_changed: true,
+            need_send_update: true,
+            need_save_to_database: true,
+            is_update_chat_full_sent: false,
+        }
+    }
+
+    /// `ChatFull::store` (ChatManager.cpp:1960-1990) with the photo
+    /// persistence deferred (the UserFull convention).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_description = !self.description.is_empty();
+        let has_legacy_invite_link = false;
+        let has_photo = false; // DIVERGENCE(Files step): !photo.is_empty()
+        let has_invite_link = self.invite_link.is_valid();
+        let has_bot_commands = !self.bot_commands.is_empty();
+        store_flags(
+            out,
+            [
+                has_description,
+                has_legacy_invite_link,
+                self.can_set_username,
+                has_photo,
+                has_invite_link,
+                has_bot_commands,
+            ],
+        );
+        store_i32(out, self.version);
+        store_i64(out, self.creator_user_id.get());
+        store_i32(out, self.participants.len() as i32);
+        for participant in &self.participants {
+            participant.store(out);
+        }
+        if has_description {
+            store_string(out, &self.description);
+        }
+        // if (has_photo) { store(photo, storer); } — Files step
+        if has_invite_link {
+            self.invite_link.store(out);
+        }
+        if has_bot_commands {
+            store_i32(out, self.bot_commands.len() as i32);
+            for commands in &self.bot_commands {
+                commands.store(out);
+            }
+        }
+    }
+
+    /// `ChatFull::parse` (ChatManager.cpp:1992-2027).
+    pub fn parse_value(input: &[u8]) -> Result<ChatFull, &'static str> {
+        let mut parser = Parser::new_log_event(input)?;
+        let chat_full = ChatFull::parse_impl(&mut parser)?;
+        parser.fetch_end()?;
+        Ok(chat_full)
+    }
+
+    pub fn parse_impl(parser: &mut Parser<'_>) -> Result<ChatFull, &'static str> {
+        let [
+            has_description,
+            legacy_has_invite_link,
+            can_set_username,
+            has_photo,
+            has_invite_link,
+            has_bot_commands,
+        ] = parser.parse_flags()?;
+        if has_photo {
+            return Err("ChatFull photo needs the FileManager format (Files step)");
+        }
+
+        let mut chat_full = ChatFull::new();
+        chat_full.can_set_username = can_set_username;
+        chat_full.version = parser.i32_()?;
+        chat_full.creator_user_id = parse_user_id(parser)?;
+        let participant_count = parser.i32_()?;
+        if participant_count < 0 {
+            return Err("Wrong vector length");
+        }
+        chat_full.participants = Vec::with_capacity(participant_count.clamp(0, 1_000_000) as usize);
+        for _ in 0..participant_count {
+            chat_full
+                .participants
+                .push(DialogParticipant::parse_impl(parser)?);
+        }
+        if has_description {
+            chat_full.description = parser.string()?;
+        }
+        if legacy_has_invite_link {
+            // the C++ parses the legacy link into a local and drops it
+            let _legacy_invite_link = parser.string()?;
+        }
+        // if (has_photo) { parse(photo, parser); } — rejected above
+        if has_invite_link {
+            chat_full.invite_link = DialogInviteLink::parse_impl(parser)?;
+        }
+        if has_bot_commands {
+            let commands_count = parser.i32_()?;
+            if commands_count < 0 {
+                return Err("Wrong vector length");
+            }
+            chat_full.bot_commands =
+                Vec::with_capacity(commands_count.clamp(0, 1_000_000) as usize);
+            for _ in 0..commands_count {
+                chat_full
+                    .bot_commands
+                    .push(BotCommands::parse_impl(parser)?);
+            }
+        }
+        Ok(chat_full)
+    }
+}
+
+impl Default for ChatFull {
+    fn default() -> Self {
+        ChatFull::new()
+    }
+}
+
+/// `ChatManager::Channel` (ChatManager.h:547-689) — one supergroup or
+/// broadcast channel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Channel {
+    pub access_hash: i64,
+    pub title: String,
+    pub photo: DialogPhoto,
+    pub emoji_status: Option<EmojiStatus>,
+    pub last_sent_emoji_status: Option<EmojiStatus>,
+    pub accent_color_id: AccentColorId,
+    pub background_custom_emoji_id: CustomEmojiId,
+    pub profile_accent_color_id: AccentColorId,
+    pub profile_background_custom_emoji_id: CustomEmojiId,
+    pub usernames: Usernames,
+    pub restriction_reasons: Vec<RestrictionReason>,
+    pub status: DialogParticipantStatus,
+    pub default_permissions: RestrictedRights,
+    pub date: i32,
+    pub participant_count: i32,
+    pub boost_level: i32,
+    pub paid_message_star_count: i64,
+    pub bot_verification_icon: CustomEmojiId,
+
+    pub max_active_story_id_next_reload_time: f64,
+    pub max_active_story_id: StoryId,
+    pub max_read_story_id: StoryId,
+
+    pub monoforum_channel_id: ChannelId,
+    pub linked_community_id: CommunityId,
+
+    pub cache_version: u32,
+
+    pub has_linked_channel: bool,
+    pub has_location: bool,
+    pub sign_messages: bool,
+    pub show_message_sender: bool,
+    pub is_slow_mode_enabled: bool,
+    pub noforwards: bool,
+    pub can_be_deleted: bool,
+    pub join_to_send: bool,
+    pub join_request: bool,
+    pub stories_hidden: bool,
+    pub autotranslation: bool,
+    pub broadcast_messages_allowed: bool,
+    pub has_live_story: bool,
+
+    pub is_megagroup: bool,
+    pub is_gigagroup: bool,
+    pub is_forum: bool,
+    pub is_forum_tabs: bool,
+    pub is_monoforum: bool,
+    pub is_admined_monoforum: bool,
+    pub is_verified: bool,
+    pub is_scam: bool,
+    pub is_fake: bool,
+
+    pub is_title_changed: bool,
+    pub is_username_changed: bool,
+    pub is_photo_changed: bool,
+    pub is_emoji_status_changed: bool,
+    pub is_accent_color_changed: bool,
+    pub is_default_permissions_changed: bool,
+    pub is_status_changed: bool,
+    pub is_stories_hidden_changed: bool,
+    pub is_has_location_changed: bool,
+    pub is_noforwards_changed: bool,
+    pub is_is_forum_changed: bool,
+    pub is_creator_changed: bool,
+    pub is_admined_monoforum_changed: bool,
+    pub had_read_access: bool,
+    pub is_being_updated: bool,
+    /// have new changes that need to be sent to the client and database
+    pub is_changed: bool,
+    /// have new changes that need only to be saved to the database
+    pub need_save_to_database: bool,
+    pub is_update_supergroup_sent: bool,
+
+    /// whether cached value is rechecked
+    pub is_repaired: bool,
+
+    /// is current channel version being saved/is saved to the database
+    pub is_saved: bool,
+    pub is_being_saved: bool,
+
+    /// true, if the channel was received from the server and not the
+    /// database
+    pub is_received_from_server: bool,
+
+    pub log_event_id: u64,
+}
+
+impl Channel {
+    pub const CACHE_VERSION: u32 = 11;
+
+    pub fn new() -> Channel {
+        Channel {
+            access_hash: 0,
+            title: String::new(),
+            photo: DialogPhoto::default(),
+            emoji_status: None,
+            last_sent_emoji_status: None,
+            accent_color_id: AccentColorId::default(),
+            background_custom_emoji_id: CustomEmojiId::default(),
+            profile_accent_color_id: AccentColorId::default(),
+            profile_background_custom_emoji_id: CustomEmojiId::default(),
+            usernames: Usernames::default(),
+            restriction_reasons: Vec::new(),
+            status: DialogParticipantStatus::banned(0, String::new()),
+            default_permissions: RestrictedRights::restrict_all(),
+            date: 0,
+            participant_count: 0,
+            boost_level: 0,
+            paid_message_star_count: 0,
+            bot_verification_icon: CustomEmojiId::default(),
+            max_active_story_id_next_reload_time: 0.0,
+            max_active_story_id: StoryId::default(),
+            max_read_story_id: StoryId::default(),
+            monoforum_channel_id: ChannelId::default(),
+            linked_community_id: CommunityId::default(),
+            cache_version: 0,
+            has_linked_channel: false,
+            has_location: false,
+            sign_messages: false,
+            show_message_sender: false,
+            is_slow_mode_enabled: false,
+            noforwards: false,
+            can_be_deleted: false,
+            join_to_send: false,
+            join_request: false,
+            stories_hidden: false,
+            autotranslation: false,
+            broadcast_messages_allowed: false,
+            has_live_story: false,
+            is_megagroup: false,
+            is_gigagroup: false,
+            is_forum: false,
+            is_forum_tabs: false,
+            is_monoforum: false,
+            is_admined_monoforum: false,
+            is_verified: false,
+            is_scam: false,
+            is_fake: false,
+            is_title_changed: true,
+            is_username_changed: true,
+            is_photo_changed: true,
+            is_emoji_status_changed: true,
+            is_accent_color_changed: true,
+            is_default_permissions_changed: true,
+            is_status_changed: true,
+            is_stories_hidden_changed: true,
+            is_has_location_changed: true,
+            is_noforwards_changed: true,
+            is_is_forum_changed: true,
+            is_creator_changed: true,
+            is_admined_monoforum_changed: false,
+            had_read_access: true,
+            is_being_updated: false,
+            is_changed: true,
+            need_save_to_database: true,
+            is_update_supergroup_sent: false,
+            is_repaired: false,
+            is_saved: false,
+            is_being_saved: false,
+            is_received_from_server: false,
+            log_event_id: 0,
+        }
+    }
+
+    /// `Channel::store` (ChatManager.cpp:2030-2175) with the photo
+    /// persistence deferred (the User::store convention).
+    pub fn store(&self, out: &mut Vec<u8>, ctx: &TimeCtx) {
+        let has_photo = false; // DIVERGENCE(Files step): photo.small_file_id.is_valid()
+        let legacy_has_username = false;
+        let use_new_rights = true;
+        let has_participant_count = self.participant_count != 0;
+        let have_default_permissions = true;
+        let has_cache_version = self.cache_version != 0;
+        let has_restriction_reasons = !self.restriction_reasons.is_empty();
+        let legacy_has_active_group_call = false;
+        let has_usernames = !self.usernames.is_empty();
+        let has_flags2 = true;
+        let has_max_active_story_id = self.max_active_story_id.is_valid();
+        let has_max_read_story_id = self.max_read_story_id.is_valid();
+        let has_max_active_story_id_next_reload_time =
+            self.max_active_story_id_next_reload_time > ctx.now;
+        let has_accent_color_id = self.accent_color_id.is_valid();
+        let has_background_custom_emoji_id = self.background_custom_emoji_id.is_valid();
+        let has_profile_accent_color_id = self.profile_accent_color_id.is_valid();
+        let has_profile_background_custom_emoji_id =
+            self.profile_background_custom_emoji_id.is_valid();
+        let has_boost_level = self.boost_level != 0;
+        let has_emoji_status = self.emoji_status.is_some();
+        let has_bot_verification_icon = self.bot_verification_icon.is_valid();
+        let has_paid_message_star_count = self.paid_message_star_count != 0;
+        let has_monoforum_channel_id = self.monoforum_channel_id.is_valid();
+        let has_linked_community_id = self.linked_community_id.is_valid();
+        store_flags(
+            out,
+            [
+                false,
+                false,
+                false,
+                self.sign_messages,
+                false,
+                false,
+                false,
+                self.is_megagroup,
+                self.is_verified,
+                has_photo,
+                legacy_has_username,
+                false,
+                use_new_rights,
+                has_participant_count,
+                have_default_permissions,
+                self.is_scam,
+                has_cache_version,
+                self.has_linked_channel,
+                self.has_location,
+                self.is_slow_mode_enabled,
+                has_restriction_reasons,
+                legacy_has_active_group_call,
+                self.is_fake,
+                self.is_gigagroup,
+                self.noforwards,
+                self.can_be_deleted,
+                self.join_to_send,
+                self.join_request,
+                has_usernames,
+                has_flags2,
+            ],
+        );
+        if has_flags2 {
+            store_flags(
+                out,
+                [
+                    self.is_forum,
+                    has_max_active_story_id,
+                    has_max_read_story_id,
+                    has_max_active_story_id_next_reload_time,
+                    self.stories_hidden,
+                    has_accent_color_id,
+                    has_background_custom_emoji_id,
+                    has_profile_accent_color_id,
+                    has_profile_background_custom_emoji_id,
+                    has_boost_level,
+                    has_emoji_status,
+                    self.show_message_sender,
+                    has_bot_verification_icon,
+                    has_paid_message_star_count,
+                    self.autotranslation,
+                    self.is_monoforum,
+                    self.broadcast_messages_allowed,
+                    has_monoforum_channel_id,
+                    self.is_forum_tabs,
+                    self.is_admined_monoforum,
+                    self.has_live_story,
+                    has_linked_community_id,
+                ],
+            );
+        }
+
+        self.status.store(out);
+        store_i64(out, self.access_hash);
+        store_string(out, &self.title);
+        // if (has_photo) { store(photo, storer); } — Files step
+        store_i32(out, self.date);
+        if has_restriction_reasons {
+            store_restriction_reasons(out, &self.restriction_reasons);
+        }
+        if has_participant_count {
+            store_i32(out, self.participant_count);
+        }
+        if self.is_megagroup {
+            self.default_permissions.store(out);
+        }
+        if has_cache_version {
+            store_u32(out, self.cache_version);
+        }
+        if has_usernames {
+            self.usernames.store(out);
+        }
+        if has_max_active_story_id {
+            store_i32(out, self.max_active_story_id.get());
+        }
+        if has_max_read_story_id {
+            store_i32(out, self.max_read_story_id.get());
+        }
+        if has_max_active_story_id_next_reload_time {
+            TimeCtx::store_time(out, self.max_active_story_id_next_reload_time, ctx);
+        }
+        if has_accent_color_id {
+            store_i32(out, self.accent_color_id.get());
+        }
+        if has_background_custom_emoji_id {
+            store_i64(out, self.background_custom_emoji_id.get());
+        }
+        if has_profile_accent_color_id {
+            store_i32(out, self.profile_accent_color_id.get());
+        }
+        if has_profile_background_custom_emoji_id {
+            store_i64(out, self.profile_background_custom_emoji_id.get());
+        }
+        if has_boost_level {
+            store_i32(out, self.boost_level);
+        }
+        if has_emoji_status {
+            self.emoji_status.as_ref().unwrap().store(out);
+        }
+        if has_bot_verification_icon {
+            store_i64(out, self.bot_verification_icon.get());
+        }
+        if has_paid_message_star_count {
+            store_i64(out, self.paid_message_star_count);
+        }
+        if has_monoforum_channel_id {
+            store_i64(out, self.monoforum_channel_id.get());
+        }
+        if has_linked_community_id {
+            store_i64(out, self.linked_community_id.get());
+        }
+    }
+
+    /// `Channel::parse` (ChatManager.cpp:2178-2384), including the legacy
+    /// rights/username/restriction reconstruction and the final status
+    /// downgrade for restricted non-megagroups.
+    pub fn parse_value(input: &[u8], ctx: &TimeCtx) -> Result<Channel, &'static str> {
+        let mut parser = Parser::new_log_event(input)?;
+        let channel = Channel::parse_impl(&mut parser, ctx)?;
+        parser.fetch_end()?;
+        Ok(channel)
+    }
+
+    pub fn parse_impl(parser: &mut Parser<'_>, ctx: &TimeCtx) -> Result<Channel, &'static str> {
+        let [
+            left,
+            kicked,
+            anyone_can_invite,
+            sign_messages,
+            is_creator,
+            can_edit,
+            can_moderate,
+            is_megagroup,
+            is_verified,
+            has_photo,
+            legacy_has_username,
+            legacy_is_restricted,
+            use_new_rights,
+            has_participant_count,
+            have_default_permissions,
+            is_scam,
+            has_cache_version,
+            has_linked_channel,
+            has_location,
+            is_slow_mode_enabled,
+            has_restriction_reasons,
+            legacy_has_active_group_call,
+            is_fake,
+            is_gigagroup,
+            noforwards,
+            can_be_deleted,
+            join_to_send,
+            join_request,
+            has_usernames,
+            has_flags2,
+        ] = parser.parse_flags()?;
+        let [
+            is_forum,
+            has_max_active_story_id,
+            has_max_read_story_id,
+            has_max_active_story_id_next_reload_time,
+            stories_hidden,
+            has_accent_color_id,
+            has_background_custom_emoji_id,
+            has_profile_accent_color_id,
+            has_profile_background_custom_emoji_id,
+            has_boost_level,
+            has_emoji_status,
+            show_message_sender,
+            has_bot_verification_icon,
+            has_paid_message_star_count,
+            autotranslation,
+            is_monoforum,
+            broadcast_messages_allowed,
+            has_monoforum_channel_id,
+            is_forum_tabs,
+            is_admined_monoforum,
+            has_live_story,
+            has_linked_community_id,
+        ] = if has_flags2 {
+            parser.parse_flags()?
+        } else {
+            [false; 22]
+        };
+        if has_photo {
+            return Err("Channel photo needs the FileManager format (Files step)");
+        }
+
+        let mut channel = Channel::new();
+        channel.sign_messages = sign_messages;
+        channel.is_megagroup = is_megagroup;
+        channel.is_verified = is_verified;
+        channel.is_scam = is_scam;
+        channel.has_linked_channel = has_linked_channel;
+        channel.has_location = has_location;
+        channel.is_slow_mode_enabled = is_slow_mode_enabled;
+        channel.is_fake = is_fake;
+        channel.is_gigagroup = is_gigagroup;
+        channel.noforwards = noforwards;
+        channel.can_be_deleted = can_be_deleted;
+        channel.join_to_send = join_to_send;
+        channel.join_request = join_request;
+        channel.is_forum = is_forum;
+        channel.stories_hidden = stories_hidden;
+        channel.show_message_sender = show_message_sender;
+        channel.autotranslation = autotranslation;
+        channel.is_monoforum = is_monoforum;
+        channel.broadcast_messages_allowed = broadcast_messages_allowed;
+        channel.is_forum_tabs = is_forum_tabs;
+        channel.is_admined_monoforum = is_admined_monoforum;
+        channel.has_live_story = has_live_story;
+
+        if use_new_rights {
+            channel.status = DialogParticipantStatus::parse_impl(parser)?;
+        } else {
+            if kicked {
+                channel.status = DialogParticipantStatus::banned(0, String::new());
+            } else if left {
+                channel.status = DialogParticipantStatus::left();
+            } else if is_creator {
+                channel.status = DialogParticipantStatus::creator(true, false, String::new());
+            } else if can_edit || can_moderate {
+                channel.status =
+                    DialogParticipantStatus::channel_administrator(false, is_megagroup);
+            } else {
+                channel.status = DialogParticipantStatus::member(0, String::new());
+            }
+        }
+        channel.access_hash = parser.i64_()?;
+        channel.title = parser.string()?;
+        // if (has_photo) { parse(photo, parser); } — rejected above
+        if legacy_has_username {
+            if has_usernames {
+                return Err("Have invalid channel flags");
+            }
+            let username = parser.string()?;
+            channel.usernames = Usernames::from_telegram(username, Vec::new());
+        }
+        channel.date = parser.i32_()?;
+        if legacy_is_restricted {
+            let restriction_reason = parser.string()?;
+            channel.restriction_reasons = get_restriction_reasons_from_legacy(&restriction_reason);
+        } else if has_restriction_reasons {
+            channel.restriction_reasons = parse_restriction_reasons(parser)?;
+        }
+        if has_participant_count {
+            channel.participant_count = parser.i32_()?;
+        }
+        if is_megagroup {
+            if have_default_permissions {
+                channel.default_permissions = RestrictedRights::parse_impl(parser)?;
+            } else {
+                channel.default_permissions = RestrictedRights::from_bools(
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    false,
+                    anyone_can_invite,
+                    false,
+                    false,
+                    false,
+                    true,
+                    true,
+                    ChannelType::Megagroup,
+                );
+            }
+        }
+        if has_cache_version {
+            channel.cache_version = parser.u32_()?;
+        }
+        if has_usernames {
+            channel.usernames = Usernames::parse_tail(parser)?;
+        }
+        if has_max_active_story_id {
+            channel.max_active_story_id = StoryId::new(parser.i32_()?);
+        }
+        if has_max_read_story_id {
+            channel.max_read_story_id = StoryId::new(parser.i32_()?);
+        }
+        if has_max_active_story_id_next_reload_time {
+            channel.max_active_story_id_next_reload_time = TimeCtx::parse_time(parser, ctx)?;
+        }
+        if has_accent_color_id {
+            channel.accent_color_id = AccentColorId::new(parser.i32_()?);
+        }
+        if has_background_custom_emoji_id {
+            channel.background_custom_emoji_id = CustomEmojiId::new(parser.i64_()?);
+        }
+        if has_profile_accent_color_id {
+            channel.profile_accent_color_id = AccentColorId::new(parser.i32_()?);
+        }
+        if has_profile_background_custom_emoji_id {
+            channel.profile_background_custom_emoji_id = CustomEmojiId::new(parser.i64_()?);
+        }
+        if has_boost_level {
+            channel.boost_level = parser.i32_()?;
+        }
+        if has_emoji_status {
+            channel.emoji_status = Some(EmojiStatus::parse_from(parser)?);
+        }
+        if has_bot_verification_icon {
+            channel.bot_verification_icon = CustomEmojiId::new(parser.i64_()?);
+        }
+        if has_paid_message_star_count {
+            channel.paid_message_star_count = parser.i64_()?;
+        }
+        if has_monoforum_channel_id {
+            channel.monoforum_channel_id = parse_channel_id(parser)?;
+        }
+        if has_linked_community_id {
+            channel.linked_community_id = CommunityId::new(parser.i64_()?);
+        }
+
+        if !tdutils::utf8::check_utf8(channel.title.as_bytes()) {
+            tdutils::log_error!("Have invalid channel title");
+            channel.title.clear();
+            channel.cache_version = 0;
+        }
+        if legacy_has_active_group_call {
+            channel.cache_version = 0;
+        }
+        if is_megagroup {
+            channel.show_message_sender = true;
+        } else if channel.status.is_restricted() {
+            if channel.status.is_member() {
+                channel.status = DialogParticipantStatus::member(0, String::new());
+            } else {
+                channel.status = DialogParticipantStatus::left();
+            }
+        }
+        Ok(channel)
+    }
+}
+
+impl Default for Channel {
+    fn default() -> Self {
+        Channel::new()
+    }
+}
+
+/// `ChatManager::ChannelFull` (ChatManager.h:691-812) — one
+/// supergroup/broadcast channel's full info.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChannelFull {
+    pub photo: Photo,
+    pub registered_photo_file_ids: Vec<FileId>,
+    pub file_source_id: FileSourceId,
+
+    pub description: String,
+    pub participant_count: i32,
+    pub administrator_count: i32,
+    pub restricted_count: i32,
+    pub banned_count: i32,
+    pub boost_count: i32,
+    pub unrestrict_boost_count: i32,
+    pub gift_count: i32,
+
+    pub send_paid_message_stars: i64,
+
+    pub invite_link: DialogInviteLink,
+
+    pub bot_commands: Vec<BotCommands>,
+    pub bot_verification: Option<BotVerification>,
+    pub guard_bot_user_id: UserId,
+
+    pub speculative_version: u32,
+    pub repair_request_version: u32,
+
+    pub sticker_set_id: StickerSetId,
+    pub emoji_sticker_set_id: StickerSetId,
+
+    pub linked_channel_id: ChannelId,
+    pub monoforum_channel_id: ChannelId,
+    pub linked_community_id: CommunityId,
+
+    pub location: DialogLocation,
+
+    pub main_profile_tab: ProfileTab,
+
+    pub stats_dc_id: DcId,
+
+    pub slow_mode_delay: i32,
+    pub slow_mode_next_send_date: i32,
+
+    pub migrated_from_max_message_id: MessageId,
+    pub migrated_from_chat_id: ChatId,
+
+    pub bot_user_ids: Vec<UserId>,
+
+    pub can_get_participants: bool,
+    pub has_hidden_participants: bool,
+    pub can_set_username: bool,
+    pub can_set_sticker_set: bool,
+    pub can_set_location: bool,
+    pub can_view_statistics: bool,
+    pub is_can_view_statistics_inited: bool,
+    pub can_view_revenue: bool,
+    pub can_view_star_revenue: bool,
+    pub is_all_history_available: bool,
+    pub can_have_sponsored_messages: bool,
+    pub has_aggressive_anti_spam_enabled: bool,
+    pub can_be_deleted: bool,
+    pub has_pinned_stories: bool,
+    /// also used for paid reactions
+    pub has_paid_media_allowed: bool,
+    pub has_stargifts_available: bool,
+    pub has_paid_messages_available: bool,
+
+    pub is_photo_changed: bool,
+    pub is_slow_mode_next_send_date_changed: bool,
+    pub is_being_updated: bool,
+    /// have new changes that need to be sent to the client and database
+    pub is_changed: bool,
+    /// have new changes that need only to be sent to the client
+    pub need_send_update: bool,
+    /// have new changes that need only to be saved to the database
+    pub need_save_to_database: bool,
+    pub is_update_channel_full_sent: bool,
+
+    pub expires_at: f64,
+}
+
+impl ChannelFull {
+    pub fn new() -> ChannelFull {
+        ChannelFull {
+            photo: Photo::default(),
+            registered_photo_file_ids: Vec::new(),
+            file_source_id: FileSourceId::default(),
+            description: String::new(),
+            participant_count: 0,
+            administrator_count: 0,
+            restricted_count: 0,
+            banned_count: 0,
+            boost_count: 0,
+            unrestrict_boost_count: 0,
+            gift_count: 0,
+            send_paid_message_stars: 0,
+            invite_link: DialogInviteLink::default(),
+            bot_commands: Vec::new(),
+            bot_verification: None,
+            guard_bot_user_id: UserId::default(),
+            speculative_version: 1,
+            repair_request_version: 0,
+            sticker_set_id: StickerSetId::default(),
+            emoji_sticker_set_id: StickerSetId::default(),
+            linked_channel_id: ChannelId::default(),
+            monoforum_channel_id: ChannelId::default(),
+            linked_community_id: CommunityId::default(),
+            location: DialogLocation::default(),
+            main_profile_tab: ProfileTab::default(),
+            stats_dc_id: DcId::default(),
+            slow_mode_delay: 0,
+            slow_mode_next_send_date: 0,
+            migrated_from_max_message_id: MessageId::default(),
+            migrated_from_chat_id: ChatId::default(),
+            bot_user_ids: Vec::new(),
+            can_get_participants: false,
+            has_hidden_participants: false,
+            can_set_username: false,
+            can_set_sticker_set: false,
+            can_set_location: false,
+            can_view_statistics: false,
+            is_can_view_statistics_inited: false,
+            can_view_revenue: false,
+            can_view_star_revenue: false,
+            is_all_history_available: true,
+            can_have_sponsored_messages: true,
+            has_aggressive_anti_spam_enabled: false,
+            can_be_deleted: false,
+            has_pinned_stories: false,
+            has_paid_media_allowed: false,
+            has_stargifts_available: false,
+            has_paid_messages_available: false,
+            is_photo_changed: true,
+            is_slow_mode_next_send_date_changed: true,
+            is_being_updated: false,
+            is_changed: true,
+            need_send_update: true,
+            need_save_to_database: true,
+            is_update_channel_full_sent: false,
+            expires_at: 0.0,
+        }
+    }
+
+    /// `ChannelFull::store` (ChatManager.cpp:2387-2553) with the photo
+    /// persistence deferred (the UserFull convention).
+    pub fn store(&self, out: &mut Vec<u8>, ctx: &TimeCtx) {
+        let has_description = !self.description.is_empty();
+        let has_administrator_count = self.administrator_count != 0;
+        let has_restricted_count = self.restricted_count != 0;
+        let has_banned_count = self.banned_count != 0;
+        let legacy_has_invite_link = false;
+        let has_sticker_set = self.sticker_set_id.is_valid();
+        let has_linked_channel_id = self.linked_channel_id.is_valid();
+        let has_migrated_from_max_message_id = self.migrated_from_max_message_id.is_valid();
+        let has_migrated_from_chat_id = self.migrated_from_chat_id.is_valid();
+        let has_location = !self.location.empty();
+        let has_bot_user_ids = !self.bot_user_ids.is_empty();
+        let is_slow_mode_enabled = self.slow_mode_delay != 0;
+        let is_slow_mode_delay_active = self.slow_mode_next_send_date != 0;
+        let has_stats_dc_id = self.stats_dc_id.is_exact();
+        let has_photo = false; // DIVERGENCE(Files step): !photo.is_empty()
+        let legacy_has_active_group_call_id = false;
+        let has_invite_link = self.invite_link.is_valid();
+        let has_bot_commands = !self.bot_commands.is_empty();
+        let has_flags2 = true;
+        let has_emoji_sticker_set = self.emoji_sticker_set_id.is_valid();
+        let has_boost_count = self.boost_count != 0;
+        let has_unrestrict_boost_count = self.unrestrict_boost_count != 0;
+        let has_can_have_sponsored_messages = true;
+        let has_bot_verification = self.bot_verification.is_some();
+        let has_gift_count = self.gift_count != 0;
+        let has_monoforum_channel_id = self.monoforum_channel_id.is_valid();
+        let has_send_paid_message_stars = self.send_paid_message_stars != 0;
+        let has_main_profile_tab = self.main_profile_tab != ProfileTab::Default;
+        let has_guard_bot_user_id = self.guard_bot_user_id.is_valid();
+        let has_linked_community_id = self.linked_community_id.is_valid();
+        store_flags(
+            out,
+            [
+                has_description,
+                has_administrator_count,
+                has_restricted_count,
+                has_banned_count,
+                legacy_has_invite_link,
+                has_sticker_set,
+                has_linked_channel_id,
+                has_migrated_from_max_message_id,
+                has_migrated_from_chat_id,
+                self.can_get_participants,
+                self.can_set_username,
+                self.can_set_sticker_set,
+                false, // legacy_can_view_statistics
+                self.is_all_history_available,
+                self.can_set_location,
+                has_location,
+                has_bot_user_ids,
+                is_slow_mode_enabled,
+                is_slow_mode_delay_active,
+                has_stats_dc_id,
+                has_photo,
+                self.is_can_view_statistics_inited,
+                self.can_view_statistics,
+                legacy_has_active_group_call_id,
+                has_invite_link,
+                has_bot_commands,
+                self.can_be_deleted,
+                self.has_aggressive_anti_spam_enabled,
+                self.has_hidden_participants,
+                has_flags2,
+            ],
+        );
+        if has_flags2 {
+            store_flags(
+                out,
+                [
+                    self.has_pinned_stories,
+                    has_emoji_sticker_set,
+                    has_boost_count,
+                    has_unrestrict_boost_count,
+                    self.can_have_sponsored_messages,
+                    self.can_view_revenue,
+                    has_can_have_sponsored_messages,
+                    self.has_paid_media_allowed,
+                    self.can_view_star_revenue,
+                    has_bot_verification,
+                    has_gift_count,
+                    self.has_stargifts_available,
+                    self.has_paid_messages_available,
+                    has_monoforum_channel_id,
+                    has_send_paid_message_stars,
+                    has_main_profile_tab,
+                    has_guard_bot_user_id,
+                    has_linked_community_id,
+                ],
+            );
+        }
+        if has_description {
+            store_string(out, &self.description);
+        }
+        store_i32(out, self.participant_count);
+        if has_administrator_count {
+            store_i32(out, self.administrator_count);
+        }
+        if has_restricted_count {
+            store_i32(out, self.restricted_count);
+        }
+        if has_banned_count {
+            store_i32(out, self.banned_count);
+        }
+        if has_sticker_set {
+            store_i64(out, self.sticker_set_id.get());
+        }
+        if has_linked_channel_id {
+            store_i64(out, self.linked_channel_id.get());
+        }
+        if has_location {
+            self.location.store(out);
+        }
+        if has_bot_user_ids {
+            store_i32(out, self.bot_user_ids.len() as i32);
+            for bot_user_id in &self.bot_user_ids {
+                store_i64(out, bot_user_id.get());
+            }
+        }
+        if has_migrated_from_max_message_id {
+            self.migrated_from_max_message_id.store(out);
+        }
+        if has_migrated_from_chat_id {
+            store_i64(out, self.migrated_from_chat_id.get());
+        }
+        if is_slow_mode_enabled {
+            store_i32(out, self.slow_mode_delay);
+        }
+        if is_slow_mode_delay_active {
+            store_i32(out, self.slow_mode_next_send_date);
+        }
+        TimeCtx::store_time(out, self.expires_at, ctx);
+        if has_stats_dc_id {
+            store_i32(out, self.stats_dc_id.get_raw_id());
+        }
+        // if (has_photo) { store(photo, storer); } — Files step
+        if has_invite_link {
+            self.invite_link.store(out);
+        }
+        if has_bot_commands {
+            store_i32(out, self.bot_commands.len() as i32);
+            for commands in &self.bot_commands {
+                commands.store(out);
+            }
+        }
+        if has_emoji_sticker_set {
+            store_i64(out, self.emoji_sticker_set_id.get());
+        }
+        if has_boost_count {
+            store_i32(out, self.boost_count);
+        }
+        if has_unrestrict_boost_count {
+            store_i32(out, self.unrestrict_boost_count);
+        }
+        if has_bot_verification {
+            self.bot_verification.as_ref().unwrap().store(out);
+        }
+        if has_gift_count {
+            store_i32(out, self.gift_count);
+        }
+        if has_monoforum_channel_id {
+            store_i64(out, self.monoforum_channel_id.get());
+        }
+        if has_send_paid_message_stars {
+            store_i64(out, self.send_paid_message_stars);
+        }
+        if has_main_profile_tab {
+            store_i32(out, self.main_profile_tab.as_raw());
+        }
+        if has_guard_bot_user_id {
+            store_i64(out, self.guard_bot_user_id.get());
+        }
+        if has_linked_community_id {
+            store_i64(out, self.linked_community_id.get());
+        }
+    }
+
+    /// `ChannelFull::parse` (ChatManager.cpp:2556-2741), including the
+    /// statistics/sponsored-messages repair tail.
+    pub fn parse_value(input: &[u8], ctx: &TimeCtx) -> Result<ChannelFull, &'static str> {
+        let mut parser = Parser::new_log_event(input)?;
+        let channel_full = ChannelFull::parse_impl(&mut parser, ctx)?;
+        parser.fetch_end()?;
+        Ok(channel_full)
+    }
+
+    pub fn parse_impl(parser: &mut Parser<'_>, ctx: &TimeCtx) -> Result<ChannelFull, &'static str> {
+        let [
+            has_description,
+            has_administrator_count,
+            has_restricted_count,
+            has_banned_count,
+            legacy_has_invite_link,
+            has_sticker_set,
+            has_linked_channel_id,
+            has_migrated_from_max_message_id,
+            has_migrated_from_chat_id,
+            can_get_participants,
+            can_set_username,
+            can_set_sticker_set,
+            legacy_can_view_statistics,
+            is_all_history_available,
+            can_set_location,
+            has_location,
+            has_bot_user_ids,
+            is_slow_mode_enabled,
+            is_slow_mode_delay_active,
+            has_stats_dc_id,
+            has_photo,
+            is_can_view_statistics_inited,
+            can_view_statistics,
+            legacy_has_active_group_call_id,
+            has_invite_link,
+            has_bot_commands,
+            can_be_deleted,
+            has_aggressive_anti_spam_enabled,
+            has_hidden_participants,
+            has_flags2,
+        ] = parser.parse_flags()?;
+        let [
+            has_pinned_stories,
+            has_emoji_sticker_set,
+            has_boost_count,
+            has_unrestrict_boost_count,
+            can_have_sponsored_messages,
+            can_view_revenue,
+            has_can_have_sponsored_messages,
+            has_paid_media_allowed,
+            can_view_star_revenue,
+            has_bot_verification,
+            has_gift_count,
+            has_stargifts_available,
+            has_paid_messages_available,
+            has_monoforum_channel_id,
+            has_send_paid_message_stars,
+            has_main_profile_tab,
+            has_guard_bot_user_id,
+            has_linked_community_id,
+        ] = if has_flags2 {
+            parser.parse_flags()?
+        } else {
+            [false; 18]
+        };
+        if has_photo {
+            return Err("ChannelFull photo needs the FileManager format (Files step)");
+        }
+
+        let mut channel_full = ChannelFull::new();
+        channel_full.can_get_participants = can_get_participants;
+        channel_full.can_set_username = can_set_username;
+        channel_full.can_set_sticker_set = can_set_sticker_set;
+        channel_full.is_all_history_available = is_all_history_available;
+        channel_full.can_set_location = can_set_location;
+        channel_full.is_can_view_statistics_inited = is_can_view_statistics_inited;
+        channel_full.can_view_statistics = can_view_statistics;
+        channel_full.can_be_deleted = can_be_deleted;
+        channel_full.has_aggressive_anti_spam_enabled = has_aggressive_anti_spam_enabled;
+        channel_full.has_hidden_participants = has_hidden_participants;
+        channel_full.has_pinned_stories = has_pinned_stories;
+        channel_full.can_have_sponsored_messages = can_have_sponsored_messages;
+        channel_full.can_view_revenue = can_view_revenue;
+        channel_full.has_paid_media_allowed = has_paid_media_allowed;
+        channel_full.can_view_star_revenue = can_view_star_revenue;
+        channel_full.has_stargifts_available = has_stargifts_available;
+        channel_full.has_paid_messages_available = has_paid_messages_available;
+
+        if has_description {
+            channel_full.description = parser.string()?;
+        }
+        channel_full.participant_count = parser.i32_()?;
+        if has_administrator_count {
+            channel_full.administrator_count = parser.i32_()?;
+        }
+        if has_restricted_count {
+            channel_full.restricted_count = parser.i32_()?;
+        }
+        if has_banned_count {
+            channel_full.banned_count = parser.i32_()?;
+        }
+        if legacy_has_invite_link {
+            // the C++ parses the legacy link into a local and drops it
+            let _legacy_invite_link = parser.string()?;
+        }
+        if has_sticker_set {
+            channel_full.sticker_set_id = StickerSetId::new(parser.i64_()?);
+        }
+        if has_linked_channel_id {
+            channel_full.linked_channel_id = parse_channel_id(parser)?;
+        }
+        if has_location {
+            channel_full.location = DialogLocation::parse_impl(parser)?;
+        }
+        if has_bot_user_ids {
+            let bot_user_count = parser.i32_()?;
+            if bot_user_count < 0 {
+                return Err("Wrong vector length");
+            }
+            channel_full.bot_user_ids =
+                Vec::with_capacity(bot_user_count.clamp(0, 1_000_000) as usize);
+            for _ in 0..bot_user_count {
+                channel_full.bot_user_ids.push(parse_user_id(parser)?);
+            }
+        }
+        if has_migrated_from_max_message_id {
+            channel_full.migrated_from_max_message_id = MessageId::parse_impl(parser)?;
+        }
+        if has_migrated_from_chat_id {
+            channel_full.migrated_from_chat_id = parse_chat_id(parser)?;
+        }
+        if is_slow_mode_enabled {
+            channel_full.slow_mode_delay = parser.i32_()?;
+        }
+        if is_slow_mode_delay_active {
+            channel_full.slow_mode_next_send_date = parser.i32_()?;
+        }
+        channel_full.expires_at = TimeCtx::parse_time(parser, ctx)?;
+        if has_stats_dc_id {
+            channel_full.stats_dc_id = DcId::create(parser.i32_()?);
+        }
+        // if (has_photo) { parse(photo, parser); } — rejected above
+        if legacy_has_active_group_call_id {
+            // the C++ parses the legacy InputGroupCallId (two int64s) into
+            // a local and drops it
+            let _id = parser.i64_()?;
+            let _access_hash = parser.i64_()?;
+        }
+        if has_invite_link {
+            channel_full.invite_link = DialogInviteLink::parse_impl(parser)?;
+        }
+        if has_bot_commands {
+            let commands_count = parser.i32_()?;
+            if commands_count < 0 {
+                return Err("Wrong vector length");
+            }
+            channel_full.bot_commands =
+                Vec::with_capacity(commands_count.clamp(0, 1_000_000) as usize);
+            for _ in 0..commands_count {
+                channel_full
+                    .bot_commands
+                    .push(BotCommands::parse_impl(parser)?);
+            }
+        }
+        if has_emoji_sticker_set {
+            channel_full.emoji_sticker_set_id = StickerSetId::new(parser.i64_()?);
+        }
+        if has_boost_count {
+            channel_full.boost_count = parser.i32_()?;
+        }
+        if has_unrestrict_boost_count {
+            channel_full.unrestrict_boost_count = parser.i32_()?;
+        }
+        if has_bot_verification {
+            channel_full.bot_verification = Some(BotVerification::parse_impl(parser)?);
+        }
+        if has_gift_count {
+            channel_full.gift_count = parser.i32_()?;
+        }
+        if has_monoforum_channel_id {
+            channel_full.monoforum_channel_id = parse_channel_id(parser)?;
+        }
+        if has_send_paid_message_stars {
+            channel_full.send_paid_message_stars = parser.i64_()?;
+        }
+        if has_main_profile_tab {
+            channel_full.main_profile_tab = ProfileTab::from_raw(parser.i32_()?);
+        }
+        if has_guard_bot_user_id {
+            channel_full.guard_bot_user_id = parse_user_id(parser)?;
+        }
+        if has_linked_community_id {
+            channel_full.linked_community_id = CommunityId::new(parser.i64_()?);
+        }
+
+        if legacy_can_view_statistics {
+            // the C++ logs at DEBUG level and ignores the flag
+        }
+        if !channel_full.is_can_view_statistics_inited {
+            channel_full.can_view_statistics = channel_full.stats_dc_id.is_exact();
+        }
+        if !has_can_have_sponsored_messages {
+            channel_full.can_have_sponsored_messages = true;
+        }
+        Ok(channel_full)
+    }
+}
+
+impl Default for ChannelFull {
+    fn default() -> Self {
+        ChannelFull::new()
     }
 }
 
@@ -4687,5 +7232,1095 @@ mod tests {
             dp_store_hex(&participant),
             "3d00000002baf56617ffffff235ed0b200000000d2f853650010fd2f00000000"
         );
+    }
+
+    // ---- DialogAdministrator / BotCommand / BotCommands / MinChannel (M.5.5) ----
+
+    #[test]
+    fn dialog_administrator_record_matches_the_cpp() {
+        let admin =
+            DialogAdministrator::new(UserId::new(3000000003), "boss".to_owned(), true, true);
+        assert_eq!(admin.get_user_id(), UserId::new(3000000003));
+        assert_eq!(admin.get_rank(), "boss");
+        assert!(admin.is_creator());
+        assert!(admin.can_be_edited());
+
+        // the byte format: the flag block, the user id, the optional rank
+        let mut out = Vec::new();
+        admin.store(&mut out);
+        assert_eq!(hex(&out), "07000000035ed0b20000000004626f7373000000");
+        let mut parser = Parser::new(&out);
+        assert_eq!(DialogAdministrator::parse_impl(&mut parser).unwrap(), admin);
+
+        // set_rank reports the change like the C++
+        let mut renamed = admin.clone();
+        assert!(renamed.set_rank("chief"));
+        assert!(!renamed.set_rank("chief"));
+        assert_eq!(renamed.get_rank(), "chief");
+
+        // a rankless administrator stores no rank
+        let rankless = DialogAdministrator::new(UserId::new(5), String::new(), false, false);
+        let mut out = Vec::new();
+        rankless.store(&mut out);
+        assert_eq!(hex(&out), "000000000500000000000000");
+        let mut parser = Parser::new(&out);
+        assert_eq!(
+            DialogAdministrator::parse_impl(&mut parser).unwrap(),
+            rankless
+        );
+
+        // from_status narrows to administrators
+        let status = DialogParticipantStatus::channel_administrator(true, true);
+        let admin = DialogAdministrator::from_status(UserId::new(3000000004), &status);
+        assert_eq!(admin.get_rank(), "");
+        assert!(!admin.is_creator());
+        assert!(admin.can_be_edited());
+        assert!(
+            std::panic::catch_unwind(|| {
+                DialogAdministrator::from_status(UserId::new(1), &DialogParticipantStatus::left())
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn bot_command_record_matches_the_cpp() {
+        let command = BotCommand::from_telegram(telegram_api::BotCommand {
+            ephemeral: true,
+            command: "/start@bot".to_owned(),
+            description: "Start".to_owned(),
+            ..Default::default()
+        });
+        assert!(command.is_ephemeral());
+
+        // the flag block, then the two TL strings
+        let mut out = Vec::new();
+        command.store(&mut out);
+        assert_eq!(
+            hex(&out),
+            "010000000a2f737461727440626f74000553746172740000"
+        );
+        let mut parser = Parser::new(&out);
+        assert_eq!(BotCommand::parse_impl(&mut parser).unwrap(), command);
+
+        // pre-SupportEphemeralMessages blobs carry no flag block
+        let mut legacy = Vec::new();
+        store_i32(&mut legacy, 60);
+        store_string(&mut legacy, "/old");
+        store_string(&mut legacy, "Old");
+        let mut parser = Parser::new_log_event(&legacy).unwrap();
+        let old = BotCommand::parse_impl(&mut parser).unwrap();
+        assert!(!old.is_ephemeral());
+        assert_eq!(old.command_, "/old");
+
+        let plain = BotCommand::new("/a".to_owned(), "b".to_owned(), false);
+        let mut out = Vec::new();
+        plain.store(&mut out);
+        assert_eq!(hex(&out), "00000000022f610001620000");
+    }
+
+    #[test]
+    fn bot_commands_update_all_matches_the_cpp() {
+        let mut all = Vec::new();
+        let start = BotCommands::from_telegram(
+            UserId::new(3000000003),
+            vec![telegram_api::BotCommand {
+                ephemeral: false,
+                command: "/start".to_owned(),
+                description: "Start".to_owned(),
+                ..Default::default()
+            }],
+        );
+        // a new bot appends and reports the change
+        assert!(BotCommands::update_all_bot_commands(&mut all, start));
+        assert_eq!(all.len(), 1);
+
+        // the same commands again change nothing
+        let same = BotCommands::from_telegram(
+            UserId::new(3000000003),
+            vec![telegram_api::BotCommand {
+                ephemeral: false,
+                command: "/start".to_owned(),
+                description: "Start".to_owned(),
+                ..Default::default()
+            }],
+        );
+        assert!(!BotCommands::update_all_bot_commands(&mut all, same));
+
+        // a changed list replaces in place
+        let changed = BotCommands::from_telegram(
+            UserId::new(3000000003),
+            vec![telegram_api::BotCommand {
+                ephemeral: false,
+                command: "/help".to_owned(),
+                description: "Help".to_owned(),
+                ..Default::default()
+            }],
+        );
+        assert!(BotCommands::update_all_bot_commands(&mut all, changed));
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].commands_.len(), 1);
+        assert_eq!(all[0].commands_[0].command_, "/help");
+
+        // a second bot joins the list
+        let second_add = BotCommands::from_telegram(
+            UserId::new(3000000004),
+            vec![telegram_api::BotCommand {
+                ephemeral: false,
+                command: "/ping".to_owned(),
+                description: "Ping".to_owned(),
+                ..Default::default()
+            }],
+        );
+        assert!(BotCommands::update_all_bot_commands(&mut all, second_add));
+        assert_eq!(all.len(), 2);
+
+        // an empty list drops the bot's entry; dropping twice is a no-op
+        let drop_second = BotCommands::from_telegram(UserId::new(3000000004), Vec::new());
+        assert!(BotCommands::update_all_bot_commands(&mut all, drop_second));
+        assert_eq!(all.len(), 1);
+        let nothing = BotCommands::from_telegram(UserId::new(3000000004), Vec::new());
+        assert!(!BotCommands::update_all_bot_commands(&mut all, nothing));
+    }
+
+    #[test]
+    fn bot_commands_store_parse_round_trips() {
+        let commands = BotCommands::from_telegram(
+            UserId::new(3000000003),
+            vec![
+                telegram_api::BotCommand {
+                    ephemeral: false,
+                    command: "/start".to_owned(),
+                    description: "Start".to_owned(),
+                    ..Default::default()
+                },
+                telegram_api::BotCommand {
+                    ephemeral: true,
+                    command: "/now".to_owned(),
+                    description: String::new(),
+                    ..Default::default()
+                },
+            ],
+        );
+        let mut out = Vec::new();
+        crate::store_parse::store_log_event_version(&mut out);
+        commands.store(&mut out);
+        let mut parser = Parser::new_log_event(&out).unwrap();
+        assert_eq!(BotCommands::parse_impl(&mut parser).unwrap(), commands);
+        parser.fetch_end().unwrap();
+
+        // pre-Support64BitIds blobs carry the bot user id as an int32 and no
+        // per-command flag block
+        let mut legacy = Vec::new();
+        store_i32(&mut legacy, 32);
+        store_i32(&mut legacy, 2140000001);
+        store_i32(&mut legacy, 1); // one command
+        store_string(&mut legacy, "/old");
+        store_string(&mut legacy, "Old");
+        let mut parser = Parser::new_log_event(&legacy).unwrap();
+        let old = BotCommands::parse_impl(&mut parser).unwrap();
+        assert_eq!(old.get_bot_user_id(), UserId::new(2140000001));
+        assert_eq!(old.commands_.len(), 1);
+        assert!(!old.commands_[0].is_ephemeral());
+    }
+
+    #[test]
+    fn min_channel_defaults_like_the_cpp() {
+        let channel = MinChannel::default();
+        assert_eq!(channel.title_, "");
+        assert_eq!(channel.photo_, DialogPhoto::default());
+        assert_eq!(channel.accent_color_id_, AccentColorId::default());
+        assert!(!channel.is_megagroup_);
+
+        let megagroup = MinChannel {
+            title_: "chat".to_owned(),
+            is_megagroup_: true,
+            ..Default::default()
+        };
+        assert!(megagroup.is_megagroup_);
+    }
+
+    // ---- StarSubscriptionPricing / DialogInviteLink / MissingInvitee /
+    // ---- VerificationStatus (M.5.6, M.5.7) ----
+
+    /// A minimal `Global` + `OptionManager` pair for the object-builder
+    /// tests; `get_user_id_object` touches neither yet.
+    struct BareEnv {
+        global: Global,
+        options: crate::option_manager::OptionManager,
+    }
+
+    impl BareEnv {
+        fn new() -> BareEnv {
+            BareEnv {
+                global: Global::new(),
+                options: crate::option_manager::OptionManager::new(false),
+            }
+        }
+
+        fn env(&mut self) -> UserEnv<'_> {
+            UserEnv {
+                global: &mut self.global,
+                options: &mut self.options,
+                auth_is_bot: false,
+            }
+        }
+    }
+
+    fn exported_invite() -> telegram_api::chatInviteExported {
+        telegram_api::chatInviteExported {
+            flags: 0,
+            revoked: false,
+            permanent: false,
+            request_needed: false,
+            link: "https://t.me/+abc".to_owned(),
+            admin_id: 3000000005,
+            date: 1_600_000_000,
+            start_date: 0,
+            expire_date: 0,
+            usage_limit: 0,
+            usage: 0,
+            requested: 0,
+            subscription_expired: 0,
+            title: String::new(),
+            subscription_pricing: telegram_api::StarsSubscriptionPricing::default(),
+        }
+    }
+
+    #[test]
+    fn star_subscription_pricing_matches_the_cpp() {
+        // the telegram form sanitizes through get_star_count
+        let pricing =
+            StarSubscriptionPricing::from_telegram(Some(telegram_api::StarsSubscriptionPricing {
+                period: 30,
+                amount: 100,
+            }));
+        assert_eq!(pricing.get_period(), 30);
+        assert_eq!(pricing.get_amount(), 100);
+        assert!(!pricing.is_empty());
+        assert_eq!(
+            pricing.get_star_subscription_pricing_object().unwrap(),
+            td_api::StarSubscriptionPricing {
+                period: 30,
+                star_count: 100
+            }
+        );
+        assert_eq!(
+            pricing.get_input_stars_subscription_pricing().unwrap(),
+            telegram_api::StarsSubscriptionPricing {
+                period: 30,
+                amount: 100
+            }
+        );
+
+        // a null pointer and the clamps
+        assert!(StarSubscriptionPricing::from_telegram(None).is_empty());
+        assert_eq!(get_star_count(-5, false), 0);
+        assert_eq!(get_star_count(-5, true), -5);
+        assert_eq!(get_star_count(i64::MIN, true), -(1i64 << 51));
+        assert_eq!(get_star_count((1i64 << 51) + 1, true), 1i64 << 51);
+        assert_eq!(get_star_count(50, false), 50);
+
+        // the td_api form drops amounts above a billion
+        let pricing = StarSubscriptionPricing::from_td_api(Some(td_api::StarSubscriptionPricing {
+            period: 7,
+            star_count: 2_000_000_000,
+        }));
+        assert!(pricing.is_empty());
+        let pricing = StarSubscriptionPricing::from_td_api(Some(td_api::StarSubscriptionPricing {
+            period: 7,
+            star_count: 12,
+        }));
+        assert_eq!(pricing.get_amount(), 12);
+
+        // the byte format: the empty flag block, the period, the amount
+        let mut out = Vec::new();
+        pricing.store(&mut out);
+        assert_eq!(hex(&out), "00000000070000000c00000000000000");
+        let mut parser = Parser::new(&out);
+        assert_eq!(
+            StarSubscriptionPricing::parse_impl(&mut parser).unwrap(),
+            pricing
+        );
+        parser.fetch_end().unwrap();
+    }
+
+    #[test]
+    fn dialog_invite_link_ctor_sanitizes_like_the_cpp() {
+        // a null pointer and the join-request form both yield the default
+        assert_eq!(
+            DialogInviteLink::from_telegram(None, false, false, "test"),
+            DialogInviteLink::default()
+        );
+        assert_eq!(
+            DialogInviteLink::from_telegram(
+                Some(
+                    telegram_api::ExportedChatInvite::chatInvitePublicJoinRequests(
+                        telegram_api::chatInvitePublicJoinRequests
+                    )
+                ),
+                false,
+                true,
+                "test"
+            ),
+            DialogInviteLink::default()
+        );
+        assert!(!DialogInviteLink::default().is_valid());
+
+        // a well-formed link parses field by field
+        let valid = DialogInviteLink::from_telegram(
+            Some(telegram_api::ExportedChatInvite::chatInviteExported(
+                exported_invite(),
+            )),
+            false,
+            false,
+            "test",
+        );
+        assert!(valid.is_valid());
+        assert_eq!(valid.get_invite_link(), "https://t.me/+abc");
+        assert_eq!(valid.get_creator_user_id(), UserId::new(3000000005));
+        assert!(!valid.is_permanent());
+
+        // malformed fields clamp exactly like the C++ repair path
+        let malformed = DialogInviteLink::from_telegram(
+            Some(telegram_api::ExportedChatInvite::chatInviteExported(
+                telegram_api::chatInviteExported {
+                    admin_id: 0,
+                    date: 5,
+                    usage_limit: -10,
+                    usage: -3,
+                    requested: -2,
+                    ..exported_invite()
+                },
+            )),
+            false,
+            false,
+            "test",
+        );
+        assert_eq!(malformed.get_creator_user_id(), UserId::new(0));
+        assert!(!malformed.is_valid());
+        // reconstructed through the private fields
+        assert_eq!(malformed.date_, 0);
+        assert_eq!(malformed.usage_limit_, 0);
+        assert_eq!(malformed.usage_count_, 0);
+        assert_eq!(malformed.request_count_, 0);
+
+        // a permanent link may carry no extra parameters
+        let wrong_permanent = DialogInviteLink::from_telegram(
+            Some(telegram_api::ExportedChatInvite::chatInviteExported(
+                telegram_api::chatInviteExported {
+                    permanent: true,
+                    title: "t".to_owned(),
+                    expire_date: 2_000_000_000,
+                    usage_limit: 10,
+                    start_date: 2_000_000_000,
+                    requested: 3,
+                    ..exported_invite()
+                },
+            )),
+            false,
+            false,
+            "test",
+        );
+        assert!(wrong_permanent.is_permanent());
+        assert_eq!(wrong_permanent.title_, "");
+        assert_eq!(wrong_permanent.expire_date_, 0);
+        assert_eq!(wrong_permanent.usage_limit_, 0);
+        assert_eq!(wrong_permanent.edit_date_, 0);
+        assert_eq!(wrong_permanent.request_count_, 0);
+
+        // join requests cannot coexist with a usage limit
+        let join_request = DialogInviteLink::from_telegram(
+            Some(telegram_api::ExportedChatInvite::chatInviteExported(
+                telegram_api::chatInviteExported {
+                    request_needed: true,
+                    usage_limit: 10,
+                    ..exported_invite()
+                },
+            )),
+            false,
+            false,
+            "test",
+        );
+        assert!(join_request.creates_join_request_);
+        assert_eq!(join_request.usage_limit_, 0);
+    }
+
+    #[test]
+    fn dialog_invite_link_store_parse_matches_the_cpp() {
+        let invite_link = DialogInviteLink {
+            invite_link_: "https://t.me/+aB3".to_owned(),
+            title_: "X".to_owned(),
+            creator_user_id_: UserId::new(3000000004),
+            pricing_: StarSubscriptionPricing::default(),
+            date_: 1_000_000_000,
+            edit_date_: 0,
+            expire_date_: 2_000_000_000,
+            usage_limit_: 10,
+            usage_count_: 5,
+            expired_usage_count_: 2,
+            request_count_: 0,
+            creates_join_request_: false,
+            is_revoked_: false,
+            is_permanent_: false,
+        };
+
+        // flags (bits 2, 3, 4, 8, 10), the link, the creator, the date, the
+        // present optionals in the C++ order
+        let mut out = Vec::new();
+        invite_link.store(&mut out);
+        assert_eq!(
+            hex(&out),
+            "1c050000\
+             1168747470733a2f2f742e6d652f2b6142330000\
+             045ed0b200000000\
+             00ca9a3b\
+             00943577\
+             0a000000\
+             05000000\
+             01580000\
+             02000000"
+        );
+        let mut parser = Parser::new(&out);
+        assert_eq!(
+            DialogInviteLink::parse_impl(&mut parser).unwrap(),
+            invite_link
+        );
+        parser.fetch_end().unwrap();
+
+        // the creates_join_request reset survives the round trip
+        let with_requests = DialogInviteLink {
+            creates_join_request_: true,
+            usage_limit_: 0,
+            ..invite_link.clone()
+        };
+        let mut out = Vec::new();
+        with_requests.store(&mut out);
+        let mut parser = Parser::new(&out);
+        assert_eq!(
+            DialogInviteLink::parse_impl(&mut parser).unwrap(),
+            with_requests
+        );
+
+        // a default link stores the bare flag word, the empty link, the
+        // creator and a zero date
+        let mut out = Vec::new();
+        DialogInviteLink::default().store(&mut out);
+        assert_eq!(hex(&out), "0000000000000000000000000000000000000000");
+    }
+
+    #[test]
+    fn dialog_invite_link_builder_matches_the_cpp() {
+        let mut bare = BareEnv::new();
+        let mut user_manager = UserManager::new();
+
+        // an invalid link builds no object
+        assert_eq!(
+            DialogInviteLink::default()
+                .get_chat_invite_link_object(&mut user_manager, &mut bare.env()),
+            None
+        );
+
+        let invite_link = DialogInviteLink::from_telegram(
+            Some(telegram_api::ExportedChatInvite::chatInviteExported(
+                telegram_api::chatInviteExported {
+                    permanent: true,
+                    title: "Channel".to_owned(),
+                    usage: 12,
+                    requested: 4,
+                    subscription_pricing: telegram_api::StarsSubscriptionPricing {
+                        period: 6,
+                        amount: 50,
+                    },
+                    expire_date: 0,
+                    ..exported_invite()
+                },
+            )),
+            false,
+            false,
+            "test",
+        );
+        // the permanent sanitizer clears the title but not the counts
+        let object = invite_link
+            .get_chat_invite_link_object(&mut user_manager, &mut bare.env())
+            .unwrap();
+        assert_eq!(object.invite_link, "https://t.me/+abc");
+        assert_eq!(object.name, "");
+        assert_eq!(object.creator_user_id, 3000000005);
+        assert_eq!(object.date, 1_600_000_000);
+        assert_eq!(object.edit_date, 0);
+        assert_eq!(object.expiration_date, 0);
+        assert_eq!(object.subscription_pricing.period, 6);
+        assert_eq!(object.subscription_pricing.star_count, 50);
+        assert_eq!(object.member_limit, 0);
+        assert_eq!(object.member_count, 12);
+        assert_eq!(object.expired_member_count, 0);
+        // the permanent sanitizer cleared the pending-request count
+        assert_eq!(object.pending_join_request_count, 0);
+        assert!(!object.creates_join_request);
+        assert!(object.is_primary);
+        assert!(!object.is_revoked);
+    }
+
+    #[test]
+    fn missing_invitees_match_the_cpp() {
+        let invitee = MissingInvitee::from_telegram(telegram_api::MissingInvitee {
+            flags: 0,
+            premium_would_allow_invite: true,
+            premium_required_for_pm: false,
+            user_id: 3000000006,
+        });
+        assert!(invitee.is_valid());
+        assert_eq!(invitee.get_user_id(), UserId::new(3000000006));
+        assert!(
+            !MissingInvitee::from_telegram(telegram_api::MissingInvitee {
+                user_id: 0,
+                ..telegram_api::MissingInvitee::default()
+            })
+            .is_valid()
+        );
+
+        // invalid entries are dropped from the list form
+        let invitees = MissingInvitees::from_telegram(vec![
+            telegram_api::MissingInvitee {
+                user_id: 0,
+                ..telegram_api::MissingInvitee::default()
+            },
+            telegram_api::MissingInvitee {
+                user_id: 42,
+                premium_required_for_pm: true,
+                ..telegram_api::MissingInvitee::default()
+            },
+        ]);
+        assert_eq!(invitees.missing_invitees_.len(), 1);
+
+        let mut bare = BareEnv::new();
+        let mut user_manager = UserManager::new();
+        let mut env = bare.env();
+        let member = invitee.get_failed_to_add_member_object(&mut user_manager, &mut env);
+        assert_eq!(member.user_id, 3000000006);
+        assert!(member.premium_would_allow_invite);
+        assert!(!member.premium_required_to_send_messages);
+        let members = invitees.get_failed_to_add_members_object(&mut user_manager, &mut env);
+        assert_eq!(members.failed_to_add_members.len(), 1);
+        assert_eq!(members.failed_to_add_members[0].user_id, 42);
+        assert!(members.failed_to_add_members[0].premium_required_to_send_messages);
+    }
+
+    #[test]
+    fn verification_status_matches_the_cpp() {
+        assert!(
+            get_verification_status_object(false, false, false, CustomEmojiId::new(0)).is_none()
+        );
+        let status =
+            get_verification_status_object(false, true, false, CustomEmojiId::new(0)).unwrap();
+        assert!(!status.is_verified);
+        assert!(status.is_scam);
+        assert!(!status.is_fake);
+        assert_eq!(status.bot_verification_icon_custom_emoji_id, 0);
+        let status =
+            get_verification_status_object(false, false, false, CustomEmojiId::new(531)).unwrap();
+        assert_eq!(status.bot_verification_icon_custom_emoji_id, 531);
+        assert!(
+            get_verification_status_object(true, false, false, CustomEmojiId::new(0))
+                .unwrap()
+                .is_verified
+        );
+    }
+
+    fn test_time_ctx() -> TimeCtx {
+        TimeCtx {
+            now: 1_000.0,
+            server_time: 2_000.0,
+        }
+    }
+
+    fn round_trip<T, S, P>(store: S, parse: P) -> T
+    where
+        S: FnOnce(&mut Vec<u8>),
+        P: FnOnce(&[u8]) -> T,
+    {
+        let mut out = Vec::new();
+        crate::store_parse::store_log_event_version(&mut out);
+        store(&mut out);
+        parse(&out)
+    }
+
+    #[test]
+    fn chat_record_round_trips_and_stays_byte_stable() {
+        let mut chat = Chat::new();
+        chat.title = "group".to_owned();
+        chat.participant_count = 7;
+        chat.date = 1_600_000_000;
+        chat.version = 3;
+        chat.default_permissions_version = 4;
+        chat.pinned_message_version = 5;
+        chat.cache_version = Chat::CACHE_VERSION;
+        chat.migrated_to_channel_id = ChannelId::new(1_000_000_000_003);
+        chat.status = DialogParticipantStatus::creator(true, false, "boss".to_owned());
+        chat.is_active = true;
+        chat.noforwards = true;
+
+        let parsed = round_trip(
+            |out| chat.store(out),
+            |input| Chat::parse_value(input).unwrap(),
+        );
+        assert_eq!(parsed, chat);
+        // byte-stable: re-storing the parsed record gives the same bytes
+        let mut first = Vec::new();
+        chat.store(&mut first);
+        let mut second = Vec::new();
+        parsed.store(&mut second);
+        assert_eq!(hex(&first), hex(&second));
+
+        // the administrator-rank downgrade the C++ applies on parse
+        chat.status = DialogParticipantStatus::group_administrator(false, "rank".to_owned());
+        let parsed = round_trip(
+            |out| chat.store(out),
+            |input| Chat::parse_value(input).unwrap(),
+        );
+        assert!(parsed.status.is_administrator());
+        assert_eq!(parsed.status.get_rank(), "");
+    }
+
+    #[test]
+    fn chat_legacy_parse_reconstructs_the_old_rights() {
+        // a pre-new-rights blob: version 32 keeps the id parse on int32
+        let mut out = Vec::new();
+        store_i32(&mut out, 32);
+        store_flags(
+            &mut out,
+            [
+                false, // left
+                true,  // kicked
+                false, // is_creator
+                false, // is_administrator
+                false, // everyone_is_administrator
+                false, // can_edit
+                true,  // is_active
+                false, // has_photo
+                false, // use_new_rights
+                false, // has_default_permissions_version
+                false, // has_pinned_message_version
+                false, // has_cache_version
+                false, // noforwards
+            ],
+        );
+        store_string(&mut out, "legacy");
+        store_i32(&mut out, 2); // participant_count
+        store_i32(&mut out, 1_600_000_000); // date
+        store_i32(&mut out, 1_000_000_001); // migrated_to_channel_id, int32
+        store_i32(&mut out, 1); // version
+        let mut parser = Parser::new_log_event(&out).unwrap();
+        let chat = Chat::parse_impl(&mut parser).unwrap();
+        parser.fetch_end().unwrap();
+
+        assert!(chat.status.is_banned());
+        let expected = RestrictedRights::from_bools(
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            true,
+            ChannelType::Unknown,
+        );
+        assert_eq!(chat.default_permissions, expected);
+        assert_eq!(chat.migrated_to_channel_id, ChannelId::new(1_000_000_001));
+    }
+
+    #[test]
+    fn chat_full_record_round_trips() {
+        let mut chat_full = ChatFull::new();
+        chat_full.version = 9;
+        chat_full.creator_user_id = UserId::new(3000000005);
+        chat_full.participants = vec![DialogParticipant::new(
+            DialogId::from_user_id(UserId::new(3000000005)),
+            UserId::new(3000000006),
+            1_600_000_000,
+            DialogParticipantStatus::member(0, String::new()),
+        )];
+        chat_full.description = "about".to_owned();
+        chat_full.can_set_username = true;
+        chat_full.invite_link = DialogInviteLink::from_telegram(
+            Some(telegram_api::ExportedChatInvite::chatInviteExported(
+                exported_invite(),
+            )),
+            false,
+            false,
+            "test",
+        );
+        chat_full.bot_commands = vec![BotCommands::from_telegram(
+            UserId::new(3000000007),
+            vec![telegram_api::BotCommand {
+                command: "/start".to_owned(),
+                description: "Start".to_owned(),
+                ..telegram_api::BotCommand::default()
+            }],
+        )];
+
+        let parsed = round_trip(
+            |out| chat_full.store(out),
+            |input| ChatFull::parse_value(input).unwrap(),
+        );
+        assert_eq!(parsed, chat_full);
+
+        // a C++-written blob with a photo is rejected, not mis-parsed
+        let mut out = Vec::new();
+        crate::store_parse::store_log_event_version(&mut out);
+        store_flags(
+            &mut out,
+            [
+                false, // has_description
+                false, // legacy_has_invite_link
+                false, // can_set_username
+                true,  // has_photo
+                false, // has_invite_link
+                false, // has_bot_commands
+            ],
+        );
+        assert!(ChatFull::parse_value(&out).is_err());
+    }
+
+    #[test]
+    fn channel_record_round_trips() {
+        let ctx = test_time_ctx();
+        let mut channel = Channel::new();
+        channel.access_hash = -1234567890123456789;
+        channel.title = "supergroup".to_owned();
+        channel.is_megagroup = true;
+        channel.is_forum = true;
+        channel.emoji_status = Some(EmojiStatus::default());
+        channel.accent_color_id = AccentColorId::new(5);
+        channel.background_custom_emoji_id = CustomEmojiId::new(42);
+        channel.usernames = Usernames::from_telegram("dupe".to_owned(), Vec::new());
+        channel.restriction_reasons = vec![RestrictionReason::new(
+            "all".to_owned(),
+            "foo".to_owned(),
+            "bar".to_owned(),
+        )];
+        channel.status = DialogParticipantStatus::creator(true, false, String::new());
+        channel.default_permissions = RestrictedRights::from_bools(
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            true,
+            ChannelType::Megagroup,
+        );
+        channel.date = 1_600_000_000;
+        channel.participant_count = 11;
+        channel.boost_level = 2;
+        channel.paid_message_star_count = 5;
+        channel.bot_verification_icon = CustomEmojiId::new(7);
+        channel.max_active_story_id = StoryId::new(30);
+        channel.max_read_story_id = StoryId::new(28);
+        channel.max_active_story_id_next_reload_time = ctx.now + 100.0;
+        channel.monoforum_channel_id = ChannelId::new(1_002_147_483_650);
+        channel.linked_community_id = CommunityId::new(55);
+        channel.cache_version = Channel::CACHE_VERSION;
+        channel.noforwards = true;
+        channel.sign_messages = true;
+
+        let parsed = round_trip(
+            |out| channel.store(out, &ctx),
+            |input| Channel::parse_value(input, &ctx).unwrap(),
+        );
+        // the parse forces show_message_sender for megagroups — the same
+        // in-place mutation the C++ performs
+        let mut expected = channel.clone();
+        expected.show_message_sender = true;
+        assert_eq!(parsed, expected);
+
+        let mut first = Vec::new();
+        expected.store(&mut first, &ctx);
+        let mut second = Vec::new();
+        parsed.store(&mut second, &ctx);
+        assert_eq!(hex(&first), hex(&second));
+
+        // megagroups force show_message_sender on parse
+        assert!(parsed.show_message_sender);
+    }
+
+    #[test]
+    fn channel_legacy_parse_reconstructs_the_old_statuses() {
+        let ctx = test_time_ctx();
+        let legacy_flags = |left: bool, kicked: bool, is_creator: bool, can_edit: bool| {
+            let mut out = Vec::new();
+            store_i32(&mut out, 40);
+            store_flags(
+                &mut out,
+                [
+                    left,       // left
+                    kicked,     // kicked
+                    false,      // anyone_can_invite
+                    false,      // sign_messages
+                    is_creator, // is_creator
+                    can_edit,   // can_edit
+                    false,      // can_moderate
+                    false,      // is_megagroup
+                    false,      // is_verified
+                    false,      // has_photo
+                    false,      // legacy_has_username
+                    false,      // legacy_is_restricted
+                    false,      // use_new_rights
+                    false,      // has_participant_count
+                    false,      // have_default_permissions
+                    false,      // is_scam
+                    false,      // has_cache_version
+                    false,      // has_linked_channel
+                    false,      // has_location
+                    false,      // is_slow_mode_enabled
+                    false,      // has_restriction_reasons
+                    false,      // legacy_has_active_group_call
+                    false,      // is_fake
+                    false,      // is_gigagroup
+                    false,      // noforwards
+                    false,      // can_be_deleted
+                    false,      // join_to_send
+                    false,      // join_request
+                    false,      // has_usernames
+                    false,      // has_flags2
+                ],
+            );
+            store_i64(&mut out, 0); // access_hash
+            store_string(&mut out, "legacy");
+            store_i32(&mut out, 1_600_000_000); // date
+            out
+        };
+        let parse_legacy = |left: bool, kicked: bool, is_creator: bool, can_edit: bool| {
+            let out = legacy_flags(left, kicked, is_creator, can_edit);
+            let mut parser = Parser::new_log_event(&out).unwrap();
+            Channel::parse_impl(&mut parser, &ctx).unwrap()
+        };
+
+        // kicked wins over left
+        let channel = parse_legacy(true, true, false, false);
+        assert!(channel.status.is_banned());
+
+        // creator reconstruction
+        let channel = parse_legacy(false, false, true, false);
+        assert!(channel.status.is_creator());
+
+        // can_edit maps to the legacy channel administrator
+        let channel = parse_legacy(false, false, false, true);
+        assert!(channel.status.is_administrator());
+
+        // plain membership
+        let channel = parse_legacy(false, false, false, false);
+        assert!(channel.status.is_member());
+    }
+
+    #[test]
+    fn channel_full_record_round_trips_and_repairs() {
+        let ctx = test_time_ctx();
+        let mut channel_full = ChannelFull::new();
+        channel_full.description = "desc".to_owned();
+        channel_full.participant_count = 100;
+        channel_full.administrator_count = 3;
+        channel_full.restricted_count = 1;
+        channel_full.banned_count = 2;
+        channel_full.boost_count = 4;
+        channel_full.unrestrict_boost_count = 6;
+        channel_full.gift_count = 8;
+        channel_full.send_paid_message_stars = 25;
+        channel_full.invite_link = DialogInviteLink::from_telegram(
+            Some(telegram_api::ExportedChatInvite::chatInviteExported(
+                exported_invite(),
+            )),
+            false,
+            false,
+            "test",
+        );
+        channel_full.bot_verification =
+            BotVerification::from_telegram(telegram_api::BotVerification {
+                bot_id: 3000000008,
+                icon: 99,
+                description: "stamp".to_owned(),
+            })
+            .into();
+        channel_full.guard_bot_user_id = UserId::new(3000000009);
+        channel_full.sticker_set_id = StickerSetId::new(111);
+        channel_full.emoji_sticker_set_id = StickerSetId::new(222);
+        channel_full.linked_channel_id = ChannelId::new(1_000_000_000_004);
+        channel_full.monoforum_channel_id = ChannelId::new(1_002_147_483_651);
+        channel_full.linked_community_id = CommunityId::new(77);
+        channel_full.main_profile_tab = ProfileTab::Posts;
+        channel_full.stats_dc_id = DcId::create(2);
+        channel_full.slow_mode_delay = 10;
+        channel_full.slow_mode_next_send_date = 1_700_000_000;
+        channel_full.migrated_from_max_message_id = MessageId::new(1234);
+        channel_full.migrated_from_chat_id = ChatId::new(12345);
+        channel_full.bot_user_ids = vec![UserId::new(3000000010), UserId::new(3000000011)];
+        channel_full.can_get_participants = true;
+        channel_full.has_hidden_participants = true;
+        channel_full.is_all_history_available = false;
+        channel_full.expires_at = ctx.now + 60.0;
+        // the repair tail re-derives this from the stats dc on parse
+        channel_full.is_can_view_statistics_inited = false;
+        channel_full.can_view_statistics = false;
+
+        let parsed = round_trip(
+            |out| channel_full.store(out, &ctx),
+            |input| ChannelFull::parse_value(input, &ctx).unwrap(),
+        );
+        // the repair tail runs on parse; the source record had the flag off
+        assert!(parsed.can_view_statistics);
+        assert!(parsed.can_have_sponsored_messages);
+
+        // a blob without the flags2 block has no sponsored-messages flag at
+        // all — the repair tail turns it back on, exactly like the C++
+        // reading a pre-flags2 database row
+        let mut out = Vec::new();
+        crate::store_parse::store_log_event_version(&mut out);
+        store_flags(
+            &mut out,
+            [
+                false, // has_description
+                false, // has_administrator_count
+                false, // has_restricted_count
+                false, // has_banned_count
+                false, // legacy_has_invite_link
+                false, // has_sticker_set
+                false, // has_linked_channel_id
+                false, // has_migrated_from_max_message_id
+                false, // has_migrated_from_chat_id
+                false, // can_get_participants
+                false, // can_set_username
+                false, // can_set_sticker_set
+                false, // legacy_can_view_statistics
+                true,  // is_all_history_available
+                false, // can_set_location
+                false, // has_location
+                false, // has_bot_user_ids
+                false, // is_slow_mode_enabled
+                false, // is_slow_mode_delay_active
+                true,  // has_stats_dc_id
+                false, // has_photo
+                false, // is_can_view_statistics_inited
+                false, // can_view_statistics
+                false, // legacy_has_active_group_call_id
+                false, // has_invite_link
+                false, // has_bot_commands
+                false, // can_be_deleted
+                false, // has_aggressive_anti_spam_enabled
+                false, // has_hidden_participants
+                false, // has_flags2
+            ],
+        );
+        store_i32(&mut out, 0); // participant_count
+        TimeCtx::store_time(&mut out, 0.0, &ctx);
+        store_i32(&mut out, DcId::create(2).get_raw_id()); // stats_dc_id
+        let parsed = ChannelFull::parse_value(&out, &ctx).unwrap();
+        assert!(parsed.can_have_sponsored_messages);
+        assert!(parsed.can_view_statistics);
+        assert!(parsed.stats_dc_id.is_exact());
+
+        // store the parsed record (with the repaired flags) — now it is a
+        // fixed point and the round trip is exact
+        let reparsed = round_trip(
+            |out| parsed.store(out, &ctx),
+            |input| ChannelFull::parse_value(input, &ctx).unwrap(),
+        );
+        assert_eq!(reparsed, parsed);
+
+        // the ProfileTab persisted-form conversions
+        assert_eq!(ProfileTab::from_raw(0), ProfileTab::Default);
+        assert_eq!(ProfileTab::from_raw(8), ProfileTab::Gifs);
+        assert_eq!(ProfileTab::from_raw(99), ProfileTab::Default);
+        assert_eq!(ProfileTab::Posts.as_raw(), 1);
+    }
+
+    #[test]
+    fn dialog_location_round_trips() {
+        let mut location = DialogLocation::default();
+        assert!(location.empty());
+        let mut out = Vec::new();
+        location.store(&mut out);
+        let mut parser = Parser::new(&out);
+        assert_eq!(DialogLocation::parse_impl(&mut parser).unwrap(), location);
+        parser.fetch_end().unwrap();
+
+        // an address-only location is non-empty but keeps an empty Location
+        location.address_ = "somewhere".to_owned();
+        assert!(!location.empty());
+        let mut out = Vec::new();
+        location.store(&mut out);
+        let mut parser = Parser::new(&out);
+        let parsed = DialogLocation::parse_impl(&mut parser).unwrap();
+        assert_eq!(parsed.get_address(), "somewhere");
+        assert!(parsed.location_.is_empty());
+        assert!(!parsed.empty());
+    }
+
+    #[test]
+    fn bot_verification_record_matches_the_cpp() {
+        let verification = BotVerification::from_telegram(telegram_api::BotVerification {
+            bot_id: 3000000008,
+            icon: 99,
+            description: "stamp".to_owned(),
+        });
+        assert!(verification.is_valid());
+        assert!(
+            !BotVerification::from_telegram(telegram_api::BotVerification {
+                bot_id: 0,
+                icon: 99,
+                description: String::new(),
+            })
+            .is_valid()
+        );
+        // an invalid record is dropped by the get_bot_verification gate
+        assert!(
+            BotVerification::get_bot_verification(Some(telegram_api::BotVerification {
+                bot_id: 0,
+                icon: 0,
+                description: String::new(),
+            }))
+            .is_none()
+        );
+        assert!(BotVerification::get_bot_verification(None).is_none());
+
+        // the byte format: the empty flag block, the two ids, the string
+        let mut out = Vec::new();
+        verification.store(&mut out);
+        assert_eq!(
+            hex(&out),
+            "00000000085ed0b2000000006300000000000000057374616d700000"
+        );
+        let mut parser = Parser::new(&out);
+        assert_eq!(
+            BotVerification::parse_impl(&mut parser).unwrap(),
+            verification
+        );
+        parser.fetch_end().unwrap();
     }
 }
