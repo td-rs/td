@@ -43,6 +43,7 @@ use crate::config_recoverer::{
 };
 use crate::config_result;
 use crate::global::Global;
+use crate::manager_option_states::ManagerOptionStates;
 use crate::option_manager::OptionManager;
 use crate::requests;
 use crate::synchronous_requests;
@@ -153,6 +154,12 @@ pub struct Td {
     /// `G()->time_zone_manager()`.
     #[allow(dead_code)]
     pub(crate) time_zone_manager: TimeZoneManager,
+    /// The four M.3.9.2 option-read receiver states (trial parameters,
+    /// freeze state, age verification, group-call message limits) — the
+    /// stand-ins for the TranscriptionManager / UserManager /
+    /// AccountManager / GroupCallManager fields until those managers
+    /// land (`crate::manager_option_states`).
+    pub(crate) manager_states: ManagerOptionStates,
     pub(crate) auth_manager: AuthManager,
     /// `Td::stop_cnt_` — the hangup and the close completion each drop one.
     stop_cnt: i32,
@@ -196,6 +203,7 @@ impl Td {
             recoverer_clock: None,
             global: Global::new(),
             time_zone_manager: TimeZoneManager::default(),
+            manager_states: ManagerOptionStates::default(),
             auth_manager: AuthManager::new(),
             stop_cnt: 2,
         }
@@ -456,6 +464,26 @@ impl Td {
         // init_file_manager / init_non_actor_managers / init_managers /
         // init_pure_actor_managers / SecretChatsManager / StorageManager —
         // each manager step appends its block here in the C++ order.
+
+        // The M.3.9.2 stand-in for the four manager constructors' pmc
+        // reads (in the C++ creation order: AccountManager Td.cpp:1157,
+        // GroupCallManager :1231, TranscriptionManager :1313, UserManager
+        // :1322) — the states replay from the binlog pmc and send the
+        // same updates the C++ constructors do. Each read moves into its
+        // manager when that manager lands.
+        {
+            let is_authorized = self.auth_manager.is_authorized();
+            let is_bot = self.auth_manager.is_bot();
+            let unix_time = self.global.unix_time();
+            let updates = {
+                let pmc = self.global.binlog_pmc();
+                self.manager_states
+                    .load(pmc, is_authorized, is_bot, unix_time)
+            };
+            for update in updates {
+                self.send_update(update);
+            }
+        }
 
         // `ConfigManager::start_up` (runs when the C++ manager actor
         // starts, i.e. after the auth restore): the post-init config fetch
@@ -767,6 +795,31 @@ impl Td {
             option_manager.update_premium_options();
         }
         self.flush_option_updates();
+
+        // The M.3.9.2 manager fan-outs — the C++ `send_closure`s from
+        // `process_app_config`, applied to the Td's manager states after
+        // the option broadcasts (the C++ actors deliver them around the
+        // option writes; this fixed order is the port's determinism).
+        if !actions.manager_updates.is_empty() {
+            let is_authorized = self.auth_manager.is_authorized();
+            let is_bot = self.auth_manager.is_bot();
+            let unix_time = self.global.unix_time();
+            for update in actions.manager_updates {
+                let sent = {
+                    let pmc = self.global.binlog_pmc();
+                    self.manager_states.on_manager_update(
+                        pmc,
+                        update,
+                        is_authorized,
+                        is_bot,
+                        unix_time,
+                    )
+                };
+                if let Some(update) = sent {
+                    self.send_update(update);
+                }
+            }
+        }
 
         for id in actions.ok_ids {
             self.send_result(id, ok_object());

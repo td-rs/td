@@ -24,9 +24,11 @@
 //! - The expire timer rides the Td actor's single `set_timeout` slot; the
 //!   Td re-syncs it after every ConfigManager interaction (the C++ manager
 //!   is its own actor with its own timer).
-//! - The manager fan-outs to ConnectionCreator / LinkManager /
-//!   TranscriptionManager / UserManager / AccountManager / GroupCallManager
-//!   have no receivers yet and are skipped at trace level.
+//! - The manager fan-outs to ConnectionCreator / LinkManager have no
+//!   receivers yet and are skipped at trace level (M.3.9.1). The four
+//!   M.3.9.2 fan-outs — TranscriptionManager / UserManager /
+//!   AccountManager / GroupCallManager — are carried as
+//!   [`ManagerUpdate`]s for the Td's [`crate::manager_option_states`].
 //! - `is_emoji` (the Unicode emoji table behind the `emojies_sounds` key
 //!   validation) is not ported; the key is accepted as-is.
 //! - Failed content-settings fetches leave the pending `getOption`s
@@ -39,6 +41,7 @@ use tddb::binlog_key_value::BinlogKeyValue;
 use tdmtproto::telegram_api;
 use tdutils::status::Status;
 
+use crate::manager_option_states::{AgeVerificationParameters, ManagerUpdate};
 use crate::option_manager::OptionManager;
 use crate::td_api;
 
@@ -61,6 +64,12 @@ pub struct ConfigActions {
     pub app_config_answers: Vec<(u64, td_api::JsonValue)>,
     /// Follow-up network queries to dispatch.
     pub queries: Vec<ConfigQuery>,
+    /// The manager fan-outs of `process_app_config` (M.3.9.2) — the C++
+    /// `send_closure`s the Td applies to its
+    /// [`crate::manager_option_states::ManagerOptionStates`], in the
+    /// emission order (the in-loop group-call one first, then the three
+    /// after the key loop).
+    pub manager_updates: Vec<ManagerUpdate>,
     /// `OptionManager::update_premium_options` ran after the app config
     /// arrived (ConfigManager.cpp:1112).
     pub refresh_premium_options: bool,
@@ -73,6 +82,7 @@ impl ConfigActions {
         self.get_option_answers.extend(other.get_option_answers);
         self.app_config_answers.extend(other.app_config_answers);
         self.queries.extend(other.queries);
+        self.manager_updates.extend(other.manager_updates);
         self.refresh_premium_options |= other.refresh_premium_options;
     }
 }
@@ -1336,7 +1346,7 @@ fn get_json_value_bool(json_value: &telegram_api::JSONValue, name: &str) -> bool
 }
 
 /// `get_json_value_int` (JsonValue.cpp:207-213).
-fn get_json_value_int(json_value: &telegram_api::JSONValue, name: &str) -> i32 {
+pub(crate) fn get_json_value_int(json_value: &telegram_api::JSONValue, name: &str) -> i32 {
     if let telegram_api::JSONValue::jsonNumber(value) = json_value {
         return value.value as i32;
     }
@@ -1345,7 +1355,7 @@ fn get_json_value_int(json_value: &telegram_api::JSONValue, name: &str) -> i32 {
 }
 
 /// `get_json_value_long` (JsonValue.cpp:215-224).
-fn get_json_value_long(json_value: &telegram_api::JSONValue, name: &str) -> i64 {
+pub(crate) fn get_json_value_long(json_value: &telegram_api::JSONValue, name: &str) -> i64 {
     match json_value {
         telegram_api::JSONValue::jsonString(value) => value.value.parse().unwrap_or(0),
         telegram_api::JSONValue::jsonNumber(value) => value.value as i64,
@@ -1366,7 +1376,7 @@ fn get_json_value_double(json_value: &telegram_api::JSONValue, name: &str) -> f6
 }
 
 /// `get_json_value_string` (JsonValue.cpp:234-240).
-fn get_json_value_string(json_value: &telegram_api::JSONValue, name: &str) -> String {
+pub(crate) fn get_json_value_string(json_value: &telegram_api::JSONValue, name: &str) -> String {
     if let telegram_api::JSONValue::jsonString(value) = json_value {
         return value.value.clone();
     }
@@ -1812,6 +1822,17 @@ impl ConfigManager {
         let mut premium_invoice_slug = String::new();
         let mut is_premium_available = false;
         let mut fragment_prefixes: Vec<String> = Vec::new();
+        // The M.3.9.2 fan-out locals (ConfigManager.cpp:1344-1357).
+        let mut transcribe_audio_trial_weekly_number = 0;
+        let mut transcribe_audio_trial_duration_max = 0;
+        let mut transcribe_audio_trial_cooldown_until = 0;
+        let mut freeze_since_date = 0;
+        let mut freeze_until_date = 0;
+        let mut freeze_appeal_url = String::new();
+        let mut need_age_video_verification = false;
+        let mut verify_age_bot_username = String::new();
+        let mut verify_age_country = String::new();
+        let mut verify_age_min = 0;
         let mut business_features: Vec<String> = Vec::new();
         let mut need_premium_for_new_chat_privacy = true;
         let mut starref_start_param_prefixes: Vec<String> = Vec::new();
@@ -2179,11 +2200,19 @@ impl ConfigManager {
                         );
                         continue;
                     }
-                    "transcribe_audio_trial_weekly_number"
-                    | "transcribe_audio_trial_duration_max"
-                    | "transcribe_audio_trial_cooldown_until" => {
-                        // TranscriptionManager::on_update_trial_parameters —
-                        // lands with the TranscriptionManager.
+                    "transcribe_audio_trial_weekly_number" => {
+                        transcribe_audio_trial_weekly_number =
+                            get_json_value_int(&key_value.value, key);
+                        continue;
+                    }
+                    "transcribe_audio_trial_duration_max" => {
+                        transcribe_audio_trial_duration_max =
+                            get_json_value_int(&key_value.value, key);
+                        continue;
+                    }
+                    "transcribe_audio_trial_cooldown_until" => {
+                        transcribe_audio_trial_cooldown_until =
+                            get_json_value_int(&key_value.value, key);
                         continue;
                     }
                     "business_promo_order" => {
@@ -2245,9 +2274,16 @@ impl ConfigManager {
                         }
                         continue;
                     }
-                    "freeze_since_date" | "freeze_until_date" | "freeze_appeal_url" => {
-                        // UserManager::on_update_freeze_state — lands with
-                        // the UserManager.
+                    "freeze_since_date" => {
+                        freeze_since_date = get_json_value_int(&key_value.value, key);
+                        continue;
+                    }
+                    "freeze_until_date" => {
+                        freeze_until_date = get_json_value_int(&key_value.value, key);
+                        continue;
+                    }
+                    "freeze_appeal_url" => {
+                        freeze_appeal_url = get_json_value_string(&key_value.value, key);
                         continue;
                     }
                     "call_requests_disabled" => {
@@ -2289,12 +2325,20 @@ impl ConfigManager {
                         );
                         continue;
                     }
-                    "need_age_video_verification"
-                    | "verify_age_bot_username"
-                    | "verify_age_country"
-                    | "verify_age_min" => {
-                        // AccountManager::on_update_age_verification_parameters —
-                        // lands with the AccountManager.
+                    "need_age_video_verification" => {
+                        need_age_video_verification = get_json_value_bool(&key_value.value, key);
+                        continue;
+                    }
+                    "verify_age_bot_username" => {
+                        verify_age_bot_username = get_json_value_string(&key_value.value, key);
+                        continue;
+                    }
+                    "verify_age_country" => {
+                        verify_age_country = get_json_value_string(&key_value.value, key);
+                        continue;
+                    }
+                    "verify_age_min" => {
+                        verify_age_min = get_json_value_int(&key_value.value, key);
                         continue;
                     }
                     "whitelisted_bots" => {
@@ -2318,8 +2362,14 @@ impl ConfigManager {
                         continue;
                     }
                     "stars_groupcall_message_limits" => {
-                        // GroupCallManager::on_update_group_call_message_limits —
-                        // lands with the GroupCallManager.
+                        // GroupCallManager::on_update_group_call_message_limits
+                        // (ConfigManager.cpp:1975-1978) — the raw value;
+                        // the manager side parses it.
+                        actions
+                            .manager_updates
+                            .push(ManagerUpdate::GroupCallMessageLimits(
+                                key_value.value.clone(),
+                            ));
                         continue;
                     }
                     "ton_stakedice_stake_suggested_amounts" => {
@@ -2405,11 +2455,32 @@ impl ConfigManager {
             telegram_api::jsonObject { value: new_values },
         ));
 
-        // The C++ fan-outs: LinkManager::update_autologin_domains,
-        // TranscriptionManager::on_update_trial_parameters,
-        // UserManager::on_update_freeze_state,
-        // AccountManager::on_update_age_verification_parameters — all
-        // skipped until their managers land (see the key handlers above).
+        // The C++ fan-outs: LinkManager::update_autologin_domains stays
+        // skipped until the LinkManager (see the key handlers above);
+        // the three M.3.9.2 fan-outs (ConfigManager.cpp:2050-2059) are
+        // carried for the Td's manager states.
+        actions
+            .manager_updates
+            .push(ManagerUpdate::TrialParameters {
+                weekly_number: transcribe_audio_trial_weekly_number,
+                duration_max: transcribe_audio_trial_duration_max,
+                cooldown_until: transcribe_audio_trial_cooldown_until,
+            });
+        actions.manager_updates.push(ManagerUpdate::FreezeState {
+            since_date: freeze_since_date,
+            until_date: freeze_until_date,
+            appeal_url: freeze_appeal_url,
+        });
+        actions
+            .manager_updates
+            .push(ManagerUpdate::AgeVerificationParameters(
+                AgeVerificationParameters::new(
+                    need_age_video_verification,
+                    verify_age_bot_username,
+                    verify_age_country,
+                    verify_age_min,
+                ),
+            ));
 
         if ignored_restriction_reasons.is_empty() {
             options.set_option_empty("ignored_restriction_reasons");
@@ -3250,6 +3321,129 @@ mod tests {
         assert!(matches!(
             actions.app_config_answers[0].1,
             td_api::JsonValue::jsonValueNull(_)
+        ));
+    }
+
+    #[test]
+    fn app_config_fan_outs_reach_the_manager_states() {
+        let mut pmc = TempPmc::new("app-config-m392");
+        let mut options = options();
+        let mut manager = ConfigManager::new(b"");
+        manager.get_app_config(7, false, false);
+        let groupcall_limits = Box::new(telegram_api::JSONValue::jsonArray(
+            telegram_api::jsonArray {
+                value: vec![Box::new(telegram_api::JSONValue::jsonObject(
+                    telegram_api::jsonObject {
+                        value: vec![Box::new(telegram_api::JSONObjectValue {
+                            key: "stars".to_string(),
+                            value: json_number(100.0),
+                        })],
+                    },
+                ))],
+            },
+        ));
+        let config = json_object(vec![
+            (
+                "stars_groupcall_message_limits".to_string(),
+                groupcall_limits,
+            ),
+            (
+                "transcribe_audio_trial_weekly_number".to_string(),
+                json_number(10.0),
+            ),
+            (
+                "transcribe_audio_trial_duration_max".to_string(),
+                json_number(300.0),
+            ),
+            (
+                "transcribe_audio_trial_cooldown_until".to_string(),
+                json_number(2000.0),
+            ),
+            ("freeze_since_date".to_string(), json_number(100.0)),
+            ("freeze_until_date".to_string(), json_number(200.0)),
+            (
+                "freeze_appeal_url".to_string(),
+                json_string("https://example.org"),
+            ),
+            ("need_age_video_verification".to_string(), json_bool(true)),
+            ("verify_age_bot_username".to_string(), json_string("bot")),
+            ("verify_age_country".to_string(), json_string("DE")),
+            ("verify_age_min".to_string(), json_number(18.0)),
+        ]);
+        let actions = manager.on_get_app_config_result(
+            &mut pmc.pmc,
+            Ok(AppConfigQueryResult::Config { hash: 42, config }),
+            false,
+            &mut options,
+            true,
+            false,
+        );
+
+        // The fan-outs in the C++ emission order: the in-loop group-call
+        // one, then the three after the key loop.
+        assert_eq!(actions.manager_updates.len(), 4);
+        assert!(matches!(
+            actions.manager_updates[0],
+            ManagerUpdate::GroupCallMessageLimits(_)
+        ));
+        let trial = match &actions.manager_updates[1] {
+            ManagerUpdate::TrialParameters {
+                weekly_number,
+                duration_max,
+                cooldown_until,
+            } => (*weekly_number, *duration_max, *cooldown_until),
+            _ => panic!("trial parameters fan-out"),
+        };
+        assert_eq!(trial, (10, 300, 2000));
+        let freeze = match &actions.manager_updates[2] {
+            ManagerUpdate::FreezeState {
+                since_date,
+                until_date,
+                appeal_url,
+            } => (*since_date, *until_date, appeal_url.clone()),
+            _ => panic!("freeze state fan-out"),
+        };
+        assert_eq!(freeze, (100, 200, "https://example.org".to_string()));
+        match &actions.manager_updates[3] {
+            ManagerUpdate::AgeVerificationParameters(parameters) => assert_eq!(
+                *parameters,
+                AgeVerificationParameters::new(true, "bot".into(), "DE".into(), 18)
+            ),
+            _ => panic!("age verification fan-out"),
+        }
+
+        // Applying them drives the manager states and persists all four
+        // pmc keys.
+        let mut states = crate::manager_option_states::ManagerOptionStates::default();
+        let mut sent = Vec::new();
+        for update in actions.manager_updates {
+            let update = { states.on_manager_update(&mut pmc.pmc, update, true, false, 1000) };
+            sent.extend(update);
+        }
+        assert_eq!(sent.len(), 4);
+        assert!(matches!(
+            sent[0],
+            td_api::Object::updateGroupCallMessageLevels(_)
+        ));
+        assert!(matches!(
+            sent[1],
+            td_api::Object::updateSpeechRecognitionTrial(_)
+        ));
+        assert!(matches!(sent[2], td_api::Object::updateFreezeState(_)));
+        assert!(matches!(
+            sent[3],
+            td_api::Object::updateAgeVerificationParameters(_)
+        ));
+        assert!(pmc.get_raw(b"speech_recognition_trial").len() > 4);
+        assert_eq!(pmc.get("freeze_state"), "100 200 https://example.org");
+        assert!(pmc.get_raw(b"age_verification").len() > 4);
+        assert!(pmc.get_raw(b"group_call_message_limits").len() > 8);
+
+        // The ten consumed keys stay out of the filtered config.
+        let parsed = AppConfig::parse(&pmc.get_raw(b"app_config")).unwrap();
+        assert!(matches!(
+            parsed.config.as_ref(),
+            telegram_api::JSONValue::jsonObject(object) if object.value.is_empty()
         ));
     }
 
