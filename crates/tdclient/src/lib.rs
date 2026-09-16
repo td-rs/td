@@ -17,6 +17,7 @@ pub mod config_result;
 pub mod connection_creator;
 pub mod global;
 pub mod link_manager;
+pub mod manager_option_states;
 pub mod misc;
 pub mod option_manager;
 pub mod requests;
