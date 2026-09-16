@@ -8,6 +8,8 @@
 //! [`MessageDbSyncInterface`] is written once the full sync surface exists
 //! (M.6.10, like the C++ class which only completes at :967).
 
+use std::sync::{Arc, Mutex};
+
 use crate::chat_manager::MessageId;
 use crate::dialog_id::{
     DialogId, MessageFullId, MessageSearchFilter, NotificationId, ServerMessageId,
@@ -15,9 +17,13 @@ use crate::dialog_id::{
 };
 use crate::store_parse::{self, Parser};
 
+use tdactor::{Actor, ActorOwn, actor_messages, create_actor_on_scheduler, send_closure_later};
+use tddb::sqlite_connection_safe::SqliteConnectionSafe;
 use tddb::sqlite_db::SqliteDb;
 use tddb::sqlite_statement::SqliteStatement;
+use tdutils::promise::Promise;
 use tdutils::status::{Result, Status};
+use tdutils::time::now_cached;
 use tdutils::try_result;
 use tdutils::unicode::{UnicodeSimpleCategory, get_unicode_simple_category};
 use tdutils::utf8::{next_utf8_unsafe, utf8_truncate};
@@ -1327,6 +1333,191 @@ impl MessageDbImpl {
     }
 }
 
+/// The `MessageDbImpl final` overrides (MessageDb.cpp:290-824) — every trait
+/// method forwards to the inherent method of the same name.
+#[allow(clippy::too_many_arguments)]
+impl MessageDbSyncInterface for MessageDbImpl {
+    fn add_message(
+        &mut self,
+        message_full_id: MessageFullId,
+        unique_message_id: ServerMessageId,
+        sender_dialog_id: DialogId,
+        random_id: i64,
+        ttl_expires_at: i32,
+        index_mask: i32,
+        search_id: i64,
+        text: String,
+        notification_id: NotificationId,
+        top_thread_message_id: MessageId,
+        data: Vec<u8>,
+    ) {
+        MessageDbImpl::add_message(
+            self,
+            message_full_id,
+            unique_message_id,
+            sender_dialog_id,
+            random_id,
+            ttl_expires_at,
+            index_mask,
+            search_id,
+            text,
+            notification_id,
+            top_thread_message_id,
+            data,
+        )
+    }
+
+    fn add_scheduled_message(&mut self, message_full_id: MessageFullId, data: Vec<u8>) {
+        MessageDbImpl::add_scheduled_message(self, message_full_id, data)
+    }
+
+    fn delete_message(&mut self, message_full_id: MessageFullId) {
+        MessageDbImpl::delete_message(self, message_full_id)
+    }
+
+    fn delete_all_dialog_messages(&mut self, dialog_id: DialogId, from_message_id: MessageId) {
+        MessageDbImpl::delete_all_dialog_messages(self, dialog_id, from_message_id)
+    }
+
+    fn delete_dialog_messages_by_sender(
+        &mut self,
+        dialog_id: DialogId,
+        sender_dialog_id: DialogId,
+    ) {
+        MessageDbImpl::delete_dialog_messages_by_sender(self, dialog_id, sender_dialog_id)
+    }
+
+    fn get_message(&mut self, message_full_id: MessageFullId) -> Result<MessageDbDialogMessage> {
+        MessageDbImpl::get_message(self, message_full_id)
+    }
+
+    fn get_message_by_unique_message_id(
+        &mut self,
+        unique_message_id: ServerMessageId,
+    ) -> Result<MessageDbMessage> {
+        MessageDbImpl::get_message_by_unique_message_id(self, unique_message_id)
+    }
+
+    fn get_message_by_random_id(
+        &mut self,
+        dialog_id: DialogId,
+        random_id: i64,
+    ) -> Result<MessageDbDialogMessage> {
+        MessageDbImpl::get_message_by_random_id(self, dialog_id, random_id)
+    }
+
+    fn get_dialog_message_by_date(
+        &mut self,
+        dialog_id: DialogId,
+        first_message_id: MessageId,
+        last_message_id: MessageId,
+        date: i32,
+    ) -> Result<MessageDbDialogMessage> {
+        MessageDbImpl::get_dialog_message_by_date(
+            self,
+            dialog_id,
+            first_message_id,
+            last_message_id,
+            date,
+        )
+    }
+
+    fn get_dialog_message_calendar(
+        &mut self,
+        query: MessageDbDialogCalendarQuery,
+    ) -> MessageDbCalendar {
+        MessageDbImpl::get_dialog_message_calendar(self, query)
+    }
+
+    fn get_dialog_sparse_message_positions(
+        &mut self,
+        query: MessageDbGetDialogSparseMessagePositionsQuery,
+    ) -> Result<MessageDbMessagePositions> {
+        MessageDbImpl::get_dialog_sparse_message_positions(self, query)
+    }
+
+    fn get_messages(&mut self, query: MessageDbMessagesQuery) -> Vec<MessageDbDialogMessage> {
+        MessageDbImpl::get_messages(self, query)
+    }
+
+    fn get_scheduled_messages(
+        &mut self,
+        dialog_id: DialogId,
+        limit: i32,
+    ) -> Vec<MessageDbDialogMessage> {
+        MessageDbImpl::get_scheduled_messages(self, dialog_id, limit)
+    }
+
+    fn get_messages_from_notification_id(
+        &mut self,
+        dialog_id: DialogId,
+        from_notification_id: NotificationId,
+        limit: i32,
+    ) -> Vec<MessageDbDialogMessage> {
+        MessageDbImpl::get_messages_from_notification_id(
+            self,
+            dialog_id,
+            from_notification_id,
+            limit,
+        )
+    }
+
+    fn get_expiring_messages(&mut self, expires_till: i32, limit: i32) -> Vec<MessageDbMessage> {
+        MessageDbImpl::get_expiring_messages(self, expires_till, limit)
+    }
+
+    fn get_calls(&mut self, query: MessageDbCallsQuery) -> MessageDbCallsResult {
+        MessageDbImpl::get_calls(self, query)
+    }
+
+    fn get_messages_fts(&mut self, query: MessageDbFtsQuery) -> MessageDbFtsResult {
+        MessageDbImpl::get_messages_fts(self, query)
+    }
+
+    fn begin_write_transaction(&mut self) -> Status {
+        MessageDbImpl::begin_write_transaction(self)
+    }
+
+    fn commit_transaction(&mut self) -> Status {
+        MessageDbImpl::commit_transaction(self)
+    }
+}
+
+/// `MessageDbSyncSafe` (MessageDb.cpp:970-987): the port follows the shared
+/// connection subset of [`SqliteConnectionSafe`] (see that module's docs) —
+/// one lazily-created [`MessageDbImpl`] behind a mutex instead of a
+/// per-scheduler-thread lsls instance.
+pub struct MessageDbSyncSafe {
+    inner: Mutex<Option<MessageDbImpl>>,
+    safe_connection: Arc<SqliteConnectionSafe>,
+}
+
+impl MessageDbSyncSafe {
+    /// `create_message_db_sync`.
+    pub fn new(safe_connection: Arc<SqliteConnectionSafe>) -> MessageDbSyncSafe {
+        MessageDbSyncSafe {
+            inner: Mutex::new(None),
+            safe_connection,
+        }
+    }
+
+    /// `MessageDbSyncSafeInterface::get()` — the closure runs against the
+    /// (lazily created, on first use) implementation.
+    pub fn with_db<R>(&self, f: impl FnOnce(&mut MessageDbImpl) -> R) -> R {
+        let mut inner = self.inner.lock().unwrap();
+        if inner.is_none() {
+            let db = MessageDbImpl::new(self.safe_connection.get().clone()).unwrap();
+            *inner = Some(db);
+        }
+        f(inner.as_mut().unwrap())
+    }
+
+    /// dropping the last reference closes the implementation.
+    pub fn close(&self) {
+        *self.inner.lock().unwrap() = None;
+    }
+}
+
 /// `td::store_log_event`-style helper used by the tests: prefix the version
 /// int the way `LogEventStorerUnsafe` does.
 #[cfg(test)]
@@ -1336,6 +1527,919 @@ fn store_message_blob(flags: i32, rest: &[u8]) -> Vec<u8> {
     store_parse::store_i32(&mut out, flags);
     out.extend_from_slice(rest);
     out
+}
+
+/// `MessageDbAsyncInterface` (MessageDb.h:151-194).
+pub trait MessageDbAsyncInterface: Send {
+    #[allow(clippy::too_many_arguments)]
+    fn add_message(
+        &self,
+        message_full_id: MessageFullId,
+        unique_message_id: ServerMessageId,
+        sender_dialog_id: DialogId,
+        random_id: i64,
+        ttl_expires_at: i32,
+        index_mask: i32,
+        search_id: i64,
+        text: String,
+        notification_id: NotificationId,
+        top_thread_message_id: MessageId,
+        data: Vec<u8>,
+        promise: Promise<()>,
+    );
+    fn add_scheduled_message(
+        &self,
+        message_full_id: MessageFullId,
+        data: Vec<u8>,
+        promise: Promise<()>,
+    );
+
+    fn delete_message(&self, message_full_id: MessageFullId, promise: Promise<()>);
+    fn delete_all_dialog_messages(
+        &self,
+        dialog_id: DialogId,
+        from_message_id: MessageId,
+        promise: Promise<()>,
+    );
+    fn delete_dialog_messages_by_sender(
+        &self,
+        dialog_id: DialogId,
+        sender_dialog_id: DialogId,
+        promise: Promise<()>,
+    );
+
+    fn get_message(&self, message_full_id: MessageFullId, promise: Promise<MessageDbDialogMessage>);
+    fn get_message_by_unique_message_id(
+        &self,
+        unique_message_id: ServerMessageId,
+        promise: Promise<MessageDbMessage>,
+    );
+    fn get_message_by_random_id(
+        &self,
+        dialog_id: DialogId,
+        random_id: i64,
+        promise: Promise<MessageDbDialogMessage>,
+    );
+    fn get_dialog_message_by_date(
+        &self,
+        dialog_id: DialogId,
+        first_message_id: MessageId,
+        last_message_id: MessageId,
+        date: i32,
+        promise: Promise<MessageDbDialogMessage>,
+    );
+
+    fn get_dialog_message_calendar(
+        &self,
+        query: MessageDbDialogCalendarQuery,
+        promise: Promise<MessageDbCalendar>,
+    );
+
+    fn get_dialog_sparse_message_positions(
+        &self,
+        query: MessageDbGetDialogSparseMessagePositionsQuery,
+        promise: Promise<MessageDbMessagePositions>,
+    );
+
+    fn get_messages(
+        &self,
+        query: MessageDbMessagesQuery,
+        promise: Promise<Vec<MessageDbDialogMessage>>,
+    );
+    fn get_scheduled_messages(
+        &self,
+        dialog_id: DialogId,
+        limit: i32,
+        promise: Promise<Vec<MessageDbDialogMessage>>,
+    );
+    fn get_messages_from_notification_id(
+        &self,
+        dialog_id: DialogId,
+        from_notification_id: NotificationId,
+        limit: i32,
+        promise: Promise<Vec<MessageDbDialogMessage>>,
+    );
+
+    fn get_calls(&self, query: MessageDbCallsQuery, promise: Promise<MessageDbCallsResult>);
+    fn get_messages_fts(&self, query: MessageDbFtsQuery, promise: Promise<MessageDbFtsResult>);
+
+    fn get_expiring_messages(
+        &self,
+        expires_till: i32,
+        limit: i32,
+        promise: Promise<Vec<MessageDbMessage>>,
+    );
+
+    fn close(&self, promise: Promise<()>);
+    fn force_flush(&self);
+}
+
+/// `MessageDbAsync` (MessageDb.cpp:989-1234): the forwarding wrapper around
+/// the [`MessageDbAsyncImpl`] actor, created with
+/// `create_actor_on_scheduler` (MessageDb.cpp:991-993).
+pub struct MessageDbAsync {
+    impl_: ActorOwn<MessageDbAsyncImpl>,
+}
+
+impl MessageDbAsync {
+    /// `MessageDbAsync(sync_db, scheduler_id)` + `create_message_db_async`
+    /// (MessageDb.cpp:1236-1239); the C++ default scheduler id is -1.
+    pub fn new(sync_db: Arc<MessageDbSyncSafe>, scheduler_id: i32) -> MessageDbAsync {
+        MessageDbAsync {
+            impl_: create_actor_on_scheduler(
+                "MessageDbActor",
+                scheduler_id,
+                MessageDbAsyncImpl::new(sync_db),
+            ),
+        }
+    }
+}
+
+/// `MessageDbAsync::Impl` (MessageDb.cpp:1071-1232). The C++ buffers write
+/// queries as `PromiseCreator::lambda`s capturing `this`; here they are
+/// buffered as the [`WriteQuery`] enum, which keeps the exact batching
+/// order (writes run inside one transaction, promises fire after commit)
+/// without the raw-pointer capture.
+enum WriteQuery {
+    Add {
+        message_full_id: MessageFullId,
+        unique_message_id: ServerMessageId,
+        sender_dialog_id: DialogId,
+        random_id: i64,
+        ttl_expires_at: i32,
+        index_mask: i32,
+        search_id: i64,
+        text: String,
+        notification_id: NotificationId,
+        top_thread_message_id: MessageId,
+        data: Vec<u8>,
+        promise: Promise<()>,
+    },
+    AddScheduled {
+        message_full_id: MessageFullId,
+        data: Vec<u8>,
+        promise: Promise<()>,
+    },
+    Delete {
+        message_full_id: MessageFullId,
+        promise: Promise<()>,
+    },
+}
+
+/// `MAX_PENDING_QUERY_COUNT` / `MAX_PENDING_QUERY_DELAY`
+/// (MessageDb.cpp:1191-1192).
+const MAX_PENDING_QUERY_COUNT: usize = 50;
+const MAX_PENDING_QUERY_DELAY: f64 = 0.01;
+
+pub struct MessageDbAsyncImpl {
+    sync_db_safe: Option<Arc<MessageDbSyncSafe>>,
+    finished_writes: Vec<Promise<()>>,
+    pending_writes: Vec<WriteQuery>,
+    wakeup_at: f64,
+}
+
+impl MessageDbAsyncImpl {
+    fn new(sync_db_safe: Arc<MessageDbSyncSafe>) -> MessageDbAsyncImpl {
+        MessageDbAsyncImpl {
+            sync_db_safe: Some(sync_db_safe),
+            finished_writes: Vec::new(),
+            pending_writes: Vec::new(),
+            wakeup_at: 0.0,
+        }
+    }
+
+    /// `Impl::sync_db_->` — run a closure against the implementation.
+    fn run_sync<R>(&mut self, f: impl FnOnce(&mut dyn MessageDbSyncInterface) -> R) -> R {
+        let sync_db_safe = self
+            .sync_db_safe
+            .as_ref()
+            .expect("MessageDbAsyncImpl used after close");
+        sync_db_safe.with_db(|db| f(db))
+    }
+
+    /// `Impl::on_write_result` (MessageDb.cpp:1102-1105): we are inside a
+    /// transaction and don't know how to handle errors.
+    fn on_write_result(&mut self, promise: Promise<()>) {
+        self.finished_writes.push(promise);
+    }
+
+    /// `Impl::add_write_query` (MessageDb.cpp:1199-1211).
+    fn add_write_query(&mut self, query: WriteQuery) {
+        self.pending_writes.push(query);
+        if self.pending_writes.len() > MAX_PENDING_QUERY_COUNT {
+            self.do_flush();
+            self.wakeup_at = 0.0;
+        } else if self.wakeup_at == 0.0 {
+            self.wakeup_at = now_cached() + MAX_PENDING_QUERY_DELAY;
+        }
+        if self.wakeup_at != 0.0 {
+            self.set_timeout_at(self.wakeup_at);
+        }
+    }
+
+    /// `Impl::add_read_query` (MessageDb.cpp:1212-1214).
+    fn add_read_query(&mut self) {
+        self.do_flush();
+    }
+
+    /// `Impl::do_flush` (MessageDb.cpp:1215-1224): begin transaction, run
+    /// the buffered writes, commit, then settle the finished-write promises.
+    fn do_flush(&mut self) {
+        if self.pending_writes.is_empty() {
+            return;
+        }
+        let pending = std::mem::take(&mut self.pending_writes);
+        self.run_sync(|db| db.begin_write_transaction().ensure());
+        for query in pending {
+            match query {
+                WriteQuery::Add {
+                    message_full_id,
+                    unique_message_id,
+                    sender_dialog_id,
+                    random_id,
+                    ttl_expires_at,
+                    index_mask,
+                    search_id,
+                    text,
+                    notification_id,
+                    top_thread_message_id,
+                    data,
+                    promise,
+                } => {
+                    self.run_sync(|db| {
+                        db.add_message(
+                            message_full_id,
+                            unique_message_id,
+                            sender_dialog_id,
+                            random_id,
+                            ttl_expires_at,
+                            index_mask,
+                            search_id,
+                            text,
+                            notification_id,
+                            top_thread_message_id,
+                            data,
+                        )
+                    });
+                    self.on_write_result(promise);
+                }
+                WriteQuery::AddScheduled {
+                    message_full_id,
+                    data,
+                    promise,
+                } => {
+                    self.run_sync(|db| db.add_scheduled_message(message_full_id, data));
+                    self.on_write_result(promise);
+                }
+                WriteQuery::Delete {
+                    message_full_id,
+                    promise,
+                } => {
+                    self.run_sync(|db| db.delete_message(message_full_id));
+                    self.on_write_result(promise);
+                }
+            }
+        }
+        self.run_sync(|db| db.commit_transaction().ensure());
+        for mut promise in std::mem::take(&mut self.finished_writes) {
+            promise.set_value(());
+        }
+        self.cancel_timeout();
+    }
+}
+
+impl Actor for MessageDbAsyncImpl {
+    /// `Impl::start_up` (MessageDb.cpp:1229-1231) — create the
+    /// implementation eagerly.
+    fn start_up(&mut self) {
+        self.run_sync(|_| {});
+    }
+
+    /// `Impl::timeout_expired` (MessageDb.cpp:1225-1227).
+    fn timeout_expired(&mut self) {
+        self.do_flush();
+    }
+}
+
+actor_messages! {
+    pub enum MessageDbAsyncMessage for MessageDbAsyncImpl {
+        AddMessage {
+            message_full_id: MessageFullId,
+            unique_message_id: ServerMessageId,
+            sender_dialog_id: DialogId,
+            random_id: i64,
+            ttl_expires_at: i32,
+            index_mask: i32,
+            search_id: i64,
+            text: String,
+            notification_id: NotificationId,
+            top_thread_message_id: MessageId,
+            data: Vec<u8>,
+            promise: Promise<()>,
+        } => on_add_message(message_full_id, unique_message_id, sender_dialog_id, random_id, ttl_expires_at, index_mask, search_id, text, notification_id, top_thread_message_id, data, promise),
+        AddScheduledMessage {
+            message_full_id: MessageFullId,
+            data: Vec<u8>,
+            promise: Promise<()>,
+        } => on_add_scheduled_message(message_full_id, data, promise),
+        DeleteMessage {
+            message_full_id: MessageFullId,
+            promise: Promise<()>,
+        } => on_delete_message(message_full_id, promise),
+        DeleteAllDialogMessages {
+            dialog_id: DialogId,
+            from_message_id: MessageId,
+            promise: Promise<()>,
+        } => on_delete_all_dialog_messages(dialog_id, from_message_id, promise),
+        DeleteDialogMessagesBySender {
+            dialog_id: DialogId,
+            sender_dialog_id: DialogId,
+            promise: Promise<()>,
+        } => on_delete_dialog_messages_by_sender(dialog_id, sender_dialog_id, promise),
+        GetMessage {
+            message_full_id: MessageFullId,
+            promise: Promise<MessageDbDialogMessage>,
+        } => on_get_message(message_full_id, promise),
+        GetMessageByUniqueMessageId {
+            unique_message_id: ServerMessageId,
+            promise: Promise<MessageDbMessage>,
+        } => on_get_message_by_unique_message_id(unique_message_id, promise),
+        GetMessageByRandomId {
+            dialog_id: DialogId,
+            random_id: i64,
+            promise: Promise<MessageDbDialogMessage>,
+        } => on_get_message_by_random_id(dialog_id, random_id, promise),
+        GetDialogMessageByDate {
+            dialog_id: DialogId,
+            first_message_id: MessageId,
+            last_message_id: MessageId,
+            date: i32,
+            promise: Promise<MessageDbDialogMessage>,
+        } => on_get_dialog_message_by_date(dialog_id, first_message_id, last_message_id, date, promise),
+        GetDialogMessageCalendar {
+            query: MessageDbDialogCalendarQuery,
+            promise: Promise<MessageDbCalendar>,
+        } => on_get_dialog_message_calendar(query, promise),
+        GetDialogSparseMessagePositions {
+            query: MessageDbGetDialogSparseMessagePositionsQuery,
+            promise: Promise<MessageDbMessagePositions>,
+        } => on_get_dialog_sparse_message_positions(query, promise),
+        GetMessages {
+            query: MessageDbMessagesQuery,
+            promise: Promise<Vec<MessageDbDialogMessage>>,
+        } => on_get_messages(query, promise),
+        GetScheduledMessages {
+            dialog_id: DialogId,
+            limit: i32,
+            promise: Promise<Vec<MessageDbDialogMessage>>,
+        } => on_get_scheduled_messages(dialog_id, limit, promise),
+        GetMessagesFromNotificationId {
+            dialog_id: DialogId,
+            from_notification_id: NotificationId,
+            limit: i32,
+            promise: Promise<Vec<MessageDbDialogMessage>>,
+        } => on_get_messages_from_notification_id(dialog_id, from_notification_id, limit, promise),
+        GetCalls {
+            query: MessageDbCallsQuery,
+            promise: Promise<MessageDbCallsResult>,
+        } => on_get_calls(query, promise),
+        GetMessagesFts {
+            query: MessageDbFtsQuery,
+            promise: Promise<MessageDbFtsResult>,
+        } => on_get_messages_fts(query, promise),
+        GetExpiringMessages {
+            expires_till: i32,
+            limit: i32,
+            promise: Promise<Vec<MessageDbMessage>>,
+        } => on_get_expiring_messages(expires_till, limit, promise),
+        Close {
+            promise: Promise<()>,
+        } => on_close(promise),
+    }
+}
+
+impl MessageDbAsyncImpl {
+    /// `Impl::add_message` (MessageDb.cpp:1075-1087).
+    #[allow(clippy::too_many_arguments)]
+    fn on_add_message(
+        &mut self,
+        message_full_id: MessageFullId,
+        unique_message_id: ServerMessageId,
+        sender_dialog_id: DialogId,
+        random_id: i64,
+        ttl_expires_at: i32,
+        index_mask: i32,
+        search_id: i64,
+        text: String,
+        notification_id: NotificationId,
+        top_thread_message_id: MessageId,
+        data: Vec<u8>,
+        promise: Promise<()>,
+    ) {
+        self.add_write_query(WriteQuery::Add {
+            message_full_id,
+            unique_message_id,
+            sender_dialog_id,
+            random_id,
+            ttl_expires_at,
+            index_mask,
+            search_id,
+            text,
+            notification_id,
+            top_thread_message_id,
+            data,
+            promise,
+        });
+    }
+
+    /// `Impl::add_scheduled_message` (MessageDb.cpp:1088-1093).
+    fn on_add_scheduled_message(
+        &mut self,
+        message_full_id: MessageFullId,
+        data: Vec<u8>,
+        promise: Promise<()>,
+    ) {
+        self.add_write_query(WriteQuery::AddScheduled {
+            message_full_id,
+            data,
+            promise,
+        });
+    }
+
+    /// `Impl::delete_message` (MessageDb.cpp:1095-1100).
+    fn on_delete_message(&mut self, message_full_id: MessageFullId, promise: Promise<()>) {
+        self.add_write_query(WriteQuery::Delete {
+            message_full_id,
+            promise,
+        });
+    }
+
+    /// `Impl::delete_all_dialog_messages` (MessageDb.cpp:1107-1111) — an
+    /// immediate (read-path) query.
+    fn on_delete_all_dialog_messages(
+        &mut self,
+        dialog_id: DialogId,
+        from_message_id: MessageId,
+        mut promise: Promise<()>,
+    ) {
+        self.add_read_query();
+        self.run_sync(|db| db.delete_all_dialog_messages(dialog_id, from_message_id));
+        promise.set_value(());
+    }
+
+    /// `Impl::delete_dialog_messages_by_sender` (MessageDb.cpp:1113-1117).
+    fn on_delete_dialog_messages_by_sender(
+        &mut self,
+        dialog_id: DialogId,
+        sender_dialog_id: DialogId,
+        mut promise: Promise<()>,
+    ) {
+        self.add_read_query();
+        self.run_sync(|db| db.delete_dialog_messages_by_sender(dialog_id, sender_dialog_id));
+        promise.set_value(());
+    }
+
+    /// `Impl::get_message` (MessageDb.cpp:1119-1122).
+    fn on_get_message(
+        &mut self,
+        message_full_id: MessageFullId,
+        mut promise: Promise<MessageDbDialogMessage>,
+    ) {
+        self.add_read_query();
+        let result = self.run_sync(|db| db.get_message(message_full_id));
+        promise.set_result(result);
+    }
+
+    /// `Impl::get_message_by_unique_message_id` (MessageDb.cpp:1123-1126).
+    fn on_get_message_by_unique_message_id(
+        &mut self,
+        unique_message_id: ServerMessageId,
+        mut promise: Promise<MessageDbMessage>,
+    ) {
+        self.add_read_query();
+        let result = self.run_sync(|db| db.get_message_by_unique_message_id(unique_message_id));
+        promise.set_result(result);
+    }
+
+    /// `Impl::get_message_by_random_id` (MessageDb.cpp:1127-1130).
+    fn on_get_message_by_random_id(
+        &mut self,
+        dialog_id: DialogId,
+        random_id: i64,
+        mut promise: Promise<MessageDbDialogMessage>,
+    ) {
+        self.add_read_query();
+        let result = self.run_sync(|db| db.get_message_by_random_id(dialog_id, random_id));
+        promise.set_result(result);
+    }
+
+    /// `Impl::get_dialog_message_by_date` (MessageDb.cpp:1131-1135).
+    fn on_get_dialog_message_by_date(
+        &mut self,
+        dialog_id: DialogId,
+        first_message_id: MessageId,
+        last_message_id: MessageId,
+        date: i32,
+        mut promise: Promise<MessageDbDialogMessage>,
+    ) {
+        self.add_read_query();
+        let result = self.run_sync(|db| {
+            db.get_dialog_message_by_date(dialog_id, first_message_id, last_message_id, date)
+        });
+        promise.set_result(result);
+    }
+
+    /// `Impl::get_dialog_message_calendar` (MessageDb.cpp:1137-1140).
+    fn on_get_dialog_message_calendar(
+        &mut self,
+        query: MessageDbDialogCalendarQuery,
+        mut promise: Promise<MessageDbCalendar>,
+    ) {
+        self.add_read_query();
+        let calendar = self.run_sync(|db| db.get_dialog_message_calendar(query));
+        promise.set_value(calendar);
+    }
+
+    /// `Impl::get_dialog_sparse_message_positions`
+    /// (MessageDb.cpp:1142-1146).
+    fn on_get_dialog_sparse_message_positions(
+        &mut self,
+        query: MessageDbGetDialogSparseMessagePositionsQuery,
+        mut promise: Promise<MessageDbMessagePositions>,
+    ) {
+        self.add_read_query();
+        let result = self.run_sync(|db| db.get_dialog_sparse_message_positions(query));
+        promise.set_result(result);
+    }
+
+    /// `Impl::get_messages` (MessageDb.cpp:1148-1151).
+    fn on_get_messages(
+        &mut self,
+        query: MessageDbMessagesQuery,
+        mut promise: Promise<Vec<MessageDbDialogMessage>>,
+    ) {
+        self.add_read_query();
+        let messages = self.run_sync(|db| db.get_messages(query));
+        promise.set_value(messages);
+    }
+
+    /// `Impl::get_scheduled_messages` (MessageDb.cpp:1152-1155).
+    fn on_get_scheduled_messages(
+        &mut self,
+        dialog_id: DialogId,
+        limit: i32,
+        mut promise: Promise<Vec<MessageDbDialogMessage>>,
+    ) {
+        self.add_read_query();
+        let messages = self.run_sync(|db| db.get_scheduled_messages(dialog_id, limit));
+        promise.set_value(messages);
+    }
+
+    /// `Impl::get_messages_from_notification_id`
+    /// (MessageDb.cpp:1156-1160).
+    fn on_get_messages_from_notification_id(
+        &mut self,
+        dialog_id: DialogId,
+        from_notification_id: NotificationId,
+        limit: i32,
+        mut promise: Promise<Vec<MessageDbDialogMessage>>,
+    ) {
+        self.add_read_query();
+        let messages = self.run_sync(|db| {
+            db.get_messages_from_notification_id(dialog_id, from_notification_id, limit)
+        });
+        promise.set_value(messages);
+    }
+
+    /// `Impl::get_calls` (MessageDb.cpp:1161-1164).
+    fn on_get_calls(
+        &mut self,
+        query: MessageDbCallsQuery,
+        mut promise: Promise<MessageDbCallsResult>,
+    ) {
+        self.add_read_query();
+        let calls = self.run_sync(|db| db.get_calls(query));
+        promise.set_value(calls);
+    }
+
+    /// `Impl::get_messages_fts` (MessageDb.cpp:1165-1168).
+    fn on_get_messages_fts(
+        &mut self,
+        query: MessageDbFtsQuery,
+        mut promise: Promise<MessageDbFtsResult>,
+    ) {
+        self.add_read_query();
+        let fts = self.run_sync(|db| db.get_messages_fts(query));
+        promise.set_value(fts);
+    }
+
+    /// `Impl::get_expiring_messages` (MessageDb.cpp:1169-1172).
+    fn on_get_expiring_messages(
+        &mut self,
+        expires_till: i32,
+        limit: i32,
+        mut promise: Promise<Vec<MessageDbMessage>>,
+    ) {
+        self.add_read_query();
+        let messages = self.run_sync(|db| db.get_expiring_messages(expires_till, limit));
+        promise.set_value(messages);
+    }
+
+    /// `Impl::close` (MessageDb.cpp:1174-1180).
+    fn on_close(&mut self, mut promise: Promise<()>) {
+        self.do_flush();
+        self.sync_db_safe = None;
+        promise.set_value(());
+        self.stop();
+    }
+
+    /// `Impl::force_flush` (MessageDb.cpp:1182-1185).
+    fn on_force_flush(&mut self) {
+        self.do_flush();
+        tracing::info!("MessageDb flushed");
+    }
+}
+
+impl MessageDbAsyncInterface for MessageDbAsync {
+    fn add_message(
+        &self,
+        message_full_id: MessageFullId,
+        unique_message_id: ServerMessageId,
+        sender_dialog_id: DialogId,
+        random_id: i64,
+        ttl_expires_at: i32,
+        index_mask: i32,
+        search_id: i64,
+        text: String,
+        notification_id: NotificationId,
+        top_thread_message_id: MessageId,
+        data: Vec<u8>,
+        promise: Promise<()>,
+    ) {
+        send_closure_later(
+            self.impl_.get(),
+            MessageDbAsyncMessage::AddMessage {
+                message_full_id,
+                unique_message_id,
+                sender_dialog_id,
+                random_id,
+                ttl_expires_at,
+                index_mask,
+                search_id,
+                text,
+                notification_id,
+                top_thread_message_id,
+                data,
+                promise,
+            },
+        );
+    }
+
+    fn add_scheduled_message(
+        &self,
+        message_full_id: MessageFullId,
+        data: Vec<u8>,
+        promise: Promise<()>,
+    ) {
+        send_closure_later(
+            self.impl_.get(),
+            MessageDbAsyncMessage::AddScheduledMessage {
+                message_full_id,
+                data,
+                promise,
+            },
+        );
+    }
+
+    fn delete_message(&self, message_full_id: MessageFullId, promise: Promise<()>) {
+        send_closure_later(
+            self.impl_.get(),
+            MessageDbAsyncMessage::DeleteMessage {
+                message_full_id,
+                promise,
+            },
+        );
+    }
+
+    fn delete_all_dialog_messages(
+        &self,
+        dialog_id: DialogId,
+        from_message_id: MessageId,
+        promise: Promise<()>,
+    ) {
+        send_closure_later(
+            self.impl_.get(),
+            MessageDbAsyncMessage::DeleteAllDialogMessages {
+                dialog_id,
+                from_message_id,
+                promise,
+            },
+        );
+    }
+
+    fn delete_dialog_messages_by_sender(
+        &self,
+        dialog_id: DialogId,
+        sender_dialog_id: DialogId,
+        promise: Promise<()>,
+    ) {
+        send_closure_later(
+            self.impl_.get(),
+            MessageDbAsyncMessage::DeleteDialogMessagesBySender {
+                dialog_id,
+                sender_dialog_id,
+                promise,
+            },
+        );
+    }
+
+    fn get_message(
+        &self,
+        message_full_id: MessageFullId,
+        promise: Promise<MessageDbDialogMessage>,
+    ) {
+        send_closure_later(
+            self.impl_.get(),
+            MessageDbAsyncMessage::GetMessage {
+                message_full_id,
+                promise,
+            },
+        );
+    }
+
+    fn get_message_by_unique_message_id(
+        &self,
+        unique_message_id: ServerMessageId,
+        promise: Promise<MessageDbMessage>,
+    ) {
+        send_closure_later(
+            self.impl_.get(),
+            MessageDbAsyncMessage::GetMessageByUniqueMessageId {
+                unique_message_id,
+                promise,
+            },
+        );
+    }
+
+    fn get_message_by_random_id(
+        &self,
+        dialog_id: DialogId,
+        random_id: i64,
+        promise: Promise<MessageDbDialogMessage>,
+    ) {
+        send_closure_later(
+            self.impl_.get(),
+            MessageDbAsyncMessage::GetMessageByRandomId {
+                dialog_id,
+                random_id,
+                promise,
+            },
+        );
+    }
+
+    fn get_dialog_message_by_date(
+        &self,
+        dialog_id: DialogId,
+        first_message_id: MessageId,
+        last_message_id: MessageId,
+        date: i32,
+        promise: Promise<MessageDbDialogMessage>,
+    ) {
+        send_closure_later(
+            self.impl_.get(),
+            MessageDbAsyncMessage::GetDialogMessageByDate {
+                dialog_id,
+                first_message_id,
+                last_message_id,
+                date,
+                promise,
+            },
+        );
+    }
+
+    fn get_dialog_message_calendar(
+        &self,
+        query: MessageDbDialogCalendarQuery,
+        promise: Promise<MessageDbCalendar>,
+    ) {
+        send_closure_later(
+            self.impl_.get(),
+            MessageDbAsyncMessage::GetDialogMessageCalendar { query, promise },
+        );
+    }
+
+    fn get_dialog_sparse_message_positions(
+        &self,
+        query: MessageDbGetDialogSparseMessagePositionsQuery,
+        promise: Promise<MessageDbMessagePositions>,
+    ) {
+        send_closure_later(
+            self.impl_.get(),
+            MessageDbAsyncMessage::GetDialogSparseMessagePositions { query, promise },
+        );
+    }
+
+    fn get_messages(
+        &self,
+        query: MessageDbMessagesQuery,
+        promise: Promise<Vec<MessageDbDialogMessage>>,
+    ) {
+        send_closure_later(
+            self.impl_.get(),
+            MessageDbAsyncMessage::GetMessages { query, promise },
+        );
+    }
+
+    fn get_scheduled_messages(
+        &self,
+        dialog_id: DialogId,
+        limit: i32,
+        promise: Promise<Vec<MessageDbDialogMessage>>,
+    ) {
+        send_closure_later(
+            self.impl_.get(),
+            MessageDbAsyncMessage::GetScheduledMessages {
+                dialog_id,
+                limit,
+                promise,
+            },
+        );
+    }
+
+    fn get_messages_from_notification_id(
+        &self,
+        dialog_id: DialogId,
+        from_notification_id: NotificationId,
+        limit: i32,
+        promise: Promise<Vec<MessageDbDialogMessage>>,
+    ) {
+        send_closure_later(
+            self.impl_.get(),
+            MessageDbAsyncMessage::GetMessagesFromNotificationId {
+                dialog_id,
+                from_notification_id,
+                limit,
+                promise,
+            },
+        );
+    }
+
+    fn get_calls(&self, query: MessageDbCallsQuery, promise: Promise<MessageDbCallsResult>) {
+        send_closure_later(
+            self.impl_.get(),
+            MessageDbAsyncMessage::GetCalls { query, promise },
+        );
+    }
+
+    fn get_messages_fts(&self, query: MessageDbFtsQuery, promise: Promise<MessageDbFtsResult>) {
+        send_closure_later(
+            self.impl_.get(),
+            MessageDbAsyncMessage::GetMessagesFts { query, promise },
+        );
+    }
+
+    fn get_expiring_messages(
+        &self,
+        expires_till: i32,
+        limit: i32,
+        promise: Promise<Vec<MessageDbMessage>>,
+    ) {
+        send_closure_later(
+            self.impl_.get(),
+            MessageDbAsyncMessage::GetExpiringMessages {
+                expires_till,
+                limit,
+                promise,
+            },
+        );
+    }
+
+    fn close(&self, promise: Promise<()>) {
+        send_closure_later(self.impl_.get(), MessageDbAsyncMessage::Close { promise });
+    }
+
+    fn force_flush(&self) {
+        // the fieldless `force_flush` has no `actor_messages!` variant (the
+        // macro requires at least one field); the raw-thunk send is the
+        // same building block the tdactor tests use
+        tdactor::send_thunk_later(
+            tdactor::ActorRef::from(self.impl_.get()),
+            tdactor::event::ActorThunk::from_boxed(Box::new(move |actor| {
+                // SAFETY: the `ActorId<MessageDbAsyncImpl>` marker names the
+                // actor's real type (the C++ `static_cast` in send_closure)
+                let actor = unsafe { &mut *(actor as *mut dyn Actor as *mut MessageDbAsyncImpl) };
+                actor.on_force_flush();
+            })),
+        );
+    }
+}
+
+/// `create_message_db_async` (MessageDb.cpp:1236-1239).
+pub fn create_message_db_async(
+    sync_db: Arc<MessageDbSyncSafe>,
+    scheduler_id: i32,
+) -> MessageDbAsync {
+    MessageDbAsync::new(sync_db, scheduler_id)
 }
 
 #[cfg(test)]
@@ -2209,5 +3313,169 @@ mod tests {
             db_impl.get_messages_from_notification_id(other_dialog, NotificationId::new(9), 10);
         let ids: Vec<i64> = page.iter().map(|m| m.message_id.get()).collect();
         assert_eq!(ids, vec![12 << 20, 11 << 20]);
+    }
+
+    /// M.6.10: the sync-safe wrapper — lazy creation, add/get through the
+    /// trait object, close.
+    #[test]
+    fn message_db_sync_safe_round_trip() {
+        use std::sync::Arc as StdArc;
+
+        let path = std::env::temp_dir()
+            .join("m6_msgdb_sync_safe")
+            .to_string_lossy()
+            .into_owned();
+        let _ = tddb::sqlite_db::destroy(&path);
+        let safe = StdArc::new(SqliteConnectionSafe::new(&path, DbKey::empty()));
+        safe.init(&path, DbKey::empty()).ensure();
+        // the schema is TdDb's job (MessageDb.cpp is called from TdDb::init)
+        let mut version = 0;
+        init_message_db(&safe.get(), &mut version).ensure();
+
+        let sync_safe = MessageDbSyncSafe::new(safe.clone());
+        let dialog_id = DialogId::new(-77);
+        sync_safe.with_db(|db| {
+            db.add_message(
+                MessageFullId::new(dialog_id, MessageId::new(1 << 20)),
+                ServerMessageId::new(1),
+                DialogId::new(0),
+                0,
+                0,
+                0,
+                0,
+                String::new(),
+                NotificationId::new(0),
+                MessageId::new(0),
+                b"safe".to_vec(),
+            );
+        });
+        let got = sync_safe
+            .with_db(|db| db.get_message(MessageFullId::new(dialog_id, MessageId::new(1 << 20))));
+        assert_eq!(got.unwrap().data, b"safe".to_vec());
+
+        sync_safe.close();
+        safe.close_and_destroy();
+    }
+
+    /// M.6.11 stress: N buffered writes burst through the batching bound,
+    /// a read flushes first, every promise fires exactly once, close drains
+    /// everything and the data lands.
+    #[test]
+    fn message_db_async_batches_and_drains() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tdactor::{ConcurrentScheduler, Scheduler};
+        use tdutils::promise::PromiseCreator;
+
+        const WRITES: usize = 120; // > 2 * MAX_PENDING_QUERY_COUNT
+
+        let path = std::env::temp_dir()
+            .join("m6_msgdb_async")
+            .to_string_lossy()
+            .into_owned();
+        let _ = tddb::sqlite_db::destroy(&path);
+        let safe = StdArc::new(SqliteConnectionSafe::new(&path, DbKey::empty()));
+        safe.init(&path, DbKey::empty()).ensure();
+        let mut version = 0;
+        init_message_db(&safe.get(), &mut version).ensure();
+
+        struct Choreography {
+            // held in a slot so the `ActorOwn` is dropped on the main thread
+            // after `finish()` — the actor stops itself in `on_close`, and the
+            // C++ owner (TdDb) likewise releases the interface object later
+            db_slot: StdArc<Mutex<Option<MessageDbAsync>>>,
+            done: StdArc<AtomicUsize>,
+            read_count: StdArc<AtomicUsize>,
+        }
+        impl Actor for Choreography {
+            fn start_up(&mut self) {
+                let db_slot = self.db_slot.clone();
+                let db_guard = db_slot.lock().unwrap();
+                let db = db_guard.as_ref().expect("db");
+                let dialog_id = DialogId::new(-99);
+                for i in 0..WRITES as i64 {
+                    let done = self.done.clone();
+                    let promise: Promise<()> = PromiseCreator::lambda(move |()| {
+                        done.fetch_add(1, Ordering::SeqCst);
+                    });
+                    db.add_message(
+                        MessageFullId::new(dialog_id, MessageId::new((i + 1) << 20)),
+                        ServerMessageId::new((i + 1) as i32),
+                        DialogId::new(0),
+                        0,
+                        0,
+                        0,
+                        0,
+                        String::new(),
+                        NotificationId::new(0),
+                        MessageId::new(0),
+                        vec![i as u8],
+                        promise,
+                    );
+                }
+                // the read flushes the batch first, then sees every write
+                let read_count = self.read_count.clone();
+                let done = self.done.clone();
+                let read_promise: Promise<Vec<MessageDbDialogMessage>> =
+                    PromiseCreator::lambda(move |messages: Vec<MessageDbDialogMessage>| {
+                        read_count.store(messages.len(), Ordering::SeqCst);
+                        // every write promise must have fired already: the
+                        // read flush settles them before running the query
+                        assert_eq!(done.load(Ordering::SeqCst), WRITES);
+                    });
+                db.get_messages(
+                    MessageDbMessagesQuery {
+                        dialog_id,
+                        from_message_id: MessageId::MAX,
+                        offset: 0,
+                        limit: 1000,
+                        ..MessageDbMessagesQuery::default()
+                    },
+                    read_promise,
+                );
+                // close drains the (already empty) batch and stops the actor;
+                // its promise is the last event, so finishing there is safe
+                let close_promise: Promise<()> =
+                    PromiseCreator::lambda(|()| Scheduler::instance().finish());
+                db.close(close_promise);
+            }
+        }
+
+        let done = StdArc::new(AtomicUsize::new(0));
+        let read_count = StdArc::new(AtomicUsize::new(0));
+        let sync_safe = StdArc::new(MessageDbSyncSafe::new(safe.clone()));
+        let db_slot: StdArc<Mutex<Option<MessageDbAsync>>> = StdArc::new(Mutex::new(None));
+        let mut sched = ConcurrentScheduler::new(0);
+        // `MessageDbAsync::new` needs a scheduler context; the test wires the
+        // actor through `create_actor_unsafe`, the ConcurrentScheduler
+        // pattern, instead
+        *db_slot.lock().unwrap() = Some(MessageDbAsync {
+            impl_: sched.create_actor_unsafe(
+                0,
+                "MessageDbActor",
+                MessageDbAsyncImpl::new(sync_safe.clone()),
+            ),
+        });
+        sched.create_actor_unsafe(
+            0,
+            "Choreography",
+            Choreography {
+                db_slot: db_slot.clone(),
+                done: done.clone(),
+                read_count: read_count.clone(),
+            },
+        );
+        sched.start();
+        while sched.run_main(10.0) {}
+        sched.finish();
+
+        assert_eq!(done.load(Ordering::SeqCst), WRITES);
+        assert_eq!(read_count.load(Ordering::SeqCst), WRITES);
+
+        // release the interface object outside any scheduler context
+        *db_slot.lock().unwrap() = None;
+
+        sync_safe.close();
+        safe.close_and_destroy();
     }
 }
