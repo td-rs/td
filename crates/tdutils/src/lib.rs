@@ -8,6 +8,7 @@ pub mod crypto;
 pub mod ed25519;
 pub mod emoji;
 pub mod gzip;
+pub mod hash;
 pub mod http_date;
 pub mod http_url;
 pub mod json;

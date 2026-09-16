@@ -59,6 +59,16 @@ pub struct ConfigActions {
     pub app_config_answers: Vec<(u64, td_api::JsonValue)>,
     /// Follow-up network queries to dispatch.
     pub queries: Vec<ConfigQuery>,
+    /// `ConnectionCreator::on_dc_options` (ConfigManager.cpp:1191): the
+    /// config's dc options for the fan-out — `Some` exactly when
+    /// `process_config` ran (an option-less config still carries
+    /// `Some(vec![])`, which the C++ call persists as the empty list).
+    /// The Td runs the `DcOptions(server_dc_options)` ctor filter and
+    /// the consumer call.
+    pub connection_creator_dc_options: Option<Vec<telegram_api::DcOption>>,
+    /// `LinkManager::update_autologin_token` (ConfigManager.cpp:1196) —
+    /// the token for the fan-out, `Some` when `process_config` ran.
+    pub autologin_token: Option<String>,
     /// `OptionManager::update_premium_options` ran after the app config
     /// arrived (ConfigManager.cpp:1112).
     pub refresh_premium_options: bool,
@@ -71,6 +81,10 @@ impl ConfigActions {
         self.get_option_answers.extend(other.get_option_answers);
         self.app_config_answers.extend(other.app_config_answers);
         self.queries.extend(other.queries);
+        self.connection_creator_dc_options = other
+            .connection_creator_dc_options
+            .or(self.connection_creator_dc_options.take());
+        self.autologin_token = other.autologin_token.or(self.autologin_token.take());
         self.refresh_premium_options |= other.refresh_premium_options;
     }
 }
@@ -191,12 +205,12 @@ impl AppConfig {
 }
 
 /// `DcOption::Flags` (DcOptions.h:24) — the stored-form flags.
-const DC_OPTION_IPV6: i32 = 1;
-const DC_OPTION_MEDIA_ONLY: i32 = 2;
-const DC_OPTION_OBFUSCATED_TCP_ONLY: i32 = 4;
-const DC_OPTION_CDN: i32 = 8;
-const DC_OPTION_STATIC: i32 = 16;
-const DC_OPTION_HAS_SECRET: i32 = 32;
+pub(crate) const DC_OPTION_IPV6: i32 = 1;
+pub(crate) const DC_OPTION_MEDIA_ONLY: i32 = 2;
+pub(crate) const DC_OPTION_OBFUSCATED_TCP_ONLY: i32 = 4;
+pub(crate) const DC_OPTION_CDN: i32 = 8;
+pub(crate) const DC_OPTION_STATIC: i32 = 16;
+pub(crate) const DC_OPTION_HAS_SECRET: i32 = 32;
 
 /// `DcId::MAX_RAW_DC_ID` (net/DcId.h:20).
 const MAX_RAW_DC_ID: i32 = 1000;
@@ -232,6 +246,32 @@ impl StoredDcOption {
     /// The `secret` field (empty without the `DC_OPTION_HAS_SECRET` flag).
     pub fn secret(&self) -> &[u8] {
         &self.secret
+    }
+
+    /// `DcOption::is_ipv6` (DcOptions.h:113).
+    pub(crate) fn is_ipv6(&self) -> bool {
+        self.flags & DC_OPTION_IPV6 != 0
+    }
+
+    /// `DcOption::is_media_only` (DcOptions.h:117).
+    pub(crate) fn is_media_only(&self) -> bool {
+        self.flags & DC_OPTION_MEDIA_ONLY != 0
+    }
+
+    /// `DcOption::is_obfuscated_tcp_only` (DcOptions.h:121).
+    pub(crate) fn is_obfuscated_tcp_only(&self) -> bool {
+        self.flags & DC_OPTION_OBFUSCATED_TCP_ONLY != 0
+    }
+
+    /// `DcOption::is_static` (DcOptions.h:125).
+    pub(crate) fn is_static(&self) -> bool {
+        self.flags & DC_OPTION_STATIC != 0
+    }
+
+    /// `DcId::is_external` — the `Cdn` flag carries the externality
+    /// (DcOptions.h:88).
+    pub(crate) fn is_cdn(&self) -> bool {
+        self.flags & DC_OPTION_CDN != 0
     }
 
     /// The C++ `DcOption(const telegram_api::dcOption &)` + the
@@ -895,8 +935,17 @@ impl ConfigManager {
         }
 
         // Do not save dc_options in the config pmc, because it will be
-        // interpreted and saved by ConnectionCreator (the net step).
-        // DcOptions(config.dc_options) → ConnectionCreator::on_dc_options.
+        // interpreted and saved by ConnectionCreator
+        // (ConfigManager.cpp:1189-1191): the DcOptions ctor filter and the
+        // ConnectionCreator::on_dc_options call run at the Td when the
+        // actions apply. LinkManager::update_autologin_token
+        // (ConfigManager.cpp:1196) rides the same actions — both fan-outs
+        // fire exactly when `process_config` ran, so both initialize here.
+        let mut actions = ConfigActions {
+            connection_creator_dc_options: Some(config.dc_options.clone()),
+            autologin_token: Some(config.autologin_token.clone()),
+            ..ConfigActions::default()
+        };
 
         options.set_option_integer(
             "recent_stickers_limit",
@@ -906,8 +955,6 @@ impl ConfigManager {
             "channels_read_media_period",
             i64::from(config.channels_read_media_period),
         );
-
-        // LinkManager::update_autologin_token — lands with the LinkManager.
 
         options.set_option_boolean("test_mode", config.test_mode);
         options.set_option_integer(
@@ -1065,7 +1112,6 @@ impl ConfigManager {
         // offline_blur_timeout_ms / offline_idle_timeout_ms / push_chat_*
         // assignments are skipped like the C++.
 
-        let mut actions = ConfigActions::default();
         if is_from_main_dc {
             actions.extend(self.reload_app_config(None, is_bot, close_flag));
             if !options.have_option("can_ignore_sensitive_content_restrictions")
@@ -2925,8 +2971,8 @@ mod tests {
 
     /// The golden snapshot for `test_config()` from the main DC: every
     /// option the C++ table sets (ConfigManager.cpp:1193-1285), in the
-    /// store's coded form. The dc_options/autologin_token fan-outs are
-    /// the stubbed M.3.9 actions and set no options.
+    /// store's coded form. The dc_options/autologin_token fan-outs
+    /// (M.3.9.1) set no options.
     const MAIN_DC_SET: [(&str, &str); 33] = [
         ("recent_stickers_limit", "I30"),
         ("channels_read_media_period", "I604800"),
