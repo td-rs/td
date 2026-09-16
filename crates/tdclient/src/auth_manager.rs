@@ -686,6 +686,14 @@ impl AuthManager {
         self.state == State::Ok
     }
 
+    /// Test-only: the authorized state without the sign-in query (the
+    /// td.rs dispatch tests need a client past the 401 gate; the real
+    /// transition rides check_authentication_code's Authorization answer).
+    #[cfg(test)]
+    pub(crate) fn force_authorized_for_test(&mut self) {
+        self.update_state(State::Ok);
+    }
+
     /// The api_id/api_hash half of `setTdlibParameters` (Td passes them
     /// through after its own validation).
     pub fn set_api_credentials(&mut self, api_id: i32, api_hash: String) {
