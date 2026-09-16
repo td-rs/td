@@ -99,17 +99,297 @@ pub enum PublicDialogType {
     ForPersonalDialog = 2,
 }
 
-/// `td::MessageId` (MessageId.h) — opaque stand-in, see the module docs.
+/// `td::MessageType` (MessageId.h:22).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MessageType {
+    #[default]
+    None,
+    Server,
+    YetUnsent,
+    Local,
+}
+
+/// `td::MessageId` (MessageId.h) — the full bit layout:
+///
+/// ```text
+/// ordinary:  |server_message_id:31|local_id:17|1|type:2|
+/// scheduled: |send_date-2^30:30|server_id:18|1|type:2|
+/// ```
+///
+/// The derived `Ord` is the C++ `operator<` over the raw id (whose
+/// same-scheduledness `CHECK` is diagnostic only); the peer/message
+/// constructors (`get_message_id`, `get_max_message_id`,
+/// `is_message_id_order_*`, MessageId.cpp:27-102) land with the message
+/// intake (MessagesManager step).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MessageId(i64);
 
 impl MessageId {
+    /// `SERVER_ID_SHIFT` (MessageId.h:27).
+    const SERVER_ID_SHIFT: i32 = 20;
+    /// `SHORT_TYPE_MASK` (MessageId.h:28).
+    const SHORT_TYPE_MASK: i64 = (1 << 2) - 1;
+    /// `TYPE_MASK` (MessageId.h:29).
+    const TYPE_MASK: i64 = (1 << 3) - 1;
+    /// `FULL_TYPE_MASK` (MessageId.h:30).
+    const FULL_TYPE_MASK: i64 = (1 << MessageId::SERVER_ID_SHIFT) - 1;
+    /// `SCHEDULED_MASK` (MessageId.h:31).
+    const SCHEDULED_MASK: i64 = 4;
+    /// `TYPE_YET_UNSENT` (MessageId.h:32).
+    const TYPE_YET_UNSENT: i64 = 1;
+    /// `TYPE_LOCAL` (MessageId.h:33).
+    const TYPE_LOCAL: i64 = 2;
+
     pub fn new(id: i64) -> MessageId {
         MessageId(id)
     }
 
+    /// `MessageId(ServerMessageId)` (MessageId.h:59-61).
+    pub fn from_server_message_id(
+        server_message_id: crate::dialog_id::ServerMessageId,
+    ) -> MessageId {
+        MessageId((server_message_id.get() as i64) << Self::SERVER_ID_SHIFT)
+    }
+
+    /// `MessageId(ScheduledServerMessageId, send_date, force)`
+    /// (MessageId.cpp:13-25) — both validation failures reset to 0 with the
+    /// C++ `LOG(ERROR)`.
+    pub fn from_scheduled(
+        server_message_id: crate::dialog_id::ScheduledServerMessageId,
+        send_date: i32,
+        force: bool,
+    ) -> MessageId {
+        if send_date <= (1 << 30) {
+            tracing::error!("Scheduled message send date {send_date} is in the past");
+            return MessageId::new(0);
+        }
+        if !server_message_id.is_valid() && !force {
+            tracing::error!(
+                "Scheduled message ID {} is invalid",
+                server_message_id.get()
+            );
+            return MessageId::new(0);
+        }
+        MessageId::new(
+            ((send_date - (1 << 30)) as i64) << 21
+                | (server_message_id.get() as i64) << 3
+                | Self::SCHEDULED_MASK,
+        )
+    }
+
+    /// `MessageId::min` (MessageId.h:70-72).
+    pub const MIN: MessageId = MessageId(Self::TYPE_YET_UNSENT);
+
+    /// `MessageId::max` (MessageId.h:73-75).
+    pub const MAX: MessageId = MessageId((i32::MAX as i64) << Self::SERVER_ID_SHIFT);
+
+    /// `MessageId::min` (MessageId.h:70-72).
+    #[allow(clippy::should_implement_trait)]
+    pub fn min() -> MessageId {
+        Self::MIN
+    }
+
+    /// `MessageId::max` (MessageId.h:73-75).
+    #[allow(clippy::should_implement_trait)]
+    pub fn max() -> MessageId {
+        Self::MAX
+    }
+
     pub fn get(self) -> i64 {
         self.0
+    }
+
+    /// `MessageId::is_valid` (MessageId.cpp:104-117).
+    pub fn is_valid(self) -> bool {
+        if self.0 <= 0 || self.0 > Self::max().get() {
+            return false;
+        }
+        if (self.0 & Self::FULL_TYPE_MASK) == 0 {
+            return true;
+        }
+        let type_ = self.0 & Self::TYPE_MASK;
+        type_ == Self::TYPE_YET_UNSENT || type_ == Self::TYPE_LOCAL
+    }
+
+    /// `MessageId::is_valid_scheduled` (MessageId.cpp:119-127).
+    pub fn is_valid_scheduled(self) -> bool {
+        if self.0 <= 0 || self.0 > (1i64 << 51) {
+            return false;
+        }
+        let type_ = self.0 & Self::TYPE_MASK;
+        type_ == Self::SCHEDULED_MASK
+            || type_ == (Self::SCHEDULED_MASK | Self::TYPE_YET_UNSENT)
+            || type_ == (Self::SCHEDULED_MASK | Self::TYPE_LOCAL)
+    }
+
+    /// `MessageId::is_valid_sponsored` (MessageId.cpp:129-137).
+    pub fn is_valid_sponsored(self) -> bool {
+        if self.0 <= Self::max().get() || self.0 > (1i64 << 51) {
+            return false;
+        }
+        self.0 & Self::TYPE_MASK == Self::TYPE_LOCAL
+    }
+
+    /// `MessageId::get_type` (MessageId.cpp:139-168). The type words are
+    /// matched with guards — a pattern `a | b` would be an or-pattern, not
+    /// the C++ bitwise disjunction.
+    pub fn get_type(self) -> MessageType {
+        if self.0 <= 0 || self.0 > (1i64 << 51) {
+            return MessageType::None;
+        }
+        if self.is_scheduled() {
+            let type_ = self.0 & Self::TYPE_MASK;
+            if type_ == Self::SCHEDULED_MASK | Self::TYPE_YET_UNSENT {
+                return MessageType::YetUnsent;
+            }
+            if type_ == Self::SCHEDULED_MASK | Self::TYPE_LOCAL {
+                return MessageType::Local;
+            }
+            if type_ == Self::SCHEDULED_MASK {
+                return MessageType::Server;
+            }
+            return MessageType::None;
+        }
+        if (self.0 & Self::FULL_TYPE_MASK) == 0 {
+            return MessageType::Server;
+        }
+        let type_ = self.0 & Self::TYPE_MASK;
+        if type_ == Self::TYPE_YET_UNSENT {
+            return MessageType::YetUnsent;
+        }
+        if type_ == Self::TYPE_LOCAL {
+            return MessageType::Local;
+        }
+        MessageType::None
+    }
+
+    /// `MessageId::is_scheduled` (MessageId.h:107-109).
+    pub fn is_scheduled(self) -> bool {
+        (self.0 & Self::SCHEDULED_MASK) != 0
+    }
+
+    /// `MessageId::is_yet_unsent` (MessageId.h:111-114).
+    pub fn is_yet_unsent(self) -> bool {
+        assert!(self.is_valid() || self.is_scheduled());
+        (self.0 & Self::SHORT_TYPE_MASK) == Self::TYPE_YET_UNSENT
+    }
+
+    /// `MessageId::is_local` (MessageId.h:116-119).
+    pub fn is_local(self) -> bool {
+        assert!(self.is_valid() || self.is_scheduled());
+        (self.0 & Self::SHORT_TYPE_MASK) == Self::TYPE_LOCAL
+    }
+
+    /// `MessageId::is_server` (MessageId.h:121-124) — also checks validness.
+    pub fn is_server(self) -> bool {
+        (self.0 & Self::FULL_TYPE_MASK) == 0 && self.0 > 0 && self.0 <= Self::max().get()
+    }
+
+    /// `MessageId::is_scheduled_server` (MessageId.h:126-129).
+    pub fn is_scheduled_server(self) -> bool {
+        assert!(self.is_valid_scheduled());
+        (self.0 & Self::SHORT_TYPE_MASK) == 0
+    }
+
+    /// `MessageId::is_any_server` (MessageId.h:131-133).
+    pub fn is_any_server(self) -> bool {
+        if self.is_scheduled() {
+            self.is_scheduled_server()
+        } else {
+            self.is_server()
+        }
+    }
+
+    /// `MessageId::get_server_message_id_force` (MessageId.cpp:170-174).
+    fn get_server_message_id_force(self) -> crate::dialog_id::ServerMessageId {
+        assert!(!self.is_scheduled());
+        crate::dialog_id::ServerMessageId::new((self.0 >> Self::SERVER_ID_SHIFT) as i32)
+    }
+
+    /// `MessageId::get_server_message_id` (MessageId.h:135-138).
+    pub fn get_server_message_id(self) -> crate::dialog_id::ServerMessageId {
+        assert!(self.0 == 0 || self.is_server());
+        self.get_server_message_id_force()
+    }
+
+    /// `MessageId::get_prev_server_message_id` (MessageId.h:141-144) — the
+    /// greatest server message identifier not bigger than this one.
+    pub fn get_prev_server_message_id(self) -> MessageId {
+        assert!(!self.is_scheduled());
+        MessageId(self.0 & !Self::FULL_TYPE_MASK)
+    }
+
+    /// `MessageId::get_next_server_message_id` (MessageId.h:146-150) — the
+    /// smallest server message identifier not less than this one.
+    pub fn get_next_server_message_id(self) -> MessageId {
+        assert!(!self.is_scheduled());
+        MessageId((self.0 + Self::FULL_TYPE_MASK) & !Self::FULL_TYPE_MASK)
+    }
+
+    /// `MessageId::get_scheduled_server_message_id_force` (MessageId.h:51-54).
+    fn get_scheduled_server_message_id_force(self) -> crate::dialog_id::ScheduledServerMessageId {
+        assert!(self.is_scheduled());
+        crate::dialog_id::ScheduledServerMessageId::new(((self.0 >> 3) & ((1 << 18) - 1)) as i32)
+    }
+
+    /// `MessageId::get_scheduled_server_message_id` (MessageId.h:154-157).
+    pub fn get_scheduled_server_message_id(self) -> crate::dialog_id::ScheduledServerMessageId {
+        assert!(self.is_scheduled_server());
+        self.get_scheduled_server_message_id_force()
+    }
+
+    /// `MessageId::get_scheduled_message_date` (MessageId.h:159-162).
+    pub fn get_scheduled_message_date(self) -> i32 {
+        assert!(self.is_valid_scheduled());
+        (self.0 >> 21) as i32 + (1 << 30)
+    }
+
+    /// `MessageId::get_next_message_id` (MessageId.cpp:176-205).
+    pub fn get_next_message_id(self, type_: MessageType) -> MessageId {
+        if self.is_scheduled() {
+            assert!(self.is_valid_scheduled());
+            let current_type = self.get_type();
+            if (current_type as i32) < (type_ as i32) {
+                return MessageId::new(self.0 - (current_type as i64) + (type_ as i64));
+            }
+            let base_id = (self.0 & !Self::TYPE_MASK) + Self::TYPE_MASK + 1 + Self::SCHEDULED_MASK;
+            return match type_ {
+                MessageType::Server => MessageId::new(base_id),
+                MessageType::YetUnsent => MessageId::new(base_id + Self::TYPE_YET_UNSENT),
+                MessageType::Local => MessageId::new(base_id + Self::TYPE_LOCAL),
+                MessageType::None => unreachable!(),
+            };
+        }
+        match type_ {
+            MessageType::Server => {
+                if self.is_server() {
+                    MessageId::from_server_message_id(crate::dialog_id::ServerMessageId::new(
+                        self.get_server_message_id().get() + 1,
+                    ))
+                } else {
+                    self.get_next_server_message_id()
+                }
+            }
+            MessageType::YetUnsent => MessageId::new(
+                ((self.0 + Self::TYPE_MASK + 1 - Self::TYPE_YET_UNSENT) & !Self::TYPE_MASK)
+                    + Self::TYPE_YET_UNSENT,
+            ),
+            MessageType::Local => MessageId::new(
+                ((self.0 + Self::TYPE_MASK + 1 - Self::TYPE_LOCAL) & !Self::TYPE_MASK)
+                    + Self::TYPE_LOCAL,
+            ),
+            MessageType::None => unreachable!(),
+        }
+    }
+
+    /// `MessageId::store` (MessageId.h:192-195).
+    pub fn store(self, out: &mut Vec<u8>) {
+        crate::store_parse::store_i64(out, self.0);
+    }
+
+    /// `MessageId::parse` (MessageId.h:197-200).
+    pub fn parse_from(parser: &mut crate::store_parse::Parser) -> Result<MessageId, &'static str> {
+        Ok(MessageId::new(parser.i64_()?))
     }
 }
 
@@ -1681,6 +1961,7 @@ impl Default for DialogParticipantStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dialog_id::{ScheduledServerMessageId, ServerMessageId};
 
     #[test]
     fn chat_id_bounds_match_the_cpp() {
@@ -3425,5 +3706,93 @@ mod tests {
         let applied = banned.apply_restrictions(only_messages, false, false);
         assert!(applied.is_banned());
         assert!(!applied.can_send_messages());
+    }
+
+    #[test]
+    fn message_id_bit_layout_matches_the_cpp() {
+        // ordinary server ids: server id shifted by SERVER_ID_SHIFT
+        let server = MessageId::from_server_message_id(ServerMessageId::new(7));
+        assert_eq!(server.get(), 7i64 << 20);
+        assert!(server.is_valid());
+        assert!(server.is_server());
+        assert!(!server.is_scheduled());
+        assert_eq!(server.get_type(), MessageType::Server);
+        assert_eq!(server.get_server_message_id(), ServerMessageId::new(7));
+
+        // yet-unsent and local occupy the low type bits
+        let yet_unsent = server.get_next_message_id(MessageType::YetUnsent);
+        assert_eq!(yet_unsent.get(), (7i64 << 20) + 1);
+        assert_eq!(yet_unsent.get_type(), MessageType::YetUnsent);
+        assert!(yet_unsent.is_yet_unsent());
+        let local = server.get_next_message_id(MessageType::Local);
+        assert_eq!(local.get(), (7i64 << 20) + 2);
+        assert!(local.is_local());
+        assert_eq!(MessageId::new(0).get_type(), MessageType::None);
+        assert!(!MessageId::new(-5).is_valid());
+
+        // scheduled ids pack send_date - 2^30 and the server id above bit 3
+        let scheduled =
+            MessageId::from_scheduled(ScheduledServerMessageId::new(13), (1 << 30) + 5, false);
+        assert!(scheduled.is_scheduled());
+        assert!(scheduled.is_valid_scheduled());
+        assert!(scheduled.is_scheduled_server());
+        assert_eq!(
+            scheduled.get_scheduled_server_message_id(),
+            ScheduledServerMessageId::new(13)
+        );
+        assert_eq!(scheduled.get_scheduled_message_date(), (1 << 30) + 5);
+        assert_eq!(scheduled.get_type(), MessageType::Server);
+        // the validation failures reset to 0 (MessageId.cpp:15-24)
+        assert_eq!(
+            MessageId::from_scheduled(ScheduledServerMessageId::new(13), 1 << 30, false),
+            MessageId::new(0)
+        );
+        assert_eq!(
+            MessageId::from_scheduled(ScheduledServerMessageId::new(0), (1 << 30) + 5, false),
+            MessageId::new(0)
+        );
+        assert_eq!(
+            MessageId::from_scheduled(ScheduledServerMessageId::new(0), (1 << 30) + 5, true).get(),
+            (5i64 << 21) | 4
+        );
+
+        // prev/next server rounding (MessageId.h:141-150)
+        let middle = MessageId::new((7i64 << 20) + 123);
+        assert_eq!(middle.get_prev_server_message_id(), server);
+        assert_eq!(
+            middle.get_next_server_message_id(),
+            MessageId::new(8i64 << 20)
+        );
+
+        // min/max (MessageId.h:70-75)
+        assert_eq!(MessageId::min().get(), 1);
+        assert_eq!(MessageId::max().get(), (i32::MAX as i64) << 20);
+        assert!(MessageId::max().is_valid());
+        // max() is already a rounded-up server id, so next == max
+        assert_eq!(
+            MessageId::max().get_next_server_message_id(),
+            MessageId::max()
+        );
+
+        // sponsored: above max() with the local type bits — the layout is
+        // |1..1(31)|local_id(17)|0|10|, so an occupied local part pushes the
+        // id above max()
+        let sponsored = MessageId::new(((i32::MAX as i64) << 20) | (1 << 3) | 2);
+        assert!(sponsored.is_valid_sponsored());
+        // bare max() has type bits 0 — a server id, not sponsored
+        assert!(!MessageId::new((i32::MAX as i64) << 20).is_valid_sponsored());
+    }
+
+    #[test]
+    fn message_id_store_parse_round_trips_the_raw_id() {
+        let message_id =
+            MessageId::from_scheduled(ScheduledServerMessageId::new(13), (1 << 30) + 5, false);
+        let mut out = Vec::new();
+        message_id.store(&mut out);
+        assert_eq!(out.len(), 8);
+        let mut parser = Parser::new(&out);
+        let parsed = MessageId::parse_from(&mut parser).expect("parses");
+        parser.fetch_end().expect("fully consumed");
+        assert_eq!(parsed, message_id);
     }
 }
