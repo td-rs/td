@@ -51,6 +51,7 @@ use crate::requests;
 use crate::synchronous_requests;
 use crate::td_api::{self, Function, Object};
 use crate::time_zone_manager::TimeZoneManager;
+use crate::user_manager::{UserEnv, UserManager};
 
 #[cfg(target_endian = "big")]
 compile_error!("TDLib requires little-endian platform");
@@ -171,6 +172,9 @@ pub struct Td {
     /// link surface is Wave 2.
     pub(crate) link_manager: Option<LinkManager>,
     pub(crate) auth_manager: AuthManager,
+    /// `Td::user_manager_` — the user/secret-chat cache (created with Td,
+    /// loaded from the binlog pmc in `init` like the C++ constructor).
+    pub(crate) user_manager: UserManager,
     /// `Td::stop_cnt_` — the hangup and the close completion each drop one.
     stop_cnt: i32,
 }
@@ -217,6 +221,7 @@ impl Td {
             manager_states: ManagerOptionStates::default(),
             link_manager: None,
             auth_manager: AuthManager::new(),
+            user_manager: UserManager::new(),
             stop_cnt: 2,
         }
     }
@@ -236,6 +241,10 @@ impl Td {
         }
 
         self.run_request(request_id, function);
+        // A manager call inside the request may have armed or cancelled a
+        // user deadline (UserManager.cpp's member MultiTimeouts re-arm on
+        // every set/cancel) — point the actor timeout at the earliest one.
+        self.rearm_user_timeouts();
     }
 
     /// `Td::run_request` (Td.cpp:299-374) — the state gate.
@@ -350,6 +359,8 @@ impl Td {
 
         tracing::info!("Successfully inited database");
         let since_last_open = opened_database.since_last_open;
+        let user_events = std::mem::take(&mut opened_database.user_events);
+        let secret_chat_events = std::mem::take(&mut opened_database.secret_chat_events);
 
         if self.state == State::Close {
             // Close asynchronously opened database
@@ -450,8 +461,18 @@ impl Td {
             match auth_str.as_str() {
                 "ok" => {
                     let is_bot = binlog_pmc.get("auth_is_bot") == "true";
-                    // The C++ checks UserManager::load_my_id() here; the
-                    // my_id restore arrives with the UserManager step.
+                    // `UserManager::load_my_id()` + the my_id option
+                    // (AuthManager.cpp:342-348); the fallback
+                    // `send_get_me_query` needs the net step.
+                    let my_id = UserManager::load_my_id(binlog_pmc);
+                    if my_id.is_valid() {
+                        tracing::info!("Logged in as {my_id:?}");
+                        if let Some(option_manager) = self.option_manager.as_mut() {
+                            option_manager.set_option_integer("my_id", my_id.get());
+                        }
+                    } else {
+                        tdutils::log_error!("Restore unknown my_id");
+                    }
                     self.auth_manager
                         .restore_from_pmc("ok", is_bot, String::new());
                 }
@@ -484,7 +505,18 @@ impl Td {
 
         // init_file_manager / init_non_actor_managers / init_managers /
         // init_pure_actor_managers / SecretChatsManager / StorageManager —
-        // each manager step appends its block here in the C++ order.
+        // each manager step appends its block here in the C++ order. The
+        // UserManager constructor loads my_id from the binlog pmc
+        // (UserManager.cpp:2824 `my_id_ = load_my_id()`); the contacts /
+        // freeze-state pmc reads arrive with their steps.
+        self.user_manager.init_my_id(self.global.binlog_pmc());
+        if !self.auth_manager.is_bot() {
+            // UserManager.cpp:2765-2771 — the my_was_online pair restore;
+            // `is_online` is OnlineManager::is_online() until its step.
+            let unix_time = self.global.unix_time();
+            self.user_manager
+                .init_my_online_status(self.global.binlog_pmc(), unix_time, false);
+        }
 
         // The M.3.9.2 stand-in for the four manager constructors' pmc
         // reads (in the C++ creation order: AccountManager Td.cpp:1157,
@@ -560,8 +592,29 @@ impl Td {
             self.send_result(request_id, requests::option_value_to_object(value));
         }
 
-        // process_binlog_events — the per-manager event vectors arrive with
-        // the managers that own them.
+        // process_binlog_events (Td.cpp:966-990): the users vector replays
+        // first, then the secret-chat infos vector (the other handlers
+        // arrive with their managers).
+        {
+            let global = &mut self.global;
+            let options = self
+                .option_manager
+                .as_mut()
+                .expect("option manager exists after init");
+            let mut env = UserEnv {
+                global,
+                options,
+                auth_is_bot: self.auth_manager.is_bot(),
+            };
+            for event in &user_events {
+                self.user_manager.on_binlog_user_event(&mut env, event);
+            }
+            for event in &secret_chat_events {
+                self.user_manager
+                    .on_binlog_secret_chat_event(&mut env, event);
+            }
+        }
+        self.flush_user_updates();
 
         // The init ping: country code pre-auth / get_difference post-auth —
         // both need the net step.
@@ -635,6 +688,7 @@ impl Td {
             self.global.set_close_flag();
             self.auth_manager.on_closing(self.destroy_flag);
             self.flush_auth_updates();
+            self.flush_user_updates();
             // updates_manager_->timeout_expired() (save PTS and QTS) and the
             // request-actor drain arrive with their steps.
         }
@@ -1290,6 +1344,24 @@ impl Td {
         }
     }
 
+    /// Drain the UserManager's queued `updateUser`-class broadcasts (the
+    /// C++ sends them straight to `Td::send_update` from the manager).
+    pub(crate) fn flush_user_updates(&mut self) {
+        for update in self.user_manager.take_updates() {
+            self.send_update(update.into());
+        }
+    }
+
+    /// Point the actor timeout at the UserManager's earliest deadline, or
+    /// cancel it when nothing is armed (the member MultiTimeouts re-arm on
+    /// every set/cancel).
+    fn rearm_user_timeouts(&mut self) {
+        match self.user_manager.next_deadline() {
+            Some(timeout_at) => self.set_timeout_at(timeout_at),
+            None => self.cancel_timeout(),
+        }
+    }
+
     /// `Td::send_result` (Td.cpp:1399-1414).
     pub(crate) fn send_result(&mut self, id: u64, object: Object) {
         if id == 0 {
@@ -1507,6 +1579,26 @@ impl Actor for Td {
 
     fn tear_down(&mut self) {
         self.close();
+    }
+
+    /// The member `user_online_timeout_` / `user_emoji_status_timeout_`
+    /// fire here (their C++ callbacks hop back into the UserManager actor);
+    /// the sweep then re-arms at the next deadline, like the MultiTimeouts'
+    /// set/cancel re-arm.
+    fn timeout_expired(&mut self) {
+        {
+            let Some(options) = self.option_manager.as_mut() else {
+                return self.rearm_user_timeouts();
+            };
+            let mut env = UserEnv {
+                global: &mut self.global,
+                options,
+                auth_is_bot: self.auth_manager.is_bot(),
+            };
+            self.user_manager.tick_timeouts(&mut env);
+        }
+        self.flush_user_updates();
+        self.rearm_user_timeouts();
     }
 
     // No `loop_`: the pending-query poll arrives with the net step (the
@@ -1810,6 +1902,76 @@ mod tests {
             system_version: "Test".to_string(),
             application_version: "1.0".to_string(),
         })
+    }
+
+    /// Test-only Td message: arm a user-online deadline (the sweep-wiring
+    /// fixture — production deadlines are armed by the manager calls
+    /// themselves, which the net-free Td cannot yet reach).
+    struct FireOnlineDeadline {
+        user_id: i64,
+        was_online: i32,
+        deadline: f64,
+    }
+
+    impl tdactor::ActorMessage for FireOnlineDeadline {
+        type Actor = Td;
+
+        fn dispatch(self, td: &mut Td) {
+            td.user_manager.seed_online_deadline_for_test(
+                crate::user_manager::UserId::new(self.user_id),
+                self.was_online,
+                self.deadline,
+            );
+            td.rearm_user_timeouts();
+        }
+    }
+
+    #[test]
+    fn user_online_deadline_fires_through_the_td_actor() {
+        let callback = CollectCallback::default();
+        run_actor_with(&callback, |actor, _callback, scheduler| {
+            let dir = temp_db_dir("online-deadline");
+            send(
+                actor,
+                scheduler,
+                13,
+                set_tdlib_parameters(dir.clone(), false),
+            );
+            let send_ptr = scheduler.send_scheduler();
+            {
+                let _guard = send_ptr.guard(false);
+                tdactor::send_closure(
+                    actor,
+                    FireOnlineDeadline {
+                        user_id: 5,
+                        was_online: tdutils::time::system() as i32 - 120,
+                        deadline: tdutils::time::now() + 0.05,
+                    },
+                );
+            }
+            // The production pump pattern (`while run_main(0.01) {}`): the
+            // inbound dispatch arms the deadline and yields; the next pump
+            // waits for the armed actor timeout and fires the sweep.
+            let _ = scheduler.run_main(0.01);
+            let _ = scheduler.run_main(0.3);
+        });
+        let fired = callback
+            .responses
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(id, object)| {
+                *id == 0
+                    && matches!(
+                        object,
+                        Object::updateUserStatus(update) if update.user_id == 5
+                            && matches!(update.status, td_api::UserStatus::userStatusOffline(_))
+                    )
+            });
+        assert!(
+            fired,
+            "the expired online deadline must broadcast updateUserStatus"
+        );
     }
 
     #[test]

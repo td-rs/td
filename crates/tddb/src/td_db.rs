@@ -78,6 +78,15 @@ impl Default for Parameters {
 pub const BINLOG_PMC_MAGIC: i32 = 0x4327;
 /// `LogEvent::HandlerType::ConfigPmcMagic` (logevent/LogEvent.h).
 pub const CONFIG_PMC_MAGIC: i32 = 0x1f18;
+/// `LogEvent::HandlerType::Users` (logevent/LogEvent.h:65) — the raw
+/// user-cache log events the `UserManager` mirror writes while a user is
+/// unsaved (`UserLogEvent`). `SecretChats` = 1 arrives with its manager.
+pub const LOG_EVENT_HANDLER_TYPE_USERS: i32 = 2;
+/// `LogEvent::HandlerType::SecretChatInfos` (logevent/LogEvent.h:68) — the
+/// raw secret-chat-cache log events the `UserManager` mirror writes while a
+/// secret chat is unsaved (`SecretChatLogEvent`). Distinct from
+/// `SecretChats` = 1, which routes to the Wave-3 `SecretChatsManager`.
+pub const LOG_EVENT_HANDLER_TYPE_SECRET_CHAT_INFOS: i32 = 5;
 
 /// `TdDb::OpenedDatabase` — the database plus the open metadata the Td actor
 /// consumes (`since_last_open`; the per-manager binlog event vectors arrive
@@ -85,6 +94,14 @@ pub const CONFIG_PMC_MAGIC: i32 = 0x1f18;
 pub struct OpenedDatabase {
     pub database: TdDb,
     pub since_last_open: i64,
+    /// The `user_events` replay vector (TdDb.cpp:76-78) — every binlog event
+    /// with the Users handler type, in binlog order, for
+    /// `UserManager::on_binlog_user_event`.
+    pub user_events: Vec<BinlogEvent>,
+    /// The `secret_chat_events` replay vector (TdDb.cpp:79-87) — every
+    /// binlog event with the SecretChatInfos handler type, in binlog order,
+    /// for `UserManager::on_binlog_secret_chat_event`.
+    pub secret_chat_events: Vec<BinlogEvent>,
 }
 
 /// `get_binlog_path` — `{database_directory}td{_test}.binlog`.
@@ -192,6 +209,9 @@ pub struct TdDb {
     parameters: Option<Parameters>,
     sql_connection: Option<Arc<SqliteConnectionSafe>>,
     files_kv: Option<SqliteKeyValue>,
+    /// `TdDb::common_kv_safe_` — the "common" table behind the C++
+    /// `get_sqlite_pmc`/`get_sqlite_sync_pmc` (the user/secret-chat store).
+    common_kv: Option<SqliteKeyValue>,
     binlog_pmc: Option<BinlogKeyValue>,
     config_pmc: Option<BinlogKeyValue>,
     binlog: Option<Arc<ConcurrentBinlog>>,
@@ -388,6 +408,7 @@ impl TdDb {
             parameters: None,
             sql_connection: None,
             files_kv: None,
+            common_kv: None,
             binlog_pmc: None,
             config_pmc: None,
             binlog: None,
@@ -466,6 +487,12 @@ impl TdDb {
         try_status!(files_kv.init_with_connection(connection.get(), "files"));
         self.files_kv = Some(files_kv);
 
+        // the "common" table (`TdDb::common_kv_safe_`, TdDb.cpp:468) is
+        // NOT created here: the C++ `SqliteKeyValueSafe` is a lazy
+        // scheduler-local storage, so the table appears on first use
+        // (`common_kv()` below) — the schema must stay byte-identical to
+        // a C++ database that never touched the sync pmc.
+
         Status::ok()
     }
 
@@ -497,6 +524,41 @@ impl TdDb {
         self.parameters
             .as_ref()
             .expect("TdDb is not initialized: parameters are missing")
+    }
+
+    /// `TdDb::get_sqlite_sync_pmc` — the synchronous view of the "common"
+    /// table. The C++ also runs an async wrapper (`get_sqlite_pmc`) on a
+    /// database scheduler; the database opens synchronously in the actor
+    /// here, so both collapse into this handle (the established M.1
+    /// divergence). Like the C++ `SqliteKeyValueSafe` (a lazy
+    /// scheduler-local storage), the table materializes on FIRST use —
+    /// a database opened and closed untouched must not carry it (the
+    /// schema-parity fixture).
+    pub fn common_kv(&mut self) -> &mut SqliteKeyValue {
+        if self.common_kv.is_none() {
+            let mut common_kv = SqliteKeyValue::new();
+            let connection = self
+                .sql_connection
+                .as_ref()
+                .expect("TdDb is not initialized: sqlite connection is missing")
+                .get();
+            common_kv
+                .init_with_connection(connection, "common")
+                .ensure();
+            self.common_kv = Some(common_kv);
+        }
+        self.common_kv
+            .as_mut()
+            .expect("the common kv was just initialized")
+    }
+
+    /// `TdDb::get_binlog` — the raw log-event surface (`binlog_add` /
+    /// `binlog_rewrite` / `binlog_erase` with a `LogEvent::HandlerType`).
+    /// A shared handle: `ConcurrentBinlog` serializes internally.
+    pub fn binlog(&mut self) -> std::sync::Arc<ConcurrentBinlog> {
+        self.binlog
+            .clone()
+            .expect("TdDb is not initialized: binlog is missing")
     }
 
     pub fn use_file_database(&self) -> bool {
@@ -539,14 +601,22 @@ impl TdDb {
         config_pmc.external_init_begin(CONFIG_PMC_MAGIC);
 
         // The combined replay callback: each pmc consumes only the events
-        // written with its own magic; the rest waits for its owner.
+        // written with its own magic; the Users and SecretChatInfos events
+        // collect for the user manager (the remaining handlers wait for
+        // their owners).
+        let mut user_events: Vec<BinlogEvent> = Vec::new();
+        let mut secret_chat_events: Vec<BinlogEvent> = Vec::new();
         let mut binlog = ConcurrentBinlog::new();
         {
             let binlog_pmc = &mut binlog_pmc;
             let config_pmc = &mut config_pmc;
+            let user_events = &mut user_events;
+            let secret_chat_events = &mut secret_chat_events;
             let callback = |event: &BinlogEvent| match event.type_ {
                 BINLOG_PMC_MAGIC => binlog_pmc.external_init_handle(event),
                 CONFIG_PMC_MAGIC => config_pmc.external_init_handle(event),
+                LOG_EVENT_HANDLER_TYPE_USERS => user_events.push(event.clone()),
+                LOG_EVENT_HANDLER_TYPE_SECRET_CHAT_INFOS => secret_chat_events.push(event.clone()),
                 _ => {}
             };
             let init_status = binlog.init(
@@ -615,6 +685,8 @@ impl TdDb {
         Result::Ok(OpenedDatabase {
             database: db,
             since_last_open,
+            user_events,
+            secret_chat_events,
         })
     }
 
@@ -631,6 +703,7 @@ impl TdDb {
             }
         }
         self.files_kv.take();
+        self.common_kv.take();
         if let Some(connection) = self.sql_connection.take() {
             connection.close();
         }
@@ -639,6 +712,7 @@ impl TdDb {
 
     pub fn close(&mut self) {
         self.files_kv.take();
+        self.common_kv.take();
         if let Some(connection) = self.sql_connection.take() {
             connection.close();
         }
