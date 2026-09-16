@@ -1570,7 +1570,7 @@ fn recovery_language_fields(language_pack: &str, language_code: &str) -> (String
 /// (JsonValue.cpp:101-134) — the JSON parser's value into the TL one. The
 /// number is lenient like `to_double` (0.0 on failure); the strings need
 /// no `clean_input_string` (the parser already yields valid UTF-8).
-fn json_value_to_tl(value: &JsonValue) -> telegram_api::JSONValue {
+pub fn json_value_to_tl(value: &JsonValue) -> telegram_api::JSONValue {
     match value {
         JsonValue::Null => telegram_api::JSONValue::jsonNull(telegram_api::jsonNull),
         JsonValue::Boolean(value) => {
