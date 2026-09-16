@@ -22,6 +22,7 @@ pub mod emoji_status;
 pub mod global;
 pub mod link_manager;
 pub mod manager_option_states;
+pub mod message_id;
 pub mod misc;
 pub mod option_manager;
 pub mod peer_color;
