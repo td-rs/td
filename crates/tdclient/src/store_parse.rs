@@ -22,6 +22,7 @@ pub mod version {
     pub const ADD_KEY_HASH_TO_SECRET_CHAT: i32 = 2;
     pub const ADD_ACCESS_HASH_TO_SECRET_CHAT: i32 = 5;
     pub const FIX_MIN_USERS: i32 = 10;
+    pub const SUPPORT_BANNED_CHANNELS: i32 = 31;
     pub const SUPPORT_64_BIT_IDS: i32 = 33;
     pub const MAKE_PARTICIPANT_FLAGS_64_BIT: i32 = 46;
     pub const ADD_USER_FLAGS2: i32 = 48;
