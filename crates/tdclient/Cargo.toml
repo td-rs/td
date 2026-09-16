@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+base64 = "0.22"
 libc = "0.2.189"
 serde = { version = "1", features = ["derive"] }
 tdactor = { path = "../tdactor" }
