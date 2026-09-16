@@ -294,6 +294,6 @@ jobs:
         # cargo-fuzz resolves fuzz/Cargo.toml relative to the cwd, so it
         # must run from the repo root, not from inside fuzz/.
         run: |
-          for target in td_api_json json_value binlog_event mtproto_packet tl_scheme_text transport_frame; do
+          for target in td_api_json json_value binlog_event mtproto_packet tl_scheme_text transport_frame app_config simple_config; do
             cargo fuzz run "$target" -- -max_total_time=60
           done
