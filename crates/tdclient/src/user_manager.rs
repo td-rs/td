@@ -2167,6 +2167,11 @@ pub struct UserManager {
     /// The load-gated internal re-dispatches (see
     /// [`PendingLoadContactsCall`]).
     pending_load_contacts_calls: Vec<PendingLoadContactsCall>,
+    /// The `()`-typed promises parked at their `[blocked: net]` query
+    /// sends — the C++ promise rides the query actor until the server
+    /// ack, the Rust collapse parks it here until the net query actors
+    /// land (the same collapse the pending-load queue uses).
+    net_blocked_promises: Vec<Promise<()>>,
     /// The load-gated td_api requests (see
     /// [`PendingUserRequest`]) — the request-actor re-run analogue: parked
     /// with the request id while the contacts load, re-run to completion
@@ -7981,7 +7986,7 @@ impl UserManager {
         &mut self,
         file_id: FileId,
         after_file_id: FileId,
-        promise: &mut Promise<()>,
+        mut promise: Promise<()>,
     ) {
         let mut file_id = file_id;
         let mut after_file_id = after_file_id;
@@ -7997,6 +8002,7 @@ impl UserManager {
             promise.set_error(Status::error(400, "Can't place saved music after self"));
             return;
         }
+        self.net_blocked_promises.push(promise);
         tdutils::log_info!("Send messages.saveMusic — [blocked: net]");
     }
 
@@ -8087,12 +8093,13 @@ impl UserManager {
     /// `UserManager::remove_saved_music` (UserManager.cpp:7372-7378) —
     /// the validation is local; the `messages.unsaveMusic` send is
     /// [blocked: net] (M.4.16).
-    pub fn remove_saved_music(&mut self, file_id: FileId, promise: &mut Promise<()>) {
+    pub fn remove_saved_music(&mut self, file_id: FileId, mut promise: Promise<()>) {
         let mut file_id = file_id;
         if let Err(status) = self.check_saved_music_file_id(&mut file_id, false) {
             promise.set_error(status);
             return;
         }
+        self.net_blocked_promises.push(promise);
         tdutils::log_info!("Send messages.unsaveMusic — [blocked: net]");
     }
 
@@ -9703,7 +9710,9 @@ impl UserManager {
             return;
         }
 
-        // ResetContactsQuery — [blocked: net]
+        // ResetContactsQuery — [blocked: net]; the promise parks until
+        // the net query actors land
+        self.net_blocked_promises.push(promise);
         tdutils::log_info!("Reset contacts query — [blocked: net]");
     }
 
@@ -10574,6 +10583,7 @@ impl UserManager {
             Err(error) => return promise.set_error(error),
         };
         let _ = input_user; // the AcceptContactQuery payload — [blocked: net]
+        self.net_blocked_promises.push(promise);
         // MessagesManager::hide_dialog_action_bar — with its step
         tdutils::log_info!("Accept contact query — [blocked: net]");
     }
@@ -14365,20 +14375,20 @@ mod tests {
         let file_id = um
             .parse_saved_music_document(audio_document(201, 21))
             .unwrap();
-        let (mut p1, a1) = recording_promise::<()>();
-        um.add_saved_music(FileId::default(), FileId::default(), &mut p1);
+        let (p1, a1) = recording_promise::<()>();
+        um.add_saved_music(FileId::default(), FileId::default(), p1);
         assert_eq!(
             a1.lock().unwrap().as_slice(),
             [Err("Invalid file identifier specified".to_owned())]
         );
-        let (mut p2, a2) = recording_promise::<()>();
-        um.add_saved_music(FileId::new(999), FileId::default(), &mut p2);
+        let (p2, a2) = recording_promise::<()>();
+        um.add_saved_music(FileId::new(999), FileId::default(), p2);
         assert_eq!(
             a2.lock().unwrap().as_slice(),
             [Err("Unknown file identifier specified".to_owned())]
         );
-        let (mut p3, a3) = recording_promise::<()>();
-        um.add_saved_music(file_id, file_id, &mut p3);
+        let (p3, a3) = recording_promise::<()>();
+        um.add_saved_music(file_id, file_id, p3);
         assert_eq!(
             a3.lock().unwrap().as_slice(),
             [Err("Can't place saved music after self".to_owned())]

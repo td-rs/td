@@ -14,7 +14,7 @@
 use crate::contact::Contact;
 use crate::td::Td;
 use crate::td_api::{self, Function, Object};
-use crate::user_manager::{PendingUserRequest, SecretChatId, UserEnv, UserId};
+use crate::user_manager::{FileId, PendingUserRequest, SecretChatId, UserEnv, UserId};
 use tdutils::promise::Promise;
 use tdutils::status::Status;
 
@@ -740,32 +740,135 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             }
         }
 
-        // --- the handlers gated on the uncommitted M.4.13 (photos/saved
-        // music), the open M.4.15 (contact policy) and the deferred
-        // subsystems — each arm is the flip point for its step ---
+        // --- the remaining photo-set handlers (the Files slice) and the
+        // deferred subsystems — each arm is the flip point for its step ---
         Function::setProfilePhoto(_) => {
             // the upload path — the Files slice (M.4.12's stub keeps the
             // C++ error surface)
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
+        Function::getUserProfilePhotos(request) => {
+            // Requests.cpp:7125-7130: no CHECK gate; the cache window
+            // answers locally, a cache miss parks in the photos queue
+            // (the GetUserQuery refetch is [blocked: net])
+            let promise = td.deferred_promise(id, Object::chatPhotos);
+            let mut env = user_env!(td);
+            td.user_manager.get_user_profile_photos(
+                &mut env,
+                UserId::new(request.user_id),
+                request.offset,
+                request.limit,
+                promise,
+            );
+        }
+        Function::getUserProfileAudios(request) => {
+            // Requests.cpp:7131-7136: the saved-music twin of
+            // getUserProfilePhotos
+            let promise = td.deferred_promise(id, Object::audios);
+            let mut env = user_env!(td);
+            td.user_manager.get_user_saved_music(
+                &mut env,
+                UserId::new(request.user_id),
+                request.offset,
+                request.limit,
+                promise,
+            );
+        }
+        Function::isProfileAudio(request) => {
+            // Requests.cpp:7137-7142: answers over the loaded my-saved-
+            // music list
+            if !check_is_user(td, id) {
+                return;
+            }
+            let mut promise = td.deferred_promise(id, |()| ok_object());
+            td.user_manager
+                .check_is_saved_music(FileId::new(request.file_id), &mut promise);
+        }
+        Function::setProfileAudioPosition(request) => {
+            // Requests.cpp:7149-7155: validation is local; the promise
+            // parks at the messages.saveMusic send ([blocked: net])
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            td.user_manager.add_saved_music(
+                FileId::new(request.file_id),
+                FileId::new(request.after_file_id),
+                promise,
+            );
+        }
+        Function::removeProfileAudio(request) => {
+            // Requests.cpp:7156-7162: the messages.unsaveMusic twin
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            td.user_manager
+                .remove_saved_music(FileId::new(request.file_id), promise);
+        }
+        Function::canSendMessageToUser(request) => {
+            // Requests.cpp:5772-5776: the local matrix answers; the
+            // premium-required re-dispatch parks in the QueryMerger
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, Object::from);
+            let mut env = user_env!(td);
+            td.user_manager.can_send_message_to_user(
+                &mut env,
+                UserId::new(request.user_id),
+                request.only_local,
+                promise,
+            );
+        }
+        Function::sharePhoneNumber(request) => {
+            // Requests.cpp:6730-6734: parks until the contacts load, then
+            // the AcceptContactQuery ack ([blocked: net])
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = user_env!(td);
+            td.user_manager
+                .share_phone_number(&mut env, UserId::new(request.user_id), promise);
+        }
+        Function::getWebAppPlaceholder(request) => {
+            // Requests.cpp:8265-8269: the missing bot info answers the
+            // C++ `send_result(nullptr)` 404
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |outline: Option<td_api::Outline>| {
+                outline.map_or_else(
+                    || {
+                        Object::error(td_api::Error {
+                            code: 404,
+                            message: "Not Found".to_string(),
+                        })
+                    },
+                    Object::outline,
+                )
+            });
+            let mut env = user_env!(td);
+            td.user_manager.get_web_app_placeholder(
+                &mut env,
+                UserId::new(request.bot_user_id),
+                promise,
+            );
+        }
         Function::deleteProfilePhoto(_)
-        | Function::getUserProfilePhotos(_)
-        | Function::getUserProfileAudios(_)
-        | Function::isProfileAudio(_)
-        | Function::addProfileAudio(_)
-        | Function::setProfileAudioPosition(_)
-        | Function::removeProfileAudio(_)
         | Function::setUserPersonalProfilePhoto(_)
         | Function::suggestUserProfilePhoto(_)
         | Function::setBotProfilePhoto(_) => {
-            // the M.4.13 photo/saved-music caches live in the uncommitted
-            // m411 worktree; route them when the union lands
+            // the photo-set family: the non-null input path rides
+            // FileManager (`set_profile_photo_impl`, the Files slice) and
+            // the null-input halves are net actors
+            // (DeleteContactProfilePhotoQuery/UpdateProfilePhotoQuery)
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
-        Function::canSendMessageToUser(_)
-        | Function::sharePhoneNumber(_)
-        | Function::getWebAppPlaceholder(_) => {
-            // the M.4.15 contact-policy halves
+        Function::addProfileAudio(_) => {
+            // the input-audio path needs FileManager's get_input_file_id
+            // (the Files slice)
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
         Function::setUserNote(_)
