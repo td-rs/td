@@ -15,6 +15,7 @@ pub mod config_manager;
 pub mod config_recoverer;
 pub mod config_result;
 pub mod global;
+pub mod manager_option_states;
 pub mod misc;
 pub mod option_manager;
 pub mod requests;
