@@ -16,6 +16,7 @@ pub mod global;
 pub mod misc;
 pub mod option_manager;
 pub mod peer_color;
+pub mod photo;
 pub mod requests;
 pub mod restriction_reason;
 pub mod store_parse;
