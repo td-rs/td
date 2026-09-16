@@ -517,6 +517,12 @@ impl Td {
             self.user_manager
                 .init_my_online_status(self.global.binlog_pmc(), unix_time, false);
         }
+        // UserManager.cpp:2829-2845 — start_up's saved-music block; the
+        // C++ gate is is_authorized() && !is_bot().
+        self.user_manager.init_my_saved_music_ids(
+            self.global.binlog_pmc(),
+            self.auth_manager.is_authorized() && !self.auth_manager.is_bot(),
+        );
 
         // The M.3.9.2 stand-in for the four manager constructors' pmc
         // reads (in the C++ creation order: AccountManager Td.cpp:1157,

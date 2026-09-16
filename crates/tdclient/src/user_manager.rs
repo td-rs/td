@@ -16,8 +16,21 @@
 //!   flag set fails to parse, exactly like a C++ parse failure);
 //! - `UserFull` carries the scalar/bool fields, `birthdate`,
 //!   `personal_channel_id` and `linked_community_id`; the bot-info,
-//!   business, star-rating, note and saved-music fields arrive with their
-//!   subsystems (a value with those fields set fails to parse);
+//!   business, star-rating and note fields arrive with their subsystems
+//!   (a value with those fields set fails to parse). The
+//!   `first_saved_music_file_id` is tracked in memory (M.4.13) but not
+//!   persisted yet — the C++ stores it through
+//!   `FileManager::store_file_id`, so the store flag stays forced off
+//!   until the Files step and the id does not survive a reopen;
+//! - the profile-photos and saved-music listing caches (`user_photos_`,
+//!   `user_saved_music_`) with their pending-request retry machines are
+//!   in (M.4.13); every file id they carry is a placeholder until the
+//!   Files step: the saved-music document ids live in a side registry
+//!   (`saved_music_file_locations`) standing in for
+//!   `get_saved_music_document_id`'s file-manager lookup, the
+//!   photo/saved-music file sources are allocated by a local counter
+//!   standing in for the FileReferenceManager, and the chatPhoto/audio
+//!   objects answer with the codegen-forced empty payloads;
 //! - the users binlog mirror (`UserLogEvent` + `on_binlog_user_event`) is
 //!   in: unsaved users log to the binlog (`HandlerType::Users`), the
 //!   sqlite save retires the event, and reopen replays it; the C++'s
@@ -59,6 +72,7 @@ use crate::emoji_status::{CustomEmojiId, EmojiStatus};
 use crate::global::Global;
 use crate::option_manager::OptionManager;
 use crate::peer_color::{AccentColorId, PeerColor, PeerColorCollectible};
+use crate::photo::{Photo, get_chat_photo_object, get_photo, photo_get_file_ids};
 use crate::restriction_reason::{
     RestrictionOptions, RestrictionReason, get_restriction_info_object, parse_restriction_reasons,
     store_restriction_reasons,
@@ -68,6 +82,7 @@ use crate::td_api;
 use crate::usernames::Usernames;
 use tddb::binlog_key_value::BinlogKeyValue;
 use tdmtproto::telegram_api;
+use tdutils::promise::Promise;
 use tdutils::status::Status;
 
 /// `User::CACHE_VERSION` (UserManager.h:633).
@@ -86,6 +101,10 @@ const MAX_NAME_LENGTH: usize = 64;
 const ACCOUNT_UPDATE_FIRST_NAME: i32 = 1 << 0;
 const ACCOUNT_UPDATE_LAST_NAME: i32 = 1 << 1;
 const ACCOUNT_UPDATE_ABOUT: i32 = 1 << 2;
+/// `MAX_GET_PROFILE_PHOTOS` (UserManager.h:870).
+const MAX_GET_PROFILE_PHOTOS: i32 = 100;
+/// `MAX_GET_SAVED_MUSIC` (UserManager.h:871).
+const MAX_GET_SAVED_MUSIC: i32 = 100;
 
 // telegram_api::user flag masks (telegram_api.h, the `user` class:
 // ACCESS_HASH_MASK = 1, FIRST_NAME_MASK = 2, ..., PHONE_MASK = 16,
@@ -155,8 +174,38 @@ impl SecretChatId {
 pub struct FileId(i32);
 
 impl FileId {
+    pub fn new(id: i32) -> FileId {
+        FileId(id)
+    }
+
     pub fn is_valid(self) -> bool {
         self.0 > 0
+    }
+
+    pub fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// `td::FileSourceId` (files/FileSourceId.h) — an opaque id the
+/// FileReferenceManager allocates. The manager is a Files-step piece, so
+/// the ids this module allocates come from a local stand-in counter and
+/// never leave the manager boundary (the values only key the two
+/// file-source maps below).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileSourceId(i32);
+
+impl FileSourceId {
+    pub fn new(id: i32) -> FileSourceId {
+        FileSourceId(id)
+    }
+
+    pub fn is_valid(self) -> bool {
+        self.0 > 0
+    }
+
+    pub fn get(self) -> i32 {
+        self.0
     }
 }
 
@@ -267,12 +316,67 @@ fn get_profile_photo(profile_photo: telegram_api::UserProfilePhoto) -> ProfilePh
 
 /// `get_profile_photo_id` (DialogPhoto.cpp) — used by the deferred
 /// `pending_user_photos_`/user-full branches.
-#[allow(dead_code)]
 fn get_profile_photo_id(profile_photo: &telegram_api::UserProfilePhoto) -> i64 {
     match profile_photo {
         telegram_api::UserProfilePhoto::userProfilePhoto(photo) => photo.photo_id,
         telegram_api::UserProfilePhoto::userProfilePhotoEmpty(_) => 0,
     }
+}
+
+/// The `UserManager::drop_user_saved_music` map mutation
+/// (UserManager.cpp:9535-9550) — a free fn so the &mut self callers
+/// inside the add/remove state machines stay borrow-clean.
+fn drop_user_saved_music_map(
+    map: &mut BTreeMap<i64, UserSavedMusic>,
+    user_id: UserId,
+    is_empty: bool,
+) {
+    if let Some(user_saved_music) = map.get_mut(&user_id.get()) {
+        let new_count = if is_empty { 0 } else { -1 };
+        if user_saved_music.count == new_count {
+            debug_assert!(user_saved_music.saved_music_file_ids.is_empty());
+            debug_assert_eq!(user_saved_music.offset, user_saved_music.count);
+        } else {
+            user_saved_music.saved_music_file_ids.clear();
+            user_saved_music.count = new_count;
+            user_saved_music.offset = user_saved_music.count;
+        }
+    }
+}
+
+/// The forced-empty `audio` payload — the C++
+/// `audios_manager_->get_audio_object` reads AudiosManager state; the
+/// object becomes real with the Audios step (module docs).
+fn empty_audio_object() -> td_api::Audio {
+    td_api::Audio::default()
+}
+
+/// `as_fake_dialog_photo`/`as_profile_photo` (DialogPhoto.cpp:142-208),
+/// reduced like `get_profile_photo`: the 'a'/'c' size selection, the
+/// minithumbnail and the animation flag with placeholder file ids. The
+/// C++ "Failed to convert" error fires when the two sizes carry no
+/// valid file id — a condition the placeholders cannot express until
+/// the Files step, so the fields are kept instead (module docs).
+fn as_profile_photo(photo: &Photo, is_personal: bool) -> ProfilePhoto {
+    let mut result = ProfilePhoto::default();
+    if !photo.is_empty() {
+        let mut has_small = false;
+        let mut has_big = false;
+        for size in &photo.photos {
+            if size.size_type == b'a' as i32 {
+                has_small = true;
+            } else if size.size_type == b'c' as i32 {
+                has_big = true;
+            }
+        }
+        if has_small && has_big {
+            result.minithumbnail = photo.minithumbnail.clone();
+            result.has_animation = !photo.animations.is_empty();
+            result.is_personal = is_personal;
+            result.id = photo.id;
+        }
+    }
+    result
 }
 
 /// `need_update_dialog_photo` (DialogPhoto.cpp).
@@ -383,6 +487,11 @@ pub struct User {
     pub contact_require_premium: bool,
     pub has_live_story: bool,
 
+    /// `User::photo_ids` (UserManager.h:631) — the ids of the photos
+    /// registered from listings/userFull, runtime-only state in the C++
+    /// (never in the store blob).
+    pub photo_ids: BTreeSet<i64>,
+
     pub is_photo_inited: bool,
 
     pub is_repaired: bool,
@@ -478,6 +587,7 @@ impl Default for User {
             stories_hidden: false,
             contact_require_premium: false,
             has_live_story: false,
+            photo_ids: BTreeSet::new(),
             is_photo_inited: false,
             is_repaired: false,
             is_name_changed: true,
@@ -1019,6 +1129,15 @@ pub struct UserFull {
     pub charge_paid_message_stars: i64,
     pub send_paid_message_stars: i64,
 
+    /// `UserFull::first_saved_music_file_id` (UserManager.h:787) — the
+    /// id is a placeholder until the Files step and the store keeps the
+    /// flag forced off (the C++ persists it through
+    /// `FileManager::store_file_id`), so it does not survive a reopen
+    /// yet.
+    pub first_saved_music_file_id: FileId,
+
+    pub is_first_saved_music_file_id_changed: bool,
+
     pub is_blocked: bool,
     pub is_blocked_for_stories: bool,
     pub can_be_called: bool,
@@ -1065,6 +1184,8 @@ impl Default for UserFull {
             linked_community_id: CommunityId::default(),
             charge_paid_message_stars: 0,
             send_paid_message_stars: 0,
+            first_saved_music_file_id: FileId::default(),
+            is_first_saved_music_file_id_changed: false,
             is_blocked: false,
             is_blocked_for_stories: false,
             can_be_called: false,
@@ -1140,7 +1261,7 @@ impl UserFull {
         let has_star_rating = false; // StarRating subsystem
         let has_pending_star_rating = false;
         let has_main_profile_tab = false; // ProfileTab subsystem
-        let has_first_saved_music_file_id = false; // Audios subsystem
+        let has_first_saved_music_file_id = false; // DIVERGENCE(Files step)
         let has_note = false; // FormattedText subsystem
         let has_manager_bot_user_id = false;
         let has_linked_community_id = self.linked_community_id.is_valid();
@@ -1615,6 +1736,73 @@ enum UserFlag {
     OnlineStatus,
 }
 
+/// `UserManager::PendingGetPhotoRequest` (UserManager.h:841).
+pub struct PendingGetPhotoRequest {
+    offset: i32,
+    limit: i32,
+    retry_count: i32,
+    promise: Promise<td_api::ChatPhotos>,
+}
+
+/// `UserManager::UserPhotos` (UserManager.h:848) — the cached window of
+/// the user's profile photos; `count`/`offset` `-1` = unknown (the C++
+/// default member initializers).
+#[derive(Clone, Debug, PartialEq)]
+pub struct UserPhotos {
+    pub photos: Vec<Photo>,
+    pub count: i32,
+    pub offset: i32,
+}
+
+impl Default for UserPhotos {
+    fn default() -> Self {
+        UserPhotos::new()
+    }
+}
+
+impl UserPhotos {
+    pub fn new() -> UserPhotos {
+        UserPhotos {
+            photos: Vec::new(),
+            count: -1,
+            offset: -1,
+        }
+    }
+}
+
+/// `UserManager::PendingGetSavedMusicRequest` (UserManager.h:854).
+pub struct PendingGetSavedMusicRequest {
+    offset: i32,
+    limit: i32,
+    retry_count: i32,
+    promise: Promise<td_api::Audios>,
+}
+
+/// `UserManager::UserSavedMusic` (UserManager.h:861) — `count`/`offset`
+/// `-1` = unknown (the C++ default member initializers).
+#[derive(Clone, Debug, PartialEq)]
+pub struct UserSavedMusic {
+    pub saved_music_file_ids: Vec<FileId>,
+    pub count: i32,
+    pub offset: i32,
+}
+
+impl Default for UserSavedMusic {
+    fn default() -> Self {
+        UserSavedMusic::new()
+    }
+}
+
+impl UserSavedMusic {
+    pub fn new() -> UserSavedMusic {
+        UserSavedMusic {
+            saved_music_file_ids: Vec::new(),
+            count: -1,
+            offset: -1,
+        }
+    }
+}
+
 /// `td::UserManager` — the in-process manager (the C++ actor collapses
 /// into the Td actor, like the M.1 AuthManager).
 #[derive(Default)]
@@ -1636,6 +1824,52 @@ pub struct UserManager {
 
     resolved_phone_numbers: BTreeMap<String, UserId>,
     restricted_user_ids: BTreeSet<i64>,
+
+    /// `my_saved_music_ids_` (UserManager.h:1296) — the server document
+    /// ids of my saved music, over the `my_saved_music_ids` binlog-pmc
+    /// key.
+    my_saved_music_ids: BTreeSet<i64>,
+    are_my_saved_music_ids_inited: bool,
+
+    /// `user_photos_` (UserManager.h:1258) — the profile-photos listing
+    /// cache.
+    user_photos: BTreeMap<i64, UserPhotos>,
+    /// `pending_get_user_photos_requests_` (UserManager.h:1259).
+    pending_get_user_photos_requests: BTreeMap<i64, Vec<PendingGetPhotoRequest>>,
+    /// `pending_user_photos_` (UserManager.h:1262) — the bot
+    /// without-chat-info-database photo hold.
+    pending_user_photos: BTreeMap<i64, telegram_api::UserProfilePhoto>,
+    /// `user_profile_photo_file_source_ids_` (UserManager.h:1255) keyed
+    /// by (user id, photo id).
+    user_profile_photo_file_source_ids: BTreeMap<(i64, i64), FileSourceId>,
+    /// `my_photo_file_id_` (UserManager.h:1256) — my photo id → the
+    /// first file id of the registered photo.
+    my_photo_file_id: BTreeMap<i64, FileId>,
+
+    /// `user_saved_music_` (UserManager.h:1291) — the saved-music listing
+    /// cache.
+    user_saved_music: BTreeMap<i64, UserSavedMusic>,
+    /// `pending_get_user_saved_music_requests_` (UserManager.h:1292).
+    pending_get_user_saved_music_requests: BTreeMap<i64, Vec<PendingGetSavedMusicRequest>>,
+    /// `user_saved_music_file_source_ids_` (UserManager.h:1289) keyed by
+    /// the `UserSavedMusicId` triple.
+    user_saved_music_file_source_ids: BTreeMap<(i64, i64, i64), FileSourceId>,
+    /// The `get_saved_music_document_id` stand-in registry
+    /// (UserManager.cpp:4673-4693): FileId → the remote
+    /// (document id, access hash). The C++ reads both off the file
+    /// manager's full remote location; the mapping is populated at the
+    /// saved-music intake until the Files step replaces it.
+    saved_music_file_locations: BTreeMap<i32, (i64, i64)>,
+    /// `reload_my_saved_music_queries_` (UserManager.h:1297).
+    reload_my_saved_music_queries: Vec<Promise<()>>,
+
+    /// The FileReferenceManager stand-in: the allocator behind every
+    /// `FileSourceId` this module hands out.
+    next_file_source_id: i32,
+    /// The placeholder allocator for saved-music `FileId`s (the
+    /// AudiosManager/DocumentsManager allocation is the Files step); the
+    /// values are internal-only and never persisted.
+    next_saved_music_file_id: i32,
 
     my_was_online_local: i32,
     was_online_local: i32,
@@ -3209,10 +3443,10 @@ impl UserManager {
         }
     }
 
-    /// `UserManager::on_update_user_photo`/`do_update_user_photo`
-    /// (UserManager.cpp:3615-3687) — the file ids are placeholders (module
-    /// docs), so the bot `pending_user_photos_` branch and the
-    /// `drop_user_photos` file-source handling are deferred.
+    /// `UserManager::on_update_user_photo` (UserManager.cpp:3615-3646):
+    /// the bot-without-chat-info-database path holds the photo in
+    /// `pending_user_photos_` until `apply_pending_user_photo`, then
+    /// suppresses no-op redeliveries for received users.
     pub fn on_update_user_photo(
         &mut self,
         env: &mut UserEnv,
@@ -3220,10 +3454,81 @@ impl UserManager {
         photo: telegram_api::UserProfilePhoto,
         source: &str,
     ) {
-        let new_photo = get_profile_photo(photo);
+        if env.auth_is_bot && !env.global.use_chat_info_database() {
+            let is_photo_inited = self
+                .users
+                .get(&user_id.get())
+                .map(|u| u.is_photo_inited)
+                .unwrap_or(false);
+            if !is_photo_inited {
+                let new_photo_id = get_profile_photo_id(&photo);
+                let old_photo_id = self
+                    .pending_user_photos
+                    .get(&user_id.get())
+                    .map(get_profile_photo_id)
+                    .unwrap_or(0);
+                if new_photo_id == old_photo_id {
+                    return;
+                }
+                let mut photo = photo;
+                if let telegram_api::UserProfilePhoto::userProfilePhoto(profile_photo) = &mut photo
+                {
+                    profile_photo.stripped_thumb.clear();
+                }
+
+                self.pending_user_photos.insert(user_id.get(), photo);
+
+                self.drop_user_photos(user_id, new_photo_id == 0, "on_update_user_photo");
+                // must not load UserFull
+                if self.get_user_full(user_id).is_some()
+                    && new_photo_id != self.get_user_full_profile_photo_id_from_cache(user_id)
+                {
+                    // we didn't send updateUser yet, so we must not send
+                    // updateUserFull with new_photo_id yet
+                    self.drop_user_full_photos(env, user_id, 0, "on_update_user_photo");
+                }
+                return;
+            }
+            let is_received = self
+                .users
+                .get(&user_id.get())
+                .map(|u| u.is_received)
+                .unwrap_or(false);
+            if is_received {
+                let new_photo_id = get_profile_photo_id(&photo);
+                let current_id = self
+                    .users
+                    .get(&user_id.get())
+                    .map(|u| u.photo.id)
+                    .unwrap_or(0);
+                if new_photo_id == current_id {
+                    return;
+                }
+            }
+        }
+
+        self.do_update_user_photo_from_telegram(env, user_id, photo, source);
+    }
+
+    /// `UserManager::do_update_user_photo` (the telegram_photo overload,
+    /// UserManager.cpp:3668-3673): conversion plus the bots'
+    /// minithumbnail wipe.
+    fn do_update_user_photo_from_telegram(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        photo: telegram_api::UserProfilePhoto,
+        source: &str,
+    ) {
+        let mut new_photo = get_profile_photo(photo);
+        if env.auth_is_bot {
+            new_photo.minithumbnail.clear();
+        }
         self.do_update_user_photo(env, user_id, new_photo, true, source);
     }
 
+    /// `UserManager::do_update_user_photo` (the ProfilePhoto overload,
+    /// UserManager.cpp:3675-3687).
     fn do_update_user_photo(
         &mut self,
         env: &mut UserEnv,
@@ -3232,29 +3537,53 @@ impl UserManager {
         invalidate_photo_cache: bool,
         source: &str,
     ) {
-        let u = self.users.get_mut(&user_id.get()).unwrap();
-        u.is_photo_inited = true;
-        if need_update_profile_photo(&u.photo, &new_photo) {
-            if u.access_hash == -1 && new_photo.small_file_id.is_valid() {
-                tdutils::log_error!(
-                    "Update profile photo of {user_id:?} without access hash from {source}"
-                );
+        let new_photo_id;
+        let photo_changed = {
+            let u = self.users.get_mut(&user_id.get()).unwrap();
+            u.is_photo_inited = true;
+            if need_update_profile_photo(&u.photo, &new_photo) {
+                if u.access_hash == -1 && new_photo.small_file_id.is_valid() {
+                    tdutils::log_error!(
+                        "Update profile photo of {user_id:?} without access hash from {source}"
+                    );
+                }
+                u.photo = new_photo;
+                u.is_photo_changed = true;
+                u.is_changed = true;
+                true
+            } else if need_update_dialog_photo_minithumbnail(
+                &u.photo.minithumbnail,
+                &new_photo.minithumbnail,
+            ) {
+                u.photo.minithumbnail = new_photo.minithumbnail;
+                u.is_photo_changed = true;
+                u.is_changed = true;
+                false
+            } else {
+                false
             }
-            u.photo = new_photo;
-            u.is_photo_changed = true;
-            u.is_changed = true;
+        };
+        if photo_changed {
+            let u = self.users.get(&user_id.get()).unwrap();
+            new_photo_id = u.photo.id;
             if invalidate_photo_cache {
-                // drop_user_photos — with the file-reference manager
+                self.drop_user_photos(user_id, new_photo_id == 0, source);
             }
-        } else if need_update_dialog_photo_minithumbnail(
-            &u.photo.minithumbnail,
-            &new_photo.minithumbnail,
-        ) {
-            u.photo.minithumbnail = new_photo.minithumbnail;
-            u.is_photo_changed = true;
-            u.is_changed = true;
+            // must not load UserFull
+            if self.get_user_full(user_id).is_some()
+                && new_photo_id != self.get_user_full_profile_photo_id_from_cache(user_id)
+            {
+                // we didn't send updateUser yet, so we must not send
+                // updateUserFull with u->photo.id yet
+                self.drop_user_full_photos(env, user_id, 0, "do_update_user_photo");
+            }
         }
-        let _ = (env, user_id, source);
+    }
+
+    /// `get_user_full_profile_photo_id` over the cached record (the
+    /// caller checked presence).
+    fn get_user_full_profile_photo_id_from_cache(&self, user_id: UserId) -> i64 {
+        Self::get_user_full_profile_photo_id(self.users_full.get(&user_id.get()).unwrap())
     }
 
     /// `UserManager::on_update_user_colors` (UserManager.cpp:3739-3753).
@@ -4282,6 +4611,9 @@ impl UserManager {
         from_database: bool,
     ) {
         self.unavailable_user_fulls.remove(&user_id.get()); // don't needed anymore
+        // register_user_saved_music (cpp:10152-10154) runs after the
+        // record borrow closes — it needs the env for the bot gate
+        let mut pending_saved_music_registration: Option<FileId> = None;
         if let Some(user_full) = self.users_full.get_mut(&user_id.get()) {
             if user_full.is_common_chat_count_changed {
                 user_full.is_common_chat_count_changed = false;
@@ -4289,7 +4621,10 @@ impl UserManager {
                 // its step
             }
             // the star rating timeout (cpp:10144-10151) — with StarRating
-            // the first-saved-music registration — with the Audios step
+            if user_full.is_first_saved_music_file_id_changed {
+                user_full.is_first_saved_music_file_id_changed = false;
+                pending_saved_music_registration = Some(user_full.first_saved_music_file_id);
+            }
             if user_full.is_has_protected_content_changed {
                 user_full.is_has_protected_content_changed = false;
                 // MessagesManager::on_dialog_has_protected_content_updated
@@ -4299,6 +4634,9 @@ impl UserManager {
             user_full.need_send_update |= user_full.is_changed;
             user_full.need_save_to_database |= user_full.is_changed;
             user_full.is_changed = false;
+        }
+        if let Some(file_id) = pending_saved_music_registration {
+            self.register_user_saved_music(env, user_id, file_id);
         }
         let (need_send_update, need_save_to_database) = {
             let user_full = self.users_full.get(&user_id.get()).unwrap();
@@ -4356,7 +4694,9 @@ impl UserManager {
         if !self.get_user_force(env, user_id, "on_get_user_full") {
             return;
         }
-        // apply_pending_user_photo (cpp:8986) — with the photo-cache step
+        // The u borrow covers the whole application below
+        // (apply_pending_user_photo, cpp:8986)
+        self.apply_pending_user_photo(env, user_id, "on_get_user_full");
 
         // The User facts the application reads (cpp:9112, 9140, 9235).
         let (is_premium_user, is_contact, user_linked_community_id) = {
@@ -4568,9 +4908,93 @@ impl UserManager {
                 stored.is_changed = true;
             }
             // get_channel_difference_if_needed for the personal chat
-            // (cpp:9250-9254) — with MessagesManager; the photo
-            // application + do_update_user_photo + saved music
-            // (cpp:9256-9323) — with the Files/photo steps
+            // (cpp:9250-9254) — with MessagesManager
+        }
+
+        // The photo application (cpp:9245-9293): do_update_user_photo
+        // should be a no-op if the server sent consistent data. The
+        // record's photos are stored as the reduced `as_profile_photo`
+        // form (module docs); register_user_photo works over the full
+        // converted photos.
+        let photo = get_photo(std::mem::take(&mut user_full.profile_photo));
+        let personal_photo = get_photo(std::mem::take(&mut user_full.personal_photo));
+        let fallback_photo = get_photo(std::mem::take(&mut user_full.fallback_photo));
+        let (photo_ptr, is_personal) = if !personal_photo.is_empty() {
+            (&personal_photo, true)
+        } else if !photo.is_empty() {
+            (&photo, false)
+        } else {
+            (&fallback_photo, false)
+        };
+        let is_photo_empty = photo_ptr.is_empty();
+        // the u->access_hash file-manager registration inside the C++
+        // conversion — the Files step
+        self.do_update_user_photo(
+            env,
+            user_id,
+            as_profile_photo(photo_ptr, is_personal),
+            false,
+            "on_get_user_full",
+        );
+        {
+            let stored = self.users_full.get_mut(&user_id.get()).unwrap();
+            let new_photo = as_profile_photo(&photo, false);
+            if new_photo != stored.photo {
+                stored.photo = new_photo;
+                stored.is_changed = true;
+            }
+            let new_personal_photo = as_profile_photo(&personal_photo, true);
+            if new_personal_photo != stored.personal_photo {
+                stored.personal_photo = new_personal_photo;
+                stored.is_changed = true;
+            }
+            let new_fallback_photo = as_profile_photo(&fallback_photo, false);
+            if new_fallback_photo != stored.fallback_photo {
+                stored.fallback_photo = new_fallback_photo;
+                stored.is_changed = true;
+            }
+        }
+        if !photo.is_empty() {
+            self.register_user_photo(user_id, &photo);
+        }
+        if user_id == self.my_id && !fallback_photo.is_empty() {
+            self.register_suggested_profile_photo(&fallback_photo);
+        }
+        if is_photo_empty {
+            self.drop_user_photos(user_id, true, "on_get_user_full");
+        }
+
+        // User must be updated before UserFull
+        if self.users.get(&user_id.get()).unwrap().is_changed {
+            tdutils::log_error!("Receive inconsistent chatPhoto and chatPhotoInfo for {user_id:?}");
+            self.update_user(env, user_id, false, false);
+        }
+
+        // The saved-music application (cpp:9295-9323) over the registry
+        // stand-in.
+        let first_saved_music_file_id = self
+            .parse_saved_music_document(std::mem::take(&mut user_full.saved_music))
+            .unwrap_or_default();
+        Self::on_update_user_full_first_saved_music_file_id(
+            self.users_full.get_mut(&user_id.get()).unwrap(),
+            first_saved_music_file_id,
+        );
+        if !first_saved_music_file_id.is_valid() {
+            self.drop_user_saved_music(user_id, true, "on_get_user_full");
+        } else {
+            let cache_conflict = self
+                .user_saved_music
+                .get(&user_id.get())
+                .map(|cache| {
+                    cache.offset == 0
+                        && (cache.saved_music_file_ids.is_empty()
+                            || cache.saved_music_file_ids[0] != first_saved_music_file_id)
+                })
+                .unwrap_or(false);
+            if cache_conflict {
+                tdutils::log_info!("Drop cache of saved music of {user_id:?}");
+                drop_user_saved_music_map(&mut self.user_saved_music, user_id, false);
+            }
         }
         // on_get_peer_settings (cpp:9330-9331) — with MessagesManager
         self.users_full
@@ -4604,12 +5028,12 @@ impl UserManager {
 
     /// `UserManager::drop_user_full` (UserManager.cpp:9552-9603):
     /// force-load, then reset the fields to their defaults and keep the
-    /// record in the cache. The photo/saved-music cache drops arrive with
-    /// M.4.13, GroupCallManager::on_update_dialog_about with its step.
+    /// record in the cache. GroupCallManager::on_update_dialog_about
+    /// arrives with its step.
     pub fn drop_user_full(&mut self, env: &mut UserEnv, user_id: UserId) {
         let loaded = self.get_user_full_force(env, user_id, "drop_user_full");
-        // drop_user_photos(user_id, false) / drop_user_saved_music
-        // (cpp:9556-9557) — with their caches
+        self.drop_user_photos(user_id, false, "drop_user_full");
+        self.drop_user_saved_music(user_id, false, "drop_user_full");
         if !loaded {
             return;
         }
@@ -4619,7 +5043,7 @@ impl UserManager {
             user_full.photo = ProfilePhoto::default();
             user_full.personal_photo = ProfilePhoto::default();
             user_full.fallback_photo = ProfilePhoto::default();
-            // first_saved_music_file_id — with the Audios step;
+            user_full.first_saved_music_file_id = FileId::default();
             // is_blocked / is_blocked_for_stories are kept (cpp:9560-9561)
             user_full.can_be_called = false;
             user_full.supports_video_calls = false;
@@ -5442,12 +5866,26 @@ impl UserManager {
         })
     }
 
-    /// `UserManager::get_user_dialog_photo` (UserManager.cpp:5484-5492);
-    /// its `apply_pending_user_photo` call is the M.4.13 photo cache
-    /// (empty until then). `None` is the C++ `nullptr`.
+    /// `UserManager::get_user_dialog_photo` (UserManager.cpp:5484-5492).
+    /// The read-only form skips the `apply_pending_user_photo` call
+    /// (it needs the env); the callers that can hold the manager open
+    /// use [`Self::get_user_dialog_photo_mut`]. `None` is the C++
+    /// `nullptr`.
     pub fn get_user_dialog_photo(&self, user_id: UserId) -> Option<&ProfilePhoto> {
-        let u = self.get_user(user_id)?;
-        Some(&u.photo)
+        self.get_user(user_id).map(|u| &u.photo)
+    }
+
+    /// `UserManager::get_user_dialog_photo` with the pending bot photo
+    /// applied first (cpp:5489).
+    pub fn get_user_dialog_photo_mut(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+    ) -> Option<&ProfilePhoto> {
+        if self.get_user(user_id).is_some() {
+            self.apply_pending_user_photo(env, user_id, "get_user_dialog_photo");
+        }
+        self.get_user(user_id).map(|u| &u.photo)
     }
 
     /// `UserManager::get_secret_chat_dialog_photo`
@@ -6169,6 +6607,1407 @@ impl UserManager {
         }
     }
 
+    // ------------------------------------------------------------------
+    // M.4.13: profile photos + saved music (UserManager.cpp:6798-7753,
+    // register_user_photo cpp:3706-3737, get_saved_music_document_id
+    // cpp:4673-4693, drop_user_photos/drop_user_saved_music
+    // cpp:9519-9553). The listing query senders ride the net step
+    // (M.4.16); every file id is a placeholder until the Files step
+    // (module docs).
+
+    /// The FileReferenceManager stand-in behind the two file-source maps.
+    fn create_file_source_id(&mut self) -> FileSourceId {
+        self.next_file_source_id += 1;
+        FileSourceId::new(self.next_file_source_id)
+    }
+
+    /// `UserManager::add_user_photos` (UserManager.cpp:7015-7022).
+    fn add_user_photos(&mut self, user_id: UserId) -> &mut UserPhotos {
+        assert!(user_id.is_valid());
+        self.user_photos.entry(user_id.get()).or_default()
+    }
+
+    /// `UserManager::drop_user_photos` (UserManager.cpp:9519-9534).
+    fn drop_user_photos(&mut self, user_id: UserId, is_empty: bool, source: &str) {
+        if let Some(user_photos) = self.user_photos.get_mut(&user_id.get()) {
+            let new_count = if is_empty { 0 } else { -1 };
+            if user_photos.count == new_count {
+                debug_assert!(user_photos.photos.is_empty());
+                debug_assert_eq!(user_photos.offset, user_photos.count);
+            } else {
+                tdutils::log_info!(
+                    "Drop photos of {user_id:?} to {} from {source}",
+                    if is_empty { "empty" } else { "unknown" }
+                );
+                user_photos.photos.clear();
+                user_photos.count = new_count;
+                user_photos.offset = user_photos.count;
+            }
+        }
+    }
+
+    /// `UserManager::apply_pending_user_photo`
+    /// (UserManager.cpp:7103-7113): apply the bot path's held photo.
+    pub fn apply_pending_user_photo(&mut self, env: &mut UserEnv, user_id: UserId, source: &str) {
+        let needs_apply = self
+            .users
+            .get(&user_id.get())
+            .map(|u| !u.is_photo_inited)
+            .unwrap_or(false)
+            && self.pending_user_photos.contains_key(&user_id.get());
+        if !needs_apply {
+            return;
+        }
+        let photo = self.pending_user_photos.remove(&user_id.get()).unwrap();
+        self.do_update_user_photo_from_telegram(env, user_id, photo, source);
+        self.update_user(env, user_id, false, false);
+    }
+
+    /// `UserManager::get_user_profile_photos`
+    /// (UserManager.cpp:6826-6885). The `photos.getUserPhotos` send is
+    /// [blocked: net] (M.4.16); requests park in the pending queue.
+    pub fn get_user_profile_photos(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        offset: i32,
+        limit: i32,
+        mut promise: Promise<td_api::ChatPhotos>,
+    ) {
+        if offset < 0 {
+            promise.set_error(Status::error(400, "Parameter offset must be non-negative"));
+            return;
+        }
+        if limit <= 0 {
+            promise.set_error(Status::error(400, "Parameter limit must be positive"));
+            return;
+        }
+        let mut limit = limit.min(MAX_GET_PROFILE_PHOTOS);
+
+        if let Err(status) = self.get_input_user(env, user_id) {
+            promise.set_error(status);
+            return;
+        }
+
+        if self.get_user(user_id).is_none() {
+            promise.set_error(Status::error(400, "User not found"));
+            return;
+        }
+
+        self.apply_pending_user_photo(env, user_id, "get_user_profile_photos");
+
+        self.add_user_photos(user_id);
+        if let Some(user_photos) = self.user_photos.get(&user_id.get())
+            && user_photos.count != -1
+        {
+            // know photo count
+            debug_assert_ne!(user_photos.offset, -1);
+            tdutils::log_info!(
+                "Have {} cached user profile photos at offset {}",
+                user_photos.count,
+                user_photos.offset
+            );
+            if offset >= user_photos.count {
+                // offset is too big
+                promise.set_value(td_api::ChatPhotos {
+                    total_count: user_photos.count,
+                    photos: Vec::new(),
+                });
+                return;
+            }
+            if limit > user_photos.count - offset {
+                limit = user_photos.count - offset;
+            }
+            let cache_begin = user_photos.offset;
+            let cache_end = cache_begin + user_photos.photos.len() as i32;
+            if cache_begin <= offset && offset + limit <= cache_end {
+                // answer query from cache
+                let photos = user_photos.photos
+                    [(offset - cache_begin) as usize..(offset - cache_begin + limit) as usize]
+                    .iter()
+                    .map(get_chat_photo_object)
+                    .collect();
+                promise.set_value(td_api::ChatPhotos {
+                    total_count: user_photos.count,
+                    photos,
+                });
+                return;
+            }
+        }
+
+        let pending_request = PendingGetPhotoRequest {
+            offset,
+            limit,
+            retry_count: 0,
+            promise,
+        };
+        let requests = self
+            .pending_get_user_photos_requests
+            .entry(user_id.get())
+            .or_default();
+        requests.push(pending_request);
+        if requests.len() != 1 {
+            return;
+        }
+
+        self.send_get_user_photos_query(user_id);
+    }
+
+    /// `UserManager::send_get_user_photos_query`
+    /// (UserManager.cpp:6887-6913) — the cache-end offset adjustment is
+    /// computed with the query; the `photos.getUserPhotos` send itself is
+    /// [blocked: net] (M.4.16).
+    fn send_get_user_photos_query(&self, user_id: UserId) {
+        let Some(requests) = self.pending_get_user_photos_requests.get(&user_id.get()) else {
+            return;
+        };
+        debug_assert!(!requests.is_empty());
+        let mut offset = requests[0].offset;
+        let mut limit = requests[0].limit;
+        if let Some(user_photos) = self.user_photos.get(&user_id.get())
+            && user_photos.count != -1
+            && offset >= user_photos.offset
+        {
+            let cache_end = user_photos.offset + user_photos.photos.len() as i32;
+            if offset < cache_end {
+                // adjust offset to the end of cache
+                debug_assert!(offset + limit > cache_end); // otherwise the request has already been answered
+                limit = offset + limit - cache_end;
+                offset = cache_end;
+            }
+        }
+        tdutils::log_info!(
+            "Send photos.getUserPhotos for {user_id:?} at offset {offset} limit {} — [blocked: net]",
+            limit.max(MAX_GET_PROFILE_PHOTOS / 5)
+        );
+    }
+
+    /// `UserManager::on_get_user_profile_photos`
+    /// (UserManager.cpp:6915-6980): the pending-request retry machine.
+    /// `result` mirrors the query promise's `Result<Unit>`.
+    pub fn on_get_user_profile_photos(
+        &mut self,
+        env: &UserEnv,
+        user_id: UserId,
+        result: Result<(), Status>,
+    ) {
+        if env.global.close_flag() {
+            // ignore_result_if_closing — the parked answer is dropped
+            return;
+        }
+        let Some(mut pending_requests) =
+            self.pending_get_user_photos_requests.remove(&user_id.get())
+        else {
+            return;
+        };
+        debug_assert!(!pending_requests.is_empty());
+        if let Err(status) = result {
+            for request in &mut pending_requests {
+                request.promise.set_error(status.clone());
+            }
+            return;
+        }
+        let count = self.add_user_photos(user_id).count;
+        if count == -1 {
+            debug_assert!(self.have_min_user(user_id));
+            // received result has just been dropped; resend request
+            pending_requests[0].retry_count += 1;
+            if pending_requests[0].retry_count >= 3 {
+                pending_requests[0]
+                    .promise
+                    .set_error(Status::error(500, "Failed to return profile photos"));
+                pending_requests.remove(0);
+                if pending_requests.is_empty() {
+                    return;
+                }
+            }
+            self.pending_get_user_photos_requests
+                .insert(user_id.get(), pending_requests);
+            self.send_get_user_photos_query(user_id);
+            return;
+        }
+
+        let user_photos = self.user_photos.get(&user_id.get()).unwrap();
+        debug_assert_ne!(user_photos.offset, -1);
+        tdutils::log_info!(
+            "Have {} cached user profile photos at offset {}",
+            user_photos.count,
+            user_photos.offset
+        );
+        let mut left_requests = Vec::new();
+        for (request_index, request_slot) in pending_requests.iter_mut().enumerate() {
+            let mut request = std::mem::replace(
+                request_slot,
+                PendingGetPhotoRequest {
+                    offset: 0,
+                    limit: 0,
+                    retry_count: 0,
+                    promise: Promise::default(),
+                },
+            );
+
+            if request.offset >= user_photos.count {
+                // offset is too big
+                request.promise.set_value(td_api::ChatPhotos {
+                    total_count: user_photos.count,
+                    photos: Vec::new(),
+                });
+                continue;
+            }
+
+            if request.limit > user_photos.count - request.offset {
+                request.limit = user_photos.count - request.offset;
+            }
+
+            let cache_begin = user_photos.offset;
+            let cache_end = cache_begin + user_photos.photos.len() as i32;
+            if cache_begin <= request.offset && request.offset + request.limit <= cache_end {
+                // answer query from cache
+                let photos = user_photos.photos[(request.offset - cache_begin) as usize
+                    ..(request.offset - cache_begin + request.limit) as usize]
+                    .iter()
+                    .map(get_chat_photo_object)
+                    .collect();
+                request.promise.set_value(td_api::ChatPhotos {
+                    total_count: user_photos.count,
+                    photos,
+                });
+                continue;
+            }
+
+            request.retry_count += 1;
+            if request_index == 0 && request.retry_count >= 3 {
+                request
+                    .promise
+                    .set_error(Status::error(500, "Failed to get profile photos"));
+                continue;
+            }
+
+            left_requests.push(request);
+        }
+
+        if !left_requests.is_empty() {
+            let requests = self
+                .pending_get_user_photos_requests
+                .entry(user_id.get())
+                .or_default();
+            let need_send = requests.is_empty();
+            requests.extend(left_requests);
+            if need_send {
+                self.send_get_user_photos_query(user_id);
+            }
+        }
+    }
+
+    /// `UserManager::on_get_user_photos` (UserManager.cpp:7024-7101):
+    /// the photos.getUserPhotos answer intake and cache fill.
+    pub fn on_get_user_photos(
+        &mut self,
+        user_id: UserId,
+        offset: i32,
+        limit: i32,
+        mut total_count: i32,
+        photos: Vec<telegram_api::Photo>,
+    ) {
+        let photo_count = photos.len() as i32;
+        let min_total_count = if offset >= 0 && photo_count > 0 {
+            offset
+        } else {
+            0
+        } + photo_count;
+        if total_count < min_total_count {
+            tdutils::log_error!(
+                "Receive wrong photos total_count {total_count} for user {user_id:?}: receive \
+                 {photo_count} photos with offset {offset}"
+            );
+            total_count = min_total_count;
+        }
+        if limit < photo_count {
+            tdutils::log_error!(
+                "Requested not more than {limit} photos, but {photo_count} received"
+            );
+        }
+
+        if !self.users.contains_key(&user_id.get()) {
+            tdutils::log_error!("Can't find {user_id:?}");
+            return;
+        }
+
+        if offset == -1 {
+            // from reload_user_profile_photo
+            debug_assert_eq!(limit, 1);
+            for photo_ptr in photos {
+                if let telegram_api::Photo::photo(server_photo) = photo_ptr {
+                    let current_photo_id = self.users.get(&user_id.get()).unwrap().photo.id;
+                    if server_photo.id == current_photo_id {
+                        // convert_photo_to_profile_photo + the
+                        // registering get_profile_photo (cpp:7047-7054) —
+                        // a no-op until the Files step (module docs)
+                    }
+                    let photo = get_photo(telegram_api::Photo::photo(server_photo));
+                    self.register_user_photo(user_id, &photo);
+                }
+            }
+            return;
+        }
+
+        tdutils::log_info!(
+            "Receive {photo_count} photos of {user_id:?} out of {total_count} with offset \
+             {offset} and limit {limit}"
+        );
+        // add_user_photos + the cache fill — the record is taken out of
+        // the map so register_user_photo can borrow the manager
+        let mut user_photos = self.user_photos.remove(&user_id.get()).unwrap_or_default();
+        user_photos.count = total_count;
+        debug_assert!(
+            self.pending_get_user_photos_requests
+                .contains_key(&user_id.get())
+        );
+
+        if user_photos.offset == -1 {
+            user_photos.offset = 0;
+            debug_assert!(user_photos.photos.is_empty());
+        }
+
+        if offset != user_photos.photos.len() as i32 + user_photos.offset {
+            tdutils::log_info!(
+                "Inappropriate offset to append {user_id:?} profile photos to cache: offset = \
+                 {offset}, current_offset = {}, photo_count = {}",
+                user_photos.offset,
+                user_photos.photos.len()
+            );
+            user_photos.photos.clear();
+            user_photos.offset = offset;
+        }
+
+        for photo in photos {
+            let user_photo = get_photo(photo);
+            if user_photo.is_empty() {
+                tdutils::log_error!(
+                    "Receive empty profile photo in getUserPhotos request for {user_id:?} with \
+                     offset {offset} and limit {limit}"
+                );
+                user_photos.count -= 1;
+                debug_assert!(user_photos.count >= 0);
+                continue;
+            }
+
+            user_photos.photos.push(user_photo);
+            let back = user_photos.photos.last().unwrap().clone();
+            self.register_user_photo(user_id, &back);
+        }
+        if user_photos.offset > user_photos.count {
+            user_photos.offset = user_photos.count;
+            user_photos.photos.clear();
+        }
+
+        let known_photo_count = user_photos.photos.len() as i32;
+        if user_photos.offset + known_photo_count > user_photos.count {
+            user_photos
+                .photos
+                .truncate((user_photos.count - user_photos.offset) as usize);
+        }
+        self.user_photos.insert(user_id.get(), user_photos);
+    }
+
+    /// `UserManager::reload_user_profile_photo`
+    /// (UserManager.cpp:6982-6992) — the `photos.getUserPhotos` send with
+    /// offset -1 is [blocked: net] (M.4.16).
+    pub fn reload_user_profile_photo(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        photo_id: i64,
+        promise: Promise<()>,
+    ) {
+        self.get_user_force(env, user_id, "reload_user_profile_photo");
+        let input_user = self.get_input_user(env, user_id);
+        if let Err(status) = input_user {
+            let mut promise = promise;
+            promise.set_error(status);
+            return;
+        }
+        tdutils::log_info!("Reload profile photo {photo_id} of {user_id:?} — [blocked: net]");
+    }
+
+    /// `UserManager::get_user_profile_photo_file_source_id`
+    /// (UserManager.cpp:6995-7013).
+    pub fn get_user_profile_photo_file_source_id(
+        &mut self,
+        user_id: UserId,
+        photo_id: i64,
+    ) -> FileSourceId {
+        if !user_id.is_valid() {
+            return FileSourceId::default();
+        }
+
+        let have_photo_id = self
+            .users
+            .get(&user_id.get())
+            .map(|u| u.photo_ids.contains(&photo_id))
+            .unwrap_or(false);
+        if have_photo_id {
+            // photo was already added, source ID was registered and
+            // shouldn't be needed
+            return FileSourceId::default();
+        }
+
+        if let Some(&source_id) = self
+            .user_profile_photo_file_source_ids
+            .get(&(user_id.get(), photo_id))
+            && source_id.is_valid()
+        {
+            return source_id;
+        }
+        let source_id = self.create_file_source_id();
+        self.user_profile_photo_file_source_ids
+            .insert((user_id.get(), photo_id), source_id);
+        source_id
+    }
+
+    /// `UserManager::register_user_photo` (UserManager.cpp:3706-3737):
+    /// the photo-id registration and the file-source bookkeeping. The
+    /// file-type probe (`ProfilePhoto`-typed sizes return early) reads
+    /// FileManager state the placeholders cannot carry — the listing
+    /// registers `FileType::Photo` sizes only (module docs), so the
+    /// pre-check reduces to the empty/files check.
+    pub fn register_user_photo(&mut self, user_id: UserId, photo: &Photo) {
+        let photo_file_ids = photo_get_file_ids(photo);
+        if photo.is_empty() || photo_file_ids.is_empty() {
+            return;
+        }
+        // file_type == FileType::ProfilePhoto return / CHECK(Photo) —
+        // the Files step restores the probe
+        let photo_id = photo.id;
+        if photo_id != 0 && self.users.contains_key(&user_id.get()) {
+            let inserted = self
+                .users
+                .get_mut(&user_id.get())
+                .unwrap()
+                .photo_ids
+                .insert(photo_id);
+            if inserted {
+                if user_id == self.my_id {
+                    self.my_photo_file_id.insert(photo_id, photo_file_ids[0]);
+                }
+                // the photo is immutable and fully received — its file
+                // source is forgotten (cpp:3728-3733); the add_file_source
+                // fan-out over the file ids is the Files step
+                let had_source = self
+                    .user_profile_photo_file_source_ids
+                    .remove(&(user_id.get(), photo_id));
+                if had_source.is_none() {
+                    // create_user_photo_file_source — the Files step
+                }
+            }
+        }
+    }
+
+    /// `UserManager::register_suggested_profile_photo`
+    /// (UserManager.cpp:3692-3704).
+    pub fn register_suggested_profile_photo(&mut self, photo: &Photo) {
+        let photo_file_ids = photo_get_file_ids(photo);
+        if photo.is_empty() || photo_file_ids.is_empty() {
+            return;
+        }
+        let photo_id = photo.id;
+        if photo_id != 0 {
+            self.my_photo_file_id.insert(photo_id, photo_file_ids[0]);
+        }
+    }
+
+    /// `UserManager::start_up`'s saved-music block
+    /// (UserManager.cpp:2829-2845) — call only for the authorized
+    /// non-bot session. An empty or broken value means the C++ reloads
+    /// the list from the server (the net step) and the set stays
+    /// un-inited.
+    pub fn init_my_saved_music_ids(
+        &mut self,
+        binlog_pmc: &mut BinlogKeyValue,
+        is_authorized_non_bot: bool,
+    ) {
+        if !is_authorized_non_bot {
+            return;
+        }
+        let value = binlog_pmc.get_raw(Self::get_my_saved_music_ids_database_key().as_bytes());
+        let ids = Self::parse_my_saved_music_ids(&value);
+        let Some(ids) = ids else {
+            // reload_my_saved_music_list — the net step
+            return;
+        };
+        for saved_music_id in ids {
+            if saved_music_id != 0 {
+                self.my_saved_music_ids.insert(saved_music_id);
+            }
+        }
+        self.are_my_saved_music_ids_inited = true;
+    }
+
+    /// The `vector<int64>` log-event form: `int32` count, then raw
+    /// `int64`s (tl_helpers.h:156-161).
+    fn parse_my_saved_music_ids(value: &[u8]) -> Option<Vec<i64>> {
+        if value.is_empty() {
+            return None;
+        }
+        let mut parser = Parser::new(value);
+        let size = match parser.i32_() {
+            Ok(size) if size >= 0 => size as usize,
+            _ => return None,
+        };
+        let mut ids = Vec::with_capacity(size);
+        for _ in 0..size {
+            ids.push(parser.i64_().ok()?);
+        }
+        // `log_event_parse`'s fetch_end — trailing bytes reject the value.
+        parser.fetch_end().ok()?;
+        Some(ids)
+    }
+
+    /// `UserManager::save_my_saved_music_ids`
+    /// (UserManager.cpp:7744-7750). The C++ iterates a FlatHashSet in
+    /// hash order; the Rust BTreeSet's ascending order is deterministic
+    /// and round-trips the same set.
+    pub fn save_my_saved_music_ids(&mut self, env: &mut UserEnv) {
+        self.are_my_saved_music_ids_inited = true;
+        let mut value = Vec::new();
+        store_parse::store_i32(&mut value, self.my_saved_music_ids.len() as i32);
+        for saved_music_id in &self.my_saved_music_ids {
+            store_parse::store_i64(&mut value, *saved_music_id);
+        }
+        env.global.td_db().binlog_pmc().set_raw(
+            Self::get_my_saved_music_ids_database_key().as_bytes(),
+            &value,
+        );
+    }
+
+    /// `UserManager::get_my_saved_music_ids_database_key`
+    /// (UserManager.cpp:7740-7742).
+    fn get_my_saved_music_ids_database_key() -> &'static str {
+        "my_saved_music_ids"
+    }
+
+    /// `UserManager::check_is_saved_music`'s local half
+    /// (UserManager.cpp:7168-7176): membership over the loaded set. The
+    /// `is_saved_music` not-inited reload and the `G()->close_status()`
+    /// gate are the net step (M.4.16); the FileId → document-id
+    /// conversion goes through the location registry.
+    pub fn check_is_saved_music(&mut self, file_id: FileId, promise: &mut Promise<()>) {
+        assert!(
+            self.are_my_saved_music_ids_inited,
+            "check_is_saved_music requires the loaded saved-music list"
+        );
+        let document_id = self.get_saved_music_document_id(file_id, false).0;
+        if !self.my_saved_music_ids.contains(&document_id) {
+            promise.set_error(Status::error(404, "Not Found"));
+            return;
+        }
+        promise.set_value(());
+    }
+
+    /// `UserManager::get_saved_music_document_id`
+    /// (UserManager.cpp:4673-4693) over the location registry (module
+    /// docs): an unknown or non-audio file answers the empty pair; the
+    /// `from_server` LOG(ERROR) surfaces fire for registry misses.
+    fn get_saved_music_document_id(
+        &self,
+        saved_music_file_id: FileId,
+        from_server: bool,
+    ) -> (i64, i64) {
+        match self
+            .saved_music_file_locations
+            .get(&saved_music_file_id.get())
+        {
+            Some(location) => *location,
+            None => {
+                if from_server {
+                    tdutils::log_error!(
+                        "Saved music {saved_music_file_id:?} has no remote location"
+                    );
+                }
+                (0, 0)
+            }
+        }
+    }
+
+    /// The `documents_manager_->on_get_document` Audio-classification
+    /// stand-in (the DocumentsManager step replaces it): a `document`
+    /// carrying a non-voice `documentAttributeAudio` is saved music. It
+    /// gets a placeholder FileId registered in the location registry.
+    fn parse_saved_music_document(&mut self, document: telegram_api::Document) -> Option<FileId> {
+        let telegram_api::Document::document(document) = document else {
+            return None;
+        };
+        let is_audio = document.attributes.iter().any(|attribute| {
+            matches!(
+                attribute,
+                telegram_api::DocumentAttribute::documentAttributeAudio(audio)
+                    if !audio.voice
+            )
+        });
+        if !is_audio {
+            return None;
+        }
+        let file_id = FileId::new(self.next_saved_music_file_id + 1);
+        self.next_saved_music_file_id += 1;
+        self.saved_music_file_locations
+            .insert(file_id.get(), (document.id, document.access_hash));
+        Some(file_id)
+    }
+
+    /// `UserManager::check_saved_music_file_id`
+    /// (UserManager.cpp:7115-7145) over the registry stand-in: an
+    /// invalid FileId answers "Invalid file identifier specified", a
+    /// registry miss "Unknown file identifier specified" (the C++
+    /// separates the empty file view from the missing audio object the
+    /// same way). Returns the inputDocument pair.
+    fn check_saved_music_file_id(
+        &self,
+        file_id: &mut FileId,
+        allow_empty: bool,
+    ) -> Result<(i64, i64), Status> {
+        if allow_empty && !file_id.is_valid() {
+            return Ok((0, 0));
+        }
+        if !file_id.is_valid() {
+            return Err(Status::error(400, "Invalid file identifier specified"));
+        }
+        let location = self.saved_music_file_locations.get(&file_id.get());
+        let Some(&(document_id, access_hash)) = location else {
+            return Err(Status::error(400, "Unknown file identifier specified"));
+        };
+        Ok((document_id, access_hash))
+    }
+
+    /// `UserManager::add_saved_music` (UserManager.cpp:7318-7332): the
+    /// validation is local; the `messages.saveMusic` send is [blocked:
+    /// net] (M.4.16).
+    pub fn add_saved_music(
+        &mut self,
+        file_id: FileId,
+        after_file_id: FileId,
+        promise: &mut Promise<()>,
+    ) {
+        let mut file_id = file_id;
+        let mut after_file_id = after_file_id;
+        if let Err(status) = self.check_saved_music_file_id(&mut file_id, false) {
+            promise.set_error(status);
+            return;
+        }
+        if let Err(status) = self.check_saved_music_file_id(&mut after_file_id, true) {
+            promise.set_error(status);
+            return;
+        }
+        if file_id == after_file_id {
+            promise.set_error(Status::error(400, "Can't place saved music after self"));
+            return;
+        }
+        tdutils::log_info!("Send messages.saveMusic — [blocked: net]");
+    }
+
+    /// `UserManager::on_add_saved_music` (UserManager.cpp:7334-7370).
+    pub fn on_add_saved_music(
+        &mut self,
+        env: &mut UserEnv,
+        file_id: FileId,
+        after_file_id: FileId,
+        promise: &mut Promise<()>,
+    ) {
+        let document_id = self.get_saved_music_document_id(file_id, true).0;
+        if document_id != 0 && !self.my_saved_music_ids.contains(&document_id) {
+            self.my_saved_music_ids.insert(document_id);
+            self.save_my_saved_music_ids(env);
+        }
+
+        let user_id = self.my_id;
+        let cache_live = self
+            .user_saved_music
+            .get(&user_id.get())
+            .map(|cache| cache.count != -1 && cache.offset != -1)
+            .unwrap_or(false);
+        if cache_live {
+            // td::remove(saved_music_file_ids, file_id) first...
+            let existing = {
+                let cache = self.user_saved_music.get(&user_id.get()).unwrap();
+                cache
+                    .saved_music_file_ids
+                    .iter()
+                    .position(|&fid| fid == file_id)
+            };
+            if let Some(index) = existing {
+                self.user_saved_music
+                    .get_mut(&user_id.get())
+                    .unwrap()
+                    .saved_music_file_ids
+                    .remove(index);
+            } else {
+                self.user_saved_music.get_mut(&user_id.get()).unwrap().count += 1;
+            }
+            if !after_file_id.is_valid() {
+                let cache = self.user_saved_music.get_mut(&user_id.get()).unwrap();
+                if cache.offset > 0 {
+                    cache.offset += 1;
+                } else {
+                    cache.saved_music_file_ids.insert(0, file_id);
+                }
+            } else {
+                // ...then the anchor lookup over the mutated list, like
+                // the C++ std::find
+                let after = {
+                    let cache = self.user_saved_music.get(&user_id.get()).unwrap();
+                    cache
+                        .saved_music_file_ids
+                        .iter()
+                        .position(|&fid| fid == after_file_id)
+                };
+                match after {
+                    None => {
+                        // can't find place to insert new saved music,
+                        // drop cache
+                        drop_user_saved_music_map(&mut self.user_saved_music, user_id, false);
+                    }
+                    Some(index) => {
+                        self.user_saved_music
+                            .get_mut(&user_id.get())
+                            .unwrap()
+                            .saved_music_file_ids
+                            .insert(index + 1, file_id);
+                    }
+                }
+            }
+        }
+        if !after_file_id.is_valid() {
+            let loaded = self.get_user_full_force(env, user_id, "on_add_saved_music");
+            if loaded {
+                Self::on_update_user_full_first_saved_music_file_id(
+                    self.users_full.get_mut(&user_id.get()).unwrap(),
+                    file_id,
+                );
+                self.update_user_full(env, user_id, "on_add_saved_music", false);
+            }
+        }
+        promise.set_value(());
+    }
+
+    /// `UserManager::remove_saved_music` (UserManager.cpp:7372-7378) —
+    /// the validation is local; the `messages.unsaveMusic` send is
+    /// [blocked: net] (M.4.16).
+    pub fn remove_saved_music(&mut self, file_id: FileId, promise: &mut Promise<()>) {
+        let mut file_id = file_id;
+        if let Err(status) = self.check_saved_music_file_id(&mut file_id, false) {
+            promise.set_error(status);
+            return;
+        }
+        tdutils::log_info!("Send messages.unsaveMusic — [blocked: net]");
+    }
+
+    /// `UserManager::on_remove_saved_music` (UserManager.cpp:7380-7420).
+    /// The `reload_user_full` fallback (cpp:7415) rides the net step —
+    /// the promise completes there (M.4.16).
+    pub fn on_remove_saved_music(
+        &mut self,
+        env: &mut UserEnv,
+        file_id: FileId,
+        promise: &mut Promise<()>,
+    ) {
+        let document_id = self.get_saved_music_document_id(file_id, true).0;
+        if self.my_saved_music_ids.remove(&document_id) {
+            self.save_my_saved_music_ids(env);
+        }
+
+        let user_id = self.my_id;
+        let cache_live = self
+            .user_saved_music
+            .get(&user_id.get())
+            .map(|cache| cache.count != -1 && cache.offset != -1)
+            .unwrap_or(false);
+        let mut removed_from_cache = false;
+        if cache_live {
+            let (position, offset) = {
+                let cache = self.user_saved_music.get(&user_id.get()).unwrap();
+                (
+                    cache
+                        .saved_music_file_ids
+                        .iter()
+                        .position(|&fid| fid == file_id),
+                    cache.offset,
+                )
+            };
+            if let Some(index) = position {
+                self.user_saved_music
+                    .get_mut(&user_id.get())
+                    .unwrap()
+                    .saved_music_file_ids
+                    .remove(index);
+                removed_from_cache = true;
+            }
+            if removed_from_cache || offset == 0 {
+                let cache = self.user_saved_music.get_mut(&user_id.get()).unwrap();
+                if cache.count > 0 {
+                    cache.count -= 1;
+                    if cache.offset > cache.count {
+                        cache.offset = cache.count;
+                    }
+                }
+            } else {
+                // can't find the removed saved music; drop cache, because
+                // offset could have been changed
+                drop_user_saved_music_map(&mut self.user_saved_music, user_id, false);
+            }
+        }
+        let loaded = self.get_user_full_force(env, user_id, "on_remove_saved_music");
+        let first_saved_matches = self
+            .users_full
+            .get(&user_id.get())
+            .map(|user_full| user_full.first_saved_music_file_id == file_id)
+            .unwrap_or(false);
+        if loaded && first_saved_matches {
+            let cache_head = self
+                .user_saved_music
+                .get(&user_id.get())
+                .map(|cache| {
+                    cache.count != -1 && cache.offset == 0 && !cache.saved_music_file_ids.is_empty()
+                })
+                .unwrap_or(false);
+            let cache_empty = self
+                .user_saved_music
+                .get(&user_id.get())
+                .map(|cache| cache.count == 0)
+                .unwrap_or(false);
+            if cache_head {
+                let new_first = self
+                    .user_saved_music
+                    .get(&user_id.get())
+                    .unwrap()
+                    .saved_music_file_ids[0];
+                Self::on_update_user_full_first_saved_music_file_id(
+                    self.users_full.get_mut(&user_id.get()).unwrap(),
+                    new_first,
+                );
+                self.update_user_full(env, user_id, "on_remove_saved_music 1", false);
+            } else if cache_empty {
+                Self::on_update_user_full_first_saved_music_file_id(
+                    self.users_full.get_mut(&user_id.get()).unwrap(),
+                    FileId::default(),
+                );
+                self.update_user_full(env, user_id, "on_remove_saved_music 2", false);
+            } else {
+                // reload_user_full — the net step; the promise completes
+                // there (M.4.16)
+                tdutils::log_info!(
+                    "Get full {user_id:?} from on_remove_saved_music — [blocked: net]"
+                );
+                return;
+            }
+        }
+        promise.set_value(());
+    }
+
+    /// `UserManager::add_user_saved_music` (UserManager.cpp:7566-7573).
+    fn add_user_saved_music(&mut self, user_id: UserId) -> &mut UserSavedMusic {
+        assert!(user_id.is_valid());
+        self.user_saved_music.entry(user_id.get()).or_default()
+    }
+
+    /// `UserManager::drop_user_saved_music` (UserManager.cpp:9535-9550);
+    /// the map mutation lives in the free fn so the add/remove state
+    /// machines stay borrow-clean.
+    fn drop_user_saved_music(&mut self, user_id: UserId, is_empty: bool, source: &str) {
+        let Some(cache) = self.user_saved_music.get(&user_id.get()) else {
+            return;
+        };
+        let new_count = if is_empty { 0 } else { -1 };
+        if cache.count == new_count {
+            debug_assert!(cache.saved_music_file_ids.is_empty());
+            debug_assert_eq!(cache.offset, cache.count);
+            return;
+        }
+        tdutils::log_info!(
+            "Drop saved music of {user_id:?} to {} from {source}",
+            if is_empty { "empty" } else { "unknown" }
+        );
+        drop_user_saved_music_map(&mut self.user_saved_music, user_id, is_empty);
+    }
+
+    /// `UserManager::get_user_saved_music` (UserManager.cpp:7422-7490).
+    /// The `users.getSavedMusic` send is [blocked: net] (M.4.16). The
+    /// audio objects are the codegen-forced empty payloads until the
+    /// AudiosManager step.
+    pub fn get_user_saved_music(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        offset: i32,
+        limit: i32,
+        mut promise: Promise<td_api::Audios>,
+    ) {
+        if offset < 0 {
+            promise.set_error(Status::error(400, "Parameter offset must be non-negative"));
+            return;
+        }
+        if limit <= 0 {
+            promise.set_error(Status::error(400, "Parameter limit must be positive"));
+            return;
+        }
+        let mut limit = limit.min(MAX_GET_SAVED_MUSIC);
+
+        if let Err(status) = self.get_input_user(env, user_id) {
+            promise.set_error(status);
+            return;
+        }
+
+        if self.get_user(user_id).is_none() {
+            promise.set_error(Status::error(400, "User not found"));
+            return;
+        }
+
+        self.add_user_saved_music(user_id);
+        if let Some(user_saved_music) = self.user_saved_music.get(&user_id.get())
+            && user_saved_music.count != -1
+        {
+            // know saved music count
+            debug_assert_ne!(user_saved_music.offset, -1);
+            tdutils::log_info!(
+                "Have {} cached saved music files at offset {}",
+                user_saved_music.count,
+                user_saved_music.offset
+            );
+            if offset >= user_saved_music.count {
+                // offset is too big
+                promise.set_value(td_api::Audios {
+                    total_count: user_saved_music.count,
+                    audios: Vec::new(),
+                });
+                return;
+            }
+            if limit > user_saved_music.count - offset {
+                limit = user_saved_music.count - offset;
+            }
+            let cache_begin = user_saved_music.offset;
+            let cache_end = cache_begin + user_saved_music.saved_music_file_ids.len() as i32;
+            if cache_begin <= offset && offset + limit <= cache_end {
+                // answer query from cache
+                let audios = user_saved_music.saved_music_file_ids
+                    [(offset - cache_begin) as usize..(offset - cache_begin + limit) as usize]
+                    .iter()
+                    .map(|_| empty_audio_object())
+                    .collect();
+                promise.set_value(td_api::Audios {
+                    total_count: user_saved_music.count,
+                    audios,
+                });
+                return;
+            }
+        }
+
+        let pending_request = PendingGetSavedMusicRequest {
+            offset,
+            limit,
+            retry_count: 0,
+            promise,
+        };
+        let requests = self
+            .pending_get_user_saved_music_requests
+            .entry(user_id.get())
+            .or_default();
+        requests.push(pending_request);
+        if requests.len() != 1 {
+            return;
+        }
+
+        self.send_get_user_saved_music_query(user_id);
+    }
+
+    /// `UserManager::send_get_user_saved_music_query`
+    /// (UserManager.cpp:7492-7518) — the send is [blocked: net] (M.4.16).
+    fn send_get_user_saved_music_query(&self, user_id: UserId) {
+        let Some(requests) = self
+            .pending_get_user_saved_music_requests
+            .get(&user_id.get())
+        else {
+            return;
+        };
+        debug_assert!(!requests.is_empty());
+        let mut offset = requests[0].offset;
+        let mut limit = requests[0].limit;
+        if let Some(user_saved_music) = self.user_saved_music.get(&user_id.get())
+            && user_saved_music.count != -1
+            && offset >= user_saved_music.offset
+        {
+            let cache_end =
+                user_saved_music.offset + user_saved_music.saved_music_file_ids.len() as i32;
+            if offset < cache_end {
+                // adjust offset to the end of cache
+                debug_assert!(offset + limit > cache_end);
+                limit = offset + limit - cache_end;
+                offset = cache_end;
+            }
+        }
+        tdutils::log_info!(
+            "Send users.getSavedMusic for {user_id:?} at offset {offset} limit {} — [blocked: net]",
+            limit.max(MAX_GET_SAVED_MUSIC / 5)
+        );
+    }
+
+    /// `UserManager::finish_get_user_saved_music`
+    /// (UserManager.cpp:7520-7564): the pending-request retry machine.
+    pub fn finish_get_user_saved_music(
+        &mut self,
+        env: &UserEnv,
+        user_id: UserId,
+        result: Result<(), Status>,
+    ) {
+        if env.global.close_flag() {
+            // ignore_result_if_closing — the parked answer is dropped
+            return;
+        }
+        let Some(mut pending_requests) = self
+            .pending_get_user_saved_music_requests
+            .remove(&user_id.get())
+        else {
+            return;
+        };
+        debug_assert!(!pending_requests.is_empty());
+        if let Err(status) = result {
+            for request in &mut pending_requests {
+                request.promise.set_error(status.clone());
+            }
+            return;
+        }
+        let count = self.add_user_saved_music(user_id).count;
+        if count == -1 {
+            debug_assert!(self.have_min_user(user_id));
+            // received result has just been dropped; resend request
+            pending_requests[0].retry_count += 1;
+            if pending_requests[0].retry_count >= 3 {
+                pending_requests[0]
+                    .promise
+                    .set_error(Status::error(500, "Failed to return saved music"));
+                pending_requests.remove(0);
+                if pending_requests.is_empty() {
+                    return;
+                }
+            }
+            self.pending_get_user_saved_music_requests
+                .insert(user_id.get(), pending_requests);
+            self.send_get_user_saved_music_query(user_id);
+            return;
+        }
+
+        let user_saved_music = self.user_saved_music.get(&user_id.get()).unwrap();
+        debug_assert_ne!(user_saved_music.offset, -1);
+        tdutils::log_info!(
+            "Have {} cached saved music files at offset {}",
+            user_saved_music.count,
+            user_saved_music.offset
+        );
+        let mut left_requests = Vec::new();
+        for (request_index, request_slot) in pending_requests.iter_mut().enumerate() {
+            let mut request = std::mem::replace(
+                request_slot,
+                PendingGetSavedMusicRequest {
+                    offset: 0,
+                    limit: 0,
+                    retry_count: 0,
+                    promise: Promise::default(),
+                },
+            );
+
+            if request.offset >= user_saved_music.count {
+                // offset is too big
+                request.promise.set_value(td_api::Audios {
+                    total_count: user_saved_music.count,
+                    audios: Vec::new(),
+                });
+                continue;
+            }
+
+            if request.limit > user_saved_music.count - request.offset {
+                request.limit = user_saved_music.count - request.offset;
+            }
+
+            let cache_begin = user_saved_music.offset;
+            let cache_end = cache_begin + user_saved_music.saved_music_file_ids.len() as i32;
+            if cache_begin <= request.offset && request.offset + request.limit <= cache_end {
+                // answer query from cache
+                let audios = user_saved_music.saved_music_file_ids[(request.offset - cache_begin)
+                    as usize
+                    ..(request.offset - cache_begin + request.limit) as usize]
+                    .iter()
+                    .map(|_| empty_audio_object())
+                    .collect();
+                request.promise.set_value(td_api::Audios {
+                    total_count: user_saved_music.count,
+                    audios,
+                });
+                continue;
+            }
+
+            request.retry_count += 1;
+            if request_index == 0 && request.retry_count >= 3 {
+                request
+                    .promise
+                    .set_error(Status::error(500, "Failed to get saved music"));
+                continue;
+            }
+
+            left_requests.push(request);
+        }
+
+        if !left_requests.is_empty() {
+            let requests = self
+                .pending_get_user_saved_music_requests
+                .entry(user_id.get())
+                .or_default();
+            let need_send = requests.is_empty();
+            requests.extend(left_requests);
+            if need_send {
+                self.send_get_user_saved_music_query(user_id);
+            }
+        }
+    }
+
+    /// `UserManager::on_get_user_saved_music`
+    /// (UserManager.cpp:7575-7657): the users.getSavedMusic answer
+    /// intake and cache fill. The document parse goes through the
+    /// registry stand-in (`parse_saved_music_document`).
+    pub fn on_get_user_saved_music(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        offset: i32,
+        limit: i32,
+        mut total_count: i32,
+        documents: Vec<telegram_api::Document>,
+    ) {
+        let saved_music_count = documents.len() as i32;
+        let min_total_count = if saved_music_count > 0 { offset } else { 0 } + saved_music_count;
+        if total_count < min_total_count {
+            tdutils::log_error!(
+                "Receive wrong saved music total_count {total_count} for user {user_id:?}: \
+                 receive {saved_music_count} saved music files with offset {offset}"
+            );
+            total_count = min_total_count;
+        }
+        if limit < saved_music_count {
+            tdutils::log_error!(
+                "Requested not more than {limit} saved music files, but {saved_music_count} \
+                 received"
+            );
+        }
+
+        assert!(self.users.contains_key(&user_id.get()));
+
+        tdutils::log_info!(
+            "Receive {saved_music_count} saved music files of {user_id:?} out of {total_count} \
+             with offset {offset} and limit {limit}"
+        );
+        // add_user_saved_music + the cache fill — the record is taken out
+        // of the map so the registry writes can borrow the manager
+        let mut user_saved_music = self
+            .user_saved_music
+            .remove(&user_id.get())
+            .unwrap_or_default();
+        user_saved_music.count = total_count;
+        debug_assert!(
+            self.pending_get_user_saved_music_requests
+                .contains_key(&user_id.get())
+        );
+
+        if user_saved_music.offset == -1 {
+            user_saved_music.offset = 0;
+            debug_assert!(user_saved_music.saved_music_file_ids.is_empty());
+        }
+
+        if offset != user_saved_music.saved_music_file_ids.len() as i32 + user_saved_music.offset {
+            tdutils::log_info!(
+                "Inappropriate offset to append {user_id:?} saved music to cache: offset = \
+                 {offset}, current_offset = {}, saved_music_count = {}",
+                user_saved_music.offset,
+                user_saved_music.saved_music_file_ids.len()
+            );
+            user_saved_music.saved_music_file_ids.clear();
+            user_saved_music.offset = offset;
+        }
+
+        let need_update_my_saved_music_ids =
+            user_id == self.my_id && self.are_my_saved_music_ids_inited;
+        let mut need_save_my_saved_music_ids = false;
+        for document in documents {
+            let parsed_file_id = self.parse_saved_music_document(document);
+            let Some(file_id) = parsed_file_id else {
+                user_saved_music.count -= 1;
+                debug_assert!(user_saved_music.count >= 0);
+                continue;
+            };
+            let document_id = self.get_saved_music_document_id(file_id, true).0;
+            if document_id == 0 {
+                user_saved_music.count -= 1;
+                debug_assert!(user_saved_music.count >= 0);
+                continue;
+            }
+            if need_update_my_saved_music_ids && !self.my_saved_music_ids.contains(&document_id) {
+                self.my_saved_music_ids.insert(document_id);
+                need_save_my_saved_music_ids = true;
+            }
+            user_saved_music.saved_music_file_ids.push(file_id);
+            self.register_user_saved_music(env, user_id, file_id);
+        }
+        if user_saved_music.offset > user_saved_music.count {
+            user_saved_music.offset = user_saved_music.count;
+            user_saved_music.saved_music_file_ids.clear();
+        }
+        if need_save_my_saved_music_ids {
+            self.save_my_saved_music_ids(env);
+        }
+
+        let known_saved_music_count = user_saved_music.saved_music_file_ids.len() as i32;
+        if user_saved_music.offset + known_saved_music_count > user_saved_music.count {
+            user_saved_music
+                .saved_music_file_ids
+                .truncate((user_saved_music.count - user_saved_music.offset) as usize);
+        }
+        let cache_offset_zero = user_saved_music.offset == 0;
+        let cache_head = if user_saved_music.saved_music_file_ids.is_empty() {
+            FileId::default()
+        } else {
+            user_saved_music.saved_music_file_ids[0]
+        };
+        self.user_saved_music
+            .insert(user_id.get(), user_saved_music);
+
+        if cache_offset_zero {
+            let loaded = self.get_user_full_force(env, user_id, "on_get_user_saved_music");
+            if loaded {
+                Self::on_update_user_full_first_saved_music_file_id(
+                    self.users_full.get_mut(&user_id.get()).unwrap(),
+                    cache_head,
+                );
+                self.update_user_full(env, user_id, "on_get_user_saved_music", false);
+            }
+        }
+    }
+
+    /// `UserManager::reload_user_saved_music`
+    /// (UserManager.cpp:7659-7666) — the send is [blocked: net] (M.4.16).
+    pub fn reload_user_saved_music(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        document_id: i64,
+        access_hash: i64,
+        promise: &mut Promise<()>,
+    ) {
+        self.get_user_force(env, user_id, "reload_user_saved_music");
+        if let Err(status) = self.get_input_user(env, user_id) {
+            promise.set_error(status);
+            return;
+        }
+        tdutils::log_info!(
+            "Reload saved music document {document_id} (hash {access_hash}) of {user_id:?} — \
+             [blocked: net]"
+        );
+    }
+
+    /// `UserManager::get_user_saved_music_file_source_id`
+    /// (UserManager.cpp:7668-7681).
+    pub fn get_user_saved_music_file_source_id(
+        &mut self,
+        user_id: UserId,
+        document_id: i64,
+        access_hash: i64,
+    ) -> FileSourceId {
+        if !user_id.is_valid() {
+            return FileSourceId::default();
+        }
+
+        if let Some(&source_id) =
+            self.user_saved_music_file_source_ids
+                .get(&(user_id.get(), document_id, access_hash))
+            && source_id.is_valid()
+        {
+            return source_id;
+        }
+        let source_id = self.create_file_source_id();
+        self.user_saved_music_file_source_ids
+            .insert((user_id.get(), document_id, access_hash), source_id);
+        source_id
+    }
+
+    /// `UserManager::register_user_saved_music`
+    /// (UserManager.cpp:4696-4712).
+    fn register_user_saved_music(&mut self, env: &mut UserEnv, user_id: UserId, file_id: FileId) {
+        if !file_id.is_valid() || env.auth_is_bot {
+            return;
+        }
+        let document_id = self.get_saved_music_document_id(file_id, true);
+        if document_id.0 == 0 {
+            return;
+        }
+        // the file-source registration + add_file_source fan-out — the
+        // Files step
+        let _ = self.get_user_saved_music_file_source_id(user_id, document_id.0, document_id.1);
+    }
+
+    /// `UserManager::on_update_user_full_first_saved_music_file_id`
+    /// (UserManager.cpp:4648-4654).
+    fn on_update_user_full_first_saved_music_file_id(
+        user_full: &mut UserFull,
+        first_saved_music_file_id: FileId,
+    ) {
+        if user_full.first_saved_music_file_id != first_saved_music_file_id {
+            user_full.first_saved_music_file_id = first_saved_music_file_id;
+            user_full.is_first_saved_music_file_id_changed = true;
+            user_full.is_changed = true;
+        }
+    }
+
+    /// `UserManager::reload_my_saved_music_list`
+    /// (UserManager.cpp:7683-7699): the promise queue is local; the
+    /// `account.getSavedMusicIds` send is [blocked: net] (M.4.16) — the
+    /// queued promises complete there.
+    pub fn reload_my_saved_music_list(&mut self, promise: Promise<()>) {
+        self.reload_my_saved_music_queries.push(promise);
+        if self.reload_my_saved_music_queries.len() != 1 {
+            return;
+        }
+        tdutils::log_info!("Send account.getSavedMusicIds — [blocked: net]");
+    }
+
+    /// `UserManager::on_get_my_saved_music_list`
+    /// (UserManager.cpp:7701-7738). The close-path abort applies when
+    /// the result is ok; the not-modified form keeps the set.
+    pub fn on_get_my_saved_music_list(
+        &mut self,
+        env: &mut UserEnv,
+        saved_music_ids: telegram_api::account_SavedMusicIds,
+    ) {
+        let mut promises = std::mem::take(&mut self.reload_my_saved_music_queries);
+        if env.global.close_flag() {
+            // the C++ turns an ok result into request_aborted_error
+            for promise in &mut promises {
+                promise.set_error(Status::error(500, "Request aborted"));
+            }
+            return;
+        }
+        match saved_music_ids {
+            telegram_api::account_SavedMusicIds::account_savedMusicIdsNotModified(_) => {}
+            telegram_api::account_SavedMusicIds::account_savedMusicIds(ids) => {
+                self.my_saved_music_ids.clear();
+                for saved_music_id in ids.ids {
+                    if saved_music_id == 0 || self.my_saved_music_ids.contains(&saved_music_id) {
+                        tdutils::log_error!("Receive {saved_music_id}");
+                        continue;
+                    }
+                    self.my_saved_music_ids.insert(saved_music_id);
+                }
+                self.save_my_saved_music_ids(env);
+            }
+        }
+        for promise in &mut promises {
+            promise.set_value(());
+        }
+    }
+
     // The read-projection helpers keep the on_get_user control flow flat.
     fn u_is_received(&self, user_id: UserId) -> bool {
         self.users
@@ -6349,6 +8188,13 @@ mod tests {
 
     impl TempEnv {
         fn new(name: &str) -> (TempEnv, UserManager) {
+            Self::with_chat_info_db(name, true)
+        }
+
+        /// The bot photo-hold path needs a database without the chat
+        /// info (`TdDb::open` forces chat info back on when the message
+        /// database is requested, so both go off together).
+        fn with_chat_info_db(name: &str, chat_info_db: bool) -> (TempEnv, UserManager) {
             // Unique per test thread: parallel tests in one process would
             // otherwise flock the same binlog against each other.
             let dir = std::env::temp_dir()
@@ -6363,6 +8209,8 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             let opened = tddb::td_db::TdDb::open(tddb::td_db::Parameters {
                 database_directory: dir.clone(),
+                use_message_database: chat_info_db,
+                use_chat_info_database: chat_info_db,
                 ..Default::default()
             })
             .unwrap();
@@ -6407,6 +8255,118 @@ mod tests {
             first_name: first_name.to_owned(),
             ..telegram_api::user::default()
         }
+    }
+
+    /// A received user with an access hash — passes `get_input_user`.
+    fn seed_received_user(temp: &mut TempEnv, um: &mut UserManager, id: i64) -> UserId {
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(id, "Alice", USER_ACCESS_HASH_MASK | (1 << 1))),
+            "test",
+        )
+    }
+
+    /// A `telegram_api::Photo` with the 'a'/'c' pair (the
+    /// `as_profile_photo` selection) plus an 'm' size.
+    fn telegram_photo(id: i64) -> telegram_api::Photo {
+        let size = |t: &str, dim: i32| {
+            telegram_api::PhotoSize::photoSize(telegram_api::photoSize {
+                r#type: t.to_owned(),
+                w: dim,
+                h: dim,
+                size: dim * dim,
+            })
+        };
+        telegram_api::Photo::photo(telegram_api::photo {
+            flags: 0,
+            has_stickers: false,
+            id,
+            access_hash: 7,
+            file_reference: Vec::new(),
+            date: 1000,
+            sizes: vec![size("a", 160), size("c", 800), size("m", 320)],
+            video_sizes: Vec::new(),
+            dc_id: 2,
+        })
+    }
+
+    fn photo_with_id(id: i64) -> Photo {
+        get_photo(telegram_photo(id))
+    }
+
+    /// A `telegram_api::Document` with a non-voice audio attribute.
+    fn audio_document(id: i64, access_hash: i64) -> telegram_api::Document {
+        telegram_api::Document::document(telegram_api::document {
+            flags: 0,
+            id,
+            access_hash,
+            file_reference: Vec::new(),
+            date: 1234,
+            mime_type: "audio/mpeg".to_owned(),
+            size: 100_000,
+            thumbs: Vec::new(),
+            video_thumbs: Vec::new(),
+            dc_id: 2,
+            attributes: vec![telegram_api::DocumentAttribute::documentAttributeAudio(
+                telegram_api::documentAttributeAudio {
+                    flags: 0,
+                    voice: false,
+                    duration: 180,
+                    title: "Song".to_owned(),
+                    performer: "Artist".to_owned(),
+                    waveform: Vec::new(),
+                },
+            )],
+        })
+    }
+
+    /// A document that classifies as nothing (no audio attribute).
+    fn document_without_audio(id: i64) -> telegram_api::Document {
+        telegram_api::Document::document(telegram_api::document {
+            flags: 0,
+            id,
+            access_hash: 5,
+            file_reference: Vec::new(),
+            date: 1234,
+            mime_type: "application/pdf".to_owned(),
+            size: 500,
+            thumbs: Vec::new(),
+            video_thumbs: Vec::new(),
+            dc_id: 2,
+            attributes: Vec::new(),
+        })
+    }
+
+    /// The recording side of [`recording_promise`].
+    type Recorded<T> = std::sync::Arc<std::sync::Mutex<Vec<Result<T, String>>>>;
+
+    /// A promise recording its outcome — the test stand-in for the
+    /// actor-side promise plumbing.
+    struct RecordingPromise<T> {
+        outcomes: Recorded<T>,
+    }
+
+    impl<T: Send + 'static> tdutils::promise::PromiseInterface<T> for RecordingPromise<T> {
+        fn set_value(&mut self, value: T) {
+            self.outcomes.lock().unwrap().push(Ok(value));
+        }
+
+        fn set_error(&mut self, error: Status) {
+            self.outcomes
+                .lock()
+                .unwrap()
+                .push(Err(error.message().to_owned()));
+        }
+    }
+
+    fn recording_promise<T: Send + 'static>() -> (Promise<T>, Recorded<T>) {
+        let outcomes: Recorded<T> = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        (
+            Promise::from_interface(RecordingPromise {
+                outcomes: outcomes.clone(),
+            }),
+            outcomes,
+        )
     }
 
     #[test]
@@ -9176,5 +11136,710 @@ mod tests {
         assert!(!um.take_updates().is_empty());
         um.on_toggle_sponsored_messages(env, false);
         assert!(um.take_updates().is_empty());
+    }
+
+    // ----- M.4.13: the saved-music registry and photos params -----
+
+    #[test]
+    fn my_saved_music_ids_round_trip_across_reopen() {
+        let dir = std::env::temp_dir().join(format!(
+            "td-rs-m13-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Phase 1: an empty database leaves the set un-inited (the C++
+        // reloads it from the server); the save writes the vector form.
+        {
+            let opened = tddb::td_db::TdDb::open(tddb::td_db::Parameters {
+                database_directory: dir.clone().to_string_lossy().into_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+            let mut global = Global::new();
+            global.init(opened.database);
+            global.binlog_pmc().set("auth", "ok");
+            let mut options = OptionManager::new(global.is_test_dc());
+            let mut um = UserManager::new();
+            um.init_my_saved_music_ids(global.binlog_pmc(), true);
+            assert!(!um.are_my_saved_music_ids_inited);
+
+            um.my_saved_music_ids.insert(11);
+            um.my_saved_music_ids.insert(22);
+            {
+                let mut env = UserEnv {
+                    global: &mut global,
+                    options: &mut options,
+                    auth_is_bot: false,
+                };
+                um.save_my_saved_music_ids(&mut env);
+            }
+            global.close_all(false);
+        }
+
+        // Phase 2: reopen — the set restores, zero ids skipped like the
+        // C++ start_up.
+        {
+            let opened = tddb::td_db::TdDb::open(tddb::td_db::Parameters {
+                database_directory: dir.clone().to_string_lossy().into_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+            let mut global = Global::new();
+            global.init(opened.database);
+            let mut um = UserManager::new();
+            um.init_my_saved_music_ids(global.binlog_pmc(), true);
+            assert!(um.are_my_saved_music_ids_inited);
+            assert!(um.my_saved_music_ids.contains(&11));
+            assert!(um.my_saved_music_ids.contains(&22));
+            assert!(!um.my_saved_music_ids.contains(&33));
+            global.close_all(false);
+        }
+
+        // Phase 3: a broken value keeps the set un-inited (the net
+        // reload half), and bots/never-authorized sessions skip the
+        // load entirely.
+        {
+            let opened = tddb::td_db::TdDb::open(tddb::td_db::Parameters {
+                database_directory: dir.clone().to_string_lossy().into_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+            let mut global = Global::new();
+            global.init(opened.database);
+            global
+                .binlog_pmc()
+                .set_raw(b"my_saved_music_ids", &[0xff, 0xff]);
+
+            let mut um = UserManager::new();
+            um.init_my_saved_music_ids(global.binlog_pmc(), true);
+            assert!(!um.are_my_saved_music_ids_inited);
+
+            // A valid vector followed by trailing bytes fails the C++
+            // log_event_parse fetch_end, so the set stays un-inited too.
+            global.binlog_pmc().set_raw(
+                b"my_saved_music_ids",
+                &[
+                    0x01, 0x00, 0x00, 0x00, 0x2b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xde,
+                ],
+            );
+            let mut um = UserManager::new();
+            um.init_my_saved_music_ids(global.binlog_pmc(), true);
+            assert!(!um.are_my_saved_music_ids_inited);
+
+            um.init_my_saved_music_ids(global.binlog_pmc(), false);
+            assert!(!um.are_my_saved_music_ids_inited);
+            global.close_all(false);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn profile_photos_params_validate_and_clamp() {
+        let (mut temp, mut um) = test_env();
+        let user_id = seed_received_user(&mut temp, &mut um, 5);
+
+        // The validation errors fire before the input-user check.
+        let (p1, a1) = recording_promise::<td_api::ChatPhotos>();
+        um.get_user_profile_photos(&mut temp.env(false), user_id, -1, 10, p1);
+        assert_eq!(
+            a1.lock().unwrap().as_slice(),
+            [Err("Parameter offset must be non-negative".to_owned())]
+        );
+        let (p2, a2) = recording_promise::<td_api::ChatPhotos>();
+        um.get_user_profile_photos(&mut temp.env(false), user_id, 0, 0, p2);
+        assert_eq!(
+            a2.lock().unwrap().as_slice(),
+            [Err("Parameter limit must be positive".to_owned())]
+        );
+
+        // An unknown user answers the input-user error.
+        let (p3, a3) = recording_promise::<td_api::ChatPhotos>();
+        um.get_user_profile_photos(&mut temp.env(false), UserId::new(999), 0, 10, p3);
+        assert_eq!(
+            a3.lock().unwrap().as_slice(),
+            [Err("User not found".to_owned())]
+        );
+
+        // A valid request parks in the pending queue with the clamped
+        // limit (the send is the net step).
+        let (p4, _a4) = recording_promise::<td_api::ChatPhotos>();
+        um.get_user_profile_photos(&mut temp.env(false), user_id, 3, 1000, p4);
+        let requests = um.pending_get_user_photos_requests.get(&5).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].offset, 3);
+        assert_eq!(requests[0].limit, MAX_GET_PROFILE_PHOTOS);
+
+        // The record answers from the cache after the intake.
+        um.on_get_user_photos(
+            user_id,
+            3,
+            100,
+            6,
+            vec![telegram_photo(31), telegram_photo(32), telegram_photo(33)],
+        );
+        um.on_get_user_profile_photos(&temp.env(false), user_id, Ok(()));
+        assert_eq!(
+            _a4.lock().unwrap().as_slice(),
+            [Ok(td_api::ChatPhotos {
+                total_count: 6,
+                photos: vec![
+                    get_chat_photo_object(&photo_with_id(31)),
+                    get_chat_photo_object(&photo_with_id(32)),
+                    get_chat_photo_object(&photo_with_id(33)),
+                ],
+            })]
+        );
+    }
+
+    #[test]
+    fn photos_cache_answers_pagination_from_cache() {
+        let (mut temp, mut um) = test_env();
+        let user_id = seed_received_user(&mut temp, &mut um, 5);
+
+        // Fill the cache window [0, 3) out of 5 (a parked request keeps
+        // the intake's pending-request check honest).
+        let (p0, _a0) = recording_promise::<td_api::ChatPhotos>();
+        um.get_user_profile_photos(&mut temp.env(false), user_id, 0, 3, p0);
+        um.on_get_user_photos(
+            user_id,
+            0,
+            3,
+            5,
+            vec![telegram_photo(11), telegram_photo(12), telegram_photo(13)],
+        );
+        um.on_get_user_profile_photos(&temp.env(false), user_id, Ok(()));
+        assert_eq!(_a0.lock().unwrap().len(), 1, "the parked request answered");
+
+        // A cache-covered request answers without parking.
+        let (p1, a1) = recording_promise::<td_api::ChatPhotos>();
+        um.get_user_profile_photos(&mut temp.env(false), user_id, 1, 2, p1);
+        assert_eq!(
+            a1.lock().unwrap().as_slice(),
+            [Ok(td_api::ChatPhotos {
+                total_count: 5,
+                photos: vec![
+                    get_chat_photo_object(&photo_with_id(12)),
+                    get_chat_photo_object(&photo_with_id(13)),
+                ],
+            })]
+        );
+        assert!(!um.pending_get_user_photos_requests.contains_key(&5));
+
+        // A limit reaching past the count clamps to the count — [2, 5)
+        // is not covered by [0, 3), so the request parks.
+        let (p2, a2) = recording_promise::<td_api::ChatPhotos>();
+        um.get_user_profile_photos(&mut temp.env(false), user_id, 2, 10, p2);
+        assert_eq!(
+            um.pending_get_user_photos_requests.get(&5).unwrap().len(),
+            1
+        );
+
+        // The offset-3 intake appends to the cache window...
+        um.on_get_user_photos(
+            user_id,
+            3,
+            10,
+            5,
+            vec![telegram_photo(14), telegram_photo(15)],
+        );
+        // ...and the completion callback answers [2, 5) from it.
+        um.on_get_user_profile_photos(&temp.env(false), user_id, Ok(()));
+        assert_eq!(
+            a2.lock().unwrap().as_slice(),
+            [Ok(td_api::ChatPhotos {
+                total_count: 5,
+                photos: vec![
+                    get_chat_photo_object(&photo_with_id(13)),
+                    get_chat_photo_object(&photo_with_id(14)),
+                    get_chat_photo_object(&photo_with_id(15)),
+                ],
+            })]
+        );
+
+        // An offset past the count answers empty with the total count.
+        let (p3, a3) = recording_promise::<td_api::ChatPhotos>();
+        um.get_user_profile_photos(&mut temp.env(false), user_id, 7, 2, p3);
+        assert_eq!(
+            a3.lock().unwrap().as_slice(),
+            [Ok(td_api::ChatPhotos {
+                total_count: 5,
+                photos: Vec::new(),
+            })]
+        );
+
+        // The photos register into User::photo_ids, and the registered
+        // photo answers no file source (cpp:7003-7006).
+        let u = um.get_user(user_id).unwrap();
+        assert!(u.photo_ids.contains(&11) && u.photo_ids.contains(&15));
+        assert_eq!(
+            um.get_user_profile_photo_file_source_id(user_id, 11),
+            FileSourceId::default()
+        );
+        // An unregistered photo id allocates a stable source id.
+        let first = um.get_user_profile_photo_file_source_id(user_id, 999);
+        assert!(first.is_valid());
+        assert_eq!(
+            um.get_user_profile_photo_file_source_id(user_id, 999),
+            first
+        );
+    }
+
+    #[test]
+    fn photos_cache_offset_mismatch_resets_and_trim() {
+        let (mut temp, mut um) = test_env();
+        let user_id = seed_received_user(&mut temp, &mut um, 5);
+
+        // Park a request so the intake's CHECK holds.
+        let (p, _a) = recording_promise::<td_api::ChatPhotos>();
+        um.get_user_profile_photos(&mut temp.env(false), user_id, 2, 4, p);
+        um.on_get_user_photos(
+            user_id,
+            2,
+            4,
+            9,
+            vec![telegram_photo(21), telegram_photo(22)],
+        );
+        let cache = um.user_photos.get(&5).unwrap();
+        assert_eq!(cache.count, 9);
+        assert_eq!(cache.offset, 2);
+        assert_eq!(cache.photos.len(), 2);
+
+        // A subsequent intake at an offset that cannot append resets the
+        // window to the new offset.
+        um.on_get_user_profile_photos(&temp.env(false), user_id, Ok(()));
+        let (p2, _a2) = recording_promise::<td_api::ChatPhotos>();
+        um.get_user_profile_photos(&mut temp.env(false), user_id, 8, 4, p2);
+        um.on_get_user_photos(user_id, 8, 4, 9, vec![telegram_photo(29)]);
+        let cache = um.user_photos.get(&5).unwrap();
+        assert_eq!(cache.offset, 8);
+        assert_eq!(cache.photos.len(), 1);
+
+        // An empty photo drops the total count; an offset beyond the
+        // count collapses the window (cpp:7099-7101).
+        um.on_get_user_profile_photos(&temp.env(false), user_id, Ok(()));
+        let (p3, _a3) = recording_promise::<td_api::ChatPhotos>();
+        um.get_user_profile_photos(&mut temp.env(false), user_id, 0, 10, p3);
+        um.on_get_user_photos(
+            user_id,
+            0,
+            10,
+            2,
+            vec![
+                telegram_api::Photo::photoEmpty(telegram_api::photoEmpty { id: 1 }),
+                telegram_photo(41),
+            ],
+        );
+        let cache = um.user_photos.get(&5).unwrap();
+        // photoEmpty → is_empty → count-- and skipped
+        assert_eq!(cache.count, 1);
+        assert_eq!(cache.photos.len(), 1);
+        assert_eq!(cache.photos[0].id, 41);
+
+        // drop_user_photos(false) resets to unknown, (true) to empty.
+        um.drop_user_photos(user_id, false, "test");
+        assert_eq!(um.user_photos.get(&5).unwrap().count, -1);
+        let (p4, _a4) = recording_promise::<td_api::ChatPhotos>();
+        um.get_user_profile_photos(&mut temp.env(false), user_id, 0, 1, p4);
+        um.on_get_user_photos(user_id, 0, 1, 1, vec![telegram_photo(51)]);
+        um.drop_user_photos(user_id, true, "test");
+        let cache = um.user_photos.get(&5).unwrap();
+        assert_eq!(cache.count, 0);
+        assert_eq!(cache.offset, 0);
+        assert!(cache.photos.is_empty());
+    }
+
+    #[test]
+    fn photos_retry_machine_errors_after_three_attempts() {
+        let (mut temp, mut um) = test_env();
+        let user_id = seed_received_user(&mut temp, &mut um, 5);
+
+        // Request [0, 5) of a count-5 listing whose intake only fills
+        // [0, 2) — never answerable from the cache.
+        let (p, a) = recording_promise::<td_api::ChatPhotos>();
+        um.get_user_profile_photos(&mut temp.env(false), user_id, 0, 5, p);
+        um.on_get_user_photos(
+            user_id,
+            0,
+            5,
+            5,
+            vec![telegram_photo(61), telegram_photo(62)],
+        );
+        um.on_get_user_profile_photos(&temp.env(false), user_id, Ok(()));
+        assert!(a.lock().unwrap().is_empty(), "no answer yet");
+        assert_eq!(
+            um.pending_get_user_photos_requests.get(&5).unwrap().len(),
+            1
+        );
+
+        um.on_get_user_profile_photos(&temp.env(false), user_id, Ok(()));
+        assert!(a.lock().unwrap().is_empty());
+        um.on_get_user_profile_photos(&temp.env(false), user_id, Ok(()));
+        assert_eq!(
+            a.lock().unwrap().as_slice(),
+            [Err("Failed to get profile photos".to_owned())]
+        );
+        assert!(!um.pending_get_user_photos_requests.contains_key(&5));
+
+        // The dropped-result branch: an unknown count resends; the third
+        // resend failure answers "Failed to return profile photos". The
+        // request must park first (offset 3 is outside the [0, 2)
+        // cache window).
+        let (p2, a2) = recording_promise::<td_api::ChatPhotos>();
+        um.get_user_profile_photos(&mut temp.env(false), user_id, 3, 1, p2);
+        // force the cache to unknown between completions (the C++ drops
+        // the received result when the cache was reset meanwhile)
+        um.drop_user_photos(user_id, false, "test");
+        um.on_get_user_profile_photos(&temp.env(false), user_id, Ok(()));
+        assert!(a2.lock().unwrap().is_empty());
+        um.drop_user_photos(user_id, false, "test");
+        um.on_get_user_profile_photos(&temp.env(false), user_id, Ok(()));
+        assert!(a2.lock().unwrap().is_empty());
+        um.drop_user_photos(user_id, false, "test");
+        um.on_get_user_profile_photos(&temp.env(false), user_id, Ok(()));
+        assert_eq!(
+            a2.lock().unwrap().as_slice(),
+            [Err("Failed to return profile photos".to_owned())]
+        );
+
+        // An error result fans out to every parked request (offsets
+        // outside the [0, 2) cache window park).
+        let (p3, a3) = recording_promise::<td_api::ChatPhotos>();
+        let (p4, a4) = recording_promise::<td_api::ChatPhotos>();
+        um.get_user_profile_photos(&mut temp.env(false), user_id, 3, 1, p3);
+        um.get_user_profile_photos(&mut temp.env(false), user_id, 4, 1, p4);
+        um.on_get_user_profile_photos(
+            &temp.env(false),
+            user_id,
+            Err(Status::error(400, "PHOTOS_INVALID")),
+        );
+        assert_eq!(
+            a3.lock().unwrap().as_slice(),
+            [Err("PHOTOS_INVALID".to_owned())]
+        );
+        assert_eq!(
+            a4.lock().unwrap().as_slice(),
+            [Err("PHOTOS_INVALID".to_owned())]
+        );
+    }
+
+    #[test]
+    fn bot_pending_user_photo_holds_and_applies() {
+        let (mut temp, mut um) = TempEnv::with_chat_info_db("unit", false);
+        assert!(!temp.global.use_chat_info_database());
+        // A bare user — `on_get_user` would apply the (empty) photo and
+        // set is_photo_inited already; the hold applies to users whose
+        // photo was never applied (e.g. database-loaded records).
+        let user_id = UserId::new(5);
+        um.add_user(user_id);
+
+        // The bot-without-chat-info-database path holds the photo.
+        um.on_update_user_photo(
+            &mut temp.env(true),
+            user_id,
+            telegram_api::UserProfilePhoto::userProfilePhoto(telegram_api::userProfilePhoto {
+                flags: 0,
+                has_video: false,
+                photo_id: 400,
+                stripped_thumb: vec![1, 2, 3],
+                dc_id: 2,
+                personal: false,
+            }),
+            "test",
+        );
+        assert!(!um.get_user(user_id).unwrap().is_photo_inited);
+        assert!(um.pending_user_photos.contains_key(&5));
+        // drop_user_photos on a missing cache entry is a no-op (cpp:9521).
+        assert!(!um.user_photos.contains_key(&5));
+
+        // A duplicate photo id does not clobber the held one.
+        um.on_update_user_photo(
+            &mut temp.env(true),
+            user_id,
+            telegram_api::UserProfilePhoto::userProfilePhoto(telegram_api::userProfilePhoto {
+                flags: 0,
+                has_video: false,
+                photo_id: 400,
+                stripped_thumb: vec![9, 9],
+                dc_id: 2,
+                personal: false,
+            }),
+            "test",
+        );
+        assert_eq!(
+            um.pending_user_photos
+                .get(&5)
+                .map(get_profile_photo_id)
+                .unwrap(),
+            400
+        );
+
+        // The first listing/getter applies the held photo and sends
+        // updateUser.
+        um.apply_pending_user_photo(&mut temp.env(true), user_id, "test");
+        let u = um.get_user(user_id).unwrap();
+        assert!(u.is_photo_inited);
+        assert_eq!(u.photo.id, 400);
+        assert!(um.pending_user_photos.is_empty());
+        assert!(
+            um.take_updates()
+                .iter()
+                .any(|update| matches!(update, td_api::Update::updateUser(u) if u.user.id == 5))
+        );
+    }
+
+    #[test]
+    fn saved_music_list_cache_and_machines() {
+        let (mut temp, mut um) = test_env();
+        // My user must be known (on_get_user self sets my_id).
+        let mut me = telegram_user(77, "Me", USER_ACCESS_HASH_MASK | (1 << 1) | USER_PHONE_MASK);
+        me.phone = "+15550001111".to_owned();
+        me.self_ = true;
+        um.on_get_user(&mut temp.env(false), telegram_api::User::user(me), "test");
+        let me_id = um.get_my_id();
+        assert_eq!(me_id.get(), 77);
+
+        // start_up's saved-music block stand-in: the authorized session
+        // has the (empty) persisted list, so the set is inited. The
+        // UserFull record pre-exists (an absent `usf` row creates none,
+        // cpp:9368-9370 — the first-saved-music update needs the record).
+        um.save_my_saved_music_ids(&mut temp.env(false));
+        assert!(um.are_my_saved_music_ids_inited);
+        um.add_user_full(me_id);
+
+        // A listing request parks; the intake fills the cache and the
+        // registry, updates my saved-music ids (persisted) and the
+        // UserFull first-saved-music field.
+        let (p, a) = recording_promise::<td_api::Audios>();
+        um.get_user_saved_music(&mut temp.env(false), me_id, 0, 10, p);
+        assert_eq!(
+            um.pending_get_user_saved_music_requests
+                .get(&77)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        um.on_get_user_saved_music(
+            &mut temp.env(false),
+            me_id,
+            0,
+            10,
+            3,
+            vec![
+                audio_document(101, 11),
+                audio_document(102, 12),
+                document_without_audio(103),
+            ],
+        );
+        um.finish_get_user_saved_music(&temp.env(false), me_id, Ok(()));
+        // The non-audio document dropped the count by one; the cache
+        // holds the two audio files; the answer carries the count.
+        let cache = um.user_saved_music.get(&77).unwrap();
+        assert_eq!(cache.count, 2);
+        assert_eq!(cache.offset, 0);
+        assert_eq!(cache.saved_music_file_ids.len(), 2);
+        let answer = a.lock().unwrap().pop().unwrap();
+        assert!(
+            matches!(answer, Ok(audios) if audios.total_count == 2 && audios.audios.len() == 2)
+        );
+
+        // my_saved_music_ids got the document ids and were persisted.
+        assert!(um.my_saved_music_ids.contains(&101));
+        assert!(um.my_saved_music_ids.contains(&102));
+        assert!(!um.my_saved_music_ids.contains(&103));
+        assert!(um.are_my_saved_music_ids_inited);
+        let raw = temp
+            .global
+            .binlog_pmc()
+            .get_raw(b"my_saved_music_ids")
+            .to_vec();
+        assert_eq!(raw.len(), 4 + 8 * 2);
+
+        // The UserFull first-saved-music points at the cache head.
+        let file_ids = cache.saved_music_file_ids.clone();
+        let user_full = um.users_full.get(&77).unwrap();
+        assert_eq!(user_full.first_saved_music_file_id, file_ids[0]);
+        assert!(!user_full.is_first_saved_music_file_id_changed);
+
+        // on_add_saved_music with no anchor inserts at the head.
+        let new_file = um
+            .parse_saved_music_document(audio_document(104, 13))
+            .unwrap();
+        let (mut pa, aa) = recording_promise::<()>();
+        um.on_add_saved_music(&mut temp.env(false), new_file, FileId::default(), &mut pa);
+        assert!(matches!(aa.lock().unwrap().as_slice()[0], Ok(())));
+        let cache = um.user_saved_music.get(&77).unwrap();
+        assert_eq!(cache.count, 3);
+        assert_eq!(cache.saved_music_file_ids[0], new_file);
+        assert!(um.my_saved_music_ids.contains(&104));
+
+        // Removing the current head (the newly added file) re-points
+        // first_saved_music to the next entry.
+        let (mut pr, ar) = recording_promise::<()>();
+        um.on_remove_saved_music(&mut temp.env(false), new_file, &mut pr);
+        assert!(matches!(ar.lock().unwrap().as_slice()[0], Ok(())));
+        let cache = um.user_saved_music.get(&77).unwrap();
+        assert_eq!(cache.count, 2);
+        assert_eq!(cache.saved_music_file_ids[0], file_ids[0]);
+        assert!(!um.my_saved_music_ids.contains(&104));
+        let user_full = um.users_full.get(&77).unwrap();
+        assert_eq!(user_full.first_saved_music_file_id, file_ids[0]);
+
+        // An anchored add inserts after the anchor; a missing anchor
+        // drops the cache.
+        let another = um
+            .parse_saved_music_document(audio_document(105, 14))
+            .unwrap();
+        let (mut pa2, _aa2) = recording_promise::<()>();
+        um.on_add_saved_music(&mut temp.env(false), another, file_ids[0], &mut pa2);
+        let cache = um.user_saved_music.get(&77).unwrap();
+        assert_eq!(cache.saved_music_file_ids[1], another);
+
+        let stray = um
+            .parse_saved_music_document(audio_document(106, 15))
+            .unwrap();
+        let (mut pa3, _aa3) = recording_promise::<()>();
+        um.on_add_saved_music(&mut temp.env(false), stray, FileId::new(9999), &mut pa3);
+        let cache = um.user_saved_music.get(&77).unwrap();
+        assert_eq!(cache.count, -1, "missing anchor drops the cache");
+        assert_eq!(cache.offset, -1);
+    }
+
+    #[test]
+    fn saved_music_validation_and_check() {
+        let (mut temp, mut um) = test_env();
+        let mut me = telegram_user(77, "Me", USER_ACCESS_HASH_MASK | (1 << 1));
+        me.self_ = true;
+        um.on_get_user(&mut temp.env(false), telegram_api::User::user(me), "test");
+
+        // A registered audio document passes; invalid/unknown ids answer
+        // the exact errors.
+        let file_id = um
+            .parse_saved_music_document(audio_document(201, 21))
+            .unwrap();
+        let (mut p1, a1) = recording_promise::<()>();
+        um.add_saved_music(FileId::default(), FileId::default(), &mut p1);
+        assert_eq!(
+            a1.lock().unwrap().as_slice(),
+            [Err("Invalid file identifier specified".to_owned())]
+        );
+        let (mut p2, a2) = recording_promise::<()>();
+        um.add_saved_music(FileId::new(999), FileId::default(), &mut p2);
+        assert_eq!(
+            a2.lock().unwrap().as_slice(),
+            [Err("Unknown file identifier specified".to_owned())]
+        );
+        let (mut p3, a3) = recording_promise::<()>();
+        um.add_saved_music(file_id, file_id, &mut p3);
+        assert_eq!(
+            a3.lock().unwrap().as_slice(),
+            [Err("Can't place saved music after self".to_owned())]
+        );
+
+        // check_is_saved_music answers over the loaded set.
+        um.my_saved_music_ids.insert(201);
+        um.are_my_saved_music_ids_inited = true;
+        let (mut p4, a4) = recording_promise::<()>();
+        um.check_is_saved_music(file_id, &mut p4);
+        assert!(matches!(a4.lock().unwrap().as_slice()[0], Ok(())));
+        let other = um
+            .parse_saved_music_document(audio_document(202, 22))
+            .unwrap();
+        let (mut p5, a5) = recording_promise::<()>();
+        um.check_is_saved_music(other, &mut p5);
+        assert_eq!(a5.lock().unwrap().as_slice(), [Err("Not Found".to_owned())]);
+
+        // reload_my_saved_music_list parks the promise (the send is the
+        // net step); the ok intake replaces the set and completes it.
+        let (p6, a6) = recording_promise::<()>();
+        um.reload_my_saved_music_list(p6);
+        um.on_get_my_saved_music_list(
+            &mut temp.env(false),
+            telegram_api::account_SavedMusicIds::account_savedMusicIds(
+                telegram_api::account_savedMusicIds {
+                    ids: vec![0, 202, 202, 203],
+                },
+            ),
+        );
+        assert!(matches!(a6.lock().unwrap().as_slice()[0], Ok(())));
+        assert_eq!(
+            um.my_saved_music_ids.iter().copied().collect::<Vec<i64>>(),
+            vec![202, 203],
+            "zero ids and duplicates are dropped"
+        );
+        assert!(
+            !temp
+                .global
+                .binlog_pmc()
+                .get_raw(b"my_saved_music_ids")
+                .is_empty()
+        );
+
+        // The not-modified form keeps the set.
+        let (p7, a7) = recording_promise::<()>();
+        um.reload_my_saved_music_list(p7);
+        um.on_get_my_saved_music_list(
+            &mut temp.env(false),
+            telegram_api::account_SavedMusicIds::account_savedMusicIdsNotModified(
+                telegram_api::account_savedMusicIdsNotModified {},
+            ),
+        );
+        assert!(matches!(a7.lock().unwrap().as_slice()[0], Ok(())));
+        assert_eq!(um.my_saved_music_ids.len(), 2);
+    }
+
+    #[test]
+    fn on_get_user_full_applies_photos_and_saved_music() {
+        let (mut temp, mut um) = test_env();
+        let user_id = seed_received_user(&mut temp, &mut um, 5);
+
+        um.on_get_user_full(
+            &mut temp.env(false),
+            telegram_api::UserFull {
+                id: 5,
+                flags: 1 << 2,   // profile_photo
+                flags2: 1 << 21, // saved_music
+                profile_photo: telegram_photo(55),
+                personal_photo: telegram_api::Photo::photoEmpty(telegram_api::photoEmpty { id: 0 }),
+                fallback_photo: telegram_api::Photo::photoEmpty(telegram_api::photoEmpty { id: 0 }),
+                saved_music: audio_document(300, 30),
+                ..telegram_api::UserFull::default()
+            },
+        );
+
+        // The User photo and UserFull photo carry the id; the photo id
+        // registers.
+        assert_eq!(um.get_user(user_id).unwrap().photo.id, 55);
+        assert!(um.get_user(user_id).unwrap().photo_ids.contains(&55));
+        assert_eq!(um.users_full.get(&5).unwrap().photo.id, 55);
+        // The saved-music document became the first-saved-music file id.
+        let first = um.users_full.get(&5).unwrap().first_saved_music_file_id;
+        assert!(first.is_valid());
+        assert_eq!(um.get_saved_music_document_id(first, false).0, 300);
+
+        // An empty userFull photo set drops the photos cache to empty
+        // and the saved-music cache too (cpp:9299-9310).
+        um.user_photos.entry(5).or_default();
+        um.user_saved_music.entry(5).or_default();
+        um.on_get_user_full(
+            &mut temp.env(false),
+            telegram_api::UserFull {
+                id: 5,
+                ..telegram_api::UserFull::default()
+            },
+        );
+        assert_eq!(um.user_photos.get(&5).unwrap().count, 0);
+        assert_eq!(um.user_saved_music.get(&5).unwrap().count, 0);
+        assert!(
+            !um.users_full
+                .get(&5)
+                .unwrap()
+                .first_saved_music_file_id
+                .is_valid()
+        );
     }
 }
