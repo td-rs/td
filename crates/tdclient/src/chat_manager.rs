@@ -4744,11 +4744,54 @@ impl Default for ChannelFull {
     }
 }
 
+/// `ChatManager::ChatLogEvent` store side (`log_event_store`) — the
+/// version framing, the chat id and the record body.
+fn store_chat_log_event(out: &mut Vec<u8>, chat_id: ChatId, chat: &Chat) {
+    crate::store_parse::store_log_event_version(out);
+    store_i64(out, chat_id.get());
+    chat.store(out);
+}
+
+/// The `ChatLogEvent` parse side (`log_event_parse`).
+fn parse_chat_log_event(input: &[u8]) -> Result<(ChatId, Chat), &'static str> {
+    let mut parser = Parser::new_log_event(input)?;
+    let chat_id = parse_chat_id(&mut parser)?;
+    let chat = Chat::parse_impl(&mut parser)?;
+    parser.fetch_end()?;
+    Ok((chat_id, chat))
+}
+
+/// `ChatManager::ChannelLogEvent` store side (`log_event_store`).
+fn store_channel_log_event(
+    out: &mut Vec<u8>,
+    channel_id: ChannelId,
+    channel: &Channel,
+    ctx: &TimeCtx,
+) {
+    crate::store_parse::store_log_event_version(out);
+    store_i64(out, channel_id.get());
+    channel.store(out, ctx);
+}
+
+/// The `ChannelLogEvent` parse side (`log_event_parse`).
+fn parse_channel_log_event(
+    input: &[u8],
+    ctx: &TimeCtx,
+) -> Result<(ChannelId, Channel), &'static str> {
+    let mut parser = Parser::new_log_event(input)?;
+    let channel_id = parse_channel_id(&mut parser)?;
+    let channel = Channel::parse_impl(&mut parser, ctx)?;
+    parser.fetch_end()?;
+    Ok((channel_id, channel))
+}
+
 /// The `ChatManager` data plane (ChatManager.h:16-999): the id-keyed
 /// record caches and the `gr`/`ch` sqlite rows. Like the M.4.5
 /// `UserManager`, the C++ async save/load sequencing (the per-id promise
 /// queues, the `is_being_saved` window) collapses onto the synchronous
-/// kv, and the binlog mirror is stubbed until M.5.13 — `log_event_id`
+/// kv, and the binlog mirror (`ChatLogEvent`/`ChannelLogEvent`) rides the
+/// same add/rewrite-while-unsaved, retire-on-save pattern as the user
+/// records — `log_event_id`
 /// stays 0 and every mirror branch is inert.
 pub struct ChatManager {
     chats: BTreeMap<i64, Chat>,
@@ -4898,10 +4941,10 @@ impl ChatManager {
         let _ = (env, channel_id, from_binlog, force);
     }
 
-    /// `ChatManager::save_chat` (ChatManager.cpp:4467-4484) with the
-    /// binlog mirror stubbed (M.5.13): the `log_event_id` write-out below
-    /// is the C++ `binlog_add`/`binlog_rewrite` hook point. The production
-    /// callers are the M.5.20+ intakes.
+    /// `ChatManager::save_chat` (ChatManager.cpp:4467-4484): the binlog
+    /// mirror (`ChatLogEvent`, `HandlerType::Chats`) add/rewrite while the
+    /// record is unsaved, then the sqlite row. The production callers are
+    /// the M.5.20+ intakes.
     #[allow(dead_code)]
     fn save_chat(&mut self, env: &mut UserEnv, chat_id: ChatId, from_binlog: bool) {
         if !env.global.use_chat_info_database() {
@@ -4913,8 +4956,24 @@ impl ChatManager {
         };
         if need_save {
             if !from_binlog {
-                // let log_event = ChatLogEvent(chat_id, c); … binlog_add /
-                // binlog_rewrite(HandlerType::Chats) — M.5.13.
+                let data = {
+                    let c = self.chats.get(&chat_id.get()).unwrap();
+                    let mut data = Vec::new();
+                    store_chat_log_event(&mut data, chat_id, c);
+                    data
+                };
+                let binlog = env.global.td_db().binlog();
+                let log_event_id = self.chats.get(&chat_id.get()).unwrap().log_event_id;
+                let new_id = if log_event_id == 0 {
+                    binlog.add(tddb::td_db::LOG_EVENT_HANDLER_TYPE_CHATS, &data)
+                } else {
+                    binlog.rewrite(
+                        log_event_id,
+                        tddb::td_db::LOG_EVENT_HANDLER_TYPE_CHATS,
+                        &data,
+                    )
+                };
+                self.chats.get_mut(&chat_id.get()).unwrap().log_event_id = new_id;
             }
             self.save_chat_to_database(env, chat_id);
         }
@@ -4944,7 +5003,7 @@ impl ChatManager {
         let c = self.chats.get_mut(&chat_id.get()).unwrap();
         c.is_being_saved = false;
         // `on_save_chat_to_database`: the row is durable, retire the
-        // binlog mirror (inert until M.5.13 sets log_event_id).
+        // binlog mirror (the row is durable).
         if c.log_event_id != 0 {
             let log_event_id = c.log_event_id;
             env.global.td_db().binlog().erase(log_event_id);
@@ -5010,6 +5069,44 @@ impl ChatManager {
         }
     }
 
+    /// `ChatManager::on_binlog_chat_event` (ChatManager.cpp:4486-4506):
+    /// the crash-window replay — restore the chat from its binlog mirror,
+    /// keep the event id so the save rewrites (not duplicates) it, then run
+    /// the C++ update path's save fan-out (from_binlog = true).
+    pub fn on_binlog_chat_event(
+        &mut self,
+        env: &mut UserEnv,
+        event: &tddb::binlog::event::BinlogEvent,
+    ) {
+        let binlog = env.global.td_db().binlog();
+        if !env.global.use_chat_info_database() {
+            binlog.erase(event.id);
+            return;
+        }
+
+        let (chat_id, chat) = match parse_chat_log_event(event.get_data()) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                tdutils::log_error!("Failed to load a basic group from binlog: {error}");
+                binlog.erase(event.id);
+                return;
+            }
+        };
+        if self.have_chat(chat_id) || !chat_id.is_valid() {
+            tdutils::log_error!("Skip adding already added {chat_id:?}");
+            binlog.erase(event.id);
+            return;
+        }
+
+        let chat_entry = self.add_chat(chat_id);
+        *chat_entry = chat;
+        self.chats.get_mut(&chat_id.get()).unwrap().log_event_id = event.id;
+
+        // update_chat(c, chat_id, true, false) — the diff machine is
+        // M.5.18; its need-save fan-out is save_chat(from_binlog = true).
+        self.save_chat(env, chat_id, true);
+    }
+
     /// `have_chat_force` (ChatManager.cpp:4660-4662).
     pub fn have_chat_force(&mut self, env: &mut UserEnv, chat_id: ChatId, source: &str) -> bool {
         self.get_chat_force(env, chat_id, source).is_some()
@@ -5066,9 +5163,28 @@ impl ChatManager {
         };
         if need_save {
             if !from_binlog {
-                // let log_event = ChannelLogEvent(channel_id, c); …
-                // binlog_add / binlog_rewrite(HandlerType::Channels) —
-                // M.5.13.
+                let data = {
+                    let c = self.channels.get(&channel_id.get()).unwrap();
+                    let ctx = env.time_ctx();
+                    let mut data = Vec::new();
+                    store_channel_log_event(&mut data, channel_id, c, &ctx);
+                    data
+                };
+                let binlog = env.global.td_db().binlog();
+                let log_event_id = self.channels.get(&channel_id.get()).unwrap().log_event_id;
+                let new_id = if log_event_id == 0 {
+                    binlog.add(tddb::td_db::LOG_EVENT_HANDLER_TYPE_CHANNELS, &data)
+                } else {
+                    binlog.rewrite(
+                        log_event_id,
+                        tddb::td_db::LOG_EVENT_HANDLER_TYPE_CHANNELS,
+                        &data,
+                    )
+                };
+                self.channels
+                    .get_mut(&channel_id.get())
+                    .unwrap()
+                    .log_event_id = new_id;
             }
             self.save_channel_to_database(env, channel_id);
         }
@@ -5183,6 +5299,46 @@ impl ChatManager {
                 // the C++ logs at INFO
             }
         }
+    }
+
+    /// `ChatManager::on_binlog_channel_event` (ChatManager.cpp:4732-4755):
+    /// the channel twin of [`ChatManager::on_binlog_chat_event`].
+    pub fn on_binlog_channel_event(
+        &mut self,
+        env: &mut UserEnv,
+        event: &tddb::binlog::event::BinlogEvent,
+    ) {
+        let binlog = env.global.td_db().binlog();
+        if !env.global.use_chat_info_database() {
+            binlog.erase(event.id);
+            return;
+        }
+
+        let ctx = env.time_ctx();
+        let (channel_id, channel) = match parse_channel_log_event(event.get_data(), &ctx) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                tdutils::log_error!("Failed to load a supergroup from binlog: {error}");
+                binlog.erase(event.id);
+                return;
+            }
+        };
+        if self.have_channel(channel_id) || !channel_id.is_valid() {
+            tdutils::log_error!("Skip adding already added {channel_id:?}");
+            binlog.erase(event.id);
+            return;
+        }
+
+        let channel_entry = self.add_channel(channel_id);
+        *channel_entry = channel;
+        self.channels
+            .get_mut(&channel_id.get())
+            .unwrap()
+            .log_event_id = event.id;
+
+        // update_channel(c, channel_id, true, false) — the diff machine is
+        // M.5.19; its need-save fan-out is save_channel(from_binlog = true).
+        self.save_channel(env, channel_id, true);
     }
 
     /// `have_channel_force` (ChatManager.cpp:4959-4961).
@@ -9096,6 +9252,153 @@ mod tests {
         }
         assert!(global.td_db().common_kv().get(b"gr999").is_empty());
         close(&mut global);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chat_log_event_replays_across_reopen() {
+        let dir = db_dir("chat-log");
+        let _ = std::fs::remove_dir_all(&dir);
+        let chat_id = ChatId::new(555);
+
+        // Phase 1: the binlog mirror was written, the sqlite row never
+        // landed — the crash window.
+        {
+            let (mut global, _options) = open_db(&dir, true);
+            let mut chat = sample_chat();
+            let mut data = Vec::new();
+            store_chat_log_event(&mut data, chat_id, &chat);
+            global
+                .td_db()
+                .binlog()
+                .add(tddb::td_db::LOG_EVENT_HANDLER_TYPE_CHATS, &data);
+            chat.title = "discarded".to_owned();
+            // no sqlite write, straight to close — the crash
+            close(&mut global);
+        }
+
+        // Phase 2: reopen — TdDb collected the Chats event; the replay
+        // restores the chat and its save retires the mirror.
+        {
+            let opened = tddb::td_db::TdDb::open(tddb::td_db::Parameters {
+                database_directory: dir.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(opened.chat_events.len(), 1, "the Chats event replays");
+            let event = opened.chat_events[0].clone();
+            drop(opened);
+
+            let (mut global, mut options) = open_db(&dir, true);
+            let mut cm = ChatManager::new();
+            {
+                let mut env = make_env(&mut global, &mut options);
+                cm.on_binlog_chat_event(&mut env, &event);
+            }
+            let c = cm.get_chat(chat_id).expect("replayed chat");
+            assert_eq!(c.title, "group");
+            assert_eq!(c.participant_count, 7);
+            assert!(c.is_active);
+            assert!(c.is_saved);
+            assert_eq!(c.log_event_id, 0, "the save retired the mirror");
+            let row = global.td_db().common_kv().get(b"gr555");
+            assert!(!row.is_empty(), "the replay saved the sqlite row");
+            assert_eq!(Chat::parse_value(&row).unwrap().title, "group");
+            // The C++ re-delivery path (skip + erase of an already-erased
+            // event id) is not exercised here: the Rust binlog lacks the
+            // C++'s idempotent re-erase, a tddb-layer divergence tracked
+            // for the binlog polish step.
+            close(&mut global);
+        }
+
+        // Phase 3: reopen again — no Chats events left; the chat loads
+        // through the manager's database path.
+        {
+            let opened = tddb::td_db::TdDb::open(tddb::td_db::Parameters {
+                database_directory: dir.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(opened.chat_events.is_empty(), "the mirror retired");
+            drop(opened);
+
+            let (mut global, mut options) = open_db(&dir, true);
+            let mut cm = ChatManager::new();
+            let mut env = make_env(&mut global, &mut options);
+            let loaded = cm.get_chat_force(&mut env, chat_id, "test").unwrap();
+            assert_eq!(loaded.title, "group");
+            assert!(loaded.is_saved);
+            close(&mut global);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn channel_log_event_replays_across_reopen() {
+        let dir = db_dir("channel-log");
+        let _ = std::fs::remove_dir_all(&dir);
+        let channel_id = ChannelId::new(900_000_000_500);
+
+        // Phase 1: the crash window — the mirror only.
+        {
+            let (mut global, _options) = open_db(&dir, true);
+            let channel = sample_channel();
+            let ctx = test_time_ctx();
+            let mut data = Vec::new();
+            store_channel_log_event(&mut data, channel_id, &channel, &ctx);
+            global
+                .td_db()
+                .binlog()
+                .add(tddb::td_db::LOG_EVENT_HANDLER_TYPE_CHANNELS, &data);
+            close(&mut global);
+        }
+
+        // Phase 2: the replay restores the channel and saves its row.
+        {
+            let opened = tddb::td_db::TdDb::open(tddb::td_db::Parameters {
+                database_directory: dir.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(opened.channel_events.len(), 1, "the Channels event replays");
+            let event = opened.channel_events[0].clone();
+            drop(opened);
+
+            let (mut global, mut options) = open_db(&dir, true);
+            let mut cm = ChatManager::new();
+            {
+                let mut env = make_env(&mut global, &mut options);
+                cm.on_binlog_channel_event(&mut env, &event);
+            }
+            let c = cm.get_channel(channel_id).expect("replayed channel");
+            assert_eq!(c.title, "supergroup");
+            assert_eq!(c.access_hash, -987654321098765432);
+            assert!(c.is_saved);
+            assert_eq!(c.log_event_id, 0, "the save retired the mirror");
+            let row = global.td_db().common_kv().get(b"ch900000000500");
+            assert!(!row.is_empty(), "the replay saved the sqlite row");
+            close(&mut global);
+        }
+
+        // Phase 3: no Channels events left; the row loads.
+        {
+            let opened = tddb::td_db::TdDb::open(tddb::td_db::Parameters {
+                database_directory: dir.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+            assert!(opened.channel_events.is_empty(), "the mirror retired");
+            drop(opened);
+
+            let (mut global, mut options) = open_db(&dir, true);
+            let mut cm = ChatManager::new();
+            let mut env = make_env(&mut global, &mut options);
+            let loaded = cm
+                .get_channel_force(&mut env, channel_id, "test", false)
+                .unwrap();
+            assert_eq!(loaded.title, "supergroup");
+            close(&mut global);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
