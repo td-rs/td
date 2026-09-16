@@ -8,6 +8,8 @@
 //! Options manager S69.
 
 pub mod auth_manager;
+pub mod birthdate;
+pub mod chat_manager;
 pub mod client;
 pub mod client_json;
 pub mod config_dispatch;
@@ -15,16 +17,22 @@ pub mod config_manager;
 pub mod config_recoverer;
 pub mod config_result;
 pub mod connection_creator;
+pub mod emoji_status;
 pub mod global;
 pub mod link_manager;
 pub mod manager_option_states;
 pub mod misc;
 pub mod option_manager;
+pub mod peer_color;
 pub mod requests;
+pub mod restriction_reason;
+pub mod store_parse;
 pub mod synchronous_requests;
 pub mod td;
 pub mod time_zone_manager;
 pub mod updates_manager;
+pub mod user_manager;
+pub mod usernames;
 
 // Generated code keeps C++-identical case-preserved names (`aiComposeTone`)
 // in types, fields and the JSON dispatch helpers alike.

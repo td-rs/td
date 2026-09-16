@@ -96,31 +96,72 @@ impl TimeZoneList {
     }
 }
 
-/// `td::store(string)` — the same TL string layout the binlog pmc uses for
-/// keys and values (`[len: i32][bytes][zero padding to 4]`).
+/// `td::store(string)` — the TL string framing (`TlStorerUnsafe::
+/// store_string`: 1-byte length below 254, `0xfe`/`0xff` forms above,
+/// zero padding to a 4-byte boundary; verified against the C++).
 fn store_string(out: &mut Vec<u8>, s: &[u8]) {
-    out.extend_from_slice(&(s.len() as i32).to_le_bytes());
+    let len = s.len();
+    let header = if len < 254 {
+        out.push(len as u8);
+        1
+    } else if len < (1 << 24) {
+        out.push(0xfe);
+        out.extend_from_slice(&(len as u32).to_le_bytes()[..3]);
+        4
+    } else if len < (1usize << 32) {
+        out.push(0xff);
+        out.extend_from_slice(&(len as u64).to_le_bytes()[..4]);
+        out.extend_from_slice(&[0, 0, 0]);
+        8
+    } else {
+        panic!("String size {len} is too big to be stored");
+    };
     out.extend_from_slice(s);
-    let pad = (4 - s.len() % 4) % 4;
+    let pad = (4 - (header + len) % 4) % 4;
     out.extend(std::iter::repeat_n(0u8, pad));
 }
 
+/// `TlParser::fetch_string` — the clean raw reader.
 fn parse_string(input: &mut &[u8]) -> Result<String, String> {
     if input.len() < 4 {
         return Err("string length is out of range".to_string());
     }
-    let len = i32::from_le_bytes(input[0..4].try_into().unwrap());
-    if len < 0 {
-        return Err("negative string length".to_string());
-    }
-    let len = len as usize;
-    let padded = (len + 3) & !3;
-    if input.len() < 4 + padded {
+    let first = input[0];
+    let (result_len, header, aligned_len) = if first < 254 {
+        let len = first as usize;
+        (len, 4usize, (len >> 2) << 2)
+    } else if first == 254 {
+        if input.len() < 4 {
+            return Err("string length is out of range".to_string());
+        }
+        let len = (input[1] as usize) | ((input[2] as usize) << 8) | ((input[3] as usize) << 16);
+        (len, 4, ((len + 3) >> 2) << 2)
+    } else {
+        if input.len() < 8 {
+            return Err("string length is out of range".to_string());
+        }
+        let mut len = 0u64;
+        for i in (1..8).rev() {
+            len = (len << 8) | input[i] as u64;
+        }
+        if len > (usize::MAX - 3) as u64 {
+            return Err("string is too big".to_string());
+        }
+        (len as usize, 8, ((len as usize + 3) >> 2) << 2)
+    };
+    if input.len() < header + aligned_len {
         return Err("string data is out of range".to_string());
     }
-    let bytes = &input[4..4 + len];
-    *input = &input[4 + padded..];
-    String::from_utf8(bytes.to_vec()).map_err(|_| "string is not UTF-8".to_string())
+    let begin = if first == 255 {
+        8
+    } else if first == 254 {
+        4
+    } else {
+        1
+    };
+    let bytes = input[begin..begin + result_len].to_vec();
+    *input = &input[header + aligned_len..];
+    String::from_utf8(bytes).map_err(|_| "string is not UTF-8".to_string())
 }
 
 fn parse_i32(input: &mut &[u8]) -> Result<i32, String> {
@@ -244,15 +285,14 @@ mod tests {
 
         let mut expected = Vec::new();
         expected.extend_from_slice(&1i32.to_le_bytes());
-        // id
-        expected.extend_from_slice(&3i32.to_le_bytes());
+        // id ("UTC": 1-byte length + 3 bytes — already 4-aligned, no pad)
+        expected.extend_from_slice(&[3]);
         expected.extend_from_slice(b"UTC");
-        expected.push(0); // padding
-        // name (26 bytes + 2 padding)
+        // name (26 bytes: 1-byte length + bytes + 1 pad byte)
         let name = b"Coordinated Universal Time";
-        expected.extend_from_slice(&(name.len() as i32).to_le_bytes());
+        expected.push(name.len() as u8);
         expected.extend_from_slice(name);
-        expected.extend_from_slice(&[0, 0]);
+        expected.push(0);
         // utc_offset
         expected.extend_from_slice(&0i32.to_le_bytes());
         // hash
@@ -273,12 +313,7 @@ mod tests {
     #[test]
     fn parse_rejects_truncated_input() {
         assert!(TimeZoneList::parse(&mut &[][..]).is_err());
-        let truncated = [
-            1i32.to_le_bytes().to_vec(),
-            3i32.to_le_bytes().to_vec(),
-            b"U".to_vec(),
-        ]
-        .concat();
+        let truncated = [1i32.to_le_bytes().to_vec(), vec![3], b"U".to_vec()].concat();
         assert!(TimeZoneList::parse(&mut truncated.as_slice()).is_err());
     }
 

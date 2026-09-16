@@ -190,7 +190,13 @@ impl ConcurrentBinlog {
 
     /// `BinlogInterface::close`
     pub fn close(&self, promise: Option<Promise>) {
-        let mut inner = self.inner.lock().unwrap();
+        // Recover from a poisoned lock: a panic in an earlier binlog call
+        // must not turn the close path (reachable from destructors) into
+        // an abort that masks the original failure.
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(mut binlog) = inner.binlog.take() {
             binlog.close(true).ensure();
         }
@@ -203,7 +209,10 @@ impl ConcurrentBinlog {
 
     /// `BinlogInterface::close_and_destroy`
     pub fn close_and_destroy(&self, promise: Option<Promise>) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(mut binlog) = inner.binlog.take() {
             binlog.close_and_destroy().ensure();
         }
