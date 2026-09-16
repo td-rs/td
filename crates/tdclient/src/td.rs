@@ -27,6 +27,7 @@ use tdactor::{Actor, ActorOwn, actor_messages};
 use tddb::td_db::{OpenedDatabase, Parameters as DbParameters, TdDb};
 use tdmtproto::telegram_api;
 use tdnet::net_query::{NetQuery, NetQueryDispatcher};
+use tdutils::promise::Promise;
 use tdutils::status::Status;
 
 use crate::auth_manager::AuthManager;
@@ -47,11 +48,12 @@ use crate::global::Global;
 use crate::link_manager::LinkManager;
 use crate::manager_option_states::ManagerOptionStates;
 use crate::option_manager::OptionManager;
+use crate::query_merger::QueryMerger;
 use crate::requests;
 use crate::synchronous_requests;
 use crate::td_api::{self, Function, Object};
 use crate::time_zone_manager::TimeZoneManager;
-use crate::user_manager::{UserEnv, UserManager};
+use crate::user_manager::{UserEnv, UserId, UserManager};
 
 #[cfg(target_endian = "big")]
 compile_error!("TDLib requires little-endian platform");
@@ -175,6 +177,12 @@ pub struct Td {
     /// `Td::user_manager_` — the user/secret-chat cache (created with Td,
     /// loaded from the binlog pmc in `init` like the C++ constructor).
     pub(crate) user_manager: UserManager,
+    /// The premium-required-to-contact QueryMerger actor (a UserManager
+    /// member in the C++; the Rust merger is an actor created by `init` —
+    /// the `ActorOwn` keeps it alive, dropping it would hang the merged
+    /// queries).
+    #[allow(dead_code)]
+    premium_required_contact_merger: Option<ActorOwn<QueryMerger>>,
     /// `Td::stop_cnt_` — the hangup and the close completion each drop one.
     stop_cnt: i32,
     /// The deferred-response outbox. The C++ request promises re-enter the
@@ -232,6 +240,7 @@ impl Td {
             link_manager: None,
             auth_manager: AuthManager::new(),
             user_manager: UserManager::new(),
+            premium_required_contact_merger: None,
             stop_cnt: 2,
             deferred_results: Arc::new(Mutex::new(Vec::new())),
         }
@@ -533,8 +542,8 @@ impl Td {
         // each manager step appends its block here in the C++ order. The
         // UserManager constructor loads my_id from the binlog pmc
         // (UserManager.cpp:2824 `my_id_ = load_my_id()`) and the
-        // contacts sync state (cpp:2748-2759); the freeze-state pmc reads
-        // arrive with their step.
+        // contacts sync state (cpp:2748-2759); the freeze-state pmc read
+        // lands with the M.4.15 step.
         self.user_manager.init_my_id(self.global.binlog_pmc());
         let unix_time = self.global.unix_time();
         let use_chat_info_database = self.global.use_chat_info_database();
@@ -551,6 +560,10 @@ impl Td {
             let unix_time = self.global.unix_time();
             self.user_manager
                 .init_my_online_status(self.global.binlog_pmc(), unix_time, false);
+            // UserManager.cpp:2773-2781 — the freeze-state restore (the
+            // updateFreezeState emission rides the flush below).
+            self.user_manager
+                .init_freeze_state(self.global.binlog_pmc());
         }
         // UserManager.cpp:2829-2845 — start_up's saved-music block; the
         // C++ gate is is_authorized() && !is_bot().
@@ -608,6 +621,33 @@ impl Td {
         let recoverer_actions = recoverer.on_dc_options_update(saved_options, &environment);
         self.config_recoverer = Some(recoverer);
         self.apply_recoverer_actions(recoverer_actions);
+
+        // The UserManager member actors (the C++ `get_is_premium_required_
+        // to_contact_queries_` value member + its `set_merge_function`;
+        // the Rust merger is an actor whose merge function messages the Td
+        // actor to build the input users and send the query).
+        {
+            let td_id = self.actor_id_of::<Td>();
+            let merger = tdactor::create_actor(
+                "GetIsPremiumRequiredToContactMerger",
+                QueryMerger::new(
+                    3,
+                    100,
+                    Box::new(move |query_ids, promise| {
+                        tdactor::send_closure(
+                            td_id.clone(),
+                            MergePremiumRequiredContactQueries {
+                                user_ids: query_ids,
+                                promise,
+                            },
+                        );
+                    }),
+                ),
+            );
+            self.user_manager.get_is_premium_required_to_contact_queries = Some(merger.get());
+            self.premium_required_contact_merger = Some(merger);
+        }
+        self.user_manager.td_actor_id = Some(self.actor_id_of::<Td>());
 
         self.parameters = Some(parameters);
 
@@ -1682,6 +1722,48 @@ impl Actor for Td {
 
     // No `loop_`: the pending-query poll arrives with the net step (the
     // C++ `Td::loop` yields to drive the NetQueryDispatcher).
+}
+
+/// The premium-required-to-contact QueryMerger merge function: build the
+/// input users and send the merged `users.getRequirementsToContact`
+/// query. The query send is [blocked: net] and answers the C++ error
+/// surface until M.4.16 wires it (which then routes the answer through
+/// `UserManager::on_get_is_premium_required_to_contact_users`).
+struct MergePremiumRequiredContactQueries {
+    user_ids: Vec<i64>,
+    promise: Promise<()>,
+}
+
+impl tdactor::ActorMessage for MergePremiumRequiredContactQueries {
+    type Actor = Td;
+
+    fn dispatch(self, td: &mut Td) {
+        let Some(options) = td.option_manager.as_mut() else {
+            // the C++ TRY_STATUS_PROMISE(promise, G()->close_status())
+            return self
+                .promise
+                .set_error(Status::error(500, "Request aborted"));
+        };
+        let env = UserEnv {
+            global: &mut td.global,
+            options,
+            auth_is_bot: td.auth_manager.is_bot(),
+        };
+        if env.global.close_flag() {
+            return self
+                .promise
+                .set_error(Status::error(500, "Request aborted"));
+        }
+        let user_ids: Vec<UserId> = self.user_ids.iter().map(|id| UserId::new(*id)).collect();
+        let input_users = td.user_manager.get_input_users_force(&env, &user_ids);
+        let _ = input_users; // the GetIsPremiumRequiredToContactQuery payload
+        tdutils::log_info!(
+            "Get requirements to contact {} users — [blocked: net]",
+            user_ids.len()
+        );
+        self.promise
+            .set_error(Status::error(500, "Network is not implemented yet"));
+    }
 }
 
 /// The `complete_pending_preauthentication_requests` id sets, collapsed
