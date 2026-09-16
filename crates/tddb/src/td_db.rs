@@ -41,7 +41,8 @@ pub const CURRENT_DB_VERSION: i32 = db_version::NEXT - 1;
 
 /// `MESSAGE_DB_INDEX_COUNT` (td/telegram/MessageDb.cpp)
 const MESSAGE_DB_INDEX_COUNT: i32 = 30;
-#[allow(dead_code)]
+/// `MESSAGE_DB_INDEX_COUNT_OLD` (td/telegram/MessageDb.cpp:42) — the nine
+/// indices the `AddMessageDbMediaIndex` migration adds.
 const MESSAGE_DB_INDEX_COUNT_OLD: i32 = 9;
 
 /// `MessageSearchFilter::Call` / `MissedCall`
@@ -309,15 +310,23 @@ fn init_dialog_db(db: &SqliteDb, version: &mut i32) -> Status {
     Status::ok()
 }
 
-/// `init_message_db`
-fn init_message_db(db: &SqliteDb, version: &mut i32) -> Status {
+/// `init_message_db` (MessageDb.cpp:45-171) — the fresh-DB path plus the
+/// `DbVersion`-gated ALTER ladder.
+pub fn init_message_db(db: &SqliteDb, version: &mut i32) -> Status {
+    tracing::info!("Init message database version={version}");
+
+    // Check if database exists
     let has_table = db.has_table("messages").unwrap();
     let mut version_local = *version;
-    if !has_table || version_local > CURRENT_DB_VERSION {
+    if !has_table {
+        version_local = 0;
+    } else if version_local > CURRENT_DB_VERSION {
+        try_status!(drop_message_db(db, version_local));
         version_local = 0;
     }
 
     if version_local == 0 {
+        tracing::info!("Create new message database");
         try_status!(
             db.exec("CREATE TABLE IF NOT EXISTS messages (dialog_id INT8, message_id INT8, unique_message_id INT4, \
                      sender_user_id INT8, random_id INT8, data BLOB, ttl_expires_at INT4, index_mask INT4, search_id INT8, \
@@ -342,8 +351,47 @@ fn init_message_db(db: &SqliteDb, version: &mut i32) -> Status {
         try_status!(add_scheduled_messages_table(db));
         version_local = CURRENT_DB_VERSION;
     }
+    if version_local < db_version::ADD_MESSAGE_DB_MEDIA_INDEX {
+        try_status!(db.exec("ALTER TABLE messages ADD COLUMN index_mask INT4"));
+        try_status!(add_media_indices(db, 0, MESSAGE_DB_INDEX_COUNT_OLD));
+    }
+    if version_local < db_version::ADD_MESSAGE_DB30_MEDIA_INDEX {
+        try_status!(add_media_indices(
+            db,
+            MESSAGE_DB_INDEX_COUNT_OLD,
+            MESSAGE_DB_INDEX_COUNT
+        ));
+    }
+    if version_local < db_version::ADD_MESSAGE_DB_FTS {
+        try_status!(db.exec("ALTER TABLE messages ADD COLUMN search_id INT8"));
+        try_status!(db.exec("ALTER TABLE messages ADD COLUMN text STRING"));
+        try_status!(add_fts(db));
+    }
+    if version_local < db_version::ADD_MESSAGES_CALL_INDEX {
+        try_status!(add_call_index(db));
+    }
+    if version_local < db_version::ADD_NOTIFICATIONS_SUPPORT {
+        try_status!(db.exec("ALTER TABLE messages ADD COLUMN notification_id INT4"));
+        try_status!(add_notification_id_index(db));
+    }
+    if version_local < db_version::ADD_SCHEDULED_MESSAGES {
+        try_status!(add_scheduled_messages_table(db));
+    }
+    if version_local < db_version::ADD_MESSAGE_THREAD_SUPPORT {
+        try_status!(db.exec("ALTER TABLE messages ADD COLUMN top_thread_message_id INT8"));
+    }
     *version = version_local;
     Status::ok()
+}
+
+/// `drop_message_db` (MessageDb.cpp:174-178) — drops only the `messages`
+/// table; the FTS and scheduled tables are left to the recreate path,
+/// like the C++.
+pub fn drop_message_db(db: &SqliteDb, version: i32) -> Status {
+    tracing::warn!(
+        "Drop message database version={version} current_db_version={CURRENT_DB_VERSION}"
+    );
+    db.exec("DROP TABLE IF EXISTS messages")
 }
 
 /// `init_story_db`
