@@ -27,8 +27,6 @@
 //! - The manager fan-outs to ConnectionCreator / LinkManager /
 //!   TranscriptionManager / UserManager / AccountManager / GroupCallManager
 //!   have no receivers yet and are skipped at trace level.
-//! - `is_emoji` (the Unicode emoji table behind the `emojies_sounds` key
-//!   validation) is not ported; the key is accepted as-is.
 //! - Failed content-settings fetches leave the pending `getOption`s
 //!   unanswered, exactly like the C++ value-only promise (the errors are
 //!   dropped).
@@ -1437,6 +1435,42 @@ fn clean_phone_number(phone_number: &mut String) {
     phone_number.retain(|c| c.is_ascii_digit());
 }
 
+/// `td::to_integer_safe<int64>` (td/utils/misc.h:200-206) — a strict
+/// canonical-decimal parse: the C++ round-trips the parsed value through its
+/// minimal decimal form, rejecting leading `+`, leading zeros, `-0`,
+/// embedded garbage and out-of-range values that `to_integer` would wrap.
+fn to_integer_safe_i64(str: &str) -> Option<i64> {
+    let bytes = str.as_bytes();
+    let digits = match bytes.first() {
+        Some(b'-') => &bytes[1..],
+        Some(_) => bytes,
+        None => return None,
+    };
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    // Leading zeros (any digit count > 1 starting with '0') don't round-trip.
+    if digits.len() > 1 && digits[0] == b'0' {
+        return None;
+    }
+    let magnitude: i128 = digits
+        .iter()
+        .fold(0i128, |acc, &d| acc * 10 + i128::from(d - b'0'));
+    let value = if str.starts_with('-') {
+        -magnitude
+    } else {
+        magnitude
+    };
+    // Values past i64::MAX/MIN would wrap in the C++ `to_integer` and fail
+    // its round-trip check — clamping them keeps the same rejection.
+    let value = value.clamp(i64::MIN as i128, i64::MAX as i128) as i64;
+    if value.to_string() == str {
+        Some(value)
+    } else {
+        None
+    }
+}
+
 /// `get_premium_limit_keys` (Premium.cpp:932-950).
 fn premium_limit_keys() -> &'static [&'static str] {
     &[
@@ -2029,12 +2063,11 @@ impl ConfigManager {
                                         _ => {}
                                     }
                                 }
-                                if id.parse::<i64>().is_err()
-                                    || access_hash.parse::<i64>().is_err()
+                                if to_integer_safe_i64(&id).is_none()
+                                    || to_integer_safe_i64(&access_hash).is_none()
                                     || !is_base64url(file_reference_base64.as_bytes())
+                                    || !tdutils::emoji::is_emoji(&sound.key)
                                 {
-                                    // is_emoji(sound->key_) is not ported (the
-                                    // Unicode emoji table) — the key is kept.
                                     tdutils::log_error!("Receive unexpected sound value {sound:?}");
                                 } else {
                                     emoji_sounds.push(sound.key.clone());
@@ -3220,6 +3253,74 @@ mod tests {
             parsed.config.as_ref(),
             telegram_api::JSONValue::jsonObject(object) if object.value.is_empty()
         ));
+    }
+
+    #[test]
+    fn emoji_sounds_are_validated_like_the_cpp() {
+        let mut pmc = TempPmc::new("emoji-sounds");
+        let mut options = options();
+        let mut manager = ConfigManager::new(b"");
+        manager.get_app_config(7, false, false);
+
+        let sound_value = |id: &str| {
+            json_object(vec![
+                ("id".to_string(), json_string(id)),
+                ("access_hash".to_string(), json_string("456")),
+                ("file_reference_base64".to_string(), json_string("QmFzZTY0")),
+            ])
+        };
+        let config = json_object(vec![(
+            "emojies_sounds".to_string(),
+            json_object(vec![
+                // A table emoji with canonical ids is accepted.
+                ("⌚".to_string(), sound_value("123")),
+                // A non-emoji key is rejected (ConfigManager.cpp:1669).
+                ("not-an-emoji".to_string(), sound_value("123")),
+                // A leading-zero id fails to_integer_safe's round trip.
+                ("⌛".to_string(), sound_value("0123")),
+                // An emoji + variation selector and i64::MIN are accepted.
+                (
+                    "⌚\u{FE0F}".to_string(),
+                    sound_value("-9223372036854775808"),
+                ),
+            ]),
+        )]);
+        manager.on_get_app_config_result(
+            &mut pmc,
+            Ok(AppConfigQueryResult::Config { hash: 1, config }),
+            false,
+            &mut options,
+            false,
+            false,
+        );
+        assert_eq!(
+            options.get_option_string("emoji_sounds", ""),
+            "⌚,123:456:QmFzZTY0,⌚\u{FE0F},-9223372036854775808:456:QmFzZTY0"
+        );
+    }
+
+    #[test]
+    fn to_integer_safe_matches_the_cpp_round_trip() {
+        assert_eq!(to_integer_safe_i64("0"), Some(0));
+        assert_eq!(to_integer_safe_i64("-1"), Some(-1));
+        assert_eq!(
+            to_integer_safe_i64("123456789012345678"),
+            Some(123456789012345678)
+        );
+        assert_eq!(to_integer_safe_i64("9223372036854775807"), Some(i64::MAX));
+        assert_eq!(to_integer_safe_i64("-9223372036854775808"), Some(i64::MIN));
+        // Out-of-range values wrap in to_integer and fail the round trip.
+        assert_eq!(to_integer_safe_i64("9223372036854775808"), None);
+        assert_eq!(to_integer_safe_i64("-9223372036854775809"), None);
+        // Non-canonical forms the C++ rejects via the PSLICE round trip.
+        assert_eq!(to_integer_safe_i64("+5"), None);
+        assert_eq!(to_integer_safe_i64("05"), None);
+        assert_eq!(to_integer_safe_i64("-0"), None);
+        assert_eq!(to_integer_safe_i64(""), None);
+        assert_eq!(to_integer_safe_i64("-"), None);
+        assert_eq!(to_integer_safe_i64("1x"), None);
+        assert_eq!(to_integer_safe_i64(" 1"), None);
+        assert_eq!(to_integer_safe_i64("1 "), None);
     }
 
     #[test]
