@@ -1464,7 +1464,7 @@ impl ConfigManager {
     /// config JSON to the options and return the filtered config (the
     /// consumed keys are stripped before it is persisted, like the C++
     /// `new_values` reassignment).
-    fn process_app_config(
+    pub fn process_app_config(
         &mut self,
         mut config: Box<telegram_api::JSONValue>,
         options: &mut OptionManager,

@@ -13,6 +13,8 @@ JSON, URL, HTML, entities, binlog reader, secret-chat crypto.
 | `mtproto_packet`  | `packet::read_with_x` — decrypt + msg_id/seq_no + body under a fixed key |
 | `tl_scheme_text`  | `tdtl` lexer + parse tree — the codegen front end                        |
 | `transport_frame` | stream transport framing (Tcp/ObfuscatedTcp/Http) via `create_transport` |
+| `app_config`     | `ConfigManager::process_app_config` — app-config JSON application over every key map (M.3.10.3) |
+| `simple_config`  | `decode_config` — simple-config RSA/AES/SHA rejection space (M.3.10.3) |
 
 Pending their Track I components: URL, HTML, entities, secret-chat crypto.
 The S78 release gate — one week fuzz-clean per target — runs against the

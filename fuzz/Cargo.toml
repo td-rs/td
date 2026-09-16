@@ -1,8 +1,9 @@
 # Fuzz targets (S78), one per parsing-heavy component that exists so far:
 # the td_api JSON request parser, the raw tdutils JSON parser, the binlog
 # event reader, the MTProto packet parser and the TL scheme text parser.
-# URL / HTML / entities / secret-chat targets arrive with their Track I
-# components.
+# The M.3.10.3 pair covers the app-config JSON application and the
+# simple-config decoder. URL / HTML / entities / secret-chat targets
+# arrive with their Track I components.
 #
 # Own manifest, excluded from the workspace (like `conformance` and
 # `bench`). Build: `cargo build` here compiles the libFuzzer runtime from
@@ -55,6 +56,16 @@ doc = false
 [[bin]]
 name = "transport_frame"
 path = "fuzz_targets/transport_frame.rs"
+doc = false
+
+[[bin]]
+name = "app_config"
+path = "fuzz_targets/app_config.rs"
+doc = false
+
+[[bin]]
+name = "simple_config"
+path = "fuzz_targets/simple_config.rs"
 doc = false
 
 # Panic = bug: the parsers must report errors, never crash (the tdlib
