@@ -23,9 +23,11 @@
 
 use crate::chat_manager::{ChannelId, ChatId};
 use crate::store_parse::{Parser, store_i32, store_i64};
+use crate::td_api;
 use crate::user_manager::{SecretChatId, UserId};
 use tdmtproto::telegram_api;
 use tdutils::log_error;
+use tdutils::status::Status;
 
 /// `td::MessageType` (MessageId.h:22) — the discriminant order is load-bearing:
 /// `MessageId::get_next_message_id` compares the numeric values.
@@ -1449,6 +1451,404 @@ impl std::fmt::Display for InputDialogId {
     }
 }
 
+/// `td::MessageContentType` (MessageContentType.h:15-113) — the discriminant
+/// order is the C++ enum order; `MessageUnsupported::CURRENT_VERSION` bumps
+/// with every addition. The classification-function family
+/// (`is_service_message_content` etc., MessageContentType.cpp) lands with the
+/// M.9 content model; only the predicate `MessageSelfDestructType` needs is
+/// ported here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(i32)]
+pub enum MessageContentType {
+    None = -1,
+    #[default]
+    Text = 0,
+    Animation,
+    Audio,
+    Document,
+    Photo,
+    Sticker,
+    Video,
+    VoiceNote,
+    Contact,
+    Location,
+    Venue,
+    ChatCreate,
+    ChatChangeTitle,
+    ChatChangePhoto,
+    ChatDeletePhoto,
+    ChatDeleteHistory,
+    ChatAddUsers,
+    ChatJoinedByLink,
+    ChatDeleteUser,
+    ChatMigrateTo,
+    ChannelCreate,
+    ChannelMigrateFrom,
+    PinMessage,
+    Game,
+    GameScore,
+    ScreenshotTaken,
+    ChatSetTtl,
+    Unsupported,
+    Call,
+    Invoice,
+    PaymentSuccessful,
+    VideoNote,
+    ContactRegistered,
+    ExpiredPhoto,
+    ExpiredVideo,
+    LiveLocation,
+    CustomServiceAction,
+    WebsiteConnected,
+    PassportDataSent,
+    PassportDataReceived,
+    Poll,
+    Dice,
+    ProximityAlertTriggered,
+    GroupCall,
+    InviteToGroupCall,
+    ChatSetTheme,
+    WebViewDataSent,
+    WebViewDataReceived,
+    GiftPremium,
+    TopicCreate,
+    TopicEdit,
+    SuggestProfilePhoto,
+    WriteAccessAllowed,
+    RequestedDialog,
+    WebViewWriteAccessAllowed,
+    SetBackground,
+    Story,
+    WriteAccessAllowedByRequest,
+    GiftCode,
+    Giveaway,
+    GiveawayLaunch,
+    GiveawayResults,
+    GiveawayWinners,
+    ExpiredVideoNote,
+    ExpiredVoiceNote,
+    BoostApply,
+    DialogShared,
+    PaidMedia,
+    PaymentRefunded,
+    GiftStars,
+    PrizeStars,
+    StarGift,
+    StarGiftUnique,
+    PaidMessagesRefunded,
+    PaidMessagesPrice,
+    ConferenceCall,
+    ToDoList,
+    TodoCompletions,
+    TodoAppendTasks,
+    GiftTon,
+    SuggestedPostSuccess,
+    SuggestedPostRefund,
+    SuggestedPostApproval,
+    SuggestBirthday,
+    StarGiftPurchaseOffer,
+    StarGiftPurchaseOfferDeclined,
+    NewCreatorPending,
+    ChangeCreator,
+    NoForwardsToggle,
+    NoForwardsRequest,
+    ManagedBotCreated,
+    PollAppendAnswer,
+    PollDeleteAnswer,
+    RichText,
+    ChangeCommunity,
+    ChatJoinedViaCommunity,
+}
+
+/// `can_be_secret_message_content` (MessageContentType.cpp) — the C++
+/// `default: UNREACHABLE()` covers only `None`.
+pub fn can_be_secret_message_content(content_type: MessageContentType) -> bool {
+    use MessageContentType::*;
+    matches!(
+        content_type,
+        Animation | Audio | Photo | Video | VideoNote | VoiceNote
+    )
+}
+
+/// `td::MessageSelfDestructType` (MessageSelfDestructType.{h,cpp}) — the ttl
+/// encoding: `0` empty, `0x7FFFFFFF` immediate, `0x7FFFFFFE` the forced
+/// replacement for non-allow_immediate immediate requests.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct MessageSelfDestructType {
+    ttl: i32,
+}
+
+impl MessageSelfDestructType {
+    /// `MessageSelfDestructType(int32 ttl, bool allow_immediate)`
+    /// (MessageSelfDestructType.h:31-36).
+    pub fn with_ttl(ttl: i32, allow_immediate: bool) -> MessageSelfDestructType {
+        let mut result = MessageSelfDestructType { ttl };
+        if !allow_immediate && result.is_immediate() {
+            result.ttl = 0x7FFFFFFE;
+        }
+        result
+    }
+
+    pub fn is_valid(self) -> bool {
+        self.ttl > 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.ttl == 0
+    }
+
+    pub fn is_immediate(self) -> bool {
+        self.ttl == 0x7FFFFFFF
+    }
+
+    /// `MessageSelfDestructType::is_secret_message_content`
+    /// (MessageSelfDestructType.cpp:23-28).
+    pub fn is_secret_message_content(self, content_type: MessageContentType) -> bool {
+        if self.ttl <= 0 || self.ttl > 60 {
+            return self.is_immediate();
+        }
+        can_be_secret_message_content(content_type)
+    }
+
+    /// `MessageSelfDestructType::ensure_at_least` (MessageSelfDestructType.cpp:30-35).
+    pub fn ensure_at_least(&mut self, ttl: i32) {
+        if self.is_immediate() || self.ttl >= ttl || self.ttl <= 0 || ttl <= 0 {
+            return;
+        }
+        self.ttl = ttl;
+    }
+
+    /// `MessageSelfDestructType::get_message_self_destruct_type`
+    /// (MessageSelfDestructType.cpp:37-59).
+    pub fn get_message_self_destruct_type(
+        self_destruct_type: Option<td_api::MessageSelfDestructType>,
+    ) -> Result<MessageSelfDestructType, Status> {
+        let self_destruct_type = match self_destruct_type {
+            Some(ty) => ty,
+            None => return Ok(MessageSelfDestructType::default()),
+        };
+        match self_destruct_type {
+            td_api::MessageSelfDestructType::messageSelfDestructTypeTimer(timer) => {
+                let ttl = timer.self_destruct_time;
+
+                const MAX_PRIVATE_MESSAGE_TTL: i32 = 60; // server-side limit
+                if ttl <= 0 || ttl > MAX_PRIVATE_MESSAGE_TTL {
+                    return Err(Status::error(
+                        400,
+                        "Invalid message content self-destruct time specified",
+                    ));
+                }
+                Ok(MessageSelfDestructType::with_ttl(ttl, true))
+            }
+            td_api::MessageSelfDestructType::messageSelfDestructTypeImmediately(_) => {
+                Ok(MessageSelfDestructType::with_ttl(0x7FFFFFFF, true))
+            }
+        }
+    }
+
+    /// `MessageSelfDestructType::get_message_self_destruct_type_object`
+    /// (MessageSelfDestructType.cpp:61-70); `None` is the C++ nullptr.
+    pub fn get_message_self_destruct_type_object(self) -> Option<td_api::MessageSelfDestructType> {
+        if self.is_immediate() {
+            return Some(
+                td_api::MessageSelfDestructType::messageSelfDestructTypeImmediately(
+                    td_api::messageSelfDestructTypeImmediately,
+                ),
+            );
+        }
+        if !self.is_empty() {
+            return Some(
+                td_api::MessageSelfDestructType::messageSelfDestructTypeTimer(
+                    td_api::messageSelfDestructTypeTimer {
+                        self_destruct_time: self.ttl,
+                    },
+                ),
+            );
+        }
+        None
+    }
+
+    /// `MessageSelfDestructType::get_input_ttl` (MessageSelfDestructType.cpp:72-74).
+    pub fn get_input_ttl(self) -> i32 {
+        self.ttl
+    }
+
+    pub fn store(self, out: &mut Vec<u8>) {
+        store_i32(out, self.ttl);
+    }
+
+    pub fn parse_value(input: &[u8]) -> Result<MessageSelfDestructType, &'static str> {
+        let mut parser = Parser::new(input);
+        let ttl = parser.i32_()?;
+        parser.fetch_end()?;
+        Ok(MessageSelfDestructType { ttl })
+    }
+}
+
+impl std::fmt::Display for MessageSelfDestructType {
+    /// `operator<<(StringBuilder, MessageSelfDestructType)`
+    /// (MessageSelfDestructType.cpp:80-88).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_empty() {
+            return write!(f, "non-self-destruct");
+        }
+        if self.is_immediate() {
+            return write!(f, "self-destruct immediately");
+        }
+        write!(f, "self-destruct at {}", self.get_input_ttl())
+    }
+}
+
+/// `td::MessageTtl` (MessageTtl.{h,cpp}) — the dialog message-auto-delete
+/// period; negative periods log and clamp to 0 like the C++ constructor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct MessageTtl {
+    period: i32,
+}
+
+impl MessageTtl {
+    /// `MessageTtl(int32 period, const char *source)` (MessageTtl.cpp:12-17).
+    pub fn new(period: i32) -> MessageTtl {
+        let mut result = MessageTtl { period };
+        if result.period < 0 {
+            log_error!("Receive message auto-delete time {}", result.period);
+            result.period = 0;
+        }
+        result
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.period == 0
+    }
+
+    /// `MessageTtl::get_message_auto_delete_time_object` (MessageTtl.cpp:19-21).
+    pub fn get_message_auto_delete_time_object(self) -> i32 {
+        self.period.max(0)
+    }
+
+    /// `MessageTtl::get_input_ttl_period` (MessageTtl.cpp:23-25).
+    pub fn get_input_ttl_period(self) -> i32 {
+        self.period
+    }
+
+    pub fn store(self, out: &mut Vec<u8>) {
+        store_i32(out, self.period);
+    }
+
+    pub fn parse_value(input: &[u8]) -> Result<MessageTtl, &'static str> {
+        let mut parser = Parser::new(input);
+        let period = parser.i32_()?;
+        parser.fetch_end()?;
+        Ok(MessageTtl { period })
+    }
+}
+
+impl std::fmt::Display for MessageTtl {
+    /// `operator<<(StringBuilder, MessageTtl)` (MessageTtl.cpp:33-35).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MessageTtl[{}]", self.period)
+    }
+}
+
+/// `td::MessageEffectId` (MessageEffectId.h).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct MessageEffectId(i64);
+
+impl MessageEffectId {
+    pub fn new(id: i64) -> MessageEffectId {
+        MessageEffectId(id)
+    }
+
+    pub fn is_valid(self) -> bool {
+        self.0 != 0
+    }
+
+    pub fn get(self) -> i64 {
+        self.0
+    }
+
+    pub fn store(self, out: &mut Vec<u8>) {
+        store_i64(out, self.0);
+    }
+
+    pub fn parse_value(input: &[u8]) -> Result<MessageEffectId, &'static str> {
+        let mut parser = Parser::new(input);
+        let id = parser.i64_()?;
+        parser.fetch_end()?;
+        Ok(MessageEffectId(id))
+    }
+}
+
+impl std::fmt::Display for MessageEffectId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "message effect {}", self.0)
+    }
+}
+
+/// `td::SavedMessagesTopicId` (SavedMessagesTopicId.h) — the wrapper over the
+/// topic's dialog id. The forward-info constructor and the `Td *`-dependent
+/// accessors (input peer/user, topic type object, dependencies) are deferred
+/// to the manager tasks that have the manager context.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct SavedMessagesTopicId {
+    dialog_id: DialogId,
+}
+
+impl SavedMessagesTopicId {
+    pub fn new(dialog_id: DialogId) -> SavedMessagesTopicId {
+        SavedMessagesTopicId { dialog_id }
+    }
+
+    pub fn is_valid(self) -> bool {
+        self.dialog_id.is_valid()
+    }
+
+    pub fn get_dialog_id(self) -> DialogId {
+        self.dialog_id
+    }
+
+    /// `SavedMessagesTopicId::get_unique_id` (SavedMessagesTopicId.h:48-50).
+    pub fn get_unique_id(self) -> i64 {
+        self.dialog_id.get()
+    }
+
+    /// `SavedMessagesTopicId::store` (SavedMessagesTopicId.h:76-78).
+    pub fn store(self, out: &mut Vec<u8>) {
+        self.dialog_id.store(out);
+    }
+
+    /// `SavedMessagesTopicId::parse` (SavedMessagesTopicId.h:80-82).
+    pub fn parse_value(input: &[u8]) -> Result<SavedMessagesTopicId, &'static str> {
+        let dialog_id = DialogId::parse_value(input)?;
+        Ok(SavedMessagesTopicId { dialog_id })
+    }
+}
+
+/// `MessagesManager::NotificationInfo` (MessagesManager.h:1290-1301) — the
+/// per-dialog notification group bookkeeping; created lazily in the C++
+/// (`unique_ptr`), so the manager holds it in an `Option`.
+#[derive(Clone, Debug, Default)]
+pub struct NotificationInfo {
+    pub message_notification_group: NotificationGroupInfo,
+    pub mention_notification_group: NotificationGroupInfo,
+    /// secret chats only
+    pub new_secret_chat_notification_id: NotificationId,
+    pub pinned_message_notification_message_id: MessageId,
+    pub max_push_notification_message_id: MessageId,
+
+    pub pending_new_message_notifications: Vec<(DialogId, MessageId)>,
+    pub pending_new_mention_notifications: Vec<(DialogId, MessageId)>,
+
+    pub notification_id_to_message_id: std::collections::HashMap<NotificationId, MessageId>,
+}
+
+/// `MessagesManager::EphemeralMessageInfo` (MessagesManager.h:1303-1306).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EphemeralMessageInfo {
+    pub anchor_message_id: MessageId,
+    pub monotonic_id: u32,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2300,5 +2700,223 @@ mod tests {
         assert_eq!(bytes.len(), 16);
         assert_eq!(InputDialogId::parse_value(&bytes).unwrap(), id);
         assert_eq!(format!("{}", id), "input chat 7");
+    }
+
+    // ---- MessageContentType + MessageSelfDestructType ----
+
+    #[test]
+    fn message_content_type_discriminants() {
+        assert_eq!(MessageContentType::None as i32, -1);
+        assert_eq!(MessageContentType::Text as i32, 0);
+        assert_eq!(MessageContentType::Photo as i32, 4);
+        assert_eq!(MessageContentType::Unsupported as i32, 27);
+        assert_eq!(MessageContentType::VideoNote as i32, 31);
+        assert_eq!(MessageContentType::Poll as i32, 40);
+        assert_eq!(MessageContentType::ChatJoinedViaCommunity as i32, 95);
+        assert_eq!(MessageContentType::default(), MessageContentType::Text);
+    }
+
+    #[test]
+    fn can_be_secret_message_content_table() {
+        for ty in [
+            MessageContentType::Animation,
+            MessageContentType::Audio,
+            MessageContentType::Photo,
+            MessageContentType::Video,
+            MessageContentType::VideoNote,
+            MessageContentType::VoiceNote,
+        ] {
+            assert!(can_be_secret_message_content(ty), "{:?}", ty);
+        }
+        for ty in [
+            MessageContentType::Text,
+            MessageContentType::Document,
+            MessageContentType::Sticker,
+            MessageContentType::ExpiredPhoto,
+            MessageContentType::StarGiftUnique,
+            MessageContentType::ChatJoinedViaCommunity,
+        ] {
+            assert!(!can_be_secret_message_content(ty), "{:?}", ty);
+        }
+    }
+
+    #[test]
+    fn message_self_destruct_type_decisions() {
+        // the forced replacement of a disallowed immediate
+        assert_eq!(
+            MessageSelfDestructType::with_ttl(0x7FFFFFFF, false).get_input_ttl(),
+            0x7FFFFFFE
+        );
+        assert!(MessageSelfDestructType::with_ttl(0x7FFFFFFF, true).is_immediate());
+
+        let ttl = MessageSelfDestructType::with_ttl(30, true);
+        assert!(ttl.is_valid());
+        assert!(!ttl.is_empty());
+        assert!(ttl.is_secret_message_content(MessageContentType::Photo));
+        assert!(!ttl.is_secret_message_content(MessageContentType::Text));
+        // ttl above the 60-second band decays to the immediate check
+        assert!(
+            !MessageSelfDestructType::with_ttl(100, true)
+                .is_secret_message_content(MessageContentType::Photo)
+        );
+        assert!(
+            MessageSelfDestructType::with_ttl(0x7FFFFFFF, true)
+                .is_secret_message_content(MessageContentType::Text),
+            "immediate self-destructs regardless of the content type"
+        );
+
+        // ensure_at_least branches — a non-positive ttl_ is never raised
+        let mut empty = MessageSelfDestructType::default();
+        empty.ensure_at_least(40);
+        assert_eq!(empty.get_input_ttl(), 0, "empty is never raised");
+        let mut low = MessageSelfDestructType::with_ttl(30, true);
+        low.ensure_at_least(40);
+        assert_eq!(low.get_input_ttl(), 40);
+        let mut high = MessageSelfDestructType::with_ttl(50, true);
+        high.ensure_at_least(40);
+        assert_eq!(high.get_input_ttl(), 50);
+        let mut immediate = MessageSelfDestructType::with_ttl(0x7FFFFFFF, true);
+        immediate.ensure_at_least(40);
+        assert!(immediate.is_immediate(), "immediate is never raised");
+        let mut zero = MessageSelfDestructType::default();
+        zero.ensure_at_least(0);
+        assert!(zero.is_empty(), "non-positive ttl is a no-op");
+    }
+
+    #[test]
+    fn message_self_destruct_type_api_and_store() {
+        assert_eq!(
+            MessageSelfDestructType::get_message_self_destruct_type(None).unwrap(),
+            MessageSelfDestructType::default()
+        );
+        let timer = MessageSelfDestructType::get_message_self_destruct_type(Some(
+            td_api::MessageSelfDestructType::messageSelfDestructTypeTimer(
+                td_api::messageSelfDestructTypeTimer {
+                    self_destruct_time: 30,
+                },
+            ),
+        ))
+        .unwrap();
+        assert_eq!(timer.get_input_ttl(), 30);
+        assert_eq!(
+            MessageSelfDestructType::get_message_self_destruct_type(Some(
+                td_api::MessageSelfDestructType::messageSelfDestructTypeTimer(
+                    td_api::messageSelfDestructTypeTimer {
+                        self_destruct_time: 61,
+                    }
+                ),
+            ))
+            .unwrap_err()
+            .code(),
+            400
+        );
+        let immediate = MessageSelfDestructType::get_message_self_destruct_type(Some(
+            td_api::MessageSelfDestructType::messageSelfDestructTypeImmediately(
+                td_api::messageSelfDestructTypeImmediately,
+            ),
+        ))
+        .unwrap();
+        assert!(immediate.is_immediate());
+
+        match timer.get_message_self_destruct_type_object().unwrap() {
+            td_api::MessageSelfDestructType::messageSelfDestructTypeTimer(t) => {
+                assert_eq!(t.self_destruct_time, 30);
+            }
+            _ => panic!("wrong self-destruct type"),
+        }
+        assert!(
+            MessageSelfDestructType::default()
+                .get_message_self_destruct_type_object()
+                .is_none()
+        );
+        match immediate.get_message_self_destruct_type_object().unwrap() {
+            td_api::MessageSelfDestructType::messageSelfDestructTypeImmediately(_) => (),
+            _ => panic!("wrong self-destruct type"),
+        }
+
+        let mut bytes = Vec::new();
+        timer.store(&mut bytes);
+        assert_eq!(bytes, 30i32.to_le_bytes());
+        assert_eq!(MessageSelfDestructType::parse_value(&bytes).unwrap(), timer);
+
+        assert_eq!(format!("{}", timer), "self-destruct at 30");
+        assert_eq!(format!("{}", immediate), "self-destruct immediately");
+        assert_eq!(
+            format!("{}", MessageSelfDestructType::default()),
+            "non-self-destruct"
+        );
+    }
+
+    // ---- MessageTtl / MessageEffectId / SavedMessagesTopicId / info structs ----
+
+    #[test]
+    fn message_ttl_basics() {
+        assert!(MessageTtl::default().is_empty());
+        let ttl = MessageTtl::new(86400);
+        assert!(!ttl.is_empty());
+        assert_eq!(ttl.get_message_auto_delete_time_object(), 86400);
+        assert_eq!(ttl.get_input_ttl_period(), 86400);
+        // negative periods log and clamp to zero, like the C++ constructor
+        let negative = MessageTtl::new(-5);
+        assert!(negative.is_empty());
+        assert_eq!(negative.get_message_auto_delete_time_object(), 0);
+
+        let mut bytes = Vec::new();
+        ttl.store(&mut bytes);
+        assert_eq!(MessageTtl::parse_value(&bytes).unwrap(), ttl);
+        assert_eq!(format!("{}", ttl), "MessageTtl[86400]");
+    }
+
+    #[test]
+    fn message_effect_id_basics() {
+        assert!(!MessageEffectId::new(0).is_valid());
+        assert!(MessageEffectId::new(7).is_valid());
+        let id = MessageEffectId::new(123456);
+        let mut bytes = Vec::new();
+        id.store(&mut bytes);
+        assert_eq!(bytes, 123456i64.to_le_bytes());
+        assert_eq!(MessageEffectId::parse_value(&bytes).unwrap(), id);
+        assert_eq!(format!("{}", id), "message effect 123456");
+    }
+
+    #[test]
+    fn saved_messages_topic_id_basics() {
+        let topic = SavedMessagesTopicId::new(DialogId::from_user_id(UserId::new(7)));
+        assert!(topic.is_valid());
+        assert_eq!(
+            topic.get_dialog_id(),
+            DialogId::from_user_id(UserId::new(7))
+        );
+        assert_eq!(topic.get_unique_id(), 7);
+        assert!(!SavedMessagesTopicId::default().is_valid());
+
+        let mut bytes = Vec::new();
+        topic.store(&mut bytes);
+        assert_eq!(bytes, 7i64.to_le_bytes());
+        assert_eq!(SavedMessagesTopicId::parse_value(&bytes).unwrap(), topic);
+    }
+
+    #[test]
+    fn notification_and_ephemeral_info_structs() {
+        let mut info = NotificationInfo::default();
+        assert!(!info.message_notification_group.is_valid());
+        assert!(info.pending_new_message_notifications.is_empty());
+        info.pending_new_message_notifications.push((
+            DialogId::from_user_id(UserId::new(7)),
+            MessageId::new(1 << 20),
+        ));
+        info.notification_id_to_message_id
+            .insert(NotificationId::new(3), MessageId::new(1 << 20));
+        assert_eq!(
+            info.notification_id_to_message_id
+                .get(&NotificationId::new(3)),
+            Some(&MessageId::new(1 << 20))
+        );
+
+        let ephemeral = EphemeralMessageInfo {
+            anchor_message_id: MessageId::new(1 << 20),
+            monotonic_id: 9,
+        };
+        assert_eq!(ephemeral.monotonic_id, 9);
     }
 }
