@@ -112,7 +112,7 @@ impl DialogId {
             {
                 return DialogType::SecretChat;
             }
-            if Self::ZERO_CHANNEL_ID - ChannelId::MIN_MONOFORUM_CHANNEL_ID <= self.0 {
+            if Self::ZERO_CHANNEL_ID - ChannelId::MAX_MONOFORUM_CHANNEL_ID <= self.0 {
                 return DialogType::Channel;
             }
         } else if 0 < self.0 && self.0 <= UserId::MAX_USER_ID {
@@ -234,8 +234,8 @@ mod tests {
         assert_eq!(DialogId::new(0).get_type(), DialogType::None);
         assert_eq!(DialogId::new(777000).get_type(), DialogType::User);
         assert_eq!(DialogId::new(-1).get_type(), DialogType::Chat);
-        // regular channel: -1000000000000 - (1 << 20) inside the band
-        let channel_id = 1000000000000i64 - (1i64 << 20);
+        // regular channel: a valid id inside the band (below MAX_CHANNEL_ID)
+        let channel_id = ChannelId::MAX_CHANNEL_ID - (1i64 << 20);
         let channel_dialog = DialogId::new(DialogId::ZERO_CHANNEL_ID - channel_id);
         assert_eq!(channel_dialog.get_type(), DialogType::Channel);
         assert_eq!(channel_dialog.get_channel_id(), ChannelId::new(channel_id));
@@ -250,8 +250,18 @@ mod tests {
         // secret chat: -2000000000000 - 100
         let secret_dialog = DialogId::new(DialogId::ZERO_SECRET_CHAT_ID - 100);
         assert_eq!(secret_dialog.get_type(), DialogType::SecretChat);
-        assert!(!DialogId::new(DialogId::ZERO_CHANNEL_ID).is_valid());
-        assert!(!DialogId::new(DialogId::ZERO_SECRET_CHAT_ID).is_valid());
+        // the C++ sentinel quirk (probed against the literal DialogId.cpp
+        // branches): a band-excluded sentinel falls into the NEXT band —
+        // ZERO_CHANNEL lands in the secret-chat check, ZERO_SECRET in the
+        // monoforum-channel check
+        assert_eq!(
+            DialogId::new(DialogId::ZERO_CHANNEL_ID).get_type(),
+            DialogType::SecretChat
+        );
+        assert_eq!(
+            DialogId::new(DialogId::ZERO_SECRET_CHAT_ID).get_type(),
+            DialogType::Channel
+        );
         assert!(channel_dialog.is_valid());
     }
 
