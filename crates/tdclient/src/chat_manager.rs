@@ -24,8 +24,9 @@
 
 use crate::global::Global;
 use crate::misc::strip_empty_characters;
-use crate::store_parse::{Parser, store_i32, store_string, store_u64, version};
+use crate::store_parse::{Parser, store_i32, store_i64, store_string, store_u64, version};
 use crate::td_api;
+use crate::user_manager::{SecretChatId, UserId};
 use tdmtproto::telegram_api;
 
 /// `td::ChatId` (ChatId.h): `0 < id ≤ MAX_CHAT_ID`.
@@ -238,6 +239,213 @@ impl StickerSetId {
 
     pub fn get(self) -> i64 {
         self.0
+    }
+}
+
+/// `td::DialogType` (DialogId.h:23).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DialogType {
+    None,
+    User,
+    Chat,
+    Channel,
+    SecretChat,
+}
+
+/// `td::DialogId` (DialogId.h:25): the signed polymorphic dialog handle. The
+/// negative ranges stack downward from the basic-group band (`-ChatId`,
+/// `ZERO_CHANNEL_ID - ChannelId`, `ZERO_SECRET_CHAT_ID + SecretChatId` and the
+/// monoforum tail); users stay positive. The four continuity pins of
+/// `DialogId::get_type` are compile-time asserts here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DialogId(i64);
+
+// DialogId.cpp:22-26 — the valid ranges are continuous.
+const _: () = assert!(DialogId::ZERO_CHANNEL_ID + 1 == -ChatId::MAX_CHAT_ID);
+const _: () = assert!(
+    DialogId::ZERO_SECRET_CHAT_ID + i32::MAX as i64 + 1
+        == DialogId::ZERO_CHANNEL_ID - ChannelId::MAX_CHANNEL_ID
+);
+const _: () = assert!(
+    DialogId::ZERO_CHANNEL_ID - ChannelId::MIN_MONOFORUM_CHANNEL_ID + 1
+        == DialogId::ZERO_SECRET_CHAT_ID + i32::MIN as i64
+);
+
+impl DialogId {
+    const ZERO_SECRET_CHAT_ID: i64 = -2_000_000_000_000;
+    const ZERO_CHANNEL_ID: i64 = -1_000_000_000_000;
+
+    /// The C++ `explicit constexpr DialogId(int64)` — no validity check.
+    pub const fn new(dialog_id: i64) -> DialogId {
+        DialogId(dialog_id)
+    }
+
+    /// `DialogId::DialogId(UserId)` — an invalid user collapses to 0.
+    pub fn from_user_id(user_id: UserId) -> DialogId {
+        if user_id.is_valid() {
+            DialogId(user_id.get())
+        } else {
+            DialogId(0)
+        }
+    }
+
+    /// `DialogId::DialogId(ChatId)`.
+    pub fn from_chat_id(chat_id: ChatId) -> DialogId {
+        if chat_id.is_valid() {
+            DialogId(-chat_id.get())
+        } else {
+            DialogId(0)
+        }
+    }
+
+    /// `DialogId::DialogId(ChannelId)`.
+    pub fn from_channel_id(channel_id: ChannelId) -> DialogId {
+        if channel_id.is_valid() {
+            DialogId(Self::ZERO_CHANNEL_ID - channel_id.get())
+        } else {
+            DialogId(0)
+        }
+    }
+
+    /// `DialogId::DialogId(SecretChatId)`.
+    pub fn from_secret_chat_id(secret_chat_id: SecretChatId) -> DialogId {
+        if secret_chat_id.is_valid() {
+            DialogId(Self::ZERO_SECRET_CHAT_ID + secret_chat_id.get() as i64)
+        } else {
+            DialogId(0)
+        }
+    }
+
+    /// `DialogId::DialogId(const telegram_api::Peer &)`.
+    pub fn from_peer(peer: &telegram_api::Peer) -> DialogId {
+        DialogId(Self::get_peer_id(peer))
+    }
+
+    /// `DialogId::DialogId(const tl_object_ptr<telegram_api::DialogPeer> &)`.
+    pub fn from_dialog_peer(dialog_peer: &telegram_api::DialogPeer) -> DialogId {
+        match dialog_peer {
+            telegram_api::DialogPeer::dialogPeer(peer) => DialogId(Self::get_peer_id(&peer.peer)),
+            telegram_api::DialogPeer::dialogPeerFolder(_) => {
+                tdutils::log_error!("Receive unsupported dialog peer {:?}", dialog_peer);
+                DialogId(0)
+            }
+            telegram_api::DialogPeer::dialogPeerCommunity(_) => {
+                tdutils::log_error!("Receive unsupported dialog peer {:?}", dialog_peer);
+                DialogId(0)
+            }
+        }
+    }
+
+    /// `DialogId::get_peer_id` — an invalid peer id logs and collapses to 0.
+    fn get_peer_id(peer: &telegram_api::Peer) -> i64 {
+        match peer {
+            telegram_api::Peer::peerUser(peer_user) => {
+                let user_id = UserId::new(peer_user.user_id);
+                if !user_id.is_valid() {
+                    tdutils::log_error!("Receive invalid user id {}", user_id.get());
+                    return 0;
+                }
+                user_id.get()
+            }
+            telegram_api::Peer::peerChat(peer_chat) => {
+                let chat_id = ChatId::new(peer_chat.chat_id);
+                if !chat_id.is_valid() {
+                    tdutils::log_error!("Receive invalid chat id {}", chat_id.get());
+                    return 0;
+                }
+                -chat_id.get()
+            }
+            telegram_api::Peer::peerChannel(peer_channel) => {
+                let channel_id = ChannelId::new(peer_channel.channel_id);
+                if !channel_id.is_valid() {
+                    tdutils::log_error!("Receive invalid channel id {}", channel_id.get());
+                    return 0;
+                }
+                Self::ZERO_CHANNEL_ID - channel_id.get()
+            }
+        }
+    }
+
+    pub fn get(self) -> i64 {
+        self.0
+    }
+
+    /// `DialogId::is_valid` — `get_type() != DialogType::None`.
+    pub fn is_valid(self) -> bool {
+        self.get_type() != DialogType::None
+    }
+
+    /// `DialogId::get_type` (DialogId.cpp:20-44) — the branch order is the
+    /// range table; the two `!= 0` guards carve `ZERO_CHANNEL_ID` and
+    /// `ZERO_SECRET_CHAT_ID` out of their otherwise-matching windows.
+    pub fn get_type(self) -> DialogType {
+        if self.0 < 0 {
+            if -ChatId::MAX_CHAT_ID <= self.0 {
+                return DialogType::Chat;
+            }
+            if Self::ZERO_CHANNEL_ID - ChannelId::MAX_CHANNEL_ID <= self.0
+                && self.0 != Self::ZERO_CHANNEL_ID
+            {
+                return DialogType::Channel;
+            }
+            if Self::ZERO_SECRET_CHAT_ID + i32::MIN as i64 <= self.0
+                && self.0 != Self::ZERO_SECRET_CHAT_ID
+            {
+                return DialogType::SecretChat;
+            }
+            if Self::ZERO_CHANNEL_ID - ChannelId::MAX_MONOFORUM_CHANNEL_ID <= self.0 {
+                return DialogType::Channel;
+            }
+        } else if 0 < self.0 && self.0 <= UserId::MAX_USER_ID {
+            return DialogType::User;
+        }
+        DialogType::None
+    }
+
+    /// `DialogId::get_user_id` — the C++ CHECKs the type.
+    pub fn get_user_id(self) -> UserId {
+        assert!(
+            self.get_type() == DialogType::User,
+            "DialogId is not a user"
+        );
+        UserId::new(self.0)
+    }
+
+    /// `DialogId::get_chat_id`.
+    pub fn get_chat_id(self) -> ChatId {
+        assert!(
+            self.get_type() == DialogType::Chat,
+            "DialogId is not a chat"
+        );
+        ChatId::new(-self.0)
+    }
+
+    /// `DialogId::get_channel_id`.
+    pub fn get_channel_id(self) -> ChannelId {
+        assert!(
+            self.get_type() == DialogType::Channel,
+            "DialogId is not a channel"
+        );
+        ChannelId::new(Self::ZERO_CHANNEL_ID - self.0)
+    }
+
+    /// `DialogId::get_secret_chat_id` — the C++ truncates back to `int32`.
+    pub fn get_secret_chat_id(self) -> SecretChatId {
+        assert!(
+            self.get_type() == DialogType::SecretChat,
+            "DialogId is not a secret chat"
+        );
+        SecretChatId::new((self.0 - Self::ZERO_SECRET_CHAT_ID) as i32)
+    }
+
+    /// `DialogId::store` — the raw id, `store_long`.
+    pub fn store(&self, out: &mut Vec<u8>) {
+        store_i64(out, self.0);
+    }
+
+    /// `DialogId::parse` — `fetch_long`.
+    pub fn parse_impl(parser: &mut Parser<'_>) -> Result<DialogId, &'static str> {
+        Ok(DialogId(parser.i64_()?))
     }
 }
 
@@ -1278,6 +1486,56 @@ impl DialogParticipantStatus {
         DialogParticipantStatus::administrator(rights, String::new(), is_current_user_creator)
     }
 
+    /// `DialogParticipantStatus(bool can_be_edited, chatAdminRights, string rank,
+    /// ChannelType)` — forcibly returns an administrator (the
+    /// `channelParticipantAdmin` intake form).
+    pub(crate) fn from_channel_admin_rights(
+        can_be_edited: bool,
+        admin_rights: &telegram_api::ChatAdminRights,
+        rank: String,
+        channel_type: ChannelType,
+    ) -> DialogParticipantStatus {
+        DialogParticipantStatus::administrator(
+            AdministratorRights::from_chat_admin_rights(Some(admin_rights), channel_type),
+            rank,
+            can_be_edited,
+        )
+    }
+
+    /// `DialogParticipantStatus(bool is_member, chatBannedRights, ChannelType,
+    /// string rank)` — forcibly returns a restricted or banned status (the
+    /// `channelParticipantBanned` intake form). The C++ mutates the input's
+    /// `until_date` to `i32::MAX` before building the rights so the
+    /// `RestrictedRights` conversion stays quiet; the Rust copy does the same
+    /// on a clone, keeping the flags and the log output identical.
+    pub(crate) fn from_channel_banned_rights(
+        is_member: bool,
+        banned_rights: telegram_api::ChatBannedRights,
+        channel_type: ChannelType,
+        rank: String,
+    ) -> DialogParticipantStatus {
+        if banned_rights.view_messages {
+            return DialogParticipantStatus::banned(banned_rights.until_date, rank);
+        }
+        if channel_type == ChannelType::Broadcast {
+            return if is_member {
+                DialogParticipantStatus::member(0, rank)
+            } else {
+                DialogParticipantStatus::left()
+            };
+        }
+
+        let until_date = Self::fix_until_date(banned_rights.until_date);
+        let mut rights = banned_rights;
+        rights.until_date = i32::MAX;
+
+        // manually create Restricted status, because the user can be restricted,
+        // but with yet unknown restrictions
+        let flags = RestrictedRights::from_chat_banned_rights(Some(&rights), channel_type).flags()
+            | (u64::from(is_member) * Self::IS_MEMBER);
+        DialogParticipantStatus::new(StatusType::Restricted, flags, until_date, rank)
+    }
+
     pub fn has_all_administrator_rights(&self, administrator_rights: AdministratorRights) -> bool {
         let flags = administrator_rights.flags()
             & (AdministratorRights::ALL_ADMINISTRATOR_RIGHTS | AdministratorRights::IS_ANONYMOUS);
@@ -1675,6 +1933,255 @@ impl Default for DialogParticipantStatus {
     /// status without a rank.
     fn default() -> DialogParticipantStatus {
         DialogParticipantStatus::banned(0, String::new())
+    }
+}
+
+/// `td::DialogParticipant` (DialogParticipant.h:721): who is in a dialog, who
+/// invited them, when, and with which rights. The byte format is the four
+/// fields in order — `DialogId` (`store_long`), `UserId` (`store_long`), the
+/// `int32` join date, then the bare `DialogParticipantStatus` — with the
+/// *parse* side branching on the log-event version: writers older than
+/// `SupportBannedChannels` (31) carried the dialog as a bare `UserId`
+/// (itself `int32` below `Support64BitIds`/33, `long` from 33 on), because
+/// basic-group dialogs were all a `DialogId` could be back then.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DialogParticipant {
+    pub dialog_id_: DialogId,
+    pub inviter_user_id_: UserId,
+    pub joined_date_: i32,
+    pub status_: DialogParticipantStatus,
+}
+
+impl DialogParticipant {
+    /// `DialogParticipant::DialogParticipant(DialogId, UserId, int32,
+    /// DialogParticipantStatus)` — an invalid-but-nonzero inviter collapses to
+    /// the zero user and a negative join date to 0, both logged.
+    pub fn new(
+        dialog_id: DialogId,
+        inviter_user_id: UserId,
+        joined_date: i32,
+        status: DialogParticipantStatus,
+    ) -> DialogParticipant {
+        let mut inviter_user_id_ = inviter_user_id;
+        if !inviter_user_id_.is_valid() && inviter_user_id_ != UserId::default() {
+            tdutils::log_error!("Receive inviter {:?}", inviter_user_id_);
+            inviter_user_id_ = UserId::default();
+        }
+        let mut joined_date_ = joined_date;
+        if joined_date_ < 0 {
+            tdutils::log_error!("Receive date {}", joined_date_);
+            joined_date_ = 0;
+        }
+        DialogParticipant {
+            dialog_id_: dialog_id,
+            inviter_user_id_,
+            joined_date_,
+            status_: status,
+        }
+    }
+
+    /// `DialogParticipant::left` — aggregate init in the C++, no fix-ups.
+    pub fn left(dialog_id: DialogId) -> DialogParticipant {
+        DialogParticipant {
+            dialog_id_: dialog_id,
+            inviter_user_id_: UserId::default(),
+            joined_date_: 0,
+            status_: DialogParticipantStatus::left(),
+        }
+    }
+
+    /// `DialogParticipant::private_member` — a private-chat membership: the
+    /// inviter is the other side when known, the member themself otherwise.
+    pub fn private_member(user_id: UserId, other_user_id: UserId) -> DialogParticipant {
+        let inviter_user_id = if other_user_id.is_valid() {
+            other_user_id
+        } else {
+            user_id
+        };
+        DialogParticipant {
+            dialog_id_: DialogId::from_user_id(user_id),
+            inviter_user_id_: inviter_user_id,
+            joined_date_: 0,
+            status_: DialogParticipantStatus::member(0, String::new()),
+        }
+    }
+
+    /// `DialogParticipant::DialogParticipant(telegram_api::ChatParticipant,
+    /// int32 chat_creation_date, bool is_current_user_creator)` — the
+    /// basic-group member list entries; the creator carries the chat creation
+    /// date, everyone else their own join date.
+    pub fn from_chat_participant(
+        participant: telegram_api::ChatParticipant,
+        chat_creation_date: i32,
+        is_current_user_creator: bool,
+    ) -> DialogParticipant {
+        match participant {
+            telegram_api::ChatParticipant::chatParticipant(participant) => DialogParticipant {
+                dialog_id_: DialogId::from_user_id(UserId::new(participant.user_id)),
+                inviter_user_id_: UserId::new(participant.inviter_id),
+                joined_date_: participant.date,
+                status_: DialogParticipantStatus::member(0, participant.rank),
+            },
+            telegram_api::ChatParticipant::chatParticipantCreator(participant) => {
+                DialogParticipant {
+                    dialog_id_: DialogId::from_user_id(UserId::new(participant.user_id)),
+                    inviter_user_id_: UserId::new(participant.user_id),
+                    joined_date_: chat_creation_date,
+                    status_: DialogParticipantStatus::creator(true, false, participant.rank),
+                }
+            }
+            telegram_api::ChatParticipant::chatParticipantAdmin(participant) => DialogParticipant {
+                dialog_id_: DialogId::from_user_id(UserId::new(participant.user_id)),
+                inviter_user_id_: UserId::new(participant.inviter_id),
+                joined_date_: participant.date,
+                status_: DialogParticipantStatus::group_administrator(
+                    is_current_user_creator,
+                    participant.rank,
+                ),
+            },
+        }
+    }
+
+    /// `DialogParticipant::DialogParticipant(telegram_api::ChannelParticipant,
+    /// ChannelType)` — the supergroup/broadcast member entries.
+    pub fn from_channel_participant(
+        participant: telegram_api::ChannelParticipant,
+        channel_type: ChannelType,
+    ) -> DialogParticipant {
+        match participant {
+            telegram_api::ChannelParticipant::channelParticipant(participant) => {
+                DialogParticipant {
+                    dialog_id_: DialogId::from_user_id(UserId::new(participant.user_id)),
+                    inviter_user_id_: UserId::default(),
+                    joined_date_: participant.date,
+                    status_: DialogParticipantStatus::member(
+                        participant.subscription_until_date,
+                        participant.rank,
+                    ),
+                }
+            }
+            telegram_api::ChannelParticipant::channelParticipantSelf(participant) => {
+                DialogParticipant {
+                    dialog_id_: DialogId::from_user_id(UserId::new(participant.user_id)),
+                    inviter_user_id_: UserId::new(participant.inviter_id),
+                    joined_date_: participant.date,
+                    status_: DialogParticipantStatus::member(
+                        participant.subscription_until_date,
+                        participant.rank,
+                    ),
+                }
+            }
+            telegram_api::ChannelParticipant::channelParticipantCreator(participant) => {
+                DialogParticipant {
+                    dialog_id_: DialogId::from_user_id(UserId::new(participant.user_id)),
+                    inviter_user_id_: UserId::default(),
+                    joined_date_: 0,
+                    status_: DialogParticipantStatus::creator(
+                        true,
+                        participant.admin_rights.anonymous,
+                        participant.rank,
+                    ),
+                }
+            }
+            telegram_api::ChannelParticipant::channelParticipantAdmin(participant) => {
+                DialogParticipant {
+                    dialog_id_: DialogId::from_user_id(UserId::new(participant.user_id)),
+                    inviter_user_id_: UserId::new(participant.promoted_by),
+                    joined_date_: participant.date,
+                    status_: DialogParticipantStatus::from_channel_admin_rights(
+                        participant.can_edit,
+                        &participant.admin_rights,
+                        participant.rank,
+                        channel_type,
+                    ),
+                }
+            }
+            telegram_api::ChannelParticipant::channelParticipantLeft(participant) => {
+                DialogParticipant {
+                    dialog_id_: DialogId::from_peer(&participant.peer),
+                    inviter_user_id_: UserId::default(),
+                    joined_date_: 0,
+                    status_: DialogParticipantStatus::left(),
+                }
+            }
+            telegram_api::ChannelParticipant::channelParticipantBanned(participant) => {
+                DialogParticipant {
+                    dialog_id_: DialogId::from_peer(&participant.peer),
+                    inviter_user_id_: UserId::new(participant.kicked_by),
+                    joined_date_: participant.date,
+                    status_: DialogParticipantStatus::from_channel_banned_rights(
+                        !participant.left,
+                        participant.banned_rights,
+                        channel_type,
+                        participant.rank,
+                    ),
+                }
+            }
+        }
+    }
+
+    /// `DialogParticipant::is_valid` — restricted/banned/appointed
+    /// administrators must know their inviter.
+    pub fn is_valid(&self) -> bool {
+        if !self.dialog_id_.is_valid() || self.joined_date_ < 0 {
+            return false;
+        }
+        if self.status_.is_restricted()
+            || self.status_.is_banned()
+            || (self.status_.is_administrator() && !self.status_.is_creator())
+        {
+            return self.inviter_user_id_.is_valid();
+        }
+        true
+    }
+
+    /// `DialogParticipant::store`.
+    pub fn store(&self, out: &mut Vec<u8>) {
+        self.dialog_id_.store(out);
+        store_i64(out, self.inviter_user_id_.get());
+        store_i32(out, self.joined_date_);
+        self.status_.store(out);
+    }
+
+    /// `DialogParticipant::parse` — the `SupportBannedChannels` gate swaps the
+    /// leading `DialogId` for the legacy bare `UserId`.
+    pub fn parse_impl(parser: &mut Parser<'_>) -> Result<DialogParticipant, &'static str> {
+        let dialog_id_ = if parser.version() >= version::SUPPORT_BANNED_CHANNELS {
+            DialogId::parse_impl(parser)?
+        } else {
+            DialogId::from_user_id(Self::parse_user_id(parser)?)
+        };
+        let inviter_user_id_ = Self::parse_user_id(parser)?;
+        let joined_date_ = parser.i32_()?;
+        let status_ = DialogParticipantStatus::parse_impl(parser)?;
+        Ok(DialogParticipant {
+            dialog_id_,
+            inviter_user_id_,
+            joined_date_,
+            status_,
+        })
+    }
+
+    /// The `td::UserId` header `parse`: `long` from `Support64BitIds`, `int32`
+    /// before.
+    fn parse_user_id(parser: &mut Parser<'_>) -> Result<UserId, &'static str> {
+        if parser.version() >= version::SUPPORT_64_BIT_IDS {
+            Ok(UserId::new(parser.i64_()?))
+        } else {
+            Ok(UserId::new(parser.i32_()? as i64))
+        }
+    }
+}
+
+impl Default for DialogParticipant {
+    /// The C++ field defaults: a zero dialog, no inviter, no date, `Left`.
+    fn default() -> DialogParticipant {
+        DialogParticipant {
+            dialog_id_: DialogId::default(),
+            inviter_user_id_: UserId::default(),
+            joined_date_: 0,
+            status_: DialogParticipantStatus::left(),
+        }
     }
 }
 
@@ -3425,5 +3932,760 @@ mod tests {
         let applied = banned.apply_restrictions(only_messages, false, false);
         assert!(applied.is_banned());
         assert!(!applied.can_send_messages());
+    }
+
+    // ---- DialogParticipant (M.5.4) ----
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn dp_store_hex(participant: &DialogParticipant) -> String {
+        let mut out = Vec::new();
+        crate::store_parse::store_log_event_version(&mut out);
+        participant.store(&mut out);
+        hex(&out)
+    }
+
+    fn dp_round_trip(participant: &DialogParticipant) -> DialogParticipant {
+        let mut out = Vec::new();
+        crate::store_parse::store_log_event_version(&mut out);
+        participant.store(&mut out);
+        let mut parser = Parser::new_log_event(&out).unwrap();
+        DialogParticipant::parse_impl(&mut parser).unwrap()
+    }
+
+    fn parse_legacy_bytes(bytes_hex: &str) -> DialogParticipant {
+        let bytes: Vec<u8> = (0..bytes_hex.len() / 2)
+            .map(|i| u8::from_str_radix(&bytes_hex[2 * i..2 * i + 2], 16).unwrap())
+            .collect();
+        let mut parser = Parser::new_log_event(&bytes).unwrap();
+        DialogParticipant::parse_impl(&mut parser).unwrap()
+    }
+
+    #[test]
+    fn dialog_id_type_table_matches_the_cpp() {
+        let none = |id: i64| !DialogId::new(id).is_valid();
+        let type_of = |id: i64| DialogId::new(id).get_type();
+
+        assert!(none(0));
+        assert_eq!(type_of(1), DialogType::User);
+        assert_eq!(type_of(UserId::MAX_USER_ID), DialogType::User);
+        assert_eq!(type_of(UserId::MAX_USER_ID + 1), DialogType::None);
+
+        // basic groups: [-MAX_CHAT_ID, -1]
+        assert_eq!(type_of(-1), DialogType::Chat);
+        assert_eq!(type_of(-ChatId::MAX_CHAT_ID), DialogType::Chat);
+        // ZERO_CHANNEL_ID itself is carved out of the channel band and falls
+        // through to the secret-chat window (DialogId.cpp:27-39 order)
+        assert_eq!(type_of(DialogId::ZERO_CHANNEL_ID), DialogType::SecretChat);
+        assert_eq!(type_of(DialogId::ZERO_CHANNEL_ID - 1), DialogType::Channel);
+        assert_eq!(
+            type_of(DialogId::ZERO_CHANNEL_ID - ChannelId::MAX_CHANNEL_ID),
+            DialogType::Channel
+        );
+        // the secret-chat window is [ZERO_SECRET_CHAT_ID + i32::MIN, -MAX_CHAT_ID-1)
+        assert_eq!(
+            type_of(DialogId::ZERO_SECRET_CHAT_ID + i32::MIN as i64),
+            DialogType::SecretChat
+        );
+        assert_eq!(
+            type_of(DialogId::ZERO_CHANNEL_ID - ChannelId::MAX_CHANNEL_ID - 1),
+            DialogType::SecretChat
+        );
+        // ZERO_SECRET_CHAT_ID is carved out of the secret-chat window and is
+        // caught by the monoforum tail — a genuine C++ quirk
+        assert_eq!(type_of(DialogId::ZERO_SECRET_CHAT_ID), DialogType::Channel);
+        assert_eq!(
+            type_of(DialogId::ZERO_CHANNEL_ID - ChannelId::MAX_MONOFORUM_CHANNEL_ID),
+            DialogType::Channel
+        );
+        assert_eq!(
+            type_of(DialogId::ZERO_CHANNEL_ID - ChannelId::MAX_MONOFORUM_CHANNEL_ID - 1),
+            DialogType::None
+        );
+        assert!(none(i64::MIN));
+    }
+
+    #[test]
+    fn dialog_id_conversions_and_getters() {
+        // invalid sources collapse to 0
+        assert_eq!(DialogId::from_user_id(UserId::new(0)), DialogId::new(0));
+        assert_eq!(
+            DialogId::from_user_id(UserId::new(UserId::MAX_USER_ID + 1)),
+            DialogId::new(0)
+        );
+        assert_eq!(DialogId::from_chat_id(ChatId::new(0)), DialogId::new(0));
+        assert_eq!(
+            DialogId::from_chat_id(ChatId::new(ChatId::MAX_CHAT_ID + 1)),
+            DialogId::new(0)
+        );
+        assert_eq!(
+            DialogId::from_channel_id(ChannelId::new(-1)),
+            DialogId::new(0)
+        );
+        assert_eq!(
+            DialogId::from_secret_chat_id(SecretChatId::new(0)),
+            DialogId::new(0)
+        );
+
+        let user = DialogId::from_user_id(UserId::new(3000000002));
+        assert_eq!(user.get(), 3000000002);
+        assert_eq!(user.get_user_id(), UserId::new(3000000002));
+
+        let chat = DialogId::from_chat_id(ChatId::new(999999999999));
+        assert_eq!(chat.get(), -999999999999);
+        assert_eq!(chat.get_chat_id(), ChatId::new(999999999999));
+
+        let channel = DialogId::from_channel_id(ChannelId::new(1000000002));
+        assert_eq!(channel.get(), -1001000000002);
+        assert_eq!(channel.get_channel_id(), ChannelId::new(1000000002));
+
+        let monoforum =
+            DialogId::from_channel_id(ChannelId::new(ChannelId::MIN_MONOFORUM_CHANNEL_ID));
+        assert_eq!(monoforum.get_type(), DialogType::Channel);
+        assert_eq!(
+            monoforum.get_channel_id(),
+            ChannelId::new(ChannelId::MIN_MONOFORUM_CHANNEL_ID)
+        );
+
+        let secret = DialogId::from_secret_chat_id(SecretChatId::new(7));
+        assert_eq!(secret.get(), -1999999999993);
+        assert_eq!(secret.get_secret_chat_id(), SecretChatId::new(7));
+
+        // wrong-type accessors assert
+        assert!(std::panic::catch_unwind(|| user.get_chat_id()).is_err());
+        assert!(std::panic::catch_unwind(|| user.get_channel_id()).is_err());
+        assert!(std::panic::catch_unwind(|| chat.get_user_id()).is_err());
+    }
+
+    #[test]
+    fn dialog_id_peer_conversions() {
+        let peer_user = telegram_api::Peer::peerUser(telegram_api::peerUser {
+            user_id: 3000000002,
+        });
+        assert_eq!(
+            DialogId::from_peer(&peer_user),
+            DialogId::from_user_id(UserId::new(3000000002))
+        );
+
+        let peer_chat = telegram_api::Peer::peerChat(telegram_api::peerChat {
+            chat_id: 1234567890,
+        });
+        assert_eq!(
+            DialogId::from_peer(&peer_chat),
+            DialogId::from_chat_id(ChatId::new(1234567890))
+        );
+
+        let peer_channel = telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+            channel_id: 1000000002,
+        });
+        assert_eq!(
+            DialogId::from_peer(&peer_channel),
+            DialogId::from_channel_id(ChannelId::new(1000000002))
+        );
+
+        // invalid peers log and collapse to 0
+        let bad_user = telegram_api::Peer::peerUser(telegram_api::peerUser { user_id: 0 });
+        assert_eq!(DialogId::from_peer(&bad_user), DialogId::new(0));
+        let bad_channel =
+            telegram_api::Peer::peerChannel(telegram_api::peerChannel { channel_id: -5 });
+        assert_eq!(DialogId::from_peer(&bad_channel), DialogId::new(0));
+
+        let wrapped =
+            telegram_api::DialogPeer::dialogPeer(telegram_api::dialogPeer { peer: peer_channel });
+        assert_eq!(
+            DialogId::from_dialog_peer(&wrapped),
+            DialogId::from_channel_id(ChannelId::new(1000000002))
+        );
+        let folder = telegram_api::DialogPeer::dialogPeerFolder(telegram_api::dialogPeerFolder {
+            folder_id: 1,
+        });
+        assert_eq!(DialogId::from_dialog_peer(&folder), DialogId::new(0));
+        let community =
+            telegram_api::DialogPeer::dialogPeerCommunity(telegram_api::dialogPeerCommunity {
+                community_id: 1,
+            });
+        assert_eq!(DialogId::from_dialog_peer(&community), DialogId::new(0));
+    }
+
+    #[test]
+    fn dialog_id_store_parse() {
+        let mut out = Vec::new();
+        DialogId::from_channel_id(ChannelId::new(1000000002)).store(&mut out);
+        assert_eq!(hex(&out), "fe25c0ef16ffffff");
+        let mut parser = Parser::new(&out);
+        assert_eq!(
+            DialogId::parse_impl(&mut parser).unwrap(),
+            DialogId::new(-1001000000002)
+        );
+
+        for id in [
+            0i64,
+            1,
+            -999999999999,
+            -1001000000002,
+            -1999999999993,
+            i64::MIN,
+            i64::MAX,
+        ] {
+            let mut out = Vec::new();
+            DialogId::new(id).store(&mut out);
+            let mut parser = Parser::new(&out);
+            assert_eq!(
+                DialogId::parse_impl(&mut parser).unwrap(),
+                DialogId::new(id)
+            );
+        }
+    }
+
+    #[test]
+    fn dialog_participant_ctor_fixups() {
+        // an invalid-but-nonzero inviter collapses to the zero user
+        let participant = DialogParticipant::new(
+            DialogId::from_user_id(UserId::new(3000000002)),
+            UserId::new(-1294967263),
+            1700000000,
+            DialogParticipantStatus::member(0, String::new()),
+        );
+        assert_eq!(participant.inviter_user_id_, UserId::new(0));
+        assert_eq!(participant.joined_date_, 1700000000);
+
+        // a negative join date collapses to 0
+        let participant = DialogParticipant::new(
+            DialogId::from_user_id(UserId::new(3000000002)),
+            UserId::new(3000000003),
+            -1,
+            DialogParticipantStatus::member(0, String::new()),
+        );
+        assert_eq!(participant.joined_date_, 0);
+
+        let participant = DialogParticipant::new(
+            DialogId::from_user_id(UserId::new(3000000002)),
+            UserId::new(3000000003),
+            1700000000,
+            DialogParticipantStatus::member(0, "kept".to_owned()),
+        );
+        assert_eq!(participant.joined_date_, 1700000000);
+        assert!(participant.status_.is_member());
+    }
+
+    #[test]
+    fn dialog_participant_left_and_private_member() {
+        let left = DialogParticipant::left(DialogId::from_chat_id(ChatId::new(1234567890)));
+        assert_eq!(left.dialog_id_, DialogId::new(-1234567890));
+        assert_eq!(left.inviter_user_id_, UserId::new(0));
+        assert_eq!(left.joined_date_, 0);
+        assert!(left.status_.is_left());
+
+        let member = DialogParticipant::private_member(UserId::new(4000000001), UserId::new(0));
+        assert_eq!(
+            member.dialog_id_,
+            DialogId::from_user_id(UserId::new(4000000001))
+        );
+        // no valid other side: the inviter is the member themself
+        assert_eq!(member.inviter_user_id_, UserId::new(4000000001));
+        assert!(member.status_.is_member());
+
+        let member =
+            DialogParticipant::private_member(UserId::new(4000000001), UserId::new(4000000002));
+        assert_eq!(member.inviter_user_id_, UserId::new(4000000002));
+    }
+
+    #[test]
+    fn dialog_participant_is_valid_matrix() {
+        // default/left: a zero dialog is invalid
+        assert!(!DialogParticipant::default().is_valid());
+        assert!(DialogParticipant::left(DialogId::from_chat_id(ChatId::new(1))).is_valid());
+
+        let member = |inviter: i64, date: i32| {
+            DialogParticipant::new(
+                DialogId::from_user_id(UserId::new(3000000002)),
+                UserId::new(inviter),
+                date,
+                DialogParticipantStatus::member(0, String::new()),
+            )
+        };
+        assert!(member(0, 1700000000).is_valid());
+        // the ctor normalizes a negative join date, so one only reaches
+        // is_valid through the aggregate-init path — where it invalidates
+        let raw = DialogParticipant {
+            dialog_id_: DialogId::from_user_id(UserId::new(3000000002)),
+            inviter_user_id_: UserId::new(3000000003),
+            joined_date_: -1,
+            status_: DialogParticipantStatus::member(0, String::new()),
+        };
+        assert!(!raw.is_valid());
+
+        // restricted/banned/appointed administrators must know their inviter
+        let restricted = |inviter: i64| {
+            DialogParticipant::new(
+                DialogId::from_user_id(UserId::new(3000000002)),
+                UserId::new(inviter),
+                1700000000,
+                DialogParticipantStatus::restricted(
+                    RestrictedRights::restrict_all(),
+                    true,
+                    1700003600,
+                    ChannelType::Megagroup,
+                    String::new(),
+                ),
+            )
+        };
+        assert!(restricted(3000000003).is_valid());
+        assert!(!restricted(0).is_valid());
+
+        let banned = |inviter: i64, until: i32| {
+            DialogParticipant::new(
+                DialogId::from_user_id(UserId::new(3000000002)),
+                UserId::new(inviter),
+                1700000000,
+                DialogParticipantStatus::banned(until, String::new()),
+            )
+        };
+        assert!(banned(3000000003, 0).is_valid());
+        assert!(!banned(0, 0).is_valid());
+
+        let admin = |inviter: i64, is_current_user_creator: bool| {
+            DialogParticipant::new(
+                DialogId::from_channel_id(ChannelId::new(2)),
+                UserId::new(inviter),
+                0,
+                DialogParticipantStatus::channel_administrator(is_current_user_creator, true),
+            )
+        };
+        assert!(!admin(0, false).is_valid());
+        assert!(admin(3000000003, false).is_valid());
+        // a legacy GroupAdministrator stays an administrator even when built
+        // with is_current_user_creator — the inviter is still required
+        assert!(!admin(0, true).is_valid());
+
+        // a true Creator status is exempt from the inviter requirement
+        let creator = DialogParticipant::new(
+            DialogId::from_channel_id(ChannelId::new(2)),
+            UserId::new(0),
+            0,
+            DialogParticipantStatus::creator(true, false, String::new()),
+        );
+        assert!(creator.is_valid());
+    }
+
+    #[test]
+    fn dialog_participant_record_bytes_match_the_cpp() {
+        let cases: Vec<(&str, DialogParticipant)> = vec![
+            ("default", DialogParticipant::default()),
+            (
+                "left",
+                DialogParticipant::left(DialogId::from_chat_id(ChatId::new(1234567890))),
+            ),
+            (
+                "private_member",
+                DialogParticipant::private_member(UserId::new(4000000001), UserId::new(0)),
+            ),
+            (
+                "member",
+                DialogParticipant::new(
+                    DialogId::from_user_id(UserId::new(3000000002)),
+                    UserId::new(3000000003),
+                    1700000000,
+                    DialogParticipantStatus::member(0, "member rank".to_owned()),
+                ),
+            ),
+            (
+                "member_until",
+                DialogParticipant::new(
+                    DialogId::from_channel_id(ChannelId::new(1234567890)),
+                    UserId::new(3000000003),
+                    1700000001,
+                    DialogParticipantStatus::member(1893456000, String::new()),
+                ),
+            ),
+            (
+                "creator",
+                DialogParticipant::new(
+                    DialogId::from_channel_id(ChannelId::new(2)),
+                    UserId::new(3000000003),
+                    0,
+                    DialogParticipantStatus::creator(true, true, "creator rank".to_owned()),
+                ),
+            ),
+            (
+                "restricted",
+                DialogParticipant::new(
+                    DialogId::from_user_id(UserId::new(3000000004)),
+                    UserId::new(3000000005),
+                    1700000002,
+                    DialogParticipantStatus::restricted(
+                        RestrictedRights::restrict_all(),
+                        true,
+                        1700003600,
+                        ChannelType::Megagroup,
+                        "restricted rank".to_owned(),
+                    ),
+                ),
+            ),
+            (
+                "banned",
+                DialogParticipant::new(
+                    DialogId::from_user_id(UserId::new(3000000006)),
+                    UserId::new(3000000007),
+                    1700000003,
+                    DialogParticipantStatus::banned(2147483647, String::new()),
+                ),
+            ),
+        ];
+        // conformance/dialog_participant_oracle/oracle.out `dp:` lines
+        let expected: Vec<(&str, &str)> = vec![
+            (
+                "default",
+                "3d00000000000000000000000000000000000000000000000010fd47ff010000",
+            ),
+            (
+                "left",
+                "3d0000002efd69b6ffffffff0000000000000000000000000010fd47ff010000",
+            ),
+            (
+                "private_member",
+                "3d00000001286bee0000000001286bee00000000000000000010fd2fff010000",
+            ),
+            (
+                "member",
+                "3d000000025ed0b200000000035ed0b20000000000f153650050fd2fff0100000b6d656d6265722072616e6b",
+            ),
+            (
+                "member_until",
+                "3d0000002eedc4e116ffffff035ed0b20000000001f153650010fdafff01000080d8db70",
+            ),
+            (
+                "creator",
+                "3d000000feef5a2b17ffffff035ed0b20000000000000000df7ffd0fff017f000c63726561746f722072616e6b000000",
+            ),
+            (
+                "restricted",
+                "3d000000045ed0b200000000055ed0b20000000002f15365004000b80000000010ff53650f726573747269637465642072616e6b",
+            ),
+            (
+                "banned",
+                "3d000000065ed0b200000000075ed0b20000000003f153650000005000000000",
+            ),
+        ];
+        for ((name, participant), (expected_name, expected_hex)) in
+            cases.iter().zip(expected.iter())
+        {
+            assert_eq!(name, expected_name);
+            assert_eq!(
+                &dp_store_hex(participant),
+                expected_hex,
+                "store mismatch for {name}"
+            );
+            assert_eq!(
+                &dp_round_trip(participant),
+                participant,
+                "round-trip mismatch for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_participant_conversion_vectors_match_the_cpp() {
+        let member = DialogParticipant::from_chat_participant(
+            telegram_api::ChatParticipant::chatParticipant(telegram_api::chatParticipant {
+                flags: 1,
+                user_id: 3000000010,
+                inviter_id: 3000000011,
+                date: 1700001000,
+                rank: "member rank".to_owned(),
+            }),
+            1600000000,
+            false,
+        );
+        assert_eq!(
+            member.dialog_id_,
+            DialogId::from_user_id(UserId::new(3000000010))
+        );
+        assert_eq!(member.inviter_user_id_, UserId::new(3000000011));
+        assert_eq!(member.joined_date_, 1700001000);
+        assert!(member.status_.is_member());
+        assert_eq!(member.status_.get_rank(), "member rank");
+
+        let creator = DialogParticipant::from_chat_participant(
+            telegram_api::ChatParticipant::chatParticipantCreator(
+                telegram_api::chatParticipantCreator {
+                    flags: 1,
+                    user_id: 3000000012,
+                    rank: "owner".to_owned(),
+                },
+            ),
+            1600000001,
+            true,
+        );
+        assert_eq!(
+            creator.dialog_id_,
+            DialogId::from_user_id(UserId::new(3000000012))
+        );
+        // the creator invites themself and carries the chat creation date
+        assert_eq!(creator.inviter_user_id_, UserId::new(3000000012));
+        assert_eq!(creator.joined_date_, 1600000001);
+        assert!(creator.status_.is_creator());
+
+        let admin = DialogParticipant::from_chat_participant(
+            telegram_api::ChatParticipant::chatParticipantAdmin(
+                telegram_api::chatParticipantAdmin {
+                    flags: 1,
+                    user_id: 3000000013,
+                    inviter_id: 3000000014,
+                    date: 1700001002,
+                    rank: "helper".to_owned(),
+                },
+            ),
+            1600000002,
+            false,
+        );
+        assert_eq!(admin.inviter_user_id_, UserId::new(3000000014));
+        assert_eq!(admin.joined_date_, 1700001002);
+        assert!(admin.status_.is_administrator() && !admin.status_.is_creator());
+
+        // conformance/dialog_participant_oracle/oracle.out `conv:` lines
+        assert_eq!(
+            dp_store_hex(&member),
+            "3d0000000a5ed0b2000000000b5ed0b200000000e8f453650050fd2fff0100000b6d656d6265722072616e6b"
+        );
+        assert_eq!(
+            dp_store_hex(&creator),
+            "3d0000000c5ed0b2000000000c5ed0b20000000001105e5fdf5ffd0fff017f00056f776e65720000"
+        );
+        assert_eq!(
+            dp_store_hex(&admin),
+            "3d0000000d5ed0b2000000000e5ed0b200000000eaf45365d946fd18ff0050000668656c70657200"
+        );
+        assert_eq!(dp_round_trip(&member), member);
+        assert_eq!(dp_round_trip(&creator), creator);
+        assert_eq!(dp_round_trip(&admin), admin);
+    }
+
+    #[test]
+    fn channel_participant_conversion_vectors_match_the_cpp() {
+        let member = DialogParticipant::from_channel_participant(
+            telegram_api::ChannelParticipant::channelParticipant(
+                telegram_api::channelParticipant {
+                    flags: 5,
+                    user_id: 3000000015,
+                    date: 1700001003,
+                    subscription_until_date: 1893456001,
+                    rank: "sub rank".to_owned(),
+                },
+            ),
+            ChannelType::Megagroup,
+        );
+        assert_eq!(
+            member.dialog_id_,
+            DialogId::from_user_id(UserId::new(3000000015))
+        );
+        assert_eq!(member.inviter_user_id_, UserId::new(0));
+        assert_eq!(member.joined_date_, 1700001003);
+        assert!(member.status_.is_member());
+
+        let self_participant = DialogParticipant::from_channel_participant(
+            telegram_api::ChannelParticipant::channelParticipantSelf(
+                telegram_api::channelParticipantSelf {
+                    flags: 1,
+                    via_request: true,
+                    user_id: 3000000016,
+                    inviter_id: 3000000017,
+                    date: 1700001004,
+                    subscription_until_date: 0,
+                    rank: String::new(),
+                },
+            ),
+            ChannelType::Broadcast,
+        );
+        assert_eq!(self_participant.inviter_user_id_, UserId::new(3000000017));
+        assert!(self_participant.status_.is_member());
+
+        let creator = DialogParticipant::from_channel_participant(
+            telegram_api::ChannelParticipant::channelParticipantCreator(
+                telegram_api::channelParticipantCreator {
+                    user_id: 3000000018,
+                    admin_rights: telegram_api::ChatAdminRights {
+                        anonymous: true,
+                        change_info: true,
+                        invite_users: true,
+                        pin_messages: true,
+                        ..Default::default()
+                    },
+                    rank: "owner".to_owned(),
+                    ..Default::default()
+                },
+            ),
+            ChannelType::Megagroup,
+        );
+        assert_eq!(creator.joined_date_, 0);
+        assert!(creator.status_.is_creator());
+
+        let admin = DialogParticipant::from_channel_participant(
+            telegram_api::ChannelParticipant::channelParticipantAdmin(
+                telegram_api::channelParticipantAdmin {
+                    can_edit: true,
+                    user_id: 3000000019,
+                    promoted_by: 3000000021,
+                    date: 1700001005,
+                    admin_rights: telegram_api::ChatAdminRights {
+                        change_info: true,
+                        invite_users: true,
+                        ..Default::default()
+                    },
+                    rank: "moderator".to_owned(),
+                    ..Default::default()
+                },
+            ),
+            ChannelType::Megagroup,
+        );
+        assert_eq!(admin.inviter_user_id_, UserId::new(3000000021));
+        assert_eq!(admin.joined_date_, 1700001005);
+        assert!(admin.status_.is_administrator() && !admin.status_.is_creator());
+
+        let left = DialogParticipant::from_channel_participant(
+            telegram_api::ChannelParticipant::channelParticipantLeft(
+                telegram_api::channelParticipantLeft {
+                    peer: telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                        channel_id: 1000000002,
+                    }),
+                },
+            ),
+            ChannelType::Megagroup,
+        );
+        assert_eq!(
+            left.dialog_id_,
+            DialogId::from_channel_id(ChannelId::new(1000000002))
+        );
+        assert!(left.status_.is_left());
+
+        let banned = DialogParticipant::from_channel_participant(
+            telegram_api::ChannelParticipant::channelParticipantBanned(
+                telegram_api::channelParticipantBanned {
+                    flags: 5,
+                    left: false,
+                    peer: telegram_api::Peer::peerUser(telegram_api::peerUser {
+                        user_id: 3000000022,
+                    }),
+                    kicked_by: 3000000023,
+                    date: 1700001006,
+                    banned_rights: telegram_api::ChatBannedRights {
+                        send_messages: true,
+                        until_date: 1700003600,
+                        ..Default::default()
+                    },
+                    rank: "spam".to_owned(),
+                },
+            ),
+            ChannelType::Megagroup,
+        );
+        assert_eq!(
+            banned.dialog_id_,
+            DialogId::from_user_id(UserId::new(3000000022))
+        );
+        assert_eq!(banned.inviter_user_id_, UserId::new(3000000023));
+        assert!(banned.status_.is_restricted() && banned.status_.is_member());
+
+        // view_messages turns the rights into a plain banned; `left` + broadcast
+        // degrade to Left()
+        let banned_view = DialogParticipant::from_channel_participant(
+            telegram_api::ChannelParticipant::channelParticipantBanned(
+                telegram_api::channelParticipantBanned {
+                    flags: 1,
+                    left: true,
+                    peer: telegram_api::Peer::peerChat(telegram_api::peerChat {
+                        chat_id: 1234567890,
+                    }),
+                    kicked_by: 0,
+                    date: 1700001007,
+                    banned_rights: telegram_api::ChatBannedRights {
+                        view_messages: true,
+                        ..Default::default()
+                    },
+                    rank: String::new(),
+                },
+            ),
+            ChannelType::Broadcast,
+        );
+        assert_eq!(
+            banned_view.dialog_id_,
+            DialogId::from_chat_id(ChatId::new(1234567890))
+        );
+        assert_eq!(banned_view.joined_date_, 1700001007);
+        assert!(banned_view.status_.is_banned());
+
+        // conformance/dialog_participant_oracle/oracle.out `conv:` lines
+        assert_eq!(
+            dp_store_hex(&member),
+            "3d0000000f5ed0b2000000000000000000000000ebf453650050fdafff01000081d8db70087375622072616e6b000000"
+        );
+        assert_eq!(
+            dp_store_hex(&self_participant),
+            "3d000000105ed0b200000000115ed0b200000000ecf453650010fd2fff010000"
+        );
+        assert_eq!(
+            dp_store_hex(&creator),
+            "3d000000125ed0b200000000000000000000000000000000df7ffd0fff017f00056f776e65720000"
+        );
+        assert_eq!(
+            dp_store_hex(&admin),
+            "3d000000135ed0b200000000155ed0b200000000edf4536511c4fd18ff000000096d6f64657261746f720000"
+        );
+        assert_eq!(
+            dp_store_hex(&left),
+            "3d000000fe25c0ef16ffffff0000000000000000000000000010fd47ff010000"
+        );
+        assert_eq!(
+            dp_store_hex(&banned),
+            "3d000000165ed0b200000000175ed0b200000000eef453650050fdbfff01000010ff5365047370616d000000"
+        );
+        assert_eq!(
+            dp_store_hex(&banned_view),
+            "3d0000002efd69b6ffffffff0000000000000000eff453650000005000000000"
+        );
+        assert_eq!(dp_round_trip(&member), member);
+        assert_eq!(dp_round_trip(&banned), banned);
+        assert_eq!(dp_round_trip(&banned_view), banned_view);
+    }
+
+    #[test]
+    fn dialog_participant_legacy_parse_vectors() {
+        // v30 (pre-SupportBannedChannels): the dialog is a bare int32 user id,
+        // the inviter an int32, the status flag word a uint32. The status tail
+        // is the uint32 truncation of the modern Member(0, "") word.
+        let participant = parse_legacy_bytes("1e00000001cf8d7f02cf8d7fd0f853650010fd2f");
+        assert_eq!(
+            participant.dialog_id_,
+            DialogId::from_user_id(UserId::new(2140000001))
+        );
+        assert_eq!(participant.inviter_user_id_, UserId::new(2140000002));
+        assert_eq!(participant.joined_date_, 1700002000);
+        // re-stored at version 61 (oracle `rt:` line)
+        assert_eq!(
+            dp_store_hex(&participant),
+            "3d00000001cf8d7f0000000002cf8d7f00000000d0f853650010fd2f00000000"
+        );
+
+        // v31: the dialog grows to a long, but the inviter is still an int32
+        // and wraps negative — the C++ keeps the garbage inviter as-is.
+        let participant = parse_legacy_bytes("1f00000002baf56617ffffff215ed0b2d1f853650010fd2f");
+        assert_eq!(participant.dialog_id_, DialogId::new(-998999999998));
+        assert_eq!(participant.inviter_user_id_, UserId::new(-1294967263));
+        assert_eq!(participant.joined_date_, 1700002001);
+        assert_eq!(
+            dp_store_hex(&participant),
+            "3d00000002baf56617ffffff215ed0b2ffffffffd1f853650010fd2f00000000"
+        );
+
+        // v33: the inviter reads as a long.
+        let participant =
+            parse_legacy_bytes("2100000002baf56617ffffff235ed0b200000000d2f853650010fd2f");
+        assert_eq!(participant.inviter_user_id_, UserId::new(3000000035));
+        assert_eq!(participant.joined_date_, 1700002002);
+        assert_eq!(
+            dp_store_hex(&participant),
+            "3d00000002baf56617ffffff235ed0b200000000d2f853650010fd2f00000000"
+        );
     }
 }
