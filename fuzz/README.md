@@ -13,8 +13,17 @@ JSON, URL, HTML, entities, binlog reader, secret-chat crypto.
 | `mtproto_packet`  | `packet::read_with_x` — decrypt + msg_id/seq_no + body under a fixed key |
 | `tl_scheme_text`  | `tdtl` lexer + parse tree — the codegen front end                        |
 | `transport_frame` | stream transport framing (Tcp/ObfuscatedTcp/Http) via `create_transport` |
+| `user_log_event`  | the `User` database blob — Users binlog events + `us<id>` rows (both framings) |
+| `user_full`       | the `UserFull` database blob — `usf<id>` rows                            |
+| `secret_chat`     | the `SecretChat` database blob — SecretChats binlog events + `sc<id>` rows |
+| `emoji_status`    | the `EmojiStatus` value parser — the payload inside `User` blobs         |
 
-Pending their Track I components: URL, HTML, entities, secret-chat crypto.
+The M.4.17 database-blob targets (`user_log_event`, `user_full`,
+`secret_chat`, `emoji_status`) cover what is attacker-reachable from the
+`td` directory: every byte parsed there replays on client start from
+on-disk state. Pending: the photo.rs value-parser target arrives with
+M.4.13; URL, HTML, entities and the secret-chat crypto targets arrive
+with their Track I components.
 The S78 release gate — one week fuzz-clean per target — runs against the
 full set once Track I lands those.
 
