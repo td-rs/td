@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# S78 long-running fuzz session: cycles the six targets forever, keeping
+# S78 long-running fuzz session: cycles the ten targets forever, keeping
 # per-target corpora (coverage-guided discovery accumulates across chunks)
 # and logging every cycle. A non-zero libFuzzer exit is a FINDING: the
 # crashing input is preserved under fuzz/artifacts/ and fuzzing moves on.
@@ -16,7 +16,7 @@ CORPUS="$ROOT/fuzz/corpus"
 ARTIFACTS="$ROOT/fuzz/artifacts"
 LOG="$ROOT/fuzz/fuzz-week.log"
 BIN="$ROOT/fuzz/target/x86_64-unknown-linux-gnu/release"
-TARGETS=(td_api_json json_value binlog_event mtproto_packet tl_scheme_text transport_frame app_config simple_config)
+TARGETS=(td_api_json json_value binlog_event mtproto_packet tl_scheme_text transport_frame app_config simple_config user_log_event user_full secret_chat emoji_status)
 CHUNK=${FUZZ_CHUNK:-1800} # seconds per target per cycle (30 min)
 
 mkdir -p "$CORPUS" "$ARTIFACTS"

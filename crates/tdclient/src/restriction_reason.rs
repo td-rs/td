@@ -80,7 +80,9 @@ pub fn parse_restriction_reasons(
     parser: &mut Parser,
 ) -> Result<Vec<RestrictionReason>, &'static str> {
     let len = parser.i32_()?;
-    if len < 0 {
+    // The C++ `parse(vector<T>&)` gates the size against the input left
+    // (`tl_helpers.h:170`) — the gate must run before the allocation.
+    if len < 0 || parser.left_len() < len as usize {
         return Err("Wrong vector length");
     }
     let mut result = Vec::with_capacity(len as usize);
@@ -329,6 +331,19 @@ mod tests {
         assert_eq!(
             parse_restriction_reasons(&mut Parser::new(&bytes)).unwrap(),
             reasons
+        );
+    }
+
+    #[test]
+    fn counts_gate_against_the_input_left() {
+        // `parse(vector<RestrictionReason>&)` rejects a count above the
+        // input left before allocating (tl_helpers.h:170).
+        let mut bytes = Vec::new();
+        crate::store_parse::store_i32(&mut bytes, 1 << 30);
+        crate::store_parse::store_i32(&mut bytes, 0);
+        assert_eq!(
+            parse_restriction_reasons(&mut Parser::new(&bytes)),
+            Err("Wrong vector length")
         );
     }
 }
