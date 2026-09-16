@@ -577,11 +577,25 @@ pub trait UpdatesSink {
     fn on_get_message_scheduled(&mut self, message: telegram_api::Message) {
         let _ = message;
     }
-    /// `SecretChatsManager::on_new_message` (the updateNewEncryptedMessage
-    /// qts intake; Wave 3). The qts ack is synchronous here (the module
-    /// docs), so the qts value travels instead of the C++ ack promise.
-    fn on_new_encrypted_message(&mut self, message: telegram_api::EncryptedMessage, qts: i32) {
-        let _ = (message, qts);
+    /// `SecretChatsManager::on_new_message` — the updateNewEncryptedMessage
+    /// qts intake and the getDifference encrypted-messages intake (Wave 3).
+    /// The qts ack is synchronous in the engine (the module docs), so the
+    /// C++ ack-promise argument collapses away.
+    fn on_new_encrypted_message(&mut self, message: telegram_api::EncryptedMessage) {
+        let _ = message;
+    }
+    /// `MessagesManager::on_get_message` for the getDifference
+    /// new-messages vector (`via get difference`; the M.7 MessagesManager
+    /// flip).
+    fn on_get_difference_message(&mut self, message: telegram_api::Message) {
+        let _ = message;
+    }
+    /// `MessagesManager::is_invalid_poll_message` — the
+    /// reget-difference trigger for unparseable polls (the M.7
+    /// MessagesManager flip).
+    fn is_invalid_poll_message(&mut self, message: &telegram_api::Message) -> bool {
+        let _ = message;
+        false
     }
     /// `ConfigManager::request_config(false)` + the promo-data reload.
     fn on_update_config(&mut self) {}
@@ -2217,7 +2231,7 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                 update
             {
                 self.add_qts(env, qts);
-                self.sink.on_new_encrypted_message(encrypted.message, qts);
+                self.sink.on_new_encrypted_message(encrypted.message);
             }
         } else if env.is_bot() {
             let (id, name) = match &update {
@@ -2988,6 +3002,440 @@ impl<S: UpdatesSink> UpdatesManager<S> {
         // try_reload_data / try_reload_often_data — M.7.17.
     }
 
+    /// `UpdatesManager::on_get_difference` (cpp:2040) — all four variants.
+    /// The response intake is driven directly by the harness while the
+    /// GetDifference sender is `[blocked: net]`.
+    pub fn on_get_difference(
+        &mut self,
+        env: &mut impl UpdatesManagerEnv,
+        difference: telegram_api::updates_Difference,
+    ) {
+        if env.close_flag() || !env.is_authorized() {
+            return;
+        }
+
+        tdutils::log_debug!("----- END  GET DIFFERENCE-----");
+        self.running_get_difference = false;
+
+        match difference {
+            telegram_api::updates_Difference::updates_differenceEmpty(difference) => {
+                self.set_date(
+                    env,
+                    difference.date,
+                    false,
+                    "on_get_difference_empty".to_string(),
+                );
+                self.seq = difference.seq;
+
+                self.process_pending_qts_updates(env);
+                if !self.pending_qts_updates.is_empty() {
+                    tdutils::log_warning!(
+                        "Drop {} pending QTS updates after receive empty difference",
+                        self.pending_qts_updates.len()
+                    );
+                    let pending_qts_updates = std::mem::take(&mut self.pending_qts_updates);
+                    for (_, mut pending_update) in pending_qts_updates {
+                        for promise in pending_update.promises.iter_mut() {
+                            promise.set_value(());
+                        }
+                    }
+                }
+
+                self.process_pending_seq_updates(env);
+                if !self.pending_seq_updates.is_empty() {
+                    tdutils::log_warning!(
+                        "Drop {} pending seq updates after receive empty difference",
+                        self.pending_seq_updates.len()
+                    );
+                    let pending_seq_updates = std::mem::take(&mut self.pending_seq_updates);
+                    for mut pending_update in pending_seq_updates {
+                        complete(pending_update.promise.take());
+                    }
+                }
+            }
+            telegram_api::updates_Difference::updates_difference(difference) => {
+                tdutils::log_debug!(
+                    "In get difference receive {} users and {} chats",
+                    difference.users.len(),
+                    difference.chats.len()
+                );
+                for user in difference.users {
+                    self.sink.on_user(user);
+                }
+                for chat in difference.chats {
+                    self.sink.on_chat(chat);
+                }
+
+                if self.get_difference_retry_count <= 5
+                    && difference
+                        .new_messages
+                        .iter()
+                        .any(|message| self.sink.is_invalid_poll_message(message))
+                {
+                    self.get_difference_retry_count += 1;
+                    tdutils::log_error!(
+                        "Receive invalid poll message in updates.difference after {} tries",
+                        self.get_difference_retry_count
+                    );
+                    self.run_get_difference(env, true, "reget difference");
+                    return;
+                }
+
+                self.process_get_difference_updates(
+                    env,
+                    difference.new_messages,
+                    difference.new_encrypted_messages,
+                    difference
+                        .other_updates
+                        .into_iter()
+                        .map(PendingUpdate::Wire)
+                        .map(Some)
+                        .collect(),
+                );
+                if self.running_get_difference {
+                    tdutils::log_error!(
+                        "Get difference has run while processing get difference updates"
+                    );
+                } else {
+                    self.on_get_updates_state(env, difference.state, "get difference");
+                }
+            }
+            telegram_api::updates_Difference::updates_differenceSlice(difference) => {
+                let is_pts_changed = have_update_pts_changed(&difference.other_updates);
+                // The C++ carries a TODO here: it compares the
+                // intermediate state against the current one without
+                // acting on it.
+
+                tdutils::log_debug!(
+                    "In get difference receive {} users and {} chats",
+                    difference.users.len(),
+                    difference.chats.len()
+                );
+                for user in difference.users {
+                    self.sink.on_user(user);
+                }
+                for chat in difference.chats {
+                    self.sink.on_chat(chat);
+                }
+
+                if self.get_difference_retry_count <= 5
+                    && difference
+                        .new_messages
+                        .iter()
+                        .any(|message| self.sink.is_invalid_poll_message(message))
+                {
+                    self.get_difference_retry_count += 1;
+                    tdutils::log_error!(
+                        "Receive invalid poll message in updates.differenceSlice after {} tries",
+                        self.get_difference_retry_count
+                    );
+                    self.run_get_difference(env, true, "reget difference");
+                    return;
+                }
+
+                self.process_get_difference_updates(
+                    env,
+                    difference.new_messages,
+                    difference.new_encrypted_messages,
+                    difference
+                        .other_updates
+                        .into_iter()
+                        .map(PendingUpdate::Wire)
+                        .map(Some)
+                        .collect(),
+                );
+                if self.running_get_difference {
+                    if !is_pts_changed {
+                        tdutils::log_error!(
+                            "Get difference has run while processing get difference updates"
+                        );
+                    }
+                } else {
+                    debug_assert!(
+                        !is_pts_changed,
+                        "updatePtsChanged must have restarted getDifference"
+                    );
+
+                    let old_pts = self.get_pts();
+                    let old_date = self.get_date();
+                    let old_qts = self.get_qts();
+                    self.on_get_updates_state(
+                        env,
+                        difference.intermediate_state,
+                        "get difference slice",
+                    );
+
+                    self.process_postponed_pts_updates(env);
+                    self.process_pending_qts_updates(env);
+
+                    let new_pts = self.get_pts();
+                    let new_date = self.get_date();
+                    let new_qts = self.get_qts();
+                    if old_pts != i32::MAX
+                        && new_date == old_date
+                        && (new_pts == old_pts
+                            || (self.min_postponed_update_pts != 0
+                                && new_pts >= self.min_postponed_update_pts))
+                        && (new_qts == old_qts
+                            || (self.min_postponed_update_qts != 0
+                                && new_qts >= self.min_postponed_update_qts))
+                    {
+                        tdutils::log_debug!("Switch back from getDifference to update processing");
+                    } else if new_pts != -1 {
+                        // just in case
+                        self.run_get_difference(env, true, "on updates_differenceSlice");
+                    }
+                }
+            }
+            telegram_api::updates_Difference::updates_differenceTooLong(difference) => {
+                if env.get_option_integer("session_count") <= 1 {
+                    tdutils::log_error!("Receive differenceTooLong");
+                }
+                self.set_pts(env, difference.pts, "differenceTooLong");
+                self.get_difference(env, "on updates_differenceTooLong");
+            }
+        }
+
+        self.get_difference_retry_count = 0;
+
+        if !self.running_get_difference {
+            self.after_get_difference(env);
+        }
+    }
+
+    /// `UpdatesManager::process_get_difference_updates` (cpp:1957).
+    fn process_get_difference_updates(
+        &mut self,
+        env: &mut impl UpdatesManagerEnv,
+        new_messages: Vec<telegram_api::Message>,
+        new_encrypted_messages: Vec<telegram_api::EncryptedMessage>,
+        mut other_updates: Vec<Option<PendingUpdate>>,
+    ) {
+        tdutils::log_debug!(
+            "In get difference receive {} messages, {} encrypted messages and {} other updates",
+            new_messages.len(),
+            new_encrypted_messages.len(),
+            other_updates.len()
+        );
+        for update in other_updates.iter_mut() {
+            if update.is_none() {
+                continue;
+            }
+            let constructor_id = update.as_ref().expect("checked above").get_id();
+            if constructor_id == telegram_api::updateMessageID::ID {
+                // in getDifference updateMessageID can't be received for
+                // scheduled messages
+                let update = update.take().expect("checked above");
+                if let PendingUpdate::Wire(telegram_api::Update::updateMessageID(
+                    update_message_id,
+                )) = update
+                {
+                    self.sink.on_update_message_id(
+                        update_message_id.random_id,
+                        update_message_id.id,
+                        false,
+                        "getDifference",
+                    );
+                }
+                debug_assert!(!self.running_get_difference);
+            } else if constructor_id == telegram_api::updateStoryID::ID {
+                let update = update.take().expect("checked above");
+                // story_manager_->on_update_story_id — the M.7.15 flip.
+                self.sink
+                    .on_unsupported_update(update.get_id(), update.name(), 1987);
+                debug_assert!(!self.running_get_difference);
+            } else if constructor_id == telegram_api::updateEncryption::ID {
+                let update = update.take().expect("checked above");
+                self.on_update(env, update, Promise::default());
+                debug_assert!(!self.running_get_difference);
+            } else if constructor_id == telegram_api::updateFolderPeers::ID {
+                let mut update = update.take().expect("checked above");
+                if let PendingUpdate::Wire(telegram_api::Update::updateFolderPeers(
+                    update_folder_peers,
+                )) = &mut update
+                {
+                    if update_folder_peers.pts_count != 0 {
+                        tdutils::log_error!(
+                            "Receive updateFolderPeers with pts_count = {}",
+                            update_folder_peers.pts_count
+                        );
+                        update_folder_peers.pts_count = 0;
+                    }
+                    update_folder_peers.pts = 0;
+                }
+                self.on_update(env, update, Promise::default());
+                debug_assert!(!self.running_get_difference);
+            } else if constructor_id == telegram_api::updateUser::ID
+                || constructor_id == telegram_api::updateChat::ID
+                || constructor_id == telegram_api::updateChannel::ID
+            {
+                *update = None;
+            }
+        }
+
+        // The session_count <= 1 message-id order validation is a
+        // MessagesManager diagnostic (no state effect); it lands with that
+        // slice.
+
+        for message in new_messages {
+            // channel messages must not be received in this vector
+            self.sink.on_get_difference_message(message);
+            debug_assert!(!self.running_get_difference);
+        }
+
+        for encrypted_message in new_encrypted_messages {
+            self.sink.on_new_encrypted_message(encrypted_message);
+        }
+
+        let mut promise = Promise::default();
+        self.process_updates(env, other_updates, true, &mut promise);
+    }
+
+    /// `UpdatesManager::on_get_pts_update` (cpp:2189) — the
+    /// GetPtsUpdateQuery response (the pts-short-gap repair intake).
+    pub fn on_get_pts_update(
+        &mut self,
+        env: &mut impl UpdatesManagerEnv,
+        pts: i32,
+        difference: telegram_api::updates_Difference,
+    ) {
+        if env.close_flag() || !env.is_authorized() {
+            return;
+        }
+        tdutils::log_debug!(
+            "Receive update with PTS {}: {}",
+            pts,
+            difference_name(&difference)
+        );
+        if self.get_pts() != pts - 1
+            || self.running_get_difference
+            || !self.postponed_pts_updates.is_empty()
+            || self.pending_pts_updates.is_empty()
+            || self.pending_pts_updates[0].pts > pts + 1
+            || self.pending_pts_updates[0].pts != pts + self.pending_pts_updates[0].pts_count
+        {
+            return;
+        }
+
+        // The C++ updates_difference → updates_differenceSlice conversion
+        // with the fallthrough: both share the slice body.
+        let slice = match difference {
+            telegram_api::updates_Difference::updates_difference(difference) => {
+                telegram_api::updates_differenceSlice {
+                    new_messages: difference.new_messages,
+                    new_encrypted_messages: difference.new_encrypted_messages,
+                    other_updates: difference.other_updates,
+                    chats: difference.chats,
+                    users: difference.users,
+                    intermediate_state: difference.state,
+                }
+            }
+            telegram_api::updates_Difference::updates_differenceSlice(difference) => difference,
+            telegram_api::updates_Difference::updates_differenceEmpty(_)
+            | telegram_api::updates_Difference::updates_differenceTooLong(_) => {
+                tdutils::log_error!(
+                    "Receive wrong difference for request with PTS = {}, but have pending with PTS = {}",
+                    pts - 1,
+                    self.pending_pts_updates[0].pts
+                );
+                return;
+            }
+        };
+        self.on_get_pts_update_slice(env, pts, slice);
+    }
+
+    /// The `updates_differenceSlice` body of `on_get_pts_update`
+    /// (cpp:2215-2264, the C++ fallthrough target).
+    fn on_get_pts_update_slice(
+        &mut self,
+        env: &mut impl UpdatesManagerEnv,
+        pts: i32,
+        difference: telegram_api::updates_differenceSlice,
+    ) {
+        if have_update_pts_changed(&difference.other_updates) {
+            return;
+        }
+
+        for user in difference.users {
+            self.sink.on_user(user);
+        }
+        for chat in difference.chats {
+            self.sink.on_chat(chat);
+        }
+
+        let mut updates: Vec<Option<PendingUpdate>> = difference
+            .other_updates
+            .into_iter()
+            .map(PendingUpdate::Wire)
+            .map(Some)
+            .collect();
+        for message in difference.new_messages {
+            updates.push(Some(PendingUpdate::Wire(
+                telegram_api::Update::updateNewMessage(telegram_api::updateNewMessage {
+                    message,
+                    pts,
+                    pts_count: 1,
+                }),
+            )));
+        }
+        let mut update_ptr: Option<PendingUpdate> = None;
+        let mut update_count = 0usize;
+        for update in updates.iter_mut() {
+            if update.is_none() {
+                continue;
+            }
+            let constructor_id = update.as_ref().expect("checked above").get_id();
+            if constructor_id == telegram_api::updateMessageID::ID {
+                // in getDifference updateMessageID can't be received for
+                // scheduled messages
+                let update = update.take().expect("checked above");
+                if let PendingUpdate::Wire(telegram_api::Update::updateMessageID(
+                    update_message_id,
+                )) = update
+                {
+                    self.sink.on_update_message_id(
+                        update_message_id.random_id,
+                        update_message_id.id,
+                        false,
+                        "on_get_pts_update",
+                    );
+                }
+                continue;
+            }
+            if constructor_id == telegram_api::updateDeleteMessages::ID
+                && let Some(PendingUpdate::Wire(telegram_api::Update::updateDeleteMessages(
+                    update_delete_messages,
+                ))) = update.as_ref()
+                && (update_delete_messages.pts_count != 0
+                    || update_delete_messages.messages.len() != 1)
+            {
+                tdutils::log_error!("Receive in getDifference updateDeleteMessages");
+            }
+
+            update_ptr = update.take();
+            update_count += 1;
+        }
+
+        if !difference.new_encrypted_messages.is_empty() || update_count != 1 {
+            tdutils::log_error!("Receive unexpected updates with PTS {}", pts);
+            return;
+        }
+
+        debug_assert!(update_ptr.is_some());
+        tdutils::log_debug!("Repair update with PTS {}", pts);
+        self.pts_fixed_short_gap += 1;
+        let now = env.now();
+        self.add_pending_pts_update(
+            env,
+            update_ptr.expect("checked above"),
+            pts,
+            1,
+            now,
+            Promise::default(),
+            "on_get_pts_update",
+        );
+    }
+
     // ------------------------------------------------------------------
     // M.7.7 skeleton — gap timers
     // ------------------------------------------------------------------
@@ -3536,6 +3984,24 @@ fn update_umbrella_name(updates: &telegram_api::Updates) -> &'static str {
     }
 }
 
+fn difference_name(difference: &telegram_api::updates_Difference) -> &'static str {
+    match difference {
+        telegram_api::updates_Difference::updates_difference(_) => "updates.difference",
+        telegram_api::updates_Difference::updates_differenceEmpty(_) => "updates.differenceEmpty",
+        telegram_api::updates_Difference::updates_differenceSlice(_) => "updates.differenceSlice",
+        telegram_api::updates_Difference::updates_differenceTooLong(_) => {
+            "updates.differenceTooLong"
+        }
+    }
+}
+
+/// `UpdatesManager::have_update_pts_changed` (cpp:4153).
+fn have_update_pts_changed(updates: &[telegram_api::Update]) -> bool {
+    updates
+        .iter()
+        .any(|update| update_id_and_name(update).0 == telegram_api::updatePtsChanged::ID)
+}
+
 /// The 11 immediately-applied updates of `on_pending_updates` (cpp:2561).
 fn is_immediately_applied_update(id: i32) -> bool {
     matches!(
@@ -3746,6 +4212,8 @@ mod tests {
         after_difference: usize,
         config_updates: usize,
         skipped: Vec<(i32, i32, i32)>, // (new_pts, old_pts, pts_count)
+        difference_messages: Vec<i32>,
+        invalid_poll: bool,
     }
 
     impl UpdatesSink for RecordingSink {
@@ -3819,7 +4287,7 @@ mod tests {
         fn on_update_user_local_was_online(&mut self, user_id: i64, date: i32) {
             self.local_was_online.push((user_id, date));
         }
-        fn on_new_encrypted_message(&mut self, message: telegram_api::EncryptedMessage, _qts: i32) {
+        fn on_new_encrypted_message(&mut self, message: telegram_api::EncryptedMessage) {
             let random_id = match message {
                 telegram_api::EncryptedMessage::encryptedMessage(m) => m.random_id,
                 _ => 0,
@@ -3840,6 +4308,16 @@ mod tests {
         }
         fn on_after_get_difference(&mut self) {
             self.after_difference += 1;
+        }
+        fn on_get_difference_message(&mut self, message: telegram_api::Message) {
+            let id = match &message {
+                telegram_api::Message::message(m) => m.id,
+                _ => 0,
+            };
+            self.difference_messages.push(id);
+        }
+        fn is_invalid_poll_message(&mut self, _message: &telegram_api::Message) -> bool {
+            self.invalid_poll
         }
         fn on_unsupported_update(&mut self, id: i32, name: &str, _cpp_line: u32) {
             self.unsupported
@@ -4799,5 +5277,262 @@ mod tests {
             "skip_old_pending_pts_update"
         );
         assert!(manager.sink().pts_applied.is_empty());
+    }
+
+    // -- M.7.6 --------------------------------------------------------
+
+    fn plain_message(id: i32) -> telegram_api::Message {
+        telegram_api::Message::message(telegram_api::message {
+            id,
+            ..telegram_api::message::default()
+        })
+    }
+
+    #[test]
+    fn difference_empty_applies_date_seq_and_drops_pending() {
+        let mut env = authorized_env();
+        let mut manager = UpdatesManager::new(RecordingSink::default());
+        manager.qts_manager.init(3);
+        // Queue a pending qts update (postponement enabled).
+        manager.skipped_postponed_updates_after_start = 0;
+        manager.add_pending_qts_update(
+            &mut env,
+            PendingUpdate::Wire(telegram_api::Update::updateManagedBot(
+                telegram_api::updateManagedBot {
+                    qts: 5,
+                    user_id: 1,
+                    bot_id: 2,
+                },
+            )),
+            5,
+            Promise::default(),
+        );
+        assert_eq!(manager.pending_qts_updates.len(), 1);
+
+        manager.on_get_difference(
+            &mut env,
+            telegram_api::updates_Difference::updates_differenceEmpty(
+                telegram_api::updates_differenceEmpty { date: 777, seq: 4 },
+            ),
+        );
+        assert_eq!(manager.get_date(), 777);
+        assert_eq!(manager.get_seq(), 4);
+        assert!(
+            manager.pending_qts_updates.is_empty(),
+            "pending QTS dropped"
+        );
+        assert_eq!(manager.sink().after_difference, 1);
+    }
+
+    #[test]
+    fn difference_full_applies_users_messages_updates_and_state() {
+        let mut env = authorized_env();
+        let mut manager = UpdatesManager::new(RecordingSink::default());
+        manager.pts_manager.init(10);
+        manager.on_get_difference(
+            &mut env,
+            telegram_api::updates_Difference::updates_difference(
+                telegram_api::updates_difference {
+                    new_messages: vec![plain_message(77)],
+                    new_encrypted_messages: vec![],
+                    other_updates: vec![new_message_update(78, 11, 1)],
+                    chats: vec![chat(3)],
+                    users: vec![user(2)],
+                    state: telegram_api::updates_State {
+                        pts: 11,
+                        qts: 6,
+                        date: 900,
+                        seq: 5,
+                        unread_count: 0,
+                    },
+                },
+            ),
+        );
+        assert_eq!(manager.sink().users, [2]);
+        assert_eq!(manager.sink().chats, [3]);
+        assert_eq!(manager.sink().difference_messages, [77]);
+        assert_eq!(
+            manager.sink().pts_applied,
+            [(78, "updateNewMessage")],
+            "force-apply path"
+        );
+        assert_eq!(manager.get_pts(), 11);
+        assert_eq!(manager.get_qts(), 6);
+        assert_eq!(manager.get_date(), 900);
+        assert_eq!(manager.get_seq(), 5);
+        assert!(!manager.running_get_difference());
+        assert_eq!(manager.sink().after_difference, 1);
+    }
+
+    #[test]
+    fn difference_slice_without_progress_switches_back() {
+        let mut env = authorized_env();
+        let mut manager = UpdatesManager::new(RecordingSink::default());
+        manager.pts_manager.init(10);
+        manager.qts_manager.init(2);
+        manager.on_get_difference(
+            &mut env,
+            telegram_api::updates_Difference::updates_differenceSlice(
+                telegram_api::updates_differenceSlice {
+                    new_messages: vec![],
+                    new_encrypted_messages: vec![],
+                    other_updates: vec![],
+                    chats: vec![],
+                    users: vec![],
+                    intermediate_state: telegram_api::updates_State {
+                        pts: 10,
+                        qts: 2,
+                        date: 0,
+                        seq: 0,
+                        unread_count: 0,
+                    },
+                },
+            ),
+        );
+        assert!(
+            !manager.running_get_difference(),
+            "switch back to update processing"
+        );
+        assert!(env.sent_difference.is_empty(), "no re-run of getDifference");
+        assert_eq!(manager.sink().after_difference, 1);
+    }
+
+    #[test]
+    fn difference_slice_with_progress_reruns_get_difference() {
+        let mut env = authorized_env();
+        let mut manager = UpdatesManager::new(RecordingSink::default());
+        manager.pts_manager.init(10);
+        manager.qts_manager.init(2);
+        manager.on_get_difference(
+            &mut env,
+            telegram_api::updates_Difference::updates_differenceSlice(
+                telegram_api::updates_differenceSlice {
+                    new_messages: vec![],
+                    new_encrypted_messages: vec![],
+                    other_updates: vec![],
+                    chats: vec![],
+                    users: vec![],
+                    intermediate_state: telegram_api::updates_State {
+                        pts: 11,
+                        qts: 2,
+                        date: 0,
+                        seq: 0,
+                        unread_count: 0,
+                    },
+                },
+            ),
+        );
+        assert!(
+            manager.running_get_difference(),
+            "the slice re-ran getDifference"
+        );
+        assert_eq!(env.sent_difference, [(11, 0, 2)]);
+        assert_eq!(
+            manager.sink().after_difference,
+            0,
+            "after_get_difference deferred"
+        );
+    }
+
+    #[test]
+    fn difference_too_long_resets_pts_and_reruns() {
+        let mut env = authorized_env();
+        let mut manager = UpdatesManager::new(RecordingSink::default());
+        manager.pts_manager.init(10);
+        manager.on_get_difference(
+            &mut env,
+            telegram_api::updates_Difference::updates_differenceTooLong(
+                telegram_api::updates_differenceTooLong { pts: 50 },
+            ),
+        );
+        assert_eq!(manager.get_pts(), 50);
+        assert_eq!(env.sent_difference, [(50, 0, 0)]);
+    }
+
+    #[test]
+    fn invalid_poll_message_regets_the_difference() {
+        let mut env = authorized_env();
+        let mut manager = UpdatesManager::new(RecordingSink::default());
+        manager.pts_manager.init(10);
+        manager.sink().invalid_poll = true;
+        manager.on_get_difference(
+            &mut env,
+            telegram_api::updates_Difference::updates_difference(
+                telegram_api::updates_difference {
+                    new_messages: vec![plain_message(1)],
+                    new_encrypted_messages: vec![],
+                    other_updates: vec![],
+                    chats: vec![],
+                    users: vec![],
+                    state: telegram_api::updates_State {
+                        pts: 11,
+                        qts: 1,
+                        date: 1,
+                        seq: 1,
+                        unread_count: 0,
+                    },
+                },
+            ),
+        );
+        assert_eq!(
+            env.sent_difference,
+            [(10, 0, 0)],
+            "reget difference with the same state"
+        );
+        assert!(manager.running_get_difference());
+        assert!(
+            manager.sink().difference_messages.is_empty(),
+            "the difference was not applied"
+        );
+    }
+
+    #[test]
+    fn get_pts_update_repairs_the_short_gap() {
+        let mut env = authorized_env();
+        let mut manager = UpdatesManager::new(RecordingSink::default());
+        manager.pts_manager.init(2);
+        let now = env.clock;
+        // A pending pts-4 update that needs pts 3 first.
+        manager.add_pending_pts_update(
+            &mut env,
+            new_message_update(5, 4, 1).into(),
+            4,
+            1,
+            now,
+            Promise::default(),
+            "test",
+        );
+        assert_eq!(manager.pending_pts_updates.len(), 1);
+
+        manager.on_get_pts_update(
+            &mut env,
+            3,
+            telegram_api::updates_Difference::updates_differenceSlice(
+                telegram_api::updates_differenceSlice {
+                    new_messages: vec![],
+                    new_encrypted_messages: vec![],
+                    other_updates: vec![new_message_update(9, 3, 1)],
+                    chats: vec![],
+                    users: vec![],
+                    intermediate_state: telegram_api::updates_State {
+                        pts: 0,
+                        qts: 0,
+                        date: 0,
+                        seq: 0,
+                        unread_count: 0,
+                    },
+                },
+            ),
+        );
+        assert_eq!(
+            manager.sink().pts_applied,
+            [(9, "updateNewMessage"), (5, "updateNewMessage")],
+            "the repair applied and unblocked the queued pts-4 update"
+        );
+        assert_eq!(manager.get_pts(), 4);
+        assert!(
+            manager.pending_pts_updates.is_empty(),
+            "the whole queue drained"
+        );
     }
 }
