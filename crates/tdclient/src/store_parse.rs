@@ -25,6 +25,7 @@ pub mod version {
     pub const SUPPORT_64_BIT_IDS: i32 = 33;
     pub const MAKE_PARTICIPANT_FLAGS_64_BIT: i32 = 46;
     pub const ADD_USER_FLAGS2: i32 = 48;
+    pub const ADD_CONTACT_VCARD: i32 = 16;
     /// `Version::Next` of tdlib 1.8.67 (`SupportEphemeralMessages` + 1).
     pub const NEXT: i32 = 62;
     /// What `LogEventStorerUnsafe` writes (`Version::Next - 1`).

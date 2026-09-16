@@ -177,6 +177,12 @@ pub struct Td {
     pub(crate) user_manager: UserManager,
     /// `Td::stop_cnt_` — the hangup and the close completion each drop one.
     stop_cnt: i32,
+    /// The deferred-response outbox. The C++ request promises re-enter the
+    /// Td actor through `send_closure(td_id_, &Td::send_result/send_error)`;
+    /// the collapsed manager calls run inside a `&mut Td` borrow, so their
+    /// promise completions push here and the actor drains at the end of the
+    /// turn (the `flush_deferred_results` send_closure hop).
+    deferred_results: DeferredResults,
 }
 
 /// A parked recoverer fetch — the C++ `get_simple_config_*` /
@@ -190,6 +196,10 @@ pub(crate) enum RecovererFetch {
     Simple(crate::config_recoverer::SimpleConfigFetch),
     Full(crate::config_recoverer::FullConfigFetch),
 }
+
+/// The deferred-response outbox shared with the request promises (see the
+/// field docs).
+type DeferredResults = Arc<Mutex<Vec<(u64, Result<Object, Status>)>>>;
 
 impl Td {
     pub fn new(callback: Box<dyn TdCallback>) -> Self {
@@ -223,6 +233,7 @@ impl Td {
             auth_manager: AuthManager::new(),
             user_manager: UserManager::new(),
             stop_cnt: 2,
+            deferred_results: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -245,6 +256,12 @@ impl Td {
         // user deadline (UserManager.cpp's member MultiTimeouts re-arm on
         // every set/cancel) — point the actor timeout at the earliest one.
         self.rearm_user_timeouts();
+        // The manager mutations broadcast `updateUser`-class updates
+        // immediately in the C++ (send_closure from the manager); the
+        // collapse queues them. The deferred promise completions answer
+        // through the same end-of-turn hop.
+        self.flush_user_updates();
+        self.flush_deferred_results();
     }
 
     /// `Td::run_request` (Td.cpp:299-374) — the state gate.
@@ -262,13 +279,21 @@ impl Td {
                 }
                 Function::getCurrentState(_) => {
                     // send response synchronously to prevent "Request aborted"
-                    let updates: Vec<td_api::Update> = self
-                        .get_fake_current_state()
-                        .into_iter()
-                        .map(|update| {
-                            td_api::Update::try_from_object(update).expect("fake state is updates")
-                        })
-                        .collect();
+                    // (the variant match avoids the generated Object →
+                    // Update downcast: it moves the 32 KB enum through a
+                    // frame-sized match and exhausts the stack in debug)
+                    let mut updates: Vec<td_api::Update> = Vec::new();
+                    for update in self.get_fake_current_state() {
+                        match update {
+                            Object::updateOption(u) => {
+                                updates.push(td_api::Update::updateOption(u))
+                            }
+                            Object::updateAuthorizationState(u) => {
+                                updates.push(td_api::Update::updateAuthorizationState(u))
+                            }
+                            _ => unreachable!("the fake state is option/auth updates only"),
+                        }
+                    }
                     return self.send_result(id, Object::updates(td_api::Updates { updates }));
                 }
                 Function::close(_) => {
@@ -507,9 +532,19 @@ impl Td {
         // init_pure_actor_managers / SecretChatsManager / StorageManager —
         // each manager step appends its block here in the C++ order. The
         // UserManager constructor loads my_id from the binlog pmc
-        // (UserManager.cpp:2824 `my_id_ = load_my_id()`); the contacts /
-        // freeze-state pmc reads arrive with their steps.
+        // (UserManager.cpp:2824 `my_id_ = load_my_id()`) and the
+        // contacts sync state (cpp:2748-2759); the freeze-state pmc reads
+        // arrive with their step.
         self.user_manager.init_my_id(self.global.binlog_pmc());
+        let unix_time = self.global.unix_time();
+        let use_chat_info_database = self.global.use_chat_info_database();
+        let auth_is_bot = self.auth_manager.is_bot();
+        self.user_manager.init_contacts_state(
+            self.global.binlog_pmc(),
+            unix_time,
+            use_chat_info_database,
+            auth_is_bot,
+        );
         if !self.auth_manager.is_bot() {
             // UserManager.cpp:2765-2771 — the my_was_online pair restore;
             // `is_online` is OnlineManager::is_online() until its step.
@@ -1365,6 +1400,42 @@ impl Td {
         }
     }
 
+    /// The deferred-response outbox drain — the `send_closure(td_id_,
+    /// &Td::send_result/send_error, id, ...)` hop the C++ request promises
+    /// make when a manager completes them (possibly from inside another
+    /// manager call, where a `&mut Td` is not available).
+    pub(crate) fn flush_deferred_results(&mut self) {
+        let deferred = {
+            let mut guard = self.deferred_results.lock().unwrap();
+            std::mem::take(&mut *guard)
+        };
+        for (id, result) in deferred {
+            match result {
+                Ok(object) => self.send_result(id, object),
+                Err(status) => self.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+    }
+
+    /// The promise factory for the request layer: a manager-completed
+    /// `Result` lands in the outbox under the request id.
+    pub(crate) fn deferred_promise<T, F>(&self, id: u64, map: F) -> tdutils::promise::Promise<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(T) -> Object + Send + 'static,
+    {
+        let outbox = Arc::clone(&self.deferred_results);
+        tdutils::promise::PromiseCreator::lambda_result(
+            move |result: tdutils::status::Result<T>| {
+                let result = match result {
+                    tdutils::status::Result::Ok(value) => Ok(map(value)),
+                    tdutils::status::Result::Err(status) => Err(status),
+                };
+                outbox.lock().unwrap().push((id, result));
+            },
+        )
+    }
+
     /// Point the actor timeout at the earliest armed deadline (the member
     /// MultiTimeouts re-arm on every set/cancel). The slot is shared with
     /// the ConfigManager expire time and the recoverer wakeup, so this
@@ -1602,6 +1673,7 @@ impl Actor for Td {
         }
         self.flush_user_updates();
         self.rearm_user_timeouts();
+        self.flush_deferred_results();
     }
 
     fn tear_down(&mut self) {
@@ -3110,5 +3182,267 @@ mod tests {
             scheduler.finish();
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Test-only Td message: seed the service-notifications user as `me`
+    /// (the getMe fixture — production my_id restores from the binlog).
+    struct SeedServiceNotificationsUser;
+
+    impl tdactor::ActorMessage for SeedServiceNotificationsUser {
+        type Actor = Td;
+
+        fn dispatch(self, td: &mut Td) {
+            // the tests exercise the authorized path (the C++ client is
+            // authorized long before getMe runs)
+            td.auth_manager.force_authorized_for_test();
+            let mut env = UserEnv {
+                global: &mut td.global,
+                options: td
+                    .option_manager
+                    .as_mut()
+                    .expect("the option manager exists after init"),
+                auth_is_bot: td.auth_manager.is_bot(),
+            };
+            td.user_manager
+                .set_my_id(&mut env, UserManager::get_service_notifications_user_id());
+            td.user_manager.add_service_notifications_user(&mut env);
+        }
+    }
+
+    fn seed_service_notifications_user(actor: &ActorOwn<Td>, scheduler: &mut ConcurrentScheduler) {
+        let send_ptr = scheduler.send_scheduler();
+        {
+            let _guard = send_ptr.guard(false);
+            tdactor::send_closure(actor, SeedServiceNotificationsUser);
+        }
+        let _ = scheduler.run_main(0.01);
+    }
+
+    fn has_answer(callback: &CollectCallback, id: u64) -> bool {
+        !responses_of(callback, id).is_empty()
+            || callback
+                .errors
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(error_id, _)| *error_id == id)
+    }
+
+    #[test]
+    fn get_me_answers_the_synthesized_service_notifications_user() {
+        let callback = CollectCallback::default();
+        run_actor_with(&callback, |actor, callback, scheduler| {
+            let dir = temp_db_dir("m416-get-me");
+            send(actor, scheduler, 1, set_tdlib_parameters(dir, false));
+            seed_service_notifications_user(actor, scheduler);
+            send(actor, scheduler, 2, Function::getMe(td_api::getMe));
+
+            let responses = responses_of(callback, 2);
+            assert_eq!(responses.len(), 1, "getMe answers exactly once");
+            let Object::user(user) = &responses[0] else {
+                panic!("getMe answers the user object, got {:?}", responses[0]);
+            };
+            assert_eq!(user.id, 777000);
+            assert!(user.is_support, "the C++ service notifications user");
+        });
+    }
+
+    #[test]
+    fn get_user_rejects_invalid_and_unknown_users() {
+        let callback = CollectCallback::default();
+        run_actor_with(&callback, |actor, callback, scheduler| {
+            let dir = temp_db_dir("m416-get-user");
+            send(actor, scheduler, 1, set_tdlib_parameters(dir, false));
+            seed_service_notifications_user(actor, scheduler);
+
+            send(
+                actor,
+                scheduler,
+                2,
+                Function::getUser(td_api::getUser {
+                    user_id: 123456789012,
+                }),
+            );
+            let error = error_of(callback, 2);
+            assert_eq!(
+                (error.code, error.message),
+                (400, "User not found".to_string())
+            );
+
+            send(
+                actor,
+                scheduler,
+                3,
+                Function::getUser(td_api::getUser { user_id: -5 }),
+            );
+            let error = error_of(callback, 3);
+            assert_eq!(
+                (error.code, error.message),
+                (400, "Invalid user identifier".to_string())
+            );
+
+            // the known special user answers from the synthesis
+            send(
+                actor,
+                scheduler,
+                4,
+                Function::getUser(td_api::getUser { user_id: 777000 }),
+            );
+            let responses = responses_of(callback, 4);
+            let Object::user(user) = &responses[0] else {
+                panic!("getUser answers the user object");
+            };
+            assert_eq!(user.id, 777000);
+        });
+    }
+
+    #[test]
+    fn set_name_answers_the_local_gate_and_parks_the_query() {
+        let callback = CollectCallback::default();
+        run_actor_with(&callback, |actor, callback, scheduler| {
+            let dir = temp_db_dir("m416-set-name");
+            send(actor, scheduler, 1, set_tdlib_parameters(dir, false));
+            seed_service_notifications_user(actor, scheduler);
+
+            send(
+                actor,
+                scheduler,
+                2,
+                Function::setName(td_api::setName {
+                    first_name: String::new(),
+                    last_name: "x".to_string(),
+                }),
+            );
+            let error = error_of(callback, 2);
+            assert_eq!(
+                (error.code, error.message),
+                (400, "First name must be non-empty".to_string())
+            );
+
+            // the profile query is [blocked: net]: validated, then parked
+            // without an answer (the C++ promise rides UpdateProfileQuery)
+            send(
+                actor,
+                scheduler,
+                3,
+                Function::setName(td_api::setName {
+                    first_name: "A".to_string(),
+                    last_name: "B".to_string(),
+                }),
+            );
+            assert!(
+                !has_answer(callback, 3),
+                "the profile query parks until the server ack"
+            );
+        });
+    }
+
+    #[test]
+    fn get_contacts_parks_on_a_fresh_install_until_the_server_load() {
+        let callback = CollectCallback::default();
+        run_actor_with(&callback, |actor, callback, scheduler| {
+            let dir = temp_db_dir("m416-get-contacts");
+            send(actor, scheduler, 1, set_tdlib_parameters(dir, false));
+            seed_service_notifications_user(actor, scheduler);
+
+            // no contacts database and no saved count: the C++ parks the
+            // request on the contacts.getContacts load — [blocked: net]
+            // here, so the request answers nothing yet
+            send(
+                actor,
+                scheduler,
+                2,
+                Function::getContacts(td_api::getContacts),
+            );
+            assert!(
+                !has_answer(callback, 2),
+                "getContacts parks until the contacts load"
+            );
+        });
+    }
+
+    #[test]
+    fn get_close_friends_parks_until_the_contacts_load() {
+        let callback = CollectCallback::default();
+        run_actor_with(&callback, |actor, callback, scheduler| {
+            let dir = temp_db_dir("m416-close-friends");
+            send(actor, scheduler, 1, set_tdlib_parameters(dir, false));
+            seed_service_notifications_user(actor, scheduler);
+
+            // GetCloseFriendsRequest parks the actor on the contacts load
+            // (the pending_user_requests re-run answers it on completion)
+            send(
+                actor,
+                scheduler,
+                2,
+                Function::getCloseFriends(td_api::getCloseFriends),
+            );
+            assert!(
+                !has_answer(callback, 2),
+                "getCloseFriends parks until the contacts load"
+            );
+        });
+    }
+
+    #[test]
+    fn get_current_state_streams_the_seeded_user_block() {
+        let callback = CollectCallback::default();
+        run_actor_with(&callback, |actor, callback, scheduler| {
+            let dir = temp_db_dir("m416-current-state");
+            send(actor, scheduler, 1, set_tdlib_parameters(dir, false));
+            seed_service_notifications_user(actor, scheduler);
+
+            send(
+                actor,
+                scheduler,
+                2,
+                Function::getCurrentState(td_api::getCurrentState),
+            );
+            let responses = responses_of(callback, 2);
+            assert_eq!(responses.len(), 1);
+            let Object::updates(updates) = &responses[0] else {
+                panic!("getCurrentState answers the updates object");
+            };
+            assert!(
+                updates.updates.iter().any(|update| matches!(
+                    update,
+                    td_api::Update::updateUser(u) if u.user.id == 777000
+                )),
+                "the seeded user streams as updateUser"
+            );
+            // no user_full was loaded for `me` in this fixture: the C++
+            // streams updateUserFullInfo only for the loaded users_full_ rows
+            assert!(
+                !updates
+                    .updates
+                    .iter()
+                    .any(|update| matches!(update, td_api::Update::updateUserFullInfo(_))),
+                "no updateUserFullInfo without a loaded user_full"
+            );
+        });
+    }
+
+    #[test]
+    fn set_close_friends_rejects_unknown_users() {
+        let callback = CollectCallback::default();
+        run_actor_with(&callback, |actor, callback, scheduler| {
+            let dir = temp_db_dir("m416-close-friends-gate");
+            send(actor, scheduler, 1, set_tdlib_parameters(dir, false));
+            seed_service_notifications_user(actor, scheduler);
+
+            send(
+                actor,
+                scheduler,
+                2,
+                Function::setCloseFriends(td_api::setCloseFriends {
+                    user_ids: vec![123456789012],
+                }),
+            );
+            let error = error_of(callback, 2);
+            assert_eq!(
+                (error.code, error.message),
+                (400, "User not found".to_string())
+            );
+        });
     }
 }
