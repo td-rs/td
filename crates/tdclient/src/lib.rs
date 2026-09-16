@@ -17,6 +17,7 @@ pub mod config_manager;
 pub mod config_recoverer;
 pub mod config_result;
 pub mod connection_creator;
+pub mod contact;
 pub mod emoji_status;
 pub mod global;
 pub mod link_manager;
