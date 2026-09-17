@@ -257,6 +257,21 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
 
+        // The M.4.16/M.6.20 manager-arm groups live in dedicated
+        // `#[inline(never)]` functions: the merged dispatcher's single
+        // match frame pushed the scheduler-thread call chain over its
+        // 2 MiB stack in debug builds (the M.6 integration gate); the
+        // group frames unwind between groups instead of nesting.
+        function => run_user_requests(td, id, function),
+    }
+}
+
+/// The M.4.16 UserManager arm group of the request dispatcher — see the
+/// frame note at the forward site in [`run_request`]. Every arm fully
+/// answers the request; `return;` exits after answering.
+#[inline(never)]
+fn run_user_requests(td: &mut Td, id: u64, function: Function) {
+    match function {
         // ------------------------------------------------------------------
         // M.4.16: the UserManager slice (the `Requests.cpp` on_request
         // overloads routing to `user_manager_`). The C++ request actors'
@@ -877,6 +892,15 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
 
+        function => run_dialog_requests(td, id, function),
+    }
+}
+
+/// The M.6.20 DialogManager arm group of the request dispatcher — see the
+/// frame note at the forward site in [`run_request`].
+#[inline(never)]
+fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
+    match function {
         // ------------------------------------------------------------------
         // M.6.20: the DialogManager-served requests
         // (Requests.cpp:3425-3530, :3667, :5781-5873, :6096, :6608, :7842).
@@ -909,7 +933,7 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             let dialog_ids = crate::dialog_manager::search_public_dialogs(
                 td,
                 &query,
-                Some(&request.type_filter),
+                request.type_filter.as_ref(),
                 promise,
             );
             if fail_from_slot(td, id, &slot) {
@@ -930,7 +954,7 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             let (total_count, dialog_ids) = crate::dialog_manager::search_dialogs(
                 td,
                 &query,
-                Some(&request.type_filter),
+                request.type_filter.as_ref(),
                 request.limit,
                 promise,
             );
@@ -952,7 +976,7 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             let dialog_ids = crate::dialog_manager::search_dialogs_on_server(
                 td,
                 &query,
-                Some(&request.type_filter),
+                request.type_filter.as_ref(),
                 request.limit,
                 promise,
             );
@@ -974,7 +998,7 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             let (total_count, dialog_ids) = crate::dialog_manager::search_recently_found_dialogs(
                 td,
                 &query,
-                Some(&request.type_filter),
+                request.type_filter.as_ref(),
                 request.limit,
                 promise,
             );
@@ -1113,7 +1137,7 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             crate::dialog_manager::set_dialog_photo(
                 td,
                 crate::dialog_id::DialogId::new(request.chat_id),
-                Some(&request.photo),
+                request.photo.as_ref(),
                 promise,
             );
             finish_unit_slot(td, id, slot);
@@ -1152,7 +1176,7 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             crate::dialog_manager::set_dialog_permissions(
                 td,
                 crate::dialog_id::DialogId::new(request.chat_id),
-                Some(&request.permissions),
+                request.permissions.as_ref(),
                 promise,
             );
             finish_unit_slot(td, id, slot);
@@ -1208,7 +1232,7 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             let (promise, slot) = object_request_promise();
             crate::dialog_manager::get_blocked_dialogs(
                 td,
-                Some(&request.block_list),
+                request.block_list.as_ref(),
                 request.offset,
                 request.limit,
                 promise,

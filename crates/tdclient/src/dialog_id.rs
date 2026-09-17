@@ -180,7 +180,13 @@ impl DialogId {
     /// error, like the C++.
     pub fn from_dialog_peer(dialog_peer: &telegram_api::DialogPeer) -> DialogId {
         match dialog_peer {
-            telegram_api::DialogPeer::dialogPeer(peer) => DialogId::from_peer(&peer.peer),
+            telegram_api::DialogPeer::dialogPeer(peer) => match peer.peer.as_ref() {
+                Some(peer) => DialogId::from_peer(peer),
+                None => {
+                    tracing::error!("Receive dialogPeer without peer");
+                    DialogId::new(0)
+                }
+            },
             telegram_api::DialogPeer::dialogPeerFolder(_) => {
                 tracing::error!("Receive unsupported dialogPeerFolder");
                 DialogId::new(0)
@@ -194,19 +200,35 @@ impl DialogId {
 
     /// `DialogId::get_message_dialog_id` (DialogId.cpp:157-181). The C++
     /// `peer_id_ == nullptr` check is the `peer_id` flag bit (flags.0) on
-    /// `messageEmpty` — the generated model carries the field without the
-    /// Option.
+    /// `messageEmpty`; the generated model carries the field as an
+    /// `Option`, so the flag-set-but-absent case degrades to the invalid
+    /// id instead of the C++'s null dereference.
     pub fn get_message_dialog_id(message: &telegram_api::Message) -> DialogId {
         match message {
             telegram_api::Message::messageEmpty(message) => {
                 if (message.flags & 1) != 0 {
-                    DialogId::from_peer(&message.peer_id)
+                    message
+                        .peer_id
+                        .as_ref()
+                        .map(DialogId::from_peer)
+                        .unwrap_or_else(|| {
+                            tracing::error!(
+                                "Receive messageEmpty with the peer_id flag unset peer"
+                            );
+                            DialogId::new(0)
+                        })
                 } else {
                     DialogId::new(0)
                 }
             }
-            telegram_api::Message::message(message) => DialogId::from_peer(&message.peer_id),
-            telegram_api::Message::messageService(message) => DialogId::from_peer(&message.peer_id),
+            telegram_api::Message::message(message) => match message.peer_id.as_ref() {
+                Some(peer) => DialogId::from_peer(peer),
+                None => DialogId::new(0),
+            },
+            telegram_api::Message::messageService(message) => match message.peer_id.as_ref() {
+                Some(peer) => DialogId::from_peer(peer),
+                None => DialogId::new(0),
+            },
         }
     }
 
