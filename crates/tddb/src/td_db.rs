@@ -89,6 +89,22 @@ pub const LOG_EVENT_HANDLER_TYPE_USERS: i32 = 2;
 /// secret chat is unsaved (`SecretChatLogEvent`). Distinct from
 /// `SecretChats` = 1, which routes to the Wave-3 `SecretChatsManager`.
 pub const LOG_EVENT_HANDLER_TYPE_SECRET_CHAT_INFOS: i32 = 5;
+/// `LogEvent::HandlerType::ToggleDialogIsPinnedOnServer` (LogEvent.h:85) —
+/// the DialogManager server-sync mirror events (M.6.18). All seven collect
+/// into one replay vector for `DialogManager::on_binlog_dialog_events`.
+pub const LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_PINNED_ON_SERVER: i32 = 0x10c;
+/// `LogEvent::HandlerType::ReorderPinnedDialogsOnServer` (LogEvent.h:86).
+pub const LOG_EVENT_HANDLER_TYPE_REORDER_PINNED_DIALOGS_ON_SERVER: i32 = 0x10d;
+/// `LogEvent::HandlerType::ToggleDialogReportSpamStateOnServer` (LogEvent.h:91).
+pub const LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_REPORT_SPAM_STATE_ON_SERVER: i32 = 0x112;
+/// `LogEvent::HandlerType::ToggleDialogIsMarkedAsUnreadOnServer` (LogEvent.h:94).
+pub const LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_MARKED_AS_UNREAD_ON_SERVER: i32 = 0x115;
+/// `LogEvent::HandlerType::ToggleDialogIsBlockedOnServer` (LogEvent.h:97).
+pub const LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_BLOCKED_ON_SERVER: i32 = 0x118;
+/// `LogEvent::HandlerType::ToggleDialogIsTranslatableOnServer` (LogEvent.h:105).
+pub const LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_TRANSLATABLE_ON_SERVER: i32 = 0x126;
+/// `LogEvent::HandlerType::ToggleDialogViewAsMessagesOnServer` (LogEvent.h:106).
+pub const LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_VIEW_AS_MESSAGES_ON_SERVER: i32 = 0x127;
 
 /// `TdDb::OpenedDatabase` — the database plus the open metadata the Td actor
 /// consumes (`since_last_open`; the per-manager binlog event vectors arrive
@@ -104,6 +120,11 @@ pub struct OpenedDatabase {
     /// binlog event with the SecretChatInfos handler type, in binlog order,
     /// for `UserManager::on_binlog_secret_chat_event`.
     pub secret_chat_events: Vec<BinlogEvent>,
+    /// The `dialog_manager_events` replay vector (TdDb.cpp `dialog_events`
+    /// shape) — every binlog event with one of the seven DialogManager
+    /// server-sync handler types, in binlog order, for
+    /// `DialogManager::on_binlog_dialog_events`.
+    pub dialog_manager_events: Vec<BinlogEvent>,
 }
 
 /// `get_binlog_path` — `{database_directory}td{_test}.binlog`.
@@ -811,17 +832,28 @@ impl TdDb {
         // their owners).
         let mut user_events: Vec<BinlogEvent> = Vec::new();
         let mut secret_chat_events: Vec<BinlogEvent> = Vec::new();
+        let mut dialog_manager_events: Vec<BinlogEvent> = Vec::new();
         let mut binlog = ConcurrentBinlog::new();
         {
             let binlog_pmc = &mut binlog_pmc;
             let config_pmc = &mut config_pmc;
             let user_events = &mut user_events;
             let secret_chat_events = &mut secret_chat_events;
+            let dialog_manager_events = &mut dialog_manager_events;
             let callback = |event: &BinlogEvent| match event.type_ {
                 BINLOG_PMC_MAGIC => binlog_pmc.external_init_handle(event),
                 CONFIG_PMC_MAGIC => config_pmc.external_init_handle(event),
                 LOG_EVENT_HANDLER_TYPE_USERS => user_events.push(event.clone()),
                 LOG_EVENT_HANDLER_TYPE_SECRET_CHAT_INFOS => secret_chat_events.push(event.clone()),
+                LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_PINNED_ON_SERVER
+                | LOG_EVENT_HANDLER_TYPE_REORDER_PINNED_DIALOGS_ON_SERVER
+                | LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_REPORT_SPAM_STATE_ON_SERVER
+                | LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_MARKED_AS_UNREAD_ON_SERVER
+                | LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_BLOCKED_ON_SERVER
+                | LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_TRANSLATABLE_ON_SERVER
+                | LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_VIEW_AS_MESSAGES_ON_SERVER => {
+                    dialog_manager_events.push(event.clone())
+                }
                 _ => {}
             };
             let init_status = binlog.init(
@@ -902,6 +934,7 @@ impl TdDb {
             since_last_open,
             user_events,
             secret_chat_events,
+            dialog_manager_events,
         })
     }
 
