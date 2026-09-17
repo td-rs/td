@@ -31,7 +31,7 @@
 //!   C++ runs the net stack as actors; the observable JSON behavior is
 //!   identical for the single-client skeleton).
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -179,6 +179,15 @@ pub struct Td {
     /// `Td::pending_preauthentication_requests_`; the C++ nulls entries as
     /// they are replayed — the Rust keeps the original and filters by id.
     pending_preauthentication_requests: Vec<(u64, Function)>,
+    /// The C++ `Td::alarm_manager_` (`AlarmManager`, created in
+    /// `Td::start_up`, Td.cpp:454): alarm id → (deadline, the parked ok
+    /// promise). The per-alarm `MultiTimeout` shares the Td's single actor
+    /// timeout slot here, like the other deadline sources; `setAlarm` is a
+    /// preinitialization request, so the map works before `init` — the C++
+    /// actor exists from `start_up` for the same reason.
+    pending_alarms: BTreeMap<i64, (f64, Promise<()>)>,
+    /// `AlarmManager::alarm_id_` — the monotonically increasing alarm key.
+    next_alarm_id: i64,
     pub(crate) can_ignore_background_updates: bool,
     parameters: Option<Parameters>,
     pub(crate) header_options: HeaderOptions,
@@ -312,6 +321,8 @@ impl Td {
             set_parameters_request_id: 0,
             pending_set_parameters_requests: Vec::new(),
             pending_preauthentication_requests: Vec::new(),
+            pending_alarms: BTreeMap::new(),
+            next_alarm_id: 0,
             can_ignore_background_updates: false,
             parameters: None,
             header_options: HeaderOptions::default(),
@@ -999,6 +1010,18 @@ impl Td {
         // StateManager — with the net step.
         self.clear_requests();
 
+        // `AlarmManager::tear_down` (AlarmManager.cpp:17-28, via the
+        // Td.cpp:788 actor reset): every pending alarm's promise errors
+        // with the aborted error. `clear_requests` already untracked the
+        // ids, so the settled errors re-enter for untracked ids and drop —
+        // the C++ promise-actor hangups after `clear` behave the same.
+        for (_, (_, mut promise)) in std::mem::take(&mut self.pending_alarms) {
+            promise.set_error(tdutils::status::Status::error(
+                crate::request_actor::REQUEST_ABORTED_CODE,
+                crate::request_actor::REQUEST_ABORTED_MESSAGE,
+            ));
+        }
+
         // `net_query_dispatcher_->stop()` (the Td.cpp:664 close path): the
         // stop flag aborts every still-dispatched query with
         // Global::request_aborted_error() (NetQueryDispatcher.cpp:49-55).
@@ -1290,10 +1313,62 @@ impl Td {
         {
             expire_time = chat_deadline;
         }
+        // The AlarmManager timers share the same slot (M.11.4): the
+        // earliest armed alarm wins.
+        if let Some(alarm_deadline) = self.next_alarm_deadline()
+            && (expire_time == 0.0 || alarm_deadline < expire_time)
+        {
+            expire_time = alarm_deadline;
+        }
         if expire_time == 0.0 {
             self.cancel_timeout();
         } else {
             self.set_timeout_at(expire_time);
+        }
+    }
+
+    /// `AlarmManager::set_alarm` (AlarmManager.cpp:52-60) behind the
+    /// `Requests::on_request(setAlarm)` `CREATE_OK_REQUEST_PROMISE`
+    /// (Requests.cpp:8976-8979): the ok answer parks until the deadline.
+    pub(crate) fn set_alarm(&mut self, id: u64, seconds: f64) {
+        if !(0.0..=3e9).contains(&seconds) {
+            return self.send_error_impl(id, 400, "Wrong parameter seconds specified");
+        }
+        self.next_alarm_id += 1;
+        let promise = self.deferred_promise(id, |()| crate::request_actor::ok_object());
+        self.pending_alarms.insert(
+            self.next_alarm_id,
+            (tdutils::time::now() + seconds, promise),
+        );
+        // the C++ alarm actor arms its own MultiTimeout timer; the shared
+        // Td timeout slot needs the mirror (a no-op outside a scheduler)
+        self.rearm_user_timeouts();
+    }
+
+    /// The earliest armed alarm deadline, for the shared timeout slot.
+    fn next_alarm_deadline(&self) -> Option<f64> {
+        self.pending_alarms
+            .values()
+            .map(|(at, _)| *at)
+            .min_by(f64::total_cmp)
+    }
+
+    /// `AlarmManager::on_alarm_timeout` (AlarmManager.cpp:36-48): every due
+    /// alarm answers its parked ok promise.
+    fn tick_alarms(&mut self) {
+        let now = tdutils::time::now();
+        let due: Vec<i64> = self
+            .pending_alarms
+            .iter()
+            .filter(|(_, (at, _))| *at <= now)
+            .map(|(alarm_id, _)| *alarm_id)
+            .collect();
+        for alarm_id in due {
+            let (_, (_, mut promise)) = self
+                .pending_alarms
+                .remove_entry(&alarm_id)
+                .expect("due alarm just disappeared");
+            promise.set_value(());
         }
     }
 
@@ -2540,6 +2615,7 @@ impl Actor for Td {
     /// into the manager actors; the sweep then re-arms at the next
     /// deadline, like the MultiTimeouts' set/cancel re-arm.
     fn timeout_expired(&mut self) {
+        self.tick_alarms();
         let close_flag = self.close_flag != 0;
         let actions = self
             .config_manager
@@ -2556,10 +2632,11 @@ impl Actor for Td {
             .unwrap_or_default();
         self.apply_recoverer_actions(actions);
 
-        {
-            let Some(options) = self.option_manager.as_mut() else {
-                return self.rearm_user_timeouts();
-            };
+        // Pre-init there is no OptionManager to build the UserEnv from —
+        // the manager ticks skip, but the tail flushes must still run: a
+        // pre-init alarm (setAlarm is preinitialization) settles its parked
+        // promise through this exact path.
+        if let Some(options) = self.option_manager.as_mut() {
             let mut env = UserEnv {
                 global: &mut self.global,
                 options,
@@ -4385,6 +4462,146 @@ mod tests {
                 (error.code, error.message),
                 (400, "User not found".to_string())
             );
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // M.11 — the request-actor settlement machine (request_actor.rs) and
+    // the AlarmManager port.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn set_alarm_answers_ok_after_the_deadline() {
+        let callback = CollectCallback::default();
+        run_actor_with(&callback, |actor, callback, scheduler| {
+            // setAlarm is a preinitialization request: it parks and fires
+            // without any setTdlibParameters, like the C++ AlarmManager
+            // created in `Td::start_up`.
+            send(
+                actor,
+                scheduler,
+                7,
+                Function::setAlarm(td_api::setAlarm { seconds: 0.05 }),
+            );
+            assert!(
+                responses_of(callback, 7).is_empty() && !has_answer(callback, 7),
+                "the ok parks until the deadline"
+            );
+            let _ = scheduler.run_main(0.1);
+            // the second pump: run_once skips the post-inbound wait once
+            // the inbound is processed, so the armed timeout fires here
+            let _ = scheduler.run_main(0.4);
+            let responses = responses_of(callback, 7);
+            assert_eq!(responses.len(), 1, "the alarm answers exactly once");
+            assert!(matches!(responses[0], Object::ok(_)));
+        });
+    }
+
+    #[test]
+    fn set_alarm_rejects_out_of_range_seconds() {
+        let callback = CollectCallback::default();
+        run_actor_with(&callback, |actor, callback, scheduler| {
+            send(
+                actor,
+                scheduler,
+                1,
+                Function::setAlarm(td_api::setAlarm { seconds: -1.0 }),
+            );
+            send(
+                actor,
+                scheduler,
+                2,
+                Function::setAlarm(td_api::setAlarm { seconds: 4e9 }),
+            );
+            for id in [1, 2] {
+                let error = error_of(callback, id);
+                assert_eq!(
+                    (error.code, error.message),
+                    (400, "Wrong parameter seconds specified".to_string())
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn close_aborts_parked_requests_and_loses_their_answers() {
+        // The M.11.2 close matrix: a parked request (a far-future alarm)
+        // gets the clear_requests answer; the alarm teardown's own aborted
+        // promise re-enters untracked and drops; a request arriving after
+        // close gets the Close-state answer.
+        let callback = CollectCallback::default();
+        run_actor_with(&callback, |actor, callback, scheduler| {
+            send(
+                actor,
+                scheduler,
+                1,
+                Function::setAlarm(td_api::setAlarm { seconds: 3600.0 }),
+            );
+            send(actor, scheduler, 2, Function::close(td_api::close));
+            let _ = scheduler.run_main(0.1);
+
+            let error = error_of(callback, 1);
+            assert_eq!(
+                (error.code, error.message),
+                (500, "Request aborted".to_string())
+            );
+            let errors = callback
+                .errors
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(error_id, _)| *error_id == 1)
+                .count();
+            assert_eq!(errors, 1, "the dropped teardown error answers once only");
+            assert!(matches!(responses_of(callback, 2)[0], Object::ok(_)));
+
+            // Post-close requests: the 500 "Request aborted" Close branch.
+            send(
+                actor,
+                scheduler,
+                3,
+                Function::testCallEmpty(td_api::testCallEmpty),
+            );
+            let _ = scheduler.run_main(0.1);
+            let error = error_of(callback, 3);
+            assert_eq!(
+                (error.code, error.message),
+                (500, "Request aborted".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn destroy_answers_parked_requests_unauthorized() {
+        // The C++ state gate special-cases only close pre-Run
+        // (Td.cpp:314-319) — destroy in WaitParameters answers the 400
+        // "Initialization parameters are needed" and never closes. The
+        // 401 drain needs State::Run: park a preinitialization alarm,
+        // init, then destroy (destroy is an authentication request,
+        // Td.cpp:180, so it passes the Run gate unauthorized).
+        let callback = CollectCallback::default();
+        run_actor_with(&callback, |actor, callback, scheduler| {
+            send(
+                actor,
+                scheduler,
+                1,
+                Function::setAlarm(td_api::setAlarm { seconds: 3600.0 }),
+            );
+            send(
+                actor,
+                scheduler,
+                2,
+                set_tdlib_parameters(temp_db_dir("m11-destroy-drain"), false),
+            );
+            seed_service_notifications_user(actor, scheduler);
+            send(actor, scheduler, 3, Function::destroy(td_api::destroy));
+            let _ = scheduler.run_main(0.1);
+            let error = error_of(callback, 1);
+            assert_eq!(
+                (error.code, error.message),
+                (401, "Unauthorized".to_string())
+            );
+            assert!(matches!(responses_of(callback, 3)[0], Object::ok(_)));
         });
     }
 }

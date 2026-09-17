@@ -1,15 +1,34 @@
-//! Port of `td/telegram/Requests.{h,cpp}` (Track I, Td M.1 subset): the
-//! `td_api` request dispatch. The C++ file is a ~9.5K-line per-function
-//! `on_request` overload set that hands each request to its manager through
-//! a `RequestActor`; the Rust dispatcher lives in one `run_request` match
-//! and grows with every manager step.
+//! Port of `td/telegram/Requests.{h,cpp}` (Track I): the `td_api` request
+//! dispatch. The C++ file is a ~9.5K-line per-function `on_request` overload
+//! set that hands each request to its manager through a `RequestActor`; the
+//! Rust dispatcher lives in one `run_request` match and grows with every
+//! manager step (the M.11 flip protocol,
+//! `RUST_REWRITE_PLAN_REQUESTS_M11.md`: arms + census fixture + corpus
+//! coverage land per slice, never the dispatcher internals).
 //!
-//! M.1 carries the handlers that need no network or manager actors: the
+//! M.1 carried the handlers that need no network or manager actors: the
 //! `test*` echo set, `getCurrentState`, `getAuthorizationState`, the
 //! `close`/`destroy` pair, and the `Run`-state `setTdlibParameters`
 //! rejection. Everything not yet ported answers the interim 500
-//! "TDLib function is not implemented yet"; the interim handlers below the
-//! `-- interim --` marker get their real bodies as their managers land.
+//! "TDLib function is not implemented yet".
+//!
+//! M.11.1 dispatcher audit (2026-09-17, vs the local C++ 1.8.67+ tree):
+//! byte-parity re-verified for the pre-existing core arms — the `test*`
+//! family (Requests.cpp:9483-9517; `testUseUpdate`'s `send_result(nullptr)`
+//! is the 404 "Not Found" `Td::send_result` rewrite, Td.cpp:1407-1409),
+//! `setTdlibParameters` (2044-2048), `close`/`destroy` (2160-2175, the ok
+//! answers before the close hop), `getAuthorizationState` (2051-2053 vs
+//! `AuthManager::get_state`, AuthManager.cpp:450-456 — the `State::None`
+//! park is unobservable: the fake-state path answers before `Run`, and the
+//! init pmc restore pins a concrete state in `Run`), `getCurrentState`
+//! (2192-2209: options → authorization → user → chat; the connection and
+//! authorized-manager blocks accumulate with their managers),
+//! `getOption`/`setOption` (8076-8086: `CLEAN_INPUT_STRING` first, then the
+//! OptionManager contract ported with M.3), the `CHECK_IS_USER`/
+//! `CHECK_IS_BOT` texts (1993-2000), and the classification lists
+//! `is_authentication_request`/`is_preinitialization_request`/
+//! `is_preauthentication_request` (Td.cpp:154-249, 26/12/37 entries) behind
+//! the `Td::run_request` state gate (Td.cpp:299-374).
 
 use crate::chat_manager::{ChannelId, ChatId, DialogId};
 use crate::contact::Contact;
@@ -275,6 +294,14 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             // `G()->td_db()->get_binlog()->change_key(...)` — the binlog
             // re-key lands with the TdDb binlog-close wiring.
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+        }
+
+        // --- the M.11.4 generic (manager-free) family ---
+        Function::setAlarm(request) => {
+            // Requests.cpp:8976-8979 → `AlarmManager::set_alarm`
+            // (AlarmManager.cpp:52-60): the ok answer parks until the
+            // deadline fires from the shared timeout slot.
+            td.set_alarm(id, request.seconds);
         }
 
         // ------------------------------------------------------------------
@@ -1141,5 +1168,66 @@ pub(crate) fn json_value_to_object(value: td_api::JsonValue) -> Object {
         V::jsonValueString(v) => Object::jsonValueString(v),
         V::jsonValueArray(v) => Object::jsonValueArray(v),
         V::jsonValueObject(v) => Object::jsonValueObject(v),
+    }
+}
+
+#[cfg(test)]
+mod request_census_tests {
+    /// M.11.3 — the dispatcher census. The fixture
+    /// (`testdata/request_census.txt`, one `name<TAB>state` line per td_api
+    /// function) must cover the pinned scheme exactly: every generated
+    /// function appears once with a known state.
+    ///
+    /// States: `sync` — answered by `synchronous_requests` (native), while
+    /// `getOption` stays `dispatched` (its synchronous half is gated by
+    /// `is_synchronous_option`); `dispatched` — a real `run_request` arm
+    /// (the parked-net tails keep the C++ local behavior); `interim` — the
+    /// 500 "TDLib function is not implemented yet" placeholder. Every
+    /// manager flip moves its functions `interim → dispatched` (and bumps
+    /// the counts below); the S74 corpus records the flipped functions'
+    /// coverage.
+    #[test]
+    fn census_fixture_covers_every_scheme_function() {
+        let raw = include_str!("testdata/request_census.txt");
+        let mut names = std::collections::BTreeSet::new();
+        let mut counts = std::collections::BTreeMap::new();
+        for line in raw.lines() {
+            let Some((name, state)) = line.split_once('\t') else {
+                panic!("census line is not `name<TAB>state`: {line:?}");
+            };
+            assert!(
+                matches!(state, "sync" | "dispatched" | "interim"),
+                "unknown census state {state:?} for {name}"
+            );
+            assert!(names.insert(name), "duplicate census entry {name}");
+            *counts.entry(state).or_insert(0usize) += 1;
+        }
+
+        // The fixture set equals the generated scheme set exactly.
+        let generated: std::collections::BTreeSet<&str> =
+            crate::td_api::ALL_FUNCTION_NAMES.iter().copied().collect();
+        let fixture: std::collections::BTreeSet<&str> = names.into_iter().collect();
+        let missing: Vec<&str> = generated.difference(&fixture).copied().collect();
+        let stale: Vec<&str> = fixture.difference(&generated).copied().collect();
+        assert!(
+            missing.is_empty(),
+            "census is missing functions: {missing:?}"
+        );
+        assert!(
+            stale.is_empty(),
+            "census carries stale functions: {stale:?}"
+        );
+
+        // The scheme size from the S07 differential dump.
+        assert_eq!(generated.len(), crate::td_api::SCHEME_FUNCTIONS);
+
+        // The flip-state ledger at the M.11 landing (fix per flip).
+        assert_eq!(*counts.get("sync").unwrap_or(&0), 14, "sync count");
+        assert_eq!(
+            *counts.get("dispatched").unwrap_or(&0),
+            64,
+            "dispatched count"
+        );
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 944, "interim count");
     }
 }

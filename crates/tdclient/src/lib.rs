@@ -31,6 +31,7 @@ pub mod peer_color;
 pub mod photo;
 pub mod query_combiner;
 pub mod query_merger;
+pub mod request_actor;
 pub mod requests;
 pub mod restriction_reason;
 pub mod store_parse;

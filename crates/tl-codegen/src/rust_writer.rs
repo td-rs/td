@@ -183,6 +183,13 @@ pub fn write_rust(p: &TlProgram, m: &SchemeModel, opts: &WriterOpts) -> String {
          pub const SCHEME_FUNCTIONS: usize = {};\n",
         p.total_types, p.total_ctors, p.total_funcs
     ));
+    // The M.11 dispatcher census: every scheme function constructor name, in
+    // the treap (ctor-id-sorted) order, for the tdclient census fixture test.
+    out.push_str("pub const ALL_FUNCTION_NAMES: &[&str] = &[\n");
+    for &f in &m.functions {
+        out.push_str(&format!("    {:?},\n", p.ctors[f].id));
+    }
+    out.push_str("];\n");
     let enums = m
         .type_kinds
         .iter()
