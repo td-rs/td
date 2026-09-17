@@ -140,7 +140,7 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             {
                 updates.push(td_api::Update::updateAuthorizationState(
                     td_api::updateAuthorizationState {
-                        authorization_state,
+                        authorization_state: Some(authorization_state),
                     },
                 ));
             }
@@ -204,7 +204,10 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             let Some(option_manager) = td.option_manager.as_mut() else {
                 return td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
             };
-            match option_manager.set_option_from_api(&name, &request.value) {
+            let Some(value) = request.value.as_ref() else {
+                return td.send_error_impl(id, 400, "Expected to receive \"value\"");
+            };
+            match option_manager.set_option_from_api(&name, value) {
                 Ok(crate::option_manager::SetOptionAction::Done) => {
                     td.flush_option_updates();
                     td.send_result(id, ok_object());
@@ -224,29 +227,30 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             td.get_application_config(id);
         }
 
-        // -- interim: the auth set is validated and routed in the C++ shape,
-        //    but the network query layer lands with the net step (every one
-        //    of these needs auth.* NetQueries, logOut's local guards
-        //    included; the ConfigManager's own queries are held by the Td
-        //    from this step on). --
+        // -- the auth set (S76): the real `AuthManager` handlers over the
+        //    walking-skeleton bridge. logOut and the password-recovery
+        //    helpers keep their interim bodies until their managers land. --
         Function::setAuthenticationPhoneNumber(request) => {
-            // CLEAN_INPUT_STRING, then `AuthManager::set_phone_number`.
-            let _ = crate::misc::clean_input_string(&request.phone_number);
-            td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+            td.set_authentication_phone_number(id, request.phone_number);
         }
         Function::checkAuthenticationCode(request) => {
-            let _ = crate::misc::clean_input_string(&request.code);
-            td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+            td.check_authentication_code(id, request.code);
         }
         Function::checkAuthenticationPassword(request) => {
-            let _ = crate::misc::clean_input_string(&request.password);
-            td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+            td.check_authentication_password(id, request.password);
+        }
+        Function::checkAuthenticationBotToken(request) => {
+            td.check_authentication_bot_token(id, request.token);
         }
         Function::logOut(_) => {
             // `AuthManager::log_out` — the local guards need the sender for
             // the query part; both arrive with the net step.
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
+
+        // -- the walking-skeleton messaging set (S76) --
+        Function::getMe(_) => td.get_me(id),
+        Function::sendMessage(request) => td.on_send_message(id, request),
         Function::setDatabaseEncryptionKey(_) => {
             // `G()->td_db()->get_binlog()->change_key(...)` — the binlog
             // re-key lands with the TdDb binlog-close wiring.
@@ -262,23 +266,6 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
         // ------------------------------------------------------------------
 
         // --- the read surface ---
-        Function::getMe(_) => {
-            // GetMeRequest (Requests.cpp:200-213): the users.getUsers park
-            // inside `get_me` is [blocked: net]
-            let user_id = {
-                let mut env = user_env!(td);
-                td.user_manager.get_me(&mut env)
-            };
-            if !user_id.is_valid() {
-                tdutils::log_info!("Get me query — [blocked: net]");
-                return;
-            }
-            let user = {
-                let env = user_env!(td);
-                td.user_manager.get_user_object_of(&env, user_id)
-            };
-            td.send_result(id, Object::user(user));
-        }
         Function::getUser(request) => {
             // GetUserRequest (Requests.cpp:217-233): set_tries(3)
             let user_id = UserId::new(request.user_id);
@@ -418,10 +405,13 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let user_id = UserId::new(request.user_id);
+            let Some(imported_contact) = request.contact else {
+                return td.send_error_impl(id, 400, "Imported contact is required");
+            };
             let mut contact = Contact::new(
-                request.contact.phone_number,
-                request.contact.first_name,
-                request.contact.last_name,
+                imported_contact.phone_number,
+                imported_contact.first_name,
+                imported_contact.last_name,
                 String::new(),
                 UserId::default(),
             );

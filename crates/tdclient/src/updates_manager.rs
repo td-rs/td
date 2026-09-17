@@ -232,11 +232,12 @@ impl<S: UpdatesSink> UpdatesManager<S> {
     fn apply_pts_update(&mut self, update: telegram_api::Update) {
         match update {
             telegram_api::Update::updateNewMessage(u) => {
-                self.sink.on_new_message(u.message, u.pts, u.pts_count);
+                self.sink
+                    .on_new_message(u.message.unwrap_or_default(), u.pts, u.pts_count);
             }
             telegram_api::Update::updateNewChannelMessage(u) => {
                 self.sink
-                    .on_new_channel_message(u.message, u.pts, u.pts_count);
+                    .on_new_channel_message(u.message.unwrap_or_default(), u.pts, u.pts_count);
             }
             telegram_api::Update::updateDeleteMessages(u) => {
                 self.sink.on_delete_messages(u.messages, u.pts, u.pts_count);
@@ -323,7 +324,9 @@ impl<S: UpdatesSink> UpdatesManager<S> {
     /// `UpdatesManager::process_update_short` — the `updates.updateShort`
     /// container (a single update with a date).
     pub fn process_update_short(&mut self, short: telegram_api::updateShort, now: f64) {
-        self.process_update(short.update, now);
+        if let Some(update) = short.update {
+            self.process_update(update, now);
+        }
         if short.date > 0 {
             self.seq = short.date;
         }
@@ -463,10 +466,10 @@ mod tests {
 
     fn new_message(id: i32, pts: i32, pts_count: i32) -> telegram_api::Update {
         telegram_api::Update::updateNewMessage(telegram_api::updateNewMessage {
-            message: telegram_api::Message::message(telegram_api::message {
+            message: Some(telegram_api::Message::message(telegram_api::message {
                 id,
                 ..telegram_api::message::default()
-            }),
+            })),
             pts,
             pts_count,
         })
@@ -566,7 +569,7 @@ mod tests {
         manager.set_pts(10);
         manager.process_update_short(
             telegram_api::updateShort {
-                update: new_message(7, 11, 1),
+                update: Some(new_message(7, 11, 1)),
                 date: 999,
             },
             0.0,

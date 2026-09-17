@@ -1091,7 +1091,11 @@ impl ConfigManager {
         );
 
         if is_from_main_dc && !options.have_option("default_reaction_need_sync") {
-            let reaction_string = reaction_type_string(&config.reactions_default);
+            let reaction_string = config
+                .reactions_default
+                .as_ref()
+                .map(reaction_type_string)
+                .unwrap_or_default();
             if !reaction_string.is_empty() && reaction_string != "$" {
                 options.set_option_string("default_reaction", &reaction_string);
             }
@@ -1372,7 +1376,10 @@ pub fn convert_json_value_object(json_value: &telegram_api::JSONValue) -> td_api
                     .map(|member| {
                         Box::new(td_api::JsonObjectMember {
                             key: member.key.clone(),
-                            value: Box::new(convert_json_value_object(&member.value)),
+                            value: member
+                                .value
+                                .as_deref()
+                                .map(|value| Box::new(convert_json_value_object(value))),
                         })
                     })
                     .collect(),
@@ -1427,6 +1434,51 @@ pub(crate) fn get_json_value_string(json_value: &telegram_api::JSONValue, name: 
     }
     tdutils::log_error!("Expected String as {name}, but found {json_value:?}");
     String::new()
+}
+
+/// `get_json_value_bool` on an optional JSON value — a missing (null in
+/// C++) value yields the default `false`.
+pub(crate) fn get_json_value_bool_option(
+    json_value: Option<&telegram_api::JSONValue>,
+    name: &str,
+) -> bool {
+    json_value.is_some_and(|value| get_json_value_bool(value, name))
+}
+
+/// `get_json_value_int` on an optional JSON value — a missing (null in
+/// C++) value yields the default `0`.
+pub(crate) fn get_json_value_int_option(
+    json_value: Option<&telegram_api::JSONValue>,
+    name: &str,
+) -> i32 {
+    json_value.map_or(0, |value| get_json_value_int(value, name))
+}
+
+/// `get_json_value_long` on an optional JSON value — a missing (null in
+/// C++) value yields the default `0`.
+pub(crate) fn get_json_value_long_option(
+    json_value: Option<&telegram_api::JSONValue>,
+    name: &str,
+) -> i64 {
+    json_value.map_or(0, |value| get_json_value_long(value, name))
+}
+
+/// `get_json_value_double` on an optional JSON value — a missing (null in
+/// C++) value yields the default `0.0`.
+pub(crate) fn get_json_value_double_option(
+    json_value: Option<&telegram_api::JSONValue>,
+    name: &str,
+) -> f64 {
+    json_value.map_or(0.0, |value| get_json_value_double(value, name))
+}
+
+/// `get_json_value_string` on an optional JSON value — a missing (null in
+/// C++) value yields the empty string.
+pub(crate) fn get_json_value_string_option(
+    json_value: Option<&telegram_api::JSONValue>,
+    name: &str,
+) -> String {
+    json_value.map_or_else(String::new, |value| get_json_value_string(value, name))
 }
 
 /// `td::implode(vec, separator)`.
@@ -1937,7 +1989,7 @@ impl ConfigManager {
                     };
                     options.set_option_boolean(
                         option_name,
-                        get_json_value_bool(&key_value.value, key),
+                        get_json_value_bool_option(key_value.value.as_deref(), key),
                     );
                     continue;
                 }
@@ -1951,7 +2003,9 @@ impl ConfigManager {
                     };
                     options.set_option_integer(
                         option_name,
-                        i64::from(get_json_value_int(&key_value.value, key).max(0)),
+                        i64::from(
+                            get_json_value_int_option(key_value.value.as_deref(), key).max(0),
+                        ),
                     );
                     continue;
                 }
@@ -1965,7 +2019,7 @@ impl ConfigManager {
                     };
                     options.set_option_integer(
                         option_name,
-                        get_json_value_long(&key_value.value, key).max(0),
+                        get_json_value_long_option(key_value.value.as_deref(), key).max(0),
                     );
                     continue;
                 }
@@ -1979,7 +2033,7 @@ impl ConfigManager {
                     };
                     options.set_option_string(
                         option_name,
-                        &get_json_value_string(&key_value.value, key),
+                        &get_json_value_string_option(key_value.value.as_deref(), key),
                     );
                     continue;
                 }
@@ -1987,10 +2041,10 @@ impl ConfigManager {
                     continue;
                 }
 
-                let value = key_value.value.as_ref();
+                let value = key_value.value.as_deref();
                 match key {
                     "ignore_restriction_reasons" => {
-                        if let telegram_api::JSONValue::jsonArray(array) = value {
+                        if let Some(telegram_api::JSONValue::jsonArray(array)) = value {
                             for reason in &array.value {
                                 let reason_name = get_json_value_string(reason, key);
                                 if !reason_name.is_empty() && !reason_name.contains(',') {
@@ -2012,7 +2066,7 @@ impl ConfigManager {
                         continue;
                     }
                     "restriction_add_platforms" => {
-                        if let telegram_api::JSONValue::jsonArray(array) = value {
+                        if let Some(telegram_api::JSONValue::jsonArray(array)) = value {
                             for platform in &array.value {
                                 let platform_name = get_json_value_string(platform, key);
                                 if !platform_name.is_empty() && !platform_name.contains(',') {
@@ -2034,11 +2088,11 @@ impl ConfigManager {
                         continue;
                     }
                     "emojies_animated_zoom" => {
-                        animated_emoji_zoom = get_json_value_double(value, key);
+                        animated_emoji_zoom = get_json_value_double_option(value, key);
                         continue;
                     }
                     "emojies_send_dice" => {
-                        if let telegram_api::JSONValue::jsonArray(array) = value {
+                        if let Some(telegram_api::JSONValue::jsonArray(array)) = value {
                             for emoji in &array.value {
                                 let emoji_text = get_json_value_string(emoji, key);
                                 if !emoji_text.is_empty() {
@@ -2054,13 +2108,13 @@ impl ConfigManager {
                         continue;
                     }
                     "emojies_send_dice_success" => {
-                        if let telegram_api::JSONValue::jsonObject(success_object) = value {
+                        if let Some(telegram_api::JSONValue::jsonObject(success_object)) = value {
                             for success_value in &success_object.value {
                                 if success_value.key.is_empty() {
                                     continue;
                                 }
-                                let telegram_api::JSONValue::jsonObject(inner) =
-                                    success_value.value.as_ref()
+                                let Some(telegram_api::JSONValue::jsonObject(inner)) =
+                                    success_value.value.as_deref()
                                 else {
                                     tdutils::log_error!(
                                         "Receive unexpected dice success value {success_value:?}"
@@ -2070,8 +2124,8 @@ impl ConfigManager {
                                 let mut dice_value = -1;
                                 let mut frame_start = -1;
                                 for dice_key_value in &inner.value {
-                                    let telegram_api::JSONValue::jsonNumber(number) =
-                                        dice_key_value.value.as_ref()
+                                    let Some(telegram_api::JSONValue::jsonNumber(number)) =
+                                        dice_key_value.value.as_deref()
                                     else {
                                         continue;
                                     };
@@ -2102,10 +2156,10 @@ impl ConfigManager {
                         continue;
                     }
                     "emojies_sounds" => {
-                        if let telegram_api::JSONValue::jsonObject(sounds) = value {
+                        if let Some(telegram_api::JSONValue::jsonObject(sounds)) = value {
                             for sound in &sounds.value {
-                                let telegram_api::JSONValue::jsonObject(inner) =
-                                    sound.value.as_ref()
+                                let Some(telegram_api::JSONValue::jsonObject(inner)) =
+                                    sound.value.as_deref()
                                 else {
                                     tdutils::log_error!("Receive unexpected emoji sound {sound:?}");
                                     continue;
@@ -2115,13 +2169,15 @@ impl ConfigManager {
                                 let mut file_reference_base64 = String::new();
                                 for sound_key_value in &inner.value {
                                     if !matches!(
-                                        sound_key_value.value.as_ref(),
-                                        telegram_api::JSONValue::jsonString(_)
+                                        sound_key_value.value.as_deref(),
+                                        Some(telegram_api::JSONValue::jsonString(_))
                                     ) {
                                         continue;
                                     }
-                                    let current_value =
-                                        get_json_value_string(&sound_key_value.value, "");
+                                    let current_value = get_json_value_string_option(
+                                        sound_key_value.value.as_deref(),
+                                        "",
+                                    );
                                     match sound_key_value.key.as_str() {
                                         "id" => id = current_value,
                                         "access_hash" => access_hash = current_value,
@@ -2150,7 +2206,7 @@ impl ConfigManager {
                         continue;
                     }
                     "gif_search_emojies" => {
-                        if let telegram_api::JSONValue::jsonArray(array) = value {
+                        if let Some(telegram_api::JSONValue::jsonArray(array)) = value {
                             for emoji in &array.value {
                                 let emoji_str = get_json_value_string(emoji, key);
                                 if !emoji_str.is_empty() && !emoji_str.contains(',') {
@@ -2176,7 +2232,7 @@ impl ConfigManager {
                         continue;
                     }
                     "round_video_encoding" => {
-                        if let telegram_api::JSONValue::jsonObject(settings) = value {
+                        if let Some(telegram_api::JSONValue::jsonObject(settings)) = value {
                             for video_note_setting in &settings.value {
                                 let option_name = match video_note_setting.key.as_str() {
                                     "diameter" => "suggested_video_note_length",
@@ -2185,8 +2241,8 @@ impl ConfigManager {
                                     "max_size" => "video_note_size_max",
                                     _ => continue,
                                 };
-                                if let telegram_api::JSONValue::jsonNumber(number) =
-                                    video_note_setting.value.as_ref()
+                                if let Some(telegram_api::JSONValue::jsonNumber(number)) =
+                                    video_note_setting.value.as_deref()
                                 {
                                     let setting_value = number.value as i32;
                                     if setting_value > 0 {
@@ -2209,7 +2265,7 @@ impl ConfigManager {
                         continue;
                     }
                     "premium_promo_order" => {
-                        if let telegram_api::JSONValue::jsonArray(array) = value {
+                        if let Some(telegram_api::JSONValue::jsonArray(array)) = value {
                             for feature in &array.value {
                                 let premium_feature = get_json_value_string(feature, key);
                                 if !premium_feature.contains(',') {
@@ -2230,7 +2286,8 @@ impl ConfigManager {
                     if let Some(suffix) = key.strip_prefix(premium_limit_key)
                         && (suffix == "_limit_default" || suffix == "_limit_premium")
                     {
-                        let setting_value = get_json_value_int(&key_value.value, key);
+                        let setting_value =
+                            get_json_value_int_option(key_value.value.as_deref(), key);
                         if setting_value > 0 {
                             options.set_option_integer(key, i64::from(setting_value));
                         } else {
@@ -2246,19 +2303,22 @@ impl ConfigManager {
 
                 match key {
                     "premium_bot_username" => {
-                        premium_bot_username = get_json_value_string(&key_value.value, key);
+                        premium_bot_username =
+                            get_json_value_string_option(key_value.value.as_deref(), key);
                         continue;
                     }
                     "premium_invoice_slug" => {
-                        premium_invoice_slug = get_json_value_string(&key_value.value, key);
+                        premium_invoice_slug =
+                            get_json_value_string_option(key_value.value.as_deref(), key);
                         continue;
                     }
                     "premium_purchase_blocked" => {
-                        is_premium_available = !get_json_value_bool(&key_value.value, key);
+                        is_premium_available =
+                            !get_json_value_bool_option(key_value.value.as_deref(), key);
                         continue;
                     }
                     "fragment_prefixes" => {
-                        if let telegram_api::JSONValue::jsonArray(array) = value {
+                        if let Some(telegram_api::JSONValue::jsonArray(array)) = value {
                             for prefix in &array.value {
                                 let mut prefix_text = get_json_value_string(prefix, key);
                                 clean_phone_number(&mut prefix_text);
@@ -2276,27 +2336,28 @@ impl ConfigManager {
                     "stories_entities" => {
                         options.set_option_boolean(
                             "need_premium_for_story_caption_entities",
-                            get_json_value_string(&key_value.value, key) == "premium",
+                            get_json_value_string_option(key_value.value.as_deref(), key)
+                                == "premium",
                         );
                         continue;
                     }
                     "transcribe_audio_trial_weekly_number" => {
                         transcribe_audio_trial_weekly_number =
-                            get_json_value_int(&key_value.value, key);
+                            get_json_value_int_option(key_value.value.as_deref(), key);
                         continue;
                     }
                     "transcribe_audio_trial_duration_max" => {
                         transcribe_audio_trial_duration_max =
-                            get_json_value_int(&key_value.value, key);
+                            get_json_value_int_option(key_value.value.as_deref(), key);
                         continue;
                     }
                     "transcribe_audio_trial_cooldown_until" => {
                         transcribe_audio_trial_cooldown_until =
-                            get_json_value_int(&key_value.value, key);
+                            get_json_value_int_option(key_value.value.as_deref(), key);
                         continue;
                     }
                     "business_promo_order" => {
-                        if let telegram_api::JSONValue::jsonArray(array) = value {
+                        if let Some(telegram_api::JSONValue::jsonArray(array)) = value {
                             for feature in &array.value {
                                 let business_feature = get_json_value_string(feature, key);
                                 if !business_feature.contains(',') {
@@ -2312,11 +2373,11 @@ impl ConfigManager {
                     }
                     "new_noncontact_peers_require_premium_without_ownpremium" => {
                         need_premium_for_new_chat_privacy =
-                            !get_json_value_bool(&key_value.value, key);
+                            !get_json_value_bool_option(key_value.value.as_deref(), key);
                         continue;
                     }
                     "web_app_allowed_protocols" => {
-                        if let telegram_api::JSONValue::jsonArray(array) = value {
+                        if let Some(telegram_api::JSONValue::jsonArray(array)) = value {
                             let mut protocol_names: Vec<String> = Vec::new();
                             for protocol in &array.value {
                                 let protocol_name = get_json_value_string(protocol, key);
@@ -2336,7 +2397,7 @@ impl ConfigManager {
                         continue;
                     }
                     "starref_start_param_prefixes" => {
-                        if let telegram_api::JSONValue::jsonArray(array) = value {
+                        if let Some(telegram_api::JSONValue::jsonArray(array)) = value {
                             for prefix in &array.value {
                                 let prefix_text = get_json_value_string(prefix, key);
                                 if !prefix_text.is_empty() && !prefix_text.contains(' ') {
@@ -2355,74 +2416,82 @@ impl ConfigManager {
                         continue;
                     }
                     "freeze_since_date" => {
-                        freeze_since_date = get_json_value_int(&key_value.value, key);
+                        freeze_since_date =
+                            get_json_value_int_option(key_value.value.as_deref(), key);
                         continue;
                     }
                     "freeze_until_date" => {
-                        freeze_until_date = get_json_value_int(&key_value.value, key);
+                        freeze_until_date =
+                            get_json_value_int_option(key_value.value.as_deref(), key);
                         continue;
                     }
                     "freeze_appeal_url" => {
-                        freeze_appeal_url = get_json_value_string(&key_value.value, key);
+                        freeze_appeal_url =
+                            get_json_value_string_option(key_value.value.as_deref(), key);
                         continue;
                     }
                     "call_requests_disabled" => {
-                        can_accept_calls = !get_json_value_bool(&key_value.value, key);
+                        can_accept_calls =
+                            !get_json_value_bool_option(key_value.value.as_deref(), key);
                         continue;
                     }
                     "ton_suggested_post_amount_min" => {
                         options.set_option_integer(
                             "suggested_post_gram_cent_count_min",
-                            get_json_value_long(&key_value.value, key) / 10000000,
+                            get_json_value_long_option(key_value.value.as_deref(), key) / 10000000,
                         );
                         continue;
                     }
                     "ton_suggested_post_amount_max" => {
                         options.set_option_integer(
                             "suggested_post_gram_cent_count_max",
-                            get_json_value_long(&key_value.value, key) / 10000000,
+                            get_json_value_long_option(key_value.value.as_deref(), key) / 10000000,
                         );
                         continue;
                     }
                     "ton_stargift_resale_amount_min" => {
                         options.set_option_integer(
                             "gift_resale_gram_cent_count_min",
-                            get_json_value_long(&key_value.value, key) / 10000000,
+                            get_json_value_long_option(key_value.value.as_deref(), key) / 10000000,
                         );
                         continue;
                     }
                     "ton_stargift_resale_amount_max" => {
                         options.set_option_integer(
                             "gift_resale_gram_cent_count_max",
-                            get_json_value_long(&key_value.value, key) / 10000000,
+                            get_json_value_long_option(key_value.value.as_deref(), key) / 10000000,
                         );
                         continue;
                     }
                     "ton_usd_rate" => {
                         options.set_option_integer(
                             "million_gram_to_usd_rate",
-                            (get_json_value_double(&key_value.value, key) * 1000000.0) as i64,
+                            (get_json_value_double_option(key_value.value.as_deref(), key)
+                                * 1000000.0) as i64,
                         );
                         continue;
                     }
                     "need_age_video_verification" => {
-                        need_age_video_verification = get_json_value_bool(&key_value.value, key);
+                        need_age_video_verification =
+                            get_json_value_bool_option(key_value.value.as_deref(), key);
                         continue;
                     }
                     "verify_age_bot_username" => {
-                        verify_age_bot_username = get_json_value_string(&key_value.value, key);
+                        verify_age_bot_username =
+                            get_json_value_string_option(key_value.value.as_deref(), key);
                         continue;
                     }
                     "verify_age_country" => {
-                        verify_age_country = get_json_value_string(&key_value.value, key);
+                        verify_age_country =
+                            get_json_value_string_option(key_value.value.as_deref(), key);
                         continue;
                     }
                     "verify_age_min" => {
-                        verify_age_min = get_json_value_int(&key_value.value, key);
+                        verify_age_min = get_json_value_int_option(key_value.value.as_deref(), key);
                         continue;
                     }
                     "whitelisted_bots" => {
-                        if let telegram_api::JSONValue::jsonArray(array) = value {
+                        if let Some(telegram_api::JSONValue::jsonArray(array)) = value {
                             for bot_user_id in &array.value {
                                 let user_id = get_json_value_long(bot_user_id, key);
                                 if user_id > 0 {
@@ -2453,7 +2522,7 @@ impl ConfigManager {
                         continue;
                     }
                     "ton_stakedice_stake_suggested_amounts" => {
-                        if let telegram_api::JSONValue::jsonArray(array) = value {
+                        if let Some(telegram_api::JSONValue::jsonArray(array)) = value {
                             for amount in &array.value {
                                 let ton_amount = get_json_value_long(amount, key);
                                 if ton_amount > 0 {
@@ -2476,7 +2545,7 @@ impl ConfigManager {
                         continue;
                     }
                     "stargifts_craft_attribute_permilles" => {
-                        if let telegram_api::JSONValue::jsonArray(array) = value {
+                        if let Some(telegram_api::JSONValue::jsonArray(array)) = value {
                             let mut row_count = 0i32;
                             for probability_row in &array.value {
                                 row_count += 1;
@@ -2748,7 +2817,12 @@ mod tests {
             telegram_api::jsonObject {
                 value: values
                     .into_iter()
-                    .map(|(key, value)| Box::new(telegram_api::JSONObjectValue { key, value }))
+                    .map(|(key, value)| {
+                        Box::new(telegram_api::JSONObjectValue {
+                            key,
+                            value: Some(value),
+                        })
+                    })
                     .collect(),
             },
         ))
@@ -2802,9 +2876,11 @@ mod tests {
             suggested_lang_code: "en".to_string(),
             lang_pack_version: 5,
             base_lang_pack_version: 4,
-            reactions_default: telegram_api::Reaction::reactionEmoji(telegram_api::reactionEmoji {
-                emoticon: "👍".to_string(),
-            }),
+            reactions_default: Some(telegram_api::Reaction::reactionEmoji(
+                telegram_api::reactionEmoji {
+                    emoticon: "👍".to_string(),
+                },
+            )),
             autologin_token: "token".to_string(),
         }
     }
@@ -3124,7 +3200,9 @@ mod tests {
             gif_search_username: String::new(),
             venue_search_username: String::new(),
             img_search_username: String::new(),
-            reactions_default: telegram_api::Reaction::reactionEmpty(telegram_api::reactionEmpty),
+            reactions_default: Some(telegram_api::Reaction::reactionEmpty(
+                telegram_api::reactionEmpty,
+            )),
             message_length_max: 5,
             caption_length_max: 2_000_000,
             online_update_period_ms: 100,
@@ -3484,7 +3562,7 @@ mod tests {
                     telegram_api::jsonObject {
                         value: vec![Box::new(telegram_api::JSONObjectValue {
                             key: "stars".to_string(),
-                            value: json_number(100.0),
+                            value: Some(json_number(100.0)),
                         })],
                     },
                 ))],
@@ -3934,7 +4012,9 @@ mod tests {
             &mut pmc,
             Ok(AppConfigQueryResult::Config {
                 hash: answer.hash,
-                config: answer.config,
+                config: answer
+                    .config
+                    .expect("help.appConfig always carries a config"),
             }),
             false,
             &mut options,
@@ -3968,8 +4048,19 @@ mod tests {
                     let (name, value) = line.split_once('\t').expect("tab-separated snapshot");
                     (name.to_string(), value.to_string())
                 })
+                // The `utc_time_offset` seed is the machine-local
+                // `Clocks::tz_offset()` (OptionManager.cpp:80-83); the
+                // snapshot pins the recorder machine's UTC 0. It is masked
+                // on both sides — the C++ itself produces a machine-dependent
+                // value here, and the recorded config never sets the option.
+                .filter(|(name, _)| name != "utc_time_offset")
                 .collect();
-        assert_eq!(options.all_options(), expected);
+        let actual: Vec<(String, String)> = options
+            .all_options()
+            .into_iter()
+            .filter(|(name, _)| name != "utc_time_offset")
+            .collect();
+        assert_eq!(actual, expected);
 
         // The filtered config persists with the hash — every consumed key
         // is stripped; only the pass-through keys survive (the C++
@@ -4031,7 +4122,9 @@ mod tests {
             &mut pmc,
             Ok(AppConfigQueryResult::Config {
                 hash: answer.hash,
-                config: answer.config,
+                config: answer
+                    .config
+                    .expect("help.appConfig always carries a config"),
             }),
             false,
             &mut options,

@@ -12,10 +12,11 @@ serde = { version = "1", features = ["derive"] }
 tdactor = { path = "../tdactor" }
 tddb = { path = "../tddb" }
 tdnet = { path = "../tdnet" }
-tokio = { version = "1", features = ["net", "time"] }
 tracing = "0.1"
 tdmtproto = { path = "../tdmtproto" }
 tdutils = { path = "../tdutils" }
+parking_lot = "0.12"
+tokio = { version = "1", features = ["rt", "sync", "net", "time", "macros"] }
 
 [build-dependencies]
 tl-codegen = { path = "../tl-codegen" }
