@@ -296,12 +296,14 @@ pub fn run_request(function: Function) -> Object {
         Function::parseMarkdown(request) => {
             let text_struct = request.text.unwrap();
             let mut text = text_struct.text;
-            let entities =
-                match message_entity::get_message_entities::<()>(None, text_struct.entities, true)
-                {
-                    std::result::Result::Ok(entities) => entities,
-                    std::result::Result::Err(status) => return make_error(400, status.message()),
-                };
+            let entities = match message_entity::get_message_entities::<()>(
+                None,
+                text_struct.entities,
+                true,
+            ) {
+                std::result::Result::Ok(entities) => entities,
+                std::result::Result::Err(status) => return make_error(400, status.message()),
+            };
             let mut entities = entities;
             let status = message_entity::fix_formatted_text(
                 &mut text,
@@ -342,14 +344,12 @@ pub fn run_request(function: Function) -> Object {
         Function::getMarkdownText(request) => {
             let text_struct = request.text.unwrap();
             let mut text = text_struct.text;
-            let entities = match message_entity::get_message_entities::<()>(
-                None,
-                text_struct.entities,
-                false,
-            ) {
-                std::result::Result::Ok(entities) => entities,
-                std::result::Result::Err(status) => return make_error(400, status.message()),
-            };
+            let entities =
+                match message_entity::get_message_entities::<()>(None, text_struct.entities, false)
+                {
+                    std::result::Result::Ok(entities) => entities,
+                    std::result::Result::Err(status) => return make_error(400, status.message()),
+                };
             let mut entities = entities;
             let status = message_entity::fix_formatted_text(
                 &mut text,

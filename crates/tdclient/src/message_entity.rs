@@ -8838,15 +8838,16 @@ mod tests {
             dump(&entity(Type::ExpandableBlockQuote, 0, 1)),
             r#"{"@type":"textEntityTypeExpandableBlockQuote"}"#
         );
-        // The date entity: null formatting_type is unrepresentable in the
-        // generated td_api, the stand-in is Relative (module docs).
+        // The date entity: no formatting requested dumps the C++ null
+        // as-is — since the M.10 union the generated td_api carries the
+        // `Option` through, so the S09 default-Relative stand-in is gone.
         assert_eq!(
             dump(&MessageEntity::formatted_date(
                 0,
                 1,
                 FormattedDate::from_raw(1000, 0)
             )),
-            r#"{"@type":"textEntityTypeDateTime","unix_time":1000,"formatting_type":{"@type":"dateTimeFormattingTypeRelative"}}"#
+            r#"{"@type":"textEntityTypeDateTime","unix_time":1000,"formatting_type":null}"#
         );
         assert_eq!(
             dump(&MessageEntity::formatted_date(

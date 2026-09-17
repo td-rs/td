@@ -717,7 +717,9 @@ impl DialogId {
                 }
             }
             telegram_api::Message::message(m) => DialogId::from_peer(m.peer_id.as_ref().unwrap()),
-            telegram_api::Message::messageService(m) => DialogId::from_peer(m.peer_id.as_ref().unwrap()),
+            telegram_api::Message::messageService(m) => {
+                DialogId::from_peer(m.peer_id.as_ref().unwrap())
+            }
         }
     }
 
@@ -4417,7 +4419,9 @@ mod tests {
         let wire = telegram_api::Message::message(telegram_api::message {
             id: 42,
             date: 1000,
-            peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser { user_id: 7 })),
+            peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                user_id: 7,
+            })),
             ..Default::default()
         });
         assert_eq!(

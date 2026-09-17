@@ -2129,9 +2129,11 @@ pub struct UserManager {
     user_full_contact_price: BTreeMap<i64, i64>,
     /// `noforwards_request_ids_` / `noforwards_request_message_full_ids_`
     /// (UserManager.h:1379-1380) — the two directions of the
-    /// noforwards-request registry.
-    noforwards_request_ids: BTreeMap<MessageFullId, i32>,
-    noforwards_request_message_full_ids: BTreeMap<i32, MessageFullId>,
+    /// noforwards-request registry. Hash maps like the C++ FlatHashMaps:
+    /// lookups must never run `MessageId`'s scheduled/ordinary ordering
+    /// CHECK, which a key-sorted container would trip.
+    noforwards_request_ids: HashMap<MessageFullId, i32>,
+    noforwards_request_message_full_ids: HashMap<i32, MessageFullId>,
     /// `current_noforwards_request_id_` (UserManager.h:1254).
     current_noforwards_request_id: i32,
     /// `freeze_since_date_` / `freeze_until_date_` / `freeze_appeal_url_`
@@ -15457,13 +15459,21 @@ mod tests {
         let deadline = *um.noforwards_request_timeouts.get(&1).unwrap();
         assert!(deadline > tdutils::time::now());
 
-        // a scheduled message never arms
+        // a scheduled message never arms — C++ checks is_scheduled() before
+        // any map access, and probing the ordered map with a scheduled key
+        // CHECK-fails there, so assert through the sizes instead
         let scheduled = MessageFullId::new(
             message_full_id.get_dialog_id(),
             crate::message_id::MessageId::new((1 << 21) | 4),
         );
         um.register_noforwards_request(&env, scheduled, unix_time - 10);
-        assert!(!um.noforwards_request_ids.contains_key(&scheduled));
+        assert_eq!(um.noforwards_request_ids.len(), 1);
+        assert_eq!(um.noforwards_request_message_full_ids.len(), 1);
+        assert_eq!(um.noforwards_request_timeouts.len(), 1);
+        assert_eq!(
+            um.noforwards_request_message_full_ids.get(&1),
+            Some(&message_full_id)
+        );
 
         // a message outside the window never arms
         let expired = channel_message_full_id(7, 2 << 20);

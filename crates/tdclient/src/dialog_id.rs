@@ -14,8 +14,7 @@
 //! this line.
 
 pub use crate::messages_manager::{
-    call_message_search_filter_index, message_search_filter_count,
-    message_search_filter_index, message_search_filter_index_mask, DialogId, DialogType,
-    FolderId, MessageFullId, MessageSearchFilter, NotificationGroupId, NotificationId,
-    ServerMessageId, ScheduledServerMessageId,
+    DialogId, DialogType, FolderId, MessageFullId, MessageSearchFilter, NotificationGroupId,
+    NotificationId, ScheduledServerMessageId, ServerMessageId, call_message_search_filter_index,
+    message_search_filter_count, message_search_filter_index, message_search_filter_index_mask,
 };
