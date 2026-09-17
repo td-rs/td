@@ -322,7 +322,7 @@ impl SecretChatId {
 pub use crate::files::{FileId, FileSourceId};
 
 /// `td::StoryId` (StoryId.h).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StoryId(i32);
 
 impl StoryId {
@@ -346,7 +346,7 @@ impl StoryId {
 }
 
 /// `td::CommunityId` (CommunityId.h).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CommunityId(i64);
 
 impl CommunityId {

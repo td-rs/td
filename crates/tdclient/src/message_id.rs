@@ -162,6 +162,25 @@ impl MessageId {
         (self.0 & Self::SCHEDULED_MASK) != 0
     }
 
+    /// `MessageId::is_valid` (MessageId.cpp:115-124) — server ids keep the
+    /// low `SERVER_ID_SHIFT` bits zero; the yet-unsent and local type
+    /// suffixes are the only non-zero low bits allowed.
+    pub fn is_valid(self) -> bool {
+        const SERVER_ID_SHIFT: i64 = 20;
+        const FULL_TYPE_MASK: i64 = (1 << SERVER_ID_SHIFT) - 1;
+        const TYPE_MASK: i64 = (1 << 3) - 1;
+        const TYPE_YET_UNSENT: i64 = 1;
+        const TYPE_LOCAL: i64 = 2;
+        if self.0 <= 0 || self.0 > ((i32::MAX as i64) << SERVER_ID_SHIFT) {
+            return false;
+        }
+        if (self.0 & FULL_TYPE_MASK) == 0 {
+            return true;
+        }
+        let id_type = self.0 & TYPE_MASK;
+        id_type == TYPE_YET_UNSENT || id_type == TYPE_LOCAL
+    }
+
     /// `MessageId::store` (MessageId.h:193-195).
     pub fn store(self, out: &mut Vec<u8>) {
         store_parse::store_i64(out, self.0);

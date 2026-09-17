@@ -37,13 +37,15 @@
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::rc::Rc;
 
-use crate::chat_manager::DcId;
-use crate::message_id::{DialogId, DialogType};
+use crate::chat_manager::{ChatId, ChannelId, DcId};
+use crate::message_id::{DialogId, DialogType, MessageFullId, MessageId};
 use crate::store_parse::{self, Parser};
 use crate::td_api;
+use crate::user_manager::{CommunityId, StoryId, UserId};
 use tddb::sqlite_key_value::SqliteKeyValue;
 use tdutils::status::{Result as TdResult, Status};
 
@@ -116,9 +118,9 @@ impl fmt::Display for FileId {
 }
 
 /// `td::FileSourceId` (files/FileSourceId.h) — an opaque id the
-/// FileReferenceManager allocates. The manager itself is M.12.2; the
-/// UserManager still hands out ids from its local stand-in counter until
-/// then.
+/// FileReferenceManager allocates. The registry is [`FileReferenceManager`]
+/// below; the UserManager's local stand-in counter lifts when the manager is
+/// wired into it (M.12.2b).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileSourceId(i32);
 
@@ -2856,8 +2858,9 @@ impl fmt::Display for FileEncryptionKey {
 
 /// The file-source registry seam (module docs): the C++
 /// `FileReferenceManager::store_file_source`/`parse_file_source` pair
-/// that `FileData` serialization calls through. M.12.2a replaces the
-/// stand-in with the real registry behind this trait.
+/// that `FileData` serialization calls through. Implemented by
+/// [`FileReferenceManager`] (M.12.2a); the byte-level tests keep the
+/// [`TestFileSources`] stand-in.
 pub trait FileSourceStorage {
     fn store_file_source(&mut self, file_source_id: FileSourceId, out: &mut Vec<u8>);
     fn parse_file_source(&mut self, parser: &mut Parser) -> Result<FileSourceId, &'static str>;
@@ -3028,6 +3031,939 @@ impl fmt::Display for FileData {
             write!(f, " remote {full}")?;
         }
         write!(f, ", sources = {:?}]", self.file_source_ids)
+    }
+}
+
+// ==== FileSource (M.12.2a) ====
+
+/// `td::BackgroundId` (BackgroundId.h) — a wire-format definition; it moves
+/// to the BackgroundManager module when that manager lands (Wave 2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BackgroundId(i64);
+
+impl BackgroundId {
+    pub fn new(id: i64) -> BackgroundId {
+        BackgroundId(id)
+    }
+
+    pub fn get(self) -> i64 {
+        self.0
+    }
+
+    /// `BackgroundId::store` (BackgroundId.h:50-52).
+    pub fn store(self, out: &mut Vec<u8>) {
+        store_parse::store_i64(out, self.0);
+    }
+
+    /// `BackgroundId::parse` (BackgroundId.h:54-56).
+    pub fn parse_from(parser: &mut Parser) -> Result<BackgroundId, &'static str> {
+        Ok(BackgroundId::new(parser.i64_()?))
+    }
+}
+
+/// `td::StoryFullId` (StoryFullId.h) — the dialog + story pair.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StoryFullId {
+    dialog_id: DialogId,
+    story_id: StoryId,
+}
+
+impl StoryFullId {
+    pub fn new(dialog_id: DialogId, story_id: StoryId) -> StoryFullId {
+        StoryFullId { dialog_id, story_id }
+    }
+
+    pub fn get_dialog_id(self) -> DialogId {
+        self.dialog_id
+    }
+
+    pub fn get_story_id(self) -> StoryId {
+        self.story_id
+    }
+
+    /// `StoryFullId::store` (StoryFullId.h:54-57) — dialog then story.
+    pub fn store(self, out: &mut Vec<u8>) {
+        self.dialog_id.store(out);
+        store_parse::store_i32(out, self.story_id.get());
+    }
+
+    /// `StoryFullId::parse` (StoryFullId.h:59-62).
+    pub fn parse_from(parser: &mut Parser) -> Result<StoryFullId, &'static str> {
+        let dialog_id = DialogId::parse_from(parser)?;
+        let story_id = StoryId::new(parser.i32_()?);
+        Ok(StoryFullId { dialog_id, story_id })
+    }
+}
+
+/// `td::StoryAlbumId` (StoryAlbumId.h).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StoryAlbumId(i32);
+
+impl StoryAlbumId {
+    pub fn new(id: i32) -> StoryAlbumId {
+        StoryAlbumId(id)
+    }
+
+    pub fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// `td::StoryAlbumFullId` (StoryAlbumFullId.h) — the dialog + album pair.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StoryAlbumFullId {
+    dialog_id: DialogId,
+    story_album_id: StoryAlbumId,
+}
+
+impl StoryAlbumFullId {
+    pub fn new(dialog_id: DialogId, story_album_id: StoryAlbumId) -> StoryAlbumFullId {
+        StoryAlbumFullId {
+            dialog_id,
+            story_album_id,
+        }
+    }
+
+    pub fn get_dialog_id(self) -> DialogId {
+        self.dialog_id
+    }
+
+    pub fn get_story_album_id(self) -> StoryAlbumId {
+        self.story_album_id
+    }
+
+    /// `StoryAlbumFullId::store` (StoryAlbumFullId.h:51-54) — dialog then album.
+    pub fn store(self, out: &mut Vec<u8>) {
+        self.dialog_id.store(out);
+        store_parse::store_i32(out, self.story_album_id.get());
+    }
+
+    /// `StoryAlbumFullId::parse` (StoryAlbumFullId.h:56-59).
+    pub fn parse_from(parser: &mut Parser) -> Result<StoryAlbumFullId, &'static str> {
+        let dialog_id = DialogId::parse_from(parser)?;
+        let story_album_id = StoryAlbumId::new(parser.i32_()?);
+        Ok(StoryAlbumFullId {
+            dialog_id,
+            story_album_id,
+        })
+    }
+}
+
+/// `td::QuickReplyShortcutId` (QuickReplyShortcutId.h).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct QuickReplyShortcutId(i32);
+
+impl QuickReplyShortcutId {
+    pub fn new(id: i32) -> QuickReplyShortcutId {
+        QuickReplyShortcutId(id)
+    }
+
+    pub fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// `td::QuickReplyMessageFullId` (QuickReplyMessageFullId.h) — the shortcut
+/// + message pair.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct QuickReplyMessageFullId {
+    quick_reply_shortcut_id: QuickReplyShortcutId,
+    message_id: MessageId,
+}
+
+impl QuickReplyMessageFullId {
+    pub fn new(quick_reply_shortcut_id: QuickReplyShortcutId, message_id: MessageId) -> QuickReplyMessageFullId {
+        QuickReplyMessageFullId {
+            quick_reply_shortcut_id,
+            message_id,
+        }
+    }
+
+    pub fn get_quick_reply_shortcut_id(self) -> QuickReplyShortcutId {
+        self.quick_reply_shortcut_id
+    }
+
+    pub fn get_message_id(self) -> MessageId {
+        self.message_id
+    }
+
+    /// `QuickReplyMessageFullId::store` (QuickReplyMessageFullId.h:54-57) —
+    /// shortcut then message.
+    pub fn store(self, out: &mut Vec<u8>) {
+        store_parse::store_i32(out, self.quick_reply_shortcut_id.get());
+        self.message_id.store(out);
+    }
+
+    /// `QuickReplyMessageFullId::parse` (QuickReplyMessageFullId.h:59-62).
+    pub fn parse_from(parser: &mut Parser) -> Result<QuickReplyMessageFullId, &'static str> {
+        let quick_reply_shortcut_id = QuickReplyShortcutId::new(parser.i32_()?);
+        let message_id = MessageId::parse_from(parser)?;
+        Ok(QuickReplyMessageFullId {
+            quick_reply_shortcut_id,
+            message_id,
+        })
+    }
+}
+
+/// `td::ForumTopicId` (ForumTopicId.h).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ForumTopicId(i32);
+
+impl ForumTopicId {
+    pub fn new(id: i32) -> ForumTopicId {
+        ForumTopicId(id)
+    }
+
+    /// `ForumTopicId::is_valid` (ForumTopicId.h:61-63).
+    pub fn is_valid(self) -> bool {
+        self.0 > 0
+    }
+
+    pub fn get(self) -> i32 {
+        self.0
+    }
+
+    /// `ForumTopicId::store` (ForumTopicId.h:78-80).
+    pub fn store(self, out: &mut Vec<u8>) {
+        store_parse::store_i32(out, self.0);
+    }
+
+    /// `ForumTopicId::parse` (ForumTopicId.h:82-84).
+    pub fn parse_from(parser: &mut Parser) -> Result<ForumTopicId, &'static str> {
+        Ok(ForumTopicId::new(parser.i32_()?))
+    }
+}
+
+/// `td::SavedMessagesTopicId` (SavedMessagesTopicId.h) — a DialogId in its
+/// own namespace.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SavedMessagesTopicId {
+    dialog_id: DialogId,
+}
+
+impl SavedMessagesTopicId {
+    pub fn new(dialog_id: DialogId) -> SavedMessagesTopicId {
+        SavedMessagesTopicId { dialog_id }
+    }
+
+    /// `SavedMessagesTopicId::is_valid` (SavedMessagesTopicId.h:43-45).
+    pub fn is_valid(self) -> bool {
+        self.dialog_id.is_valid()
+    }
+
+    pub fn get_dialog_id(self) -> DialogId {
+        self.dialog_id
+    }
+
+    /// `SavedMessagesTopicId::store` (SavedMessagesTopicId.h:68-70).
+    pub fn store(self, out: &mut Vec<u8>) {
+        self.dialog_id.store(out);
+    }
+
+    /// `SavedMessagesTopicId::parse` (SavedMessagesTopicId.h:72-74).
+    pub fn parse_from(parser: &mut Parser) -> Result<SavedMessagesTopicId, &'static str> {
+        Ok(SavedMessagesTopicId::new(DialogId::parse_from(parser)?))
+    }
+}
+
+/// `td::MessageTopic::Type` (MessageTopic.h:26) — kept as the raw `int32`
+/// like the C++ enum: `td::parse` of a trivially-copyable enum neither
+/// validates nor rejects unknown values.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MessageTopicType(i32);
+
+impl MessageTopicType {
+    pub const NONE: Self = Self(0);
+    pub const THREAD: Self = Self(1);
+    pub const FORUM: Self = Self(2);
+    pub const MONOFORUM: Self = Self(3);
+    pub const SAVED_MESSAGES: Self = Self(4);
+
+    pub const fn from_raw(raw: i32) -> MessageTopicType {
+        MessageTopicType(raw)
+    }
+
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// `td::MessageTopic` (MessageTopic.h:22-83).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct MessageTopic {
+    type_: MessageTopicType,
+    dialog_id: DialogId,
+    top_thread_message_id: MessageId,
+    forum_topic_id: ForumTopicId,
+    saved_messages_topic_id: SavedMessagesTopicId,
+}
+
+impl MessageTopic {
+    /// `MessageTopic::thread` (MessageTopic.cpp:105-112).
+    pub fn thread(dialog_id: DialogId, top_thread_message_id: MessageId) -> MessageTopic {
+        MessageTopic {
+            type_: MessageTopicType::THREAD,
+            dialog_id,
+            top_thread_message_id,
+            ..MessageTopic::default()
+        }
+    }
+
+    /// `MessageTopic::forum` (MessageTopic.cpp:114-120).
+    pub fn forum(dialog_id: DialogId, forum_topic_id: ForumTopicId) -> MessageTopic {
+        MessageTopic {
+            type_: MessageTopicType::FORUM,
+            dialog_id,
+            forum_topic_id,
+            ..MessageTopic::default()
+        }
+    }
+
+    /// `MessageTopic::monoforum` (MessageTopic.cpp:122-128).
+    pub fn monoforum(dialog_id: DialogId, saved_messages_topic_id: SavedMessagesTopicId) -> MessageTopic {
+        MessageTopic {
+            type_: MessageTopicType::MONOFORUM,
+            dialog_id,
+            saved_messages_topic_id,
+            ..MessageTopic::default()
+        }
+    }
+
+    /// `MessageTopic::saved_messages` (MessageTopic.cpp:130-136).
+    pub fn saved_messages(dialog_id: DialogId, saved_messages_topic_id: SavedMessagesTopicId) -> MessageTopic {
+        MessageTopic {
+            type_: MessageTopicType::SAVED_MESSAGES,
+            dialog_id,
+            saved_messages_topic_id,
+            ..MessageTopic::default()
+        }
+    }
+
+    /// `MessageTopic::store` (MessageTopic.hpp:16-45) — a flags bitmask then
+    /// each present field, in declaration order.
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_type = self.type_ != MessageTopicType::NONE;
+        let has_dialog_id = self.dialog_id.is_valid();
+        let has_top_thread_message_id = self.top_thread_message_id.is_valid();
+        let has_forum_topic_id = self.forum_topic_id.is_valid();
+        let has_saved_messages_topic_id = self.saved_messages_topic_id.is_valid();
+        store_parse::store_flags(
+            out,
+            [
+                has_type,
+                has_dialog_id,
+                has_top_thread_message_id,
+                has_forum_topic_id,
+                has_saved_messages_topic_id,
+            ],
+        );
+        if has_type {
+            store_parse::store_i32(out, self.type_.get());
+        }
+        if has_dialog_id {
+            self.dialog_id.store(out);
+        }
+        if has_top_thread_message_id {
+            self.top_thread_message_id.store(out);
+        }
+        if has_forum_topic_id {
+            self.forum_topic_id.store(out);
+        }
+        if has_saved_messages_topic_id {
+            self.saved_messages_topic_id.store(out);
+        }
+    }
+
+    /// `MessageTopic::parse` (MessageTopic.hpp:47-81).
+    pub fn parse_from(parser: &mut Parser) -> Result<MessageTopic, &'static str> {
+        let [has_type, has_dialog_id, has_top_thread_message_id, has_forum_topic_id, has_saved_messages_topic_id] =
+            parser.parse_flags::<5>()?;
+        let type_ = if has_type {
+            MessageTopicType::from_raw(parser.i32_()?)
+        } else {
+            MessageTopicType::NONE
+        };
+        let dialog_id = if has_dialog_id {
+            DialogId::parse_from(parser)?
+        } else {
+            DialogId::default()
+        };
+        let top_thread_message_id = if has_top_thread_message_id {
+            MessageId::parse_from(parser)?
+        } else {
+            MessageId::default()
+        };
+        let forum_topic_id = if has_forum_topic_id {
+            ForumTopicId::parse_from(parser)?
+        } else {
+            ForumTopicId::default()
+        };
+        let saved_messages_topic_id = if has_saved_messages_topic_id {
+            SavedMessagesTopicId::parse_from(parser)?
+        } else {
+            SavedMessagesTopicId::default()
+        };
+        Ok(MessageTopic {
+            type_,
+            dialog_id,
+            top_thread_message_id,
+            forum_topic_id,
+            saved_messages_topic_id,
+        })
+    }
+}
+
+/// `FileReferenceManager::FileSource` (FileReferenceManager.h:153-249) —
+/// the append-only source table's payload, one variant per manager-scoped
+/// origin. The tag is the variant's position in the C++ `Variant` list.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum FileSource {
+    Message(MessageFullId),
+    UserPhoto { user_id: UserId, photo_id: i64 },
+    ChatPhoto(ChatId),
+    ChannelPhoto(ChannelId),
+    Wallpapers,
+    WebPage(String),
+    SavedAnimations,
+    RecentStickers { is_attached: bool },
+    FavoriteStickers,
+    Background { background_id: BackgroundId, access_hash: i64 },
+    ChatFull(ChatId),
+    ChannelFull(ChannelId),
+    AppConfig,
+    SavedRingtones,
+    UserFull(UserId),
+    AttachMenuBot(UserId),
+    WebApp { user_id: UserId, short_name: String },
+    Story(StoryFullId),
+    QuickReplyMessage(QuickReplyMessageFullId),
+    StarTransaction { dialog_id: DialogId, transaction_id: String, is_refund: bool },
+    BotMediaPreview(UserId),
+    BotMediaPreviewInfo { bot_user_id: UserId, language_code: String },
+    StoryAlbum(StoryAlbumFullId),
+    UserSavedMusic { user_id: UserId, document_id: i64, access_hash: i64 },
+    DraftMessage { dialog_id: DialogId, topic: MessageTopic },
+    RichMessage(MessageFullId),
+    WelcomeMessages(DialogId),
+    CommunityFull(CommunityId),
+}
+
+impl FileSource {
+    /// The `Variant` offset (`FileReferenceManager.hpp:50`).
+    fn tag(&self) -> i32 {
+        match self {
+            FileSource::Message(_) => 0,
+            FileSource::UserPhoto { .. } => 1,
+            FileSource::ChatPhoto(_) => 2,
+            FileSource::ChannelPhoto(_) => 3,
+            FileSource::Wallpapers => 4,
+            FileSource::WebPage(_) => 5,
+            FileSource::SavedAnimations => 6,
+            FileSource::RecentStickers { .. } => 7,
+            FileSource::FavoriteStickers => 8,
+            FileSource::Background { .. } => 9,
+            FileSource::ChatFull(_) => 10,
+            FileSource::ChannelFull(_) => 11,
+            FileSource::AppConfig => 12,
+            FileSource::SavedRingtones => 13,
+            FileSource::UserFull(_) => 14,
+            FileSource::AttachMenuBot(_) => 15,
+            FileSource::WebApp { .. } => 16,
+            FileSource::Story(_) => 17,
+            FileSource::QuickReplyMessage(_) => 18,
+            FileSource::StarTransaction { .. } => 19,
+            FileSource::BotMediaPreview(_) => 20,
+            FileSource::BotMediaPreviewInfo { .. } => 21,
+            FileSource::StoryAlbum(_) => 22,
+            FileSource::UserSavedMusic { .. } => 23,
+            FileSource::DraftMessage { .. } => 24,
+            FileSource::RichMessage(_) => 25,
+            FileSource::WelcomeMessages(_) => 26,
+            FileSource::CommunityFull(_) => 27,
+        }
+    }
+
+    /// The `store_file_source` payload: tag then fields, in the C++ `visit`
+    /// order (FileReferenceManager.hpp:51-100).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        store_parse::store_i32(out, self.tag());
+        match self {
+            FileSource::Message(message_full_id) => message_full_id.store(out),
+            FileSource::UserPhoto { user_id, photo_id } => {
+                store_parse::store_i64(out, user_id.get());
+                store_parse::store_i64(out, *photo_id);
+            }
+            FileSource::ChatPhoto(chat_id) => store_parse::store_i64(out, chat_id.get()),
+            FileSource::ChannelPhoto(channel_id) => store_parse::store_i64(out, channel_id.get()),
+            FileSource::Wallpapers | FileSource::SavedAnimations | FileSource::FavoriteStickers
+            | FileSource::AppConfig | FileSource::SavedRingtones => {}
+            FileSource::WebPage(url) => store_parse::store_string(out, url),
+            FileSource::RecentStickers { is_attached } => store_parse::store_i32(out, i32::from(*is_attached)),
+            FileSource::Background {
+                background_id,
+                access_hash,
+            } => {
+                background_id.store(out);
+                store_parse::store_i64(out, *access_hash);
+            }
+            FileSource::ChatFull(chat_id) => store_parse::store_i64(out, chat_id.get()),
+            FileSource::ChannelFull(channel_id) => store_parse::store_i64(out, channel_id.get()),
+            FileSource::UserFull(user_id) | FileSource::AttachMenuBot(user_id) | FileSource::BotMediaPreview(user_id) => {
+                store_parse::store_i64(out, user_id.get());
+            }
+            FileSource::WebApp { user_id, short_name } => {
+                store_parse::store_i64(out, user_id.get());
+                store_parse::store_string(out, short_name);
+            }
+            FileSource::Story(story_full_id) => story_full_id.store(out),
+            FileSource::QuickReplyMessage(message_full_id) => message_full_id.store(out),
+            FileSource::StarTransaction {
+                dialog_id,
+                transaction_id,
+                is_refund,
+            } => {
+                dialog_id.store(out);
+                store_parse::store_string(out, transaction_id);
+                store_parse::store_i32(out, i32::from(*is_refund));
+            }
+            FileSource::BotMediaPreviewInfo {
+                bot_user_id,
+                language_code,
+            } => {
+                store_parse::store_i64(out, bot_user_id.get());
+                store_parse::store_string(out, language_code);
+            }
+            FileSource::StoryAlbum(story_album_full_id) => story_album_full_id.store(out),
+            FileSource::UserSavedMusic {
+                user_id,
+                document_id,
+                access_hash,
+            } => {
+                store_parse::store_i64(out, user_id.get());
+                store_parse::store_i64(out, *document_id);
+                store_parse::store_i64(out, *access_hash);
+            }
+            FileSource::DraftMessage { dialog_id, topic } => {
+                dialog_id.store(out);
+                topic.store(out);
+            }
+            FileSource::RichMessage(message_full_id) => message_full_id.store(out),
+            FileSource::WelcomeMessages(dialog_id) => dialog_id.store(out),
+            FileSource::CommunityFull(community_id) => store_parse::store_i64(out, community_id.get()),
+        }
+    }
+
+    /// The `parse_file_source` dispatch (FileReferenceManager.hpp:103-254);
+    /// unknown tags are the C++ `parser.set_error` case.
+    pub fn parse_from(parser: &mut Parser) -> Result<FileSource, &'static str> {
+        let tag = parser.i32_()?;
+        match tag {
+            0 => Ok(FileSource::Message(MessageFullId::parse_from(parser)?)),
+            1 => Ok(FileSource::UserPhoto {
+                user_id: UserId::new(parser.i64_()?),
+                photo_id: parser.i64_()?,
+            }),
+            2 => Ok(FileSource::ChatPhoto(ChatId::new(parser.i64_()?))),
+            3 => Ok(FileSource::ChannelPhoto(ChannelId::new(parser.i64_()?))),
+            4 => Ok(FileSource::Wallpapers),
+            5 => Ok(FileSource::WebPage(parser.string()?)),
+            6 => Ok(FileSource::SavedAnimations),
+            7 => Ok(FileSource::RecentStickers {
+                is_attached: parser.i32_()? != 0,
+            }),
+            8 => Ok(FileSource::FavoriteStickers),
+            9 => Ok(FileSource::Background {
+                background_id: BackgroundId::parse_from(parser)?,
+                access_hash: parser.i64_()?,
+            }),
+            10 => Ok(FileSource::ChatFull(ChatId::new(parser.i64_()?))),
+            11 => Ok(FileSource::ChannelFull(ChannelId::new(parser.i64_()?))),
+            12 => Ok(FileSource::AppConfig),
+            13 => Ok(FileSource::SavedRingtones),
+            14 => Ok(FileSource::UserFull(UserId::new(parser.i64_()?))),
+            15 => Ok(FileSource::AttachMenuBot(UserId::new(parser.i64_()?))),
+            16 => Ok(FileSource::WebApp {
+                user_id: UserId::new(parser.i64_()?),
+                short_name: parser.string()?,
+            }),
+            17 => Ok(FileSource::Story(StoryFullId::parse_from(parser)?)),
+            18 => Ok(FileSource::QuickReplyMessage(QuickReplyMessageFullId::parse_from(parser)?)),
+            19 => Ok(FileSource::StarTransaction {
+                dialog_id: DialogId::parse_from(parser)?,
+                transaction_id: parser.string()?,
+                is_refund: parser.i32_()? != 0,
+            }),
+            20 => Ok(FileSource::BotMediaPreview(UserId::new(parser.i64_()?))),
+            21 => Ok(FileSource::BotMediaPreviewInfo {
+                bot_user_id: UserId::new(parser.i64_()?),
+                language_code: parser.string()?,
+            }),
+            22 => Ok(FileSource::StoryAlbum(StoryAlbumFullId::parse_from(parser)?)),
+            23 => Ok(FileSource::UserSavedMusic {
+                user_id: UserId::new(parser.i64_()?),
+                document_id: parser.i64_()?,
+                access_hash: parser.i64_()?,
+            }),
+            24 => Ok(FileSource::DraftMessage {
+                dialog_id: DialogId::parse_from(parser)?,
+                topic: MessageTopic::parse_from(parser)?,
+            }),
+            25 => Ok(FileSource::RichMessage(MessageFullId::parse_from(parser)?)),
+            26 => Ok(FileSource::WelcomeMessages(DialogId::parse_from(parser)?)),
+            27 => Ok(FileSource::CommunityFull(CommunityId::new(parser.i64_()?))),
+            _ => Err("Invalid type in FileSource"),
+        }
+    }
+}
+
+/// `td::FastSetWithPosition` (SetWithPosition.h:19-104) — the checked half
+/// of the iteration cursor plus the not-yet-checked remainder, both kept in
+/// value order (`std::set`).
+#[derive(Debug, Default)]
+struct FastSetWithPosition<T: Ord> {
+    checked: BTreeSet<T>,
+    not_checked: BTreeSet<T>,
+}
+
+impl<T: Ord + Copy> FastSetWithPosition<T> {
+    /// `get_some_elements` (SetWithPosition.h:21-37): the extremes of each
+    /// half deduplicate down to the overall first and last.
+    fn get_some_elements(&self) -> Vec<T> {
+        let mut res = Vec::with_capacity(4);
+        if !self.checked.is_empty() {
+            res.push(*self.checked.iter().next().unwrap());
+            res.push(*self.checked.iter().next_back().unwrap());
+        }
+        if !self.not_checked.is_empty() {
+            res.push(*self.not_checked.iter().next().unwrap());
+            res.push(*self.not_checked.iter().next_back().unwrap());
+        }
+        res.dedup();
+        if res.len() > 2 {
+            res.drain(1..res.len() - 1);
+        }
+        res
+    }
+
+    fn add(&mut self, x: T) -> bool {
+        if self.checked.contains(&x) {
+            return false;
+        }
+        self.not_checked.insert(x)
+    }
+
+    fn remove(&mut self, x: T) -> bool {
+        self.checked.remove(&x) || self.not_checked.remove(&x)
+    }
+
+    fn has_next(&self) -> bool {
+        !self.not_checked.is_empty()
+    }
+
+    /// `reset_position` (SetWithPosition.h:54-61).
+    #[allow(dead_code)] // the repair cursor walks it (M.12.4)
+    fn reset_position(&mut self) {
+        if self.not_checked.is_empty() {
+            self.not_checked = std::mem::take(&mut self.checked);
+        } else {
+            self.not_checked.extend(self.checked.iter().copied());
+            self.checked.clear();
+        }
+    }
+
+    /// `next` (SetWithPosition.h:63-70).
+    #[allow(clippy::should_implement_trait)]
+    fn next(&mut self) -> T {
+        let res = *self.not_checked.iter().next().expect("has_next");
+        self.not_checked.remove(&res);
+        self.checked.insert(res);
+        res
+    }
+
+    /// `merge` (SetWithPosition.h:72-91): the larger set absorbs the smaller;
+    /// the survivor keeps everything checked.
+    fn merge(&mut self, mut other: Self) {
+        if self.size() < other.size() {
+            std::mem::swap(self, &mut other);
+        }
+        for x in other.checked {
+            self.not_checked.remove(&x);
+            self.checked.insert(x);
+        }
+        for x in other.not_checked {
+            if self.checked.contains(&x) {
+                continue;
+            }
+            self.not_checked.insert(x);
+        }
+    }
+
+    fn size(&self) -> usize {
+        self.checked.len() + self.not_checked.len()
+    }
+}
+
+/// `td::SetWithPosition` (SetWithPosition.h:106-226) — the single-value
+/// fast path in front of `FastSetWithPosition`, ported with the C++
+/// `empty` quirk: once the fast set exists, `empty` is always false.
+#[derive(Debug, Default)]
+struct SetWithPosition<T: Ord + Copy + Default> {
+    value: T,
+    has_value: bool,
+    is_checked: bool,
+    fast: Option<Box<FastSetWithPosition<T>>>,
+}
+
+impl<T: Ord + Copy + Default> SetWithPosition<T> {
+    /// `get_some_elements` (SetWithPosition.h:109-117).
+    fn get_some_elements(&self) -> Vec<T> {
+        if let Some(fast) = &self.fast {
+            return fast.get_some_elements();
+        }
+        if self.has_value {
+            return vec![self.value];
+        }
+        Vec::new()
+    }
+
+    /// `add` (SetWithPosition.h:119-134).
+    fn add(&mut self, x: T) -> bool {
+        if let Some(fast) = &mut self.fast {
+            return fast.add(x);
+        }
+        if !self.has_value {
+            self.value = x;
+            self.has_value = true;
+            self.is_checked = false;
+            return true;
+        }
+        if self.value == x {
+            return false;
+        }
+        self.make_fast();
+        self.fast.as_mut().expect("make_fast").add(x)
+    }
+
+    /// `remove` (SetWithPosition.h:136-146).
+    fn remove(&mut self, x: T) -> bool {
+        if let Some(fast) = &mut self.fast {
+            return fast.remove(x);
+        }
+        if self.has_value && self.value == x {
+            self.has_value = false;
+            self.is_checked = false;
+            return true;
+        }
+        false
+    }
+
+    /// `has_next` (SetWithPosition.h:148-153).
+    #[allow(dead_code)] // the repair cursor walks it (M.12.4)
+    fn has_next(&self) -> bool {
+        match &self.fast {
+            Some(fast) => fast.has_next(),
+            None => self.has_value && !self.is_checked,
+        }
+    }
+
+    /// `reset_position` (SetWithPosition.h:155-161).
+    #[allow(dead_code)] // the repair cursor walks it (M.12.4)
+    fn reset_position(&mut self) {
+        if let Some(fast) = &mut self.fast {
+            fast.reset_position();
+            return;
+        }
+        self.is_checked = false;
+    }
+
+    /// `next` (SetWithPosition.h:163-170).
+    #[allow(clippy::should_implement_trait)]
+    #[allow(dead_code)] // the repair cursor walks it (M.12.4)
+    fn next(&mut self) -> T {
+        if let Some(fast) = &mut self.fast {
+            return fast.next();
+        }
+        assert!(self.has_next());
+        self.is_checked = true;
+        self.value
+    }
+
+    /// `merge` (SetWithPosition.h:172-193): size-swap first, then the
+    /// equal-single-value fast path, then both halves go fast.
+    fn merge(&mut self, other: &mut Self) {
+        if self.size() < other.size() {
+            std::mem::swap(self, other);
+        }
+        if other.size() == 0 {
+            return;
+        }
+        if other.fast.is_none() && self.fast.is_none() && self.value == other.value {
+            self.is_checked |= other.is_checked;
+            *other = Self::default();
+            return;
+        }
+        self.make_fast();
+        other.make_fast();
+        let other_fast = other.fast.take().expect("make_fast");
+        self.fast.as_mut().expect("make_fast").merge(*other_fast);
+        *other = Self::default();
+    }
+
+    /// `size` (SetWithPosition.h:195-200).
+    fn size(&self) -> usize {
+        match &self.fast {
+            Some(fast) => fast.size(),
+            None => usize::from(self.has_value),
+        }
+    }
+
+    /// `empty` (SetWithPosition.h:202-207) — false unconditionally once the
+    /// fast set exists, even when it holds nothing.
+    #[allow(dead_code)] // the repair cursor walks it (M.12.4)
+    fn empty(&self) -> bool {
+        match &self.fast {
+            Some(_) => false,
+            None => !self.has_value,
+        }
+    }
+
+    /// `make_fast` (SetWithPosition.h:215-225).
+    fn make_fast(&mut self) {
+        if self.fast.is_some() {
+            return;
+        }
+        assert!(self.has_value);
+        let mut fast = Box::<FastSetWithPosition<T>>::default();
+        fast.add(self.value);
+        if self.is_checked {
+            fast.next();
+        }
+        self.fast = Some(fast);
+    }
+}
+
+/// `td::FileReferenceManager` (FileReferenceManager.h) — the file-source
+/// registry, collapsed per the single-scheduler convention: plain methods on
+/// an owned struct replace the actor, and the per-manager `create_*` dedup
+/// caches (`user_profile_photo_file_source_ids_` et al) fold into the single
+/// value index below. The repair-query machinery (`Query`/`run_node`/
+/// `on_query_result`) lands with the download path (M.12.4) once the
+/// per-manager reload callbacks exist.
+#[derive(Debug, Default)]
+pub struct FileReferenceManager {
+    /// The append-only source table (`file_sources_`): id = index + 1.
+    file_sources: Vec<FileSource>,
+    /// Source value → interned id (`add_file_source_id` +
+    /// `get_current_file_source_id`, FileReferenceManager.cpp:210-219).
+    source_index: HashMap<FileSource, FileSourceId>,
+    /// Per-file source sets (`nodes_`).
+    nodes: HashMap<FileId, FileSourceNode>,
+}
+
+/// `FileReferenceManager::Node` (FileReferenceManager.h:147-151) minus the
+/// repair-query state.
+#[derive(Debug, Default)]
+struct FileSourceNode {
+    file_source_ids: SetWithPosition<FileSourceId>,
+}
+
+impl FileReferenceManager {
+    pub fn new() -> FileReferenceManager {
+        FileReferenceManager::default()
+    }
+
+    /// `add_file_source_id` with the per-manager caches folded in: an equal
+    /// source keeps its id, a new one appends.
+    pub fn intern(&mut self, source: FileSource) -> FileSourceId {
+        if let Some(&file_source_id) = self.source_index.get(&source) {
+            return file_source_id;
+        }
+        self.file_sources.push(source.clone());
+        let file_source_id = FileSourceId::new(self.file_sources.len() as i32);
+        self.source_index.insert(source, file_source_id);
+        file_source_id
+    }
+
+    /// `add_node` (FileReferenceManager.cpp:327-334).
+    fn add_node(&mut self, node_id: FileId) -> &mut FileSourceNode {
+        assert!(node_id.is_valid());
+        self.nodes.entry(node_id).or_default()
+    }
+
+    /// `add_file_source` (FileReferenceManager.cpp:359-366) without the
+    /// `source` trace argument.
+    pub fn add_file_source(&mut self, node_id: FileId, file_source_id: FileSourceId) -> bool {
+        self.add_node(node_id).file_source_ids.add(file_source_id)
+    }
+
+    /// `remove_file_source` (FileReferenceManager.cpp:368-377).
+    pub fn remove_file_source(&mut self, node_id: FileId, file_source_id: FileSourceId) -> bool {
+        assert!(node_id.is_valid());
+        match self.nodes.get_mut(&node_id) {
+            Some(node) => node.file_source_ids.remove(file_source_id),
+            None => false,
+        }
+    }
+
+    /// `get_some_file_sources` (FileReferenceManager.cpp:379-386).
+    pub fn get_some_file_sources(&self, node_id: FileId) -> Vec<FileSourceId> {
+        match self.nodes.get(&node_id) {
+            Some(node) => node.file_source_ids.get_some_elements(),
+            None => Vec::new(),
+        }
+    }
+
+    /// `get_some_message_file_sources` (FileReferenceManager.cpp:388-401).
+    pub fn get_some_message_file_sources(&self, node_id: FileId) -> Vec<MessageFullId> {
+        self.get_some_file_sources(node_id)
+            .into_iter()
+            .filter_map(|file_source_id| {
+                let index = file_source_id.get() as usize - 1;
+                assert!(index < self.file_sources.len());
+                match &self.file_sources[index] {
+                    FileSource::Message(message_full_id) => Some(*message_full_id),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// `merge` (FileReferenceManager.cpp:403-431) without the repair-query
+    /// block: the from-node keeps its (now empty) entry, as in C++, so the
+    /// M.12.4 machinery finds it for query redirection.
+    pub fn merge(&mut self, to_node_id: FileId, from_node_id: FileId) {
+        let mut from_sources = match self.nodes.get_mut(&from_node_id) {
+            Some(from_node) => std::mem::take(&mut from_node.file_source_ids),
+            None => return,
+        };
+        let to_node = self.add_node(to_node_id);
+        to_node.file_source_ids.merge(&mut from_sources);
+    }
+}
+
+impl FileSourceStorage for FileReferenceManager {
+    /// `FileReferenceManager::store_file_source`
+    /// (FileReferenceManager.hpp:45-101).
+    fn store_file_source(&mut self, file_source_id: FileSourceId, out: &mut Vec<u8>) {
+        let index = file_source_id.get() as usize - 1;
+        assert!(
+            index < self.file_sources.len(),
+            "file source id out of range"
+        );
+        self.file_sources[index].store(out);
+    }
+
+    /// `FileReferenceManager::parse_file_source`
+    /// (FileReferenceManager.hpp:103-254): the never-repairable sources
+    /// (chat/channel photos, wallpapers) consume their payload but yield no
+    /// id, and every parsed source re-interns through the value index.
+    fn parse_file_source(&mut self, parser: &mut Parser) -> Result<FileSourceId, &'static str> {
+        match FileSource::parse_from(parser)? {
+            FileSource::ChatPhoto(_) | FileSource::ChannelPhoto(_) | FileSource::Wallpapers => {
+                Ok(FileSourceId::new(0))
+            }
+            source => Ok(self.intern(source)),
+        }
     }
 }
 
@@ -6342,5 +7278,399 @@ mod tests {
         assert_eq!(driver1.last_grant_active_limit(), 100);
         assert_eq!(driver2.last_grant_active_limit(), 100);
         assert_eq!(driver3.grant_count(), 0);
+    }
+
+    #[test]
+    fn message_id_validity_matches_the_cpp_gate() {
+        // `MessageId::is_valid` (MessageId.cpp:115-124): server ids plus the
+        // yet-unsent and local suffixes only
+        assert!(MessageId::new(1 << 20).is_valid());
+        assert!(MessageId::new((5 << 20) | 1).is_valid());
+        assert!(MessageId::new((5 << 20) | 2).is_valid());
+        assert!(!MessageId::new(0).is_valid());
+        assert!(!MessageId::new(-1).is_valid());
+        assert!(!MessageId::new(4).is_valid()); // scheduled bits, no shift
+        assert!(!MessageId::new((5 << 20) | 3).is_valid());
+        assert!(!MessageId::new(((i32::MAX as i64) << 20) + (1 << 20)).is_valid());
+    }
+
+    #[test]
+    fn message_topic_wire_matches_the_cpp_layout() {
+        // the default topic stores only the zero flags word
+        let mut out = Vec::new();
+        MessageTopic::default().store(&mut out);
+        assert_eq!(out, [0, 0, 0, 0]);
+        assert_eq!(
+            MessageTopic::parse_from(&mut Parser::new(&out)).unwrap(),
+            MessageTopic::default()
+        );
+
+        let dialog_id = DialogId::new(100);
+
+        // thread: type + dialog + top thread message -> flags 0b111
+        let topic = MessageTopic::thread(dialog_id, MessageId::new(5 << 20));
+        let mut out = Vec::new();
+        topic.store(&mut out);
+        let mut expected = Vec::new();
+        store_parse::store_i32(&mut expected, 7);
+        store_parse::store_i32(&mut expected, 1); // Type::Thread
+        dialog_id.store(&mut expected);
+        MessageId::new(5 << 20).store(&mut expected);
+        assert_eq!(out, expected);
+        assert_eq!(MessageTopic::parse_from(&mut Parser::new(&out)).unwrap(), topic);
+
+        // forum: the forum topic flag joins the bitmask
+        let topic = MessageTopic::forum(dialog_id, ForumTopicId::new(7));
+        let mut out = Vec::new();
+        topic.store(&mut out);
+        let mut expected = Vec::new();
+        store_parse::store_i32(&mut expected, 0b1011);
+        store_parse::store_i32(&mut expected, 2); // Type::Forum
+        dialog_id.store(&mut expected);
+        ForumTopicId::new(7).store(&mut expected);
+        assert_eq!(out, expected);
+        assert_eq!(MessageTopic::parse_from(&mut Parser::new(&out)).unwrap(), topic);
+
+        // monoforum and saved messages keep the dialog in both the flag and
+        // the SavedMessagesTopicId payload
+        let saved_messages_topic_id = SavedMessagesTopicId::new(DialogId::new(-100200300));
+        for topic in [
+            MessageTopic::monoforum(dialog_id, saved_messages_topic_id),
+            MessageTopic::saved_messages(dialog_id, saved_messages_topic_id),
+        ] {
+            let mut out = Vec::new();
+            topic.store(&mut out);
+            assert_eq!(MessageTopic::parse_from(&mut Parser::new(&out)).unwrap(), topic);
+        }
+    }
+
+    /// One representative of every `FileSource` variant, tag order 0-27.
+    fn all_file_sources() -> Vec<FileSource> {
+        let dialog_id = DialogId::new(-100200300);
+        let user_id = UserId::new(42);
+        vec![
+            FileSource::Message(MessageFullId::new(dialog_id, MessageId::new(11 << 20))),
+            FileSource::UserPhoto { user_id, photo_id: 99 },
+            FileSource::ChatPhoto(ChatId::new(500)),
+            FileSource::ChannelPhoto(ChannelId::new(1100)),
+            FileSource::Wallpapers,
+            FileSource::WebPage("https://example.com".to_string()),
+            FileSource::SavedAnimations,
+            FileSource::RecentStickers { is_attached: true },
+            FileSource::FavoriteStickers,
+            FileSource::Background {
+                background_id: BackgroundId::new(77),
+                access_hash: -123,
+            },
+            FileSource::ChatFull(ChatId::new(500)),
+            FileSource::ChannelFull(ChannelId::new(1100)),
+            FileSource::AppConfig,
+            FileSource::SavedRingtones,
+            FileSource::UserFull(user_id),
+            FileSource::AttachMenuBot(user_id),
+            FileSource::WebApp {
+                user_id,
+                short_name: "botapp".to_string(),
+            },
+            FileSource::Story(StoryFullId::new(dialog_id, StoryId::new(9))),
+            FileSource::QuickReplyMessage(QuickReplyMessageFullId::new(
+                QuickReplyShortcutId::new(3),
+                MessageId::new(13 << 20),
+            )),
+            FileSource::StarTransaction {
+                dialog_id,
+                transaction_id: "tx".to_string(),
+                is_refund: true,
+            },
+            FileSource::BotMediaPreview(user_id),
+            FileSource::BotMediaPreviewInfo {
+                bot_user_id: user_id,
+                language_code: "en".to_string(),
+            },
+            FileSource::StoryAlbum(StoryAlbumFullId::new(dialog_id, StoryAlbumId::new(4))),
+            FileSource::UserSavedMusic {
+                user_id,
+                document_id: 555,
+                access_hash: -7,
+            },
+            FileSource::DraftMessage {
+                dialog_id,
+                topic: MessageTopic::forum(dialog_id, ForumTopicId::new(7)),
+            },
+            FileSource::RichMessage(MessageFullId::new(dialog_id, MessageId::new(12 << 20))),
+            FileSource::WelcomeMessages(dialog_id),
+            FileSource::CommunityFull(CommunityId::new(88)),
+        ]
+    }
+
+    #[test]
+    fn file_source_wire_round_trips_all_variants() {
+        let sources = all_file_sources();
+        assert_eq!(sources.len(), 28);
+
+        // the wire payload round-trips value-exactly and keeps the variant
+        // tag in the C++ Variant order
+        for (tag, source) in sources.iter().enumerate() {
+            let mut out = Vec::new();
+            source.store(&mut out);
+            assert_eq!(i32::from_le_bytes(out[0..4].try_into().unwrap()), tag as i32);
+            assert_eq!(&FileSource::parse_from(&mut Parser::new(&out)).unwrap(), source);
+        }
+
+        // a concrete byte pin: tag 7 then the int32 bool
+        let mut out = Vec::new();
+        FileSource::RecentStickers { is_attached: true }.store(&mut out);
+        assert_eq!(out, [7, 0, 0, 0, 1, 0, 0, 0]);
+    }
+
+    #[test]
+    fn file_source_registry_interns_by_value_and_re_interns_on_parse() {
+        let sources = all_file_sources();
+
+        // interning: equal values keep ids, new values append
+        let mut manager = FileReferenceManager::new();
+        let ids: Vec<FileSourceId> = sources
+            .iter()
+            .cloned()
+            .map(|source| manager.intern(source))
+            .collect();
+        assert_eq!(ids[0], FileSourceId::new(1));
+        assert_eq!(manager.intern(sources[0].clone()), ids[0]);
+        assert_eq!(manager.intern(sources[27].clone()), ids[27]);
+
+        // store -> parse through the same registry returns the interned id,
+        // except the never-repairable sources which parse to no id
+        for (source, id) in sources.iter().zip(&ids) {
+            if matches!(
+                source,
+                FileSource::ChatPhoto(_) | FileSource::ChannelPhoto(_) | FileSource::Wallpapers
+            ) {
+                continue;
+            }
+            let mut out = Vec::new();
+            manager.store_file_source(*id, &mut out);
+            assert_eq!(
+                manager.parse_file_source(&mut Parser::new(&out)).unwrap(),
+                *id
+            );
+        }
+
+        // a fresh registry re-interns in encounter order, like the C++
+        // per-manager caches do on load
+        let mut fresh = FileReferenceManager::new();
+        for source in &sources {
+            let mut out = Vec::new();
+            source.store(&mut out);
+            let parsed = fresh.parse_file_source(&mut Parser::new(&out)).unwrap();
+            if matches!(
+                source,
+                FileSource::ChatPhoto(_) | FileSource::ChannelPhoto(_) | FileSource::Wallpapers
+            ) {
+                assert_eq!(parsed, FileSourceId::new(0));
+            }
+        }
+        // ...and the 25 repairable sources consumed ids 1.. in order: the
+        // first one re-interns to its id and the next new value appends at 26
+        assert_eq!(fresh.intern(sources[0].clone()), FileSourceId::new(1));
+        assert_eq!(
+            fresh.intern(FileSource::WebPage("https://other.example.com".to_string())),
+            FileSourceId::new(26)
+        );
+    }
+
+    #[test]
+    fn file_source_parse_drops_never_repairable_sources() {
+        let mut manager = FileReferenceManager::new();
+
+        // chat photo: the payload is consumed, the id comes back empty
+        let mut out = Vec::new();
+        FileSource::ChatPhoto(ChatId::new(500)).store(&mut out);
+        assert_eq!(
+            manager.parse_file_source(&mut Parser::new(&out)).unwrap(),
+            FileSourceId::new(0)
+        );
+
+        let mut out = Vec::new();
+        FileSource::ChannelPhoto(ChannelId::new(1100)).store(&mut out);
+        assert_eq!(
+            manager.parse_file_source(&mut Parser::new(&out)).unwrap(),
+            FileSourceId::new(0)
+        );
+
+        // wallpapers: the tag alone
+        let mut out = Vec::new();
+        FileSource::Wallpapers.store(&mut out);
+        assert_eq!(
+            manager.parse_file_source(&mut Parser::new(&out)).unwrap(),
+            FileSourceId::new(0)
+        );
+
+        // nothing above was interned, so the next id is still 1
+        assert_eq!(
+            manager.intern(FileSource::SavedAnimations),
+            FileSourceId::new(1)
+        );
+    }
+
+    #[test]
+    fn file_source_parse_rejects_unknown_tags() {
+        let mut manager = FileReferenceManager::new();
+        let mut out = Vec::new();
+        store_parse::store_i32(&mut out, 28);
+        assert_eq!(
+            manager.parse_file_source(&mut Parser::new(&out)),
+            Err("Invalid type in FileSource")
+        );
+    }
+
+    #[test]
+    fn set_with_position_matches_the_cpp_semantics() {
+        // the single-value path: add once, dedupe the repeat, cursor moves
+        let mut set: SetWithPosition<u32> = SetWithPosition::default();
+        assert!(set.add(1));
+        assert!(!set.add(1));
+        assert_eq!(set.size(), 1);
+        assert!(!set.empty());
+        assert!(set.has_next());
+        assert_eq!(set.next(), 1);
+        assert!(!set.has_next());
+        set.reset_position();
+        assert!(set.has_next());
+        assert!(!set.remove(2));
+
+        // the extremes heuristic: checked {1}, not checked {2, 3} -> [1, 3]
+        let mut set: SetWithPosition<u32> = SetWithPosition::default();
+        assert!(set.add(1));
+        assert_eq!(set.next(), 1);
+        assert!(set.add(2));
+        assert!(set.add(3));
+        assert_eq!(set.get_some_elements(), [1, 3]);
+
+        // the C++ `empty` quirk: fast path exists but holds nothing
+        assert!(set.remove(3));
+        assert!(set.remove(2));
+        assert!(set.remove(1));
+        assert_eq!(set.size(), 0);
+        assert!(!set.empty());
+
+        // merge keeps everything checked on the larger side; iteration stays
+        // in value order
+        let mut a: SetWithPosition<u32> = SetWithPosition::default();
+        assert!(a.add(1));
+        assert_eq!(a.next(), 1); // a = {1} checked, size 1
+        let mut b: SetWithPosition<u32> = SetWithPosition::default();
+        assert!(b.add(2));
+        assert!(b.add(3)); // b = {2, 3} not checked, size 2
+        a.merge(&mut b); // swap: b is larger, a absorbs b
+        assert_eq!(a.size(), 3);
+        assert_eq!(a.next(), 2);
+        assert_eq!(a.next(), 3);
+        assert!(!a.has_next());
+        a.reset_position();
+        assert_eq!(a.next(), 1);
+        assert!(b.empty());
+
+        // the equal-single-value fast path carries the checked flag across
+        let mut a: SetWithPosition<u32> = SetWithPosition::default();
+        assert!(a.add(5));
+        let mut b: SetWithPosition<u32> = SetWithPosition::default();
+        assert!(b.add(5));
+        assert_eq!(b.next(), 5);
+        a.merge(&mut b);
+        assert_eq!(a.size(), 1);
+        assert!(!a.has_next()); // `is_checked_ |= other.is_checked_`
+        a.reset_position();
+        assert!(a.has_next());
+        assert_eq!(a.next(), 5);
+        assert!(!a.has_next());
+    }
+
+    #[test]
+    fn file_reference_manager_nodes_match_the_cpp_surface() {
+        let mut manager = FileReferenceManager::new();
+        let file_id = FileId::new(1, 0);
+        let s1 = manager.intern(FileSource::SavedAnimations);
+        let s2 = manager.intern(FileSource::FavoriteStickers);
+        let s3 = manager.intern(FileSource::AppConfig);
+        // a missing node removes and reads as nothing
+        assert!(!manager.remove_file_source(file_id, s1));
+        assert!(manager.get_some_file_sources(file_id).is_empty());
+
+        // get_some keeps the extremes until the cursor walks the set
+        assert!(manager.add_file_source(file_id, s1));
+        assert!(!manager.add_file_source(file_id, s1));
+        assert!(manager.add_file_source(file_id, s2));
+        assert!(manager.add_file_source(file_id, s3));
+        assert_eq!(manager.get_some_file_sources(file_id), [s1, s3]);
+
+        // merge folds the from-node set in and leaves the entry in place;
+        // get_some still reports only the extremes, so membership is probed
+        // through remove
+        let other_file_id = FileId::new(2, 0);
+        assert!(manager.add_file_source(other_file_id, s2));
+        manager.merge(file_id, other_file_id);
+        assert_eq!(manager.get_some_file_sources(file_id), [s1, s3]);
+        assert!(manager.get_some_file_sources(other_file_id).is_empty());
+        assert!(manager.remove_file_source(file_id, s2));
+        assert_eq!(manager.get_some_file_sources(file_id), [s1, s3]);
+
+        // merging from a missing node is a no-op
+        manager.merge(file_id, FileId::new(3, 0));
+        assert_eq!(manager.get_some_file_sources(file_id), [s1, s3]);
+    }
+
+    #[test]
+    fn file_reference_manager_filters_message_sources() {
+        let mut manager = FileReferenceManager::new();
+        let dialog_id = DialogId::new(-100200300);
+        let m1 = MessageFullId::new(dialog_id, MessageId::new(11 << 20));
+        let m2 = MessageFullId::new(dialog_id, MessageId::new(12 << 20));
+        let file_id = FileId::new(1, 0);
+        let s1 = manager.intern(FileSource::Message(m1));
+        let s2 = manager.intern(FileSource::SavedAnimations);
+        let s3 = manager.intern(FileSource::Message(m2));
+        manager.add_file_source(file_id, s1);
+        manager.add_file_source(file_id, s2);
+        manager.add_file_source(file_id, s3);
+        assert_eq!(manager.get_some_message_file_sources(file_id), [m1, m2]);
+    }
+
+    #[test]
+    fn file_data_sources_survive_the_real_registry() {
+        let message_full_id = MessageFullId::new(DialogId::new(-100200300), MessageId::new(11 << 20));
+        let mut manager = FileReferenceManager::new();
+        let ids = vec![
+            manager.intern(FileSource::Message(message_full_id)),
+            manager.intern(FileSource::RecentStickers { is_attached: true }),
+            manager.intern(FileSource::WebPage("https://example.com".to_string())),
+        ];
+
+        let data = FileData {
+            remote_name: "a.jpg".to_string(),
+            file_source_ids: ids,
+            ..FileData::default()
+        };
+        let mut out = Vec::new();
+        data.store(&mut out, &mut manager);
+
+        // the trailing source section: count, then tag + payload each
+        let mut expected_tail = Vec::new();
+        store_parse::store_i32(&mut expected_tail, 3);
+        store_parse::store_i32(&mut expected_tail, 0);
+        message_full_id.store(&mut expected_tail);
+        store_parse::store_i32(&mut expected_tail, 7);
+        store_parse::store_i32(&mut expected_tail, 1);
+        store_parse::store_i32(&mut expected_tail, 5);
+        store_parse::store_string(&mut expected_tail, "https://example.com");
+        assert_eq!(&out[out.len() - expected_tail.len()..], &expected_tail[..]);
+
+        // a fresh registry re-interns the sources in encounter order
+        let mut fresh = FileReferenceManager::new();
+        let parsed = FileData::parse_from(&mut Parser::new(&out), true, Some(&mut fresh)).unwrap();
+        assert_eq!(
+            parsed.file_source_ids,
+            [FileSourceId::new(1), FileSourceId::new(2), FileSourceId::new(3)]
+        );
+        assert_eq!(parsed.remote_name, "a.jpg");
     }
 }
