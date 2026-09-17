@@ -10031,7 +10031,13 @@ impl ChatManager {
             .unwrap_or_default();
         if monoforum_channel_id.is_valid() && !self.have_channel(monoforum_channel_id) {
             if left_tries > 3 && env.global.use_chat_info_database() {
-                self.load_channel_from_database(user_manager, env, monoforum_channel_id, false, false);
+                self.load_channel_from_database(
+                    user_manager,
+                    env,
+                    monoforum_channel_id,
+                    false,
+                    false,
+                );
             } else if left_tries > 2 && env.auth_is_bot {
                 promise.set_error(Status::error(500, "Network is not implemented yet"));
                 return false;
@@ -10080,7 +10086,9 @@ impl ChatManager {
 
     /// `get_chat_participant_count` (ChatManager.cpp:8622-8626).
     pub fn get_chat_participant_count(&self, chat_id: ChatId) -> i32 {
-        self.get_chat(chat_id).map(|c| c.participant_count).unwrap_or(0)
+        self.get_chat(chat_id)
+            .map(|c| c.participant_count)
+            .unwrap_or(0)
     }
 
     /// `get_chat_is_active` (ChatManager.cpp:8628-8632).
@@ -10145,14 +10153,14 @@ impl ChatManager {
             let c = self.get_chat(chat_id).cloned();
             updates.push(self.get_update_basic_group_object(chat_id, c.as_ref()));
         }
-        let channel_full_ids: Vec<i64> =
-            self.channels_full.keys().copied().collect::<Vec<_>>();
+        let channel_full_ids: Vec<i64> = self.channels_full.keys().copied().collect::<Vec<_>>();
         for channel_id in channel_full_ids {
             let channel_id = ChannelId::new(channel_id);
             let c = self.get_channel(channel_id).cloned();
-            debug_assert!(self
-                .get_channel_full_const(channel_id)
-                .is_some_and(|f| f.is_update_channel_full_sent));
+            debug_assert!(
+                self.get_channel_full_const(channel_id)
+                    .is_some_and(|f| f.is_update_channel_full_sent)
+            );
             let update = self.get_update_supergroup_full_info_object(
                 user_manager,
                 env,
@@ -10164,16 +10172,489 @@ impl ChatManager {
         }
         let chat_full_ids: Vec<i64> = self.chats_full.keys().copied().collect::<Vec<_>>();
         for chat_id in chat_full_ids {
-            let basic_group_id = self.get_basic_group_id_object(ChatId::new(chat_id), "get_current_state");
-            let full_object = self.get_basic_group_full_info_object(user_manager, env, ChatId::new(chat_id));
-            debug_assert!(self
-                .get_chat_full(ChatId::new(chat_id))
-                .is_some_and(|f| f.is_update_chat_full_sent));
-            updates.push(td_api::Update::updateBasicGroupFullInfo(td_api::updateBasicGroupFullInfo {
-                basic_group_id,
-                basic_group_full_info: full_object,
-            }));
+            let basic_group_id =
+                self.get_basic_group_id_object(ChatId::new(chat_id), "get_current_state");
+            let full_object =
+                self.get_basic_group_full_info_object(user_manager, env, ChatId::new(chat_id));
+            debug_assert!(
+                self.get_chat_full(ChatId::new(chat_id))
+                    .is_some_and(|f| f.is_update_chat_full_sent)
+            );
+            updates.push(td_api::Update::updateBasicGroupFullInfo(
+                td_api::updateBasicGroupFullInfo {
+                    basic_group_id,
+                    basic_group_full_info: full_object,
+                },
+            ));
         }
+    }
+
+    // ---- M.5.38-M.5.43: permission getters and the setter/query surface
+    // (ChatManager.cpp:3165-4045) ----
+
+    /// `get_chat_permissions(ChatId)` (ChatManager.cpp:8574-8580).
+    pub fn get_chat_permissions_id(&self, chat_id: ChatId) -> DialogParticipantStatus {
+        match self.get_chat(chat_id) {
+            Some(c) => Self::get_chat_permissions_record(c),
+            None => DialogParticipantStatus::banned(0, String::new()),
+        }
+    }
+
+    /// `get_chat_permissions(const Chat *)` (ChatManager.cpp:8582-8588).
+    pub fn get_chat_permissions_record(c: &Chat) -> DialogParticipantStatus {
+        if !c.is_active {
+            return DialogParticipantStatus::banned(0, String::new());
+        }
+        c.status
+            .apply_restrictions(c.default_permissions, false, false)
+    }
+
+    /// `get_channel_permissions(ChannelId)` (ChatManager.cpp:8693-8699).
+    pub fn get_channel_permissions_id(
+        &self,
+        global: &Global,
+        channel_id: ChannelId,
+    ) -> DialogParticipantStatus {
+        match self.get_channel(channel_id) {
+            Some(c) => self.get_channel_permissions_channel(global, channel_id, c),
+            None => DialogParticipantStatus::banned(0, String::new()),
+        }
+    }
+
+    /// `get_channel_permissions(ChannelId, const Channel *)`
+    /// (ChatManager.cpp:8701-8714) — megagroup boosters bypass the
+    /// default restrictions when the full says they boosted enough.
+    pub(crate) fn get_channel_permissions_channel(
+        &self,
+        global: &Global,
+        channel_id: ChannelId,
+        c: &Channel,
+    ) -> DialogParticipantStatus {
+        let mut status = c.status.clone();
+        status.update_restrictions(global);
+        let mut is_booster = false;
+        if c.is_megagroup {
+            is_booster = self.get_channel_full_const(channel_id).is_none_or(|f| {
+                f.unrestrict_boost_count == 0 || f.boost_count >= f.unrestrict_boost_count
+            });
+        }
+        status.apply_restrictions(c.default_permissions, is_booster, false)
+    }
+
+    /// `set_chat_description` (ChatManager.cpp:3165-3176) — the
+    /// EditChatAboutQuery send is [blocked: net] (M.5.45).
+    pub fn set_chat_description(
+        &mut self,
+        _user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        description: &str,
+        mut promise: Promise<()>,
+    ) {
+        let _new_description = crate::misc::strip_empty_characters(description, 255, false);
+        let Some(c) = self.get_chat(chat_id) else {
+            return promise.set_error(Status::error(400, "Chat info not found"));
+        };
+        let permissions = Self::get_chat_permissions_record(c);
+        let permissions =
+            permissions.apply_restrictions(c.default_permissions, false, env.auth_is_bot);
+        if !permissions.can_change_info_and_settings() {
+            return promise.set_error(Status::error(
+                400,
+                "Not enough rights to set chat description",
+            ));
+        }
+        tdutils::log_info!("EditChatAboutQuery for {chat_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `set_channel_description` (ChatManager.cpp:3678-3688).
+    pub fn set_channel_description(
+        &mut self,
+        _user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        description: &str,
+        mut promise: Promise<()>,
+    ) {
+        let _new_description = crate::misc::strip_empty_characters(description, 255, false);
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Chat info not found"));
+        };
+        let permissions = self.get_channel_permissions_channel(env.global, channel_id, c);
+        if !permissions.can_change_info_and_settings() {
+            return promise.set_error(Status::error(
+                400,
+                "Not enough rights to set chat description",
+            ));
+        }
+        tdutils::log_info!("EditChatAboutQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `set_channel_username` (ChatManager.cpp:3178-3191) — the
+    /// UpdateChannelUsernameQuery send is [blocked: net] (M.5.45).
+    pub fn set_channel_username(
+        &mut self,
+        _user_manager: &mut UserManager,
+        _env: &mut UserEnv,
+        channel_id: ChannelId,
+        username: &str,
+        mut promise: Promise<()>,
+    ) {
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Supergroup not found"));
+        };
+        if !c.status.is_creator() {
+            return promise.set_error(Status::error(
+                400,
+                "Not enough rights to change supergroup username",
+            ));
+        }
+        if !username.is_empty() && !crate::misc::is_allowed_username(username) {
+            return promise.set_error(Status::error(400, "Username is invalid"));
+        }
+        tdutils::log_info!("UpdateChannelUsernameQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `toggle_channel_username_is_active` (ChatManager.cpp:3194-3208) —
+    /// the optimistic local update lands before the blocked-net query.
+    pub fn toggle_channel_username_is_active(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        username: String,
+        is_active: bool,
+        mut promise: Promise<()>,
+    ) {
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Supergroup not found"));
+        };
+        if !c.status.is_creator() {
+            return promise.set_error(Status::error(400, "Not enough rights to change username"));
+        }
+        if !c.usernames.can_toggle(false, &username) {
+            return promise.set_error(Status::error(400, "Wrong username specified"));
+        }
+        let toggled = c.usernames.toggle(false, &username, is_active);
+        self.on_update_channel_usernames(user_manager, env, channel_id, toggled);
+        self.update_channel(user_manager, env, channel_id, false, false);
+        tdutils::log_info!("ToggleChannelUsernameQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `disable_all_channel_usernames` (ChatManager.cpp:3211-3221).
+    pub fn disable_all_channel_usernames(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        mut promise: Promise<()>,
+    ) {
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Supergroup not found"));
+        };
+        if !c.status.is_creator() {
+            return promise.set_error(Status::error(400, "Not enough rights to disable usernames"));
+        }
+        let deactivated = c.usernames.deactivate_all();
+        self.on_update_channel_usernames(user_manager, env, channel_id, deactivated);
+        self.update_channel(user_manager, env, channel_id, false, false);
+        tdutils::log_info!(
+            "DeactivateAllChannelUsernamesQuery for {channel_id:?} — [blocked: net]"
+        );
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `reorder_channel_usernames` (ChatManager.cpp:3224-3240) — order
+    /// lists of one or zero resolve locally without a query.
+    pub fn reorder_channel_usernames(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        usernames: Vec<String>,
+        mut promise: Promise<()>,
+    ) {
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Supergroup not found"));
+        };
+        if !c.status.is_creator() {
+            return promise.set_error(Status::error(400, "Not enough rights to reorder usernames"));
+        }
+        if !c.usernames.can_reorder_to(&usernames) {
+            return promise.set_error(Status::error(400, "Invalid username order specified"));
+        }
+        if usernames.len() <= 1 {
+            return promise.set_value(());
+        }
+        let reordered = c.usernames.reorder_to(usernames);
+        self.on_update_channel_usernames(user_manager, env, channel_id, reordered);
+        self.update_channel(user_manager, env, channel_id, false, false);
+        tdutils::log_info!("ReorderChannelUsernamesQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `set_channel_accent_color` (ChatManager.cpp:3275-3293).
+    pub fn set_channel_accent_color(
+        &mut self,
+        _user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        accent_color_id: AccentColorId,
+        _background_custom_emoji_id: CustomEmojiId,
+        mut promise: Promise<()>,
+    ) {
+        if !accent_color_id.is_valid() {
+            return promise.set_error(Status::error(
+                400,
+                "Invalid accent color identifier specified",
+            ));
+        }
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Chat not found"));
+        };
+        if c.is_megagroup {
+            return promise.set_error(Status::error(
+                400,
+                "Accent color can be changed only in channel chats",
+            ));
+        }
+        if !self
+            .get_channel_permissions_channel(env.global, channel_id, c)
+            .can_change_info_and_settings_as_administrator()
+        {
+            return promise.set_error(Status::error(400, "Not enough rights in the channel"));
+        }
+        tdutils::log_info!("UpdateChannelColorQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `set_channel_profile_accent_color` (ChatManager.cpp:3296-3308).
+    pub fn set_channel_profile_accent_color(
+        &mut self,
+        _user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        _profile_accent_color_id: AccentColorId,
+        _profile_background_custom_emoji_id: CustomEmojiId,
+        mut promise: Promise<()>,
+    ) {
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Chat not found"));
+        };
+        if !self
+            .get_channel_permissions_channel(env.global, channel_id, c)
+            .can_change_info_and_settings_as_administrator()
+        {
+            return promise.set_error(Status::error(400, "Not enough rights in the chat"));
+        }
+        tdutils::log_info!("UpdateChannelColorQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `set_channel_emoji_status` (ChatManager.cpp:3311-3325).
+    pub fn set_channel_emoji_status(
+        &mut self,
+        _user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        _emoji_status: Option<EmojiStatus>,
+        mut promise: Promise<()>,
+    ) {
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Chat not found"));
+        };
+        if !self
+            .get_channel_permissions_channel(env.global, channel_id, c)
+            .can_change_info_and_settings_as_administrator()
+        {
+            return promise.set_error(Status::error(400, "Not enough rights in the chat"));
+        }
+        // StickersManager add_recent_emoji_status — the wave-2 stub.
+        tdutils::log_info!("UpdateChannelEmojiStatusQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `set_channel_sticker_set` (ChatManager.cpp:3328-3356).
+    pub fn set_channel_sticker_set(
+        &mut self,
+        _user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        sticker_set_id: StickerSetId,
+        mut promise: Promise<()>,
+    ) {
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Supergroup not found"));
+        };
+        if !c.is_megagroup {
+            return promise.set_error(Status::error(
+                400,
+                "Chat sticker set can be set only for supergroups",
+            ));
+        }
+        if !self
+            .get_channel_permissions_channel(env.global, channel_id, c)
+            .can_change_info_and_settings_as_administrator()
+        {
+            return promise.set_error(Status::error(
+                400,
+                "Not enough rights to change supergroup sticker set",
+            ));
+        }
+        if sticker_set_id.is_valid() {
+            // stickers_manager_->get_input_sticker_set — the StickersManager
+            // fan-out lands with wave 2; interim answers nothing to forward
+            return promise.set_error(Status::error(400, "Sticker set not found"));
+        }
+        if let Some(f) = self.get_channel_full_const(channel_id)
+            && !f.can_set_sticker_set
+        {
+            return promise.set_error(Status::error(400, "Can't set supergroup sticker set"));
+        }
+        tdutils::log_info!("SetChannelStickerSetQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `set_channel_emoji_sticker_set` (ChatManager.cpp:3359-3383) — the
+    /// "Cuctom" typo is load-bearing (verbatim C++ string).
+    pub fn set_channel_emoji_sticker_set(
+        &mut self,
+        _user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        sticker_set_id: StickerSetId,
+        mut promise: Promise<()>,
+    ) {
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Supergroup not found"));
+        };
+        if !c.is_megagroup {
+            return promise.set_error(Status::error(
+                400,
+                "Cuctom emoji sticker set can be set only for supergroups",
+            ));
+        }
+        if !self
+            .get_channel_permissions_channel(env.global, channel_id, c)
+            .can_change_info_and_settings_as_administrator()
+        {
+            return promise.set_error(Status::error(
+                400,
+                "Not enough rights to change custom emoji sticker set in the supergroup",
+            ));
+        }
+        if sticker_set_id.is_valid() {
+            return promise.set_error(Status::error(400, "Sticker set not found"));
+        }
+        tdutils::log_info!("SetChannelEmojiStickerSetQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `set_channel_unrestrict_boost_count` (ChatManager.cpp:3386-3403).
+    pub fn set_channel_unrestrict_boost_count(
+        &mut self,
+        _user_manager: &mut UserManager,
+        _env: &mut UserEnv,
+        channel_id: ChannelId,
+        unrestrict_boost_count: i32,
+        mut promise: Promise<()>,
+    ) {
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Supergroup not found"));
+        };
+        if !c.is_megagroup {
+            return promise.set_error(Status::error(
+                400,
+                "Unrestrict boost count can be set only for supergroups",
+            ));
+        }
+        if !self.get_channel_status(channel_id).can_restrict_members() {
+            return promise.set_error(Status::error(
+                400,
+                "Not enough rights to change unrestrict boost count set in the supergroup",
+            ));
+        }
+        if !(0..=8).contains(&unrestrict_boost_count) {
+            return promise.set_error(Status::error(
+                400,
+                "Invalid new value for the unrestrict boost count specified",
+            ));
+        }
+        tdutils::log_info!(
+            "SetChannelBoostsToUnblockRestrictionsQuery for {channel_id:?} — [blocked: net]"
+        );
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `set_channel_main_profile_tab` (ChatManager.cpp:3406-3430) — the
+    /// SetChannelMainProfileTabQuery send is [blocked: net]; its on_ok
+    /// completion (`on_set_channel_main_profile_tab`) still lands.
+    pub fn set_channel_main_profile_tab(
+        &mut self,
+        _user_manager: &mut UserManager,
+        _env: &mut UserEnv,
+        channel_id: ChannelId,
+        main_profile_tab: td_api::ProfileTab,
+        mut promise: Promise<()>,
+    ) {
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Supergroup not found"));
+        };
+        if Self::get_channel_type(c) == ChannelType::Megagroup {
+            return promise.set_error(Status::error(
+                400,
+                "Main profile tab can't be changed in supergroups",
+            ));
+        }
+        if !c.status.can_change_info_and_settings_as_administrator() {
+            return promise.set_error(Status::error(
+                400,
+                "Not enough rights to change main profile tab",
+            ));
+        }
+        let channel_type = Self::get_channel_type(c);
+        let Some(profile_tab) = get_profile_tab_tdapi(Some(&main_profile_tab), channel_type) else {
+            return promise.set_error(Status::error(400, "Profile tab must be non-empty"));
+        };
+        if !is_allowed_profile_tab(profile_tab, channel_type) {
+            return promise.set_error(Status::error(
+                400,
+                "Invalid profile tab specified for the chat",
+            ));
+        }
+        tdutils::log_info!("SetChannelMainProfileTabQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `on_set_channel_main_profile_tab` (ChatManager.cpp:3433-3441) — the
+    /// query completion hook. Production caller: the net step (M.5.45).
+    #[allow(dead_code)]
+    fn on_set_channel_main_profile_tab(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        main_profile_tab: ProfileTab,
+        mut promise: Promise<()>,
+    ) {
+        if let Some(f) = self.get_channel_full_mut(channel_id)
+            && f.main_profile_tab != main_profile_tab
+        {
+            f.main_profile_tab = main_profile_tab;
+            f.is_changed = true;
+            self.update_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                "on_set_channel_main_profile_tab",
+                false,
+            );
+        }
+        promise.set_value(());
     }
 
     /// `ChatManager::save_chat` (ChatManager.cpp:4467-4484): the binlog
@@ -13214,6 +13695,33 @@ fn get_profile_tab(profile_tab: telegram_api::ProfileTab, channel_type: ChannelT
         ProfileTab::Default
     } else {
         result
+    }
+}
+
+/// `get_profile_tab_tdapi` (ProfileTab.cpp:61-90) — the td_api → internal
+/// conversion with the allow-matrix gate. `None` input answers `None`
+/// (the caller errors "Profile tab must be non-empty" — kept at the call
+/// site to match the C++ promise flow).
+fn get_profile_tab_tdapi(
+    profile_tab: Option<&td_api::ProfileTab>,
+    channel_type: ChannelType,
+) -> Option<ProfileTab> {
+    let profile_tab = profile_tab?;
+    let result = match profile_tab {
+        td_api::ProfileTab::profileTabPosts(_) => ProfileTab::Posts,
+        td_api::ProfileTab::profileTabGifts(_) => ProfileTab::Gifts,
+        td_api::ProfileTab::profileTabMedia(_) => ProfileTab::Media,
+        td_api::ProfileTab::profileTabFiles(_) => ProfileTab::Files,
+        td_api::ProfileTab::profileTabMusic(_) => ProfileTab::Music,
+        td_api::ProfileTab::profileTabVoice(_) => ProfileTab::Voice,
+        td_api::ProfileTab::profileTabLinks(_) => ProfileTab::Links,
+        td_api::ProfileTab::profileTabGifs(_) => ProfileTab::Gifs,
+    };
+    if !is_allowed_profile_tab(result, channel_type) {
+        tdutils::log_error!("Receive {result:?} for {channel_type:?}");
+        None
+    } else {
+        Some(result)
     }
 }
 
