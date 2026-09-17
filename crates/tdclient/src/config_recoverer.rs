@@ -1597,7 +1597,7 @@ pub fn json_value_to_tl(value: &JsonValue) -> telegram_api::JSONValue {
                     .map(|(key, value)| {
                         Box::new(telegram_api::JSONObjectValue {
                             key: key.to_string(),
-                            value: Box::new(json_value_to_tl(value)),
+                            value: Some(Box::new(json_value_to_tl(value))),
                         })
                     })
                     .collect(),
@@ -1644,10 +1644,10 @@ pub fn gen_recovery_header(options: &RecoveryHeaderOptions) -> Result<Vec<u8>, S
             .iter_mut()
             .find(|member| member.key == "tz_offset")
         {
-            Some(member) => *member.value = tz_offset,
+            Some(member) => member.value = Some(Box::new(tz_offset)),
             None => object.value.push(Box::new(telegram_api::JSONObjectValue {
                 key: "tz_offset".to_string(),
-                value: Box::new(tz_offset),
+                value: Some(Box::new(tz_offset)),
             })),
         }
     }
@@ -1659,7 +1659,7 @@ pub fn gen_recovery_header(options: &RecoveryHeaderOptions) -> Result<Vec<u8>, S
     let mut out = Vec::new();
     telegram_api::invokeWithLayer {
         layer: RECOVERY_MTPROTO_LAYER,
-        query: Box::new(telegram_api::Function::initConnection(
+        query: Some(Box::new(telegram_api::Function::initConnection(
             telegram_api::initConnection {
                 flags,
                 api_id: options.api_id,
@@ -1669,22 +1669,18 @@ pub fn gen_recovery_header(options: &RecoveryHeaderOptions) -> Result<Vec<u8>, S
                 system_lang_code: options.system_language_code.clone(),
                 lang_pack,
                 lang_code,
-                proxy: match &options.mtproto_proxy {
-                    Some((address, port)) => telegram_api::InputClientProxy {
+                proxy: options.mtproto_proxy.as_ref().map(|(address, port)| {
+                    telegram_api::InputClientProxy {
                         address: address.clone(),
                         port: *port,
-                    },
-                    None => telegram_api::InputClientProxy {
-                        address: String::new(),
-                        port: 0,
-                    },
-                },
-                params: Box::new(json_value),
-                query: Box::new(telegram_api::Function::help_getConfig(
+                    }
+                }),
+                params: Some(Box::new(json_value)),
+                query: Some(Box::new(telegram_api::Function::help_getConfig(
                     telegram_api::help_getConfig,
-                )),
+                ))),
             },
-        )),
+        ))),
     }
     .store_boxed(&mut out);
     Ok(out)
@@ -3626,7 +3622,7 @@ mod tests {
         let mut out = Vec::new();
         telegram_api::invokeWithLayer {
             layer: 229,
-            query: Box::new(telegram_api::Function::initConnection(
+            query: Some(Box::new(telegram_api::Function::initConnection(
                 telegram_api::initConnection {
                     flags,
                     api_id: 94575,
@@ -3636,22 +3632,16 @@ mod tests {
                     system_lang_code: "en".to_string(),
                     lang_pack: lang_pack.to_string(),
                     lang_code: lang_code.to_string(),
-                    proxy: match proxy {
-                        Some((address, port)) => telegram_api::InputClientProxy {
-                            address: address.to_string(),
-                            port,
-                        },
-                        None => telegram_api::InputClientProxy {
-                            address: String::new(),
-                            port: 0,
-                        },
-                    },
-                    params: Box::new(params),
-                    query: Box::new(telegram_api::Function::help_getConfig(
+                    proxy: proxy.map(|(address, port)| telegram_api::InputClientProxy {
+                        address: address.to_string(),
+                        port,
+                    }),
+                    params: Some(Box::new(params)),
+                    query: Some(Box::new(telegram_api::Function::help_getConfig(
                         telegram_api::help_getConfig,
-                    )),
+                    ))),
                 },
-            )),
+            ))),
         }
         .store_boxed(&mut out);
         out
@@ -3666,9 +3656,9 @@ mod tests {
     fn tz_member(value: f64) -> telegram_api::JSONObjectValue {
         telegram_api::JSONObjectValue {
             key: "tz_offset".to_string(),
-            value: Box::new(telegram_api::JSONValue::jsonNumber(
+            value: Some(Box::new(telegram_api::JSONValue::jsonNumber(
                 telegram_api::jsonNumber { value },
-            )),
+            ))),
         }
     }
 
@@ -3726,9 +3716,9 @@ mod tests {
         let header = gen_recovery_header(&options).expect("the header builds");
         let keep = telegram_api::JSONObjectValue {
             key: "keep".to_string(),
-            value: Box::new(telegram_api::JSONValue::jsonBool(telegram_api::jsonBool {
-                value: true,
-            })),
+            value: Some(Box::new(telegram_api::JSONValue::jsonBool(
+                telegram_api::jsonBool { value: true },
+            ))),
         };
         let expected = stored_header(
             1 << 1,
