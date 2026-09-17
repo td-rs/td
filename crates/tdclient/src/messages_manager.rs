@@ -22,6 +22,7 @@
 //!   via `log_error!`.
 
 use crate::chat_manager::{ChannelId, ChatId};
+use crate::message_content::{MessageContentType, can_be_secret_message_content};
 use crate::message_entity::FormattedText;
 use crate::store_parse::{Parser, store_flags, store_i32, store_i64, store_string};
 use crate::td_api;
@@ -1451,125 +1452,6 @@ impl std::fmt::Display for InputDialogId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "input {}", self.dialog_id)
     }
-}
-
-/// `td::MessageContentType` (MessageContentType.h:15-113) — the discriminant
-/// order is the C++ enum order; `MessageUnsupported::CURRENT_VERSION` bumps
-/// with every addition. The classification-function family
-/// (`is_service_message_content` etc., MessageContentType.cpp) lands with the
-/// M.9 content model; only the predicate `MessageSelfDestructType` needs is
-/// ported here.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-#[repr(i32)]
-pub enum MessageContentType {
-    None = -1,
-    #[default]
-    Text = 0,
-    Animation,
-    Audio,
-    Document,
-    Photo,
-    Sticker,
-    Video,
-    VoiceNote,
-    Contact,
-    Location,
-    Venue,
-    ChatCreate,
-    ChatChangeTitle,
-    ChatChangePhoto,
-    ChatDeletePhoto,
-    ChatDeleteHistory,
-    ChatAddUsers,
-    ChatJoinedByLink,
-    ChatDeleteUser,
-    ChatMigrateTo,
-    ChannelCreate,
-    ChannelMigrateFrom,
-    PinMessage,
-    Game,
-    GameScore,
-    ScreenshotTaken,
-    ChatSetTtl,
-    Unsupported,
-    Call,
-    Invoice,
-    PaymentSuccessful,
-    VideoNote,
-    ContactRegistered,
-    ExpiredPhoto,
-    ExpiredVideo,
-    LiveLocation,
-    CustomServiceAction,
-    WebsiteConnected,
-    PassportDataSent,
-    PassportDataReceived,
-    Poll,
-    Dice,
-    ProximityAlertTriggered,
-    GroupCall,
-    InviteToGroupCall,
-    ChatSetTheme,
-    WebViewDataSent,
-    WebViewDataReceived,
-    GiftPremium,
-    TopicCreate,
-    TopicEdit,
-    SuggestProfilePhoto,
-    WriteAccessAllowed,
-    RequestedDialog,
-    WebViewWriteAccessAllowed,
-    SetBackground,
-    Story,
-    WriteAccessAllowedByRequest,
-    GiftCode,
-    Giveaway,
-    GiveawayLaunch,
-    GiveawayResults,
-    GiveawayWinners,
-    ExpiredVideoNote,
-    ExpiredVoiceNote,
-    BoostApply,
-    DialogShared,
-    PaidMedia,
-    PaymentRefunded,
-    GiftStars,
-    PrizeStars,
-    StarGift,
-    StarGiftUnique,
-    PaidMessagesRefunded,
-    PaidMessagesPrice,
-    ConferenceCall,
-    ToDoList,
-    TodoCompletions,
-    TodoAppendTasks,
-    GiftTon,
-    SuggestedPostSuccess,
-    SuggestedPostRefund,
-    SuggestedPostApproval,
-    SuggestBirthday,
-    StarGiftPurchaseOffer,
-    StarGiftPurchaseOfferDeclined,
-    NewCreatorPending,
-    ChangeCreator,
-    NoForwardsToggle,
-    NoForwardsRequest,
-    ManagedBotCreated,
-    PollAppendAnswer,
-    PollDeleteAnswer,
-    RichText,
-    ChangeCommunity,
-    ChatJoinedViaCommunity,
-}
-
-/// `can_be_secret_message_content` (MessageContentType.cpp) — the C++
-/// `default: UNREACHABLE()` covers only `None`.
-pub fn can_be_secret_message_content(content_type: MessageContentType) -> bool {
-    use MessageContentType::*;
-    matches!(
-        content_type,
-        Animation | Audio | Photo | Video | VideoNote | VoiceNote
-    )
 }
 
 /// `td::MessageSelfDestructType` (MessageSelfDestructType.{h,cpp}) — the ttl

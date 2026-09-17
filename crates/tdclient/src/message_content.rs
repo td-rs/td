@@ -52,10 +52,9 @@ use crate::user_manager::{FileId, UserId};
 
 /// `td::MessageContentType` (MessageContentType.h:15-113) — the discriminant
 /// order is the C++ enum order; `MessageUnsupported::CURRENT_VERSION` bumps
-/// with every addition. This copy is textually identical to the one on the
-/// `m10` line (messages_manager.rs); at integration m10's copy is deleted in
-/// favor of this module — the m10 commit note already reserves the rest of
-/// the MessageContentType family for the M.9 content model.
+/// with every addition. The single copy on the union line (the m10-line
+/// duplicate in messages_manager.rs was deleted in favor of this module at
+/// the M.9.1 integration, as that commit note reserved).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 #[repr(i32)]
 pub enum MessageContentType {
@@ -157,6 +156,16 @@ pub enum MessageContentType {
     RichText,
     ChangeCommunity,
     ChatJoinedViaCommunity,
+}
+
+/// `can_be_secret_message_content` (MessageContentType.cpp) — the C++
+/// `default: UNREACHABLE()` covers only `None`.
+pub fn can_be_secret_message_content(content_type: MessageContentType) -> bool {
+    use MessageContentType::*;
+    matches!(
+        content_type,
+        Animation | Audio | Photo | Video | VideoNote | VoiceNote
+    )
 }
 
 /// `td::WebPageId` (WebPageId.h:17-50) — the instant-view page id; `0` is
