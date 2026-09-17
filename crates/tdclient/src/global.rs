@@ -230,6 +230,25 @@ impl Global {
             .unwrap_or(false)
     }
 
+    /// `Global::is_expected_error` (Global.h:723-739) — the errors the
+    /// query layer answers without logging a failure.
+    pub fn is_expected_error(&self, error: &tdutils::status::Status) -> bool {
+        debug_assert!(error.is_error());
+        if error.code() == 401 {
+            // authorization is lost
+            return true;
+        }
+        if error.code() == 420 || error.code() == 429 {
+            // flood wait
+            return true;
+        }
+        if error.code() == 406 && error.message() == "FROZEN_METHOD_INVALID" {
+            // the account is frozen
+            return true;
+        }
+        self.close_flag()
+    }
+
     /// `Global::use_sqlite_pmc()` — gated on the file database exactly like
     /// the C++ (`TdDb::use_sqlite_pmc`).
     pub fn use_sqlite_pmc(&self) -> bool {
