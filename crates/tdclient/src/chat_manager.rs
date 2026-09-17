@@ -8878,6 +8878,343 @@ impl ChatManager {
         }
     }
 
+    // ---- M.5.27: the speculative machine and the channel error intake
+    // (ChatManager.cpp:6393-6663) ----
+
+    /// `speculative_add_count` (ChatManager.cpp:6466-6477).
+    fn speculative_add_count(count: &mut i32, delta_count: i32, min_count: i32) -> bool {
+        let mut new_count = *count + delta_count;
+        if new_count < min_count {
+            new_count = min_count;
+        }
+        if new_count == *count {
+            return false;
+        }
+        *count = new_count;
+        true
+    }
+
+    /// `on_get_channel_error` (ChatManager.cpp:6393-6464). Returns true
+    /// when the error was handled. The member-leave branch cannot call
+    /// the not-yet-ported on_get_channel_forbidden, so the emulation
+    /// reduces to the invalidation tail (the channel-intake slice owns
+    /// the full form).
+    #[allow(dead_code)] // production caller: the net query error paths (M.10)
+    fn on_get_channel_error(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        status: &Status,
+        source: &str,
+    ) -> bool {
+        tdutils::log_info!("Receive {status} in {channel_id:?} from {source}");
+        if status.message() == "BOT_METHOD_INVALID" {
+            return true;
+        }
+        if status.message() == "CHANNEL_MONOFORUM_UNSUPPORTED" {
+            tdutils::log_error!(
+                "Receive CHANNEL_MONOFORUM_UNSUPPORTED in {channel_id:?} from {source}"
+            );
+            return true;
+        }
+        if env.global.is_expected_error(status) {
+            return true;
+        }
+        if matches!(
+            status.message(),
+            "CHANNEL_PRIVATE" | "CHANNEL_PUBLIC_GROUP_NA" | "FROZEN_PARTICIPANT_MISSING"
+        ) {
+            if !channel_id.is_valid() {
+                tdutils::log_error!("Receive {status} in invalid {channel_id:?} from {source}");
+                return false;
+            }
+            let initial_channel_id = channel_id;
+            let mut channel_id = channel_id;
+            let initial_slow_mode = self
+                .get_channel(channel_id)
+                .map(|c| c.is_slow_mode_enabled)
+                .unwrap_or(false);
+            if self.get_channel(channel_id).is_some_and(|c| c.is_monoforum) {
+                channel_id = self
+                    .get_channel(channel_id)
+                    .map(|c| c.monoforum_channel_id)
+                    .unwrap_or_default();
+            }
+            if self.get_channel(channel_id).is_none() {
+                if source == "GetChannelDifferenceQuery" || source == "GetChannelsQuery" {
+                    // the restart/diff path re-fetches the channel by id
+                    return true;
+                }
+                tdutils::log_error!(
+                    "Receive {status} in not found {initial_channel_id:?}/{channel_id:?} from {source}"
+                );
+                return false;
+            }
+            // the client-side supergroup snapshot for the tail LOG_IF
+            let _debug_channel_object = self.get_supergroup_object(channel_id);
+
+            let is_member = self
+                .get_channel(channel_id)
+                .is_some_and(|c| c.status.is_member());
+            if is_member {
+                // the C++ emulates the leave via on_get_channel_forbidden
+                // with a synthesized channelForbidden — that intake is the
+                // channel slice; the invalidation tail still runs.
+            } else if !self
+                .get_channel(channel_id)
+                .is_some_and(|c| c.status.is_banned())
+            {
+                // drop usernames when they are known
+                let has_usernames = self
+                    .get_channel(channel_id)
+                    .is_some_and(|c| c.usernames != Usernames::default());
+                if has_usernames {
+                    tdutils::log_info!("Drop usernames of {channel_id:?}");
+                    let usernames = Usernames::from_telegram(String::new(), Vec::new());
+                    self.on_update_channel_usernames(user_manager, env, channel_id, usernames);
+                }
+                if let Some(c) = self.get_channel_mut(channel_id) {
+                    Self::on_update_channel_has_location(c, false);
+                }
+                // the DialogInviteLinkManager remove_dialog_access_by_invite_link
+                // — the wave-2 stub.
+                self.update_channel(user_manager, env, channel_id, false, false);
+            }
+            let drop_slow_mode = !self
+                .get_channel(channel_id)
+                .is_some_and(|c| c.is_slow_mode_enabled);
+            self.invalidate_channel_full(user_manager, env, channel_id, drop_slow_mode, source);
+            if channel_id != initial_channel_id {
+                self.invalidate_channel_full(
+                    user_manager,
+                    env,
+                    initial_channel_id,
+                    initial_slow_mode,
+                    source,
+                );
+            }
+            if self.have_input_peer_channel_id(env, initial_channel_id, AccessRights::Read) {
+                tdutils::log_error!(
+                    "Have read access to {initial_channel_id:?} after receiving CHANNEL_PRIVATE"
+                );
+            }
+            return true;
+        }
+        false
+    }
+
+    /// `speculative_add_channel_participants`
+    /// (ChatManager.cpp:6479-6512). The DialogParticipantManager cache and
+    /// the MessagesManager bots fan-out are the wave-2 stubs.
+    #[allow(dead_code)] // production caller: MessagesManager add paths (M.10)
+    #[allow(clippy::too_many_arguments)]
+    fn speculative_add_channel_participants(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        added_user_ids: &[UserId],
+        _inviter_user_id: UserId,
+        _date: i32,
+        by_me: bool,
+    ) {
+        if self
+            .get_channel_full_force(
+                user_manager,
+                env,
+                channel_id,
+                true,
+                "speculative_add_channel_participants",
+                false,
+            )
+            .is_none()
+        {
+            return;
+        }
+        let mut delta_participant_count = 0;
+        let mut bots_changed = false;
+        {
+            let Some(f) = self.get_channel_full_mut(channel_id) else {
+                return;
+            };
+            for user_id in added_user_ids.iter().copied() {
+                if !user_id.is_valid() {
+                    continue;
+                }
+                delta_participant_count += 1;
+                if user_manager.is_user_bot_of(user_id) && !f.bot_user_ids.contains(&user_id) {
+                    f.bot_user_ids.push(user_id);
+                    f.need_save_to_database = true;
+                    bots_changed = true;
+                }
+            }
+        }
+        if bots_changed {
+            self.reload_channel_full(
+                env,
+                channel_id,
+                Promise::default(),
+                "speculative_add_channel_participants",
+            );
+            // messages_manager on_dialog_bots_updated — the M.10 stub.
+        }
+        {
+            let Some(f) = self.get_channel_full_mut(channel_id) else {
+                return;
+            };
+            if f.is_changed {
+                f.speculative_version += 1;
+            }
+        }
+        self.update_channel_full(
+            user_manager,
+            env,
+            channel_id,
+            "speculative_add_channel_participants",
+            false,
+        );
+        if delta_participant_count == 0 {
+            return;
+        }
+        self.speculative_add_channel_participant_count(
+            user_manager,
+            env,
+            channel_id,
+            delta_participant_count,
+            by_me,
+        );
+    }
+
+    /// `speculative_delete_channel_participant`
+    /// (ChatManager.cpp:6514-6538). No speculative_version bump — C++.
+    #[allow(dead_code)] // production caller: MessagesManager delete paths (M.10)
+    fn speculative_delete_channel_participant(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        deleted_user_id: UserId,
+        by_me: bool,
+    ) {
+        if !deleted_user_id.is_valid() {
+            return;
+        }
+        // td_->dialog_participant_manager_->delete_cached_channel_participant
+        // — the wave-2 stub.
+        if user_manager.is_user_bot_of(deleted_user_id)
+            && self
+                .get_channel_full_force(
+                    user_manager,
+                    env,
+                    channel_id,
+                    true,
+                    "speculative_delete_channel_participant",
+                    false,
+                )
+                .is_some()
+        {
+            if let Some(f) = self.get_channel_full_mut(channel_id) {
+                if let Some(position) = f.bot_user_ids.iter().position(|id| *id == deleted_user_id)
+                {
+                    f.bot_user_ids.remove(position);
+                    f.need_save_to_database = true;
+                    // messages_manager on_dialog_bots_updated — the M.10 stub.
+                }
+                if f.guard_bot_user_id == deleted_user_id {
+                    f.guard_bot_user_id = UserId::default();
+                }
+            }
+            self.update_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                "speculative_delete_channel_participant",
+                false,
+            );
+        }
+        self.speculative_add_channel_participant_count(user_manager, env, channel_id, -1, by_me);
+    }
+
+    /// `speculative_add_channel_participant_count`
+    /// (ChatManager.cpp:6540-6570).
+    fn speculative_add_channel_participant_count(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        delta_participant_count: i32,
+        by_me: bool,
+    ) {
+        if by_me {
+            // own changes may already be counted — silent full reset
+            self.invalidate_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                false,
+                "speculative_add_channel_participant_count",
+            );
+            return;
+        }
+        if self
+            .get_channel_full_force(
+                user_manager,
+                env,
+                channel_id,
+                true,
+                "speculative_add_channel_participant_count",
+                false,
+            )
+            .is_none()
+        {
+            return;
+        }
+        let min_count = self
+            .get_channel_full_const(channel_id)
+            .map(|f| f.administrator_count)
+            .unwrap_or(0);
+        {
+            let Some(c) = self.get_channel_mut(channel_id) else {
+                return;
+            };
+            if c.participant_count != 0
+                && Self::speculative_add_count(
+                    &mut c.participant_count,
+                    delta_participant_count,
+                    min_count,
+                )
+            {
+                c.is_changed = true;
+            }
+        }
+        self.update_channel(user_manager, env, channel_id, false, false);
+        let changed = {
+            let Some(f) = self.get_channel_full_mut(channel_id) else {
+                return;
+            };
+            let changed = Self::speculative_add_count(
+                &mut f.participant_count,
+                delta_participant_count,
+                min_count,
+            );
+            f.is_changed |= changed;
+            if f.is_changed {
+                f.speculative_version += 1;
+            }
+            changed
+        };
+        if changed {
+            self.update_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                "speculative_add_channel_participant_count",
+                false,
+            );
+        }
+    }
+
     /// `ChatManager::save_chat` (ChatManager.cpp:4467-4484): the binlog
     /// mirror (`ChatLogEvent`, `HandlerType::Chats`) add/rewrite while the
     /// record is unsaved, then the sqlite row. Reached from
