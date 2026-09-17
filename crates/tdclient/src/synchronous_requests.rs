@@ -495,11 +495,19 @@ mod tests {
     /// entities, escapes, pre/code narrowing, blockquotes and expandable
     /// blockquotes, tg://user/tg://emoji/tg://time links, CRLF handling,
     /// UTF-16 offsets and the 400 error paths). The M.8.8 Markdown v3
-    /// battery is the last 97 entries: parseMarkdown with and without
+    /// battery is the next 97 entries: parseMarkdown with and without
     /// pre-existing entities, getMarkdownText over every entity type the
     /// v3 formatter handles plus the kept-entity and return-original
     /// paths, the 400 error paths and parse→format→parse round-trip
-    /// pairs. Corpus responses store the oracle output decoded: tdlib's
+    /// pairs. The M.8.9 HTML battery is the last 612 entries:
+    /// parseTextEntities in textParseModeHTML mode over the C++ unit-test
+    /// battery (every tag alias, the attribute subset, entity decoding,
+    /// pre/code merging, tg-emoji/tg-time/blockquote forms, UTF-16
+    /// offsets and the 400 error paths), a malformed-HTML fuzz seed set
+    /// (truncated tags, stray brackets, numeric-entity overflow, attribute
+    /// edge cases, case folding) and byte-prefix truncations of six
+    /// representative inputs. Corpus responses store the oracle output
+    /// decoded: tdlib's
     /// JSON layer escapes non-ASCII as \uXXXX (astral chars as surrogate
     /// pairs) while the Rust layer emits raw UTF-8, so non-ASCII was
     /// normalized to characters at recording time (control-char escapes
@@ -536,7 +544,7 @@ mod tests {
             );
             checked += 1;
         }
-        assert_eq!(checked, 510, "the corpus shrank");
+        assert_eq!(checked, 1122, "the corpus shrank");
     }
 
     #[test]
