@@ -10657,6 +10657,41 @@ impl ChatManager {
         promise.set_value(());
     }
 
+    /// `delete_chat` (ChatManager.cpp:4021-4032) — the DeleteChatQuery
+    /// send is [blocked: net] (M.5.46); local state mutation happens in
+    /// the query's on_ok.
+    pub fn delete_chat(&mut self, env: &mut UserEnv, chat_id: ChatId, mut promise: Promise<()>) {
+        let Some(c) = self.get_chat(chat_id) else {
+            return promise.set_error(Status::error(400, "Chat info not found"));
+        };
+        if !Self::get_chat_permissions_record(c).is_creator() {
+            return promise.set_error(Status::error(400, "Not enough rights to delete the chat"));
+        }
+        if !c.is_active {
+            return promise.set_error(Status::error(400, "Chat is already deactivated"));
+        }
+        tdutils::log_info!("DeleteChatQuery for {chat_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `delete_channel` (ChatManager.cpp:4036-4045) — the DeleteChannelQuery
+    /// send is [blocked: net] (M.5.46).
+    pub fn delete_channel(
+        &mut self,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        mut promise: Promise<()>,
+    ) {
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Chat info not found"));
+        };
+        if !c.can_be_deleted {
+            return promise.set_error(Status::error(400, "The chat can't be deleted"));
+        }
+        tdutils::log_info!("DeleteChannelQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
     /// `ChatManager::save_chat` (ChatManager.cpp:4467-4484): the binlog
     /// mirror (`ChatLogEvent`, `HandlerType::Chats`) add/rewrite while the
     /// record is unsaved, then the sqlite row. Reached from
