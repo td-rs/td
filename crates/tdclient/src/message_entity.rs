@@ -14,10 +14,11 @@
 //! Offset/length units are UTF-16 code units everywhere (the C++ uses
 //! `td::utf16_length` etc.); helpers live in `tdutils::utf8`.
 
+use crate::chat_manager::{ChannelId, ChatId};
 use crate::emoji_status::CustomEmojiId;
 use crate::formatted_date::FormattedDate;
 use crate::td_api;
-use crate::user_manager::UserId;
+use crate::user_manager::{SecretChatId, UserId};
 use tdutils::status::Status;
 
 /// The `const UserManager *user_manager` parameter of the C++ converters.
@@ -39,6 +40,33 @@ pub trait UserManagerLike {
     /// `UserManager::get_input_user_force` — the C++ CHECKs
     /// `user_manager != nullptr` before this call.
     fn get_input_user_force(&mut self, user_id: UserId) -> tdmtproto::telegram_api::InputUser;
+
+    /// `UserManager::is_user_bot` — the `need_always_skip_bot_commands`
+    /// probe; `()` knows no users, so nothing is a bot.
+    fn is_user_bot(&self, _user_id: UserId) -> bool {
+        false
+    }
+
+    /// `UserManager::get_secret_chat_user_id` — `()` knows no secret chats.
+    fn get_secret_chat_user_id(&self, _secret_chat_id: SecretChatId) -> UserId {
+        UserId::default()
+    }
+
+    /// `UserManager::get_secret_chat_layer` — `()` knows no secret chats.
+    fn get_secret_chat_layer(&self, _secret_chat_id: SecretChatId) -> i32 {
+        0
+    }
+
+    /// `UserManager::get_replies_bot_user_id` — production value; the
+    /// test-dc value is selected by the real manager implementation.
+    fn get_replies_bot_user_id() -> UserId {
+        UserId::new(1271266957)
+    }
+
+    /// `UserManager::get_verification_codes_bot_user_id`.
+    fn get_verification_codes_bot_user_id() -> UserId {
+        UserId::new(489000)
+    }
 }
 
 /// The C++ `user_manager == nullptr` case: raw ids, no validation, no
@@ -58,6 +86,26 @@ impl UserManagerLike for () {
 
     fn get_input_user_force(&mut self, _user_id: UserId) -> tdmtproto::telegram_api::InputUser {
         unreachable!("the C++ CHECK(user_manager != nullptr) fired")
+    }
+}
+
+/// Minimal `DialogId` (DialogId.h) — the full port lands with the dialog
+/// machinery; this carries only the identity the entity rules consume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DialogId {
+    User(UserId),
+    SecretChat(SecretChatId),
+    Chat(ChatId),
+    Channel(ChannelId),
+    None,
+}
+
+impl DialogId {
+    /// `DialogId::is_valid` — `None` models an invalid id; the inner-id
+    /// validity checks land with the full DialogId port (every branch the
+    /// entity rules take agrees with the C++ either way).
+    pub fn is_valid(self) -> bool {
+        !matches!(self, DialogId::None)
     }
 }
 
@@ -887,11 +935,11 @@ pub fn get_message_entities<U: UserManagerLike + ?Sized>(
 }
 
 // ---------------------------------------------------------------------------
-// telegram_api input converter (MessageEntity.cpp:3853-3990)
+// telegram_api input converter (MessageEntity.cpp:3804-3953)
 // ---------------------------------------------------------------------------
 
 /// `get_message_entities` over server `telegram_api` input
-/// (MessageEntity.cpp:3853-3990).
+/// (MessageEntity.cpp:3804-3953).
 pub fn get_server_message_entities<U: UserManagerLike + ?Sized>(
     mut user_manager: Option<&mut U>,
     server_entities: Vec<tdmtproto::telegram_api::MessageEntity>,
@@ -1085,17 +1133,18 @@ pub fn get_server_message_entities<U: UserManagerLike + ?Sized>(
 }
 
 // ---------------------------------------------------------------------------
-// secret_api input converter (MessageEntity.cpp:3992-4094)
+// secret_api input converter (MessageEntity.cpp:3955-4087)
 // ---------------------------------------------------------------------------
 
-/// The sticker-cache dependency of the secret converter:
-/// `td->stickers_manager_->is_premium_custom_emoji(custom_emoji_id, false)`.
-/// `None` models a cold cache (unknown emoji → not premium → kept), the
-/// state a real cache starts in.
-pub type IsPremiumCustomEmoji<'a> = Option<&'a mut dyn FnMut(CustomEmojiId) -> bool>;
+/// The sticker-cache dependency of the secret converter and the quote
+/// rules: `td->stickers_manager_->is_premium_custom_emoji(custom_emoji_id,
+/// default_result)` (StickersManager.cpp:2065-2074). `None` models a cold
+/// cache (unknown emoji → the C++ `default_result`), the state a real
+/// cache starts in.
+pub type IsPremiumCustomEmoji<'a> = Option<&'a mut dyn FnMut(CustomEmojiId, bool) -> bool>;
 
 /// `get_message_entities` over `secret_api` input
-/// (MessageEntity.cpp:3992-4094). The custom-emoji preload
+/// (MessageEntity.cpp:3955-4087). The custom-emoji preload
 /// (`get_custom_emoji_stickers` + the multipromise fan-out) lands with the
 /// StickersManager step — the returned entities are identical, only the
 /// cache warming is parked.
@@ -1219,8 +1268,8 @@ pub fn get_secret_message_entities(
                 let custom_emoji_id = CustomEmojiId::new(entity.document_id);
                 let is_premium_emoji = !is_premium
                     && match is_premium_custom_emoji.as_mut() {
-                        Some(check) => check(custom_emoji_id),
-                        None => false, // cold cache: unknown → not premium
+                        Some(check) => check(custom_emoji_id, false),
+                        None => false, // cold cache: unknown → the C++ default_result
                     };
                 if !is_premium_emoji && custom_emoji_ids.len() < MAX_CUSTOM_EMOJI_ENTITIES {
                     entities.push(MessageEntity::custom_emoji(
@@ -1245,10 +1294,10 @@ pub fn get_secret_message_entities(
 }
 
 // ---------------------------------------------------------------------------
-// Quote entity rules (MessageEntity.cpp:4857-4897)
+// Quote entity rules (MessageEntity.cpp:4840-4910)
 // ---------------------------------------------------------------------------
 
-/// `is_allowed_quote_entity_type` (MessageEntity.cpp:4857-4872).
+/// `is_allowed_quote_entity_type` (MessageEntity.cpp:4840-4853).
 pub fn is_allowed_quote_entity_type(r#type: Type) -> bool {
     matches!(
         r#type,
@@ -1262,7 +1311,7 @@ pub fn is_allowed_quote_entity_type(r#type: Type) -> bool {
     )
 }
 
-/// `keep_only_custom_emoji` (MessageEntity.cpp:4874-4878): returns whether
+/// `keep_only_custom_emoji` (MessageEntity.cpp:4855-4858): returns whether
 /// anything was removed.
 pub fn keep_only_custom_emoji(text: &mut FormattedText) -> bool {
     let before = text.entities.len();
@@ -1271,12 +1320,99 @@ pub fn keep_only_custom_emoji(text: &mut FormattedText) -> bool {
     before != text.entities.len()
 }
 
-/// `remove_unallowed_quote_entities` (MessageEntity.cpp:4888-4890).
+/// `remove_unallowed_quote_entities` (MessageEntity.cpp:4901-4903).
 pub fn remove_unallowed_quote_entities(text: &mut FormattedText) -> bool {
     let before = text.entities.len();
     text.entities
         .retain(|entity| entity.r#type.is_some_and(is_allowed_quote_entity_type));
     before != text.entities.len()
+}
+
+/// `remove_unallowed_quote_user_entities` (MessageEntity.cpp:4905-4910).
+pub fn remove_unallowed_quote_user_entities(
+    text: &mut FormattedText,
+    skip_bot_commands: bool,
+    skip_media_timestamps: bool,
+) -> bool {
+    let before = text.entities.len();
+    text.entities.retain(|entity| {
+        entity.r#type.is_some_and(|r#type| {
+            is_allowed_quote_entity_type(r#type)
+                || is_found_entity_type(r#type, skip_bot_commands, skip_media_timestamps)
+        })
+    });
+    before != text.entities.len()
+}
+
+/// `remove_premium_custom_emoji_entities` (MessageEntity.cpp:4860-4865).
+pub fn remove_premium_custom_emoji_entities(
+    entities: &mut Vec<MessageEntity>,
+    remove_unknown: bool,
+    mut is_premium_custom_emoji: IsPremiumCustomEmoji<'_>,
+) {
+    entities.retain(|entity| {
+        if entity.r#type != Some(Type::CustomEmoji) {
+            return true;
+        }
+        match is_premium_custom_emoji.as_mut() {
+            Some(check) => !check(entity.custom_emoji_id, remove_unknown),
+            None => !remove_unknown, // cold cache: unknown emoji → the C++ default_result
+        }
+    });
+}
+
+/// `remove_unallowed_entities` (MessageEntity.cpp:4867-4899). The
+/// Td-owned capabilities are threaded explicitly: the secret-chat layer
+/// comes from the user manager, the premium check is the
+/// `IsPremiumCustomEmoji` closure (`is_premium_custom_emoji(id, true)`),
+/// and the dialog premium gate is the plain
+/// `can_use_premium_custom_emoji_in_dialog` bool.
+pub fn remove_unallowed_entities<U: UserManagerLike + ?Sized>(
+    text: &mut FormattedText,
+    dialog_id: DialogId,
+    user_manager: Option<&U>,
+    is_premium_custom_emoji: IsPremiumCustomEmoji<'_>,
+    can_use_premium_custom_emoji_in_dialog: bool,
+) {
+    if text.entities.is_empty() {
+        return;
+    }
+
+    if let DialogId::SecretChat(secret_chat_id) = dialog_id {
+        let layer = user_manager.map_or(0, |user_manager| {
+            user_manager.get_secret_chat_layer(secret_chat_id)
+        });
+        text.entities.retain(|entity| {
+            let Some(r#type) = entity.r#type else {
+                return false;
+            };
+            if layer < SECRET_CHAT_LAYER_NEW_ENTITIES
+                && matches!(
+                    r#type,
+                    Type::Underline
+                        | Type::Strikethrough
+                        | Type::BlockQuote
+                        | Type::ExpandableBlockQuote
+                )
+            {
+                return false;
+            }
+            if layer < SECRET_CHAT_LAYER_SPOILER_AND_CUSTOM_EMOJI_ENTITIES
+                && matches!(r#type, Type::Spoiler | Type::CustomEmoji)
+            {
+                return false;
+            }
+            r#type != Type::FormattedDate
+        });
+
+        if layer < SECRET_CHAT_LAYER_NEW_ENTITIES {
+            sort_entities(&mut text.entities);
+            remove_intersecting_entities(&mut text.entities);
+        }
+    }
+    if !can_use_premium_custom_emoji_in_dialog {
+        remove_premium_custom_emoji_entities(&mut text.entities, true, is_premium_custom_emoji);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4752,14 +4888,16 @@ fn remove_invalid_entities(text: &str, entities: &mut Vec<MessageEntity>) -> (us
 
     remove_empty_entities(entities);
 
-    for pos in 0..bytes.len() {
+    let mut pos = 0usize;
+    while pos < bytes.len() {
         let c = bytes[pos];
         match c {
             b'\n' | 32 => {}
             _ => {
-                let mut pos = pos;
                 // The C++ reads text[pos + 1] past the end (the NUL
-                // terminator, itself a first code unit — the loop exits).
+                // terminator, itself a first code unit — the loop exits)
+                // and advances the loop `pos` over the whole symbol; the
+                // continuation bytes must not be counted separately.
                 while pos + 1 < bytes.len()
                     && !tdutils::utf8::is_utf8_character_first_code_unit(bytes[pos + 1])
                 {
@@ -4772,6 +4910,7 @@ fn remove_invalid_entities(text: &str, entities: &mut Vec<MessageEntity>) -> (us
         }
 
         utf16_offset += 1;
+        pos += 1;
     }
     (last_non_whitespace_pos, last_non_whitespace_utf16_offset)
 }
@@ -5043,6 +5182,100 @@ pub fn get_formatted_text<U: UserManagerLike + ?Sized>(
     FormattedText { text, entities }
 }
 
+/// `get_formatted_text(user_manager, textWithEntities, skip_media_timestamps,
+/// skip_trim, source)` (MessageEntity.cpp:4112-4120).
+pub fn get_formatted_text_of_text_with_entities<U: UserManagerLike + ?Sized>(
+    user_manager: Option<&mut U>,
+    text_with_entities: Option<tdmtproto::telegram_api::TextWithEntities>,
+    skip_media_timestamps: bool,
+    skip_trim: bool,
+    source: &str,
+) -> FormattedText {
+    let Some(text_with_entities) = text_with_entities else {
+        return FormattedText::default();
+    };
+    get_formatted_text(
+        user_manager,
+        text_with_entities.text,
+        text_with_entities.entities,
+        skip_media_timestamps,
+        skip_trim,
+        source,
+    )
+}
+
+/// `get_formatted_text(td, dialog_id, td_api::formattedText, is_bot,
+/// allow_empty, skip_media_timestamps, skip_trim, ltrim_count)`
+/// (MessageEntity.cpp:4649-4678). The Td-owned inputs are threaded
+/// explicitly: the OptionManager flags (`always_parse_markdown` and
+/// `session_count`) and the `remove_unallowed_entities` capabilities.
+#[allow(clippy::too_many_arguments)]
+pub fn get_formatted_text_of_input<U: UserManagerLike + ?Sized>(
+    mut user_manager: Option<&mut U>,
+    dialog_id: DialogId,
+    text: Option<td_api::FormattedText>,
+    is_bot: bool,
+    allow_empty: bool,
+    skip_media_timestamps: bool,
+    skip_trim: bool,
+    ltrim_count: Option<&mut i32>,
+    always_parse_markdown: bool,
+    session_count: i32,
+    is_premium_custom_emoji: IsPremiumCustomEmoji<'_>,
+    can_use_premium_custom_emoji_in_dialog: bool,
+) -> Result<FormattedText, Status> {
+    let Some(mut text) = text else {
+        if allow_empty {
+            return Ok(FormattedText::default());
+        }
+        return Err(Status::error(400, "Text must be non-empty"));
+    };
+
+    let mut entities = get_message_entities(user_manager.as_deref_mut(), text.entities, true)?;
+    let need_skip_bot_commands =
+        need_always_skip_bot_commands(user_manager.as_deref(), dialog_id, is_bot);
+    let skip_new_entities = is_bot && session_count > 1;
+    fix_formatted_text(
+        &mut text.text,
+        &mut entities,
+        allow_empty,
+        allow_empty && is_bot,
+        skip_new_entities || always_parse_markdown,
+        skip_new_entities || need_skip_bot_commands,
+        is_bot || skip_media_timestamps || always_parse_markdown,
+        skip_trim,
+        ltrim_count,
+    )?;
+
+    let mut result = FormattedText {
+        text: text.text,
+        entities,
+    };
+    if always_parse_markdown {
+        result = parse_markdown_v3(result);
+        fix_formatted_text(
+            &mut result.text,
+            &mut result.entities,
+            allow_empty,
+            allow_empty && is_bot,
+            false,
+            need_skip_bot_commands,
+            is_bot || skip_media_timestamps,
+            skip_trim,
+            None,
+        )
+        .expect("the C++ .ensure()");
+    }
+    remove_unallowed_entities(
+        &mut result,
+        dialog_id,
+        user_manager.as_deref(),
+        is_premium_custom_emoji,
+        can_use_premium_custom_emoji_in_dialog,
+    );
+    Ok(result)
+}
+
 /// `get_input_text_with_entities` (MessageEntity.cpp:4089-4094).
 pub fn get_input_text_with_entities<U: UserManagerLike + ?Sized>(
     user_manager: Option<&mut U>,
@@ -5056,7 +5289,7 @@ pub fn get_input_text_with_entities<U: UserManagerLike + ?Sized>(
 }
 
 /// `get_input_message_entities(user_manager, entities, source)`
-/// (MessageEntity.cpp:4742-4850).
+/// (MessageEntity.cpp:4742-4829).
 pub fn get_input_message_entities<U: UserManagerLike + ?Sized>(
     mut user_manager: Option<&mut U>,
     entities: &[MessageEntity],
@@ -5231,7 +5464,7 @@ pub fn get_input_message_entities<U: UserManagerLike + ?Sized>(
 }
 
 /// `get_input_message_entities(user_manager, text, source)`
-/// (MessageEntity.cpp:4852-4858).
+/// (MessageEntity.cpp:4831-4838).
 pub fn get_input_message_entities_of_text<U: UserManagerLike + ?Sized>(
     user_manager: Option<&mut U>,
     text: Option<&FormattedText>,
@@ -5412,6 +5645,54 @@ pub fn has_bot_commands(text: Option<&FormattedText>) -> bool {
         }
     }
     false
+}
+
+/// `add_formatted_text_dependencies` (MessageEntity.cpp:4680-4687). The
+/// `Dependencies` type lands with the messages wave; the port threads its
+/// user-id `add` (which filters invalid ids, Dependencies.cpp:22-27) as a
+/// closure so the entity walk is complete now.
+pub fn add_formatted_text_dependencies(
+    dependencies: &mut dyn FnMut(UserId),
+    text: Option<&FormattedText>,
+) {
+    let Some(text) = text else {
+        return;
+    };
+    for entity in &text.entities {
+        if entity.user_id.is_valid() {
+            dependencies(entity.user_id);
+        }
+    }
+}
+
+/// `need_always_skip_bot_commands` (MessageEntity.cpp:4714-4740).
+pub fn need_always_skip_bot_commands<U: UserManagerLike + ?Sized>(
+    user_manager: Option<&U>,
+    dialog_id: DialogId,
+    is_bot: bool,
+) -> bool {
+    if !dialog_id.is_valid() {
+        return true;
+    }
+    if is_bot {
+        return false;
+    }
+
+    match dialog_id {
+        DialogId::User(user_id) => {
+            user_id == U::get_replies_bot_user_id()
+                || user_id == U::get_verification_codes_bot_user_id()
+                || user_manager.is_none_or(|user_manager| !user_manager.is_user_bot(user_id))
+        }
+        DialogId::SecretChat(secret_chat_id) => {
+            let user_id = user_manager.map_or(UserId::default(), |user_manager| {
+                user_manager.get_secret_chat_user_id(secret_chat_id)
+            });
+            !user_id.is_valid()
+                || user_manager.is_none_or(|user_manager| !user_manager.is_user_bot(user_id))
+        }
+        DialogId::Chat(_) | DialogId::Channel(_) | DialogId::None => false,
+    }
 }
 
 // ===== M.8.6 — Markdown v1 (MessageEntity.cpp:1929-2046) =====
@@ -8572,17 +8853,17 @@ mod tests {
         )];
         let entities = get_secret_message_entities(secret.clone(), true, None);
         assert_eq!(entities.len(), 1);
-        let mut checker = |id: CustomEmojiId| id.get() == 42;
+        let mut checker = |id: CustomEmojiId, _remove_unknown: bool| id.get() == 42;
         let entities = get_secret_message_entities(secret.clone(), false, Some(&mut checker));
         assert!(entities.is_empty());
-        let mut checker = |_: CustomEmojiId| false;
+        let mut checker = |_: CustomEmojiId, _remove_unknown: bool| false;
         let entities = get_secret_message_entities(secret, false, Some(&mut checker));
         assert_eq!(entities.len(), 1);
     }
 
     #[test]
     fn quote_entity_rules() {
-        // is_allowed_quote_entity_type (MessageEntity.cpp:4857-4872).
+        // is_allowed_quote_entity_type (MessageEntity.cpp:4840-4853).
         assert!(is_allowed_quote_entity_type(Type::Bold));
         assert!(is_allowed_quote_entity_type(Type::FormattedDate));
         assert!(!is_allowed_quote_entity_type(Type::Url));
@@ -8635,5 +8916,908 @@ mod tests {
                 "https://t.me/".to_owned()
             )]
         );
+    }
+
+    // ===== M.8.2 — input converters + fix_entities =====
+
+    /// td_api::FormattedText → FormattedText (`get_formatted_text_of_input`)
+    /// → td_api::FormattedText (`get_formatted_text_object`) round trip on
+    /// a corpus covering every td_api entity type. A user dialog on the
+    /// `()` manager skips bot-command discovery, so the corpus entity set
+    /// survives the merge with the finders.
+    #[test]
+    fn formatted_text_input_round_trip() {
+        fn td_entity(
+            offset: i32,
+            length: i32,
+            r#type: td_api::TextEntityType,
+        ) -> td_api::TextEntity {
+            td_api::TextEntity {
+                offset,
+                length,
+                r#type,
+            }
+        }
+        let bold = || td_api::TextEntityType::textEntityTypeBold(td_api::textEntityTypeBold {});
+        let italic =
+            || td_api::TextEntityType::textEntityTypeItalic(td_api::textEntityTypeItalic {});
+        let code = || td_api::TextEntityType::textEntityTypeCode(td_api::textEntityTypeCode {});
+
+        // (input, expected fixed FormattedText, expected td_api output when
+        // it differs from the input).
+        let cases: Vec<(
+            td_api::FormattedText,
+            FormattedText,
+            Option<td_api::FormattedText>,
+        )> = vec![
+            // Simple per-type cases: the old entity wins the merge.
+            (
+                td_api::FormattedText {
+                    text: "@abc".into(),
+                    entities: vec![td_entity(
+                        0,
+                        4,
+                        td_api::TextEntityType::textEntityTypeMention(
+                            td_api::textEntityTypeMention {},
+                        ),
+                    )],
+                },
+                FormattedText {
+                    text: "@abc".into(),
+                    entities: vec![entity(Type::Mention, 0, 4)],
+                },
+                None,
+            ),
+            (
+                td_api::FormattedText {
+                    text: "#tag".into(),
+                    entities: vec![td_entity(
+                        0,
+                        4,
+                        td_api::TextEntityType::textEntityTypeHashtag(
+                            td_api::textEntityTypeHashtag {},
+                        ),
+                    )],
+                },
+                FormattedText {
+                    text: "#tag".into(),
+                    entities: vec![entity(Type::Hashtag, 0, 4)],
+                },
+                None,
+            ),
+            (
+                td_api::FormattedText {
+                    text: "/cmd@bot".into(),
+                    entities: vec![td_entity(
+                        0,
+                        8,
+                        td_api::TextEntityType::textEntityTypeBotCommand(
+                            td_api::textEntityTypeBotCommand {},
+                        ),
+                    )],
+                },
+                FormattedText {
+                    text: "/cmd@bot".into(),
+                    entities: vec![entity(Type::BotCommand, 0, 8)],
+                },
+                None,
+            ),
+            (
+                td_api::FormattedText {
+                    text: "example.com".into(),
+                    entities: vec![td_entity(
+                        0,
+                        11,
+                        td_api::TextEntityType::textEntityTypeUrl(td_api::textEntityTypeUrl {}),
+                    )],
+                },
+                FormattedText {
+                    text: "example.com".into(),
+                    entities: vec![entity(Type::Url, 0, 11)],
+                },
+                None,
+            ),
+            (
+                td_api::FormattedText {
+                    text: "a@b.c".into(),
+                    entities: vec![td_entity(
+                        0,
+                        5,
+                        td_api::TextEntityType::textEntityTypeEmailAddress(
+                            td_api::textEntityTypeEmailAddress {},
+                        ),
+                    )],
+                },
+                FormattedText {
+                    text: "a@b.c".into(),
+                    entities: vec![entity(Type::EmailAddress, 0, 5)],
+                },
+                None,
+            ),
+            (
+                td_api::FormattedText {
+                    text: "$ABC".into(),
+                    entities: vec![td_entity(
+                        0,
+                        4,
+                        td_api::TextEntityType::textEntityTypeCashtag(
+                            td_api::textEntityTypeCashtag {},
+                        ),
+                    )],
+                },
+                FormattedText {
+                    text: "$ABC".into(),
+                    entities: vec![entity(Type::Cashtag, 0, 4)],
+                },
+                None,
+            ),
+            (
+                td_api::FormattedText {
+                    text: "+15555550100".into(),
+                    entities: vec![td_entity(
+                        0,
+                        12,
+                        td_api::TextEntityType::textEntityTypePhoneNumber(
+                            td_api::textEntityTypePhoneNumber {},
+                        ),
+                    )],
+                },
+                FormattedText {
+                    text: "+15555550100".into(),
+                    entities: vec![entity(Type::PhoneNumber, 0, 12)],
+                },
+                None,
+            ),
+            (
+                td_api::FormattedText {
+                    text: "4111111111111111".into(),
+                    entities: vec![td_entity(
+                        0,
+                        16,
+                        td_api::TextEntityType::textEntityTypeBankCardNumber(
+                            td_api::textEntityTypeBankCardNumber {},
+                        ),
+                    )],
+                },
+                FormattedText {
+                    text: "4111111111111111".into(),
+                    entities: vec![entity(Type::BankCardNumber, 0, 16)],
+                },
+                None,
+            ),
+            (
+                td_api::FormattedText {
+                    text: "abc".into(),
+                    entities: vec![td_entity(0, 3, bold())],
+                },
+                FormattedText {
+                    text: "abc".into(),
+                    entities: vec![entity(Type::Bold, 0, 3)],
+                },
+                None,
+            ),
+            (
+                td_api::FormattedText {
+                    text: "abc".into(),
+                    entities: vec![td_entity(0, 3, italic())],
+                },
+                FormattedText {
+                    text: "abc".into(),
+                    entities: vec![entity(Type::Italic, 0, 3)],
+                },
+                None,
+            ),
+            (
+                td_api::FormattedText {
+                    text: "abc".into(),
+                    entities: vec![td_entity(
+                        0,
+                        3,
+                        td_api::TextEntityType::textEntityTypeUnderline(
+                            td_api::textEntityTypeUnderline {},
+                        ),
+                    )],
+                },
+                FormattedText {
+                    text: "abc".into(),
+                    entities: vec![entity(Type::Underline, 0, 3)],
+                },
+                None,
+            ),
+            (
+                td_api::FormattedText {
+                    text: "abc".into(),
+                    entities: vec![td_entity(
+                        0,
+                        3,
+                        td_api::TextEntityType::textEntityTypeStrikethrough(
+                            td_api::textEntityTypeStrikethrough {},
+                        ),
+                    )],
+                },
+                FormattedText {
+                    text: "abc".into(),
+                    entities: vec![entity(Type::Strikethrough, 0, 3)],
+                },
+                None,
+            ),
+            (
+                td_api::FormattedText {
+                    text: "abc".into(),
+                    entities: vec![td_entity(
+                        0,
+                        3,
+                        td_api::TextEntityType::textEntityTypeSpoiler(
+                            td_api::textEntityTypeSpoiler {},
+                        ),
+                    )],
+                },
+                FormattedText {
+                    text: "abc".into(),
+                    entities: vec![entity(Type::Spoiler, 0, 3)],
+                },
+                None,
+            ),
+            (
+                td_api::FormattedText {
+                    text: "abc".into(),
+                    entities: vec![td_entity(
+                        0,
+                        3,
+                        td_api::TextEntityType::textEntityTypeBlockQuote(
+                            td_api::textEntityTypeBlockQuote {},
+                        ),
+                    )],
+                },
+                FormattedText {
+                    text: "abc".into(),
+                    entities: vec![entity(Type::BlockQuote, 0, 3)],
+                },
+                None,
+            ),
+            (
+                td_api::FormattedText {
+                    text: "abc".into(),
+                    entities: vec![td_entity(
+                        0,
+                        3,
+                        td_api::TextEntityType::textEntityTypeExpandableBlockQuote(
+                            td_api::textEntityTypeExpandableBlockQuote {},
+                        ),
+                    )],
+                },
+                FormattedText {
+                    text: "abc".into(),
+                    entities: vec![entity(Type::ExpandableBlockQuote, 0, 3)],
+                },
+                None,
+            ),
+            (
+                td_api::FormattedText {
+                    text: "abc".into(),
+                    entities: vec![td_entity(0, 3, code())],
+                },
+                FormattedText {
+                    text: "abc".into(),
+                    entities: vec![entity(Type::Code, 0, 3)],
+                },
+                None,
+            ),
+            (
+                td_api::FormattedText {
+                    text: "abc".into(),
+                    entities: vec![td_entity(
+                        0,
+                        3,
+                        td_api::TextEntityType::textEntityTypePre(td_api::textEntityTypePre {}),
+                    )],
+                },
+                FormattedText {
+                    text: "abc".into(),
+                    entities: vec![entity(Type::Pre, 0, 3)],
+                },
+                None,
+            ),
+            (
+                td_api::FormattedText {
+                    text: "abc".into(),
+                    entities: vec![td_entity(
+                        0,
+                        3,
+                        td_api::TextEntityType::textEntityTypePreCode(
+                            td_api::textEntityTypePreCode {
+                                language: "python".into(),
+                            },
+                        ),
+                    )],
+                },
+                FormattedText {
+                    text: "abc".into(),
+                    entities: vec![MessageEntity::with_argument(
+                        Type::PreCode,
+                        0,
+                        3,
+                        "python".to_owned(),
+                    )],
+                },
+                None,
+            ),
+            (
+                td_api::FormattedText {
+                    text: "abc".into(),
+                    entities: vec![td_entity(
+                        0,
+                        3,
+                        td_api::TextEntityType::textEntityTypeTextUrl(
+                            td_api::textEntityTypeTextUrl {
+                                url: "https://t.me/".into(),
+                            },
+                        ),
+                    )],
+                },
+                FormattedText {
+                    text: "abc".into(),
+                    entities: vec![MessageEntity::with_argument(
+                        Type::TextUrl,
+                        0,
+                        3,
+                        "https://t.me/".to_owned(),
+                    )],
+                },
+                None,
+            ),
+            (
+                td_api::FormattedText {
+                    text: "abc".into(),
+                    entities: vec![td_entity(
+                        0,
+                        3,
+                        td_api::TextEntityType::textEntityTypeMentionName(
+                            td_api::textEntityTypeMentionName { user_id: 777 },
+                        ),
+                    )],
+                },
+                FormattedText {
+                    text: "abc".into(),
+                    entities: vec![MessageEntity::mention_name(0, 3, UserId::new(777))],
+                },
+                None,
+            ),
+            (
+                td_api::FormattedText {
+                    text: "1:23".into(),
+                    entities: vec![td_entity(
+                        0,
+                        4,
+                        td_api::TextEntityType::textEntityTypeMediaTimestamp(
+                            td_api::textEntityTypeMediaTimestamp {
+                                media_timestamp: 83,
+                            },
+                        ),
+                    )],
+                },
+                FormattedText {
+                    text: "1:23".into(),
+                    entities: vec![MessageEntity::media_timestamp(0, 4, 83)],
+                },
+                None,
+            ),
+            (
+                td_api::FormattedText {
+                    text: "😀".into(),
+                    entities: vec![td_entity(
+                        0,
+                        2,
+                        td_api::TextEntityType::textEntityTypeCustomEmoji(
+                            td_api::textEntityTypeCustomEmoji { custom_emoji_id: 1 },
+                        ),
+                    )],
+                },
+                FormattedText {
+                    text: "😀".into(),
+                    entities: vec![MessageEntity::custom_emoji(0, 2, CustomEmojiId::new(1))],
+                },
+                None,
+            ),
+            (
+                td_api::FormattedText {
+                    text: "abc".into(),
+                    entities: vec![td_entity(
+                        0,
+                        3,
+                        td_api::TextEntityType::textEntityTypeDateTime(
+                            td_api::textEntityTypeDateTime {
+                                unix_time: 1_000_000_000,
+                                formatting_type:
+                                    td_api::DateTimeFormattingType::dateTimeFormattingTypeRelative(
+                                        td_api::dateTimeFormattingTypeRelative {},
+                                    ),
+                            },
+                        ),
+                    )],
+                },
+                FormattedText {
+                    text: "abc".into(),
+                    entities: vec![MessageEntity::formatted_date(
+                        0,
+                        3,
+                        FormattedDate::from_raw(1_000_000_000, date_flags::RELATIVE),
+                    )],
+                },
+                None,
+            ),
+            // Overlapping splittable entities are resplit by fix_entities:
+            // the common range is split per type into non-overlapping
+            // Bold/Italic runs.
+            (
+                td_api::FormattedText {
+                    text: "abcdefghi".into(),
+                    entities: vec![td_entity(0, 5, bold()), td_entity(3, 6, italic())],
+                },
+                FormattedText {
+                    text: "abcdefghi".into(),
+                    entities: vec![
+                        entity(Type::Bold, 0, 3),
+                        entity(Type::Italic, 3, 6),
+                        entity(Type::Bold, 3, 2),
+                    ],
+                },
+                Some(td_api::FormattedText {
+                    text: "abcdefghi".into(),
+                    entities: vec![
+                        td_entity(0, 3, bold()),
+                        td_entity(3, 6, italic()),
+                        td_entity(3, 2, bold()),
+                    ],
+                }),
+            ),
+            // Intersecting continuous entities keep the first one.
+            (
+                td_api::FormattedText {
+                    text: "abcdefg".into(),
+                    entities: vec![
+                        td_entity(0, 4, code()),
+                        td_entity(
+                            2,
+                            5,
+                            td_api::TextEntityType::textEntityTypeTextUrl(
+                                td_api::textEntityTypeTextUrl {
+                                    url: "https://t.me/".into(),
+                                },
+                            ),
+                        ),
+                    ],
+                },
+                FormattedText {
+                    text: "abcdefg".into(),
+                    entities: vec![entity(Type::Code, 0, 4)],
+                },
+                Some(td_api::FormattedText {
+                    text: "abcdefg".into(),
+                    entities: vec![td_entity(0, 4, code())],
+                }),
+            ),
+            // A blockquote may contain other entities.
+            (
+                td_api::FormattedText {
+                    text: "abcde".into(),
+                    entities: vec![
+                        td_entity(
+                            0,
+                            5,
+                            td_api::TextEntityType::textEntityTypeBlockQuote(
+                                td_api::textEntityTypeBlockQuote {},
+                            ),
+                        ),
+                        td_entity(1, 3, bold()),
+                    ],
+                },
+                FormattedText {
+                    text: "abcde".into(),
+                    entities: vec![entity(Type::BlockQuote, 0, 5), entity(Type::Bold, 1, 3)],
+                },
+                None,
+            ),
+            // '\r' is removed and the entity shrinks with it.
+            (
+                td_api::FormattedText {
+                    text: "a\rb".into(),
+                    entities: vec![td_entity(0, 3, bold())],
+                },
+                FormattedText {
+                    text: "ab".into(),
+                    entities: vec![entity(Type::Bold, 0, 2)],
+                },
+                Some(td_api::FormattedText {
+                    text: "ab".into(),
+                    entities: vec![td_entity(0, 2, bold())],
+                }),
+            ),
+            // A user dialog skips bot-command discovery entirely.
+            (
+                td_api::FormattedText {
+                    text: "/cmd@bot".into(),
+                    entities: vec![],
+                },
+                FormattedText {
+                    text: "/cmd@bot".into(),
+                    entities: vec![],
+                },
+                None,
+            ),
+        ];
+        for (input, expected, expected_obj) in cases {
+            let out = get_formatted_text_of_input::<()>(
+                Some(&mut ()),
+                DialogId::User(UserId::new(123)),
+                Some(input.clone()),
+                false,
+                false,
+                false,
+                false,
+                None,
+                false,
+                0,
+                None,
+                true,
+            )
+            .unwrap();
+            assert_eq!(out, expected, "fixed FormattedText for {input:?}");
+            let obj = get_formatted_text_object(Some(&mut ()), &out, false, i32::MAX);
+            assert_eq!(
+                obj,
+                expected_obj.unwrap_or(input),
+                "td_api round trip for the case above"
+            );
+        }
+
+        // Trim + ltrim_count.
+        let mut ltrim_count = 0;
+        let trimmed = get_formatted_text_of_input::<()>(
+            Some(&mut ()),
+            DialogId::User(UserId::new(123)),
+            Some(td_api::FormattedText {
+                text: "  abc".into(),
+                entities: vec![td_entity(2, 3, bold())],
+            }),
+            false,
+            false,
+            false,
+            false,
+            Some(&mut ltrim_count),
+            false,
+            0,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(ltrim_count, 2);
+        assert_eq!(
+            trimmed,
+            FormattedText {
+                text: "abc".into(),
+                entities: vec![entity(Type::Bold, 0, 3)],
+            }
+        );
+
+        // Secret chat at layer 0 (`()` manager): underline, spoiler and
+        // formatted date are dropped; bold and code stay.
+        let secret_input = td_api::FormattedText {
+            text: "abcde".into(),
+            entities: vec![
+                td_entity(0, 1, bold()),
+                td_entity(
+                    1,
+                    1,
+                    td_api::TextEntityType::textEntityTypeUnderline(
+                        td_api::textEntityTypeUnderline {},
+                    ),
+                ),
+                td_entity(
+                    2,
+                    1,
+                    td_api::TextEntityType::textEntityTypeSpoiler(td_api::textEntityTypeSpoiler {}),
+                ),
+                td_entity(3, 1, code()),
+                td_entity(
+                    4,
+                    1,
+                    td_api::TextEntityType::textEntityTypeDateTime(
+                        td_api::textEntityTypeDateTime {
+                            unix_time: 1_000_000_000,
+                            formatting_type:
+                                td_api::DateTimeFormattingType::dateTimeFormattingTypeRelative(
+                                    td_api::dateTimeFormattingTypeRelative {},
+                                ),
+                        },
+                    ),
+                ),
+            ],
+        };
+        let secret_out = get_formatted_text_of_input::<()>(
+            Some(&mut ()),
+            DialogId::SecretChat(SecretChatId::new(1)),
+            Some(secret_input),
+            false,
+            false,
+            false,
+            false,
+            None,
+            false,
+            0,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            secret_out,
+            FormattedText {
+                text: "abcde".into(),
+                entities: vec![entity(Type::Bold, 0, 1), entity(Type::Code, 3, 1)],
+            }
+        );
+
+        // A dialog without premium custom emoji drops premium ones.
+        let premium_check: &mut dyn FnMut(CustomEmojiId, bool) -> bool =
+            &mut |custom_emoji_id, _remove_unknown| custom_emoji_id.get() == 1;
+        let premium_out = get_formatted_text_of_input::<()>(
+            Some(&mut ()),
+            DialogId::User(UserId::new(123)),
+            Some(td_api::FormattedText {
+                text: "a😀b".into(),
+                entities: vec![
+                    td_entity(0, 1, bold()),
+                    td_entity(
+                        1,
+                        2,
+                        td_api::TextEntityType::textEntityTypeCustomEmoji(
+                            td_api::textEntityTypeCustomEmoji { custom_emoji_id: 1 },
+                        ),
+                    ),
+                ],
+            }),
+            false,
+            false,
+            false,
+            false,
+            None,
+            false,
+            0,
+            Some(premium_check),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            premium_out,
+            FormattedText {
+                text: "a😀b".into(),
+                entities: vec![entity(Type::Bold, 0, 1)],
+            }
+        );
+
+        // always_parse_markdown runs parse_markdown_v3 and re-fixes.
+        let markdown_out = get_formatted_text_of_input::<()>(
+            Some(&mut ()),
+            DialogId::User(UserId::new(123)),
+            Some(td_api::FormattedText {
+                text: "**bold**".into(),
+                entities: vec![],
+            }),
+            false,
+            false,
+            false,
+            false,
+            None,
+            true,
+            0,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            markdown_out,
+            FormattedText {
+                text: "bold".into(),
+                entities: vec![entity(Type::Bold, 0, 4)],
+            }
+        );
+
+        // A null text is an error unless empty input is allowed.
+        assert_eq!(
+            get_formatted_text_of_input::<()>(
+                None,
+                DialogId::User(UserId::new(123)),
+                None,
+                false,
+                false,
+                false,
+                false,
+                None,
+                false,
+                0,
+                None,
+                true,
+            )
+            .unwrap_err()
+            .message(),
+            "Text must be non-empty"
+        );
+        assert_eq!(
+            get_formatted_text_of_input::<()>(
+                None,
+                DialogId::User(UserId::new(123)),
+                None,
+                false,
+                true,
+                false,
+                false,
+                None,
+                false,
+                0,
+                None,
+                true,
+            )
+            .unwrap(),
+            FormattedText::default()
+        );
+    }
+
+    /// `get_formatted_text(user_manager, textWithEntities, ...)`
+    /// (MessageEntity.cpp:4112-4120): the null wrapper and the delegation.
+    #[test]
+    fn formatted_text_of_text_with_entities_wrapper() {
+        assert_eq!(
+            get_formatted_text_of_text_with_entities::<()>(None, None, false, false, "test"),
+            FormattedText::default()
+        );
+        let out = get_formatted_text_of_text_with_entities::<()>(
+            None,
+            Some(tdmtproto::telegram_api::TextWithEntities {
+                text: "abc".into(),
+                entities: vec![],
+            }),
+            false,
+            false,
+            "test",
+        );
+        assert_eq!(
+            out,
+            FormattedText {
+                text: "abc".into(),
+                entities: vec![],
+            }
+        );
+    }
+
+    /// `need_always_skip_bot_commands` (MessageEntity.cpp:4714-4740) with
+    /// the `()` manager (no users, no secret chats, no bots).
+    #[test]
+    fn need_always_skip_bot_commands_rules() {
+        // An invalid dialog always skips; a bot sender never skips.
+        assert!(need_always_skip_bot_commands::<()>(
+            None,
+            DialogId::None,
+            false
+        ));
+        assert!(!need_always_skip_bot_commands::<()>(
+            None,
+            DialogId::User(UserId::new(1)),
+            true
+        ));
+        // The replies and verification-codes bots are always skipped.
+        assert!(need_always_skip_bot_commands::<()>(
+            None,
+            DialogId::User(UserId::new(1271266957)),
+            false
+        ));
+        assert!(need_always_skip_bot_commands::<()>(
+            None,
+            DialogId::User(UserId::new(489000)),
+            false
+        ));
+        // Unknown users are not bots → skipped.
+        assert!(need_always_skip_bot_commands::<()>(
+            None,
+            DialogId::User(UserId::new(123)),
+            false
+        ));
+        // Secret chats with the `()` manager resolve to an invalid user.
+        assert!(need_always_skip_bot_commands::<()>(
+            None,
+            DialogId::SecretChat(SecretChatId::new(1)),
+            false
+        ));
+        // Chats and channels never skip bot commands.
+        assert!(!need_always_skip_bot_commands::<()>(
+            None,
+            DialogId::Chat(ChatId::new(1)),
+            false
+        ));
+        assert!(!need_always_skip_bot_commands::<()>(
+            None,
+            DialogId::Channel(ChannelId::new(1)),
+            false
+        ));
+    }
+
+    /// `remove_unallowed_quote_user_entities` (MessageEntity.cpp:4905-4910):
+    /// found types survive, the rest are removed.
+    #[test]
+    fn quote_user_entity_rules() {
+        let mut text = FormattedText {
+            text: String::new(),
+            entities: vec![
+                entity(Type::Bold, 0, 1),
+                entity(Type::Url, 1, 1),
+                entity(Type::MediaTimestamp, 2, 1),
+                entity(Type::BotCommand, 3, 1),
+                entity(Type::Code, 4, 1),
+            ],
+        };
+        // With both skip flags cleared every entity except Code is allowed.
+        assert!(remove_unallowed_quote_user_entities(
+            &mut text, false, false
+        ));
+        assert_eq!(
+            text.entities.iter().map(|e| e.r#type).collect::<Vec<_>>(),
+            vec![
+                Some(Type::Bold),
+                Some(Type::Url),
+                Some(Type::MediaTimestamp),
+                Some(Type::BotCommand),
+            ]
+        );
+        // With both skip flags set the bot command and the media timestamp
+        // go too; Url is a found type regardless of the flags.
+        assert!(remove_unallowed_quote_user_entities(&mut text, true, true));
+        assert_eq!(
+            text.entities.iter().map(|e| e.r#type).collect::<Vec<_>>(),
+            vec![Some(Type::Bold), Some(Type::Url)]
+        );
+    }
+
+    /// `remove_premium_custom_emoji_entities` (MessageEntity.cpp:4860-4865)
+    /// and `add_formatted_text_dependencies`
+    /// (MessageEntity.cpp:4680-4687).
+    #[test]
+    fn premium_custom_emoji_and_dependencies() {
+        let mut entities = vec![
+            entity(Type::Bold, 0, 1),
+            MessageEntity::custom_emoji(1, 1, CustomEmojiId::new(9)),
+            MessageEntity::custom_emoji(2, 1, CustomEmojiId::new(10)),
+        ];
+        let check: &mut dyn FnMut(CustomEmojiId, bool) -> bool =
+            &mut |custom_emoji_id, _remove_unknown| custom_emoji_id.get() == 9;
+        remove_premium_custom_emoji_entities(&mut entities, true, Some(check));
+        assert_eq!(
+            entities,
+            vec![
+                entity(Type::Bold, 0, 1),
+                MessageEntity::custom_emoji(2, 1, CustomEmojiId::new(10)),
+            ]
+        );
+        // A cold cache with remove_unknown treats unknown emoji as premium.
+        let mut entities = vec![MessageEntity::custom_emoji(0, 1, CustomEmojiId::new(9))];
+        remove_premium_custom_emoji_entities(&mut entities, true, None);
+        assert!(entities.is_empty());
+        let mut entities = vec![MessageEntity::custom_emoji(0, 1, CustomEmojiId::new(9))];
+        remove_premium_custom_emoji_entities(&mut entities, false, None);
+        assert_eq!(entities.len(), 1);
+
+        // Only the MentionName user id is collected (Dependencies::add
+        // filters invalid ids).
+        let text = FormattedText {
+            text: String::new(),
+            entities: vec![
+                entity(Type::Bold, 0, 1),
+                MessageEntity::mention_name(1, 2, UserId::new(777)),
+            ],
+        };
+        let mut collected = Vec::new();
+        add_formatted_text_dependencies(&mut |user_id| collected.push(user_id), Some(&text));
+        assert_eq!(collected, vec![UserId::new(777)]);
+        let mut collected = Vec::new();
+        add_formatted_text_dependencies(&mut |user_id| collected.push(user_id), None);
+        assert!(collected.is_empty());
     }
 }

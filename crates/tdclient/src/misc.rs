@@ -174,9 +174,11 @@ fn is_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\r' | b'\n' | 0 | 0x0b)
 }
 
-/// `td::trim` (tdutils/misc.h:133) over the shared whitespace set.
+/// `td::trim` (tdutils/misc.h:133) over the shared whitespace set; the
+/// ASCII gate keeps the byte-based C++ semantics (`is_space` is defined on
+/// bytes only, so no multi-byte character can be trimmed).
 fn trim(s: &str) -> &str {
-    s.trim_matches(|c: char| is_space(c as u8))
+    s.trim_matches(|c: char| c.is_ascii() && is_space(c as u8))
 }
 
 /// `td::to_lower` (tdutils/misc.h:64-85) — ASCII-only.
@@ -255,7 +257,7 @@ pub fn clean_name(s: &str, max_length: usize) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out[..new_len])
-        .trim_matches(|c: char| is_space(c as u8))
+        .trim_matches(|c: char| c.is_ascii() && is_space(c as u8))
         .to_owned()
 }
 
