@@ -2409,27 +2409,27 @@ mod tests {
                 MessageContentType::Text,
             ),
             (
-                create_animation_message_content(FileId::new(1)),
+                create_animation_message_content(FileId::new(1, 0)),
                 MessageContentType::Animation,
             ),
             (
-                create_audio_message_content(FileId::new(2)),
+                create_audio_message_content(FileId::new(2, 0)),
                 MessageContentType::Audio,
             ),
             (
-                create_document_message_content(FileId::new(3)),
+                create_document_message_content(FileId::new(3, 0)),
                 MessageContentType::Document,
             ),
             (
-                create_photo_message_content(Photo::default(), FileId::new(4)),
+                create_photo_message_content(Photo::default(), FileId::new(4, 0)),
                 MessageContentType::Photo,
             ),
             (
-                create_video_message_content(FileId::new(5), Photo::default(), 0),
+                create_video_message_content(FileId::new(5, 0), Photo::default(), 0),
                 MessageContentType::Video,
             ),
             (
-                create_voice_note_message_content(FileId::new(6)),
+                create_voice_note_message_content(FileId::new(6, 0)),
                 MessageContentType::VoiceNote,
             ),
             (
@@ -2847,10 +2847,10 @@ mod tests {
     /// (MessageContent.cpp:4653-4704).
     #[test]
     fn factories_build_the_cpp_defaults() {
-        let animation = create_animation_message_content(FileId::new(11));
+        let animation = create_animation_message_content(FileId::new(11, 0));
         match &animation {
             MessageContent::Animation(content) => {
-                assert_eq!(content.file_id, FileId::new(11));
+                assert_eq!(content.file_id, FileId::new(11, 0));
                 assert!(content.caption.text.is_empty());
                 assert!(!content.has_spoiler);
             }
@@ -2860,10 +2860,10 @@ mod tests {
             ),
         }
 
-        let video = create_video_message_content(FileId::new(12), Photo::default(), 30);
+        let video = create_video_message_content(FileId::new(12, 0), Photo::default(), 30);
         match &video {
             MessageContent::Video(content) => {
-                assert_eq!(content.file_id, FileId::new(12));
+                assert_eq!(content.file_id, FileId::new(12, 0));
                 assert!(content.alternative_file_ids.is_empty());
                 assert!(content.hls_file_ids.is_empty());
                 assert!(content.storyboard_file_ids.is_empty());
@@ -2875,11 +2875,11 @@ mod tests {
             _ => panic!("create_video_message_content built {:?}", video.get_type()),
         }
 
-        let photo = create_photo_message_content(Photo::default(), FileId::new(13));
+        let photo = create_photo_message_content(Photo::default(), FileId::new(13, 0));
         match &photo {
             MessageContent::Photo(content) => {
                 assert!(content.photo.is_empty());
-                assert_eq!(content.video_file_id, FileId::new(13));
+                assert_eq!(content.video_file_id, FileId::new(13, 0));
                 assert!(!content.has_spoiler);
             }
             _ => panic!("create_photo_message_content built {:?}", photo.get_type()),
@@ -2961,7 +2961,7 @@ mod tests {
 
         poll.attached_media = Some(Box::new(create_photo_message_content(
             Photo::default(),
-            FileId::new(1),
+            FileId::new(1, 0),
         )));
         match &poll.attached_media {
             Some(boxed) => assert_eq!(boxed.get_type(), MessageContentType::Photo),
