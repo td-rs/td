@@ -1,18 +1,22 @@
 //! Port of `td/telegram/SynchronousRequests.{h,cpp}` + the td_api half of
 //! `td/telegram/JsonValue.cpp` (S68): the `td_execute` offline request set.
 //!
-//! The log- and JSON-related functions are complete here. The text-parse,
-//! language-pack, phone-number and push-id functions are listed in the C++
-//! switch but land with their managers (Wave 1/3); until then they report
+//! The log- and JSON-related functions are complete here, and the M.8
+//! MessageEntity slice flips the five text-parse functions
+//! (`getTextEntities`, `parseTextEntities`, `parseMarkdown`,
+//! `getMarkdownText` — the C++ `parseHtml` is the `parseTextEntities`
+//! HTML parse mode). The language-pack, phone-number and push-id functions
+//! still land with their managers (Wave 1/3); until then they report
 //! "The method can't be executed synchronously", like any other request.
 
 use std::sync::Mutex;
 
+use crate::message_entity;
 use crate::option_manager;
 use crate::td_api;
 use crate::td_api::{Function, JsonValue as TdJsonValue, Object};
 use tdutils::json::{JsonValue, json_decode};
-use tdutils::status::Result;
+use tdutils::status::{Result, Status};
 
 /// `SynchronousRequests::make_error`.
 pub fn make_error(code: i32, message: &str) -> Object {
@@ -69,7 +73,11 @@ fn tag_verbosity() -> &'static Mutex<Vec<i32>> {
 pub fn is_synchronous_request(function: &Function) -> bool {
     matches!(
         function,
-        Function::getJsonValue(_)
+        Function::getTextEntities(_)
+            | Function::parseTextEntities(_)
+            | Function::parseMarkdown(_)
+            | Function::getMarkdownText(_)
+            | Function::getJsonValue(_)
             | Function::getJsonString(_)
             | Function::setLogStream(_)
             | Function::getLogStream(_)
@@ -81,8 +89,7 @@ pub fn is_synchronous_request(function: &Function) -> bool {
             | Function::addLogMessage(_)
             | Function::testReturnError(_)
     ) || matches!(function, Function::getOption(g) if option_manager::is_synchronous_option(&g.name))
-    // Not ported yet (need their managers): searchQuote, getTextEntities,
-    // parseTextEntities, parseMarkdown, getMarkdownText, searchStringsByPrefix,
+    // Not ported yet (need their managers): searchQuote, searchStringsByPrefix,
     // checkQuickReplyShortcutName, getCountryFlagEmoji, getFileMimeType,
     // getFileExtension, cleanFileName, getLanguagePackString,
     // getPhoneNumberInfoSync, getChatFolderDefaultIconName,
@@ -220,6 +227,139 @@ pub fn run_request(function: Function) -> Object {
             Object::ok(td_api::Ok)
         }
         Function::testReturnError(request) => Object::error(request.error),
+        Function::getTextEntities(request) => {
+            if !tdutils::utf8::check_utf8(request.text.as_bytes()) {
+                return make_error(400, "Text must be encoded in UTF-8");
+            }
+            let text_entities = message_entity::find_entities(&request.text, false, false);
+            Object::textEntities(td_api::TextEntities {
+                entities: message_entity::get_text_entities_object::<()>(
+                    None,
+                    &text_entities,
+                    false,
+                    i32::MAX,
+                ),
+            })
+        }
+        Function::parseTextEntities(request) => {
+            // must not use clean_input_string, because \r may be used as a separator
+            if !tdutils::utf8::check_utf8(request.text.as_bytes()) {
+                return make_error(400, "Text must be encoded in UTF-8");
+            }
+
+            let parse_mode_version = match &request.parse_mode {
+                td_api::TextParseMode::textParseModeHTML(_) => None,
+                td_api::TextParseMode::textParseModeMarkdown(markdown) => Some(markdown.version),
+            };
+            let mut text = request.text;
+            let r_entities: std::result::Result<Vec<message_entity::MessageEntity>, Status> = {
+                if tdutils::utf8::utf8_length(&text) > 65536 {
+                    Err(Status::error_message("Text is too long"))
+                } else {
+                    match parse_mode_version {
+                        None => message_entity::parse_html(&mut text),
+                        Some(version) if version == 0 || version == 1 => {
+                            message_entity::parse_markdown(&mut text)
+                        }
+                        Some(2) => message_entity::parse_markdown_v2(&mut text),
+                        Some(_) => Err(Status::error_message("Wrong Markdown version specified")),
+                    }
+                }
+            };
+            let entities = match r_entities {
+                std::result::Result::Ok(entities) => entities,
+                std::result::Result::Err(status) => {
+                    return make_error(400, &format!("Can't parse entities: {}", status.message()));
+                }
+            };
+
+            Object::formattedText(td_api::FormattedText {
+                text,
+                entities: message_entity::get_text_entities_object::<()>(
+                    None, &entities, false, -1,
+                ),
+            })
+        }
+        Function::parseMarkdown(request) => {
+            let mut text = request.text.text;
+            let entities =
+                match message_entity::get_message_entities::<()>(None, request.text.entities, true)
+                {
+                    std::result::Result::Ok(entities) => entities,
+                    std::result::Result::Err(status) => return make_error(400, status.message()),
+                };
+            let mut entities = entities;
+            let status = message_entity::fix_formatted_text(
+                &mut text,
+                &mut entities,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                None,
+            );
+            if let std::result::Result::Err(status) = status {
+                return make_error(400, status.message());
+            }
+
+            let mut parsed_text =
+                message_entity::parse_markdown_v3(message_entity::FormattedText { text, entities });
+            message_entity::fix_formatted_text(
+                &mut parsed_text.text,
+                &mut parsed_text.entities,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                None,
+            )
+            .expect("the C++ .ensure()");
+            Object::formattedText(message_entity::get_formatted_text_object::<()>(
+                None,
+                &parsed_text,
+                false,
+                i32::MAX,
+            ))
+        }
+        Function::getMarkdownText(request) => {
+            let mut text = request.text.text;
+            let entities = match message_entity::get_message_entities::<()>(
+                None,
+                request.text.entities,
+                false,
+            ) {
+                std::result::Result::Ok(entities) => entities,
+                std::result::Result::Err(status) => return make_error(400, status.message()),
+            };
+            let mut entities = entities;
+            let status = message_entity::fix_formatted_text(
+                &mut text,
+                &mut entities,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                None,
+            );
+            if let std::result::Result::Err(status) = status {
+                return make_error(400, status.message());
+            }
+
+            let markdown_text =
+                message_entity::get_markdown_v3(message_entity::FormattedText { text, entities });
+            Object::formattedText(message_entity::get_formatted_text_object::<()>(
+                None,
+                &markdown_text,
+                false,
+                i32::MAX,
+            ))
+        }
         _ => make_error(400, "The method can't be executed synchronously"),
     }
 }
@@ -331,6 +471,52 @@ mod tests {
             response.to_json(),
             r#"{"@type":"optionValueString","value":"1.8.67"}"#
         );
+    }
+
+    /// The M.8 differential gate: the recorded C++ `td_execute` outputs
+    /// (tdlib at the pinned upstream commit d1085f9ce, the local
+    /// TD_BUILD/libtdjson.so 1.8.67 build) replayed through the ported
+    /// `td_execute` path must produce byte-identical JSON. The corpus
+    /// covers URL/mention/hashtag/cashtag/bank-card/timestamp matchers,
+    /// Markdown v1/v2/v3 and HTML parsing, and their error paths.
+    ///
+    /// One entry is hand-corrected against the local C++ source: the
+    /// TD_BUILD oracle corrupts the Markdown v1 bare-bracket URL branch
+    /// (probe: "[t.me]" answers `"http://.mee/"` — no C++ source version
+    /// ever did that; the v1 parser has built the URL from the bracket
+    /// content verbatim since v1.0.0, MessageEntity.cpp:2005-2021), so
+    /// golden[205] expects the source-true `TextUrl` instead of the
+    /// corrupted empty-entities answer (version-drift rule: the local
+    /// tree wins).
+    #[test]
+    fn message_entity_requests_match_the_cpp_oracle() {
+        use tdutils::json::{JsonValue, json_decode};
+
+        let golden = include_str!("testdata/message_entity_cpp_golden.jsonl");
+        let mut checked = 0usize;
+        for line in golden.lines() {
+            let record = match json_decode(line) {
+                Result::Ok(value) => value,
+                Result::Err(status) => panic!("bad golden line: {}", status.message()),
+            };
+            let JsonValue::Object(record_object) = &record else {
+                panic!("the golden line is not an object")
+            };
+            let JsonValue::String(request) =
+                record_object.get_field("request").expect("request field")
+            else {
+                panic!("the golden request is not a string")
+            };
+            let JsonValue::String(expected_response) =
+                record_object.get_field("response").expect("response field")
+            else {
+                panic!("the golden response is not a string")
+            };
+            let actual = crate::client_json::execute(request);
+            assert_eq!(actual, *expected_response, "diverged on request: {request}");
+            checked += 1;
+        }
+        assert_eq!(checked, 234, "the corpus shrank");
     }
 
     #[test]
