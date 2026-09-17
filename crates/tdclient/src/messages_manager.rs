@@ -22,10 +22,12 @@
 //!   via `log_error!`.
 
 use crate::chat_manager::{ChannelId, ChatId};
-use crate::store_parse::{Parser, store_i32, store_i64};
+use crate::message_entity::FormattedText;
+use crate::store_parse::{Parser, store_flags, store_i32, store_i64, store_string};
 use crate::td_api;
 use crate::user_manager::{SecretChatId, UserId};
 use tdmtproto::telegram_api;
+use tdutils::hash::{combine_hashes, hash_int64, hash_uint32};
 use tdutils::log_error;
 use tdutils::status::Status;
 
@@ -1849,8 +1851,1119 @@ pub struct EphemeralMessageInfo {
     pub monotonic_id: u32,
 }
 
+// ---------------------------------------------------------------------------
+// M.10.1b — the companion value plane of the Message/Dialog structs
+// (StoryId.{h}, StoryFullId.h, DialogFilterId.h, FolderId.h, DialogListId.h,
+// MessageOrigin.h, FactCheck.h, ReactionType.h, ChatReactions.h, MinChannel.h,
+// MessageReplyInfo.h, NotificationSoundType.h, NotificationSound.h,
+// DialogNotificationSettings.h, DialogActionBar.h, BusinessBotManageBar.h).
+//
+// The inline C++ store/parse bodies are ported byte-exactly; formats that
+// live in the .cpp files land with the slices that consume them (the
+// wire/td_api conversions likewise). Documented stand-ins:
+// - `SuggestedPost`/`SuggestedPostPrice` are NOT defined here — batch 2
+//   re-points `SuggestedPost.price` at the M.9-line `message_content.rs`
+//   `SuggestedPostPrice` (which arrives with the M.9.1 merge); a local copy
+//   here would be a duplicate definition the merge would have to reconcile.
+// - `MinChannel` drops `DialogPhoto`/`AccentColorId` (they live on the
+//   unmerged m54 line; the fields arrive at that integration).
+// - `MessageReactions` is an opaque placeholder until the Wave-2
+//   ReactionManager slice.
+// ---------------------------------------------------------------------------
+
+/// `td::StoryId` (StoryId.h) — a per-dialog story identifier.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct StoryId(i32);
+
+impl StoryId {
+    /// `StoryId::MAX_SERVER_STORY_ID` (StoryId.h:22).
+    pub const MAX_SERVER_STORY_ID: i32 = 1_999_999_999;
+
+    pub fn new(story_id: i32) -> StoryId {
+        StoryId(story_id)
+    }
+
+    /// `StoryId::get_input_story_ids` (StoryId.h:31-38).
+    pub fn get_input_story_ids(story_ids: &[StoryId]) -> Vec<i32> {
+        story_ids.iter().map(|story_id| story_id.get()).collect()
+    }
+
+    /// `StoryId::get_story_ids` (StoryId.h:40-47).
+    pub fn get_story_ids(input_story_ids: &[i32]) -> Vec<StoryId> {
+        input_story_ids
+            .iter()
+            .map(|&input_story_id| StoryId(input_story_id))
+            .collect()
+    }
+
+    pub fn get(self) -> i32 {
+        self.0
+    }
+
+    /// `StoryId::is_valid` (StoryId.h:61-63).
+    pub fn is_valid(self) -> bool {
+        self.0 > 0
+    }
+
+    /// `StoryId::is_server` (StoryId.h:65-67).
+    pub fn is_server(self) -> bool {
+        self.0 > 0 && self.0 <= Self::MAX_SERVER_STORY_ID
+    }
+
+    /// `StoryId::store` (StoryId.h:69-72).
+    pub fn store(self, out: &mut Vec<u8>) {
+        store_i32(out, self.0);
+    }
+
+    /// `StoryId::parse` (StoryId.h:74-77).
+    pub fn parse_value(input: &[u8]) -> Result<StoryId, &'static str> {
+        let mut parser = Parser::new(input);
+        let id = parser.i32_()?;
+        parser.fetch_end()?;
+        Ok(StoryId(id))
+    }
+}
+
+impl std::fmt::Display for StoryId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "story {}", self.0)
+    }
+}
+
+/// `td::StoryFullId` (StoryFullId.h) — a story together with its owner dialog.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StoryFullId {
+    pub dialog_id: DialogId,
+    pub story_id: StoryId,
+}
+
+impl StoryFullId {
+    pub fn new(dialog_id: DialogId, story_id: StoryId) -> StoryFullId {
+        StoryFullId {
+            dialog_id,
+            story_id,
+        }
+    }
+
+    pub fn get_dialog_id(self) -> DialogId {
+        self.dialog_id
+    }
+
+    pub fn get_story_id(self) -> StoryId {
+        self.story_id
+    }
+
+    /// `StoryFullId::is_valid` (StoryFullId.h:46-48).
+    pub fn is_valid(self) -> bool {
+        self.dialog_id.is_valid() && self.story_id.is_valid()
+    }
+
+    /// `StoryFullId::is_server` (StoryFullId.h:50-52).
+    pub fn is_server(self) -> bool {
+        self.dialog_id.is_valid() && self.story_id.is_server()
+    }
+
+    /// `StoryFullId::store` (StoryFullId.h:54-58).
+    pub fn store(self, out: &mut Vec<u8>) {
+        self.dialog_id.store(out);
+        self.story_id.store(out);
+    }
+
+    /// `StoryFullId::parse` (StoryFullId.h:60-64).
+    pub fn parse_value(input: &[u8]) -> Result<StoryFullId, &'static str> {
+        let mut parser = Parser::new(input);
+        let dialog_id = parser.i64_()?;
+        let story_id = parser.i32_()?;
+        parser.fetch_end()?;
+        Ok(StoryFullId::new(DialogId(dialog_id), StoryId(story_id)))
+    }
+}
+
+/// `td::StoryFullIdHash` (StoryFullId.h:67-71) — `combine_hashes` over the
+/// C++ `DialogIdHash`/`StoryIdHash`, not a derived hash.
+impl std::hash::Hash for StoryFullId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u32(combine_hashes(
+            hash_int64(self.dialog_id.get()),
+            hash_uint32(self.story_id.get() as u32),
+        ));
+    }
+}
+
+impl std::fmt::Display for StoryFullId {
+    /// `operator<<(StringBuilder&, StoryFullId)` (StoryFullId.h:73-75).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} in {}", self.story_id, self.dialog_id)
+    }
+}
+
+/// `td::DialogFilterId` (DialogFilterId.h) — a chat-folder filter identifier.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DialogFilterId(i32);
+
+impl DialogFilterId {
+    /// `DialogFilterId::min` (DialogFilterId.h:30-32).
+    pub const MIN_FILTER_ID: i32 = 2;
+    /// `DialogFilterId::max` (DialogFilterId.h:33-35).
+    pub const MAX_FILTER_ID: i32 = 255;
+
+    pub const fn new(dialog_filter_id: i32) -> DialogFilterId {
+        DialogFilterId(dialog_filter_id)
+    }
+
+    /// `DialogFilterId::get_dialog_filter_ids` (DialogFilterId.h:37-44).
+    pub fn get_dialog_filter_ids(chat_folder_ids: &[i32]) -> Vec<DialogFilterId> {
+        chat_folder_ids
+            .iter()
+            .map(|&chat_folder_id| DialogFilterId(chat_folder_id))
+            .collect()
+    }
+
+    /// `DialogFilterId::is_valid` (DialogFilterId.h:46-49) — the `max()` bound
+    /// is deliberately not checked.
+    pub fn is_valid(self) -> bool {
+        self.0 >= Self::MIN_FILTER_ID
+    }
+
+    pub fn get(self) -> i32 {
+        self.0
+    }
+
+    /// `DialogFilterId::store` (DialogFilterId.h:67-70).
+    pub fn store(self, out: &mut Vec<u8>) {
+        store_i32(out, self.0);
+    }
+
+    /// `DialogFilterId::parse` (DialogFilterId.h:72-75).
+    pub fn parse_value(input: &[u8]) -> Result<DialogFilterId, &'static str> {
+        let mut parser = Parser::new(input);
+        let id = parser.i32_()?;
+        parser.fetch_end()?;
+        Ok(DialogFilterId(id))
+    }
+}
+
+impl std::fmt::Display for DialogFilterId {
+    /// (DialogFilterId.h:84-86) — C++ prints "folder", not "filter".
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "folder {}", self.0)
+    }
+}
+
+/// `td::FolderId` (FolderId.h) — the archive/main dialog folder; the only
+/// valid non-main folder is 1.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FolderId(i32);
+
+impl FolderId {
+    pub fn new(folder_id: i32) -> FolderId {
+        FolderId(if folder_id != 1 { 0 } else { folder_id })
+    }
+
+    /// `FolderId::main` (FolderId.h:56-58).
+    pub fn main() -> FolderId {
+        FolderId(0)
+    }
+
+    /// `FolderId::archive` (FolderId.h:59-61).
+    pub fn archive() -> FolderId {
+        FolderId(1)
+    }
+
+    pub fn get(self) -> i32 {
+        self.0
+    }
+
+    /// `FolderId::store` (FolderId.h:43-46).
+    pub fn store(self, out: &mut Vec<u8>) {
+        store_i32(out, self.0);
+    }
+
+    /// `FolderId::parse` (FolderId.h:48-54) — the clamp is re-applied on read.
+    pub fn parse_value(input: &[u8]) -> Result<FolderId, &'static str> {
+        let mut parser = Parser::new(input);
+        let id = parser.i32_()?;
+        parser.fetch_end()?;
+        Ok(FolderId::new(id))
+    }
+}
+
+impl std::fmt::Display for FolderId {
+    /// (FolderId.h:70-72).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "folder {}", self.0)
+    }
+}
+
+/// `td::DialogListId` (DialogListId.h) — a FolderId or a DialogFilterId
+/// packed into one i64; filters live above the `FILTER_ID_SHIFT` offset.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DialogListId(i64);
+
+impl DialogListId {
+    /// `DialogListId::FILTER_ID_SHIFT` (DialogListId.h:25).
+    pub const FILTER_ID_SHIFT: i64 = 1i64 << 32;
+
+    /// `DialogListId(DialogFilterId)` (DialogListId.h:35-36).
+    pub fn from_filter(dialog_filter_id: DialogFilterId) -> DialogListId {
+        DialogListId(dialog_filter_id.get() as i64 + Self::FILTER_ID_SHIFT)
+    }
+
+    /// `DialogListId(FolderId)` (DialogListId.h:38-39).
+    pub fn from_folder(folder_id: FolderId) -> DialogListId {
+        DialogListId(folder_id.get() as i64)
+    }
+
+    pub fn get(self) -> i64 {
+        self.0
+    }
+
+    /// `DialogListId::is_folder` (DialogListId.h:60-62).
+    pub fn is_folder(self) -> bool {
+        (i32::MIN as i64) <= self.0 && self.0 <= (i32::MAX as i64)
+    }
+
+    /// `DialogListId::is_filter` (DialogListId.h:64-67).
+    pub fn is_filter(self) -> bool {
+        (i32::MIN as i64 + Self::FILTER_ID_SHIFT) <= self.0
+            && self.0 <= (i32::MAX as i64 + Self::FILTER_ID_SHIFT)
+    }
+
+    /// `DialogListId::get_folder_id` (DialogListId.h:69-72).
+    pub fn get_folder_id(self) -> FolderId {
+        assert!(self.is_folder());
+        FolderId::new(self.0 as i32)
+    }
+
+    /// `DialogListId::get_filter_id` (DialogListId.h:74-77).
+    pub fn get_filter_id(self) -> DialogFilterId {
+        assert!(self.is_filter());
+        DialogFilterId((self.0 - Self::FILTER_ID_SHIFT) as i32)
+    }
+}
+
+/// `td::DialogListIdHash` (DialogListId.h:80-84).
+impl std::hash::Hash for DialogListId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u32(hash_int64(self.0));
+    }
+}
+
+/// `td::MessageOrigin` (MessageOrigin.h) — where a forwarded/replied message
+/// originally comes from; the wire/td_api conversions live with the
+/// receive-path slices.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MessageOrigin {
+    pub sender_user_id: UserId,
+    pub sender_dialog_id: DialogId,
+    pub message_id: MessageId,
+    pub author_signature: String,
+    pub sender_name: String,
+}
+
+impl MessageOrigin {
+    pub fn new(
+        sender_user_id: UserId,
+        sender_dialog_id: DialogId,
+        message_id: MessageId,
+        author_signature: String,
+        sender_name: String,
+    ) -> MessageOrigin {
+        MessageOrigin {
+            sender_user_id,
+            sender_dialog_id,
+            message_id,
+            author_signature,
+            sender_name,
+        }
+    }
+
+    /// `MessageOrigin::is_empty` (MessageOrigin.h:49-52).
+    pub fn is_empty(&self) -> bool {
+        !self.sender_user_id.is_valid()
+            && !self.sender_dialog_id.is_valid()
+            && !self.message_id.is_valid()
+            && self.author_signature.is_empty()
+            && self.sender_name.is_empty()
+    }
+
+    /// `MessageOrigin::is_channel_post` (MessageOrigin.h:64-66).
+    pub fn is_channel_post(&self) -> bool {
+        self.message_id.is_valid()
+    }
+
+    /// `MessageOrigin::has_sender_signature` (MessageOrigin.h:68-70).
+    pub fn has_sender_signature(&self) -> bool {
+        !self.author_signature.is_empty() || !self.sender_name.is_empty()
+    }
+
+    /// `MessageOrigin::get_sender_name` (MessageOrigin.h:60-62).
+    pub fn get_sender_name(&self) -> &str {
+        &self.sender_name
+    }
+}
+
+/// `td::FactCheck` (FactCheck.h) — the fact-check block attached to a message.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FactCheck {
+    pub country_code: String,
+    pub text: FormattedText,
+    pub hash: i64,
+    pub need_check: bool,
+}
+
+impl FactCheck {
+    /// `FactCheck::is_empty` (FactCheck.h:41-43).
+    pub fn is_empty(&self) -> bool {
+        self.hash == 0
+    }
+
+    /// `FactCheck::need_check` (FactCheck.h:45-47).
+    pub fn need_check(&self) -> bool {
+        self.need_check
+    }
+}
+
+/// `td::ReactionType` (ReactionType.h) — an emoji reaction, a custom emoji
+/// reaction (the internal string starts with `'#'`) or the paid reaction
+/// (`"$"`). The wire/td_api conversions and the `Hash<string>`-parity hash
+/// land with the Wave-2 reactions slice.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ReactionType(String);
+
+impl ReactionType {
+    /// `ReactionType::ReactionType(string &&)` (ReactionType.cpp:36-38).
+    pub fn new(reaction: impl Into<String>) -> ReactionType {
+        ReactionType(reaction.into())
+    }
+
+    /// `ReactionType::is_empty` (ReactionType.h:68-70).
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// `ReactionType::get_string` (ReactionType.h:72-74).
+    pub fn get_string(&self) -> &str {
+        &self.0
+    }
+
+    /// `ReactionType::is_custom_reaction` (ReactionType.cpp:171-173).
+    pub fn is_custom_reaction(&self) -> bool {
+        self.0.starts_with('#')
+    }
+
+    /// `ReactionType::is_paid_reaction` (ReactionType.cpp:175-177).
+    pub fn is_paid_reaction(&self) -> bool {
+        self.0 == "$"
+    }
+}
+
+impl std::fmt::Display for ReactionType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// `td::ChatReactions` (ChatReactions.h) — the per-dialog available-reactions
+/// set.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChatReactions {
+    pub reaction_types: Vec<ReactionType>,
+    /// implies empty `reaction_types`
+    pub allow_all_regular: bool,
+    /// implies `allow_all_regular`
+    pub allow_all_custom: bool,
+    pub reactions_limit: i32,
+    pub paid_reactions_available: bool,
+}
+
+impl ChatReactions {
+    /// `ChatReactions::legacy` (ChatReactions.h:30-34).
+    pub fn legacy(reaction_types: Vec<ReactionType>) -> ChatReactions {
+        ChatReactions {
+            reaction_types,
+            ..ChatReactions::default()
+        }
+    }
+
+    /// `ChatReactions(bool, bool)` (ChatReactions.h:41-43).
+    pub fn from_all_flags(allow_all_regular: bool, allow_all_custom: bool) -> ChatReactions {
+        ChatReactions {
+            allow_all_regular,
+            allow_all_custom,
+            ..ChatReactions::default()
+        }
+    }
+
+    /// `ChatReactions::empty` (ChatReactions.h:56-58).
+    pub fn empty(&self) -> bool {
+        self.reaction_types.is_empty() && !self.allow_all_regular && !self.paid_reactions_available
+    }
+}
+
+/// `td::MinChannel` (MinChannel.h) — STAND-IN: `DialogPhoto` and
+/// `AccentColorId` live on the unmerged m54 line and arrive with that
+/// integration; the `photo`/`accent_color_id` fields are deferred with them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MinChannel {
+    pub title: String,
+    pub is_megagroup: bool,
+}
+
+/// `td::MessageReplyInfo` (MessageReplyInfo.h) — the comment-thread reply
+/// info attached to channel posts; the update/need_reget logic lands with the
+/// receive-path slices.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageReplyInfo {
+    pub reply_count: i32,
+    pub pts: i32,
+    /// comments only
+    pub recent_replier_dialog_ids: Vec<DialogId>,
+    /// comments only
+    pub replier_min_channels: Vec<(ChannelId, MinChannel)>,
+    /// comments only
+    pub channel_id: ChannelId,
+    pub max_message_id: MessageId,
+    pub last_read_inbox_message_id: MessageId,
+    pub last_read_outbox_message_id: MessageId,
+    pub is_comment: bool,
+    pub is_dropped: bool,
+}
+
+impl Default for MessageReplyInfo {
+    /// The C++ in-class defaults (MessageReplyInfo.h:26-34): the counters
+    /// start at -1 ("unknown"), not 0.
+    fn default() -> MessageReplyInfo {
+        MessageReplyInfo {
+            reply_count: -1,
+            pts: -1,
+            recent_replier_dialog_ids: Vec::new(),
+            replier_min_channels: Vec::new(),
+            channel_id: ChannelId::default(),
+            max_message_id: MessageId::default(),
+            last_read_inbox_message_id: MessageId::default(),
+            last_read_outbox_message_id: MessageId::default(),
+            is_comment: false,
+            is_dropped: false,
+        }
+    }
+}
+
+impl MessageReplyInfo {
+    /// `MessageReplyInfo::MAX_RECENT_REPLIERS` (MessageReplyInfo.h:37).
+    pub const MAX_RECENT_REPLIERS: usize = 3;
+
+    /// `MessageReplyInfo::is_empty` (MessageReplyInfo.h:43-45).
+    pub fn is_empty(&self) -> bool {
+        self.reply_count < 0
+    }
+
+    /// `MessageReplyInfo::was_dropped` (MessageReplyInfo.h:47-49).
+    pub fn was_dropped(&self) -> bool {
+        self.is_dropped
+    }
+}
+
+/// `td::NotificationSoundType` (NotificationSoundType.h:13).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(i32)]
+pub enum NotificationSoundType {
+    #[default]
+    None = 0,
+    Local = 1,
+    Ringtone = 2,
+}
+
+/// `td::NotificationSound` (NotificationSound.h) — the virtual-base class
+/// hierarchy (NotificationSound.cpp:14-44: None/Local/Ringtone) flattened
+/// into an enum; the store/parse format lands with the notification-settings
+/// slice.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum NotificationSound {
+    /// `NotificationSoundNone`
+    #[default]
+    None,
+    /// `NotificationSoundLocal`
+    Local(String),
+    /// `NotificationSoundRingtone` — a ringtone document id
+    Ringtone(i64),
+}
+
+impl NotificationSound {
+    /// The `NotificationSound::get_type` overloads of the three subclasses.
+    pub fn get_type(&self) -> NotificationSoundType {
+        match self {
+            NotificationSound::None => NotificationSoundType::None,
+            NotificationSound::Local(_) => NotificationSoundType::Local,
+            NotificationSound::Ringtone(_) => NotificationSoundType::Ringtone,
+        }
+    }
+}
+
+/// `td::DialogNotificationSettings` (DialogNotificationSettings.h) — the
+/// per-dialog notification settings with the C++ in-class defaults; the
+/// wire/td_api conversions land with M.10.13/M.10.14.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DialogNotificationSettings {
+    pub mute_until: i32,
+    pub sound: Option<NotificationSound>,
+    pub story_sound: Option<NotificationSound>,
+    pub show_preview: bool,
+    pub mute_stories: bool,
+    pub hide_story_sender: bool,
+    pub silent_send_message: bool,
+    pub use_default_mute_until: bool,
+    pub use_default_show_preview: bool,
+    pub use_default_mute_stories: bool,
+    pub use_default_hide_story_sender: bool,
+    pub is_synchronized: bool,
+    // local settings
+    pub use_default_disable_pinned_message_notifications: bool,
+    pub disable_pinned_message_notifications: bool,
+    pub use_default_disable_mention_notifications: bool,
+    pub disable_mention_notifications: bool,
+}
+
+impl Default for DialogNotificationSettings {
+    /// The C++ in-class defaults (DialogNotificationSettings.h:21-38).
+    fn default() -> DialogNotificationSettings {
+        DialogNotificationSettings {
+            mute_until: 0,
+            sound: None,
+            story_sound: None,
+            show_preview: true,
+            mute_stories: false,
+            hide_story_sender: false,
+            silent_send_message: false,
+            use_default_mute_until: true,
+            use_default_show_preview: true,
+            use_default_mute_stories: true,
+            use_default_hide_story_sender: true,
+            is_synchronized: false,
+            use_default_disable_pinned_message_notifications: true,
+            disable_pinned_message_notifications: false,
+            use_default_disable_mention_notifications: true,
+            disable_mention_notifications: false,
+        }
+    }
+}
+
+/// `td::DialogActionBar` (DialogActionBar.h) — the peer-report/join-request
+/// action bar; the wire conversions and the `.cpp` helpers
+/// (`create`/`fix`/`is_empty` and friends) land with the dialog-list slices.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DialogActionBar {
+    /// distance to the peer; -1 = unknown
+    pub distance: i32,
+    pub join_request_date: i32,
+    pub join_request_dialog_title: String,
+    pub registration_month: i32,
+    pub phone_country: i32,
+    pub last_name_change_date: i32,
+    pub last_photo_change_date: i32,
+    pub can_report_spam: bool,
+    pub can_add_contact: bool,
+    pub can_block_user: bool,
+    pub can_share_phone_number: bool,
+    pub can_report_location: bool,
+    pub can_unarchive: bool,
+    pub can_invite_members: bool,
+    pub is_join_request_broadcast: bool,
+}
+
+impl Default for DialogActionBar {
+    /// Mirrors the C++ field initializers (DialogActionBar.h:19-34): every
+    /// field zeroes out except `distance`, which starts at -1 ("unknown") —
+    /// a derived Default would make `store` treat it as a known distance.
+    fn default() -> DialogActionBar {
+        DialogActionBar {
+            distance: -1,
+            join_request_date: 0,
+            join_request_dialog_title: String::new(),
+            registration_month: 0,
+            phone_country: 0,
+            last_name_change_date: 0,
+            last_photo_change_date: 0,
+            can_report_spam: false,
+            can_add_contact: false,
+            can_block_user: false,
+            can_share_phone_number: false,
+            can_report_location: false,
+            can_unarchive: false,
+            can_invite_members: false,
+            is_join_request_broadcast: false,
+        }
+    }
+}
+
+impl DialogActionBar {
+    pub fn can_report_spam(&self) -> bool {
+        self.can_report_spam
+    }
+
+    pub fn can_unarchive(&self) -> bool {
+        self.can_unarchive
+    }
+
+    /// `DialogActionBar::store` (DialogActionBar.h:80-122) — 14 flag words
+    /// (C++ `BEGIN_STORE_FLAGS` order preserved) plus the conditional fields.
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_distance = self.distance >= 0;
+        let has_join_request = !self.join_request_dialog_title.is_empty();
+        let has_registration_month = self.registration_month > 0;
+        let has_phone_country = self.phone_country > 0;
+        let has_last_name_change_date = self.last_name_change_date > 0;
+        let has_last_photo_change_date = self.last_photo_change_date > 0;
+        store_flags(
+            out,
+            [
+                self.can_report_spam,
+                self.can_add_contact,
+                self.can_block_user,
+                self.can_share_phone_number,
+                self.can_report_location,
+                self.can_unarchive,
+                self.can_invite_members,
+                has_distance,
+                self.is_join_request_broadcast,
+                has_join_request,
+                has_registration_month,
+                has_phone_country,
+                has_last_name_change_date,
+                has_last_photo_change_date,
+            ],
+        );
+        if has_distance {
+            store_i32(out, self.distance);
+        }
+        if has_join_request {
+            store_string(out, &self.join_request_dialog_title);
+            store_i32(out, self.join_request_date);
+        }
+        if has_registration_month {
+            store_i32(out, self.registration_month);
+        }
+        if has_phone_country {
+            store_i32(out, self.phone_country);
+        }
+        if has_last_name_change_date {
+            store_i32(out, self.last_name_change_date);
+        }
+        if has_last_photo_change_date {
+            store_i32(out, self.last_photo_change_date);
+        }
+    }
+
+    /// `DialogActionBar::parse` (DialogActionBar.h:124-167).
+    pub fn parse_value(input: &[u8]) -> Result<DialogActionBar, &'static str> {
+        let mut parser = Parser::new(input);
+        let mut result = DialogActionBar::default();
+        let [
+            can_report_spam,
+            can_add_contact,
+            can_block_user,
+            can_share_phone_number,
+            can_report_location,
+            can_unarchive,
+            can_invite_members,
+            has_distance,
+            is_join_request_broadcast,
+            has_join_request,
+            has_registration_month,
+            has_phone_country,
+            has_last_name_change_date,
+            has_last_photo_change_date,
+        ] = parser.parse_flags::<14>()?;
+        result.can_report_spam = can_report_spam;
+        result.can_add_contact = can_add_contact;
+        result.can_block_user = can_block_user;
+        result.can_share_phone_number = can_share_phone_number;
+        result.can_report_location = can_report_location;
+        result.can_unarchive = can_unarchive;
+        result.can_invite_members = can_invite_members;
+        result.is_join_request_broadcast = is_join_request_broadcast;
+        if has_distance {
+            result.distance = parser.i32_()?;
+        }
+        if has_join_request {
+            result.join_request_dialog_title = parser.string()?;
+            result.join_request_date = parser.i32_()?;
+        }
+        if has_registration_month {
+            result.registration_month = parser.i32_()?;
+        }
+        if has_phone_country {
+            result.phone_country = parser.i32_()?;
+        }
+        if has_last_name_change_date {
+            result.last_name_change_date = parser.i32_()?;
+        }
+        if has_last_photo_change_date {
+            result.last_photo_change_date = parser.i32_()?;
+        }
+        parser.fetch_end()?;
+        Ok(result)
+    }
+}
+
+/// `td::BusinessBotManageBar` (BusinessBotManageBar.h) — the business-bot
+/// manage bar shown in private dialogs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BusinessBotManageBar {
+    pub business_bot_user_id: UserId,
+    pub business_bot_manage_url: String,
+    pub is_business_bot_paused: bool,
+    pub can_business_bot_reply: bool,
+}
+
+impl BusinessBotManageBar {
+    /// `BusinessBotManageBar::store` (BusinessBotManageBar.h:46-61).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_business_bot_user_id = self.business_bot_user_id.is_valid();
+        let has_business_bot_manage_url = !self.business_bot_manage_url.is_empty();
+        store_flags(
+            out,
+            [
+                self.is_business_bot_paused,
+                self.can_business_bot_reply,
+                has_business_bot_user_id,
+                has_business_bot_manage_url,
+            ],
+        );
+        if has_business_bot_user_id {
+            // C++ `td::store(UserId)` = `storer.store_long(id)` (UserId.h:53-55);
+            // the legacy Support64BitIds version gate rides the enclosing
+            // Message/Dialog parse (M.10.2 blob layer).
+            store_i64(out, self.business_bot_user_id.get());
+        }
+        if has_business_bot_manage_url {
+            store_string(out, &self.business_bot_manage_url);
+        }
+    }
+
+    /// `BusinessBotManageBar::parse` (BusinessBotManageBar.h:63-79).
+    pub fn parse_value(input: &[u8]) -> Result<BusinessBotManageBar, &'static str> {
+        let mut parser = Parser::new(input);
+        let mut result = BusinessBotManageBar::default();
+        let [
+            is_business_bot_paused,
+            can_business_bot_reply,
+            has_business_bot_user_id,
+            has_business_bot_manage_url,
+        ] = parser.parse_flags::<4>()?;
+        result.is_business_bot_paused = is_business_bot_paused;
+        result.can_business_bot_reply = can_business_bot_reply;
+        if has_business_bot_user_id {
+            let user_id = parser.i64_()?;
+            result.business_bot_user_id = UserId::new(user_id);
+        }
+        if has_business_bot_manage_url {
+            result.business_bot_manage_url = parser.string()?;
+        }
+        parser.fetch_end()?;
+        Ok(result)
+    }
+}
+
+/// `td::MessageReactions` — STAND-IN: the full struct is owned by the Wave-2
+/// ReactionManager slice; until then the `Message`/`Dialog` fields only need
+/// an opaque owned value (MessagesManager.h:127 forward-declares it).
+#[derive(Clone, Debug, Default)]
+pub struct MessageReactions {
+    // ported with the Wave-2 reactions slice
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn story_ids_semantics_and_roundtrip() {
+        assert!(!StoryId::new(0).is_valid());
+        assert!(StoryId::new(1).is_valid());
+        assert!(StoryId::new(StoryId::MAX_SERVER_STORY_ID).is_server());
+        assert!(!StoryId::new(StoryId::MAX_SERVER_STORY_ID + 1).is_server());
+
+        let mut bytes = Vec::new();
+        StoryId::new(7).store(&mut bytes);
+        assert_eq!(StoryId::parse_value(&bytes).unwrap().get(), 7);
+
+        assert_eq!(
+            StoryId::get_story_ids(&StoryId::get_input_story_ids(&[
+                StoryId::new(3),
+                StoryId::new(9)
+            ])),
+            vec![StoryId::new(3), StoryId::new(9)]
+        );
+    }
+
+    #[test]
+    fn story_full_id_semantics_and_roundtrip() {
+        let dialog_id = DialogId::from_user_id(UserId::new(123));
+        assert!(!StoryFullId::default().is_valid());
+        let full_id = StoryFullId::new(dialog_id, StoryId::new(5));
+        assert!(full_id.is_valid());
+        assert!(full_id.is_server());
+        assert_eq!(full_id.get_dialog_id(), dialog_id);
+        assert_eq!(full_id.get_story_id(), StoryId::new(5));
+
+        let mut bytes = Vec::new();
+        full_id.store(&mut bytes);
+        assert_eq!(StoryFullId::parse_value(&bytes).unwrap(), full_id);
+
+        // the hash is the C++ combine_hashes(DialogIdHash, StoryIdHash) form
+        let hash_of = |id: StoryFullId| {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            std::hash::Hash::hash(&id, &mut hasher);
+            std::hash::Hasher::finish(&hasher)
+        };
+        assert_eq!(
+            hash_of(full_id),
+            hash_of(StoryFullId::new(dialog_id, StoryId::new(5)))
+        );
+    }
+
+    #[test]
+    fn folder_id_clamps_to_main_and_archive() {
+        assert_eq!(FolderId::new(0), FolderId::main());
+        assert_eq!(FolderId::new(1), FolderId::archive());
+        assert_eq!(FolderId::new(2), FolderId::main());
+        assert_eq!(FolderId::new(-1), FolderId::main());
+
+        let mut bytes = Vec::new();
+        FolderId::archive().store(&mut bytes);
+        assert_eq!(FolderId::parse_value(&bytes).unwrap(), FolderId::archive());
+
+        // parse re-applies the clamp for out-of-band values
+        let mut bad = Vec::new();
+        store_i32(&mut bad, 7);
+        assert_eq!(FolderId::parse_value(&bad).unwrap(), FolderId::main());
+    }
+
+    #[test]
+    fn dialog_list_id_packs_folders_and_filters() {
+        assert!(DialogListId::from_folder(FolderId::archive()).is_folder());
+        assert_eq!(
+            DialogListId::from_folder(FolderId::archive()).get_folder_id(),
+            FolderId::archive()
+        );
+        assert!(!DialogListId::from_folder(FolderId::main()).is_filter());
+
+        let filter_id = DialogFilterId::new(42);
+        let list_id = DialogListId::from_filter(filter_id);
+        assert!(list_id.is_filter());
+        assert!(!list_id.is_folder());
+        assert_eq!(list_id.get_filter_id(), filter_id);
+        assert_eq!(DialogListId::FILTER_ID_SHIFT, 1i64 << 32);
+    }
+
+    #[test]
+    fn dialog_filter_id_bounds() {
+        assert!(!DialogFilterId::new(1).is_valid());
+        assert!(DialogFilterId::new(DialogFilterId::MIN_FILTER_ID).is_valid());
+        assert!(DialogFilterId::new(DialogFilterId::MAX_FILTER_ID).is_valid());
+
+        let mut bytes = Vec::new();
+        DialogFilterId::new(9).store(&mut bytes);
+        assert_eq!(
+            DialogFilterId::parse_value(&bytes).unwrap(),
+            DialogFilterId::new(9)
+        );
+    }
+
+    #[test]
+    fn message_origin_inline_semantics() {
+        assert!(MessageOrigin::default().is_empty());
+        assert!(!MessageOrigin::default().is_channel_post());
+        assert!(!MessageOrigin::default().has_sender_signature());
+
+        let hidden = MessageOrigin::new(
+            UserId::default(),
+            DialogId::default(),
+            MessageId::default(),
+            String::new(),
+            "Anonymous".to_string(),
+        );
+        assert!(!hidden.is_empty());
+        assert!(hidden.has_sender_signature());
+        assert_eq!(hidden.get_sender_name(), "Anonymous");
+
+        let channel_post = MessageOrigin::new(
+            UserId::default(),
+            DialogId::default(),
+            MessageId::from_server_message_id(ServerMessageId::new(11)),
+            String::new(),
+            String::new(),
+        );
+        assert!(channel_post.is_channel_post());
+        assert!(!channel_post.has_sender_signature());
+    }
+
+    #[test]
+    fn fact_check_semantics() {
+        assert!(FactCheck::default().is_empty());
+        assert!(
+            !FactCheck {
+                hash: 1,
+                need_check: true,
+                ..FactCheck::default()
+            }
+            .is_empty()
+        );
+        assert!(
+            FactCheck {
+                hash: 1,
+                need_check: true,
+                ..FactCheck::default()
+            }
+            .need_check()
+        );
+    }
+
+    #[test]
+    fn reaction_type_predicates() {
+        assert!(ReactionType::default().is_empty());
+        let emoji = ReactionType::new("👍");
+        assert!(!emoji.is_empty());
+        assert!(!emoji.is_custom_reaction());
+        assert!(!emoji.is_paid_reaction());
+        assert!(ReactionType::new("#12345").is_custom_reaction());
+        assert!(ReactionType::new("$").is_paid_reaction());
+    }
+
+    #[test]
+    fn chat_reactions_empty_rule() {
+        assert!(ChatReactions::default().empty());
+        assert!(!ChatReactions::legacy(vec![ReactionType::new("👍")]).empty());
+        assert!(!ChatReactions::from_all_flags(true, false).empty());
+        assert!(
+            !ChatReactions {
+                paid_reactions_available: true,
+                ..ChatReactions::default()
+            }
+            .empty()
+        );
+        // allow_all_custom alone (without allow_all_regular) still counts as
+        // empty by the C++ definition
+        assert!(ChatReactions::from_all_flags(false, true).empty());
+    }
+
+    #[test]
+    fn message_reply_info_defaults() {
+        let info = MessageReplyInfo::default();
+        assert!(info.is_empty());
+        assert!(!info.was_dropped());
+        assert_eq!(info.reply_count, -1);
+        assert_eq!(info.pts, -1);
+        assert_eq!(MessageReplyInfo::MAX_RECENT_REPLIERS, 3);
+
+        let dropped = MessageReplyInfo {
+            is_dropped: true,
+            reply_count: 0,
+            ..MessageReplyInfo::default()
+        };
+        assert!(!dropped.is_empty());
+        assert!(dropped.was_dropped());
+    }
+
+    #[test]
+    fn notification_sound_types() {
+        assert_eq!(
+            NotificationSound::default().get_type(),
+            NotificationSoundType::None
+        );
+        assert_eq!(
+            NotificationSound::Local("classic".to_string()).get_type(),
+            NotificationSoundType::Local
+        );
+        assert_eq!(
+            NotificationSound::Ringtone(77).get_type(),
+            NotificationSoundType::Ringtone
+        );
+    }
+
+    #[test]
+    fn dialog_notification_settings_defaults() {
+        let settings = DialogNotificationSettings::default();
+        assert_eq!(settings.mute_until, 0);
+        assert!(settings.sound.is_none());
+        assert!(settings.story_sound.is_none());
+        assert!(settings.show_preview);
+        assert!(!settings.mute_stories);
+        assert!(!settings.hide_story_sender);
+        assert!(!settings.silent_send_message);
+        assert!(settings.use_default_mute_until);
+        assert!(settings.use_default_show_preview);
+        assert!(settings.use_default_mute_stories);
+        assert!(settings.use_default_hide_story_sender);
+        assert!(!settings.is_synchronized);
+        assert!(settings.use_default_disable_pinned_message_notifications);
+        assert!(!settings.disable_pinned_message_notifications);
+        assert!(settings.use_default_disable_mention_notifications);
+        assert!(!settings.disable_mention_notifications);
+    }
+
+    #[test]
+    fn dialog_action_bar_roundtrip() {
+        let empty = DialogActionBar::default();
+        let mut bytes = Vec::new();
+        empty.store(&mut bytes);
+        assert_eq!(DialogActionBar::parse_value(&bytes).unwrap(), empty);
+        // the -1 distance default survives the roundtrip
+        assert_eq!(DialogActionBar::parse_value(&bytes).unwrap().distance, -1);
+
+        let full = DialogActionBar {
+            distance: 42,
+            join_request_date: 1700000000,
+            join_request_dialog_title: "chat".to_string(),
+            registration_month: 202401,
+            phone_country: 972,
+            last_name_change_date: 1700000001,
+            last_photo_change_date: 1700000002,
+            can_report_spam: true,
+            can_add_contact: true,
+            can_block_user: true,
+            can_share_phone_number: true,
+            can_report_location: true,
+            can_unarchive: true,
+            can_invite_members: true,
+            is_join_request_broadcast: true,
+        };
+        bytes.clear();
+        full.store(&mut bytes);
+        assert_eq!(DialogActionBar::parse_value(&bytes).unwrap(), full);
+        assert!(full.can_report_spam());
+        assert!(full.can_unarchive());
+    }
+
+    #[test]
+    fn business_bot_manage_bar_roundtrip() {
+        let empty = BusinessBotManageBar::default();
+        let mut bytes = Vec::new();
+        empty.store(&mut bytes);
+        assert_eq!(BusinessBotManageBar::parse_value(&bytes).unwrap(), empty);
+
+        let full = BusinessBotManageBar {
+            business_bot_user_id: UserId::new(12345),
+            business_bot_manage_url: "https://t.me".to_string(),
+            is_business_bot_paused: true,
+            can_business_bot_reply: true,
+        };
+        bytes.clear();
+        full.store(&mut bytes);
+        assert_eq!(BusinessBotManageBar::parse_value(&bytes).unwrap(), full);
+
+        // flags-only form: invalid user id and empty url are both dropped
+        let flags_only = BusinessBotManageBar {
+            is_business_bot_paused: true,
+            ..BusinessBotManageBar::default()
+        };
+        bytes.clear();
+        flags_only.store(&mut bytes);
+        let parsed = BusinessBotManageBar::parse_value(&bytes).unwrap();
+        assert!(parsed.is_business_bot_paused);
+        assert!(!parsed.business_bot_user_id.is_valid());
+        assert!(parsed.business_bot_manage_url.is_empty());
+    }
+
     use super::*;
 
     // ---- ServerMessageId / ScheduledServerMessageId / EphemeralMessageId ----
