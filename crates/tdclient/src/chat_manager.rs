@@ -205,6 +205,28 @@ impl DcId {
     }
 }
 
+/// `DcId::operator<<` (net/DcId.h:98-114).
+impl std::fmt::Display for DcId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "DcId{{")?;
+        if *self == DcId::invalid() {
+            write!(f, "invalid")?;
+        } else if *self == DcId::default() {
+            write!(f, "empty")?;
+        } else if self.is_empty() {
+            write!(f, "is_empty")?;
+        } else if self.is_main() {
+            write!(f, "main")?;
+        } else {
+            write!(f, "{}", self.get_raw_id())?;
+            if self.is_external() {
+                write!(f, " external")?;
+            }
+        }
+        write!(f, "}}")
+    }
+}
+
 /// `td::FileSourceId` (files/FileSourceId.h).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FileSourceId(i32);

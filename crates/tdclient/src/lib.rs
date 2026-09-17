@@ -20,6 +20,7 @@ pub mod connection_creator;
 pub mod contact;
 pub mod convert;
 pub mod emoji_status;
+pub mod files;
 pub mod global;
 pub mod link_manager;
 pub mod manager_option_states;
