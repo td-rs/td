@@ -497,3 +497,73 @@ mod misc_helper_tests {
         assert_eq!(s, "a b c");
     }
 }
+
+/// `search_strings_by_prefix` (misc.cpp:406-417): the `Hints`-backed prefix
+/// search behind the synchronous `searchStringsByPrefix` request. Keys are
+/// the string positions (empty strings enter as `" "`, a searchable
+/// stand-in), ratings equal the positions so ties answer in input order.
+pub fn search_strings_by_prefix(
+    strings: Vec<String>,
+    query: &str,
+    limit: i32,
+    return_all_for_empty_query: bool,
+) -> (i32, Vec<i32>) {
+    let mut hints = tdutils::hints::Hints::default();
+    for (index, string) in strings.iter().enumerate() {
+        hints.add(index as i64, if string.is_empty() { " " } else { string });
+        hints.set_rating(index as i64, index as i64);
+    }
+    let (total_count, keys) = hints.search(query, limit, return_all_for_empty_query);
+    (
+        total_count as i32,
+        keys.into_iter().map(|key| key as i32).collect(),
+    )
+}
+
+#[cfg(test)]
+mod search_strings_by_prefix_tests {
+    use super::search_strings_by_prefix;
+
+    #[test]
+    fn prefix_matches_answer_in_input_order() {
+        let strings = vec![
+            "Delta".to_owned(),
+            "charlie".to_owned(),
+            "Charlie".to_owned(),
+            "bravo".to_owned(),
+        ];
+        let (total, positions) = search_strings_by_prefix(strings, "char", 10, false);
+        assert_eq!(total, 2);
+        assert_eq!(positions, vec![1, 2]);
+    }
+
+    #[test]
+    fn limit_cuts_but_total_count_survives() {
+        let strings: Vec<String> = ["ab1", "ab2", "ab3", "ab4"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let (total, positions) = search_strings_by_prefix(strings, "ab", 2, false);
+        assert_eq!(total, 4);
+        assert_eq!(positions, vec![0, 1]);
+    }
+
+    #[test]
+    fn empty_query_is_returned_only_on_request() {
+        let strings = vec!["one".to_owned(), String::new(), " ".to_owned()];
+        let (total, positions) = search_strings_by_prefix(strings.clone(), "", 10, true);
+        assert_eq!(total, 3);
+        assert_eq!(positions, vec![0, 1, 2]);
+        let (total, positions) = search_strings_by_prefix(strings, "", 10, false);
+        assert_eq!(total, 0);
+        assert!(positions.is_empty());
+    }
+
+    #[test]
+    fn no_match_answers_zero() {
+        let strings = vec!["alpha".to_owned(), "beta".to_owned()];
+        let (total, positions) = search_strings_by_prefix(strings, "gamma", 10, false);
+        assert_eq!(total, 0);
+        assert!(positions.is_empty());
+    }
+}

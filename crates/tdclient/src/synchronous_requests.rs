@@ -80,13 +80,18 @@ pub fn is_synchronous_request(function: &Function) -> bool {
             | Function::getLogTagVerbosityLevel(_)
             | Function::addLogMessage(_)
             | Function::testReturnError(_)
+            | Function::getFileMimeType(_)
+            | Function::getFileExtension(_)
+            | Function::searchStringsByPrefix(_)
     ) || matches!(function, Function::getOption(g) if option_manager::is_synchronous_option(&g.name))
-    // Not ported yet (need their managers): searchQuote, getTextEntities,
-    // parseTextEntities, parseMarkdown, getMarkdownText, searchStringsByPrefix,
-    // checkQuickReplyShortcutName, getCountryFlagEmoji, getFileMimeType,
-    // getFileExtension, cleanFileName, getLanguagePackString,
-    // getPhoneNumberInfoSync, getChatFolderDefaultIconName,
-    // getThemeParametersJsonString, getPushReceiverId.
+    // Not ported yet: searchQuote (MessageQuote, M.8-adjacent),
+    // getTextEntities/parseTextEntities/parseMarkdown/getMarkdownText
+    // (MessageEntity, M.8), checkQuickReplyShortcutName (QuickReplyManager),
+    // getCountryFlagEmoji/getPhoneNumberInfoSync (CountryInfoManager),
+    // cleanFileName (needs the `get_unicode_simple_category` tables, M.8),
+    // getLanguagePackString (LanguagePackManager),
+    // getChatFolderDefaultIconName (DialogFilter), getPushReceiverId
+    // (NotificationManager), getThemeParametersJsonString (ThemeManager).
 }
 
 /// `JsonValue.cpp:get_json_value_object`: `tdutils::JsonValue` → td_api.
@@ -231,6 +236,44 @@ pub fn run_request(function: Function) -> Object {
             Object::ok(td_api::Ok)
         }
         Function::testReturnError(request) => Object::error(request.error.unwrap_or_default()),
+        // --- the M.11.4 generic (manager-free) synchronous set ---
+        Function::getFileMimeType(request) => {
+            // SynchronousRequests.cpp:262-265 — no UTF-8 check on the name.
+            let path_view = tdutils::path_view::PathView::new(&request.file_name);
+            Object::text(td_api::Text {
+                text: tdutils::mime_type::from_extension(path_view.extension()),
+            })
+        }
+        Function::getFileExtension(request) => {
+            // SynchronousRequests.cpp:267-269 — no UTF-8 check on the type.
+            Object::text(td_api::Text {
+                text: tdutils::mime_type::to_extension(&request.mime_type),
+            })
+        }
+        Function::searchStringsByPrefix(request) => {
+            // `do_request(searchStringsByPrefix)` → misc.cpp:406-417 — the
+            // UTF-8 gates run first.
+            let Some(query) = crate::misc::clean_input_string(&request.query) else {
+                return make_error(400, "Strings must be encoded in UTF-8");
+            };
+            let mut strings = Vec::with_capacity(request.strings.len());
+            for string in &request.strings {
+                let Some(string) = crate::misc::clean_input_string(string) else {
+                    return make_error(400, "Strings must be encoded in UTF-8");
+                };
+                strings.push(string);
+            }
+            let (total_count, positions) = crate::misc::search_strings_by_prefix(
+                strings,
+                &query,
+                request.limit,
+                !request.return_none_for_empty_query,
+            );
+            Object::foundPositions(td_api::FoundPositions {
+                total_count,
+                positions,
+            })
+        }
         _ => make_error(400, "The method can't be executed synchronously"),
     }
 }
@@ -521,6 +564,82 @@ mod tests {
         assert_eq!(
             run_request(function).to_json(),
             r#"{"@type":"logStreamDefault"}"#
+        );
+    }
+
+    #[test]
+    fn get_file_mime_type_answers_the_canonical_type() {
+        // SynchronousRequests.cpp:262-265: `PathView(file_name).extension()`
+        // through `MimeType::from_extension`.
+        let function = Function::getFileMimeType(td_api::getFileMimeType {
+            file_name: "/music/song.mp3".to_string(),
+        });
+        assert_eq!(
+            run_request(function).to_json(),
+            r#"{"@type":"text","text":"audio/mpeg"}"#
+        );
+        let function = Function::getFileMimeType(td_api::getFileMimeType {
+            file_name: "archive.tar.gz".to_string(),
+        });
+        // the bundled mime_types.txt (byte-identical to the C++
+        // tdutils/generate/mime_types.txt) has no `gz` entry, so the C++
+        // answers the default empty string and logs the unknown extension
+        assert_eq!(
+            run_request(function).to_json(),
+            r#"{"@type":"text","text":""}"#
+        );
+        let function = Function::getFileMimeType(td_api::getFileMimeType {
+            file_name: "noextension".to_string(),
+        });
+        assert_eq!(
+            run_request(function).to_json(),
+            r#"{"@type":"text","text":""}"#
+        );
+    }
+
+    #[test]
+    fn get_file_extension_answers_the_canonical_extension() {
+        // SynchronousRequests.cpp:267-269: `MimeType::to_extension`.
+        let function = Function::getFileExtension(td_api::getFileExtension {
+            mime_type: "audio/mpeg".to_string(),
+        });
+        assert_eq!(
+            run_request(function).to_json(),
+            r#"{"@type":"text","text":"mp3"}"#
+        );
+        let function = Function::getFileExtension(td_api::getFileExtension {
+            mime_type: "no/such-type".to_string(),
+        });
+        assert_eq!(
+            run_request(function).to_json(),
+            r#"{"@type":"text","text":""}"#
+        );
+    }
+
+    #[test]
+    fn search_strings_by_prefix_answers_positions() {
+        let function = Function::searchStringsByPrefix(td_api::searchStringsByPrefix {
+            strings: vec!["Delta".to_string(), "charlie".to_string()],
+            query: "char".to_string(),
+            limit: 10,
+            return_none_for_empty_query: false,
+        });
+        assert_eq!(
+            run_request(function).to_json(),
+            // the C++ keys are the 0-based indices (`hints.add(i, ...)`,
+            // misc.cpp:406-419) and the Hints search is prefix-only:
+            // "char" prefix-matches only "charlie"
+            r#"{"@type":"foundPositions","total_count":1,"positions":[1]}"#
+        );
+        let function = Function::searchStringsByPrefix(td_api::searchStringsByPrefix {
+            strings: vec!["ab1".to_string(), "ab2".to_string(), "ab3".to_string()],
+            query: String::new(),
+            limit: 2,
+            return_none_for_empty_query: false,
+        });
+        assert_eq!(
+            run_request(function).to_json(),
+            r#"{"@type":"foundPositions","total_count":3,"positions":[0,1]}"#
         );
     }
 }
