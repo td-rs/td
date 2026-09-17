@@ -143,8 +143,11 @@ for line in sys.stdin:
     # The `@wait` corpus markers are harness bookkeeping (the driver's
     # wait-for-update primitive, and how the gate times the phone
     # message) — their stream position races with the live updates, and
-    # the diff is about client-emitted records.
-    if '"@wait"' in record.get("request", ""):
+    # the diff is about client-emitted records. The request value is the
+    # parsed JSON object, so the check is a dict-key test (a quoted
+    # '"@wait"' string match never fires — the marker survived into the
+    # diff streams until this fix).
+    if "@wait" in record.get("request", {}):
         continue
     masked = mask(record)
     if not masked:

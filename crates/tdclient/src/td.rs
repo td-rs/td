@@ -689,22 +689,6 @@ impl Td {
         }
         self.flush_auth_updates();
 
-        // `Global::init` — the group-call levels the recorder pins right
-        // after the auth state, before the ok.
-        self.send_update(Object::updateGroupCallMessageLevels(
-            td_api::updateGroupCallMessageLevels {
-                levels: vec![td_api::GroupCallMessageLevel {
-                    min_star_count: 0,
-                    pin_duration: 0,
-                    max_text_length: 30,
-                    max_custom_emoji_count: 0,
-                    first_color: 9788635,
-                    second_color: 9788635,
-                    background_color: 4786075,
-                }],
-            },
-        ));
-
         // init_file_manager / init_non_actor_managers / init_managers /
         // init_pure_actor_managers / SecretChatsManager / StorageManager —
         // each manager step appends its block here in the C++ order. The
