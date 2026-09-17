@@ -965,7 +965,7 @@ fn emit_object_umbrella(out: &mut String, p: &TlProgram, m: &SchemeModel, opts: 
         ));
     }
     out.push_str(
-        "                id => Result::Err(format!(\"Unknown constructor 0x{:x}\", id as u32)),\n\
+        "                id => Result::Err(format!(\"Unknown constructor 0x{:08x}\", id as u32)),\n\
          \x20           },\n            \
          other => Result::Err(format!(\"Expected String or Integer, but receive {}\", other.type_name())),\n        \
          }\n    }\n}\n\n",
@@ -1077,7 +1077,7 @@ fn emit_enum_json(out: &mut String, p: &TlProgram, ctors: &[usize]) {
         ));
     }
     out.push_str(
-        "                id => Result::Err(format!(\"Unknown constructor 0x{:x}\", id as u32)),\n\
+        "                id => Result::Err(format!(\"Unknown constructor 0x{:08x}\", id as u32)),\n\
          \x20           },\n            \
          other => Result::Err(format!(\"Expected String or Integer, but receive {}\", other.type_name())),\n        \
          }\n    }\n",

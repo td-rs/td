@@ -364,6 +364,87 @@ pub fn run_request(function: Function) -> Object {
     }
 }
 
+/// The flattened-model null bridge. The generated td_api model (S09)
+/// decodes a null or absent object field to its default variant, while the
+/// C++ keeps `object_ptr` nulls and checks them in
+/// `SynchronousRequests::do_request`. The checks that change the observable
+/// output cannot be expressed in `run_request` (the nullness is already
+/// lost), so `client_json.rs::to_request` applies them at the JSON
+/// boundary, where every request passes. The returned `testReturnError`
+/// serializes to the same `td_api::error` the C++ `make_error` response
+/// does, keeping the output byte-identical (including the `@extra` splice).
+///
+/// `SynchronousRequests.cpp:188/215`: `parseMarkdown`/`getMarkdownText`
+/// require a non-null `text`; `SynchronousRequests.cpp:153`:
+/// `parseTextEntities` requires a non-null `parse_mode`.
+pub fn null_pointer_request_error(request: &JsonValue) -> Option<Function> {
+    let JsonValue::Object(object) = request else {
+        return None;
+    };
+    let type_name = match object.get_field("@type") {
+        Some(JsonValue::String(name)) => name.as_str(),
+        _ => return None,
+    };
+    let null_or_absent =
+        |field: &str| matches!(object.get_field(field), None | Some(JsonValue::Null));
+    let error = |message: &str| {
+        Some(Function::testReturnError(td_api::testReturnError {
+            error: td_api::Error {
+                code: 400,
+                message: message.to_string(),
+            },
+        }))
+    };
+    match type_name {
+        "parseMarkdown" | "getMarkdownText" if null_or_absent("text") => {
+            error("Text must be non-empty")
+        }
+        "parseTextEntities" if null_or_absent("parse_mode") => {
+            error("Parse mode must be non-empty")
+        }
+        _ => None,
+    }
+}
+
+/// `MessageEntity.cpp:3673` (`get_message_entities`): input entities with a
+/// null `type_` are skipped — a null element, or an element whose `type`
+/// field is absent or null. The flattened model decodes them to a default
+/// `textEntityTypeMention` and keeps them, so the skip is applied to the
+/// raw JSON at the boundary instead; the C++ decodes faithfully and drops
+/// them one step later, and the observable output is identical.
+/// Wrong-shaped elements (numbers, strings, objects with a non-null but
+/// invalid `type`) are left untouched so the decoder still reports the
+/// C++'s 400 messages. Only the two flipped functions taking input
+/// entities are covered — `searchQuote` stays in the deferred set, and
+/// M.9/M.10 consumers extend this when they wire their
+/// `get_message_entities` inputs.
+pub fn drop_null_typed_entities(request: &mut JsonValue) {
+    let JsonValue::Object(object) = request else {
+        return;
+    };
+    let type_name = match object.get_field("@type") {
+        Some(JsonValue::String(name)) => name.as_str(),
+        _ => return,
+    };
+    if type_name != "parseMarkdown" && type_name != "getMarkdownText" {
+        return;
+    }
+    let Some(JsonValue::Object(text)) = object.get_mut_field("text") else {
+        return;
+    };
+    let Some(JsonValue::Array(entities)) = text.get_mut_field("entities") else {
+        return;
+    };
+    entities.retain(|entity| match entity {
+        JsonValue::Null => false,
+        JsonValue::Object(entity_object) => !matches!(
+            entity_object.get_field("type"),
+            None | Some(JsonValue::Null)
+        ),
+        _ => true,
+    });
+}
+
 /// `Logging::set_current_stream` (the tdutils halves: `set_file_path` for
 /// default/file, the null interface for empty).
 fn set_current_stream(stream: td_api::LogStream) -> std::result::Result<(), String> {
@@ -506,7 +587,14 @@ mod tests {
     /// offsets and the 400 error paths), a malformed-HTML fuzz seed set
     /// (truncated tags, stray brackets, numeric-entity overflow, attribute
     /// edge cases, case folding) and byte-prefix truncations of six
-    /// representative inputs. Corpus responses store the oracle output
+    /// representative inputs. The M.8.10 battery is the last 42 entries:
+    /// the flipped functions' null-field edge cases (null/absent `text`
+    /// and `parse_mode` 400s, null-typed input entities skipped like
+    /// `get_message_entities` does, wrong-typed fields, unknown and
+    /// numeric `@type`s, the `@extra` splice through the null bridge),
+    /// entity-heavy `getTextEntities` kitchen-sink texts and
+    /// parseMarkdown/getMarkdownText round-trips. Corpus responses store
+    /// the oracle output
     /// decoded: tdlib's
     /// JSON layer escapes non-ASCII as \uXXXX (astral chars as surrogate
     /// pairs) while the Rust layer emits raw UTF-8, so non-ASCII was
@@ -544,7 +632,7 @@ mod tests {
             );
             checked += 1;
         }
-        assert_eq!(checked, 1122, "the corpus shrank");
+        assert_eq!(checked, 1164, "the corpus shrank");
     }
 
     #[test]
