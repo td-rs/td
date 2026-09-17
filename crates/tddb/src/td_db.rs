@@ -1108,16 +1108,15 @@ mod tests {
         tddb.close();
         let mut tddb = TdDb::new();
         let mut pmc = test_binlog_pmc("m6_tddb_enc_pmc");
-        assert!(
-            tddb.init_sqlite(
+        assert!(tddb
+            .init_sqlite(
                 &path,
                 &Parameters::default(),
                 &DbKey::password("tomato"),
                 &DbKey::empty(),
                 &mut pmc,
             )
-            .is_error()
-        );
+            .is_error());
         let _ = crate::sqlite_db::destroy(&path);
     }
 

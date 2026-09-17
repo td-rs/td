@@ -2089,7 +2089,7 @@ impl UserManager {
     /// `u != nullptr && u->is_received` — a registered but not-yet-received
     /// user is not accessible.
     pub fn have_accessible_user(&self, user_id: UserId) -> bool {
-        self.get_user(user_id).map_or(false, |u| u.is_received)
+        self.get_user(user_id).is_some_and(|u| u.is_received)
     }
 
     /// `UserManager::get_user_database_key` (UserManager.cpp:4870-4872).

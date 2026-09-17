@@ -222,7 +222,6 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
 
         // --- M.6.20: the DialogManager-served requests
         // (Requests.cpp:3425-3530, :3667, :5781-5873, :6096, :6608, :7842).
-
         Function::searchPublicChat(request) => {
             // the C++ has no CHECK_IS_USER here (Requests.cpp:3429-3432) —
             // bots may resolve public chats
@@ -258,7 +257,8 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             if fail_from_slot(td, id, &slot) {
                 return;
             }
-            let chats = crate::dialog_manager::get_chats_object(-1, &dialog_ids, "searchPublicChats");
+            let chats =
+                crate::dialog_manager::get_chats_object(-1, &dialog_ids, "searchPublicChats");
             td.send_result(id, Object::chats(chats));
         }
         Function::searchChats(request) => {
@@ -279,11 +279,8 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             if fail_from_slot(td, id, &slot) {
                 return;
             }
-            let chats = crate::dialog_manager::get_chats_object(
-                total_count,
-                &dialog_ids,
-                "searchChats",
-            );
+            let chats =
+                crate::dialog_manager::get_chats_object(total_count, &dialog_ids, "searchChats");
             td.send_result(id, Object::chats(chats));
         }
         Function::searchChatsOnServer(request) => {
@@ -304,11 +301,8 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             if fail_from_slot(td, id, &slot) {
                 return;
             }
-            let chats = crate::dialog_manager::get_chats_object(
-                -1,
-                &dialog_ids,
-                "searchChatsOnServer",
-            );
+            let chats =
+                crate::dialog_manager::get_chats_object(-1, &dialog_ids, "searchChatsOnServer");
             td.send_result(id, Object::chats(chats));
         }
         Function::searchRecentlyFoundChats(request) => {
@@ -527,7 +521,9 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             crate::dialog_manager::toggle_dialog_has_protected_content(
                 td,
                 crate::dialog_id::DialogId::new(request.chat_id),
-                Some(crate::chat_manager::MessageId::new(request.request_message_id)),
+                Some(crate::chat_manager::MessageId::new(
+                    request.request_message_id,
+                )),
                 !request.approve,
                 promise,
             );
@@ -619,19 +615,18 @@ fn clean_or_utf8_error(td: &mut Td, id: u64, s: &str) -> Option<String> {
     }
 }
 
+/// The unit-shaped slot half of the collapse, aliased to match `ObjectSlot`.
+type UnitSlot = std::sync::Arc<std::sync::Mutex<Option<Result<()>>>>;
+
 /// The synchronous collapse of `CREATE_REQUEST_PROMISE` for `Promise<Unit>`
 /// requests: the promise error surface lands in the slot; successes are
 /// signaled by an empty slot and the caller sends the result itself.
-fn unit_request_promise() -> (
-    tdutils::promise::Promise<()>,
-    std::sync::Arc<std::sync::Mutex<Option<Result<()>>>>,
-) {
+fn unit_request_promise() -> (tdutils::promise::Promise<()>, UnitSlot) {
     let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
     let capture = std::sync::Arc::clone(&slot);
-    let promise =
-        tdutils::promise::PromiseCreator::lambda_result(move |result: Result<()>| {
-            *capture.lock().unwrap() = Some(result);
-        });
+    let promise = tdutils::promise::PromiseCreator::lambda_result(move |result: Result<()>| {
+        *capture.lock().unwrap() = Some(result);
+    });
     (promise, slot)
 }
 
@@ -650,11 +645,7 @@ fn object_request_promise() -> (tdutils::promise::Promise<crate::td_api::Object>
 }
 
 /// Send the slot's error, if any; `true` means the error was sent.
-fn fail_from_slot(
-    td: &mut Td,
-    id: u64,
-    slot: &std::sync::Mutex<Option<Result<()>>>,
-) -> bool {
+fn fail_from_slot(td: &mut Td, id: u64, slot: &std::sync::Mutex<Option<Result<()>>>) -> bool {
     let outcome = slot.lock().unwrap().take();
     match outcome {
         Some(Result::Err(status)) => {
@@ -669,7 +660,11 @@ fn fail_from_slot(
 /// (Requests.cpp:1923-1930): the error is sent as-is, and a success sends
 /// `ok` — the C++ `create_ok_request_promise` answers `send_result(id, ok)`
 /// on `set_value`.
-fn finish_unit_slot(td: &mut Td, id: u64, slot: std::sync::Arc<std::sync::Mutex<Option<Result<()>>>>) {
+fn finish_unit_slot(
+    td: &mut Td,
+    id: u64,
+    slot: std::sync::Arc<std::sync::Mutex<Option<Result<()>>>>,
+) {
     match slot.lock().unwrap().take() {
         Some(Result::Ok(())) => td.send_result(id, ok_object()),
         Some(Result::Err(status)) => td.send_error_impl(id, status.code(), status.message()),
