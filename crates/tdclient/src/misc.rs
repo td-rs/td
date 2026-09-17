@@ -12,7 +12,7 @@ const LENGTH_LIMIT: usize = 35000;
 
 /// `replace_offending_characters` (misc.cpp:62-77):
 /// `(U+200F|U+200E){N}(U+200F|U+200E)` -> `(U+200C){N}$2`.
-fn replace_offending_characters(s: &mut [u8]) {
+pub(crate) fn replace_offending_characters(s: &mut [u8]) {
     // The C++ reads up to two bytes past `pos` unconditionally (safe on
     // NUL-terminated strings); out-of-bounds reads are modeled as 0.
     fn at(s: &[u8], i: usize) -> u8 {
@@ -366,6 +366,11 @@ pub fn strip_empty_characters(s: &str, max_length: usize, strip_rtlo: bool) -> S
         break;
     }
     trimmed.to_owned()
+}
+
+/// `td::is_empty_string` (misc.cpp:256-258).
+pub fn is_empty_string(s: &str) -> bool {
+    strip_empty_characters(s, s.len(), false).is_empty()
 }
 
 /// `td::is_valid_username` (misc.cpp:260-282).
