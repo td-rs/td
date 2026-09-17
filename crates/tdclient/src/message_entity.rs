@@ -3876,11 +3876,16 @@ fn fix_url(url: &str) -> &str {
     let mut rest = url;
 
     let mut has_protocol = false;
-    let str_begin = rest[..rest.len().min(10)].to_ascii_lowercase();
-    if str_begin.starts_with("http://")
-        || str_begin.starts_with("https://")
-        || str_begin.starts_with("ftp://")
-        || str_begin.starts_with("tonsite://")
+    // The C++ `to_lower(str.substr(0, 10))` prefix checks, done on bytes:
+    // `Slice::substr` may cut a UTF-8 code point in half (Rust `&str`
+    // slicing would panic), and `utf8_to_lower` never maps a non-ASCII
+    // byte of a valid UTF-8 input to an ASCII letter, so ASCII-case-
+    // insensitive byte comparison is exact.
+    let str_begin = &rest.as_bytes()[..rest.len().min(10)];
+    if str_begin.len() >= 7 && str_begin[..7].eq_ignore_ascii_case(b"http://")
+        || str_begin.len() >= 8 && str_begin[..8].eq_ignore_ascii_case(b"https://")
+        || str_begin.len() >= 6 && str_begin[..6].eq_ignore_ascii_case(b"ftp://")
+        || str_begin.len() >= 10 && str_begin[..10].eq_ignore_ascii_case(b"tonsite://")
     {
         let pos = rest.find(':').unwrap();
         rest = &rest[pos + 3..];
@@ -4068,16 +4073,24 @@ pub fn get_first_url(text: &FormattedText) -> &str {
                 if entity.length <= 4 {
                     continue;
                 }
+                if entity.offset < 0 {
+                    // A negative offset converts to a huge `size_t` in the
+                    // C++ and yields an empty URL, which `is_plain_domain`
+                    // rejects.
+                    continue;
+                }
                 let url = tdutils::utf8::utf8_utf16_substr_range(
                     &text.text,
-                    entity.offset.max(0) as usize,
-                    entity.length.max(0) as usize,
+                    entity.offset as usize,
+                    entity.length as usize,
                 );
-                let scheme = url[..url.len().min(8)].to_ascii_lowercase();
-                if scheme == "ton:"
-                    || scheme.starts_with("tg:")
-                    || scheme == "ftp:"
-                    || scheme == "tonsite:"
+                // The C++ `to_lower(url.substr(0, 8))` scheme checks, done
+                // on bytes for the same reason as in `fix_url`.
+                let scheme = &url.as_bytes()[..url.len().min(8)];
+                if scheme.eq_ignore_ascii_case(b"ton:")
+                    || (scheme.len() >= 3 && scheme[..3].eq_ignore_ascii_case(b"tg:"))
+                    || scheme.eq_ignore_ascii_case(b"ftp:")
+                    || scheme.eq_ignore_ascii_case(b"tonsite:")
                     || is_plain_domain(url)
                 {
                     continue;
@@ -4086,11 +4099,11 @@ pub fn get_first_url(text: &FormattedText) -> &str {
             }
             Some(Type::TextUrl) => {
                 let url = entity.argument.as_str();
-                let scheme = url[..url.len().min(8)].to_ascii_lowercase();
-                if scheme == "ton:"
-                    || scheme.starts_with("tg:")
-                    || scheme == "ftp:"
-                    || scheme == "tonsite:"
+                let scheme = &url.as_bytes()[..url.len().min(8)];
+                if scheme.eq_ignore_ascii_case(b"ton:")
+                    || (scheme.len() >= 3 && scheme[..3].eq_ignore_ascii_case(b"tg:"))
+                    || scheme.eq_ignore_ascii_case(b"ftp:")
+                    || scheme.eq_ignore_ascii_case(b"tonsite:")
                 {
                     continue;
                 }
@@ -8092,8 +8105,9 @@ mod tests {
     }
 
     /// The M.8.3 matcher battery — the exact inputs whose C++ `td_execute`
-    /// `getTextEntities` outputs are recorded as the last 21 entries of
-    /// `testdata/message_entity_cpp_golden.jsonl`.
+    /// `getTextEntities` outputs are recorded as the 21 entries of
+    /// `testdata/message_entity_cpp_golden.jsonl` right before the M.8.4
+    /// URL battery.
     fn matcher_battery() -> Vec<String> {
         let mut battery: Vec<String> = [
             // mentions
@@ -8285,6 +8299,354 @@ mod tests {
             find_bank_card_numbers("4242424242424242 1:23"),
             ["4242424242424242"]
         );
+    }
+
+    /// The M.8.4 URL battery — the exact inputs whose C++ `td_execute`
+    /// `getTextEntities` outputs are recorded as the last 41 entries of
+    /// `testdata/message_entity_cpp_golden.jsonl`: Unicode URLs, trailing
+    /// punctuation, IDN-lite paths, tg:// links, ports, protocols, user
+    /// data, IPv4, typo-squats, and the byte-prefix regressions.
+    fn url_battery() -> Vec<String> {
+        vec![
+            "мюнхен.рф и москва.рф/путь?q=1 и сайт.онлайн".to_string(),
+            "123456789ü.de and 12345678€.de".to_string(),
+            "日本語.jp/パス/次 and https://例え.テスト/".to_string(),
+            "ünü.de and bücher.eu/test/ü".to_string(),
+            "Visit example.com, (or example.org/test), check test.net! bye.".to_string(),
+            "go to example.com/path?q=1&x=2, then example.com/word.".to_string(),
+            "example.com/a(b)c(d) and example.com/a(b — balance".to_string(),
+            "example.com/foo):bar and example.com/foo):".to_string(),
+            "example.com/(foo)! example.com/(unclosed example.com/a,b,c".to_string(),
+            "example.com/a<b>c example.com/a«b» example.com/a\"b example.com/a'b".to_string(),
+            "example.com/a\nb and example.com/a\u{200c}b and example.com/a\u{200b}b".to_string(),
+            "xn--bcher-kva.de/start and xn--80adxhks.xn--p1ai and xn--bcher-kva.notatld"
+                .to_string(),
+            "münchen.xn--bcher-kva and xn-- and xn--abc.com".to_string(),
+            "tg://resolve?domain=telegram and TG://emoji?id=5 and ton://transfer/x".to_string(),
+            "tonsite://deploy.ton and tonsite://x and tonsite://".to_string(),
+            "tg://дуров and tg:// and t.me and t.me/durov".to_string(),
+            "tg://x? and tg://xxtg://y".to_string(),
+            "example.com:8080/x example.com:65535 example.com:65536 example.com:99999 example.com:0"
+                .to_string(),
+            "http://x.com HTTPS://X.COM ftp://files.example.org tftp://x.com sftp://x.com"
+                .to_string(),
+            "seehttps://x.com xhttp://y.com mysftp://x.com FTP://X.COM".to_string(),
+            "mailto:user@example.com user:pass@example.com user@example.com".to_string(),
+            "127.0.0.1/x 256.256.256.256 0.0.0.0 255.255.255.255 1.2.3.4 999.1.2.3 025.1.2.3 25.1.2.3"
+                .to_string(),
+            "12.34.56.78 1234.5678.9012.3456 1.2.3.4.5 3.14".to_string(),
+            "example..com example.com- example-.com example. unknown.example-tld".to_string(),
+            "http://no-tld.xyzabc no-tld.xyzabc https://a.b.c".to_string(),
+            "teiegram.org xteiegram.org TEIEGRAM.ORG".to_string(),
+            "a.b a.c e.c e.co ab.cd com t.me".to_string(),
+            "exa_mple.com ex-ample.com word.word example.kaufen".to_string(),
+            "example.com. example.com..next example.com#frag example.com/#".to_string(),
+            "example.com/! example.com/? example.com/?a=b".to_string(),
+            "https://t.me/durov and t.me @durov #tag https://example.com".to_string(),
+            "http://.mee http://./ http://.com/ https://.".to_string(),
+            "example.com/путь/дальше and example.com/→".to_string(),
+            "https://example.com/path/ü and https://ün.de/x".to_string(),
+            "www.example.com https://www.example.com/path www.example.com:443".to_string(),
+            "meet.google.com/abc-def and a.b c.de 3.14 and 2.5".to_string(),
+            "tonsite://deploy.ton/tgz and t.me/s/mode".to_string(),
+            "See (https://example.com/a) and [example.com/b] {example.com/c}".to_string(),
+            "example.com/вопрос) example.com/ув!".to_string(),
+            "tg://emoji?id=5😀 and (@example.com)".to_string(),
+            "h.t.t.p://x.com http:://x.com —https://x.com".to_string(),
+        ]
+    }
+
+    /// M.8.4 property test: every URL extraction over the battery is a
+    /// substring of the input, extractions are ordered and non-overlapping,
+    /// and each family keeps its structural shape.
+    #[test]
+    fn url_extractions_are_substrings_of_the_input() {
+        fn check(text: &str, extractions: &[&str]) {
+            let mut last_end = 0usize;
+            for &extraction in extractions {
+                let pos = text[last_end..]
+                    .find(extraction)
+                    .map(|pos| pos + last_end)
+                    .unwrap_or_else(|| {
+                        panic!("extraction {extraction:?} is not a substring of {text:?}")
+                    });
+                assert!(
+                    pos >= last_end,
+                    "extractions overlap or go backwards in {text:?}"
+                );
+                last_end = pos + extraction.len();
+            }
+        }
+
+        for text in url_battery() {
+            check(&text, &match_tg_urls(&text));
+            check(&text, &find_tg_urls(&text));
+
+            let urls: Vec<&str> = find_urls(&text).into_iter().map(|(url, _)| url).collect();
+            check(&text, &urls);
+            assert!(
+                urls.iter()
+                    .all(|url| !url.is_empty() && (url.contains('.') || url.contains('@')))
+            );
+
+            let tg_urls = find_tg_urls(&text);
+            assert!(tg_urls.iter().all(|url| url.contains("://")));
+        }
+    }
+
+    /// M.8.4 golden vectors: extraction lists hand-checked against the
+    /// recorded C++ `getTextEntities` outputs for the same inputs
+    /// (`testdata/message_entity_cpp_golden.jsonl`).
+    #[test]
+    fn url_extraction_golden_vectors() {
+        // The C++ tonsite quirk, preserved verbatim: the tg-url matcher
+        // slices from `ptr - 3`, so "tonsite://" matches begin at "ite".
+        assert_eq!(
+            find_tg_urls("tonsite://deploy.ton and tonsite://x and tonsite://"),
+            ["ite://deploy", "ite://x"]
+        );
+        assert_eq!(
+            find_tg_urls("tg://resolve?domain=telegram and TG://emoji?id=5 and ton://transfer/x"),
+            [
+                "tg://resolve?domain=telegram",
+                "TG://emoji?id=5",
+                "ton://transfer/x"
+            ]
+        );
+        // The trailing "://y" is unreachable: the tg-url loop requires
+        // strictly more than 5 bytes left at the second ':'.
+        assert_eq!(
+            find_tg_urls("tg://x? and tg://xxtg://y"),
+            ["tg://x", "tg://xxtg"]
+        );
+        // tg:// links with a non-ASCII domain never match.
+        assert_eq!(
+            find_tg_urls("tg://дуров and tg:// and t.me and t.me/durov"),
+            Vec::<&str>::new()
+        );
+
+        // IDN domains with Cyrillic TLDs.
+        assert_eq!(
+            find_urls("мюнхен.рф и москва.рф/путь?q=1 и сайт.онлайн"),
+            [
+                ("мюнхен.рф", false),
+                ("москва.рф/путь?q=1", false),
+                ("сайт.онлайн", false)
+            ]
+        );
+        // Multibyte code points split at the 10-byte protocol probe — the
+        // byte-prefix regression inputs.
+        assert_eq!(
+            find_urls("123456789ü.de and 12345678€.de"),
+            [("123456789ü.de", false), ("12345678€.de", false)]
+        );
+        assert_eq!(
+            find_urls("日本語.jp/パス/次 and https://例え.テスト/"),
+            [
+                ("日本語.jp/パス/次", false),
+                ("https://例え.テスト/", false)
+            ]
+        );
+        // The path ends at the unbalanced ')' and the closing chars drop.
+        assert_eq!(
+            find_urls("example.com/foo):bar and example.com/foo):"),
+            [("example.com/foo", false), ("example.com/foo", false)]
+        );
+        // The mailto: prefix becomes an EmailAddress; a bare user@host is
+        // an EmailAddress, but user:pass@host stays a URL.
+        assert_eq!(
+            find_urls("mailto:user@example.com user:pass@example.com user@example.com"),
+            [
+                ("user@example.com", true),
+                ("user:pass@example.com", false),
+                ("user@example.com", true)
+            ]
+        );
+        // IPv4 and short numeric domains; >255 octets and leading zeros
+        // are rejected.
+        assert_eq!(
+            find_urls(
+                "127.0.0.1/x 256.256.256.256 0.0.0.0 255.255.255.255 1.2.3.4 999.1.2.3 025.1.2.3 25.1.2.3"
+            ),
+            [
+                ("127.0.0.1/x", false),
+                ("0.0.0.0", false),
+                ("255.255.255.255", false),
+                ("1.2.3.4", false),
+                ("25.1.2.3", false)
+            ]
+        );
+        assert_eq!(
+            find_urls("example..com example.com- example-.com example. unknown.example-tld"),
+            Vec::<(&str, bool)>::new()
+        );
+        // A protocol forgives an unknown TLD, but a one-code-point TLD is
+        // always rejected.
+        assert_eq!(
+            find_urls("http://no-tld.xyzabc no-tld.xyzabc https://a.b.c"),
+            [("http://no-tld.xyzabc", false)]
+        );
+        // The teiegram.org typo-squat is rejected, but only at exactly
+        // 12 bytes.
+        assert_eq!(
+            find_urls("teiegram.org xteiegram.org TEIEGRAM.ORG"),
+            [("xteiegram.org", false)]
+        );
+        // '_' in a domain rejects it; '-' only rejects when it ends a
+        // domain part.
+        assert_eq!(
+            find_urls("exa_mple.com ex-ample.com word.word example.kaufen"),
+            [("ex-ample.com", false), ("example.kaufen", false)]
+        );
+        assert_eq!(
+            find_urls("example.com/! example.com/? example.com/?a=b"),
+            [
+                ("example.com/", false),
+                ("example.com/", false),
+                ("example.com/?a=b", false)
+            ]
+        );
+        assert_eq!(
+            find_urls("http://.mee http://./ http://.com/ https://."),
+            Vec::<(&str, bool)>::new()
+        );
+        // Protocol candidates with extra scheme symbols are cut to the
+        // last known scheme.
+        assert_eq!(
+            find_urls("h.t.t.p://x.com http:://x.com —https://x.com"),
+            [("https://x.com", false)]
+        );
+        assert_eq!(
+            find_urls("meet.google.com/abc-def and a.b c.de 3.14 and 2.5"),
+            [("meet.google.com/abc-def", false), ("c.de", false)]
+        );
+        // Only the URL matcher, not the tg-url matcher, runs fix_url.
+        assert_eq!(
+            find_urls("tonsite://deploy.ton and tonsite://x and tonsite://"),
+            [("tonsite://deploy.ton", false)]
+        );
+    }
+
+    /// M.8.4 regression: the protocol probes read the first 10 (`fix_url`)
+    /// or 8 (`get_first_url`) BYTES like the C++ `Slice::substr` +
+    /// `utf8_to_lower`; a multibyte code point split at the boundary must
+    /// not panic.
+    #[test]
+    fn url_prefix_probes_are_byte_lenient() {
+        assert_eq!(fix_url("123456789ü.de"), "123456789ü.de");
+        assert_eq!(fix_url("12345678€.de"), "12345678€.de");
+        assert_eq!(fix_url("hTtPs://üx.de/a"), "hTtPs://üx.de/a");
+        assert_eq!(fix_url("123456789ü.xyzabc"), "");
+
+        let text = FormattedText {
+            text: "1234567€x.com/p".to_string(),
+            entities: vec![MessageEntity {
+                r#type: Some(Type::Url),
+                offset: 0,
+                length: 15,
+                ..Default::default()
+            }],
+        };
+        assert_eq!(get_first_url(&text), "1234567€x.com/p");
+
+        let text = FormattedText {
+            text: String::new(),
+            entities: vec![MessageEntity {
+                r#type: Some(Type::TextUrl),
+                offset: 0,
+                length: 1,
+                argument: "http://€x.com".to_string(),
+                ..Default::default()
+            }],
+        };
+        assert_eq!(get_first_url(&text), "http://€x.com");
+    }
+
+    /// `get_first_url` skip rules (MessageEntity.cpp:1846-1851, 1876-1879):
+    /// tg:-prefixed, exactly `ton:`/`ftp:`, `tonsite:`-prefixed TextUrl
+    /// arguments and plain-domain Url entities are skipped; `ton://` and
+    /// `ftp://` fall through because the C++ compares the lowercased first
+    /// 8 bytes against the bare scheme names.
+    #[test]
+    fn get_first_url_skip_rules() {
+        for argument in ["tg://emoji", "TG://x", "ton:", "ftp:", "tonsite:x"] {
+            let text = FormattedText {
+                text: String::new(),
+                entities: vec![MessageEntity {
+                    r#type: Some(Type::TextUrl),
+                    offset: 0,
+                    length: 1,
+                    argument: argument.to_string(),
+                    ..Default::default()
+                }],
+            };
+            assert_eq!(get_first_url(&text), "", "{argument}");
+        }
+        for argument in ["ftp://x.com", "ton://x", "example.com"] {
+            let text = FormattedText {
+                text: String::new(),
+                entities: vec![MessageEntity {
+                    r#type: Some(Type::TextUrl),
+                    offset: 0,
+                    length: 1,
+                    argument: argument.to_string(),
+                    ..Default::default()
+                }],
+            };
+            assert_eq!(get_first_url(&text), argument, "{argument}");
+        }
+        // A plain-domain Url entity is skipped; a negative offset wraps to
+        // a huge size_t in the C++ and yields an empty URL, which
+        // is_plain_domain rejects; a short Url entity is skipped before
+        // the substring is taken.
+        let plain = FormattedText {
+            text: "example.com".to_string(),
+            entities: vec![MessageEntity {
+                r#type: Some(Type::Url),
+                offset: 0,
+                length: 11,
+                ..Default::default()
+            }],
+        };
+        assert_eq!(get_first_url(&plain), "");
+        let negative = FormattedText {
+            text: "https://example.com".to_string(),
+            entities: vec![MessageEntity {
+                r#type: Some(Type::Url),
+                offset: -3,
+                length: 19,
+                ..Default::default()
+            }],
+        };
+        assert_eq!(get_first_url(&negative), "");
+        let short = FormattedText {
+            text: "https://example.com".to_string(),
+            entities: vec![MessageEntity {
+                r#type: Some(Type::Url),
+                offset: 0,
+                length: 4,
+                ..Default::default()
+            }],
+        };
+        assert_eq!(get_first_url(&short), "");
+    }
+
+    /// `is_visible_url` (MessageEntity.cpp:1907-1927): only a Url entity
+    /// with the same UTF-16 length whose slice equals the given URL counts.
+    #[test]
+    fn visible_url_matching() {
+        let text = FormattedText {
+            text: "go to example.com now".to_string(),
+            entities: vec![MessageEntity {
+                r#type: Some(Type::Url),
+                offset: 6,
+                length: 11,
+                ..Default::default()
+            }],
+        };
+        assert!(is_visible_url(&text, "example.com"));
+        assert!(!is_visible_url(&text, "example.org"));
+        assert!(!is_visible_url(&text, ""));
     }
 
     #[test]
