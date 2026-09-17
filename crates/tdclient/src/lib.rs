@@ -19,6 +19,7 @@ pub mod config_result;
 pub mod connection_creator;
 pub mod dialog_db;
 pub mod dialog_id;
+pub mod dialog_manager;
 pub mod emoji_status;
 pub mod global;
 pub mod link_manager;
