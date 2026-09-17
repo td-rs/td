@@ -7325,9 +7325,9 @@ pub fn get_markdown_v3(text: FormattedText) -> FormattedText {
     let bytes = text.text.as_bytes();
     let mut pos = 0usize;
     while pos <= bytes.len() {
-        // The C++ reads `text.text[text.text.size()]` as the terminating
-        // '\0' (not a first code unit), running the stack unwinding once at
-        // the end.
+        // The C++ iterates pos <= size and reads `text.text[size]` as the
+        // terminating '\0'; it is not a first code unit, so the final
+        // iteration emits nothing and just breaks (no stack unwinding).
         let c = bytes.get(pos).copied().unwrap_or(0);
         if tdutils::utf8::is_utf8_character_first_code_unit(c) {
             while let Some(top) = nested_entities_stack.last() {
@@ -9918,6 +9918,265 @@ mod tests {
         let error = parse_markdown_v2(&mut owned).unwrap_err();
         let message: &str = "Invalid tg://emoji or tg://time URL specified";
         assert_eq!((error.code(), error.message()), (400, message));
+    }
+
+    // ===== M.8.8 — Markdown v3 (MessageEntity.cpp:2401-3238) =====
+
+    /// M.8.8 hand-traced vectors for `parse_markdown_v3`
+    /// (MessageEntity.cpp:2992-3068) and `get_markdown_v3`
+    /// (MessageEntity.cpp:3070-3238) on the direct functions: v3
+    /// delimiters are doubled (`__`/`**`/`~~`/`||`), fences split pre
+    /// entities, predetermined entities win over the syntax they cover and
+    /// the formatter's parse-check returns the original text when the
+    /// formatted text would not round-trip. The `td_execute` oracle corpus
+    /// for the same dialect is the last 97 entries of
+    /// `testdata/message_entity_cpp_golden.jsonl`.
+    #[test]
+    fn parse_markdown_v3_golden_vectors() {
+        fn parse(text: &str) -> (String, Vec<MessageEntity>) {
+            let result = parse_markdown_v3(FormattedText {
+                text: text.to_owned(),
+                entities: Vec::new(),
+            });
+            (result.text, result.entities)
+        }
+        fn parse_with(text: &str, entities: Vec<MessageEntity>) -> (String, Vec<MessageEntity>) {
+            let result = parse_markdown_v3(FormattedText {
+                text: text.to_owned(),
+                entities,
+            });
+            (result.text, result.entities)
+        }
+        let bold = |offset, length| MessageEntity::new(Type::Bold, offset, length);
+        let italic = |offset, length| MessageEntity::new(Type::Italic, offset, length);
+        let strike = |offset, length| MessageEntity::new(Type::Strikethrough, offset, length);
+        let spoiler = |offset, length| MessageEntity::new(Type::Spoiler, offset, length);
+        let pre = |offset, length| MessageEntity::new(Type::Pre, offset, length);
+        let pre_code = |offset, length, language: &str| {
+            MessageEntity::with_argument(Type::PreCode, offset, length, language.to_owned())
+        };
+        let text_url = |offset, length, url: &str| {
+            MessageEntity::with_argument(Type::TextUrl, offset, length, url.to_owned())
+        };
+
+        // v3 delimiters are doubled; single-character pairs stay literal.
+        assert_eq!(parse("__i__"), ("i".to_owned(), vec![italic(0, 1)]));
+        assert_eq!(parse("**b**"), ("b".to_owned(), vec![bold(0, 1)]));
+        assert_eq!(parse("~~s~~"), ("s".to_owned(), vec![strike(0, 1)]));
+        assert_eq!(parse("||p||"), ("p".to_owned(), vec![spoiler(0, 1)]));
+        assert_eq!(
+            parse("**bold _italic_ bold**"),
+            ("bold _italic_ bold".to_owned(), vec![bold(0, 18)])
+        );
+
+        // Mixed battery: entities at stripped-text offsets.
+        assert_eq!(
+            parse("__i__ ~~s~~ **b** ||sp|| [t](https://t.me/x)"),
+            (
+                "i s b sp t".to_owned(),
+                vec![
+                    italic(0, 1),
+                    strike(2, 1),
+                    bold(4, 1),
+                    spoiler(6, 2),
+                    text_url(9, 1, "https://t.me/x"),
+                ]
+            )
+        );
+        assert_eq!(
+            parse("**a** and **b**"),
+            ("a and b".to_owned(), vec![bold(0, 1), bold(6, 1)])
+        );
+        // v3 never errors: lone and unpaired delimiters stay literal.
+        assert_eq!(parse("__"), ("__".to_owned(), Vec::new()));
+        assert_eq!(parse("**"), ("**".to_owned(), Vec::new()));
+
+        // Pre entities: the language is recognized only before a newline;
+        // without one the whole fence body is the content.
+        assert_eq!(
+            parse("```python\nprint(1)\n```"),
+            ("print(1)\n".to_owned(), vec![pre_code(0, 9, "python")])
+        );
+        assert_eq!(
+            parse("```lang code```"),
+            ("lang code".to_owned(), vec![pre(0, 9)])
+        );
+        // CRLF after a fence is not a language separator: it stays content.
+        assert_eq!(parse("```\rx\r```"), ("\rx\r".to_owned(), vec![pre(0, 3)]));
+        // Double backticks are not fences.
+        assert_eq!(parse("a `` b"), ("a `` b".to_owned(), Vec::new()));
+
+        // UTF-16 offsets: astral emoji count as 2, CJK as 1 each.
+        assert_eq!(
+            parse("\u{1f600}**b**\u{1f400}"),
+            ("\u{1f600}b\u{1f400}".to_owned(), vec![bold(2, 1)])
+        );
+        assert_eq!(
+            parse("中文**粗体**"),
+            ("中文粗体".to_owned(), vec![bold(2, 2)])
+        );
+
+        // Predetermined splittable entities win over the syntax they cover;
+        // new entities are parsed in the gaps.
+        assert_eq!(
+            parse_with("keep **new**", vec![bold(0, 4)]),
+            ("keep new".to_owned(), vec![bold(0, 4), bold(5, 3)])
+        );
+        // The pair inside the predetermined entity is still found: the C++
+        // `combine` is a plain append, so the surviving entities are
+        // emitted twice here (the API path's fix_entities merges the
+        // duplicates afterwards).
+        assert_eq!(
+            parse_with("~~a~~ __b__", vec![strike(0, 3)]),
+            (
+                "a b".to_owned(),
+                vec![strike(0, 1), strike(0, 1), italic(2, 1)]
+            )
+        );
+        // A predetermined Pre entity keeps its fence; the tail is parsed.
+        assert_eq!(
+            parse_with("```x``` **b**", vec![pre(0, 3)]),
+            ("```x``` b".to_owned(), vec![pre(0, 3), bold(8, 1)])
+        );
+    }
+
+    /// M.8.8 hand-traced vectors for `get_markdown_v3`: the formatting of
+    /// every supported type, the kept-entity paths (underline, blockquote,
+    /// invalid language codes) and the parse-check return-original
+    /// behavior.
+    #[test]
+    fn get_markdown_v3_golden_vectors() {
+        fn get(text: &str, entities: Vec<MessageEntity>) -> (String, Vec<MessageEntity>) {
+            let result = get_markdown_v3(FormattedText {
+                text: text.to_owned(),
+                entities,
+            });
+            (result.text, result.entities)
+        }
+        let bold = |offset, length| MessageEntity::new(Type::Bold, offset, length);
+        let italic = |offset, length| MessageEntity::new(Type::Italic, offset, length);
+        let strike = |offset, length| MessageEntity::new(Type::Strikethrough, offset, length);
+        let spoiler = |offset, length| MessageEntity::new(Type::Spoiler, offset, length);
+        let code = |offset, length| MessageEntity::new(Type::Code, offset, length);
+        let pre = |offset, length| MessageEntity::new(Type::Pre, offset, length);
+        let pre_code = |offset, length, language: &str| {
+            MessageEntity::with_argument(Type::PreCode, offset, length, language.to_owned())
+        };
+        let text_url = |offset, length, url: &str| {
+            MessageEntity::with_argument(Type::TextUrl, offset, length, url.to_owned())
+        };
+        let underline = |offset, length| MessageEntity::new(Type::Underline, offset, length);
+
+        // The four splittable types and TextUrl format and drop entities.
+        assert_eq!(
+            get(
+                "italic bold strike spoiler",
+                vec![italic(0, 6), bold(7, 4), strike(12, 6), spoiler(19, 7)]
+            ),
+            (
+                "__italic__ **bold** ~~strike~~ ||spoiler||".to_owned(),
+                Vec::new()
+            )
+        );
+        assert_eq!(
+            get("url", vec![text_url(0, 3, "https://t.me/x")]),
+            ("[url](https://t.me/x)".to_owned(), Vec::new())
+        );
+
+        // Code/Pre/PreCode fences; PreCode needs a newline after the fence.
+        assert_eq!(
+            get("code", vec![code(0, 4)]),
+            ("`code`".to_owned(), Vec::new())
+        );
+        assert_eq!(
+            get("x", vec![pre(0, 1)]),
+            ("```\nx```".to_owned(), Vec::new())
+        );
+        assert_eq!(
+            get("line1\nline2", vec![pre(0, 11)]),
+            ("```\nline1\nline2```".to_owned(), Vec::new())
+        );
+        assert_eq!(
+            get("print(1)\n", vec![pre_code(0, 9, "python")]),
+            ("```python\nprint(1)\n```".to_owned(), Vec::new())
+        );
+
+        // Unsupported forms: the entity is kept and the text stays as-is.
+        assert_eq!(
+            get("a b", vec![pre_code(0, 3, "c x")]),
+            ("a b".to_owned(), vec![pre_code(0, 3, "c x")])
+        );
+        assert_eq!(
+            get("ab", vec![underline(0, 2)]),
+            ("ab".to_owned(), vec![underline(0, 2)])
+        );
+        assert_eq!(
+            get("x", vec![MessageEntity::new(Type::BlockQuote, 0, 1)]),
+            (
+                "x".to_owned(),
+                vec![MessageEntity::new(Type::BlockQuote, 0, 1)]
+            )
+        );
+
+        // A code entity containing a backtick cannot round-trip (the
+        // formatted fence would not re-parse to the same entity), so the
+        // original text and entities are returned.
+        assert_eq!(
+            get("a ` b", vec![code(2, 1)]),
+            ("a ` b".to_owned(), vec![code(2, 1)])
+        );
+        // Nested Bold+Italic round-trips through the doubled delimiters
+        // (the parse-check passes, so the formatted text is returned).
+        assert_eq!(
+            get("nested", vec![bold(0, 6), italic(1, 2)]),
+            ("**n__es__ted**".to_owned(), Vec::new())
+        );
+
+        // Adjacent entities round-trip and drop out.
+        assert_eq!(
+            get("abcd", vec![bold(0, 2), italic(2, 2)]),
+            ("**ab**__cd__".to_owned(), Vec::new())
+        );
+
+        // UTF-16 offsets: the astral emoji counts as 2 code units.
+        assert_eq!(
+            get("emoji \u{1f600}", vec![italic(0, 5)]),
+            ("__emoji__ \u{1f600}".to_owned(), Vec::new())
+        );
+    }
+
+    /// M.8.8 parse→format→parse round-trip fixed points: for every corpus
+    /// text, `get_markdown_v3` output re-parses to the exact entities
+    /// `parse_markdown_v3` produced (canonical formatting is idempotent).
+    #[test]
+    fn markdown_v3_round_trip_fixed_points() {
+        let corpus = [
+            "__i__ ~~s~~ **b** ||sp|| [t](https://t.me/x)",
+            "**bold _italic_ bold**",
+            "```python\nprint(1)\n```",
+            "```\r\nwin\r\n```",
+            "`code` mid **bold** end",
+            "**a** and **b**",
+            "**a**__b__**c**",
+            "||p\np||",
+            "```lang code```",
+            "[t](https://t.me/x) [u](https://t.me/y)",
+            "\u{1f600}**b**\u{1f400}",
+            "中文**粗体**",
+            ">quoted **b**",
+            "**b** >x",
+            "just plain text",
+            "",
+        ];
+        for text in corpus {
+            let parsed = parse_markdown_v3(FormattedText {
+                text: text.to_owned(),
+                entities: Vec::new(),
+            });
+            let markdown = get_markdown_v3(parsed.clone());
+            let reparsed = parse_markdown_v3(markdown);
+            assert_eq!(reparsed, parsed, "round-trip fixed point for {text:?}");
+        }
     }
 
     // ===== M.8.2 — input converters + fix_entities =====

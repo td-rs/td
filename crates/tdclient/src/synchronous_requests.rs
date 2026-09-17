@@ -491,12 +491,17 @@ mod tests {
     /// and the Rust port — reads the pristine bracket content, so those six
     /// entries hold the source-true answers instead of the mangled ones.
     ///
-    /// The M.8.7 Markdown v2 battery is the last 76 entries (nested
+    /// The M.8.7 Markdown v2 battery is the next 76 entries (nested
     /// entities, escapes, pre/code narrowing, blockquotes and expandable
     /// blockquotes, tg://user/tg://emoji/tg://time links, CRLF handling,
-    /// UTF-16 offsets and the 400 error paths). Corpus responses store the
-    /// oracle output decoded: tdlib's JSON layer escapes non-ASCII as
-    /// \uXXXX while the Rust layer emits raw UTF-8, so non-ASCII was
+    /// UTF-16 offsets and the 400 error paths). The M.8.8 Markdown v3
+    /// battery is the last 97 entries: parseMarkdown with and without
+    /// pre-existing entities, getMarkdownText over every entity type the
+    /// v3 formatter handles plus the kept-entity and return-original
+    /// paths, the 400 error paths and parse→format→parse round-trip
+    /// pairs. Corpus responses store the oracle output decoded: tdlib's
+    /// JSON layer escapes non-ASCII as \uXXXX (astral chars as surrogate
+    /// pairs) while the Rust layer emits raw UTF-8, so non-ASCII was
     /// normalized to characters at recording time (control-char escapes
     /// stay, matching both layers).
     #[test]
@@ -531,7 +536,7 @@ mod tests {
             );
             checked += 1;
         }
-        assert_eq!(checked, 413, "the corpus shrank");
+        assert_eq!(checked, 510, "the corpus shrank");
     }
 
     #[test]
