@@ -9848,6 +9848,119 @@ impl ChatManager {
         }
     }
 
+    /// `on_update_channel_bot_commands` (ChatManager.cpp:9112-9119).
+    pub fn on_update_channel_bot_commands(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        bot_commands: BotCommands,
+    ) {
+        if self
+            .get_channel_full_force(
+                user_manager,
+                env,
+                channel_id,
+                true,
+                "on_update_channel_bot_commands",
+                false,
+            )
+            .is_none()
+        {
+            return;
+        }
+        let mut changed = false;
+        if let Some(f) = self.get_channel_full_mut(channel_id)
+            && BotCommands::update_all_bot_commands(&mut f.bot_commands, bot_commands)
+        {
+            f.is_changed = true;
+            changed = true;
+        }
+        if changed {
+            self.update_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                "on_update_channel_bot_commands",
+                false,
+            );
+        }
+    }
+
+    /// `on_update_channel_guard_bot_user_id` (ChatManager.cpp:9121-9127).
+    pub fn on_update_channel_guard_bot_user_id(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        guard_bot_user_id: UserId,
+    ) {
+        if self
+            .get_channel_full_force(
+                user_manager,
+                env,
+                channel_id,
+                true,
+                "on_update_channel_guard_bot_user_id",
+                false,
+            )
+            .is_some()
+        {
+            self.on_update_channel_full_guard_bot_user_id(
+                user_manager,
+                channel_id,
+                guard_bot_user_id,
+            );
+            self.update_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                "on_update_channel_guard_bot_user_id",
+                false,
+            );
+        }
+    }
+
+    /// `on_update_channel_permanent_invite_link`
+    /// (ChatManager.cpp:9144-9152).
+    pub fn on_update_channel_permanent_invite_link(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        invite_link: &DialogInviteLink,
+    ) {
+        if self
+            .get_channel_full_force(
+                user_manager,
+                env,
+                channel_id,
+                true,
+                "on_update_channel_permanent_invite_link",
+                false,
+            )
+            .is_none()
+        {
+            return;
+        }
+        let mut changed = false;
+        if let Some(f) = self.get_channel_full_mut(channel_id)
+            && Self::update_permanent_invite_link(&mut f.invite_link, invite_link.clone())
+        {
+            f.is_changed = true;
+            changed = true;
+        }
+        if changed {
+            self.update_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                "on_update_channel_permanent_invite_link",
+                false,
+            );
+        }
+    }
+
     /// `ChatManager::save_chat` (ChatManager.cpp:4467-4484): the binlog
     /// mirror (`ChatLogEvent`, `HandlerType::Chats`) add/rewrite while the
     /// record is unsaved, then the sqlite row. Reached from
