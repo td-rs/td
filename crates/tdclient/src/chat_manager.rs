@@ -9961,6 +9961,221 @@ impl ChatManager {
         }
     }
 
+    // ---- M.5.34/M.5.35/M.5.37: the read surface ----
+
+    /// `get_chat` (ChatManager.cpp:8397-8419) — the left-tries ladder.
+    /// Renamed `try_get_chat` here: the landed `get_chat` record accessor
+    /// owns the C++ record-form overload.
+    /// The db branch is the synchronous-kv load; the queue branch is the
+    /// landed net-blocked GetChatsQuery error.
+    pub fn try_get_chat(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        left_tries: i32,
+        mut promise: Promise<()>,
+    ) -> bool {
+        if !chat_id.is_valid() {
+            promise.set_error(Status::error(400, "Invalid basic group identifier"));
+            return false;
+        }
+        if !self.have_chat(chat_id) {
+            if left_tries > 2 && env.global.use_chat_info_database() {
+                self.load_chat_from_database(user_manager, env, chat_id, false);
+                return false;
+            }
+            if left_tries > 1 {
+                // get_chat_queries_.add_query — the deduped net query is
+                // [blocked: net] (M.5.44)
+                promise.set_error(Status::error(500, "Network is not implemented yet"));
+                return false;
+            }
+            promise.set_error(Status::error(400, "Group not found"));
+            return false;
+        }
+        promise.set_value(());
+        true
+    }
+
+    /// `get_channel` (ChatManager.cpp:8928-8936) — the left-tries ladder
+    /// with the bot-gated queue branch and the monoforum tail. Renamed
+    /// `try_get_channel` (record accessor owns the C++ overload).
+    pub fn try_get_channel(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        left_tries: i32,
+        mut promise: Promise<()>,
+    ) -> bool {
+        if !channel_id.is_valid() {
+            promise.set_error(Status::error(400, "Invalid supergroup identifier"));
+            return false;
+        }
+        if !self.have_channel(channel_id) {
+            if left_tries > 2 && env.auth_is_bot {
+                self.load_channel_from_database(user_manager, env, channel_id, false, false);
+                return false;
+            }
+            if left_tries > 1 {
+                promise.set_error(Status::error(500, "Network is not implemented yet"));
+                return false;
+            }
+            promise.set_error(Status::error(400, "Supergroup not found"));
+            return false;
+        }
+        let monoforum_channel_id = self
+            .get_channel(channel_id)
+            .map(|c| c.monoforum_channel_id)
+            .unwrap_or_default();
+        if monoforum_channel_id.is_valid() && !self.have_channel(monoforum_channel_id) {
+            if left_tries > 3 && env.global.use_chat_info_database() {
+                self.load_channel_from_database(user_manager, env, monoforum_channel_id, false, false);
+            } else if left_tries > 2 && env.auth_is_bot {
+                promise.set_error(Status::error(500, "Network is not implemented yet"));
+                return false;
+            } else {
+                promise.set_value(());
+                return true;
+            }
+        }
+        promise.set_value(());
+        true
+    }
+
+    /// `get_channel_type` (ChatManager.cpp:8605-8617) — the id-level
+    /// fallback ladder through the min-channel cache.
+    #[allow(dead_code)] // production callers: MessagesManager/updates (M.10)
+    pub(crate) fn get_channel_type_by_id(&self, channel_id: ChannelId) -> ChannelType {
+        if let Some(c) = self.get_channel(channel_id) {
+            return Self::get_channel_type(c);
+        }
+        if let Some(min) = self.get_min_channel(channel_id) {
+            return if min.is_megagroup_ {
+                ChannelType::Megagroup
+            } else {
+                ChannelType::Broadcast
+            };
+        }
+        ChannelType::Unknown
+    }
+
+    /// `get_unsupported_channel_id` (ChatManager.cpp:3161-3163).
+    pub fn get_unsupported_channel_id(&self, env: &UserEnv) -> ChannelId {
+        ChannelId::new(if env.global.is_test_dc() {
+            10_304_875
+        } else {
+            1_535_424_647
+        })
+    }
+
+    /// `get_chat_status` (ChatManager.cpp:8634-8640).
+    pub fn get_chat_status(&self, chat_id: ChatId) -> DialogParticipantStatus {
+        match self.get_chat(chat_id) {
+            Some(c) => c.status.clone(),
+            None => DialogParticipantStatus::banned(0, String::new()),
+        }
+    }
+
+    /// `get_chat_participant_count` (ChatManager.cpp:8622-8626).
+    pub fn get_chat_participant_count(&self, chat_id: ChatId) -> i32 {
+        self.get_chat(chat_id).map(|c| c.participant_count).unwrap_or(0)
+    }
+
+    /// `get_chat_is_active` (ChatManager.cpp:8628-8632).
+    pub fn get_chat_is_active(&self, chat_id: ChatId) -> bool {
+        self.get_chat(chat_id).is_some_and(|c| c.is_active)
+    }
+
+    /// `get_chat_date` (ChatManager.cpp:8612-8616).
+    pub fn get_chat_date(&self, chat_id: ChatId) -> i32 {
+        self.get_chat(chat_id).map(|c| c.date).unwrap_or(0)
+    }
+
+    /// `get_channel_status` (ChatManager.cpp:8642-8648).
+    pub fn get_channel_status(&self, channel_id: ChannelId) -> DialogParticipantStatus {
+        match self.get_channel(channel_id) {
+            Some(c) => c.status.clone(),
+            None => DialogParticipantStatus::banned(0, String::new()),
+        }
+    }
+
+    /// `get_channel_date` (ChatManager.cpp:8619-8623) and
+    /// `get_channel_participant_count` (8625-8629) and the plain flag
+    /// getters (8631-8655 region) collapsed onto their record fields.
+    pub fn get_channel_field_snapshot(&self, channel_id: ChannelId) -> (i32, i32, bool, bool) {
+        match self.get_channel(channel_id) {
+            Some(c) => (c.date, c.participant_count, c.is_verified, c.sign_messages),
+            None => (0, 0, false, false),
+        }
+    }
+
+    /// `get_current_state` (ChatManager.cpp:9966-9992) — the state-dump
+    /// terminal piece. Order contract: unknown placeholders first; channels
+    /// before chats ("chat objects can contain channel_id, so they must be
+    /// sent after channels" — cpp:9977); fulls last, channels-full before
+    /// chats-full. Intra-container order is hash order in the C++ and
+    /// sorted in Rust — differential tests compare per-container sets.
+    pub fn get_current_state(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        updates: &mut Vec<td_api::Update>,
+    ) {
+        for chat_id in self.unknown_chats.iter().copied() {
+            let chat_id = ChatId::new(chat_id);
+            if !self.have_chat(chat_id) {
+                updates.push(Self::get_update_unknown_basic_group_object(chat_id));
+            }
+        }
+        for channel_id in self.unknown_channels.iter().copied() {
+            let channel_id = ChannelId::new(channel_id);
+            if !self.have_channel(channel_id) {
+                updates.push(self.get_update_unknown_supergroup_object(channel_id));
+            }
+        }
+        for raw_channel_id in self.channels.keys().copied().collect::<Vec<_>>() {
+            let channel_id = ChannelId::new(raw_channel_id);
+            let c = self.get_channel(channel_id).cloned();
+            updates.push(self.get_update_supergroup_object(channel_id, c.as_ref()));
+        }
+        for raw_chat_id in self.chats.keys().copied().collect::<Vec<_>>() {
+            let chat_id = ChatId::new(raw_chat_id);
+            let c = self.get_chat(chat_id).cloned();
+            updates.push(self.get_update_basic_group_object(chat_id, c.as_ref()));
+        }
+        let channel_full_ids: Vec<i64> =
+            self.channels_full.keys().copied().collect::<Vec<_>>();
+        for channel_id in channel_full_ids {
+            let channel_id = ChannelId::new(channel_id);
+            let c = self.get_channel(channel_id).cloned();
+            debug_assert!(self
+                .get_channel_full_const(channel_id)
+                .is_some_and(|f| f.is_update_channel_full_sent));
+            let update = self.get_update_supergroup_full_info_object(
+                user_manager,
+                env,
+                channel_id,
+                "get_current_state",
+            );
+            updates.push(update);
+            let _ = c;
+        }
+        let chat_full_ids: Vec<i64> = self.chats_full.keys().copied().collect::<Vec<_>>();
+        for chat_id in chat_full_ids {
+            let basic_group_id = self.get_basic_group_id_object(ChatId::new(chat_id), "get_current_state");
+            let full_object = self.get_basic_group_full_info_object(user_manager, env, ChatId::new(chat_id));
+            debug_assert!(self
+                .get_chat_full(ChatId::new(chat_id))
+                .is_some_and(|f| f.is_update_chat_full_sent));
+            updates.push(td_api::Update::updateBasicGroupFullInfo(td_api::updateBasicGroupFullInfo {
+                basic_group_id,
+                basic_group_full_info: full_object,
+            }));
+        }
+    }
+
     /// `ChatManager::save_chat` (ChatManager.cpp:4467-4484): the binlog
     /// mirror (`ChatLogEvent`, `HandlerType::Chats`) add/rewrite while the
     /// record is unsaved, then the sqlite row. Reached from
