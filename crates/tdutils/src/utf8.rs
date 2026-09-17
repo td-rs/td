@@ -221,8 +221,12 @@ pub fn utf8_utf16_truncate(s: &str, length: usize) -> &str {
             }
             length_left -= 1;
             if b >= 0xf0 {
-                // >= 4 bytes in symbol => surrogate pair
-                length_left -= 1;
+                // >= 4 bytes in symbol => surrogate pair. The C++ `size_t`
+                // underflows to SIZE_MAX here and the truncation is
+                // silently defeated for the rest of the string; preserve
+                // that quirk verbatim (a truncate(2) that starts a
+                // surrogate pair at its last unit returns the whole input).
+                length_left = length_left.wrapping_sub(1);
             }
         }
     }
@@ -298,23 +302,28 @@ pub fn utf8_to_lower(s: &str) -> String {
 mod utf16_tests {
     use super::*;
 
-    /// utf8.cpp:159-164 — ASCII counts one, 4-byte characters two.
+    /// utf8.cpp:159-164 — ASCII counts one, 4-byte characters two; 2-byte
+    /// BMP characters (here Cyrillic) are one UTF-16 code unit each (the
+    /// C++ per-byte sum: the lead byte is a first code unit, the
+    /// continuation byte is not).
     #[test]
     fn utf16_length_counts_surrogate_pairs() {
         assert_eq!(utf8_utf16_length("abc"), 3);
-        assert_eq!(utf8_utf16_length("аб"), 4);
+        assert_eq!(utf8_utf16_length("аб"), 2);
         assert_eq!(utf8_utf16_length("\u{1F42D}"), 2, "a surrogate pair");
         assert_eq!(utf8_utf16_length("a\u{1F42D}b"), 4);
         assert_eq!(utf8_utf16_length(""), 0);
     }
 
     /// utf8.cpp:166-191 — truncation at code-point boundaries and the
-    /// substr compositions.
+    /// substr compositions. `truncate(s, 2)` returns the whole input: the
+    /// second code unit of the surrogate pair underflows the C++ `size_t`
+    /// and the truncation is defeated (pinned C++ quirk, kept verbatim).
     #[test]
     fn utf16_truncate_and_substr() {
         let s = "a\u{1F42D}bc";
         assert_eq!(utf8_utf16_truncate(s, 3), "a\u{1F42D}");
-        assert_eq!(utf8_utf16_truncate(s, 2), "a\u{1F42D}");
+        assert_eq!(utf8_utf16_truncate(s, 2), s);
         assert_eq!(utf8_utf16_truncate(s, 1), "a");
         assert_eq!(utf8_utf16_truncate(s, 10), s);
         assert_eq!(utf8_utf16_substr(s, 1), "\u{1F42D}bc");
