@@ -138,6 +138,13 @@ impl MessageId {
         self.0 != 0
     }
 
+    /// `MessageId::is_server` (MessageId.h:131-133) — the full
+    /// local/scheduled/server classification lands with MessagesManager
+    /// (M.10); a positive raw id is a server id today.
+    pub fn is_server(self) -> bool {
+        self.0 > 0
+    }
+
     /// The `MessageId` header `store` (MessageId.h:193-200) — the raw id
     /// both ways, no version gate.
     pub fn store(&self, out: &mut Vec<u8>) {
@@ -10660,7 +10667,7 @@ impl ChatManager {
     /// `delete_chat` (ChatManager.cpp:4021-4032) — the DeleteChatQuery
     /// send is [blocked: net] (M.5.46); local state mutation happens in
     /// the query's on_ok.
-    pub fn delete_chat(&mut self, env: &mut UserEnv, chat_id: ChatId, mut promise: Promise<()>) {
+    pub fn delete_chat(&mut self, _env: &mut UserEnv, chat_id: ChatId, mut promise: Promise<()>) {
         let Some(c) = self.get_chat(chat_id) else {
             return promise.set_error(Status::error(400, "Chat info not found"));
         };
@@ -10678,7 +10685,7 @@ impl ChatManager {
     /// send is [blocked: net] (M.5.46).
     pub fn delete_channel(
         &mut self,
-        env: &mut UserEnv,
+        _env: &mut UserEnv,
         channel_id: ChannelId,
         mut promise: Promise<()>,
     ) {
@@ -10689,6 +10696,636 @@ impl ChatManager {
             return promise.set_error(Status::error(400, "The chat can't be deleted"));
         }
         tdutils::log_info!("DeleteChannelQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    // ---- M.5.41: the toggle family (ChatManager.cpp:3444-3675) ----
+
+    /// `toggle_channel_sign_messages` (ChatManager.cpp:3444-3458).
+    pub fn toggle_channel_sign_messages(
+        &mut self,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        _sign_messages: bool,
+        _show_message_sender: bool,
+        mut promise: Promise<()>,
+    ) {
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Supergroup not found"));
+        };
+        if Self::get_channel_type(c) == ChannelType::Megagroup {
+            return promise.set_error(Status::error(
+                400,
+                "Message signatures can't be toggled in supergroups",
+            ));
+        }
+        if !self
+            .get_channel_permissions_channel(env.global, channel_id, c)
+            .can_change_info_and_settings()
+        {
+            return promise.set_error(Status::error(
+                400,
+                "Not enough rights to toggle channel sign messages",
+            ));
+        }
+        tdutils::log_info!("ToggleChannelSignaturesQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `toggle_channel_join_to_send` (ChatManager.cpp:3461-3473).
+    pub fn toggle_channel_join_to_send(
+        &mut self,
+        _env: &mut UserEnv,
+        channel_id: ChannelId,
+        _join_to_send: bool,
+        mut promise: Promise<()>,
+    ) {
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Supergroup not found"));
+        };
+        if Self::get_channel_type(c) == ChannelType::Broadcast || c.is_gigagroup || c.is_monoforum {
+            return promise.set_error(Status::error(
+                400,
+                "The method can be called only for ordinary supergroups",
+            ));
+        }
+        if !self.get_channel_status(channel_id).can_restrict_members() {
+            return promise.set_error(Status::error(400, "Not enough rights"));
+        }
+        tdutils::log_info!("ToggleChannelJoinToSendQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `toggle_channel_join_request` (ChatManager.cpp:3476-3494).
+    #[allow(clippy::too_many_arguments)]
+    pub fn toggle_channel_join_request(
+        &mut self,
+        _user_manager: &mut UserManager,
+        _env: &mut UserEnv,
+        channel_id: ChannelId,
+        join_request: bool,
+        guard_bot_user_id: UserId,
+        apply_to_invite_links: bool,
+        mut promise: Promise<()>,
+    ) {
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Supergroup not found"));
+        };
+        if Self::get_channel_type(c) == ChannelType::Broadcast || c.is_gigagroup || c.is_monoforum {
+            return promise.set_error(Status::error(
+                400,
+                "The method can be called only for ordinary supergroups",
+            ));
+        }
+        if !self.get_channel_status(channel_id).can_restrict_members() {
+            return promise.set_error(Status::error(400, "Not enough rights"));
+        }
+        let _ = (join_request, guard_bot_user_id, apply_to_invite_links);
+        // the guard-bot input_user resolution is the net step's job (M.5.45)
+        tdutils::log_info!("ToggleChannelJoinRequestQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `toggle_channel_is_all_history_available`
+    /// (ChatManager.cpp:3497-3517) — the gate order is load-bearing.
+    pub fn toggle_channel_is_all_history_available(
+        &mut self,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        is_all_history_available: bool,
+        mut promise: Promise<()>,
+    ) {
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Supergroup not found"));
+        };
+        if !self
+            .get_channel_permissions_channel(env.global, channel_id, c)
+            .can_change_info_and_settings()
+        {
+            return promise.set_error(Status::error(
+                400,
+                "Not enough rights to toggle all supergroup history availability",
+            ));
+        }
+        if Self::get_channel_type(c) != ChannelType::Megagroup {
+            return promise.set_error(Status::error(
+                400,
+                "Message history can be hidden in supergroups only",
+            ));
+        }
+        if (c.is_forum || c.is_monoforum) && !is_all_history_available {
+            return promise.set_error(Status::error(
+                400,
+                "Message history can't be hidden in forum and channel direct messages supergroups",
+            ));
+        }
+        if c.has_linked_channel && !is_all_history_available {
+            return promise.set_error(Status::error(
+                400,
+                "Message history can't be hidden in discussion supergroups",
+            ));
+        }
+        tdutils::log_info!("TogglePrehistoryHiddenQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `toggle_channel_can_have_sponsored_messages`
+    /// (ChatManager.cpp:3520-3534).
+    pub fn toggle_channel_can_have_sponsored_messages(
+        &mut self,
+        _env: &mut UserEnv,
+        channel_id: ChannelId,
+        _can_have_sponsored_messages: bool,
+        mut promise: Promise<()>,
+    ) {
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Supergroup not found"));
+        };
+        if !self.get_channel_status(channel_id).is_creator() {
+            return promise.set_error(Status::error(
+                400,
+                "Not enough rights to disable sponsored messages",
+            ));
+        }
+        if Self::get_channel_type(c) != ChannelType::Broadcast {
+            return promise.set_error(Status::error(
+                400,
+                "Sponsored messages can be disabled only in channels",
+            ));
+        }
+        tdutils::log_info!("RestrictSponsoredMessagesQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `toggle_channel_has_automatic_translation`
+    /// (ChatManager.cpp:3537-3550).
+    pub fn toggle_channel_has_automatic_translation(
+        &mut self,
+        _env: &mut UserEnv,
+        channel_id: ChannelId,
+        _has_automatic_translation: bool,
+        mut promise: Promise<()>,
+    ) {
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Supergroup not found"));
+        };
+        if !c.status.can_change_info_and_settings_as_administrator() {
+            return promise.set_error(Status::error(
+                400,
+                "Not enough rights to change automatic translation",
+            ));
+        }
+        if Self::get_channel_type(c) != ChannelType::Broadcast {
+            return promise.set_error(Status::error(
+                400,
+                "Automatic translation can be enabled only in channels",
+            ));
+        }
+        tdutils::log_info!("ToggleAutotranslationQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `toggle_channel_has_hidden_participants`
+    /// (ChatManager.cpp:3588-3593).
+    pub fn toggle_channel_has_hidden_participants(
+        &mut self,
+        _user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        _has_hidden_participants: bool,
+        // user_manager is consumed by get_channel_full_force above
+        mut promise: Promise<()>,
+    ) {
+        let full = self.get_channel_full_const(channel_id).cloned();
+        let check = self.can_hide_channel_participants(env, channel_id, full.as_ref());
+        match check {
+            tdutils::status::Result::Ok(()) => {
+                tdutils::log_info!(
+                    "ToggleParticipantsHiddenQuery for {channel_id:?} — [blocked: net]"
+                );
+                promise.set_error(Status::error(500, "Network is not implemented yet"));
+            }
+            tdutils::status::Result::Err(status) => promise.set_error(status),
+        }
+    }
+
+    /// `toggle_channel_has_aggressive_anti_spam_enabled`
+    /// (ChatManager.cpp:3639-3645).
+    pub fn toggle_channel_has_aggressive_anti_spam_enabled(
+        &mut self,
+        _user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        _has_aggressive_anti_spam_enabled: bool,
+        mut promise: Promise<()>,
+    ) {
+        let full = self.get_channel_full_const(channel_id).cloned();
+        let check = self.can_toggle_channel_aggressive_anti_spam(env, channel_id, full.as_ref());
+        match check {
+            tdutils::status::Result::Ok(()) => {
+                tdutils::log_info!("ToggleAntiSpamQuery for {channel_id:?} — [blocked: net]");
+                promise.set_error(Status::error(500, "Network is not implemented yet"));
+            }
+            tdutils::status::Result::Err(status) => promise.set_error(status),
+        }
+    }
+
+    /// `toggle_channel_is_forum` (ChatManager.cpp:3648-3664) — the no-op
+    /// equal-state early-OK resolves without a query.
+    pub fn toggle_channel_is_forum(
+        &mut self,
+        _env: &mut UserEnv,
+        channel_id: ChannelId,
+        is_forum: bool,
+        is_forum_tabs: bool,
+        mut promise: Promise<()>,
+    ) {
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Supergroup not found"));
+        };
+        if c.is_forum == is_forum && c.is_forum_tabs == is_forum_tabs {
+            return promise.set_value(());
+        }
+        if !c.status.is_creator() {
+            return promise.set_error(Status::error(
+                400,
+                "Not enough rights to convert the group to a forum",
+            ));
+        }
+        if Self::get_channel_type(c) != ChannelType::Megagroup {
+            return promise.set_error(Status::error(
+                400,
+                "Forums can be enabled in supergroups only",
+            ));
+        }
+        tdutils::log_info!("ToggleForumQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `can_convert_channel_to_gigagroup` (ChatManager.cpp:3925-3928).
+    pub fn can_convert_channel_to_gigagroup(
+        &mut self,
+        _env: &mut UserEnv,
+        channel_id: ChannelId,
+    ) -> bool {
+        let Some(c) = self.get_channel(channel_id) else {
+            return false;
+        };
+        if Self::get_channel_type(c) != ChannelType::Megagroup
+            || !self.get_channel_status(channel_id).is_creator()
+            || c.is_gigagroup
+            || c.default_permissions != RestrictedRights::restrict_all()
+        {
+            return false;
+        }
+        true
+    }
+
+    /// `convert_channel_to_gigagroup` (ChatManager.cpp:3667-3675).
+    pub fn convert_channel_to_gigagroup(
+        &mut self,
+        _user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        mut promise: Promise<()>,
+    ) {
+        if !self.can_convert_channel_to_gigagroup(env, channel_id) {
+            return promise.set_error(Status::error(
+                400,
+                "Can't convert the chat to a broadcast group",
+            ));
+        }
+        // td_->suggested_action_manager_->remove_dialog_suggested_action —
+        // the M.13 stub.
+        tdutils::log_info!("ConvertToGigagroupQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    // ---- M.5.42: discussion / monoforum / location / slow mode /
+    // statistics / report / paid messages (ChatManager.cpp:3691-4018) ----
+
+    /// `set_channel_discussion_group` (ChatManager.cpp:3691-3758). The
+    /// have_dialog_force gates are the DialogManager stubs (M.6/M.10); the
+    /// SetDiscussionGroupQuery send is [blocked: net].
+    pub fn set_channel_discussion_group(
+        &mut self,
+        _user_manager: &mut UserManager,
+        _env: &mut UserEnv,
+        dialog_id: DialogId,
+        discussion_dialog_id: DialogId,
+        mut promise: Promise<()>,
+    ) {
+        if !dialog_id.is_valid() && !discussion_dialog_id.is_valid() {
+            return promise.set_error(Status::error(400, "Invalid chat identifiers specified"));
+        }
+        // the broadcast side
+        if dialog_id.is_valid() {
+            // have_dialog_force — the DialogManager stub (M.6)
+            if self.get_channel_type_by_id(dialog_id.get_channel_id()) != ChannelType::Broadcast {
+                return promise.set_error(Status::error(400, "Chat is not a channel"));
+            }
+            let Some(c) = self.get_channel(dialog_id.get_channel_id()) else {
+                return promise.set_error(Status::error(400, "Chat info not found"));
+            };
+            if c.is_megagroup {
+                return promise.set_error(Status::error(400, "Chat is not a channel"));
+            }
+            if !c.status.can_change_info_and_settings_as_administrator() {
+                return promise.set_error(Status::error(400, "Not enough rights in the channel"));
+            }
+            // get_input_channel — CHECKed non-null in C++
+        }
+        // the discussion (megagroup) side
+        if discussion_dialog_id.is_valid() {
+            if self.get_channel_type_by_id(discussion_dialog_id.get_channel_id())
+                != ChannelType::Megagroup
+            {
+                return promise
+                    .set_error(Status::error(400, "Discussion chat is not a supergroup"));
+            }
+            let Some(c) = self.get_channel(discussion_dialog_id.get_channel_id()) else {
+                return promise.set_error(Status::error(400, "Discussion chat info not found"));
+            };
+            if !c.is_megagroup {
+                return promise
+                    .set_error(Status::error(400, "Discussion chat is not a supergroup"));
+            }
+            if !(c.status.is_administrator() && c.status.can_pin_messages()) {
+                return promise
+                    .set_error(Status::error(400, "Not enough rights in the supergroup"));
+            }
+        }
+        tdutils::log_info!(
+            "SetDiscussionGroupQuery for {dialog_id:?}/{discussion_dialog_id:?} — [blocked: net]"
+        );
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `set_channel_monoforum_group` (ChatManager.cpp:3761-3792).
+    pub fn set_channel_monoforum_group(
+        &mut self,
+        _user_manager: &mut UserManager,
+        _env: &mut UserEnv,
+        dialog_id: DialogId,
+        is_enabled: bool,
+        mut paid_message_star_count: i64,
+        mut promise: Promise<()>,
+    ) {
+        if !dialog_id.is_valid() {
+            return promise.set_error(Status::error(400, "Invalid chat identifier specified"));
+        }
+        // have_dialog_force — the DialogManager stub (M.6)
+        if self.get_channel_type_by_id(dialog_id.get_channel_id()) != ChannelType::Broadcast {
+            return promise.set_error(Status::error(400, "Chat is not a supergroup"));
+        }
+        let Some(c) = self.get_channel(dialog_id.get_channel_id()) else {
+            return promise.set_error(Status::error(400, "Chat info not found"));
+        };
+        if c.is_megagroup {
+            return promise.set_error(Status::error(400, "Chat is not a channel"));
+        }
+        if !c.status.is_creator() {
+            return promise.set_error(Status::error(400, "Not enough rights in the channel"));
+        }
+        if !is_enabled {
+            paid_message_star_count = 0;
+            let _ = paid_message_star_count;
+        } else if !(0..=1_000_000).contains(&paid_message_star_count) {
+            return promise.set_error(Status::error(
+                400,
+                "Invalid number of Telegram Stars specified",
+            ));
+        }
+        tdutils::log_info!("UpdatePaidMessagesPriceQuery for {dialog_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `set_channel_location` (ChatManager.cpp:3795-3811).
+    pub fn set_channel_location(
+        &mut self,
+        _user_manager: &mut UserManager,
+        _env: &mut UserEnv,
+        channel_id: ChannelId,
+        location: &DialogLocation,
+        mut promise: Promise<()>,
+    ) {
+        if location.empty() {
+            return promise.set_error(Status::error(400, "Invalid chat location specified"));
+        }
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Chat info not found"));
+        };
+        if !c.is_megagroup {
+            return promise.set_error(Status::error(400, "Chat is not a supergroup"));
+        }
+        if !c.status.is_creator() {
+            return promise.set_error(Status::error(400, "Not enough rights in the supergroup"));
+        }
+        tdutils::log_info!("EditLocationQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `set_channel_slow_mode_delay` (ChatManager.cpp:3814-3843) — the
+    /// allowed-value check precedes the id validity check, like the C++.
+    pub fn set_channel_slow_mode_delay(
+        &mut self,
+        _user_manager: &mut UserManager,
+        _env: &mut UserEnv,
+        dialog_id: DialogId,
+        slow_mode_delay: i32,
+        mut promise: Promise<()>,
+    ) {
+        if !matches!(slow_mode_delay, 0 | 5 | 10 | 30 | 60 | 300 | 900 | 3600) {
+            return promise.set_error(Status::error(400, "Invalid new value for slow mode delay"));
+        }
+        if !dialog_id.is_valid() {
+            return promise.set_error(Status::error(400, "Invalid chat identifier specified"));
+        }
+        if self.get_channel_type_by_id(dialog_id.get_channel_id()) != ChannelType::Megagroup {
+            return promise.set_error(Status::error(400, "Chat is not a supergroup"));
+        }
+        let Some(c) = self.get_channel(dialog_id.get_channel_id()) else {
+            return promise.set_error(Status::error(400, "Chat info not found"));
+        };
+        if !c.is_megagroup {
+            return promise.set_error(Status::error(400, "Chat is not a supergroup"));
+        }
+        if !self
+            .get_channel_status(dialog_id.get_channel_id())
+            .can_restrict_members()
+        {
+            return promise.set_error(Status::error(400, "Not enough rights in the supergroup"));
+        }
+        tdutils::log_info!("ToggleSlowModeQuery for {dialog_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `get_channel_statistics_dc_id` (ChatManager.cpp:3846-3876) — the
+    /// full re-fetch on a missing/unexact DC rides the blocked-net query.
+    pub fn get_channel_statistics_dc_id(
+        &mut self,
+        _user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        dialog_id: DialogId,
+        for_full_statistics: bool,
+        mut promise: Promise<DcId>,
+    ) {
+        if !dialog_id.is_valid() {
+            return promise.set_error(Status::error(400, "Invalid chat identifier specified"));
+        }
+        if self.get_channel_type_by_id(dialog_id.get_channel_id()) != ChannelType::Broadcast {
+            return promise.set_error(Status::error(400, "Chat is not a channel"));
+        }
+        let Some(_) = self.get_channel(dialog_id.get_channel_id()) else {
+            return promise.set_error(Status::error(400, "Chat info not found"));
+        };
+        let dc = self
+            .get_channel_full_const(dialog_id.get_channel_id())
+            .map(|f| f.stats_dc_id);
+        let can_view = self
+            .get_channel_full_const(dialog_id.get_channel_id())
+            .map(|f| f.can_view_statistics)
+            .unwrap_or(false);
+        if dc.is_none_or(|dc| !dc.is_exact()) || (for_full_statistics && !can_view) {
+            self.send_get_channel_full_query(
+                env,
+                dialog_id.get_channel_id(),
+                Promise::default(),
+                "get_channel_statistics_dc_id",
+            );
+            return promise.set_error(Status::error(500, "Network is not implemented yet"));
+        }
+        promise.set_value(dc.unwrap_or_default());
+    }
+
+    /// `can_get_channel_message_statistics` (ChatManager.cpp:3895-3906).
+    pub fn can_get_channel_message_statistics(&self, env: &UserEnv, channel_id: ChannelId) -> bool {
+        debug_assert!(!env.auth_is_bot);
+        let Some(c) = self.get_channel(channel_id) else {
+            return false;
+        };
+        if c.is_megagroup {
+            return false;
+        }
+        match self.get_channel_full_const(channel_id) {
+            Some(f) => f.stats_dc_id.is_exact(),
+            None => c.status.can_post_messages(),
+        }
+    }
+
+    /// `can_get_channel_story_statistics` (ChatManager.cpp:3909-3921) — a
+    /// verbatim duplicate of the message-statistics predicate in the C++.
+    pub fn can_get_channel_story_statistics(&self, env: &UserEnv, channel_id: ChannelId) -> bool {
+        debug_assert!(!env.auth_is_bot);
+        let Some(c) = self.get_channel(channel_id) else {
+            return false;
+        };
+        if c.is_megagroup {
+            return false;
+        }
+        match self.get_channel_full_const(channel_id) {
+            Some(f) => f.stats_dc_id.is_exact(),
+            None => c.status.can_post_messages(),
+        }
+    }
+
+    /// `report_channel_spam` (ChatManager.cpp:3931-3965). The per-message
+    /// sender grouping needs MessagesManager (M.6); with no senders the
+    /// C++ answers OK locally.
+    pub fn report_channel_spam(
+        &mut self,
+        _user_manager: &mut UserManager,
+        _env: &mut UserEnv,
+        channel_id: ChannelId,
+        _message_ids: &[MessageId],
+        mut promise: Promise<()>,
+    ) {
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Supergroup not found"));
+        };
+        if !c.is_megagroup {
+            return promise.set_error(Status::error(
+                400,
+                "Spam can be reported only in supergroups",
+            ));
+        }
+        if !c.status.is_administrator() {
+            return promise.set_error(Status::error(
+                400,
+                "Spam can be reported only by chat administrators",
+            ));
+        }
+        // the per-message sender grouping is the M.6 stub; with no senders
+        // resolvable locally the C++ reports nothing and answers OK
+        promise.set_value(());
+    }
+
+    /// `report_channel_anti_spam_false_positive`
+    /// (ChatManager.cpp:3969-3985).
+    pub fn report_channel_anti_spam_false_positive(
+        &mut self,
+        _user_manager: &mut UserManager,
+        _env: &mut UserEnv,
+        channel_id: ChannelId,
+        message_id: MessageId,
+        mut promise: Promise<()>,
+    ) {
+        let Some(c) = self.get_channel(channel_id) else {
+            return promise.set_error(Status::error(400, "Supergroup not found"));
+        };
+        if !c.is_megagroup {
+            return promise.set_error(Status::error(400, "The chat is not a supergroup"));
+        }
+        if !c.status.is_administrator() {
+            return promise.set_error(Status::error(
+                400,
+                "Anti-spam checks false positives can be reported only by chat administrators",
+            ));
+        }
+        if !message_id.is_server() {
+            return promise.set_error(Status::error(400, "Invalid message identifier specified"));
+        }
+        tdutils::log_info!(
+            "ReportChannelAntiSpamFalsePositiveQuery for {channel_id:?} — [blocked: net]"
+        );
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `set_channel_send_paid_message_star_count`
+    /// (ChatManager.cpp:3989-4018).
+    pub fn set_channel_send_paid_message_star_count(
+        &mut self,
+        _user_manager: &mut UserManager,
+        _env: &mut UserEnv,
+        dialog_id: DialogId,
+        count: i64,
+        mut promise: Promise<()>,
+    ) {
+        if !dialog_id.is_valid() {
+            return promise.set_error(Status::error(400, "Invalid chat identifier specified"));
+        }
+        if self.get_channel_type_by_id(dialog_id.get_channel_id()) != ChannelType::Megagroup {
+            return promise.set_error(Status::error(400, "Chat is not a supergroup"));
+        }
+        let Some(c) = self.get_channel(dialog_id.get_channel_id()) else {
+            return promise.set_error(Status::error(400, "Chat info not found"));
+        };
+        if !c.is_megagroup {
+            return promise.set_error(Status::error(400, "Chat is not a supergroup"));
+        }
+        if !self
+            .get_channel_status(dialog_id.get_channel_id())
+            .can_restrict_members()
+        {
+            return promise.set_error(Status::error(400, "Not enough rights in the supergroup"));
+        }
+        if !(0..=1_000_000).contains(&count) {
+            return promise.set_error(Status::error(
+                400,
+                "Invalid number of Telegram Stars specified",
+            ));
+        }
+        tdutils::log_info!("UpdatePaidMessagesPriceQuery for {dialog_id:?} — [blocked: net]");
         promise.set_error(Status::error(500, "Network is not implemented yet"));
     }
 
