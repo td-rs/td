@@ -6,21 +6,23 @@
 //! enum-of-structs, the per-class `get_type` mapping, and the `create_*`
 //! factories (MessageContent.cpp:4653-4704).
 //!
-//! Landed in two steps: M.9.1a (the discriminant enum, the trivial id
-//! wrappers, 61 variants) and M.9.1c/M.9.1d (the value companions and 16
+//! Landed in steps: M.9.1a (the discriminant enum, the trivial id
+//! wrappers, 61 variants), M.9.1c/M.9.1d (the value companions and 16
 //! more variants: geo/topic/background/giveaway/invoice/game/paid-media/
-//! passport). 77 of the 96 variants are modeled.
+//! passport), and M.9.1b (the `DialogId` plane — 12 more variants plus the
+//! `ToDoCompletion`/`SharedDialog`/`CommunityId`/`Address`/`OrderInfo`
+//! companions they need). 89 of the 96 variants are modeled.
 //!
-//! The remaining 19 variants are pinned by companion types that do not
-//! exist on this base yet and land with them:
-//! - needs `DialogId` (arrives with the m10 integration): `Story`,
-//!   `ProximityAlertTriggered`, `RequestedDialog`, `GiftCode`,
-//!   `PaymentRefunded`, `PrizeStars`, `ConferenceCall`, `DialogShared`,
-//!   `PaymentSuccessful`, the `StarGift` family (`StarGift`,
-//!   `StarGiftUnique`, `StarGiftPurchaseOffer`,
-//!   `StarGiftPurchaseOfferDeclined`), `ChangeCommunity`,
-//!   `ChatJoinedViaCommunity`, and `ToDoList` (its completions carry a
-//!   `DialogId`; the [`ToDoList`]/[`ToDoItem`] values are ported here).
+//! The remaining 7 variants are pinned by companion types that do not
+//! exist on this line yet and land with them:
+//! - the `StarGift` family (`StarGift`, `StarGiftUnique`,
+//!   `StarGiftPurchaseOffer`, `StarGiftPurchaseOfferDeclined`) — M.9.1b
+//!   re-checked the C++ and found these need the `StarGift` VALUE class
+//!   (StarGift.h, with its `StarGiftAttribute`/`StarGiftBackground`/
+//!   `PeerColorCollectible` plane and `FileId` stickers), not just the
+//!   `DialogId`s M.9.1 recorded; the value plane is the Wave-3
+//!   Gifts/Stickers slice (`StarGiftResalePrice`, the only other missing
+//!   piece, is trivial and lands with its consumers).
 //! - `Contact` — needs `td::Contact`: M.4.14's `contact.rs` landed on the
 //!   master line *after* this branch's base (`85af8aa`), so the value
 //!   arrives with the master-line integration, not with this slice.
@@ -47,7 +49,9 @@ use crate::birthdate::Birthdate;
 use crate::chat_manager::{ChannelId, ChatId, MessageId};
 use crate::emoji_status::CustomEmojiId;
 use crate::message_entity::{FormattedText, MessageEntity};
+use crate::messages_manager::{DialogId, StoryFullId};
 use crate::photo::{Dimensions, Photo};
+use crate::store_parse::{Parser, store_i64};
 use crate::user_manager::{FileId, UserId};
 
 /// `td::MessageContentType` (MessageContentType.h:15-113) — the discriminant
@@ -952,15 +956,127 @@ pub struct ToDoItem {
     pub title: FormattedText,
 }
 
-/// `td::ToDoList` (ToDoList.h:15-20). The `ToDoCompletion` type needs a
-/// `DialogId`, so the `MessageToDoList` variant lands with the m10
-/// integration; this value does not.
+/// `td::ToDoList` (ToDoList.h:15-20).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ToDoList {
     pub title: FormattedText,
     pub items: Vec<ToDoItem>,
     pub others_can_append: bool,
     pub others_can_complete: bool,
+}
+
+/// `td::ToDoCompletion` (ToDoCompletion.h:18-24). The wire constructor,
+/// `store`/`parse` and `add_dependencies` land with their slices.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ToDoCompletion {
+    pub id: i32,
+    pub completed_by_dialog_id: DialogId,
+    pub date: i32,
+}
+
+impl ToDoCompletion {
+    /// `ToDoCompletion::is_valid` (ToDoCompletion.h:29-31).
+    pub fn is_valid(&self) -> bool {
+        self.completed_by_dialog_id.is_valid() && self.date > 0
+    }
+}
+
+/// `td::CommunityId` (CommunityId.h) — the id of a (newer-tree) community;
+/// `0` is the unset default and the only invalid value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct CommunityId(i64);
+
+impl CommunityId {
+    pub fn new(id: i64) -> CommunityId {
+        CommunityId(id)
+    }
+
+    /// `CommunityId::is_valid` (CommunityId.h).
+    pub fn is_valid(self) -> bool {
+        self.0 > 0
+    }
+
+    pub fn get(self) -> i64 {
+        self.0
+    }
+
+    /// `CommunityId::get_fake_dialog_id` (CommunityId.h) — the community
+    /// reuses the channel dialog-id band.
+    pub fn get_fake_dialog_id(self) -> DialogId {
+        DialogId::from_channel_id(ChannelId::new(self.0))
+    }
+
+    /// `CommunityId::store` — raw `store_long`.
+    pub fn store(self, out: &mut Vec<u8>) {
+        store_i64(out, self.0);
+    }
+
+    /// `CommunityId::parse` — raw `fetch_long`.
+    pub fn parse_value(input: &[u8]) -> Result<CommunityId, &'static str> {
+        let mut parser = Parser::new(input);
+        let id = parser.i64_()?;
+        parser.fetch_end()?;
+        Ok(CommunityId(id))
+    }
+}
+
+/// `td::SharedDialog` (SharedDialog.h:21-60) — a dialog shared through a
+/// `messageActionRequestedDialog`; `first_name`/`last_name`/`username`/
+/// `photo` are filled only for shared users. The wire constructor,
+/// `store`/`parse` and the td_api objects land with their slices.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SharedDialog {
+    pub dialog_id: DialogId,
+    pub first_name: String,
+    pub last_name: String,
+    pub username: String,
+    pub photo: Photo,
+}
+
+impl SharedDialog {
+    /// `SharedDialog::is_valid` (SharedDialog.h:30-32).
+    pub fn is_valid(&self) -> bool {
+        self.dialog_id.is_valid()
+    }
+
+    /// `SharedDialog::is_user` (SharedDialog.h:34-36).
+    pub fn is_user(&self) -> bool {
+        self.dialog_id.get_type() == crate::messages_manager::DialogType::User
+    }
+
+    /// `SharedDialog::is_dialog` (SharedDialog.h:38-42) — chats and
+    /// channels; users and secret chats are not "dialogs" here.
+    pub fn is_dialog(&self) -> bool {
+        matches!(
+            self.dialog_id.get_type(),
+            crate::messages_manager::DialogType::Chat
+                | crate::messages_manager::DialogType::Channel
+        )
+    }
+}
+
+/// `td::Address` (OrderInfo.h:16-24) — the Wave-3 Payments value the
+/// `OrderInfo` carries; the wire/td_api constructors land with their
+/// slices.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Address {
+    pub country_code: String,
+    pub state: String,
+    pub city: String,
+    pub street_line1: String,
+    pub street_line2: String,
+    pub postal_code: String,
+}
+
+/// `td::OrderInfo` (OrderInfo.h:38-45) — the bot-side order details the
+/// payment-successful content carries behind `unique_ptr` (an `Option`
+/// here).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OrderInfo {
+    pub name: String,
+    pub phone_number: String,
+    pub email_address: String,
+    pub shipping_address: Option<Box<Address>>,
 }
 
 /// `td::SecureValueType` (SecureValue.h:27-42) — the element-type enum the
@@ -1726,6 +1842,123 @@ pub struct MessageTodoAppendTasks {
     pub items: Vec<ToDoItem>,
 }
 
+/// `MessageProximityAlertTriggered` (MessageContent.cpp:838-853).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessageProximityAlertTriggered {
+    pub traveler_dialog_id: DialogId,
+    pub watcher_dialog_id: DialogId,
+    pub distance: i32,
+}
+
+/// `MessagePaymentSuccessful` (MessageContent.cpp:601-633) — the bots-only
+/// tail (`shipping_option_id`/`order_info`/charge ids) is filled only for
+/// bot receivers. The wire-ctor keeps `is_recurring || is_first_recurring`
+/// normalization for the conversion slice.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessagePaymentSuccessful {
+    pub invoice_dialog_id: DialogId,
+    pub invoice_message_id: MessageId,
+    pub currency: String,
+    pub total_amount: i64,
+    pub invoice_payload: String,
+    pub subscription_until_date: i32,
+    pub is_recurring: bool,
+    pub is_first_recurring: bool,
+    pub shipping_option_id: String,
+    pub order_info: Option<OrderInfo>,
+    pub telegram_payment_charge_id: String,
+    pub provider_payment_charge_id: String,
+}
+
+/// `MessageRequestedDialog` (MessageContent.cpp:1000-1012).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessageRequestedDialog {
+    pub shared_dialog_ids: Vec<DialogId>,
+    pub button_id: i32,
+}
+
+/// `MessageStory` (MessageContent.cpp:1044-1056).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessageStory {
+    pub story_full_id: StoryFullId,
+    pub via_mention: bool,
+}
+
+/// `MessageGiftCode` (MessageContent.cpp:1065-1095) — the wire-ctor keeps
+/// the `via_giveaway || is_unclaimed` normalization for the conversion
+/// slice.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessageGiftCode {
+    pub creator_dialog_id: DialogId,
+    pub text: FormattedText,
+    pub days: i32,
+    pub currency: String,
+    pub amount: i64,
+    pub crypto_currency: String,
+    pub crypto_amount: i64,
+    pub via_giveaway: bool,
+    pub is_unclaimed: bool,
+    pub code: String,
+}
+
+/// `MessageDialogShared` (MessageContent.cpp:1222-1234).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessageDialogShared {
+    pub shared_dialogs: Vec<SharedDialog>,
+    pub button_id: i32,
+}
+
+/// `MessagePaymentRefunded` (MessageContent.cpp:1254-1276).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessagePaymentRefunded {
+    pub dialog_id: DialogId,
+    pub currency: String,
+    pub total_amount: i64,
+    pub invoice_payload: String,
+    pub telegram_payment_charge_id: String,
+    pub provider_payment_charge_id: String,
+}
+
+/// `MessagePrizeStars` (MessageContent.cpp:1304-1324).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessagePrizeStars {
+    pub star_count: i64,
+    pub transaction_id: String,
+    pub boosted_dialog_id: DialogId,
+    pub giveaway_message_id: MessageId,
+    pub is_unclaimed: bool,
+}
+
+/// `MessageConferenceCall` (MessageContent.cpp:1479-1501).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessageConferenceCall {
+    pub call_id: i64,
+    pub duration: i32,
+    pub other_participant_dialog_ids: Vec<DialogId>,
+    pub is_active: bool,
+    pub is_video: bool,
+    pub was_missed: bool,
+}
+
+/// `MessageToDoList` (MessageContent.cpp:1504-1516).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessageToDoList {
+    pub list: ToDoList,
+    pub completions: Vec<ToDoCompletion>,
+}
+
+/// `MessageChangeCommunity` (MessageContent.cpp:1804-1812).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessageChangeCommunity {
+    pub community_id: CommunityId,
+}
+
+/// `MessageChatJoinedViaCommunity` (MessageContent.cpp:1817-1825).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessageChatJoinedViaCommunity {
+    pub community_id: CommunityId,
+}
+
 /// `td::MessageContent` (MessageContent.h:62-72) — the C++ class hierarchy
 /// flattened into an enum of structs. The C++ header comment applies to
 /// every inheritor: do not forget to update `merge_message_contents` and
@@ -1818,6 +2051,20 @@ pub enum MessageContent {
     PassportDataReceived(MessagePassportDataReceived),
     PaidMedia(MessagePaidMedia),
     TodoAppendTasks(MessageTodoAppendTasks),
+    // The M.9.1b additions; the C++ positions are pinned by the
+    // `MessageContentType` discriminant enum, not by this model enum.
+    PaymentSuccessful(MessagePaymentSuccessful),
+    ProximityAlertTriggered(MessageProximityAlertTriggered),
+    RequestedDialog(MessageRequestedDialog),
+    Story(MessageStory),
+    GiftCode(MessageGiftCode),
+    DialogShared(MessageDialogShared),
+    PaymentRefunded(MessagePaymentRefunded),
+    PrizeStars(MessagePrizeStars),
+    ConferenceCall(MessageConferenceCall),
+    ToDoList(MessageToDoList),
+    ChangeCommunity(MessageChangeCommunity),
+    ChatJoinedViaCommunity(MessageChatJoinedViaCommunity),
 }
 
 impl MessageContent {
@@ -1906,6 +2153,20 @@ impl MessageContent {
             MessageContent::PassportDataReceived(_) => MessageContentType::PassportDataReceived,
             MessageContent::PaidMedia(_) => MessageContentType::PaidMedia,
             MessageContent::TodoAppendTasks(_) => MessageContentType::TodoAppendTasks,
+            MessageContent::PaymentSuccessful(_) => MessageContentType::PaymentSuccessful,
+            MessageContent::ProximityAlertTriggered(_) => {
+                MessageContentType::ProximityAlertTriggered
+            }
+            MessageContent::RequestedDialog(_) => MessageContentType::RequestedDialog,
+            MessageContent::Story(_) => MessageContentType::Story,
+            MessageContent::GiftCode(_) => MessageContentType::GiftCode,
+            MessageContent::DialogShared(_) => MessageContentType::DialogShared,
+            MessageContent::PaymentRefunded(_) => MessageContentType::PaymentRefunded,
+            MessageContent::PrizeStars(_) => MessageContentType::PrizeStars,
+            MessageContent::ConferenceCall(_) => MessageContentType::ConferenceCall,
+            MessageContent::ToDoList(_) => MessageContentType::ToDoList,
+            MessageContent::ChangeCommunity(_) => MessageContentType::ChangeCommunity,
+            MessageContent::ChatJoinedViaCommunity(_) => MessageContentType::ChatJoinedViaCommunity,
         }
     }
 }
@@ -3037,5 +3298,117 @@ mod tests {
         for (content, expected_type) in contents {
             assert_eq!(content.get_type(), expected_type);
         }
+    }
+
+    #[test]
+    fn m91b_variants_map_to_the_cpp_types() {
+        let contents = [
+            (
+                MessageContent::PaymentSuccessful(MessagePaymentSuccessful::default()),
+                MessageContentType::PaymentSuccessful,
+            ),
+            (
+                MessageContent::ProximityAlertTriggered(MessageProximityAlertTriggered::default()),
+                MessageContentType::ProximityAlertTriggered,
+            ),
+            (
+                MessageContent::RequestedDialog(MessageRequestedDialog::default()),
+                MessageContentType::RequestedDialog,
+            ),
+            (
+                MessageContent::Story(MessageStory::default()),
+                MessageContentType::Story,
+            ),
+            (
+                MessageContent::GiftCode(MessageGiftCode::default()),
+                MessageContentType::GiftCode,
+            ),
+            (
+                MessageContent::DialogShared(MessageDialogShared::default()),
+                MessageContentType::DialogShared,
+            ),
+            (
+                MessageContent::PaymentRefunded(MessagePaymentRefunded::default()),
+                MessageContentType::PaymentRefunded,
+            ),
+            (
+                MessageContent::PrizeStars(MessagePrizeStars::default()),
+                MessageContentType::PrizeStars,
+            ),
+            (
+                MessageContent::ConferenceCall(MessageConferenceCall::default()),
+                MessageContentType::ConferenceCall,
+            ),
+            (
+                MessageContent::ToDoList(MessageToDoList::default()),
+                MessageContentType::ToDoList,
+            ),
+            (
+                MessageContent::ChangeCommunity(MessageChangeCommunity::default()),
+                MessageContentType::ChangeCommunity,
+            ),
+            (
+                MessageContent::ChatJoinedViaCommunity(MessageChatJoinedViaCommunity::default()),
+                MessageContentType::ChatJoinedViaCommunity,
+            ),
+        ];
+        for (content, expected_type) in contents {
+            assert_eq!(content.get_type(), expected_type);
+        }
+    }
+
+    #[test]
+    fn community_id_semantics() {
+        assert!(!CommunityId::default().is_valid());
+        assert!(CommunityId::new(42).is_valid());
+        assert_eq!(CommunityId::new(42).get(), 42);
+
+        // the fake dialog id rides the channel band: DialogId(ChannelId(id))
+        let fake = CommunityId::new(7).get_fake_dialog_id();
+        assert_eq!(fake, DialogId::from_channel_id(ChannelId::new(7)));
+        assert_eq!(
+            fake.get_type(),
+            crate::messages_manager::DialogType::Channel
+        );
+
+        let mut bytes = Vec::new();
+        CommunityId::new(123456789).store(&mut bytes);
+        assert_eq!(
+            CommunityId::parse_value(&bytes).unwrap(),
+            CommunityId::new(123456789)
+        );
+    }
+
+    #[test]
+    fn shared_dialog_and_todo_completion_predicates() {
+        let user_shared = SharedDialog {
+            dialog_id: DialogId::from_user_id(crate::user_manager::UserId::new(7)),
+            first_name: "A".to_string(),
+            ..SharedDialog::default()
+        };
+        assert!(user_shared.is_valid());
+        assert!(user_shared.is_user());
+        assert!(!user_shared.is_dialog());
+
+        let chat_shared = SharedDialog {
+            dialog_id: DialogId::from_chat_id(ChatId::new(123)),
+            ..SharedDialog::default()
+        };
+        assert!(chat_shared.is_dialog());
+        assert!(!chat_shared.is_user());
+
+        assert!(!SharedDialog::default().is_valid());
+
+        let mut completion = ToDoCompletion {
+            id: 1,
+            date: 1000,
+            ..ToDoCompletion::default()
+        };
+        assert!(!completion.is_valid());
+        completion.completed_by_dialog_id =
+            DialogId::from_user_id(crate::user_manager::UserId::new(7));
+        assert!(completion.is_valid());
+        completion.date = 0;
+        assert!(!completion.is_valid());
     }
 }
