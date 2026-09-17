@@ -9654,6 +9654,272 @@ mod tests {
         );
     }
 
+    // ===== M.8.7 — Markdown v2 =====
+
+    /// M.8.7 hand-traced vectors for `parse_markdown_v2`
+    /// (MessageEntity.cpp:2048-2399): nested entities, escapes, pre/code
+    /// narrowing, expandable blockquotes, custom emoji/FormattedDate links
+    /// and the 400 error paths — all pinning the source semantics. The
+    /// `td_execute` oracle corpus for the same dialect is the last 76
+    /// entries of `testdata/message_entity_cpp_golden.jsonl`.
+    #[test]
+    fn parse_markdown_v2_golden_vectors() {
+        fn parse(text: &str) -> (String, Vec<MessageEntity>) {
+            let mut owned = text.to_owned();
+            let entities = parse_markdown_v2(&mut owned).unwrap();
+            (owned, entities)
+        }
+        let bold = |offset, length| MessageEntity::new(Type::Bold, offset, length);
+        let italic = |offset, length| MessageEntity::new(Type::Italic, offset, length);
+        let underline = |offset, length| MessageEntity::new(Type::Underline, offset, length);
+        let strike = |offset, length| MessageEntity::new(Type::Strikethrough, offset, length);
+        let spoiler = |offset, length| MessageEntity::new(Type::Spoiler, offset, length);
+        let code = |offset, length| MessageEntity::new(Type::Code, offset, length);
+        let pre = |offset, length| MessageEntity::new(Type::Pre, offset, length);
+        let pre_code = |offset, length, language: &str| {
+            MessageEntity::with_argument(Type::PreCode, offset, length, language.to_owned())
+        };
+        let blockquote = |offset, length| MessageEntity::new(Type::BlockQuote, offset, length);
+        let expandable =
+            |offset, length| MessageEntity::new(Type::ExpandableBlockQuote, offset, length);
+        let text_url = |offset, length, url: &str| {
+            MessageEntity::with_argument(Type::TextUrl, offset, length, url.to_owned())
+        };
+
+        // v2 delimiters are single characters; `**`/`__`/`~~` open and
+        // immediately close an empty entity, which is then dropped.
+        assert_eq!(parse("*bold*"), ("bold".to_owned(), vec![bold(0, 4)]));
+        assert_eq!(parse("_italic_"), ("italic".to_owned(), vec![italic(0, 6)]));
+        assert_eq!(
+            parse("__underline__"),
+            ("underline".to_owned(), vec![underline(0, 9)])
+        );
+        assert_eq!(parse("~strike~"), ("strike".to_owned(), vec![strike(0, 6)]));
+        assert_eq!(parse("~~strike~~"), ("strike".to_owned(), vec![]));
+        assert_eq!(
+            parse("||spoiler||"),
+            ("spoiler".to_owned(), vec![spoiler(0, 7)])
+        );
+        assert_eq!(parse("`code`"), ("code".to_owned(), vec![code(0, 4)]));
+
+        // Escapes drop the backslash before any ASCII char in 1..=126.
+        assert_eq!(parse("a\\.b"), ("a.b".to_owned(), vec![]));
+        assert_eq!(parse("\\\\"), ("\\".to_owned(), vec![]));
+        assert_eq!(parse("abc\\"), ("abc\\".to_owned(), vec![]));
+
+        // Nested entities: the inner entity is emitted at its own offsets.
+        assert_eq!(
+            parse("*bold _italic_ bold*"),
+            (
+                "bold italic bold".to_owned(),
+                vec![bold(0, 16), italic(5, 6)]
+            )
+        );
+        assert_eq!(
+            parse("_italic *bold* italic_"),
+            (
+                "italic bold italic".to_owned(),
+                vec![italic(0, 18), bold(7, 4)]
+            )
+        );
+        assert_eq!(
+            parse("*bold `code` bold*"),
+            ("bold code bold".to_owned(), vec![bold(0, 14), code(5, 4)])
+        );
+        // Inside code the reserved set narrows to the backtick.
+        assert_eq!(
+            parse("`code *star*`"),
+            ("code *star*".to_owned(), vec![code(0, 11)])
+        );
+        assert_eq!(
+            parse("*a _b_ c*"),
+            ("a b c".to_owned(), vec![bold(0, 5), italic(2, 1)])
+        );
+
+        // Pre blocks: language, one-newline skip (LF and CRLF), content.
+        assert_eq!(
+            parse("```python\ncode\n```"),
+            ("code\n".to_owned(), vec![pre_code(0, 5, "python")])
+        );
+        assert_eq!(
+            parse("```\r\nwin\r\n```"),
+            ("win\r\n".to_owned(), vec![pre(0, 5)])
+        );
+        // The language ends at the space; the space starts the content.
+        assert_eq!(
+            parse("```lang code```"),
+            (" code".to_owned(), vec![pre_code(0, 5, "lang")])
+        );
+        assert_eq!(parse("```c\n```"), (String::new(), vec![]));
+
+        // Blockquotes: `>` at line starts, content until the last line.
+        assert_eq!(
+            parse(">quote"),
+            ("quote".to_owned(), vec![blockquote(0, 5)])
+        );
+        assert_eq!(
+            parse(">line1\n>line2"),
+            ("line1\nline2".to_owned(), vec![blockquote(0, 11)])
+        );
+        assert_eq!(
+            parse(">line1\nafter"),
+            ("line1\nafter".to_owned(), vec![blockquote(0, 6)])
+        );
+        // The unclosed `||` spoiler makes the blockquote expandable: it is
+        // dropped from the stack and the newline becomes the last line
+        // (the entity_byte_offset is the first `|`).
+        assert_eq!(parse(">||\n"), ("\n".to_owned(), vec![expandable(0, 1)]));
+        assert_eq!(
+            parse(">||\r\n"),
+            ("\r\n".to_owned(), vec![expandable(0, 2)])
+        );
+        // Empty expandable blockquotes emit nothing.
+        assert_eq!(parse(">||"), (String::new(), vec![]));
+        // A closed spoiler inside a blockquote stays a blockquote.
+        assert_eq!(
+            parse(">||x||"),
+            ("x".to_owned(), vec![blockquote(0, 1), spoiler(0, 1)])
+        );
+
+        // TextUrl: the explicit form, the bare-bracket form (the bracket
+        // content is the URL, escapes dropped) and invalid URLs.
+        assert_eq!(
+            parse("[text](https://t.me/durov)"),
+            (
+                "text".to_owned(),
+                vec![text_url(0, 4, "https://t.me/durov")]
+            )
+        );
+        assert_eq!(
+            parse("[t\\.me/durov]"),
+            (
+                "t.me/durov".to_owned(),
+                vec![text_url(0, 10, "http://t.me/durov")]
+            )
+        );
+        assert_eq!(parse("[text only]"), ("text only".to_owned(), vec![]));
+        // tg://user links become MentionNames.
+        assert_eq!(
+            parse("[n](tg://user?id=42)"),
+            (
+                "n".to_owned(),
+                vec![MessageEntity::mention_name(0, 1, UserId::new(42))]
+            )
+        );
+        assert_eq!(
+            parse("[tg://user?id\\=42]"),
+            (
+                "tg://user?id=42".to_owned(),
+                vec![MessageEntity::mention_name(0, 15, UserId::new(42))]
+            )
+        );
+
+        // Custom emoji and FormattedDate links.
+        assert_eq!(
+            parse("![\u{1f600}](tg://emoji?id=5)"),
+            (
+                "\u{1f600}".to_owned(),
+                vec![MessageEntity::custom_emoji(0, 2, CustomEmojiId::new(5),)]
+            )
+        );
+        let date = FormattedDate::get_formatted_date_by_format(1600000000, "r").unwrap();
+        assert_eq!(
+            parse("![x](tg://time?unix=1600000000&format=r)"),
+            (
+                "x".to_owned(),
+                vec![MessageEntity::formatted_date(0, 1, date)]
+            )
+        );
+
+        // UTF-16 offsets: 4-byte emoji count as 2, CJK as 1 each.
+        assert_eq!(
+            parse("\u{1f600}*bold*\u{1f400}"),
+            ("\u{1f600}bold\u{1f400}".to_owned(), vec![bold(2, 4)])
+        );
+        assert_eq!(
+            parse("中文*粗体*"),
+            ("中文粗体".to_owned(), vec![bold(2, 2)])
+        );
+        // A bold entity spans a newline.
+        assert_eq!(parse("*a\nb*"), ("a\nb".to_owned(), vec![bold(0, 3)]));
+
+        // Unclosed entities are 400 errors with the C++ byte offset and the
+        // C++ message shape "Can't find end of <type> entity at byte offset".
+        for (text, message) in [
+            (
+                "```unterminated",
+                "Can't find end of Pre entity at byte offset 0",
+            ),
+            (
+                "`unterminated",
+                "Can't find end of Code entity at byte offset 0",
+            ),
+            (
+                "unclosed __u",
+                "Can't find end of Underline entity at byte offset 9",
+            ),
+            (
+                "||unclosed",
+                "Can't find end of Spoiler entity at byte offset 0",
+            ),
+            (
+                "[unclosed",
+                "Can't find end of TextUrl entity at byte offset 0",
+            ),
+            (
+                "[text](unclosed",
+                "Can't find end of a URL at byte offset 7",
+            ),
+            (
+                "*a _b* c_",
+                "Can't find end of Italic entity at byte offset 8",
+            ),
+            (">||x", "Can't find end of Spoiler entity at byte offset 1"),
+        ] {
+            let mut owned = text.to_owned();
+            let error = parse_markdown_v2(&mut owned).unwrap_err();
+            assert_eq!((error.code(), error.message()), (400, message));
+        }
+
+        // Unescaped reserved characters are 400 errors naming the character.
+        for (text, message) in [
+            (
+                "pre >x",
+                "Character '>' is reserved and must be escaped with the preceding '\\'",
+            ),
+            (
+                "a.b",
+                "Character '.' is reserved and must be escaped with the preceding '\\'",
+            ),
+            (
+                "a|b",
+                "Character '|' is reserved and must be escaped with the preceding '\\'",
+            ),
+            (
+                "a!b",
+                "Character '!' is reserved and must be escaped with the preceding '\\'",
+            ),
+            (
+                "a=b",
+                "Character '=' is reserved and must be escaped with the preceding '\\'",
+            ),
+        ] {
+            let mut owned = text.to_owned();
+            let error = parse_markdown_v2(&mut owned).unwrap_err();
+            assert_eq!((error.code(), error.message()), (400, message));
+        }
+
+        // Custom emoji link errors.
+        let mut owned = "![x]".to_owned();
+        let error = parse_markdown_v2(&mut owned).unwrap_err();
+        let message: &str = "The entity must contain a tg://emoji or tg://time URL";
+        assert_eq!((error.code(), error.message()), (400, message));
+        let mut owned = "![x](tg://emoji)".to_owned();
+        let error = parse_markdown_v2(&mut owned).unwrap_err();
+        let message: &str = "Invalid tg://emoji or tg://time URL specified";
+        assert_eq!((error.code(), error.message()), (400, message));
+    }
+
     // ===== M.8.2 — input converters + fix_entities =====
 
     /// td_api::FormattedText → FormattedText (`get_formatted_text_of_input`)

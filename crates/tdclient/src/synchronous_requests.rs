@@ -490,6 +490,15 @@ mod tests {
     /// `"http://.mee/"` from "t.me"). Every version before that refactor —
     /// and the Rust port — reads the pristine bracket content, so those six
     /// entries hold the source-true answers instead of the mangled ones.
+    ///
+    /// The M.8.7 Markdown v2 battery is the last 76 entries (nested
+    /// entities, escapes, pre/code narrowing, blockquotes and expandable
+    /// blockquotes, tg://user/tg://emoji/tg://time links, CRLF handling,
+    /// UTF-16 offsets and the 400 error paths). Corpus responses store the
+    /// oracle output decoded: tdlib's JSON layer escapes non-ASCII as
+    /// \uXXXX while the Rust layer emits raw UTF-8, so non-ASCII was
+    /// normalized to characters at recording time (control-char escapes
+    /// stay, matching both layers).
     #[test]
     fn message_entity_requests_match_the_cpp_oracle() {
         use tdutils::json::{JsonValue, json_decode};
@@ -522,7 +531,7 @@ mod tests {
             );
             checked += 1;
         }
-        assert_eq!(checked, 337, "the corpus shrank");
+        assert_eq!(checked, 413, "the corpus shrank");
     }
 
     #[test]
