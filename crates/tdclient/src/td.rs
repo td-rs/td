@@ -102,6 +102,10 @@ pub struct Td {
     /// `Td::user_manager_` — the user/secret-chat cache (created with Td,
     /// loaded from the binlog pmc in `init` like the C++ constructor).
     pub(crate) user_manager: UserManager,
+    /// `Td::chat_manager_` — the basic-group/supergroup cache (created with
+    /// Td; its binlog replay rides the same `process_binlog_events` pass as
+    /// the users, in the C++ users→chats→channels order).
+    pub(crate) chat_manager: crate::chat_manager::ChatManager,
     /// `Td::stop_cnt_` — the hangup and the close completion each drop one.
     stop_cnt: i32,
 }
@@ -125,6 +129,7 @@ impl Td {
             time_zone_manager: TimeZoneManager::default(),
             auth_manager: AuthManager::new(),
             user_manager: UserManager::new(),
+            chat_manager: crate::chat_manager::ChatManager::new(),
             stop_cnt: 2,
         }
     }
@@ -264,6 +269,8 @@ impl Td {
         let since_last_open = opened_database.since_last_open;
         let user_events = std::mem::take(&mut opened_database.user_events);
         let secret_chat_events = std::mem::take(&mut opened_database.secret_chat_events);
+        let chat_events = std::mem::take(&mut opened_database.chat_events);
+        let channel_events = std::mem::take(&mut opened_database.channel_events);
 
         if self.state == State::Close {
             // Close asynchronously opened database
@@ -436,6 +443,18 @@ impl Td {
             for event in &secret_chat_events {
                 self.user_manager
                     .on_binlog_secret_chat_event(&mut env, event);
+            }
+            // the C++ replays the chats vector, then the channels vector
+            // (Td.cpp:966-990, users→chats→channels order); the chat
+            // handlers ride the M.5.18 diff machine, the channel handlers
+            // run the save fan-out directly until M.5.19 lands
+            for event in &chat_events {
+                self.chat_manager
+                    .on_binlog_chat_event(&mut self.user_manager, &mut env, event);
+            }
+            for event in &channel_events {
+                self.chat_manager
+                    .on_binlog_channel_event(&mut self.user_manager, &mut env, event);
             }
         }
         self.flush_user_updates();
@@ -653,19 +672,29 @@ impl Td {
         }
     }
 
-    /// Drain the UserManager's queued `updateUser`-class broadcasts (the
-    /// C++ sends them straight to `Td::send_update` from the manager).
+    /// Drain the managers' queued update broadcasts (the C++ sends them
+    /// straight to `Td::send_update` from the managers).
     pub(crate) fn flush_user_updates(&mut self) {
         for update in self.user_manager.take_updates() {
             self.send_update(update.into());
         }
+        for update in self.chat_manager.take_updates() {
+            self.send_update(update.into());
+        }
     }
 
-    /// Point the actor timeout at the UserManager's earliest deadline, or
+    /// Point the actor timeout at the managers' earliest deadline, or
     /// cancel it when nothing is armed (the member MultiTimeouts re-arm on
     /// every set/cancel).
     fn rearm_user_timeouts(&mut self) {
-        match self.user_manager.next_deadline() {
+        let earliest = [
+            self.user_manager.next_deadline(),
+            self.chat_manager.next_deadline(),
+        ]
+        .into_iter()
+        .flatten()
+        .min_by(f64::total_cmp);
+        match earliest {
             Some(timeout_at) => self.set_timeout_at(timeout_at),
             None => self.cancel_timeout(),
         }
@@ -853,10 +882,10 @@ impl Actor for Td {
         self.close();
     }
 
-    /// The member `user_online_timeout_` / `user_emoji_status_timeout_`
-    /// fire here (their C++ callbacks hop back into the UserManager actor);
-    /// the sweep then re-arms at the next deadline, like the MultiTimeouts'
-    /// set/cancel re-arm.
+    /// The member MultiTimeouts (the user online/emoji-status pair and the
+    /// ChatManager channel trio) fire here — their C++ callbacks hop back
+    /// into the manager actors; the sweep then re-arms at the next
+    /// deadline, like the MultiTimeouts' set/cancel re-arm.
     fn timeout_expired(&mut self) {
         {
             let Some(options) = self.option_manager.as_mut() else {
@@ -868,6 +897,8 @@ impl Actor for Td {
                 auth_is_bot: self.auth_manager.is_bot(),
             };
             self.user_manager.tick_timeouts(&mut env);
+            self.chat_manager
+                .tick_timeouts(&mut self.user_manager, &mut env);
         }
         self.flush_user_updates();
         self.rearm_user_timeouts();
