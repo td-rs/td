@@ -826,7 +826,7 @@ impl TimeCtx {
         }
     }
 
-    fn store_time(out: &mut Vec<u8>, time_at: f64, ctx: &TimeCtx) {
+    pub(crate) fn store_time(out: &mut Vec<u8>, time_at: f64, ctx: &TimeCtx) {
         if time_at == 0.0 {
             store_parse::store_f64(out, -1.0);
         } else {
@@ -836,7 +836,7 @@ impl TimeCtx {
         }
     }
 
-    fn parse_time(parser: &mut Parser, ctx: &TimeCtx) -> Result<f64, &'static str> {
+    pub(crate) fn parse_time(parser: &mut Parser, ctx: &TimeCtx) -> Result<f64, &'static str> {
         let time_left = parser.f64_()?;
         if time_left < -0.1 {
             return Ok(0.0);
@@ -4496,6 +4496,50 @@ impl UserManager {
             Some(u) => !u.is_deleted && u.is_bot,
             None => false,
         }
+    }
+
+    /// `UserManager::get_bot_commands` (UserManager.cpp:5841-5883) — the
+    /// bot-info command extraction behind the chatFull/channelFull
+    /// intakes. `participants` filters channel bots to chat members.
+    pub fn get_bot_commands(
+        &mut self,
+        env: &mut UserEnv,
+        bot_infos: Vec<telegram_api::BotInfo>,
+        participants: Option<&[crate::chat_manager::DialogParticipant]>,
+    ) -> Vec<crate::chat_manager::BotCommands> {
+        let mut result = Vec::new();
+        if env.auth_is_bot {
+            return result;
+        }
+        for bot_info in bot_infos {
+            if bot_info.commands.is_empty() {
+                continue;
+            }
+            let user_id = UserId::new(bot_info.user_id);
+            if !self.get_user_force(env, user_id, "get_bot_commands") {
+                tdutils::log_error!("Receive unknown {user_id:?}");
+                continue;
+            }
+            if !self.is_user_bot_of(user_id) {
+                if !self.is_user_deleted_of(user_id) {
+                    tdutils::log_error!("Receive non-bot {user_id:?}");
+                }
+                continue;
+            }
+            if let Some(participants) = participants
+                && !participants
+                    .iter()
+                    .any(|p| p.dialog_id_ == crate::chat_manager::DialogId::from_user_id(user_id))
+            {
+                tdutils::log_error!("Skip commands of non-member bot {user_id:?}");
+                continue;
+            }
+            result.push(crate::chat_manager::BotCommands::from_telegram(
+                user_id,
+                bot_info.commands,
+            ));
+        }
+        result
     }
 
     /// `UserManager::have_input_peer_user` (UserManager.cpp:5271-5300);
