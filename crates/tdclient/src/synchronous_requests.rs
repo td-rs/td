@@ -480,14 +480,16 @@ mod tests {
     /// covers URL/mention/hashtag/cashtag/bank-card/timestamp matchers,
     /// Markdown v1/v2/v3 and HTML parsing, and their error paths.
     ///
-    /// One entry is hand-corrected against the local C++ source: the
-    /// TD_BUILD oracle corrupts the Markdown v1 bare-bracket URL branch
-    /// (probe: "[t.me]" answers `"http://.mee/"` — no C++ source version
-    /// ever did that; the v1 parser has built the URL from the bracket
-    /// content verbatim since v1.0.0, MessageEntity.cpp:2005-2021), so
-    /// golden[205] expects the source-true `TextUrl` instead of the
-    /// corrupted empty-entities answer (version-drift rule: the local
-    /// tree wins).
+    /// The M.8.6 Markdown v1 battery hand-corrects the six bare-bracket
+    /// `[url]` entries: `fd53a8160` ("Replace text in-place in
+    /// parse_markdown") made the v1 parser compact `text` in place, and the
+    /// bare-bracket branch `url.assign(text, begin_pos + 1,
+    /// i - begin_pos - 1)` (MessageEntity.cpp:2005-2007) then reads bytes
+    /// the compaction already overwrote — a read-after-overwrite bug in the
+    /// pinned C++ itself (probe: "[t.me]" yields the `TextUrl`
+    /// `"http://.mee/"` from "t.me"). Every version before that refactor —
+    /// and the Rust port — reads the pristine bracket content, so those six
+    /// entries hold the source-true answers instead of the mangled ones.
     #[test]
     fn message_entity_requests_match_the_cpp_oracle() {
         use tdutils::json::{JsonValue, json_decode};
@@ -513,10 +515,14 @@ mod tests {
                 panic!("the golden response is not a string")
             };
             let actual = crate::client_json::execute(request);
-            assert_eq!(actual, *expected_response, "diverged on request: {request}");
+            assert_eq!(
+                actual, *expected_response,
+                "diverged on request: {request}\n  expected: {}\n  actual: {}",
+                *expected_response, actual
+            );
             checked += 1;
         }
-        assert_eq!(checked, 296, "the corpus shrank");
+        assert_eq!(checked, 337, "the corpus shrank");
     }
 
     #[test]
