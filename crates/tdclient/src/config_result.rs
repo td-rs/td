@@ -132,7 +132,9 @@ fn decode_app_config_answer(bytes: &[u8]) -> Result<AppConfigQueryResult, Status
     match telegram_api::help_appConfig::parse(bytes) {
         Ok(app_config) => Ok(AppConfigQueryResult::Config {
             hash: app_config.hash,
-            config: app_config.config,
+            config: app_config
+                .config
+                .expect("help.appConfig always carries a config"),
         }),
         Err(error) => {
             tracing::error!("Can't parse app config answer: {error}");
@@ -344,7 +346,9 @@ mod tests {
         // help.getAppConfig → help.appConfig{hash, config}.
         let app_config = telegram_api::help_appConfig {
             hash: -12345,
-            config: Box::new(telegram_api::JSONValue::jsonNull(telegram_api::jsonNull)),
+            config: Some(Box::new(telegram_api::JSONValue::jsonNull(
+                telegram_api::jsonNull,
+            ))),
         };
         let mut bytes = Vec::new();
         app_config.store_boxed(&mut bytes);

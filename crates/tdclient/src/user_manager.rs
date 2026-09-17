@@ -3037,7 +3037,7 @@ impl UserManager {
             let secret_chat_object =
                 make_secret_chat_object(secret_chat_id, &self.secret_chats[&secret_chat_id.get()]);
             self.send_update(td_api::Update::updateSecretChat(td_api::updateSecretChat {
-                secret_chat: secret_chat_object,
+                secret_chat: Some(secret_chat_object),
             }));
             let c = self.secret_chats.get_mut(&secret_chat_id.get()).unwrap();
             c.is_changed = false;
@@ -3259,15 +3259,16 @@ impl UserManager {
         // the test DCs carry no profile photo for the special users
         if !is_test_dc && profile_photo_id != 0 {
             user.flags |= 1 << 5; // photo:flags.5
-            user.photo =
-                telegram_api::UserProfilePhoto::userProfilePhoto(telegram_api::userProfilePhoto {
+            user.photo = Some(telegram_api::UserProfilePhoto::userProfilePhoto(
+                telegram_api::userProfilePhoto {
                     flags: 0,
                     has_video: false,
                     personal: false,
                     photo_id: profile_photo_id,
                     stripped_thumb: Vec::new(),
                     dc_id: profile_photo_dc_id,
-                });
+                },
+            ));
         }
         telegram_api::User::user(user)
     }
@@ -3397,8 +3398,11 @@ impl UserManager {
         let mut need_location_bot = user.bot_inline_geo;
         let mut need_apply_min_photo = user.apply_min_photo;
         let is_fake = user.fake;
-        let stories_available =
-            (user.flags2 & USER_STORIES_MAX_ID_MASK) != 0 && user.stories_max_id.max_id > 0;
+        let stories_available = (user.flags2 & USER_STORIES_MAX_ID_MASK) != 0
+            && user
+                .stories_max_id
+                .as_ref()
+                .is_some_and(|stories_max_id| stories_max_id.max_id > 0);
         let stories_unavailable = user.stories_unavailable;
         let stories_hidden = user.stories_hidden;
         let contact_require_premium = user.contact_require_premium;
@@ -3576,7 +3580,7 @@ impl UserManager {
             || self.u_is_deleted(user_id)
         {
             let photo = std::mem::take(&mut user.photo);
-            self.on_update_user_photo(env, user_id, photo, source);
+            self.on_update_user_photo(env, user_id, photo.unwrap_or_default(), source);
         }
         if is_me_regular_user {
             if is_received || !self.u_is_received(user_id) {
@@ -3585,7 +3589,7 @@ impl UserManager {
             }
             if is_received || !self.u_is_received(user_id) || self.u_was_online(user_id) == 0 {
                 let status = std::mem::take(&mut user.status);
-                self.on_update_user_online_impl(env, user_id, status);
+                self.on_update_user_online_impl(env, user_id, status.unwrap_or_default());
             }
             if is_received {
                 self.on_update_user_is_contact_impl(
@@ -3608,14 +3612,19 @@ impl UserManager {
             );
             self.on_update_user_usernames_impl(env, user_id, usernames);
         }
-        let emoji_status = EmojiStatus::get_emoji_status(std::mem::take(&mut user.emoji_status));
+        let emoji_status = EmojiStatus::get_emoji_status(
+            std::mem::take(&mut user.emoji_status).unwrap_or_default(),
+        );
         self.on_update_user_emoji_status_impl(user_id, emoji_status);
 
-        if matches!(user.color, telegram_api::PeerColor::peerColorCollectible(_)) {
-            let telegram_api::PeerColor::peerColorCollectible(collectible) = std::mem::replace(
-                &mut user.color,
-                telegram_api::PeerColor::peerColor(Default::default()),
-            ) else {
+        if matches!(
+            user.color,
+            Some(telegram_api::PeerColor::peerColorCollectible(_))
+        ) {
+            let Some(telegram_api::PeerColor::peerColorCollectible(collectible)) = user
+                .color
+                .replace(telegram_api::PeerColor::peerColor(Default::default()))
+            else {
                 unreachable!("just matched");
             };
             let collectible = PeerColorCollectible::get_peer_color_collectible(collectible);
@@ -3626,7 +3635,11 @@ impl UserManager {
                 collectible,
             );
         } else {
-            let peer_color = PeerColor::from_telegram(&user.color);
+            let peer_color = user
+                .color
+                .as_ref()
+                .map(PeerColor::from_telegram)
+                .unwrap_or_default();
             self.on_update_user_colors_impl(
                 user_id,
                 peer_color.accent_color_id(),
@@ -3634,7 +3647,11 @@ impl UserManager {
                 None,
             );
         }
-        let profile_peer_color = PeerColor::from_telegram(&user.profile_color);
+        let profile_peer_color = user
+            .profile_color
+            .as_ref()
+            .map(PeerColor::from_telegram)
+            .unwrap_or_default();
         self.on_update_user_profile_colors_impl(
             user_id,
             profile_peer_color.accent_color_id(),
@@ -3650,8 +3667,11 @@ impl UserManager {
             }
             if stories_available || stories_unavailable {
                 // update at the end, because it calls need_poll_user_active_stories
-                let live = user.stories_max_id.live;
-                let max_id = user.stories_max_id.max_id;
+                let (live, max_id) = user
+                    .stories_max_id
+                    .as_ref()
+                    .map(|stories_max_id| (stories_max_id.live, stories_max_id.max_id))
+                    .unwrap_or((false, 0));
                 self.on_update_user_story_ids(user_id, live, max_id, StoryId::default());
             }
             let restriction_reasons = crate::restriction_reason::get_restriction_reasons(
@@ -4605,7 +4625,7 @@ impl UserManager {
         let status = self.get_user_status_object(env, user_id);
         self.send_update(td_api::Update::updateUserStatus(td_api::updateUserStatus {
             user_id: user_id.get(),
-            status,
+            status: Some(status),
         }));
         // DialogParticipantManager::update_user_online_member_count
     }
@@ -4868,7 +4888,7 @@ impl UserManager {
         if is_changed {
             let user_object = self.get_user_object_of(env, user_id);
             self.send_update(td_api::Update::updateUser(td_api::updateUser {
-                user: user_object,
+                user: Some(user_object),
             }));
             let u = self.users.get_mut(&user_id.get()).unwrap();
             u.is_changed = false;
@@ -4885,7 +4905,7 @@ impl UserManager {
             let status = self.get_user_status_object(env, user_id);
             self.send_update(td_api::Update::updateUserStatus(td_api::updateUserStatus {
                 user_id: user_id.get(),
-                status,
+                status: Some(status),
             }));
             let u = self.users.get_mut(&user_id.get()).unwrap();
             u.is_status_changed = false;
@@ -5091,7 +5111,7 @@ impl UserManager {
             self.send_update(td_api::Update::updateUserFullInfo(
                 td_api::updateUserFullInfo {
                     user_id: user_id_object,
-                    user_full_info: full_info,
+                    user_full_info: Some(full_info),
                 },
             ));
             let user_full = self.users_full.get_mut(&user_id.get()).unwrap();
@@ -5184,20 +5204,29 @@ impl UserManager {
         // on_update_user_full_send_paid_message_stars (cpp:9034-9035).
         let send_paid_message_stars = get_star_count(user_full.send_paid_messages_stars);
         // on_update_user_full_charge_paid_message_stars (cpp:9032-9033).
-        let charge_paid_message_stars =
-            get_star_count(user_full.settings.charge_paid_message_stars);
+        let charge_paid_message_stars = get_star_count(
+            user_full
+                .settings
+                .as_ref()
+                .map(|settings| settings.charge_paid_message_stars)
+                .unwrap_or_default(),
+        );
         // on_update_user_full_need_phone_number_privacy_exception
         // (cpp:9029-9031 + hook cpp:4446-4459).
-        let mut need_phone_number_privacy_exception = user_full.settings.need_contacts_exception;
+        let mut need_phone_number_privacy_exception = user_full
+            .settings
+            .as_ref()
+            .map(|settings| settings.need_contacts_exception)
+            .unwrap_or_default();
         if need_phone_number_privacy_exception && (is_contact || user_id == self.my_id) {
             need_phone_number_privacy_exception = false;
         }
         let birthdate = if flags2 & (1 << 5) != 0 {
-            Birthdate::new(
-                user_full.birthday.day,
-                user_full.birthday.month,
-                user_full.birthday.year,
-            )
+            user_full
+                .birthday
+                .as_ref()
+                .map(|birthday| Birthdate::new(birthday.day, birthday.month, birthday.year))
+                .unwrap_or_default()
         } else {
             Birthdate::default()
         };
@@ -5347,9 +5376,11 @@ impl UserManager {
         // record's photos are stored as the reduced `as_profile_photo`
         // form (module docs); register_user_photo works over the full
         // converted photos.
-        let photo = get_photo(std::mem::take(&mut user_full.profile_photo));
-        let personal_photo = get_photo(std::mem::take(&mut user_full.personal_photo));
-        let fallback_photo = get_photo(std::mem::take(&mut user_full.fallback_photo));
+        let photo = get_photo(std::mem::take(&mut user_full.profile_photo).unwrap_or_default());
+        let personal_photo =
+            get_photo(std::mem::take(&mut user_full.personal_photo).unwrap_or_default());
+        let fallback_photo =
+            get_photo(std::mem::take(&mut user_full.fallback_photo).unwrap_or_default());
         let (photo_ptr, is_personal) = if !personal_photo.is_empty() {
             (&personal_photo, true)
         } else if !photo.is_empty() {
@@ -5404,7 +5435,9 @@ impl UserManager {
         // The saved-music application (cpp:9295-9323) over the registry
         // stand-in.
         let first_saved_music_file_id = self
-            .parse_saved_music_document(std::mem::take(&mut user_full.saved_music))
+            .parse_saved_music_document(
+                std::mem::take(&mut user_full.saved_music).unwrap_or_default(),
+            )
             .unwrap_or_default();
         Self::on_update_user_full_first_saved_music_file_id(
             self.users_full.get_mut(&user_id.get()).unwrap(),
@@ -5813,7 +5846,7 @@ impl UserManager {
     /// (UserManager.cpp:10269-10276).
     pub fn get_update_unknown_user_object(&self, user_id: UserId) -> td_api::Update {
         let user = make_unknown_user_object(user_id, self.my_id);
-        td_api::Update::updateUser(td_api::updateUser { user })
+        td_api::Update::updateUser(td_api::updateUser { user: Some(user) })
     }
 
     /// `UserManager::get_user_id_object` (UserManager.cpp:10278-10291).
@@ -5873,12 +5906,12 @@ impl UserManager {
             id: user_id.get(),
             first_name: u.first_name.clone(),
             last_name: u.last_name.clone(),
-            usernames: u.usernames.get_usernames_object(),
+            usernames: Some(u.usernames.get_usernames_object()),
             phone_number: u.phone_number.clone(),
-            status: self.get_user_status_object(env, user_id),
+            status: Some(self.get_user_status_object(env, user_id)),
             // profile_photo: null in the C++ until the Files step — the
             // codegen forces an empty payload here (module docs)
-            profile_photo: empty_profile_photo_object(),
+            profile_photo: Some(empty_profile_photo_object()),
             accent_color_id: {
                 // ThemeManager::get_accent_color_id_object(accent, default):
                 // invalid ids fall back to the id-derived default
@@ -5889,34 +5922,34 @@ impl UserManager {
                 }
             },
             background_custom_emoji_id: u.background_custom_emoji_id.get(),
-            upgraded_gift_colors: u
-                .peer_color_collectible
-                .as_ref()
-                .map(|collectible| collectible.get_upgraded_gift_colors_object())
-                .unwrap_or_default(),
+            upgraded_gift_colors: Some(
+                u.peer_color_collectible
+                    .as_ref()
+                    .map(|collectible| collectible.get_upgraded_gift_colors_object())
+                    .unwrap_or_default(),
+            ),
             profile_accent_color_id: u.profile_accent_color_id.get(),
             profile_background_custom_emoji_id: u.profile_background_custom_emoji_id.get(),
-            emoji_status,
+            emoji_status: Some(emoji_status),
             is_contact: self.is_user_contact_of(user_id, false),
             is_mutual_contact: self.is_user_contact_of(user_id, true),
             is_close_friend: u.is_close_friend,
-            verification_status: td_api::VerificationStatus {
+            verification_status: Some(td_api::VerificationStatus {
                 is_verified: u.is_verified,
                 is_scam: u.is_scam,
                 is_fake: u.is_fake,
                 bot_verification_icon_custom_emoji_id: u.bot_verification_icon.get(),
-            },
+            }),
             is_premium: u.is_premium,
             is_support: u.is_support,
-            restriction_info: get_restriction_info_object(
-                &u.restriction_reasons,
-                &env.restriction_options(),
-            )
-            .unwrap_or(td_api::RestrictionInfo {
-                restriction_reason: String::new(),
-                has_sensitive_content: false,
-            }),
-            active_story_state: {
+            restriction_info: Some(
+                get_restriction_info_object(&u.restriction_reasons, &env.restriction_options())
+                    .unwrap_or(td_api::RestrictionInfo {
+                        restriction_reason: String::new(),
+                        has_sensitive_content: false,
+                    }),
+            ),
+            active_story_state: Some({
                 let (max_active, max_read, has_live) = self.get_user_active_story_state(user_id);
                 if !max_active.is_server() {
                     // the C++ emits null; the forced stand-in is the read state
@@ -5930,11 +5963,11 @@ impl UserManager {
                 } else {
                     td_api::ActiveStoryState::activeStoryStateRead(td_api::activeStoryStateRead)
                 }
-            },
+            }),
             restricts_new_chats,
             paid_message_star_count: u.paid_message_star_count,
             have_access,
-            r#type,
+            r#type: Some(r#type),
             language_code: u.language_code.clone(),
             added_to_attachment_menu: u.attach_menu_enabled,
         }
@@ -5989,18 +6022,18 @@ impl UserManager {
         let _ = env;
         td_api::UserFullInfo {
             // photos: forced empty until the Files step (module docs)
-            personal_photo: td_api::ChatPhoto::default(),
-            photo: td_api::ChatPhoto::default(),
-            public_photo: td_api::ChatPhoto::default(),
+            personal_photo: Some(td_api::ChatPhoto::default()),
+            photo: Some(td_api::ChatPhoto::default()),
+            public_photo: Some(td_api::ChatPhoto::default()),
             community_id: user_full.linked_community_id.get(),
-            block_list: if user_full.is_blocked {
+            block_list: Some(if user_full.is_blocked {
                 td_api::BlockList::blockListMain(td_api::blockListMain)
             } else if user_full.is_blocked_for_stories {
                 td_api::BlockList::blockListStories(td_api::blockListStories)
             } else {
                 // the C++ emits null; the forced stand-in is blockListMain
                 td_api::BlockList::blockListMain(td_api::blockListMain)
-            },
+            }),
             can_be_called: user_full.can_be_called,
             supports_video_calls: user_full.supports_video_calls,
             has_private_calls: user_full.has_private_calls,
@@ -6011,50 +6044,50 @@ impl UserManager {
             need_phone_number_privacy_exception: user_full.need_phone_number_privacy_exception,
             set_chat_background: user_full.wallpaper_overridden,
             uses_unofficial_app: user_full.unofficial_security_risk,
-            bio,
-            birthdate: td_api::Birthdate {
+            bio: Some(bio),
+            birthdate: Some(td_api::Birthdate {
                 day: user_full.birthdate.get_day(),
                 month: user_full.birthdate.get_month(),
                 year: user_full.birthdate.get_year(),
-            },
+            }),
             personal_chat_id: user_full.personal_channel_id,
             gift_count: user_full.gift_count,
             group_in_common_count: user_full.common_chat_count,
             incoming_paid_message_star_count: user_full.charge_paid_message_stars,
             outgoing_paid_message_star_count: user_full.send_paid_message_stars,
-            gift_settings: td_api::GiftSettings {
+            gift_settings: Some(td_api::GiftSettings {
                 show_gift_button: false,
-                accepted_gift_types: td_api::AcceptedGiftTypes::default(),
-            },
-            bot_verification: td_api::BotVerification {
+                accepted_gift_types: Some(td_api::AcceptedGiftTypes::default()),
+            }),
+            bot_verification: Some(td_api::BotVerification {
                 bot_user_id: 0,
                 icon_custom_emoji_id: 0,
-                custom_description: td_api::FormattedText {
+                custom_description: Some(td_api::FormattedText {
                     text: String::new(),
                     entities: Vec::new(),
-                },
-            },
-            main_profile_tab: td_api::ProfileTab::profileTabPosts(td_api::profileTabPosts),
-            first_profile_audio: td_api::Audio::default(),
-            rating: td_api::UserRating {
+                }),
+            }),
+            main_profile_tab: Some(td_api::ProfileTab::profileTabPosts(td_api::profileTabPosts)),
+            first_profile_audio: Some(td_api::Audio::default()),
+            rating: Some(td_api::UserRating {
                 level: 0,
                 is_maximum_level_reached: false,
                 rating: 0,
                 ..td_api::UserRating::default()
-            },
-            pending_rating: td_api::UserRating {
+            }),
+            pending_rating: Some(td_api::UserRating {
                 level: 0,
                 is_maximum_level_reached: false,
                 rating: 0,
                 ..td_api::UserRating::default()
-            },
+            }),
             pending_rating_date: 0,
-            note: td_api::FormattedText {
+            note: Some(td_api::FormattedText {
                 text: String::new(),
                 entities: Vec::new(),
-            },
-            business_info: td_api::BusinessInfo::default(),
-            bot_info: td_api::BotInfo::default(),
+            }),
+            business_info: Some(td_api::BusinessInfo::default()),
+            bot_info: Some(td_api::BotInfo::default()),
         }
     }
 
@@ -6320,7 +6353,9 @@ impl UserManager {
         for secret_chat_id in unknown_secret_chats {
             if !self.secret_chats.contains_key(&secret_chat_id) {
                 updates.push(td_api::Update::updateSecretChat(td_api::updateSecretChat {
-                    secret_chat: make_unknown_secret_chat_object(SecretChatId::new(secret_chat_id)),
+                    secret_chat: Some(make_unknown_secret_chat_object(SecretChatId::new(
+                        secret_chat_id,
+                    ))),
                 }));
             }
         }
@@ -6329,7 +6364,7 @@ impl UserManager {
         for user_id in user_ids {
             let user_object = self.get_user_object_of(env, UserId::new(user_id));
             updates.push(td_api::Update::updateUser(td_api::updateUser {
-                user: user_object,
+                user: Some(user_object),
             }));
         }
         // secret chat objects contain user_id, so they must be sent after users
@@ -6340,7 +6375,7 @@ impl UserManager {
                 &self.secret_chats[&secret_chat_id],
             );
             updates.push(td_api::Update::updateSecretChat(td_api::updateSecretChat {
-                secret_chat: object,
+                secret_chat: Some(object),
             }));
         }
 
@@ -6901,7 +6936,7 @@ impl UserManager {
             self.unknown_secret_chats.insert(secret_chat_id.get());
             let secret_chat = make_unknown_secret_chat_object(secret_chat_id);
             self.send_update(td_api::Update::updateSecretChat(td_api::updateSecretChat {
-                secret_chat,
+                secret_chat: Some(secret_chat),
             }));
         }
         secret_chat_id.get()
@@ -6929,7 +6964,7 @@ impl UserManager {
         Some(td_api::SecretChat {
             id: secret_chat_id.get(),
             user_id: self.get_user_id_object(env, user_id, "secretChat"),
-            state: get_secret_chat_state_object(state),
+            state: Some(get_secret_chat_state_object(state)),
             is_outbound,
             key_hash,
             layer,
@@ -9089,7 +9124,7 @@ impl UserManager {
         for status in statuses {
             let user_id = UserId::new(status.user_id);
             if user_id != my_user_id {
-                self.on_update_user_online(env, user_id, status.status);
+                self.on_update_user_online(env, user_id, status.status.unwrap_or_default());
             }
         }
         self.save_next_contacts_sync_date(env);
@@ -9919,11 +9954,11 @@ impl UserManager {
         for contact in &birthdays.contacts {
             let user_id = UserId::new(contact.contact_id);
             if self.is_user_contact_of(user_id, false) {
-                let birthdate = Birthdate::new(
-                    contact.birthday.day,
-                    contact.birthday.month,
-                    contact.birthday.year,
-                );
+                let birthdate = contact
+                    .birthday
+                    .as_ref()
+                    .map(|birthday| Birthdate::new(birthday.day, birthday.month, birthday.year))
+                    .unwrap_or_default();
                 let is_changed = {
                     let mut is_changed = false;
                     if self.get_user_full_force(env, user_id, "on_get_contact_birthdates") {
@@ -9963,9 +9998,11 @@ impl UserManager {
             .iter()
             .map(|(user_id, birthdate)| td_api::CloseBirthdayUser {
                 user_id: self.get_user_id_object(env, *user_id, "closeBirthdayUser"),
-                birthdate: birthdate
-                    .get_birthdate_object()
-                    .expect("contact_birthdates.users_ holds only non-empty birthdates"),
+                birthdate: Some(
+                    birthdate
+                        .get_birthdate_object()
+                        .expect("contact_birthdates.users_ holds only non-empty birthdates"),
+                ),
             })
             .collect();
         td_api::Update::updateContactCloseBirthdays(td_api::updateContactCloseBirthdays {
@@ -10151,11 +10188,11 @@ impl UserManager {
 /// emits `emojiStatusUpgradedGift` there).
 fn make_emoji_status_object(status: &EmojiStatus) -> td_api::EmojiStatus {
     td_api::EmojiStatus {
-        r#type: td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
+        r#type: Some(td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
             td_api::emojiStatusTypeCustomEmoji {
                 custom_emoji_id: status.get_custom_emoji_id().get(),
             },
-        ),
+        )),
         expiration_date: status.get_until_date(),
     }
 }
@@ -10164,9 +10201,9 @@ fn make_emoji_status_object(status: &EmojiStatus) -> td_api::EmojiStatus {
 /// null; module docs).
 fn empty_emoji_status_object() -> td_api::EmojiStatus {
     td_api::EmojiStatus {
-        r#type: td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
+        r#type: Some(td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
             td_api::emojiStatusTypeCustomEmoji { custom_emoji_id: 0 },
-        ),
+        )),
         expiration_date: 0,
     }
 }
@@ -10177,7 +10214,9 @@ fn make_unknown_secret_chat_object(secret_chat_id: SecretChatId) -> td_api::Secr
     td_api::SecretChat {
         id: secret_chat_id.get(),
         user_id: 0,
-        state: td_api::SecretChatState::secretChatStateClosed(td_api::secretChatStateClosed),
+        state: Some(td_api::SecretChatState::secretChatStateClosed(
+            td_api::secretChatStateClosed,
+        )),
         is_outbound: false,
         key_hash: Vec::new(),
         layer: 0,
@@ -10193,7 +10232,7 @@ fn make_secret_chat_object(
     td_api::SecretChat {
         id: secret_chat_id.get(),
         user_id: secret_chat.user_id.get(),
-        state: get_secret_chat_state_object(secret_chat.state),
+        state: Some(get_secret_chat_state_object(secret_chat.state)),
         is_outbound: secret_chat.is_outbound,
         key_hash: secret_chat.key_hash.clone().into_bytes(),
         layer: secret_chat.layer,
@@ -10215,18 +10254,45 @@ fn get_secret_chat_state_object(state: SecretChatState) -> td_api::SecretChatSta
     }
 }
 
+/// The forced-empty `file` payload with the never-null `local`/`remote`
+/// object_ptrs materialized (td's generated `File` always emits them).
+fn empty_file_object() -> td_api::File {
+    td_api::File {
+        id: 0,
+        size: 0,
+        expected_size: 0,
+        local: Some(td_api::LocalFile {
+            path: String::new(),
+            can_be_downloaded: false,
+            can_be_deleted: false,
+            is_downloading_active: false,
+            is_downloading_completed: false,
+            download_offset: 0,
+            downloaded_prefix_size: 0,
+            downloaded_size: 0,
+        }),
+        remote: Some(td_api::RemoteFile {
+            id: String::new(),
+            unique_id: String::new(),
+            is_uploading_active: false,
+            is_uploading_completed: false,
+            uploaded_size: 0,
+        }),
+    }
+}
+
 /// The forced-empty `profilePhoto` payload (the codegen cannot express
 /// null; module docs).
 fn empty_profile_photo_object() -> td_api::ProfilePhoto {
     td_api::ProfilePhoto {
         id: 0,
-        small: td_api::File::default(),
-        big: td_api::File::default(),
-        minithumbnail: td_api::Minithumbnail {
+        small: Some(empty_file_object()),
+        big: Some(empty_file_object()),
+        minithumbnail: Some(td_api::Minithumbnail {
             width: 0,
             height: 0,
             data: Vec::new(),
-        },
+        }),
         has_animation: false,
         is_personal: false,
     }
@@ -10240,48 +10306,48 @@ fn make_unknown_user_object(user_id: UserId, my_id: UserId) -> td_api::User {
         id: user_id.get(),
         first_name: String::new(),
         last_name: String::new(),
-        usernames: td_api::Usernames {
+        usernames: Some(td_api::Usernames {
             active_usernames: Vec::new(),
             disabled_usernames: Vec::new(),
             editable_username: String::new(),
             collectible_usernames: Vec::new(),
-        },
+        }),
         phone_number: String::new(),
-        status: td_api::UserStatus::userStatusEmpty(td_api::userStatusEmpty),
-        profile_photo: empty_profile_photo_object(),
+        status: Some(td_api::UserStatus::userStatusEmpty(td_api::userStatusEmpty)),
+        profile_photo: Some(empty_profile_photo_object()),
         accent_color_id: AccentColorId::from_peer_id(user_id.get()).get(),
         background_custom_emoji_id: 0,
-        upgraded_gift_colors: td_api::UpgradedGiftColors::default(),
+        upgraded_gift_colors: Some(td_api::UpgradedGiftColors::default()),
         profile_accent_color_id: -1,
         profile_background_custom_emoji_id: 0,
-        emoji_status: td_api::EmojiStatus {
-            r#type: td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
+        emoji_status: Some(td_api::EmojiStatus {
+            r#type: Some(td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
                 td_api::emojiStatusTypeCustomEmoji { custom_emoji_id: 0 },
-            ),
+            )),
             expiration_date: 0,
-        },
+        }),
         is_contact: false,
         is_mutual_contact: false,
         is_close_friend: false,
-        verification_status: td_api::VerificationStatus {
+        verification_status: Some(td_api::VerificationStatus {
             is_verified: false,
             is_scam: false,
             is_fake: false,
             bot_verification_icon_custom_emoji_id: 0,
-        },
+        }),
         is_premium: false,
         is_support: false,
-        restriction_info: td_api::RestrictionInfo {
+        restriction_info: Some(td_api::RestrictionInfo {
             restriction_reason: String::new(),
             has_sensitive_content: false,
-        },
-        active_story_state: td_api::ActiveStoryState::activeStoryStateRead(
+        }),
+        active_story_state: Some(td_api::ActiveStoryState::activeStoryStateRead(
             td_api::activeStoryStateRead,
-        ),
+        )),
         restricts_new_chats: false,
         paid_message_star_count: 0,
         have_access,
-        r#type: td_api::UserType::userTypeUnknown(td_api::userTypeUnknown),
+        r#type: Some(td_api::UserType::userTypeUnknown(td_api::userTypeUnknown)),
         language_code: String::new(),
         added_to_attachment_menu: false,
     }
@@ -10329,7 +10395,7 @@ impl UserManager {
                 if need_update {
                     let user_object = self.get_user_object_of(env, *user_id);
                     self.send_update(td_api::Update::updateUser(td_api::updateUser {
-                        user: user_object,
+                        user: Some(user_object),
                     }));
                 }
             }
@@ -10366,7 +10432,7 @@ impl UserManager {
             if !has_access_hash {
                 let user_object = self.get_user_object_of(env, *user_id);
                 self.send_update(td_api::Update::updateUser(td_api::updateUser {
-                    user: user_object,
+                    user: Some(user_object),
                 }));
             }
         }
@@ -10742,7 +10808,7 @@ impl UserManager {
         for user_id in user_ids {
             let user_object = self.get_user_object_of(env, UserId::new(user_id));
             self.send_update(td_api::Update::updateUser(td_api::updateUser {
-                user: user_object,
+                user: Some(user_object),
             }));
         }
     }
@@ -11000,9 +11066,11 @@ mod tests {
         assert_eq!(u.cache_version, USER_CACHE_VERSION);
         let updates = um.take_updates();
         assert!(
-            updates
-                .iter()
-                .any(|update| matches!(update, td_api::Update::updateUser(u) if u.user.id == 5 && u.user.first_name == "Alice")),
+            updates.iter().any(|update| matches!(
+                update,
+                td_api::Update::updateUser(u)
+                    if u.user.as_ref().is_some_and(|user| user.id == 5 && user.first_name == "Alice")
+            )),
             "updateUser must be sent"
         );
     }
@@ -11355,17 +11423,20 @@ mod tests {
         assert_eq!(updates.len(), 1, "updateSecretChat on the first intake");
         match &updates[0] {
             td_api::Update::updateSecretChat(update) => {
-                assert_eq!(update.secret_chat.id, 1);
-                assert_eq!(update.secret_chat.user_id, 42);
+                let Some(secret_chat) = update.secret_chat.as_ref() else {
+                    panic!("the secret chat payload must be present");
+                };
+                assert_eq!(secret_chat.id, 1);
+                assert_eq!(secret_chat.user_id, 42);
                 assert!(
                     matches!(
-                        update.secret_chat.state,
-                        td_api::SecretChatState::secretChatStatePending(_)
+                        secret_chat.state,
+                        Some(td_api::SecretChatState::secretChatStatePending(_))
                     ),
                     "Waiting converts to secretChatStatePending"
                 );
-                assert!(update.secret_chat.is_outbound);
-                assert_eq!(update.secret_chat.layer, 101);
+                assert!(secret_chat.is_outbound);
+                assert_eq!(secret_chat.layer, 101);
             }
             other => panic!("unexpected update {other:?}"),
         }
@@ -11657,7 +11728,7 @@ mod tests {
             let updates = um.take_updates();
             assert!(
                 updates.iter().any(
-                    |u| matches!(u, td_api::Update::updateSecretChat(u) if u.secret_chat.id == 9)
+                    |u| matches!(u, td_api::Update::updateSecretChat(u) if u.secret_chat.as_ref().is_some_and(|secret_chat| secret_chat.id == 9))
                 ),
                 "updateSecretChat on the replay"
             );
@@ -11980,8 +12051,9 @@ mod tests {
         let expires = (tdutils::time::system() as i64 + 3600) as i32;
         let full_flags = USER_ACCESS_HASH_MASK | (1 << 1) | (1 << 6); // access_hash, first_name, status
         let mut user = telegram_user(5, "Bob", full_flags);
-        user.status =
-            telegram_api::UserStatus::userStatusOnline(telegram_api::userStatusOnline { expires });
+        user.status = Some(telegram_api::UserStatus::userStatusOnline(
+            telegram_api::userStatusOnline { expires },
+        ));
         um.on_get_user(&mut temp.env(false), telegram_api::User::user(user), "t");
         let updates = um.take_updates();
         // A new user folds the status into its updateUser — a separate
@@ -11990,7 +12062,7 @@ mod tests {
         assert!(
             updates
                 .iter()
-                .any(|update| matches!(update, td_api::Update::updateUser(u) if u.user.id == 5)),
+                .any(|update| matches!(update, td_api::Update::updateUser(u) if u.user.as_ref().is_some_and(|user| user.id == 5))),
             "the new user must be sent"
         );
         assert!(
@@ -12022,8 +12094,9 @@ mod tests {
         let expires = (tdutils::time::system() as i64 + 60) as i32;
         let full_flags = USER_ACCESS_HASH_MASK | (1 << 1) | (1 << 6); // access_hash, first_name, status
         let mut user = telegram_user(5, "Bob", full_flags);
-        user.status =
-            telegram_api::UserStatus::userStatusOnline(telegram_api::userStatusOnline { expires });
+        user.status = Some(telegram_api::UserStatus::userStatusOnline(
+            telegram_api::userStatusOnline { expires },
+        ));
         um.on_get_user(&mut temp.env(false), telegram_api::User::user(user), "t");
         um.take_updates();
         // move was_online into the past, then fire the deadline
@@ -12036,7 +12109,7 @@ mod tests {
         assert!(updates.iter().any(|update| matches!(
             update,
             td_api::Update::updateUserStatus(s) if s.user_id == 5 &&
-                matches!(s.status, td_api::UserStatus::userStatusOffline(_))
+                matches!(s.status, Some(td_api::UserStatus::userStatusOffline(_)))
         )));
     }
 
@@ -12291,7 +12364,7 @@ mod tests {
         let updates = um.take_updates();
         assert!(updates.iter().any(|update| matches!(
             update,
-            td_api::Update::updateUserFullInfo(f) if f.user_id == 5 && f.user_full_info.bio.text == "the bio"
+            td_api::Update::updateUserFullInfo(f) if f.user_id == 5 && f.user_full_info.as_ref().is_some_and(|full| full.bio.as_ref().is_some_and(|bio| bio.text == "the bio"))
         )));
     }
 
@@ -12314,19 +12387,19 @@ mod tests {
         let mut user_full = telegram_api::UserFull {
             id: 5,
             flags: (1 << 4) | (1 << 5) | (1 << 20), // calls available+private, voice forbidden
-            settings: telegram_api::PeerSettings {
+            settings: Some(telegram_api::PeerSettings {
                 flags: (1 << 4) | (1 << 14), // need_contacts_exception, charge_paid_message_stars
                 need_contacts_exception: true,
                 charge_paid_message_stars: 1i64 << 52, // clamps to the maximum
                 ..telegram_api::PeerSettings::default()
-            },
+            }),
             private_forward_name: "pf".to_owned(),
-            birthday: telegram_api::Birthday {
+            birthday: Some(telegram_api::Birthday {
                 day: 7,
                 month: 11,
                 year: 1990,
                 ..telegram_api::Birthday::default()
-            },
+            }),
             ..telegram_api::UserFull::default()
         };
         user_full.flags2 = (1 << 5) | (1 << 24); // birthday, noforwards_peer_enabled
@@ -12350,11 +12423,11 @@ mod tests {
         um.users.get_mut(&5).unwrap().is_contact = true;
         let user_full = telegram_api::UserFull {
             id: 5,
-            settings: telegram_api::PeerSettings {
+            settings: Some(telegram_api::PeerSettings {
                 flags: 1 << 4,
                 need_contacts_exception: true,
                 ..telegram_api::PeerSettings::default()
-            },
+            }),
             private_forward_name: "pf".to_owned(),
             ..telegram_api::UserFull::default()
         };
@@ -12635,7 +12708,7 @@ mod tests {
         um.get_current_state(&mut temp.env(false), &mut updates);
         assert!(updates.iter().any(|update| matches!(
             update,
-            td_api::Update::updateUser(u) if u.user.id == 5
+            td_api::Update::updateUser(u) if u.user.as_ref().is_some_and(|user| user.id == 5)
         )));
     }
 
@@ -12749,14 +12822,15 @@ mod tests {
         // the process-monotonic clock would read as an ancient status.
         let expires = temp.env(false).unix_time() + 300;
         let mut user = telegram_user(5, "A", USER_ACCESS_HASH_MASK | (1 << 1));
-        user.status =
-            telegram_api::UserStatus::userStatusOnline(telegram_api::userStatusOnline { expires });
+        user.status = Some(telegram_api::UserStatus::userStatusOnline(
+            telegram_api::userStatusOnline { expires },
+        ));
         um.on_get_user(&mut temp.env(false), telegram_api::User::user(user), "t");
         let updates = um.take_updates();
         assert!(
             updates
                 .iter()
-                .any(|u| matches!(u, td_api::Update::updateUser(x) if x.user.id == 5)),
+                .any(|u| matches!(u, td_api::Update::updateUser(x) if x.user.as_ref().is_some_and(|user| user.id == 5))),
             "updateUser must be sent"
         );
         // The C++ diff machine clears is_status_changed together with the
@@ -13342,11 +13416,11 @@ mod tests {
         let status_object = um.get_user_emoji_status_object_of(both_id).unwrap();
         assert!(matches!(
             status_object.r#type,
-            td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
+            Some(td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
                 td_api::emojiStatusTypeCustomEmoji {
                     custom_emoji_id: 77
                 }
-            )
+            ))
         ));
 
         // Stories and the poll predicate.
@@ -13474,8 +13548,8 @@ mod tests {
         );
         assert!(matches!(
             &updates[0],
-            td_api::Update::updateSecretChat(u) if u.secret_chat.id == 66
-                && u.secret_chat.user_id == 0
+            td_api::Update::updateSecretChat(u) if u.secret_chat.as_ref().is_some_and(|secret_chat| secret_chat.id == 66
+                && secret_chat.user_id == 0)
         ));
         assert!(um.unknown_secret_chats.contains(&66));
 
@@ -13580,7 +13654,7 @@ mod tests {
         assert!(
             updates
                 .iter()
-                .any(|update| matches!(update, td_api::Update::updateUserFullInfo(f) if f.user_full_info.bio.text == "the bio")),
+                .any(|update| matches!(update, td_api::Update::updateUserFullInfo(f) if f.user_full_info.as_ref().is_some_and(|full| full.bio.as_ref().is_some_and(|bio| bio.text == "the bio")))),
             "the about change must emit updateUserFullInfo"
         );
     }
@@ -13754,9 +13828,11 @@ mod tests {
         let updates = um.take_updates();
         assert!(
             updates.iter().any(
-                |update| matches!(update, td_api::Update::updateUser(u) if matches!(
-                    u.user.emoji_status.r#type,
-                    td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(_)
+                |update| matches!(update, td_api::Update::updateUser(u) if u.user.as_ref().is_some_and(
+                    |user| user.emoji_status.as_ref().is_some_and(|emoji_status| matches!(
+                        emoji_status.r#type,
+                        Some(td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(_))
+                    ))
                 ))
             ),
             "the emoji status must surface in updateUser"
@@ -13774,9 +13850,11 @@ mod tests {
         um.on_set_birthdate(env, birthdate);
         assert_eq!(um.get_user_full(user_id).unwrap().birthdate, birthdate);
         let first_updates = um.take_updates();
-        assert!(first_updates
-            .iter()
-            .any(|update| matches!(update, td_api::Update::updateUserFullInfo(f) if f.user_full_info.birthdate.day == 5)));
+        assert!(first_updates.iter().any(|update| matches!(
+            update,
+            td_api::Update::updateUserFullInfo(f)
+                if f.user_full_info.as_ref().is_some_and(|full| full.birthdate.as_ref().is_some_and(|birthdate| birthdate.day == 5))
+        )));
 
         // The same birthdate again is a silent no-op.
         um.on_set_birthdate(env, birthdate);
@@ -14248,7 +14326,7 @@ mod tests {
         assert!(
             um.take_updates()
                 .iter()
-                .any(|update| matches!(update, td_api::Update::updateUser(u) if u.user.id == 5))
+                .any(|update| matches!(update, td_api::Update::updateUser(u) if u.user.as_ref().is_some_and(|user| user.id == 5)))
         );
     }
 
@@ -14464,10 +14542,14 @@ mod tests {
                 id: 5,
                 flags: 1 << 2,   // profile_photo
                 flags2: 1 << 21, // saved_music
-                profile_photo: telegram_photo(55),
-                personal_photo: telegram_api::Photo::photoEmpty(telegram_api::photoEmpty { id: 0 }),
-                fallback_photo: telegram_api::Photo::photoEmpty(telegram_api::photoEmpty { id: 0 }),
-                saved_music: audio_document(300, 30),
+                profile_photo: Some(telegram_photo(55)),
+                personal_photo: Some(telegram_api::Photo::photoEmpty(telegram_api::photoEmpty {
+                    id: 0,
+                })),
+                fallback_photo: Some(telegram_api::Photo::photoEmpty(telegram_api::photoEmpty {
+                    id: 0,
+                })),
+                saved_music: Some(audio_document(300, 30)),
                 ..telegram_api::UserFull::default()
             },
         );
@@ -14642,7 +14724,7 @@ mod tests {
         assert!(
             um.take_updates()
                 .iter()
-                .any(|update| matches!(update, td_api::Update::updateUser(u) if u.user.id == 2))
+                .any(|update| matches!(update, td_api::Update::updateUser(u) if u.user.as_ref().is_some_and(|user| user.id == 2)))
         );
     }
 
@@ -15130,12 +15212,12 @@ mod tests {
             Some(telegram_api::contacts_ContactBirthdays {
                 contacts: vec![telegram_api::ContactBirthday {
                     contact_id: 2,
-                    birthday: telegram_api::Birthday {
+                    birthday: Some(telegram_api::Birthday {
                         flags: 1,
                         day: 3,
                         month: 4,
                         year: 1990,
-                    },
+                    }),
                 }],
                 users: Vec::new(),
             }),
@@ -15150,7 +15232,7 @@ mod tests {
             update,
             td_api::Update::updateContactCloseBirthdays(u)
                 if u.close_birthday_users.len() == 1 && u.close_birthday_users[0].user_id == 2
-                && u.close_birthday_users[0].birthdate.day == 3
+                && u.close_birthday_users[0].birthdate.as_ref().is_some_and(|birthdate| birthdate.day == 3)
         )));
 
         // the dismiss option swaps the next answer for an empty one — the
@@ -15227,9 +15309,9 @@ mod tests {
             &mut temp.env(false),
             vec![telegram_api::ContactStatus {
                 user_id: 2,
-                status: telegram_api::UserStatus::userStatusOnline(
+                status: Some(telegram_api::UserStatus::userStatusOnline(
                     telegram_api::userStatusOnline { expires },
-                ),
+                )),
             }],
         );
         assert!(um.get_user(UserId::new(2)).unwrap().was_online > 0);
@@ -15326,7 +15408,7 @@ mod tests {
         assert_eq!(um.user_messages.get(&5).unwrap().len(), 1);
         let updates = um.take_updates();
         assert!(
-            matches!(&updates[0], td_api::Update::updateUser(u) if u.user.id == 5),
+            matches!(&updates[0], td_api::Update::updateUser(u) if u.user.as_ref().is_some_and(|user| user.id == 5)),
             "the registry appearance emits updateUser for the min user"
         );
 
@@ -15350,7 +15432,7 @@ mod tests {
         assert!(!um.user_messages.contains_key(&5));
         let updates = um.take_updates();
         assert!(
-            matches!(&updates[0], td_api::Update::updateUser(u) if u.user.id == 5),
+            matches!(&updates[0], td_api::Update::updateUser(u) if u.user.as_ref().is_some_and(|user| user.id == 5)),
             "the last registry reference emits updateUser for the min user"
         );
 
@@ -15687,8 +15769,12 @@ mod tests {
         um.on_ignored_restriction_reasons_changed(&env);
         let updates = um.take_updates();
         assert_eq!(updates.len(), 2);
-        assert!(matches!(&updates[0], td_api::Update::updateUser(u) if u.user.id == 5));
-        assert!(matches!(&updates[1], td_api::Update::updateUser(u) if u.user.id == 999));
+        assert!(
+            matches!(&updates[0], td_api::Update::updateUser(u) if u.user.as_ref().is_some_and(|user| user.id == 5))
+        );
+        assert!(
+            matches!(&updates[1], td_api::Update::updateUser(u) if u.user.as_ref().is_some_and(|user| user.id == 999))
+        );
     }
 
     #[test]

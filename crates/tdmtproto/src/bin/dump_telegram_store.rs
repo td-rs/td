@@ -90,9 +90,9 @@ fn main() {
             folder_id: 42,
             offset_date: 0,
             offset_id: 0,
-            offset_peer: Box::new(telegram_api::InputPeer::inputPeerEmpty(
+            offset_peer: Some(Box::new(telegram_api::InputPeer::inputPeerEmpty(
                 telegram_api::inputPeerEmpty,
-            )),
+            ))),
             limit: 0,
             hash: 0,
         };
@@ -107,9 +107,9 @@ fn main() {
             folder_id: 42,
             offset_date: 0,
             offset_id: 0,
-            offset_peer: Box::new(telegram_api::InputPeer::inputPeerEmpty(
+            offset_peer: Some(Box::new(telegram_api::InputPeer::inputPeerEmpty(
                 telegram_api::inputPeerEmpty,
-            )),
+            ))),
             limit: 0,
             hash: 0,
         };
@@ -130,10 +130,10 @@ fn main() {
     {
         let obj = telegram_api::inputChatUploadedPhoto {
             flags: 0,
-            file: empty_input_file(),
-            video: empty_input_file(),
+            file: Some(empty_input_file()),
+            video: Some(empty_input_file()),
             video_start_ts: 0.0,
-            video_emoji_markup: empty_video_size(),
+            video_emoji_markup: Some(empty_video_size()),
         };
         let mut out = Vec::new();
         obj.store_boxed(&mut out);
@@ -142,27 +142,33 @@ fn main() {
     {
         let obj = telegram_api::inputChatUploadedPhoto {
             flags: 15,
-            file: telegram_api::InputFile::inputFile(telegram_api::inputFile {
-                id: 1,
-                parts: 2,
-                name: "name".to_owned(),
-                md5_checksum: "md5".to_owned(),
-            }),
-            video: telegram_api::InputFile::inputFile(telegram_api::inputFile {
-                id: 3,
-                parts: 4,
-                name: "video".to_owned(),
-                md5_checksum: "sum".to_owned(),
-            }),
+            file: Some(telegram_api::InputFile::inputFile(
+                telegram_api::inputFile {
+                    id: 1,
+                    parts: 2,
+                    name: "name".to_owned(),
+                    md5_checksum: "md5".to_owned(),
+                },
+            )),
+            video: Some(telegram_api::InputFile::inputFile(
+                telegram_api::inputFile {
+                    id: 3,
+                    parts: 4,
+                    name: "video".to_owned(),
+                    md5_checksum: "sum".to_owned(),
+                },
+            )),
             video_start_ts: 1.5,
-            video_emoji_markup: telegram_api::VideoSize::videoSize(telegram_api::videoSize {
-                flags: 0,
-                r#type: "u".to_owned(),
-                w: 640,
-                h: 360,
-                size: 0,
-                video_start_ts: 0.0,
-            }),
+            video_emoji_markup: Some(telegram_api::VideoSize::videoSize(
+                telegram_api::videoSize {
+                    flags: 0,
+                    r#type: "u".to_owned(),
+                    w: 640,
+                    h: 360,
+                    size: 0,
+                    video_start_ts: 0.0,
+                },
+            )),
         };
         let mut out = Vec::new();
         obj.store_boxed(&mut out);
