@@ -7,6 +7,9 @@
 //! consumed by `utf8_to_lower` and the misc string helpers) has no M.4.4
 //! consumer and is not carried yet; add it with its first user.
 
+use crate::unicode_simple_category_tables::{
+    SIMPLE_CATEGORY_JUMP_POS, SIMPLE_CATEGORY_RANGES, SIMPLE_CATEGORY_TABLE,
+};
 use crate::unicode_tables::{
     PREPARE_SEARCH_CHARACTER_RANGES, PREPARE_SEARCH_CHARACTER_TABLE, WITHOUT_DIACRITICS_RANGES,
     WITHOUT_DIACRITICS_TABLE,
@@ -79,4 +82,50 @@ pub fn remove_diacritics(code: u32) -> u32 {
     } else {
         binary_search_ranges(WITHOUT_DIACRITICS_RANGES, code)
     }
+}
+
+/// `td::UnicodeSimpleCategory` (unicode.h:13) — the discriminants are the
+/// table codes; `Separator` = 4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum UnicodeSimpleCategory {
+    Unknown,
+    Letter,
+    DecimalNumber,
+    Number,
+    Separator,
+}
+
+fn simple_category_from_code(code: u32) -> UnicodeSimpleCategory {
+    match code {
+        0 => UnicodeSimpleCategory::Unknown,
+        1 => UnicodeSimpleCategory::Letter,
+        2 => UnicodeSimpleCategory::DecimalNumber,
+        3 => UnicodeSimpleCategory::Number,
+        4 => UnicodeSimpleCategory::Separator,
+        // the committed tables only encode 0-4
+        _ => panic!("bad simple-category code {code}"),
+    }
+}
+
+/// C++ `get_unicode_simple_category` (unicode.cpp:1281-1294): the direct
+/// 128-entry table, then the jump-point-accelerated walk over the
+/// pair-encoded `(base << 5 | category)` ranges ending in the
+/// `0xFFFFFFFF` sentinel; the transform `(code << 5) + 30` keeps the
+/// walk's `<=` comparison equivalent to "greatest base not exceeding the
+/// code".
+pub fn get_unicode_simple_category(code: u32) -> UnicodeSimpleCategory {
+    if code < 128 {
+        return simple_category_from_code(SIMPLE_CATEGORY_TABLE[code as usize] as u32);
+    }
+    let jump_pos_index = if code <= 0x20000 {
+        (code >> 7) as usize
+    } else {
+        ((0x20000 >> 7) - (0x20000 >> 16) + (code >> 16)) as usize
+    };
+    let mut it = SIMPLE_CATEGORY_JUMP_POS[jump_pos_index] as usize;
+    let transformed = (code << 5) + 30;
+    while SIMPLE_CATEGORY_RANGES[it] <= transformed {
+        it += 1;
+    }
+    simple_category_from_code(SIMPLE_CATEGORY_RANGES[it - 1] & 31)
 }
