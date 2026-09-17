@@ -28,9 +28,10 @@ use crate::emoji_status::{CustomEmojiId, EmojiStatus};
 use crate::global::Global;
 use crate::misc::strip_empty_characters;
 use crate::peer_color::AccentColorId;
+use crate::peer_color::PeerColor;
 use crate::photo::{DialogPhoto, Photo, get_chat_photo_object, photo_get_file_ids};
 use crate::restriction_reason::{
-    RestrictionOptions, RestrictionReason, get_restriction_info_object,
+    RestrictionOptions, RestrictionReason, get_restriction_info_object, get_restriction_reasons,
     get_restriction_reasons_from_legacy, parse_restriction_reasons, store_restriction_reasons,
 };
 use crate::store_parse::{
@@ -5476,7 +5477,9 @@ impl ChatManager {
                 c.last_sent_emoji_status = effective_emoji_status;
                 c.last_sent_emoji_status.as_ref().and_then(|last_sent| {
                     let left_time = i64::from(last_sent.get_until_date()) - i64::from(unix_time);
-                    (0..30 * 86400).contains(&left_time).then_some(left_time as f64)
+                    (0..30 * 86400)
+                        .contains(&left_time)
+                        .then_some(left_time as f64)
                 })
             };
             if let Some(timeout_in) = armed_timeout {
@@ -5819,6 +5822,1735 @@ impl ChatManager {
 
         // must not load ChannelFull, because must not change the Channel
         debug_assert!(have_channel_full == self.get_channel_full_const(channel_id).is_some());
+    }
+
+    // ---- M.5.20: the telegram_api::Chat application matrix ----
+
+    /// `need_update_dialog_photo` (DialogPhoto.cpp:212-215) — the small
+    /// and big file ids plus the animation and personal flags; the
+    /// minithumbnail is compared separately by [`Self::on_update_chat_photo`].
+    fn need_update_dialog_photo(from: &DialogPhoto, to: &DialogPhoto) -> bool {
+        from.small_file_id != to.small_file_id
+            || from.big_file_id != to.big_file_id
+            || from.has_animation != to.has_animation
+            || from.is_personal != to.is_personal
+    }
+
+    /// `on_update_chat_title` (ChatManager.cpp:7483-7487).
+    fn on_update_chat_title(c: &mut Chat, chat_id: ChatId, title: String) {
+        let _ = chat_id;
+        if c.title != title {
+            c.title = title;
+            c.is_title_changed = true;
+            c.need_save_to_database = true;
+        }
+    }
+
+    /// `on_update_chat_active` (ChatManager.cpp:7491-7495).
+    fn on_update_chat_active(c: &mut Chat, chat_id: ChatId, is_active: bool) {
+        if c.is_active != is_active {
+            c.is_active = is_active;
+            c.is_is_active_changed = true;
+            c.is_changed = true;
+        }
+        let _ = chat_id;
+    }
+
+    /// `on_update_chat_migrated_to_channel_id` (ChatManager.cpp:7499-7505)
+    /// — an invalid new id never overwrites the stored one.
+    fn on_update_chat_migrated_to_channel_id(
+        c: &mut Chat,
+        chat_id: ChatId,
+        migrated_to_channel_id: ChannelId,
+    ) {
+        if c.migrated_to_channel_id != migrated_to_channel_id && migrated_to_channel_id.is_valid() {
+            if c.migrated_to_channel_id.is_valid() {
+                tdutils::log_error!(
+                    "Upgraded supergroup ID for {chat_id:?} has changed from {:?} to {migrated_to_channel_id:?}",
+                    c.migrated_to_channel_id
+                );
+            }
+            c.migrated_to_channel_id = migrated_to_channel_id;
+            c.is_changed = true;
+        }
+    }
+
+    /// `on_update_chat_noforwards` (ChatManager.cpp:7357-7363).
+    fn on_update_chat_noforwards(c: &mut Chat, chat_id: ChatId, noforwards: bool) {
+        if c.noforwards != noforwards {
+            tdutils::log_info!(
+                "{chat_id:?} has_protected_content changed from {} to {noforwards}",
+                c.noforwards
+            );
+            c.noforwards = noforwards;
+            c.is_noforwards_changed = true;
+            c.need_save_to_database = true;
+        }
+    }
+
+    /// `on_update_chat_default_permissions` (ChatManager.cpp:7345-7354),
+    /// the `Chat *` form. The `ChatId` overload belongs to the
+    /// updateChatDefaultBannedRights intake — a later slice.
+    fn on_update_chat_default_permissions(
+        c: &mut Chat,
+        chat_id: ChatId,
+        default_permissions: RestrictedRights,
+        version: i32,
+    ) {
+        if c.default_permissions != default_permissions && version >= c.default_permissions_version
+        {
+            tdutils::log_info!("{chat_id:?} default permissions changed");
+            c.default_permissions = default_permissions;
+            c.default_permissions_version = version;
+            c.is_default_permissions_changed = true;
+            c.need_save_to_database = true;
+        }
+    }
+
+    /// `on_update_chat_status` (ChatManager.cpp:7258-7292). The left
+    /// branch zeroes the participant count and invalidates all three
+    /// independent version counters at once.
+    fn on_update_chat_status(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        status: DialogParticipantStatus,
+    ) {
+        let Some(c) = self.get_chat_mut(chat_id) else {
+            return;
+        };
+        if c.status == status {
+            return;
+        }
+        tdutils::log_info!(
+            "Update {chat_id:?} status from {:?} to {status:?}",
+            c.status
+        );
+        let old_status = c.status.clone();
+        let need_reload_group_call = old_status.can_manage_calls() != status.can_manage_calls();
+        let need_drop_invite_link =
+            old_status.can_manage_invite_links() && !status.can_manage_invite_links();
+        let need_drop_welcome_messages = old_status.can_change_info_and_settings_as_administrator()
+            && !status.can_change_info_and_settings_as_administrator();
+        let is_left = status.is_left();
+        c.status = status;
+        c.is_status_changed = true;
+        if is_left {
+            c.participant_count = 0;
+            c.version = -1;
+            c.default_permissions_version = -1;
+            c.pinned_message_version = -1;
+        }
+        if is_left {
+            self.drop_chat_full(user_manager, env, chat_id);
+        } else if need_drop_invite_link
+            && self
+                .get_chat_full_force(user_manager, env, chat_id, "on_update_chat_status")
+                .is_some()
+        {
+            self.on_update_chat_full_invite_link(env, chat_id, None);
+            self.update_chat_full(user_manager, env, chat_id, "on_update_chat_status", false);
+        }
+        if need_reload_group_call {
+            // td_->messages_manager_->on_update_dialog_group_call_rights —
+            // the M.10 stub.
+        }
+        if need_drop_welcome_messages {
+            // td_->welcome_message_manager_->drop_welcome_messages — the
+            // wave-3 stub.
+        }
+        let c = self.get_chat_mut(chat_id).expect("checked above");
+        c.is_changed = true;
+    }
+
+    /// `on_update_chat_participant_count` (ChatManager.cpp:7411-7443) —
+    /// the version machine: stale versions answer silently, the
+    /// deleted-user leave keeps the version and repairs instead.
+    fn on_update_chat_participant_count(
+        &mut self,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        participant_count: i32,
+        version: i32,
+        debug_str: &str,
+    ) {
+        let Some(c) = self.get_chat_mut(chat_id) else {
+            return;
+        };
+        let mut needs_repair = false;
+        if version <= -1 {
+            tdutils::log_error!("Receive wrong version {version} in {chat_id:?}{debug_str}");
+            return;
+        }
+        if version < c.version {
+            tdutils::log_info!(
+                "Receive number of members in {chat_id:?} with version {version}{debug_str}, but current version is {}",
+                c.version
+            );
+            return;
+        }
+        if c.participant_count != participant_count {
+            if version == c.version && participant_count != 0 {
+                // version is not changed when a deleted user is removed
+                if c.participant_count != participant_count + 1 {
+                    tdutils::log_error!(
+                        "Number of members in {chat_id:?} has changed from {} to {participant_count}, but version {version} remains unchanged{debug_str}",
+                        c.participant_count
+                    );
+                }
+                needs_repair = true;
+            }
+            c.participant_count = participant_count;
+            c.version = version;
+            c.is_changed = true;
+            if needs_repair {
+                self.repair_chat_participants(env, chat_id);
+            }
+            return;
+        }
+        if version > c.version {
+            c.version = version;
+            c.need_save_to_database = true;
+        }
+    }
+
+    /// `repair_chat_participants` (ChatManager.cpp) — the C++ re-requests
+    /// the chat full through the net layer; [blocked: net] (M.5.44).
+    fn repair_chat_participants(&mut self, env: &mut UserEnv, chat_id: ChatId) {
+        let _ = env;
+        tdutils::log_info!("Repair participants of {chat_id:?} — [blocked: net]");
+    }
+
+    /// `on_update_chat_photo` (ChatManager.cpp:7446-7452) — the
+    /// `telegram_api::ChatPhoto` wrapper.
+    fn on_update_chat_photo(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        chat_photo: telegram_api::ChatPhoto,
+    ) {
+        let photo = DialogPhoto::get_dialog_photo(Some(chat_photo));
+        self.on_update_chat_photo_impl(user_manager, env, chat_id, photo, true);
+    }
+
+    /// `on_update_chat_photo_impl` (ChatManager.cpp:7454-7480).
+    fn on_update_chat_photo_impl(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        photo: DialogPhoto,
+        invalidate_photo_cache: bool,
+    ) {
+        let mut photo = photo;
+        if env.auth_is_bot {
+            photo.minithumbnail = String::new();
+        }
+        let photo_differs = {
+            let Some(c) = self.get_chat(chat_id) else {
+                return;
+            };
+            Self::need_update_dialog_photo(&c.photo, &photo)
+        };
+        if photo_differs {
+            tdutils::log_debug!("Update photo of {chat_id:?}");
+            let small_file_id_valid;
+            {
+                let c = self.get_chat_mut(chat_id).expect("checked above");
+                c.photo = photo;
+                c.is_photo_changed = true;
+                c.need_save_to_database = true;
+                small_file_id_valid = c.photo.small_file_id.is_valid();
+            }
+            if invalidate_photo_cache && self.get_chat_full(chat_id).is_some() {
+                if let Some(f) = self.get_chat_full_mut(chat_id)
+                    && !f.photo.is_empty()
+                {
+                    f.photo = Photo::default();
+                    f.is_changed = true;
+                }
+                if small_file_id_valid {
+                    self.reload_chat_full(env, chat_id, Promise::default(), "on_update_chat_photo");
+                }
+                self.update_chat_full(user_manager, env, chat_id, "on_update_chat_photo", false);
+            }
+        } else {
+            let Some(c) = self.get_chat_mut(chat_id) else {
+                return;
+            };
+            if c.photo.minithumbnail != photo.minithumbnail {
+                c.photo.minithumbnail = photo.minithumbnail;
+                c.is_photo_changed = true;
+                c.need_save_to_database = true;
+            }
+        }
+    }
+
+    /// `on_get_chat_empty` (ChatManager.cpp:9152-9162) — never changes
+    /// state.
+    fn on_get_chat_empty(&mut self, chat: telegram_api::chatEmpty, source: &str) {
+        let chat_id = ChatId::new(chat.id);
+        if !chat_id.is_valid() {
+            tdutils::log_error!("Receive invalid {chat_id:?} from {source}");
+            return;
+        }
+        if !self.have_chat(chat_id) {
+            tdutils::log_error!(
+                "Have no information about {chat_id:?} but received chatEmpty from {source}"
+            );
+        }
+    }
+
+    /// `on_get_chat` — the basic-group constructor
+    /// (ChatManager.cpp:9164-9252).
+    fn on_get_basic_group_chat(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat: telegram_api::chat,
+        source: &str,
+    ) {
+        let mut chat = chat;
+        let debug_str = format!(" from {source}");
+        let chat_id = ChatId::new(chat.id);
+        if !chat_id.is_valid() {
+            tdutils::log_error!("Receive invalid {chat_id:?}{debug_str}");
+            return;
+        }
+
+        // the status ladder: creator, then admin, then left, then member
+        let status = if chat.creator {
+            DialogParticipantStatus::creator(!chat.left, false, String::new())
+        } else if chat.flags & (1 << 13) != 0 {
+            DialogParticipantStatus::administrator(
+                AdministratorRights::from_chat_admin_rights(
+                    Some(&chat.admin_rights),
+                    ChannelType::Unknown,
+                ),
+                String::new(),
+                false,
+            )
+        } else if chat.left {
+            DialogParticipantStatus::left()
+        } else {
+            DialogParticipantStatus::member(0, String::new())
+        };
+
+        // the upgraded-to supergroup: unknown channels are created on the
+        // spot so the client sees every added channel
+        let mut migrated_to_channel_id = ChannelId::default();
+        match &chat.migrated_to {
+            telegram_api::InputChannel::inputChannel(ic) => {
+                migrated_to_channel_id = ChannelId::new(ic.channel_id);
+                if !self.have_channel_force(user_manager, env, migrated_to_channel_id, source) {
+                    if !migrated_to_channel_id.is_valid() {
+                        tdutils::log_error!(
+                            "Receive invalid {migrated_to_channel_id:?}{debug_str}"
+                        );
+                    } else {
+                        {
+                            let c = self.add_channel(migrated_to_channel_id);
+                            c.access_hash = ic.access_hash;
+                            c.title = chat.title.clone();
+                            c.status = DialogParticipantStatus::left();
+                            c.is_megagroup = true;
+                        }
+                        // we definitely need to call update_channel, because
+                        // the client should know about every added channel
+                        self.update_channel(
+                            user_manager,
+                            env,
+                            migrated_to_channel_id,
+                            false,
+                            false,
+                        );
+                        // get_channel_queries_.add_query — [blocked: net]
+                        // (M.5.44).
+                    }
+                }
+            }
+            telegram_api::InputChannel::inputChannelEmpty(_)
+            | telegram_api::InputChannel::inputChannelFromMessage(_) => {
+                tdutils::log_error!(
+                    "Receive invalid information about upgraded supergroup for {chat_id:?}{debug_str}"
+                );
+            }
+        }
+
+        // get_chat_force first, to load the versions from the database
+        let c_exists = self
+            .get_chat_force(user_manager, env, chat_id, source)
+            .is_some();
+        if !c_exists {
+            self.add_chat(chat_id);
+        }
+
+        Self::on_update_chat_title(
+            self.get_chat_mut(chat_id).expect("added above"),
+            chat_id,
+            std::mem::take(&mut chat.title),
+        );
+        if !status.is_left() {
+            self.on_update_chat_participant_count(
+                env,
+                chat_id,
+                chat.participants_count,
+                chat.version,
+                &debug_str,
+            );
+        } else {
+            chat.photo = telegram_api::ChatPhoto::chatPhotoEmpty(telegram_api::chatPhotoEmpty {});
+        }
+
+        {
+            let c = self.get_chat_mut(chat_id).expect("added above");
+            if c.date != chat.date {
+                if c.date != 0 {
+                    tdutils::log_error!(
+                        "Chat creation date has changed from {} to {}{debug_str}",
+                        c.date,
+                        chat.date
+                    );
+                }
+                c.date = chat.date;
+                c.need_save_to_database = true;
+            }
+        }
+
+        self.on_update_chat_status(user_manager, env, chat_id, status);
+        Self::on_update_chat_default_permissions(
+            self.get_chat_mut(chat_id).expect("added above"),
+            chat_id,
+            RestrictedRights::from_chat_banned_rights(
+                if chat.flags & (1 << 14) != 0 {
+                    Some(&chat.default_banned_rights)
+                } else {
+                    None
+                },
+                ChannelType::Unknown,
+            ),
+            chat.version,
+        );
+        let chat_photo = std::mem::take(&mut chat.photo);
+        self.on_update_chat_photo(user_manager, env, chat_id, chat_photo);
+        Self::on_update_chat_active(
+            self.get_chat_mut(chat_id).expect("added above"),
+            chat_id,
+            !chat.deactivated,
+        );
+        Self::on_update_chat_noforwards(
+            self.get_chat_mut(chat_id).expect("added above"),
+            chat_id,
+            chat.noforwards,
+        );
+        Self::on_update_chat_migrated_to_channel_id(
+            self.get_chat_mut(chat_id).expect("added above"),
+            chat_id,
+            migrated_to_channel_id,
+        );
+
+        let migrated_valid = migrated_to_channel_id.is_valid();
+        {
+            let c = self.get_chat_mut(chat_id).expect("added above");
+            if !c.is_active && !migrated_valid {
+                tdutils::log_info!("{chat_id:?} is deactivated{debug_str}");
+            }
+            if c.cache_version != Chat::CACHE_VERSION {
+                c.cache_version = Chat::CACHE_VERSION;
+                c.need_save_to_database = true;
+            }
+            c.is_received_from_server = true;
+        }
+        self.update_chat(user_manager, env, chat_id, false, false);
+        // td_->messages_manager_->on_update_dialog_group_call — the M.10
+        // stub (GroupCallManager slice).
+    }
+
+    /// `on_get_chat_forbidden` (ChatManager.cpp:9254-9283).
+    fn on_get_chat_forbidden(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat: telegram_api::chatForbidden,
+        source: &str,
+    ) {
+        let chat_id = ChatId::new(chat.id);
+        if !chat_id.is_valid() {
+            tdutils::log_error!("Receive invalid {chat_id:?} from {source}");
+            return;
+        }
+        let is_uninited = self
+            .get_chat_force(user_manager, env, chat_id, source)
+            .is_none();
+        self.add_chat(chat_id);
+        Self::on_update_chat_title(
+            self.get_chat_mut(chat_id).expect("added above"),
+            chat_id,
+            chat.title,
+        );
+        self.on_update_chat_photo(
+            user_manager,
+            env,
+            chat_id,
+            telegram_api::ChatPhoto::chatPhotoEmpty(telegram_api::chatPhotoEmpty {}),
+        );
+        {
+            let c = self.get_chat_mut(chat_id).expect("added above");
+            if c.date != 0 {
+                // removed in 38-th layer
+                c.date = 0;
+                c.need_save_to_database = true;
+            }
+        }
+        self.on_update_chat_status(
+            user_manager,
+            env,
+            chat_id,
+            DialogParticipantStatus::banned(0, String::new()),
+        );
+        if is_uninited {
+            Self::on_update_chat_active(
+                self.get_chat_mut(chat_id).expect("added above"),
+                chat_id,
+                true,
+            );
+            Self::on_update_chat_migrated_to_channel_id(
+                self.get_chat_mut(chat_id).expect("added above"),
+                chat_id,
+                ChannelId::default(),
+            );
+        }
+        {
+            let c = self.get_chat_mut(chat_id).expect("added above");
+            if c.cache_version != Chat::CACHE_VERSION {
+                c.cache_version = Chat::CACHE_VERSION;
+                c.need_save_to_database = true;
+            }
+            c.is_received_from_server = true;
+        }
+        self.update_chat(user_manager, env, chat_id, false, false);
+    }
+
+    /// `on_get_chat` (ChatManager.cpp:5704-5733) — the constructor
+    /// dispatcher. Communities are consumed and dropped by the
+    /// CommunityManager stub.
+    pub(crate) fn on_get_chat(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat: telegram_api::Chat,
+        source: &str,
+    ) {
+        match chat {
+            telegram_api::Chat::chatEmpty(c) => self.on_get_chat_empty(c, source),
+            telegram_api::Chat::chat(c) => {
+                self.on_get_basic_group_chat(user_manager, env, c, source)
+            }
+            telegram_api::Chat::chatForbidden(c) => {
+                self.on_get_chat_forbidden(user_manager, env, c, source)
+            }
+            telegram_api::Chat::channel(c) => self.on_get_channel(user_manager, env, c, source),
+            telegram_api::Chat::channelForbidden(c) => {
+                self.on_get_channel_forbidden(user_manager, env, c, source)
+            }
+            // td_->community_manager_->on_get_community — consume and drop;
+            // the community slice owns them.
+            chat @ (telegram_api::Chat::community(_)
+            | telegram_api::Chat::communityForbidden(_)) => {
+                let _ = chat;
+            }
+        }
+    }
+
+    /// `on_get_chats` (ChatManager.cpp:5735-5757) — communities before
+    /// channels before plain chats, because the basic-group intake
+    /// consults the migrated-to channel.
+    #[allow(dead_code)] // production caller: UpdatesManager (M.7) / M.5.47
+    pub(crate) fn on_get_chats(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chats: Vec<telegram_api::Chat>,
+        source: &str,
+    ) {
+        let mut chats: Vec<Option<telegram_api::Chat>> = chats.into_iter().map(Some).collect();
+        let take_matching =
+            |pred: fn(&telegram_api::Chat) -> bool, chats: &mut Vec<Option<telegram_api::Chat>>| {
+                chats
+                    .iter_mut()
+                    .filter(|c| c.as_ref().is_some_and(pred))
+                    .map(|c| c.take().expect("filtered to Some"))
+                    .collect::<Vec<_>>()
+            };
+        for chat in take_matching(
+            |c| {
+                matches!(
+                    c,
+                    telegram_api::Chat::community(_) | telegram_api::Chat::communityForbidden(_)
+                )
+            },
+            &mut chats,
+        ) {
+            self.on_get_chat(user_manager, env, chat, source);
+        }
+        for chat in take_matching(
+            |c| {
+                matches!(
+                    c,
+                    telegram_api::Chat::channel(_) | telegram_api::Chat::channelForbidden(_)
+                )
+            },
+            &mut chats,
+        ) {
+            self.on_get_chat(user_manager, env, chat, source);
+        }
+        for chat in take_matching(|_| true, &mut chats) {
+            self.on_get_chat(user_manager, env, chat, source);
+        }
+    }
+
+    /// `get_channel_ids` (ChatManager.cpp:4048-4062).
+    #[allow(dead_code)] // production caller: MessagesManager intakes (M.10)
+    pub(crate) fn get_channel_ids(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chats: Vec<telegram_api::Chat>,
+        source: &str,
+    ) -> Vec<ChannelId> {
+        let mut channel_ids = Vec::new();
+        for chat in chats {
+            let channel_id = Self::get_channel_id(&chat);
+            if !channel_id.is_valid() {
+                tdutils::log_error!("Receive invalid {channel_id:?} from {source}");
+                continue;
+            }
+            self.on_get_chat(user_manager, env, chat, source);
+            if self.have_channel(channel_id) {
+                channel_ids.push(channel_id);
+            }
+        }
+        channel_ids
+    }
+
+    // ---- M.5.21/M.5.30-M.5.32 helpers: the channel compare-then-set
+    // family the intakes apply (ChatManager.cpp:7594-8311) ----
+
+    /// `on_update_channel_title` (ChatManager.cpp:7702-7706).
+    fn on_update_channel_title(c: &mut Channel, channel_id: ChannelId, title: String) {
+        if c.title != title {
+            c.title = title;
+            c.is_title_changed = true;
+            c.need_save_to_database = true;
+        }
+        let _ = channel_id;
+    }
+
+    /// `on_update_channel_usernames` (ChatManager.cpp:8037-8053) plus
+    /// `on_channel_usernames_changed` (cpp:8055-8063).
+    fn on_update_channel_usernames(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        usernames: Usernames,
+    ) {
+        let differs = self
+            .get_channel(channel_id)
+            .is_some_and(|c| c.usernames != usernames);
+        if differs {
+            // td_->dialog_manager_->on_dialog_usernames_updated and
+            // messages_manager_->on_dialog_usernames_updated — the M.10 stubs.
+            let sent = self
+                .get_channel(channel_id)
+                .is_some_and(|c| c.is_update_supergroup_sent);
+            if sent {
+                let (old, new) = {
+                    let c = self.get_channel_mut(channel_id).expect("checked above");
+                    (c.usernames.clone(), usernames.clone())
+                };
+                self.on_channel_usernames_changed(user_manager, env, channel_id, &old, &new);
+            }
+            let c = self.get_channel_mut(channel_id).expect("checked above");
+            c.usernames = usernames;
+            c.is_username_changed = true;
+            c.is_changed = true;
+        } else {
+            // td_->dialog_manager_->on_dialog_usernames_received — the M.10 stub.
+        }
+    }
+
+    /// `on_channel_usernames_changed` (ChatManager.cpp:8055-8063).
+    fn on_channel_usernames_changed(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        old: &Usernames,
+        new: &Usernames,
+    ) {
+        let have_channel_full = self.get_channel_full_const(channel_id).is_some();
+        if !old.has_first_username() || !new.has_first_username() {
+            let drop = !self
+                .get_channel(channel_id)
+                .is_some_and(|c| c.is_slow_mode_enabled);
+            self.invalidate_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                drop,
+                "on_channel_usernames_changed",
+            );
+        }
+        // must not load ChannelFull, because must not change the Channel
+        debug_assert!(have_channel_full == self.get_channel_full_const(channel_id).is_some());
+    }
+
+    /// `on_update_channel_photo` (ChatManager.cpp:7594-7648) — the
+    /// channel twin of [`Self::on_update_chat_photo_impl`].
+    fn on_update_channel_photo(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        chat_photo: telegram_api::ChatPhoto,
+    ) {
+        // the C++ passes c->access_hash to the file-manager form — dropped
+        // by the Files-step stand-in
+        let photo = DialogPhoto::get_dialog_photo(Some(chat_photo));
+        let mut photo = photo;
+        if env.auth_is_bot {
+            photo.minithumbnail = String::new();
+        }
+        let photo_differs = {
+            let Some(c) = self.get_channel(channel_id) else {
+                return;
+            };
+            Self::need_update_dialog_photo(&c.photo, &photo)
+        };
+        if photo_differs {
+            tdutils::log_debug!("Update photo of {channel_id:?}");
+            let small_file_id_valid;
+            {
+                let c = self.get_channel_mut(channel_id).expect("checked above");
+                c.photo = photo;
+                c.is_photo_changed = true;
+                c.need_save_to_database = true;
+                small_file_id_valid = c.photo.small_file_id.is_valid();
+            }
+            if small_file_id_valid
+                && let Some(f) = self.get_channel_full_mut(channel_id)
+                && f.expires_at > 0.0
+            {
+                f.expires_at = 0.0;
+                f.need_save_to_database = true;
+            }
+            if small_file_id_valid {
+                self.reload_channel_full(
+                    env,
+                    channel_id,
+                    Promise::default(),
+                    "on_update_channel_photo",
+                );
+            }
+            self.update_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                "on_update_channel_photo",
+                false,
+            );
+        } else {
+            let Some(c) = self.get_channel_mut(channel_id) else {
+                return;
+            };
+            if c.photo.minithumbnail != photo.minithumbnail {
+                c.photo.minithumbnail = photo.minithumbnail;
+                c.is_photo_changed = true;
+                c.need_save_to_database = true;
+            }
+        }
+    }
+
+    /// `on_update_channel_emoji_status` (ChatManager.cpp:7651-7658).
+    fn on_update_channel_emoji_status(
+        c: &mut Channel,
+        channel_id: ChannelId,
+        emoji_status: Option<EmojiStatus>,
+    ) {
+        if c.emoji_status != emoji_status {
+            tdutils::log_debug!("Update {channel_id:?} emoji status");
+            c.emoji_status = emoji_status;
+            c.is_emoji_status_changed = true;
+            c.need_save_to_database = true;
+        }
+    }
+
+    /// `on_update_channel_accent_color_id` (ChatManager.cpp:7661-7668).
+    fn on_update_channel_accent_color_id(
+        c: &mut Channel,
+        channel_id: ChannelId,
+        mut accent_color_id: AccentColorId,
+    ) {
+        if accent_color_id == AccentColorId::from_peer_id(channel_id.get())
+            || !accent_color_id.is_valid()
+        {
+            accent_color_id = AccentColorId::default();
+        }
+        if c.accent_color_id != accent_color_id {
+            c.accent_color_id = accent_color_id;
+            c.is_accent_color_changed = true;
+            c.need_save_to_database = true;
+        }
+    }
+
+    /// `on_update_channel_background_custom_emoji_id`
+    /// (ChatManager.cpp:7672-7677) — flips the accent-color flag.
+    fn on_update_channel_background_custom_emoji_id(
+        c: &mut Channel,
+        background_custom_emoji_id: CustomEmojiId,
+    ) {
+        if c.background_custom_emoji_id != background_custom_emoji_id {
+            c.background_custom_emoji_id = background_custom_emoji_id;
+            c.is_accent_color_changed = true;
+            c.need_save_to_database = true;
+        }
+    }
+
+    /// `on_update_channel_profile_accent_color_id`
+    /// (ChatManager.cpp:7681-7689).
+    fn on_update_channel_profile_accent_color_id(
+        c: &mut Channel,
+        mut profile_accent_color_id: AccentColorId,
+    ) {
+        if !profile_accent_color_id.is_valid() {
+            profile_accent_color_id = AccentColorId::default();
+        }
+        if c.profile_accent_color_id != profile_accent_color_id {
+            c.profile_accent_color_id = profile_accent_color_id;
+            c.is_accent_color_changed = true;
+            c.need_save_to_database = true;
+        }
+    }
+
+    /// `on_update_channel_profile_background_custom_emoji_id`
+    /// (ChatManager.cpp:7693-7699) — flips the accent-color flag.
+    fn on_update_channel_profile_background_custom_emoji_id(
+        c: &mut Channel,
+        profile_background_custom_emoji_id: CustomEmojiId,
+    ) {
+        if c.profile_background_custom_emoji_id != profile_background_custom_emoji_id {
+            c.profile_background_custom_emoji_id = profile_background_custom_emoji_id;
+            c.is_accent_color_changed = true;
+            c.need_save_to_database = true;
+        }
+    }
+
+    /// `on_update_channel_default_permissions`
+    /// (ChatManager.cpp:7809-7816) — broadcast channels ignore them.
+    fn on_update_channel_default_permissions(
+        c: &mut Channel,
+        channel_id: ChannelId,
+        default_permissions: RestrictedRights,
+    ) {
+        if c.is_megagroup && c.default_permissions != default_permissions {
+            tdutils::log_info!("{channel_id:?} default permissions changed");
+            c.default_permissions = default_permissions;
+            c.is_default_permissions_changed = true;
+            c.need_save_to_database = true;
+        }
+    }
+
+    /// `on_update_channel_has_location` (ChatManager.cpp:7820-7825).
+    fn on_update_channel_has_location(c: &mut Channel, has_location: bool) {
+        if c.has_location != has_location {
+            c.has_location = has_location;
+            c.is_has_location_changed = true;
+            c.need_save_to_database = true;
+        }
+    }
+
+    /// `on_update_channel_noforwards` (ChatManager.cpp:7829-7834).
+    fn on_update_channel_noforwards(c: &mut Channel, noforwards: bool) {
+        if c.noforwards != noforwards {
+            c.noforwards = noforwards;
+            c.is_noforwards_changed = true;
+            c.need_save_to_database = true;
+        }
+    }
+
+    /// `on_update_channel_is_forum` (ChatManager.cpp:7838-7848).
+    fn on_update_channel_is_forum(c: &mut Channel, is_forum: bool, is_forum_tabs: bool) {
+        if c.is_forum != is_forum || c.is_forum_tabs != is_forum_tabs {
+            c.is_forum = is_forum;
+            c.is_forum_tabs = is_forum_tabs;
+            c.is_is_forum_changed = true;
+            c.is_changed = true;
+        }
+    }
+
+    /// `on_update_channel_stories_hidden` (ChatManager.cpp:7973-7982).
+    fn on_update_channel_stories_hidden(env: &UserEnv, c: &mut Channel, stories_hidden: bool) {
+        if env.auth_is_bot {
+            return;
+        }
+        if c.stories_hidden != stories_hidden {
+            c.stories_hidden = stories_hidden;
+            c.is_stories_hidden_changed = true;
+            c.need_save_to_database = true;
+        }
+    }
+
+    /// `on_update_channel_bot_verification_icon`
+    /// (ChatManager.cpp:7986-7990).
+    fn on_update_channel_bot_verification_icon(
+        c: &mut Channel,
+        bot_verification_icon: CustomEmojiId,
+    ) {
+        if c.bot_verification_icon != bot_verification_icon {
+            c.bot_verification_icon = bot_verification_icon;
+            c.is_changed = true;
+        }
+    }
+
+    /// `MAX_ACTIVE_STORY_ID_RELOAD_TIME` (ChatManager.h:694).
+    const MAX_ACTIVE_STORY_ID_RELOAD_TIME: f64 = 3600.0;
+
+    /// `get_channel_active_story_state` (ChatManager.cpp:9880-9883) — the
+    /// local story-state comparator.
+    fn get_channel_active_story_state(c: &Channel) -> (StoryId, StoryId, bool) {
+        (c.max_active_story_id, c.max_read_story_id, c.has_live_story)
+    }
+
+    /// `need_poll_channel_active_stories` (ChatManager.cpp:9875-9878).
+    fn need_poll_channel_active_stories(env: &UserEnv, c: &Channel, channel_id: ChannelId) -> bool {
+        if c.status.is_member() {
+            return false;
+        }
+        // && have_input_peer_channel(c, channel_id, AccessRights::Read) —
+        // the poll gate widens when the full input-peer access check lands
+        let _ = (env, channel_id);
+        true
+    }
+
+    /// `on_update_channel_story_ids_impl` (ChatManager.cpp:7865-7924).
+    fn on_update_channel_story_ids_impl(
+        &mut self,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        recent_story: telegram_api::RecentStory,
+        max_read_story_id: StoryId,
+    ) {
+        if env.auth_is_bot {
+            return;
+        }
+        let max_active_story_id = StoryId::new(recent_story.max_id);
+        let has_live_story = recent_story.live;
+        if max_active_story_id != StoryId::default() && !max_active_story_id.is_server() {
+            tdutils::log_error!("Receive max active {max_active_story_id:?} for {channel_id:?}");
+            return;
+        }
+        if max_read_story_id != StoryId::default() && !max_read_story_id.is_server() {
+            tdutils::log_error!("Receive max read {max_read_story_id:?} for {channel_id:?}");
+            return;
+        }
+        if has_live_story && max_active_story_id == StoryId::default() {
+            tdutils::log_error!("Receive live story without identifier for {channel_id:?}");
+            return;
+        }
+        let Some(c) = self.get_channel_mut(channel_id) else {
+            return;
+        };
+        let active_story_state = Self::get_channel_active_story_state(c);
+        if c.has_live_story != has_live_story {
+            c.has_live_story = has_live_story;
+            c.need_save_to_database = true;
+        }
+        if c.max_active_story_id != max_active_story_id {
+            tdutils::log_info!("Change last active story in {channel_id:?}");
+            c.max_active_story_id = max_active_story_id;
+            c.need_save_to_database = true;
+        }
+        if Self::need_poll_channel_active_stories(env, c, channel_id) {
+            let next = env.global.server_time() + Self::MAX_ACTIVE_STORY_ID_RELOAD_TIME;
+            if next
+                > c.max_active_story_id_next_reload_time
+                    + Self::MAX_ACTIVE_STORY_ID_RELOAD_TIME / 5.0
+            {
+                c.max_active_story_id_next_reload_time = next;
+                c.need_save_to_database = true;
+            }
+        }
+        if !max_active_story_id.is_valid() {
+            debug_assert!(max_read_story_id == StoryId::default());
+            if c.max_read_story_id != StoryId::default() {
+                c.max_read_story_id = StoryId::default();
+                c.need_save_to_database = true;
+            }
+        } else if max_read_story_id.get() > c.max_read_story_id.get() {
+            c.max_read_story_id = max_read_story_id;
+            c.need_save_to_database = true;
+        }
+        if active_story_state != Self::get_channel_active_story_state(c) {
+            c.is_changed = true;
+        }
+    }
+
+    /// `on_get_channel` (ChatManager.cpp:9285-9638) — the ten-stage
+    /// supergroup/broadcast application.
+    fn on_get_channel(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel: telegram_api::channel,
+        source: &str,
+    ) {
+        let mut channel = channel;
+        let channel_id = ChannelId::new(channel.id);
+        if !channel_id.is_valid() {
+            tdutils::log_error!("Receive invalid {channel_id:?} from {source}");
+            return;
+        }
+
+        // stage 0: the empty-object stub the server sends for unseen
+        // channels
+        if channel.flags == 0 && channel.access_hash == 0 && channel.title.is_empty() {
+            let c = self.get_channel_force(user_manager, env, channel_id, source, false);
+            if c.is_some() {
+                tdutils::log_error!(
+                    "Receive from {source} empty {channel_id:?}, have a supergroup"
+                );
+            }
+            if c.is_none() && !self.have_min_channel(channel_id) {
+                self.min_channels
+                    .insert(channel_id.get(), MinChannel::default());
+            }
+            return;
+        }
+
+        // stage 1: locals
+        let is_min = channel.min;
+        let access_hash = channel.access_hash;
+        let has_linked_channel = channel.has_link;
+        let sign_messages_initial = channel.signatures;
+        let join_to_send = channel.join_to_send;
+        let join_request = channel.join_request;
+        let is_slow_mode_enabled_initial = channel.slowmode_enabled;
+        let is_megagroup = channel.megagroup;
+        let is_verified = channel.verified;
+        let is_scam = channel.scam;
+        let is_fake = channel.fake;
+        let is_gigagroup = channel.gigagroup;
+        let is_forum = channel.forum;
+        let is_forum_tabs = channel.forum_tabs;
+        let is_monoforum = channel.monoforum;
+        let have_participant_count = channel.flags & (1 << 17) != 0;
+        let mut participant_count = channel.participants_count;
+        let stories_unavailable = channel.stories_unavailable;
+        let mut show_message_sender = channel.signature_profiles;
+        let boost_level = channel.level;
+        let mut paid_message_star_count = channel.send_paid_messages_stars;
+        let autotranslation = channel.autotranslation;
+        let mut broadcast_messages_allowed = channel.broadcast_messages_allowed;
+        let mut monoforum_channel_id = ChannelId::new(channel.linked_monoforum_id);
+        let mut linked_community_id = CommunityId::new(channel.linked_community_id);
+        let stories_available = channel.stories_max_id.max_id > 0;
+
+        // stage 2: normalization
+        if (monoforum_channel_id != ChannelId::default() && !monoforum_channel_id.is_valid())
+            || monoforum_channel_id == channel_id
+        {
+            tdutils::log_error!(
+                "Receive channel direct messages {monoforum_channel_id:?} for {channel_id:?}"
+            );
+            monoforum_channel_id = ChannelId::default();
+        }
+        if !linked_community_id.is_valid() {
+            linked_community_id = CommunityId::default();
+        }
+        if have_participant_count
+            && let Some(channel_full) = self.get_channel_full_const(channel_id)
+            && channel_full.administrator_count > participant_count
+        {
+            // must run before the participant-count diff below
+            participant_count = channel_full.administrator_count;
+        }
+        if channel.broadcast == is_megagroup {
+            tdutils::log_error!(
+                "Receive wrong channel flag is_broadcast == is_megagroup == {is_megagroup} from {source}"
+            );
+        }
+        let mut is_forum_tabs = is_forum_tabs;
+        if is_forum_tabs && !is_forum {
+            tdutils::log_error!("Receive forum tabs in non-forum {channel_id:?} from {source}");
+            is_forum_tabs = false;
+        }
+        let mut sign_messages = sign_messages_initial;
+        let mut is_slow_mode_enabled = is_slow_mode_enabled_initial;
+        let mut is_gigagroup = is_gigagroup;
+        let mut is_forum = is_forum;
+        let mut is_monoforum = is_monoforum;
+        if is_megagroup {
+            if sign_messages {
+                tdutils::log_error!("Need to sign messages in the {channel_id:?} from {source}");
+            }
+            if broadcast_messages_allowed {
+                tdutils::log_error!(
+                    "Receive supergroup with channel direct messages group as {channel_id:?} from {source}"
+                );
+            }
+            sign_messages = true;
+            show_message_sender = true;
+            broadcast_messages_allowed = false;
+        } else {
+            if is_slow_mode_enabled && channel_id.get() >= 8_000_000_000 {
+                tdutils::log_error!("Slow mode enabled in the {channel_id:?} from {source}");
+            }
+            if is_gigagroup {
+                tdutils::log_error!("Receive broadcast gigagroup as {channel_id:?}");
+            }
+            if is_forum {
+                tdutils::log_error!("Receive broadcast forum as {channel_id:?}");
+            }
+            if is_monoforum {
+                tdutils::log_error!("Receive broadcast monoforum group as {channel_id:?}");
+            }
+            is_slow_mode_enabled = false;
+            is_gigagroup = false;
+            is_forum = false;
+            is_forum_tabs = false;
+            is_monoforum = false;
+            paid_message_star_count = 0;
+        }
+        if is_gigagroup {
+            // td_->suggested_action_manager_->remove_dialog_suggested_action(
+            // SuggestedAction::ConvertToGigagroup) — the M.13 stub.
+        }
+
+        // stage 3: the min-channel branch
+        if is_min {
+            let Some(c) = self.get_channel_force(user_manager, env, channel_id, source, false)
+            else {
+                // unknown channel: build the degraded MinChannel placeholder
+                let mut photo =
+                    DialogPhoto::get_dialog_photo(Some(std::mem::take(&mut channel.photo)));
+                if env.auth_is_bot {
+                    photo.minithumbnail = String::new();
+                }
+                let peer_color = PeerColor::from_telegram(&channel.color);
+                let min_channel = MinChannel {
+                    title_: std::mem::take(&mut channel.title),
+                    photo_: photo,
+                    accent_color_id_: peer_color.accent_color_id(),
+                    is_megagroup_: is_megagroup,
+                };
+                self.min_channels.insert(channel_id.get(), min_channel);
+                return;
+            };
+            let old_join_to_send = Self::get_channel_join_to_send(c);
+            let old_join_request = Self::get_channel_join_request(c);
+            Self::on_update_channel_title(c, channel_id, std::mem::take(&mut channel.title));
+            let usernames = Usernames::from_telegram(
+                std::mem::take(&mut channel.username),
+                std::mem::take(&mut channel.usernames),
+            );
+            self.on_update_channel_usernames(user_manager, env, channel_id, usernames);
+
+            // min updates must not resurrect a photo over a banned status
+            let banned = self
+                .get_channel(channel_id)
+                .is_some_and(|c| c.status.is_banned());
+            if !banned {
+                let photo = std::mem::take(&mut channel.photo);
+                self.on_update_channel_photo(user_manager, env, channel_id, photo);
+            }
+            {
+                let c = self.get_channel_mut(channel_id).expect("known min channel");
+                Self::on_update_channel_has_location(c, channel.has_geo);
+                Self::on_update_channel_noforwards(c, channel.noforwards);
+                Self::on_update_channel_is_forum(c, is_forum, is_forum_tabs);
+                let emoji_status =
+                    EmojiStatus::get_emoji_status(std::mem::take(&mut channel.emoji_status));
+                Self::on_update_channel_emoji_status(c, channel_id, emoji_status);
+
+                let changed = c.has_linked_channel != has_linked_channel
+                    || c.is_slow_mode_enabled != is_slow_mode_enabled
+                    || c.is_megagroup != is_megagroup
+                    || c.is_scam != is_scam
+                    || c.is_fake != is_fake
+                    || c.is_gigagroup != is_gigagroup
+                    || c.is_monoforum != is_monoforum
+                    || c.boost_level != boost_level
+                    || c.paid_message_star_count != paid_message_star_count
+                    || c.autotranslation != autotranslation
+                    || c.broadcast_messages_allowed != broadcast_messages_allowed;
+                if changed {
+                    c.has_linked_channel = has_linked_channel;
+                    c.is_slow_mode_enabled = is_slow_mode_enabled;
+                    c.is_megagroup = is_megagroup;
+                    c.is_scam = is_scam;
+                    c.is_fake = is_fake;
+                    c.is_gigagroup = is_gigagroup;
+                    c.is_monoforum = is_monoforum;
+                    c.boost_level = boost_level;
+                    c.paid_message_star_count = paid_message_star_count;
+                    c.autotranslation = autotranslation;
+                    c.broadcast_messages_allowed = broadcast_messages_allowed;
+                    c.is_changed = true;
+                }
+                if !env.auth_is_bot {
+                    let restriction_reasons =
+                        get_restriction_reasons(std::mem::take(&mut channel.restriction_reason));
+                    if restriction_reasons != c.restriction_reasons {
+                        c.restriction_reasons = restriction_reasons;
+                        c.is_changed = true;
+                    }
+                    Self::on_update_channel_bot_verification_icon(
+                        c,
+                        CustomEmojiId::new(channel.bot_verification_icon),
+                    );
+                }
+                let join_quad_changed = c.join_to_send != join_to_send
+                    || c.join_request != join_request
+                    || c.monoforum_channel_id != monoforum_channel_id
+                    || c.linked_community_id != linked_community_id;
+                if join_quad_changed {
+                    c.join_to_send = join_to_send;
+                    c.join_request = join_request;
+                    c.monoforum_channel_id = monoforum_channel_id;
+                    c.linked_community_id = linked_community_id;
+                    c.need_save_to_database = true;
+                }
+                // sign_messages isn't known for min-channels
+                if c.is_verified != is_verified {
+                    c.is_verified = is_verified;
+                    c.is_changed = true;
+                }
+                if old_join_to_send != Self::get_channel_join_to_send(c)
+                    || old_join_request != Self::get_channel_join_request(c)
+                {
+                    c.is_changed = true;
+                }
+                // must be after setting of c->is_megagroup
+                Self::on_update_channel_default_permissions(
+                    c,
+                    channel_id,
+                    RestrictedRights::from_chat_banned_rights(
+                        if channel.flags & (1 << 18) != 0 {
+                            Some(&channel.default_banned_rights)
+                        } else {
+                            None
+                        },
+                        ChannelType::Megagroup,
+                    ),
+                );
+                let drop_slow_mode = !c.is_slow_mode_enabled;
+                if changed {
+                    self.invalidate_channel_full(
+                        user_manager,
+                        env,
+                        channel_id,
+                        drop_slow_mode,
+                        "on_get_min_channel",
+                    );
+                }
+            }
+            self.update_channel(user_manager, env, channel_id, false, false);
+            return;
+        }
+
+        // stage 4: the access-hash gate
+        if access_hash == 0 {
+            tdutils::log_error!("Receive non-min {channel_id:?} without access_hash from {source}");
+            return;
+        }
+
+        // stage 5: the status derivation
+        let channel_type = if is_megagroup {
+            ChannelType::Megagroup
+        } else {
+            ChannelType::Broadcast
+        };
+        let status = if channel.creator {
+            DialogParticipantStatus::creator(!channel.left, false, String::new())
+        } else if channel.flags & (1 << 13) != 0 {
+            DialogParticipantStatus::administrator(
+                AdministratorRights::from_chat_admin_rights(
+                    Some(&channel.admin_rights),
+                    channel_type,
+                ),
+                String::new(),
+                false,
+            )
+        } else if channel.flags & (1 << 15) != 0 {
+            DialogParticipantStatus::from_channel_banned_rights(
+                !channel.left,
+                channel.banned_rights,
+                channel_type,
+                String::new(),
+            )
+        } else if channel.left {
+            DialogParticipantStatus::left()
+        } else {
+            DialogParticipantStatus::member(channel.subscription_until_date, String::new())
+        };
+
+        // stage 6: the creator pre-load
+        if status.is_creator() {
+            self.get_channel_force(user_manager, env, channel_id, source, false);
+        }
+
+        // stage 7: the monoforum admin side-effects
+        let mut is_admined_monoforum = false;
+        if monoforum_channel_id.is_valid() {
+            if is_monoforum {
+                if let Some(monoforum_c) =
+                    self.get_channel_force(user_manager, env, monoforum_channel_id, source, false)
+                {
+                    is_admined_monoforum = monoforum_c.status.can_manage_direct_messages();
+                } else if status.is_member() && env.auth_is_bot {
+                    is_admined_monoforum = true;
+                }
+            } else if let Some(monoforum_c) = self.get_channel_mut(monoforum_channel_id)
+                && status.can_manage_direct_messages() != monoforum_c.is_admined_monoforum
+            {
+                monoforum_c.is_admined_monoforum = status.can_manage_direct_messages();
+                monoforum_c.is_admined_monoforum_changed = true;
+                monoforum_c.is_changed = true;
+                self.update_channel(user_manager, env, monoforum_channel_id, false, false);
+            }
+        }
+
+        // stage 8: the record application
+        let record_was_empty = !self.channels.contains_key(&channel_id.get());
+        self.add_channel(channel_id);
+        if record_was_empty {
+            // the first real creation erases the MinChannel placeholder
+            self.min_channels.remove(&channel_id.get());
+        }
+        let old_join_to_send;
+        let old_join_request;
+        {
+            let c = self.add_channel(channel_id);
+            old_join_to_send = Self::get_channel_join_to_send(c);
+            old_join_request = Self::get_channel_join_request(c);
+        }
+        let mut need_invalidate_channel_full = false;
+        let mut need_update_participant_count = false;
+        {
+            let c = self.add_channel(channel_id);
+            if c.access_hash != access_hash {
+                c.access_hash = access_hash;
+                c.need_save_to_database = true;
+            }
+            if c.date != channel.date {
+                c.date = channel.date;
+                c.is_changed = true;
+            }
+            if have_participant_count && participant_count != c.participant_count {
+                need_update_participant_count = true;
+                c.participant_count = participant_count;
+                c.is_changed = true;
+            }
+            let changed = c.has_linked_channel != has_linked_channel
+                || c.is_slow_mode_enabled != is_slow_mode_enabled
+                || c.is_megagroup != is_megagroup
+                || c.is_scam != is_scam
+                || c.is_fake != is_fake
+                || c.is_gigagroup != is_gigagroup
+                || c.is_monoforum != is_monoforum
+                || c.boost_level != boost_level
+                || c.paid_message_star_count != paid_message_star_count
+                || c.broadcast_messages_allowed != broadcast_messages_allowed;
+            if changed {
+                c.has_linked_channel = has_linked_channel;
+                c.is_slow_mode_enabled = is_slow_mode_enabled;
+                c.is_megagroup = is_megagroup;
+                c.is_scam = is_scam;
+                c.is_fake = is_fake;
+                c.is_gigagroup = is_gigagroup;
+                c.is_monoforum = is_monoforum;
+                c.boost_level = boost_level;
+                c.paid_message_star_count = paid_message_star_count;
+                c.broadcast_messages_allowed = broadcast_messages_allowed;
+                c.is_changed = true;
+                need_invalidate_channel_full = true;
+            }
+            if !env.auth_is_bot {
+                let restriction_reasons =
+                    get_restriction_reasons(std::mem::take(&mut channel.restriction_reason));
+                if restriction_reasons != c.restriction_reasons {
+                    c.restriction_reasons = restriction_reasons;
+                    c.is_changed = true;
+                }
+                Self::on_update_channel_bot_verification_icon(
+                    c,
+                    CustomEmojiId::new(channel.bot_verification_icon),
+                );
+            }
+            let join_quad_changed = c.join_to_send != join_to_send
+                || c.join_request != join_request
+                || c.monoforum_channel_id != monoforum_channel_id
+                || c.linked_community_id != linked_community_id;
+            if join_quad_changed {
+                c.join_to_send = join_to_send;
+                c.join_request = join_request;
+                c.monoforum_channel_id = monoforum_channel_id;
+                c.linked_community_id = linked_community_id;
+                c.need_save_to_database = true;
+            }
+            let verify_quad_changed = c.is_verified != is_verified
+                || c.sign_messages != sign_messages
+                || c.show_message_sender != show_message_sender
+                || c.autotranslation != autotranslation;
+            if verify_quad_changed {
+                c.is_verified = is_verified;
+                c.sign_messages = sign_messages;
+                c.show_message_sender = show_message_sender;
+                c.autotranslation = autotranslation;
+                c.is_changed = true;
+            }
+            if old_join_to_send != Self::get_channel_join_to_send(c)
+                || old_join_request != Self::get_channel_join_request(c)
+            {
+                c.is_changed = true;
+            }
+            if c.is_admined_monoforum != is_admined_monoforum {
+                c.is_admined_monoforum = is_admined_monoforum;
+                c.is_admined_monoforum_changed = true;
+                c.is_changed = true;
+            }
+        }
+
+        // stage 9: the on_update application order
+        Self::on_update_channel_title(
+            self.add_channel(channel_id),
+            channel_id,
+            std::mem::take(&mut channel.title),
+        );
+        {
+            let photo = std::mem::take(&mut channel.photo);
+            self.on_update_channel_photo(user_manager, env, channel_id, photo);
+        }
+        let peer_color = PeerColor::from_telegram(&channel.color);
+        Self::on_update_channel_accent_color_id(
+            self.add_channel(channel_id),
+            channel_id,
+            peer_color.accent_color_id(),
+        );
+        Self::on_update_channel_background_custom_emoji_id(
+            self.add_channel(channel_id),
+            peer_color.background_custom_emoji_id(),
+        );
+        let profile_peer_color = PeerColor::from_telegram(&channel.profile_color);
+        Self::on_update_channel_profile_accent_color_id(
+            self.add_channel(channel_id),
+            profile_peer_color.accent_color_id(),
+        );
+        Self::on_update_channel_profile_background_custom_emoji_id(
+            self.add_channel(channel_id),
+            profile_peer_color.background_custom_emoji_id(),
+        );
+        self.on_update_channel_status(user_manager, env, channel_id, status);
+        {
+            let usernames = Usernames::from_telegram(
+                std::mem::take(&mut channel.username),
+                std::mem::take(&mut channel.usernames),
+            );
+            // uses the (new) status; must run after on_update_channel_status
+            self.on_update_channel_usernames(user_manager, env, channel_id, usernames);
+        }
+        Self::on_update_channel_has_location(self.add_channel(channel_id), channel.has_geo);
+        Self::on_update_channel_noforwards(self.add_channel(channel_id), channel.noforwards);
+        Self::on_update_channel_is_forum(self.add_channel(channel_id), is_forum, is_forum_tabs);
+        {
+            let emoji_status =
+                EmojiStatus::get_emoji_status(std::mem::take(&mut channel.emoji_status));
+            Self::on_update_channel_emoji_status(
+                self.add_channel(channel_id),
+                channel_id,
+                emoji_status,
+            );
+        }
+        if !env.auth_is_bot && !channel.stories_hidden_min {
+            Self::on_update_channel_stories_hidden(
+                env,
+                self.add_channel(channel_id),
+                channel.stories_hidden,
+            );
+        }
+        // must be after setting of c->is_megagroup
+        Self::on_update_channel_default_permissions(
+            self.add_channel(channel_id),
+            channel_id,
+            RestrictedRights::from_chat_banned_rights(
+                if channel.flags & (1 << 18) != 0 {
+                    Some(&channel.default_banned_rights)
+                } else {
+                    None
+                },
+                ChannelType::Megagroup,
+            ),
+        );
+        // update at the end, because it calls need_poll_channel_active_stories
+        if !env.auth_is_bot && (stories_available || stories_unavailable) {
+            let stories_max_id = std::mem::take(&mut channel.stories_max_id);
+            self.on_update_channel_story_ids_impl(
+                env,
+                channel_id,
+                stories_max_id,
+                StoryId::default(),
+            );
+        }
+
+        // stage 10: finalize
+        {
+            let c = self.add_channel(channel_id);
+            if c.cache_version != Channel::CACHE_VERSION {
+                c.cache_version = Channel::CACHE_VERSION;
+                c.need_save_to_database = true;
+            }
+            c.is_received_from_server = true;
+        }
+        self.update_channel(user_manager, env, channel_id, false, false);
+        if need_update_participant_count
+            && let Some(channel_full) =
+                self.get_channel_full(env, channel_id, true, "on_get_channel")
+            && channel_full.participant_count != participant_count
+        {
+            channel_full.participant_count = participant_count;
+            channel_full.is_changed = true;
+            self.update_channel_full(user_manager, env, channel_id, "on_get_channel", false);
+        }
+        if need_invalidate_channel_full {
+            let drop = !self
+                .get_channel(channel_id)
+                .is_some_and(|c| c.is_slow_mode_enabled);
+            self.invalidate_channel_full(user_manager, env, channel_id, drop, "on_get_channel");
+        }
+        // td_->messages_manager_->on_update_dialog_group_call — the M.10 stub.
+        if monoforum_channel_id.is_valid()
+            && !env.auth_is_bot
+            && !self.have_channel(monoforum_channel_id)
+        {
+            // reloads the channel's own full, not the monoforum's
+            self.reload_channel_full(env, channel_id, Promise::default(), "load monoforum");
+        }
+    }
+
+    /// `on_get_channel_forbidden` (ChatManager.cpp:9640-9759).
+    fn on_get_channel_forbidden(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        mut channel: telegram_api::channelForbidden,
+        source: &str,
+    ) {
+        let channel_id = ChannelId::new(channel.id);
+        if !channel_id.is_valid() {
+            tdutils::log_error!("Receive invalid {channel_id:?} from {source}");
+            return;
+        }
+        if channel.flags == 0 && channel.access_hash == 0 && channel.title.is_empty() {
+            let c = self.get_channel_force(user_manager, env, channel_id, source, false);
+            tdutils::log_error!(
+                "Receive empty forbidden {channel_id:?} from {source}, have a supergroup"
+            );
+            if c.is_none() && !self.have_min_channel(channel_id) {
+                self.min_channels
+                    .insert(channel_id.get(), MinChannel::default());
+            }
+            return;
+        }
+
+        let sign_messages;
+        let show_message_sender;
+        let join_to_send = false;
+        let join_request = false;
+        let is_slow_mode_enabled = false;
+        let is_megagroup = channel.megagroup;
+        let is_verified = false;
+        let is_scam = false;
+        let is_fake = false;
+        let autotranslation = false;
+        let broadcast_messages_allowed = false;
+        let is_monoforum = channel.monoforum;
+        let is_admined_monoforum = false;
+
+        if channel.broadcast == is_megagroup {
+            tdutils::log_error!(
+                "Receive wrong channel flag is_broadcast == is_megagroup == {is_megagroup} from {source}"
+            );
+        }
+        if is_megagroup {
+            sign_messages = true;
+            show_message_sender = true;
+        } else {
+            sign_messages = false;
+            show_message_sender = false;
+        }
+
+        self.add_channel(channel_id);
+        let old_join_to_send;
+        let old_join_request;
+        {
+            let c = self.add_channel(channel_id);
+            old_join_to_send = Self::get_channel_join_to_send(c);
+            old_join_request = Self::get_channel_join_request(c);
+        }
+        let mut need_invalidate_channel_full = false;
+        {
+            let c = self.add_channel(channel_id);
+            if c.access_hash != channel.access_hash {
+                c.access_hash = channel.access_hash;
+                c.need_save_to_database = true;
+            }
+            if c.date != 0 {
+                c.date = 0;
+                c.is_changed = true;
+            }
+            // the deliberate C++ commented-out has_linked_channel line
+            let changed = c.is_slow_mode_enabled != is_slow_mode_enabled
+                || c.is_megagroup != is_megagroup
+                || !c.restriction_reasons.is_empty()
+                || c.is_scam != is_scam
+                || c.is_fake != is_fake
+                || c.join_to_send != join_to_send
+                || c.join_request != join_request
+                || c.broadcast_messages_allowed != broadcast_messages_allowed
+                || c.is_monoforum != is_monoforum;
+            if changed {
+                c.is_slow_mode_enabled = is_slow_mode_enabled;
+                c.is_megagroup = is_megagroup;
+                c.restriction_reasons.clear();
+                c.is_scam = is_scam;
+                c.is_fake = is_fake;
+                c.join_to_send = join_to_send;
+                c.join_request = join_request;
+                c.broadcast_messages_allowed = broadcast_messages_allowed;
+                c.is_monoforum = is_monoforum;
+                c.is_changed = true;
+                need_invalidate_channel_full = true;
+            }
+            if c.is_monoforum && c.monoforum_channel_id == ChannelId::default() {
+                let offset: i64 = if env.global.is_test_dc() {
+                    1_300_000_000_000
+                } else {
+                    1_070_000_000_000
+                };
+                let expected_monoforum_channel_id = ChannelId::new(channel_id.get() - offset);
+                if expected_monoforum_channel_id.is_valid() {
+                    c.monoforum_channel_id = expected_monoforum_channel_id;
+                    c.need_save_to_database = true;
+                }
+            }
+            if c.join_to_send != join_to_send || c.join_request != join_request {
+                c.join_to_send = join_to_send;
+                c.join_request = join_request;
+                c.need_save_to_database = true;
+            }
+            let verify_quad_changed = c.is_verified != is_verified
+                || c.sign_messages != sign_messages
+                || c.show_message_sender != show_message_sender
+                || c.autotranslation != autotranslation;
+            if verify_quad_changed {
+                c.is_verified = is_verified;
+                c.sign_messages = sign_messages;
+                c.show_message_sender = show_message_sender;
+                c.autotranslation = autotranslation;
+                c.is_changed = true;
+            }
+            if old_join_to_send != Self::get_channel_join_to_send(c)
+                || old_join_request != Self::get_channel_join_request(c)
+            {
+                c.is_changed = true;
+            }
+            if c.is_admined_monoforum != is_admined_monoforum {
+                c.is_admined_monoforum = false;
+                c.is_admined_monoforum_changed = true;
+                c.is_changed = true;
+            }
+            Self::on_update_channel_title(c, channel_id, std::mem::take(&mut channel.title));
+        }
+        {
+            let photo = telegram_api::ChatPhoto::chatPhotoEmpty(telegram_api::chatPhotoEmpty {});
+            self.on_update_channel_photo(user_manager, env, channel_id, photo);
+        }
+        // deliberately not called: on_update_channel_usernames /
+        // on_update_channel_has_location — we don't know whether the
+        // channel usernames are empty, so don't update them
+        {
+            let c = self.add_channel(channel_id);
+            Self::on_update_channel_noforwards(c, false);
+            Self::on_update_channel_emoji_status(c, channel_id, None);
+            Self::on_update_channel_bot_verification_icon(c, CustomEmojiId::default());
+            // td_->messages_manager_->on_update_dialog_group_call — the M.10 stub.
+            // must be after setting of c->is_megagroup
+            Self::on_update_channel_default_permissions(
+                c,
+                channel_id,
+                RestrictedRights::from_chat_banned_rights(None, ChannelType::Megagroup),
+            );
+        }
+        self.on_update_channel_status(
+            user_manager,
+            env,
+            channel_id,
+            DialogParticipantStatus::banned(
+                if channel.flags & (1 << 16) != 0 {
+                    channel.until_date
+                } else {
+                    0
+                },
+                String::new(),
+            ),
+        );
+        {
+            let c = self.add_channel(channel_id);
+            if c.participant_count != 0 {
+                c.participant_count = 0;
+                c.is_changed = true;
+            }
+            if c.cache_version != Channel::CACHE_VERSION {
+                c.cache_version = Channel::CACHE_VERSION;
+                c.need_save_to_database = true;
+            }
+            c.is_received_from_server = true;
+        }
+        self.update_channel(user_manager, env, channel_id, false, false);
+
+        if self
+            .get_channel(channel_id)
+            .is_some_and(|c| c.participant_count != 0)
+            && let Some(channel_full) =
+                self.get_channel_full(env, channel_id, true, "on_get_channel_forbidden")
+            && channel_full.participant_count != 0
+        {
+            channel_full.participant_count = 0;
+            channel_full.administrator_count = 0;
+            channel_full.is_changed = true;
+            self.update_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                "on_get_channel_forbidden 2",
+                false,
+            );
+        }
+        if need_invalidate_channel_full {
+            let drop = !self
+                .get_channel(channel_id)
+                .is_some_and(|c| c.is_slow_mode_enabled);
+            self.invalidate_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                drop,
+                "on_get_channel_forbidden 3",
+            );
+        }
     }
 
     /// `ChatManager::save_chat` (ChatManager.cpp:4467-4484): the binlog
@@ -6738,10 +8470,7 @@ impl ChatManager {
     }
 
     /// `get_simple_input_peer` (ChatManager.cpp:2831-2841).
-    pub fn get_simple_input_peer(
-        &self,
-        dialog_id: DialogId,
-    ) -> Option<telegram_api::InputPeer> {
+    pub fn get_simple_input_peer(&self, dialog_id: DialogId) -> Option<telegram_api::InputPeer> {
         debug_assert!(dialog_id.get_type() == DialogType::Channel);
         let channel_id = dialog_id.get_channel_id();
         let c = self.get_channel(channel_id)?;
@@ -6765,6 +8494,11 @@ impl ChatManager {
         format!("chf{}", channel_id.get()).into_bytes()
     }
 
+    /// `get_channel_full_mut` — the local map accessor.
+    fn get_channel_full_mut(&mut self, channel_id: ChannelId) -> Option<&mut ChannelFull> {
+        self.channels_full.get_mut(&channel_id.get())
+    }
+
     /// `get_chat_full` (ChatManager.cpp:8432-8438).
     fn get_chat_full(&self, chat_id: ChatId) -> Option<&ChatFull> {
         self.chats_full.get(&chat_id.get())
@@ -6781,9 +8515,7 @@ impl ChatManager {
     #[allow(dead_code)]
     fn add_chat_full(&mut self, chat_id: ChatId) -> &mut ChatFull {
         debug_assert!(chat_id.is_valid());
-        self.chats_full
-            .entry(chat_id.get())
-            .or_default()
+        self.chats_full.entry(chat_id.get()).or_default()
     }
 
     /// `get_channel_full_const` (ChatManager.cpp:8958-8960).
@@ -6796,9 +8528,7 @@ impl ChatManager {
     #[allow(dead_code)]
     fn add_channel_full(&mut self, channel_id: ChannelId) -> &mut ChannelFull {
         debug_assert!(channel_id.is_valid());
-        self.channels_full
-            .entry(channel_id.get())
-            .or_default()
+        self.channels_full.entry(channel_id.get()).or_default()
     }
 
     /// `save_chat_full` (ChatManager.cpp:4996-5004) collapsed onto the
@@ -13215,7 +14945,11 @@ mod tests {
         assert!(cm.channel_unban_timeouts.is_empty());
         assert!(cm.channel_emoji_status_timeouts.is_empty());
         let updates = cm.take_updates();
-        assert!(updates.iter().any(|u| matches!(u, td_api::Update::updateSupergroup(_))));
+        assert!(
+            updates
+                .iter()
+                .any(|u| matches!(u, td_api::Update::updateSupergroup(_)))
+        );
         close(&mut global);
         let _ = std::fs::remove_dir_all(db_dir("m514-unban"));
     }
@@ -13480,10 +15214,8 @@ mod tests {
         // channels: banned members have no peer; monoforum children resolve
         // through the parent at Read; the from-message branch stays a stub
         let mut banned = sample_channel();
-        banned.status = DialogParticipantStatus::banned(
-            env.global.unix_time() + 100,
-            String::new(),
-        );
+        banned.status =
+            DialogParticipantStatus::banned(env.global.unix_time() + 100, String::new());
         *cm.add_channel(channel_id) = banned;
         assert!(!cm.have_input_peer_channel_id(&env, channel_id, AccessRights::Read));
         assert!(
@@ -13511,5 +15243,208 @@ mod tests {
         assert!(simple.is_some());
         close(&mut global);
         let _ = std::fs::remove_dir_all(db_dir("m514-input-peer"));
+    }
+
+    #[test]
+    fn chat_dispatcher_routes_and_applies_the_field_matrix() {
+        let (mut global, mut options) = open_db(&db_dir("m520-dispatch"), true);
+        let mut cm = ChatManager::new();
+        let mut um = UserManager::new();
+        let mut env = make_env(&mut global, &mut options);
+        let chat_id = ChatId::new(700);
+
+        // a creator chat: the field matrix lands in the record, the status
+        // ladder picks creator, the versions come straight from the wire
+        let chat = telegram_api::Chat::chat(telegram_api::chat {
+            flags: (1 << 13) | (1 << 14) | (1 << 18),
+            creator: true,
+            noforwards: true,
+            id: chat_id.get(),
+            title: "dispatched".to_owned(),
+            participants_count: 12,
+            date: 1_700_000_000,
+            version: 4,
+            admin_rights: telegram_api::ChatAdminRights::default(),
+            default_banned_rights: telegram_api::ChatBannedRights::default(),
+            ..telegram_api::chat::default()
+        });
+        cm.on_get_chat(&mut um, &mut env, chat, "test");
+        let c = cm.get_chat(chat_id).expect("basic group applied");
+        assert_eq!(c.title, "dispatched");
+        assert_eq!(c.participant_count, 12);
+        assert_eq!(c.version, 4);
+        assert_eq!(c.date, 1_700_000_000);
+        assert!(c.status.is_creator());
+        assert!(c.noforwards);
+        assert!(c.is_received_from_server);
+        assert_eq!(c.cache_version, Chat::CACHE_VERSION);
+
+        // chatEmpty for an unknown chat changes nothing
+        cm.on_get_chat(
+            &mut um,
+            &mut env,
+            telegram_api::Chat::chatEmpty(telegram_api::chatEmpty { id: 999 }),
+            "test",
+        );
+        assert!(!cm.have_chat(ChatId::new(999)));
+
+        // communities are consumed by the CommunityManager stub
+        let before = cm.take_updates();
+        assert!(!before.is_empty());
+        cm.take_updates();
+        cm.on_get_chat(
+            &mut um,
+            &mut env,
+            telegram_api::Chat::community(telegram_api::community::default()),
+            "test",
+        );
+        assert!(cm.take_updates().is_empty());
+        close(&mut global);
+        let _ = std::fs::remove_dir_all(db_dir("m520-dispatch"));
+    }
+
+    #[test]
+    fn on_get_chats_resolves_the_migrated_pair() {
+        let (mut global, mut options) = open_db(&db_dir("m520-chats"), true);
+        let mut cm = ChatManager::new();
+        let mut um = UserManager::new();
+        let mut env = make_env(&mut global, &mut options);
+        let chat_id = ChatId::new(701);
+        let upgraded = ChannelId::new(702);
+
+        // the basic group first: its migrated-to supergroup does not exist
+        // yet and gets force-created as a left megagroup placeholder
+        cm.on_get_chats(
+            &mut um,
+            &mut env,
+            vec![
+                telegram_api::Chat::chat(telegram_api::chat {
+                    left: true,
+                    id: chat_id.get(),
+                    title: "upgraded group".to_owned(),
+                    migrated_to: telegram_api::InputChannel::inputChannel(
+                        telegram_api::inputChannel {
+                            channel_id: upgraded.get(),
+                            access_hash: 4242,
+                        },
+                    ),
+                    ..telegram_api::chat::default()
+                }),
+                telegram_api::Chat::channel(telegram_api::channel {
+                    broadcast: true,
+                    id: upgraded.get(),
+                    access_hash: 4242,
+                    title: "the supergroup".to_owned(),
+                    ..telegram_api::channel::default()
+                }),
+            ],
+            "test",
+        );
+        assert_eq!(
+            cm.get_chat(chat_id).expect("group").migrated_to_channel_id,
+            upgraded
+        );
+        let channel = cm.get_channel(upgraded).expect("supergroup");
+        assert_eq!(channel.title, "the supergroup");
+        assert!(channel.is_received_from_server);
+        close(&mut global);
+        let _ = std::fs::remove_dir_all(db_dir("m520-chats"));
+    }
+
+    #[test]
+    fn channel_intake_applies_megagroup_normalization_and_min_cache() {
+        let (mut global, mut options) = open_db(&db_dir("m521-channel"), true);
+        let mut cm = ChatManager::new();
+        let mut um = UserManager::new();
+        let mut env = make_env(&mut global, &mut options);
+        let channel_id = ChannelId::new(100_000_000_710);
+
+        // megagroup: signatures are forced on and broadcast flags forced off
+        cm.on_get_channel(
+            &mut um,
+            &mut env,
+            telegram_api::channel {
+                megagroup: true,
+                signatures: true,
+                flags: 1 << 17,
+                id: channel_id.get(),
+                access_hash: -77,
+                title: "normalized".to_owned(),
+                participants_count: 30,
+                ..telegram_api::channel::default()
+            },
+            "test",
+        );
+        {
+            let c = cm.get_channel(channel_id).expect("supergroup applied");
+            assert!(c.sign_messages);
+            assert!(c.show_message_sender);
+            assert!(!c.broadcast_messages_allowed);
+            assert!(c.is_megagroup);
+            assert!(c.is_received_from_server);
+            assert_eq!(c.participant_count, 30);
+            assert_eq!(c.access_hash, -77);
+        }
+        let updates = cm.take_updates();
+        assert!(
+            updates
+                .iter()
+                .any(|u| matches!(u, td_api::Update::updateSupergroup(_)))
+        );
+
+        // an unknown min-channel lands in the degraded placeholder cache,
+        // not in the real channel map
+        let min_id = ChannelId::new(100_000_000_711);
+        cm.on_get_channel(
+            &mut um,
+            &mut env,
+            telegram_api::channel {
+                flags: 1 << 12,
+                min: true,
+                id: min_id.get(),
+                title: "min only".to_owned(),
+                ..telegram_api::channel::default()
+            },
+            "test",
+        );
+        assert!(!cm.have_channel(min_id));
+        let min = cm.get_min_channel(min_id).expect("min placeholder");
+        assert_eq!(min.title_, "min only");
+        close(&mut global);
+        let _ = std::fs::remove_dir_all(db_dir("m521-channel"));
+    }
+
+    #[test]
+    fn channel_forbidden_zeroes_the_record() {
+        let (mut global, mut options) = open_db(&db_dir("m521-forbidden"), true);
+        let mut cm = ChatManager::new();
+        let mut um = UserManager::new();
+        let mut env = make_env(&mut global, &mut options);
+        let channel_id = ChannelId::new(100_000_000_712);
+        {
+            let c = cm.add_channel(channel_id);
+            *c = sample_channel();
+            c.date = 1_700_000_000;
+            c.participant_count = 11;
+        }
+        cm.on_get_channel_forbidden(
+            &mut um,
+            &mut env,
+            telegram_api::channelForbidden {
+                broadcast: true,
+                id: channel_id.get(),
+                access_hash: -5,
+                until_date: 0,
+                ..telegram_api::channelForbidden::default()
+            },
+            "test",
+        );
+        let c = cm.get_channel(channel_id).unwrap();
+        assert!(c.status.is_banned());
+        assert_eq!(c.date, 0);
+        assert_eq!(c.participant_count, 0);
+        assert!(c.is_received_from_server);
+        close(&mut global);
+        let _ = std::fs::remove_dir_all(db_dir("m521-forbidden"));
     }
 }
