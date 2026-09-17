@@ -391,7 +391,7 @@ pub trait NetActor: Send {
 }
 
 /// The `SessionMultiProxy` plug-in point: route a ready query to its
-/// destination DC session. Track G replaces the test implementations.
+/// destination DC session. The net step's pool router implements it.
 pub trait SessionSink: Send {
     fn send(&mut self, dc_id: DcId, query_type: NetQueryType, query: NetQuery);
 }
@@ -399,6 +399,24 @@ pub trait SessionSink: Send {
 /// The `Td::on_result` plug-in point for callback-less queries.
 pub trait TdSink: Send {
     fn on_result(&mut self, query: NetQuery);
+}
+
+/// The lazy per-DC initialization hook — the `wait_dc_init` init body
+/// (NetQueryDispatcher.cpp:227-266) and the `set_main_dc_id` tail
+/// (:429-445), which live in the client layer (the `AuthDataShared` +
+/// `SessionMultiProxy` creation needs the binlog pmc and the option
+/// reads). The dispatcher only calls it; everything it touches is
+/// created client-side, so the driver tasks' first sends materialize
+/// the sessions (the C++ `SessionProxy` laziness).
+pub trait DcInitSink: Send {
+    /// Create the per-DC machinery for `dc_id` (the C++ `init dc` block).
+    /// `false` = refused (the C++ "Closing" error).
+    fn init_dc(&mut self, dc_id: DcId) -> bool;
+
+    /// `set_main_dc_id`'s tail: the old/new `update_main_flag` sends, the
+    /// `DcAuthManager::update_main_dc` and the binlog `"main_dc_id"`
+    /// persistence.
+    fn update_main_dc(&mut self, new_main_dc_id: i32);
 }
 
 /// One delayed query of the `NetQueryDelayer` stand-in.
@@ -410,13 +428,15 @@ pub struct DelayedQuery {
     pub query: NetQuery,
 }
 
-/// `td::NetQueryDispatcher` — the Track F slice.
+/// `td::NetQueryDispatcher` — the Track F slice with the net step's
+/// lazy per-DC init hook.
 pub struct NetQueryDispatcher {
     stop_flag: AtomicBool,
     main_dc_id: AtomicI32,
     dcs: Mutex<HashMap<i32, DcState>>,
     session_sink: Mutex<Box<dyn SessionSink>>,
     td_sink: Mutex<Box<dyn TdSink>>,
+    dc_init_sink: Mutex<Box<dyn DcInitSink>>,
     delayer: Mutex<Vec<DelayedQuery>>,
     query_id: AtomicU64,
 }
@@ -428,13 +448,18 @@ struct DcState {
 }
 
 impl NetQueryDispatcher {
-    pub fn new(session_sink: Box<dyn SessionSink>, td_sink: Box<dyn TdSink>) -> Self {
+    pub fn new(
+        session_sink: Box<dyn SessionSink>,
+        td_sink: Box<dyn TdSink>,
+        dc_init_sink: Box<dyn DcInitSink>,
+    ) -> Self {
         Self {
             stop_flag: AtomicBool::new(false),
             main_dc_id: AtomicI32::new(1),
             dcs: Mutex::new(HashMap::new()),
             session_sink: Mutex::new(session_sink),
             td_sink: Mutex::new(td_sink),
+            dc_init_sink: Mutex::new(dc_init_sink),
             delayer: Mutex::new(Vec::new()),
             query_id: AtomicU64::new(0),
         }
@@ -451,12 +476,31 @@ impl NetQueryDispatcher {
         DcId::internal(self.main_dc_id.load(Ordering::Relaxed))
     }
 
-    pub fn set_main_dc_id(&self, new_main_dc_id: i32) {
+    /// The constructor's binlog restore (NetQueryDispatcher.cpp:373-376):
+    /// the `"main_dc_id"` pmc read runs client-side before `new` and the
+    /// value lands here. No fan-out — restoring is not migrating (the
+    /// C++ constructor only assigns the member).
+    pub fn load_main_dc_id(&self, new_main_dc_id: i32) {
         assert!(
             DcId::is_valid_raw(new_main_dc_id),
             "invalid main DC id {new_main_dc_id}"
         );
         self.main_dc_id.store(new_main_dc_id, Ordering::SeqCst);
+    }
+
+    /// `NetQueryDispatcher::set_main_dc_id` (cpp:420-445): validate, dedup,
+    /// store, then the sink tail (the pool main flags, the
+    /// `DcAuthManager::update_main_dc` and the binlog persistence).
+    pub fn set_main_dc_id(&self, new_main_dc_id: i32) {
+        if !DcId::is_valid_raw(new_main_dc_id) {
+            tdutils::log_error!("Receive wrong DC {new_main_dc_id}");
+            return;
+        }
+        if self.main_dc_id.load(Ordering::SeqCst) == new_main_dc_id {
+            return;
+        }
+        self.main_dc_id.store(new_main_dc_id, Ordering::SeqCst);
+        self.dc_init_sink.lock().update_main_dc(new_main_dc_id);
     }
 
     pub fn mark_dc_valid(&self, raw_dc_id: i32) {
@@ -602,21 +646,43 @@ impl NetQueryDispatcher {
         }
     }
 
-    /// `wait_dc_init` — readiness only; the async init request belongs to
-    /// Track G (`ConfigManager`/`DcAuthManager`).
-    fn wait_dc_init(&self, dc_id: DcId, _force: bool) -> std::result::Result<(), Status> {
+    /// `wait_dc_init` (NetQueryDispatcher.cpp:201-278). The C++ init body
+    /// (the `AuthDataShared` + four `SessionMultiProxy` creation) runs in
+    /// the [`DcInitSink`]; a forced call on a not-yet-valid DC performs
+    /// the init inline (the dispatcher is actor-serialized, so the C++
+    /// spin-wait at :267-275 has no racing initializer to wait for).
+    fn wait_dc_init(&self, dc_id: DcId, force: bool) -> std::result::Result<(), Status> {
         if !dc_id.is_exact() {
             return Err(Status::error_message("Not exact DC"));
         }
-        let dcs = self.dcs.lock();
-        let Some(dc) = dcs.get(&dc_id.get_raw_id()) else {
-            return Err(Status::error_message("Invalid DC"));
+        let should_init = {
+            let mut dcs = self.dcs.lock();
+            let dc = dcs.entry(dc_id.get_raw_id()).or_default();
+            if dc.is_valid {
+                if dc.is_inited {
+                    return Ok(());
+                }
+                false
+            } else {
+                if !force {
+                    return Err(Status::error_message("Invalid DC"));
+                }
+                dc.is_valid = true;
+                true
+            }
         };
-        if !dc.is_valid {
-            return Err(Status::error_message("Invalid DC"));
-        }
-        if !dc.is_inited {
-            return Err(Status::error_message("DC not inited"));
+        if should_init {
+            let ok = self.dc_init_sink.lock().init_dc(dc_id);
+            if !ok {
+                // The refused init must not wedge the DC into the
+                // valid-but-uninited state (the C++ spin-wait has no
+                // counterpart here): revert, so a later dispatch retries.
+                if let Some(dc) = self.dcs.lock().get_mut(&dc_id.get_raw_id()) {
+                    dc.is_valid = false;
+                }
+                return Err(Status::error_message("Closing"));
+            }
+            self.mark_dc_inited(dc_id.get_raw_id());
         }
         Ok(())
     }

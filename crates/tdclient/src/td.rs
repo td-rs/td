@@ -31,21 +31,25 @@
 //!   C++ runs the net stack as actors; the observable JSON behavior is
 //!   identical for the single-client skeleton).
 
+use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use tdactor::{Actor, ActorOwn, Scheduler, actor_messages, send_closure_later};
 use tddb::td_db::{OpenedDatabase, Parameters as DbParameters, TdDb};
 use tdmtproto::telegram_api;
-use tdnet::net_query::{NetQuery, NetQueryDispatcher};
+use tdnet::net_query::{DcId, NetQuery, NetQueryDispatcher};
 use tdutils::promise::Promise;
 use tdutils::status::Status;
 
+use crate::auth_data_shared::{
+    AuthDataShared, AuthDataSnapshot, NetEvent, NetEventQueue, load_auth_key_from_pmc,
+    load_salts_from_pmc, save_auth_key_to_pmc, save_salts_to_pmc,
+};
 use crate::auth_manager::{AuthManager, AuthQuerySender};
 use crate::config_dispatch::{
-    CompletedNetQueries, ConfigQueryCallback, SentNetQueries, TdConfigSink, TdSessionSink,
-    build_config_net_query,
+    CompletedNetQueries, ConfigQueryCallback, TdConfigSink, build_config_net_query,
 };
 use crate::config_manager::{
     ConfigActions, ConfigManager, ConfigQuery, ConfigQueryResult, StoredDcOption,
@@ -57,13 +61,16 @@ use crate::config_recoverer::{
 use crate::config_result;
 use crate::connection_creator::ConnectionCreator;
 use crate::convert::{self, MessageSpec};
+use crate::dc_auth_manager::{DcAuthManager, DcCompletedQueue};
 use crate::global::Global;
 use crate::link_manager::LinkManager;
 use crate::manager_option_states::ManagerOptionStates;
+use crate::mtproto_header::gen_default_header;
 use crate::net::{AuthSender, BridgeConfig, NetBridge, QueryAnswer};
 use crate::option_manager::OptionManager;
 use crate::query_merger::QueryMerger;
 use crate::requests;
+use crate::session_multi_proxy::{NetRouter, NetShared, PublicRsaKeySharedMain, RouterSink};
 use crate::synchronous_requests;
 use crate::td_api::{self, Function, Object};
 use crate::time_zone_manager::TimeZoneManager;
@@ -195,12 +202,36 @@ pub struct Td {
     pub(crate) config_manager: Option<ConfigManager>,
     /// The client-side `NetQueryDispatcher` (`Td.cpp:914-919`), created in
     /// `init`; the ConfigManager queries and the `pingProxy` main-DC read
-    /// go through it.
+    /// go through it, and the pool router delivers everything to the
+    /// per-DC session drivers.
     pub(crate) net_query_dispatcher: Option<NetQueryDispatcher>,
-    /// Queries that passed the dispatcher's DC-init gate, parked with
-    /// their resolved DC by `TdSessionSink` until the Track-G session step
-    /// routes them to real sessions.
-    pub(crate) sent_net_queries: SentNetQueries,
+    /// The dispatcher's sink trio — the pool router (`SessionSink` +
+    /// `DcInitSink`), kept out for the close-time pool shutdown and the
+    /// option-mirror sync.
+    pub(crate) net_router: Option<Arc<NetRouter>>,
+    /// The shared driver context (the C++ `G()` session surface).
+    pub(crate) net_shared: Option<Arc<NetShared>>,
+    /// The per-raw-DC shared auth data (`auth<raw>`/`salt<raw>` pmc
+    /// images), built at `init` and shared with the pools and the
+    /// `DcAuthManager`.
+    pub(crate) auth_data_registry: HashMap<i32, Arc<AuthDataShared>>,
+    /// The net-inert test double of the dispatcher's session sink: the
+    /// queries park here instead of driving the live pools (the M.3.8.1
+    /// stand-in shape). Production runs never touch it.
+    #[cfg(test)]
+    pub(crate) sent_net_queries: Arc<Mutex<Vec<(DcId, NetQuery)>>>,
+    /// The net-inert mode switch: a net-inert test Td dispatches through
+    /// the parking sink and a refusing DC-init stand-in — the exact
+    /// M.3.8.1 dispatcher semantics — instead of the net step's pool
+    /// router, so the config-flow tests stay hermetic.
+    #[cfg(test)]
+    pub(crate) inert_net: bool,
+    /// The C++ `Td::dc_auth_manager_` (`DcAuthManager.cpp` — the
+    /// export/import loop), inline on the actor; `None` until `init`
+    /// builds the driver context.
+    pub(crate) dc_auth_manager: Option<DcAuthManager>,
+    /// The dc-auth export/import completions parked by their callbacks.
+    pub(crate) dc_completed_queries: DcCompletedQueue,
     /// Completed ConfigManager queries — `(token, NetQuery)` parked by
     /// `ConfigQueryCallback` (token 0 = the callback-less `TdSink`
     /// stand-in); M.3.8.2 routes them into `on_config_query_result`.
@@ -215,6 +246,9 @@ pub struct Td {
     /// `RecovererSimpleConfigResult`/`RecovererFullConfigResult` messages,
     /// which tests and the executors alike deliver).
     pub(crate) pending_recoverer_fetches: Vec<RecovererFetch>,
+    /// Live `telegram_api::Updates` packets from the session drivers —
+    /// parked for the UpdatesManager fan-out flips (M.7.12-M.7.15).
+    pub(crate) pending_net_updates: Vec<Vec<u8>>,
     /// The recoverer's armed wakeup (`set_timeout_at` source, sharing the
     /// single Td timeout slot with the config expire time — the earliest
     /// wins, and the fired timeout re-loops both state machines).
@@ -315,7 +349,16 @@ impl Td {
             connection_creator: None,
             config_manager: None,
             net_query_dispatcher: None,
+            net_router: None,
+            net_shared: None,
+            auth_data_registry: HashMap::new(),
+            #[cfg(test)]
             sent_net_queries: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(test)]
+            inert_net: false,
+            dc_auth_manager: None,
+            dc_completed_queries: DcCompletedQueue::new(),
+            pending_net_updates: Vec::new(),
             completed_config_queries: Arc::new(Mutex::new(Vec::new())),
             config_recoverer: None,
             pending_recoverer_fetches: Vec::new(),
@@ -366,6 +409,7 @@ impl Td {
         // immediately in the C++ (send_closure from the manager); the
         // collapse queues them. The deferred promise completions answer
         // through the same end-of-turn hop.
+        self.drain_net_events();
         self.flush_user_updates();
         self.flush_deferred_results();
     }
@@ -617,19 +661,131 @@ impl Td {
             header_options.is_emulator = option_manager.get_option_boolean("is_emulator", false);
         }
 
-        // VLOG "Create NetQueryDispatcher" (Td.cpp:914-919): the
-        // client-side dispatcher over the session/td sinks — the
-        // ConfigManager queries dispatch through it below; the pending
-        // pingProxy requests complete once their main-DC reads go through
-        // it.
-        self.net_query_dispatcher = Some(NetQueryDispatcher::new(
-            Box::new(TdSessionSink {
-                sent: self.sent_net_queries.clone(),
-            }),
+        // VLOG "Create NetQueryDispatcher" (Td.cpp:914-919) + the net
+        // step's session wiring: the per-DC shared auth data (the
+        // `auth<raw>`/`salt<raw>` pmc images), the driver context, the
+        // pool router and the DcAuthManager — the C++ lazy
+        // `wait_dc_init` body, hoisted to init where the pmc lives.
+        let net_events = NetEventQueue::new();
+        let server_time_difference = self.global.get_server_time_difference();
+        {
+            let mut registry = HashMap::new();
+            let binlog_pmc = self.global.binlog_pmc();
+            // The internal DCs are 1..=5 (DcId.h) — the C++ creates the
+            // shared auth data per DC on demand; the pmc images read the
+            // same keys.
+            for raw in 1..=5i32 {
+                let dc_id = DcId::internal(raw);
+                let snapshot = AuthDataSnapshot {
+                    auth_key: load_auth_key_from_pmc(binlog_pmc, dc_id),
+                    future_salts: load_salts_from_pmc(binlog_pmc, dc_id),
+                    server_time_difference,
+                };
+                registry.insert(
+                    raw,
+                    AuthDataShared::new(dc_id, snapshot, net_events.clone()),
+                );
+            }
+            self.auth_data_registry = registry;
+        }
+        let scheduler = if Scheduler::in_scheduler_context() {
+            Some(Scheduler::instance_ptr())
+        } else {
+            None
+        };
+        let td_actor_id = if Scheduler::in_scheduler_context() {
+            Some(self.actor_id_of::<Td>())
+        } else {
+            None
+        };
+        // The constructor's binlog restore (NetQueryDispatcher.cpp:373-376
+        // + DcAuthManager.cpp:30-42): the pmc `"main_dc_id"`, defaulting
+        // to 1.
+        let main_dc_raw = {
+            let stored = self.global.binlog_pmc().get("main_dc_id");
+            let parsed: i32 = stored.trim().parse().unwrap_or(0);
+            if parsed != 0 && DcId::is_valid_raw(parsed) {
+                parsed
+            } else {
+                1
+            }
+        };
+        let is_test_dc = self.global.is_test_dc();
+        let shared = Arc::new(NetShared {
+            td: td_actor_id,
+            scheduler,
+            events: net_events,
+            header: Mutex::new(gen_default_header(&self.header_options)),
+            dc_options: Mutex::new(
+                self.connection_creator
+                    .as_ref()
+                    .map(|creator| creator.dc_options().to_vec())
+                    .unwrap_or_default(),
+            ),
+            is_test_dc,
+            main_dc_id: Arc::new(std::sync::atomic::AtomicI32::new(main_dc_raw)),
+            public_rsa_key: Arc::new(PublicRsaKeySharedMain::create(is_test_dc)),
+        });
+        let (session_count, is_premium) = {
+            let option_manager = self
+                .option_manager
+                .as_ref()
+                .expect("option manager just set");
+            (
+                option_manager.get_option_integer("session_count", 1) as i32,
+                option_manager.get_option_boolean("is_premium", false),
+            )
+        };
+        let router = Arc::new(NetRouter::new(
+            shared.clone(),
+            self.auth_data_registry.clone(),
+            session_count,
+            is_premium,
+        ));
+        // The net-inert tests keep the M.3.8.1 dispatcher semantics: the
+        // queries park in `sent_net_queries` and every DC-init is
+        // refused — nothing reaches the network. Production (and the
+        // net-step tests) route through the pool router.
+        #[cfg(test)]
+        let (session_sink, dc_init_sink): (
+            Box<dyn tdnet::net_query::SessionSink>,
+            Box<dyn tdnet::net_query::DcInitSink>,
+        ) = if self.inert_net {
+            (
+                Box::new(crate::config_dispatch::TdSessionSink {
+                    sent: self.sent_net_queries.clone(),
+                }),
+                Box::new(InertDcInit),
+            )
+        } else {
+            (
+                Box::new(RouterSink(router.clone())),
+                Box::new(RouterSink(router.clone())),
+            )
+        };
+        #[cfg(not(test))]
+        let (session_sink, dc_init_sink) = (
+            Box::new(RouterSink(router.clone())) as Box<dyn tdnet::net_query::SessionSink>,
+            Box::new(RouterSink(router.clone())) as Box<dyn tdnet::net_query::DcInitSink>,
+        );
+        let dispatcher = NetQueryDispatcher::new(
+            session_sink,
             Box::new(TdConfigSink {
                 completed: self.completed_config_queries.clone(),
             }),
-        ));
+            dc_init_sink,
+        );
+        if main_dc_raw != 1 {
+            dispatcher.load_main_dc_id(main_dc_raw);
+        }
+        self.net_query_dispatcher = Some(dispatcher);
+        self.net_router = Some(router);
+        self.net_shared = Some(shared.clone());
+        let mut dc_auth_manager = DcAuthManager::new(shared, self.dc_completed_queries.clone());
+        if main_dc_raw != 1 {
+            dc_auth_manager.update_main_dc(DcId::internal(main_dc_raw));
+        }
+        self.dc_auth_manager = Some(dc_auth_manager);
 
         // VLOG "Create AuthManager" (Td.cpp:923-926) + the constructor pmc
         // restore (AuthManager.cpp:337-366).
@@ -994,15 +1150,17 @@ impl Td {
         if let Some(dispatcher) = self.net_query_dispatcher.take() {
             dispatcher.stop();
         }
-        for (_, mut net_query) in std::mem::take(&mut *self.sent_net_queries.lock().unwrap()) {
-            net_query.set_error(config_result::request_aborted_error());
-            if let Some(mut callback) = net_query.move_callback() {
-                callback.on_result(net_query);
-            }
+        // The pool shutdown: every session driver fails its in-flight
+        // queries with "Request aborted" (the C++ per-DC
+        // SessionMultiProxy resets in `stop`, NetQueryDispatcher.cpp:290-295).
+        if let Some(router) = self.net_router.take() {
+            router.close();
         }
+        self.net_shared = None;
+        self.dc_auth_manager = None;
+        self.auth_data_registry.clear();
         self.drain_config_net_query_completions();
-        self.sent_net_queries.lock().unwrap().clear();
-        self.completed_config_queries.lock().unwrap().clear();
+        self.completed_config_queries.lock().clear();
 
         self.global.close_all(self.destroy_flag);
         self.option_manager = None;
@@ -1159,6 +1317,11 @@ impl Td {
             return;
         };
         connection_creator.on_dc_options(options, seed, is_test_dc, self.global.binlog_pmc());
+        // The session drivers read the same merged option list (the
+        // C++ ConnectionCreator hands connections out directly).
+        if let Some(shared) = self.net_shared.as_ref() {
+            *shared.dc_options.lock() = connection_creator.dc_options().to_vec();
+        }
     }
 
     /// Complete the requests a ConfigManager call produced and hold its
@@ -1508,6 +1671,107 @@ impl Td {
         dispatcher.dispatch_with_callback(net_query, Box::new(callback));
     }
 
+    /// The driver-event pump — the `Td` half of the session machinery
+    /// (the C++ hops land here as [`NetEvent`]s): the pmc writes, the
+    /// `Global` server-time updates, the `DcAuthManager` state pumps
+    /// and the sign-in main-DC flips. Also the dc-auth export/import
+    /// completion drain.
+    pub(crate) fn drain_net_events(&mut self) {
+        let Some(shared) = self.net_shared.as_ref() else {
+            return;
+        };
+        for event in shared.events.take() {
+            match event {
+                NetEvent::UpdatePacket(packet) => self.pending_net_updates.push(packet),
+                NetEvent::ServerTimeDifference {
+                    raw_dc_id,
+                    diff,
+                    force,
+                } => {
+                    if let Some(options) = self.option_manager.as_mut() {
+                        self.global
+                            .update_server_time_difference(diff, force, options);
+                    }
+                    if let Some(shared_auth) = self.auth_data_registry.get(&raw_dc_id) {
+                        shared_auth.set_server_time_difference(diff);
+                    }
+                }
+                NetEvent::PersistAuthKey { raw_dc_id } => {
+                    if let Some(shared_auth) = self.auth_data_registry.get(&raw_dc_id) {
+                        let auth_key = shared_auth.get_auth_key();
+                        save_auth_key_to_pmc(
+                            self.global.binlog_pmc(),
+                            DcId::internal(raw_dc_id),
+                            &auth_key,
+                        );
+                    }
+                }
+                NetEvent::PersistSalts { raw_dc_id } => {
+                    if let Some(shared_auth) = self.auth_data_registry.get(&raw_dc_id) {
+                        let salts = shared_auth.get_future_salts();
+                        save_salts_to_pmc(
+                            self.global.binlog_pmc(),
+                            DcId::internal(raw_dc_id),
+                            &salts,
+                        );
+                    }
+                }
+                NetEvent::PersistMainDc(raw_dc_id) => {
+                    self.global
+                        .binlog_pmc()
+                        .set("main_dc_id", &raw_dc_id.to_string());
+                }
+                NetEvent::MainDcChanged(raw_dc_id) => {
+                    if let Some(dc_auth_manager) = self.dc_auth_manager.as_mut() {
+                        dc_auth_manager.update_main_dc(DcId::internal(raw_dc_id));
+                    }
+                }
+                NetEvent::DcAdded { raw_dc_id } => {
+                    let Some(shared_auth) = self.auth_data_registry.get(&raw_dc_id).cloned() else {
+                        continue;
+                    };
+                    if let Some(dc_auth_manager) = self.dc_auth_manager.as_mut() {
+                        dc_auth_manager.add_dc(shared_auth);
+                    }
+                }
+                NetEvent::AuthKeyChanged { raw_dc_id } => {
+                    if let Some(dc_auth_manager) = self.dc_auth_manager.as_mut() {
+                        dc_auth_manager.update_auth_key_state(raw_dc_id);
+                    }
+                }
+                NetEvent::SignInMainDc { raw_dc_id } => {
+                    // Session.cpp:902-904 — the sign-in answers set the
+                    // main DC (the dispatcher dedups).
+                    if let Some(dispatcher) = self.net_query_dispatcher.as_ref() {
+                        dispatcher.set_main_dc_id(raw_dc_id);
+                    }
+                }
+                NetEvent::Unauthorized { message } => {
+                    // Session.cpp:963-967's `G()->log_out(message)` — the
+                    // auth-side log-out machinery rides the auth-net
+                    // slice; the state flag is already flipped on the
+                    // session's key.
+                    tracing::warn!("Log out: {message}");
+                }
+                NetEvent::QueryResult(query) => {
+                    self.completed_config_queries.lock().push((0, query));
+                }
+            }
+        }
+        // The dc-auth completions, then the loop (the C++ `loop` runs
+        // after every state touch).
+        let Some(dispatcher) = self.net_query_dispatcher.as_ref() else {
+            return;
+        };
+        let Some(dc_auth_manager) = self.dc_auth_manager.as_mut() else {
+            return;
+        };
+        for (raw_dc_id, query) in dc_auth_manager.take_completed() {
+            dc_auth_manager.on_result(raw_dc_id, query);
+        }
+        dc_auth_manager.loop_(dispatcher, || dispatcher.next_query_id());
+    }
+
     /// `G()->unix_time()` — the server-time-corrected wall clock; the value
     /// comes from the Global hub inited at `Td::init` (before this, without
     /// a session the server difference is just the local default).
@@ -1614,7 +1878,7 @@ impl Td {
     /// the dispatcher-stop aborts, the actor flow once the callback
     /// delivery is wired there.
     pub(crate) fn drain_config_net_query_completions(&mut self) {
-        let completions = std::mem::take(&mut *self.completed_config_queries.lock().unwrap());
+        let completions = std::mem::take(&mut *self.completed_config_queries.lock());
         for (token, net_query) in completions {
             self.on_config_net_query_result(token, net_query);
         }
@@ -1634,7 +1898,7 @@ impl Td {
     /// manager call, where a `&mut Td` is not available).
     pub(crate) fn flush_deferred_results(&mut self) {
         let deferred = {
-            let mut guard = self.deferred_results.lock().unwrap();
+            let mut guard = self.deferred_results.lock();
             std::mem::take(&mut *guard)
         };
         for (id, result) in deferred {
@@ -1659,7 +1923,7 @@ impl Td {
                     tdutils::status::Result::Ok(value) => Ok(map(value)),
                     tdutils::status::Result::Err(status) => Err(status),
                 };
-                outbox.lock().unwrap().push((id, result));
+                outbox.lock().push((id, result));
             },
         )
     }
@@ -2465,6 +2729,11 @@ actor_messages! {
         Request { request_id: u64, function: Function, } => request(request_id, function),
         Close => close_impl(false),
         Destroy => close_impl(true),
+        /// A driver-thread nudge: the session drivers and the shared
+        /// auth data queue their events into `net_shared.events`; this
+        /// wakes the actor to drain them (the C++
+        /// `send_closure_later(G()->td(), ...)`.
+        DrainNetEvents => drain_net_events(),
         /// A completed ConfigManager query — the C++
         /// `ConfigManager::on_result` dispatch. The net step calls this
         /// when a pending query completes; tests drive the config flow
@@ -2534,15 +2803,15 @@ impl Actor for Td {
         }
         self.flush_user_updates();
         self.rearm_user_timeouts();
+        // The driver events (salts persists, key changes, updates) pump
+        // through the same slot when no DrainNetEvents nudge beat it.
+        self.drain_net_events();
         self.flush_deferred_results();
     }
 
     fn tear_down(&mut self) {
         self.close();
     }
-
-    // No `loop_`: the pending-query poll arrives with the net step (the
-    // C++ `Td::loop` yields to drive the NetQueryDispatcher).
 }
 
 /// The premium-required-to-contact QueryMerger merge function: build the
@@ -2761,11 +3030,27 @@ pub fn send_request(actor: &ActorOwn<Td>, request_id: u64, function: Function) {
     );
 }
 
+/// The net-inert DC-init stand-in: refuses every init (the M.3.8.1
+/// dispatcher semantics — each query completes with the C++ "No such dc"
+/// gate error) without materializing any session machinery.
+#[cfg(test)]
+struct InertDcInit;
+
+#[cfg(test)]
+impl tdnet::net_query::DcInitSink for InertDcInit {
+    fn init_dc(&mut self, _dc_id: DcId) -> bool {
+        false
+    }
+
+    fn update_main_dc(&mut self, _new_main_dc_id: i32) {}
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config_manager::StoredDcOptions;
-    use std::sync::{Arc, Mutex};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
     use tdactor::{ConcurrentScheduler, create_actor};
     use tdmtproto::telegram_api;
 
@@ -2777,10 +3062,10 @@ mod tests {
 
     impl TdCallback for CollectCallback {
         fn on_result(&mut self, id: u64, result: Object) {
-            self.responses.lock().unwrap().push((id, result));
+            self.responses.lock().push((id, result));
         }
         fn on_error(&mut self, id: u64, error: td_api::Error) {
-            self.errors.lock().unwrap().push((id, error));
+            self.errors.lock().push((id, error));
         }
     }
 
@@ -2825,7 +3110,6 @@ mod tests {
         callback
             .responses
             .lock()
-            .unwrap()
             .iter()
             .filter(|(response_id, _)| *response_id == id)
             .map(|(_, object)| object.clone())
@@ -2836,7 +3120,6 @@ mod tests {
         callback
             .errors
             .lock()
-            .unwrap()
             .iter()
             .find(|(error_id, _)| *error_id == id)
             .map(|(_, error)| error.clone())
@@ -2939,22 +3222,17 @@ mod tests {
             let _ = scheduler.run_main(0.01);
             let _ = scheduler.run_main(0.3);
         });
-        let fired = callback
-            .responses
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(id, object)| {
-                *id == 0
-                    && matches!(
-                        object,
-                        Object::updateUserStatus(update) if update.user_id == 5
-                            && matches!(
-                                update.status,
-                                Some(td_api::UserStatus::userStatusOffline(_))
-                            )
-                    )
-            });
+        let fired = callback.responses.lock().iter().any(|(id, object)| {
+            *id == 0
+                && matches!(
+                    object,
+                    Object::updateUserStatus(update) if update.user_id == 5
+                        && matches!(
+                            update.status,
+                            Some(td_api::UserStatus::userStatusOffline(_))
+                        )
+                )
+        });
         assert!(
             fired,
             "the expired online deadline must broadcast updateUserStatus"
@@ -2966,7 +3244,7 @@ mod tests {
         let callback = CollectCallback::default();
         run_actor_with(&callback, |_actor, callback, scheduler| {
             let _ = scheduler.run_main(0.01);
-            let responses = callback.responses.lock().unwrap();
+            let responses = callback.responses.lock();
             // version, commit_hash, then authorizationStateWaitTdlibParameters.
             assert_eq!(responses.len(), 3);
             assert_eq!(responses[0].0, 0);
@@ -3062,15 +3340,10 @@ mod tests {
                 }),
             );
             assert!(
-                callback
-                    .responses
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .all(|(id, _)| *id == 0),
+                callback.responses.lock().iter().all(|(id, _)| *id == 0),
                 "no request responses in WaitParameters"
             );
-            assert!(callback.errors.lock().unwrap().is_empty());
+            assert!(callback.errors.lock().is_empty());
         });
     }
 
@@ -3094,7 +3367,7 @@ mod tests {
 
             // The update stream ends with WaitPhoneNumber before the ok.
             {
-                let responses = callback.responses.lock().unwrap();
+                let responses = callback.responses.lock();
                 let ok_pos = responses
                     .iter()
                     .position(|(id, object)| *id == 20 && matches!(object, Object::ok(_)))
@@ -3177,7 +3450,7 @@ mod tests {
                     )),
                 }),
             );
-            assert!(callback.errors.lock().unwrap().is_empty());
+            assert!(callback.errors.lock().is_empty());
 
             send(actor, scheduler, 31, set_tdlib_parameters(db_dir, false));
             assert!(
@@ -3301,7 +3574,7 @@ mod tests {
                     .any(|object| matches!(object, Object::ok(_)))
             );
             let auth_updates: Vec<String> = {
-                let responses = callback.responses.lock().unwrap();
+                let responses = callback.responses.lock();
                 let closed_pos = responses
                     .iter()
                     .position(|(_, object)| auth_state_of(object) == "closed")
@@ -3357,7 +3630,7 @@ mod tests {
                     .any(|object| matches!(object, Object::ok(_)))
             );
             let auth_updates: Vec<String> = {
-                let responses = callback.responses.lock().unwrap();
+                let responses = callback.responses.lock();
                 responses
                     .iter()
                     .filter(|(id, _)| *id == 0)
@@ -3638,17 +3911,18 @@ mod tests {
             responses: callback.responses.clone(),
             errors: callback.errors.clone(),
         }));
+        td.inert_net = true;
         let Function::setTdlibParameters(parameters) = set_tdlib_parameters(db_dir, false) else {
             unreachable!("setTdlibParameters helper");
         };
         td.on_set_tdlib_parameters(20, parameters);
         assert_eq!(td.state, State::Run);
         // The start-up GetConfig went through the dispatcher; without a
-        // session-inited DC the slice's DC gate completes it with the C++
-        // "No such dc" error through the token-8 callback.
-        assert!(td.sent_net_queries.lock().unwrap().is_empty());
+        // session-inited DC the net-inert DC gate completes it with the
+        // C++ "No such dc" error through the token-8 callback.
+        assert!(td.sent_net_queries.lock().is_empty());
         {
-            let completed = td.completed_config_queries.lock().unwrap();
+            let completed = td.completed_config_queries.lock();
             assert_eq!(completed.len(), 1);
             assert_eq!(completed[0].0, 8);
             assert_eq!(completed[0].1.error().message(), "No such dc DcId{1}");
@@ -3668,6 +3942,7 @@ mod tests {
             responses: callback.responses.clone(),
             errors: callback.errors.clone(),
         }));
+        td.inert_net = true;
         let Function::setTdlibParameters(parameters) = set_tdlib_parameters(db_dir, false) else {
             unreachable!("setTdlibParameters helper");
         };
@@ -3725,7 +4000,7 @@ mod tests {
         );
         net_query.set_ok(answer);
         {
-            let mut completions = td.completed_config_queries.lock().unwrap();
+            let mut completions = td.completed_config_queries.lock();
             completions.clear();
             completions.push((token, net_query));
         }
@@ -3733,9 +4008,9 @@ mod tests {
         // The ok config triggers the C++ follow-up app-config reload
         // (process_config → reload_app_config) — a fresh GetAppConfig
         // dispatch parks its own DC-gate completion.
-        assert_eq!(td.completed_config_queries.lock().unwrap().len(), 1);
+        assert_eq!(td.completed_config_queries.lock().len(), 1);
         td.drain_config_net_query_completions();
-        assert!(td.completed_config_queries.lock().unwrap().is_empty());
+        assert!(td.completed_config_queries.lock().is_empty());
 
         // The M.3.9.1 fan-outs (ConfigManager.cpp:1191/1196): the
         // DcOptions ctor dropped the invalid dc id, the ConnectionCreator
@@ -3761,7 +4036,7 @@ mod tests {
             "token"
         );
 
-        let responses = callback.responses.lock().unwrap();
+        let responses = callback.responses.lock();
         let option_updates: Vec<(String, td_api::OptionValue)> = responses
             .iter()
             .filter_map(|(id, object)| {
@@ -3815,6 +4090,7 @@ mod tests {
             responses: callback.responses.clone(),
             errors: callback.errors.clone(),
         }));
+        td.inert_net = true;
         let Function::setTdlibParameters(parameters) = set_tdlib_parameters(db_dir, false) else {
             unreachable!("setTdlibParameters helper");
         };
@@ -3854,7 +4130,7 @@ mod tests {
         );
         net_query.set_ok(answer);
         {
-            let mut completions = td.completed_config_queries.lock().unwrap();
+            let mut completions = td.completed_config_queries.lock();
             completions.clear();
             completions.push((token, net_query));
         }
@@ -3865,14 +4141,14 @@ mod tests {
         // fresh GetAppConfig dispatch parks its own DC-gate completion
         // with the token-1 callback.
         {
-            let completions = td.completed_config_queries.lock().unwrap();
+            let completions = td.completed_config_queries.lock();
             assert_eq!(completions.len(), 1);
             assert_eq!(completions[0].0, 1, "the app-config reload token");
         }
         td.drain_config_net_query_completions();
-        assert!(td.completed_config_queries.lock().unwrap().is_empty());
+        assert!(td.completed_config_queries.lock().is_empty());
         assert_eq!(td.config_manager.as_ref().unwrap().config_sent_cnt(), 0);
-        let responses = callback.responses.lock().unwrap();
+        let responses = callback.responses.lock();
         assert!(responses.iter().any(|(id, object)| {
             *id == 0
                 && matches!(
@@ -3909,7 +4185,7 @@ mod tests {
             reopen_sessions: false,
         };
         let (mut net_query, _) = build_config_net_query(&query, 999, false);
-        net_query.set_error(crate::config_result::request_aborted_error());
+        net_query.set_error(tdnet::net_query::request_aborted_error());
         td.on_config_net_query_result(1, net_query);
         assert_eq!(td.config_manager.as_ref().unwrap().config_sent_cnt(), 1);
 
@@ -3944,19 +4220,19 @@ mod tests {
             reopen_sessions: false,
         };
         let (mut net_query, token) = build_config_net_query(&query, 1, false);
-        net_query.set_error(crate::config_result::request_aborted_error());
+        net_query.set_error(tdnet::net_query::request_aborted_error());
         {
-            let mut completions = td.completed_config_queries.lock().unwrap();
+            let mut completions = td.completed_config_queries.lock();
             completions.clear();
             completions.push((token, net_query));
         }
         td.drain_config_net_query_completions();
-        assert!(td.completed_config_queries.lock().unwrap().is_empty());
+        assert!(td.completed_config_queries.lock().is_empty());
         assert_eq!(td.config_manager.as_ref().unwrap().config_sent_cnt(), 0);
 
         td.close_impl(false);
-        assert!(td.completed_config_queries.lock().unwrap().is_empty());
-        assert!(td.sent_net_queries.lock().unwrap().is_empty());
+        assert!(td.completed_config_queries.lock().is_empty());
+        assert!(td.sent_net_queries.lock().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4128,7 +4404,6 @@ mod tests {
             || callback
                 .errors
                 .lock()
-                .unwrap()
                 .iter()
                 .any(|(error_id, _)| *error_id == id)
     }

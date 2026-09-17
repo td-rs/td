@@ -7,6 +7,7 @@
 //! ([`synchronous_requests`]); the full ClientManager port is S70, the
 //! Options manager S69.
 
+pub mod auth_data_shared;
 pub mod auth_manager;
 pub mod birthdate;
 pub mod chat_manager;
@@ -19,12 +20,14 @@ pub mod config_result;
 pub mod connection_creator;
 pub mod contact;
 pub mod convert;
+pub mod dc_auth_manager;
 pub mod emoji_status;
 pub mod global;
 pub mod link_manager;
 pub mod manager_option_states;
 pub mod message_id;
 pub mod misc;
+pub mod mtproto_header;
 pub mod net;
 pub mod option_manager;
 pub mod peer_color;
@@ -33,6 +36,7 @@ pub mod query_combiner;
 pub mod query_merger;
 pub mod requests;
 pub mod restriction_reason;
+pub mod session_multi_proxy;
 pub mod store_parse;
 pub mod synchronous_requests;
 pub mod td;

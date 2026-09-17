@@ -16,16 +16,19 @@
 //! `Td::on_config_query_result`; until then they accumulate in dispatch
 //! order in the shared buffers.
 
-use std::sync::{Arc, Mutex};
+use parking_lot::Mutex;
+use std::sync::Arc;
 
 use tdnet::net_query::{
-    AuthFlag, DcId, GzipFlag, NetQuery, NetQueryCallback, NetQueryType, SessionSink, TdSink,
+    AuthFlag, DcId, GzipFlag, NetQuery, NetQueryCallback, NetQueryType, TdSink,
 };
 
 use crate::config_manager::ConfigQuery;
 
 /// Queries that passed the dispatcher's DC-init gate, parked with their
-/// resolved DC by [`TdSessionSink`].
+/// resolved DC by [`TdSessionSink`]. Test-only: production routes
+/// through the net-step pool router.
+#[cfg(test)]
 pub(crate) type SentNetQueries = Arc<Mutex<Vec<(DcId, NetQuery)>>>;
 
 /// Completed ConfigManager queries parked with their link tokens by
@@ -123,22 +126,24 @@ impl ConfigQueryCallback {
 
 impl NetQueryCallback for ConfigQueryCallback {
     fn on_result(&mut self, query: NetQuery) {
-        self.completed.lock().unwrap().push((self.token, query));
+        self.completed.lock().push((self.token, query));
     }
 }
 
-/// The Td's session-routing sink — the C++ `SessionMultiProxy` /
-/// `wait_dc_init` destination, which lands with the Track-G session step.
-/// Queries that pass the dispatcher's DC-init gate park here with their
-/// resolved DC; until sessions exist the gate rejects every DC, so the
-/// buffer stays empty in production.
+/// The session-routing sink the config tests use — the same
+/// [`SessionSink`](tdnet::net_query::SessionSink) plug-in the net step's
+/// production router ([`crate::session_multi_proxy::RouterSink`]) fills.
+/// The tests accept every DC init, so dispatched queries land here with
+/// their resolved DC instead of reaching real sessions.
+#[cfg(test)]
 pub(crate) struct TdSessionSink {
     pub(crate) sent: SentNetQueries,
 }
 
-impl SessionSink for TdSessionSink {
+#[cfg(test)]
+impl tdnet::net_query::SessionSink for TdSessionSink {
     fn send(&mut self, dc_id: DcId, _query_type: NetQueryType, query: NetQuery) {
-        self.sent.lock().unwrap().push((dc_id, query));
+        self.sent.lock().push((dc_id, query));
     }
 }
 
@@ -151,7 +156,7 @@ pub(crate) struct TdConfigSink {
 
 impl TdSink for TdConfigSink {
     fn on_result(&mut self, query: NetQuery) {
-        self.completed.lock().unwrap().push((0, query));
+        self.completed.lock().push((0, query));
     }
 }
 
@@ -159,7 +164,19 @@ impl TdSink for TdConfigSink {
 mod tests {
     use super::*;
     use tdmtproto::telegram_api;
-    use tdnet::net_query::NetQueryDispatcher;
+    use tdnet::net_query::{DcInitSink, NetQueryDispatcher};
+
+    /// The DC-init stand-in: accepts every init so the dispatched config
+    /// queries pass the gate into the [`TdSessionSink`] buffer.
+    struct AcceptingDcInit;
+
+    impl DcInitSink for AcceptingDcInit {
+        fn init_dc(&mut self, _dc_id: DcId) -> bool {
+            true
+        }
+
+        fn update_main_dc(&mut self, _new_main_dc_id: i32) {}
+    }
 
     fn dispatcher_with_sinks() -> (SentNetQueries, CompletedNetQueries, NetQueryDispatcher) {
         let sent = Arc::new(Mutex::new(Vec::new()));
@@ -169,6 +186,7 @@ mod tests {
             Box::new(TdConfigSink {
                 completed: completed.clone(),
             }),
+            Box::new(AcceptingDcInit),
         );
         (sent, completed, dispatcher)
     }
@@ -305,7 +323,7 @@ mod tests {
             );
 
             {
-                let mut sent = sent.lock().unwrap();
+                let mut sent = sent.lock();
                 assert_eq!(sent.len(), 1, "one parked query");
                 let (dest_dc, mut query) = sent.pop().unwrap();
                 assert_eq!(dest_dc, DcId::internal(1), "main resolved to the default 1");
@@ -313,29 +331,42 @@ mod tests {
                 assert_eq!(query.tl_constructor(), telegram_api::help_getConfig::ID);
                 // The attached callback is the token carrier: deliver the
                 // query back through it.
-                assert!(
-                    completed.lock().unwrap().is_empty(),
-                    "nothing completed yet"
-                );
+                assert!(completed.lock().is_empty(), "nothing completed yet");
                 let mut callback = query.move_callback().expect("dispatch_with_callback");
                 callback.on_result(query);
             }
             let (got_token, _) = completed
                 .lock()
-                .unwrap()
                 .pop()
                 .expect("the callback delivery parked the query");
             assert_eq!(got_token, token, "reopen-sessions token");
-            assert!(completed.lock().unwrap().is_empty(), "one per dispatch");
+            assert!(completed.lock().is_empty(), "one per dispatch");
         }
     }
 
-    /// Without a session-inited DC the slice's DC gate completes the query
-    /// with the C++ "No such dc" error through the callback — the parked
-    /// completions keep the dispatch order (the queue behavior).
+    /// The DC-init stand-in that refuses every init — the dispatcher's
+    /// gate then completes each query with the C++ "No such dc" error.
+    struct RefusingDcInit;
+
+    impl DcInitSink for RefusingDcInit {
+        fn init_dc(&mut self, _dc_id: DcId) -> bool {
+            false
+        }
+
+        fn update_main_dc(&mut self, _new_main_dc_id: i32) {}
+    }
+
     #[test]
     fn dc_gate_completions_keep_dispatch_order() {
-        let (sent, completed, dispatcher) = dispatcher_with_sinks();
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let completed = Arc::new(Mutex::new(Vec::new()));
+        let dispatcher = NetQueryDispatcher::new(
+            Box::new(TdSessionSink { sent: sent.clone() }),
+            Box::new(TdConfigSink {
+                completed: completed.clone(),
+            }),
+            Box::new(RefusingDcInit),
+        );
 
         let first = dispatch(
             &dispatcher,
@@ -354,8 +385,8 @@ mod tests {
         );
         assert_eq!((first, second), (8, 1));
 
-        assert!(sent.lock().unwrap().is_empty(), "nothing reached a session");
-        let completed = completed.lock().unwrap();
+        assert!(sent.lock().is_empty(), "nothing reached a session");
+        let completed = completed.lock();
         assert_eq!(completed.len(), 2);
         assert_eq!(completed[0].0, 8);
         assert_eq!(

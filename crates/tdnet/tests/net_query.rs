@@ -8,8 +8,9 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use tdnet::net_query::{
-    AuthFlag, CANCELED_ERROR_CODE, DcId, GzipFlag, NetActor, NetQuery, NetQueryCallback,
-    NetQueryDispatcher, NetQueryType, RESEND_ERROR_CODE, ResendFn, SessionSink, TdSink,
+    AuthFlag, CANCELED_ERROR_CODE, DcId, DcInitSink, GzipFlag, NetActor, NetQuery,
+    NetQueryCallback, NetQueryDispatcher, NetQueryType, RESEND_ERROR_CODE, ResendFn, SessionSink,
+    TdSink,
 };
 use tdutils::status::Status;
 
@@ -75,12 +76,26 @@ fn make_query(dc_id: DcId) -> NetQuery {
     )
 }
 
+/// The DC-init stand-in: refuses every init, so an un-inited DC keeps the
+/// dispatcher's "No such dc" gate without materializing sessions.
+#[derive(Default)]
+struct RecordingDcInit;
+
+impl DcInitSink for RecordingDcInit {
+    fn init_dc(&mut self, _dc_id: DcId) -> bool {
+        false
+    }
+
+    fn update_main_dc(&mut self, _new_main_dc_id: i32) {}
+}
+
 fn make_dispatcher() -> (Arc<RecordingSession>, Arc<RecordingTd>, NetQueryDispatcher) {
     let session = Arc::new(RecordingSession::default());
     let td = Arc::new(RecordingTd::default());
     let dispatcher = NetQueryDispatcher::new(
         Box::new(SessionHandle(session.clone())),
         Box::new(TdHandle(td.clone())),
+        Box::new(RecordingDcInit),
     );
     (session, td, dispatcher)
 }

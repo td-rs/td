@@ -63,11 +63,6 @@ pub(crate) fn reconstruct_config_query(token: u64, net_query: &NetQuery) -> Opti
     })
 }
 
-/// `Global::request_aborted_error()` (Global.h:701-703).
-pub(crate) fn request_aborted_error() -> Status {
-    Status::error(500, "Request aborted")
-}
-
 /// `boolTrue#997275b5` / `boolFalse#bc799737` (telegram_api.tl:11-12) —
 /// the scheme-builtin `Bool` is not generated as a type; the two boxed
 /// wire constructors are all `fetch_result` of a `Bool`-returning function
@@ -483,7 +478,7 @@ mod tests {
         // request_aborted_error, NetQueryDispatcher.cpp:49-55) propagates
         // verbatim through the decode.
         let query = ConfigQuery::GetAppConfig { hash: 5 };
-        let mut net_query = failed(42, &query, request_aborted_error());
+        let mut net_query = failed(42, &query, tdnet::net_query::request_aborted_error());
         assert_eq!(net_query.id(), 42);
         let ConfigQueryResult::GetAppConfig(Err(error)) =
             decode_config_query_result(&query, &mut net_query)
