@@ -7562,13 +7562,18 @@ fn decode_html_entity(bytes: &[u8], pos: &mut usize) -> u32 {
             // hexadecimal numeric character reference
             end_pos += 1;
             while is_hex_digit(at(end_pos)) {
-                res = res * 16 + hex_to_int(at(end_pos));
+                // The C++ accumulates into a uint32; the value only matters
+                // when the span check below accepts it, but the multiplication
+                // must not panic in debug builds on the rejected long forms.
+                res = res.wrapping_mul(16).wrapping_add(hex_to_int(at(end_pos)));
                 end_pos += 1;
             }
         } else {
             // decimal numeric character reference
             while is_digit(at(end_pos)) {
-                res = res * 10 + u32::from(at(end_pos) - b'0');
+                res = res
+                    .wrapping_mul(10)
+                    .wrapping_add(u32::from(at(end_pos) - b'0'));
                 end_pos += 1;
             }
         }
@@ -7797,8 +7802,14 @@ pub fn parse_html(str: &mut String) -> Result<Vec<MessageEntity>, Status> {
                     if at(i) == end_character {
                         i += 1;
                     }
-                    attribute_value = String::from_utf8(decoded)
-                        .map_err(|_| Status::error(400, "Invalid UTF-8 in an attribute value"))?;
+                    // The C++ keeps the decoded bytes in a std::string, where
+                    // surrogate halves encoded by numeric entities stay as
+                    // raw bytes; Rust strings cannot hold those, so they are
+                    // replaced here. Every consumer either byte-compares
+                    // against ASCII (span/blockquote), parses leading digits
+                    // (tg-time unix) or rejects non-ASCII wholesale (links),
+                    // so the C++ outcome is preserved.
+                    attribute_value = String::from_utf8_lossy(&decoded).into_owned();
                 }
                 if at(i) == 0 {
                     return Err(Status::error(
@@ -7952,8 +7963,12 @@ pub fn parse_html(str: &mut String) -> Result<Vec<MessageEntity>, Status> {
                 } else if tag_name == "a" {
                     let mut url = std::mem::take(&mut nested_entities.last_mut().unwrap().argument);
                     if url.is_empty() {
-                        url = String::from_utf8(result[back_entity_begin_pos..].to_vec())
-                            .expect("the accumulated output is valid UTF-8");
+                        // Surrogate halves from decoded entities become
+                        // U+FFFD; the C++ passes the raw bytes to the link
+                        // checkers, which reject non-ASCII either way, and
+                        // the final check_utf8 still fails on surrogates.
+                        url =
+                            String::from_utf8_lossy(&result[back_entity_begin_pos..]).into_owned();
                     }
                     let user_id = crate::link_manager::get_link_user_id(&url);
                     if user_id.is_valid() {
@@ -8048,13 +8063,16 @@ pub fn parse_html(str: &mut String) -> Result<Vec<MessageEntity>, Status> {
 
     sort_entities(&mut entities);
 
-    *str = String::from_utf8(result).expect("the compaction keeps whole characters");
-    if need_recheck_utf8 && !tdutils::utf8::check_utf8(str.as_bytes()) {
+    // The C++ checks the resized std::string, which can hold surrogate
+    // halves; Rust strings cannot, so the check runs on the byte buffer
+    // before the conversion.
+    if need_recheck_utf8 && !tdutils::utf8::check_utf8(&result) {
         return Err(Status::error(
             400,
             "Text contains invalid Unicode characters after decoding HTML entities, check for unmatched surrogate code units",
         ));
     }
+    *str = String::from_utf8(result).expect("the compaction keeps whole characters");
     Ok(entities)
 }
 
@@ -10177,6 +10195,253 @@ mod tests {
             let reparsed = parse_markdown_v3(markdown);
             assert_eq!(reparsed, parsed, "round-trip fixed point for {text:?}");
         }
+    }
+
+    // ===== M.8.9 — HTML parser (MessageEntity.cpp:3289-3578) =====
+
+    /// M.8.9 hand-traced vectors for `parse_html` on the direct function,
+    /// covering the tag aliases, the attribute subset, entity decoding,
+    /// pre/code merging, UTF-16 offsets and the 400 error paths. The
+    /// `td_execute` oracle corpus for the same dialect (including the
+    /// malformed-HTML fuzz seeds) is the last 612 entries of
+    /// `testdata/message_entity_cpp_golden.jsonl`.
+    #[test]
+    fn parse_html_golden_vectors() {
+        fn parse(text: &str) -> Result<(String, Vec<MessageEntity>), String> {
+            let mut text = text.to_owned();
+            let entities = parse_html(&mut text).map_err(|status| status.message().to_owned())?;
+            Ok((text, entities))
+        }
+        let entity =
+            |r#type: Type, offset: i32, length: i32| MessageEntity::new(r#type, offset, length);
+
+        // Text without tags (or with only unknown entities) is unchanged.
+        assert_eq!(parse(""), Ok(("".to_owned(), Vec::new())));
+        assert_eq!(parse("➡️ ➡️"), Ok(("➡️ ➡️".to_owned(), Vec::new())));
+        assert_eq!(
+            parse("&ge;&lt;&gt;&amp;&quot;&laquo;&raquo;&#12345678;"),
+            Ok(("&ge;<>&\"&laquo;&raquo;&#12345678;".to_owned(), Vec::new()))
+        );
+
+        // The four decoded entities and the numeric forms.
+        assert_eq!(
+            parse("&lt;&gt;&amp;&quot;&#65;&#x1F600;"),
+            Ok(("<>&\"A\u{1F600}".to_owned(), Vec::new()))
+        );
+        // An unterminated numeric entity overflows the C++ uint32
+        // accumulator and is rejected without panicking (regression: the
+        // accumulation uses wrapping arithmetic).
+        assert_eq!(
+            parse("&#99999999999999999999;"),
+            Ok(("&#99999999999999999999;".to_owned(), Vec::new()))
+        );
+
+        // Tag aliases map to the same types.
+        for (open, close) in [
+            ("<i>", "</i>"),
+            ("<em>", "</em>"),
+            ("<b>", "</b>"),
+            ("<strong>", "</strong>"),
+            ("<u>", "</u>"),
+            ("<ins>", "</ins>"),
+            ("<s>", "</s>"),
+            ("<strike>", "</strike>"),
+            ("<del>", "</del>"),
+        ] {
+            let (open, close) = (open.to_owned(), close.to_owned());
+            let r#type = match open.as_str() {
+                "<i>" | "<em>" => Type::Italic,
+                "<b>" | "<strong>" => Type::Bold,
+                "<u>" | "<ins>" => Type::Underline,
+                _ => Type::Strikethrough,
+            };
+            assert_eq!(
+                parse(&format!("{open}x{close}")),
+                Ok(("x".to_owned(), vec![entity(r#type, 0, 1)]))
+            );
+        }
+
+        // UTF-16 offsets: an emoji pair counts 2 code units per emoji.
+        assert_eq!(
+            parse("🏟 🏟<i>🏟 &lt🏟</i>"),
+            Ok(("🏟 🏟🏟 <🏟".to_owned(), vec![entity(Type::Italic, 5, 6)]))
+        );
+        assert_eq!(
+            parse("🏟 🏟&lt;<i    aba  =  190azAz-.>a</i>"),
+            Ok(("🏟 🏟<a".to_owned(), vec![entity(Type::Italic, 6, 1)]))
+        );
+
+        // Block quotes and the expandable flag (bare or with any value).
+        assert_eq!(
+            parse("<blockquote>x</blockquote>"),
+            Ok(("x".to_owned(), vec![entity(Type::BlockQuote, 0, 1)]))
+        );
+        assert_eq!(
+            parse("<blockquote expandable>x</blockquote>"),
+            Ok((
+                "x".to_owned(),
+                vec![entity(Type::ExpandableBlockQuote, 0, 1)]
+            ))
+        );
+        assert_eq!(
+            parse("<blockquote expandable=false>x</blockquote>"),
+            Ok((
+                "x".to_owned(),
+                vec![entity(Type::ExpandableBlockQuote, 0, 1)]
+            ))
+        );
+
+        // Spoilers: the span class attribute and the dedicated tag.
+        assert_eq!(
+            parse("<span class = \"tg-spoiler\">x</span>"),
+            Ok(("x".to_owned(), vec![entity(Type::Spoiler, 0, 1)]))
+        );
+        assert_eq!(
+            parse("<tg-spoiler>x</tg-spoiler>"),
+            Ok(("x".to_owned(), vec![entity(Type::Spoiler, 0, 1)]))
+        );
+
+        // pre/code and the PreCode merge in both nesting orders.
+        assert_eq!(
+            parse("<pre>x</pre>"),
+            Ok(("x".to_owned(), vec![entity(Type::Pre, 0, 1)]))
+        );
+        assert_eq!(
+            parse("<code>x</code>"),
+            Ok(("x".to_owned(), vec![entity(Type::Code, 0, 1)]))
+        );
+        assert_eq!(
+            parse("<pre><code>x</code></pre>"),
+            Ok((
+                "x".to_owned(),
+                vec![entity(Type::Pre, 0, 1), entity(Type::Code, 0, 1)]
+            ))
+        );
+        let pre_code = |offset, length, language: &str| {
+            MessageEntity::with_argument(Type::PreCode, offset, length, language.to_owned())
+        };
+        assert_eq!(
+            parse("<pre><code class=\"language-fift\">x</code></pre>"),
+            Ok(("x".to_owned(), vec![pre_code(0, 1, "fift")]))
+        );
+        assert_eq!(
+            parse("<code class=\"language-fift\"><pre>x</pre></code>"),
+            Ok(("x".to_owned(), vec![pre_code(0, 1, "fift")]))
+        );
+
+        // Links: the href argument (fixed up by the link manager), the URL
+        // taken from the link text, and rejected hrefs producing no entity.
+        let text_url = |offset, length, url: &str| {
+            MessageEntity::with_argument(Type::TextUrl, offset, length, url.to_owned())
+        };
+        assert_eq!(
+            parse("<a href=telegram.org> </a>"),
+            Ok((" ".to_owned(), vec![text_url(0, 1, "http://telegram.org/")]))
+        );
+        assert_eq!(
+            parse("<a>telegram.org</a>"),
+            Ok((
+                "telegram.org".to_owned(),
+                vec![text_url(0, 12, "http://telegram.org/")]
+            ))
+        );
+        assert_eq!(parse("<a> </a>"), Ok((" ".to_owned(), Vec::new())));
+        assert_eq!(
+            parse("<a href=\"javascript:alert(1)\">x</a>"),
+            Ok(("x".to_owned(), Vec::new()))
+        );
+
+        // Custom emoji and formatted date tags.
+        assert_eq!(
+            parse("<tg-emoji emoji-id = \"12345\">x</tg-emoji>"),
+            Ok((
+                "x".to_owned(),
+                vec![MessageEntity::custom_emoji(0, 1, CustomEmojiId::new(12345))]
+            ))
+        );
+        assert_eq!(
+            parse("<tg-time unix = \"12345\", format = \"r\">x</tg-time>"),
+            Ok((
+                "x".to_owned(),
+                vec![MessageEntity::formatted_date(
+                    0,
+                    1,
+                    FormattedDate::from_raw(12345, 1)
+                )]
+            ))
+        );
+        // A tg-time without a format attribute still emits the entity; the
+        // td_api layer cannot represent its null formatting type (the C++
+        // passes nullptr there), which is why the corpus avoids the
+        // serialization of this exact shape.
+        let empty_format =
+            parse("<tg-time unix=\"5\">x</tg-time>").expect("a tg-time without a format attribute");
+        assert_eq!(empty_format.0, "x");
+        assert_eq!(empty_format.1.len(), 1);
+        assert_eq!(empty_format.1[0].r#type, Some(Type::FormattedDate));
+        assert_eq!(empty_format.1[0].date.get_date(), 5);
+        assert!(
+            empty_format.1[0]
+                .date
+                .get_date_time_formatting_type_object()
+                .is_none()
+        );
+
+        // Zero-length entities are dropped but the tags are consumed.
+        assert_eq!(parse("<b></b>"), Ok(("".to_owned(), Vec::new())));
+        // Empty end tags close the innermost entity.
+        assert_eq!(
+            parse("🏟 🏟&lt;<i>🏟 🏟&lt;</>"),
+            Ok(("🏟 🏟<🏟 🏟<".to_owned(), vec![entity(Type::Italic, 6, 6)]))
+        );
+        // CR/LF/TAB survive inside entities (no clean_input_string here).
+        assert_eq!(
+            parse("<i>\r</i>"),
+            Ok(("\r".to_owned(), vec![entity(Type::Italic, 0, 1)]))
+        );
+
+        // The 400 error paths with the exact C++ messages.
+        assert_eq!(
+            parse("<"),
+            Err("Unclosed start tag at byte offset 0".to_owned())
+        );
+        assert_eq!(
+            parse("</"),
+            Err("Unexpected end tag at byte offset 0".to_owned())
+        );
+        assert_eq!(
+            parse("<div>x</div>"),
+            Err("Unsupported start tag \"div\" at byte offset 0".to_owned())
+        );
+        assert_eq!(
+            parse("<b>x</i>"),
+            Err("Unmatched end tag at byte offset 4, expected \"</b>\", found \"</i>\"".to_owned())
+        );
+        assert_eq!(
+            parse("<b>x"),
+            Err("Can't find end tag corresponding to start tag \"b\"".to_owned())
+        );
+        assert_eq!(
+            parse("<span>x</span>"),
+            Err("Tag \"span\" must have class \"tg-spoiler\" at byte offset 0".to_owned())
+        );
+        assert_eq!(
+            parse("<tg-emoji>x</tg-emoji>"),
+            Err("Invalid custom emoji identifier specified".to_owned())
+        );
+        assert_eq!(
+            parse("<tg-time unix=\"5\" format=\"z\">x</tg-time>"),
+            Err("Invalid date format used".to_owned())
+        );
+        assert_eq!(
+            parse("<i    =aba>"),
+            Err("Empty attribute name in the tag \"i\" at byte offset 0".to_owned())
+        );
+        // Decoded surrogate halves fail the final UTF-8 recheck.
+        assert_eq!(
+            parse("&#xDFDF;"),
+            Err("Text contains invalid Unicode characters after decoding HTML entities, check for unmatched surrogate code units".to_owned())
+        );
     }
 
     // ===== M.8.2 — input converters + fix_entities =====
