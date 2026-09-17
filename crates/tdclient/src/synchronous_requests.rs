@@ -1,18 +1,22 @@
 //! Port of `td/telegram/SynchronousRequests.{h,cpp}` + the td_api half of
 //! `td/telegram/JsonValue.cpp` (S68): the `td_execute` offline request set.
 //!
-//! The log- and JSON-related functions are complete here. The text-parse,
-//! language-pack, phone-number and push-id functions are listed in the C++
-//! switch but land with their managers (Wave 1/3); until then they report
+//! The log- and JSON-related functions are complete here, and the M.8
+//! MessageEntity slice flips the five text-parse functions
+//! (`getTextEntities`, `parseTextEntities`, `parseMarkdown`,
+//! `getMarkdownText` — the C++ `parseHtml` is the `parseTextEntities`
+//! HTML parse mode). The language-pack, phone-number and push-id functions
+//! still land with their managers (Wave 1/3); until then they report
 //! "The method can't be executed synchronously", like any other request.
 
 use std::sync::Mutex;
 
+use crate::message_entity;
 use crate::option_manager;
 use crate::td_api;
 use crate::td_api::{Function, JsonValue as TdJsonValue, Object};
 use tdutils::json::{JsonValue, json_decode};
-use tdutils::status::Result;
+use tdutils::status::{Result, Status};
 
 /// `SynchronousRequests::make_error`.
 pub fn make_error(code: i32, message: &str) -> Object {
@@ -69,7 +73,11 @@ fn tag_verbosity() -> &'static Mutex<Vec<i32>> {
 pub fn is_synchronous_request(function: &Function) -> bool {
     matches!(
         function,
-        Function::getJsonValue(_)
+        Function::getTextEntities(_)
+            | Function::parseTextEntities(_)
+            | Function::parseMarkdown(_)
+            | Function::getMarkdownText(_)
+            | Function::getJsonValue(_)
             | Function::getJsonString(_)
             | Function::setLogStream(_)
             | Function::getLogStream(_)
@@ -81,8 +89,7 @@ pub fn is_synchronous_request(function: &Function) -> bool {
             | Function::addLogMessage(_)
             | Function::testReturnError(_)
     ) || matches!(function, Function::getOption(g) if option_manager::is_synchronous_option(&g.name))
-    // Not ported yet (need their managers): searchQuote, getTextEntities,
-    // parseTextEntities, parseMarkdown, getMarkdownText, searchStringsByPrefix,
+    // Not ported yet (need their managers): searchQuote, searchStringsByPrefix,
     // checkQuickReplyShortcutName, getCountryFlagEmoji, getFileMimeType,
     // getFileExtension, cleanFileName, getLanguagePackString,
     // getPhoneNumberInfoSync, getChatFolderDefaultIconName,
@@ -220,8 +227,222 @@ pub fn run_request(function: Function) -> Object {
             Object::ok(td_api::Ok)
         }
         Function::testReturnError(request) => Object::error(request.error),
+        Function::getTextEntities(request) => {
+            if !tdutils::utf8::check_utf8(request.text.as_bytes()) {
+                return make_error(400, "Text must be encoded in UTF-8");
+            }
+            let text_entities = message_entity::find_entities(&request.text, false, false);
+            Object::textEntities(td_api::TextEntities {
+                entities: message_entity::get_text_entities_object::<()>(
+                    None,
+                    &text_entities,
+                    false,
+                    i32::MAX,
+                ),
+            })
+        }
+        Function::parseTextEntities(request) => {
+            // must not use clean_input_string, because \r may be used as a separator
+            if !tdutils::utf8::check_utf8(request.text.as_bytes()) {
+                return make_error(400, "Text must be encoded in UTF-8");
+            }
+
+            let parse_mode_version = match &request.parse_mode {
+                td_api::TextParseMode::textParseModeHTML(_) => None,
+                td_api::TextParseMode::textParseModeMarkdown(markdown) => Some(markdown.version),
+            };
+            let mut text = request.text;
+            let r_entities: std::result::Result<Vec<message_entity::MessageEntity>, Status> = {
+                if tdutils::utf8::utf8_length(&text) > 65536 {
+                    Err(Status::error_message("Text is too long"))
+                } else {
+                    match parse_mode_version {
+                        None => message_entity::parse_html(&mut text),
+                        Some(version) if version == 0 || version == 1 => {
+                            message_entity::parse_markdown(&mut text)
+                        }
+                        Some(2) => message_entity::parse_markdown_v2(&mut text),
+                        Some(_) => Err(Status::error_message("Wrong Markdown version specified")),
+                    }
+                }
+            };
+            let entities = match r_entities {
+                std::result::Result::Ok(entities) => entities,
+                std::result::Result::Err(status) => {
+                    return make_error(400, &format!("Can't parse entities: {}", status.message()));
+                }
+            };
+
+            Object::formattedText(td_api::FormattedText {
+                text,
+                entities: message_entity::get_text_entities_object::<()>(
+                    None, &entities, false, -1,
+                ),
+            })
+        }
+        Function::parseMarkdown(request) => {
+            let mut text = request.text.text;
+            let entities =
+                match message_entity::get_message_entities::<()>(None, request.text.entities, true)
+                {
+                    std::result::Result::Ok(entities) => entities,
+                    std::result::Result::Err(status) => return make_error(400, status.message()),
+                };
+            let mut entities = entities;
+            let status = message_entity::fix_formatted_text(
+                &mut text,
+                &mut entities,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                None,
+            );
+            if let std::result::Result::Err(status) = status {
+                return make_error(400, status.message());
+            }
+
+            let mut parsed_text =
+                message_entity::parse_markdown_v3(message_entity::FormattedText { text, entities });
+            message_entity::fix_formatted_text(
+                &mut parsed_text.text,
+                &mut parsed_text.entities,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                None,
+            )
+            .expect("the C++ .ensure()");
+            Object::formattedText(message_entity::get_formatted_text_object::<()>(
+                None,
+                &parsed_text,
+                false,
+                i32::MAX,
+            ))
+        }
+        Function::getMarkdownText(request) => {
+            let mut text = request.text.text;
+            let entities = match message_entity::get_message_entities::<()>(
+                None,
+                request.text.entities,
+                false,
+            ) {
+                std::result::Result::Ok(entities) => entities,
+                std::result::Result::Err(status) => return make_error(400, status.message()),
+            };
+            let mut entities = entities;
+            let status = message_entity::fix_formatted_text(
+                &mut text,
+                &mut entities,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                None,
+            );
+            if let std::result::Result::Err(status) = status {
+                return make_error(400, status.message());
+            }
+
+            let markdown_text =
+                message_entity::get_markdown_v3(message_entity::FormattedText { text, entities });
+            Object::formattedText(message_entity::get_formatted_text_object::<()>(
+                None,
+                &markdown_text,
+                false,
+                i32::MAX,
+            ))
+        }
         _ => make_error(400, "The method can't be executed synchronously"),
     }
+}
+
+/// The flattened-model null bridge. The generated td_api model (S09)
+/// decodes a null or absent object field to its default variant, while the
+/// C++ keeps `object_ptr` nulls and checks them in
+/// `SynchronousRequests::do_request`. The checks that change the observable
+/// output cannot be expressed in `run_request` (the nullness is already
+/// lost), so `client_json.rs::to_request` applies them at the JSON
+/// boundary, where every request passes. The returned `testReturnError`
+/// serializes to the same `td_api::error` the C++ `make_error` response
+/// does, keeping the output byte-identical (including the `@extra` splice).
+///
+/// `SynchronousRequests.cpp:188/215`: `parseMarkdown`/`getMarkdownText`
+/// require a non-null `text`; `SynchronousRequests.cpp:153`:
+/// `parseTextEntities` requires a non-null `parse_mode`.
+pub fn null_pointer_request_error(request: &JsonValue) -> Option<Function> {
+    let JsonValue::Object(object) = request else {
+        return None;
+    };
+    let type_name = match object.get_field("@type") {
+        Some(JsonValue::String(name)) => name.as_str(),
+        _ => return None,
+    };
+    let null_or_absent =
+        |field: &str| matches!(object.get_field(field), None | Some(JsonValue::Null));
+    let error = |message: &str| {
+        Some(Function::testReturnError(td_api::testReturnError {
+            error: td_api::Error {
+                code: 400,
+                message: message.to_string(),
+            },
+        }))
+    };
+    match type_name {
+        "parseMarkdown" | "getMarkdownText" if null_or_absent("text") => {
+            error("Text must be non-empty")
+        }
+        "parseTextEntities" if null_or_absent("parse_mode") => {
+            error("Parse mode must be non-empty")
+        }
+        _ => None,
+    }
+}
+
+/// `MessageEntity.cpp:3673` (`get_message_entities`): input entities with a
+/// null `type_` are skipped — a null element, or an element whose `type`
+/// field is absent or null. The flattened model decodes them to a default
+/// `textEntityTypeMention` and keeps them, so the skip is applied to the
+/// raw JSON at the boundary instead; the C++ decodes faithfully and drops
+/// them one step later, and the observable output is identical.
+/// Wrong-shaped elements (numbers, strings, objects with a non-null but
+/// invalid `type`) are left untouched so the decoder still reports the
+/// C++'s 400 messages. Only the two flipped functions taking input
+/// entities are covered — `searchQuote` stays in the deferred set, and
+/// M.9/M.10 consumers extend this when they wire their
+/// `get_message_entities` inputs.
+pub fn drop_null_typed_entities(request: &mut JsonValue) {
+    let JsonValue::Object(object) = request else {
+        return;
+    };
+    let type_name = match object.get_field("@type") {
+        Some(JsonValue::String(name)) => name.as_str(),
+        _ => return,
+    };
+    if type_name != "parseMarkdown" && type_name != "getMarkdownText" {
+        return;
+    }
+    let Some(JsonValue::Object(text)) = object.get_mut_field("text") else {
+        return;
+    };
+    let Some(JsonValue::Array(entities)) = text.get_mut_field("entities") else {
+        return;
+    };
+    entities.retain(|entity| match entity {
+        JsonValue::Null => false,
+        JsonValue::Object(entity_object) => !matches!(
+            entity_object.get_field("type"),
+            None | Some(JsonValue::Null)
+        ),
+        _ => true,
+    });
 }
 
 /// `Logging::set_current_stream` (the tdutils halves: `set_file_path` for
@@ -331,6 +552,87 @@ mod tests {
             response.to_json(),
             r#"{"@type":"optionValueString","value":"1.8.67"}"#
         );
+    }
+
+    /// The M.8 differential gate: the recorded C++ `td_execute` outputs
+    /// (tdlib at the pinned upstream commit d1085f9ce, the local
+    /// TD_BUILD/libtdjson.so 1.8.67 build) replayed through the ported
+    /// `td_execute` path must produce byte-identical JSON. The corpus
+    /// covers URL/mention/hashtag/cashtag/bank-card/timestamp matchers,
+    /// Markdown v1/v2/v3 and HTML parsing, and their error paths.
+    ///
+    /// The M.8.6 Markdown v1 battery hand-corrects the six bare-bracket
+    /// `[url]` entries: `fd53a8160` ("Replace text in-place in
+    /// parse_markdown") made the v1 parser compact `text` in place, and the
+    /// bare-bracket branch `url.assign(text, begin_pos + 1,
+    /// i - begin_pos - 1)` (MessageEntity.cpp:2005-2007) then reads bytes
+    /// the compaction already overwrote — a read-after-overwrite bug in the
+    /// pinned C++ itself (probe: "[t.me]" yields the `TextUrl`
+    /// `"http://.mee/"` from "t.me"). Every version before that refactor —
+    /// and the Rust port — reads the pristine bracket content, so those six
+    /// entries hold the source-true answers instead of the mangled ones.
+    ///
+    /// The M.8.7 Markdown v2 battery is the next 76 entries (nested
+    /// entities, escapes, pre/code narrowing, blockquotes and expandable
+    /// blockquotes, tg://user/tg://emoji/tg://time links, CRLF handling,
+    /// UTF-16 offsets and the 400 error paths). The M.8.8 Markdown v3
+    /// battery is the next 97 entries: parseMarkdown with and without
+    /// pre-existing entities, getMarkdownText over every entity type the
+    /// v3 formatter handles plus the kept-entity and return-original
+    /// paths, the 400 error paths and parse→format→parse round-trip
+    /// pairs. The M.8.9 HTML battery is the last 612 entries:
+    /// parseTextEntities in textParseModeHTML mode over the C++ unit-test
+    /// battery (every tag alias, the attribute subset, entity decoding,
+    /// pre/code merging, tg-emoji/tg-time/blockquote forms, UTF-16
+    /// offsets and the 400 error paths), a malformed-HTML fuzz seed set
+    /// (truncated tags, stray brackets, numeric-entity overflow, attribute
+    /// edge cases, case folding) and byte-prefix truncations of six
+    /// representative inputs. The M.8.10 battery is the last 42 entries:
+    /// the flipped functions' null-field edge cases (null/absent `text`
+    /// and `parse_mode` 400s, null-typed input entities skipped like
+    /// `get_message_entities` does, wrong-typed fields, unknown and
+    /// numeric `@type`s, the `@extra` splice through the null bridge),
+    /// entity-heavy `getTextEntities` kitchen-sink texts and
+    /// parseMarkdown/getMarkdownText round-trips. Corpus responses store
+    /// the oracle output
+    /// decoded: tdlib's
+    /// JSON layer escapes non-ASCII as \uXXXX (astral chars as surrogate
+    /// pairs) while the Rust layer emits raw UTF-8, so non-ASCII was
+    /// normalized to characters at recording time (control-char escapes
+    /// stay, matching both layers).
+    #[test]
+    fn message_entity_requests_match_the_cpp_oracle() {
+        use tdutils::json::{JsonValue, json_decode};
+
+        let golden = include_str!("testdata/message_entity_cpp_golden.jsonl");
+        let mut checked = 0usize;
+        for line in golden.lines() {
+            let record = match json_decode(line) {
+                Result::Ok(value) => value,
+                Result::Err(status) => panic!("bad golden line: {}", status.message()),
+            };
+            let JsonValue::Object(record_object) = &record else {
+                panic!("the golden line is not an object")
+            };
+            let JsonValue::String(request) =
+                record_object.get_field("request").expect("request field")
+            else {
+                panic!("the golden request is not a string")
+            };
+            let JsonValue::String(expected_response) =
+                record_object.get_field("response").expect("response field")
+            else {
+                panic!("the golden response is not a string")
+            };
+            let actual = crate::client_json::execute(request);
+            assert_eq!(
+                actual, *expected_response,
+                "diverged on request: {request}\n  expected: {}\n  actual: {}",
+                *expected_response, actual
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 1164, "the corpus shrank");
     }
 
     #[test]

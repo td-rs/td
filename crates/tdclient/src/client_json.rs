@@ -58,6 +58,18 @@ pub fn to_request(request: &str) -> (Function, String) {
         _ => unreachable!(),
     };
 
+    // The flattened-model null bridge (see synchronous_requests.rs): the
+    // C++ keeps null object fields as null pointers and checks them in
+    // `SynchronousRequests::do_request` / `get_message_entities`; the
+    // generated model decodes them to default values, so the checks that
+    // change the observable output are applied to the raw JSON here.
+    crate::synchronous_requests::drop_null_typed_entities(&mut json_value);
+    if let Some(error_function) =
+        crate::synchronous_requests::null_pointer_request_error(&json_value)
+    {
+        return (error_function, extra);
+    }
+
     // The generated parser takes the re-serialized object (the C++ moves
     // the tdutils value into `from_json`; the equivalent here is one
     // encode/parse round).
