@@ -787,7 +787,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             }
             let mut promise = td.deferred_promise(id, |()| ok_object());
             td.user_manager
-                .check_is_saved_music(FileId::new(request.file_id), &mut promise);
+                .check_is_saved_music(FileId::new(request.file_id, 0), &mut promise);
         }
         Function::setProfileAudioPosition(request) => {
             // Requests.cpp:7149-7155: validation is local; the promise
@@ -797,8 +797,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise = td.deferred_promise(id, |()| ok_object());
             td.user_manager.add_saved_music(
-                FileId::new(request.file_id),
-                FileId::new(request.after_file_id),
+                FileId::new(request.file_id, 0),
+                FileId::new(request.after_file_id, 0),
                 promise,
             );
         }
@@ -809,7 +809,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise = td.deferred_promise(id, |()| ok_object());
             td.user_manager
-                .remove_saved_music(FileId::new(request.file_id), promise);
+                .remove_saved_music(FileId::new(request.file_id, 0), promise);
         }
         Function::canSendMessageToUser(request) => {
             // Requests.cpp:5772-5776: the local matrix answers; the

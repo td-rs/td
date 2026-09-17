@@ -545,11 +545,16 @@ fn init_story_db(db: &SqliteDb, version: &mut i32) -> Status {
     Status::ok()
 }
 
-/// `init_file_db`
+/// `init_file_db` (files/FileDb.cpp:40-57)
 fn init_file_db(db: &SqliteDb, version: &mut i32) -> Status {
     let has_table = db.has_table("files").unwrap();
     let mut version_local = *version;
-    if !has_table || version_local < db_version::FIX_FILE_REMOTE_LOCATION_KEY_BUG {
+    if !has_table {
+        version_local = 0;
+    } else if version_local < db_version::FIX_FILE_REMOTE_LOCATION_KEY_BUG {
+        // `drop_file_db` (FileDb.cpp:34-38): a pre-fix database is
+        // dropped instead of migrated.
+        try_status!(SqliteKeyValue::drop_table(db, "files"));
         version_local = 0;
     }
     if version_local == 0 {
@@ -776,6 +781,16 @@ impl TdDb {
         self.common_kv
             .as_mut()
             .expect("the common kv was just initialized")
+    }
+
+    /// `TdDb::file_db_`'s key-value handle — the "files" table behind the
+    /// C++ `SqliteKeyValueSafe` (created by `init_file_db` at open). The
+    /// FileDb access layer of the Files step (tdclient) wraps this; the
+    /// C++ actor marshaling collapses into the single scheduler thread.
+    pub fn files_kv(&mut self) -> &mut SqliteKeyValue {
+        self.files_kv
+            .as_mut()
+            .expect("TdDb is not initialized: the files key-value is missing")
     }
 
     /// `TdDb::get_binlog` — the raw log-event surface (`binlog_add` /

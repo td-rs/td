@@ -309,47 +309,17 @@ impl SecretChatId {
     }
 }
 
-/// `td::FileId` — the file-manager handle. The store/parse of files lands
-/// with the Files step; the id is threaded through the photo structures
-/// so the shapes are already in place.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FileId(i32);
-
-impl FileId {
-    pub fn new(id: i32) -> FileId {
-        FileId(id)
-    }
-
-    pub fn is_valid(self) -> bool {
-        self.0 > 0
-    }
-
-    pub fn get(self) -> i32 {
-        self.0
-    }
-}
-
-/// `td::FileSourceId` (files/FileSourceId.h) — an opaque id the
-/// FileReferenceManager allocates. The manager is a Files-step piece, so
-/// the ids this module allocates come from a local stand-in counter and
+/// `td::FileId` (files/FileId.h) — re-exported from the Files step
+/// (M.12.1), which landed the real two-component handle (id + remote id,
+/// compared by id alone). The photo structures' serialization still
+/// writes no file ids: the C++ `FileId` store is FileManager-mediated
+/// (`FileManager::store_file`), so that gate lifts with M.12.2.
+///
+/// `td::FileSourceId` (files/FileSourceId.h) — re-exported too; the ids
+/// this module allocates still come from the local stand-in counter and
 /// never leave the manager boundary (the values only key the two
-/// file-source maps below).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FileSourceId(i32);
-
-impl FileSourceId {
-    pub fn new(id: i32) -> FileSourceId {
-        FileSourceId(id)
-    }
-
-    pub fn is_valid(self) -> bool {
-        self.0 > 0
-    }
-
-    pub fn get(self) -> i32 {
-        self.0
-    }
-}
+/// file-source maps below) until the FileReferenceManager lands.
+pub use crate::files::{FileId, FileSourceId};
 
 /// `td::StoryId` (StoryId.h).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -427,8 +397,8 @@ impl ProfilePhoto {
             ],
         );
         if has_file_ids {
-            store_i32(out, self.small_file_id.0);
-            store_i32(out, self.big_file_id.0);
+            store_i32(out, self.small_file_id.get());
+            store_i32(out, self.big_file_id.get());
         }
         if has_minithumbnail {
             store_string(out, &self.minithumbnail);
@@ -7992,7 +7962,7 @@ impl UserManager {
         if !is_audio {
             return None;
         }
-        let file_id = FileId::new(self.next_saved_music_file_id + 1);
+        let file_id = FileId::new(self.next_saved_music_file_id + 1, 0);
         self.next_saved_music_file_id += 1;
         self.saved_music_file_locations
             .insert(file_id.get(), (document.id, document.access_hash));
@@ -14444,7 +14414,7 @@ mod tests {
             .parse_saved_music_document(audio_document(106, 15))
             .unwrap();
         let (mut pa3, _aa3) = recording_promise::<()>();
-        um.on_add_saved_music(&mut temp.env(false), stray, FileId::new(9999), &mut pa3);
+        um.on_add_saved_music(&mut temp.env(false), stray, FileId::new(9999, 0), &mut pa3);
         let cache = um.user_saved_music.get(&77).unwrap();
         assert_eq!(cache.count, -1, "missing anchor drops the cache");
         assert_eq!(cache.offset, -1);
@@ -14469,7 +14439,7 @@ mod tests {
             [Err("Invalid file identifier specified".to_owned())]
         );
         let (p2, a2) = recording_promise::<()>();
-        um.add_saved_music(FileId::new(999), FileId::default(), p2);
+        um.add_saved_music(FileId::new(999, 0), FileId::default(), p2);
         assert_eq!(
             a2.lock().unwrap().as_slice(),
             [Err("Unknown file identifier specified".to_owned())]

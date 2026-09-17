@@ -23,6 +23,7 @@ pub mod dialog_db;
 pub mod dialog_id;
 pub mod dialog_manager;
 pub mod emoji_status;
+pub mod files;
 pub mod formatted_date;
 pub mod global;
 pub mod link_manager;
