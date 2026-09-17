@@ -426,12 +426,40 @@ pub fn is_allowed_username(username: &str) -> bool {
     true
 }
 
+/// `td::clean_username` (misc.cpp:52-56): remove all dots, ASCII-lowercase,
+/// trim the C whitespace set from both ends.
+pub fn clean_username(str: &str) -> String {
+    let without_dots: String = str.chars().filter(|&c| c != '.').collect();
+    let trimmed = without_dots.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r'));
+    trimmed.to_ascii_lowercase()
+}
+
+/// `td::get_valid_short_usernames` (MessageEntity.cpp:1347-1350) — the
+/// mention-usable usernames shorter than the 4-character minimum. The data
+/// table is standalone; the rest of MessageEntity arrives with M.8.
+pub fn get_valid_short_usernames() -> &'static [&'static str] {
+    &["gif", "nft", "pic", "ufc", "vid"]
+}
+
 #[cfg(test)]
 mod misc_helper_tests {
     use super::{
-        clean_name, is_allowed_username, is_valid_username, replace_with_spaces,
-        strip_empty_characters,
+        clean_name, clean_username, get_valid_short_usernames, is_allowed_username,
+        is_valid_username, replace_with_spaces, strip_empty_characters,
     };
+
+    #[test]
+    fn clean_username_strips_dots_lowercases_and_trims() {
+        // misc.cpp:52-56.
+        assert_eq!(clean_username("Ab.C..D"), "abcd");
+        assert_eq!(clean_username("  User\tname \n"), "user\tname");
+        assert_eq!(clean_username(""), "");
+    }
+
+    #[test]
+    fn valid_short_usernames_match_the_cpp_table() {
+        assert_eq!(get_valid_short_usernames(), &["gif", "nft", "pic", "ufc", "vid"]);
+    }
 
     #[test]
     fn clean_name_collapses_and_trims() {

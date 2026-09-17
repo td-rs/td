@@ -469,6 +469,26 @@ impl Global {
     pub fn binlog_pmc(&mut self) -> &mut BinlogKeyValue {
         self.td_db().binlog_pmc()
     }
+
+    /// `Global::is_expected_error` (Global.h:723-737) — errors that are
+    /// normal during a session: lost authorization, flood waits, a frozen
+    /// account, or anything arriving while the client is closing.
+    pub fn is_expected_error(&self, error: &tdutils::status::Status) -> bool {
+        assert!(error.is_error(), "is_expected_error needs an error status");
+        if error.code() == 401 {
+            // authorization is lost
+            return true;
+        }
+        if error.code() == 420 || error.code() == 429 {
+            // flood wait
+            return true;
+        }
+        if error.code() == 406 && error.message() == "FROZEN_METHOD_INVALID" {
+            // the account is frozen
+            return true;
+        }
+        self.close_flag()
+    }
 }
 
 /// `Global::to_unix_time` (Global.cpp:190-195) — the range-checked
