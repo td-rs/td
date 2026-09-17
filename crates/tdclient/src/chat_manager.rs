@@ -28,10 +28,10 @@ use crate::emoji_status::{CustomEmojiId, EmojiStatus};
 use crate::global::Global;
 use crate::misc::strip_empty_characters;
 use crate::peer_color::AccentColorId;
-use crate::photo::{DialogPhoto, Photo};
+use crate::photo::{DialogPhoto, Photo, get_chat_photo_object, photo_get_file_ids};
 use crate::restriction_reason::{
-    RestrictionReason, get_restriction_reasons_from_legacy, parse_restriction_reasons,
-    store_restriction_reasons,
+    RestrictionOptions, RestrictionReason, get_restriction_info_object,
+    get_restriction_reasons_from_legacy, parse_restriction_reasons, store_restriction_reasons,
 };
 use crate::store_parse::{
     Parser, store_f64, store_flags, store_i32, store_i64, store_string, store_u32, store_u64,
@@ -39,10 +39,12 @@ use crate::store_parse::{
 };
 use crate::td_api;
 use crate::user_manager::{
-    CommunityId, FileId, SecretChatId, StoryId, TimeCtx, UserEnv, UserId, UserManager,
+    AccessRights, CommunityId, FileId, SecretChatId, StoryId, TimeCtx, UserEnv, UserId, UserManager,
 };
 use crate::usernames::Usernames;
 use tdmtproto::telegram_api;
+use tdutils::promise::Promise;
+use tdutils::status::Status;
 
 /// `td::ChatId` (ChatId.h): `0 < id ≤ MAX_CHAT_ID`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -3208,6 +3210,26 @@ impl BotVerification {
         self.bot_user_id_.is_valid() && self.icon_.is_valid()
     }
 
+    /// `BotVerification::get_bot_verification_object`
+    /// (BotVerification.cpp:76-83). The description's entity search is the
+    /// MessageEntity step (M.8) — the text answers with no entities.
+    pub(crate) fn get_bot_verification_object(
+        &self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+    ) -> td_api::BotVerification {
+        let bot_user_id =
+            user_manager.get_user_id_object(env, self.bot_user_id_, "botVerification");
+        td_api::BotVerification {
+            bot_user_id,
+            icon_custom_emoji_id: self.icon_.get(),
+            custom_description: td_api::FormattedText {
+                text: self.description_.clone(),
+                entities: Vec::new(),
+            },
+        }
+    }
+
     /// `store` (BotVerification.hpp:17-23) — the (empty) flag block, then
     /// the bot user id, the icon and the description.
     pub fn store(&self, out: &mut Vec<u8>) {
@@ -4796,19 +4818,69 @@ fn parse_channel_log_event(
 pub struct ChatManager {
     chats: BTreeMap<i64, Chat>,
     /// the `grf<id>` plane — M.5.15.
-    #[allow(dead_code)]
     chats_full: BTreeMap<i64, ChatFull>,
     channels: BTreeMap<i64, Channel>,
     /// the `chf<id>` plane — M.5.16.
-    #[allow(dead_code)]
     channels_full: BTreeMap<i64, ChannelFull>,
     /// feed the unknown-basic-group/supergroup builders — M.5.36/M.5.37.
-    #[allow(dead_code)]
     unknown_chats: BTreeSet<i64>,
-    #[allow(dead_code)]
     unknown_channels: BTreeSet<i64>,
     loaded_from_database_chats: BTreeSet<i64>,
     loaded_from_database_channels: BTreeSet<i64>,
+    /// `min_channels_` (ChatManager.h:957) — the degraded channel records
+    /// (M.5.21 fills them; the id-object builders already consult them).
+    min_channels: BTreeMap<i64, MinChannel>,
+    /// `channel_emoji_status_timeout_` / `channel_unban_timeout_` /
+    /// `slow_mode_delay_timeout_` (ChatManager.h:994-996) — the member
+    /// MultiTimeouts as deadline maps keyed by the raw channel id, driven
+    /// by the Td tick (the M.4.7 pattern).
+    channel_emoji_status_timeouts: BTreeMap<i64, f64>,
+    channel_unban_timeouts: BTreeMap<i64, f64>,
+    slow_mode_delay_timeouts: BTreeMap<i64, f64>,
+    /// `Td::send_update` fan-out — queued and flushed by the Td actor like
+    /// the UserManager's `updateUser` queue.
+    pending_updates: Vec<td_api::Update>,
+    /// `invalidated_channels_full_` (ChatManager.h:961) — fulls invalidated
+    /// before they were ever loaded.
+    invalidated_channels_full: BTreeSet<i64>,
+    /// `unavailable_chat_fulls_` / `unavailable_channel_fulls_`
+    /// (ChatManager.h:976/:980) — fulls known to be absent from the
+    /// database (the one-shot load gate).
+    unavailable_chat_fulls: BTreeSet<i64>,
+    unavailable_channel_fulls: BTreeSet<i64>,
+    /// `chat_full_file_source_ids_` / `channel_full_file_source_ids_`
+    /// (ChatManager.h:955/:962) — file sources for fulls that were never
+    /// materialized in memory.
+    chat_full_file_source_ids: BTreeMap<i64, FileSourceId>,
+    channel_full_file_source_ids: BTreeMap<i64, FileSourceId>,
+    /// `channel_messages_` (ChatManager.h:987) — empty until
+    /// register/unregister_message_channels lands (M.5.43); the
+    /// input-channel builders consult it.
+    channel_messages: BTreeMap<i64, BTreeSet<i64>>,
+    /// `linked_channel_ids_` (ChatManager.h:989) — empty until
+    /// on_update_channel_full_linked_channel_id lands (M.5.26).
+    linked_channel_ids: BTreeMap<i64, i64>,
+    /// `dialogs_for_discussion_` (ChatManager.h:971) — in-memory only in
+    /// the C++ too (re-fetched from the server); fed by
+    /// [`ChatManager::update_dialogs_for_discussion`].
+    dialogs_for_discussion: Vec<DialogId>,
+    dialogs_for_discussion_inited: bool,
+    /// `created_public_channels_` / `created_public_channels_inited_`
+    /// (ChatManager.h:963-967), indexed by `PublicDialogType` — the pmc
+    /// keys `public_channels0/1/2` (ChatManager.cpp:4236-4245).
+    created_public_channels: [Vec<i64>; 3],
+    created_public_channels_inited: [bool; 3],
+    /// `inactive_channel_ids_` (ChatManager.h:977) — in-memory only.
+    inactive_channel_ids: Vec<i64>,
+    inactive_channel_ids_inited: bool,
+    /// `restricted_channel_ids_` (ChatManager.h:992) — the supergroups a
+    /// `get_current_state` refire touches when the ignored-restriction
+    /// reasons option changes.
+    restricted_channel_ids: BTreeSet<i64>,
+    /// The `FileReferenceManager::create_*_file_source` stand-in — a local
+    /// counter (the Files-step convention), replaced by the real registry
+    /// with the Files slice.
+    file_source_id_counter: i32,
 }
 
 impl ChatManager {
@@ -4822,6 +4894,26 @@ impl ChatManager {
             unknown_channels: BTreeSet::new(),
             loaded_from_database_chats: BTreeSet::new(),
             loaded_from_database_channels: BTreeSet::new(),
+            min_channels: BTreeMap::new(),
+            channel_emoji_status_timeouts: BTreeMap::new(),
+            channel_unban_timeouts: BTreeMap::new(),
+            slow_mode_delay_timeouts: BTreeMap::new(),
+            pending_updates: Vec::new(),
+            invalidated_channels_full: BTreeSet::new(),
+            unavailable_chat_fulls: BTreeSet::new(),
+            unavailable_channel_fulls: BTreeSet::new(),
+            chat_full_file_source_ids: BTreeMap::new(),
+            channel_full_file_source_ids: BTreeMap::new(),
+            channel_messages: BTreeMap::new(),
+            linked_channel_ids: BTreeMap::new(),
+            dialogs_for_discussion: Vec::new(),
+            dialogs_for_discussion_inited: false,
+            created_public_channels: [Vec::new(), Vec::new(), Vec::new()],
+            created_public_channels_inited: [false; 3],
+            inactive_channel_ids: Vec::new(),
+            inactive_channel_ids_inited: false,
+            restricted_channel_ids: BTreeSet::new(),
+            file_source_id_counter: 0,
         }
     }
 
@@ -4922,30 +5014,817 @@ impl ChatManager {
         value
     }
 
-    /// `ChatManager::update_chat` (ChatManager.cpp:5246) — the changed /
-    /// need-send / need-save diff machine lands with M.5.18; until then
-    /// every caller is a silent store.
-    fn update_chat(&mut self, env: &mut UserEnv, chat_id: ChatId, from_binlog: bool, force: bool) {
-        let _ = (env, chat_id, from_binlog, force);
+    /// `ChatManager::update_chat` (ChatManager.cpp:5246-5345). The
+    /// MessagesManager dialog fan-outs (`on_dialog_photo_updated`,
+    /// `on_dialog_title_updated`, `on_dialog_default_permissions_updated`,
+    /// `on_dialog_access_updated`, `on_dialog_has_protected_content_updated`,
+    /// `try_update_dialog_pos`, `drop_dialog_pending_join_requests`) are
+    /// the documented M.10 stubs; `update_dialogs_for_discussion` keeps
+    /// its C++ shape. The 1.0-second SleepActor hop around the
+    /// status-repair reload defers only the net query, so the interim
+    /// `reload_chat` call is direct.
+    fn update_chat(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        from_binlog: bool,
+        from_database: bool,
+    ) {
+        if self.get_chat(chat_id).is_some_and(|c| c.is_being_updated) {
+            tdutils::log_error!("Detected recursive update of {chat_id:?}");
+        }
+        if let Some(c) = self.get_chat_mut(chat_id) {
+            c.is_being_updated = true;
+        }
+
+        let mut need_update_chat_full = false;
+        let photo_changed = self.get_chat(chat_id).is_some_and(|c| c.is_photo_changed);
+        if photo_changed {
+            // td_->messages_manager_->on_dialog_photo_updated — the M.10 stub.
+            if let Some(c) = self.get_chat_mut(chat_id) {
+                c.is_photo_changed = false;
+            }
+            let chat_full_differs = match (self.get_chat_full(chat_id), self.get_chat(chat_id)) {
+                (Some(full), Some(c)) => !is_same_dialog_photo(&full.photo, &c.photo),
+                _ => false,
+            };
+            if chat_full_differs {
+                self.on_update_chat_full_photo(env, chat_id, Photo::default());
+                if self
+                    .get_chat_full(chat_id)
+                    .is_some_and(|f| f.is_update_chat_full_sent)
+                {
+                    need_update_chat_full = true;
+                }
+                let small_file_id_valid = self
+                    .get_chat(chat_id)
+                    .is_some_and(|c| c.photo.small_file_id.is_valid());
+                if small_file_id_valid {
+                    self.reload_chat_full(env, chat_id, Promise::default(), "update_chat");
+                }
+            }
+        }
+        let title_changed = self.get_chat(chat_id).is_some_and(|c| c.is_title_changed);
+        if title_changed {
+            // td_->messages_manager_->on_dialog_title_updated — the M.10 stub.
+            if let Some(c) = self.get_chat_mut(chat_id) {
+                c.is_title_changed = false;
+            }
+        }
+        let default_permissions_changed = self
+            .get_chat(chat_id)
+            .is_some_and(|c| c.is_default_permissions_changed);
+        if default_permissions_changed {
+            // td_->messages_manager_->on_dialog_default_permissions_updated
+            // — the M.10 stub.
+            if let Some(c) = self.get_chat_mut(chat_id) {
+                c.is_default_permissions_changed = false;
+            }
+        }
+        let is_active_changed = self
+            .get_chat(chat_id)
+            .is_some_and(|c| c.is_is_active_changed);
+        if is_active_changed {
+            let suitable = self
+                .get_chat(chat_id)
+                .is_some_and(Self::is_suitable_discussion_chat);
+            self.update_dialogs_for_discussion(DialogId::from_chat_id(chat_id), suitable);
+            if let Some(c) = self.get_chat_mut(chat_id) {
+                c.is_is_active_changed = false;
+            }
+            // td_->messages_manager_->on_dialog_access_updated — the M.10 stub.
+        }
+        let status_changed = self.get_chat(chat_id).is_some_and(|c| c.is_status_changed);
+        if status_changed {
+            // td_->messages_manager_->drop_dialog_pending_join_requests —
+            // the M.10 stub.
+            if !from_database {
+                // td_->messages_manager_->try_update_dialog_pos — the M.10
+                // stub. If the chat was already sent to the client, the C++
+                // reloads it a second later to repair its status; the
+                // SleepActor defers only the net query.
+                if self
+                    .get_chat(chat_id)
+                    .is_some_and(|c| c.is_update_basic_group_sent)
+                {
+                    self.reload_chat(env, chat_id, Promise::default(), "ReloadChatSleepActor");
+                }
+            }
+            // td_->messages_manager_->on_dialog_access_updated — the M.10 stub.
+            if let Some(c) = self.get_chat_mut(chat_id) {
+                c.is_status_changed = false;
+            }
+        }
+        let noforwards_changed = self
+            .get_chat(chat_id)
+            .is_some_and(|c| c.is_noforwards_changed);
+        if noforwards_changed {
+            // td_->messages_manager_->on_dialog_has_protected_content_updated
+            // — the M.10 stub.
+            if let Some(c) = self.get_chat_mut(chat_id) {
+                c.is_noforwards_changed = false;
+            }
+        }
+
+        if need_update_chat_full {
+            debug_assert!(self.get_chat_full(chat_id).is_some());
+            self.update_chat_full(user_manager, env, chat_id, "update_chat", false);
+        }
+
+        let changed = {
+            let Some(c) = self.get_chat_mut(chat_id) else {
+                return;
+            };
+            tdutils::log_debug!(
+                "Update {chat_id:?}: need_save_to_database = {}, is_changed = {}",
+                c.need_save_to_database,
+                c.is_changed
+            );
+            c.need_save_to_database |= c.is_changed;
+            if c.need_save_to_database {
+                if !from_database {
+                    c.is_saved = false;
+                }
+                c.need_save_to_database = false;
+            }
+            let changed = c.is_changed;
+            if changed {
+                c.is_changed = false;
+                c.is_update_basic_group_sent = true;
+            }
+            changed
+        };
+        if changed {
+            let c_snapshot = self.get_chat(chat_id).cloned();
+            let update = self.get_update_basic_group_object(chat_id, c_snapshot.as_ref());
+            self.pending_updates.push(update);
+        }
+        if !from_database {
+            self.save_chat(env, chat_id, from_binlog);
+        }
+        if let Some(c) = self.get_chat_mut(chat_id) {
+            c.is_being_updated = false;
+        }
+        let need_repair = self
+            .get_chat(chat_id)
+            .is_some_and(|c| c.cache_version != Chat::CACHE_VERSION && !c.is_repaired)
+            && self.have_input_peer_chat(chat_id, AccessRights::Read)
+            && !env.global.close_flag();
+        if need_repair {
+            if let Some(c) = self.get_chat_mut(chat_id) {
+                c.is_repaired = true;
+            }
+            tdutils::log_info!("Repairing cache of {chat_id:?}");
+            self.reload_chat(env, chat_id, Promise::default(), "update_chat");
+        }
     }
 
-    /// `ChatManager::update_channel` (ChatManager.cpp:5346) — lands with
-    /// M.5.19, same shape as [`ChatManager::update_chat`].
+    /// `is_suitable_discussion_chat` (ChatManager.cpp:4088-4090).
+    fn is_suitable_discussion_chat(c: &Chat) -> bool {
+        c.is_active && c.status.is_creator()
+    }
+
+    /// `update_dialogs_for_discussion` (ChatManager.cpp:4319-4332). The
+    /// newest-suitable-first insert order matches the C++ (`begin()`).
+    fn update_dialogs_for_discussion(&mut self, dialog_id: DialogId, is_suitable: bool) {
+        if !self.dialogs_for_discussion_inited {
+            return;
+        }
+        if is_suitable {
+            if !self.dialogs_for_discussion.contains(&dialog_id) {
+                tdutils::log_debug!("Add {dialog_id:?} to list of suitable discussion chats");
+                self.dialogs_for_discussion.insert(0, dialog_id);
+            }
+        } else if let Some(position) = self
+            .dialogs_for_discussion
+            .iter()
+            .position(|d| *d == dialog_id)
+        {
+            self.dialogs_for_discussion.remove(position);
+            tdutils::log_debug!("Remove {dialog_id:?} from list of suitable discussion chats");
+        }
+    }
+
+    /// `ChatManager::update_channel` (ChatManager.cpp:5346-5547). The
+    /// MessagesManager/StoryManager/DialogManager dialog fan-outs and the
+    /// SuggestedActionManager/DialogParticipantManager refires are the
+    /// documented stubs; `update_created_public_channels`,
+    /// `update_dialogs_for_discussion`, `remove_inactive_channel` and the
+    /// restricted-id set keep their C++ shapes. The 1.0-second SleepActor
+    /// hop around the status-repair reload defers only the net query, so
+    /// the interim `reload_channel` call is direct.
     fn update_channel(
         &mut self,
+        user_manager: &mut UserManager,
         env: &mut UserEnv,
         channel_id: ChannelId,
         from_binlog: bool,
-        force: bool,
+        from_database: bool,
     ) {
-        let _ = (env, channel_id, from_binlog, force);
+        if self
+            .get_channel(channel_id)
+            .is_some_and(|c| c.is_being_updated)
+        {
+            tdutils::log_error!("Detected recursive update of {channel_id:?}");
+        }
+        if let Some(c) = self.get_channel_mut(channel_id) {
+            c.is_being_updated = true;
+        }
+
+        let mut need_update_channel_full = false;
+        let photo_changed = self
+            .get_channel(channel_id)
+            .is_some_and(|c| c.is_photo_changed);
+        if photo_changed {
+            // td_->messages_manager_->on_dialog_photo_updated (+ the
+            // monoforum twin) — the M.10 stub.
+            if let Some(c) = self.get_channel_mut(channel_id) {
+                c.is_photo_changed = false;
+            }
+            let full_snapshot = self
+                .get_channel_full(env, channel_id, true, "update_channel")
+                .map(|f| (f.photo.clone(), f.is_update_channel_full_sent));
+            let full_differs = full_snapshot.is_some_and(|(full_photo, _)| {
+                !is_same_dialog_photo(
+                    &full_photo,
+                    &self.get_channel(channel_id).expect("checked above").photo,
+                )
+            });
+            if full_differs {
+                self.on_update_channel_full_photo(env, channel_id, Photo::default());
+                if self
+                    .get_channel_full_const(channel_id)
+                    .is_some_and(|f| f.is_update_channel_full_sent)
+                {
+                    need_update_channel_full = true;
+                }
+                let small_file_id_valid = self
+                    .get_channel(channel_id)
+                    .is_some_and(|c| c.photo.small_file_id.is_valid());
+                if small_file_id_valid
+                    && let Some(f) = self.get_channel_full(env, channel_id, true, "update_channel")
+                    && f.expires_at > 0.0
+                {
+                    f.expires_at = 0.0;
+                    f.need_save_to_database = true;
+                }
+                if small_file_id_valid {
+                    self.send_get_channel_full_query(
+                        env,
+                        channel_id,
+                        Promise::default(),
+                        "update_channel",
+                    );
+                }
+            }
+        }
+        let accent_color_changed = self
+            .get_channel(channel_id)
+            .is_some_and(|c| c.is_accent_color_changed);
+        if accent_color_changed {
+            // td_->messages_manager_->on_dialog_accent_colors_updated (+ the
+            // monoforum twin) — the M.10 stub.
+            if let Some(c) = self.get_channel_mut(channel_id) {
+                c.is_accent_color_changed = false;
+            }
+        }
+        let title_changed = self
+            .get_channel(channel_id)
+            .is_some_and(|c| c.is_title_changed);
+        if title_changed {
+            // td_->messages_manager_->on_dialog_title_updated (+ the
+            // monoforum twin) — the M.10 stub.
+            if let Some(c) = self.get_channel_mut(channel_id) {
+                c.is_title_changed = false;
+            }
+        }
+        // must run before the status branch, like the C++
+        let admined_monoforum_changed = self
+            .get_channel(channel_id)
+            .is_some_and(|c| c.is_admined_monoforum_changed);
+        if admined_monoforum_changed {
+            let status = self.get_channel(channel_id).map(|c| c.status.clone());
+            if let Some(status) = status {
+                self.on_update_channel_status(user_manager, env, channel_id, status);
+            }
+            // send_closure_later(messages_manager on_dialog_deleted) — the
+            // M.10 stub.
+            if let Some(c) = self.get_channel_mut(channel_id) {
+                c.is_admined_monoforum_changed = false;
+            }
+        }
+        // must run after the admined-monoforum branch
+        let status_changed = self
+            .get_channel(channel_id)
+            .is_some_and(|c| c.is_status_changed);
+        if status_changed {
+            {
+                let c = self.get_channel_mut(channel_id).expect("checked above");
+                c.status.update_restrictions(env.global);
+                let until_date = c.status.get_until_date();
+                let mut left_time = 0.0;
+                if until_date > 0 {
+                    left_time = until_date as f64 - env.global.server_time() + 2.0;
+                    if left_time <= 0.0 {
+                        c.status.update_restrictions(env.global);
+                        debug_assert!(c.status.get_until_date() == 0);
+                    }
+                }
+                if left_time > 0.0 && left_time < 366.0 * 86400.0 {
+                    Self::set_timeout(&mut self.channel_unban_timeouts, channel_id, left_time);
+                } else {
+                    Self::cancel_timeout(&mut self.channel_unban_timeouts, channel_id);
+                }
+            }
+            let suitable = self
+                .get_channel(channel_id)
+                .is_some_and(Self::is_suitable_discussion_channel);
+            self.update_dialogs_for_discussion(DialogId::from_channel_id(channel_id), suitable);
+            if !self
+                .get_channel(channel_id)
+                .is_some_and(|c| c.status.is_member())
+            {
+                self.remove_inactive_channel(channel_id);
+            }
+            // td_->messages_manager_->drop_dialog_pending_join_requests —
+            // the M.10 stub.
+            if !from_database
+                && self
+                    .get_channel(channel_id)
+                    .is_some_and(|c| c.is_update_supergroup_sent)
+            {
+                // the C++ SleepActor defers only the net query
+                self.reload_channel(
+                    env,
+                    channel_id,
+                    Promise::default(),
+                    "ReloadChannelSleepActor",
+                );
+            }
+            // td_->messages_manager_->on_dialog_access_updated — the M.10 stub.
+            if let Some(c) = self.get_channel_mut(channel_id) {
+                c.is_status_changed = false;
+            }
+        }
+        let username_changed = self
+            .get_channel(channel_id)
+            .is_some_and(|c| c.is_username_changed);
+        if username_changed {
+            let is_creator = self
+                .get_channel(channel_id)
+                .is_some_and(|c| c.status.is_creator());
+            if is_creator {
+                let c = self.get_channel(channel_id).cloned();
+                self.update_created_public_channels(env, &c.expect("checked above"), channel_id);
+            }
+            // td_->messages_manager_->on_dialog_access_updated — the M.10 stub.
+            if let Some(c) = self.get_channel_mut(channel_id) {
+                c.is_username_changed = false;
+            }
+        }
+        let default_permissions_changed = self
+            .get_channel(channel_id)
+            .is_some_and(|c| c.is_default_permissions_changed);
+        if default_permissions_changed {
+            // td_->messages_manager_->on_dialog_default_permissions_updated
+            // and the SuggestedActionManager ConvertToGigagroup removal —
+            // the M.10/M.13 stubs.
+            if let Some(c) = self.get_channel_mut(channel_id) {
+                c.is_default_permissions_changed = false;
+            }
+        }
+        let has_location_changed = self
+            .get_channel(channel_id)
+            .is_some_and(|c| c.is_has_location_changed);
+        if has_location_changed {
+            let is_creator = self
+                .get_channel(channel_id)
+                .is_some_and(|c| c.status.is_creator());
+            if is_creator {
+                let c = self.get_channel(channel_id).cloned();
+                self.update_created_public_channels(env, &c.expect("checked above"), channel_id);
+            }
+            // td_->messages_manager_->on_dialog_access_updated — the M.10 stub.
+            if let Some(c) = self.get_channel_mut(channel_id) {
+                c.is_has_location_changed = false;
+            }
+        }
+        let creator_changed = self
+            .get_channel(channel_id)
+            .is_some_and(|c| c.is_creator_changed);
+        if creator_changed {
+            let c = self.get_channel(channel_id).cloned();
+            self.update_created_public_channels(env, &c.expect("checked above"), channel_id);
+            if let Some(c) = self.get_channel_mut(channel_id) {
+                c.is_creator_changed = false;
+            }
+        }
+        let noforwards_changed = self
+            .get_channel(channel_id)
+            .is_some_and(|c| c.is_noforwards_changed);
+        if noforwards_changed {
+            // td_->messages_manager_->on_dialog_has_protected_content_updated
+            // — the M.10 stub.
+            if let Some(c) = self.get_channel_mut(channel_id) {
+                c.is_noforwards_changed = false;
+            }
+        }
+        let is_forum_changed = self
+            .get_channel(channel_id)
+            .is_some_and(|c| c.is_is_forum_changed);
+        if is_forum_changed {
+            let suitable = self
+                .get_channel(channel_id)
+                .is_some_and(Self::is_suitable_discussion_channel);
+            self.update_dialogs_for_discussion(DialogId::from_channel_id(channel_id), suitable);
+            // td_->messages_manager_->on_update_dialog_is_forum — the M.10 stub.
+            if let Some(c) = self.get_channel_mut(channel_id) {
+                c.is_is_forum_changed = false;
+            }
+        }
+        let stories_hidden_changed = self
+            .get_channel(channel_id)
+            .is_some_and(|c| c.is_stories_hidden_changed);
+        if stories_hidden_changed {
+            // send_closure_later(story_manager on_dialog_active_stories_order_updated)
+            // — the StoryManager stub.
+            if let Some(c) = self.get_channel_mut(channel_id) {
+                c.is_stories_hidden_changed = false;
+            }
+        }
+        let unix_time = env.global.unix_time();
+        let effective_emoji_status = EmojiStatus::get_effective_emoji_status(
+            &self
+                .get_channel(channel_id)
+                .and_then(|c| c.emoji_status.clone()),
+            true,
+            unix_time,
+        );
+        let emoji_status_changed = self
+            .get_channel(channel_id)
+            .is_some_and(|c| effective_emoji_status != c.last_sent_emoji_status);
+        if emoji_status_changed {
+            let had_last_sent = self
+                .get_channel(channel_id)
+                .is_some_and(|c| c.last_sent_emoji_status.is_some());
+            if had_last_sent {
+                Self::cancel_timeout(&mut self.channel_emoji_status_timeouts, channel_id);
+            }
+            let armed_timeout = {
+                let c = self.get_channel_mut(channel_id).expect("checked above");
+                c.last_sent_emoji_status = effective_emoji_status;
+                c.last_sent_emoji_status.as_ref().and_then(|last_sent| {
+                    let left_time = i64::from(last_sent.get_until_date()) - i64::from(unix_time);
+                    (0..30 * 86400).contains(&left_time).then_some(left_time as f64)
+                })
+            };
+            if let Some(timeout_in) = armed_timeout {
+                Self::set_timeout(
+                    &mut self.channel_emoji_status_timeouts,
+                    channel_id,
+                    timeout_in,
+                );
+            }
+            // td_->messages_manager_->on_dialog_emoji_status_updated (+ the
+            // monoforum twin) — the M.10 stub.
+        }
+        if let Some(c) = self.get_channel_mut(channel_id) {
+            c.is_emoji_status_changed = false;
+        }
+
+        if !env.auth_is_bot {
+            let restrictions_empty = self
+                .get_channel(channel_id)
+                .is_some_and(|c| c.restriction_reasons.is_empty());
+            if restrictions_empty {
+                self.restricted_channel_ids.remove(&channel_id.get());
+            } else {
+                self.restricted_channel_ids.insert(channel_id.get());
+            }
+        }
+
+        // from_binlog || from_database → dialog_manager
+        // on_dialog_usernames_received — the M.6 stub.
+        // !is_channel_public(c) && !c->has_linked_channel → messages_manager
+        // on_update_dialog_default_send_message_as_dialog_id — the M.10 stub.
+
+        if need_update_channel_full {
+            debug_assert!(self.get_channel_full_const(channel_id).is_some());
+            self.update_channel_full(user_manager, env, channel_id, "update_channel", false);
+        }
+
+        let changed = {
+            let Some(c) = self.get_channel_mut(channel_id) else {
+                return;
+            };
+            tdutils::log_debug!(
+                "Update {channel_id:?}: need_save_to_database = {}, is_changed = {}",
+                c.need_save_to_database,
+                c.is_changed
+            );
+            c.need_save_to_database |= c.is_changed;
+            if c.need_save_to_database {
+                if !from_database {
+                    c.is_saved = false;
+                }
+                c.need_save_to_database = false;
+            }
+            let changed = c.is_changed;
+            if changed {
+                c.is_changed = false;
+                c.is_update_supergroup_sent = true;
+            }
+            changed
+        };
+        if changed {
+            let c_snapshot = self.get_channel(channel_id).cloned();
+            let update = self.get_update_supergroup_object(channel_id, c_snapshot.as_ref());
+            self.pending_updates.push(update);
+        }
+        if !from_database {
+            self.save_channel(env, channel_id, from_binlog);
+        }
+        if let Some(c) = self.get_channel_mut(channel_id) {
+            c.is_being_updated = false;
+        }
+        let have_read_access = self.have_input_peer_channel_id(env, channel_id, AccessRights::Read);
+        if let Some(c) = self.get_channel_mut(channel_id) {
+            if c.had_read_access && !have_read_access {
+                // send_closure_later(messages_manager on_dialog_deleted) —
+                // the M.10 stub.
+            }
+            c.had_read_access = have_read_access;
+        }
+        let need_repair = self
+            .get_channel(channel_id)
+            .is_some_and(|c| c.cache_version != Channel::CACHE_VERSION && !c.is_repaired)
+            && self.have_input_peer_channel_id(env, channel_id, AccessRights::Read)
+            && !env.global.close_flag();
+        if need_repair {
+            if let Some(c) = self.get_channel_mut(channel_id) {
+                c.is_repaired = true;
+            }
+            tdutils::log_info!("Repairing cache of {channel_id:?}");
+            self.reload_channel(env, channel_id, Promise::default(), "update_channel");
+        }
+    }
+
+    /// `is_suitable_discussion_channel` (ChatManager.cpp:4092-4096).
+    fn is_suitable_discussion_channel(c: &Channel) -> bool {
+        c.is_megagroup
+            && c.status.is_administrator()
+            && c.status.can_pin_messages()
+            && !c.is_monoforum
+            && !c.is_forum
+    }
+
+    /// `is_suitable_created_public_channel` (ChatManager.cpp:4101-4115).
+    fn is_suitable_created_public_channel(
+        public_dialog_type: PublicDialogType,
+        c: Option<&Channel>,
+    ) -> bool {
+        let Some(c) = c else {
+            return false;
+        };
+        if !c.status.is_creator() {
+            return false;
+        }
+        match public_dialog_type {
+            PublicDialogType::HasUsername => c.usernames.has_editable_username(),
+            PublicDialogType::IsLocationBased => c.has_location,
+            PublicDialogType::ForPersonalDialog => {
+                !c.is_megagroup && c.usernames.has_first_username()
+            }
+        }
+    }
+
+    /// `update_created_public_channels` (ChatManager.cpp:4195-4216). The
+    /// `reload_created_public_dialogs` refire is the net query — the
+    /// interim logs and skips it.
+    fn update_created_public_channels(
+        &mut self,
+        env: &mut UserEnv,
+        c: &Channel,
+        channel_id: ChannelId,
+    ) {
+        for public_dialog_type in [
+            PublicDialogType::HasUsername,
+            PublicDialogType::IsLocationBased,
+            PublicDialogType::ForPersonalDialog,
+        ] {
+            let index = public_dialog_type as usize;
+            if !self.created_public_channels_inited[index] {
+                continue;
+            }
+            let was_changed;
+            if !Self::is_suitable_created_public_channel(public_dialog_type, Some(c)) {
+                let old_len = self.created_public_channels[index].len();
+                self.created_public_channels[index].retain(|id| *id != channel_id.get());
+                was_changed = self.created_public_channels[index].len() != old_len;
+            } else if !self.created_public_channels[index].contains(&channel_id.get()) {
+                self.created_public_channels[index].push(channel_id.get());
+                was_changed = true;
+            } else {
+                was_changed = false;
+            }
+            if was_changed {
+                self.save_created_public_channels(public_dialog_type, env);
+                // reload_created_public_dialogs — the GetCreatedPublicChannels
+                // query is [blocked: net] (M.5.46).
+                tdutils::log_info!(
+                    "GetCreatedPublicChannelsQuery for {public_dialog_type:?} — [blocked: net]"
+                );
+            }
+        }
+    }
+
+    /// `save_created_public_channels` (ChatManager.cpp:4232-4245).
+    fn save_created_public_channels(
+        &mut self,
+        public_dialog_type: PublicDialogType,
+        env: &mut UserEnv,
+    ) {
+        let index = public_dialog_type as usize;
+        debug_assert!(self.created_public_channels_inited[index]);
+        if !env.global.use_message_database() {
+            return;
+        }
+        let joined = self.created_public_channels[index]
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        env.global
+            .td_db()
+            .binlog_pmc()
+            .set(&format!("public_channels{index}"), &joined);
+    }
+
+    /// `remove_inactive_channel` (ChatManager.cpp:4370-4375).
+    fn remove_inactive_channel(&mut self, channel_id: ChannelId) {
+        if self.inactive_channel_ids_inited
+            && let Some(position) = self
+                .inactive_channel_ids
+                .iter()
+                .position(|id| *id == channel_id.get())
+        {
+            self.inactive_channel_ids.remove(position);
+            tdutils::log_debug!("Remove {channel_id:?} from list of inactive channels");
+        }
+    }
+
+    /// `on_update_channel_status` (ChatManager.cpp:7710-7736).
+    fn on_update_channel_status(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        mut status: DialogParticipantStatus,
+    ) {
+        let Some(c) = self.get_channel(channel_id) else {
+            return;
+        };
+        if c.is_monoforum {
+            if status.is_member() {
+                // monoforums have no member tags
+                status = if c.is_admined_monoforum && !env.auth_is_bot {
+                    DialogParticipantStatus::administrator(
+                        AdministratorRights::from_bools(
+                            true,
+                            true,
+                            false,
+                            false,
+                            false,
+                            false,
+                            false,
+                            false,
+                            false,
+                            false,
+                            false,
+                            false,
+                            false,
+                            false,
+                            false,
+                            false,
+                            false,
+                            false,
+                            false,
+                            ChannelType::Megagroup,
+                        ),
+                        String::new(),
+                        false,
+                    )
+                } else {
+                    DialogParticipantStatus::member(0, String::new())
+                };
+            } else {
+                status = DialogParticipantStatus::left();
+            }
+        }
+        if c.status != status {
+            tdutils::log_info!(
+                "Update {channel_id:?} status from {:?} to {:?}",
+                c.status,
+                status
+            );
+            if c.is_update_supergroup_sent {
+                let old_status = c.status.clone();
+                self.on_channel_status_changed(user_manager, env, channel_id, &old_status, &status);
+            }
+            let c = self.get_channel_mut(channel_id).expect("checked above");
+            c.status = status;
+            c.is_status_changed = true;
+            c.is_changed = true;
+        }
+    }
+
+    /// `on_channel_status_changed` (ChatManager.cpp:7738-7804). The
+    /// StoryManager/WelcomeMessageManager/DialogParticipantManager/
+    /// SuggestedActionManager/DialogInviteLinkManager fan-outs are the
+    /// documented stubs.
+    fn on_channel_status_changed(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        old_status: &DialogParticipantStatus,
+        new_status: &DialogParticipantStatus,
+    ) {
+        debug_assert!(
+            self.get_channel(channel_id)
+                .is_some_and(|c| c.is_update_supergroup_sent)
+        );
+        let have_channel_full = self.get_channel_full_const(channel_id).is_some();
+
+        let need_reload_group_call = old_status.can_manage_calls() != new_status.can_manage_calls();
+        if old_status.can_manage_invite_links() && !new_status.can_manage_invite_links() {
+            if self.get_channel_full_const(channel_id).is_some() {
+                // otherwise the invite link drops when the channel loads
+                self.on_update_channel_full_invite_link(env, channel_id, None);
+                let need_drop_slow_mode_delay = !self
+                    .get_channel(channel_id)
+                    .is_some_and(|c| c.is_slow_mode_enabled);
+                self.do_invalidate_channel_full(channel_id, need_drop_slow_mode_delay);
+                self.update_channel_full(
+                    user_manager,
+                    env,
+                    channel_id,
+                    "on_channel_status_changed",
+                    false,
+                );
+            }
+        } else {
+            let need_drop_slow_mode_delay = !self
+                .get_channel(channel_id)
+                .is_some_and(|c| c.is_slow_mode_enabled);
+            self.invalidate_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                need_drop_slow_mode_delay,
+                "on_channel_status_changed",
+            );
+        }
+        // the WelcomeMessageManager drop — the wave-3 stub.
+        let _ = old_status.can_change_info_and_settings_as_administrator()
+            && !new_status.can_change_info_and_settings_as_administrator();
+
+        if old_status.is_creator() != new_status.is_creator() {
+            if let Some(c) = self.get_channel_mut(channel_id) {
+                c.is_creator_changed = true;
+            }
+            // send_get_channel_full_query(nullptr, ...) — the query the
+            // owner change refires is [blocked: net] (M.5.45).
+            tdutils::log_info!("GetFullChannelQuery after the owner change — [blocked: net]");
+            // the DialogParticipantManager/SuggestedActionManager refires —
+            // the wave-2 stubs.
+        }
+
+        if old_status.is_member() != new_status.is_member() || new_status.is_banned() {
+            // td_->dialog_invite_link_manager_->remove_dialog_access_by_invite_link
+            // — the wave-2 stub.
+            if new_status.is_member() || new_status.is_creator() {
+                self.reload_channel_full(
+                    env,
+                    channel_id,
+                    Promise::default(),
+                    "on_channel_status_changed",
+                );
+            }
+        }
+        // the group-call rights, participant-cache, dialog-deleted and
+        // expiring-stories refires — the M.10/M.12 stubs.
+        let _ = need_reload_group_call;
+
+        // must not load ChannelFull, because must not change the Channel
+        debug_assert!(have_channel_full == self.get_channel_full_const(channel_id).is_some());
     }
 
     /// `ChatManager::save_chat` (ChatManager.cpp:4467-4484): the binlog
     /// mirror (`ChatLogEvent`, `HandlerType::Chats`) add/rewrite while the
-    /// record is unsaved, then the sqlite row. The production callers are
-    /// the M.5.20+ intakes.
-    #[allow(dead_code)]
+    /// record is unsaved, then the sqlite row. Reached from
+    /// [`ChatManager::update_chat`]'s need-save fan-out.
     fn save_chat(&mut self, env: &mut UserEnv, chat_id: ChatId, from_binlog: bool) {
         if !env.global.use_chat_info_database() {
             return;
@@ -5014,7 +5893,13 @@ impl ChatManager {
     /// `load_chat_from_database` + `_impl` + `on_load_chat_from_database`
     /// (ChatManager.cpp:4582-4658) collapsed onto the synchronous kv (the
     /// per-id promise queue exists only to batch the async completions).
-    fn load_chat_from_database(&mut self, env: &mut UserEnv, chat_id: ChatId, force: bool) {
+    fn load_chat_from_database(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        force: bool,
+    ) {
         if env.global.close_flag() && !force {
             return;
         }
@@ -5048,7 +5933,7 @@ impl ChatManager {
                     self.chats.insert(chat_id_value, chat);
                     let c = self.chats.get_mut(&chat_id_value).unwrap();
                     c.is_saved = true;
-                    self.update_chat(env, chat_id, true, true);
+                    self.update_chat(user_manager, env, chat_id, true, true);
                 }
                 Err(error) => {
                     tdutils::log_error!("Failed to load {chat_id:?} from database: {error}");
@@ -5063,7 +5948,12 @@ impl ChatManager {
             .map(|c| c.migrated_to_channel_id);
         if let Some(migrated_to_channel_id) = migrated_to_channel_id
             && migrated_to_channel_id.is_valid()
-            && !self.have_channel_force(env, migrated_to_channel_id, "on_load_chat_from_database")
+            && !self.have_channel_force(
+                user_manager,
+                env,
+                migrated_to_channel_id,
+                "on_load_chat_from_database",
+            )
         {
             tdutils::log_error!("Can't find the migrated-to channel from {chat_id:?}");
         }
@@ -5075,6 +5965,7 @@ impl ChatManager {
     /// the C++ update path's save fan-out (from_binlog = true).
     pub fn on_binlog_chat_event(
         &mut self,
+        user_manager: &mut UserManager,
         env: &mut UserEnv,
         event: &tddb::binlog::event::BinlogEvent,
     ) {
@@ -5102,14 +5993,21 @@ impl ChatManager {
         *chat_entry = chat;
         self.chats.get_mut(&chat_id.get()).unwrap().log_event_id = event.id;
 
-        // update_chat(c, chat_id, true, false) — the diff machine is
-        // M.5.18; its need-save fan-out is save_chat(from_binlog = true).
-        self.save_chat(env, chat_id, true);
+        // update_chat(c, chat_id, true, false) — its need-save fan-out is
+        // save_chat(from_binlog = true).
+        self.update_chat(user_manager, env, chat_id, true, false);
     }
 
     /// `have_chat_force` (ChatManager.cpp:4660-4662).
-    pub fn have_chat_force(&mut self, env: &mut UserEnv, chat_id: ChatId, source: &str) -> bool {
-        self.get_chat_force(env, chat_id, source).is_some()
+    pub fn have_chat_force(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        source: &str,
+    ) -> bool {
+        self.get_chat_force(user_manager, env, chat_id, source)
+            .is_some()
     }
 
     /// `get_chat_force` (ChatManager.cpp:4664-4687) — the synchronous
@@ -5117,6 +6015,7 @@ impl ChatManager {
     /// load means the query layer re-parks).
     pub fn get_chat_force(
         &mut self,
+        user_manager: &mut UserManager,
         env: &mut UserEnv,
         chat_id: ChatId,
         source: &str,
@@ -5131,7 +6030,7 @@ impl ChatManager {
                 .map(|c| c.migrated_to_channel_id);
             if let Some(migrated_to_channel_id) = migrated_to_channel_id
                 && migrated_to_channel_id.is_valid()
-                && !self.have_channel_force(env, migrated_to_channel_id, source)
+                && !self.have_channel_force(user_manager, env, migrated_to_channel_id, source)
             {
                 tdutils::log_error!(
                     "Can't find the migrated-to channel from {chat_id:?} from {source}"
@@ -5146,13 +6045,13 @@ impl ChatManager {
             return None;
         }
 
-        self.load_chat_from_database(env, chat_id, true);
+        self.load_chat_from_database(user_manager, env, chat_id, true);
         self.chats.get_mut(&chat_id.get())
     }
 
     /// `ChatManager::save_channel` (ChatManager.cpp:4713-4730) — the
-    /// channel twin of [`ChatManager::save_chat`].
-    #[allow(dead_code)]
+    /// channel twin of [`ChatManager::save_chat`], reached from
+    /// [`ChatManager::update_channel`]'s need-save fan-out.
     fn save_channel(&mut self, env: &mut UserEnv, channel_id: ChannelId, from_binlog: bool) {
         if !env.global.use_chat_info_database() {
             return;
@@ -5228,6 +6127,7 @@ impl ChatManager {
     /// mirror stubbed, the branch never sees an in-memory record.
     fn load_channel_from_database(
         &mut self,
+        user_manager: &mut UserManager,
         env: &mut UserEnv,
         channel_id: ChannelId,
         force: bool,
@@ -5264,7 +6164,7 @@ impl ChatManager {
                     self.channels.insert(channel_id_value, channel);
                     let c = self.channels.get_mut(&channel_id_value).unwrap();
                     c.is_saved = true;
-                    self.update_channel(env, channel_id, true, true);
+                    self.update_channel(user_manager, env, channel_id, true, true);
                 }
                 Err(error) => {
                     tdutils::log_error!("Failed to load {channel_id:?} from database: {error}");
@@ -5289,10 +6189,11 @@ impl ChatManager {
                 // the C++ logs at INFO and gives up
             } else if self
                 .get_channel_force(
+                    user_manager,
                     env,
                     monoforum_channel_id,
                     "on_load_channel_from_database",
-                    true,
+                    is_recursive,
                 )
                 .is_none()
             {
@@ -5305,6 +6206,7 @@ impl ChatManager {
     /// the channel twin of [`ChatManager::on_binlog_chat_event`].
     pub fn on_binlog_channel_event(
         &mut self,
+        user_manager: &mut UserManager,
         env: &mut UserEnv,
         event: &tddb::binlog::event::BinlogEvent,
     ) {
@@ -5336,25 +6238,27 @@ impl ChatManager {
             .unwrap()
             .log_event_id = event.id;
 
-        // update_channel(c, channel_id, true, false) — the diff machine is
-        // M.5.19; its need-save fan-out is save_channel(from_binlog = true).
-        self.save_channel(env, channel_id, true);
+        // update_channel(c, channel_id, true, false) — its need-save
+        // fan-out is save_channel(from_binlog = true).
+        self.update_channel(user_manager, env, channel_id, true, false);
     }
 
     /// `have_channel_force` (ChatManager.cpp:4959-4961).
     pub fn have_channel_force(
         &mut self,
+        user_manager: &mut UserManager,
         env: &mut UserEnv,
         channel_id: ChannelId,
         source: &str,
     ) -> bool {
-        self.get_channel_force(env, channel_id, source, false)
+        self.get_channel_force(user_manager, env, channel_id, source, false)
             .is_some()
     }
 
     /// `get_channel_force` (ChatManager.cpp:4963-4976).
     pub fn get_channel_force(
         &mut self,
+        user_manager: &mut UserManager,
         env: &mut UserEnv,
         channel_id: ChannelId,
         source: &str,
@@ -5377,14 +6281,2689 @@ impl ChatManager {
             return None;
         }
 
-        self.load_channel_from_database(env, channel_id, true, is_recursive);
+        self.load_channel_from_database(user_manager, env, channel_id, true, is_recursive);
         self.channels.get_mut(&channel_id.get())
+    }
+
+    // ---- M.5.14: the three member MultiTimeouts (ChatManager.h:994-996),
+    // driven by the Td tick instead of the actor framework ----
+
+    /// `MultiTimeout::set_timeout_in` (deadline = now + in; re-set replaces).
+    fn set_timeout(deadlines: &mut BTreeMap<i64, f64>, channel_id: ChannelId, timeout_in: f64) {
+        deadlines.insert(channel_id.get(), tdutils::time::now() + timeout_in);
+    }
+
+    /// `MultiTimeout::cancel_timeout`.
+    fn cancel_timeout(deadlines: &mut BTreeMap<i64, f64>, channel_id: ChannelId) {
+        deadlines.remove(&channel_id.get());
+    }
+
+    /// The earliest armed deadline across the three timeouts, or `None` —
+    /// the Td actor's re-arm key.
+    pub(crate) fn next_deadline(&self) -> Option<f64> {
+        self.channel_emoji_status_timeouts
+            .values()
+            .chain(self.channel_unban_timeouts.values())
+            .chain(self.slow_mode_delay_timeouts.values())
+            .copied()
+            .min_by(f64::total_cmp)
+    }
+
+    /// Fire every expired deadline (the `on_*_timeout_callback` +
+    /// `send_closure_later` hop collapses into a direct call, the M.4.7
+    /// convention); the caller re-arms from [`ChatManager::next_deadline`].
+    pub fn tick_timeouts(&mut self, user_manager: &mut UserManager, env: &mut UserEnv) {
+        let now = tdutils::time::now();
+        let expired: Vec<i64> = self
+            .channel_emoji_status_timeouts
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            self.channel_emoji_status_timeouts.remove(&id);
+            self.on_channel_emoji_status_timeout(user_manager, env, ChannelId::new(id));
+        }
+        let expired: Vec<i64> = self
+            .channel_unban_timeouts
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            self.channel_unban_timeouts.remove(&id);
+            self.on_channel_unban_timeout(user_manager, env, ChannelId::new(id));
+        }
+        let expired: Vec<i64> = self
+            .slow_mode_delay_timeouts
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            self.slow_mode_delay_timeouts.remove(&id);
+            self.on_slow_mode_delay_timeout(user_manager, env, ChannelId::new(id));
+        }
+    }
+
+    /// `on_channel_emoji_status_timeout` (ChatManager.cpp:1762-1772).
+    fn on_channel_emoji_status_timeout(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+    ) {
+        if env.global.close_flag() {
+            return;
+        }
+        if self.get_channel(channel_id).is_none() {
+            debug_assert!(false, "Missing {channel_id:?} for the emoji status timeout");
+            return;
+        }
+        debug_assert!(
+            self.get_channel(channel_id)
+                .is_some_and(|c| c.is_update_supergroup_sent)
+        );
+        self.update_channel(user_manager, env, channel_id, false, false);
+    }
+
+    /// `on_channel_unban_timeout` (ChatManager.cpp:1784-1805).
+    fn on_channel_unban_timeout(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+    ) {
+        if env.global.close_flag() {
+            return;
+        }
+        {
+            let Some(c) = self.get_channel_mut(channel_id) else {
+                debug_assert!(false, "Missing {channel_id:?} for the unban timeout");
+                return;
+            };
+            let old_status = c.status.clone();
+            c.status.update_restrictions(env.global);
+            if c.status == old_status {
+                if c.status.is_restricted() || c.status.is_banned() {
+                    tdutils::log_error!("Status of {channel_id:?} wasn't updated: {old_status:?}");
+                }
+            } else {
+                c.is_changed = true;
+            }
+            tdutils::log_info!("Update {channel_id:?} status");
+            c.is_status_changed = true;
+        }
+        let need_drop_slow_mode_delay = !self
+            .get_channel(channel_id)
+            .is_some_and(|c| c.is_slow_mode_enabled);
+        self.invalidate_channel_full(
+            user_manager,
+            env,
+            channel_id,
+            need_drop_slow_mode_delay,
+            "on_channel_unban_timeout",
+        );
+        // always call, because in case of failure we need to reactivate timeout
+        self.update_channel(user_manager, env, channel_id, false, false);
+    }
+
+    /// `on_slow_mode_delay_timeout` (ChatManager.cpp:1817-1825).
+    fn on_slow_mode_delay_timeout(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+    ) {
+        if env.global.close_flag() {
+            return;
+        }
+        self.on_update_channel_slow_mode_next_send_date(user_manager, env, channel_id, 0);
+    }
+
+    /// `on_update_channel_slow_mode_next_send_date`
+    /// (ChatManager.cpp:8243-8253).
+    pub(crate) fn on_update_channel_slow_mode_next_send_date(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        slow_mode_next_send_date: i32,
+    ) {
+        let unchanged = self
+            .channels_full
+            .get(&channel_id.get())
+            .is_none_or(|f| f.slow_mode_next_send_date == slow_mode_next_send_date);
+        if unchanged {
+            return;
+        }
+        {
+            let Some(f) = self.channels_full.get_mut(&channel_id.get()) else {
+                return;
+            };
+            f.slow_mode_next_send_date = slow_mode_next_send_date;
+            f.is_slow_mode_next_send_date_changed = true;
+            f.is_changed = true;
+        }
+        self.update_channel_full(
+            user_manager,
+            env,
+            channel_id,
+            "on_update_channel_slow_mode_next_send_date",
+            false,
+        );
+    }
+
+    /// The queued `Td::send_update` fan-out; the Td actor flushes it on
+    /// the same points as the UserManager queue.
+    pub(crate) fn take_updates(&mut self) -> Vec<td_api::Update> {
+        std::mem::take(&mut self.pending_updates)
+    }
+
+    // ---- M.5.21 groundwork: the min-channel cache accessors
+    // (ChatManager.cpp:8895-8915) ----
+
+    /// `have_min_channel` (ChatManager.cpp:8895-8897).
+    pub fn have_min_channel(&self, channel_id: ChannelId) -> bool {
+        self.min_channels.contains_key(&channel_id.get())
+    }
+
+    /// `get_min_channel` (ChatManager.cpp:8899-8901).
+    pub fn get_min_channel(&self, channel_id: ChannelId) -> Option<&MinChannel> {
+        self.min_channels.get(&channel_id.get())
+    }
+
+    /// `add_min_channel` (ChatManager.cpp:8903-8908).
+    pub fn add_min_channel(&mut self, channel_id: ChannelId, min_channel: MinChannel) {
+        if self.have_channel(channel_id)
+            || self.have_min_channel(channel_id)
+            || !channel_id.is_valid()
+        {
+            return;
+        }
+        self.min_channels.insert(channel_id.get(), min_channel);
+    }
+
+    // ---- M.5.33 groundwork: the access checks the full-query senders
+    // validate with (the full InputPeer family stays with M.5.33) ----
+
+    /// `get_channel_type` (ChatManager.cpp:2872-2877).
+    fn get_channel_type(c: &Channel) -> ChannelType {
+        if c.is_megagroup {
+            return ChannelType::Megagroup;
+        }
+        ChannelType::Broadcast
+    }
+
+    /// `is_broadcast_channel` (ChatManager.cpp:2879-2881).
+    fn is_broadcast_channel(&self, channel_id: ChannelId) -> bool {
+        self.get_channel(channel_id)
+            .is_some_and(|c| Self::get_channel_type(c) == ChannelType::Broadcast)
+    }
+
+    /// `is_channel_public` (ChatManager.cpp:8601-8603).
+    fn is_channel_public(c: &Channel) -> bool {
+        c.usernames.has_first_username() || c.has_location
+    }
+
+    /// `get_input_channel` (ChatManager.cpp:2744-2769). The
+    /// `inputChannelFromMessage` branch needs `get_simple_input_peer`
+    /// (M.5.33) — unreachable until `channel_messages_` is fed (M.5.43).
+    fn get_input_channel(
+        &self,
+        env: &UserEnv,
+        channel_id: ChannelId,
+    ) -> Option<telegram_api::InputChannel> {
+        let Some(c) = self.channels.get(&channel_id.get()) else {
+            if env.auth_is_bot && channel_id.is_valid() {
+                return Some(telegram_api::InputChannel::inputChannel(
+                    telegram_api::inputChannel {
+                        channel_id: channel_id.get(),
+                        access_hash: 0,
+                    },
+                ));
+            }
+            if let Some(messages) = self.channel_messages.get(&channel_id.get()) {
+                debug_assert!(!messages.is_empty());
+                // inputChannelFromMessage(get_simple_input_peer(dialog_id), ...) —
+                // the M.5.33 deferral; the map stays empty until M.5.43.
+                let _ = messages;
+                tdutils::log_error!("Can't get input channel from message for {channel_id:?}");
+            }
+            return None;
+        };
+        Some(telegram_api::InputChannel::inputChannel(
+            telegram_api::inputChannel {
+                channel_id: channel_id.get(),
+                access_hash: c.access_hash,
+            },
+        ))
+    }
+
+    /// `have_input_peer_channel` (ChatManager.cpp:2883-2907, the
+    /// `const Channel *` form). The `have_dialog_access_by_invite_link`
+    /// fan-out answers false until the DialogInviteLinkManager step.
+    fn have_input_peer_channel(
+        &self,
+        env: &UserEnv,
+        c: Option<&Channel>,
+        channel_id: ChannelId,
+        access_rights: AccessRights,
+        from_linked: bool,
+    ) -> bool {
+        let Some(c) = c else {
+            if env.auth_is_bot && channel_id.is_valid() {
+                return true;
+            }
+            return self.channel_messages.contains_key(&channel_id.get());
+        };
+        if access_rights == AccessRights::Know {
+            return true;
+        }
+        if !from_linked && c.is_monoforum {
+            if env.auth_is_bot {
+                return c.is_admined_monoforum;
+            }
+            let monoforum_channel_id = c.monoforum_channel_id;
+            let monoforum_channel = self.get_channel(monoforum_channel_id);
+            if let Some(monoforum_channel) = monoforum_channel {
+                return self.have_input_peer_channel(
+                    env,
+                    Some(monoforum_channel),
+                    monoforum_channel_id,
+                    AccessRights::Read,
+                    true,
+                );
+            }
+            tdutils::log_info!("Have no parent {monoforum_channel_id:?}");
+            return true;
+        }
+
+        if c.status.is_administrator() {
+            return true;
+        }
+        if c.status.is_banned() {
+            return false;
+        }
+        if c.status.is_member() {
+            return true;
+        }
+
+        let is_public = Self::is_channel_public(c);
+        if access_rights == AccessRights::Read {
+            if is_public {
+                return true;
+            }
+            if !from_linked && c.has_linked_channel && c.is_megagroup {
+                let linked_channel_id = self
+                    .linked_channel_ids
+                    .get(&channel_id.get())
+                    .copied()
+                    .unwrap_or_default();
+                let linked_channel_id = ChannelId::new(linked_channel_id);
+                if linked_channel_id.is_valid() && self.have_channel(linked_channel_id) {
+                    if self.have_input_peer_channel(
+                        env,
+                        self.get_channel(linked_channel_id),
+                        linked_channel_id,
+                        access_rights,
+                        true,
+                    ) {
+                        return true;
+                    }
+                } else {
+                    return true;
+                }
+            }
+            // td_->dialog_invite_link_manager_->have_dialog_access_by_invite_link
+            // — the DialogInviteLinkManager stub (M.2x wave 2).
+            return false;
+        }
+
+        if !from_linked && c.is_megagroup && !env.auth_is_bot && c.has_linked_channel {
+            let linked_channel_id = self
+                .linked_channel_ids
+                .get(&channel_id.get())
+                .copied()
+                .unwrap_or_default();
+            let linked_channel_id = ChannelId::new(linked_channel_id);
+            if linked_channel_id.is_valid() && (is_public || self.have_channel(linked_channel_id)) {
+                return is_public
+                    || self.have_input_peer_channel(
+                        env,
+                        self.get_channel(linked_channel_id),
+                        linked_channel_id,
+                        AccessRights::Read,
+                        true,
+                    );
+            }
+            return true;
+        }
+        false
+    }
+
+    /// `have_input_peer_channel(ChannelId, AccessRights)` (ChatManager.cpp:2803-2806).
+    pub(crate) fn have_input_peer_channel_id(
+        &self,
+        env: &UserEnv,
+        channel_id: ChannelId,
+        access_rights: AccessRights,
+    ) -> bool {
+        let c = self.get_channel(channel_id);
+        self.have_input_peer_channel(env, c, channel_id, access_rights, false)
+    }
+
+    /// `have_input_peer_chat(const Chat *, AccessRights)`
+    /// (ChatManager.cpp:2771-2793).
+    fn have_input_peer_chat_record(c: Option<&Chat>, access_rights: AccessRights) -> bool {
+        let Some(c) = c else {
+            tdutils::log_debug!("Have no basic group");
+            return false;
+        };
+        if access_rights == AccessRights::Know || access_rights == AccessRights::Read {
+            return true;
+        }
+        if c.status.is_left() {
+            tdutils::log_debug!("Have left basic group");
+            return false;
+        }
+        if access_rights == AccessRights::Write && !c.is_active {
+            tdutils::log_debug!("Have inactive basic group");
+            return false;
+        }
+        true
+    }
+
+    /// `have_input_peer_chat(ChatId, AccessRights)` (ChatManager.cpp:2769-2771).
+    pub(crate) fn have_input_peer_chat(
+        &self,
+        chat_id: ChatId,
+        access_rights: AccessRights,
+    ) -> bool {
+        Self::have_input_peer_chat_record(self.get_chat(chat_id), access_rights)
+    }
+
+    /// `get_input_peer_chat` (ChatManager.cpp:2795-2801).
+    pub fn get_input_peer_chat(
+        &self,
+        chat_id: ChatId,
+        access_rights: AccessRights,
+    ) -> Option<telegram_api::InputPeer> {
+        let c = self.get_chat(chat_id);
+        if !Self::have_input_peer_chat_record(c, access_rights) {
+            return None;
+        }
+        Some(telegram_api::InputPeer::inputPeerChat(
+            telegram_api::inputPeerChat {
+                chat_id: chat_id.get(),
+            },
+        ))
+    }
+
+    /// `get_input_peer_channel` (ChatManager.cpp:2808-2829). The
+    /// `channel_messages_` branch needs the M.5.43 message-id packing, so
+    /// it errors like [`ChatManager::get_input_channel`] until then.
+    pub fn get_input_peer_channel(
+        &self,
+        env: &UserEnv,
+        channel_id: ChannelId,
+        access_rights: AccessRights,
+    ) -> Option<telegram_api::InputPeer> {
+        let c = self.get_channel(channel_id);
+        if !self.have_input_peer_channel(env, c, channel_id, access_rights, false) {
+            return None;
+        }
+        let Some(c) = c else {
+            if env.auth_is_bot && channel_id.is_valid() {
+                return Some(telegram_api::InputPeer::inputPeerChannel(
+                    telegram_api::inputPeerChannel {
+                        channel_id: channel_id.get(),
+                        access_hash: 0,
+                    },
+                ));
+            }
+            if self.channel_messages.contains_key(&channel_id.get()) {
+                // inputPeerChannelFromMessage(get_simple_input_peer(dialog_id), ...) —
+                // the M.5.43 deferral; the map stays empty until then.
+                tdutils::log_error!("Can't get input peer channel from message for {channel_id:?}");
+            }
+            return None;
+        };
+        Some(telegram_api::InputPeer::inputPeerChannel(
+            telegram_api::inputPeerChannel {
+                channel_id: channel_id.get(),
+                access_hash: c.access_hash,
+            },
+        ))
+    }
+
+    /// `get_simple_input_peer` (ChatManager.cpp:2831-2841).
+    pub fn get_simple_input_peer(
+        &self,
+        dialog_id: DialogId,
+    ) -> Option<telegram_api::InputPeer> {
+        debug_assert!(dialog_id.get_type() == DialogType::Channel);
+        let channel_id = dialog_id.get_channel_id();
+        let c = self.get_channel(channel_id)?;
+        Some(telegram_api::InputPeer::inputPeerChannel(
+            telegram_api::inputPeerChannel {
+                channel_id: channel_id.get(),
+                access_hash: c.access_hash,
+            },
+        ))
+    }
+
+    // ---- M.5.15/M.5.16: the ChatFull/ChannelFull persistence plane ----
+
+    /// `get_chat_full_database_key` (ChatManager.cpp:5011-5013).
+    fn get_chat_full_database_key(chat_id: ChatId) -> Vec<u8> {
+        format!("grf{}", chat_id.get()).into_bytes()
+    }
+
+    /// `get_channel_full_database_key` (ChatManager.cpp:5088-5090).
+    fn get_channel_full_database_key(channel_id: ChannelId) -> Vec<u8> {
+        format!("chf{}", channel_id.get()).into_bytes()
+    }
+
+    /// `get_chat_full` (ChatManager.cpp:8432-8438).
+    fn get_chat_full(&self, chat_id: ChatId) -> Option<&ChatFull> {
+        self.chats_full.get(&chat_id.get())
+    }
+
+    /// (the M.5.28+ participant intakes consume the mutable accessor)
+    #[allow(dead_code)]
+    fn get_chat_full_mut(&mut self, chat_id: ChatId) -> Option<&mut ChatFull> {
+        self.chats_full.get_mut(&chat_id.get())
+    }
+
+    /// `add_chat_full` (ChatManager.cpp:8440-8447) — the M.5.23+
+    /// on_get_chat_full intakes are its production callers.
+    #[allow(dead_code)]
+    fn add_chat_full(&mut self, chat_id: ChatId) -> &mut ChatFull {
+        debug_assert!(chat_id.is_valid());
+        self.chats_full
+            .entry(chat_id.get())
+            .or_default()
+    }
+
+    /// `get_channel_full_const` (ChatManager.cpp:8958-8960).
+    fn get_channel_full_const(&self, channel_id: ChannelId) -> Option<&ChannelFull> {
+        self.channels_full.get(&channel_id.get())
+    }
+
+    /// `add_channel_full` (ChatManager.cpp:8975-8982) — the M.5.25+
+    /// on_get_channel_full intakes are its production callers.
+    #[allow(dead_code)]
+    fn add_channel_full(&mut self, channel_id: ChannelId) -> &mut ChannelFull {
+        debug_assert!(channel_id.is_valid());
+        self.channels_full
+            .entry(channel_id.get())
+            .or_default()
+    }
+
+    /// `save_chat_full` (ChatManager.cpp:4996-5004) collapsed onto the
+    /// synchronous kv. Fulls carry no binlog mirror (the C++ saves only
+    /// the `grf`/`chf` rows).
+    fn save_chat_full(&mut self, env: &mut UserEnv, chat_id: ChatId) {
+        if !env.global.use_chat_info_database() {
+            return;
+        }
+        tdutils::log_info!("Trying to save to database full {chat_id:?}");
+        let Some(chat_full) = self.chats_full.get(&chat_id.get()) else {
+            debug_assert!(false, "Missing {chat_id:?} in save_chat_full");
+            return;
+        };
+        let mut value = Vec::new();
+        chat_full.store_value(&mut value);
+        env.global
+            .td_db()
+            .common_kv()
+            .set(&Self::get_chat_full_database_key(chat_id), &value);
+    }
+
+    /// `save_channel_full` (ChatManager.cpp:5073-5081).
+    fn save_channel_full(&mut self, env: &mut UserEnv, channel_id: ChannelId) {
+        if !env.global.use_chat_info_database() {
+            return;
+        }
+        tdutils::log_info!("Trying to save to database full {channel_id:?}");
+        let Some(channel_full) = self.channels_full.get(&channel_id.get()) else {
+            debug_assert!(false, "Missing {channel_id:?} in save_channel_full");
+            return;
+        };
+        let ctx = env.time_ctx();
+        let mut value = Vec::new();
+        channel_full.store_value(&mut value, &ctx);
+        env.global
+            .td_db()
+            .common_kv()
+            .set(&Self::get_channel_full_database_key(channel_id), &value);
+    }
+
+    /// `on_load_chat_full_from_database` (ChatManager.cpp:5020-5061) —
+    /// the `Dependencies::resolve_force` fan-out collapses into
+    /// synchronous user force-loads; the dialog/community dependencies
+    /// are the documented M.6/M.12 stubs.
+    fn on_load_chat_full_from_database(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        value: Vec<u8>,
+    ) {
+        if self.chats_full.contains_key(&chat_id.get()) || value.is_empty() {
+            return;
+        }
+        let mut chat_full = match ChatFull::parse_value(&value) {
+            Ok(chat_full) => chat_full,
+            Err(error) => {
+                // can't happen unless database is broken — clean all known
+                // data about the chat and pretend there was nothing
+                tdutils::log_error!("Repair broken full {chat_id:?}: {error}");
+                self.chats_full.remove(&chat_id.get());
+                env.global
+                    .td_db()
+                    .common_kv()
+                    .erase(&Self::get_chat_full_database_key(chat_id));
+                return;
+            }
+        };
+        // dependencies: creator + participants' senders + inviters + the
+        // invite-link creator. `add_message_sender_dependencies` on a
+        // chat/channel/secret dialog is the DialogManager force-create stub.
+        let creator_user_id = chat_full.creator_user_id;
+        if creator_user_id.is_valid()
+            && !user_manager.have_user_force(
+                env,
+                creator_user_id,
+                "on_load_chat_full_from_database",
+            )
+        {
+            self.chats_full.remove(&chat_id.get());
+            env.global
+                .td_db()
+                .common_kv()
+                .erase(&Self::get_chat_full_database_key(chat_id));
+            return;
+        }
+        for participant in &chat_full.participants {
+            if participant.dialog_id_.get_type() == DialogType::User {
+                let user_id = participant.dialog_id_.get_user_id();
+                if user_id.is_valid()
+                    && !user_manager.have_user_force(
+                        env,
+                        user_id,
+                        "on_load_chat_full_from_database",
+                    )
+                {
+                    self.chats_full.remove(&chat_id.get());
+                    env.global
+                        .td_db()
+                        .common_kv()
+                        .erase(&Self::get_chat_full_database_key(chat_id));
+                    return;
+                }
+            }
+            let inviter_user_id = participant.inviter_user_id_;
+            if inviter_user_id.is_valid()
+                && !user_manager.have_user_force(
+                    env,
+                    inviter_user_id,
+                    "on_load_chat_full_from_database",
+                )
+            {
+                self.chats_full.remove(&chat_id.get());
+                env.global
+                    .td_db()
+                    .common_kv()
+                    .erase(&Self::get_chat_full_database_key(chat_id));
+                return;
+            }
+        }
+        let invite_creator_user_id = chat_full.invite_link.get_creator_user_id();
+        if invite_creator_user_id.is_valid()
+            && !user_manager.have_user_force(
+                env,
+                invite_creator_user_id,
+                "on_load_chat_full_from_database",
+            )
+        {
+            self.chats_full.remove(&chat_id.get());
+            env.global
+                .td_db()
+                .common_kv()
+                .erase(&Self::get_chat_full_database_key(chat_id));
+            return;
+        }
+
+        // `CHECK(get_chat(chat_id) != nullptr)` — the caller force-loaded it.
+        let (need_invite_link, c_is_active, c_photo_small_valid) = {
+            let Some(c) = self.get_chat(chat_id) else {
+                debug_assert!(
+                    false,
+                    "Missing chat {chat_id:?} in on_load_chat_full_from_database"
+                );
+                return;
+            };
+            (
+                c.is_active && c.status.can_manage_invite_links(),
+                c.is_active,
+                c.photo.small_file_id.is_valid(),
+            )
+        };
+        let _ = c_is_active;
+        let have_invite_link = chat_full.invite_link.is_valid();
+        if need_invite_link != have_invite_link {
+            if need_invite_link {
+                // ignore ChatFull without invite link
+                self.chats_full.remove(&chat_id.get());
+                return;
+            }
+            chat_full.invite_link = DialogInviteLink::default();
+        }
+
+        let c_photo_same = self
+            .get_chat(chat_id)
+            .is_some_and(|c| is_same_dialog_photo(&chat_full.photo, &c.photo));
+        // auto photo = std::move(chat_full->photo); chat_full->photo = Photo();
+        let mut photo = std::mem::take(&mut chat_full.photo);
+        if !c_photo_same {
+            photo = Photo::default();
+            if c_photo_small_valid {
+                // reload_chat_full(chat_id, Auto(), ...) — an empty promise
+                self.send_get_chat_full_query(
+                    env,
+                    chat_id,
+                    Promise::default(),
+                    "on_load_chat_full_from_database",
+                );
+            }
+        }
+
+        // td_->group_call_manager_->on_update_dialog_about — the
+        // GroupCallManager stub (wave 3).
+        self.chats_full.insert(chat_id.get(), chat_full);
+        self.on_update_chat_full_photo(env, chat_id, photo);
+        let f = self.chats_full.get_mut(&chat_id.get()).unwrap();
+        f.is_update_chat_full_sent = true;
+        self.update_chat_full(
+            user_manager,
+            env,
+            chat_id,
+            "on_load_chat_full_from_database",
+            true,
+        );
+    }
+
+    /// `get_chat_full_force` (ChatManager.cpp:5063-5081) — the synchronous
+    /// db-load path behind the `unavailable_chat_fulls_` one-shot gate.
+    fn get_chat_full_force(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        source: &str,
+    ) -> Option<&mut ChatFull> {
+        if !self.have_chat_force(user_manager, env, chat_id, source) {
+            return None;
+        }
+        if self.chats_full.contains_key(&chat_id.get()) {
+            return self.chats_full.get_mut(&chat_id.get());
+        }
+        if !env.global.use_chat_info_database() {
+            return None;
+        }
+        if !self.unavailable_chat_fulls.insert(chat_id.get()) {
+            return None;
+        }
+        tdutils::log_info!("Trying to load full {chat_id:?} from database from {source}");
+        let value = env
+            .global
+            .td_db()
+            .common_kv()
+            .get(&Self::get_chat_full_database_key(chat_id));
+        self.on_load_chat_full_from_database(user_manager, env, chat_id, value);
+        self.chats_full.get_mut(&chat_id.get())
+    }
+
+    /// `is_chat_full_outdated` (ChatManager.cpp:8449-8477) over the
+    /// snapshot of the `Chat` fields it reads (the load path cannot hold
+    /// a `&Chat` across the force-load; the snapshot carries them).
+    fn is_chat_full_outdated(
+        &self,
+        full_version: i32,
+        has_valid_invite_link: bool,
+        full_photo: &Photo,
+        c: &ChatSnapshot,
+        chat_id: ChatId,
+        only_participants: bool,
+    ) -> bool {
+        if !c.is_active && full_version == -1 {
+            return false;
+        }
+        if full_version != c.version {
+            tdutils::log_info!(
+                "Have outdated ChatFull {chat_id:?} with current version {full_version} and chat version {}",
+                c.version
+            );
+            return true;
+        }
+        if !only_participants && c.is_active && c.can_manage_invite_links && !has_valid_invite_link
+        {
+            tdutils::log_info!("Have outdated invite link in {chat_id:?}");
+            return true;
+        }
+        if !only_participants && !is_same_dialog_photo(full_photo, &c.photo) {
+            tdutils::log_info!("Have outdated chat photo in {chat_id:?}");
+            return true;
+        }
+        false
+    }
+
+    /// `load_chat_full` (ChatManager.cpp:8479-8510). The story-manager
+    /// view fan-out is the StoryManager stub.
+    pub fn load_chat_full(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        force: bool,
+        mut promise: Promise<()>,
+        source: &str,
+    ) {
+        let Some(c_snapshot) = self.get_chat(chat_id).map(|c| ChatSnapshot {
+            is_active: c.is_active,
+            version: c.version,
+            can_manage_invite_links: c.status.can_manage_invite_links(),
+            photo: c.photo.clone(),
+        }) else {
+            return promise.set_error(Status::error(400, "Group not found"));
+        };
+        let full_snapshot = self
+            .get_chat_full_force(user_manager, env, chat_id, source)
+            .map(|f| (f.version, f.invite_link.is_valid(), f.photo.clone()));
+        let is_outdated = match full_snapshot {
+            Some((version, has_valid_invite_link, photo)) => self.is_chat_full_outdated(
+                version,
+                has_valid_invite_link,
+                &photo,
+                &c_snapshot,
+                chat_id,
+                false,
+            ),
+            None => {
+                tdutils::log_info!("Full {chat_id:?} not found");
+                return self.send_get_chat_full_query(env, chat_id, promise, source);
+            }
+        };
+        if is_outdated {
+            tdutils::log_info!("Have outdated full {chat_id:?}");
+            if env.auth_is_bot && !force {
+                return self.send_get_chat_full_query(env, chat_id, promise, source);
+            }
+            self.send_get_chat_full_query(env, chat_id, Promise::default(), source);
+        }
+        // td_->story_manager_->on_view_dialog_active_stories(participants)
+        // — the StoryManager stub (wave 3).
+        promise.set_value(());
+    }
+
+    /// `send_get_chat_full_query` (ChatManager.cpp:8513-8525) — the
+    /// QueryCombiner + GetFullChatQuery send is `[blocked: net]`; the
+    /// validation surfaces stay exact.
+    fn send_get_chat_full_query(
+        &mut self,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        mut promise: Promise<()>,
+        source: &str,
+    ) {
+        tdutils::log_info!("Get full {chat_id:?} from {source}");
+        if !chat_id.is_valid() {
+            return promise.set_error(Status::error(500, "Invalid chat_id"));
+        }
+        let _ = env;
+        tdutils::log_info!("GetFullChatQuery for {chat_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `reload_chat_full` (ChatManager.cpp:8512).
+    pub fn reload_chat_full(
+        &mut self,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        promise: Promise<()>,
+        source: &str,
+    ) {
+        self.send_get_chat_full_query(env, chat_id, promise, source);
+    }
+
+    /// `reload_chat` (ChatManager.cpp:8421-8429) — the GetChatsQuery send
+    /// is [blocked: net] (M.5.44); the validation surfaces stay exact.
+    fn reload_chat(
+        &mut self,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        mut promise: Promise<()>,
+        source: &str,
+    ) {
+        tdutils::log_info!("Reload {chat_id:?} from {source}");
+        if env.global.close_flag() {
+            return promise.set_error(Status::error(400, "The server is temporarily unavailable"));
+        }
+        if !chat_id.is_valid() {
+            return promise.set_error(Status::error(400, "Invalid basic group identifier"));
+        }
+        let _ = source;
+        tdutils::log_info!("GetChatsQuery for {chat_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `reload_channel` (ChatManager.cpp:8938-8946) — the GetChannels
+    /// query send is [blocked: net] (M.5.44); the validation surfaces
+    /// stay exact.
+    fn reload_channel(
+        &mut self,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        mut promise: Promise<()>,
+        source: &str,
+    ) {
+        tdutils::log_info!("Reload {channel_id:?} from {source}");
+        if env.global.close_flag() {
+            return promise.set_error(Status::error(400, "The server is temporarily unavailable"));
+        }
+        if !channel_id.is_valid() {
+            return promise.set_error(Status::error(400, "Invalid supergroup identifier"));
+        }
+        let _ = source;
+        tdutils::log_info!("GetChannelsQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `on_load_channel_full_from_database` (ChatManager.cpp:5098-5220).
+    /// The dialog/community dependencies are the documented M.6/M.12
+    /// stubs; the user dependencies collapse into synchronous
+    /// force-loads. `update_channel` is still the M.5.19 slot.
+    fn on_load_channel_full_from_database(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        value: Vec<u8>,
+        source: &str,
+        is_recursive: bool,
+    ) {
+        if self.channels_full.contains_key(&channel_id.get()) || value.is_empty() {
+            return;
+        }
+        let parsed = {
+            let ctx = env.time_ctx();
+            ChannelFull::parse_value(&value, &ctx)
+        };
+        let mut channel_full = match parsed {
+            Ok(channel_full) => channel_full,
+            Err(error) => {
+                // can't happen unless database is broken
+                tdutils::log_error!("Repair broken full {channel_id:?}: {error}");
+                self.channels_full.remove(&channel_id.get());
+                env.global
+                    .td_db()
+                    .common_kv()
+                    .erase(&Self::get_channel_full_database_key(channel_id));
+                return;
+            }
+        };
+        // must not depend on the linked/monoforum dialogs themselves (the
+        // message database can be disabled) — the Dialogs are forcibly
+        // created in update_channel_full (the DialogManager stub);
+        // add_dialog_dependencies + the community dependency land with
+        // their managers.
+        let mut user_dependencies: Vec<UserId> = Vec::new();
+        user_dependencies.push(channel_full.guard_bot_user_id);
+        user_dependencies.extend(channel_full.bot_user_ids.iter().copied());
+        if let Some(bot_verification) = &channel_full.bot_verification {
+            user_dependencies.push(bot_verification.bot_user_id_);
+        }
+        user_dependencies.push(channel_full.invite_link.get_creator_user_id());
+        for user_id in user_dependencies {
+            if user_id.is_valid() && !user_manager.have_user_force(env, user_id, source) {
+                self.channels_full.remove(&channel_id.get());
+                env.global
+                    .td_db()
+                    .common_kv()
+                    .erase(&Self::get_channel_full_database_key(channel_id));
+                return;
+            }
+        }
+        let migrated_from_chat_id = channel_full.migrated_from_chat_id;
+        if migrated_from_chat_id.is_valid()
+            && !self.have_chat_force(user_manager, env, migrated_from_chat_id, source)
+        {
+            self.channels_full.remove(&channel_id.get());
+            env.global
+                .td_db()
+                .common_kv()
+                .erase(&Self::get_channel_full_database_key(channel_id));
+            return;
+        }
+
+        // `CHECK(get_channel(channel_id) != nullptr)` — the caller
+        // force-loaded it.
+        let need_invite_link = self
+            .get_channel(channel_id)
+            .is_some_and(|c| c.status.can_manage_invite_links());
+        let have_invite_link = channel_full.invite_link.is_valid();
+        if need_invite_link != have_invite_link {
+            if need_invite_link {
+                // ignore ChannelFull without invite link
+                self.channels_full.remove(&channel_id.get());
+                return;
+            }
+            channel_full.invite_link = DialogInviteLink::default();
+        }
+
+        let c_photo_small_valid = self
+            .get_channel(channel_id)
+            .is_some_and(|c| c.photo.small_file_id.is_valid());
+        let c_photo_same = self
+            .get_channel(channel_id)
+            .is_some_and(|c| is_same_dialog_photo(&channel_full.photo, &c.photo));
+        let mut photo = std::mem::take(&mut channel_full.photo);
+        if !c_photo_same {
+            photo = Photo::default();
+            if c_photo_small_valid {
+                channel_full.expires_at = 0.0;
+            }
+        }
+
+        if channel_full.participant_count < channel_full.administrator_count {
+            channel_full.participant_count = channel_full.administrator_count;
+        }
+        let c_participant_count = self.get_channel(channel_id).map(|c| c.participant_count);
+        if let Some(c_participant_count) = c_participant_count
+            && c_participant_count != 0
+            && c_participant_count != channel_full.participant_count
+        {
+            channel_full.participant_count = c_participant_count;
+            if channel_full.participant_count < channel_full.administrator_count {
+                channel_full.participant_count = channel_full.administrator_count;
+                channel_full.expires_at = 0.0;
+                let c = self.get_channel_mut(channel_id).unwrap();
+                c.participant_count = channel_full.participant_count;
+                c.is_changed = true;
+            }
+        }
+        let c_can_be_deleted = self.get_channel(channel_id).map(|c| c.can_be_deleted);
+        if let Some(c_can_be_deleted) = c_can_be_deleted
+            && c_can_be_deleted != channel_full.can_be_deleted
+        {
+            let c = self.get_channel_mut(channel_id).unwrap();
+            c.can_be_deleted = channel_full.can_be_deleted;
+            c.need_save_to_database = true;
+        }
+
+        let c_is_slow_mode_enabled = self
+            .get_channel(channel_id)
+            .is_some_and(|c| c.is_slow_mode_enabled);
+        let was_invalidated = self.invalidated_channels_full.remove(&channel_id.get());
+        let drop_slow_mode = !c_is_slow_mode_enabled;
+        if was_invalidated || (!c_is_slow_mode_enabled && channel_full.slow_mode_delay != 0) {
+            Self::do_invalidate_channel_full_record(&mut channel_full, drop_slow_mode);
+        }
+
+        // td_->group_call_manager_->on_update_dialog_about — the
+        // GroupCallManager stub (wave 3).
+        self.channels_full.insert(channel_id.get(), channel_full);
+        self.on_update_channel_full_photo(env, channel_id, photo);
+
+        // send_closure_later(messages_manager on_dialog_bots_updated) —
+        // the MessagesManager stub.
+        self.update_channel(user_manager, env, channel_id, false, false);
+
+        let f = self.channels_full.get_mut(&channel_id.get()).unwrap();
+        f.is_update_channel_full_sent = true;
+        self.update_channel_full(user_manager, env, channel_id, source, true);
+
+        let expires_at = self
+            .channels_full
+            .get(&channel_id.get())
+            .map(|f| f.expires_at)
+            .unwrap_or(0.0);
+        if expires_at == 0.0 {
+            self.load_channel_full(
+                user_manager,
+                env,
+                channel_id,
+                true,
+                Promise::default(),
+                "on_load_channel_full_from_database",
+            );
+        }
+
+        let monoforum_channel_id = self
+            .channels_full
+            .get(&channel_id.get())
+            .map(|f| f.monoforum_channel_id)
+            .unwrap_or_default();
+        if monoforum_channel_id.is_valid()
+            && self.get_channel_full_const(monoforum_channel_id).is_none()
+            && (is_recursive
+                || self
+                    .get_channel_full_force(
+                        user_manager,
+                        env,
+                        monoforum_channel_id,
+                        true,
+                        source,
+                        true,
+                    )
+                    .is_none())
+        {
+            {
+                tdutils::log_info!(
+                    "Can't find full {monoforum_channel_id:?} from full {channel_id:?}"
+                );
+                self.reload_channel_full(env, monoforum_channel_id, Promise::default(), source);
+            }
+        }
+    }
+
+    /// `get_channel_full_force` (ChatManager.cpp:5222-5241).
+    fn get_channel_full_force(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        only_local: bool,
+        source: &str,
+        is_recursive: bool,
+    ) -> Option<&mut ChannelFull> {
+        if !self.have_channel_force(user_manager, env, channel_id, source) {
+            return None;
+        }
+        if self.channels_full.contains_key(&channel_id.get()) {
+            return self.channels_full.get_mut(&channel_id.get());
+        }
+        if !env.global.use_chat_info_database() {
+            return None;
+        }
+        if !self.unavailable_channel_fulls.insert(channel_id.get()) {
+            return None;
+        }
+        tdutils::log_info!("Trying to load full {channel_id:?} from database from {source}");
+        let value = env
+            .global
+            .td_db()
+            .common_kv()
+            .get(&Self::get_channel_full_database_key(channel_id));
+        self.on_load_channel_full_from_database(
+            user_manager,
+            env,
+            channel_id,
+            value,
+            source,
+            is_recursive,
+        );
+        if only_local || self.channels_full.contains_key(&channel_id.get()) {
+            return self.channels_full.get_mut(&channel_id.get());
+        }
+        // C++ returns get_channel_full(channel_id, only_local, source) —
+        // which re-checks the expiry and may send the query.
+        self.get_channel_full(env, channel_id, only_local, source)
+    }
+
+    /// `get_channel_full` (ChatManager.cpp:8962-8973).
+    fn get_channel_full(
+        &mut self,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        only_local: bool,
+        source: &str,
+    ) -> Option<&mut ChannelFull> {
+        let is_expired = self
+            .channels_full
+            .get(&channel_id.get())
+            .map(|f| f.is_expired());
+        if is_expired == Some(true) && !only_local && !env.auth_is_bot {
+            self.send_get_channel_full_query(env, channel_id, Promise::default(), source);
+        }
+        self.channels_full.get_mut(&channel_id.get())
+    }
+
+    /// `load_channel_full` (ChatManager.cpp:8984-9013).
+    pub fn load_channel_full(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        force: bool,
+        mut promise: Promise<()>,
+        source: &str,
+    ) {
+        let is_expired =
+            match self.get_channel_full_force(user_manager, env, channel_id, true, source, false) {
+                Some(channel_full) => channel_full.is_expired(),
+                None => {
+                    // the C++ passes the null ChannelFull — the version
+                    // bookkeeping inside skips
+                    return self.send_get_channel_full_query(env, channel_id, promise, source);
+                }
+            };
+        if is_expired {
+            if env.auth_is_bot && !force {
+                return self.send_get_channel_full_query(
+                    env,
+                    channel_id,
+                    promise,
+                    "load expired channel_full",
+                );
+            }
+            // the reload result only logs in C++
+            self.send_get_channel_full_query(
+                env,
+                channel_id,
+                Promise::default(),
+                "load expired channel_full",
+            );
+        }
+        promise.set_value(());
+    }
+
+    /// `send_get_channel_full_query` (ChatManager.cpp:9015-9048) — the
+    /// GetFullChannelQuery send is `[blocked: net]`; the validation and
+    /// the `repair_request_version` bookkeeping stay exact.
+    fn send_get_channel_full_query(
+        &mut self,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        mut promise: Promise<()>,
+        source: &str,
+    ) {
+        let input_channel = self.get_input_channel(env, channel_id);
+        if input_channel.is_none() {
+            return promise.set_error(Status::error(400, "Supergroup not found"));
+        }
+        if !self.have_input_peer_channel_id(env, channel_id, AccessRights::Read) {
+            return promise.set_error(Status::error(400, "Can't access the chat"));
+        }
+        let bookkeeping = self
+            .channels_full
+            .get(&channel_id.get())
+            .map(|f| (f.repair_request_version, f.speculative_version));
+        if let Some((repair_request_version, speculative_version)) = bookkeeping {
+            if promise.is_empty() {
+                if repair_request_version != 0 {
+                    tdutils::log_info!("Skip get full {channel_id:?} request from {source}");
+                    return;
+                }
+                let f = self.channels_full.get_mut(&channel_id.get()).unwrap();
+                f.repair_request_version = speculative_version;
+            } else {
+                let f = self.channels_full.get_mut(&channel_id.get()).unwrap();
+                f.repair_request_version = u32::MAX;
+            }
+        }
+        tdutils::log_info!("Get full {channel_id:?} from {source}");
+        let _ = input_channel;
+        tdutils::log_info!("GetFullChannelQuery for {channel_id:?} — [blocked: net]");
+        promise.set_error(Status::error(500, "Network is not implemented yet"));
+    }
+
+    /// `reload_channel_full` (ChatManager.cpp:9028-9031).
+    pub fn reload_channel_full(
+        &mut self,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        promise: Promise<()>,
+        source: &str,
+    ) {
+        self.send_get_channel_full_query(env, channel_id, promise, source);
+    }
+
+    // ---- M.5.27 (pulled forward): the invalidation machine the unban
+    // timeout and the load path ride on ----
+
+    /// `invalidate_channel_full` (ChatManager.cpp:6638-6647).
+    pub(crate) fn invalidate_channel_full(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        need_drop_slow_mode_delay: bool,
+        source: &str,
+    ) {
+        tdutils::log_info!("Invalidate supergroup full for {channel_id:?} from {source}");
+        if self.channels_full.contains_key(&channel_id.get()) {
+            // must not load ChannelFull
+            self.do_invalidate_channel_full(channel_id, need_drop_slow_mode_delay);
+            self.update_channel_full(user_manager, env, channel_id, source, false);
+        } else if channel_id.is_valid() {
+            self.invalidated_channels_full.insert(channel_id.get());
+        }
+    }
+
+    /// `do_invalidate_channel_full` (ChatManager.cpp:6649-6663) over the
+    /// map record — the post-insert form. The dialog_manager
+    /// full-invalidation fan-out is the DialogManager stub.
+    fn do_invalidate_channel_full(
+        &mut self,
+        channel_id: ChannelId,
+        need_drop_slow_mode_delay: bool,
+    ) {
+        let Some(f) = self.channels_full.get_mut(&channel_id.get()) else {
+            debug_assert!(
+                false,
+                "Missing full {channel_id:?} in do_invalidate_channel_full"
+            );
+            return;
+        };
+        Self::do_invalidate_channel_full_record(f, need_drop_slow_mode_delay);
+    }
+
+    /// `do_invalidate_channel_full(ChannelFull *, ...)` — the record form
+    /// the load path runs before the parsed full is inserted.
+    fn do_invalidate_channel_full_record(f: &mut ChannelFull, need_drop_slow_mode_delay: bool) {
+        // td_->dialog_manager_->on_dialog_info_full_invalidated — the
+        // DialogManager stub.
+        if f.expires_at >= tdutils::time::now() {
+            f.expires_at = 0.0;
+            f.need_save_to_database = true;
+        }
+        if need_drop_slow_mode_delay && f.slow_mode_delay != 0 {
+            f.slow_mode_delay = 0;
+            f.slow_mode_next_send_date = 0;
+            f.is_slow_mode_next_send_date_changed = true;
+            f.is_changed = true;
+        }
+    }
+
+    /// `drop_chat_full` (ChatManager.cpp:7576-7594). The
+    /// `update_chat_online_member_count` fan-out is the
+    /// GroupCallManager/MessagesManager stub; the M.5.29 intake is the
+    /// production caller.
+    #[allow(dead_code)]
+    pub(crate) fn drop_chat_full(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+    ) {
+        if self
+            .get_chat_full_force(user_manager, env, chat_id, "drop_chat_full")
+            .is_none()
+        {
+            return;
+        }
+        tdutils::log_info!("Drop basicGroupFullInfo of {chat_id:?}");
+        self.on_update_chat_full_photo(env, chat_id, Photo::default());
+        {
+            let Some(f) = self.chats_full.get_mut(&chat_id.get()) else {
+                return;
+            };
+            // chat_full->creator_user_id = UserId();
+            f.participants.clear();
+            f.bot_commands.clear();
+            f.version = -1;
+            Self::update_permanent_invite_link(&mut f.invite_link, DialogInviteLink::default());
+            f.is_changed = true;
+        }
+        self.update_chat_full(user_manager, env, chat_id, "drop_chat_full", false);
+    }
+
+    // ---- M.5.17: the full-info file-source edges (the Files-step
+    // stand-ins) ----
+
+    /// The `FileReferenceManager::create_*_file_source` stand-in — a local
+    /// counter (replaced by the real registry with the Files slice).
+    fn create_file_source_id(&mut self) -> FileSourceId {
+        self.file_source_id_counter += 1;
+        FileSourceId::new(self.file_source_id_counter)
+    }
+
+    /// `get_chat_full_file_source_id` (ChatManager.cpp:8320-8337).
+    pub fn get_chat_full_file_source_id(
+        &mut self,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+    ) -> FileSourceId {
+        if !chat_id.is_valid() {
+            return FileSourceId::default();
+        }
+        if let Some(chat_full) = self.get_chat_full(chat_id) {
+            // chat full was already added, source ID was registered and
+            // shouldn't be needed
+            return if chat_full.is_update_chat_full_sent {
+                FileSourceId::default()
+            } else {
+                chat_full.file_source_id
+            };
+        }
+        let _ = env;
+        match self.chat_full_file_source_ids.get(&chat_id.get()) {
+            Some(source_id) if source_id.is_valid() => *source_id,
+            _ => {
+                let new_source_id = self.create_file_source_id();
+                self.chat_full_file_source_ids
+                    .insert(chat_id.get(), new_source_id);
+                new_source_id
+            }
+        }
+    }
+
+    /// `get_channel_full_file_source_id` (ChatManager.cpp:8339-8356).
+    pub fn get_channel_full_file_source_id(
+        &mut self,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+    ) -> FileSourceId {
+        if !channel_id.is_valid() {
+            return FileSourceId::default();
+        }
+        if let Some(channel_full) = self.get_channel_full_const(channel_id) {
+            // channel full was already added, source ID was registered and
+            // shouldn't be needed
+            return if channel_full.is_update_channel_full_sent {
+                FileSourceId::default()
+            } else {
+                channel_full.file_source_id
+            };
+        }
+        let _ = env;
+        match self.channel_full_file_source_ids.get(&channel_id.get()) {
+            Some(source_id) if source_id.is_valid() => *source_id,
+            _ => {
+                let new_source_id = self.create_file_source_id();
+                self.channel_full_file_source_ids
+                    .insert(channel_id.get(), new_source_id);
+                new_source_id
+            }
+        }
+    }
+
+    // ---- the full-photo appliers (ChatManager.cpp:6664-6722). The
+    // `change_files_source` fan-out is the Files-step no-op; the
+    // registered-file-ids bookkeeping stays. ----
+
+    /// `on_update_chat_full_photo` (ChatManager.cpp:6664-6690).
+    fn on_update_chat_full_photo(&mut self, env: &mut UserEnv, chat_id: ChatId, photo: Photo) {
+        let _ = env;
+        if !self.chats_full.contains_key(&chat_id.get()) {
+            debug_assert!(
+                false,
+                "Missing full {chat_id:?} in on_update_chat_full_photo"
+            );
+            return;
+        }
+        let photo_file_ids = {
+            let Some(f) = self.chats_full.get_mut(&chat_id.get()) else {
+                return;
+            };
+            if photo != f.photo {
+                f.photo = photo;
+                f.is_changed = true;
+            }
+            photo_get_file_ids(&f.photo)
+        };
+        let same = self
+            .chats_full
+            .get(&chat_id.get())
+            .is_some_and(|f| f.registered_photo_file_ids == photo_file_ids);
+        if same {
+            return;
+        }
+        let need_source = !self
+            .chats_full
+            .get(&chat_id.get())
+            .is_some_and(|f| f.file_source_id.is_valid());
+        if need_source {
+            let moved_source = match self
+                .chat_full_file_source_ids
+                .get(&chat_id.get())
+                .copied()
+                .filter(|id| id.is_valid())
+            {
+                // move the file source inside of the full
+                Some(stored) => {
+                    self.chat_full_file_source_ids.remove(&chat_id.get());
+                    stored
+                }
+                // need to create a new file source for the full
+                None => self.create_file_source_id(),
+            };
+            if let Some(f) = self.chats_full.get_mut(&chat_id.get()) {
+                f.file_source_id = moved_source;
+            }
+        }
+        if let Some(f) = self.chats_full.get_mut(&chat_id.get()) {
+            f.registered_photo_file_ids = photo_file_ids;
+        }
+    }
+
+    /// `on_update_channel_full_photo` (ChatManager.cpp:6692-6722).
+    fn on_update_channel_full_photo(
+        &mut self,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        photo: Photo,
+    ) {
+        let _ = env;
+        if !self.channels_full.contains_key(&channel_id.get()) {
+            debug_assert!(
+                false,
+                "Missing full {channel_id:?} in on_update_channel_full_photo"
+            );
+            return;
+        }
+        let photo_file_ids = {
+            let Some(f) = self.channels_full.get_mut(&channel_id.get()) else {
+                return;
+            };
+            if photo != f.photo {
+                f.photo = photo;
+                f.is_changed = true;
+                f.is_photo_changed = true;
+            }
+            photo_get_file_ids(&f.photo)
+        };
+        let same = self
+            .channels_full
+            .get(&channel_id.get())
+            .is_some_and(|f| f.registered_photo_file_ids == photo_file_ids);
+        if same {
+            return;
+        }
+        let need_source = !self
+            .channels_full
+            .get(&channel_id.get())
+            .is_some_and(|f| f.file_source_id.is_valid());
+        if need_source {
+            let moved_source = match self
+                .channel_full_file_source_ids
+                .get(&channel_id.get())
+                .copied()
+                .filter(|id| id.is_valid())
+            {
+                Some(stored) => {
+                    self.channel_full_file_source_ids.remove(&channel_id.get());
+                    stored
+                }
+                None => self.create_file_source_id(),
+            };
+            if let Some(f) = self.channels_full.get_mut(&channel_id.get()) {
+                f.file_source_id = moved_source;
+            }
+        }
+        if let Some(f) = self.channels_full.get_mut(&channel_id.get()) {
+            f.registered_photo_file_ids = photo_file_ids;
+        }
+    }
+
+    // ---- the permanent-invite-link machinery (ChatManager.cpp:6724-6743,
+    // :6982-6995) ----
+
+    /// `update_permanent_invite_link` (ChatManager.cpp:6982-6995). The
+    /// `dialog_invite_link_manager_->invalidate_invite_link_info`
+    /// fan-out is the DialogInviteLinkManager stub (wave 2).
+    #[allow(dead_code)]
+    fn update_permanent_invite_link(
+        invite_link: &mut DialogInviteLink,
+        new_invite_link: DialogInviteLink,
+    ) -> bool {
+        if new_invite_link != *invite_link {
+            // if (invite_link.is_valid() && invite_link.get_invite_link() != ...)
+            //   — invalidate the old link's info (stub)
+            *invite_link = new_invite_link;
+            return true;
+        }
+        false
+    }
+
+    /// `on_update_chat_full_invite_link` (ChatManager.cpp:6724-6731) —
+    /// the M.5.24 intake caller lands with on_get_chat_full.
+    #[allow(dead_code)]
+    fn on_update_chat_full_invite_link(
+        &mut self,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        invite_link: Option<telegram_api::ExportedChatInvite>,
+    ) {
+        let _ = env;
+        let Some(f) = self.chats_full.get_mut(&chat_id.get()) else {
+            debug_assert!(
+                false,
+                "Missing full {chat_id:?} in on_update_chat_full_invite_link"
+            );
+            return;
+        };
+        let new_invite_link =
+            DialogInviteLink::from_telegram(invite_link, false, false, "ChatFull");
+        if Self::update_permanent_invite_link(&mut f.invite_link, new_invite_link) {
+            f.is_changed = true;
+        }
+    }
+
+    /// `on_update_channel_full_invite_link` (ChatManager.cpp:6733-6740) —
+    /// the M.5.26 intake caller lands with on_get_channel_full.
+    #[allow(dead_code)]
+    fn on_update_channel_full_invite_link(
+        &mut self,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        invite_link: Option<telegram_api::ExportedChatInvite>,
+    ) {
+        let _ = env;
+        let Some(f) = self.channels_full.get_mut(&channel_id.get()) else {
+            debug_assert!(
+                false,
+                "Missing full {channel_id:?} in on_update_channel_full_invite_link"
+            );
+            return;
+        };
+        let new_invite_link =
+            DialogInviteLink::from_telegram(invite_link, false, false, "ChannelFull");
+        if Self::update_permanent_invite_link(&mut f.invite_link, new_invite_link) {
+            f.is_changed = true;
+        }
+    }
+
+    // ---- M.5.24/M.5.26 (cores pulled forward): the full diff machines
+    // (ChatManager.cpp:5558-5620, :5622-5700) ----
+
+    /// `update_chat_full` (ChatManager.cpp:5558-5620). The
+    /// dialog_participant_manager/messages_manager fan-outs are the
+    /// documented stubs.
+    fn update_chat_full(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        source: &str,
+        from_database: bool,
+    ) {
+        if self
+            .chats_full
+            .get(&chat_id.get())
+            .is_some_and(|f| f.is_being_updated)
+        {
+            tdutils::log_error!("Detected recursive update of full {chat_id:?} from {source}");
+        }
+        if let Some(f) = self.chats_full.get_mut(&chat_id.get()) {
+            f.is_being_updated = true;
+        }
+        self.unavailable_chat_fulls.remove(&chat_id.get());
+        let (need_send_update, need_save) = {
+            let Some(f) = self.chats_full.get_mut(&chat_id.get()) else {
+                debug_assert!(false, "Missing full {chat_id:?} in update_chat_full");
+                return;
+            };
+            f.need_send_update |= f.is_changed;
+            f.need_save_to_database |= f.is_changed;
+            f.is_changed = false;
+            (f.need_send_update, f.need_save_to_database)
+        };
+        if need_send_update || need_save {
+            tdutils::log_info!("Update full {chat_id:?} from {source}");
+        }
+        if need_send_update {
+            // the administrators + bots lists (the stub fan-outs consume
+            // them in C++)
+            let mut bot_user_ids: Vec<UserId> = Vec::new();
+            let mut administrators: Vec<crate::chat_manager::DialogAdministrator> = Vec::new();
+            let participants = self
+                .chats_full
+                .get(&chat_id.get())
+                .map(|f| f.participants.clone())
+                .unwrap_or_default();
+            for participant in &participants {
+                if participant.dialog_id_.get_type() == DialogType::User {
+                    let user_id = participant.dialog_id_.get_user_id();
+                    if participant.status_.is_administrator() {
+                        administrators.push(DialogAdministrator::from_status(
+                            user_id,
+                            &participant.status_,
+                        ));
+                    }
+                    if user_manager.is_user_bot_of(user_id) {
+                        bot_user_ids.push(user_id);
+                    }
+                }
+            }
+            if let Some(f) = self.chats_full.get_mut(&chat_id.get()) {
+                f.bot_commands
+                    .retain(|commands| bot_user_ids.contains(&commands.get_bot_user_id()));
+            }
+            // td_->dialog_participant_manager_->on_update_dialog_administrators
+            // and messages_manager on_dialog_bots_updated — the stubs.
+            let _ = administrators;
+
+            {
+                let c_is_sent = self
+                    .get_chat(chat_id)
+                    .map(|c| c.is_update_basic_group_sent)
+                    .unwrap_or(false);
+                // CHECK(c == nullptr || c->is_update_basic_group_sent)
+                debug_assert!(self.get_chat(chat_id).is_none() || c_is_sent);
+            }
+            let basic_group_id = self.get_basic_group_id_object(chat_id, "update_chat_full");
+            let full_object = self.get_basic_group_full_info_object(user_manager, env, chat_id);
+            if let Some(f) = self.chats_full.get_mut(&chat_id.get()) {
+                if !f.is_update_chat_full_sent {
+                    tdutils::log_error!(
+                        "Send partial updateBasicGroupFullInfo for {chat_id:?} from {source}"
+                    );
+                    f.is_update_chat_full_sent = true;
+                }
+                f.need_send_update = false;
+            }
+            self.pending_updates
+                .push(td_api::Update::updateBasicGroupFullInfo(
+                    td_api::updateBasicGroupFullInfo {
+                        basic_group_id,
+                        basic_group_full_info: full_object,
+                    },
+                ));
+        }
+        if need_save {
+            if !from_database {
+                self.save_chat_full(env, chat_id);
+            }
+            if let Some(f) = self.chats_full.get_mut(&chat_id.get()) {
+                f.need_save_to_database = false;
+            }
+        }
+        if let Some(f) = self.chats_full.get_mut(&chat_id.get()) {
+            f.is_being_updated = false;
+        }
+    }
+
+    /// `update_channel_full` (ChatManager.cpp:5622-5700). The
+    /// dialog_manager force-create and the monoforum photo special-case
+    /// keep their C++ shape; the linked/monoforum dialog creation is the
+    /// DialogManager stub.
+    fn update_channel_full(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        source: &str,
+        from_database: bool,
+    ) {
+        if self
+            .channels_full
+            .get(&channel_id.get())
+            .is_some_and(|f| f.is_being_updated)
+        {
+            tdutils::log_error!("Detected recursive update of full {channel_id:?} from {source}");
+        }
+        if let Some(f) = self.channels_full.get_mut(&channel_id.get()) {
+            f.is_being_updated = true;
+        }
+        self.unavailable_channel_fulls.remove(&channel_id.get());
+        {
+            // CHECK(channel_full->participant_count >= administrator_count)
+            let counts = self
+                .channels_full
+                .get(&channel_id.get())
+                .map(|f| (f.participant_count, f.administrator_count));
+            debug_assert!(counts.is_none_or(|(p, a)| p >= a));
+        }
+        if self
+            .channels_full
+            .get(&channel_id.get())
+            .is_some_and(|f| f.is_slow_mode_next_send_date_changed)
+        {
+            let now = env.global.server_time();
+            let f = self.channels_full.get_mut(&channel_id.get()).unwrap();
+            if f.slow_mode_next_send_date as f64 > now + 3601.0 {
+                f.slow_mode_next_send_date = (now as i32) + 3601;
+            }
+            if (f.slow_mode_next_send_date as f64) <= now {
+                f.slow_mode_next_send_date = 0;
+            }
+            if f.slow_mode_next_send_date == 0 {
+                Self::cancel_timeout(&mut self.slow_mode_delay_timeouts, channel_id);
+            } else {
+                let timeout_in = f.slow_mode_next_send_date as f64 - now + 0.002;
+                Self::set_timeout(&mut self.slow_mode_delay_timeouts, channel_id, timeout_in);
+            }
+            f.is_slow_mode_next_send_date_changed = false;
+        }
+        if self
+            .channels_full
+            .get(&channel_id.get())
+            .is_some_and(|f| f.is_photo_changed)
+        {
+            let emit_monoforum = {
+                let Some(f) = self.channels_full.get(&channel_id.get()) else {
+                    return;
+                };
+                f.monoforum_channel_id.is_valid() && self.is_broadcast_channel(channel_id)
+            };
+            if emit_monoforum {
+                let monoforum_channel_id = self
+                    .channels_full
+                    .get(&channel_id.get())
+                    .map(|f| f.monoforum_channel_id)
+                    .unwrap_or_default();
+                let monoforum_sent = self
+                    .channels_full
+                    .get(&monoforum_channel_id.get())
+                    .is_some_and(|f| f.is_update_channel_full_sent);
+                if monoforum_sent {
+                    let update = self.get_update_supergroup_full_info_object(
+                        user_manager,
+                        env,
+                        monoforum_channel_id,
+                        "update_channel_full monoforum",
+                    );
+                    self.pending_updates.push(update);
+                }
+            }
+            let f = self.channels_full.get_mut(&channel_id.get()).unwrap();
+            f.is_photo_changed = false;
+        }
+        let (need_send_update, need_save) = {
+            let Some(f) = self.channels_full.get_mut(&channel_id.get()) else {
+                return;
+            };
+            if f.need_save_to_database {
+                let bot_user_ids = f.bot_user_ids.clone();
+                let before = f.bot_commands.len();
+                f.bot_commands
+                    .retain(|commands| bot_user_ids.contains(&commands.get_bot_user_id()));
+                f.is_changed |= before != f.bot_commands.len();
+            }
+            f.need_send_update |= f.is_changed;
+            f.need_save_to_database |= f.is_changed;
+            f.is_changed = false;
+            (f.need_send_update, f.need_save_to_database)
+        };
+        if need_send_update || need_save {
+            tdutils::log_info!("Update full {channel_id:?} from {source}");
+        }
+        if need_send_update {
+            let (linked_valid, linked_id, monoforum_valid, monoforum_id) = self
+                .channels_full
+                .get(&channel_id.get())
+                .map(|f| {
+                    (
+                        f.linked_channel_id.is_valid(),
+                        f.linked_channel_id,
+                        f.monoforum_channel_id.is_valid(),
+                        f.monoforum_channel_id,
+                    )
+                })
+                .unwrap_or((false, ChannelId::default(), false, ChannelId::default()));
+            // dialog_manager_->force_create_dialog(linked/monoforum) — the
+            // DialogManager stub (M.6).
+            let _ = (linked_valid, linked_id, monoforum_valid, monoforum_id);
+
+            let update =
+                self.get_update_supergroup_full_info_object(user_manager, env, channel_id, source);
+            if let Some(f) = self.channels_full.get_mut(&channel_id.get()) {
+                if !f.is_update_channel_full_sent {
+                    tdutils::log_error!(
+                        "Send partial updateSupergroupFullInfo for {channel_id:?} from {source}"
+                    );
+                    f.is_update_channel_full_sent = true;
+                }
+                f.need_send_update = false;
+            }
+            self.pending_updates.push(update);
+        }
+        if need_save {
+            if !from_database {
+                self.save_channel_full(env, channel_id);
+            }
+            if let Some(f) = self.channels_full.get_mut(&channel_id.get()) {
+                f.need_save_to_database = false;
+            }
+        }
+        if let Some(f) = self.channels_full.get_mut(&channel_id.get()) {
+            f.is_being_updated = false;
+        }
+    }
+
+    // ---- the query-failure handlers (ChatManager.cpp:6235-6251) ----
+
+    /// `on_get_chat_full_failed` (ChatManager.cpp:6235-6241).
+    pub fn on_get_chat_full_failed(&mut self, env: &mut UserEnv, chat_id: ChatId) {
+        if env.global.close_flag() {
+            return;
+        }
+        tdutils::log_info!("Failed to get full {chat_id:?}");
+    }
+
+    /// `on_get_channel_full_failed` (ChatManager.cpp:6243-6251).
+    pub fn on_get_channel_full_failed(
+        &mut self,
+        _user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+    ) {
+        if env.global.close_flag() {
+            return;
+        }
+        tdutils::log_info!("Failed to get full {channel_id:?}");
+        if let Some(channel_full) =
+            self.get_channel_full(env, channel_id, true, "on_get_channel_full")
+        {
+            channel_full.repair_request_version = 0;
+        }
+    }
+
+    // ---- M.5.36/M.5.37 (cores pulled forward): the id + object builders
+    // the full diff machines emit through (ChatManager.cpp:9783-9962) ----
+
+    /// `get_basic_group_id_object` (ChatManager.cpp:9795-9803).
+    pub fn get_basic_group_id_object(&mut self, chat_id: ChatId, source: &str) -> i64 {
+        if chat_id.is_valid()
+            && self.get_chat(chat_id).is_none()
+            && !self.unknown_chats.contains(&chat_id.get())
+        {
+            tdutils::log_error!("Have no information about {chat_id:?} from {source}");
+            self.unknown_chats.insert(chat_id.get());
+            let update = Self::get_update_unknown_basic_group_object(chat_id);
+            self.pending_updates.push(update);
+        }
+        chat_id.get()
+    }
+
+    /// `get_update_unknown_basic_group_object` (ChatManager.cpp:9790-9793).
+    pub fn get_update_unknown_basic_group_object(chat_id: ChatId) -> td_api::Update {
+        td_api::Update::updateBasicGroup(td_api::updateBasicGroup {
+            basic_group: td_api::BasicGroup {
+                id: chat_id.get(),
+                member_count: 0,
+                status: DialogParticipantStatus::banned(0, String::new())
+                    .get_chat_member_status_object(),
+                is_active: true,
+                upgraded_to_supergroup_id: 0,
+            },
+        })
+    }
+
+    /// `get_supergroup_id_object` (ChatManager.cpp:9862-9877).
+    pub fn get_supergroup_id_object(&mut self, channel_id: ChannelId, source: &str) -> i64 {
+        if channel_id.is_valid()
+            && self.get_channel(channel_id).is_none()
+            && !self.unknown_channels.contains(&channel_id.get())
+        {
+            if self.have_min_channel(channel_id) {
+                tdutils::log_info!("Have only min {channel_id:?} received from {source}");
+            } else {
+                tdutils::log_error!(
+                    "Have no information about {channel_id:?} received from {source}"
+                );
+            }
+            self.unknown_channels.insert(channel_id.get());
+            let update = self.get_update_unknown_supergroup_object(channel_id);
+            self.pending_updates.push(update);
+        }
+        channel_id.get()
+    }
+
+    /// `get_update_unknown_supergroup_object` (ChatManager.cpp:9886-9897).
+    /// The nullable object/enum fields answer the codegen-forced empty
+    /// payloads.
+    pub fn get_update_unknown_supergroup_object(&self, channel_id: ChannelId) -> td_api::Update {
+        let is_megagroup = self
+            .get_min_channel(channel_id)
+            .is_some_and(|m| m.is_megagroup_);
+        td_api::Update::updateSupergroup(td_api::updateSupergroup {
+            supergroup: td_api::Supergroup {
+                id: channel_id.get(),
+                usernames: td_api::Usernames {
+                    active_usernames: Vec::new(),
+                    disabled_usernames: Vec::new(),
+                    editable_username: String::new(),
+                    collectible_usernames: Vec::new(),
+                },
+                date: 0,
+                status: DialogParticipantStatus::banned(0, String::new())
+                    .get_chat_member_status_object(),
+                member_count: 0,
+                boost_level: 0,
+                has_automatic_translation: false,
+                has_linked_chat: false,
+                has_location: false,
+                sign_messages: false,
+                show_message_sender: false,
+                join_to_send_messages: !is_megagroup,
+                join_by_request: false,
+                is_slow_mode_enabled: false,
+                is_channel: !is_megagroup,
+                is_broadcast_group: false,
+                is_forum: false,
+                is_direct_messages_group: false,
+                is_administered_direct_messages_group: false,
+                verification_status: td_api::VerificationStatus::default(),
+                has_direct_messages_group: false,
+                has_forum_tabs: false,
+                restriction_info: td_api::RestrictionInfo::default(),
+                paid_message_star_count: 0,
+                active_story_state: td_api::ActiveStoryState::default(),
+            },
+        })
+    }
+
+    /// `get_basic_group_object(chat_id, c)` (ChatManager.cpp:9817-9824).
+    pub fn get_basic_group_object_const(
+        &mut self,
+        chat_id: ChatId,
+        c: &Chat,
+    ) -> td_api::BasicGroup {
+        let migrated = c.migrated_to_channel_id;
+        td_api::BasicGroup {
+            id: chat_id.get(),
+            member_count: c.participant_count,
+            status: c.status.get_chat_member_status_object(),
+            is_active: c.is_active,
+            upgraded_to_supergroup_id: self
+                .get_supergroup_id_object(migrated, "get_basic_group_object"),
+        }
+    }
+
+    /// `get_basic_group_object(chat_id)` (ChatManager.cpp:9812-9814).
+    pub fn get_basic_group_object(&mut self, chat_id: ChatId) -> Option<td_api::BasicGroup> {
+        let c = self.get_chat(chat_id).cloned()?;
+        Some(self.get_basic_group_object_const(chat_id, &c))
+    }
+
+    /// `get_update_basic_group_object` (ChatManager.cpp:9782-9788).
+    pub fn get_update_basic_group_object(
+        &mut self,
+        chat_id: ChatId,
+        c: Option<&Chat>,
+    ) -> td_api::Update {
+        match c {
+            None => Self::get_update_unknown_basic_group_object(chat_id),
+            Some(c) => {
+                let basic_group = self.get_basic_group_object_const(chat_id, c);
+                td_api::Update::updateBasicGroup(td_api::updateBasicGroup { basic_group })
+            }
+        }
+    }
+
+    /// `get_channel_join_to_send` (ChatManager.cpp static).
+    fn get_channel_join_to_send(c: &Channel) -> bool {
+        (c.join_to_send || !c.is_megagroup || !c.has_linked_channel) && !c.is_monoforum
+    }
+
+    /// `get_channel_join_request` (ChatManager.cpp static).
+    fn get_channel_join_request(c: &Channel) -> bool {
+        c.join_request && c.is_megagroup && !c.is_monoforum && !c.is_gigagroup
+    }
+
+    /// `get_channel_verification_status_object` (ChatManager.cpp).
+    fn get_channel_verification_status_object(c: &Channel) -> Option<td_api::VerificationStatus> {
+        get_verification_status_object(c.is_verified, c.is_scam, c.is_fake, c.bot_verification_icon)
+    }
+
+    /// `get_channel_active_story_state` +
+    /// `ActiveStoryState::get_active_story_state_object` — the story-state
+    /// triple of the channel.
+    fn get_channel_active_story_state_object(c: &Channel) -> td_api::ActiveStoryState {
+        if c.has_live_story {
+            td_api::ActiveStoryState::activeStoryStateLive(td_api::activeStoryStateLive {
+                story_id: 0,
+            })
+        } else if c.max_read_story_id.get() < c.max_active_story_id.get() {
+            td_api::ActiveStoryState::activeStoryStateUnread(td_api::activeStoryStateUnread {})
+        } else {
+            td_api::ActiveStoryState::activeStoryStateRead(td_api::activeStoryStateRead {})
+        }
+    }
+
+    /// `get_supergroup_object(channel_id, c)` (ChatManager.cpp:9909-9931).
+    pub fn get_supergroup_object_const(
+        &mut self,
+        channel_id: ChannelId,
+        c: &Channel,
+    ) -> td_api::Supergroup {
+        let restriction_reasons = c.restriction_reasons.clone();
+        td_api::Supergroup {
+            id: channel_id.get(),
+            usernames: c.usernames.get_usernames_object(),
+            date: c.date,
+            status: c.status.get_chat_member_status_object(),
+            member_count: c.participant_count,
+            boost_level: c.boost_level,
+            has_automatic_translation: c.autotranslation,
+            has_linked_chat: c.has_linked_channel,
+            has_location: c.has_location,
+            sign_messages: c.sign_messages,
+            show_message_sender: c.show_message_sender,
+            join_to_send_messages: Self::get_channel_join_to_send(c),
+            join_by_request: Self::get_channel_join_request(c),
+            is_slow_mode_enabled: c.is_slow_mode_enabled,
+            is_channel: !c.is_megagroup,
+            is_broadcast_group: c.is_gigagroup,
+            is_forum: c.is_forum,
+            is_direct_messages_group: c.is_monoforum,
+            is_administered_direct_messages_group: c.is_admined_monoforum,
+            verification_status: Self::get_channel_verification_status_object(c)
+                .unwrap_or_default(),
+            has_direct_messages_group: c.broadcast_messages_allowed,
+            has_forum_tabs: c.is_forum_tabs,
+            restriction_info: get_restriction_info_object(
+                &restriction_reasons,
+                &RestrictionOptions {
+                    ignored_restriction_reasons: String::new(),
+                    restriction_add_platforms: String::new(),
+                    ignore_platform_restrictions: false,
+                },
+            )
+            .unwrap_or_default(),
+            paid_message_star_count: c.paid_message_star_count,
+            active_story_state: Self::get_channel_active_story_state_object(c),
+        }
+    }
+
+    /// `get_supergroup_object(channel_id)` (ChatManager.cpp:9904-9907).
+    pub fn get_supergroup_object(&mut self, channel_id: ChannelId) -> Option<td_api::Supergroup> {
+        let c = self.get_channel(channel_id).cloned()?;
+        Some(self.get_supergroup_object_const(channel_id, &c))
+    }
+
+    /// `get_update_supergroup_object` (ChatManager.cpp:9879-9884).
+    pub fn get_update_supergroup_object(
+        &mut self,
+        channel_id: ChannelId,
+        c: Option<&Channel>,
+    ) -> td_api::Update {
+        match c {
+            None => self.get_update_unknown_supergroup_object(channel_id),
+            Some(c) => {
+                let supergroup = self.get_supergroup_object_const(channel_id, c);
+                td_api::Update::updateSupergroup(td_api::updateSupergroup { supergroup })
+            }
+        }
+    }
+
+    /// `get_chat_member_object` (ChatManager.cpp:6383-6391). The
+    /// `messageSenderChat` branch carries the unified td_api chat object
+    /// (the C++ routes through `dialog_manager_->get_chat_id_object`).
+    pub(crate) fn get_chat_member_object(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        dialog_participant: &DialogParticipant,
+        source: &str,
+    ) -> td_api::ChatMember {
+        let rank = dialog_participant.status_.get_rank().to_owned();
+        let member_id = self.get_message_sender_object(
+            user_manager,
+            env,
+            dialog_participant.dialog_id_,
+            source,
+        );
+        let inviter_user_id = user_manager.get_user_id_object(
+            env,
+            dialog_participant.inviter_user_id_,
+            "chatMember.inviter_user_id",
+        );
+        td_api::ChatMember {
+            member_id,
+            tag: rank,
+            inviter_user_id,
+            joined_chat_date: dialog_participant.joined_date_,
+            status: dialog_participant.status_.get_chat_member_status_object(),
+        }
+    }
+
+    /// `get_message_sender_object` (MessageSender.cpp:60-66). The C++
+    /// gates the chat branch on `messages_manager_->have_dialog` (M.6/M.10)
+    /// and force-creates the dialog; the stand-in answers
+    /// `messageSenderChat(dialog_id)` directly, which is the steady-state
+    /// answer once those land.
+    pub(crate) fn get_message_sender_object(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        dialog_id: DialogId,
+        source: &str,
+    ) -> td_api::MessageSender {
+        let _ = self;
+        match dialog_id.get_type() {
+            DialogType::User => {
+                let user_id = user_manager.get_user_id_object(env, dialog_id.get_user_id(), source);
+                td_api::MessageSender::messageSenderUser(td_api::messageSenderUser { user_id })
+            }
+            DialogType::Chat | DialogType::Channel | DialogType::SecretChat => {
+                // dialog_manager_->get_chat_id_object — the raw dialog id
+                td_api::MessageSender::messageSenderChat(td_api::messageSenderChat {
+                    chat_id: dialog_id.get(),
+                })
+            }
+            DialogType::None => {
+                tdutils::log_error!(
+                    "Receive invalid {dialog_id:?} in get_message_sender_object from {source}"
+                );
+                td_api::MessageSender::messageSenderUser(td_api::messageSenderUser { user_id: 0 })
+            }
+        }
+    }
+
+    /// `get_basic_group_full_info_object(chat_id, chat_full)`
+    /// (ChatManager.cpp:9827-9848).
+    pub fn get_basic_group_full_info_object(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+    ) -> td_api::BasicGroupFullInfo {
+        let Some(chat_full) = self.chats_full.get(&chat_id.get()) else {
+            debug_assert!(
+                false,
+                "Missing full {chat_id:?} in get_basic_group_full_info_object"
+            );
+            return td_api::BasicGroupFullInfo {
+                photo: get_chat_photo_object(&Photo::default()),
+                description: String::new(),
+                creator_user_id: 0,
+                members: Vec::new(),
+                can_hide_members: false,
+                can_toggle_aggressive_anti_spam: false,
+                invite_link: td_api::ChatInviteLink::default(),
+                bot_commands: Vec::new(),
+            };
+        };
+        let photo = chat_full.photo.clone();
+        let description = chat_full.description.clone();
+        let creator_user_id = chat_full.creator_user_id;
+        let participants = chat_full.participants.clone();
+        let invite_link = chat_full.invite_link.clone();
+        let bot_commands = chat_full.bot_commands.clone();
+
+        let creator_user_id =
+            user_manager.get_user_id_object(env, creator_user_id, "basicGroupFullInfo");
+        let members = participants
+            .iter()
+            .map(|participant| {
+                self.get_chat_member_object(
+                    user_manager,
+                    env,
+                    participant,
+                    "get_basic_group_full_info_object",
+                )
+            })
+            .collect();
+        let can_hide_members = self.can_hide_chat_participants(env, chat_id).is_ok();
+        let can_toggle_aggressive_anti_spam = self
+            .can_toggle_chat_aggressive_anti_spam(env, chat_id)
+            .is_ok();
+        let invite_link_object = invite_link
+            .get_chat_invite_link_object(user_manager, env)
+            .unwrap_or_default();
+        let bot_commands = bot_commands
+            .iter()
+            .map(|commands| commands.get_bot_commands_object(user_manager, env))
+            .collect();
+        td_api::BasicGroupFullInfo {
+            photo: get_chat_photo_object(&photo),
+            description,
+            creator_user_id,
+            members,
+            can_hide_members,
+            can_toggle_aggressive_anti_spam,
+            invite_link: invite_link_object,
+            bot_commands,
+        }
+    }
+
+    /// `get_supergroup_full_info_object(channel_id, channel_full, c)`
+    /// (ChatManager.cpp:9927-9953). The `channel_full` is cloned at the
+    /// call boundary (the C++ holds the pointer); the community-id object
+    /// is the CommunityManager stand-in (valid → raw id, else 0).
+    pub fn get_supergroup_full_info_object(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        channel_full: &ChannelFull,
+        c: Option<&Channel>,
+    ) -> td_api::SupergroupFullInfo {
+        let mut slow_mode_delay_expires_in = 0.0f64;
+        if channel_full.slow_mode_next_send_date != 0
+            && (channel_full.unrestrict_boost_count == 0
+                || channel_full.boost_count < channel_full.unrestrict_boost_count)
+        {
+            slow_mode_delay_expires_in =
+                (channel_full.slow_mode_next_send_date as f64 - env.global.server_time()).max(1e-3);
+        }
+        let has_hidden_participants =
+            channel_full.has_hidden_participants || !channel_full.can_get_participants;
+        let mut photo = channel_full.photo.clone();
+        if c.is_some_and(|c| c.is_monoforum)
+            && let Some(monoforum_channel_full) =
+                self.get_channel_full_const(channel_full.monoforum_channel_id)
+        {
+            photo = monoforum_channel_full.photo.clone();
+        }
+        let bot_commands = channel_full
+            .bot_commands
+            .iter()
+            .map(|commands| commands.get_bot_commands_object(user_manager, env))
+            .collect();
+        let bot_verification = channel_full
+            .bot_verification
+            .as_ref()
+            .map(|v| v.get_bot_verification_object(user_manager, env))
+            .unwrap_or_default();
+        let invite_link = channel_full
+            .invite_link
+            .clone()
+            .get_chat_invite_link_object(user_manager, env)
+            .unwrap_or_default();
+        let guard_bot_user_id = user_manager.get_user_id_object(
+            env,
+            channel_full.guard_bot_user_id,
+            "supergroupFullInfo guard bot",
+        );
+        let can_hide_members = self
+            .can_hide_channel_participants(env, channel_id, Some(channel_full))
+            .is_ok();
+        let can_toggle_aggressive_anti_spam = self
+            .can_toggle_channel_aggressive_anti_spam(env, channel_id, Some(channel_full))
+            .is_ok();
+        let migrated_from_basic_group_id = {
+            let migrated_from_chat_id = channel_full.migrated_from_chat_id;
+            self.get_basic_group_id_object(migrated_from_chat_id, "get_supergroup_full_info_object")
+        };
+        let community_id = if channel_full.linked_community_id.is_valid() {
+            channel_full.linked_community_id.get()
+        } else {
+            0
+        };
+        td_api::SupergroupFullInfo {
+            photo: get_chat_photo_object(&photo),
+            community_id,
+            description: channel_full.description.clone(),
+            member_count: channel_full.participant_count,
+            administrator_count: channel_full.administrator_count,
+            restricted_count: channel_full.restricted_count,
+            banned_count: channel_full.banned_count,
+            linked_chat_id: DialogId::from_channel_id(channel_full.linked_channel_id).get(),
+            direct_messages_chat_id: DialogId::from_channel_id(channel_full.monoforum_channel_id)
+                .get(),
+            slow_mode_delay: channel_full.slow_mode_delay,
+            slow_mode_delay_expires_in,
+            can_enable_paid_messages: channel_full.has_paid_messages_available,
+            can_enable_paid_reaction: channel_full.has_paid_media_allowed,
+            can_get_members: channel_full.can_get_participants,
+            has_hidden_members: has_hidden_participants,
+            can_hide_members,
+            can_set_sticker_set: channel_full.can_set_sticker_set,
+            can_set_location: channel_full.can_set_location,
+            can_get_statistics: channel_full.can_view_statistics,
+            can_get_revenue_statistics: channel_full.can_view_revenue,
+            can_get_star_revenue_statistics: channel_full.can_view_star_revenue,
+            can_send_gift: channel_full.has_stargifts_available,
+            can_toggle_aggressive_anti_spam,
+            is_all_history_available: channel_full.is_all_history_available,
+            can_have_sponsored_messages: channel_full.can_have_sponsored_messages,
+            has_aggressive_anti_spam_enabled: channel_full.has_aggressive_anti_spam_enabled,
+            has_paid_media_allowed: channel_full.has_paid_media_allowed,
+            has_pinned_stories: channel_full.has_pinned_stories,
+            gift_count: channel_full.gift_count,
+            my_boost_count: channel_full.boost_count,
+            unrestrict_boost_count: channel_full.unrestrict_boost_count,
+            outgoing_paid_message_star_count: channel_full.send_paid_message_stars,
+            sticker_set_id: channel_full.sticker_set_id.get(),
+            custom_emoji_sticker_set_id: channel_full.emoji_sticker_set_id.get(),
+            location: channel_full
+                .location
+                .get_chat_location_object()
+                .unwrap_or_default(),
+            invite_link,
+            guard_bot_user_id,
+            bot_commands,
+            bot_verification,
+            main_profile_tab: get_profile_tab_object(channel_full.main_profile_tab),
+            upgraded_from_basic_group_id: migrated_from_basic_group_id,
+            upgraded_from_max_message_id: channel_full.migrated_from_max_message_id.get(),
+        }
+    }
+
+    /// `get_update_supergroup_full_info_object`
+    /// (ChatManager.cpp:9955-9961). The full/channel are cloned at the
+    /// lookup boundary.
+    pub fn get_update_supergroup_full_info_object(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        channel_id: ChannelId,
+        source: &str,
+    ) -> td_api::Update {
+        let c = self.get_channel(channel_id).cloned();
+        debug_assert!(c.as_ref().is_none_or(|c| c.is_update_supergroup_sent));
+        let channel_full = self.get_channel_full_const(channel_id).cloned();
+        let Some(channel_full) = channel_full else {
+            debug_assert!(
+                false,
+                "Missing full {channel_id:?} in get_update_supergroup_full_info_object"
+            );
+            return self.get_update_unknown_supergroup_object(channel_id);
+        };
+        let supergroup_id = self.get_supergroup_id_object(channel_id, source);
+        let supergroup_full_info = self.get_supergroup_full_info_object(
+            user_manager,
+            env,
+            channel_id,
+            &channel_full,
+            c.as_ref(),
+        );
+        td_api::Update::updateSupergroupFullInfo(td_api::updateSupergroupFullInfo {
+            supergroup_id,
+            supergroup_full_info,
+        })
+    }
+
+    // ---- the can-hide/can-toggle Status checks
+    // (ChatManager.cpp:3581-3638) ----
+
+    /// `can_hide_chat_participants` (ChatManager.cpp:3581-3596).
+    pub(crate) fn can_hide_chat_participants(
+        &self,
+        env: &UserEnv,
+        chat_id: ChatId,
+    ) -> tdutils::status::Result<()> {
+        let Some(c) = self.get_chat(chat_id) else {
+            return tdutils::status::Result::Err(Status::error(400, "Basic group not found"));
+        };
+        if !c.status.is_creator() {
+            return tdutils::status::Result::Err(Status::error(
+                400,
+                "Not enough rights to hide group members",
+            ));
+        }
+        if (c.participant_count as i64)
+            < env
+                .options
+                .get_option_integer("hidden_members_group_size_min", 0)
+        {
+            return tdutils::status::Result::Err(Status::error(
+                400,
+                "The basic group is too small",
+            ));
+        }
+        tdutils::status::Result::Ok(())
+    }
+
+    /// `can_hide_channel_participants` (ChatManager.cpp:3598-3614).
+    pub(crate) fn can_hide_channel_participants(
+        &self,
+        env: &UserEnv,
+        channel_id: ChannelId,
+        channel_full: Option<&ChannelFull>,
+    ) -> tdutils::status::Result<()> {
+        let Some(c) = self.get_channel(channel_id) else {
+            return tdutils::status::Result::Err(Status::error(400, "Supergroup not found"));
+        };
+        if !c.status.can_restrict_members() {
+            return tdutils::status::Result::Err(Status::error(
+                400,
+                "Not enough rights to hide group members",
+            ));
+        }
+        if Self::get_channel_type(c) != ChannelType::Megagroup {
+            return tdutils::status::Result::Err(Status::error(
+                400,
+                "Group members are hidden by default in channels",
+            ));
+        }
+        if channel_full.is_some_and(|f| f.has_hidden_participants) {
+            return tdutils::status::Result::Ok(());
+        }
+        if c.participant_count > 0
+            && (c.participant_count as i64)
+                < env
+                    .options
+                    .get_option_integer("hidden_members_group_size_min", 0)
+        {
+            return tdutils::status::Result::Err(Status::error(400, "The supergroup is too small"));
+        }
+        tdutils::status::Result::Ok(())
+    }
+
+    /// `can_toggle_chat_aggressive_anti_spam` (ChatManager.cpp:3620-3632).
+    pub(crate) fn can_toggle_chat_aggressive_anti_spam(
+        &self,
+        env: &UserEnv,
+        chat_id: ChatId,
+    ) -> tdutils::status::Result<()> {
+        let Some(c) = self.get_chat(chat_id) else {
+            return tdutils::status::Result::Err(Status::error(400, "Basic group not found"));
+        };
+        if !c.status.is_creator() {
+            return tdutils::status::Result::Err(Status::error(
+                400,
+                "Not enough rights to enable aggressive anti-spam checks",
+            ));
+        }
+        if (c.participant_count as i64)
+            < env
+                .options
+                .get_option_integer("aggressive_anti_spam_supergroup_member_count_min", 0)
+        {
+            return tdutils::status::Result::Err(Status::error(
+                400,
+                "The basic group is too small",
+            ));
+        }
+        tdutils::status::Result::Ok(())
+    }
+
+    /// `can_toggle_channel_aggressive_anti_spam`
+    /// (ChatManager.cpp:3634-3647+).
+    pub(crate) fn can_toggle_channel_aggressive_anti_spam(
+        &self,
+        env: &UserEnv,
+        channel_id: ChannelId,
+        channel_full: Option<&ChannelFull>,
+    ) -> tdutils::status::Result<()> {
+        let Some(c) = self.get_channel(channel_id) else {
+            return tdutils::status::Result::Err(Status::error(400, "Supergroup not found"));
+        };
+        if !c.status.can_delete_messages() {
+            return tdutils::status::Result::Err(Status::error(
+                400,
+                "Not enough rights to enable aggressive anti-spam checks",
+            ));
+        }
+        if Self::get_channel_type(c) != ChannelType::Megagroup {
+            return tdutils::status::Result::Err(Status::error(
+                400,
+                "Aggressive anti-spam checks can be enabled in supergroups only",
+            ));
+        }
+        if c.is_gigagroup {
+            return tdutils::status::Result::Err(Status::error(
+                400,
+                "Aggressive anti-spam checks can't be enabled in broadcast supergroups",
+            ));
+        }
+        if channel_full.is_some_and(|f| f.has_aggressive_anti_spam_enabled) {
+            return tdutils::status::Result::Ok(());
+        }
+        if c.has_location
+            || c.usernames
+                .get_editable_username()
+                .starts_with("translation_")
+        {
+            return tdutils::status::Result::Ok(());
+        }
+        if c.participant_count > 0
+            && (c.participant_count as i64)
+                < env
+                    .options
+                    .get_option_integer("aggressive_anti_spam_supergroup_member_count_min", 0)
+        {
+            return tdutils::status::Result::Err(Status::error(400, "The supergroup is too small"));
+        }
+        tdutils::status::Result::Ok(())
     }
 }
 
 impl Default for ChatManager {
     fn default() -> Self {
         ChatManager::new()
+    }
+}
+
+/// The snapshot of the `Chat` fields `is_chat_full_outdated` reads — the
+/// load path cannot hold a `&Chat` across the force-load.
+struct ChatSnapshot {
+    is_active: bool,
+    version: i32,
+    can_manage_invite_links: bool,
+    photo: DialogPhoto,
+}
+
+/// `is_same_dialog_photo` (DialogPhoto.cpp:202-210) — the
+/// `get_unique_file_id` indirection collapses to raw `FileId` equality
+/// without the FileManager (the Files step).
+fn is_same_dialog_photo(photo: &Photo, dialog_photo: &DialogPhoto) -> bool {
+    let fake_photo = DialogPhoto::as_fake_dialog_photo(photo, DialogId::default(), false);
+    fake_photo.small_file_id == dialog_photo.small_file_id
+        && fake_photo.big_file_id == dialog_photo.big_file_id
+}
+
+/// `get_profile_tab_object` (ProfileTab.cpp:122-150) — `ProfileTab::Default`
+/// answers the codegen-forced empty payload where the C++ returns null.
+fn get_profile_tab_object(profile_tab: ProfileTab) -> td_api::ProfileTab {
+    match profile_tab {
+        ProfileTab::Default => td_api::ProfileTab::default(),
+        ProfileTab::Posts => td_api::ProfileTab::profileTabPosts(td_api::profileTabPosts {}),
+        ProfileTab::Gifts => td_api::ProfileTab::profileTabGifts(td_api::profileTabGifts {}),
+        ProfileTab::Media => td_api::ProfileTab::profileTabMedia(td_api::profileTabMedia {}),
+        ProfileTab::Files => td_api::ProfileTab::profileTabFiles(td_api::profileTabFiles {}),
+        ProfileTab::Links => td_api::ProfileTab::profileTabLinks(td_api::profileTabLinks {}),
+        ProfileTab::Music => td_api::ProfileTab::profileTabMusic(td_api::profileTabMusic {}),
+        ProfileTab::Voice => td_api::ProfileTab::profileTabVoice(td_api::profileTabVoice {}),
+        ProfileTab::Gifs => td_api::ProfileTab::profileTabGifs(td_api::profileTabGifs {}),
+    }
+}
+
+impl DialogParticipantStatus {
+    /// `get_chat_member_status_object` (DialogParticipant.cpp:497-518).
+    /// The C++ `string *rank` out-parameter is read by the caller through
+    /// `get_rank()` instead.
+    pub(crate) fn get_chat_member_status_object(&self) -> td_api::ChatMemberStatus {
+        if matches!(self.type_, StatusType::Creator) {
+            return td_api::ChatMemberStatus::chatMemberStatusCreator(
+                td_api::chatMemberStatusCreator {
+                    is_anonymous: self.is_anonymous(),
+                    is_member: self.is_member(),
+                },
+            );
+        }
+        if matches!(self.type_, StatusType::Administrator) {
+            return td_api::ChatMemberStatus::chatMemberStatusAdministrator(
+                td_api::chatMemberStatusAdministrator {
+                    can_be_edited: self.can_be_edited(),
+                    rights: self
+                        .get_administrator_rights()
+                        .get_chat_administrator_rights_object(),
+                },
+            );
+        }
+        if matches!(self.type_, StatusType::Member) {
+            return td_api::ChatMemberStatus::chatMemberStatusMember(
+                td_api::chatMemberStatusMember {
+                    member_until_date: self.until_date_,
+                },
+            );
+        }
+        if matches!(self.type_, StatusType::Restricted) {
+            return td_api::ChatMemberStatus::chatMemberStatusRestricted(
+                td_api::chatMemberStatusRestricted {
+                    is_member: self.is_member(),
+                    restricted_until_date: self.until_date_,
+                    permissions: self.get_restricted_rights().get_chat_permissions_object(),
+                },
+            );
+        }
+        if matches!(self.type_, StatusType::Left) {
+            return td_api::ChatMemberStatus::chatMemberStatusLeft(td_api::chatMemberStatusLeft {});
+        }
+        td_api::ChatMemberStatus::chatMemberStatusBanned(td_api::chatMemberStatusBanned {
+            banned_until_date: self.until_date_,
+        })
+    }
+}
+
+impl BotCommand {
+    /// `get_bot_command_object` — the td_api surface of the record.
+    pub(crate) fn get_bot_command_object(&self) -> td_api::BotCommand {
+        td_api::BotCommand {
+            command: self.command_.clone(),
+            description: self.description_.clone(),
+            is_ephemeral: self.is_ephemeral_,
+        }
+    }
+}
+
+impl BotCommands {
+    /// `BotCommands::get_bot_commands_object` (BotCommand.cpp:138-142).
+    pub(crate) fn get_bot_commands_object(
+        &self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+    ) -> td_api::BotCommands {
+        td_api::BotCommands {
+            bot_user_id: user_manager.get_user_id_object(
+                env,
+                self.bot_user_id_,
+                "get_bot_commands_object",
+            ),
+            commands: self
+                .commands_
+                .iter()
+                .map(|c| c.get_bot_command_object())
+                .collect(),
+        }
+    }
+}
+
+impl DialogLocation {
+    /// `DialogLocation::get_chat_location_object` — `None` where the C++
+    /// returns a null object.
+    pub(crate) fn get_chat_location_object(&self) -> Option<td_api::ChatLocation> {
+        if self.empty() {
+            return None;
+        }
+        Some(td_api::ChatLocation {
+            location: td_api::Location {
+                latitude: self.location_.latitude_,
+                longitude: self.location_.longitude_,
+                horizontal_accuracy: self.location_.horizontal_accuracy_,
+            },
+            address: self.address_.clone(),
+        })
+    }
+}
+
+impl ChatFull {
+    /// `log_event_store(ChatFull)` — the version-prefixed database value.
+    pub fn store_value(&self, out: &mut Vec<u8>) {
+        crate::store_parse::store_log_event_version(out);
+        self.store(out);
+    }
+}
+
+impl ChannelFull {
+    /// `log_event_store(ChannelFull)` — the version-prefixed database value.
+    pub fn store_value(&self, out: &mut Vec<u8>, ctx: &TimeCtx) {
+        crate::store_parse::store_log_event_version(out);
+        self.store(out, ctx);
+    }
+
+    /// `is_expired` (ChatManager.h:665-667).
+    pub fn is_expired(&self) -> bool {
+        self.expires_at < tdutils::time::now()
     }
 }
 
@@ -9028,6 +12607,33 @@ mod tests {
         }
     }
 
+    type RecordedPromise = (
+        Promise<()>,
+        std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<()>>>>,
+    );
+
+    /// A `Promise<()>` that records its result for the test to inspect.
+    fn recorded_unit_promise() -> RecordedPromise {
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let sink = recorded.clone();
+        let promise = tdutils::promise::PromiseCreator::lambda_result(
+            move |result: tdutils::status::Result<()>| {
+                *sink.lock().unwrap() = Some(result);
+            },
+        );
+        (promise, recorded)
+    }
+
+    fn assert_unit_error(
+        recorded: &std::sync::Mutex<Option<tdutils::status::Result<()>>>,
+        expected: &str,
+    ) {
+        match &*recorded.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => assert_eq!(status.message(), expected),
+            other => panic!("expected the error {expected:?}, got {other:?}"),
+        }
+    }
+
     fn sample_chat() -> Chat {
         let mut chat = Chat::new();
         chat.title = "group".to_owned();
@@ -9131,13 +12737,16 @@ mod tests {
         {
             let (mut global, mut options) = open_db(&dir, true);
             let mut cm = ChatManager::new();
+            let mut um = UserManager::new();
             let mut env = make_env(&mut global, &mut options);
             assert!(
-                cm.get_chat_force(&mut env, ChatId::new(778), "test")
+                cm.get_chat_force(&mut um, &mut env, ChatId::new(778), "test")
                     .is_none(),
                 "an unknown chat stays absent"
             );
-            let loaded = cm.get_chat_force(&mut env, chat_id, "test").unwrap();
+            let loaded = cm
+                .get_chat_force(&mut um, &mut env, chat_id, "test")
+                .unwrap();
             assert!(loaded.is_saved);
             assert_eq!(loaded.title, "group");
             assert_eq!(loaded.participant_count, 7);
@@ -9181,13 +12790,20 @@ mod tests {
         {
             let (mut global, mut options) = open_db(&dir, true);
             let mut cm = ChatManager::new();
+            let mut um = UserManager::new();
             let mut env = make_env(&mut global, &mut options);
             assert!(
-                cm.get_channel_force(&mut env, ChannelId::new(900_000_000_200), "test", false)
-                    .is_none()
+                cm.get_channel_force(
+                    &mut um,
+                    &mut env,
+                    ChannelId::new(900_000_000_200),
+                    "test",
+                    false
+                )
+                .is_none()
             );
             let loaded = cm
-                .get_channel_force(&mut env, channel_id, "test", false)
+                .get_channel_force(&mut um, &mut env, channel_id, "test", false)
                 .unwrap();
             assert_eq!(loaded.title, "supergroup");
             // megagroups force show_message_sender on parse
@@ -9228,9 +12844,13 @@ mod tests {
         {
             let (mut global, mut options) = open_db(&dir, true);
             let mut cm = ChatManager::new();
+            let mut um = UserManager::new();
             let mut env = make_env(&mut global, &mut options);
-            assert!(cm.get_chat_force(&mut env, chat_id, "test").is_some());
-            assert!(!cm.have_channel_force(&mut env, missing_channel_id, "test"));
+            assert!(
+                cm.get_chat_force(&mut um, &mut env, chat_id, "test")
+                    .is_some()
+            );
+            assert!(!cm.have_channel_force(&mut um, &mut env, missing_channel_id, "test"));
             close(&mut global);
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -9291,9 +12911,10 @@ mod tests {
 
             let (mut global, mut options) = open_db(&dir, true);
             let mut cm = ChatManager::new();
+            let mut um = UserManager::new();
             {
                 let mut env = make_env(&mut global, &mut options);
-                cm.on_binlog_chat_event(&mut env, &event);
+                cm.on_binlog_chat_event(&mut um, &mut env, &event);
             }
             let c = cm.get_chat(chat_id).expect("replayed chat");
             assert_eq!(c.title, "group");
@@ -9324,8 +12945,11 @@ mod tests {
 
             let (mut global, mut options) = open_db(&dir, true);
             let mut cm = ChatManager::new();
+            let mut um = UserManager::new();
             let mut env = make_env(&mut global, &mut options);
-            let loaded = cm.get_chat_force(&mut env, chat_id, "test").unwrap();
+            let loaded = cm
+                .get_chat_force(&mut um, &mut env, chat_id, "test")
+                .unwrap();
             assert_eq!(loaded.title, "group");
             assert!(loaded.is_saved);
             close(&mut global);
@@ -9366,9 +12990,10 @@ mod tests {
 
             let (mut global, mut options) = open_db(&dir, true);
             let mut cm = ChatManager::new();
+            let mut um = UserManager::new();
             {
                 let mut env = make_env(&mut global, &mut options);
-                cm.on_binlog_channel_event(&mut env, &event);
+                cm.on_binlog_channel_event(&mut um, &mut env, &event);
             }
             let c = cm.get_channel(channel_id).expect("replayed channel");
             assert_eq!(c.title, "supergroup");
@@ -9392,13 +13017,499 @@ mod tests {
 
             let (mut global, mut options) = open_db(&dir, true);
             let mut cm = ChatManager::new();
+            let mut um = UserManager::new();
             let mut env = make_env(&mut global, &mut options);
             let loaded = cm
-                .get_channel_force(&mut env, channel_id, "test", false)
+                .get_channel_force(&mut um, &mut env, channel_id, "test", false)
                 .unwrap();
             assert_eq!(loaded.title, "supergroup");
             close(&mut global);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- ChatManager timeouts + full planes (M.5.14–M.5.17) ----
+
+    fn sample_chat_full() -> ChatFull {
+        let mut chat_full = ChatFull::new();
+        chat_full.description = "about".to_owned();
+        chat_full.creator_user_id = UserId::new(0);
+        chat_full.participants = Vec::new();
+        chat_full.version = 3;
+        // the creator-chat gate requires a present link; its admin_id
+        // sanitizes to the invalid user, so the load dependency resolves
+        // without a loadable user
+        let mut zero_admin = exported_invite();
+        zero_admin.admin_id = 0;
+        chat_full.invite_link = DialogInviteLink::from_telegram(
+            Some(telegram_api::ExportedChatInvite::chatInviteExported(
+                zero_admin,
+            )),
+            false,
+            false,
+            "test",
+        );
+        chat_full
+    }
+
+    fn sample_channel_full() -> ChannelFull {
+        let mut channel_full = ChannelFull::new();
+        channel_full.description = "supergroup about".to_owned();
+        channel_full.participant_count = 11;
+        channel_full.administrator_count = 2;
+        channel_full.slow_mode_delay = 30;
+        // the sample channel's member status requires no invite link; a
+        // present one would need a loadable creator user to resolve
+        channel_full
+    }
+
+    #[test]
+    fn chat_full_plane_round_trips_through_reopen() {
+        let dir = db_dir("m514-chat-full-plane");
+        let chat_id = ChatId::new(77);
+        {
+            let (mut global, mut options) = open_db(&dir, true);
+            let mut cm = ChatManager::new();
+            let mut um = UserManager::new();
+            let mut env = make_env(&mut global, &mut options);
+            cm.add_chat(chat_id).clone_from(&sample_chat());
+            // a member-status chat: the load's invite-link gate drops
+            // fulls of invite-link-managing chats without a valid stored
+            // link (a valid link would need a loadable creator user)
+            cm.get_chat_mut(chat_id).unwrap().status =
+                DialogParticipantStatus::member(0, String::new());
+            cm.update_chat(&mut um, &mut env, chat_id, false, false);
+            cm.save_chat(&mut env, chat_id, false);
+            *cm.add_chat_full(chat_id) = sample_chat_full();
+            cm.save_chat_full(&mut env, chat_id);
+            close(&mut global);
+        }
+        {
+            let (mut global, mut options) = open_db(&dir, true);
+            let mut cm = ChatManager::new();
+            let mut um = UserManager::new();
+            let mut env = make_env(&mut global, &mut options);
+            // the chat itself loads first (the C++ caller contract)
+            assert!(cm.have_chat_force(&mut um, &mut env, chat_id, "test"));
+            let chat_full = cm
+                .get_chat_full_force(&mut um, &mut env, chat_id, "test")
+                .expect("full loads after the chat");
+            assert_eq!(chat_full.description, "about");
+            assert_eq!(chat_full.version, 3);
+            assert!(chat_full.is_update_chat_full_sent);
+            // the load emits updateBasicGroupFullInfo (the C++ load path
+            // ends in update_chat_full(from_database = true))
+            let updates = cm.take_updates();
+            assert!(
+                updates
+                    .iter()
+                    .any(|u| matches!(u, td_api::Update::updateBasicGroupFullInfo(_)))
+            );
+            close(&mut global);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn channel_full_plane_round_trips_and_arms_the_slow_mode_deadline() {
+        let dir = db_dir("m514-channel-full-plane");
+        let channel_id = ChannelId::new(100_000_000_078);
+        {
+            let (mut global, mut options) = open_db(&dir, true);
+            let mut cm = ChatManager::new();
+            let mut um = UserManager::new();
+            let mut env = make_env(&mut global, &mut options);
+            cm.add_channel(channel_id).clone_from(&sample_channel());
+            cm.update_channel(&mut um, &mut env, channel_id, false, false);
+            cm.save_channel(&mut env, channel_id, false);
+            let mut channel_full = sample_channel_full();
+            channel_full.slow_mode_next_send_date = env.global.unix_time() + 100;
+            channel_full.is_slow_mode_next_send_date_changed = true;
+            *cm.add_channel_full(channel_id) = channel_full;
+            cm.save_channel_full(&mut env, channel_id);
+            close(&mut global);
+        }
+        {
+            let (mut global, mut options) = open_db(&dir, true);
+            let mut cm = ChatManager::new();
+            let mut um = UserManager::new();
+            let mut env = make_env(&mut global, &mut options);
+            assert!(cm.have_channel_force(&mut um, &mut env, channel_id, "test"));
+            // the stored slow mode survives the load only on a channel with
+            // slow mode enabled (C++ drops it from the full otherwise)
+            cm.get_channel_mut(channel_id).unwrap().is_slow_mode_enabled = true;
+            let channel_full = cm
+                .get_channel_full_force(&mut um, &mut env, channel_id, true, "test", false)
+                .expect("full loads after the channel");
+            assert_eq!(channel_full.description, "supergroup about");
+            assert_eq!(channel_full.participant_count, 11);
+            assert!(!channel_full.invite_link.is_valid());
+            assert!(channel_full.is_update_channel_full_sent);
+            // update_channel_full(from_database = true) ran the slow-mode
+            // block: the deadline is armed at next_send_date - server_time
+            assert!(cm.slow_mode_delay_timeouts.contains_key(&channel_id.get()));
+            let updates = cm.take_updates();
+            assert!(
+                updates
+                    .iter()
+                    .any(|u| matches!(u, td_api::Update::updateSupergroupFullInfo(_)))
+            );
+
+            // fire the slow-mode deadline: next_send_date resets to 0, the
+            // timeout cancels, and the full update re-emits
+            cm.slow_mode_delay_timeouts
+                .insert(channel_id.get(), tdutils::time::now() - 1.0);
+            cm.tick_timeouts(&mut um, &mut env);
+            let channel_full = cm.get_channel_full_const(channel_id).unwrap();
+            assert_eq!(channel_full.slow_mode_next_send_date, 0);
+            assert!(!cm.slow_mode_delay_timeouts.contains_key(&channel_id.get()));
+            let updates = cm.take_updates();
+            assert!(
+                updates
+                    .iter()
+                    .any(|u| matches!(u, td_api::Update::updateSupergroupFullInfo(_)))
+            );
+            close(&mut global);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unban_deadline_updates_the_status_and_invalidates_the_full() {
+        let (mut global, mut options) = open_db(&db_dir("m514-unban"), false);
+        let mut cm = ChatManager::new();
+        let mut um = UserManager::new();
+        let mut env = make_env(&mut global, &mut options);
+        let channel_id = ChannelId::new(100_000_000_079);
+        {
+            let c = cm.add_channel(channel_id);
+            c.clone_from(&sample_channel());
+            c.status = DialogParticipantStatus::restricted(
+                RestrictedRights::restrict_all(),
+                true,
+                env.global.unix_time() - 10,
+                ChannelType::Megagroup,
+                String::new(),
+            );
+            c.is_update_supergroup_sent = true;
+        }
+        let old_status = cm.get_channel(channel_id).unwrap().status.clone();
+
+        // arm the unban deadline in the past (the deadline map is the
+        // MultiTimeout stand-in); the C++ unified queue pops the unban
+        // callback before the later emoji deadline
+        let t0 = tdutils::time::now();
+        cm.channel_unban_timeouts.insert(channel_id.get(), t0 - 1.0);
+        assert_eq!(cm.next_deadline(), Some(t0 - 1.0));
+        cm.tick_timeouts(&mut um, &mut env);
+
+        // the restriction expired: update_channel consumed the diff flags,
+        // emitted updateSupergroup, and with no full loaded the
+        // invalidation registered instead
+        let c = cm.get_channel(channel_id).unwrap();
+        assert_ne!(c.status, old_status);
+        assert!(!c.is_status_changed);
+        assert!(!c.is_changed);
+        assert!(c.is_update_supergroup_sent);
+        assert!(cm.invalidated_channels_full.contains(&channel_id.get()));
+        assert!(cm.channel_unban_timeouts.is_empty());
+        assert!(cm.channel_emoji_status_timeouts.is_empty());
+        let updates = cm.take_updates();
+        assert!(updates.iter().any(|u| matches!(u, td_api::Update::updateSupergroup(_))));
+        close(&mut global);
+        let _ = std::fs::remove_dir_all(db_dir("m514-unban"));
+    }
+
+    #[test]
+    fn chat_full_load_repairs_a_corrupt_row() {
+        let dir = db_dir("m514-corrupt-grf");
+        let chat_id = ChatId::new(88);
+        {
+            let (mut global, mut options) = open_db(&dir, true);
+            let mut cm = ChatManager::new();
+            let mut env = make_env(&mut global, &mut options);
+            cm.add_chat(chat_id).clone_from(&sample_chat());
+            cm.save_chat(&mut env, chat_id, false);
+            env.global.td_db().common_kv().set(
+                &ChatManager::get_chat_full_database_key(chat_id),
+                &[1, 2, 3, 4, 5],
+            );
+            close(&mut global);
+        }
+        {
+            let (mut global, mut options) = open_db(&dir, true);
+            let mut cm = ChatManager::new();
+            let mut um = UserManager::new();
+            let mut env = make_env(&mut global, &mut options);
+            assert!(cm.have_chat_force(&mut um, &mut env, chat_id, "test"));
+            // the parse fails: the row is erased and the full is unknown;
+            // the one-shot gate keeps answering None afterwards
+            assert!(
+                cm.get_chat_full_force(&mut um, &mut env, chat_id, "test")
+                    .is_none()
+            );
+            assert!(
+                cm.get_chat_full_force(&mut um, &mut env, chat_id, "test")
+                    .is_none()
+            );
+            assert!(
+                env.global
+                    .td_db()
+                    .common_kv()
+                    .get(&ChatManager::get_chat_full_database_key(chat_id))
+                    .is_empty()
+            );
+            close(&mut global);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chat_full_load_drops_a_full_without_the_required_invite_link() {
+        let dir = db_dir("m514-invite-gate");
+        let chat_id = ChatId::new(89);
+        {
+            let (mut global, mut options) = open_db(&dir, true);
+            let mut cm = ChatManager::new();
+            let mut env = make_env(&mut global, &mut options);
+            let mut chat = sample_chat(); // creator + active: can_manage_invite_links
+            chat.status = DialogParticipantStatus::creator(true, false, String::new());
+            cm.add_chat(chat_id).clone_from(&chat);
+            cm.save_chat(&mut env, chat_id, false);
+            *cm.add_chat_full(chat_id) = sample_chat_full(); // no invite link
+            cm.save_chat_full(&mut env, chat_id);
+            close(&mut global);
+        }
+        {
+            let (mut global, mut options) = open_db(&dir, true);
+            let mut cm = ChatManager::new();
+            let mut um = UserManager::new();
+            let mut env = make_env(&mut global, &mut options);
+            assert!(cm.have_chat_force(&mut um, &mut env, chat_id, "test"));
+            // need_invite_link != have_invite_link with need == true: the
+            // row stays but the full is treated as absent
+            assert!(
+                cm.get_chat_full_force(&mut um, &mut env, chat_id, "test")
+                    .is_none()
+            );
+            assert!(
+                !env.global
+                    .td_db()
+                    .common_kv()
+                    .get(&ChatManager::get_chat_full_database_key(chat_id))
+                    .is_empty()
+            );
+            close(&mut global);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_senders_answer_the_cpp_validation_surfaces() {
+        let (mut global, mut options) = open_db(&db_dir("m514-queries"), false);
+        let mut cm = ChatManager::new();
+        let mut um = UserManager::new();
+        let mut env = make_env(&mut global, &mut options);
+
+        let (p1, r1) = recorded_unit_promise();
+        cm.load_chat_full(&mut um, &mut env, ChatId::new(0), false, p1, "test");
+        assert_unit_error(&r1, "Group not found");
+
+        // the C++ load_chat_full consults the in-memory chat first: an
+        // unknown chat answers the 400 without any query
+        let (p2, r2) = recorded_unit_promise();
+        cm.load_chat_full(&mut um, &mut env, ChatId::new(91), false, p2, "test");
+        assert_unit_error(&r2, "Group not found");
+
+        // with the chat known but no full anywhere, the get query answers
+        // the net-step surface
+        cm.add_chat(ChatId::new(91)).clone_from(&sample_chat());
+        let (p2b, r2b) = recorded_unit_promise();
+        cm.load_chat_full(&mut um, &mut env, ChatId::new(91), false, p2b, "test");
+        assert_unit_error(&r2b, "Network is not implemented yet");
+
+        // reload_chat_full forwards blindly in the C++ (cpp:8509-8511);
+        // the "Can't access the chat" surface is the GetFullChatQuery
+        // on_error mapping (cpp:1086), which lands with the net step
+        let (p3, r3) = recorded_unit_promise();
+        cm.reload_chat_full(&mut env, ChatId::new(92), p3, "test");
+        assert_unit_error(&r3, "Network is not implemented yet");
+
+        let (p4, r4) = recorded_unit_promise();
+        cm.load_channel_full(&mut um, &mut env, ChannelId::new(0), false, p4, "test");
+        assert_unit_error(&r4, "Supergroup not found");
+
+        // the channel twin needs the channel + read access before the net
+        cm.on_get_chat_full_failed(&mut env, ChatId::new(5));
+        cm.on_get_channel_full_failed(&mut um, &mut env, ChannelId::new(5));
+        close(&mut global);
+        let _ = std::fs::remove_dir_all(db_dir("m514-queries"));
+    }
+
+    #[test]
+    fn file_source_ids_follow_the_cpp_edges() {
+        let (mut global, mut options) = open_db(&db_dir("m514-file-sources"), false);
+        let mut cm = ChatManager::new();
+        let mut env = make_env(&mut global, &mut options);
+        let chat_id = ChatId::new(93);
+
+        // no full in memory: the stand-in registry hands out sources
+        let first = cm.get_chat_full_file_source_id(&mut env, chat_id);
+        assert!(first.is_valid());
+        assert_eq!(cm.get_chat_full_file_source_id(&mut env, chat_id), first);
+        assert!(
+            !cm.get_chat_full_file_source_id(&mut env, ChatId::new(0))
+                .is_valid()
+        );
+
+        // a full that was never sent keeps its (still invalid) source;
+        // after the update was sent the C++ answers the invalid id
+        cm.add_chat_full(chat_id);
+        let via_full = cm.get_chat_full_file_source_id(&mut env, chat_id);
+        assert!(!via_full.is_valid());
+
+        let channel_id = ChannelId::new(100_000_000_094);
+        let channel_source = cm.get_channel_full_file_source_id(&mut env, channel_id);
+        assert!(channel_source.is_valid());
+        close(&mut global);
+        let _ = std::fs::remove_dir_all(db_dir("m514-file-sources"));
+    }
+
+    #[test]
+    fn id_objects_queue_the_unknown_updates_once() {
+        let (mut global, mut options) = open_db(&db_dir("m514-unknown"), false);
+        let mut cm = ChatManager::new();
+        let mut _env = make_env(&mut global, &mut options);
+        let chat_id = ChatId::new(95);
+        let channel_id = ChannelId::new(100_000_000_096);
+
+        assert_eq!(cm.get_basic_group_id_object(chat_id, "test"), 95);
+        assert_eq!(cm.get_basic_group_id_object(chat_id, "test"), 95);
+        assert_eq!(
+            cm.get_supergroup_id_object(channel_id, "test"),
+            channel_id.get()
+        );
+        assert_eq!(
+            cm.get_supergroup_id_object(channel_id, "test"),
+            channel_id.get()
+        );
+
+        let updates = cm.take_updates();
+        let unknown_group = updates
+            .iter()
+            .filter(|u| matches!(u, td_api::Update::updateBasicGroup(_)))
+            .count();
+        let unknown_super = updates
+            .iter()
+            .filter(|u| matches!(u, td_api::Update::updateSupergroup(_)))
+            .count();
+        assert_eq!(unknown_group, 1);
+        assert_eq!(unknown_super, 1);
+
+        // known ids never queue
+        cm.add_chat(chat_id).clone_from(&sample_chat());
+        cm.add_min_channel(channel_id, MinChannel::default());
+        assert_eq!(cm.get_basic_group_id_object(chat_id, "test"), 95);
+        assert_eq!(
+            cm.get_supergroup_id_object(channel_id, "test"),
+            channel_id.get()
+        );
+        assert!(cm.take_updates().is_empty());
+        assert!(cm.have_min_channel(channel_id));
+        close(&mut global);
+        let _ = std::fs::remove_dir_all(db_dir("m514-unknown"));
+    }
+
+    #[test]
+    fn full_photo_applier_tracks_registered_file_ids() {
+        let (mut global, mut options) = open_db(&db_dir("m514-photo"), false);
+        let mut cm = ChatManager::new();
+        let mut env = make_env(&mut global, &mut options);
+        let chat_id = ChatId::new(97);
+        cm.add_chat_full(chat_id);
+        cm.get_chat_full_mut(chat_id).unwrap().is_changed = false;
+        // an empty photo on an empty full: nothing changes
+        cm.on_update_chat_full_photo(&mut env, chat_id, Photo::default());
+        let f = cm.get_chat_full(chat_id).unwrap();
+        assert!(!f.is_changed);
+        assert!(f.registered_photo_file_ids.is_empty());
+        // empty-vs-empty photos compare equal (invalid file ids both sides)
+        assert!(is_same_dialog_photo(
+            &Photo::default(),
+            &DialogPhoto::default()
+        ));
+        close(&mut global);
+        let _ = std::fs::remove_dir_all(db_dir("m514-photo"));
+    }
+
+    #[test]
+    fn input_peer_gates_match_the_cpp() {
+        let (mut global, mut options) = open_db(db_dir("m514-input-peer").as_str(), false);
+        let mut cm = ChatManager::new();
+        let env = make_env(&mut global, &mut options);
+        let chat_id = ChatId::new(600);
+        let channel_id = ChannelId::new(100_000_000_601);
+        let monoforum_id = ChannelId::new(100_000_000_602);
+
+        // basic groups: unknown → no peer; Know/Read always; Write needs an
+        // active chat; left status blocks Write
+        assert!(!cm.have_input_peer_chat(chat_id, AccessRights::Read));
+        assert!(
+            cm.get_input_peer_chat(chat_id, AccessRights::Read)
+                .is_none()
+        );
+        let mut chat = Chat::new();
+        chat.is_active = true;
+        chat.status = DialogParticipantStatus::creator(true, false, String::new());
+        *cm.add_chat(chat_id) = chat;
+        assert!(
+            cm.get_input_peer_chat(chat_id, AccessRights::Read)
+                .is_some()
+        );
+        assert!(
+            cm.get_input_peer_chat(chat_id, AccessRights::Write)
+                .is_some()
+        );
+        let mut left_chat = Chat::new();
+        left_chat.is_active = true;
+        left_chat.status = DialogParticipantStatus::left();
+        *cm.add_chat(ChatId::new(603)) = left_chat;
+        assert!(!cm.have_input_peer_chat(ChatId::new(603), AccessRights::Write));
+        assert!(cm.have_input_peer_chat(ChatId::new(603), AccessRights::Read));
+
+        // channels: banned members have no peer; monoforum children resolve
+        // through the parent at Read; the from-message branch stays a stub
+        let mut banned = sample_channel();
+        banned.status = DialogParticipantStatus::banned(
+            env.global.unix_time() + 100,
+            String::new(),
+        );
+        *cm.add_channel(channel_id) = banned;
+        assert!(!cm.have_input_peer_channel_id(&env, channel_id, AccessRights::Read));
+        assert!(
+            cm.get_input_peer_channel(&env, channel_id, AccessRights::Read)
+                .is_none()
+        );
+
+        let mut parent = sample_channel();
+        parent.status = DialogParticipantStatus::member(0, String::new());
+        parent.is_monoforum = true;
+        parent.monoforum_channel_id = monoforum_id;
+        *cm.add_channel(monoforum_id) = parent;
+        let mut child = sample_channel();
+        child.status = DialogParticipantStatus::member(0, String::new());
+        child.is_monoforum = true;
+        child.monoforum_channel_id = monoforum_id;
+        *cm.add_channel(ChannelId::new(100_000_000_603)) = child;
+        assert!(cm.have_input_peer_channel_id(
+            &env,
+            ChannelId::new(100_000_000_603),
+            AccessRights::Read
+        ));
+
+        let simple = cm.get_simple_input_peer(DialogId::from_channel_id(channel_id));
+        assert!(simple.is_some());
+        close(&mut global);
+        let _ = std::fs::remove_dir_all(db_dir("m514-input-peer"));
     }
 }
