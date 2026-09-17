@@ -2434,7 +2434,7 @@ pub fn on_binlog_dialog_events(td: &mut Td, events: &[tddb::binlog::event::Binlo
                 let Ok(log_event) = ReorderPinnedDialogsOnServerLogEvent::parse(event.get_data())
                 else {
                     continue; // log_event_parse(...).ensure() aborts upstream; a
-                              // bad event here is a foreign binlog
+                    // bad event here is a foreign binlog
                 };
                 let dialog_ids: Vec<DialogId> = log_event
                     .dialog_ids
@@ -3964,12 +3964,14 @@ mod tests {
             Some(tdmtproto::telegram_api::InputDialogPeer::inputDialogPeer(_))
         ));
         // secret chats never produce an input dialog peer
-        assert!(get_input_dialog_peer(
-            &mut td,
-            DialogId::from_secret_chat_id(crate::user_manager::SecretChatId::new(1)),
-            AccessRights::Read
-        )
-        .is_none());
+        assert!(
+            get_input_dialog_peer(
+                &mut td,
+                DialogId::from_secret_chat_id(crate::user_manager::SecretChatId::new(1)),
+                AccessRights::Read
+            )
+            .is_none()
+        );
     }
 
     #[test]
