@@ -26,6 +26,7 @@ use crate::global::Global;
 use crate::misc::strip_empty_characters;
 use crate::store_parse::{Parser, store_i32, store_string, store_u64, version};
 use crate::td_api;
+use crate::user_manager::{SecretChatId, UserId};
 use tdmtproto::telegram_api;
 
 /// `td::ChatId` (ChatId.h): `0 < id ≤ MAX_CHAT_ID`.
@@ -110,6 +111,178 @@ impl MessageId {
 
     pub fn get(self) -> i64 {
         self.0
+    }
+}
+
+/// `td::DialogType` (DialogId.h:23).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DialogType {
+    None,
+    User,
+    Chat,
+    Channel,
+    SecretChat,
+}
+
+/// `td::DialogId` (DialogId.h:25): the signed polymorphic dialog handle. The
+/// negative ranges stack downward from the basic-group band (`-ChatId`,
+/// `ZERO_CHANNEL_ID - ChannelId`, `ZERO_SECRET_CHAT_ID + SecretChatId` and the
+/// monoforum tail); users stay positive. The four continuity pins of
+/// `DialogId::get_type` are compile-time asserts here.
+///
+/// Ported for the UpdatesManager statics (M.7.8) with the same shape the
+/// ChatManager records slice carries; the merge point is this definition.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DialogId(i64);
+
+// DialogId.cpp:22-26 — the valid ranges are continuous.
+const _: () = assert!(DialogId::ZERO_CHANNEL_ID + 1 == -ChatId::MAX_CHAT_ID);
+const _: () = assert!(
+    DialogId::ZERO_SECRET_CHAT_ID + i32::MAX as i64 + 1
+        == DialogId::ZERO_CHANNEL_ID - ChannelId::MAX_CHANNEL_ID
+);
+
+impl DialogId {
+    const ZERO_SECRET_CHAT_ID: i64 = -2_000_000_000_000;
+    const ZERO_CHANNEL_ID: i64 = -1_000_000_000_000;
+
+    /// The C++ `explicit constexpr DialogId(int64)` — no validity check.
+    pub const fn new(dialog_id: i64) -> DialogId {
+        DialogId(dialog_id)
+    }
+
+    /// `DialogId::DialogId(UserId)` — an invalid user collapses to 0.
+    pub fn from_user_id(user_id: UserId) -> DialogId {
+        if user_id.is_valid() {
+            DialogId(user_id.get())
+        } else {
+            DialogId(0)
+        }
+    }
+
+    /// `DialogId::DialogId(ChatId)`.
+    pub fn from_chat_id(chat_id: ChatId) -> DialogId {
+        if chat_id.is_valid() {
+            DialogId(-chat_id.get())
+        } else {
+            DialogId(0)
+        }
+    }
+
+    /// `DialogId::DialogId(ChannelId)`.
+    pub fn from_channel_id(channel_id: ChannelId) -> DialogId {
+        if channel_id.is_valid() {
+            DialogId(Self::ZERO_CHANNEL_ID - channel_id.get())
+        } else {
+            DialogId(0)
+        }
+    }
+
+    /// `DialogId::DialogId(SecretChatId)`.
+    pub fn from_secret_chat_id(secret_chat_id: SecretChatId) -> DialogId {
+        if secret_chat_id.is_valid() {
+            DialogId(Self::ZERO_SECRET_CHAT_ID + secret_chat_id.get() as i64)
+        } else {
+            DialogId(0)
+        }
+    }
+
+    /// `DialogId::DialogId(const telegram_api::Peer &)`.
+    pub fn from_peer(peer: &telegram_api::Peer) -> DialogId {
+        DialogId(Self::get_peer_id(peer))
+    }
+
+    /// `DialogId::get_peer_id` — an invalid peer id logs and collapses to 0.
+    fn get_peer_id(peer: &telegram_api::Peer) -> i64 {
+        match peer {
+            telegram_api::Peer::peerUser(peer_user) => {
+                let user_id = UserId::new(peer_user.user_id);
+                if !user_id.is_valid() {
+                    tdutils::log_error!("Receive invalid user id {}", user_id.get());
+                    return 0;
+                }
+                user_id.get()
+            }
+            telegram_api::Peer::peerChat(peer_chat) => {
+                let chat_id = ChatId::new(peer_chat.chat_id);
+                if !chat_id.is_valid() {
+                    tdutils::log_error!("Receive invalid chat id {}", chat_id.get());
+                    return 0;
+                }
+                -chat_id.get()
+            }
+            telegram_api::Peer::peerChannel(peer_channel) => {
+                let channel_id = ChannelId::new(peer_channel.channel_id);
+                if !channel_id.is_valid() {
+                    tdutils::log_error!("Receive invalid channel id {}", channel_id.get());
+                    return 0;
+                }
+                Self::ZERO_CHANNEL_ID - channel_id.get()
+            }
+        }
+    }
+
+    pub fn get(self) -> i64 {
+        self.0
+    }
+
+    /// `DialogId::is_valid` — `get_type() != DialogType::None`.
+    pub fn is_valid(self) -> bool {
+        self.get_type() != DialogType::None
+    }
+
+    /// `DialogId::get_type` (DialogId.cpp:20-44) — the branch order is the
+    /// range table; the two `!= 0` guards carve `ZERO_CHANNEL_ID` and
+    /// `ZERO_SECRET_CHAT_ID` out of their otherwise-matching windows.
+    pub fn get_type(self) -> DialogType {
+        if self.0 < 0 {
+            if -ChatId::MAX_CHAT_ID <= self.0 {
+                return DialogType::Chat;
+            }
+            if Self::ZERO_CHANNEL_ID - ChannelId::MAX_CHANNEL_ID <= self.0
+                && self.0 != Self::ZERO_CHANNEL_ID
+            {
+                return DialogType::Channel;
+            }
+            if Self::ZERO_SECRET_CHAT_ID + i32::MIN as i64 <= self.0
+                && self.0 != Self::ZERO_SECRET_CHAT_ID
+            {
+                return DialogType::SecretChat;
+            }
+            if Self::ZERO_CHANNEL_ID - ChannelId::MAX_MONOFORUM_CHANNEL_ID <= self.0 {
+                return DialogType::Channel;
+            }
+        } else if 0 < self.0 && self.0 <= UserId::MAX_USER_ID {
+            return DialogType::User;
+        }
+        DialogType::None
+    }
+
+    /// `DialogId::get_user_id` — the C++ CHECKs the type.
+    pub fn get_user_id(self) -> UserId {
+        assert!(
+            self.get_type() == DialogType::User,
+            "DialogId is not a user"
+        );
+        UserId::new(self.0)
+    }
+
+    /// `DialogId::get_chat_id`.
+    pub fn get_chat_id(self) -> ChatId {
+        assert!(
+            self.get_type() == DialogType::Chat,
+            "DialogId is not a chat"
+        );
+        ChatId::new(-self.0)
+    }
+
+    /// `DialogId::get_channel_id`.
+    pub fn get_channel_id(self) -> ChannelId {
+        assert!(
+            self.get_type() == DialogType::Channel,
+            "DialogId is not a channel"
+        );
+        ChannelId::new(Self::ZERO_CHANNEL_ID - self.0)
     }
 }
 

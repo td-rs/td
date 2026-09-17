@@ -27,17 +27,19 @@
 //!   (`MultiPromiseActorSafe`, `send_closure_later`); our promises complete
 //!   at the same decision points, synchronously. `being_processed_updates_`
 //!   bookkeeping is therefore not observable.
-//! - `is_acceptable_update` returns `true` until M.7.10/M.7.11 port the
-//!   acceptability filter; the unacceptable-update branch of
-//!   `on_pending_updates` (the updateChannelTooLong replacement ladder)
-//!   lands with it.
+//! - The acceptability filter (M.7.10/M.7.11) asks the sink whether a
+//!   user/chat/channel is known; the filter's `nullptr`-peer semantics
+//!   collapse onto the wire's zero-id default peer (see
+//!   `peer_id_is_zero`).
 //! - The pmc state reads use a strict canonical-form int32 parse; the C++
 //!   `to_integer<int32>` is a lenient prefix parse. Values are self-written
 //!   (`to_string(int32)`), so intact databases parse identically; a corrupt
 //!   value logs an error and reads as 0 instead of C++'s prefix value.
 
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 
+use crate::chat_manager::{ChannelId, ChatId, DialogId, DialogType};
 use tdmtproto::telegram_api;
 use tdutils::promise::Promise;
 use tdutils::status::Status;
@@ -623,6 +625,227 @@ pub trait UpdatesSink {
             cpp_line
         );
     }
+    /// `Td::send_update(updateSpeedLimitNotification)` — the
+    /// speed-limit notice out to the client (the M.7.16 aux seam).
+    fn on_speed_limit_notification(&mut self, is_upload: bool) {
+        let _ = is_upload;
+    }
+    /// `UpdatesManager::try_reload_data`'s fan-out — the C++ makes ~45
+    /// saved-config reload calls (cpp:2418-2462): saved animations,
+    /// autosave settings, the created public dialogs trio, the default
+    /// emoji statuses quartet, paid-reaction privacy, saved ringtones +
+    /// the scope notification settings trio, quick-reply shortcuts,
+    /// reactions + message effects + the reaction-list family, owned
+    /// star/ton counts, the installed/featured/recent/favorite sticker
+    /// families + the special sticker sets, the default custom-emoji
+    /// stickers + the sticker-list emoji statuses, accent colors, chat
+    /// themes, profile accent colors, time zones, AI compose tones,
+    /// contact birthdates, the saved-music list and web browser settings.
+    /// The calls land here as their manager slices land.
+    fn reload_data(&mut self) {}
+    /// `UpdatesManager::try_reload_often_data`'s fan-out — the stories
+    /// reload pair (cpp:2520-2522).
+    fn reload_often_data(&mut self) {}
+
+    // ---- M.7.10 — the acceptability filter's manager asks (cpp:715-731).
+    // The defaults mirror an empty cache (unknown ⇒ unacceptable); the
+    // td-level impl asks the landed managers.
+
+    /// `UserManager::have_user_force && have_accessible_user`.
+    fn is_acceptable_user(&mut self, user_id: i64) -> bool {
+        let _ = user_id;
+        false
+    }
+    /// `ChatManager::have_chat_force` — M.5 flip.
+    fn is_acceptable_chat(&mut self, chat_id: i64) -> bool {
+        let _ = chat_id;
+        false
+    }
+    /// `ChatManager::have_channel_force` — M.5 flip.
+    fn is_acceptable_channel(&mut self, channel_id: i64) -> bool {
+        let _ = channel_id;
+        false
+    }
+    /// `CommunityManager::have_community_force &&
+    /// have_accessible_community` — Wave 2.
+    fn is_acceptable_community(&mut self, community_id: i64) -> bool {
+        let _ = community_id;
+        false
+    }
+    /// the negated `UserManager::get_input_user(...).is_error()` of the
+    /// mention-name/button checks (cpp:771/788).
+    fn can_get_input_user(&mut self, user_id: i64) -> bool {
+        let _ = user_id;
+        false
+    }
+    /// `MessagesManager::is_old_channel_update` — the unacceptable-update
+    /// replacement ladder (cpp:2607); M.7 MessagesManager flip.
+    fn is_old_channel_update(&mut self, channel_id: i64, pts: i32) -> bool {
+        let _ = (channel_id, pts);
+        false
+    }
+
+    // ---- M.7.12 — the real manager groups (UserManager is landed; the
+    // td-level sink impl calls into user_manager with its env, the M.3.9
+    // manager convention).
+
+    /// `UserManager::on_update_user_online` (cpp:4364).
+    fn on_update_user_status(&mut self, user_id: i64, status: telegram_api::UserStatus) {
+        let _ = (user_id, status);
+    }
+    /// `UserManager::on_update_user_name` (cpp:4369).
+    fn on_update_user_name(&mut self, user_id: i64, first_name: String, last_name: String) {
+        let _ = (user_id, first_name, last_name);
+    }
+    /// `UserManager::on_update_user_usernames` — the empty-editable
+    /// constructor of cpp:4372.
+    fn on_update_user_usernames(&mut self, user_id: i64, usernames: crate::usernames::Usernames) {
+        let _ = (user_id, usernames);
+    }
+    /// `UserManager::on_update_user_phone_number` (cpp:4377).
+    fn on_update_user_phone(&mut self, user_id: i64, phone: String) {
+        let _ = (user_id, phone);
+    }
+    /// `UserManager::invalidate_user_full` (cpp:4382).
+    fn invalidate_user_full(&mut self, user_id: i64) {
+        let _ = user_id;
+    }
+    /// `UserManager::on_update_user_emoji_status` (cpp:4387); the wire
+    /// `emojiStatusEmpty` is the None of the manager intake.
+    fn on_update_user_emoji_status(
+        &mut self,
+        user_id: i64,
+        emoji_status: telegram_api::EmojiStatus,
+    ) {
+        let _ = (user_id, emoji_status);
+    }
+    /// `UserManager::on_update_contacts_reset` (cpp:4813).
+    fn on_update_contacts_reset(&mut self) {}
+
+    // ---- M.7.13 — the message-family seams (messages_manager; the
+    // td-level sink impl fans each out when that slice lands). The wire
+    // struct travels whole, exactly like `on_update_channel_too_long`.
+
+    /// `MessagesManager::on_update_service_notification` (cpp:3834).
+    fn on_update_service_notification(&mut self, _update: telegram_api::updateServiceNotification) {
+    }
+    /// `MessagesManager::on_update_read_channel_inbox` (cpp:3844).
+    fn on_update_read_channel_inbox(&mut self, _update: telegram_api::updateReadChannelInbox) {}
+    /// `MessagesManager::on_update_read_channel_outbox` (cpp:3849).
+    fn on_update_read_channel_outbox(&mut self, _update: telegram_api::updateReadChannelOutbox) {}
+    /// `MessagesManager::on_update_read_channel_messages_contents`
+    /// (cpp:3854).
+    fn on_update_read_channel_messages_contents(
+        &mut self,
+        _update: telegram_api::updateChannelReadMessagesContents,
+    ) {
+    }
+    /// `MessagesManager::on_update_channel_max_unavailable_message_id`
+    /// (cpp:3912); the engine validated the channel id.
+    fn on_update_channel_max_unavailable_message_id(
+        &mut self,
+        _update: telegram_api::updateChannelAvailableMessages,
+    ) {
+    }
+    /// `MessagesManager::on_update_dialog_view_as_messages` (cpp:3920).
+    fn on_update_dialog_view_as_messages(
+        &mut self,
+        _update: telegram_api::updateChannelViewForumAsMessages,
+    ) {
+    }
+    /// `MessagesManager::on_update_read_message_comments` — the inbox
+    /// half, incl. the broadcast-post echo (cpp:3926).
+    fn on_update_read_channel_discussion_inbox(
+        &mut self,
+        _update: telegram_api::updateReadChannelDiscussionInbox,
+    ) {
+    }
+    /// `MessagesManager::on_update_read_message_comments` — the outbox
+    /// half (cpp:3944).
+    fn on_update_read_channel_discussion_outbox(
+        &mut self,
+        _update: telegram_api::updateReadChannelDiscussionOutbox,
+    ) {
+    }
+    /// `MessagesManager::on_get_peer_settings` (cpp:4070).
+    fn on_get_peer_settings(&mut self, _update: telegram_api::updatePeerSettings) {}
+    /// `MessagesManager::on_update_dialog_message_ttl` (cpp:4075).
+    fn on_update_dialog_message_ttl(&mut self, _update: telegram_api::updatePeerHistoryTTL) {}
+    /// `MessagesManager::on_update_message_view_count` (cpp:3887); the
+    /// engine validated the channel id.
+    fn on_update_message_view_count(&mut self, _update: telegram_api::updateChannelMessageViews) {}
+    /// `MessagesManager::on_update_message_forward_count` (cpp:3899).
+    fn on_update_message_forward_count(
+        &mut self,
+        _update: telegram_api::updateChannelMessageForwards,
+    ) {
+    }
+    /// `MessagesManager::on_update_live_location_viewed` (cpp:4830).
+    fn on_update_live_location_viewed(&mut self, _update: telegram_api::updateGeoLiveViewed) {}
+    /// `MessagesManager::on_update_message_extended_media` (cpp:4836).
+    fn on_update_message_extended_media(
+        &mut self,
+        _update: telegram_api::updateMessageExtendedMedia,
+    ) {
+    }
+    /// `MessagesManager::on_update_message_reactions` (cpp:4101); the
+    /// C++ passes the apply promise through — the synchronous seam
+    /// completes it engine-side.
+    fn on_update_message_reactions(&mut self, _update: telegram_api::updateMessageReactions) {}
+    /// `MessagesManager::on_update_dialog_pending_join_requests`
+    /// (cpp:4962).
+    fn on_update_dialog_pending_join_requests(
+        &mut self,
+        _update: telegram_api::updatePendingJoinRequests,
+    ) {
+    }
+    /// `MessagesManager::on_update_dialog_is_blocked` (cpp:4397).
+    fn on_update_dialog_is_blocked(&mut self, _update: telegram_api::updatePeerBlocked) {}
+    /// `MessagesManager::on_new_ephemeral_message` /
+    /// `WelcomeMessageManager::on_new_welcome_message` — the
+    /// `welcome_template` flag picks the target (cpp:3792); the flag is
+    /// preserved for the flip.
+    fn on_new_ephemeral_message(
+        &mut self,
+        _message: telegram_api::EphemeralMessage,
+        is_welcome: bool,
+    ) {
+        let _ = is_welcome;
+    }
+    /// `MessagesManager::on_edited_ephemeral_message` /
+    /// `WelcomeMessageManager::on_edited_welcome_message` (cpp:3801).
+    fn on_edited_ephemeral_message(
+        &mut self,
+        _message: telegram_api::EphemeralMessage,
+        is_welcome: bool,
+    ) {
+        let _ = is_welcome;
+    }
+    /// `MessagesManager::on_delete_ephemeral_messages` +
+    /// `WelcomeMessageManager::on_delete_welcome_messages` (cpp:3811);
+    /// the ids are the raw wire values.
+    fn on_delete_ephemeral_messages(&mut self, _peer: telegram_api::Peer, _ids: Vec<i32>) {}
+
+    // ---- M.7.14 — the dialog-family seams (messages_manager pair for the
+    // drafts; the pinned/marked trio; flips when M.6 lands).
+
+    /// `MessagesManager::on_update_dialog_draft_message` /
+    /// `SavedMessagesManager::on_update_topic_draft_message` — the
+    /// `saved_peer_id` branch is recorded in the payload (cpp:4468).
+    fn on_update_dialog_draft_message(&mut self, _update: telegram_api::updateDraftMessage) {}
+    /// `MessagesManager::on_update_dialog_is_pinned` (cpp:4480).
+    fn on_update_dialog_is_pinned(&mut self, _update: telegram_api::updateDialogPinned) {}
+    /// `MessagesManager::on_update_pinned_dialogs` (cpp:4486); the C++
+    /// ignores `order_`.
+    fn on_update_pinned_dialogs(&mut self, _update: telegram_api::updatePinnedDialogs) {}
+    /// `MessagesManager::on_update_dialog_is_marked_as_unread` /
+    /// `SavedMessagesManager::on_update_topic_is_marked_as_unread`
+    /// (cpp:4501).
+    fn on_update_dialog_is_marked_as_unread(
+        &mut self,
+        _update: telegram_api::updateDialogUnreadMark,
+    ) {
+    }
 }
 
 /// The `G()->`/`td_->` environment the engine runs against: the clock,
@@ -665,6 +888,11 @@ pub trait UpdatesManagerEnv {
     /// The `GetPtsUpdateQuery` (the pts-short-gap repair) —
     /// `[blocked: net]`.
     fn send_get_pts_update(&mut self, pts: i32);
+    /// The `PingServerQuery` — `[blocked: net]`; the response intake is
+    /// [`UpdatesManager::on_server_pong`].
+    fn send_ping_server(&mut self);
+    /// `td_->online_manager_->is_online()` (the data-reload precondition).
+    fn is_online(&mut self) -> bool;
 }
 
 /// `td::PtsManager` — the db/mem pts pair plus the ordered in-flight
@@ -808,6 +1036,15 @@ struct PendingQtsUpdate {
     promises: Vec<Promise<()>>,
 }
 
+/// `UpdatesManager::SessionInfo` (h:316) — the per-auth-key update
+/// statistics the auth-key reset path maintains.
+#[derive(Debug, Default, Clone, Copy)]
+struct SessionInfo {
+    first_update_time: f64,
+    last_update_time: f64,
+    update_count: i32,
+}
+
 /// `td::UpdatesManager` — the engine core. The sink and environment are
 /// injected per call site (the `&mut env` manager convention), so the
 /// struct carries only the engine state.
@@ -871,6 +1108,17 @@ pub struct UpdatesManager<S: UpdatesSink> {
     #[allow(dead_code)]
     get_difference_retry_count: i32,
 
+    // M.7.16 — the aux machinery state (cpp:1908-1957).
+    is_ping_sent: bool,
+    session_infos: BTreeMap<u64, SessionInfo>,
+    next_notify_speed_limited: [f64; 2],
+
+    // M.7.17 — the data reloaders (cpp:2373-2534).
+    next_data_reload_time: f64,
+    data_reload_timeout: Timeout,
+    next_often_data_reload_time: f64,
+    often_data_reload_timeout: Timeout,
+
     sink: S,
 }
 
@@ -919,6 +1167,13 @@ impl<S: UpdatesSink> UpdatesManager<S> {
             min_postponed_update_qts: 0,
             get_difference_start_time: 0.0,
             get_difference_retry_count: 0,
+            next_data_reload_time: 0.0,
+            data_reload_timeout: Timeout::default(),
+            next_often_data_reload_time: 0.0,
+            often_data_reload_timeout: Timeout::default(),
+            is_ping_sent: false,
+            session_infos: BTreeMap::new(),
+            next_notify_speed_limited: [0.0; 2],
             sink,
         }
     }
@@ -1027,9 +1282,10 @@ impl<S: UpdatesSink> UpdatesManager<S> {
         }
     }
 
-    /// `UpdatesManager::timeout_expired` (cpp:624) — the throttled-save
-    /// flush; fired from [`Self::tick_timeouts`].
-    fn timeout_expired(&mut self, env: &mut impl UpdatesManagerEnv) {
+    /// `UpdatesManager::timeout_expired` (cpp:624) — the throttled
+    /// pmc save flush; fired from [`Self::tick_timeouts`] and the
+    /// close-path flush (the `Td::close_impl` wiring).
+    pub(crate) fn timeout_expired(&mut self, env: &mut impl UpdatesManagerEnv) {
         if self.pending_pts != 0 {
             self.last_pts_save_time -= 2.0 * MAX_PTS_SAVE_DELAY;
             let pts = self.pending_pts;
@@ -1377,7 +1633,7 @@ impl<S: UpdatesSink> UpdatesManager<S> {
             }
             telegram_api::Updates::updateShort(short) => {
                 tdutils::log_debug!("Receive updateShort");
-                if !self.is_acceptable_update(&short.update) {
+                if !self.is_acceptable_update(env, &short.update) {
                     tdutils::log_error!(
                         "Receive unacceptable short update: {}",
                         update_id_and_name(&short.update).1
@@ -1618,24 +1874,71 @@ impl<S: UpdatesSink> UpdatesManager<S> {
         let need_postpone = self.running_get_difference;
         let can_postpone = self.can_postpone_updates();
         if !need_postpone {
-            // The C++ unacceptable-update ladder (the updateChannelTooLong
-            // replacement) needs the real is_acceptable_update — M.7.11
-            // lands it with the filter; today the filter accepts
-            // everything, so this branch is not reachable.
             for update in updates.iter_mut() {
-                let Some(update_ref) = update.as_ref() else {
+                let Some(update_ref) = update.as_mut() else {
                     continue;
                 };
-                if !self.is_acceptable_update(update_ref.wire().expect("wire update")) {
-                    tdutils::log_error!(
-                        "Receive unacceptable update {} from {}",
-                        update_ref.name(),
-                        source
-                    );
-                    self.get_difference(env, "on unacceptable updates in on_pending_updates");
-                    complete(promise);
-                    return;
+                let wire = update_ref.wire().expect("wire update");
+                if self.is_acceptable_update(env, wire) {
+                    continue;
                 }
+
+                // for channels we can try to replace an unacceptable
+                // update with updateChannelTooLong (cpp:2592-2620)
+                let mut pts = 0;
+                let channel_message = match wire {
+                    telegram_api::Update::updateNewChannelMessage(update) => {
+                        pts = update.pts;
+                        Some(&update.message)
+                    }
+                    telegram_api::Update::updateEditChannelMessage(update) => {
+                        pts = update.pts;
+                        Some(&update.message)
+                    }
+                    _ => None,
+                };
+                if let Some(message) = channel_message {
+                    let dialog_id = message_dialog_id(message);
+                    if dialog_id.get_type() == DialogType::Channel {
+                        let channel_id = dialog_id.get_channel_id();
+                        if self.sink.is_acceptable_channel(channel_id.get()) {
+                            if self.sink.is_old_channel_update(channel_id.get(), pts) {
+                                // the update will be ignored anyway, so
+                                // there is no reason to replace it or
+                                // force get_difference
+                                tdutils::log_info!(
+                                    "Allow an outdated unacceptable update from {}",
+                                    source
+                                );
+                                continue;
+                            }
+                            if !matches!(message, telegram_api::Message::messageService(_)) {
+                                // don't replace service messages, because
+                                // they can be about bot's kicking
+                                tdutils::log_info!(
+                                    "Replace update about new message with updateChannelTooLong in dialog {}",
+                                    dialog_id.get()
+                                );
+                                *update_ref = PendingUpdate::Wire(
+                                    telegram_api::Update::updateChannelTooLong(
+                                        telegram_api::updateChannelTooLong {
+                                            flags: 1,
+                                            channel_id: channel_id.get(),
+                                            pts,
+                                        },
+                                    ),
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        tdutils::log_error!("Update is not from a channel: {}", update_ref.name());
+                    }
+                }
+
+                self.get_difference(env, "on unacceptable updates in on_pending_updates");
+                complete(promise);
+                return;
             }
         }
 
@@ -2450,7 +2753,7 @@ impl<S: UpdatesSink> UpdatesManager<S> {
 
         // is_acceptable_update check was skipped for postponed PTS updates
         if source == AFTER_GET_DIFFERENCE_SOURCE
-            && !self.is_acceptable_update(update.wire().expect("wire update"))
+            && !self.is_acceptable_update(env, update.wire().expect("wire update"))
         {
             tdutils::log_info!("Postpone again unacceptable pending update");
             self.postpone_pts_update(env, update, new_pts, pts_count, receive_time, promise);
@@ -2999,7 +3302,9 @@ impl<S: UpdatesSink> UpdatesManager<S> {
         self.sink.on_after_get_difference();
         self.get_difference_start_time = 0.0;
 
-        // try_reload_data / try_reload_often_data — M.7.17.
+        // cpp:2369-2370 — the reloaders re-run after every getDifference.
+        self.try_reload_data(env);
+        self.try_reload_often_data(env);
     }
 
     /// `UpdatesManager::on_get_difference` (cpp:2040) — all four variants.
@@ -3609,8 +3914,9 @@ impl<S: UpdatesSink> UpdatesManager<S> {
     /// convention (`next_deadline`/`tick_timeouts`, the UserManager
     /// pattern). Fires, in order: the throttled-save flush
     /// (`timeout_expired`), `check_pts_gap`, `fill_pts_gap`,
-    /// `fill_seq_gap`, `fill_qts_gap` and the getDifference retry
-    /// (`fill_get_difference_gap` → `fill_gap("")`).
+    /// `fill_seq_gap`, `fill_qts_gap`, the getDifference retry
+    /// (`fill_get_difference_gap` → `fill_gap("")`) and the data/often
+    /// data reloaders.
     pub fn next_deadline(&self) -> Option<f64> {
         [
             self.save_timeout.deadline,
@@ -3619,6 +3925,8 @@ impl<S: UpdatesSink> UpdatesManager<S> {
             self.seq_gap_timeout.deadline,
             self.qts_gap_timeout.deadline,
             self.retry_timeout.deadline,
+            self.data_reload_timeout.deadline,
+            self.often_data_reload_timeout.deadline,
         ]
         .into_iter()
         .flatten()
@@ -3690,6 +3998,24 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                 self.fill_gap(env, String::new());
                 continue;
             }
+            if self
+                .data_reload_timeout
+                .deadline
+                .is_some_and(|deadline| deadline <= now)
+            {
+                self.data_reload_timeout.cancel_timeout();
+                self.try_reload_data(env);
+                continue;
+            }
+            if self
+                .often_data_reload_timeout
+                .deadline
+                .is_some_and(|deadline| deadline <= now)
+            {
+                self.often_data_reload_timeout.cancel_timeout();
+                self.try_reload_often_data(env);
+                continue;
+            }
             break;
         }
     }
@@ -3702,6 +4028,20 @@ impl<S: UpdatesSink> UpdatesManager<S> {
     /// intakes are here for the engine-internal kinds; the message-family
     /// seams route to the sink; the rest are enumerated trace drops
     /// (M.7.12–M.7.15 flip them).
+    /// The Wave-2/3 enumerated trace drop: record via the sink and settle
+    /// the apply promise (the C++ overload for the kind only completes the
+    /// promise into the dropped manager).
+    fn drop_unsupported(
+        &mut self,
+        id: i32,
+        name: &'static str,
+        cpp_line: u32,
+        mut promise: Promise<()>,
+    ) {
+        self.sink.on_unsupported_update(id, name, cpp_line);
+        promise.set_value(());
+    }
+
     fn on_update(
         &mut self,
         env: &mut impl UpdatesManagerEnv,
@@ -3848,6 +4188,34 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                     "updateDeleteChannelMessages",
                 );
             }
+            PendingUpdate::Wire(telegram_api::Update::updateEditChannelMessage(update)) => {
+                let dialog_peer = message_peer_id(&update.message).cloned();
+                let new_pts = update.pts;
+                let pts_count = update.pts_count;
+                self.sink.add_pending_channel_update(
+                    dialog_peer,
+                    PendingUpdate::Wire(telegram_api::Update::updateEditChannelMessage(update)),
+                    new_pts,
+                    pts_count,
+                    promise,
+                    "updateEditChannelMessage",
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updatePinnedChannelMessages(update)) => {
+                let dialog_peer = telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                    channel_id: update.channel_id,
+                });
+                let new_pts = update.pts;
+                let pts_count = update.pts_count;
+                self.sink.add_pending_channel_update(
+                    Some(dialog_peer),
+                    PendingUpdate::Wire(telegram_api::Update::updatePinnedChannelMessages(update)),
+                    new_pts,
+                    pts_count,
+                    promise,
+                    "updatePinnedChannelMessages",
+                );
+            }
             PendingUpdate::Wire(telegram_api::Update::updatePtsChanged(_)) => {
                 if env.get_option_integer("session_count") > 1 {
                     let old_pts = self.get_pts();
@@ -3929,15 +4297,1188 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                 );
                 promise.set_value(());
             }
-            // Every qts arm in C++ is exactly this call (the 17-type
-            // is_qts_update table).
-            update @ PendingUpdate::Wire(_) if is_qts_update(&update) => {
-                let qts = get_update_qts(&update);
-                self.add_pending_qts_update(env, update, qts, promise);
+            PendingUpdate::Wire(telegram_api::Update::updateChannelWebPage(update)) => {
+                // web_pages_manager_->on_get_web_page — M.7.15 flip; the
+                // channel pts still advances through the dummy update
+                // (cpp:4093).
+                self.sink.on_unsupported_update(
+                    telegram_api::updateChannelWebPage::ID,
+                    "updateChannelWebPage",
+                    4095,
+                );
+                let dialog_peer = telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                    channel_id: update.channel_id,
+                });
+                let pts = update.pts;
+                let pts_count = update.pts_count;
+                self.sink.add_pending_channel_update(
+                    Some(dialog_peer),
+                    PendingUpdate::Dummy,
+                    pts,
+                    pts_count,
+                    Promise::default(),
+                    "updateChannelWebPage",
+                );
+                promise.set_value(());
             }
-            PendingUpdate::Wire(other) => {
-                let (id, name) = update_id_and_name(&other);
-                self.sink.on_unsupported_update(id, name, 3746);
+
+            // ---- M.7.12 — the UserManager group (real) ---------------
+            PendingUpdate::Wire(telegram_api::Update::updateUserStatus(update)) => {
+                self.sink
+                    .on_update_user_status(update.user_id, update.status);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateUserName(update)) => {
+                self.sink
+                    .on_update_user_name(update.user_id, update.first_name, update.last_name);
+                self.sink.on_update_user_usernames(
+                    update.user_id,
+                    crate::usernames::Usernames::from_telegram(String::new(), update.usernames),
+                );
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateUserPhone(update)) => {
+                self.sink.on_update_user_phone(update.user_id, update.phone);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateUser(update)) => {
+                self.sink.invalidate_user_full(update.user_id);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateUserEmojiStatus(update)) => {
+                self.sink
+                    .on_update_user_emoji_status(update.user_id, update.emoji_status);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateContactsReset(_)) => {
+                self.sink.on_update_contacts_reset();
+                promise.set_value(());
+            }
+
+            // ---- the post-authorization auth ignores (cpp:4887/4892) --
+            PendingUpdate::Wire(telegram_api::Update::updateLoginToken(_)) => {
+                tdutils::log_info!("Ignore updateLoginToken after authorization");
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateSentPhoneCode(_)) => {
+                tdutils::log_info!("Ignore updateSentPhoneCode after authorization");
+                promise.set_value(());
+            }
+
+            // ---- M.7.13 — the ephemeral-message family ---------------
+            PendingUpdate::Wire(telegram_api::Update::updateNewEphemeralMessage(update)) => {
+                let is_welcome = update.message.welcome_template;
+                self.sink
+                    .on_new_ephemeral_message(update.message, is_welcome);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateEditEphemeralMessage(update)) => {
+                let is_welcome = update.message.welcome_template;
+                self.sink
+                    .on_edited_ephemeral_message(update.message, is_welcome);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateDeleteEphemeralMessages(update)) => {
+                self.sink
+                    .on_delete_ephemeral_messages(update.peer, update.ids);
+                promise.set_value(());
+            }
+
+            // ---- M.7.13 — the message-family seams -------------------
+            PendingUpdate::Wire(telegram_api::Update::updateServiceNotification(update)) => {
+                self.sink.on_update_service_notification(update);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateReadChannelInbox(update)) => {
+                self.sink.on_update_read_channel_inbox(update);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateReadChannelOutbox(update)) => {
+                self.sink.on_update_read_channel_outbox(update);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateChannelReadMessagesContents(
+                update,
+            )) => {
+                self.sink.on_update_read_channel_messages_contents(update);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateChannelAvailableMessages(update)) => {
+                if !ChannelId::new(update.channel_id).is_valid() {
+                    tdutils::log_error!("Receive invalid channel id {}", update.channel_id);
+                } else {
+                    self.sink
+                        .on_update_channel_max_unavailable_message_id(update);
+                }
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateChannelViewForumAsMessages(update)) => {
+                self.sink.on_update_dialog_view_as_messages(update);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateReadChannelDiscussionInbox(update)) => {
+                self.sink.on_update_read_channel_discussion_inbox(update);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateReadChannelDiscussionOutbox(
+                update,
+            )) => {
+                self.sink.on_update_read_channel_discussion_outbox(update);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updatePeerSettings(update)) => {
+                self.sink.on_get_peer_settings(update);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updatePeerHistoryTTL(update)) => {
+                self.sink.on_update_dialog_message_ttl(update);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateChannelMessageViews(update)) => {
+                if !ChannelId::new(update.channel_id).is_valid() {
+                    tdutils::log_error!("Receive invalid channel id {}", update.channel_id);
+                } else {
+                    self.sink.on_update_message_view_count(update);
+                }
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateChannelMessageForwards(update)) => {
+                if !ChannelId::new(update.channel_id).is_valid() {
+                    tdutils::log_error!("Receive invalid channel id {}", update.channel_id);
+                } else {
+                    self.sink.on_update_message_forward_count(update);
+                }
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateGeoLiveViewed(update)) => {
+                self.sink.on_update_live_location_viewed(update);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateMessageExtendedMedia(update)) => {
+                self.sink.on_update_message_extended_media(update);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateMessageReactions(update)) => {
+                self.sink.on_update_message_reactions(update);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updatePendingJoinRequests(update)) => {
+                self.sink.on_update_dialog_pending_join_requests(update);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updatePeerBlocked(update)) => {
+                self.sink.on_update_dialog_is_blocked(update);
+                promise.set_value(());
+            }
+
+            // ---- M.7.14 — the dialog-family seams --------------------
+            PendingUpdate::Wire(telegram_api::Update::updateDraftMessage(update)) => {
+                self.sink.on_update_dialog_draft_message(update);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateDialogPinned(update)) => {
+                self.sink.on_update_dialog_is_pinned(update);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updatePinnedDialogs(update)) => {
+                self.sink.on_update_pinned_dialogs(update);
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateDialogUnreadMark(update)) => {
+                self.sink.on_update_dialog_is_marked_as_unread(update);
+                promise.set_value(());
+            }
+
+            // ---- the qts family: every C++ overload is exactly
+            // add_pending_qts_update (cpp:4629-5087) -------------------
+            PendingUpdate::Wire(telegram_api::Update::updateNewEncryptedMessage(update)) => {
+                let qts = update.qts;
+                self.add_pending_qts_update(
+                    env,
+                    PendingUpdate::Wire(telegram_api::Update::updateNewEncryptedMessage(update)),
+                    qts,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateMessagePollVote(update)) => {
+                let qts = update.qts;
+                self.add_pending_qts_update(
+                    env,
+                    PendingUpdate::Wire(telegram_api::Update::updateMessagePollVote(update)),
+                    qts,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateManagedBot(update)) => {
+                let qts = update.qts;
+                self.add_pending_qts_update(
+                    env,
+                    PendingUpdate::Wire(telegram_api::Update::updateManagedBot(update)),
+                    qts,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBotStopped(update)) => {
+                let qts = update.qts;
+                self.add_pending_qts_update(
+                    env,
+                    PendingUpdate::Wire(telegram_api::Update::updateBotStopped(update)),
+                    qts,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateChatParticipant(update)) => {
+                let qts = update.qts;
+                self.add_pending_qts_update(
+                    env,
+                    PendingUpdate::Wire(telegram_api::Update::updateChatParticipant(update)),
+                    qts,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateChannelParticipant(update)) => {
+                let qts = update.qts;
+                self.add_pending_qts_update(
+                    env,
+                    PendingUpdate::Wire(telegram_api::Update::updateChannelParticipant(update)),
+                    qts,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBotChatInviteRequester(update)) => {
+                let qts = update.qts;
+                self.add_pending_qts_update(
+                    env,
+                    PendingUpdate::Wire(telegram_api::Update::updateBotChatInviteRequester(update)),
+                    qts,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBotChatBoost(update)) => {
+                let qts = update.qts;
+                self.add_pending_qts_update(
+                    env,
+                    PendingUpdate::Wire(telegram_api::Update::updateBotChatBoost(update)),
+                    qts,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBotMessageReaction(update)) => {
+                let qts = update.qts;
+                self.add_pending_qts_update(
+                    env,
+                    PendingUpdate::Wire(telegram_api::Update::updateBotMessageReaction(update)),
+                    qts,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBotMessageReactions(update)) => {
+                let qts = update.qts;
+                self.add_pending_qts_update(
+                    env,
+                    PendingUpdate::Wire(telegram_api::Update::updateBotMessageReactions(update)),
+                    qts,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBotPurchasedPaidMedia(update)) => {
+                let qts = update.qts;
+                self.add_pending_qts_update(
+                    env,
+                    PendingUpdate::Wire(telegram_api::Update::updateBotPurchasedPaidMedia(update)),
+                    qts,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBotGuestChatQuery(update)) => {
+                let qts = update.qts;
+                self.add_pending_qts_update(
+                    env,
+                    PendingUpdate::Wire(telegram_api::Update::updateBotGuestChatQuery(update)),
+                    qts,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBotBusinessConnect(update)) => {
+                let qts = update.qts;
+                self.add_pending_qts_update(
+                    env,
+                    PendingUpdate::Wire(telegram_api::Update::updateBotBusinessConnect(update)),
+                    qts,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBotNewBusinessMessage(update)) => {
+                let qts = update.qts;
+                self.add_pending_qts_update(
+                    env,
+                    PendingUpdate::Wire(telegram_api::Update::updateBotNewBusinessMessage(update)),
+                    qts,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBotEditBusinessMessage(update)) => {
+                let qts = update.qts;
+                self.add_pending_qts_update(
+                    env,
+                    PendingUpdate::Wire(telegram_api::Update::updateBotEditBusinessMessage(update)),
+                    qts,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBotDeleteBusinessMessage(update)) => {
+                let qts = update.qts;
+                self.add_pending_qts_update(
+                    env,
+                    PendingUpdate::Wire(telegram_api::Update::updateBotDeleteBusinessMessage(
+                        update,
+                    )),
+                    qts,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBotStarsSubscription(update)) => {
+                let qts = update.qts;
+                self.add_pending_qts_update(
+                    env,
+                    PendingUpdate::Wire(telegram_api::Update::updateBotStarsSubscription(update)),
+                    qts,
+                    promise,
+                );
+            }
+
+            // ---- the no-op overloads ---------------------------------
+            PendingUpdate::Wire(telegram_api::Update::updatePeerLocated(_)) => {
+                // shouldn't be sent by the server (cpp:4081)
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateNewStoryReaction(_)) => {
+                // the unsupported-updates tail (cpp:5146)
+                promise.set_value(());
+            }
+
+            // ---- Wave-2/3 enumerated trace drops ----------------------
+            PendingUpdate::Wire(telegram_api::Update::updateAttachMenuBots(_)) => {
+                // attach_menu_manager reload — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateAttachMenuBots::ID,
+                    "updateAttachMenuBots",
+                    4123,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updatePaidReactionPrivacy(_)) => {
+                // reaction_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updatePaidReactionPrivacy::ID,
+                    "updatePaidReactionPrivacy",
+                    4118,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateRecentReactions(_)) => {
+                // reaction_manager reload — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateRecentReactions::ID,
+                    "updateRecentReactions",
+                    4108,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateSavedReactionTags(_)) => {
+                // reaction_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateSavedReactionTags::ID,
+                    "updateSavedReactionTags",
+                    4113,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateWebViewResultSent(_)) => {
+                // web_app_manager + td_api update — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateWebViewResultSent::ID,
+                    "updateWebViewResultSent",
+                    4127,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateRecentEmojiStatuses(_)) => {
+                // get_recent_emoji_statuses reload — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateRecentEmojiStatuses::ID,
+                    "updateRecentEmojiStatuses",
+                    4392,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateSavedDialogPinned(_)) => {
+                // saved_messages_manager reload — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateSavedDialogPinned::ID,
+                    "updateSavedDialogPinned",
+                    4491,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updatePinnedSavedDialogs(_)) => {
+                // saved_messages_manager reload — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updatePinnedSavedDialogs::ID,
+                    "updatePinnedSavedDialogs",
+                    4496,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateDialogFilter(_)) => {
+                // dialog_filter_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateDialogFilter::ID,
+                    "updateDialogFilter",
+                    4511,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateDialogFilters(_)) => {
+                // dialog_filter_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateDialogFilters::ID,
+                    "updateDialogFilters",
+                    4515,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateDialogFilterOrder(_)) => {
+                // dialog_filter_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateDialogFilterOrder::ID,
+                    "updateDialogFilterOrder",
+                    4519,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateUserTyping(_)) => {
+                // dialog_action_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateUserTyping::ID,
+                    "updateUserTyping",
+                    4332,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateChatUserTyping(_)) => {
+                // dialog_action_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateChatUserTyping::ID,
+                    "updateChatUserTyping",
+                    4340,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateChannelUserTyping(_)) => {
+                // dialog_action_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateChannelUserTyping::ID,
+                    "updateChannelUserTyping",
+                    4348,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateEncryptedChatTyping(_)) => {
+                // dialog_action_manager + secret chats — Wave 3.
+                self.drop_unsupported(
+                    telegram_api::updateEncryptedChatTyping::ID,
+                    "updateEncryptedChatTyping",
+                    4356,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateChat(_)) => {
+                // dialog_manager on_dialog_info_full_invalidated — M.6 flip.
+                self.drop_unsupported(telegram_api::updateChat::ID, "updateChat", 3839, promise);
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateChannel(_)) => {
+                // chat_manager invalidate_channel_full — M.5 flip.
+                self.drop_unsupported(
+                    telegram_api::updateChannel::ID,
+                    "updateChannel",
+                    3865,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateChatParticipants(_)) => {
+                // chat_manager on_get_chat_participants — M.5 flip.
+                self.drop_unsupported(
+                    telegram_api::updateChatParticipants::ID,
+                    "updateChatParticipants",
+                    4414,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateChatParticipantAdd(_)) => {
+                // chat_manager on_update_chat_add_user — M.5 flip.
+                self.drop_unsupported(
+                    telegram_api::updateChatParticipantAdd::ID,
+                    "updateChatParticipantAdd",
+                    4419,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateChatParticipantAdmin(_)) => {
+                // chat_manager on_update_chat_edit_administrator — M.5 flip.
+                self.drop_unsupported(
+                    telegram_api::updateChatParticipantAdmin::ID,
+                    "updateChatParticipantAdmin",
+                    4425,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateChatParticipantRank(_)) => {
+                // chat_manager on_update_chat_participant_rank — M.5 flip.
+                self.drop_unsupported(
+                    telegram_api::updateChatParticipantRank::ID,
+                    "updateChatParticipantRank",
+                    4432,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateChatParticipantDelete(_)) => {
+                // chat_manager on_update_chat_delete_user — M.5 flip.
+                self.drop_unsupported(
+                    telegram_api::updateChatParticipantDelete::ID,
+                    "updateChatParticipantDelete",
+                    4438,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateChatDefaultBannedRights(_)) => {
+                // chat_manager default-permissions pair — M.5 flip.
+                self.drop_unsupported(
+                    telegram_api::updateChatDefaultBannedRights::ID,
+                    "updateChatDefaultBannedRights",
+                    4444,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updatePinnedForumTopic(_)) => {
+                // forum_topic_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updatePinnedForumTopic::ID,
+                    "updatePinnedForumTopic",
+                    3989,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updatePinnedForumTopics(_)) => {
+                // forum_topic_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updatePinnedForumTopics::ID,
+                    "updatePinnedForumTopics",
+                    3995,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateReadMonoForumInbox(_)) => {
+                // saved_messages_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateReadMonoForumInbox::ID,
+                    "updateReadMonoForumInbox",
+                    3957,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateReadMonoForumOutbox(_)) => {
+                // saved_messages_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateReadMonoForumOutbox::ID,
+                    "updateReadMonoForumOutbox",
+                    3969,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateMonoForumNoPaidException(_)) => {
+                // saved_messages_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateMonoForumNoPaidException::ID,
+                    "updateMonoForumNoPaidException",
+                    3981,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateNotifySettings(_)) => {
+                // messages/notification/forum scope split — M.6/Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateNotifySettings::ID,
+                    "updateNotifySettings",
+                    4025,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateSavedRingtones(_)) => {
+                // notification_settings_manager reload — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateSavedRingtones::ID,
+                    "updateSavedRingtones",
+                    4968,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBotCommands(_)) => {
+                // dialog_manager on_update_dialog_bot_commands — M.6 flip.
+                self.drop_unsupported(
+                    telegram_api::updateBotCommands::ID,
+                    "updateBotCommands",
+                    4403,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBotMenuButton(_)) => {
+                // user_manager on_update_bot_menu_button — flip with the
+                // bot-menu-button step.
+                self.drop_unsupported(
+                    telegram_api::updateBotMenuButton::ID,
+                    "updateBotMenuButton",
+                    4409,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateJoinChatWebViewDecision(_)) => {
+                // dialog_manager + td_api update — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateJoinChatWebViewDecision::ID,
+                    "updateJoinChatWebViewDecision",
+                    4523,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBotInlineQuery(_)) => {
+                // inline_queries_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateBotInlineQuery::ID,
+                    "updateBotInlineQuery",
+                    4543,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBotInlineSend(_)) => {
+                // inline_queries_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateBotInlineSend::ID,
+                    "updateBotInlineSend",
+                    4550,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBotCallbackQuery(_)) => {
+                // callback_queries_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateBotCallbackQuery::ID,
+                    "updateBotCallbackQuery",
+                    4556,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateEphemeralBotCallbackQuery(_)) => {
+                // callback_queries_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateEphemeralBotCallbackQuery::ID,
+                    "updateEphemeralBotCallbackQuery",
+                    4563,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateInlineBotCallbackQuery(_)) => {
+                // callback_queries_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateInlineBotCallbackQuery::ID,
+                    "updateInlineBotCallbackQuery",
+                    4571,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBusinessBotCallbackQuery(_)) => {
+                // callback_queries_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateBusinessBotCallbackQuery::ID,
+                    "updateBusinessBotCallbackQuery",
+                    4579,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateFavedStickers(_)) => {
+                // stickers_manager reload — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateFavedStickers::ID,
+                    "updateFavedStickers",
+                    4587,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateSavedGifs(_)) => {
+                // animations_manager reload — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateSavedGifs::ID,
+                    "updateSavedGifs",
+                    4592,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateNewStickerSet(_)) => {
+                // stickers_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateNewStickerSet::ID,
+                    "updateNewStickerSet",
+                    4645,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateStickerSets(_)) => {
+                // stickers_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateStickerSets::ID,
+                    "updateStickerSets",
+                    4651,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateStickerSetsOrder(_)) => {
+                // stickers_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateStickerSetsOrder::ID,
+                    "updateStickerSetsOrder",
+                    4657,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateMoveStickerSetToTop(_)) => {
+                // stickers_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateMoveStickerSetToTop::ID,
+                    "updateMoveStickerSetToTop",
+                    4663,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateReadFeaturedStickers(_)) => {
+                // stickers_manager reload — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateReadFeaturedStickers::ID,
+                    "updateReadFeaturedStickers",
+                    4669,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateReadFeaturedEmojiStickers(_)) => {
+                // stickers_manager reload — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateReadFeaturedEmojiStickers::ID,
+                    "updateReadFeaturedEmojiStickers",
+                    4675,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateRecentStickers(_)) => {
+                // stickers_manager reload — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateRecentStickers::ID,
+                    "updateRecentStickers",
+                    4681,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateEmojiGameInfo(_)) => {
+                // message_query_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateEmojiGameInfo::ID,
+                    "updateEmojiGameInfo",
+                    4603,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateEncryption(_)) => {
+                // secret_chats_manager — Wave 3.
+                self.drop_unsupported(
+                    telegram_api::updateEncryption::ID,
+                    "updateEncryption",
+                    4624,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateEncryptedMessagesRead(_)) => {
+                // messages_manager read_secret_chat_outbox — Wave 3.
+                self.drop_unsupported(
+                    telegram_api::updateEncryptedMessagesRead::ID,
+                    "updateEncryptedMessagesRead",
+                    4634,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updatePrivacy(_)) => {
+                // privacy_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updatePrivacy::ID,
+                    "updatePrivacy",
+                    4640,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBotShippingQuery(_)) => {
+                // td_api bot-query surface — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateBotShippingQuery::ID,
+                    "updateBotShippingQuery",
+                    4687,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBotPrecheckoutQuery(_)) => {
+                // td_api bot-query surface — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateBotPrecheckoutQuery::ID,
+                    "updateBotPrecheckoutQuery",
+                    4704,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBotWebhookJSON(_)) => {
+                // td_api custom event — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateBotWebhookJSON::ID,
+                    "updateBotWebhookJSON",
+                    4720,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateBotWebhookJSONQuery(_)) => {
+                // td_api custom query — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateBotWebhookJSONQuery::ID,
+                    "updateBotWebhookJSONQuery",
+                    4725,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updatePhoneCall(_)) => {
+                // call_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updatePhoneCall::ID,
+                    "updatePhoneCall",
+                    4731,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updatePhoneCallSignalingData(_)) => {
+                // call_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updatePhoneCallSignalingData::ID,
+                    "updatePhoneCallSignalingData",
+                    4736,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateGroupCallConnection(_)) => {
+                // group_call_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateGroupCallConnection::ID,
+                    "updateGroupCallConnection",
+                    4743,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateGroupCallChainBlocks(_)) => {
+                // group_call_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateGroupCallChainBlocks::ID,
+                    "updateGroupCallChainBlocks",
+                    4753,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateGroupCall(_)) => {
+                // group_call_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateGroupCall::ID,
+                    "updateGroupCall",
+                    4762,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateGroupCallParticipants(_)) => {
+                // group_call_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateGroupCallParticipants::ID,
+                    "updateGroupCallParticipants",
+                    4768,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateGroupCallMessage(_)) => {
+                // group_call_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateGroupCallMessage::ID,
+                    "updateGroupCallMessage",
+                    4775,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateGroupCallEncryptedMessage(_)) => {
+                // group_call_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateGroupCallEncryptedMessage::ID,
+                    "updateGroupCallEncryptedMessage",
+                    4781,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateDeleteGroupCallMessages(_)) => {
+                // group_call_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateDeleteGroupCallMessages::ID,
+                    "updateDeleteGroupCallMessages",
+                    4789,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateStarGiftAuctionState(_)) => {
+                // star_gift_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateStarGiftAuctionState::ID,
+                    "updateStarGiftAuctionState",
+                    4801,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateStarGiftAuctionUserState(_)) => {
+                // star_gift_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateStarGiftAuctionUserState::ID,
+                    "updateStarGiftAuctionUserState",
+                    4807,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateLangPackTooLong(_)) => {
+                // language_pack_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateLangPackTooLong::ID,
+                    "updateLangPackTooLong",
+                    4818,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateLangPack(_)) => {
+                // language_pack_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateLangPack::ID,
+                    "updateLangPack",
+                    4824,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateMessagePoll(_)) => {
+                // poll_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateMessagePoll::ID,
+                    "updateMessagePoll",
+                    4843,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateDeleteScheduledMessages(_)) => {
+                // messages_manager scheduled-delete + wait_message_add —
+                // the MessagesManager slice flip.
+                self.drop_unsupported(
+                    telegram_api::updateDeleteScheduledMessages::ID,
+                    "updateDeleteScheduledMessages",
+                    4864,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateTheme(_)) => {
+                // theme_manager — Wave 2.
+                self.drop_unsupported(telegram_api::updateTheme::ID, "updateTheme", 4949, promise);
+            }
+            PendingUpdate::Wire(telegram_api::Update::updatePeerWallpaper(_)) => {
+                // user_manager wallpaper + messages_manager background —
+                // M.6/Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updatePeerWallpaper::ID,
+                    "updatePeerWallpaper",
+                    4953,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateTranscribedAudio(_)) => {
+                // transcription_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateTranscribedAudio::ID,
+                    "updateTranscribedAudio",
+                    4972,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateAutoSaveSettings(_)) => {
+                // autosave_manager reload — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateAutoSaveSettings::ID,
+                    "updateAutoSaveSettings",
+                    4977,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateStory(_)) => {
+                // story_manager — Wave 2.
+                self.drop_unsupported(telegram_api::updateStory::ID, "updateStory", 4982, promise);
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateReadStories(_)) => {
+                // story_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateReadStories::ID,
+                    "updateReadStories",
+                    4987,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateStoriesStealthMode(_)) => {
+                // story_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateStoriesStealthMode::ID,
+                    "updateStoriesStealthMode",
+                    4992,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateSentStoryReaction(_)) => {
+                // story_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateSentStoryReaction::ID,
+                    "updateSentStoryReaction",
+                    4997,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateNewAuthorization(_)) => {
+                // account_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateNewAuthorization::ID,
+                    "updateNewAuthorization",
+                    5008,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateNewBotConnection(_)) => {
+                // account_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateNewBotConnection::ID,
+                    "updateNewBotConnection",
+                    5018,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateQuickReplies(_)) => {
+                // quick_reply_manager reload — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateQuickReplies::ID,
+                    "updateQuickReplies",
+                    5033,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateNewQuickReply(_)) => {
+                // quick_reply_manager reload — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateNewQuickReply::ID,
+                    "updateNewQuickReply",
+                    5038,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateDeleteQuickReply(_)) => {
+                // quick_reply_manager reload — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateDeleteQuickReply::ID,
+                    "updateDeleteQuickReply",
+                    5043,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateQuickReplyMessage(_)) => {
+                // quick_reply_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateQuickReplyMessage::ID,
+                    "updateQuickReplyMessage",
+                    5048,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateDeleteQuickReplyMessages(_)) => {
+                // quick_reply_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateDeleteQuickReplyMessages::ID,
+                    "updateDeleteQuickReplyMessages",
+                    5053,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateStarsBalance(_)) => {
+                // star_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateStarsBalance::ID,
+                    "updateStarsBalance",
+                    5093,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateStarsRevenueStatus(_)) => {
+                // star/statistics managers — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateStarsRevenueStatus::ID,
+                    "updateStarsRevenueStatus",
+                    5109,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateAiComposeTones(_)) => {
+                // translation_manager reload — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateAiComposeTones::ID,
+                    "updateAiComposeTones",
+                    5129,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateWebBrowserSettings(_)) => {
+                // web_browser_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateWebBrowserSettings::ID,
+                    "updateWebBrowserSettings",
+                    5134,
+                    promise,
+                );
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateWebBrowserException(_)) => {
+                // web_browser_manager — Wave 2.
+                self.drop_unsupported(
+                    telegram_api::updateWebBrowserException::ID,
+                    "updateWebBrowserException",
+                    5139,
+                    promise,
+                );
+            }
+
+            // ---- the C++ log-only overloads --------------------------
+            PendingUpdate::Wire(telegram_api::Update::updateStarGiftCraftFail(_)) => {
+                tdutils::log_error!("Receive unexpected updateStarGiftCraftFail");
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateStoryID(_)) => {
+                tdutils::log_error!(
+                    "Receive not in getDifference and not in on_pending_updates updateStoryID"
+                );
+                promise.set_value(());
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateSmsJob(_)) => {
+                tdutils::log_error!("Receive updateSmsJob");
                 promise.set_value(());
             }
             PendingUpdate::Dummy | PendingUpdate::SentMessage { .. } => {
@@ -3950,11 +5491,1113 @@ impl<S: UpdatesSink> UpdatesManager<S> {
         }
     }
 
-    /// `UpdatesManager::is_acceptable_update` (M.7.11) — a stub until the
-    /// acceptability filter lands (see the module docs).
-    fn is_acceptable_update(&self, _update: &telegram_api::Update) -> bool {
+    /// `UpdatesManager::is_acceptable_peer` (cpp:733) — an absent peer
+    /// (the C++ nullptr; the wire default encodes the zero id) is
+    /// acceptable.
+    fn is_acceptable_peer(&mut self, peer: &telegram_api::Peer) -> bool {
+        if peer_id_is_zero(peer) {
+            return true;
+        }
+        let dialog_id = DialogId::from_peer(peer);
+        match dialog_id.get_type() {
+            DialogType::User => self.sink.is_acceptable_user(dialog_id.get_user_id().get()),
+            DialogType::Chat => self.sink.is_acceptable_chat(dialog_id.get_chat_id().get()),
+            DialogType::Channel => self
+                .sink
+                .is_acceptable_channel(dialog_id.get_channel_id().get()),
+            // The C++ UNREACHABLE arms: wire peers carry no secret-chat
+            // dialogs and the zero dialog was excluded above; reject (the
+            // LOG_CHECK policy).
+            DialogType::None | DialogType::SecretChat => false,
+        }
+    }
+
+    /// `UpdatesManager::is_acceptable_message_entities` (cpp:766) — the
+    /// mention-name entities need a constructible InputUser.
+    fn is_acceptable_message_entities(&mut self, entities: &[telegram_api::MessageEntity]) -> bool {
+        for entity in entities {
+            if let telegram_api::MessageEntity::messageEntityMentionName(entity) = entity
+                && (!self.sink.is_acceptable_user(entity.user_id)
+                    || !self.sink.can_get_input_user(entity.user_id))
+            {
+                return false;
+            }
+        }
         true
     }
+
+    /// `UpdatesManager::is_acceptable_reply_markup` (cpp:780) — only the
+    /// inline markup carries user-profile buttons.
+    fn is_acceptable_reply_markup(&mut self, reply_markup: &telegram_api::ReplyMarkup) -> bool {
+        let telegram_api::ReplyMarkup::replyInlineMarkup(markup) = reply_markup else {
+            return true;
+        };
+        for row in &markup.rows {
+            for button in &row.buttons {
+                if let telegram_api::InlineButtonType::inlineButtonTypeUserProfile(button) =
+                    &button.r#type
+                    && (!self.sink.is_acceptable_user(button.user_id)
+                        || !self.sink.can_get_input_user(button.user_id))
+                {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// `UpdatesManager::is_acceptable_message_reply_header` (cpp:798).
+    fn is_acceptable_message_reply_header(
+        &mut self,
+        header: &telegram_api::MessageReplyHeader,
+    ) -> bool {
+        match header {
+            telegram_api::MessageReplyHeader::messageReplyHeader(header) => {
+                self.is_acceptable_peer(&header.reply_to_peer_id)
+                    && self.is_acceptable_message_forward_header(&header.reply_from)
+                    && self.is_acceptable_message_entities(&header.quote_entities)
+                    && self.is_acceptable_message_media(&header.reply_media)
+            }
+            telegram_api::MessageReplyHeader::messageReplyStoryHeader(header) => {
+                self.is_acceptable_peer(&header.peer)
+            }
+        }
+    }
+
+    /// `UpdatesManager::is_acceptable_message_forward_header` (cpp:822).
+    fn is_acceptable_message_forward_header(
+        &mut self,
+        header: &telegram_api::MessageFwdHeader,
+    ) -> bool {
+        self.is_acceptable_peer(&header.from_id) && self.is_acceptable_peer(&header.saved_from_peer)
+    }
+
+    /// `UpdatesManager::is_acceptable_message_media` (cpp:839) — the
+    /// poll/web-page/todo payloads always carry min users and chats (the
+    /// C++ comment), everything unrecognized is acceptable.
+    fn is_acceptable_message_media(&mut self, media: &telegram_api::MessageMedia) -> bool {
+        match media {
+            telegram_api::MessageMedia::messageMediaContact(media) => {
+                media.user_id == 0 || self.sink.is_acceptable_user(media.user_id)
+            }
+            telegram_api::MessageMedia::messageMediaStory(media) => {
+                self.is_acceptable_peer(&media.peer)
+            }
+            telegram_api::MessageMedia::messageMediaGiveaway(media) => media
+                .channels
+                .iter()
+                .all(|channel_id| self.sink.is_acceptable_channel(*channel_id)),
+            telegram_api::MessageMedia::messageMediaGiveawayResults(media) => {
+                self.sink.is_acceptable_channel(media.channel_id)
+                    && media
+                        .winners
+                        .iter()
+                        .all(|user_id| self.sink.is_acceptable_user(*user_id))
+            }
+            _ => true,
+        }
+    }
+
+    /// `UpdatesManager::is_acceptable_message` (cpp:887).
+    fn is_acceptable_message(
+        &mut self,
+        env: &mut impl UpdatesManagerEnv,
+        message: &telegram_api::Message,
+    ) -> bool {
+        match message {
+            telegram_api::Message::messageEmpty(_) => true,
+            telegram_api::Message::message(message) => {
+                self.is_acceptable_peer(&message.peer_id)
+                    && self.is_acceptable_peer(&message.from_id)
+                    && self.is_acceptable_message_reply_header(&message.reply_to)
+                    && self.is_acceptable_message_forward_header(&message.fwd_from)
+                    && (message.via_bot_id == 0 || self.sink.is_acceptable_user(message.via_bot_id))
+                    && self.is_acceptable_message_entities(&message.entities)
+                    && self.is_acceptable_message_media(&message.media)
+                    && self.is_acceptable_reply_markup(&message.reply_markup)
+            }
+            telegram_api::Message::messageService(message) => {
+                if !self.is_acceptable_peer(&message.peer_id)
+                    || !self.is_acceptable_peer(&message.from_id)
+                {
+                    return false;
+                }
+                self.is_acceptable_message_action(env, &message.action)
+            }
+        }
+    }
+
+    /// The messageService action switch of cpp:897-1136. The C++
+    /// allowlist passes; the checked actions consult the sink. The match
+    /// is exhaustive over the pinned scheme's MessageAction — a new
+    /// codegen variant fails to compile until it is classified here (the
+    /// C++ `UNREACHABLE` default, reject-at-build-time).
+    fn is_acceptable_message_action(
+        &mut self,
+        env: &mut impl UpdatesManagerEnv,
+        action: &telegram_api::MessageAction,
+    ) -> bool {
+        use telegram_api::MessageAction as MA;
+        match action {
+            MA::messageActionEmpty(_)
+            | MA::messageActionChatEditTitle(_)
+            | MA::messageActionChatEditPhoto(_)
+            | MA::messageActionChatDeletePhoto(_)
+            | MA::messageActionCustomAction(_)
+            | MA::messageActionBotAllowed(_)
+            | MA::messageActionHistoryClear(_)
+            | MA::messageActionChannelCreate(_)
+            | MA::messageActionPinMessage(_)
+            | MA::messageActionGameScore(_)
+            | MA::messageActionPhoneCall(_)
+            | MA::messageActionPaymentSent(_)
+            | MA::messageActionPaymentSentMe(_)
+            | MA::messageActionScreenshotTaken(_)
+            | MA::messageActionSecureValuesSent(_)
+            | MA::messageActionSecureValuesSentMe(_)
+            | MA::messageActionContactSignUp(_)
+            | MA::messageActionGroupCall(_)
+            | MA::messageActionGroupCallScheduled(_)
+            | MA::messageActionSetChatTheme(_)
+            | MA::messageActionChatJoinedByRequest(_)
+            | MA::messageActionWebViewDataSentMe(_)
+            | MA::messageActionWebViewDataSent(_)
+            | MA::messageActionGiftPremium(_)
+            | MA::messageActionTopicCreate(_)
+            | MA::messageActionTopicEdit(_)
+            | MA::messageActionSuggestProfilePhoto(_)
+            | MA::messageActionSetChatWallPaper(_)
+            | MA::messageActionGiveawayLaunch(_)
+            | MA::messageActionGiveawayResults(_)
+            | MA::messageActionBoostApply(_)
+            | MA::messageActionRequestedPeerSentMe(_)
+            | MA::messageActionGiftStars(_)
+            | MA::messageActionPrizeStars(_)
+            | MA::messageActionStarGift(_)
+            | MA::messageActionStarGiftUnique(_)
+            | MA::messageActionPaidMessagesRefunded(_)
+            | MA::messageActionPaidMessagesPrice(_)
+            | MA::messageActionTodoCompletions(_)
+            | MA::messageActionTodoAppendTasks(_)
+            | MA::messageActionSuggestedPostApproval(_)
+            | MA::messageActionSuggestedPostSuccess(_)
+            | MA::messageActionSuggestedPostRefund(_)
+            | MA::messageActionGiftTon(_)
+            | MA::messageActionSuggestBirthday(_)
+            | MA::messageActionStarGiftPurchaseOffer(_)
+            | MA::messageActionStarGiftPurchaseOfferDeclined(_)
+            | MA::messageActionNoForwardsToggle(_)
+            | MA::messageActionNoForwardsRequest(_)
+            | MA::messageActionPollAppendAnswer(_)
+            | MA::messageActionPollDeleteAnswer(_)
+            | MA::messageActionManagedBotCreated(_) => true,
+            MA::messageActionChatCreate(action) => action
+                .users
+                .iter()
+                .all(|user_id| self.sink.is_acceptable_user(*user_id)),
+            MA::messageActionChatAddUser(action) => action
+                .users
+                .iter()
+                .all(|user_id| self.sink.is_acceptable_user(*user_id)),
+            // inviter_id_ isn't used (the C++ comment).
+            MA::messageActionChatJoinedByLink(_) => true,
+            MA::messageActionChatDeleteUser(action) => self.sink.is_acceptable_user(action.user_id),
+            MA::messageActionChatMigrateTo(action) => {
+                self.sink.is_acceptable_channel(action.channel_id)
+            }
+            MA::messageActionChannelMigrateFrom(action) => {
+                self.sink.is_acceptable_chat(action.chat_id)
+            }
+            MA::messageActionGeoProximityReached(action) => {
+                self.is_acceptable_peer(&action.from_id) && self.is_acceptable_peer(&action.to_id)
+            }
+            MA::messageActionInviteToGroupCall(action) => action
+                .users
+                .iter()
+                .all(|user_id| self.sink.is_acceptable_user(*user_id)),
+            MA::messageActionSetMessagesTTL(action) => {
+                action.auto_setting_from == 0
+                    || self.sink.is_acceptable_user(action.auto_setting_from)
+            }
+            MA::messageActionRequestedPeer(action) => {
+                env.is_bot()
+                    || action
+                        .peers
+                        .iter()
+                        .all(|peer| self.is_acceptable_peer(peer))
+            }
+            MA::messageActionGiftCode(action) => self.is_acceptable_peer(&action.boost_peer),
+            MA::messageActionPaymentRefunded(action) => self.is_acceptable_peer(&action.peer),
+            MA::messageActionConferenceCall(action) => action
+                .other_participants
+                .iter()
+                .all(|peer| self.is_acceptable_peer(peer)),
+            MA::messageActionNewCreatorPending(action) => {
+                self.sink.is_acceptable_user(action.new_creator_id)
+            }
+            MA::messageActionChangeCreator(action) => {
+                self.sink.is_acceptable_user(action.new_creator_id)
+            }
+            MA::messageActionChangeCommunity(action) => {
+                action.community_id == 0 || self.sink.is_acceptable_community(action.community_id)
+            }
+            MA::messageActionChatJoinedViaCommunity(action) => {
+                action.community_id == 0 || self.sink.is_acceptable_community(action.community_id)
+            }
+        }
+    }
+
+    /// `UpdatesManager::is_acceptable_update` (cpp:1148) — only the five
+    /// message carriers are inspected.
+    fn is_acceptable_update(
+        &mut self,
+        env: &mut impl UpdatesManagerEnv,
+        update: &telegram_api::Update,
+    ) -> bool {
+        let message = match update {
+            telegram_api::Update::updateNewMessage(update) => &update.message,
+            telegram_api::Update::updateNewChannelMessage(update) => &update.message,
+            telegram_api::Update::updateNewScheduledMessage(update) => &update.message,
+            telegram_api::Update::updateEditMessage(update) => &update.message,
+            telegram_api::Update::updateEditChannelMessage(update) => &update.message,
+            _ => return true,
+        };
+        self.is_acceptable_message(env, message)
+    }
+
+    // ------------------------------------------------------------------
+    // M.7.16 — the aux machinery (cpp:1896-1957)
+    // ------------------------------------------------------------------
+    /// `UpdatesManager::get_most_unused_auth_key_id` (cpp:1896) — the
+    /// session with the oldest update; 0 when everything is current.
+    fn get_most_unused_auth_key_id(&self, env: &mut impl UpdatesManagerEnv) -> u64 {
+        let mut min_auth_key_id = 0u64;
+        let mut min_time = env.now();
+        for (auth_key_id, info) in &self.session_infos {
+            if info.last_update_time < min_time {
+                min_time = info.last_update_time;
+                min_auth_key_id = *auth_key_id;
+            }
+        }
+        min_auth_key_id
+    }
+
+    /// `UpdatesManager::on_update_from_auth_key_id` (cpp:1908) — the
+    /// per-session update accounting; a fresh session evicts the oldest
+    /// session beyond the `session_count` option.
+    pub fn on_update_from_auth_key_id(
+        &mut self,
+        env: &mut impl UpdatesManagerEnv,
+        auth_key_id: u64,
+    ) {
+        if auth_key_id == 0 {
+            return;
+        }
+        let now = env.now();
+        let is_new = {
+            let info = self.session_infos.entry(auth_key_id).or_default();
+            info.last_update_time = now;
+            let is_new = info.update_count == 0;
+            info.update_count += 1;
+            if is_new {
+                info.first_update_time = now;
+            }
+            is_new
+        };
+        if is_new {
+            let max_sessions = std::cmp::max(env.get_option_integer("session_count"), 1) as usize;
+            while self.session_infos.len() > max_sessions {
+                let unused_auth_key_id = self.get_most_unused_auth_key_id(env);
+                tdutils::log_info!("Delete statistics for auth key {unused_auth_key_id}");
+                if self.session_infos.remove(&unused_auth_key_id).is_none() {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// `UpdatesManager::ping_server` (cpp:1926) — the pong drives the
+    /// state intake; the query send is the `[blocked: net]` env seam.
+    pub fn ping_server(&mut self, env: &mut impl UpdatesManagerEnv) {
+        if self.is_ping_sent {
+            return;
+        }
+        self.is_ping_sent = true;
+        env.send_ping_server();
+    }
+
+    /// `UpdatesManager::on_server_pong` (cpp:1936) — `None` is the failed
+    /// query (the C++ null state); a stale pong triggers getDifference.
+    pub fn on_server_pong(
+        &mut self,
+        env: &mut impl UpdatesManagerEnv,
+        state: Option<telegram_api::updates_State>,
+    ) {
+        tdutils::log_info!("Receive server pong");
+        self.is_ping_sent = false;
+        let is_stale = match state {
+            None => true,
+            Some(state) => state.pts > self.get_pts() || state.seq > self.seq,
+        };
+        if is_stale {
+            self.get_difference(env, "on server pong");
+        }
+    }
+
+    /// `UpdatesManager::notify_speed_limited` (cpp:1946) — the
+    /// user-visible speed-limit notice, throttled by the
+    /// `upload_premium_speedup_notify_period` option.
+    pub fn notify_speed_limited(&mut self, env: &mut impl UpdatesManagerEnv, is_upload: bool) {
+        let now = env.now();
+        if now < self.next_notify_speed_limited[usize::from(is_upload)] {
+            return;
+        }
+        self.next_notify_speed_limited[usize::from(is_upload)] =
+            now + env.get_option_integer("upload_premium_speedup_notify_period") as f64;
+        self.sink.on_speed_limit_notification(is_upload);
+    }
+
+    // ------------------------------------------------------------------
+    // M.7.17 — the data reloaders (cpp:2373-2534)
+    // ------------------------------------------------------------------
+
+    /// `UpdatesManager::schedule_data_reload` (cpp:2373).
+    fn schedule_data_reload(&mut self, env: &mut impl UpdatesManagerEnv) {
+        if self.data_reload_timeout.has_timeout() {
+            return;
+        }
+        let timeout = self.next_data_reload_time - env.now();
+        self.data_reload_timeout.set_timeout_in(env.now(), timeout);
+    }
+
+    /// `UpdatesManager::try_reload_data` (cpp:2391) — the four
+    /// preconditions (authorized, not a bot, no running getDifference,
+    /// online), the 365-day one-shot gate and the
+    /// [`UpdatesSink::reload_data`] fan-out.
+    pub fn try_reload_data(&mut self, env: &mut impl UpdatesManagerEnv) {
+        if !env.is_authorized() || env.is_bot() || self.running_get_difference || !env.is_online() {
+            return;
+        }
+        let now = env.now();
+        if now < self.next_data_reload_time {
+            self.schedule_data_reload(env);
+            return;
+        }
+        self.next_data_reload_time = now + f64::from(365 * 86400);
+        self.sink.reload_data();
+        self.on_data_reloaded(env);
+    }
+
+    /// `UpdatesManager::on_data_reloaded` (cpp:2478) — the C++ re-arm
+    /// arrives through the reload promise; the synchronous sink collapses
+    /// it to an immediate re-arm (the module-docs convention).
+    pub fn on_data_reloaded(&mut self, env: &mut impl UpdatesManagerEnv) {
+        if env.close_flag() {
+            return;
+        }
+        self.next_data_reload_time = env.now() + f64::from(tdutils::random::fast(3000, 4200));
+        self.data_reload_timeout.cancel_timeout();
+        self.schedule_data_reload(env);
+    }
+
+    /// `UpdatesManager::schedule_often_data_reload` (cpp:2491).
+    fn schedule_often_data_reload(&mut self, env: &mut impl UpdatesManagerEnv) {
+        if self.often_data_reload_timeout.has_timeout() {
+            return;
+        }
+        let timeout = self.next_often_data_reload_time - env.now();
+        self.often_data_reload_timeout
+            .set_timeout_in(env.now(), timeout);
+    }
+
+    /// `UpdatesManager::try_reload_often_data` (cpp:2511) — the same gate
+    /// as [`Self::try_reload_data`] with the stories fan-out.
+    pub fn try_reload_often_data(&mut self, env: &mut impl UpdatesManagerEnv) {
+        if !env.is_authorized() || env.is_bot() || self.running_get_difference || !env.is_online() {
+            return;
+        }
+        let now = env.now();
+        if now < self.next_often_data_reload_time {
+            self.schedule_often_data_reload(env);
+            return;
+        }
+        self.next_often_data_reload_time = now + f64::from(365 * 86400);
+        self.sink.reload_often_data();
+        self.on_often_data_reloaded(env);
+    }
+
+    /// `UpdatesManager::on_often_data_reloaded` (cpp:2529).
+    pub fn on_often_data_reloaded(&mut self, env: &mut impl UpdatesManagerEnv) {
+        if env.close_flag() {
+            return;
+        }
+        self.next_often_data_reload_time = env.now() + f64::from(tdutils::random::fast(300, 420));
+        self.often_data_reload_timeout.cancel_timeout();
+        self.schedule_often_data_reload(env);
+    }
+}
+
+// ------------------------------------------------------------------
+// M.7.8 — the container statics (the free functions other managers call on
+// an `Updates` umbrella they already hold; the C++ statics on
+// UpdatesManager, cpp:1412-1851).
+// ------------------------------------------------------------------
+
+/// The `td::MessageId` bit layout (MessageId.h:17-23) — the statics below
+/// need the server/scheduled comparisons before the full `MessageId` port
+/// lands with the MessagesManager slice (`chat_manager::MessageId` is the
+/// opaque stand-in today).
+const MESSAGE_ID_SERVER_SHIFT: u32 = 20;
+const MESSAGE_ID_TYPE_MASK: i64 = (1 << 3) - 1;
+const MESSAGE_ID_FULL_TYPE_MASK: i64 = (1 << MESSAGE_ID_SERVER_SHIFT) - 1;
+const MESSAGE_ID_SCHEDULED_MASK: i64 = 4;
+const MESSAGE_ID_TYPE_YET_UNSENT: i64 = 1;
+const MESSAGE_ID_TYPE_LOCAL: i64 = 2;
+
+/// `MessageId::max()` — MessageId.h:66.
+const MESSAGE_ID_MAX: i64 = (i32::MAX as i64) << MESSAGE_ID_SERVER_SHIFT;
+
+/// `MessageId(ServerMessageId)` — MessageId.h:57-59.
+fn server_message_id_to_message_id(server_message_id: i32) -> i64 {
+    (server_message_id as i64) << MESSAGE_ID_SERVER_SHIFT
+}
+
+/// `MessageId::is_valid` — MessageId.cpp:112-122.
+fn is_valid_message_id(id: i64) -> bool {
+    if id <= 0 || id > MESSAGE_ID_MAX {
+        return false;
+    }
+    if (id & MESSAGE_ID_FULL_TYPE_MASK) == 0 {
+        return true;
+    }
+    let type_bits = id & MESSAGE_ID_TYPE_MASK;
+    type_bits == MESSAGE_ID_TYPE_YET_UNSENT || type_bits == MESSAGE_ID_TYPE_LOCAL
+}
+
+/// `MessageId::is_valid_scheduled` — MessageId.cpp:126-132.
+fn is_valid_scheduled_message_id(id: i64) -> bool {
+    if id <= 0 || id > 1i64 << 51 {
+        return false;
+    }
+    let type_bits = id & MESSAGE_ID_TYPE_MASK;
+    type_bits == MESSAGE_ID_SCHEDULED_MASK
+        || type_bits == (MESSAGE_ID_SCHEDULED_MASK | MESSAGE_ID_TYPE_YET_UNSENT)
+        || type_bits == (MESSAGE_ID_SCHEDULED_MASK | MESSAGE_ID_TYPE_LOCAL)
+}
+
+/// `MessageId::is_scheduled_server` — MessageId.h:126-129, with the C++
+/// `CHECK(is_valid_scheduled())` folded into the predicate.
+fn is_scheduled_server_message_id(id: i64) -> bool {
+    is_valid_scheduled_message_id(id) && (id & MESSAGE_ID_TYPE_MASK) == MESSAGE_ID_SCHEDULED_MASK
+}
+
+/// `MessageId::get_scheduled_server_message_id_force` — MessageId.h:51-56.
+fn scheduled_server_message_id_of(id: i64) -> i32 {
+    ((id >> 3) & ((1 << 18) - 1)) as i32
+}
+
+/// `MessageId::get_server_message_id_force` — MessageId.h:47-49.
+fn server_message_id_of(id: i64) -> i32 {
+    (id >> MESSAGE_ID_SERVER_SHIFT) as i32
+}
+
+/// `MessageId(ScheduledServerMessageId, send_date)` — MessageId.cpp:15-26;
+/// the two C++ `LOG(ERROR)`-and-zero paths collapse to 0.
+fn scheduled_message_id_to_message_id(scheduled_server_message_id: i32, send_date: i32) -> i64 {
+    if send_date <= 1 << 30 {
+        tdutils::log_error!("Scheduled message send date {send_date} is in the past");
+        return 0;
+    }
+    if !(0 < scheduled_server_message_id && scheduled_server_message_id < 1 << 18) {
+        tdutils::log_error!("Scheduled message ID {scheduled_server_message_id} is invalid");
+        return 0;
+    }
+    (((send_date - (1 << 30)) as i64) << 21)
+        | ((scheduled_server_message_id as i64) << 3)
+        | MESSAGE_ID_SCHEDULED_MASK
+}
+
+/// `MessageId::get_message_id(message, is_scheduled)` — MessageId.cpp:28-49.
+fn message_id_from_message(message: &telegram_api::Message, is_scheduled: bool) -> i64 {
+    match message {
+        telegram_api::Message::messageEmpty(message) => {
+            if is_scheduled {
+                0
+            } else {
+                server_message_id_to_message_id(message.id)
+            }
+        }
+        telegram_api::Message::message(message) => {
+            if is_scheduled {
+                scheduled_message_id_to_message_id(message.id, message.date)
+            } else {
+                server_message_id_to_message_id(message.id)
+            }
+        }
+        telegram_api::Message::messageService(message) => {
+            if is_scheduled {
+                scheduled_message_id_to_message_id(message.id, message.date)
+            } else {
+                server_message_id_to_message_id(message.id)
+            }
+        }
+    }
+}
+
+/// `DialogId::get_message_dialog_id(message)` — the peer of any message
+/// carrier; `messageEmpty` yields the invalid dialog.
+fn message_dialog_id(message: &telegram_api::Message) -> DialogId {
+    match message_peer_id(message) {
+        Some(peer) => DialogId::from_peer(peer),
+        None => DialogId::new(0),
+    }
+}
+
+/// `MessageFullId::get_message_full_id(message, is_scheduled)` — the
+/// (dialog, message-id) pair; `messageEmpty` carries the invalid dialog.
+fn message_full_id(message: &telegram_api::Message, is_scheduled: bool) -> (DialogId, i64) {
+    (
+        message_dialog_id(message),
+        message_id_from_message(message, is_scheduled),
+    )
+}
+
+/// `UpdatesManager::get_updates` (the C++ private helper) — the updates
+/// vector of the two container umbrella variants.
+fn get_updates_vec(updates: &telegram_api::Updates) -> Option<&Vec<telegram_api::Update>> {
+    match updates {
+        telegram_api::Updates::updates(updates) => Some(&updates.updates),
+        telegram_api::Updates::updatesCombined(updates) => Some(&updates.updates),
+        _ => None,
+    }
+}
+
+/// The mutable variant, for the erasing extractors.
+fn get_updates_vec_mut(
+    updates: &mut telegram_api::Updates,
+) -> Option<&mut Vec<telegram_api::Update>> {
+    match updates {
+        telegram_api::Updates::updates(updates) => Some(&mut updates.updates),
+        telegram_api::Updates::updatesCombined(updates) => Some(&mut updates.updates),
+        _ => None,
+    }
+}
+
+/// `UpdatesManager::are_empty_updates` (cpp:1412) — true for the two
+/// carry-no-updates umbrellas, the container emptiness otherwise.
+pub fn are_empty_updates(updates: &telegram_api::Updates) -> bool {
+    match updates {
+        telegram_api::Updates::updatesTooLong(_)
+        | telegram_api::Updates::updateShortSentMessage(_) => true,
+        telegram_api::Updates::updateShortMessage(_)
+        | telegram_api::Updates::updateShortChatMessage(_)
+        | telegram_api::Updates::updateShort(_) => false,
+        telegram_api::Updates::updatesCombined(updates) => updates.updates.is_empty(),
+        telegram_api::Updates::updates(updates) => updates.updates.is_empty(),
+    }
+}
+
+/// `UpdatesManager::get_sent_messages_random_ids` (cpp:1434) — the
+/// random_ids of the updateMessageID entries whose message the container
+/// itself carries (the sent-message echo guard).
+pub fn get_sent_messages_random_ids(updates: &telegram_api::Updates) -> HashSet<i64> {
+    let mut random_ids = HashSet::new();
+    let Some(updates_vec) = get_updates_vec(updates) else {
+        return random_ids;
+    };
+    let new_messages = get_new_messages(updates);
+    for update in updates_vec {
+        let telegram_api::Update::updateMessageID(update_message_id) = update else {
+            continue;
+        };
+        let random_id = update_message_id.random_id;
+        if random_id == 0 {
+            continue;
+        }
+        let mut found_message = false;
+        for &(message, is_scheduled) in &new_messages {
+            let message_id = message_id_from_message(message, is_scheduled);
+            if is_scheduled {
+                found_message |= is_scheduled_server_message_id(message_id)
+                    && scheduled_server_message_id_of(message_id) == update_message_id.id;
+            } else {
+                found_message |= is_valid_message_id(message_id)
+                    && server_message_id_of(message_id) == update_message_id.id;
+            }
+        }
+        if found_message && !random_ids.insert(random_id) {
+            tdutils::log_error!("Receive twice updateMessageID for {random_id}");
+        }
+    }
+    random_ids
+}
+
+/// `UpdatesManager::get_message_by_random_id` (cpp:1464) — the sent
+/// message behind an updateMessageID, when the container carries exactly
+/// one candidate; `dialog_id` is the sending dialog (the invalid dialog
+/// matches only empty-carried messages, the C++ default-DialogId path).
+pub fn get_message_by_random_id(
+    updates: &telegram_api::Updates,
+    dialog_id: DialogId,
+    random_id: i64,
+) -> Option<&telegram_api::Message> {
+    let updates_vec = get_updates_vec(updates)?;
+
+    let mut message_id = 0;
+    for update in updates_vec {
+        let telegram_api::Update::updateMessageID(update_message_id) = update else {
+            continue;
+        };
+        if update_message_id.random_id == random_id {
+            if message_id != 0 || update_message_id.id == 0 {
+                return None;
+            }
+            message_id = update_message_id.id;
+        }
+    }
+    if message_id == 0 {
+        return None;
+    }
+
+    let target = (dialog_id, server_message_id_to_message_id(message_id));
+    let mut result: Option<&telegram_api::Message> = None;
+    for update in updates_vec {
+        let message = match update {
+            telegram_api::Update::updateNewMessage(update) => &update.message,
+            telegram_api::Update::updateNewChannelMessage(update) => &update.message,
+            _ => continue,
+        };
+        if message_full_id(message, false) == target {
+            if result.is_some() {
+                return None;
+            }
+            result = Some(message);
+        }
+    }
+    result
+}
+
+/// `UpdatesManager::is_additional_service_message` (cpp:1505) — the
+/// messageService `SetMessagesTTL` marker that filters new-message
+/// extraction.
+pub fn is_additional_service_message(message: &telegram_api::Message) -> bool {
+    match message {
+        telegram_api::Message::messageService(message) => matches!(
+            message.action,
+            telegram_api::MessageAction::messageActionSetMessagesTTL(_)
+        ),
+        _ => false,
+    }
+}
+
+/// `UpdatesManager::get_new_messages` (cpp:1513) — the
+/// `[Message, is_scheduled]` pairs of the container, service-TTL markers
+/// excluded.
+pub fn get_new_messages(updates: &telegram_api::Updates) -> Vec<(&telegram_api::Message, bool)> {
+    let mut messages = Vec::new();
+    let Some(updates_vec) = get_updates_vec(updates) else {
+        return messages;
+    };
+    for update in updates_vec {
+        let (message, is_scheduled) = match update {
+            telegram_api::Update::updateNewMessage(update) => (&update.message, false),
+            telegram_api::Update::updateNewChannelMessage(update) => (&update.message, false),
+            telegram_api::Update::updateNewScheduledMessage(update) => (&update.message, true),
+            _ => continue,
+        };
+        if !is_additional_service_message(message) {
+            messages.push((message, is_scheduled));
+        }
+    }
+    messages
+}
+
+/// `UpdatesManager::get_new_ephemeral_messages` (cpp:1541).
+pub fn get_new_ephemeral_messages(
+    updates: &telegram_api::Updates,
+) -> Vec<&telegram_api::EphemeralMessage> {
+    let mut messages = Vec::new();
+    let Some(updates_vec) = get_updates_vec(updates) else {
+        return messages;
+    };
+    for update in updates_vec {
+        if let telegram_api::Update::updateNewEphemeralMessage(update) = update {
+            messages.push(&update.message);
+        }
+    }
+    messages
+}
+
+/// `UpdatesManager::get_update_new_group_call_id` (cpp:1554) — the
+/// `(id, access_hash)` of the single groupCall the container carries;
+/// `None` is the C++ invalid InputGroupCallId (absent, multiple, or
+/// divergent).
+pub fn get_update_new_group_call_id(updates: &telegram_api::Updates) -> Option<(i64, i64)> {
+    let mut result: Option<(i64, i64)> = None;
+    if let Some(updates_vec) = get_updates_vec(updates) {
+        for update in updates_vec {
+            let mut input_group_call_id: Option<(i64, i64)> = None;
+            if let telegram_api::Update::updateGroupCall(update) = update
+                && let telegram_api::GroupCall::groupCall(group_call) = &update.call
+            {
+                input_group_call_id = Some((group_call.id, group_call.access_hash));
+            }
+            if let Some(input_group_call_id) = input_group_call_id {
+                if result.is_none() {
+                    result = Some(input_group_call_id);
+                } else if result != Some(input_group_call_id) {
+                    result = None;
+                    break;
+                }
+            }
+        }
+    }
+    if result.is_none() {
+        tdutils::log_error!(
+            "Receive wrong response {}",
+            update_umbrella_string_name(updates)
+        );
+    }
+    result
+}
+
+/// The umbrella name for the statics' error logs (the free helpers have no
+/// `update_umbrella_name` access for non-umbrella reasons — this is the
+/// same table).
+fn update_umbrella_string_name(updates: &telegram_api::Updates) -> &'static str {
+    update_umbrella_name(updates)
+}
+
+/// `UpdatesManager::process_updates_users_and_chats` (cpp:1600) — the
+/// users/chats pre-application; the vectors are drained into the sink and
+/// cleared in place, the C++ `std::move` + `clear()` pair.
+pub fn process_updates_users_and_chats(
+    sink: &mut impl UpdatesSink,
+    updates: &mut telegram_api::Updates,
+) {
+    let (users, chats) = match updates {
+        telegram_api::Updates::updatesCombined(updates) => (
+            std::mem::take(&mut updates.users),
+            std::mem::take(&mut updates.chats),
+        ),
+        telegram_api::Updates::updates(updates) => (
+            std::mem::take(&mut updates.users),
+            std::mem::take(&mut updates.chats),
+        ),
+        _ => return,
+    };
+    for user in users {
+        sink.on_user(user);
+    }
+    for chat in chats {
+        sink.on_chat(chat);
+    }
+}
+
+/// `UpdatesManager::extract_join_group_call_presentation_params`
+/// (cpp:1622) — removes and returns the presentation
+/// updateGroupCallConnection params. The C++ iterates a container
+/// unconditionally (undefined on the leaf umbrellas); here the leaf
+/// umbrellas yield the empty string.
+pub fn extract_join_group_call_presentation_params(updates: &mut telegram_api::Updates) -> String {
+    let Some(updates_vec) = get_updates_vec_mut(updates) else {
+        return String::new();
+    };
+    let position = updates_vec.iter().position(|update| {
+        matches!(
+            update,
+            telegram_api::Update::updateGroupCallConnection(update) if update.presentation
+        )
+    });
+    let Some(position) = position else {
+        return String::new();
+    };
+    let telegram_api::Update::updateGroupCallConnection(update) = updates_vec.remove(position)
+    else {
+        unreachable!("the position was matched above")
+    };
+    update.params.data
+}
+
+/// `UpdatesManager::extract_star_gift_craft_fail` (cpp:1640) — removes the
+/// first updateStarGiftCraftFail and reports whether one was present.
+pub fn extract_star_gift_craft_fail(updates: &mut telegram_api::Updates) -> bool {
+    let Some(updates_vec) = get_updates_vec_mut(updates) else {
+        return false;
+    };
+    let position = updates_vec
+        .iter()
+        .position(|update| matches!(update, telegram_api::Update::updateStarGiftCraftFail(_)));
+    let Some(position) = position else {
+        return false;
+    };
+    updates_vec.remove(position);
+    true
+}
+
+/// `UpdatesManager::extract_group_call_messages` (cpp:1653) — removes and
+/// returns every updateGroupCallMessage. The C++ moves the objects out and
+/// leaves moved-from nulls in the container (any later iteration would
+/// CHECK-crash); draining the entries is the same observable contract for
+/// the callers, which never re-iterate the container.
+pub fn extract_group_call_messages(
+    updates: &mut telegram_api::Updates,
+) -> Vec<telegram_api::updateGroupCallMessage> {
+    let Some(updates_vec) = get_updates_vec_mut(updates) else {
+        return Vec::new();
+    };
+    let mut result = Vec::new();
+    let mut position = 0;
+    while position < updates_vec.len() {
+        if matches!(
+            updates_vec[position],
+            telegram_api::Update::updateGroupCallMessage(_)
+        ) {
+            let telegram_api::Update::updateGroupCallMessage(update) = updates_vec.remove(position)
+            else {
+                unreachable!("the position was matched above")
+            };
+            result.push(update);
+        } else {
+            position += 1;
+        }
+    }
+    result
+}
+
+/// `UpdatesManager::extract_story` (cpp:1668) — removes and returns the
+/// owner's story; the business path accepts the skipped-story variant and
+/// only runs on 1-2-update containers. The C++ moves the story out and
+/// leaves the updateStory in place with a null story (never re-iterated by
+/// the callers); draining the entry is the same observable contract.
+pub fn extract_story(
+    updates: &mut telegram_api::Updates,
+    owner_dialog_id: DialogId,
+    is_business: bool,
+) -> Option<telegram_api::StoryItem> {
+    let updates_vec = get_updates_vec_mut(updates)?;
+    if is_business && updates_vec.len() != 1 && updates_vec.len() != 2 {
+        return None;
+    }
+    let position = updates_vec.iter().position(|update| {
+        matches!(update, telegram_api::Update::updateStory(update)
+            if DialogId::from_peer(&update.peer) == owner_dialog_id
+                && (is_business || matches!(&*update.story, telegram_api::StoryItem::storyItem(_))))
+    });
+    let position = position?;
+    let telegram_api::Update::updateStory(update) = updates_vec.remove(position) else {
+        unreachable!("the position was matched above")
+    };
+    Some(*update.story)
+}
+
+/// `UpdatesManager::get_update_notify_settings_dialog_ids` (cpp:1697) —
+/// the peer-dialog of every updateNotifySettings; scope/community wrappers
+/// and invalid peers log and skip, exactly as the C++.
+pub fn get_update_notify_settings_dialog_ids(updates: &telegram_api::Updates) -> Vec<DialogId> {
+    let mut dialog_ids = Vec::new();
+    let Some(updates_vec) = get_updates_vec(updates) else {
+        return dialog_ids;
+    };
+    dialog_ids.reserve(updates_vec.len());
+    for update in updates_vec {
+        let mut dialog_id = DialogId::new(0);
+        if let telegram_api::Update::updateNotifySettings(update) = update
+            && let telegram_api::NotifyPeer::notifyPeer(notify_peer) = &update.peer
+        {
+            dialog_id = DialogId::from_peer(&notify_peer.peer);
+        }
+        if dialog_id.is_valid() {
+            dialog_ids.push(dialog_id);
+        } else {
+            tdutils::log_error!("Receive unexpected {}", update_id_and_name(update).1);
+        }
+    }
+    dialog_ids
+}
+
+/// `UpdatesManager::get_update_ids` (cpp:1727) — the constructor ids the
+/// umbrella carries; the leaf umbrellas collapse to themselves.
+pub fn get_update_ids(updates: &telegram_api::Updates) -> Vec<i32> {
+    let updates_vec = match updates {
+        telegram_api::Updates::updatesTooLong(_) => return vec![telegram_api::updatesTooLong::ID],
+        telegram_api::Updates::updateShortMessage(_) => {
+            return vec![telegram_api::updateShortMessage::ID];
+        }
+        telegram_api::Updates::updateShortChatMessage(_) => {
+            return vec![telegram_api::updateShortChatMessage::ID];
+        }
+        telegram_api::Updates::updateShortSentMessage(_) => {
+            return vec![telegram_api::updateShortSentMessage::ID];
+        }
+        telegram_api::Updates::updateShort(update) => {
+            return vec![update_id_and_name(&update.update).0];
+        }
+        telegram_api::Updates::updatesCombined(updates) => &updates.updates,
+        telegram_api::Updates::updates(updates) => &updates.updates,
+    };
+    updates_vec
+        .iter()
+        .map(|update| update_id_and_name(update).0)
+        .collect()
+}
+
+/// `ChatManager::get_unsupported_channel_id` (ChatManager.cpp:3161) — the
+/// test/main dummy channel the dialog-id lists filter out.
+fn get_unsupported_channel_id(is_test_dc: bool) -> ChannelId {
+    ChannelId::new(if is_test_dc {
+        10_304_875
+    } else {
+        1_535_424_647
+    })
+}
+
+/// `ChatManager::get_dialog_id(chat)` (ChatManager.cpp:4435) — the channel
+/// dialog when the chat carries one, the basic-group dialog otherwise.
+fn chat_dialog_id(chat: &telegram_api::Chat) -> DialogId {
+    let channel_id = match chat {
+        telegram_api::Chat::channel(channel) => Some(ChannelId::new(channel.id)),
+        telegram_api::Chat::channelForbidden(channel) => Some(ChannelId::new(channel.id)),
+        _ => None,
+    };
+    if let Some(channel_id) = channel_id
+        && channel_id.is_valid()
+    {
+        return DialogId::from_channel_id(channel_id);
+    }
+    let chat_id = match chat {
+        telegram_api::Chat::chatEmpty(chat) => ChatId::new(chat.id),
+        telegram_api::Chat::chat(chat) => ChatId::new(chat.id),
+        telegram_api::Chat::chatForbidden(chat) => ChatId::new(chat.id),
+        _ => ChatId::default(),
+    };
+    DialogId::from_chat_id(chat_id)
+}
+
+/// `UpdatesManager::get_chat_dialog_ids` (cpp:1764) — the chat dialogs the
+/// container carries; the unsupported test/main dummy channel drops out
+/// once the list is plural. The leaf umbrellas log and yield empty, as the
+/// C++.
+pub fn get_chat_dialog_ids(updates: &telegram_api::Updates, is_test_dc: bool) -> Vec<DialogId> {
+    let chats: &[telegram_api::Chat] = match updates {
+        telegram_api::Updates::updatesTooLong(_)
+        | telegram_api::Updates::updateShortMessage(_)
+        | telegram_api::Updates::updateShortChatMessage(_)
+        | telegram_api::Updates::updateShort(_)
+        | telegram_api::Updates::updateShortSentMessage(_) => {
+            tdutils::log_error!(
+                "Receive {} instead of updates",
+                update_umbrella_string_name(updates)
+            );
+            return Vec::new();
+        }
+        telegram_api::Updates::updatesCombined(updates) => &updates.chats,
+        telegram_api::Updates::updates(updates) => &updates.chats,
+    };
+
+    let mut dialog_ids = Vec::with_capacity(chats.len());
+    for chat in chats {
+        let dialog_id = chat_dialog_id(chat);
+        if dialog_id.is_valid() {
+            dialog_ids.push(dialog_id);
+        } else {
+            tdutils::log_error!("Can't find identifier of {:?}", chat);
+        }
+    }
+    if dialog_ids.len() > 1 {
+        let unsupported = DialogId::from_channel_id(get_unsupported_channel_id(is_test_dc));
+        dialog_ids.retain(|&dialog_id| dialog_id != unsupported);
+    }
+    dialog_ids
+}
+
+/// `UpdatesManager::get_community_id` (cpp:1807) — the raw id of the
+/// single non-regular channel update the container carries; `None` is the
+/// C++ invalid CommunityId (absent, multiple, or non-positive).
+pub fn get_community_id(updates: &telegram_api::Updates) -> Option<i64> {
+    let mut community_id: Option<i64> = None;
+    if let Some(updates_vec) = get_updates_vec(updates) {
+        for update in updates_vec {
+            let telegram_api::Update::updateChannel(update) = update else {
+                continue;
+            };
+            let channel_id = ChannelId::new(update.channel_id);
+            if channel_id.is_regular_channel() {
+                continue;
+            }
+            if community_id.is_some() {
+                tdutils::log_error!("Receive multiple updateChannel");
+                return None;
+            }
+            if update.channel_id <= 0 {
+                tdutils::log_error!("Receive {}", update.channel_id);
+                return None;
+            }
+            community_id = Some(update.channel_id);
+        }
+    }
+    if community_id.is_none() {
+        tdutils::log_error!("Receive no community");
+    }
+    community_id
+}
+
+/// `UpdatesManager::get_update_edit_message_pts` (cpp:1832) — the pts of
+/// the container's edit-update for `message_full_id`; -1 collapses to 0
+/// with the C++ plural error, absence is the C++ missing error.
+pub fn get_update_edit_message_pts(
+    updates: &telegram_api::Updates,
+    full_id: (DialogId, i64),
+) -> i32 {
+    let mut pts: i32 = 0;
+    let Some(updates_vec) = get_updates_vec(updates) else {
+        return 0;
+    };
+    for update in updates_vec {
+        let update_pts: i32 = match update {
+            telegram_api::Update::updateEditMessage(update)
+                if message_full_id(&update.message, false) == full_id =>
+            {
+                update.pts
+            }
+            telegram_api::Update::updateEditChannelMessage(update)
+                if message_full_id(&update.message, false) == full_id =>
+            {
+                update.pts
+            }
+            telegram_api::Update::updateNewScheduledMessage(update) => {
+                let new_message_full_id = message_full_id(&update.message, true);
+                if new_message_full_id.0 == full_id.0
+                    && is_scheduled_server_message_id(new_message_full_id.1)
+                    && is_scheduled_server_message_id(full_id.1)
+                    && scheduled_server_message_id_of(new_message_full_id.1)
+                        == scheduled_server_message_id_of(full_id.1)
+                {
+                    -2
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        };
+        if update_pts != 0 {
+            pts = if pts == 0 { update_pts } else { -1 };
+        }
+    }
+    if pts == -1 {
+        tdutils::log_error!(
+            "Receive multiple edit message updates in {}",
+            update_umbrella_string_name(updates)
+        );
+        pts = 0;
+    } else if pts == 0 {
+        tdutils::log_error!(
+            "Receive no edit message updates for {} in {}",
+            full_id.0.get(),
+            update_umbrella_string_name(updates)
+        );
+    }
+    pts
 }
 
 /// Complete an optional promise (the C++ `promise.set_value(Unit())` on a
@@ -4027,6 +6670,17 @@ fn message_peer_id(message: &telegram_api::Message) -> Option<&telegram_api::Pee
         telegram_api::Message::message(m) => Some(&m.peer_id),
         telegram_api::Message::messageService(m) => Some(&m.peer_id),
         telegram_api::Message::messageEmpty(_) => None,
+    }
+}
+
+/// The C++ nullptr-peer of the acceptability filter: the wire default
+/// encodes an absent peer as the zero id (the flag-gated object fields
+/// parse to their default), and a zero id is unacceptable anyway.
+fn peer_id_is_zero(peer: &telegram_api::Peer) -> bool {
+    match peer {
+        telegram_api::Peer::peerUser(peer) => peer.user_id == 0,
+        telegram_api::Peer::peerChat(peer) => peer.chat_id == 0,
+        telegram_api::Peer::peerChannel(peer) => peer.channel_id == 0,
     }
 }
 
@@ -4207,13 +6861,18 @@ mod tests {
         encrypted_messages: Vec<i64>,
         login_tokens: usize,
         sent_codes: usize,
-        unsupported: Vec<(i32, &'static str)>,
+        unsupported: Vec<(i32, String)>,
         before_difference: usize,
         after_difference: usize,
         config_updates: usize,
         skipped: Vec<(i32, i32, i32)>, // (new_pts, old_pts, pts_count)
         difference_messages: Vec<i32>,
         invalid_poll: bool,
+        speed_limit_notifications: Vec<bool>,
+        reload_data_calls: usize,
+        often_reload_calls: usize,
+        deny_users: std::collections::BTreeSet<i64>,
+        channel_too_long: Vec<(i64, i32, bool)>,
     }
 
     impl UpdatesSink for RecordingSink {
@@ -4320,8 +6979,39 @@ mod tests {
             self.invalid_poll
         }
         fn on_unsupported_update(&mut self, id: i32, name: &str, _cpp_line: u32) {
-            self.unsupported
-                .push((id, Box::leak(name.to_string().into_boxed_str())));
+            self.unsupported.push((id, name.to_string()));
+        }
+        // The harness simulates a populated cache: every queried
+        // user/chat/channel is known and InputUser-constructible, except
+        // the explicitly denied users.
+        fn is_acceptable_user(&mut self, user_id: i64) -> bool {
+            !self.deny_users.contains(&user_id)
+        }
+        fn is_acceptable_chat(&mut self, _chat_id: i64) -> bool {
+            true
+        }
+        fn is_acceptable_channel(&mut self, _channel_id: i64) -> bool {
+            true
+        }
+        fn can_get_input_user(&mut self, _user_id: i64) -> bool {
+            true
+        }
+        fn on_update_channel_too_long(
+            &mut self,
+            update: telegram_api::updateChannelTooLong,
+            force: bool,
+        ) {
+            self.channel_too_long
+                .push((update.channel_id, update.pts, force));
+        }
+        fn on_speed_limit_notification(&mut self, is_upload: bool) {
+            self.speed_limit_notifications.push(is_upload);
+        }
+        fn reload_data(&mut self) {
+            self.reload_data_calls += 1;
+        }
+        fn reload_often_data(&mut self) {
+            self.often_reload_calls += 1;
         }
     }
 
@@ -4340,6 +7030,8 @@ mod tests {
         sent_updates_state: usize,
         sent_confirm: Vec<(i32, i32)>,
         sent_pts_updates: Vec<i32>,
+        sent_pings: usize,
+        online: bool,
     }
 
     impl UpdatesManagerEnv for TestEnv {
@@ -4393,6 +7085,12 @@ mod tests {
         }
         fn send_get_pts_update(&mut self, pts: i32) {
             self.sent_pts_updates.push(pts);
+        }
+        fn send_ping_server(&mut self) {
+            self.sent_pings += 1;
+        }
+        fn is_online(&mut self) -> bool {
+            self.online
         }
     }
 
@@ -5251,7 +7949,10 @@ mod tests {
         );
         assert_eq!(
             manager.sink().unsupported,
-            [(telegram_api::updateFavedStickers::ID, "updateFavedStickers")],
+            [(
+                telegram_api::updateFavedStickers::ID,
+                "updateFavedStickers".to_string()
+            )],
             "trace-dropped with the scheme name"
         );
     }
@@ -5533,6 +8234,709 @@ mod tests {
         assert!(
             manager.pending_pts_updates.is_empty(),
             "the whole queue drained"
+        );
+    }
+
+    // ==== M.7.8/M.7.9 — the container statics --------
+
+    fn peer_user(user_id: i64) -> telegram_api::Peer {
+        telegram_api::Peer::peerUser(telegram_api::peerUser { user_id })
+    }
+
+    fn dialog_of(peer: &telegram_api::Peer) -> DialogId {
+        DialogId::from_peer(peer)
+    }
+
+    fn message_for(user_id: i64, id: i32) -> telegram_api::Message {
+        telegram_api::Message::message(telegram_api::message {
+            id,
+            peer_id: peer_user(user_id),
+            ..telegram_api::message::default()
+        })
+    }
+
+    #[test]
+    fn statics_classify_container_emptiness() {
+        assert!(are_empty_updates(&telegram_api::Updates::updatesTooLong(
+            telegram_api::updatesTooLong {},
+        )));
+        assert!(are_empty_updates(&updates_container(vec![], 0, 0)));
+        assert!(!are_empty_updates(&updates_container(
+            vec![new_message_update(5, 4, 1)],
+            0,
+            0
+        )));
+        assert!(!are_empty_updates(&telegram_api::Updates::updateShort(
+            telegram_api::updateShort {
+                update: telegram_api::Update::updateConfig(telegram_api::updateConfig {}),
+                date: 0,
+            },
+        )));
+    }
+
+    #[test]
+    fn statics_extract_new_messages_and_filter_service_ttl() {
+        let ttl_service = telegram_api::Update::updateNewMessage(telegram_api::updateNewMessage {
+            message: telegram_api::Message::messageService(telegram_api::messageService {
+                id: 9,
+                peer_id: peer_user(100),
+                action: telegram_api::MessageAction::messageActionSetMessagesTTL(
+                    telegram_api::messageActionSetMessagesTTL {
+                        flags: 0,
+                        period: 60,
+                        auto_setting_from: 0,
+                    },
+                ),
+                ..telegram_api::messageService::default()
+            }),
+            pts: 2,
+            pts_count: 1,
+        });
+        let updates = updates_container(
+            vec![
+                new_message_update(5, 4, 1),
+                ttl_service,
+                telegram_api::Update::updateNewScheduledMessage(
+                    telegram_api::updateNewScheduledMessage {
+                        message: message_for(100, 7),
+                    },
+                ),
+                new_message_update(6, 5, 1),
+            ],
+            0,
+            0,
+        );
+        let messages = get_new_messages(&updates);
+        assert_eq!(messages.len(), 3, "the service-TTL marker is filtered out");
+        assert_eq!(message_id_from_message(messages[0].0, false), 5 << 20);
+        assert!(!messages[0].1);
+        assert!(messages[1].1, "the scheduled pair is flagged");
+    }
+
+    #[test]
+    fn statics_message_by_random_id() {
+        let updates = updates_container(
+            vec![
+                telegram_api::Update::updateMessageID(telegram_api::updateMessageID {
+                    id: 5,
+                    random_id: 42,
+                }),
+                new_message_update(5, 4, 1),
+            ],
+            0,
+            0,
+        );
+        let dialog = dialog_of(&peer_user(100));
+        let found = get_message_by_random_id(&updates, dialog, 42);
+        assert!(found.is_some(), "the container carries message 5");
+        let other_dialog = dialog_of(&peer_user(101));
+        assert!(get_message_by_random_id(&updates, other_dialog, 42).is_none());
+        assert!(get_message_by_random_id(&updates, dialog, 43).is_none());
+    }
+
+    #[test]
+    fn statics_sent_random_ids_match_container_messages() {
+        let updates = updates_container(
+            vec![
+                telegram_api::Update::updateMessageID(telegram_api::updateMessageID {
+                    id: 5,
+                    random_id: 42,
+                }),
+                telegram_api::Update::updateMessageID(telegram_api::updateMessageID {
+                    id: 99,
+                    random_id: 43,
+                }),
+                new_message_update(5, 4, 1),
+            ],
+            0,
+            0,
+        );
+        let random_ids = get_sent_messages_random_ids(&updates);
+        assert_eq!(random_ids, HashSet::from([42]));
+    }
+
+    #[test]
+    fn statics_update_ids_leaf_short_container() {
+        assert_eq!(
+            get_update_ids(&telegram_api::Updates::updatesTooLong(
+                telegram_api::updatesTooLong {}
+            )),
+            vec![telegram_api::updatesTooLong::ID]
+        );
+        assert_eq!(
+            get_update_ids(&telegram_api::Updates::updateShort(
+                telegram_api::updateShort {
+                    update: telegram_api::Update::updateConfig(telegram_api::updateConfig {}),
+                    date: 0,
+                }
+            )),
+            vec![telegram_api::updateConfig::ID]
+        );
+        assert_eq!(
+            get_update_ids(&updates_container(
+                vec![
+                    new_message_update(5, 4, 1),
+                    telegram_api::Update::updateChannel(telegram_api::updateChannel {
+                        channel_id: 55
+                    }),
+                ],
+                0,
+                0
+            )),
+            vec![
+                telegram_api::updateNewMessage::ID,
+                telegram_api::updateChannel::ID
+            ]
+        );
+    }
+
+    #[test]
+    fn statics_chat_dialog_ids_filter_invalid_and_unsupported() {
+        let chats = vec![
+            telegram_api::Chat::channel(telegram_api::channel {
+                id: 55,
+                ..telegram_api::channel::default()
+            }),
+            telegram_api::Chat::chat(telegram_api::chat {
+                id: 3,
+                ..telegram_api::chat::default()
+            }),
+            telegram_api::Chat::chatEmpty(telegram_api::chatEmpty { id: 0 }),
+        ];
+        let updates = telegram_api::Updates::updatesCombined(telegram_api::updatesCombined {
+            updates: vec![],
+            users: vec![],
+            chats: chats.clone(),
+            date: 0,
+            seq_start: 0,
+            seq: 0,
+        });
+        let dialog_ids = get_chat_dialog_ids(&updates, false);
+        assert_eq!(
+            dialog_ids,
+            vec![
+                DialogId::from_channel_id(ChannelId::new(55)),
+                DialogId::from_chat_id(ChatId::new(3)),
+            ],
+            "the empty chat is invalid and skipped"
+        );
+
+        // The unsupported test/main dummy channel drops out once plural.
+        let unsupported_channel = telegram_api::Chat::channel(telegram_api::channel {
+            id: 1_535_424_647,
+            ..telegram_api::channel::default()
+        });
+        let updates = telegram_api::Updates::updatesCombined(telegram_api::updatesCombined {
+            updates: vec![],
+            users: vec![],
+            chats: vec![unsupported_channel, chats[0].clone(), chats[1].clone()],
+            date: 0,
+            seq_start: 0,
+            seq: 0,
+        });
+        let dialog_ids = get_chat_dialog_ids(&updates, false);
+        assert_eq!(
+            dialog_ids,
+            vec![
+                DialogId::from_channel_id(ChannelId::new(55)),
+                DialogId::from_chat_id(ChatId::new(3)),
+            ],
+            "the dummy channel is removed"
+        );
+    }
+
+    #[test]
+    fn statics_extract_presentation_params_removes_entry() {
+        let mut updates = updates_container(
+            vec![
+                telegram_api::Update::updateGroupCallConnection(
+                    telegram_api::updateGroupCallConnection {
+                        flags: 0,
+                        presentation: true,
+                        params: telegram_api::DataJSON {
+                            data: "params".to_string(),
+                        },
+                    },
+                ),
+                new_message_update(5, 4, 1),
+            ],
+            0,
+            0,
+        );
+        assert_eq!(
+            extract_join_group_call_presentation_params(&mut updates),
+            "params"
+        );
+        let remaining = get_updates_vec(&updates).expect("container");
+        assert_eq!(remaining.len(), 1, "the presentation update was removed");
+        assert!(matches!(
+            remaining[0],
+            telegram_api::Update::updateNewMessage(_)
+        ));
+        // A non-presentation connection stays put.
+        let mut updates = updates_container(
+            vec![telegram_api::Update::updateGroupCallConnection(
+                telegram_api::updateGroupCallConnection {
+                    flags: 0,
+                    presentation: false,
+                    params: telegram_api::DataJSON {
+                        data: "main".to_string(),
+                    },
+                },
+            )],
+            0,
+            0,
+        );
+        assert_eq!(
+            extract_join_group_call_presentation_params(&mut updates),
+            ""
+        );
+        assert_eq!(get_updates_vec(&updates).expect("container").len(), 1);
+    }
+
+    #[test]
+    fn statics_extract_star_gift_and_group_call_messages() {
+        let mut updates = updates_container(
+            vec![
+                new_message_update(5, 4, 1),
+                telegram_api::Update::updateGroupCallMessage(
+                    telegram_api::updateGroupCallMessage {
+                        call: telegram_api::InputGroupCall::inputGroupCall(
+                            telegram_api::inputGroupCall::default(),
+                        ),
+                        message: telegram_api::GroupCallMessage::default(),
+                    },
+                ),
+                telegram_api::Update::updateStarGiftCraftFail(
+                    telegram_api::updateStarGiftCraftFail {},
+                ),
+            ],
+            0,
+            0,
+        );
+        assert!(extract_star_gift_craft_fail(&mut updates));
+        assert!(!extract_star_gift_craft_fail(&mut updates));
+        let group_call_messages = extract_group_call_messages(&mut updates);
+        assert_eq!(group_call_messages.len(), 1);
+        assert_eq!(get_updates_vec(&updates).expect("container").len(), 1);
+    }
+
+    #[test]
+    fn statics_extract_story_owner_and_business_rules() {
+        let make = |is_business_count: usize| {
+            let mut entries = vec![telegram_api::Update::updateStory(
+                telegram_api::updateStory {
+                    peer: peer_user(7),
+                    story: Box::new(telegram_api::StoryItem::storyItemSkipped(
+                        telegram_api::storyItemSkipped {
+                            id: 3,
+                            ..telegram_api::storyItemSkipped::default()
+                        },
+                    )),
+                },
+            )];
+            for extra in 0..is_business_count {
+                entries.push(new_message_update(extra as i32 + 10, extra as i32 + 2, 1));
+            }
+            updates_container(entries, 0, 0)
+        };
+        let owner = dialog_of(&peer_user(7));
+        let other = dialog_of(&peer_user(8));
+
+        let mut updates = make(0);
+        assert!(
+            extract_story(&mut updates, owner, false).is_none(),
+            "the skipped story is rejected without the business flag"
+        );
+        assert!(extract_story(&mut updates, other, false).is_none());
+        let story = extract_story(&mut updates, owner, true);
+        assert!(
+            story.is_some(),
+            "the business path accepts the skipped story"
+        );
+        assert!(
+            get_updates_vec(&updates).expect("container").is_empty(),
+            "the extracted entry is drained"
+        );
+
+        // The business size gate: 3-entry containers are refused.
+        let mut updates = make(2);
+        assert!(extract_story(&mut updates, owner, true).is_none());
+    }
+
+    #[test]
+    fn statics_edit_message_pts_single_plural_scheduled() {
+        let scheduled_date = (1 << 30) + 500;
+        let updates = updates_container(
+            vec![
+                telegram_api::Update::updateEditMessage(telegram_api::updateEditMessage {
+                    message: message_for(100, 5),
+                    pts: 12,
+                    pts_count: 1,
+                }),
+                telegram_api::Update::updateNewScheduledMessage(
+                    telegram_api::updateNewScheduledMessage {
+                        message: telegram_api::Message::message(telegram_api::message {
+                            id: 8,
+                            date: scheduled_date,
+                            peer_id: peer_user(100),
+                            ..telegram_api::message::default()
+                        }),
+                    },
+                ),
+            ],
+            0,
+            0,
+        );
+        let edit_full = (
+            dialog_of(&peer_user(100)),
+            server_message_id_to_message_id(5),
+        );
+        assert_eq!(get_update_edit_message_pts(&updates, edit_full), 12);
+        let other_edit = (
+            dialog_of(&peer_user(100)),
+            server_message_id_to_message_id(6),
+        );
+        assert_eq!(get_update_edit_message_pts(&updates, other_edit), 0);
+
+        let scheduled_full = (
+            dialog_of(&peer_user(100)),
+            scheduled_message_id_to_message_id(8, scheduled_date),
+        );
+        assert_eq!(get_update_edit_message_pts(&updates, scheduled_full), -2);
+
+        let plural = updates_container(
+            vec![
+                telegram_api::Update::updateEditMessage(telegram_api::updateEditMessage {
+                    message: message_for(100, 5),
+                    pts: 12,
+                    pts_count: 1,
+                }),
+                telegram_api::Update::updateEditMessage(telegram_api::updateEditMessage {
+                    message: message_for(100, 5),
+                    pts: 13,
+                    pts_count: 1,
+                }),
+            ],
+            0,
+            0,
+        );
+        assert_eq!(get_update_edit_message_pts(&plural, edit_full), 0);
+    }
+
+    #[test]
+    fn message_id_layout_pins() {
+        assert_eq!(server_message_id_to_message_id(5), 5 << 20);
+        assert!(is_valid_message_id(server_message_id_to_message_id(5)));
+        assert!(is_valid_message_id((5 << 20) | MESSAGE_ID_TYPE_LOCAL));
+        assert!(
+            !is_valid_message_id(3),
+            "yet-unsent|local is not a valid type"
+        );
+        assert!(!is_valid_message_id(MESSAGE_ID_MAX + (5 << 20)));
+
+        let scheduled = scheduled_message_id_to_message_id(8, (1 << 30) + 500);
+        assert!(is_scheduled_server_message_id(scheduled));
+        assert!(is_valid_scheduled_message_id(scheduled));
+        assert!(!is_valid_message_id(scheduled));
+        assert_eq!(scheduled_server_message_id_of(scheduled), 8);
+        assert_eq!(scheduled_message_id_to_message_id(8, 100), 0, "past date");
+        assert_eq!(scheduled_message_id_to_message_id(0, (1 << 30) + 500), 0);
+    }
+
+    // ==== M.7.16/M.7.17 — the aux machinery and the reloaders --------
+
+    #[test]
+    fn aux_auth_key_accounting_evicts_the_oldest_session() {
+        let mut env = authorized_env();
+        let mut manager = UpdatesManager::new(RecordingSink::default());
+        env.options.insert("session_count".to_string(), 2);
+
+        manager.on_update_from_auth_key_id(&mut env, 11);
+        env.clock += 10.0;
+        manager.on_update_from_auth_key_id(&mut env, 22);
+        env.clock += 10.0;
+        manager.on_update_from_auth_key_id(&mut env, 33);
+        assert!(
+            !manager.session_infos.contains_key(&11),
+            "three sessions with a cap of two evict the oldest"
+        );
+        assert!(manager.session_infos.contains_key(&22));
+        assert!(manager.session_infos.contains_key(&33));
+
+        // The zero auth key is ignored (cpp:1909).
+        manager.on_update_from_auth_key_id(&mut env, 0);
+        assert_eq!(manager.session_infos.len(), 2);
+    }
+
+    #[test]
+    fn aux_pong_drives_the_state_intake() {
+        let mut env = authorized_env();
+        let mut manager = UpdatesManager::new(RecordingSink::default());
+        manager.pts_manager.init(5);
+        manager.seq = 3;
+
+        manager.ping_server(&mut env);
+        assert_eq!(env.sent_pings, 1);
+        manager.ping_server(&mut env);
+        assert_eq!(env.sent_pings, 1, "the ping is single-flight");
+
+        let state = |pts: i32, seq: i32| telegram_api::updates_State {
+            pts,
+            qts: 0,
+            date: 0,
+            seq,
+            unread_count: 0,
+        };
+        // A current pong changes nothing.
+        manager.on_server_pong(&mut env, Some(state(5, 3)));
+        assert!(env.sent_difference.is_empty());
+        // A pong from ahead of the local state triggers getDifference
+        // (the C++ `state->pts_ > get_pts() || state->seq_ > seq_`).
+        manager.on_server_pong(&mut env, Some(state(6, 3)));
+        assert_eq!(env.sent_difference.len(), 1);
+        // A null pong (the failed query) would trigger it, but the
+        // difference is already running.
+        manager.on_server_pong(&mut env, None);
+        assert_eq!(env.sent_difference.len(), 1);
+    }
+
+    #[test]
+    fn aux_speed_limit_notice_throttles_per_lane() {
+        let mut env = authorized_env();
+        env.options
+            .insert("upload_premium_speedup_notify_period".to_string(), 60);
+        let mut manager = UpdatesManager::new(RecordingSink::default());
+
+        manager.notify_speed_limited(&mut env, true);
+        assert_eq!(manager.sink().speed_limit_notifications, [true]);
+        manager.notify_speed_limited(&mut env, true);
+        assert_eq!(
+            manager.sink().speed_limit_notifications.len(),
+            1,
+            "the notice throttles inside the option period"
+        );
+        env.clock += 61.0;
+        manager.notify_speed_limited(&mut env, true);
+        assert_eq!(manager.sink().speed_limit_notifications.len(), 2);
+        // The upload/download lanes throttle independently.
+        manager.notify_speed_limited(&mut env, false);
+        assert_eq!(
+            manager.sink().speed_limit_notifications,
+            [true, true, false]
+        );
+    }
+
+    #[test]
+    fn reloaders_gate_and_rearm_like_the_cpp() {
+        let mut env = authorized_env();
+        let mut manager = UpdatesManager::new(RecordingSink::default());
+
+        // Bots never reload.
+        env.bot = true;
+        manager.try_reload_data(&mut env);
+        assert_eq!(manager.sink().reload_data_calls, 0);
+        env.bot = false;
+        env.online = true;
+
+        // The first attempt passes the gate (now >= next 0) and re-arms
+        // into the Random::fast(3000, 4200) window.
+        manager.try_reload_data(&mut env);
+        assert_eq!(manager.sink().reload_data_calls, 1);
+        let rearm = manager.next_data_reload_time - env.clock;
+        assert!(
+            (3000.0..=4200.0).contains(&rearm),
+            "the re-arm window is 3000..4200, got {rearm}"
+        );
+
+        // Inside the window the attempt only reschedules.
+        manager.try_reload_data(&mut env);
+        assert_eq!(manager.sink().reload_data_calls, 1);
+        assert!(manager.data_reload_timeout.has_timeout());
+
+        // The often pair re-arms into its own 300..420 window.
+        manager.try_reload_often_data(&mut env);
+        assert_eq!(manager.sink().often_reload_calls, 1);
+        let often_rearm = manager.next_often_data_reload_time - env.clock;
+        assert!((300.0..=420.0).contains(&often_rearm));
+
+        // Unauthorized bodies return without touching the timers.
+        env.authorized = false;
+        let calls = manager.sink().reload_data_calls;
+        manager.try_reload_data(&mut env);
+        assert_eq!(manager.sink().reload_data_calls, calls);
+    }
+
+    #[test]
+    fn dispatcher_enumerates_drops_without_a_wildcard() {
+        let mut env = authorized_env();
+        let mut manager = UpdatesManager::new(RecordingSink::default());
+        let update = telegram_api::Update::updateUserTyping(telegram_api::updateUserTyping {
+            ..telegram_api::updateUserTyping::default()
+        });
+        let name = update_id_and_name(&update).1;
+        manager.on_update(&mut env, update.into(), Promise::default());
+        assert_eq!(
+            manager.sink().unsupported,
+            [(telegram_api::updateUserTyping::ID, name.to_string())]
+        );
+
+        // The channel-pts family reaches the channel machine, not the
+        // drop counter (the updateEditChannelMessage arm of cpp:3870).
+        let edit = telegram_api::Update::updateEditChannelMessage(
+            telegram_api::updateEditChannelMessage {
+                message: message_for(100, 5),
+                pts: 6,
+                pts_count: 2,
+            },
+        );
+        manager.on_update(&mut env, edit.into(), Promise::default());
+        assert_eq!(manager.sink().channel_updates, [(100, 6, 2)]);
+        assert_eq!(manager.sink().unsupported.len(), 1);
+    }
+
+    #[test]
+    fn pins_match_the_cpp_header() {
+        // UpdatesManager.h:161-168 + h:255/h:308 and the synthetic ids of
+        // h:42/h:63.
+        assert_eq!(FORCED_GET_DIFFERENCE_PTS_DIFF, 100_000);
+        assert_eq!(GAP_TIMEOUT_UPDATE_COUNT, 20);
+        assert_eq!(MIN_UNFILLED_GAP_TIME, 0.05);
+        assert_eq!(MAX_UNFILLED_GAP_TIME, 0.7);
+        assert_eq!(MAX_PTS_SAVE_DELAY, 0.05);
+        assert_eq!(UPDATE_APPLY_WARNING_TIME, 0.1);
+        // The dead debug kill switch pins to false at compile time.
+        const { assert!(!DROP_PTS_UPDATES) };
+        assert_eq!(AFTER_GET_DIFFERENCE_SOURCE, "after get difference");
+        assert_eq!(SKIPPED_POSTPONED_UPDATES_AFTER_START, 50_000);
+        assert_eq!(PendingUpdate::Dummy.get_id(), 1_234_567_891);
+        assert_eq!(PendingUpdate::Dummy.name(), "dummyUpdate");
+        assert_eq!(
+            PendingUpdate::SentMessage {
+                random_id: 0,
+                message_id: 0,
+                date: 0,
+                ttl_period: 0
+            }
+            .get_id(),
+            1_234_567_890
+        );
+        assert_eq!(
+            PendingUpdate::SentMessage {
+                random_id: 0,
+                message_id: 0,
+                date: 0,
+                ttl_period: 0
+            }
+            .name(),
+            "updateSentMessage"
+        );
+        // h:255 — `date_source_ = "nowhere"` is the fresh-ctor state.
+        let manager: UpdatesManager<RecordingSink> = UpdatesManager::new(RecordingSink::default());
+        assert_eq!(manager.date_source, "nowhere");
+    }
+
+    // ==== M.7.10/M.7.11 — the acceptability filter --------
+
+    /// A sink whose cache is empty: every manager ask fails, so any
+    /// update touching a non-zero peer is unacceptable.
+    #[derive(Default)]
+    struct EmptyCacheSink;
+
+    impl UpdatesSink for EmptyCacheSink {
+        fn on_user(&mut self, _user: telegram_api::User) {}
+        fn on_chat(&mut self, _chat: telegram_api::Chat) {}
+        fn process_pts_update(&mut self, _update: PendingUpdate) {}
+        fn add_pending_channel_update(
+            &mut self,
+            _peer: Option<telegram_api::Peer>,
+            _update: PendingUpdate,
+            _pts: i32,
+            _pts_count: i32,
+            _promise: Promise<()>,
+            _source: &str,
+        ) {
+        }
+    }
+
+    #[test]
+    fn acceptability_asks_the_sink_for_known_peers() {
+        let mut env = authorized_env();
+        let mut manager = UpdatesManager::new(RecordingSink::default());
+        // The harness cache is populated: a regular new message passes.
+        let update = telegram_api::Update::updateNewMessage(telegram_api::updateNewMessage {
+            message: message_for(100, 5),
+            pts: 4,
+            pts_count: 1,
+        });
+        assert!(manager.is_acceptable_update(&mut env, &update));
+
+        // The empty cache: the message peer user 100 is unknown.
+        let mut manager = UpdatesManager::new(EmptyCacheSink);
+        let update = telegram_api::Update::updateNewMessage(telegram_api::updateNewMessage {
+            message: message_for(100, 5),
+            pts: 4,
+            pts_count: 1,
+        });
+        assert!(!manager.is_acceptable_update(&mut env, &update));
+
+        // A zero-id peer is the absent mark and passes even on the empty
+        // cache.
+        let update = telegram_api::Update::updateNewMessage(telegram_api::updateNewMessage {
+            message: telegram_api::Message::message(telegram_api::message {
+                id: 5,
+                peer_id: peer_user(0),
+                from_id: peer_user(0),
+                ..telegram_api::message::default()
+            }),
+            pts: 4,
+            pts_count: 1,
+        });
+        assert!(
+            manager.is_acceptable_update(&mut env, &update),
+            "the zero-id peers are the C++ nullptr and pass"
+        );
+    }
+
+    #[test]
+    fn acceptability_ladder_replaces_channel_updates_with_too_long() {
+        let mut env = authorized_env();
+        let mut sink = RecordingSink::default();
+        sink.deny_users.insert(100);
+        let mut manager = UpdatesManager::new(sink);
+
+        let update =
+            telegram_api::Update::updateNewChannelMessage(telegram_api::updateNewChannelMessage {
+                message: telegram_api::Message::message(telegram_api::message {
+                    id: 5,
+                    peer_id: telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                        channel_id: 55,
+                    }),
+                    from_id: peer_user(100),
+                    ..telegram_api::message::default()
+                }),
+                pts: 6,
+                pts_count: 2,
+            });
+        let now = env.clock;
+        manager.on_pending_updates(
+            &mut env,
+            vec![Some(PendingUpdate::Wire(update))],
+            0,
+            0,
+            0,
+            now,
+            Some(Promise::default()),
+            "test",
+        );
+        assert_eq!(
+            manager.sink().channel_too_long,
+            [(55, 6, false)],
+            "the unacceptable update was replaced with updateChannelTooLong"
+        );
+        assert!(
+            manager.sink().channel_updates.is_empty(),
+            "the channel pts machine was not fed the original update"
         );
     }
 }
