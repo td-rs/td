@@ -22,11 +22,16 @@
 //!   via `log_error!`.
 
 use crate::chat_manager::{ChannelId, ChatId};
-use crate::message_content::{MessageContentType, can_be_secret_message_content};
+use crate::message_content::{
+    BackgroundInfo, InputGroupCallId, MessageContent, MessageContentType, SuggestedPostPrice,
+    can_be_secret_message_content,
+};
 use crate::message_entity::FormattedText;
+use crate::restriction_reason::RestrictionReason;
 use crate::store_parse::{Parser, store_flags, store_i32, store_i64, store_string};
 use crate::td_api;
 use crate::user_manager::{SecretChatId, UserId};
+use std::collections::{HashMap, HashSet};
 use tdmtproto::telegram_api;
 use tdutils::hash::{combine_hashes, hash_int64, hash_uint32};
 use tdutils::log_error;
@@ -2555,6 +2560,940 @@ pub struct MessageReactions {
     // ported with the Wave-2 reactions slice
 }
 
+// ---------------------------------------------------------------------------
+// M.10.1b batch 2 — the Message/Dialog struct plane (MessagesManager.h
+// 1118-1269 and 1308-1492), with the companions those structs pull in:
+// SuggestedPost.h, MessageForwardInfo.h (LastForwardedMessageInfo),
+// RepliedMessageInfo.h (MessageQuote), MessageInputReplyTo.h,
+// InputMessageText.h, DraftMessage.h (+ the DraftMessageContent subclasses
+// from DraftMessage.cpp:29-120), FileUploadId.h, and the
+// logevent/LogEventHelper.h LogEventIdWithGeneration.
+//
+// Field order follows the C++ structs; the Rust structs keep the C++
+// field-initializer defaults via manual `Default` impls (the C++
+// `Message() = default` / `Dialog() = default`). The C++ nodes are
+// move-only and identity-typed (`Message` inherits ListNode; copies are
+// deleted), so neither struct derives Clone/PartialEq — only Debug +
+// Default. Documented stand-ins:
+// - `MessageReactions` (above), `ChatTheme` (needs the Wave-3
+//   StarGift/ThemeSettings plane), `OrderedMessages`/`MessageLruList`
+//   (intrusive C++ node containers; the receive-path slices pick the Rust
+//   shape), `SendQueryRef` (the C++ `NetQueryRef` — [blocked: net]).
+// - the `WaitFree*`/`Flat*` containers map to std `HashMap`/`HashSet` for
+//   now (the M.4/M.5 convention).
+// ---------------------------------------------------------------------------
+
+/// `td::FileUploadId` (files/FileUploadId.h) — the FileManager-assigned
+/// upload id; only the raw value is modeled here (the Files slice owns the
+/// registry).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FileUploadId(i64);
+
+impl FileUploadId {
+    pub fn new(id: i64) -> FileUploadId {
+        FileUploadId(id)
+    }
+
+    pub fn get(self) -> i64 {
+        self.0
+    }
+}
+
+/// `td::LogEventIdWithGeneration` (logevent/LogEventHelper.h:20-23).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LogEventIdWithGeneration {
+    pub log_event_id: u64,
+    pub generation: u64,
+}
+
+/// `td::MessageQuote` (MessageQuote.h) — the text quote a reply points at.
+/// The wire/td_api constructors and `search_quote` land with their slices;
+/// the ctor keeps `max(0, position)` and the `remove_unallowed_quote_entities`
+/// call for them.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessageQuote {
+    pub text: FormattedText,
+    pub position: i32,
+    pub is_manual: bool,
+}
+
+impl MessageQuote {
+    /// `MessageQuote::is_empty` (MessageQuote.h).
+    pub fn is_empty(&self) -> bool {
+        self.text.text.is_empty()
+    }
+}
+
+/// `td::LastForwardedMessageInfo` (MessageForwardInfo.h:26-73) — where the
+/// latest copy of a forwarded message comes from.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LastForwardedMessageInfo {
+    pub dialog_id: DialogId,
+    pub message_id: MessageId,
+    pub sender_dialog_id: DialogId,
+    pub sender_name: String,
+    pub date: i32,
+    pub is_outgoing: bool,
+}
+
+impl LastForwardedMessageInfo {
+    pub fn new(
+        dialog_id: DialogId,
+        message_id: MessageId,
+        sender_dialog_id: DialogId,
+        sender_name: String,
+        date: i32,
+        is_outgoing: bool,
+    ) -> LastForwardedMessageInfo {
+        LastForwardedMessageInfo {
+            dialog_id,
+            message_id,
+            sender_dialog_id,
+            sender_name,
+            date,
+            is_outgoing,
+        }
+    }
+
+    /// `LastForwardedMessageInfo::has_sender_name` (MessageForwardInfo.h).
+    pub fn has_sender_name(&self) -> bool {
+        !self.sender_name.is_empty()
+    }
+
+    pub fn get_dialog_id(self) -> DialogId {
+        self.dialog_id
+    }
+
+    /// `LastForwardedMessageInfo::get_message_full_id` (MessageForwardInfo.h).
+    pub fn get_message_full_id(self) -> MessageFullId {
+        MessageFullId::new(self.dialog_id, self.message_id)
+    }
+
+    // `is_empty`/`validate` live in MessageForwardInfo.cpp — they land with
+    // the forward-info consuming slices.
+}
+
+/// `td::MessageForwardInfo` (MessageForwardInfo.h:76-117).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessageForwardInfo {
+    pub origin: MessageOrigin,
+    pub date: i32,
+    pub last_message_info: LastForwardedMessageInfo,
+    pub psa_type: String,
+    pub is_imported: bool,
+}
+
+/// `td::RepliedMessageInfo` (RepliedMessageInfo.h:23-50) — the reply header
+/// of a message; `origin_date`/`origin`/`content` are filled only for
+/// replies to messages from other chats. The wire/td_api constructors and
+/// the `Td`-taking methods land with their slices.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RepliedMessageInfo {
+    pub message_id: MessageId,
+    pub dialog_id: DialogId,
+    pub origin_date: i32,
+    pub origin: MessageOrigin,
+    pub content: Option<MessageContent>,
+    pub quote: MessageQuote,
+    pub todo_item_id: i32,
+    pub poll_option_id: String,
+}
+
+impl RepliedMessageInfo {
+    /// `RepliedMessageInfo::legacy` (RepliedMessageInfo.h:57-62).
+    pub fn legacy(
+        reply_to_message_id: MessageId,
+        reply_in_dialog_id: DialogId,
+    ) -> RepliedMessageInfo {
+        RepliedMessageInfo {
+            message_id: reply_to_message_id,
+            dialog_id: reply_in_dialog_id,
+            ..RepliedMessageInfo::default()
+        }
+    }
+
+    /// `RepliedMessageInfo::is_empty` (RepliedMessageInfo.h:67-69).
+    pub fn is_empty(&self) -> bool {
+        self.message_id == MessageId::default() && self.origin.is_empty()
+    }
+
+    /// `RepliedMessageInfo::is_external` (RepliedMessageInfo.h:71-73).
+    pub fn is_external(&self) -> bool {
+        self.origin_date != 0
+    }
+}
+
+/// `td::MessageInputReplyTo` (MessageInputReplyTo.h:19-29) — the reply
+/// description sent with a message. `debug_source` defaults to
+/// `"unknown"` like the C++ `const char *`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MessageInputReplyTo {
+    pub message_id: MessageId,
+    pub ephemeral_message_id: EphemeralMessageId,
+    pub dialog_id: DialogId,
+    pub quote: MessageQuote,
+    pub todo_item_id: i32,
+    pub poll_option_id: String,
+    pub debug_source: &'static str,
+    pub story_full_id: StoryFullId,
+}
+
+impl Default for MessageInputReplyTo {
+    fn default() -> MessageInputReplyTo {
+        MessageInputReplyTo {
+            message_id: MessageId::default(),
+            ephemeral_message_id: EphemeralMessageId::default(),
+            dialog_id: DialogId::default(),
+            quote: MessageQuote::default(),
+            todo_item_id: 0,
+            poll_option_id: String::new(),
+            debug_source: "unknown",
+            story_full_id: StoryFullId::default(),
+        }
+    }
+}
+
+/// `td::InputMessageText` (InputMessageText.h:24-33).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InputMessageText {
+    pub text: FormattedText,
+    pub web_page_url: String,
+    pub disable_web_page_preview: bool,
+    pub force_small_media: bool,
+    pub force_large_media: bool,
+    pub show_above_text: bool,
+    pub clear_draft: bool,
+}
+
+impl InputMessageText {
+    /// `InputMessageText::is_empty` (InputMessageText.h:47-50).
+    pub fn is_empty(&self) -> bool {
+        self.text.text.is_empty() && self.web_page_url.is_empty()
+    }
+}
+
+/// `td::SuggestedPost` (SuggestedPost.h) — the model half; the wire/td_api
+/// constructors live in SuggestedPost.cpp and land with the consuming
+/// slices. `price` re-points at the M.9-line `message_content`
+/// `SuggestedPostPrice` (batch 1 deliberately left it undefined here).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SuggestedPost {
+    pub price: SuggestedPostPrice,
+    pub schedule_date: i32,
+    pub is_accepted: bool,
+    pub is_rejected: bool,
+}
+
+impl SuggestedPost {
+    /// `SuggestedPost::is_pending` (SuggestedPost.h).
+    pub fn is_pending(&self) -> bool {
+        !self.is_accepted && !self.is_rejected
+    }
+
+    /// `SuggestedPost::get_schedule_date` (SuggestedPost.h).
+    pub fn get_schedule_date(&self) -> i32 {
+        self.schedule_date
+    }
+}
+
+/// `td::DraftMessageContentType` (DraftMessage.h:33).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum DraftMessageContentType {
+    VideoNote = 0,
+    VoiceNote = 1,
+}
+
+/// `td::DraftMessageContentVideoNote` (DraftMessage.cpp:29-48).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DraftMessageContentVideoNote {
+    pub path: String,
+    pub duration: i32,
+    pub length: i32,
+    pub ttl: MessageSelfDestructType,
+}
+
+/// `td::DraftMessageContentVoiceNote` (DraftMessage.cpp:104-123).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DraftMessageContentVoiceNote {
+    pub path: String,
+    pub duration: i32,
+    pub waveform: String,
+    pub ttl: MessageSelfDestructType,
+}
+
+/// The `DraftMessageContent` C++ class hierarchy (DraftMessage.h:35-48)
+/// flattened into an enum of structs; the td_api objects land with the
+/// drafts slice.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DraftMessageContent {
+    VideoNote(DraftMessageContentVideoNote),
+    VoiceNote(DraftMessageContentVoiceNote),
+}
+
+impl DraftMessageContent {
+    /// The per-class `get_type` overrides (DraftMessage.cpp:44-48/119-123).
+    pub fn get_type(&self) -> DraftMessageContentType {
+        match self {
+            DraftMessageContent::VideoNote(_) => DraftMessageContentType::VideoNote,
+            DraftMessageContent::VoiceNote(_) => DraftMessageContentType::VoiceNote,
+        }
+    }
+}
+
+/// `td::DraftMessage` (DraftMessage.h:50-60) — `rich_message_content` must
+/// be `MessageRichText` once RichText lands (Wave-2); `local_content` is
+/// the not-yet-uploaded draft media.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DraftMessage {
+    pub date: i32,
+    pub message_input_reply_to: MessageInputReplyTo,
+    pub input_message_text: InputMessageText,
+    pub rich_message_content: Option<MessageContent>,
+    pub local_content: Option<DraftMessageContent>,
+    pub message_effect_id: MessageEffectId,
+    pub suggested_post: Option<SuggestedPost>,
+}
+
+impl DraftMessage {
+    /// `DraftMessage::get_date` (DraftMessage.h:67-69).
+    pub fn get_date(&self) -> i32 {
+        self.date
+    }
+
+    /// `DraftMessage::is_local` (DraftMessage.h:71-73).
+    pub fn is_local(&self) -> bool {
+        self.local_content.is_some()
+    }
+}
+
+/// The C++ `NetQueryRef send_query_ref` (MessagesManager.h:1256) — the
+/// in-flight send query of a yet-unsent message. STAND-IN while net is
+/// blocked; the net step replaces it with the real reference handle.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SendQueryRef {
+    // [blocked: net]
+}
+
+/// `td::ChatTheme` — STAND-IN: needs the `StarGift` + `ThemeSettings`
+/// plane (ChatTheme.h); the Wave-3 Gifts slice owns the real model. The
+/// `Dialog` fields only need an opaque owned value meanwhile.
+#[derive(Clone, Debug, Default)]
+pub struct ChatTheme {
+    // ported with the Wave-3 gifts/theme slice
+}
+
+/// The C++ `OrderedMessages` container (OrderedMessages.h) — an intrusive
+/// tree of `Message *` nodes. STAND-IN until the receive-path slices pick
+/// the Rust shape (the messages themselves live in
+/// [`Dialog::messages`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OrderedMessages {
+    // receiver-path slice
+}
+
+/// The C++ `ListNode message_lru_list` (MessagesManager.h:1470) — the
+/// dialog's message LRU chain. STAND-IN for the same reason as
+/// [`OrderedMessages`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MessageLruList {
+    // receiver-path slice
+}
+
+/// `td::MessagesManager::DialogScheduledMessages` (MessagesManager.h:
+/// 1280-1287). No Clone — the scheduled `Message` nodes are identity-typed.
+#[derive(Debug, Default)]
+pub struct DialogScheduledMessages {
+    pub scheduled_message_date: HashMap<ScheduledServerMessageId, i32>,
+    pub last_assigned_scheduled_message_id: HashMap<i32, MessageId>,
+    pub deleted_scheduled_server_message_ids: HashSet<ScheduledServerMessageId>,
+    pub scheduled_messages: HashMap<MessageId, Box<Message>>,
+}
+
+/// `td::MessagesManager::Message` (MessagesManager.h:1118-1269) — the
+/// ~95-field message node. Field order and field-initializer defaults
+/// follow the C++ struct exactly (`max_reply_media_timestamp = -1`,
+/// `max_own_media_timestamp = -2`, `debug_source = "null"`); the node is
+/// identity-typed in C++ (copies deleted), so Rust gives it neither Clone
+/// nor PartialEq. Fields marked "for send_message"/"for resend_message"
+/// are the send-path scratch space (M.10.8-M.10.11).
+#[derive(Debug)]
+pub struct Message {
+    pub message_id: MessageId,
+    pub sender_user_id: UserId,
+    pub sender_dialog_id: DialogId,
+    pub receiver_user_id: UserId,
+    pub ephemeral_message_id: EphemeralMessageId,
+    pub saved_messages_topic_id: SavedMessagesTopicId,
+    pub date: i32,
+    pub edit_date: i32,
+    pub send_date: i32,
+    /// for yet unsent messages
+    pub sending_id: i32,
+    pub sender_boost_count: i32,
+    pub paid_message_star_count: i64,
+    pub chat_instance: i64,
+    pub random_id: i64,
+    pub forward_info: Option<MessageForwardInfo>,
+    pub replied_message_info: RepliedMessageInfo,
+    pub reply_to_story_full_id: StoryFullId,
+    pub top_thread_message_id: MessageId,
+    pub linked_top_thread_message_id: MessageId,
+    pub local_thread_message_ids: Vec<MessageId>,
+    /// for send_message
+    pub initial_sender_dialog_id: DialogId,
+    /// for send_message
+    pub initial_top_thread_message_id: MessageId,
+    /// for send_message
+    pub input_reply_to: MessageInputReplyTo,
+    /// for send_message
+    pub reply_to_random_id: i64,
+    /// for send_message
+    pub send_callback_query_id: i64,
+    /// for send_message
+    pub send_emoji: String,
+    /// for send_message
+    pub new_video_start_timestamp: i32,
+    /// for send_message
+    pub file_upload_ids: Vec<FileUploadId>,
+    /// for send_message
+    pub thumbnail_file_upload_ids: Vec<FileUploadId>,
+    pub via_bot_user_id: UserId,
+    pub guest_bot_via_dialog_id: DialogId,
+    pub via_business_bot_user_id: UserId,
+    pub restriction_reasons: Vec<RestrictionReason>,
+    pub author_signature: String,
+    pub summary_from_language: String,
+    pub sender_rank: String,
+    pub is_channel_post: bool,
+    pub is_topic_message: bool,
+    pub is_outgoing: bool,
+    pub is_failed_to_send: bool,
+    pub disable_notification: bool,
+    pub contains_mention: bool,
+    pub contains_unread_mention: bool,
+    pub hide_edit_date: bool,
+    /// had non-inline reply markup?
+    pub had_reply_markup: bool,
+    pub had_forward_info: bool,
+    /// must be shown only while tapped
+    pub is_content_secret: bool,
+    pub is_mention_notification_disabled: bool,
+    pub is_from_scheduled: bool,
+    pub is_from_offline: bool,
+    pub is_pinned: bool,
+    pub are_media_timestamp_entities_found: bool,
+    pub noforwards: bool,
+    pub invert_media: bool,
+    pub disable_web_page_preview: bool,
+    pub video_processing_pending: bool,
+    pub reactions_are_possible: bool,
+    pub is_paid_suggested_post_stars: bool,
+    pub is_paid_suggested_post_ton: bool,
+    /// for send_message
+    pub has_explicit_sender: bool,
+    /// for send_message
+    pub is_copy: bool,
+    /// for send_message
+    pub from_background: bool,
+    /// for send_message
+    pub allow_paid: bool,
+    /// for send_message
+    pub update_stickersets_order: bool,
+    /// for send_message
+    pub clear_draft: bool,
+    /// for send_message
+    pub in_game_share: bool,
+    /// for send_message
+    pub initial_is_topic_message: bool,
+    /// for send_message
+    pub is_quick_reply_message: bool,
+    /// for send_message
+    pub send_anchor: bool,
+    /// for resend_message
+    pub hide_via_bot: bool,
+    /// for resend_message
+    pub is_bot_start_message: bool,
+    /// for resend_message
+    pub real_forward_from_dialog_id: DialogId,
+    /// for resend_message
+    pub real_forward_from_message_id: MessageId,
+    pub notification_id: NotificationId,
+    pub removed_notification_id: NotificationId,
+    pub max_reply_media_timestamp: i32,
+    /// to update replied messages on the first load
+    pub max_own_media_timestamp: i32,
+    pub view_count: i32,
+    pub forward_count: i32,
+    pub reply_info: MessageReplyInfo,
+    pub reactions: Option<MessageReactions>,
+    pub fact_check: Option<FactCheck>,
+    pub suggested_post: Option<SuggestedPost>,
+    pub thread_draft_message: Option<DraftMessage>,
+    pub available_reactions_generation: u32,
+    pub interaction_info_update_date: i32,
+    pub history_generation: u32,
+    pub legacy_layer: i32,
+    pub send_error_code: i32,
+    pub send_error_message: String,
+    pub try_resend_at: f64,
+    /// counted from message send date
+    pub ttl_period: i32,
+    /// counted from message content view date
+    pub ttl: MessageSelfDestructType,
+    /// only for TTL
+    pub ttl_expires_at: f64,
+    pub media_album_id: i64,
+    pub effect_id: MessageEffectId,
+    pub content: Option<MessageContent>,
+    pub reply_markup: Option<Box<telegram_api::ReplyMarkup>>,
+    pub ephemeral_message: Option<Box<Message>>,
+    pub schedule_repeat_period: i32,
+    pub edited_schedule_date: i32,
+    pub edited_schedule_repeat_period: i32,
+    pub edit_generation: u64,
+    pub last_edit_pts: i32,
+    pub debug_source: &'static str,
+    pub last_access_date: i32,
+    /// whether the message is known to the app
+    pub is_update_sent: bool,
+    pub send_message_log_event_id: u64,
+    pub send_query_ref: SendQueryRef,
+}
+
+impl Default for Message {
+    /// The C++ field initializers (MessagesManager.h:1119-1267).
+    fn default() -> Message {
+        Message {
+            message_id: MessageId::default(),
+            sender_user_id: UserId::default(),
+            sender_dialog_id: DialogId::default(),
+            receiver_user_id: UserId::default(),
+            ephemeral_message_id: EphemeralMessageId::default(),
+            saved_messages_topic_id: SavedMessagesTopicId::default(),
+            date: 0,
+            edit_date: 0,
+            send_date: 0,
+            sending_id: 0,
+            sender_boost_count: 0,
+            paid_message_star_count: 0,
+            chat_instance: 0,
+            random_id: 0,
+            forward_info: None,
+            replied_message_info: RepliedMessageInfo::default(),
+            reply_to_story_full_id: StoryFullId::default(),
+            top_thread_message_id: MessageId::default(),
+            linked_top_thread_message_id: MessageId::default(),
+            local_thread_message_ids: Vec::new(),
+            initial_sender_dialog_id: DialogId::default(),
+            initial_top_thread_message_id: MessageId::default(),
+            input_reply_to: MessageInputReplyTo::default(),
+            reply_to_random_id: 0,
+            send_callback_query_id: 0,
+            send_emoji: String::new(),
+            new_video_start_timestamp: 0,
+            file_upload_ids: Vec::new(),
+            thumbnail_file_upload_ids: Vec::new(),
+            via_bot_user_id: UserId::default(),
+            guest_bot_via_dialog_id: DialogId::default(),
+            via_business_bot_user_id: UserId::default(),
+            restriction_reasons: Vec::new(),
+            author_signature: String::new(),
+            summary_from_language: String::new(),
+            sender_rank: String::new(),
+            is_channel_post: false,
+            is_topic_message: false,
+            is_outgoing: false,
+            is_failed_to_send: false,
+            disable_notification: false,
+            contains_mention: false,
+            contains_unread_mention: false,
+            hide_edit_date: false,
+            had_reply_markup: false,
+            had_forward_info: false,
+            is_content_secret: false,
+            is_mention_notification_disabled: false,
+            is_from_scheduled: false,
+            is_from_offline: false,
+            is_pinned: false,
+            are_media_timestamp_entities_found: false,
+            noforwards: false,
+            invert_media: false,
+            disable_web_page_preview: false,
+            video_processing_pending: false,
+            reactions_are_possible: false,
+            is_paid_suggested_post_stars: false,
+            is_paid_suggested_post_ton: false,
+            has_explicit_sender: false,
+            is_copy: false,
+            from_background: false,
+            allow_paid: false,
+            update_stickersets_order: false,
+            clear_draft: false,
+            in_game_share: false,
+            initial_is_topic_message: false,
+            is_quick_reply_message: false,
+            send_anchor: false,
+            hide_via_bot: false,
+            is_bot_start_message: false,
+            real_forward_from_dialog_id: DialogId::default(),
+            real_forward_from_message_id: MessageId::default(),
+            notification_id: NotificationId::default(),
+            removed_notification_id: NotificationId::default(),
+            max_reply_media_timestamp: -1,
+            max_own_media_timestamp: -2,
+            view_count: 0,
+            forward_count: 0,
+            reply_info: MessageReplyInfo::default(),
+            reactions: None,
+            fact_check: None,
+            suggested_post: None,
+            thread_draft_message: None,
+            available_reactions_generation: 0,
+            interaction_info_update_date: 0,
+            history_generation: 0,
+            legacy_layer: 0,
+            send_error_code: 0,
+            send_error_message: String::new(),
+            try_resend_at: 0.0,
+            ttl_period: 0,
+            ttl: MessageSelfDestructType::default(),
+            ttl_expires_at: 0.0,
+            media_album_id: 0,
+            effect_id: MessageEffectId::default(),
+            content: None,
+            reply_markup: None,
+            ephemeral_message: None,
+            schedule_repeat_period: 0,
+            edited_schedule_date: 0,
+            edited_schedule_repeat_period: 0,
+            edit_generation: 0,
+            last_edit_pts: 0,
+            debug_source: "null",
+            last_access_date: 0,
+            is_update_sent: false,
+            send_message_log_event_id: 0,
+            send_query_ref: SendQueryRef::default(),
+        }
+    }
+}
+
+/// `message_search_filter_count()` (MessageSearchFilter.h:43-45) — the
+/// `Dialog` per-filter index/count arrays' length (`Size - 1`, i.e. every
+/// real filter except `Empty`).
+pub const MESSAGE_SEARCH_FILTER_COUNT: usize = 20;
+
+/// `td::MessagesManager::Dialog` (MessagesManager.h:1308-1492) — the
+/// per-dialog cache node. Field order and field-initializer defaults
+/// follow the C++ struct (`order`/`pending_order = DEFAULT_ORDER` = -1,
+/// `need_restore_reply_markup = true`); identity-typed like `Message`, so
+/// no Clone/PartialEq. The `WaitFree*`/`Flat*` containers are std maps for
+/// now; the intrusive node containers are stand-ins (see the section
+/// notes).
+#[derive(Debug)]
+pub struct Dialog {
+    pub dialog_id: DialogId,
+    /// identifier of the last known server message received from update,
+    /// there should be no server messages after it
+    pub last_new_message_id: MessageId,
+    /// identifier of the message after which currently there are no
+    /// messages, i.e. a message without a gap after it, memory only
+    pub last_message_id: MessageId,
+    /// identifier of the first message in the database, needed until there
+    /// are no gaps in the database
+    pub first_database_message_id: MessageId,
+    /// identifier of the last local or server message
+    pub last_database_message_id: MessageId,
+    pub first_database_message_id_by_index: [MessageId; MESSAGE_SEARCH_FILTER_COUNT],
+    pub message_count_by_index: [i32; MESSAGE_SEARCH_FILTER_COUNT],
+    pub server_unread_count: i32,
+    pub local_unread_count: i32,
+    pub unread_mention_count: i32,
+    pub unread_reaction_count: i32,
+    pub unread_poll_vote_count: i32,
+    /// secret chats only
+    pub last_read_inbox_message_date: i32,
+    pub last_read_inbox_message_id: MessageId,
+    pub last_read_outbox_message_id: MessageId,
+    pub last_pinned_message_id: MessageId,
+    pub reply_markup_message_id: MessageId,
+    pub notification_settings: DialogNotificationSettings,
+    pub available_reactions: ChatReactions,
+    pub available_reactions_generation: u32,
+    pub message_ttl: MessageTtl,
+    pub draft_message: Option<DraftMessage>,
+    pub action_bar: Option<DialogActionBar>,
+    pub business_bot_manage_bar: Option<BusinessBotManageBar>,
+    pub save_draft_message_log_event_id: LogEventIdWithGeneration,
+    pub save_notification_settings_log_event_id: LogEventIdWithGeneration,
+    pub set_folder_id_log_event_id: LogEventIdWithGeneration,
+    pub active_group_call_id: InputGroupCallId,
+    pub expected_active_group_call_id: InputGroupCallId,
+    pub default_join_group_call_as_dialog_id: DialogId,
+    pub default_send_message_as_dialog_id: DialogId,
+    pub background_info: BackgroundInfo,
+    pub chat_theme: Option<ChatTheme>,
+    pub pending_join_request_count: i32,
+    pub pending_join_request_user_ids: Vec<UserId>,
+    pub have_full_history_source: i32,
+    pub unload_dialog_delay_seed: i32,
+    pub last_media_album_id: i64,
+    pub history_generation: u32,
+    pub open_count: u32,
+    pub max_ephemeral_message_num: u32,
+    pub notification_info: Option<NotificationInfo>,
+    pub folder_id: FolderId,
+    pub dialog_list_ids: Vec<DialogListId>,
+    /// all mentions with a message identifier not greater than it are
+    /// implicitly read
+    pub last_read_all_mentions_message_id: MessageId,
+    /// maximum unavailable message identifier for dialogs with
+    /// cleared/unavailable history
+    pub max_unavailable_message_id: MessageId,
+    pub order: i64,
+    pub pending_order: i64,
+    pub deleted_last_message_id: MessageId,
+    pub delete_last_message_date: i32,
+    pub last_clear_history_date: i32,
+    pub last_clear_history_message_id: MessageId,
+    pub last_edited_message_id: MessageId,
+    pub scheduled_messages_sync_generation: u32,
+    pub last_repair_scheduled_messages_generation: u32,
+    pub max_added_message_id: MessageId,
+    pub being_added_message_id: MessageId,
+    pub being_updated_last_new_message_id: MessageId,
+    pub being_updated_last_database_message_id: MessageId,
+    pub being_deleted_message_id: MessageId,
+    pub has_contact_registered_message: bool,
+    pub is_last_message_deleted_locally: bool,
+    pub need_repair_action_bar: bool,
+    pub know_action_bar: bool,
+    pub has_outgoing_messages: bool,
+    pub was_opened: bool,
+    pub need_unload_on_close: bool,
+    pub need_restore_reply_markup: bool,
+    pub need_drop_default_send_message_as_dialog_id: bool,
+    pub have_full_history: bool,
+    pub is_empty: bool,
+    pub is_last_read_inbox_message_id_inited: bool,
+    pub is_last_read_outbox_message_id_inited: bool,
+    pub is_last_pinned_message_id_inited: bool,
+    pub is_folder_id_inited: bool,
+    pub need_repair_server_unread_count: bool,
+    pub need_repair_channel_server_unread_count: bool,
+    pub is_forum: bool,
+    pub is_forum_tabs: bool,
+    pub view_as_messages: bool,
+    pub is_marked_as_unread: bool,
+    pub is_blocked: bool,
+    pub is_is_blocked_inited: bool,
+    pub is_blocked_for_stories: bool,
+    pub is_is_blocked_for_stories_inited: bool,
+    pub last_sent_has_scheduled_messages: bool,
+    pub has_scheduled_server_messages: bool,
+    pub has_scheduled_database_messages: bool,
+    pub is_has_scheduled_database_messages_checked: bool,
+    pub has_loaded_scheduled_messages_from_database: bool,
+    pub sent_scheduled_messages: bool,
+    pub has_welcome_messages: bool,
+    /// whether the dialog was stored to database without last message
+    pub had_last_yet_unsent_message: bool,
+    pub has_active_group_call: bool,
+    pub is_group_call_empty: bool,
+    pub is_message_ttl_inited: bool,
+    pub has_expected_active_group_call_id: bool,
+    pub has_bots: bool,
+    pub is_view_as_messages_inited: bool,
+    pub is_saved_messages_view_as_messages_inited: bool,
+    pub is_has_bots_inited: bool,
+    pub is_background_inited: bool,
+    pub is_chat_theme_inited: bool,
+    pub is_available_reactions_inited: bool,
+    pub had_yet_unsent_message_id_overflow: bool,
+    pub need_repair_unread_mention_count: bool,
+    pub need_repair_unread_reaction_count: bool,
+    pub need_repair_unread_poll_vote_count: bool,
+    pub is_translatable: bool,
+    pub last_need_hide_dialog_draft_message: bool,
+    pub last_need_hide_reactions: bool,
+    pub is_update_new_chat_sent: bool,
+    pub is_update_new_chat_being_sent: bool,
+    pub has_unload_timeout: bool,
+    pub is_channel_difference_finished: bool,
+    /// for channels only
+    pub pts: i32,
+    /// for channels only
+    pub pending_read_channel_inbox_pts: i32,
+    /// for channels only
+    pub pending_read_channel_inbox_server_unread_count: i32,
+    /// for channels only
+    pub pending_read_channel_inbox_max_message_id: MessageId,
+    /// for secret chats and yet unsent messages only
+    pub random_id_to_message_id: HashMap<i64, MessageId>,
+    pub ephemeral_message_ids: HashMap<EphemeralMessageId, EphemeralMessageInfo>,
+    /// identifier of the last local or yet unsent message, assigned after
+    /// application start, used to guarantee that all assigned message
+    /// identifiers are different
+    pub last_assigned_message_id: MessageId,
+    pub deleted_message_ids: HashSet<MessageId>,
+    pub deleted_ephemeral_message_ids: HashSet<EphemeralMessageId>,
+    pub client_data: String,
+    pub messages: HashMap<MessageId, Box<Message>>,
+    pub message_lru_list: MessageLruList,
+    pub ordered_messages: OrderedMessages,
+    pub scheduled_messages: Option<DialogScheduledMessages>,
+    /// to be removed soon
+    pub debug_set_dialog_last_database_message_id: &'static str,
+    /// message identifiers loaded from database
+    pub debug_last_new_message_id: MessageId,
+    pub debug_first_database_message_id: MessageId,
+    pub debug_last_database_message_id: MessageId,
+}
+
+/// `DEFAULT_ORDER` (DialogDate.h:69).
+pub const DEFAULT_ORDER: i64 = -1;
+
+impl Default for Dialog {
+    /// The C++ field initializers (MessagesManager.h:1309-1466).
+    fn default() -> Dialog {
+        Dialog {
+            dialog_id: DialogId::default(),
+            last_new_message_id: MessageId::default(),
+            last_message_id: MessageId::default(),
+            first_database_message_id: MessageId::default(),
+            last_database_message_id: MessageId::default(),
+            first_database_message_id_by_index: [MessageId::default(); MESSAGE_SEARCH_FILTER_COUNT],
+            message_count_by_index: [0; MESSAGE_SEARCH_FILTER_COUNT],
+            server_unread_count: 0,
+            local_unread_count: 0,
+            unread_mention_count: 0,
+            unread_reaction_count: 0,
+            unread_poll_vote_count: 0,
+            last_read_inbox_message_date: 0,
+            last_read_inbox_message_id: MessageId::default(),
+            last_read_outbox_message_id: MessageId::default(),
+            last_pinned_message_id: MessageId::default(),
+            reply_markup_message_id: MessageId::default(),
+            notification_settings: DialogNotificationSettings::default(),
+            available_reactions: ChatReactions::default(),
+            available_reactions_generation: 0,
+            message_ttl: MessageTtl::default(),
+            draft_message: None,
+            action_bar: None,
+            business_bot_manage_bar: None,
+            save_draft_message_log_event_id: LogEventIdWithGeneration::default(),
+            save_notification_settings_log_event_id: LogEventIdWithGeneration::default(),
+            set_folder_id_log_event_id: LogEventIdWithGeneration::default(),
+            active_group_call_id: InputGroupCallId::default(),
+            expected_active_group_call_id: InputGroupCallId::default(),
+            default_join_group_call_as_dialog_id: DialogId::default(),
+            default_send_message_as_dialog_id: DialogId::default(),
+            background_info: BackgroundInfo::default(),
+            chat_theme: None,
+            pending_join_request_count: 0,
+            pending_join_request_user_ids: Vec::new(),
+            have_full_history_source: 0,
+            unload_dialog_delay_seed: 0,
+            last_media_album_id: 0,
+            history_generation: 0,
+            open_count: 0,
+            max_ephemeral_message_num: 0,
+            notification_info: None,
+            folder_id: FolderId::default(),
+            dialog_list_ids: Vec::new(),
+            last_read_all_mentions_message_id: MessageId::default(),
+            max_unavailable_message_id: MessageId::default(),
+            order: DEFAULT_ORDER,
+            pending_order: DEFAULT_ORDER,
+            deleted_last_message_id: MessageId::default(),
+            delete_last_message_date: 0,
+            last_clear_history_date: 0,
+            last_clear_history_message_id: MessageId::default(),
+            last_edited_message_id: MessageId::default(),
+            scheduled_messages_sync_generation: 0,
+            last_repair_scheduled_messages_generation: 0,
+            max_added_message_id: MessageId::default(),
+            being_added_message_id: MessageId::default(),
+            being_updated_last_new_message_id: MessageId::default(),
+            being_updated_last_database_message_id: MessageId::default(),
+            being_deleted_message_id: MessageId::default(),
+            has_contact_registered_message: false,
+            is_last_message_deleted_locally: false,
+            need_repair_action_bar: false,
+            know_action_bar: false,
+            has_outgoing_messages: false,
+            was_opened: false,
+            need_unload_on_close: false,
+            need_restore_reply_markup: true,
+            need_drop_default_send_message_as_dialog_id: false,
+            have_full_history: false,
+            is_empty: false,
+            is_last_read_inbox_message_id_inited: false,
+            is_last_read_outbox_message_id_inited: false,
+            is_last_pinned_message_id_inited: false,
+            is_folder_id_inited: false,
+            need_repair_server_unread_count: false,
+            need_repair_channel_server_unread_count: false,
+            is_forum: false,
+            is_forum_tabs: false,
+            view_as_messages: false,
+            is_marked_as_unread: false,
+            is_blocked: false,
+            is_is_blocked_inited: false,
+            is_blocked_for_stories: false,
+            is_is_blocked_for_stories_inited: false,
+            last_sent_has_scheduled_messages: false,
+            has_scheduled_server_messages: false,
+            has_scheduled_database_messages: false,
+            is_has_scheduled_database_messages_checked: false,
+            has_loaded_scheduled_messages_from_database: false,
+            sent_scheduled_messages: false,
+            has_welcome_messages: false,
+            had_last_yet_unsent_message: false,
+            has_active_group_call: false,
+            is_group_call_empty: false,
+            is_message_ttl_inited: false,
+            has_expected_active_group_call_id: false,
+            has_bots: false,
+            is_view_as_messages_inited: false,
+            is_saved_messages_view_as_messages_inited: false,
+            is_has_bots_inited: false,
+            is_background_inited: false,
+            is_chat_theme_inited: false,
+            is_available_reactions_inited: false,
+            had_yet_unsent_message_id_overflow: false,
+            need_repair_unread_mention_count: false,
+            need_repair_unread_reaction_count: false,
+            need_repair_unread_poll_vote_count: false,
+            is_translatable: false,
+            last_need_hide_dialog_draft_message: false,
+            last_need_hide_reactions: false,
+            is_update_new_chat_sent: false,
+            is_update_new_chat_being_sent: false,
+            has_unload_timeout: false,
+            is_channel_difference_finished: false,
+            pts: 0,
+            pending_read_channel_inbox_pts: 0,
+            pending_read_channel_inbox_server_unread_count: 0,
+            pending_read_channel_inbox_max_message_id: MessageId::default(),
+            random_id_to_message_id: HashMap::new(),
+            ephemeral_message_ids: HashMap::new(),
+            last_assigned_message_id: MessageId::default(),
+            deleted_message_ids: HashSet::new(),
+            deleted_ephemeral_message_ids: HashSet::new(),
+            client_data: String::new(),
+            messages: HashMap::new(),
+            message_lru_list: MessageLruList::default(),
+            ordered_messages: OrderedMessages::default(),
+            scheduled_messages: None,
+            debug_set_dialog_last_database_message_id: "Unknown",
+            debug_last_new_message_id: MessageId::default(),
+            debug_first_database_message_id: MessageId::default(),
+            debug_last_database_message_id: MessageId::default(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -3913,5 +4852,112 @@ mod tests {
             monotonic_id: 9,
         };
         assert_eq!(ephemeral.monotonic_id, 9);
+    }
+
+    #[test]
+    fn message_and_dialog_keep_the_cpp_field_defaults() {
+        let message = Message::default();
+        assert_eq!(message.max_reply_media_timestamp, -1);
+        assert_eq!(message.max_own_media_timestamp, -2);
+        assert_eq!(message.debug_source, "null");
+        assert!(message.content.is_none());
+        assert!(!message.is_outgoing);
+
+        let dialog = Dialog::default();
+        assert_eq!(dialog.order, DEFAULT_ORDER);
+        assert_eq!(dialog.pending_order, DEFAULT_ORDER);
+        assert!(dialog.need_restore_reply_markup);
+        assert_eq!(dialog.debug_set_dialog_last_database_message_id, "Unknown");
+        assert_eq!(
+            dialog.message_count_by_index,
+            [0; MESSAGE_SEARCH_FILTER_COUNT]
+        );
+        assert_eq!(MESSAGE_SEARCH_FILTER_COUNT, 20);
+        assert!(dialog.messages.is_empty());
+        assert!(
+            dialog
+                .first_database_message_id_by_index
+                .iter()
+                .all(|&id| id == MessageId::default())
+        );
+    }
+
+    #[test]
+    fn reply_forward_draft_plane_predicates() {
+        let legacy = RepliedMessageInfo::legacy(
+            MessageId::from_server_message_id(ServerMessageId::new(5)),
+            DialogId::default(),
+        );
+        assert!(!legacy.is_empty());
+        assert!(!legacy.is_external());
+        assert!(RepliedMessageInfo::default().is_empty());
+
+        let external = RepliedMessageInfo {
+            origin_date: 1700000000,
+            ..RepliedMessageInfo::default()
+        };
+        assert!(external.is_external());
+
+        assert!(MessageQuote::default().is_empty());
+        assert!(InputMessageText::default().is_empty());
+        assert!(
+            !InputMessageText {
+                web_page_url: "https://t.me".to_string(),
+                ..InputMessageText::default()
+            }
+            .is_empty()
+        );
+
+        let last_info = LastForwardedMessageInfo::new(
+            DialogId::from_channel_id(ChannelId::new(123)),
+            MessageId::from_server_message_id(ServerMessageId::new(7)),
+            DialogId::default(),
+            String::new(),
+            1700000001,
+            false,
+        );
+        assert!(!last_info.has_sender_name());
+        assert_eq!(
+            last_info.get_message_full_id(),
+            MessageFullId::new(
+                DialogId::from_channel_id(ChannelId::new(123)),
+                MessageId::from_server_message_id(ServerMessageId::new(7))
+            )
+        );
+
+        let voice = DraftMessageContent::VoiceNote(DraftMessageContentVoiceNote::default());
+        assert_eq!(voice.get_type(), DraftMessageContentType::VoiceNote);
+
+        let mut draft = DraftMessage {
+            date: 1700000002,
+            ..DraftMessage::default()
+        };
+        assert_eq!(draft.get_date(), 1700000002);
+        assert!(!draft.is_local());
+        draft.local_content = Some(DraftMessageContent::VideoNote(
+            DraftMessageContentVideoNote::default(),
+        ));
+        assert!(draft.is_local());
+
+        let pending = SuggestedPost::default();
+        assert!(pending.is_pending());
+        let accepted = SuggestedPost {
+            is_accepted: true,
+            ..pending
+        };
+        assert!(!accepted.is_pending());
+    }
+
+    #[test]
+    fn dialog_scheduled_messages_container() {
+        let mut scheduled = DialogScheduledMessages::default();
+        let id = ScheduledServerMessageId::new(11);
+        scheduled.scheduled_message_date.insert(id, 1700000003);
+        scheduled
+            .last_assigned_scheduled_message_id
+            .insert(1700000003, MessageId::from_scheduled(id, 1700000003, false));
+        scheduled.deleted_scheduled_server_message_ids.insert(id);
+        assert_eq!(scheduled.scheduled_message_date.get(&id), Some(&1700000003));
+        assert!(scheduled.deleted_scheduled_server_message_ids.contains(&id));
     }
 }
