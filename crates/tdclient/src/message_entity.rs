@@ -10377,4 +10377,523 @@ mod tests {
         add_formatted_text_dependencies(&mut |user_id| collected.push(user_id), None);
         assert!(collected.is_empty());
     }
+
+    // ----- M.8.5 fuzz-lite: entity fixup invariants (verify clause) ------
+    // Random entity sets checked for the sortedness / non-intersection /
+    // validity invariants of MessageEntity.cpp:1444-1827, against
+    // independent references restated from the C++ in test code.
+
+    /// A dependency-free SplitMix64: deterministic across runs and
+    /// platforms (the crate has no rand dev-dependency).
+    struct Prng(u64);
+
+    impl Prng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// All 23 real entity types (the `Size` sentinel is not a variant).
+    const ALL_TYPES: [Type; 23] = [
+        Type::Mention,
+        Type::Hashtag,
+        Type::BotCommand,
+        Type::Url,
+        Type::EmailAddress,
+        Type::Bold,
+        Type::Italic,
+        Type::Code,
+        Type::Pre,
+        Type::PreCode,
+        Type::TextUrl,
+        Type::MentionName,
+        Type::Cashtag,
+        Type::PhoneNumber,
+        Type::Underline,
+        Type::Strikethrough,
+        Type::BlockQuote,
+        Type::BankCardNumber,
+        Type::MediaTimestamp,
+        Type::Spoiler,
+        Type::CustomEmoji,
+        Type::ExpandableBlockQuote,
+        Type::FormattedDate,
+    ];
+
+    /// Random text over 1-, 2-, 3- and 4-byte UTF-8 code points, with the
+    /// byte offsets of every character boundary.
+    struct TextFixture {
+        text: String,
+        boundaries: Vec<usize>,
+    }
+
+    fn random_text(prng: &mut Prng) -> TextFixture {
+        const ALPHABET: [&str; 6] = ["a", " ", "\n", "é", "中", "🐀"];
+        let mut text = String::new();
+        let mut boundaries = vec![0usize];
+        for _ in 0..3 + prng.below(24) {
+            text.push_str(ALPHABET[prng.below(ALPHABET.len())]);
+            boundaries.push(text.len());
+        }
+        TextFixture { text, boundaries }
+    }
+
+    /// A random entity spanning whole characters of `fixture`.
+    fn random_entity(prng: &mut Prng, fixture: &TextFixture) -> MessageEntity {
+        let begin = fixture.boundaries[prng.below(fixture.boundaries.len() - 1)];
+        let end_candidates: Vec<usize> = fixture
+            .boundaries
+            .iter()
+            .copied()
+            .filter(|&end| end > begin)
+            .collect();
+        let end = end_candidates[prng.below(end_candidates.len())];
+        MessageEntity::new(
+            ALL_TYPES[prng.below(ALL_TYPES.len())],
+            begin as i32,
+            (end - begin) as i32,
+        )
+    }
+
+    /// Sorted, non-intersecting entities built by construction (each
+    /// entity starts after the previous one ends).
+    fn random_non_intersecting_set(prng: &mut Prng, fixture: &TextFixture) -> Vec<MessageEntity> {
+        let mut entities = Vec::new();
+        let mut occupied_until = 0usize;
+        for _ in 0..prng.below(8) {
+            let candidates: Vec<usize> = (0..fixture.boundaries.len() - 1)
+                .filter(|&i| fixture.boundaries[i] >= occupied_until)
+                .collect();
+            if candidates.is_empty() {
+                break;
+            }
+            let begin = fixture.boundaries[candidates[prng.below(candidates.len())]];
+            let end_candidates: Vec<usize> = fixture
+                .boundaries
+                .iter()
+                .copied()
+                .filter(|&end| end > begin)
+                .collect();
+            let end = end_candidates[prng.below(end_candidates.len())];
+            entities.push(MessageEntity::new(
+                ALL_TYPES[prng.below(ALL_TYPES.len())],
+                begin as i32,
+                (end - begin) as i32,
+            ));
+            occupied_until = end;
+        }
+        entities
+    }
+
+    fn check_sorted_non_intersecting(entities: &[MessageEntity]) {
+        for window in entities.windows(2) {
+            assert!(window[0] <= window[1], "not sorted: {:?}", entities);
+            assert!(
+                window[0].offset + window[0].length <= window[1].offset,
+                "intersecting: {:?}",
+                entities
+            );
+        }
+    }
+
+    fn utf16_length(text: &str) -> i32 {
+        text.chars().map(|c| c.len_utf16() as i32).sum()
+    }
+
+    /// Independent reference for `fix_entity_offsets`
+    /// (MessageEntity.cpp:1679-1721): sort, greedily keep the first
+    /// non-intersecting entities, then convert byte offsets to UTF-16
+    /// code units via `char_indices`.
+    fn reference_fix_entity_offsets(text: &str, entities: &mut Vec<MessageEntity>) {
+        entities.sort();
+        let mut kept: Vec<MessageEntity> = Vec::new();
+        let mut last_entity_end = 0i32;
+        for entity in entities.drain(..) {
+            if entity.offset >= last_entity_end {
+                last_entity_end = entity.offset + entity.length;
+                kept.push(entity);
+            }
+        }
+        let byte_to_utf16 = |byte_offset: i32| -> i32 {
+            let mut utf16_pos = 0i32;
+            for (byte, c) in text.char_indices() {
+                if byte as i32 >= byte_offset {
+                    break;
+                }
+                utf16_pos += c.len_utf16() as i32;
+            }
+            utf16_pos
+        };
+        for entity in &mut kept {
+            let begin = byte_to_utf16(entity.offset);
+            let end = byte_to_utf16(entity.offset + entity.length);
+            entity.offset = begin;
+            entity.length = end - begin;
+        }
+        *entities = kept;
+    }
+
+    #[test]
+    fn fix_entity_offsets_fuzz_lite() {
+        let mut prng = Prng(0x6d38_2e35_91ab_c7d0);
+        for _ in 0..3000 {
+            let fixture = random_text(&mut prng);
+            let input: Vec<MessageEntity> = (0..prng.below(12))
+                .map(|_| random_entity(&mut prng, &fixture))
+                .collect();
+
+            let mut expected = input.clone();
+            reference_fix_entity_offsets(&fixture.text, &mut expected);
+
+            let mut actual = input.clone();
+            fix_entity_offsets(&fixture.text, &mut actual);
+            assert_eq!(
+                actual, expected,
+                "text {:?} input {:?}",
+                fixture.text, input
+            );
+
+            check_sorted_non_intersecting(&actual);
+            let utf16_len = utf16_length(&fixture.text);
+            for entity in &actual {
+                assert!(entity.offset >= 0);
+                assert!(entity.offset + entity.length <= utf16_len);
+            }
+        }
+    }
+
+    #[test]
+    fn remove_intersecting_entities_fuzz_lite() {
+        let mut prng = Prng(0x51a3_f2c1_77de_0419);
+        for _ in 0..3000 {
+            let fixture = random_text(&mut prng);
+            let mut input: Vec<MessageEntity> = (0..prng.below(12))
+                .map(|_| random_entity(&mut prng, &fixture))
+                .collect();
+            input.sort();
+
+            let mut expected: Vec<MessageEntity> = Vec::new();
+            let mut last_entity_end = 0i32;
+            for entity in input.iter().cloned() {
+                if entity.offset >= last_entity_end {
+                    last_entity_end = entity.offset + entity.length;
+                    expected.push(entity);
+                }
+            }
+
+            let mut actual = input.clone();
+            remove_intersecting_entities(&mut actual);
+            assert_eq!(actual, expected, "input {:?}", input);
+            check_sorted_non_intersecting(&actual);
+        }
+    }
+
+    #[test]
+    fn merge_entities_fuzz_lite() {
+        let mut prng = Prng(0x7a3c_55d9_e2b4_01c6);
+        for _ in 0..3000 {
+            let fixture = random_text(&mut prng);
+            let old = random_non_intersecting_set(&mut prng, &fixture);
+            let new = random_non_intersecting_set(&mut prng, &fixture);
+
+            let actual = merge_entities(old.clone(), new.clone());
+            check_sorted_non_intersecting(&actual);
+
+            // Independent restatement: old entities survive; a new entity
+            // survives unless it overlaps some old entity; the result is
+            // their sorted union (both inputs are non-intersecting, so the
+            // entity sets are unique).
+            let mut expected = old.clone();
+            'new_entities: for new_entity in &new {
+                for old_entity in &old {
+                    if new_entity.offset + new_entity.length > old_entity.offset
+                        && new_entity.offset < old_entity.offset + old_entity.length
+                    {
+                        continue 'new_entities;
+                    }
+                }
+                expected.push(new_entity.clone());
+            }
+            expected.sort();
+            assert_eq!(actual, expected, "old {:?} new {:?}", old, new);
+        }
+    }
+
+    /// Independent O(n²) restatement of `are_entities_valid`
+    /// (MessageEntity.cpp:1559-1626): each entity is checked against
+    /// every ancestor containing its start, and splittable entities of
+    /// the same type may not touch.
+    fn reference_entities_valid(entities: &[MessageEntity]) -> bool {
+        if entities.is_empty() {
+            return true;
+        }
+        let mut last_end_by_splittable = [-1i32; SPLITTABLE_ENTITY_TYPE_COUNT];
+        for (index, entity) in entities.iter().enumerate() {
+            let entity_end = entity.offset + entity.length;
+            let mut ancestor_mask = 0i32;
+            let mut parent: Option<&MessageEntity> = None;
+            for prev in &entities[..index] {
+                if entity.offset < prev.offset + prev.length {
+                    ancestor_mask |= entity_type_mask(prev.r#type.unwrap());
+                    parent = Some(prev);
+                }
+            }
+            if let Some(parent) = parent {
+                if entity_end > parent.offset + parent.length {
+                    // entity intersects some previous entity
+                    return false;
+                }
+                if (ancestor_mask & entity_type_mask(entity.r#type.unwrap())) != 0 {
+                    // entity has the same type as one of the previous nested
+                    return false;
+                }
+                if is_pre_entity(parent.r#type.unwrap()) {
+                    // Pre and Code can't contain nested entities
+                    return false;
+                }
+                if is_pre_entity(entity.r#type.unwrap())
+                    && (ancestor_mask & !blockquote_entities_mask()) != 0
+                {
+                    // Pre and Code can't be part of other entities, except blockquote
+                    return false;
+                }
+                if (is_continuous_entity(entity.r#type.unwrap())
+                    || is_blockquote_entity(entity.r#type.unwrap()))
+                    && (ancestor_mask & continuous_entities_mask()) != 0
+                {
+                    // continuous and blockquote can't be part of other continuous entity
+                    return false;
+                }
+                if is_blockquote_entity(entity.r#type.unwrap())
+                    && (ancestor_mask & blockquote_entities_mask()) != 0
+                {
+                    // blockquote entities can't be nested
+                    return false;
+                }
+                if (ancestor_mask & splittable_entities_mask()) != 0 {
+                    // the previous nested entity may be needed to split for consistency
+                    return false;
+                }
+            }
+            if is_splittable_entity(entity.r#type.unwrap()) {
+                let splittable_index = splittable_entity_type_index(entity.r#type.unwrap());
+                if last_end_by_splittable[splittable_index] >= entity.offset {
+                    // the entities can be merged
+                    return false;
+                }
+                last_end_by_splittable[splittable_index] = entity_end;
+            }
+        }
+        true
+    }
+
+    /// Sorted, non-intersecting entities with random nesting: a parent
+    /// spans a whole run of the flat entities underneath it (the parent
+    /// type is biased toward an existing child type to hit same-type
+    /// nesting).
+    fn random_nested_set(prng: &mut Prng, fixture: &TextFixture) -> Vec<MessageEntity> {
+        let mut entities = random_non_intersecting_set(prng, fixture);
+        if !entities.is_empty() && prng.below(2) == 0 {
+            let first = prng.below(entities.len());
+            let last = first + prng.below(entities.len() - first);
+            let parent_begin = entities[first].offset;
+            let parent_end = entities[last].offset + entities[last].length;
+            let parent_type = if prng.below(2) == 0 {
+                entities[prng.below(entities.len())].r#type.unwrap()
+            } else {
+                ALL_TYPES[prng.below(ALL_TYPES.len())]
+            };
+            entities.push(MessageEntity::new(
+                parent_type,
+                parent_begin,
+                parent_end - parent_begin,
+            ));
+            entities.sort();
+        }
+        entities
+    }
+
+    #[test]
+    fn are_entities_valid_fuzz_lite() {
+        let mut prng = Prng(0x3b7d_5a19_c04e_88f2);
+        for _ in 0..4000 {
+            let fixture = random_text(&mut prng);
+            let entities = random_nested_set(&mut prng, &fixture);
+            assert_eq!(
+                are_entities_valid(&entities),
+                reference_entities_valid(&entities),
+                "entities {:?}",
+                entities
+            );
+        }
+    }
+
+    #[test]
+    fn remove_entities_intersecting_blockquote_fuzz_lite() {
+        let mut prng = Prng(0x2b7c_91a4_f8d3_6e50);
+        for _ in 0..3000 {
+            let fixture = random_text(&mut prng);
+            let input = random_non_intersecting_set(&mut prng, &fixture);
+            // Half the entries are blockquote entities, half arbitrary
+            // (the C++ skips non-blockquote entries while scanning).
+            let blockquotes: Vec<MessageEntity> = random_non_intersecting_set(&mut prng, &fixture)
+                .into_iter()
+                .map(|mut blockquote| {
+                    blockquote.r#type = Some(if prng.below(2) == 0 {
+                        if prng.below(2) == 0 {
+                            Type::BlockQuote
+                        } else {
+                            Type::ExpandableBlockQuote
+                        }
+                    } else {
+                        ALL_TYPES[prng.below(ALL_TYPES.len())]
+                    });
+                    blockquote
+                })
+                .collect();
+
+            // Independent restatement of MessageEntity.cpp:1653-1668:
+            // the first blockquote entity extending past the entity start
+            // drops it only when the entity crosses its boundary; an
+            // entity fully inside a blockquote is kept.
+            let expected: Vec<MessageEntity> = input
+                .iter()
+                .filter(|entity| {
+                    let entity_end = entity.offset + entity.length;
+                    let candidate = blockquotes.iter().find(|blockquote| {
+                        is_blockquote_entity(blockquote.r#type.unwrap())
+                            && blockquote.offset + blockquote.length > entity.offset
+                    });
+                    !candidate.is_some_and(|blockquote| {
+                        blockquote.offset + blockquote.length < entity_end
+                            || (entity.offset < blockquote.offset && blockquote.offset < entity_end)
+                    })
+                })
+                .cloned()
+                .collect();
+
+            let mut actual = input.clone();
+            remove_entities_intersecting_blockquote(&mut actual, &blockquotes);
+            assert_eq!(
+                actual, expected,
+                "input {:?} blockquotes {:?}",
+                input, blockquotes
+            );
+            check_sorted_non_intersecting(&actual);
+        }
+    }
+
+    /// Directed cases for `remove_entities_intersecting_blockquote`
+    /// (MessageEntity.cpp:1646-1677): an entity fully inside a
+    /// blockquote is kept; an entity crossing a blockquote boundary is
+    /// dropped; touching is not intersecting; the empty list is a fast
+    /// path.
+    #[test]
+    fn remove_entities_intersecting_blockquote_directed() {
+        let blockquote = [entity(Type::BlockQuote, 3, 7)];
+        // crossing the left boundary: dropped
+        let mut left = vec![entity(Type::Bold, 0, 5)];
+        remove_entities_intersecting_blockquote(&mut left, &blockquote);
+        assert!(left.is_empty());
+        // fully inside: kept
+        let mut inside = vec![entity(Type::Bold, 5, 3)];
+        remove_entities_intersecting_blockquote(&mut inside, &blockquote);
+        assert_eq!(inside, vec![entity(Type::Bold, 5, 3)]);
+        // crossing the right boundary: dropped
+        let mut right = vec![entity(Type::Bold, 8, 4)];
+        remove_entities_intersecting_blockquote(&mut right, &blockquote);
+        assert!(right.is_empty());
+        // touching the blockquote end: kept
+        let mut touching = vec![entity(Type::Bold, 10, 2)];
+        remove_entities_intersecting_blockquote(&mut touching, &blockquote);
+        assert_eq!(touching, vec![entity(Type::Bold, 10, 2)]);
+        // non-blockquote entries in the list are skipped
+        let mixed = [entity(Type::Bold, 0, 2), entity(Type::BlockQuote, 3, 7)];
+        let mut crossing = vec![entity(Type::Bold, 8, 4)];
+        remove_entities_intersecting_blockquote(&mut crossing, &mixed);
+        assert!(crossing.is_empty());
+        // empty blockquote list: everything survives
+        let mut entities = vec![entity(Type::Bold, 1, 2), entity(Type::Url, 5, 2)];
+        remove_entities_intersecting_blockquote(&mut entities, &[]);
+        assert_eq!(entities.len(), 2);
+    }
+
+    /// `fix_entity_offsets` failure semantics: the C++ `CHECK(cnt == 0)`
+    /// (MessageEntity.cpp:1719) is a fatal abort, ported as a panic.
+    /// Offsets must land on UTF-8 character boundaries within the text;
+    /// a 4-byte code point counts as two UTF-16 units.
+    #[test]
+    fn fix_entity_offsets_failure_semantics() {
+        // entity begin in the middle of a multi-byte character
+        let mut entities = vec![entity(Type::Bold, 1, 1)];
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fix_entity_offsets("éé", &mut entities);
+            }))
+            .is_err()
+        );
+        // entity end in the middle of a multi-byte character
+        let mut entities = vec![entity(Type::Bold, 0, 1)];
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fix_entity_offsets("éé", &mut entities);
+            }))
+            .is_err()
+        );
+        // entity reaching past the end of the text
+        let mut entities = vec![entity(Type::Bold, 0, 8)];
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fix_entity_offsets("ab", &mut entities);
+            }))
+            .is_err()
+        );
+        // zero-length entity hits the CHECK in remove_intersecting_entities
+        let mut entities = vec![entity(Type::Bold, 0, 0)];
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fix_entity_offsets("ab", &mut entities);
+            }))
+            .is_err()
+        );
+        // a 4-byte code point becomes two UTF-16 code units
+        let mut entities = vec![entity(Type::Bold, 0, 4), entity(Type::Url, 5, 1)];
+        fix_entity_offsets("🐀ax", &mut entities);
+        assert_eq!(
+            entities,
+            vec![entity(Type::Bold, 0, 2), entity(Type::Url, 3, 1)]
+        );
+    }
+
+    /// `find_entities` output invariants over the matcher battery (the
+    /// corpus replay covers value-level parity with the C++ oracle).
+    #[test]
+    fn find_entities_output_invariants() {
+        for text in matcher_battery() {
+            for skip_bot_commands in [false, true] {
+                for skip_media_timestamps in [false, true] {
+                    let entities = find_entities(&text, skip_bot_commands, skip_media_timestamps);
+                    check_sorted_non_intersecting(&entities);
+                    let utf16_len = utf16_length(&text);
+                    for entity in &entities {
+                        assert!(entity.offset >= 0, "{} {:?}", text, entities);
+                        assert!(
+                            entity.offset + entity.length <= utf16_len,
+                            "{} {:?}",
+                            text,
+                            entities
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
