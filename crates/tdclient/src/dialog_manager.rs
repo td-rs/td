@@ -465,7 +465,7 @@ pub fn get_dialog_info_full(
                 .user_manager
                 .load_user_full(&mut env, user_id, false, source)
             {
-                Ok(()) => promise.set_value(()),
+                Ok(_) => promise.set_value(()),
                 Err(message) => promise.set_error(Status::error(400, message)),
             }
         }

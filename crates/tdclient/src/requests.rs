@@ -1307,7 +1307,7 @@ fn search_contacts_request(td: &mut Td, id: u64, query: String, limit: i32) {
 /// the imported contacts. The `note` field is the MessageEntity step (the
 /// M.4.14 divergence keeps it unparsed and unstored); the vCard-less
 /// `importedContact` constructor builds an empty vCard.
-fn get_contacts(imported: &[td_api::ImportedContact]) -> Result<Vec<Contact>, Status> {
+fn get_contacts(imported: &[td_api::ImportedContact]) -> std::result::Result<Vec<Contact>, Status> {
     let mut contacts = Vec::with_capacity(imported.len());
     for imported_contact in imported {
         let mut contact = Contact::new(
