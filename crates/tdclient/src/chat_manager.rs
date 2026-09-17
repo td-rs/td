@@ -7413,6 +7413,639 @@ impl ChatManager {
         }
     }
 
+    // ---- M.5.28/M.5.29: the updateChat* intake family ----
+
+    /// `on_update_chat_full_participants_short` (ChatManager.cpp:7527-7546)
+    /// — the single-step version gate. True when the caller may apply.
+    #[allow(dead_code)] // production caller: UpdatesManager (M.7) / M.5.47
+    fn on_update_chat_full_participants_short(
+        &mut self,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        version: i32,
+    ) -> bool {
+        if version <= -1 {
+            tdutils::log_error!("Receive wrong version {version} for {chat_id:?}");
+            return false;
+        }
+        let Some(f) = self.chats_full.get_mut(&chat_id.get()) else {
+            return false;
+        };
+        if f.version == -1 {
+            tdutils::log_info!("{chat_id:?} chat members are unknown, nothing to update");
+            return false;
+        }
+        if f.version + 1 == version {
+            f.version = version;
+            return true;
+        }
+        tdutils::log_info!(
+            "Number of members in {chat_id:?} with version {} has changed, but new version is {version}",
+            f.version
+        );
+        self.repair_chat_participants(env, chat_id);
+        false
+    }
+
+    /// `on_update_chat_add_user` (ChatManager.cpp:6999-7068).
+    #[allow(dead_code)] // production caller: UpdatesManager (M.7) / M.5.47
+    #[allow(clippy::too_many_arguments)]
+    fn on_update_chat_add_user(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        inviter_user_id: UserId,
+        user_id: UserId,
+        date: i32,
+        version: i32,
+    ) {
+        if !chat_id.is_valid() {
+            tdutils::log_error!("Receive invalid {chat_id:?}");
+            return;
+        }
+        if !user_manager.have_min_user(user_id) {
+            tdutils::log_error!("Can't find {user_id:?}");
+            return;
+        }
+        if !user_manager.have_min_user(inviter_user_id) {
+            tdutils::log_error!("Can't find {inviter_user_id:?}");
+            return;
+        }
+        tdutils::log_info!(
+            "Receive updateChatParticipantAdd to {chat_id:?} with {user_id:?} invited by {inviter_user_id:?} at {date} with version {version}"
+        );
+        if self
+            .get_chat_full_force(user_manager, env, chat_id, "on_update_chat_add_user")
+            .is_none()
+        {
+            tdutils::log_info!("Ignoring update about members of {chat_id:?}");
+            return;
+        }
+        let (status_is_left, chat_version, participant_count) = {
+            let Some(c) = self.get_chat(chat_id) else {
+                tdutils::log_error!(
+                    "Receive updateChatParticipantAdd for unknown {chat_id:?}. Couldn't apply it"
+                );
+                self.repair_chat_participants(env, chat_id);
+                return;
+            };
+            (c.status.is_left(), c.version, c.participant_count)
+        };
+        if status_is_left {
+            tdutils::log_warning!(
+                "Receive updateChatParticipantAdd for left {chat_id:?}. Couldn't apply it"
+            );
+            self.repair_chat_participants(env, chat_id);
+            return;
+        }
+        if self.on_update_chat_full_participants_short(env, chat_id, version) {
+            let mut readded = false;
+            let mut found_same_inviter = false;
+            {
+                let Some(f) = self.chats_full.get_mut(&chat_id.get()) else {
+                    return;
+                };
+                let user_dialog_id = DialogId::from_user_id(user_id);
+                if let Some(participant) = f
+                    .participants
+                    .iter_mut()
+                    .find(|p| p.dialog_id_ == user_dialog_id)
+                {
+                    if participant.inviter_user_id_ != inviter_user_id {
+                        tdutils::log_error!(
+                            "{user_id:?} was re-added to {chat_id:?} by {inviter_user_id:?}, previously invited by {:?}",
+                            participant.inviter_user_id_
+                        );
+                        participant.inviter_user_id_ = inviter_user_id;
+                        participant.joined_date_ = date;
+                        self.repair_chat_participants(env, chat_id);
+                        readded = true;
+                    } else {
+                        tdutils::log_info!("{user_id:?} was re-added to {chat_id:?}");
+                        found_same_inviter = true;
+                    }
+                    let _ = readded || found_same_inviter;
+                } else {
+                    let status = if user_id == f.creator_user_id {
+                        DialogParticipantStatus::creator(true, false, String::new())
+                    } else {
+                        DialogParticipantStatus::member(0, String::new())
+                    };
+                    f.participants.push(DialogParticipant::new(
+                        user_dialog_id,
+                        inviter_user_id,
+                        date,
+                        status,
+                    ));
+                }
+            }
+            if readded || found_same_inviter {
+                return;
+            }
+            self.update_chat_online_member_count_full(user_manager, env, chat_id, false);
+            if let Some(f) = self.chats_full.get_mut(&chat_id.get()) {
+                f.is_changed = true;
+            }
+            self.update_chat_full(user_manager, env, chat_id, "on_update_chat_add_user", false);
+            if let Some(f) = self.get_chat_full(chat_id)
+                && f.version == chat_version
+                && f.participants.len() as i32 != participant_count
+            {
+                // chat is already updated
+                tdutils::log_error!(
+                    "Number of members in {chat_id:?} with version {} is {} but there are {} members in the ChatFull",
+                    f.version,
+                    participant_count,
+                    f.participants.len()
+                );
+                self.repair_chat_participants(env, chat_id);
+            }
+        }
+    }
+
+    /// `on_update_chat_edit_administrator` (ChatManager.cpp:7069-7138).
+    #[allow(dead_code)] // production caller: UpdatesManager (M.7) / M.5.47
+    fn on_update_chat_edit_administrator(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        user_id: UserId,
+        is_administrator: bool,
+        version: i32,
+    ) {
+        if !chat_id.is_valid() {
+            tdutils::log_error!("Receive invalid {chat_id:?}");
+            return;
+        }
+        if !user_manager.have_min_user(user_id) {
+            tdutils::log_error!("Can't find {user_id:?}");
+            return;
+        }
+        tdutils::log_info!(
+            "Receive updateChatParticipantAdmin in {chat_id:?} with {user_id:?}, administrator rights {is_administrator} with version {version}"
+        );
+        let Some(c) = self.get_chat_force(
+            user_manager,
+            env,
+            chat_id,
+            "on_update_chat_edit_administrator",
+        ) else {
+            tdutils::log_info!("Ignoring update about members of unknown {chat_id:?}");
+            return;
+        };
+        if c.status.is_left() {
+            tdutils::log_warning!(
+                "Receive updateChatParticipantAdmin for left {chat_id:?}. Couldn't apply it"
+            );
+            self.repair_chat_participants(env, chat_id);
+            return;
+        }
+        if version <= -1 {
+            tdutils::log_error!("Receive wrong version {version} for {chat_id:?}");
+            return;
+        }
+        debug_assert!(c.version >= 0);
+        let status = if is_administrator {
+            DialogParticipantStatus::group_administrator(c.status.is_creator(), String::new())
+        } else {
+            DialogParticipantStatus::member(0, String::new())
+        };
+        let mut apply_status = false;
+        if version > c.version {
+            if version != c.version + 1 {
+                tdutils::log_info!(
+                    "Administrators of {chat_id:?} with version {} has changed, but new version is {version}",
+                    c.version
+                );
+                self.repair_chat_participants(env, chat_id);
+                return;
+            }
+            c.version = version;
+            c.need_save_to_database = true;
+            // if chat with version was already received, the update is
+            // already processed; call on_update_chat_status only if the
+            // version advanced
+            apply_status = user_id == user_manager.get_my_id() && !c.status.is_creator();
+        }
+        if apply_status {
+            self.on_update_chat_status(user_manager, env, chat_id, status.clone());
+        }
+        self.update_chat(user_manager, env, chat_id, false, false);
+        if self
+            .get_chat_full_force(
+                user_manager,
+                env,
+                chat_id,
+                "on_update_chat_edit_administrator",
+            )
+            .is_some()
+        {
+            let applied = {
+                let Some(f) = self.chats_full.get_mut(&chat_id.get()) else {
+                    return;
+                };
+                if f.version + 1 == version {
+                    let user_dialog_id = DialogId::from_user_id(user_id);
+                    if let Some(participant) = f
+                        .participants
+                        .iter_mut()
+                        .find(|p| p.dialog_id_ == user_dialog_id)
+                    {
+                        let rank = participant.status_.get_rank().to_owned();
+                        let mut new_status = status;
+                        new_status.set_rank(rank);
+                        participant.status_ = new_status;
+                        f.is_changed = true;
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+            if applied {
+                self.update_chat_full(
+                    user_manager,
+                    env,
+                    chat_id,
+                    "on_update_chat_edit_administrator",
+                    false,
+                );
+                return;
+            }
+            tdutils::log_info!("Can't find chat member or version have increased too much");
+            self.repair_chat_participants(env, chat_id);
+        }
+    }
+
+    /// `on_update_chat_participant_rank` (ChatManager.cpp:7140-7201).
+    #[allow(dead_code)] // production caller: UpdatesManager (M.7) / M.5.47
+    fn on_update_chat_participant_rank(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        user_id: UserId,
+        rank: String,
+        version: i32,
+    ) {
+        if !chat_id.is_valid() {
+            tdutils::log_error!("Receive invalid {chat_id:?}");
+            return;
+        }
+        if !user_manager.have_min_user(user_id) {
+            tdutils::log_error!("Can't find {user_id:?}");
+            return;
+        }
+        tdutils::log_info!(
+            "Receive updateChatParticipantRank in {chat_id:?} with {user_id:?}, tag {rank} with version {version}"
+        );
+        let Some(c) = self.get_chat_force(
+            user_manager,
+            env,
+            chat_id,
+            "on_update_chat_participant_rank",
+        ) else {
+            tdutils::log_info!("Ignoring update about members of unknown {chat_id:?}");
+            return;
+        };
+        if c.status.is_left() {
+            tdutils::log_warning!(
+                "Receive updateChatParticipantRank for left {chat_id:?}. Couldn't apply it"
+            );
+            self.repair_chat_participants(env, chat_id);
+            return;
+        }
+        if version <= -1 {
+            tdutils::log_error!("Receive wrong version {version} for {chat_id:?}");
+            return;
+        }
+        debug_assert!(c.version >= 0);
+        if version > c.version {
+            if version != c.version + 1 {
+                tdutils::log_info!(
+                    "Members of {chat_id:?} with version {} has changed, but new version is {version}",
+                    c.version
+                );
+                self.repair_chat_participants(env, chat_id);
+                return;
+            }
+            c.version = version;
+            c.need_save_to_database = true;
+        }
+        self.update_chat(user_manager, env, chat_id, false, false);
+        if self
+            .get_chat_full_force(
+                user_manager,
+                env,
+                chat_id,
+                "on_update_chat_participant_rank",
+            )
+            .is_some()
+        {
+            let mut applied = false;
+            if let Some(f) = self.chats_full.get_mut(&chat_id.get())
+                && f.version + 1 == version
+            {
+                let user_dialog_id = DialogId::from_user_id(user_id);
+                if let Some(participant) = f
+                    .participants
+                    .iter_mut()
+                    .find(|p| p.dialog_id_ == user_dialog_id)
+                    && participant.status_.set_rank(rank.clone())
+                {
+                    f.is_changed = true;
+                    applied = true;
+                }
+            }
+            if applied {
+                self.update_chat_full(
+                    user_manager,
+                    env,
+                    chat_id,
+                    "on_update_chat_participant_rank",
+                    false,
+                );
+                return;
+            }
+            tdutils::log_info!("Can't find chat member or version have increased too much");
+            self.repair_chat_participants(env, chat_id);
+        }
+    }
+
+    /// `on_update_chat_delete_user` (ChatManager.cpp:7203-7256).
+    #[allow(dead_code)] // production caller: UpdatesManager (M.7) / M.5.47
+    fn on_update_chat_delete_user(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        user_id: UserId,
+        version: i32,
+    ) {
+        if !chat_id.is_valid() {
+            tdutils::log_error!("Receive invalid {chat_id:?}");
+            return;
+        }
+        if !user_manager.have_min_user(user_id) {
+            tdutils::log_error!("Can't find {user_id:?}");
+            return;
+        }
+        tdutils::log_info!(
+            "Receive updateChatParticipantDelete from {chat_id:?} with {user_id:?} and version {version}"
+        );
+        if self
+            .get_chat_full_force(user_manager, env, chat_id, "on_update_chat_delete_user")
+            .is_none()
+        {
+            tdutils::log_info!("Ignoring update about members of {chat_id:?}");
+            return;
+        }
+        let Some(c) = self.get_chat_force(user_manager, env, chat_id, "on_update_chat_delete_user")
+        else {
+            tdutils::log_error!("Receive updateChatParticipantDelete for unknown {chat_id:?}");
+            self.repair_chat_participants(env, chat_id);
+            return;
+        };
+        if user_id == user_manager.get_my_id() {
+            if c.status.is_member() {
+                tdutils::log_warning!(
+                    "User was removed from {chat_id:?} but it is not left the group. Possible if updates comes out of order"
+                );
+            }
+            return;
+        }
+        if c.status.is_left() {
+            tdutils::log_info!("Receive updateChatParticipantDelete for left {chat_id:?}");
+            self.repair_chat_participants(env, chat_id);
+            return;
+        }
+        if !self.on_update_chat_full_participants_short(env, chat_id, version) {
+            return;
+        }
+        let removed = {
+            let Some(f) = self.chats_full.get_mut(&chat_id.get()) else {
+                return;
+            };
+            let user_dialog_id = DialogId::from_user_id(user_id);
+            match f
+                .participants
+                .iter()
+                .position(|p| p.dialog_id_ == user_dialog_id)
+            {
+                Some(position) => {
+                    // the C++ swap-remove
+                    f.participants[position] = f.participants[f.participants.len() - 1].clone();
+                    f.participants.pop();
+                    f.is_changed = true;
+                    true
+                }
+                None => {
+                    tdutils::log_error!(
+                        "Can't find basic group member {user_id:?} in {chat_id:?} to be removed"
+                    );
+                    false
+                }
+            }
+        };
+        if !removed {
+            self.repair_chat_participants(env, chat_id);
+            return;
+        }
+        self.update_chat_online_member_count_full(user_manager, env, chat_id, false);
+        self.update_chat_full(
+            user_manager,
+            env,
+            chat_id,
+            "on_update_chat_delete_user",
+            false,
+        );
+        let participant_count = self.get_chat(chat_id).map(|c| c.participant_count);
+        if let (Some(f), Some(pc)) = (self.get_chat_full(chat_id), participant_count)
+            && f.participants.len() as i32 != pc
+        {
+            self.repair_chat_participants(env, chat_id);
+        }
+    }
+
+    /// `on_update_chat_pinned_message` (ChatManager.cpp:7366-7409).
+    #[allow(dead_code)] // production caller: UpdatesManager (M.7) / M.5.47
+    fn on_update_chat_pinned_message(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        pinned_message_id: MessageId,
+        version: i32,
+    ) {
+        if !chat_id.is_valid() {
+            tdutils::log_error!("Receive invalid {chat_id:?}");
+            return;
+        }
+        let Some(c) =
+            self.get_chat_force(user_manager, env, chat_id, "on_update_chat_pinned_message")
+        else {
+            tdutils::log_info!("Ignoring update about unknown {chat_id:?}");
+            return;
+        };
+        tdutils::log_info!(
+            "Receive updateChatPinnedMessage in {chat_id:?} with {pinned_message_id:?} and version {version}. Current version is {}/{}",
+            c.version,
+            c.pinned_message_version
+        );
+        if c.status.is_left() {
+            // repair 'just in case'
+            self.repair_chat_participants(env, chat_id);
+            return;
+        }
+        if version <= -1 {
+            tdutils::log_error!("Receive wrong version {version} for {chat_id:?}");
+            return;
+        }
+        debug_assert!(c.version >= 0);
+        if version >= c.pinned_message_version {
+            if version != c.version + 1 && version != c.version {
+                tdutils::log_info!(
+                    "Pinned message of {chat_id:?} with version {} has changed, but new version is {version}",
+                    c.version
+                );
+                self.repair_chat_participants(env, chat_id);
+            } else if version == c.version + 1
+                && let Some(c) = self.get_chat_mut(chat_id)
+            {
+                c.version = version;
+                c.need_save_to_database = true;
+            }
+            // messages_manager on_update_dialog_last_pinned_message_id — the
+            // M.10 stub (runs on both sub-branches).
+            if let Some(c) = self.get_chat_mut(chat_id)
+                && version > c.pinned_message_version
+            {
+                tdutils::log_info!(
+                    "Change pinned message version of {chat_id:?} from {} to {version}",
+                    c.pinned_message_version
+                );
+                c.pinned_message_version = version;
+                c.need_save_to_database = true;
+            }
+            self.update_chat(user_manager, env, chat_id, false, false);
+        }
+    }
+
+    /// `on_update_chat_description` (ChatManager.cpp:7509-7526).
+    #[allow(dead_code)] // production caller: UpdatesManager (M.7) / M.5.47
+    fn on_update_chat_description(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        description: String,
+    ) {
+        if !chat_id.is_valid() {
+            tdutils::log_error!("Receive invalid {chat_id:?}");
+            return;
+        }
+        if self
+            .get_chat_full_force(user_manager, env, chat_id, "on_update_chat_description")
+            .is_none()
+        {
+            return;
+        }
+        let mut changed = false;
+        if let Some(f) = self.get_chat_full_mut(chat_id)
+            && f.description != description
+        {
+            f.description = description;
+            f.is_changed = true;
+            changed = true;
+        }
+        if changed {
+            // td_->group_call_manager_->on_update_dialog_about — the wave-2
+            // stub.
+            self.update_chat_full(
+                user_manager,
+                env,
+                chat_id,
+                "on_update_chat_description",
+                false,
+            );
+        }
+    }
+
+    /// `on_update_chat_bot_commands` (ChatManager.cpp:7602-7607).
+    #[allow(dead_code)] // production caller: UpdatesManager (M.7) / M.5.47
+    fn on_update_chat_bot_commands(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        bot_commands: BotCommands,
+    ) {
+        if self
+            .get_chat_full_force(user_manager, env, chat_id, "on_update_chat_bot_commands")
+            .is_none()
+        {
+            return;
+        }
+        let mut changed = false;
+        if let Some(f) = self.get_chat_full_mut(chat_id)
+            && BotCommands::update_all_bot_commands(&mut f.bot_commands, bot_commands)
+        {
+            f.is_changed = true;
+            changed = true;
+        }
+        if changed {
+            self.update_chat_full(
+                user_manager,
+                env,
+                chat_id,
+                "on_update_chat_bot_commands",
+                false,
+            );
+        }
+    }
+
+    /// `on_update_chat_permanent_invite_link` (ChatManager.cpp:7610-7614).
+    #[allow(dead_code)] // production caller: UpdatesManager (M.7) / M.5.47
+    fn on_update_chat_permanent_invite_link(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        invite_link: &DialogInviteLink,
+    ) {
+        if self
+            .get_chat_full_force(
+                user_manager,
+                env,
+                chat_id,
+                "on_update_chat_permanent_invite_link",
+            )
+            .is_none()
+        {
+            return;
+        }
+        let mut changed = false;
+        if let Some(f) = self.get_chat_full_mut(chat_id)
+            && Self::update_permanent_invite_link(&mut f.invite_link, invite_link.clone())
+        {
+            f.is_changed = true;
+            changed = true;
+        }
+        if changed {
+            self.update_chat_full(
+                user_manager,
+                env,
+                chat_id,
+                "on_update_chat_permanent_invite_link",
+                false,
+            );
+        }
+    }
+
     /// `on_get_chat_empty` (ChatManager.cpp:9152-9162) — never changes
     /// state.
     fn on_get_chat_empty(&mut self, chat: telegram_api::chatEmpty, source: &str) {
