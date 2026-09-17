@@ -108,9 +108,9 @@ mod tests {
             folder_id: 42,
             offset_date: 0,
             offset_id: 0,
-            offset_peer: Box::new(telegram_api::InputPeer::inputPeerEmpty(
+            offset_peer: Some(Box::new(telegram_api::InputPeer::inputPeerEmpty(
                 telegram_api::inputPeerEmpty,
-            )),
+            ))),
             limit: 0,
             hash: 0,
         };
@@ -137,9 +137,9 @@ mod tests {
             folder_id: 42,
             offset_date: 0,
             offset_id: 0,
-            offset_peer: Box::new(telegram_api::InputPeer::inputPeerEmpty(
+            offset_peer: Some(Box::new(telegram_api::InputPeer::inputPeerEmpty(
                 telegram_api::inputPeerEmpty,
-            )),
+            ))),
             limit: 0,
             hash: 0,
         };

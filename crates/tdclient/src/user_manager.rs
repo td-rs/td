@@ -44,6 +44,45 @@
 //!   funnels through `SecretChatsManager` (Wave 3) and
 //!   `DialogManager::force_create_dialog` — and the `HandlerType::
 //!   SecretChats` (= 1) events route to that manager, not here;
+//! - the contacts slice (cpp:7910-8889) is in: the `user_contacts` /
+//!   `user_imported_contacts` sqlite rows and the
+//!   `saved_contact_count`/`next_contacts_sync_date` binlog-pmc pair (the
+//!   constructor block cpp:2748-2759), `on_get_contacts`/
+//!   `on_get_contacts_statuses`, the `ImportContactsTask` machine with
+//!   the unique-id dedup (`import_contacts`/`on_imported_contacts`/
+//!   `change_imported_contacts`/`on_update_contacts_reset`),
+//!   `contacts_hints_` search, close friends, the birthdate sync
+//!   (`ContactBirthdates` + `updateContactCloseBirthdays`) and
+//!   `search_user_by_phone_number`/`on_resolved_phone_number`. The
+//!   query senders (`contacts.getContacts`, the import family, the
+//!   close-friends editor, `contacts.getBirthdays`, the phone resolver)
+//!   ride the net step; the load-gated entry points keep the C++
+//!   caller-retry contract (park the promise, return the empty result)
+//!   with `add_contact`/`get_imported_contact_count` re-dispatched from
+//!   a parked-call queue (the C++ actor-message analogue);
+//! - the contact-policy slice (cpp:7754-7909 + the policy intakes) is in:
+//!   the message-users registry (`user_messages_` +
+//!   `register_message_users`/`unregister_message_users`; the
+//!   `ChatManager::have_channel` gate is the `known_channels` stand-in,
+//!   empty until the ChatManager slice feeds it), `can_send_message_to_user`
+//!   with the `get_is_premium_required_to_contact_queries_` QueryMerger
+//!   (the merger actor is created by `Td::init`; its merge function's net
+//!   send is [blocked: net] and answers the C++ error surface until
+//!   M.4.16), the `user_full_contact_price_` cache + its intake
+//!   `on_get_is_premium_required_to_contact_users`, `allow_send_message_
+//!   to_user`, `share_phone_number` (parked in the contacts-load queue),
+//!   the noforwards-request registry + deadline map
+//!   (`register_noforwards_request`/`unregister_noforwards_request`/
+//!   `on_noforwards_request_timeout`), the `user_rating_timeout_` deadline
+//!   plumbing (the arming fields arrive with the StarRating subsystem),
+//!   `get_web_app_placeholder` (bot_info absent until its subsystem, so
+//!   the answer is the C++ null), the freeze state
+//!   (`init_freeze_state`/`on_update_freeze_state`/`get_update_freeze_
+//!   state_object`), `on_update_online_status_privacy` (the statuses
+//!   re-fetch is [blocked: net]), `on_update_phone_number_privacy` and
+//!   `on_ignored_restriction_reasons_changed` (+ `restricted_user_ids_`);
+//!   the `inputPeerUserFromMessage`/`inputUserFromMessage` conversions
+//!   wait for `ChatManager::get_simple_input_peer`;
 //! - cross-manager notifications (MessagesManager dialog title/photo
 //!   updates, StoryManager, ReactionManager, ContactsManager hints,
 //!   OnlineManager, ConfigManager) are documented no-ops in
@@ -53,8 +92,10 @@
 //! - the read surface (cpp:5196-5880) ports the InputUser/InputPeer/
 //!   `inputEncryptedChat` construction, `get_bot_data` and the field
 //!   getters; the min-user fromMessage fallback (`user_messages_` +
-//!   `ChatManager::get_simple_input_peer`) lands with the message-users
-//!   registry step, `get_user_default_permissions`/`get_secret_chat_
+//!   `ChatManager::get_simple_input_peer`) is half in — the registry and
+//!   the `have_input_peer_user` admission landed with M.4.15, the
+//!   fromMessage conversions wait for the ChatManager slice,
+//!   `get_user_default_permissions`/`get_secret_chat_
 //!   default_permissions` and `get_bot_commands` carry
 //!   `RestrictedRights`/`BotCommands` from `DialogParticipant.h` into
 //!   the ChatManager slice, and `reload_user`/`send_get_me_query` are
@@ -65,11 +106,13 @@
 //!   payloads (empty `usernames`, `userStatusEmpty`, the empty photo,
 //!   `activeStoryStateRead`, ...) where the C++ emits `null`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::birthdate::Birthdate;
+use crate::contact::Contact;
 use crate::emoji_status::{CustomEmojiId, EmojiStatus};
 use crate::global::Global;
+use crate::message_id::{DialogType, MessageFullId};
 use crate::option_manager::OptionManager;
 use crate::peer_color::{AccentColorId, PeerColor, PeerColorCollectible};
 use crate::photo::{Photo, get_chat_photo_object, get_photo, photo_get_file_ids};
@@ -78,11 +121,13 @@ use crate::restriction_reason::{
     store_restriction_reasons,
 };
 use crate::store_parse::{self, Parser};
-use crate::td_api;
+use crate::td_api::{self, Object};
 use crate::usernames::Usernames;
 use tddb::binlog_key_value::BinlogKeyValue;
 use tdmtproto::telegram_api;
-use tdutils::promise::Promise;
+use tdutils::hints::Hints;
+use tdutils::promise::{Promise, PromiseCreator};
+use tdutils::random::Xorshift128plus;
 use tdutils::status::Status;
 
 /// `User::CACHE_VERSION` (UserManager.h:633).
@@ -127,6 +172,103 @@ fn get_star_count(amount: i64) -> i64 {
         return max_amount;
     }
     amount
+}
+
+/// `td::split(s, ' ')` (tdutils/misc.h:26-32) — the first delimiter; the
+/// second element keeps the remainder (embedded delimiters included).
+fn split_first_space(s: &str) -> (String, String) {
+    match s.find(' ') {
+        Some(pos) => (s[..pos].to_owned(), s[pos + 1..].to_owned()),
+        None => (s.to_owned(), String::new()),
+    }
+}
+
+/// `Random::fast` (td/utils/Random.h) — a one-shot xorshift seeded from
+/// the process-wide fast generator (the C++ keeps one global state; the
+/// per-call sequence is equivalent for a stateless draw).
+fn random_fast(min_value: i32, max_value: i32) -> i32 {
+    Xorshift128plus::from_seed(tdutils::random::fast_uint64()).fast(min_value, max_value)
+}
+
+/// `get_vector_hash` (misc.cpp:311-320) — the contacts hash fold.
+fn get_vector_hash(numbers: &[u64]) -> i64 {
+    let mut acc: u64 = 0;
+    for number in numbers {
+        acc ^= acc >> 21;
+        acc ^= acc << 35;
+        acc ^= acc >> 4;
+        acc = acc.wrapping_add(*number);
+    }
+    acc as i64
+}
+
+/// `td::set_promises` (Promise.h) — resolve the queue with the default
+/// value.
+fn set_promises<T: Send + Default>(promises: &mut Vec<Promise<T>>) {
+    for mut promise in std::mem::take(promises) {
+        promise.set_value(T::default());
+    }
+}
+
+/// `td::fail_promises` (Promise.h) — fail the queue with a cloned error.
+fn fail_promises<T: Send>(promises: &mut Vec<Promise<T>>, error: &Status) {
+    for mut promise in std::mem::take(promises) {
+        promise.set_error(error.clone());
+    }
+}
+
+/// `log_event_store(vector<UserId>)` for the `user_contacts` sqlite row
+/// (UserManager.cpp:7983-7991): the log-event version, the vector count
+/// and the int64 ids (the `UserId::store` = `store_long` framing).
+fn store_user_ids_log_event(out: &mut Vec<u8>, user_ids: &[i64]) {
+    store_parse::store_log_event_version(out);
+    store_parse::store_i32(out, user_ids.len() as i32);
+    for user_id in user_ids {
+        store_parse::store_i64(out, *user_id);
+    }
+}
+
+/// `log_event_parse(vector<UserId>)` — the parse half.
+fn parse_user_ids_log_event(input: &[u8]) -> Result<Vec<i64>, &'static str> {
+    let mut parser = Parser::new_log_event(input)?;
+    let count = parser.i32_()?;
+    if count < 0 || count as usize > input.len() {
+        // the C++ parse(vector) get_left_len gate (tl_helpers.h) — a
+        // hostile count must not drive a huge allocation
+        return Err("Wrong vector length");
+    }
+    let mut user_ids = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        user_ids.push(parser.i64_()?);
+    }
+    parser.fetch_end()?;
+    Ok(user_ids)
+}
+
+/// `log_event_store(vector<Contact>)` for the `user_imported_contacts`
+/// sqlite row (UserManager.cpp:8297-8306).
+fn store_contacts_log_event(out: &mut Vec<u8>, contacts: &[Contact]) {
+    store_parse::store_log_event_version(out);
+    store_parse::store_i32(out, contacts.len() as i32);
+    for contact in contacts {
+        contact.store(out);
+    }
+}
+
+/// `log_event_parse(vector<Contact>)` — the parse half.
+fn parse_contacts_log_event(input: &[u8]) -> Result<Vec<Contact>, &'static str> {
+    let mut parser = Parser::new_log_event(input)?;
+    let count = parser.i32_()?;
+    if count < 0 || count as usize > input.len() {
+        // the C++ parse(vector) get_left_len gate (tl_helpers.h)
+        return Err("Wrong vector length");
+    }
+    let mut contacts = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        contacts.push(Contact::parse_from(&mut parser)?);
+    }
+    parser.fetch_end()?;
+    Ok(contacts)
 }
 
 /// `td::UserId` (UserId.h): 0 < id ≤ 2^40 - 1.
@@ -407,11 +549,12 @@ pub enum SecretChatState {
     Closed = 2,
 }
 
-/// `clean_phone_number` (misc.h) — keep digits and '+' only.
+/// `clean_phone_number` (misc.cpp:58-60) — keep digits only (the C++
+/// `remove_if(!is_digit)` drops the '+' too).
 fn clean_phone_number(phone_number: String) -> String {
     phone_number
         .chars()
-        .filter(|c| c.is_ascii_digit() || *c == '+')
+        .filter(|c| c.is_ascii_digit())
         .collect()
 }
 
@@ -1718,11 +1861,15 @@ impl<'a> UserEnv<'a> {
     }
 }
 
-/// `td::AccessRights` (AccessRights.h) — the subset the user manager uses.
+/// `td::AccessRights` (AccessRights.h) — `enum class AccessRights : int32 {
+/// Know, Read, Edit, Write }`; the variants stay in-memory only here, so the
+/// declaration order keeps the pre-M.6 subset first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AccessRights {
     Know,
     Read,
+    /// `AccessRights::Edit` — arrives with the DialogManager slice.
+    Edit,
     Write,
 }
 
@@ -1813,6 +1960,75 @@ impl UserSavedMusic {
     }
 }
 
+/// `UserManager::ImportContactsTask` (UserManager.h:1345-1351) — the
+/// in-flight import: the caller promise, the input contacts and the two
+/// per-position result buffers.
+struct ImportContactsTask {
+    promise: Promise<()>,
+    // the retry round rebuilds `inputPhoneContact`s from these — the
+    // re-send is [blocked: net], so the field is write-only until then
+    #[allow(dead_code)]
+    input_contacts: Vec<Contact>,
+    imported_user_ids: Vec<UserId>,
+    unimported_contact_invites: Vec<i32>,
+}
+
+/// `UserManager::ContactBirthdates` (UserManager.h:1388-1393).
+#[derive(Default)]
+struct ContactBirthdates {
+    users: Vec<(UserId, Birthdate)>,
+    next_sync_time: f64,
+    is_being_synced: bool,
+    need_drop: bool,
+}
+
+/// The load-gated calls the C++ re-dispatches as actor messages from the
+/// load-contacts promise; the Rust manager parks them here (the
+/// actor-message-queue analogue) and replays them on load completion or
+/// errors them on load failure.
+enum PendingLoadContactsCall {
+    AddContact {
+        user_id: UserId,
+        contact: Contact,
+        share_phone_number: bool,
+        promise: Promise<()>,
+    },
+    GetImportedContactCount {
+        promise: Promise<i32>,
+    },
+    SharePhoneNumber {
+        user_id: UserId,
+        promise: Promise<()>,
+    },
+}
+/// The load-gated td_api requests (`Requests.cpp` request actors
+/// `GetCloseFriendsRequest`/`SearchContactsRequest`/
+/// `ImportContactsRequest`/`ChangeImportedContactsRequest`): parked while
+/// the contacts load. The C++ request actors re-run `do_run` after the
+/// load and answer from `do_send_result`; the Rust park carries a
+/// data promise the request layer resolves (the manager builds the
+/// td_api object on the re-run, like `do_send_result` does).
+pub(crate) enum PendingUserRequest {
+    GetCloseFriends {
+        promise: Promise<Object>,
+    },
+    SearchContacts {
+        query: String,
+        limit: i32,
+        promise: Promise<Object>,
+    },
+    ImportContacts {
+        contacts: Vec<Contact>,
+        random_id: i64,
+        promise: Promise<Object>,
+    },
+    ChangeImportedContacts {
+        contacts: Vec<Contact>,
+        random_id: i64,
+        promise: Promise<Object>,
+    },
+}
+
 /// `td::UserManager` — the in-process manager (the C++ actor collapses
 /// into the Td actor, like the M.1 AuthManager).
 #[derive(Default)]
@@ -1894,11 +2110,122 @@ pub struct UserManager {
     user_online_timeouts: BTreeMap<i64, f64>,
     /// `user_emoji_status_timeout_` deadlines.
     user_emoji_status_timeouts: BTreeMap<i64, f64>,
+    /// `user_rating_timeout_` deadlines — the M.4.15 plumbing; the
+    /// StarRating fields that arm it arrive with their subsystem, so the
+    /// map stays empty until then.
+    user_rating_timeouts: BTreeMap<i64, f64>,
+    /// `noforwards_request_timeout_` deadlines.
+    noforwards_request_timeouts: BTreeMap<i32, f64>,
+
+    // ------------------------------------------------------------------
+    // Contact policy + registries (UserManager.cpp:7754-7909 + the policy
+    // intakes) — M.4.15.
+    /// `user_messages_` (UserManager.h:1358) — per user, the channel
+    /// messages that referenced them (the min-user fallback registry).
+    user_messages: BTreeMap<i64, BTreeSet<MessageFullId>>,
+    /// `user_full_contact_price_` (UserManager.h:1377) — the cached
+    /// premium-required-to-contact price per user: `-1` premium required,
+    /// `0` no restriction, `> 0` the paid-messages star count.
+    user_full_contact_price: BTreeMap<i64, i64>,
+    /// `noforwards_request_ids_` / `noforwards_request_message_full_ids_`
+    /// (UserManager.h:1379-1380) — the two directions of the
+    /// noforwards-request registry.
+    noforwards_request_ids: BTreeMap<MessageFullId, i32>,
+    noforwards_request_message_full_ids: BTreeMap<i32, MessageFullId>,
+    /// `current_noforwards_request_id_` (UserManager.h:1254).
+    current_noforwards_request_id: i32,
+    /// `freeze_since_date_` / `freeze_until_date_` / `freeze_appeal_url_`
+    /// (UserManager.h:1384-1386).
+    freeze_since_date: i32,
+    freeze_until_date: i32,
+    freeze_appeal_url: String,
+    /// The `ChatManager::have_channel` stand-in behind the
+    /// `register_message_users` channel gate: the known-channel registry
+    /// ChatManager will feed when it lands, empty until then.
+    known_channels: BTreeSet<i64>,
+    /// `get_is_premium_required_to_contact_queries_` (UserManager.h:1312)
+    /// — the QueryMerger actor, created by the Td init.
+    pub(crate) get_is_premium_required_to_contact_queries:
+        Option<tdactor::ActorId<crate::query_merger::QueryMerger>>,
+    /// The owning Td actor (the C++ `td_` back-pointer) — the
+    /// `can_send_message_to_user` merger re-dispatch rides it.
+    pub(crate) td_actor_id: Option<tdactor::ActorId<crate::td::Td>>,
+
+    // ------------------------------------------------------------------
+    // Contacts (UserManager.cpp:7910-8889) + the constructor's contacts
+    // block (cpp:2748-2759). The query senders (`contacts.getContacts`,
+    // the import family, `contacts.getStatuses`, `contacts.getBirthdays`,
+    // `contacts.resolvePhone`, the close-friends editor) ride the net
+    // step; the local state machines, the intakes and the persistence
+    // are here.
+    /// `are_contacts_loaded_` (UserManager.h:1360).
+    are_contacts_loaded: bool,
+    /// `next_contacts_sync_date_` (UserManager.h:1361).
+    next_contacts_sync_date: i32,
+    /// `contacts_hints_` (UserManager.h:1362) — the contact search index
+    /// over first/last names and usernames.
+    contacts_hints: Hints,
+    /// `load_contacts_queries_` (UserManager.h:1363) — the pending
+    /// load-contacts promises (the caller-retry contract).
+    load_contacts_queries: Vec<Promise<()>>,
+    /// The load-gated internal re-dispatches (see
+    /// [`PendingLoadContactsCall`]).
+    pending_load_contacts_calls: Vec<PendingLoadContactsCall>,
+    /// The `()`-typed promises parked at their `[blocked: net]` query
+    /// sends — the C++ promise rides the query actor until the server
+    /// ack, the Rust collapse parks it here until the net query actors
+    /// land (the same collapse the pending-load queue uses).
+    net_blocked_promises: Vec<Promise<()>>,
+    /// The load-gated td_api requests (see
+    /// [`PendingUserRequest`]) — the request-actor re-run analogue: parked
+    /// with the request id while the contacts load, re-run to completion
+    /// on load finish / failed.
+    pending_user_requests: Vec<PendingUserRequest>,
+    /// `saved_contact_count_` (UserManager.h:1365) — `-1` before the
+    /// first load (the `new()` override).
+    saved_contact_count: i32,
+
+    /// `are_imported_contacts_loaded_` (UserManager.h:1370).
+    are_imported_contacts_loaded: bool,
+    /// `load_imported_contacts_queries_` (UserManager.h:1371).
+    load_imported_contacts_queries: Vec<Promise<()>>,
+    /// `all_imported_contacts_` (UserManager.h:1373) — the persisted
+    /// imported-contacts list.
+    all_imported_contacts: Vec<Contact>,
+    /// `are_imported_contacts_changing_` (UserManager.h:1374).
+    are_imported_contacts_changing: bool,
+    /// `need_clear_imported_contacts_` (UserManager.h:1375).
+    need_clear_imported_contacts: bool,
+    /// `import_contact_tasks_` (UserManager.h:1355) — the in-flight
+    /// import tasks by random_id.
+    import_contact_tasks: BTreeMap<i64, ImportContactsTask>,
+    /// `imported_contacts_` (UserManager.h:1354) — the reserved
+    /// import-result slots by random_id.
+    imported_contacts: BTreeMap<i64, (Vec<UserId>, Vec<i32>)>,
+
+    /// `next_all_imported_contacts_` / `imported_contacts_unique_id_` /
+    /// `imported_contacts_pos_` (UserManager.h:1396-1398) — the
+    /// `change_imported_contacts` state between the removal and the
+    /// import.
+    next_all_imported_contacts: Vec<Contact>,
+    imported_contacts_unique_id: Vec<usize>,
+    imported_contacts_pos: Vec<usize>,
+    /// `imported_contact_user_ids_` / `unimported_contact_invites_`
+    /// (UserManager.h:1400-1401) — the `change_imported_contacts`
+    /// results.
+    imported_contact_user_ids: Vec<UserId>,
+    unimported_contact_invites: Vec<i32>,
+
+    /// `contact_birthdates_` (UserManager.h:1388-1393).
+    contact_birthdates: ContactBirthdates,
 }
 
 impl UserManager {
     pub fn new() -> UserManager {
-        UserManager::default()
+        UserManager {
+            saved_contact_count: -1,
+            ..UserManager::default()
+        }
     }
 
     pub fn take_updates(&mut self) -> Vec<td_api::Update> {
@@ -1941,8 +2268,9 @@ impl UserManager {
 
     /// The constructor's `my_was_online_local` / `my_was_online_remote`
     /// binlog-pmc restore (UserManager.cpp:2765-2771); the freeze-state
-    /// half of the block arrives with M.4.15. `is_online` is
-    /// `OnlineManager::is_online()` — `false` until its step lands.
+    /// half of the block is [`init_freeze_state`](Self::init_freeze_state).
+    /// `is_online` is `OnlineManager::is_online()` — `false` until its
+    /// step lands.
     pub fn init_my_online_status(
         &mut self,
         binlog_pmc: &mut BinlogKeyValue,
@@ -1953,6 +2281,23 @@ impl UserManager {
         self.was_online_remote = binlog_pmc.get("my_was_online_remote").parse().unwrap_or(0);
         if self.was_online_local >= unix_time && !is_online {
             self.was_online_local = unix_time - 1;
+        }
+    }
+
+    /// The constructor's freeze-state restore (UserManager.cpp:2773-2781):
+    /// the binlog pmc `freeze_state` string `"since until appeal"` (the
+    /// C++ two `split`s) plus the `updateFreezeState` emission on a
+    /// non-empty value.
+    pub fn init_freeze_state(&mut self, binlog_pmc: &mut BinlogKeyValue) {
+        let log_event_string = binlog_pmc.get("freeze_state");
+        if !log_event_string.is_empty() {
+            let (freeze_since_date, rest) = split_first_space(&log_event_string);
+            let (freeze_until_date, freeze_appeal_url) = split_first_space(&rest);
+            self.freeze_since_date = freeze_since_date.parse().unwrap_or(0);
+            self.freeze_until_date = freeze_until_date.parse().unwrap_or(0);
+            self.freeze_appeal_url = freeze_appeal_url;
+            let update = self.get_update_freeze_state_object();
+            self.send_update(td_api::Update::updateFreezeState(update));
         }
     }
 
@@ -2081,10 +2426,11 @@ impl UserManager {
         self.get_user(user_id).is_some()
     }
 
-    /// `UserManager::have_accessible_user` (UserManager.cpp:4824-4828);
-    /// the message-registered branch lands with MessagesManager.
+    /// `UserManager::have_accessible_user` (UserManager.cpp:4824-4828):
+    /// `u != nullptr && u->is_received` — a registered but not-yet-received
+    /// user is not accessible.
     pub fn have_accessible_user(&self, user_id: UserId) -> bool {
-        self.have_min_user(user_id)
+        self.get_user(user_id).is_some_and(|u| u.is_received)
     }
 
     /// `UserManager::get_user_database_key` (UserManager.cpp:4870-4872).
@@ -2691,7 +3037,7 @@ impl UserManager {
             let secret_chat_object =
                 make_secret_chat_object(secret_chat_id, &self.secret_chats[&secret_chat_id.get()]);
             self.send_update(td_api::Update::updateSecretChat(td_api::updateSecretChat {
-                secret_chat: secret_chat_object,
+                secret_chat: Some(secret_chat_object),
             }));
             let c = self.secret_chats.get_mut(&secret_chat_id.get()).unwrap();
             c.is_changed = false;
@@ -2913,15 +3259,16 @@ impl UserManager {
         // the test DCs carry no profile photo for the special users
         if !is_test_dc && profile_photo_id != 0 {
             user.flags |= 1 << 5; // photo:flags.5
-            user.photo =
-                telegram_api::UserProfilePhoto::userProfilePhoto(telegram_api::userProfilePhoto {
+            user.photo = Some(telegram_api::UserProfilePhoto::userProfilePhoto(
+                telegram_api::userProfilePhoto {
                     flags: 0,
                     has_video: false,
                     personal: false,
                     photo_id: profile_photo_id,
                     stripped_thumb: Vec::new(),
                     dc_id: profile_photo_dc_id,
-                });
+                },
+            ));
         }
         telegram_api::User::user(user)
     }
@@ -2993,12 +3340,13 @@ impl UserManager {
                 if !preloaded {
                     self.add_user(user_id);
                 }
-            } else if is_contact && !env.auth_is_bot {
+            } else if is_contact && !self.are_contacts_loaded {
                 // preload contact users from database to know that
-                // is_contact didn't change (are_contacts_loaded_ is false
-                // until the Contacts step)
+                // is_contact didn't change and the list of contacts
+                // doesn't need to be saved to the database
                 let preloaded = self.get_user_force_impl(env, user_id, "on_get_user 3");
                 if !preloaded {
+                    tdutils::log_info!("Receive contact {user_id:?} for the first time");
                     self.add_user(user_id);
                 }
             } else {
@@ -3050,8 +3398,11 @@ impl UserManager {
         let mut need_location_bot = user.bot_inline_geo;
         let mut need_apply_min_photo = user.apply_min_photo;
         let is_fake = user.fake;
-        let stories_available =
-            (user.flags2 & USER_STORIES_MAX_ID_MASK) != 0 && user.stories_max_id.max_id > 0;
+        let stories_available = (user.flags2 & USER_STORIES_MAX_ID_MASK) != 0
+            && user
+                .stories_max_id
+                .as_ref()
+                .is_some_and(|stories_max_id| stories_max_id.max_id > 0);
         let stories_unavailable = user.stories_unavailable;
         let stories_hidden = user.stories_hidden;
         let contact_require_premium = user.contact_require_premium;
@@ -3176,8 +3527,8 @@ impl UserManager {
                 u.contact_require_premium = contact_require_premium;
                 u.paid_message_star_count = paid_message_star_count;
                 u.is_changed = true;
-                // user_full_contact_price_ — the premium-contact pricing
-                // cache lands with the contact queries
+                // the changed facts retire the cached contact price
+                self.user_full_contact_price.remove(&user_id.get());
             }
             if is_received && attach_menu_enabled != u.attach_menu_enabled {
                 u.attach_menu_enabled = attach_menu_enabled;
@@ -3229,7 +3580,7 @@ impl UserManager {
             || self.u_is_deleted(user_id)
         {
             let photo = std::mem::take(&mut user.photo);
-            self.on_update_user_photo(env, user_id, photo, source);
+            self.on_update_user_photo(env, user_id, photo.unwrap_or_default(), source);
         }
         if is_me_regular_user {
             if is_received || !self.u_is_received(user_id) {
@@ -3238,7 +3589,7 @@ impl UserManager {
             }
             if is_received || !self.u_is_received(user_id) || self.u_was_online(user_id) == 0 {
                 let status = std::mem::take(&mut user.status);
-                self.on_update_user_online_impl(env, user_id, status);
+                self.on_update_user_online_impl(env, user_id, status.unwrap_or_default());
             }
             if is_received {
                 self.on_update_user_is_contact_impl(
@@ -3261,14 +3612,19 @@ impl UserManager {
             );
             self.on_update_user_usernames_impl(env, user_id, usernames);
         }
-        let emoji_status = EmojiStatus::get_emoji_status(std::mem::take(&mut user.emoji_status));
+        let emoji_status = EmojiStatus::get_emoji_status(
+            std::mem::take(&mut user.emoji_status).unwrap_or_default(),
+        );
         self.on_update_user_emoji_status_impl(user_id, emoji_status);
 
-        if matches!(user.color, telegram_api::PeerColor::peerColorCollectible(_)) {
-            let telegram_api::PeerColor::peerColorCollectible(collectible) = std::mem::replace(
-                &mut user.color,
-                telegram_api::PeerColor::peerColor(Default::default()),
-            ) else {
+        if matches!(
+            user.color,
+            Some(telegram_api::PeerColor::peerColorCollectible(_))
+        ) {
+            let Some(telegram_api::PeerColor::peerColorCollectible(collectible)) = user
+                .color
+                .replace(telegram_api::PeerColor::peerColor(Default::default()))
+            else {
                 unreachable!("just matched");
             };
             let collectible = PeerColorCollectible::get_peer_color_collectible(collectible);
@@ -3279,7 +3635,11 @@ impl UserManager {
                 collectible,
             );
         } else {
-            let peer_color = PeerColor::from_telegram(&user.color);
+            let peer_color = user
+                .color
+                .as_ref()
+                .map(PeerColor::from_telegram)
+                .unwrap_or_default();
             self.on_update_user_colors_impl(
                 user_id,
                 peer_color.accent_color_id(),
@@ -3287,7 +3647,11 @@ impl UserManager {
                 None,
             );
         }
-        let profile_peer_color = PeerColor::from_telegram(&user.profile_color);
+        let profile_peer_color = user
+            .profile_color
+            .as_ref()
+            .map(PeerColor::from_telegram)
+            .unwrap_or_default();
         self.on_update_user_profile_colors_impl(
             user_id,
             profile_peer_color.accent_color_id(),
@@ -3303,8 +3667,11 @@ impl UserManager {
             }
             if stories_available || stories_unavailable {
                 // update at the end, because it calls need_poll_user_active_stories
-                let live = user.stories_max_id.live;
-                let max_id = user.stories_max_id.max_id;
+                let (live, max_id) = user
+                    .stories_max_id
+                    .as_ref()
+                    .map(|stories_max_id| (stories_max_id.live, stories_max_id.max_id))
+                    .unwrap_or((false, 0));
                 self.on_update_user_story_ids(user_id, live, max_id, StoryId::default());
             }
             let restriction_reasons = crate::restriction_reason::get_restriction_reasons(
@@ -3849,6 +4216,7 @@ impl UserManager {
             is_mutual_contact = false;
             is_close_friend = false;
         }
+        let mut reload_contact_birthdates = false;
         let u = self.users.get_mut(&user_id.get()).unwrap();
         if u.is_contact != is_contact
             || u.is_mutual_contact != is_mutual_contact
@@ -3861,10 +4229,13 @@ impl UserManager {
             if u.is_mutual_contact != is_mutual_contact {
                 u.is_mutual_contact = is_mutual_contact;
                 u.is_is_mutual_contact_changed = true;
-                // reload_contact_birthdates — with the Contacts step
+                reload_contact_birthdates = true;
             }
             u.is_close_friend = is_close_friend;
             u.is_changed = true;
+        }
+        if reload_contact_birthdates {
+            self.reload_contact_birthdates(env, true);
         }
     }
 
@@ -4133,7 +4504,7 @@ impl UserManager {
     }
 
     /// `UserManager::have_input_peer_user` (UserManager.cpp:5271-5300);
-    /// the user_messages branch lands with MessagesManager.
+    /// the `user_messages_` admission landed with M.4.15.
     pub fn have_input_peer_user(
         &self,
         env: &UserEnv,
@@ -4149,8 +4520,8 @@ impl UserManager {
     }
 
     /// `UserManager::have_input_peer_user(const User *, ...)`
-    /// (UserManager.cpp:5271-5286); the `user_messages_` registry branch
-    /// lands with the message-users step.
+    /// (UserManager.cpp:5271-5286); the registry admission is the
+    /// `user_messages_.count(user_id) != 0` check.
     fn have_input_peer_user_for(
         &self,
         u: Option<&User>,
@@ -4162,14 +4533,20 @@ impl UserManager {
             return true;
         }
         let Some(u) = u else {
-            return auth_is_bot && user_id.is_valid();
+            if auth_is_bot && user_id.is_valid() {
+                return true;
+            }
+            return self.user_messages.contains_key(&user_id.get());
         };
         if u.access_hash == -1 || u.is_min_access_hash {
-            return auth_is_bot && user_id.is_valid();
+            if auth_is_bot && user_id.is_valid() {
+                return true;
+            }
+            return self.user_messages.contains_key(&user_id.get());
         }
         match access_rights {
             AccessRights::Know | AccessRights::Read => true,
-            AccessRights::Write => !u.is_deleted,
+            AccessRights::Write | AccessRights::Edit => !u.is_deleted,
         }
     }
 
@@ -4204,7 +4581,9 @@ impl UserManager {
             .unwrap_or(false)
     }
 
-    /// `UserManager::get_user_search_text` (UserManager.cpp:5759-5762).
+    /// `UserManager::get_user_search_text` (UserManager.cpp:5759-5762) —
+    /// first name, last name and ALL active usernames, space-joined (the
+    /// C++ `implode`).
     pub fn get_user_search_text_of(&self, user_id: UserId) -> String {
         let Some(u) = self.get_user(user_id) else {
             return String::new();
@@ -4213,7 +4592,7 @@ impl UserManager {
             "{} {} {}",
             u.first_name,
             u.last_name,
-            u.usernames.get_first_username()
+            u.usernames.get_active_usernames().join(" ")
         )
     }
 
@@ -4246,13 +4625,13 @@ impl UserManager {
         let status = self.get_user_status_object(env, user_id);
         self.send_update(td_api::Update::updateUserStatus(td_api::updateUserStatus {
             user_id: user_id.get(),
-            status,
+            status: Some(status),
         }));
         // DialogParticipantManager::update_user_online_member_count
     }
 
-    /// Drive the online/emoji-status deadlines (the MultiTimeout
-    /// replacement); the Td actor polls this on its tick.
+    /// Drive the online/emoji-status/noforwards/rating deadlines (the
+    /// MultiTimeout replacement); the Td actor polls this on its tick.
     pub fn tick_timeouts(&mut self, env: &mut UserEnv) {
         let now = tdutils::time::now();
         let expired: Vec<i64> = self
@@ -4277,6 +4656,26 @@ impl UserManager {
                 self.update_user(env, UserId::new(id), false, false);
             }
         }
+        let expired: Vec<i32> = self
+            .noforwards_request_timeouts
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for request_id in expired {
+            self.noforwards_request_timeouts.remove(&request_id);
+            self.on_noforwards_request_timeout(env, request_id);
+        }
+        let expired: Vec<i64> = self
+            .user_rating_timeouts
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for user_id in expired {
+            self.user_rating_timeouts.remove(&user_id);
+            self.on_user_rating_timeout(env, UserId::new(user_id));
+        }
     }
 
     /// The earliest armed deadline (the member MultiTimeouts' next firing
@@ -4285,6 +4684,8 @@ impl UserManager {
         self.user_online_timeouts
             .values()
             .chain(self.user_emoji_status_timeouts.values())
+            .chain(self.noforwards_request_timeouts.values())
+            .chain(self.user_rating_timeouts.values())
             .copied()
             .min_by(f64::total_cmp)
     }
@@ -4352,9 +4753,10 @@ impl UserManager {
             .is_is_contact_changed;
         let is_username_changed = self.take_user_flag(user_id, UserFlag::Username);
         if is_name_changed || is_username_changed || is_is_contact_changed {
-            // update_contacts_hints — with the Contacts step; the C++ also
-            // clears is_username_changed here, unconditionally of which of
-            // the three flags triggered the hints update
+            // the C++ also clears is_username_changed here, unconditionally
+            // of which of the three flags triggered the hints update — the
+            // `take_user_flag(Username)` above is that clear
+            self.update_contacts_hints(env, user_id, from_database);
         }
         if self.take_user_flag(user_id, UserFlag::IsContact) {
             let is_contact = self.is_user_contact_of(user_id, false);
@@ -4486,7 +4888,7 @@ impl UserManager {
         if is_changed {
             let user_object = self.get_user_object_of(env, user_id);
             self.send_update(td_api::Update::updateUser(td_api::updateUser {
-                user: user_object,
+                user: Some(user_object),
             }));
             let u = self.users.get_mut(&user_id.get()).unwrap();
             u.is_changed = false;
@@ -4503,7 +4905,7 @@ impl UserManager {
             let status = self.get_user_status_object(env, user_id);
             self.send_update(td_api::Update::updateUserStatus(td_api::updateUserStatus {
                 user_id: user_id.get(),
-                status,
+                status: Some(status),
             }));
             let u = self.users.get_mut(&user_id.get()).unwrap();
             u.is_status_changed = false;
@@ -4658,7 +5060,9 @@ impl UserManager {
                 // CommonDialogManager::drop_common_dialogs_cache — with
                 // its step
             }
-            // the star rating timeout (cpp:10144-10151) — with StarRating
+            // the star-rating timeout arm (cpp:10144-10151) — the deadline
+            // plumbing landed with M.4.15, the arming fields and the
+            // `is_pending_star_rating_changed` flag arrive with StarRating
             if user_full.is_first_saved_music_file_id_changed {
                 user_full.is_first_saved_music_file_id_changed = false;
                 pending_saved_music_registration = Some(user_full.first_saved_music_file_id);
@@ -4707,7 +5111,7 @@ impl UserManager {
             self.send_update(td_api::Update::updateUserFullInfo(
                 td_api::updateUserFullInfo {
                     user_id: user_id_object,
-                    user_full_info: full_info,
+                    user_full_info: Some(full_info),
                 },
             ));
             let user_full = self.users_full.get_mut(&user_id.get()).unwrap();
@@ -4800,20 +5204,29 @@ impl UserManager {
         // on_update_user_full_send_paid_message_stars (cpp:9034-9035).
         let send_paid_message_stars = get_star_count(user_full.send_paid_messages_stars);
         // on_update_user_full_charge_paid_message_stars (cpp:9032-9033).
-        let charge_paid_message_stars =
-            get_star_count(user_full.settings.charge_paid_message_stars);
+        let charge_paid_message_stars = get_star_count(
+            user_full
+                .settings
+                .as_ref()
+                .map(|settings| settings.charge_paid_message_stars)
+                .unwrap_or_default(),
+        );
         // on_update_user_full_need_phone_number_privacy_exception
         // (cpp:9029-9031 + hook cpp:4446-4459).
-        let mut need_phone_number_privacy_exception = user_full.settings.need_contacts_exception;
+        let mut need_phone_number_privacy_exception = user_full
+            .settings
+            .as_ref()
+            .map(|settings| settings.need_contacts_exception)
+            .unwrap_or_default();
         if need_phone_number_privacy_exception && (is_contact || user_id == self.my_id) {
             need_phone_number_privacy_exception = false;
         }
         let birthdate = if flags2 & (1 << 5) != 0 {
-            Birthdate::new(
-                user_full.birthday.day,
-                user_full.birthday.month,
-                user_full.birthday.year,
-            )
+            user_full
+                .birthday
+                .as_ref()
+                .map(|birthday| Birthdate::new(birthday.day, birthday.month, birthday.year))
+                .unwrap_or_default()
         } else {
             Birthdate::default()
         };
@@ -4963,9 +5376,11 @@ impl UserManager {
         // record's photos are stored as the reduced `as_profile_photo`
         // form (module docs); register_user_photo works over the full
         // converted photos.
-        let photo = get_photo(std::mem::take(&mut user_full.profile_photo));
-        let personal_photo = get_photo(std::mem::take(&mut user_full.personal_photo));
-        let fallback_photo = get_photo(std::mem::take(&mut user_full.fallback_photo));
+        let photo = get_photo(std::mem::take(&mut user_full.profile_photo).unwrap_or_default());
+        let personal_photo =
+            get_photo(std::mem::take(&mut user_full.personal_photo).unwrap_or_default());
+        let fallback_photo =
+            get_photo(std::mem::take(&mut user_full.fallback_photo).unwrap_or_default());
         let (photo_ptr, is_personal) = if !personal_photo.is_empty() {
             (&personal_photo, true)
         } else if !photo.is_empty() {
@@ -5020,7 +5435,9 @@ impl UserManager {
         // The saved-music application (cpp:9295-9323) over the registry
         // stand-in.
         let first_saved_music_file_id = self
-            .parse_saved_music_document(std::mem::take(&mut user_full.saved_music))
+            .parse_saved_music_document(
+                std::mem::take(&mut user_full.saved_music).unwrap_or_default(),
+            )
             .unwrap_or_default();
         Self::on_update_user_full_first_saved_music_file_id(
             self.users_full.get_mut(&user_id.get()).unwrap(),
@@ -5126,9 +5543,13 @@ impl UserManager {
         self.update_user_full(env, user_id, "drop_user_full", false);
     }
 
-    /// `UserManager::add_user_full` (UserManager.cpp:8898-8902).
+    /// `UserManager::add_user_full` (UserManager.cpp:8898-8906) — a new
+    /// record retires the premium-contact price cache entry.
     pub fn add_user_full(&mut self, user_id: UserId) -> &mut UserFull {
         assert!(user_id.is_valid());
+        if !self.users_full.contains_key(&user_id.get()) {
+            self.user_full_contact_price.remove(&user_id.get());
+        }
         self.users_full.entry(user_id.get()).or_default()
     }
 
@@ -5286,13 +5707,16 @@ impl UserManager {
         user_id: UserId,
         force: bool,
         source: &str,
-    ) -> Result<(), &'static str> {
+    ) -> Result<bool, &'static str> {
         if !self.users.contains_key(&user_id.get()) {
             return Err("User not found");
         }
         if !self.get_user_full_force(env, user_id, source) {
-            // send_get_user_full_query — [blocked: net]
-            return Ok(());
+            // the never-loaded case: `send_get_user_full_query` parks the
+            // promise on the merged `users.getFullUser` query —
+            // [blocked: net], the merger wiring lands with the net step
+            tdutils::log_info!("Get full {user_id:?} from {source} — [blocked: net]");
+            return Ok(false);
         }
         let expired = {
             let ctx = env.time_ctx();
@@ -5302,10 +5726,14 @@ impl UserManager {
                 .is_expired(&ctx)
         };
         if expired {
-            let _ = force; // the bot gate (cpp:8942-8947) — [blocked: net]
+            // cpp:8941-8948 — the expired row triggers the background
+            // refresh query (bots: the promise itself rides the query);
+            // the refresh send is [blocked: net]
+            let _ = force;
+            tdutils::log_info!("Get full {user_id:?} refresh — [blocked: net]");
         }
         // StoryManager::on_view_dialog_active_stories — with its step
-        Ok(())
+        Ok(true)
     }
 
     /// `UserManager::reload_user_full` (UserManager.cpp:8954-8957) — the
@@ -5418,7 +5846,7 @@ impl UserManager {
     /// (UserManager.cpp:10269-10276).
     pub fn get_update_unknown_user_object(&self, user_id: UserId) -> td_api::Update {
         let user = make_unknown_user_object(user_id, self.my_id);
-        td_api::Update::updateUser(td_api::updateUser { user })
+        td_api::Update::updateUser(td_api::updateUser { user: Some(user) })
     }
 
     /// `UserManager::get_user_id_object` (UserManager.cpp:10278-10291).
@@ -5478,12 +5906,12 @@ impl UserManager {
             id: user_id.get(),
             first_name: u.first_name.clone(),
             last_name: u.last_name.clone(),
-            usernames: u.usernames.get_usernames_object(),
+            usernames: Some(u.usernames.get_usernames_object()),
             phone_number: u.phone_number.clone(),
-            status: self.get_user_status_object(env, user_id),
+            status: Some(self.get_user_status_object(env, user_id)),
             // profile_photo: null in the C++ until the Files step — the
             // codegen forces an empty payload here (module docs)
-            profile_photo: empty_profile_photo_object(),
+            profile_photo: Some(empty_profile_photo_object()),
             accent_color_id: {
                 // ThemeManager::get_accent_color_id_object(accent, default):
                 // invalid ids fall back to the id-derived default
@@ -5494,34 +5922,34 @@ impl UserManager {
                 }
             },
             background_custom_emoji_id: u.background_custom_emoji_id.get(),
-            upgraded_gift_colors: u
-                .peer_color_collectible
-                .as_ref()
-                .map(|collectible| collectible.get_upgraded_gift_colors_object())
-                .unwrap_or_default(),
+            upgraded_gift_colors: Some(
+                u.peer_color_collectible
+                    .as_ref()
+                    .map(|collectible| collectible.get_upgraded_gift_colors_object())
+                    .unwrap_or_default(),
+            ),
             profile_accent_color_id: u.profile_accent_color_id.get(),
             profile_background_custom_emoji_id: u.profile_background_custom_emoji_id.get(),
-            emoji_status,
+            emoji_status: Some(emoji_status),
             is_contact: self.is_user_contact_of(user_id, false),
             is_mutual_contact: self.is_user_contact_of(user_id, true),
             is_close_friend: u.is_close_friend,
-            verification_status: td_api::VerificationStatus {
+            verification_status: Some(td_api::VerificationStatus {
                 is_verified: u.is_verified,
                 is_scam: u.is_scam,
                 is_fake: u.is_fake,
                 bot_verification_icon_custom_emoji_id: u.bot_verification_icon.get(),
-            },
+            }),
             is_premium: u.is_premium,
             is_support: u.is_support,
-            restriction_info: get_restriction_info_object(
-                &u.restriction_reasons,
-                &env.restriction_options(),
-            )
-            .unwrap_or(td_api::RestrictionInfo {
-                restriction_reason: String::new(),
-                has_sensitive_content: false,
-            }),
-            active_story_state: {
+            restriction_info: Some(
+                get_restriction_info_object(&u.restriction_reasons, &env.restriction_options())
+                    .unwrap_or(td_api::RestrictionInfo {
+                        restriction_reason: String::new(),
+                        has_sensitive_content: false,
+                    }),
+            ),
+            active_story_state: Some({
                 let (max_active, max_read, has_live) = self.get_user_active_story_state(user_id);
                 if !max_active.is_server() {
                     // the C++ emits null; the forced stand-in is the read state
@@ -5535,11 +5963,11 @@ impl UserManager {
                 } else {
                     td_api::ActiveStoryState::activeStoryStateRead(td_api::activeStoryStateRead)
                 }
-            },
+            }),
             restricts_new_chats,
             paid_message_star_count: u.paid_message_star_count,
             have_access,
-            r#type,
+            r#type: Some(r#type),
             language_code: u.language_code.clone(),
             added_to_attachment_menu: u.attach_menu_enabled,
         }
@@ -5594,18 +6022,18 @@ impl UserManager {
         let _ = env;
         td_api::UserFullInfo {
             // photos: forced empty until the Files step (module docs)
-            personal_photo: td_api::ChatPhoto::default(),
-            photo: td_api::ChatPhoto::default(),
-            public_photo: td_api::ChatPhoto::default(),
+            personal_photo: Some(td_api::ChatPhoto::default()),
+            photo: Some(td_api::ChatPhoto::default()),
+            public_photo: Some(td_api::ChatPhoto::default()),
             community_id: user_full.linked_community_id.get(),
-            block_list: if user_full.is_blocked {
+            block_list: Some(if user_full.is_blocked {
                 td_api::BlockList::blockListMain(td_api::blockListMain)
             } else if user_full.is_blocked_for_stories {
                 td_api::BlockList::blockListStories(td_api::blockListStories)
             } else {
                 // the C++ emits null; the forced stand-in is blockListMain
                 td_api::BlockList::blockListMain(td_api::blockListMain)
-            },
+            }),
             can_be_called: user_full.can_be_called,
             supports_video_calls: user_full.supports_video_calls,
             has_private_calls: user_full.has_private_calls,
@@ -5616,50 +6044,50 @@ impl UserManager {
             need_phone_number_privacy_exception: user_full.need_phone_number_privacy_exception,
             set_chat_background: user_full.wallpaper_overridden,
             uses_unofficial_app: user_full.unofficial_security_risk,
-            bio,
-            birthdate: td_api::Birthdate {
+            bio: Some(bio),
+            birthdate: Some(td_api::Birthdate {
                 day: user_full.birthdate.get_day(),
                 month: user_full.birthdate.get_month(),
                 year: user_full.birthdate.get_year(),
-            },
+            }),
             personal_chat_id: user_full.personal_channel_id,
             gift_count: user_full.gift_count,
             group_in_common_count: user_full.common_chat_count,
             incoming_paid_message_star_count: user_full.charge_paid_message_stars,
             outgoing_paid_message_star_count: user_full.send_paid_message_stars,
-            gift_settings: td_api::GiftSettings {
+            gift_settings: Some(td_api::GiftSettings {
                 show_gift_button: false,
-                accepted_gift_types: td_api::AcceptedGiftTypes::default(),
-            },
-            bot_verification: td_api::BotVerification {
+                accepted_gift_types: Some(td_api::AcceptedGiftTypes::default()),
+            }),
+            bot_verification: Some(td_api::BotVerification {
                 bot_user_id: 0,
                 icon_custom_emoji_id: 0,
-                custom_description: td_api::FormattedText {
+                custom_description: Some(td_api::FormattedText {
                     text: String::new(),
                     entities: Vec::new(),
-                },
-            },
-            main_profile_tab: td_api::ProfileTab::profileTabPosts(td_api::profileTabPosts),
-            first_profile_audio: td_api::Audio::default(),
-            rating: td_api::UserRating {
+                }),
+            }),
+            main_profile_tab: Some(td_api::ProfileTab::profileTabPosts(td_api::profileTabPosts)),
+            first_profile_audio: Some(td_api::Audio::default()),
+            rating: Some(td_api::UserRating {
                 level: 0,
                 is_maximum_level_reached: false,
                 rating: 0,
                 ..td_api::UserRating::default()
-            },
-            pending_rating: td_api::UserRating {
+            }),
+            pending_rating: Some(td_api::UserRating {
                 level: 0,
                 is_maximum_level_reached: false,
                 rating: 0,
                 ..td_api::UserRating::default()
-            },
+            }),
             pending_rating_date: 0,
-            note: td_api::FormattedText {
+            note: Some(td_api::FormattedText {
                 text: String::new(),
                 entities: Vec::new(),
-            },
-            business_info: td_api::BusinessInfo::default(),
-            bot_info: td_api::BotInfo::default(),
+            }),
+            business_info: Some(td_api::BusinessInfo::default()),
+            bot_info: Some(td_api::BotInfo::default()),
         }
     }
 
@@ -5693,6 +6121,227 @@ impl UserManager {
 
     /// `UserManager::get_current_state`
     /// (UserManager.cpp:10533-10566) — the supported blocks.
+    /// The `are_contacts_loaded_` gate for the request layer.
+    pub(crate) fn are_contacts_loaded(&self) -> bool {
+        self.are_contacts_loaded
+    }
+
+    /// Park a load-gated td_api request (see [`PendingUserRequest`]).
+    pub(crate) fn park_pending_user_request(&mut self, request: PendingUserRequest) {
+        self.pending_user_requests.push(request);
+    }
+
+    /// `UserManager::get_user(UserId, int, Promise)`
+    /// (UserManager.cpp:5159-5192) — the request-facing overload. The
+    /// asynchronous db-load park collapses onto the synchronous
+    /// `get_user_force` re-check; the merged `users.getUsers` query tail
+    /// is [blocked: net] and answers nothing (the QueryMerger wiring
+    /// lands with the net step). `Ok(true)` — answerable;
+    /// `Ok(false)` — the query tail parked; `Err` — the promise error.
+    pub fn load_user(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        left_tries: i32,
+    ) -> Result<bool, Status> {
+        if !user_id.is_valid() {
+            return Err(Status::error(400, "Invalid user identifier"));
+        }
+
+        if user_id == UserManager::get_service_notifications_user_id()
+            || user_id == UserManager::get_replies_bot_user_id(env.global.is_test_dc())
+            || user_id == UserManager::get_verification_codes_bot_user_id()
+            || user_id == UserManager::get_anonymous_bot_user_id(env.global.is_test_dc())
+            || user_id == UserManager::get_channel_bot_user_id(env.global.is_test_dc())
+            || user_id == UserManager::get_anti_spam_bot_user_id(env.global.is_test_dc())
+        {
+            self.get_user_force(env, user_id, "get_user");
+        }
+
+        let have = if env.auth_is_bot {
+            self.have_accessible_user(user_id)
+        } else {
+            self.have_min_user(user_id)
+        };
+        if !have {
+            // the C++ `left_tries > 2 && use_chat_info_database()` branch
+            // parks the promise on the asynchronous db load; the load is
+            // synchronous here, so the re-run collapses into this check
+            if left_tries > 2 && env.global.use_chat_info_database() {
+                self.get_user_force(env, user_id, "get_user");
+            }
+            let have = if env.auth_is_bot {
+                self.have_accessible_user(user_id)
+            } else {
+                self.have_min_user(user_id)
+            };
+            if !have {
+                let r_input_user = self.get_input_user(env, user_id);
+                if left_tries == 1 || r_input_user.is_err() {
+                    return Err(match r_input_user {
+                        Err(error) => error,
+                        Ok(_) => Status::error(400, "User not found"),
+                    });
+                }
+
+                // the merged users.getUsers query — [blocked: net]
+                tdutils::log_info!("Get user {user_id:?} query — [blocked: net]");
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// The `pending_user_requests` re-run (the request actors' post-load
+    /// `do_run` re-entry). The loaded local halves answer synchronously;
+    /// an import/change whose machine went asynchronous re-parks with its
+    /// reserved `random_id` (the C++ actor re-runs on the task-promise
+    /// completion and pops the reserved result then).
+    pub(crate) fn drain_pending_user_requests(&mut self, env: &mut UserEnv) {
+        let mut index = 0;
+        while index < self.pending_user_requests.len() {
+            let request = self.pending_user_requests.remove(index);
+            match request {
+                PendingUserRequest::GetCloseFriends { mut promise } => {
+                    let user_ids = self.get_close_friends(env, Promise::default());
+                    // GetCloseFriendsRequest::do_send_result — the
+                    // close-friends list with the -1 total_count
+                    let object = Object::users(self.get_users_object_of(env, -1, &user_ids));
+                    promise.set_value(object);
+                }
+                PendingUserRequest::SearchContacts {
+                    query,
+                    limit,
+                    mut promise,
+                } => {
+                    let (total_count, user_ids) =
+                        self.search_contacts(env, &query, limit, Promise::default());
+                    let object =
+                        Object::users(self.get_users_object_of(env, total_count, &user_ids));
+                    promise.set_value(object);
+                }
+                PendingUserRequest::ImportContacts {
+                    contacts,
+                    mut random_id,
+                    mut promise,
+                } => {
+                    if random_id != 0 && !self.imported_contacts.contains_key(&random_id) {
+                        // the ImportContactsTask is still awaiting its server
+                        // answer — keep it parked until the finish hook
+                        self.pending_user_requests.insert(
+                            index,
+                            PendingUserRequest::ImportContacts {
+                                contacts,
+                                random_id,
+                                promise,
+                            },
+                        );
+                        index += 1;
+                        continue;
+                    }
+                    let result =
+                        self.import_contacts(env, contacts, &mut random_id, Promise::default());
+                    if random_id != 0 && self.import_contact_tasks.contains_key(&random_id) {
+                        // the machine went asynchronous — wake on the
+                        // on_import_contacts_finished re-run
+                        self.pending_user_requests.insert(
+                            index,
+                            PendingUserRequest::ImportContacts {
+                                contacts: Vec::new(),
+                                random_id,
+                                promise,
+                            },
+                        );
+                        index += 1;
+                    } else {
+                        // ImportContactsRequest::do_send_result
+                        let object = Object::importedContacts(
+                            self.make_imported_contacts_object(env, &result.0, &result.1),
+                        );
+                        promise.set_value(object);
+                    }
+                }
+                PendingUserRequest::ChangeImportedContacts {
+                    mut contacts,
+                    mut random_id,
+                    mut promise,
+                } => {
+                    if random_id != 0 && self.import_contact_tasks.contains_key(&random_id) {
+                        // the change task is still awaiting its server answer
+                        self.pending_user_requests.insert(
+                            index,
+                            PendingUserRequest::ChangeImportedContacts {
+                                contacts,
+                                random_id,
+                                promise,
+                            },
+                        );
+                        index += 1;
+                        continue;
+                    }
+                    let result = self.change_imported_contacts(
+                        env,
+                        &mut contacts,
+                        &mut random_id,
+                        Promise::default(),
+                    );
+                    if random_id != 0 && self.import_contact_tasks.contains_key(&random_id) {
+                        // the machine went asynchronous (the import phase) —
+                        // wake on the on_import_contacts_finished re-run
+                        self.pending_user_requests.insert(
+                            index,
+                            PendingUserRequest::ChangeImportedContacts {
+                                contacts: Vec::new(),
+                                random_id,
+                                promise,
+                            },
+                        );
+                        index += 1;
+                    } else if random_id != 0 {
+                        // the machine completed within the call (the empty
+                        // short-circuit) — the C++ actor's second run pops
+                        // the member state and answers
+                        let mut consumed = Vec::new();
+                        let result = self.change_imported_contacts(
+                            env,
+                            &mut consumed,
+                            &mut random_id,
+                            Promise::default(),
+                        );
+                        let object = Object::importedContacts(
+                            self.make_imported_contacts_object(env, &result.0, &result.1),
+                        );
+                        promise.set_value(object);
+                    } else {
+                        let object = Object::importedContacts(
+                            self.make_imported_contacts_object(env, &result.0, &result.1),
+                        );
+                        promise.set_value(object);
+                    }
+                }
+            }
+        }
+    }
+
+    /// `UserManager::get_user_ids_object` (UserManager.cpp:10361-10366)
+    /// folded into the `ImportContactsRequest::do_send_result` shape.
+    fn make_imported_contacts_object(
+        &mut self,
+        env: &mut UserEnv,
+        user_ids: &[UserId],
+        unimported_contact_invites: &[i32],
+    ) -> td_api::ImportedContacts {
+        let user_ids: Vec<i64> = user_ids
+            .iter()
+            .map(|user_id| self.get_user_id_object(env, *user_id, "ImportContactsRequest"))
+            .collect();
+        td_api::ImportedContacts {
+            user_ids,
+            importer_count: unimported_contact_invites.to_vec(),
+        }
+    }
+
     pub fn get_current_state(&mut self, env: &mut UserEnv, updates: &mut Vec<td_api::Update>) {
         let unknown_users: Vec<i64> = self.unknown_users.iter().copied().collect();
         for user_id in unknown_users {
@@ -5704,7 +6353,9 @@ impl UserManager {
         for secret_chat_id in unknown_secret_chats {
             if !self.secret_chats.contains_key(&secret_chat_id) {
                 updates.push(td_api::Update::updateSecretChat(td_api::updateSecretChat {
-                    secret_chat: make_unknown_secret_chat_object(SecretChatId::new(secret_chat_id)),
+                    secret_chat: Some(make_unknown_secret_chat_object(SecretChatId::new(
+                        secret_chat_id,
+                    ))),
                 }));
             }
         }
@@ -5713,7 +6364,7 @@ impl UserManager {
         for user_id in user_ids {
             let user_object = self.get_user_object_of(env, UserId::new(user_id));
             updates.push(td_api::Update::updateUser(td_api::updateUser {
-                user: user_object,
+                user: Some(user_object),
             }));
         }
         // secret chat objects contain user_id, so they must be sent after users
@@ -5724,9 +6375,10 @@ impl UserManager {
                 &self.secret_chats[&secret_chat_id],
             );
             updates.push(td_api::Update::updateSecretChat(td_api::updateSecretChat {
-                secret_chat: object,
+                secret_chat: Some(object),
             }));
         }
+
         // users_full blocks and the contact birthdates/freeze-state
         // updates arrive with the UserFull store and the Contacts step
     }
@@ -5737,9 +6389,11 @@ impl UserManager {
     // getters. `None`/`Err` stand-ins keep the C++ `nullptr`/400 surfaces.
 
     /// `UserManager::get_input_user` (UserManager.cpp:5206-5232). The
-    /// min-user fallback through the `user_messages_` registry arrives
-    /// with the message-users step — until then the C++ bot branch and
-    /// the 400 errors below it are the reachable outcomes.
+    /// `user_messages_` registry is in (M.4.15); the
+    /// `inputUserFromMessage` construction (cpp:5215-5224) waits for
+    /// `ChatManager::get_simple_input_peer` — the registry stays empty
+    /// until ChatManager feeds `known_channels`, so the bot branch and
+    /// the 400 errors are the reachable outcomes meanwhile.
     pub fn get_input_user(
         &self,
         env: &UserEnv,
@@ -5814,9 +6468,12 @@ impl UserManager {
     }
 
     /// `UserManager::get_input_peer_user` (UserManager.cpp:5302-5325);
-    /// `None` is the C++ `nullptr`. In the force branch the only
-    /// reachable fallback (without the `user_messages_` registry) is the
-    /// bot one, which `have_input_peer_user_for` already admitted.
+    /// `None` is the C++ `nullptr`. The registry admission is in
+    /// (M.4.15); for a registry-only user the C++ builds
+    /// `inputPeerUserFromMessage` (cpp:5312-5321) via
+    /// `ChatManager::get_simple_input_peer`, which arrives with its
+    /// slice — until then the registry stays empty and the branch is
+    /// unreachable (`None` keeps the C++ nullptr surface).
     pub fn get_input_peer_user(
         &self,
         env: &UserEnv,
@@ -5836,15 +6493,23 @@ impl UserManager {
             None => true,
             Some(u) => u.access_hash == -1 || u.is_min_access_hash,
         };
-        let access_hash = if inaccessible {
-            0
-        } else {
-            u.map(|u| u.access_hash).unwrap()
-        };
+        if inaccessible {
+            if env.auth_is_bot && user_id.is_valid() {
+                return Some(telegram_api::InputPeer::inputPeerUser(
+                    telegram_api::inputPeerUser {
+                        user_id: user_id.get(),
+                        access_hash: 0,
+                    },
+                ));
+            }
+            // the C++ `user_messages_` CHECK + `inputPeerUserFromMessage`
+            // — with ChatManager (see the doc comment)
+            return None;
+        }
         Some(telegram_api::InputPeer::inputPeerUser(
             telegram_api::inputPeerUser {
                 user_id: user_id.get(),
-                access_hash,
+                access_hash: u.map(|u| u.access_hash).unwrap(),
             },
         ))
     }
@@ -5859,7 +6524,9 @@ impl UserManager {
             None => false,
             Some(secret_chat) => match access_rights {
                 AccessRights::Know | AccessRights::Read => true,
-                AccessRights::Write => secret_chat.state == SecretChatState::Active,
+                AccessRights::Write | AccessRights::Edit => {
+                    secret_chat.state == SecretChatState::Active
+                }
             },
         }
     }
@@ -6269,10 +6936,39 @@ impl UserManager {
             self.unknown_secret_chats.insert(secret_chat_id.get());
             let secret_chat = make_unknown_secret_chat_object(secret_chat_id);
             self.send_update(td_api::Update::updateSecretChat(td_api::updateSecretChat {
-                secret_chat,
+                secret_chat: Some(secret_chat),
             }));
         }
         secret_chat_id.get()
+    }
+
+    /// `UserManager::get_secret_chat_object(SecretChatId)`
+    /// (UserManager.cpp:10514-10521) — the request-facing builder; `None`
+    /// (the C++ `nullptr` → 404 "Not Found") when the id is unknown.
+    pub(crate) fn get_secret_chat_object_for_request(
+        &mut self,
+        env: &mut UserEnv,
+        secret_chat_id: SecretChatId,
+    ) -> Option<td_api::SecretChat> {
+        let (user_id, state, is_outbound, key_hash, layer) = {
+            let secret_chat = self.get_secret_chat(secret_chat_id)?;
+            (
+                secret_chat.user_id,
+                secret_chat.state,
+                secret_chat.is_outbound,
+                secret_chat.key_hash.clone().into_bytes(),
+                secret_chat.layer,
+            )
+        };
+        self.get_user_force(env, user_id, "get_secret_chat_object");
+        Some(td_api::SecretChat {
+            id: secret_chat_id.get(),
+            user_id: self.get_user_id_object(env, user_id, "secretChat"),
+            state: Some(get_secret_chat_state_object(state)),
+            is_outbound,
+            key_hash,
+            layer,
+        })
     }
 
     // ------------------------------------------------------------------
@@ -7332,7 +8028,7 @@ impl UserManager {
         &mut self,
         file_id: FileId,
         after_file_id: FileId,
-        promise: &mut Promise<()>,
+        mut promise: Promise<()>,
     ) {
         let mut file_id = file_id;
         let mut after_file_id = after_file_id;
@@ -7348,6 +8044,7 @@ impl UserManager {
             promise.set_error(Status::error(400, "Can't place saved music after self"));
             return;
         }
+        self.net_blocked_promises.push(promise);
         tdutils::log_info!("Send messages.saveMusic — [blocked: net]");
     }
 
@@ -7438,12 +8135,13 @@ impl UserManager {
     /// `UserManager::remove_saved_music` (UserManager.cpp:7372-7378) —
     /// the validation is local; the `messages.unsaveMusic` send is
     /// [blocked: net] (M.4.16).
-    pub fn remove_saved_music(&mut self, file_id: FileId, promise: &mut Promise<()>) {
+    pub fn remove_saved_music(&mut self, file_id: FileId, mut promise: Promise<()>) {
         let mut file_id = file_id;
         if let Err(status) = self.check_saved_music_file_id(&mut file_id, false) {
             promise.set_error(status);
             return;
         }
+        self.net_blocked_promises.push(promise);
         tdutils::log_info!("Send messages.unsaveMusic — [blocked: net]");
     }
 
@@ -8080,6 +8778,1409 @@ impl UserManager {
             .map(|u| u.was_online)
             .unwrap_or(0)
     }
+
+    // ------------------------------------------------------------------
+    // Contacts (UserManager.cpp:7910-8889). The query senders are
+    // [blocked: net]: `reload_contacts` (GetContactsQuery),
+    // `add_contact` (AddContactQuery), `do_import_contacts`
+    // (ImportContactsQuery), `remove_contacts`/`remove_contacts_by_
+    // phone_number` (DeleteContacts(Query)), `clear_imported_contacts`
+    // (ResetContactsQuery), the close-friends editor (EditCloseFriends
+    // Query), `search_user_by_phone_number` (ResolvePhoneQuery),
+    // `reload_contact_birthdates` (GetContactsBirthdaysQuery) and
+    // `hide_contact_birthdays` (DismissContactBirthdaysSuggestionQuery).
+    // The load-gated entry points follow the C++ caller-retry contract:
+    // they park the promise in the load queue and return the empty
+    // result; `add_contact` and `get_imported_contact_count` re-dispatch
+    // internally, so they park in `pending_load_contacts_calls` (the
+    // C++ actor-message analogue).
+
+    /// The `UserManager` constructor's contacts block
+    /// (UserManager.cpp:2748-2759).
+    pub fn init_contacts_state(
+        &mut self,
+        binlog_pmc: &mut BinlogKeyValue,
+        unix_time: i32,
+        use_chat_info_database: bool,
+        auth_is_bot: bool,
+    ) {
+        if use_chat_info_database {
+            let next_contacts_sync_date = binlog_pmc.get("next_contacts_sync_date");
+            if !next_contacts_sync_date.is_empty() {
+                let next_contacts_sync_date: i32 = next_contacts_sync_date.parse().unwrap_or(0);
+                self.next_contacts_sync_date = next_contacts_sync_date.min(unix_time + 100_000);
+            }
+
+            let saved_contact_count = binlog_pmc.get("saved_contact_count");
+            if !saved_contact_count.is_empty() {
+                self.saved_contact_count = saved_contact_count.parse().unwrap_or(0);
+            }
+        } else if !auth_is_bot {
+            binlog_pmc.erase("next_contacts_sync_date");
+            binlog_pmc.erase("saved_contact_count");
+        }
+    }
+
+    /// `UserManager::load_contacts` (UserManager.cpp:7910-7934).
+    pub fn load_contacts(&mut self, env: &mut UserEnv, mut promise: Promise<()>) {
+        if env.auth_is_bot {
+            self.are_contacts_loaded = true;
+            self.saved_contact_count = 0;
+        }
+        if self.are_contacts_loaded && self.saved_contact_count != -1 {
+            tdutils::log_info!("Contacts are already loaded");
+            promise.set_value(());
+            return;
+        }
+        self.load_contacts_queries.push(promise);
+        if self.load_contacts_queries.len() == 1 {
+            if env.global.use_chat_info_database()
+                && self.next_contacts_sync_date > 0
+                && self.saved_contact_count != -1
+            {
+                tdutils::log_info!("Load contacts from database");
+                let value = env.global.td_db().common_kv().get(b"user_contacts");
+                self.on_load_contacts_from_database(env, value);
+            } else {
+                tdutils::log_info!("Load contacts from server");
+                self.reload_contacts(env, true);
+            }
+        } else {
+            tdutils::log_info!("Load contacts request has already been sent");
+        }
+    }
+
+    /// `UserManager::get_contacts_hash` (UserManager.cpp:7936-7956).
+    pub fn get_contacts_hash(&mut self, env: &mut UserEnv) -> i64 {
+        if !self.are_contacts_loaded {
+            return 0;
+        }
+
+        let mut user_ids = self.contacts_hints.search_empty(100_000).1;
+        debug_assert!(user_ids.windows(2).all(|w| w[0] <= w[1]));
+        let my_id = self.get_my_id();
+        if self.get_user_force(env, my_id, "get_contacts_hash") {
+            let u = self.get_user(my_id).expect("force-loaded above");
+            if u.is_contact {
+                let pos = user_ids.partition_point(|&id| id < my_id.get());
+                user_ids.insert(pos, my_id.get());
+            }
+        }
+
+        let mut numbers = Vec::with_capacity(user_ids.len() + 1);
+        numbers.push(self.saved_contact_count as u64);
+        for user_id in user_ids {
+            numbers.push(user_id as u64);
+        }
+        get_vector_hash(&numbers)
+    }
+
+    /// `UserManager::reload_contacts` (UserManager.cpp:7958-7965) — the
+    /// `GetContactsQuery` send is [blocked: net]; the sync-date gate
+    /// still advances to `i32::MAX` exactly like the C++ before the send.
+    pub fn reload_contacts(&mut self, env: &mut UserEnv, force: bool) {
+        if !env.global.close_flag()
+            && !env.auth_is_bot
+            && self.next_contacts_sync_date != i32::MAX
+            && (self.next_contacts_sync_date < env.unix_time() || force)
+        {
+            self.next_contacts_sync_date = i32::MAX;
+            tdutils::log_info!(
+                "Get contacts with hash {} — [blocked: net]",
+                self.get_contacts_hash(env)
+            );
+        }
+    }
+
+    /// `UserManager::save_next_contacts_sync_date`
+    /// (UserManager.cpp:7967-7975).
+    pub fn save_next_contacts_sync_date(&mut self, env: &mut UserEnv) {
+        if env.global.close_flag() || !env.global.use_chat_info_database() {
+            return;
+        }
+        env.global.binlog_pmc().set(
+            "next_contacts_sync_date",
+            &self.next_contacts_sync_date.to_string(),
+        );
+    }
+
+    /// `UserManager::save_contacts_to_database` (UserManager.cpp:7977-7999)
+    /// — the binlog force-sync + async sqlite set collapse onto the
+    /// synchronous pmc + kv writes (the M.4.5 divergence).
+    pub fn save_contacts_to_database(&mut self, env: &mut UserEnv) {
+        if !env.global.use_chat_info_database() || !self.are_contacts_loaded {
+            return;
+        }
+
+        tdutils::log_info!("Schedule save contacts to database");
+        let user_ids = self.contacts_hints.search_empty(100_000).1;
+
+        env.global
+            .binlog_pmc()
+            .set("saved_contact_count", &self.saved_contact_count.to_string());
+        let mut value = Vec::with_capacity(8 * (user_ids.len() + 2));
+        store_user_ids_log_event(&mut value, &user_ids);
+        env.global.td_db().common_kv().set(b"user_contacts", &value);
+        self.save_next_contacts_sync_date(env);
+    }
+
+    /// `UserManager::on_get_contacts` (UserManager.cpp:8001-8054) — the
+    /// `GetContactsStatusesQuery` send is [blocked: net].
+    pub fn on_get_contacts(
+        &mut self,
+        env: &mut UserEnv,
+        new_contacts: telegram_api::contacts_Contacts,
+    ) {
+        self.next_contacts_sync_date = env.unix_time() + random_fast(70_000, 100_000);
+
+        match new_contacts {
+            telegram_api::contacts_Contacts::contacts_contactsNotModified(
+                telegram_api::contacts_contactsNotModified,
+            ) => {
+                if self.saved_contact_count == -1 {
+                    self.saved_contact_count = 0;
+                }
+                self.on_get_contacts_finished(env, self.contacts_hints.size());
+                tdutils::log_info!("Get contacts statuses — [blocked: net]");
+            }
+            telegram_api::contacts_Contacts::contacts_contacts(contacts) => {
+                let mut contact_user_ids: BTreeSet<i64> = BTreeSet::new();
+                for user in &contacts.users {
+                    let user_id = match user {
+                        telegram_api::User::user(user) => UserId::new(user.id),
+                        telegram_api::User::userEmpty(user) => UserId::new(user.id),
+                    };
+                    if !user_id.is_valid() {
+                        tdutils::log_error!("Receive invalid {user_id:?}");
+                        continue;
+                    }
+                    contact_user_ids.insert(user_id.get());
+                }
+                self.on_get_users(env, contacts.users, "on_get_contacts");
+
+                let my_id = self.get_my_id();
+                let user_ids: Vec<i64> = self.users.keys().copied().collect();
+                for user_id in user_ids {
+                    let is_contact = self
+                        .users
+                        .get(&user_id)
+                        .expect("collected above")
+                        .is_contact;
+                    let should_be_contact = contact_user_ids.contains(&user_id);
+                    if is_contact != should_be_contact {
+                        if is_contact {
+                            tdutils::log_info!("Drop contact with {user_id}");
+                            if user_id != my_id.get() {
+                                assert!(
+                                    self.contacts_hints.has_key(user_id),
+                                    "{} {} {}",
+                                    my_id.get(),
+                                    user_id,
+                                    self.get_user_search_text_of(UserId::new(user_id))
+                                );
+                            }
+                            self.on_update_user_is_contact_impl(
+                                env,
+                                UserId::new(user_id),
+                                false,
+                                false,
+                                false,
+                            );
+                            {
+                                let u = self.users.get_mut(&user_id).expect("collected above");
+                                assert!(u.is_is_contact_changed);
+                                u.cache_version = 0;
+                                u.is_repaired = false;
+                            }
+                            self.update_user(env, UserId::new(user_id), false, false);
+                            assert!(
+                                !self
+                                    .users
+                                    .get(&user_id)
+                                    .expect("collected above")
+                                    .is_contact
+                            );
+                            if user_id != my_id.get() {
+                                assert!(!self.contacts_hints.has_key(user_id));
+                            }
+                        } else {
+                            tdutils::log_error!(
+                                "Receive non-contact {user_id} in the list of contacts"
+                            );
+                        }
+                    }
+                }
+
+                self.saved_contact_count = contacts.saved_count;
+                self.on_get_contacts_finished(env, usize::MAX);
+            }
+        }
+    }
+
+    /// `UserManager::on_get_contacts_failed` (UserManager.cpp:8056-8060).
+    pub fn on_get_contacts_failed(&mut self, env: &mut UserEnv, error: Status) {
+        self.next_contacts_sync_date = env.unix_time() + random_fast(5, 10);
+        fail_promises(&mut self.load_contacts_queries, &error);
+        for call in std::mem::take(&mut self.pending_load_contacts_calls) {
+            match call {
+                PendingLoadContactsCall::AddContact { mut promise, .. } => {
+                    promise.set_error(error.clone());
+                }
+                PendingLoadContactsCall::GetImportedContactCount { mut promise } => {
+                    promise.set_error(error.clone());
+                }
+                PendingLoadContactsCall::SharePhoneNumber { mut promise, .. } => {
+                    promise.set_error(error.clone());
+                }
+            }
+        }
+    }
+
+    /// `UserManager::on_load_contacts_from_database`
+    /// (UserManager.cpp:8062-8103) — the
+    /// `load_contact_users_multipromise_` fan-in collapses onto the
+    /// synchronous per-user loads; a user that fails to load (a broken
+    /// row) falls back to `reload_contacts(true)` like the C++ multipromise
+    /// error path.
+    fn on_load_contacts_from_database(&mut self, env: &mut UserEnv, value: Vec<u8>) {
+        if env.global.close_flag() {
+            return;
+        }
+        if value.is_empty() {
+            self.reload_contacts(env, true);
+            return;
+        }
+
+        let user_ids = match parse_user_ids_log_event(&value) {
+            Ok(user_ids) => user_ids,
+            Err(_) => {
+                tdutils::log_error!("Failed to load contacts from database");
+                self.reload_contacts(env, true);
+                return;
+            }
+        };
+
+        let version = Parser::new_log_event(&value)
+            .map(|parser| parser.version())
+            .unwrap_or(0);
+        if version < store_parse::version::ADD_USER_FLAGS2 {
+            self.next_contacts_sync_date = 0;
+            self.save_next_contacts_sync_date(env);
+            self.reload_contacts(env, true);
+        }
+
+        tdutils::log_info!(
+            "Successfully loaded {} contacts from database",
+            user_ids.len()
+        );
+        let expected_contact_count = user_ids.len();
+        for user_id in user_ids {
+            if !self.get_user_force(env, UserId::new(user_id), "load contacts from database") {
+                tdutils::log_info!("Failed to load contact users from database");
+                self.reload_contacts(env, true);
+                return;
+            }
+        }
+        self.on_get_contacts_finished(env, expected_contact_count);
+    }
+
+    /// `UserManager::on_get_contacts_finished` (UserManager.cpp:8105-8112).
+    fn on_get_contacts_finished(&mut self, env: &mut UserEnv, expected_contact_count: usize) {
+        tdutils::log_info!(
+            "Finished to get {} contacts out of expected {}",
+            self.contacts_hints.size(),
+            expected_contact_count
+        );
+        self.are_contacts_loaded = true;
+        set_promises(&mut self.load_contacts_queries);
+        if expected_contact_count != self.contacts_hints.size() {
+            self.save_contacts_to_database(env);
+        }
+        for call in std::mem::take(&mut self.pending_load_contacts_calls) {
+            match call {
+                PendingLoadContactsCall::AddContact {
+                    user_id,
+                    contact,
+                    share_phone_number,
+                    promise,
+                } => self.add_contact(env, user_id, contact, share_phone_number, promise),
+                PendingLoadContactsCall::GetImportedContactCount { promise } => {
+                    self.get_imported_contact_count(env, promise)
+                }
+                PendingLoadContactsCall::SharePhoneNumber { user_id, promise } => {
+                    self.share_phone_number(env, user_id, promise)
+                }
+            }
+        }
+    }
+
+    /// `UserManager::on_get_contacts_statuses` (UserManager.cpp:8114-8123).
+    pub fn on_get_contacts_statuses(
+        &mut self,
+        env: &mut UserEnv,
+        statuses: Vec<telegram_api::ContactStatus>,
+    ) {
+        let my_user_id = self.get_my_id();
+        for status in statuses {
+            let user_id = UserId::new(status.user_id);
+            if user_id != my_user_id {
+                self.on_update_user_online(env, user_id, status.status.unwrap_or_default());
+            }
+        }
+        self.save_next_contacts_sync_date(env);
+    }
+
+    /// `UserManager::add_contact` (UserManager.cpp:8125-8153) — the note
+    /// branch (`on_set_user_note`) and the `AddContactQuery` send are
+    /// [blocked: net] (the note is the MessageEntity step).
+    pub fn add_contact(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        contact: Contact,
+        share_phone_number: bool,
+        mut promise: Promise<()>,
+    ) {
+        let input_user = match self.get_input_user(env, user_id) {
+            Ok(input_user) => input_user,
+            Err(error) => return promise.set_error(error),
+        };
+        let _ = input_user; // the AddContactQuery payload — [blocked: net]
+
+        if !self.are_contacts_loaded {
+            self.pending_load_contacts_calls
+                .push(PendingLoadContactsCall::AddContact {
+                    user_id,
+                    contact,
+                    share_phone_number,
+                    promise,
+                });
+            self.load_contacts(env, Promise::default());
+            return;
+        }
+
+        tdutils::log_info!(
+            "Add contact {contact:?} for {user_id:?} with share_phone_number = {share_phone_number}"
+        );
+        // AddContactQuery — [blocked: net]
+        tdutils::log_info!("Add contact query — [blocked: net]");
+    }
+
+    /// `UserManager::import_contacts` (UserManager.cpp:8155-8181) — the
+    /// `ImportContactsQuery` send is [blocked: net]; the caller-retry
+    /// contract keeps the promise in the load queue when the contacts
+    /// aren't loaded yet.
+    pub fn import_contacts(
+        &mut self,
+        env: &mut UserEnv,
+        contacts: Vec<Contact>,
+        random_id: &mut i64,
+        mut promise: Promise<()>,
+    ) -> (Vec<UserId>, Vec<i32>) {
+        if !self.are_contacts_loaded {
+            self.load_contacts(env, promise);
+            return (Vec::new(), Vec::new());
+        }
+
+        tdutils::log_info!(
+            "Asked to import {} contacts with random_id = {}",
+            contacts.len(),
+            *random_id
+        );
+        if *random_id != 0 {
+            // request has already been sent before
+            let Some(result) = self.imported_contacts.remove(random_id) else {
+                panic!("reserved import result slot is missing");
+            };
+            promise.set_value(());
+            return result;
+        }
+
+        loop {
+            *random_id = tdutils::random::secure_int64();
+            if *random_id != 0 && *random_id != 1 && !self.imported_contacts.contains_key(random_id)
+            {
+                break;
+            }
+        }
+        self.imported_contacts
+            .insert(*random_id, (Vec::new(), Vec::new())); // reserve place for result
+
+        self.do_import_contacts(env, contacts, *random_id, promise);
+        (Vec::new(), Vec::new())
+    }
+
+    /// `UserManager::do_import_contacts` (UserManager.cpp:8183-8206) —
+    /// the `ImportContactsQuery` send is [blocked: net]; the task is
+    /// registered and waits for `on_imported_contacts`/`on_import_
+    /// contacts_finished` like in the C++.
+    fn do_import_contacts(
+        &mut self,
+        env: &mut UserEnv,
+        contacts: Vec<Contact>,
+        random_id: i64,
+        mut promise: Promise<()>,
+    ) {
+        let size = contacts.len();
+        if size == 0 {
+            self.on_import_contacts_finished(env, random_id, Vec::new(), Vec::new());
+            promise.set_value(());
+            return;
+        }
+
+        let task = ImportContactsTask {
+            promise,
+            input_contacts: contacts,
+            imported_user_ids: vec![UserId::default(); size],
+            unimported_contact_invites: vec![0; size],
+        };
+        let is_added = self.import_contact_tasks.insert(random_id, task).is_none();
+        assert!(is_added);
+
+        // ImportContactsQuery — [blocked: net]
+        tdutils::log_info!("Import {} contacts query — [blocked: net]", size);
+    }
+
+    /// `UserManager::on_imported_contacts` (UserManager.cpp:8208-8268) —
+    /// the retry re-send is [blocked: net]; the task stays registered
+    /// exactly like the C++ between the retry rounds.
+    pub fn on_imported_contacts(
+        &mut self,
+        env: &mut UserEnv,
+        random_id: i64,
+        result: Result<telegram_api::contacts_ImportedContacts, Status>,
+    ) {
+        if let Err(error) = result {
+            let mut task = self
+                .import_contact_tasks
+                .remove(&random_id)
+                .expect("import task exists");
+            task.promise.set_error(error);
+            return;
+        }
+        let imported_contacts = result.expect("checked above");
+
+        self.on_get_users(env, imported_contacts.users, "on_imported_contacts");
+
+        {
+            let task = self
+                .import_contact_tasks
+                .get_mut(&random_id)
+                .expect("import task exists");
+            for imported_contact in &imported_contacts.imported {
+                let client_id = imported_contact.client_id;
+                if client_id < 0 || client_id >= task.imported_user_ids.len() as i64 {
+                    tdutils::log_error!("Wrong client_id {client_id} returned");
+                    continue;
+                }
+                task.imported_user_ids[client_id as usize] = UserId::new(imported_contact.user_id);
+            }
+            for popular_contact in &imported_contacts.popular_invites {
+                let client_id = popular_contact.client_id;
+                if client_id < 0 || client_id >= task.unimported_contact_invites.len() as i64 {
+                    tdutils::log_error!("Wrong client_id {client_id} returned");
+                    continue;
+                }
+                if popular_contact.importers < 0 {
+                    tdutils::log_error!(
+                        "Wrong number of importers {} returned",
+                        popular_contact.importers
+                    );
+                    continue;
+                }
+                task.unimported_contact_invites[client_id as usize] = popular_contact.importers;
+            }
+        }
+
+        if !imported_contacts.retry_contacts.is_empty() {
+            // the C++ re-sends the retry client ids with the same
+            // random_id and keeps the task — [blocked: net]
+            tdutils::log_info!(
+                "Retry {} contacts import — [blocked: net]",
+                imported_contacts.retry_contacts.len()
+            );
+            return;
+        }
+
+        let mut task = self
+            .import_contact_tasks
+            .remove(&random_id)
+            .expect("checked above");
+        self.on_import_contacts_finished(
+            env,
+            random_id,
+            std::mem::take(&mut task.imported_user_ids),
+            std::mem::take(&mut task.unimported_contact_invites),
+        );
+        task.promise.set_value(());
+    }
+
+    /// `UserManager::on_import_contacts_finished`
+    /// (UserManager.cpp:8270-8328).
+    pub fn on_import_contacts_finished(
+        &mut self,
+        env: &mut UserEnv,
+        random_id: i64,
+        imported_contact_user_ids: Vec<UserId>,
+        unimported_contact_invites: Vec<i32>,
+    ) {
+        tdutils::log_info!(
+            "Contacts import with random_id {random_id} has finished: {imported_contact_user_ids:?}"
+        );
+        if random_id == 1 {
+            // import from change_imported_contacts
+            self.all_imported_contacts = std::mem::take(&mut self.next_all_imported_contacts);
+
+            let result_size = self.imported_contacts_unique_id.len();
+            let unique_size = self.all_imported_contacts.len();
+            let add_size = self.imported_contacts_pos.len();
+
+            self.imported_contact_user_ids
+                .resize(result_size, UserId::default());
+            self.unimported_contact_invites.resize(result_size, 0);
+
+            assert!(imported_contact_user_ids.len() == add_size);
+            assert!(unimported_contact_invites.len() == add_size);
+            assert!(self.imported_contacts_unique_id.len() == result_size);
+
+            let mut unique_id_to_unimported_contact_invites: HashMap<i64, i32> = HashMap::new();
+            for i in 0..add_size {
+                let unique_id = self.imported_contacts_pos[i];
+                // to ensure updateUser
+                self.get_user_id_object(
+                    env,
+                    imported_contact_user_ids[i],
+                    "on_import_contacts_finished",
+                );
+                self.all_imported_contacts[unique_id].set_user_id(imported_contact_user_ids[i]);
+                unique_id_to_unimported_contact_invites
+                    .insert(unique_id as i64, unimported_contact_invites[i]);
+            }
+
+            if env.global.use_chat_info_database() {
+                // the binlog force-sync collapses onto the synchronous kv
+                // write (the M.4.5 divergence)
+                let mut value = Vec::new();
+                store_contacts_log_event(&mut value, &self.all_imported_contacts);
+                env.global
+                    .td_db()
+                    .common_kv()
+                    .set(b"user_imported_contacts", &value);
+            }
+
+            for i in 0..result_size {
+                let unique_id = self.imported_contacts_unique_id[i];
+                assert!(unique_id < unique_size);
+                self.imported_contact_user_ids[i] =
+                    self.all_imported_contacts[unique_id].get_user_id();
+                match unique_id_to_unimported_contact_invites.get(&(unique_id as i64)) {
+                    Some(invites) => self.unimported_contact_invites[i] = *invites,
+                    None => self.unimported_contact_invites[i] = 0,
+                }
+            }
+            // the parked change requests re-run now (the C++ request actor
+            // wakes on the task promise and pops the member state)
+            self.drain_pending_user_requests(env);
+            return;
+        }
+
+        let entry = self
+            .imported_contacts
+            .get_mut(&random_id)
+            .expect("reserved import result slot exists");
+        assert!(entry.0.is_empty());
+        assert!(entry.1.is_empty());
+        *entry = (imported_contact_user_ids, unimported_contact_invites);
+        // the parked import/change requests re-run now (the C++ request
+        // actor wakes on the task promise and pops the reserved result)
+        self.drain_pending_user_requests(env);
+    }
+
+    /// `UserManager::remove_contacts` (UserManager.cpp:8330-8353) — the
+    /// `DeleteContactsQuery` send is [blocked: net].
+    pub fn remove_contacts(
+        &mut self,
+        env: &mut UserEnv,
+        user_ids: Vec<UserId>,
+        mut promise: Promise<()>,
+    ) {
+        tdutils::log_info!("Delete contacts: {user_ids:?}");
+        if !self.are_contacts_loaded {
+            self.load_contacts(env, promise);
+            return;
+        }
+
+        let mut input_users: Vec<telegram_api::InputUser> = Vec::new();
+        for user_id in user_ids {
+            if self.get_user(user_id).is_some_and(|u| u.is_contact)
+                && let Ok(input_user) = self.get_input_user(env, user_id)
+            {
+                input_users.push(input_user);
+            }
+        }
+
+        if input_users.is_empty() {
+            promise.set_value(());
+            return;
+        }
+
+        // DeleteContactsQuery — [blocked: net]
+        tdutils::log_info!(
+            "Delete {} contacts query — [blocked: net]",
+            input_users.len()
+        );
+    }
+
+    /// `UserManager::remove_contacts_by_phone_number`
+    /// (UserManager.cpp:8355-8365) — the `DeleteContactsByPhoneNumberQuery`
+    /// send is [blocked: net].
+    pub fn remove_contacts_by_phone_number(
+        &mut self,
+        env: &mut UserEnv,
+        user_phone_numbers: Vec<String>,
+        user_ids: Vec<UserId>,
+        promise: Promise<()>,
+    ) {
+        tdutils::log_info!("Delete contacts by phone number: {user_phone_numbers:?}");
+        if !self.are_contacts_loaded {
+            self.load_contacts(env, promise);
+            return;
+        }
+
+        // DeleteContactsByPhoneNumberQuery — [blocked: net]
+        tdutils::log_info!(
+            "Delete contacts by phone number query ({} numbers, {user_ids:?}) — [blocked: net]",
+            user_phone_numbers.len()
+        );
+    }
+
+    /// `UserManager::on_deleted_contacts` (UserManager.cpp:8367-8386).
+    pub fn on_deleted_contacts(&mut self, env: &mut UserEnv, deleted_contact_user_ids: &[UserId]) {
+        tdutils::log_info!("Contacts deletion has finished for {deleted_contact_user_ids:?}");
+
+        for user_id in deleted_contact_user_ids {
+            let is_contact = self
+                .users
+                .get(&user_id.get())
+                .expect("contact user exists")
+                .is_contact;
+            if !is_contact {
+                continue;
+            }
+
+            tdutils::log_info!("Drop contact with {user_id:?}");
+            self.on_update_user_is_contact_impl(env, *user_id, false, false, false);
+            {
+                let u = self
+                    .users
+                    .get_mut(&user_id.get())
+                    .expect("contact user exists");
+                assert!(u.is_is_contact_changed);
+                u.cache_version = 0;
+                u.is_repaired = false;
+            }
+            self.update_user(env, *user_id, false, false);
+            assert!(
+                !self
+                    .users
+                    .get(&user_id.get())
+                    .expect("contact user exists")
+                    .is_contact
+            );
+            assert!(!self.contacts_hints.has_key(user_id.get()));
+        }
+    }
+
+    /// `UserManager::get_imported_contact_count` (UserManager.cpp:8388-8404).
+    pub fn get_imported_contact_count(&mut self, env: &mut UserEnv, mut promise: Promise<i32>) {
+        if !self.are_contacts_loaded || self.saved_contact_count == -1 {
+            self.pending_load_contacts_calls
+                .push(PendingLoadContactsCall::GetImportedContactCount { promise });
+            self.load_contacts(env, Promise::default());
+            return;
+        }
+        self.reload_contacts(env, false);
+
+        promise.set_value(self.saved_contact_count);
+    }
+
+    /// `UserManager::load_imported_contacts` (UserManager.cpp:8406-8431).
+    pub fn load_imported_contacts(&mut self, env: &mut UserEnv, mut promise: Promise<()>) {
+        if env.auth_is_bot {
+            self.are_imported_contacts_loaded = true;
+        }
+        if self.are_imported_contacts_loaded {
+            tdutils::log_info!("Imported contacts are already loaded");
+            promise.set_value(());
+            return;
+        }
+        self.load_imported_contacts_queries.push(promise);
+        if self.load_imported_contacts_queries.len() == 1 {
+            if env.global.use_chat_info_database() {
+                tdutils::log_info!("Load imported contacts from database");
+                let value = env
+                    .global
+                    .td_db()
+                    .common_kv()
+                    .get(b"user_imported_contacts");
+                self.on_load_imported_contacts_from_database(env, value);
+            } else {
+                tdutils::log_info!("Have no previously imported contacts");
+                self.on_load_imported_contacts_from_database(env, Vec::new());
+            }
+        } else {
+            tdutils::log_info!("Load imported contacts request has already been sent");
+        }
+    }
+
+    /// `UserManager::on_load_imported_contacts_from_database`
+    /// (UserManager.cpp:8433-8471) — the
+    /// `load_imported_contact_users_multipromise_` fan-in collapses onto
+    /// the synchronous per-user loads.
+    fn on_load_imported_contacts_from_database(&mut self, env: &mut UserEnv, value: Vec<u8>) {
+        if env.global.close_flag() {
+            return;
+        }
+
+        assert!(!self.are_imported_contacts_loaded);
+        let mut value = value;
+        if self.need_clear_imported_contacts {
+            self.need_clear_imported_contacts = false;
+            value.clear();
+        }
+        if value.is_empty() {
+            assert!(self.all_imported_contacts.is_empty());
+        } else if let Ok(contacts) = parse_contacts_log_event(&value) {
+            tdutils::log_info!(
+                "Successfully loaded {} imported contacts from database",
+                contacts.len()
+            );
+            self.all_imported_contacts = contacts;
+        } else {
+            tdutils::log_error!("Failed to load all imported contacts from database");
+            self.all_imported_contacts.clear();
+        }
+
+        // the C++ multipromise leaves the load pending on a user-load
+        // failure; the synchronous load is infallible except for a broken
+        // row, which reproduces that stall
+        let user_ids: Vec<UserId> = self
+            .all_imported_contacts
+            .iter()
+            .map(|contact| contact.get_user_id())
+            .filter(|user_id| user_id.is_valid())
+            .collect();
+        for user_id in user_ids {
+            if !self.get_user_force(env, user_id, "load imported contacts") {
+                tdutils::log_info!("Failed to load imported contact users from database");
+                return;
+            }
+        }
+        self.on_load_imported_contacts_finished(env);
+    }
+
+    /// `UserManager::on_load_imported_contacts_finished`
+    /// (UserManager.cpp:8473-8486).
+    fn on_load_imported_contacts_finished(&mut self, env: &mut UserEnv) {
+        tdutils::log_info!(
+            "Finished to load {} imported contacts",
+            self.all_imported_contacts.len()
+        );
+
+        let user_ids: Vec<UserId> = self
+            .all_imported_contacts
+            .iter()
+            .map(|contact| contact.get_user_id())
+            .collect();
+        for user_id in user_ids {
+            // to ensure updateUser
+            self.get_user_id_object(env, user_id, "on_load_imported_contacts_finished");
+        }
+
+        if self.need_clear_imported_contacts {
+            self.need_clear_imported_contacts = false;
+            self.all_imported_contacts.clear();
+        }
+        self.are_imported_contacts_loaded = true;
+        set_promises(&mut self.load_imported_contacts_queries);
+    }
+
+    /// `UserManager::change_imported_contacts`
+    /// (UserManager.cpp:8488-8598) — the
+    /// `remove_contacts_by_phone_number` continuation and the
+    /// `ImportContactsQuery` re-send are [blocked: net]; the dedup
+    /// machine, the to-delete/to-add diff and the
+    /// `are_imported_contacts_changing_` gate are ported.
+    pub fn change_imported_contacts(
+        &mut self,
+        env: &mut UserEnv,
+        contacts: &mut [Contact],
+        random_id: &mut i64,
+        mut promise: Promise<()>,
+    ) -> (Vec<UserId>, Vec<i32>) {
+        if !self.are_contacts_loaded {
+            self.load_contacts(env, promise);
+            return (Vec::new(), Vec::new());
+        }
+        if !self.are_imported_contacts_loaded {
+            self.load_imported_contacts(env, promise);
+            return (Vec::new(), Vec::new());
+        }
+
+        tdutils::log_info!(
+            "Asked to change imported contacts to a list of {} contacts with random_id = {}",
+            contacts.len(),
+            *random_id
+        );
+        if *random_id != 0 {
+            // request has already been sent before
+            if self.need_clear_imported_contacts {
+                self.need_clear_imported_contacts = false;
+                self.all_imported_contacts.clear();
+                if env.global.use_chat_info_database() {
+                    env.global
+                        .td_db()
+                        .common_kv()
+                        .erase(b"user_imported_contacts");
+                }
+                self.reload_contacts(env, true);
+            }
+
+            assert!(self.are_imported_contacts_changing);
+            self.are_imported_contacts_changing = false;
+
+            let unimported_contact_invites = std::mem::take(&mut self.unimported_contact_invites);
+            let imported_contact_user_ids = std::mem::take(&mut self.imported_contact_user_ids);
+
+            promise.set_value(());
+            return (imported_contact_user_ids, unimported_contact_invites);
+        }
+
+        if self.are_imported_contacts_changing {
+            promise.set_error(Status::error(
+                400,
+                "ChangeImportedContacts can be called only once at the same time",
+            ));
+            return (Vec::new(), Vec::new());
+        }
+
+        let mut new_contacts_unique_id: Vec<usize> = Vec::with_capacity(contacts.len());
+        let mut unique_new_contacts: Vec<Contact> = Vec::with_capacity(contacts.len());
+        // the C++ unordered_map<Contact, size_t, ContactHash, ContactEqual>
+        // — keyed on (phone number, first name, last name)
+        let mut different_new_contacts: HashMap<(String, String, String), (Contact, usize)> =
+            HashMap::new();
+        let mut different_new_phone_numbers: BTreeSet<String> = BTreeSet::new();
+        let mut unique_size = 0usize;
+        for contact in contacts.iter().cloned() {
+            let key = contact.get_dedup_key();
+            let unique_id = match different_new_contacts.entry(key.clone()) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.get().1,
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    unique_new_contacts.push(contact.clone());
+                    different_new_phone_numbers.insert(contact.get_phone_number().to_owned());
+                    entry.insert((contact, unique_size));
+                    unique_size += 1;
+                    unique_size - 1
+                }
+            };
+            new_contacts_unique_id.push(unique_id);
+        }
+
+        let mut to_delete: Vec<String> = Vec::new();
+        let mut to_delete_user_ids: Vec<UserId> = Vec::new();
+        for old_contact in &self.all_imported_contacts {
+            let user_id = old_contact.get_user_id();
+            let key = old_contact.get_dedup_key();
+            if !different_new_contacts.contains_key(&key) {
+                let phone_number = old_contact.get_phone_number().to_owned();
+                if !different_new_phone_numbers.contains(&phone_number) {
+                    to_delete.push(phone_number);
+                    if user_id.is_valid() {
+                        to_delete_user_ids.push(user_id);
+                    }
+                }
+            } else {
+                let (_, unique_id) = different_new_contacts.remove(&key).expect("checked above");
+                unique_new_contacts[unique_id].set_user_id(user_id);
+            }
+        }
+        let to_add: (Vec<usize>, Vec<Contact>) = different_new_contacts
+            .into_values()
+            .map(|(contact, unique_id)| (unique_id, contact))
+            .unzip();
+
+        if to_add.0.is_empty() && to_delete.is_empty() {
+            for i in 0..contacts.len() {
+                let unique_id = new_contacts_unique_id[i];
+                contacts[i].set_user_id(unique_new_contacts[unique_id].get_user_id());
+            }
+
+            promise.set_value(());
+            return (
+                contacts
+                    .iter()
+                    .map(|contact| contact.get_user_id())
+                    .collect(),
+                vec![0; contacts.len()],
+            );
+        }
+
+        self.are_imported_contacts_changing = true;
+        *random_id = 1;
+
+        self.remove_contacts_by_phone_number(
+            env,
+            to_delete,
+            to_delete_user_ids,
+            Promise::default(),
+        );
+        // the C++ chains the removal query into on_clear_imported_contacts
+        // → do_import_contacts(1); both ride the net step, so the
+        // continuation is driven explicitly by the callers (the tests) —
+        // [blocked: net]
+        (Vec::new(), Vec::new())
+    }
+
+    /// `UserManager::clear_imported_contacts` (UserManager.cpp:8600-8609)
+    /// — the `ResetContactsQuery` send is [blocked: net].
+    pub fn clear_imported_contacts(&mut self, _env: &mut UserEnv, mut promise: Promise<()>) {
+        tdutils::log_info!("Delete imported contacts");
+
+        if self.saved_contact_count == 0 {
+            promise.set_value(());
+            return;
+        }
+
+        // ResetContactsQuery — [blocked: net]; the promise parks until
+        // the net query actors land
+        self.net_blocked_promises.push(promise);
+        tdutils::log_info!("Reset contacts query — [blocked: net]");
+    }
+
+    /// `UserManager::on_clear_imported_contacts`
+    /// (UserManager.cpp:8611-8620).
+    pub fn on_clear_imported_contacts(
+        &mut self,
+        env: &mut UserEnv,
+        contacts: Vec<Contact>,
+        contacts_unique_id: Vec<usize>,
+        to_add: (Vec<usize>, Vec<Contact>),
+        promise: Promise<()>,
+    ) {
+        tdutils::log_info!("Add {} contacts", to_add.0.len());
+        self.next_all_imported_contacts = contacts;
+        self.imported_contacts_unique_id = contacts_unique_id;
+        self.imported_contacts_pos = to_add.0;
+
+        self.do_import_contacts(env, to_add.1, 1, promise);
+    }
+
+    /// `UserManager::on_update_contacts_reset`
+    /// (UserManager.cpp:8622-8668).
+    pub fn on_update_contacts_reset(&mut self, env: &mut UserEnv) {
+        self.saved_contact_count = 0;
+        if env.global.use_chat_info_database() {
+            env.global.binlog_pmc().set("saved_contact_count", "0");
+            env.global
+                .td_db()
+                .common_kv()
+                .erase(b"user_imported_contacts");
+        }
+        if !self.are_imported_contacts_loaded {
+            if self.load_imported_contacts_queries.is_empty() {
+                assert!(self.all_imported_contacts.is_empty());
+                tdutils::log_info!("Imported contacts were never loaded, just clear them");
+            } else {
+                tdutils::log_info!(
+                    "Imported contacts are being loaded, clear them after they will be loaded"
+                );
+                self.need_clear_imported_contacts = true;
+            }
+        } else if !self.are_imported_contacts_changing {
+            tdutils::log_info!(
+                "Imported contacts were loaded, but aren't changing now, just clear them"
+            );
+            self.all_imported_contacts.clear();
+        } else {
+            tdutils::log_info!(
+                "Imported contacts are changing now, clear them after they will be changed"
+            );
+            self.need_clear_imported_contacts = true;
+        }
+        self.reload_contacts(env, true);
+    }
+
+    /// `UserManager::update_contacts_hints` (UserManager.cpp:8670-8701).
+    pub fn update_contacts_hints(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        from_database: bool,
+    ) {
+        let is_contact = self.is_user_contact_of(user_id, false);
+        if env.auth_is_bot {
+            if is_contact {
+                tdutils::log_error!("Bot has {user_id:?} as a contact");
+            }
+            return;
+        }
+
+        let key = user_id.get();
+        let old_value = self.contacts_hints.key_to_string(key);
+        let new_value = if is_contact {
+            self.get_user_search_text_of(user_id)
+        } else {
+            String::new()
+        };
+
+        if new_value != old_value {
+            if is_contact {
+                self.contacts_hints.add(key, &new_value);
+            } else {
+                self.contacts_hints.remove(key);
+            }
+        }
+
+        if env.global.use_chat_info_database() {
+            // update contacts database
+            if !self.are_contacts_loaded {
+                if !from_database
+                    && self.load_contacts_queries.is_empty()
+                    && is_contact
+                    && self
+                        .users
+                        .get(&key)
+                        .is_some_and(|u| u.is_is_contact_changed)
+                {
+                    self.search_contacts(env, "", i32::MAX, Promise::default());
+                }
+            } else if old_value.is_empty() == is_contact {
+                self.save_contacts_to_database(env);
+            }
+        }
+    }
+
+    /// `UserManager::search_contacts` (UserManager.cpp:8703-8733).
+    pub fn search_contacts(
+        &mut self,
+        env: &mut UserEnv,
+        query: &str,
+        limit: i32,
+        mut promise: Promise<()>,
+    ) -> (i32, Vec<UserId>) {
+        tdutils::log_info!("Search contacts with query = \"{query}\" and limit = {limit}");
+
+        if limit < 0 {
+            promise.set_error(Status::error(400, "Limit must be non-negative"));
+            return (0, Vec::new());
+        }
+
+        if !self.are_contacts_loaded {
+            self.load_contacts(env, promise);
+            return (0, Vec::new());
+        }
+        self.reload_contacts(env, false);
+
+        let result = if query.is_empty() {
+            self.contacts_hints.search_empty(limit)
+        } else {
+            self.contacts_hints.search(query, limit, false)
+        };
+
+        let user_ids: Vec<UserId> = result.1.iter().map(|&key| UserId::new(key)).collect();
+
+        promise.set_value(());
+        (result.0 as i32, user_ids)
+    }
+
+    /// `UserManager::reload_contact_birthdates`
+    /// (UserManager.cpp:8735-8749) — the
+    /// `GetContactsBirthdaysQuery` send is [blocked: net].
+    pub fn reload_contact_birthdates(&mut self, env: &mut UserEnv, force: bool) {
+        if env
+            .options
+            .get_option_boolean("dismiss_birthday_contact_today", false)
+        {
+            self.contact_birthdates.need_drop = true;
+            if !self.contact_birthdates.is_being_synced {
+                self.contact_birthdates.is_being_synced = true;
+                self.on_get_contact_birthdates(env, None);
+            }
+            return;
+        }
+        if !env.global.close_flag()
+            && !env.auth_is_bot
+            && !self.contact_birthdates.is_being_synced
+            && (self.contact_birthdates.next_sync_time < tdutils::time::now() || force)
+        {
+            self.contact_birthdates.is_being_synced = true;
+            // GetContactsBirthdaysQuery — [blocked: net]
+            tdutils::log_info!("Get contacts birthdays query — [blocked: net]");
+        }
+    }
+
+    /// `UserManager::on_get_contact_birthdates`
+    /// (UserManager.cpp:8751-8787).
+    pub fn on_get_contact_birthdates(
+        &mut self,
+        env: &mut UserEnv,
+        birthdays: Option<telegram_api::contacts_ContactBirthdays>,
+    ) {
+        assert!(self.contact_birthdates.is_being_synced);
+        self.contact_birthdates.is_being_synced = false;
+        let mut birthdays = birthdays;
+        if self.contact_birthdates.need_drop {
+            // the C++ swaps in an empty contacts_contactBirthdays object
+            // and falls through — the users list clears and the update
+            // fires; a `nullptr` without the drop only resets the timer
+            birthdays = Some(telegram_api::contacts_ContactBirthdays {
+                contacts: Vec::new(),
+                users: Vec::new(),
+            });
+            self.contact_birthdates.need_drop = false;
+        }
+        if birthdays.is_none() {
+            self.contact_birthdates.next_sync_time =
+                tdutils::time::now() + f64::from(random_fast(120, 180));
+            return;
+        }
+        let birthdays = birthdays.expect("checked above");
+        self.contact_birthdates.next_sync_time =
+            tdutils::time::now() + f64::from(random_fast(86_400 / 4, 86_400 / 3));
+
+        self.on_get_users(env, birthdays.users, "on_get_contact_birthdates");
+        let mut users: Vec<(UserId, Birthdate)> = Vec::new();
+        for contact in &birthdays.contacts {
+            let user_id = UserId::new(contact.contact_id);
+            if self.is_user_contact_of(user_id, false) {
+                let birthdate = contact
+                    .birthday
+                    .as_ref()
+                    .map(|birthday| Birthdate::new(birthday.day, birthday.month, birthday.year))
+                    .unwrap_or_default();
+                let is_changed = {
+                    let mut is_changed = false;
+                    if self.get_user_full_force(env, user_id, "on_get_contact_birthdates") {
+                        let user_full = self
+                            .users_full
+                            .get_mut(&user_id.get())
+                            .expect("force-loaded above");
+                        if user_full.birthdate != birthdate {
+                            user_full.birthdate = birthdate;
+                            user_full.is_changed = true;
+                            is_changed = true;
+                        }
+                    }
+                    is_changed
+                };
+                if is_changed {
+                    self.update_user_full(env, user_id, "on_get_contact_birthdates", false);
+                }
+                if !birthdate.is_empty() {
+                    users.push((user_id, birthdate));
+                }
+            }
+        }
+        if self.contact_birthdates.users != users {
+            self.contact_birthdates.users = users;
+            let update = self.get_update_contact_close_birthdays(env);
+            self.send_update(update);
+        }
+        // there is no need to save them between restarts
+    }
+
+    /// `UserManager::get_update_contact_close_birthdays`
+    /// (UserManager.cpp:10465-10472).
+    fn get_update_contact_close_birthdays(&mut self, env: &mut UserEnv) -> td_api::Update {
+        let users = self.contact_birthdates.users.clone();
+        let close_birthday_users = users
+            .iter()
+            .map(|(user_id, birthdate)| td_api::CloseBirthdayUser {
+                user_id: self.get_user_id_object(env, *user_id, "closeBirthdayUser"),
+                birthdate: Some(
+                    birthdate
+                        .get_birthdate_object()
+                        .expect("contact_birthdates.users_ holds only non-empty birthdates"),
+                ),
+            })
+            .collect();
+        td_api::Update::updateContactCloseBirthdays(td_api::updateContactCloseBirthdays {
+            close_birthday_users,
+        })
+    }
+
+    /// `UserManager::hide_contact_birthdays` (UserManager.cpp:8789-8791)
+    /// — the `DismissContactBirthdaysSuggestionQuery` send is
+    /// [blocked: net].
+    pub fn hide_contact_birthdays(&mut self, _promise: Promise<()>) {
+        tdutils::log_info!("Dismiss contact birthdays suggestion query — [blocked: net]");
+    }
+
+    /// `UserManager::get_close_friends` (UserManager.cpp:8793-8813).
+    pub fn get_close_friends(
+        &mut self,
+        env: &mut UserEnv,
+        mut promise: Promise<()>,
+    ) -> Vec<UserId> {
+        if !self.are_contacts_loaded {
+            self.load_contacts(env, promise);
+            return Vec::new();
+        }
+        self.reload_contacts(env, false);
+
+        let result = self.contacts_hints.search_empty(10_000);
+
+        let mut user_ids = Vec::new();
+        for key in result.1 {
+            let user_id = UserId::new(key);
+            if self.get_user(user_id).is_some_and(|u| u.is_close_friend) {
+                user_ids.push(user_id);
+            }
+        }
+
+        promise.set_value(());
+        user_ids
+    }
+
+    /// `UserManager::set_close_friends` (UserManager.cpp:8815-8823) — the
+    /// `EditCloseFriendsQuery` send is [blocked: net].
+    pub fn set_close_friends(&mut self, user_ids: Vec<UserId>, mut promise: Promise<()>) {
+        for user_id in &user_ids {
+            if !self.have_min_user(*user_id) {
+                return promise.set_error(Status::error(400, "User not found"));
+            }
+        }
+
+        tdutils::log_info!("Edit close friends query for {user_ids:?} — [blocked: net]");
+    }
+
+    /// `UserManager::on_set_close_friends` (UserManager.cpp:8825-8839).
+    pub fn on_set_close_friends(
+        &mut self,
+        env: &mut UserEnv,
+        user_ids: Vec<UserId>,
+        mut promise: Promise<()>,
+    ) {
+        let close_friend_user_ids: BTreeSet<i64> = user_ids
+            .iter()
+            .map(|user_id| {
+                assert!(user_id.is_valid());
+                user_id.get()
+            })
+            .collect();
+        let known_user_ids: Vec<i64> = self.users.keys().copied().collect();
+        for user_id in known_user_ids {
+            let (is_contact, is_mutual_contact, is_close_friend) = {
+                let u = self.users.get(&user_id).expect("collected above");
+                (u.is_contact, u.is_mutual_contact, u.is_close_friend)
+            };
+            if is_contact && is_close_friend != close_friend_user_ids.contains(&user_id) {
+                self.on_update_user_is_contact_impl(
+                    env,
+                    UserId::new(user_id),
+                    is_contact,
+                    is_mutual_contact,
+                    !is_close_friend,
+                );
+                self.update_user(env, UserId::new(user_id), false, false);
+            }
+        }
+        promise.set_value(());
+    }
+
+    /// `UserManager::search_user_by_phone_number`
+    /// (UserManager.cpp:8841-8860) — the `ResolvePhoneQuery` send is
+    /// [blocked: net].
+    pub fn search_user_by_phone_number(
+        &mut self,
+        phone_number: String,
+        only_local: bool,
+        mut promise: Promise<()>,
+    ) -> UserId {
+        let phone_number = clean_phone_number(phone_number);
+        if phone_number.is_empty() {
+            promise.set_error(Status::error(200, "Phone number is invalid"));
+            return UserId::default();
+        }
+
+        if let Some(user_id) = self.resolved_phone_numbers.get(&phone_number) {
+            promise.set_value(());
+            return *user_id;
+        }
+
+        if only_local {
+            promise.set_value(());
+        } else {
+            // ResolvePhoneQuery — [blocked: net]
+            tdutils::log_info!("Resolve phone number \"{phone_number}\" query — [blocked: net]");
+        }
+        UserId::default()
+    }
+
+    /// The request-facing `search_user_by_phone_number`
+    /// (SearchUserByPhoneNumberRequest, Requests.cpp:364-390) —
+    /// `Ok(Some(id))` when the C++ promise completed synchronously (the
+    /// resolved cache, possibly the negative default, or the only_local
+    /// form), `Ok(None)` when the ResolvePhoneQuery park answers nothing
+    /// ([blocked: net]), `Err` — the phone-number error.
+    pub(crate) fn search_user_by_phone_number_for_request(
+        &mut self,
+        phone_number: String,
+        only_local: bool,
+    ) -> Result<Option<UserId>, Status> {
+        let phone_number = clean_phone_number(phone_number);
+        if phone_number.is_empty() {
+            return Err(Status::error(200, "Phone number is invalid"));
+        }
+
+        if let Some(user_id) = self.resolved_phone_numbers.get(&phone_number) {
+            return Ok(Some(*user_id));
+        }
+
+        if only_local {
+            return Ok(Some(UserId::default()));
+        }
+
+        // ResolvePhoneQuery — [blocked: net]
+        tdutils::log_info!("Resolve phone number \"{phone_number}\" query — [blocked: net]");
+        Ok(None)
+    }
+
+    /// The request-facing `search_user_by_phone_number`
+    /// (SearchUserByPhoneNumberRequest, Requests.cpp:364-390) —
+    /// `UserManager::on_resolved_phone_number` (UserManager.cpp:8862-8888).
+    pub fn on_resolved_phone_number(&mut self, phone_number: String, user_id: UserId) {
+        if !user_id.is_valid() {
+            self.resolved_phone_numbers
+                .insert(phone_number, UserId::default()); // negative cache
+            return;
+        }
+
+        if let Some(known_user_id) = self.resolved_phone_numbers.get(&phone_number) {
+            if *known_user_id != user_id {
+                tdutils::log_warning!(
+                    "Resolve phone number \"{phone_number}\" to {user_id:?}, but have it in {known_user_id:?}"
+                );
+                self.resolved_phone_numbers.insert(phone_number, user_id);
+            }
+            return;
+        }
+
+        match self.get_user(user_id) {
+            None => tdutils::log_error!(
+                "Resolve phone number \"{phone_number}\" to unknown {user_id:?}"
+            ),
+            Some(u) if !u.phone_number.is_empty() => tdutils::log_error!(
+                "Resolve phone number \"{phone_number}\" to {user_id:?} with phone number {}",
+                u.phone_number
+            ),
+            // the user's phone number can be hidden by privacy settings,
+            // despite the user can be found by the phone number
+            Some(_) => {}
+        }
+        self.resolved_phone_numbers.insert(phone_number, user_id); // always update cached value
+    }
 }
 
 /// `EmojiStatus::get_emoji_status_object` — the reduced payload; the
@@ -8087,11 +10188,11 @@ impl UserManager {
 /// emits `emojiStatusUpgradedGift` there).
 fn make_emoji_status_object(status: &EmojiStatus) -> td_api::EmojiStatus {
     td_api::EmojiStatus {
-        r#type: td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
+        r#type: Some(td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
             td_api::emojiStatusTypeCustomEmoji {
                 custom_emoji_id: status.get_custom_emoji_id().get(),
             },
-        ),
+        )),
         expiration_date: status.get_until_date(),
     }
 }
@@ -8100,9 +10201,9 @@ fn make_emoji_status_object(status: &EmojiStatus) -> td_api::EmojiStatus {
 /// null; module docs).
 fn empty_emoji_status_object() -> td_api::EmojiStatus {
     td_api::EmojiStatus {
-        r#type: td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
+        r#type: Some(td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
             td_api::emojiStatusTypeCustomEmoji { custom_emoji_id: 0 },
-        ),
+        )),
         expiration_date: 0,
     }
 }
@@ -8113,7 +10214,9 @@ fn make_unknown_secret_chat_object(secret_chat_id: SecretChatId) -> td_api::Secr
     td_api::SecretChat {
         id: secret_chat_id.get(),
         user_id: 0,
-        state: td_api::SecretChatState::secretChatStateClosed(td_api::secretChatStateClosed),
+        state: Some(td_api::SecretChatState::secretChatStateClosed(
+            td_api::secretChatStateClosed,
+        )),
         is_outbound: false,
         key_hash: Vec::new(),
         layer: 0,
@@ -8129,20 +10232,52 @@ fn make_secret_chat_object(
     td_api::SecretChat {
         id: secret_chat_id.get(),
         user_id: secret_chat.user_id.get(),
-        state: match secret_chat.state {
-            SecretChatState::Waiting => {
-                td_api::SecretChatState::secretChatStatePending(td_api::secretChatStatePending)
-            }
-            SecretChatState::Active => {
-                td_api::SecretChatState::secretChatStateReady(td_api::secretChatStateReady)
-            }
-            SecretChatState::Closed | SecretChatState::Unknown => {
-                td_api::SecretChatState::secretChatStateClosed(td_api::secretChatStateClosed)
-            }
-        },
+        state: Some(get_secret_chat_state_object(secret_chat.state)),
         is_outbound: secret_chat.is_outbound,
         key_hash: secret_chat.key_hash.clone().into_bytes(),
         layer: secret_chat.layer,
+    }
+}
+
+/// `UserManager::get_secret_chat_state_object` (UserManager.cpp:10284-10296).
+fn get_secret_chat_state_object(state: SecretChatState) -> td_api::SecretChatState {
+    match state {
+        SecretChatState::Waiting => {
+            td_api::SecretChatState::secretChatStatePending(td_api::secretChatStatePending)
+        }
+        SecretChatState::Active => {
+            td_api::SecretChatState::secretChatStateReady(td_api::secretChatStateReady)
+        }
+        SecretChatState::Closed | SecretChatState::Unknown => {
+            td_api::SecretChatState::secretChatStateClosed(td_api::secretChatStateClosed)
+        }
+    }
+}
+
+/// The forced-empty `file` payload with the never-null `local`/`remote`
+/// object_ptrs materialized (td's generated `File` always emits them).
+fn empty_file_object() -> td_api::File {
+    td_api::File {
+        id: 0,
+        size: 0,
+        expected_size: 0,
+        local: Some(td_api::LocalFile {
+            path: String::new(),
+            can_be_downloaded: false,
+            can_be_deleted: false,
+            is_downloading_active: false,
+            is_downloading_completed: false,
+            download_offset: 0,
+            downloaded_prefix_size: 0,
+            downloaded_size: 0,
+        }),
+        remote: Some(td_api::RemoteFile {
+            id: String::new(),
+            unique_id: String::new(),
+            is_uploading_active: false,
+            is_uploading_completed: false,
+            uploaded_size: 0,
+        }),
     }
 }
 
@@ -8151,13 +10286,13 @@ fn make_secret_chat_object(
 fn empty_profile_photo_object() -> td_api::ProfilePhoto {
     td_api::ProfilePhoto {
         id: 0,
-        small: td_api::File::default(),
-        big: td_api::File::default(),
-        minithumbnail: td_api::Minithumbnail {
+        small: Some(empty_file_object()),
+        big: Some(empty_file_object()),
+        minithumbnail: Some(td_api::Minithumbnail {
             width: 0,
             height: 0,
             data: Vec::new(),
-        },
+        }),
         has_animation: false,
         is_personal: false,
     }
@@ -8171,56 +10306,534 @@ fn make_unknown_user_object(user_id: UserId, my_id: UserId) -> td_api::User {
         id: user_id.get(),
         first_name: String::new(),
         last_name: String::new(),
-        usernames: td_api::Usernames {
+        usernames: Some(td_api::Usernames {
             active_usernames: Vec::new(),
             disabled_usernames: Vec::new(),
             editable_username: String::new(),
             collectible_usernames: Vec::new(),
-        },
+        }),
         phone_number: String::new(),
-        status: td_api::UserStatus::userStatusEmpty(td_api::userStatusEmpty),
-        profile_photo: empty_profile_photo_object(),
+        status: Some(td_api::UserStatus::userStatusEmpty(td_api::userStatusEmpty)),
+        profile_photo: Some(empty_profile_photo_object()),
         accent_color_id: AccentColorId::from_peer_id(user_id.get()).get(),
         background_custom_emoji_id: 0,
-        upgraded_gift_colors: td_api::UpgradedGiftColors::default(),
+        upgraded_gift_colors: Some(td_api::UpgradedGiftColors::default()),
         profile_accent_color_id: -1,
         profile_background_custom_emoji_id: 0,
-        emoji_status: td_api::EmojiStatus {
-            r#type: td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
+        emoji_status: Some(td_api::EmojiStatus {
+            r#type: Some(td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
                 td_api::emojiStatusTypeCustomEmoji { custom_emoji_id: 0 },
-            ),
+            )),
             expiration_date: 0,
-        },
+        }),
         is_contact: false,
         is_mutual_contact: false,
         is_close_friend: false,
-        verification_status: td_api::VerificationStatus {
+        verification_status: Some(td_api::VerificationStatus {
             is_verified: false,
             is_scam: false,
             is_fake: false,
             bot_verification_icon_custom_emoji_id: 0,
-        },
+        }),
         is_premium: false,
         is_support: false,
-        restriction_info: td_api::RestrictionInfo {
+        restriction_info: Some(td_api::RestrictionInfo {
             restriction_reason: String::new(),
             has_sensitive_content: false,
-        },
-        active_story_state: td_api::ActiveStoryState::activeStoryStateRead(
+        }),
+        active_story_state: Some(td_api::ActiveStoryState::activeStoryStateRead(
             td_api::activeStoryStateRead,
-        ),
+        )),
         restricts_new_chats: false,
         paid_message_star_count: 0,
         have_access,
-        r#type: td_api::UserType::userTypeUnknown(td_api::userTypeUnknown),
+        r#type: Some(td_api::UserType::userTypeUnknown(td_api::userTypeUnknown)),
         language_code: String::new(),
         added_to_attachment_menu: false,
+    }
+}
+
+// ------------------------------------------------------------------
+// Contact policy + registries (UserManager.cpp:7754-7909 + the policy
+// intakes) — M.4.15. The message-users registry needs `MessageFullId`
+// (crate::message_id, the C++ DialogId/MessageId/MessageFullId subset);
+// the premium-required-to-contact QueryMerger actor is created by the Td
+// init and stored in `get_is_premium_required_to_contact_queries`.
+
+impl UserManager {
+    /// `UserManager::register_message_users` (UserManager.cpp:7754-7769).
+    /// The `ChatManager::have_channel` gate is the `known_channels`
+    /// stand-in — empty (no channel admitted) until the ChatManager slice
+    /// feeds it. Users without a usable access hash get an `updateUser`
+    /// when their registry entry appears.
+    pub fn register_message_users(
+        &mut self,
+        env: &UserEnv,
+        message_full_id: MessageFullId,
+        user_ids: &[UserId],
+    ) {
+        let dialog_id = message_full_id.get_dialog_id();
+        assert!(
+            dialog_id.get_type() == DialogType::Channel,
+            "register_message_users for a non-channel dialog"
+        );
+        if !self
+            .known_channels
+            .contains(&dialog_id.get_channel_id().get())
+        {
+            return;
+        }
+        for user_id in user_ids {
+            assert!(user_id.is_valid());
+            let has_access_hash = self
+                .get_user(*user_id)
+                .is_some_and(|u| u.access_hash != -1 && !u.is_min_access_hash);
+            if !has_access_hash {
+                let user_messages = self.user_messages.entry(user_id.get()).or_default();
+                let need_update = user_messages.is_empty();
+                user_messages.insert(message_full_id);
+                if need_update {
+                    let user_object = self.get_user_object_of(env, *user_id);
+                    self.send_update(td_api::Update::updateUser(td_api::updateUser {
+                        user: Some(user_object),
+                    }));
+                }
+            }
+        }
+    }
+
+    /// `UserManager::unregister_message_users` (UserManager.cpp:7771-7791) —
+    /// the fast path and the last-reference `updateUser` re-emission.
+    pub fn unregister_message_users(
+        &mut self,
+        env: &UserEnv,
+        message_full_id: MessageFullId,
+        user_ids: &[UserId],
+    ) {
+        if self.user_messages.is_empty() {
+            // fast path
+            return;
+        }
+        for user_id in user_ids {
+            let entry_empty = match self.user_messages.get_mut(&user_id.get()) {
+                Some(user_messages) => {
+                    user_messages.remove(&message_full_id);
+                    user_messages.is_empty()
+                }
+                None => continue,
+            };
+            if !entry_empty {
+                continue;
+            }
+            self.user_messages.remove(&user_id.get());
+            let has_access_hash = self
+                .get_user(*user_id)
+                .is_some_and(|u| u.access_hash != -1 && !u.is_min_access_hash);
+            if !has_access_hash {
+                let user_object = self.get_user_object_of(env, *user_id);
+                self.send_update(td_api::Update::updateUser(td_api::updateUser {
+                    user: Some(user_object),
+                }));
+            }
+        }
+    }
+
+    /// `UserManager::can_send_message_to_user` (UserManager.cpp:7795-7852).
+    /// The uncached, non-force path parks in the premium-required-to-contact
+    /// QueryMerger; its merged query re-dispatches this call with
+    /// `force = true` through the Td actor. The C++ `u->paid_message_star_
+    /// count` dereference in the premium disjunct is UB when `u == nullptr`;
+    /// the Rust port treats a missing user as `false` there (the earlier
+    /// `have_input_peer_user` check already answered the deleted/null forms).
+    pub fn can_send_message_to_user(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        force: bool,
+        mut promise: Promise<td_api::CanSendMessageToUserResult>,
+    ) {
+        if env.global.close_flag() {
+            // the C++ `G()->close_status()`; the codebase's close answer
+            // (client.rs) is 500 "Request aborted"
+            return promise.set_error(Status::error(500, "Request aborted"));
+        }
+        if user_id == self.my_id {
+            return promise.set_value(
+                td_api::CanSendMessageToUserResult::canSendMessageToUserResultOk(
+                    td_api::canSendMessageToUserResultOk,
+                ),
+            );
+        }
+        let u = self.get_user(user_id);
+        if !self.have_input_peer_user_for(u, user_id, AccessRights::Write, env.auth_is_bot) {
+            return promise.set_value(
+                td_api::CanSendMessageToUserResult::canSendMessageToUserResultUserIsDeleted(
+                    td_api::canSendMessageToUserResultUserIsDeleted,
+                ),
+            );
+        }
+        assert!(user_id.is_valid());
+        let u_accepts = u.is_some_and(|u| {
+            (!u.contact_require_premium && u.paid_message_star_count == 0) || u.is_mutual_contact
+        });
+        let premium_accepts = u.is_some_and(|u| {
+            env.options.get_option_boolean("is_premium", false) && u.paid_message_star_count == 0
+        });
+        if u_accepts || premium_accepts {
+            return promise.set_value(
+                td_api::CanSendMessageToUserResult::canSendMessageToUserResultOk(
+                    td_api::canSendMessageToUserResultOk,
+                ),
+            );
+        }
+        if self.get_user_full_force(env, user_id, "can_send_message_to_user") {
+            let user_full = self.users_full.get(&user_id.get()).unwrap();
+            if user_full.send_paid_message_stars > 0 {
+                return promise.set_value(
+                td_api::CanSendMessageToUserResult::canSendMessageToUserResultUserHasPaidMessages(
+                    td_api::canSendMessageToUserResultUserHasPaidMessages {
+                        outgoing_paid_message_star_count: user_full.send_paid_message_stars,
+                    },
+                ),
+            );
+            }
+            if user_full.contact_require_premium {
+                return promise.set_value(
+                td_api::CanSendMessageToUserResult::canSendMessageToUserResultUserRestrictsNewChats(
+                    td_api::canSendMessageToUserResultUserRestrictsNewChats,
+                ),
+            );
+            }
+            return promise.set_value(
+                td_api::CanSendMessageToUserResult::canSendMessageToUserResultOk(
+                    td_api::canSendMessageToUserResultOk,
+                ),
+            );
+        }
+        match self.user_full_contact_price.get(&user_id.get()).copied() {
+            Some(price) if price > 0 => {
+                return promise.set_value(
+                td_api::CanSendMessageToUserResult::canSendMessageToUserResultUserHasPaidMessages(
+                    td_api::canSendMessageToUserResultUserHasPaidMessages {
+                        outgoing_paid_message_star_count: price,
+                    },
+                ),
+            );
+            }
+            Some(-1) => {
+                return promise.set_value(
+                td_api::CanSendMessageToUserResult::canSendMessageToUserResultUserRestrictsNewChats(
+                    td_api::canSendMessageToUserResultUserRestrictsNewChats,
+                ),
+            );
+            }
+            Some(_) => {
+                return promise.set_value(
+                    td_api::CanSendMessageToUserResult::canSendMessageToUserResultOk(
+                        td_api::canSendMessageToUserResultOk,
+                    ),
+                );
+            }
+            None => {}
+        }
+        if force {
+            return promise.set_value(
+                td_api::CanSendMessageToUserResult::canSendMessageToUserResultOk(
+                    td_api::canSendMessageToUserResultOk,
+                ),
+            );
+        }
+
+        let Some(merger) = self.get_is_premium_required_to_contact_queries.clone() else {
+            tdutils::log_error!("Premium-required-to-contact merger not wired");
+            return promise.set_error(Status::error(500, "Request aborted"));
+        };
+        let td_actor_id = self
+            .td_actor_id
+            .clone()
+            .expect("the Td actor id is wired by the Td init");
+        let query_promise = PromiseCreator::lambda_result(tdactor::promise_send_closure(
+            td_actor_id,
+            move |td: &mut crate::td::Td, result: tdutils::status::Result<()>| {
+                match result {
+                    tdutils::status::Result::Ok(()) => {
+                        // the merged query resolved — re-run with force
+                        let Some(options) = td.option_manager.as_mut() else {
+                            return promise.set_error(Status::error(500, "Request aborted"));
+                        };
+                        let mut env = UserEnv {
+                            global: &mut td.global,
+                            options,
+                            auth_is_bot: td.auth_manager.is_bot(),
+                        };
+                        td.user_manager
+                            .can_send_message_to_user(&mut env, user_id, true, promise);
+                    }
+                    tdutils::status::Result::Err(error) => {
+                        promise.set_error(error);
+                    }
+                }
+            },
+        ));
+        tdactor::send_closure(
+            merger,
+            crate::query_merger::QueryMergerMessage::AddQuery {
+                query_id: user_id.get(),
+                promise: query_promise,
+            },
+        );
+    }
+
+    /// `UserManager::on_get_is_premium_required_to_contact_users`
+    /// (UserManager.cpp:7854-7882) — the merged-query answer: cache the
+    /// price per user that has no `UserFull` yet.
+    pub fn on_get_is_premium_required_to_contact_users(
+        &mut self,
+        user_ids: Vec<UserId>,
+        requirements: Vec<telegram_api::RequirementToContact>,
+        mut promise: Promise<()>,
+    ) {
+        if user_ids.len() != requirements.len() {
+            tdutils::log_error!(
+                "Receive {} flags instead of {}",
+                requirements.len(),
+                user_ids.len()
+            );
+            return promise.set_error(Status::error(500, "Receive invalid response"));
+        }
+        for (user_id, requirement) in user_ids.iter().zip(requirements.iter()) {
+            assert!(user_id.is_valid());
+            if self.get_user_full(*user_id).is_none() {
+                let price = match requirement {
+                    telegram_api::RequirementToContact::requirementToContactEmpty(_) => 0,
+                    telegram_api::RequirementToContact::requirementToContactPremium(_) => -1,
+                    telegram_api::RequirementToContact::requirementToContactPaidMessages(r) => {
+                        get_star_count(r.stars_amount)
+                    }
+                };
+                self.user_full_contact_price.insert(user_id.get(), price);
+            }
+        }
+        promise.set_value(());
+    }
+
+    /// `UserManager::allow_send_message_to_user` (UserManager.cpp:7884-7892).
+    pub fn allow_send_message_to_user(&mut self, env: &UserEnv, user_id: UserId) {
+        assert!(!env.auth_is_bot);
+        if self.get_user_full(user_id).is_none() {
+            assert!(user_id.is_valid());
+            if let Some(price) = self.user_full_contact_price.get_mut(&user_id.get())
+                && *price == -1
+            {
+                *price = 0;
+            }
+        }
+    }
+
+    /// `UserManager::share_phone_number` (UserManager.cpp:7896-7909). The
+    /// load-gated re-dispatch rides the parked-call queue (the C++ actor
+    /// message); the `AcceptContactQuery` send is [blocked: net] and the
+    /// `hide_dialog_action_bar` fan-out is MessagesManager's.
+    pub fn share_phone_number(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        mut promise: Promise<()>,
+    ) {
+        if env.global.close_flag() {
+            // the C++ TRY_STATUS_PROMISE(promise, G()->close_status())
+            return promise.set_error(Status::error(500, "Request aborted"));
+        }
+        if !self.are_contacts_loaded {
+            self.pending_load_contacts_calls
+                .push(PendingLoadContactsCall::SharePhoneNumber { user_id, promise });
+            self.load_contacts(env, Promise::default());
+            return;
+        }
+        tdutils::log_info!("Share phone number with {user_id:?}");
+        let input_user = match self.get_input_user(env, user_id) {
+            Ok(input_user) => input_user,
+            Err(error) => return promise.set_error(error),
+        };
+        let _ = input_user; // the AcceptContactQuery payload — [blocked: net]
+        self.net_blocked_promises.push(promise);
+        // MessagesManager::hide_dialog_action_bar — with its step
+        tdutils::log_info!("Accept contact query — [blocked: net]");
+    }
+
+    /// `UserManager::register_noforwards_request` (UserManager.cpp:9438-9450)
+    /// — arm the noforwards deadline when the request window is still open
+    /// and the message is not scheduled.
+    pub fn register_noforwards_request(
+        &mut self,
+        env: &UserEnv,
+        message_full_id: MessageFullId,
+        message_date: i32,
+    ) {
+        let message_id = message_full_id.get_message_id();
+        let duration = env
+            .options
+            .get_option_integer("has_protected_content_disable_request_duration", 86400);
+        let left_time = message_date as i64 + duration - env.unix_time() as i64;
+        if left_time > 0 && !message_id.is_scheduled() {
+            assert_ne!(message_id.get(), 0);
+            assert!(
+                !self.noforwards_request_ids.contains_key(&message_full_id),
+                "a second noforwards request for one message"
+            );
+            self.current_noforwards_request_id += 1;
+            let request_id = self.current_noforwards_request_id;
+            self.noforwards_request_ids
+                .insert(message_full_id, request_id);
+            self.noforwards_request_message_full_ids
+                .insert(request_id, message_full_id);
+            self.noforwards_request_timeouts
+                .insert(request_id, tdutils::time::now() + left_time as f64 + 1.0);
+        }
+    }
+
+    /// `UserManager::unregister_noforwards_request`
+    /// (UserManager.cpp:9452-9462).
+    pub fn unregister_noforwards_request(&mut self, message_full_id: MessageFullId) {
+        let Some(request_id) = self.noforwards_request_ids.remove(&message_full_id) else {
+            return;
+        };
+        assert_ne!(request_id, 0);
+        self.noforwards_request_message_full_ids.remove(&request_id);
+        self.noforwards_request_timeouts.remove(&request_id);
+    }
+
+    /// `UserManager::on_noforwards_request_timeout`
+    /// (UserManager.cpp:2935-2947) — the deadline fire: drop the registration
+    /// and let MessagesManager refresh the message (its step).
+    fn on_noforwards_request_timeout(&mut self, env: &UserEnv, request_id: i32) {
+        if env.global.close_flag() {
+            return;
+        }
+        let Some(message_full_id) = self
+            .noforwards_request_message_full_ids
+            .get(&request_id)
+            .copied()
+        else {
+            return;
+        };
+        self.unregister_noforwards_request(message_full_id);
+        // MessagesManager::on_external_update_message_content — with its step
+    }
+
+    /// `UserManager::get_web_app_placeholder` (UserManager.cpp:9464-9469).
+    /// `bot_info` is absent until its subsystem, so the placeholder-path
+    /// branch is unreachable and the answer is always the C++ null.
+    pub fn get_web_app_placeholder(
+        &mut self,
+        env: &mut UserEnv,
+        user_id: UserId,
+        mut promise: Promise<Option<td_api::Outline>>,
+    ) {
+        if !self.get_user_full_force(env, user_id, "get_web_app_placeholder") {
+            return promise.set_value(None);
+        }
+        // the C++ reads user_full->bot_info->placeholder_path and builds the
+        // outline (`get_outline_object`); both arrive with the BotInfo step
+        promise.set_value(None);
+    }
+
+    /// `UserManager::get_update_freeze_state_object` (UserManager.cpp:4786-4789).
+    fn get_update_freeze_state_object(&self) -> td_api::updateFreezeState {
+        td_api::updateFreezeState {
+            is_frozen: self.freeze_since_date > 0,
+            freezing_date: self.freeze_since_date,
+            deletion_date: self.freeze_until_date,
+            appeal_link: self.freeze_appeal_url.clone(),
+        }
+    }
+
+    /// `UserManager::on_update_freeze_state` (UserManager.cpp:4791-4806) —
+    /// the no-op guard, the `updateFreezeState` emission and the binlog-pmc
+    /// persistence (erase when the freeze ended).
+    pub fn on_update_freeze_state(
+        &mut self,
+        env: &mut UserEnv,
+        freeze_since_date: i32,
+        freeze_until_date: i32,
+        freeze_appeal_url: String,
+    ) {
+        if freeze_since_date == self.freeze_since_date
+            && freeze_until_date == self.freeze_until_date
+            && freeze_appeal_url == self.freeze_appeal_url
+        {
+            return;
+        }
+        self.freeze_since_date = freeze_since_date;
+        self.freeze_until_date = freeze_until_date;
+        self.freeze_appeal_url = freeze_appeal_url;
+        let update = self.get_update_freeze_state_object();
+        self.send_update(td_api::Update::updateFreezeState(update));
+        if self.freeze_since_date > 0 {
+            env.global.binlog_pmc().set(
+                "freeze_state",
+                &format!(
+                    "{} {} {}",
+                    self.freeze_since_date, self.freeze_until_date, self.freeze_appeal_url
+                ),
+            );
+        } else {
+            env.global.binlog_pmc().erase("freeze_state");
+        }
+    }
+
+    /// `UserManager::on_update_online_status_privacy`
+    /// (UserManager.cpp:4768-4770). The `GetContactsStatusesQuery` send is
+    /// [blocked: net] (the M.4.16 un-stub).
+    pub fn on_update_online_status_privacy(&mut self, _env: &mut UserEnv) {
+        tdutils::log_info!("Get contacts statuses — [blocked: net]");
+    }
+
+    /// `UserManager::on_update_phone_number_privacy`
+    /// (UserManager.cpp:4772-4778) — every cached `UserFull`'s
+    /// `need_phone_number_privacy_exception` can be outdated, so all expire.
+    pub fn on_update_phone_number_privacy(&mut self, env: &UserEnv) {
+        assert!(!env.auth_is_bot);
+        tdutils::log_info!("Updated phone number privacy settings");
+        for user_full in self.users_full.values_mut() {
+            user_full.expires_at = 0.0;
+        }
+    }
+
+    /// `UserManager::on_ignored_restriction_reasons_changed`
+    /// (UserManager.cpp:4780-4784) — re-emit every restricted user (the
+    /// C++ null-user form is the Rust unknown-user object).
+    pub fn on_ignored_restriction_reasons_changed(&mut self, env: &UserEnv) {
+        let user_ids: Vec<i64> = self.restricted_user_ids.iter().copied().collect();
+        for user_id in user_ids {
+            let user_object = self.get_user_object_of(env, UserId::new(user_id));
+            self.send_update(td_api::Update::updateUser(td_api::updateUser {
+                user: Some(user_object),
+            }));
+        }
+    }
+
+    /// `UserManager::on_user_rating_timeout` (UserManager.cpp:2905-2923) —
+    /// the deadline plumbing is in (M.4.15); the body reads the UserFull
+    /// star-rating fields that arrive with the StarRating subsystem, so until
+    /// then the timeout never arms and a fire is a no-op.
+    fn on_user_rating_timeout(&mut self, env: &UserEnv, user_id: UserId) {
+        if env.global.close_flag() {
+            return;
+        }
+        if self.users_full.contains_key(&user_id.get()) {
+            // the pending-star-rating application and the update_user_full
+            // re-run (cpp:2909-2923) — with the StarRating fields
+        }
+        // else: the C++ CHECK(user_full != nullptr); the map stays empty
+        // until the StarRating fields exist, so a fire is unreachable
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tdutils::promise::PromiseCreator;
 
     fn test_env() -> (TempEnv, UserManager) {
         TempEnv::new("unit")
@@ -8453,9 +11066,11 @@ mod tests {
         assert_eq!(u.cache_version, USER_CACHE_VERSION);
         let updates = um.take_updates();
         assert!(
-            updates
-                .iter()
-                .any(|update| matches!(update, td_api::Update::updateUser(u) if u.user.id == 5 && u.user.first_name == "Alice")),
+            updates.iter().any(|update| matches!(
+                update,
+                td_api::Update::updateUser(u)
+                    if u.user.as_ref().is_some_and(|user| user.id == 5 && user.first_name == "Alice")
+            )),
             "updateUser must be sent"
         );
     }
@@ -8609,7 +11224,10 @@ mod tests {
         let parsed = User::parse_value(&bytes, &ctx).unwrap();
         assert_eq!(parsed.first_name, "Alice");
         assert_eq!(parsed.last_name, "Smith");
-        assert_eq!(parsed.phone_number, "+15551234567");
+        // the C++ `User::parse` cleans the phone too (cpp:1860s) —
+        // `clean_phone_number` is digits-only (misc.cpp:58-60), the '+'
+        // does not survive a store/parse round-trip
+        assert_eq!(parsed.phone_number, "15551234567");
         assert_eq!(parsed.access_hash, 42);
         assert!(parsed.is_received);
         assert_eq!(parsed.was_online, 123456);
@@ -8805,17 +11423,20 @@ mod tests {
         assert_eq!(updates.len(), 1, "updateSecretChat on the first intake");
         match &updates[0] {
             td_api::Update::updateSecretChat(update) => {
-                assert_eq!(update.secret_chat.id, 1);
-                assert_eq!(update.secret_chat.user_id, 42);
+                let Some(secret_chat) = update.secret_chat.as_ref() else {
+                    panic!("the secret chat payload must be present");
+                };
+                assert_eq!(secret_chat.id, 1);
+                assert_eq!(secret_chat.user_id, 42);
                 assert!(
                     matches!(
-                        update.secret_chat.state,
-                        td_api::SecretChatState::secretChatStatePending(_)
+                        secret_chat.state,
+                        Some(td_api::SecretChatState::secretChatStatePending(_))
                     ),
                     "Waiting converts to secretChatStatePending"
                 );
-                assert!(update.secret_chat.is_outbound);
-                assert_eq!(update.secret_chat.layer, 101);
+                assert!(secret_chat.is_outbound);
+                assert_eq!(secret_chat.layer, 101);
             }
             other => panic!("unexpected update {other:?}"),
         }
@@ -9107,7 +11728,7 @@ mod tests {
             let updates = um.take_updates();
             assert!(
                 updates.iter().any(
-                    |u| matches!(u, td_api::Update::updateSecretChat(u) if u.secret_chat.id == 9)
+                    |u| matches!(u, td_api::Update::updateSecretChat(u) if u.secret_chat.as_ref().is_some_and(|secret_chat| secret_chat.id == 9))
                 ),
                 "updateSecretChat on the replay"
             );
@@ -9430,8 +12051,9 @@ mod tests {
         let expires = (tdutils::time::system() as i64 + 3600) as i32;
         let full_flags = USER_ACCESS_HASH_MASK | (1 << 1) | (1 << 6); // access_hash, first_name, status
         let mut user = telegram_user(5, "Bob", full_flags);
-        user.status =
-            telegram_api::UserStatus::userStatusOnline(telegram_api::userStatusOnline { expires });
+        user.status = Some(telegram_api::UserStatus::userStatusOnline(
+            telegram_api::userStatusOnline { expires },
+        ));
         um.on_get_user(&mut temp.env(false), telegram_api::User::user(user), "t");
         let updates = um.take_updates();
         // A new user folds the status into its updateUser — a separate
@@ -9440,7 +12062,7 @@ mod tests {
         assert!(
             updates
                 .iter()
-                .any(|update| matches!(update, td_api::Update::updateUser(u) if u.user.id == 5)),
+                .any(|update| matches!(update, td_api::Update::updateUser(u) if u.user.as_ref().is_some_and(|user| user.id == 5))),
             "the new user must be sent"
         );
         assert!(
@@ -9472,8 +12094,9 @@ mod tests {
         let expires = (tdutils::time::system() as i64 + 60) as i32;
         let full_flags = USER_ACCESS_HASH_MASK | (1 << 1) | (1 << 6); // access_hash, first_name, status
         let mut user = telegram_user(5, "Bob", full_flags);
-        user.status =
-            telegram_api::UserStatus::userStatusOnline(telegram_api::userStatusOnline { expires });
+        user.status = Some(telegram_api::UserStatus::userStatusOnline(
+            telegram_api::userStatusOnline { expires },
+        ));
         um.on_get_user(&mut temp.env(false), telegram_api::User::user(user), "t");
         um.take_updates();
         // move was_online into the past, then fire the deadline
@@ -9486,7 +12109,7 @@ mod tests {
         assert!(updates.iter().any(|update| matches!(
             update,
             td_api::Update::updateUserStatus(s) if s.user_id == 5 &&
-                matches!(s.status, td_api::UserStatus::userStatusOffline(_))
+                matches!(s.status, Some(td_api::UserStatus::userStatusOffline(_)))
         )));
     }
 
@@ -9741,7 +12364,7 @@ mod tests {
         let updates = um.take_updates();
         assert!(updates.iter().any(|update| matches!(
             update,
-            td_api::Update::updateUserFullInfo(f) if f.user_id == 5 && f.user_full_info.bio.text == "the bio"
+            td_api::Update::updateUserFullInfo(f) if f.user_id == 5 && f.user_full_info.as_ref().is_some_and(|full| full.bio.as_ref().is_some_and(|bio| bio.text == "the bio"))
         )));
     }
 
@@ -9764,19 +12387,19 @@ mod tests {
         let mut user_full = telegram_api::UserFull {
             id: 5,
             flags: (1 << 4) | (1 << 5) | (1 << 20), // calls available+private, voice forbidden
-            settings: telegram_api::PeerSettings {
+            settings: Some(telegram_api::PeerSettings {
                 flags: (1 << 4) | (1 << 14), // need_contacts_exception, charge_paid_message_stars
                 need_contacts_exception: true,
                 charge_paid_message_stars: 1i64 << 52, // clamps to the maximum
                 ..telegram_api::PeerSettings::default()
-            },
+            }),
             private_forward_name: "pf".to_owned(),
-            birthday: telegram_api::Birthday {
+            birthday: Some(telegram_api::Birthday {
                 day: 7,
                 month: 11,
                 year: 1990,
                 ..telegram_api::Birthday::default()
-            },
+            }),
             ..telegram_api::UserFull::default()
         };
         user_full.flags2 = (1 << 5) | (1 << 24); // birthday, noforwards_peer_enabled
@@ -9800,11 +12423,11 @@ mod tests {
         um.users.get_mut(&5).unwrap().is_contact = true;
         let user_full = telegram_api::UserFull {
             id: 5,
-            settings: telegram_api::PeerSettings {
+            settings: Some(telegram_api::PeerSettings {
                 flags: 1 << 4,
                 need_contacts_exception: true,
                 ..telegram_api::PeerSettings::default()
-            },
+            }),
             private_forward_name: "pf".to_owned(),
             ..telegram_api::UserFull::default()
         };
@@ -9911,11 +12534,11 @@ mod tests {
             um.load_user_full(&mut temp.env(false), UserId::new(999), false, "t"),
             Err("User not found")
         );
-        // No cached full and no row: the local half returns without the
-        // [blocked: net] query.
+        // No cached full and no row: the promise parks on the merged
+        // users.getFullUser query ([blocked: net]) — Ok(false).
         assert_eq!(
             um.load_user_full(&mut temp.env(false), UserId::new(5), false, "t"),
-            Ok(())
+            Ok(false)
         );
 
         // An expired row still force-loads (the C++ reload decision is
@@ -9944,7 +12567,7 @@ mod tests {
         }));
         assert_eq!(
             um.load_user_full(&mut temp.env(false), UserId::new(5), false, "t"),
-            Ok(())
+            Ok(true)
         );
     }
 
@@ -10085,7 +12708,7 @@ mod tests {
         um.get_current_state(&mut temp.env(false), &mut updates);
         assert!(updates.iter().any(|update| matches!(
             update,
-            td_api::Update::updateUser(u) if u.user.id == 5
+            td_api::Update::updateUser(u) if u.user.as_ref().is_some_and(|user| user.id == 5)
         )));
     }
 
@@ -10199,14 +12822,15 @@ mod tests {
         // the process-monotonic clock would read as an ancient status.
         let expires = temp.env(false).unix_time() + 300;
         let mut user = telegram_user(5, "A", USER_ACCESS_HASH_MASK | (1 << 1));
-        user.status =
-            telegram_api::UserStatus::userStatusOnline(telegram_api::userStatusOnline { expires });
+        user.status = Some(telegram_api::UserStatus::userStatusOnline(
+            telegram_api::userStatusOnline { expires },
+        ));
         um.on_get_user(&mut temp.env(false), telegram_api::User::user(user), "t");
         let updates = um.take_updates();
         assert!(
             updates
                 .iter()
-                .any(|u| matches!(u, td_api::Update::updateUser(x) if x.user.id == 5)),
+                .any(|u| matches!(u, td_api::Update::updateUser(x) if x.user.as_ref().is_some_and(|user| user.id == 5))),
             "updateUser must be sent"
         );
         // The C++ diff machine clears is_status_changed together with the
@@ -10792,11 +13416,11 @@ mod tests {
         let status_object = um.get_user_emoji_status_object_of(both_id).unwrap();
         assert!(matches!(
             status_object.r#type,
-            td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
+            Some(td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
                 td_api::emojiStatusTypeCustomEmoji {
                     custom_emoji_id: 77
                 }
-            )
+            ))
         ));
 
         // Stories and the poll predicate.
@@ -10924,8 +13548,8 @@ mod tests {
         );
         assert!(matches!(
             &updates[0],
-            td_api::Update::updateSecretChat(u) if u.secret_chat.id == 66
-                && u.secret_chat.user_id == 0
+            td_api::Update::updateSecretChat(u) if u.secret_chat.as_ref().is_some_and(|secret_chat| secret_chat.id == 66
+                && secret_chat.user_id == 0)
         ));
         assert!(um.unknown_secret_chats.contains(&66));
 
@@ -11030,7 +13654,7 @@ mod tests {
         assert!(
             updates
                 .iter()
-                .any(|update| matches!(update, td_api::Update::updateUserFullInfo(f) if f.user_full_info.bio.text == "the bio")),
+                .any(|update| matches!(update, td_api::Update::updateUserFullInfo(f) if f.user_full_info.as_ref().is_some_and(|full| full.bio.as_ref().is_some_and(|bio| bio.text == "the bio")))),
             "the about change must emit updateUserFullInfo"
         );
     }
@@ -11204,9 +13828,11 @@ mod tests {
         let updates = um.take_updates();
         assert!(
             updates.iter().any(
-                |update| matches!(update, td_api::Update::updateUser(u) if matches!(
-                    u.user.emoji_status.r#type,
-                    td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(_)
+                |update| matches!(update, td_api::Update::updateUser(u) if u.user.as_ref().is_some_and(
+                    |user| user.emoji_status.as_ref().is_some_and(|emoji_status| matches!(
+                        emoji_status.r#type,
+                        Some(td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(_))
+                    ))
                 ))
             ),
             "the emoji status must surface in updateUser"
@@ -11224,9 +13850,11 @@ mod tests {
         um.on_set_birthdate(env, birthdate);
         assert_eq!(um.get_user_full(user_id).unwrap().birthdate, birthdate);
         let first_updates = um.take_updates();
-        assert!(first_updates
-            .iter()
-            .any(|update| matches!(update, td_api::Update::updateUserFullInfo(f) if f.user_full_info.birthdate.day == 5)));
+        assert!(first_updates.iter().any(|update| matches!(
+            update,
+            td_api::Update::updateUserFullInfo(f)
+                if f.user_full_info.as_ref().is_some_and(|full| full.birthdate.as_ref().is_some_and(|birthdate| birthdate.day == 5))
+        )));
 
         // The same birthdate again is a silent no-op.
         um.on_set_birthdate(env, birthdate);
@@ -11698,7 +14326,7 @@ mod tests {
         assert!(
             um.take_updates()
                 .iter()
-                .any(|update| matches!(update, td_api::Update::updateUser(u) if u.user.id == 5))
+                .any(|update| matches!(update, td_api::Update::updateUser(u) if u.user.as_ref().is_some_and(|user| user.id == 5)))
         );
     }
 
@@ -11832,20 +14460,20 @@ mod tests {
         let file_id = um
             .parse_saved_music_document(audio_document(201, 21))
             .unwrap();
-        let (mut p1, a1) = recording_promise::<()>();
-        um.add_saved_music(FileId::default(), FileId::default(), &mut p1);
+        let (p1, a1) = recording_promise::<()>();
+        um.add_saved_music(FileId::default(), FileId::default(), p1);
         assert_eq!(
             a1.lock().unwrap().as_slice(),
             [Err("Invalid file identifier specified".to_owned())]
         );
-        let (mut p2, a2) = recording_promise::<()>();
-        um.add_saved_music(FileId::new(999), FileId::default(), &mut p2);
+        let (p2, a2) = recording_promise::<()>();
+        um.add_saved_music(FileId::new(999), FileId::default(), p2);
         assert_eq!(
             a2.lock().unwrap().as_slice(),
             [Err("Unknown file identifier specified".to_owned())]
         );
-        let (mut p3, a3) = recording_promise::<()>();
-        um.add_saved_music(file_id, file_id, &mut p3);
+        let (p3, a3) = recording_promise::<()>();
+        um.add_saved_music(file_id, file_id, p3);
         assert_eq!(
             a3.lock().unwrap().as_slice(),
             [Err("Can't place saved music after self".to_owned())]
@@ -11914,10 +14542,14 @@ mod tests {
                 id: 5,
                 flags: 1 << 2,   // profile_photo
                 flags2: 1 << 21, // saved_music
-                profile_photo: telegram_photo(55),
-                personal_photo: telegram_api::Photo::photoEmpty(telegram_api::photoEmpty { id: 0 }),
-                fallback_photo: telegram_api::Photo::photoEmpty(telegram_api::photoEmpty { id: 0 }),
-                saved_music: audio_document(300, 30),
+                profile_photo: Some(telegram_photo(55)),
+                personal_photo: Some(telegram_api::Photo::photoEmpty(telegram_api::photoEmpty {
+                    id: 0,
+                })),
+                fallback_photo: Some(telegram_api::Photo::photoEmpty(telegram_api::photoEmpty {
+                    id: 0,
+                })),
+                saved_music: Some(audio_document(300, 30)),
                 ..telegram_api::UserFull::default()
             },
         );
@@ -11952,5 +14584,1249 @@ mod tests {
                 .first_saved_music_file_id
                 .is_valid()
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Contacts (M.4.14)
+
+    fn telegram_contact(id: i64, first_name: &str, last_name: &str) -> telegram_api::user {
+        telegram_api::user {
+            // access_hash, first_name, last_name, contact
+            flags: USER_ACCESS_HASH_MASK | (1 << 1) | (1 << 2) | (1 << 11),
+            contact: true,
+            id,
+            access_hash: 123,
+            first_name: first_name.to_owned(),
+            last_name: last_name.to_owned(),
+            ..telegram_api::user::default()
+        }
+    }
+
+    fn contacts_list(
+        saved_count: i32,
+        users: Vec<telegram_api::user>,
+    ) -> telegram_api::contacts_Contacts {
+        telegram_api::contacts_Contacts::contacts_contacts(telegram_api::contacts_contacts {
+            contacts: Vec::new(),
+            saved_count,
+            users: users.into_iter().map(telegram_api::User::user).collect(),
+        })
+    }
+
+    /// A `Promise<()>` that flips an observable flag on completion (the
+    /// `PromiseCreator` closures are `'static`).
+    fn promise_flag() -> (Promise<()>, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag_clone = flag.clone();
+        (
+            PromiseCreator::lambda(move |_: ()| {
+                flag_clone.store(true, std::sync::atomic::Ordering::SeqCst)
+            }),
+            flag,
+        )
+    }
+
+    /// The `promise_result` slots (a type-complexity clippy alias).
+    type Slots = (
+        Promise<()>,
+        std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<()>>>>,
+    );
+    /// A `Promise<()>` capturing its `Result` into a shared slot.
+    fn promise_result() -> Slots {
+        let result = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let result_clone = result.clone();
+        (
+            PromiseCreator::lambda_result(move |r| *result_clone.lock().unwrap() = Some(r)),
+            result,
+        )
+    }
+
+    /// Loads the contacts (marking `are_contacts_loaded_`) through the
+    /// `on_get_contacts` intake, like the first server answer would.
+    fn load_contacts_via_on_get_contacts(
+        um: &mut UserManager,
+        env: &mut UserEnv,
+        users: Vec<telegram_api::user>,
+        saved_count: i32,
+    ) {
+        let unix_time = env.unix_time();
+        um.on_get_contacts(env, contacts_list(saved_count, users));
+        assert!(um.are_contacts_loaded);
+        assert_eq!(um.saved_contact_count, saved_count);
+        assert!(
+            (unix_time + 70_000..=unix_time + 100_000).contains(&um.next_contacts_sync_date),
+            "the next sync date is a Random::fast(70000, 100000) draw"
+        );
+    }
+
+    #[test]
+    fn contacts_constructor_block_restores_the_binlog_pmc_pair() {
+        let (mut temp, mut um) = test_env();
+
+        // a fresh manager with empty keys keeps the defaults
+        let unix_time = temp.global.unix_time();
+        let mut um2 = UserManager::new();
+        um2.init_contacts_state(temp.global.binlog_pmc(), unix_time, true, false);
+        assert_eq!(um2.next_contacts_sync_date, 0);
+        assert_eq!(um2.saved_contact_count, -1);
+
+        temp.global.binlog_pmc().set(
+            "next_contacts_sync_date",
+            &(unix_time + 200_000).to_string(),
+        );
+        temp.global.binlog_pmc().set("saved_contact_count", "42");
+
+        um.init_contacts_state(temp.global.binlog_pmc(), unix_time, true, false);
+        // the C++ clamps to unix_time + 100000
+        assert_eq!(um.next_contacts_sync_date, unix_time + 100_000);
+        assert_eq!(um.saved_contact_count, 42);
+        assert!(!um.are_contacts_loaded);
+    }
+
+    #[test]
+    fn on_get_contacts_syncs_contact_flags_and_rebuilds_the_hints() {
+        let (mut temp, mut um) = test_env();
+        um.set_my_id(&mut temp.env(false), UserId::new(1));
+
+        // user 2 is a known contact, user 3 a known non-contact; the
+        // server now answers that only 2 (with a fresh name) and the new
+        // 4 are contacts
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_contact(2, "Old", "Name")),
+            "test",
+        );
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(3, "Nobody", USER_ACCESS_HASH_MASK | (1 << 1))),
+            "test",
+        );
+
+        load_contacts_via_on_get_contacts(
+            &mut um,
+            &mut temp.env(false),
+            vec![
+                telegram_contact(2, "Alice", "Cooper"),
+                telegram_contact(4, "Bob", "Dylan"),
+            ],
+            2,
+        );
+
+        assert!(um.get_user(UserId::new(2)).unwrap().is_contact);
+        assert_eq!(um.get_user(UserId::new(2)).unwrap().first_name, "Alice");
+        assert!(um.get_user(UserId::new(4)).unwrap().is_contact);
+        assert!(!um.get_user(UserId::new(3)).unwrap().is_contact);
+        assert!(um.contacts_hints.has_key(2));
+        assert!(um.contacts_hints.has_key(4));
+        assert!(!um.contacts_hints.has_key(3));
+        // the search text carries the updated name
+        assert_eq!(um.contacts_hints.key_to_string(2), "Alice Cooper ");
+        assert!(
+            um.take_updates()
+                .iter()
+                .any(|update| matches!(update, td_api::Update::updateUser(u) if u.user.as_ref().is_some_and(|user| user.id == 2)))
+        );
+    }
+
+    #[test]
+    fn contacts_hints_search_names_usernames_and_the_hash() {
+        let (mut temp, mut um) = test_env();
+        um.set_my_id(&mut temp.env(false), UserId::new(1));
+
+        let users = vec![
+            telegram_contact(2, "Alice", "Cooper"),
+            telegram_contact(3, "Bob", "Dylan"),
+            telegram_contact(4, "Alice", "Bobson"),
+        ];
+        for user in &users {
+            um.on_get_user(
+                &mut temp.env(false),
+                telegram_api::User::user(user.clone()),
+                "test",
+            );
+        }
+
+        load_contacts_via_on_get_contacts(&mut um, &mut temp.env(false), users, 3);
+
+        // the usernames arrive after the contacts list (an update, not a
+        // user re-application, so the list can't wipe them)
+        um.on_update_user_usernames(
+            &mut temp.env(false),
+            UserId::new(2),
+            Usernames::from_telegram("alice_cooper".to_owned(), Vec::new()),
+        );
+
+        // the usernames join the search text (the C++ implode — no
+        // trailing separator after the last username)
+        assert_eq!(
+            um.contacts_hints.key_to_string(2),
+            "Alice Cooper alice_cooper"
+        );
+
+        let (count, ids) =
+            um.search_contacts(&mut temp.env(false), "alice", 10, Promise::default());
+        assert_eq!(count, 2, "Alice Cooper and Alice Bobson");
+        assert_eq!(ids, vec![UserId::new(2), UserId::new(4)]);
+
+        // the username-only word finds Alice Cooper
+        let (_, ids) = um.search_contacts(&mut temp.env(false), "cooper", 10, Promise::default());
+        assert_eq!(ids, vec![UserId::new(2)]);
+
+        // the empty query lists every contact, truncated by the limit
+        let (count, ids) = um.search_contacts(&mut temp.env(false), "", 2, Promise::default());
+        assert_eq!(count, 3);
+        assert_eq!(ids.len(), 2);
+
+        // the close friends are the contacts with the close-friend flag
+        um.on_update_user_is_contact_impl(&mut temp.env(false), UserId::new(3), true, true, true);
+        um.update_user(&mut temp.env(false), UserId::new(3), false, false);
+        let close_friends = um.get_close_friends(&mut temp.env(false), Promise::default());
+        assert_eq!(close_friends, vec![UserId::new(3)]);
+
+        // the hash folds the saved count and the sorted contact ids
+        let hash = um.get_contacts_hash(&mut temp.env(false));
+        let numbers: Vec<u64> = vec![3, 2, 3, 4];
+        assert_eq!(hash, get_vector_hash(&numbers));
+    }
+
+    #[test]
+    fn contacts_persist_and_restore_across_a_database_reopen() {
+        let dir = std::env::temp_dir()
+            .join(format!(
+                "td-rs-m414-contacts-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ))
+            .to_string_lossy()
+            .into_owned();
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Phase 1: contacts arrive, then the save lands in the binlog pmc
+        // and the `user_contacts` row.
+        {
+            let opened = tddb::td_db::TdDb::open(tddb::td_db::Parameters {
+                database_directory: dir.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+            let mut global = Global::new();
+            global.init(opened.database);
+            global.binlog_pmc().set("auth", "ok");
+            let mut options = OptionManager::new(global.is_test_dc());
+            let mut um = UserManager::new();
+            um.init_my_id(global.binlog_pmc());
+            let unix_time = global.unix_time();
+            um.init_contacts_state(global.binlog_pmc(), unix_time, true, false);
+            let mut env = UserEnv {
+                global: &mut global,
+                options: &mut options,
+                auth_is_bot: false,
+            };
+            um.set_my_id(&mut env, UserId::new(1));
+            let contact_2 = telegram_contact(2, "Alice", "Cooper");
+            let contact_3 = telegram_contact(3, "Bob", "Dylan");
+            um.on_get_user(
+                &mut env,
+                telegram_api::User::user(contact_2.clone()),
+                "test",
+            );
+            um.on_get_user(
+                &mut env,
+                telegram_api::User::user(contact_3.clone()),
+                "test",
+            );
+            load_contacts_via_on_get_contacts(&mut um, &mut env, vec![contact_2, contact_3], 2);
+            um.save_contacts_to_database(&mut env);
+            assert_eq!(
+                global.binlog_pmc().get("saved_contact_count"),
+                "2",
+                "the count rides the binlog pmc"
+            );
+            assert!(!global.td_db().common_kv().get(b"user_contacts").is_empty());
+            drop(options);
+            global.close_all(false);
+        }
+
+        // Phase 2: reopen — the pmc pair restores and `load_contacts` reads
+        // the row, reindexes the hints and resolves the queue.
+        {
+            let opened = tddb::td_db::TdDb::open(tddb::td_db::Parameters {
+                database_directory: dir.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+            let mut global = Global::new();
+            global.init(opened.database);
+            let mut options = OptionManager::new(global.is_test_dc());
+            let mut um = UserManager::new();
+            um.init_my_id(global.binlog_pmc());
+            let unix_time = global.unix_time();
+            um.init_contacts_state(global.binlog_pmc(), unix_time, true, false);
+            assert_eq!(um.saved_contact_count, 2);
+            assert!(um.next_contacts_sync_date > 0);
+            let mut env = UserEnv {
+                global: &mut global,
+                options: &mut options,
+                auth_is_bot: false,
+            };
+            let (promise, loaded) = promise_flag();
+            um.load_contacts(&mut env, promise);
+            assert!(
+                loaded.load(std::sync::atomic::Ordering::SeqCst),
+                "the load resolves synchronously from the row"
+            );
+            assert!(um.are_contacts_loaded);
+            assert_eq!(um.contacts_hints.size(), 2);
+            assert!(um.contacts_hints.has_key(2));
+            assert!(um.contacts_hints.has_key(3));
+            assert!(um.get_user(UserId::new(2)).unwrap().is_contact);
+            drop(options);
+            global.close_all(false);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_contacts_state_machine_reserves_replays_and_retries() {
+        let (mut temp, mut um) = test_env();
+        um.set_my_id(&mut temp.env(false), UserId::new(1));
+        load_contacts_via_on_get_contacts(&mut um, &mut temp.env(false), Vec::new(), 0);
+
+        let contact_a = Contact::new(
+            "+123".to_owned(),
+            "A".to_owned(),
+            String::new(),
+            String::new(),
+            UserId::default(),
+        );
+        let contact_b = Contact::new(
+            "+456".to_owned(),
+            "B".to_owned(),
+            String::new(),
+            String::new(),
+            UserId::default(),
+        );
+        let mut random_id = 0i64;
+        let (promise, finished) = promise_flag();
+        let (user_ids, invites) = um.import_contacts(
+            &mut temp.env(false),
+            vec![contact_a.clone(), contact_b.clone()],
+            &mut random_id,
+            promise,
+        );
+        assert!(user_ids.is_empty());
+        assert!(invites.is_empty());
+        assert_ne!(random_id, 0, "the slot id is generated");
+        assert!(um.imported_contacts.contains_key(&random_id));
+        assert!(um.import_contact_tasks.contains_key(&random_id));
+        assert!(
+            !finished.load(std::sync::atomic::Ordering::SeqCst),
+            "the query result has not arrived yet"
+        );
+
+        // a retry answer keeps the task alive
+        um.on_imported_contacts(
+            &mut temp.env(false),
+            random_id,
+            Ok(telegram_api::contacts_ImportedContacts {
+                imported: vec![telegram_api::ImportedContact {
+                    user_id: 10,
+                    client_id: 0,
+                }],
+                popular_invites: Vec::new(),
+                retry_contacts: vec![1],
+                users: Vec::new(),
+            }),
+        );
+        assert!(um.import_contact_tasks.contains_key(&random_id));
+
+        // the final answer fills the buffers and the slot
+        um.on_imported_contacts(
+            &mut temp.env(false),
+            random_id,
+            Ok(telegram_api::contacts_ImportedContacts {
+                imported: vec![
+                    telegram_api::ImportedContact {
+                        user_id: 10,
+                        client_id: 0,
+                    },
+                    telegram_api::ImportedContact {
+                        user_id: 20,
+                        client_id: 1,
+                    },
+                ],
+                popular_invites: vec![telegram_api::PopularContact {
+                    client_id: 1,
+                    importers: 5,
+                }],
+                retry_contacts: Vec::new(),
+                users: Vec::new(),
+            }),
+        );
+        assert!(!um.import_contact_tasks.contains_key(&random_id));
+        assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+
+        // the replay returns the stored result
+        let (promise, replay_done) = promise_flag();
+        let (user_ids, invites) =
+            um.import_contacts(&mut temp.env(false), Vec::new(), &mut random_id, promise);
+        assert_eq!(user_ids, vec![UserId::new(10), UserId::new(20)]);
+        assert_eq!(invites, vec![0, 5]);
+        assert!(replay_done.load(std::sync::atomic::Ordering::SeqCst));
+
+        // an error answer fails the promise and drops the task
+        let mut random_id2 = 0i64;
+        let (promise, error) = promise_result();
+        um.import_contacts(
+            &mut temp.env(false),
+            vec![contact_a],
+            &mut random_id2,
+            promise,
+        );
+        um.on_imported_contacts(
+            &mut temp.env(false),
+            random_id2,
+            Err(Status::error(500, "SERVICE_UNAVAILABLE")),
+        );
+        let error = error.lock().unwrap().take().expect("the promise failed");
+        assert!(error.is_error());
+        assert_eq!(error.error().message(), "SERVICE_UNAVAILABLE");
+        assert!(!um.import_contact_tasks.contains_key(&random_id2));
+    }
+
+    #[test]
+    fn change_imported_contacts_dedups_and_replays_the_change_result() {
+        let (mut temp, mut um) = test_env();
+        um.set_my_id(&mut temp.env(false), UserId::new(1));
+        load_contacts_via_on_get_contacts(&mut um, &mut temp.env(false), Vec::new(), 0);
+
+        // the imported users exist (their rows feed the force-load below)
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(
+                11,
+                "Old A",
+                USER_ACCESS_HASH_MASK | (1 << 1) | (1 << 2),
+            )),
+            "test",
+        );
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(telegram_user(
+                12,
+                "Old B",
+                USER_ACCESS_HASH_MASK | (1 << 1) | (1 << 2),
+            )),
+            "test",
+        );
+
+        // the persisted imported-contacts row: two old contacts
+        let old_a = Contact::new(
+            "+1".to_owned(),
+            "Old A".to_owned(),
+            String::new(),
+            String::new(),
+            UserId::new(11),
+        );
+        let old_b = Contact::new(
+            "+2".to_owned(),
+            "Old B".to_owned(),
+            String::new(),
+            String::new(),
+            UserId::new(12),
+        );
+        let mut blob = Vec::new();
+        store_contacts_log_event(&mut blob, &[old_a.clone(), old_b.clone()]);
+        temp.global
+            .td_db()
+            .common_kv()
+            .set(b"user_imported_contacts", &blob);
+        let (promise, loaded) = promise_flag();
+        um.load_imported_contacts(&mut temp.env(false), promise);
+        assert!(loaded.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(um.are_imported_contacts_loaded);
+        assert_eq!(um.all_imported_contacts.len(), 2);
+
+        // the change: a duplicated pair, one match (keeps the old user id),
+        // one new contact and old B deleted
+        let keep_a = Contact::new(
+            "+1".to_owned(),
+            "Old A".to_owned(),
+            String::new(),
+            String::new(),
+            UserId::default(),
+        );
+        let new_c = Contact::new(
+            "+3".to_owned(),
+            "New C".to_owned(),
+            String::new(),
+            String::new(),
+            UserId::default(),
+        );
+        let mut contacts = vec![keep_a.clone(), keep_a.clone(), new_c.clone()];
+        let mut random_id = 0i64;
+        let (user_ids, invites) = um.change_imported_contacts(
+            &mut temp.env(false),
+            &mut contacts,
+            &mut random_id,
+            Promise::default(),
+        );
+        assert!(
+            user_ids.is_empty(),
+            "the change needs the removal + import roundtrip"
+        );
+        assert!(invites.is_empty());
+        assert_eq!(random_id, 1);
+        assert!(um.are_imported_contacts_changing);
+
+        // a concurrent change is rejected
+        let mut contacts2 = vec![new_c.clone()];
+        let mut random_id2 = 0i64;
+        let (promise, error) = promise_result();
+        um.change_imported_contacts(
+            &mut temp.env(false),
+            &mut contacts2,
+            &mut random_id2,
+            promise,
+        );
+        let error = error.lock().unwrap().take().expect("the promise failed");
+        let error = error.error().clone();
+        assert_eq!(error.code(), 400);
+        assert_eq!(
+            error.message(),
+            "ChangeImportedContacts can be called only once at the same time"
+        );
+
+        // the removal continuation hands the unique contacts to the import
+        let unique_contacts = vec![keep_a.clone(), new_c.clone()];
+        let contacts_unique_id = vec![0usize, 0usize, 1usize];
+        let to_add = (vec![0usize, 1usize], unique_contacts);
+        let (promise, change_done) = promise_flag();
+        um.on_clear_imported_contacts(
+            &mut temp.env(false),
+            vec![keep_a.clone(), new_c.clone()],
+            contacts_unique_id,
+            to_add,
+            promise,
+        );
+        assert!(um.import_contact_tasks.contains_key(&1i64));
+        assert!(
+            !change_done.load(std::sync::atomic::Ordering::SeqCst),
+            "the import query has not answered yet"
+        );
+
+        // the import answer fills the task buffers, resolves the promise
+        // and finishes the change bookkeeping
+        um.on_imported_contacts(
+            &mut temp.env(false),
+            1,
+            Ok(telegram_api::contacts_ImportedContacts {
+                imported: vec![
+                    telegram_api::ImportedContact {
+                        user_id: 11,
+                        client_id: 0,
+                    },
+                    telegram_api::ImportedContact {
+                        user_id: 31,
+                        client_id: 1,
+                    },
+                ],
+                popular_invites: Vec::new(),
+                retry_contacts: Vec::new(),
+                users: Vec::new(),
+            }),
+        );
+        assert!(change_done.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(um.all_imported_contacts.len(), 2);
+        assert_eq!(um.all_imported_contacts[0].get_user_id(), UserId::new(11));
+        assert_eq!(um.all_imported_contacts[1].get_user_id(), UserId::new(31));
+        assert_eq!(um.imported_contact_user_ids.len(), 3);
+        assert_eq!(
+            um.imported_contact_user_ids,
+            vec![UserId::new(11), UserId::new(11), UserId::new(31)]
+        );
+        assert_eq!(um.unimported_contact_invites, vec![0, 0, 0]);
+        assert!(
+            !temp
+                .global
+                .td_db()
+                .common_kv()
+                .get(b"user_imported_contacts")
+                .is_empty()
+        );
+
+        // the replay returns the change results and clears the gate
+        let mut contacts3 = Vec::new();
+        let (promise, replay_done) = promise_flag();
+        let (user_ids, invites) = um.change_imported_contacts(
+            &mut temp.env(false),
+            &mut contacts3,
+            &mut random_id,
+            promise,
+        );
+        assert_eq!(
+            user_ids,
+            vec![UserId::new(11), UserId::new(11), UserId::new(31)]
+        );
+        assert_eq!(invites, vec![0, 0, 0]);
+        assert!(replay_done.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!um.are_imported_contacts_changing);
+
+        // a fully-matching change is a no-op that answers immediately
+        let mut contacts4 = vec![keep_a.clone(), new_c.clone()];
+        let mut random_id4 = 0i64;
+        let (promise, noop_done) = promise_flag();
+        let (user_ids, invites) = um.change_imported_contacts(
+            &mut temp.env(false),
+            &mut contacts4,
+            &mut random_id4,
+            promise,
+        );
+        assert_eq!(user_ids, vec![UserId::new(11), UserId::new(31)]);
+        assert_eq!(invites, vec![0, 0]);
+        assert!(noop_done.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(random_id4, 0, "no roundtrip was started");
+    }
+
+    #[test]
+    fn contact_birthdates_update_the_full_and_emit_close_birthdays() {
+        let (mut temp, mut um) = test_env();
+        um.set_my_id(&mut temp.env(false), UserId::new(1));
+        let contact = telegram_contact(2, "Alice", "Cooper");
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(contact.clone()),
+            "test",
+        );
+        load_contacts_via_on_get_contacts(&mut um, &mut temp.env(false), vec![contact], 1);
+        um.add_user_full(UserId::new(2));
+
+        um.reload_contact_birthdates(&mut temp.env(false), true);
+        assert!(um.contact_birthdates.is_being_synced);
+
+        let before = um.contact_birthdates.next_sync_time;
+        um.on_get_contact_birthdates(
+            &mut temp.env(false),
+            Some(telegram_api::contacts_ContactBirthdays {
+                contacts: vec![telegram_api::ContactBirthday {
+                    contact_id: 2,
+                    birthday: Some(telegram_api::Birthday {
+                        flags: 1,
+                        day: 3,
+                        month: 4,
+                        year: 1990,
+                    }),
+                }],
+                users: Vec::new(),
+            }),
+        );
+        assert!(!um.contact_birthdates.is_being_synced);
+        assert!(um.contact_birthdates.next_sync_time > before);
+        let user_full = um
+            .get_user_full(UserId::new(2))
+            .expect("force-loaded above");
+        assert_eq!(user_full.birthdate, Birthdate::new(3, 4, 1990));
+        assert!(um.take_updates().iter().any(|update| matches!(
+            update,
+            td_api::Update::updateContactCloseBirthdays(u)
+                if u.close_birthday_users.len() == 1 && u.close_birthday_users[0].user_id == 2
+                && u.close_birthday_users[0].birthdate.as_ref().is_some_and(|birthdate| birthdate.day == 3)
+        )));
+
+        // the dismiss option swaps the next answer for an empty one — the
+        // users list clears and an empty update fires
+        temp.options
+            .set_option_boolean("dismiss_birthday_contact_today", true);
+        um.reload_contact_birthdates(&mut temp.env(false), true);
+        assert!(
+            !um.contact_birthdates.need_drop,
+            "the drop ran through the nullptr intake"
+        );
+        assert!(!um.contact_birthdates.is_being_synced);
+        assert!(um.contact_birthdates.users.is_empty());
+        assert!(
+            um.take_updates()
+                .iter()
+                .any(|update| matches!(update, td_api::Update::updateContactCloseBirthdays(u) if u.close_birthday_users.is_empty()))
+        );
+    }
+
+    #[test]
+    fn search_user_by_phone_number_uses_the_resolved_cache() {
+        let (mut temp, mut um) = test_env();
+        um.set_my_id(&mut temp.env(false), UserId::new(1));
+
+        // the digits-only cleaning
+        let (promise, done) = promise_flag();
+        let found = um.search_user_by_phone_number("+1 (23) 45-6".to_owned(), true, promise);
+        assert_eq!(found, UserId::default());
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(
+            um.resolved_phone_numbers.is_empty(),
+            "only_local never caches"
+        );
+
+        // the negative cache
+        um.on_resolved_phone_number("123456".to_owned(), UserId::default());
+        let (promise, done) = promise_flag();
+        let found = um.search_user_by_phone_number("123456".to_owned(), true, promise);
+        assert_eq!(found, UserId::default());
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+
+        // a resolved user answers from the cache
+        um.on_resolved_phone_number("777".to_owned(), UserId::new(42));
+        let (promise, done) = promise_flag();
+        let found = um.search_user_by_phone_number("777".to_owned(), false, promise);
+        assert_eq!(found, UserId::new(42));
+        assert!(done.load(std::sync::atomic::Ordering::SeqCst));
+
+        // the empty number is an error
+        let (promise, error) = promise_result();
+        let found = um.search_user_by_phone_number("+".to_owned(), false, promise);
+        assert_eq!(found, UserId::default());
+        let error = error.lock().unwrap().take().expect("the promise failed");
+        let error = error.error().clone();
+        assert_eq!(error.code(), 200);
+        assert_eq!(error.message(), "Phone number is invalid");
+    }
+
+    #[test]
+    fn on_get_contacts_statuses_feeds_the_online_machinery() {
+        let (mut temp, mut um) = test_env();
+        um.set_my_id(&mut temp.env(false), UserId::new(1));
+        let contact = telegram_contact(2, "Alice", "Cooper");
+        um.on_get_user(
+            &mut temp.env(false),
+            telegram_api::User::user(contact.clone()),
+            "test",
+        );
+        load_contacts_via_on_get_contacts(&mut um, &mut temp.env(false), vec![contact], 1);
+
+        let expires = temp.global.unix_time() + 60;
+        um.on_get_contacts_statuses(
+            &mut temp.env(false),
+            vec![telegram_api::ContactStatus {
+                user_id: 2,
+                status: Some(telegram_api::UserStatus::userStatusOnline(
+                    telegram_api::userStatusOnline { expires },
+                )),
+            }],
+        );
+        assert!(um.get_user(UserId::new(2)).unwrap().was_online > 0);
+        assert!(
+            !temp
+                .global
+                .binlog_pmc()
+                .get("next_contacts_sync_date")
+                .is_empty(),
+            "the statuses complete the sync and save the date"
+        );
+    }
+
+    #[test]
+    fn on_update_contacts_reset_clears_the_imported_contacts() {
+        let (mut temp, mut um) = test_env();
+        um.set_my_id(&mut temp.env(false), UserId::new(1));
+        load_contacts_via_on_get_contacts(&mut um, &mut temp.env(false), Vec::new(), 7);
+
+        // the imported contacts are being loaded — the reset defers the clear
+        temp.global
+            .td_db()
+            .common_kv()
+            .set(b"user_imported_contacts", &[0x00]);
+        let (promise, loaded) = promise_flag();
+        um.load_imported_contacts(&mut temp.env(false), promise);
+        // a broken blob clears the list, so the load still finishes
+        assert!(loaded.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(um.are_imported_contacts_loaded);
+
+        um.on_update_contacts_reset(&mut temp.env(false));
+        assert_eq!(um.saved_contact_count, 0);
+        assert_eq!(
+            temp.global.binlog_pmc().get("saved_contact_count"),
+            "0",
+            "the reset count rides the binlog pmc"
+        );
+        assert!(
+            temp.global
+                .td_db()
+                .common_kv()
+                .get(b"user_imported_contacts")
+                .is_empty(),
+            "the imported-contacts row is erased"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Contact policy + registries (M.4.15)
+
+    /// A `MessageFullId` of a channel message: the C++ dialog id is
+    /// `ZERO_CHANNEL_ID - channel_id`.
+    fn channel_message_full_id(channel_id: i64, message_id: i64) -> MessageFullId {
+        MessageFullId::new(
+            crate::message_id::DialogId::new(
+                crate::message_id::DialogId::ZERO_CHANNEL_ID - channel_id,
+            ),
+            crate::message_id::MessageId::new(message_id),
+        )
+    }
+
+    /// A min (no-phone) cached user — access hash present but not usable.
+    fn add_min_user(um: &mut UserManager, env: &mut UserEnv, id: i64, name: &str) -> UserId {
+        let mut min_user = telegram_user(id, name, USER_ACCESS_HASH_MASK | (1 << 1));
+        min_user.min = true;
+        um.on_get_user(env, telegram_api::User::user(min_user), "test")
+    }
+
+    /// A received cached user with a usable access hash.
+    fn add_received_user(um: &mut UserManager, env: &mut UserEnv, id: i64, name: &str) -> UserId {
+        um.on_get_user(
+            env,
+            telegram_api::User::user(telegram_user(id, name, USER_ACCESS_HASH_MASK | (1 << 1))),
+            "test",
+        )
+    }
+
+    #[test]
+    fn message_users_registry_gates_on_known_channels_and_reemits() {
+        let (mut temp, mut um) = test_env();
+        let mut env = temp.env(false);
+        let min_user_id = add_min_user(&mut um, &mut env, 5, "Min");
+        um.take_updates(); // the seeding's own updateUser
+
+        let message_full_id = channel_message_full_id(7, 1 << 20);
+        // an unknown channel: the ChatManager stand-in gate drops the call
+        um.register_message_users(&env, message_full_id, &[min_user_id]);
+        assert!(um.user_messages.is_empty());
+        assert!(um.take_updates().is_empty());
+
+        // a known channel admits; the min user gets an updateUser
+        um.known_channels.insert(7);
+        um.register_message_users(&env, message_full_id, &[min_user_id]);
+        assert_eq!(um.user_messages.get(&5).unwrap().len(), 1);
+        let updates = um.take_updates();
+        assert!(
+            matches!(&updates[0], td_api::Update::updateUser(u) if u.user.as_ref().is_some_and(|user| user.id == 5)),
+            "the registry appearance emits updateUser for the min user"
+        );
+
+        // a second message for the same user does not re-emit
+        um.register_message_users(&env, channel_message_full_id(7, 2 << 20), &[min_user_id]);
+        assert!(um.take_updates().is_empty());
+
+        // a received user never enters the registry
+        let full_user_id = add_received_user(&mut um, &mut env, 6, "Full");
+        um.take_updates(); // the seeding's own updateUser
+        um.register_message_users(&env, message_full_id, &[full_user_id]);
+        assert!(!um.user_messages.contains_key(&6));
+
+        // unregistering one of two messages keeps the entry (no re-emit)
+        um.unregister_message_users(&env, message_full_id, &[min_user_id]);
+        assert!(um.take_updates().is_empty());
+        assert_eq!(um.user_messages.get(&5).unwrap().len(), 1);
+
+        // the last reference removes the entry and re-emits
+        um.unregister_message_users(&env, channel_message_full_id(7, 2 << 20), &[min_user_id]);
+        assert!(!um.user_messages.contains_key(&5));
+        let updates = um.take_updates();
+        assert!(
+            matches!(&updates[0], td_api::Update::updateUser(u) if u.user.as_ref().is_some_and(|user| user.id == 5)),
+            "the last registry reference emits updateUser for the min user"
+        );
+
+        // the fast path: nothing registered, nothing emitted
+        um.unregister_message_users(&env, message_full_id, &[min_user_id]);
+        assert!(um.take_updates().is_empty());
+    }
+
+    #[test]
+    fn noforwards_request_registry_arms_fires_and_cancels() {
+        let (mut temp, mut um) = test_env();
+        let mut env = temp.env(false);
+        let unix_time = env.unix_time();
+        let message_full_id = channel_message_full_id(7, 1 << 20);
+
+        // a message date inside the window arms the deadline
+        um.register_noforwards_request(&env, message_full_id, unix_time - 10);
+        assert_eq!(
+            um.noforwards_request_ids.get(&message_full_id).copied(),
+            Some(1)
+        );
+        let deadline = *um.noforwards_request_timeouts.get(&1).unwrap();
+        assert!(deadline > tdutils::time::now());
+
+        // a scheduled message never arms
+        let scheduled = MessageFullId::new(
+            message_full_id.get_dialog_id(),
+            crate::message_id::MessageId::new((1 << 21) | 4),
+        );
+        um.register_noforwards_request(&env, scheduled, unix_time - 10);
+        assert!(!um.noforwards_request_ids.contains_key(&scheduled));
+
+        // a message outside the window never arms
+        let expired = channel_message_full_id(7, 2 << 20);
+        um.register_noforwards_request(&env, expired, unix_time - 1_000_000);
+        assert!(!um.noforwards_request_ids.contains_key(&expired));
+
+        // the fire path: drag the deadline into the past and tick
+        *um.noforwards_request_timeouts.get_mut(&1).unwrap() = tdutils::time::now() - 1.0;
+        um.tick_timeouts(&mut env);
+        assert!(um.noforwards_request_ids.is_empty());
+        assert!(um.noforwards_request_message_full_ids.is_empty());
+        assert!(!um.noforwards_request_timeouts.contains_key(&1));
+
+        // unregister cancels the deadline; unknown unregister is a no-op
+        um.register_noforwards_request(&env, message_full_id, unix_time - 10);
+        assert_eq!(
+            um.noforwards_request_ids.get(&message_full_id).copied(),
+            Some(2)
+        );
+        um.unregister_noforwards_request(message_full_id);
+        assert!(um.noforwards_request_timeouts.is_empty());
+        assert!(um.noforwards_request_ids.is_empty());
+        um.unregister_noforwards_request(message_full_id);
+    }
+
+    /// The shared completion slot of the can-send deferred promise.
+    type CanSendResultSlot = std::sync::Arc<
+        std::sync::Mutex<Option<tdutils::status::Result<td_api::CanSendMessageToUserResult>>>,
+    >;
+
+    /// A `Promise<CanSendMessageToUserResult>` capturing its `Result` into
+    /// a shared slot.
+    fn promise_can_send_result() -> (
+        Promise<td_api::CanSendMessageToUserResult>,
+        CanSendResultSlot,
+    ) {
+        let result = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let result_clone = result.clone();
+        (
+            PromiseCreator::lambda_result(move |r| *result_clone.lock().unwrap() = Some(r)),
+            result,
+        )
+    }
+
+    fn is_can_send_ok(
+        result: &Option<tdutils::status::Result<td_api::CanSendMessageToUserResult>>,
+    ) -> bool {
+        matches!(
+            result,
+            Some(tdutils::status::Result::Ok(
+                td_api::CanSendMessageToUserResult::canSendMessageToUserResultOk(_)
+            ))
+        )
+    }
+
+    #[test]
+    fn can_send_message_to_user_answers_the_cpp_matrix() {
+        let (mut temp, mut um) = test_env();
+        let mut env = temp.env(false);
+
+        // self: Ok
+        um.my_id = UserId::new(7);
+        let (promise, result) = promise_can_send_result();
+        um.can_send_message_to_user(&mut env, UserId::new(7), false, promise);
+        assert!(is_can_send_ok(&result.lock().unwrap()));
+
+        // an unknown (non-bot) user: UserIsDeleted
+        let (promise, result) = promise_can_send_result();
+        um.can_send_message_to_user(&mut env, UserId::new(99), false, promise);
+        assert!(matches!(
+            &*result.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(
+                td_api::CanSendMessageToUserResult::canSendMessageToUserResultUserIsDeleted(_)
+            ))
+        ));
+
+        // a received user without restrictions: Ok
+        let user_id = add_received_user(&mut um, &mut env, 5, "Alice");
+        let (promise, result) = promise_can_send_result();
+        um.can_send_message_to_user(&mut env, user_id, false, promise);
+        assert!(is_can_send_ok(&result.lock().unwrap()));
+
+        // a deleted user: UserIsDeleted (the Write gate)
+        um.users.get_mut(&5).unwrap().is_deleted = true;
+        let (promise, result) = promise_can_send_result();
+        um.can_send_message_to_user(&mut env, user_id, false, promise);
+        assert!(matches!(
+            &*result.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(
+                td_api::CanSendMessageToUserResult::canSendMessageToUserResultUserIsDeleted(_)
+            ))
+        ));
+
+        // mutual contact bypasses the premium requirement
+        let mutual_user_id = add_received_user(&mut um, &mut env, 8, "Bob");
+        let u = um.users.get_mut(&8).unwrap();
+        u.is_deleted = false;
+        u.contact_require_premium = true;
+        u.paid_message_star_count = 5;
+        u.is_mutual_contact = true;
+        let (promise, result) = promise_can_send_result();
+        um.can_send_message_to_user(&mut env, mutual_user_id, false, promise);
+        assert!(is_can_send_ok(&result.lock().unwrap()));
+
+        // the premium option does not bypass a non-zero paid-message price
+        // (the C++ premium disjunct requires paid_message_star_count == 0):
+        // the ladder falls through to the merger, which is unwired in the
+        // unit env and answers the "Request aborted" surface
+        env.options.set_option_boolean("is_premium", true);
+        um.users.get_mut(&8).unwrap().is_mutual_contact = false;
+        let (promise, result) = promise_can_send_result();
+        um.can_send_message_to_user(&mut env, mutual_user_id, false, promise);
+        assert!(matches!(
+            &*result.lock().unwrap(),
+            Some(tdutils::status::Result::Err(status)) if status.code() == 500
+        ));
+        env.options.set_option_boolean("is_premium", false);
+
+        // the cached contact price answers (paid / premium / none)
+        um.user_full_contact_price.insert(8, 12);
+        let (promise, result) = promise_can_send_result();
+        um.can_send_message_to_user(&mut env, mutual_user_id, false, promise);
+        assert!(matches!(
+            &*result.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(
+                td_api::CanSendMessageToUserResult::canSendMessageToUserResultUserHasPaidMessages(v)
+            )) if v.outgoing_paid_message_star_count == 12
+        ));
+        um.user_full_contact_price.insert(8, -1);
+        let (promise, result) = promise_can_send_result();
+        um.can_send_message_to_user(&mut env, mutual_user_id, false, promise);
+        assert!(matches!(
+            &*result.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(
+                td_api::CanSendMessageToUserResult::canSendMessageToUserResultUserRestrictsNewChats(
+                    _
+                )
+            ))
+        ));
+        um.user_full_contact_price.insert(8, 0);
+        let (promise, result) = promise_can_send_result();
+        um.can_send_message_to_user(&mut env, mutual_user_id, false, promise);
+        assert!(is_can_send_ok(&result.lock().unwrap()));
+
+        // the cached UserFull answers (paid / premium / none)
+        um.user_full_contact_price.clear();
+        um.add_user_full(UserId::new(8));
+        um.users_full.get_mut(&8).unwrap().send_paid_message_stars = 7;
+        let (promise, result) = promise_can_send_result();
+        um.can_send_message_to_user(&mut env, mutual_user_id, false, promise);
+        assert!(matches!(
+            &*result.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(
+                td_api::CanSendMessageToUserResult::canSendMessageToUserResultUserHasPaidMessages(v)
+            )) if v.outgoing_paid_message_star_count == 7
+        ));
+        um.users_full.get_mut(&8).unwrap().send_paid_message_stars = 0;
+        um.users_full.get_mut(&8).unwrap().contact_require_premium = true;
+        let (promise, result) = promise_can_send_result();
+        um.can_send_message_to_user(&mut env, mutual_user_id, false, promise);
+        assert!(matches!(
+            &*result.lock().unwrap(),
+            Some(tdutils::status::Result::Ok(
+                td_api::CanSendMessageToUserResult::canSendMessageToUserResultUserRestrictsNewChats(
+                    _
+                )
+            ))
+        ));
+        um.users_full.get_mut(&8).unwrap().contact_require_premium = false;
+        let (promise, result) = promise_can_send_result();
+        um.can_send_message_to_user(&mut env, mutual_user_id, false, promise);
+        assert!(is_can_send_ok(&result.lock().unwrap()));
+
+        // an uncached user with force: Ok (the merged-query half)
+        let forced_user_id = add_received_user(&mut um, &mut env, 9, "Eve");
+        let u = um.users.get_mut(&9).unwrap();
+        u.contact_require_premium = true;
+        u.paid_message_star_count = 3;
+        let (promise, result) = promise_can_send_result();
+        um.can_send_message_to_user(&mut env, forced_user_id, true, promise);
+        assert!(is_can_send_ok(&result.lock().unwrap()));
+    }
+
+    #[test]
+    fn share_phone_number_parks_until_contacts_load_and_errors_on_failure() {
+        let (mut temp, mut um) = test_env();
+        let mut env = temp.env(false);
+        let user_id = add_received_user(&mut um, &mut env, 5, "Alice");
+
+        // parked while the contacts are unloaded; the failure drain errors
+        // the parked promise
+        let (promise, result) = promise_result();
+        um.share_phone_number(&mut env, user_id, promise);
+        assert_eq!(um.pending_load_contacts_calls.len(), 1);
+        um.on_get_contacts_failed(&mut env, Status::error(400, "contact load failed"));
+        assert!(matches!(
+            *result.lock().unwrap(),
+            Some(tdutils::status::Result::Err(_))
+        ));
+        assert!(um.pending_load_contacts_calls.is_empty());
+
+        // the loaded path re-dispatches through the parked-call queue
+        let (promise, _flag) = promise_flag();
+        um.share_phone_number(&mut env, user_id, promise);
+        assert_eq!(um.pending_load_contacts_calls.len(), 1);
+        load_contacts_via_on_get_contacts(
+            &mut um,
+            &mut env,
+            vec![telegram_user(5, "Alice", USER_ACCESS_HASH_MASK | (1 << 1))],
+            1,
+        );
+        assert!(um.pending_load_contacts_calls.is_empty());
+
+        // the loaded path errors on an unknown user (the get_input_user 400)
+        let (promise, result) = promise_result();
+        um.share_phone_number(&mut env, UserId::new(99), promise);
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.code() == 400)
+        );
+    }
+
+    #[test]
+    fn freeze_state_restores_updates_and_persists() {
+        let (mut temp, mut um) = test_env();
+        let mut env = temp.env(false);
+        env.global.binlog_pmc().set(
+            "freeze_state",
+            "1700000000 1800000000 https://appeal.example/x y",
+        );
+
+        // the constructor restore emits updateFreezeState
+        um.init_freeze_state(env.global.binlog_pmc());
+        assert_eq!(um.freeze_since_date, 1700000000);
+        assert_eq!(um.freeze_until_date, 1800000000);
+        assert_eq!(um.freeze_appeal_url, "https://appeal.example/x y");
+        let updates = um.take_updates();
+        assert!(matches!(&updates[0], td_api::Update::updateFreezeState(u)
+                if u.is_frozen
+                    && u.freezing_date == 1700000000
+                    && u.deletion_date == 1800000000
+                    && u.appeal_link == "https://appeal.example/x y"));
+
+        // the no-op guard keeps state and storage untouched
+        um.on_update_freeze_state(
+            &mut env,
+            1700000000,
+            1800000000,
+            "https://appeal.example/x y".to_owned(),
+        );
+        assert!(um.take_updates().is_empty());
+        assert_eq!(
+            env.global.binlog_pmc().get("freeze_state"),
+            "1700000000 1800000000 https://appeal.example/x y"
+        );
+
+        // a change emits and re-persists
+        um.on_update_freeze_state(&mut env, 1700000001, 1800000000, String::new());
+        let updates = um.take_updates();
+        assert!(matches!(&updates[0], td_api::Update::updateFreezeState(u)
+                if u.freezing_date == 1700000001 && u.appeal_link.is_empty()));
+        assert_eq!(
+            env.global.binlog_pmc().get("freeze_state"),
+            "1700000001 1800000000 "
+        );
+
+        // the end of the freeze erases the pmc value
+        um.on_update_freeze_state(&mut env, 0, 0, String::new());
+        assert!(env.global.binlog_pmc().get("freeze_state").is_empty());
+        let updates = um.take_updates();
+        assert!(matches!(&updates[0], td_api::Update::updateFreezeState(u) if !u.is_frozen));
+
+        // an absent pmc value restores nothing
+        let (mut temp2, mut um2) = test_env();
+        um2.init_freeze_state(temp2.global.binlog_pmc());
+        assert!(um2.take_updates().is_empty());
+        assert_eq!(um2.freeze_since_date, 0);
+    }
+
+    #[test]
+    fn privacy_updates_expire_user_fulls_and_reemit_restricted_users() {
+        let (mut temp, mut um) = test_env();
+        let mut env = temp.env(false);
+        um.my_id = UserId::new(1);
+
+        // the user record precedes its full: a fresh full is born
+        // need_send_update, and the C++ CHECK(u == nullptr ||
+        // u->is_update_user_sent) forbids announcing a full before its user
+        add_received_user(&mut um, &mut env, 5, "Alice");
+        um.take_updates();
+
+        // the phone-number privacy update expires every cached UserFull
+        um.add_user_full(UserId::new(5));
+        um.add_user_full(UserId::new(6));
+        um.users_full.get_mut(&5).unwrap().expires_at = 123.0;
+        um.users_full.get_mut(&6).unwrap().expires_at = 456.0;
+        um.on_update_phone_number_privacy(&env);
+        assert_eq!(um.users_full.get(&5).unwrap().expires_at, 0.0);
+        assert_eq!(um.users_full.get(&6).unwrap().expires_at, 0.0);
+
+        // the ignored-restrictions update re-emits every restricted user
+        um.restricted_user_ids.insert(5);
+        um.restricted_user_ids.insert(999); // the C++ null-user form
+        um.on_ignored_restriction_reasons_changed(&env);
+        let updates = um.take_updates();
+        assert_eq!(updates.len(), 2);
+        assert!(
+            matches!(&updates[0], td_api::Update::updateUser(u) if u.user.as_ref().is_some_and(|user| user.id == 5))
+        );
+        assert!(
+            matches!(&updates[1], td_api::Update::updateUser(u) if u.user.as_ref().is_some_and(|user| user.id == 999))
+        );
+    }
+
+    #[test]
+    fn premium_contact_price_intake_caches_and_allow_clears() {
+        let (mut temp, mut um) = test_env();
+        let env = temp.env(false);
+        let (promise, flag) = promise_flag();
+        um.on_get_is_premium_required_to_contact_users(
+            vec![UserId::new(5), UserId::new(6), UserId::new(7)],
+            vec![
+                telegram_api::RequirementToContact::requirementToContactEmpty(
+                    telegram_api::requirementToContactEmpty,
+                ),
+                telegram_api::RequirementToContact::requirementToContactPremium(
+                    telegram_api::requirementToContactPremium,
+                ),
+                telegram_api::RequirementToContact::requirementToContactPaidMessages(
+                    telegram_api::requirementToContactPaidMessages { stars_amount: 15 },
+                ),
+            ],
+            promise,
+        );
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(um.user_full_contact_price.get(&5), Some(&0));
+        assert_eq!(um.user_full_contact_price.get(&6), Some(&-1));
+        assert_eq!(um.user_full_contact_price.get(&7), Some(&15));
+
+        // a user with a cached UserFull is skipped
+        um.add_user_full(UserId::new(8));
+        let (promise, _flag) = promise_flag();
+        um.on_get_is_premium_required_to_contact_users(
+            vec![UserId::new(8)],
+            vec![
+                telegram_api::RequirementToContact::requirementToContactPremium(
+                    telegram_api::requirementToContactPremium,
+                ),
+            ],
+            promise,
+        );
+        assert!(!um.user_full_contact_price.contains_key(&8));
+
+        // the size mismatch errors with the C++ message
+        let (promise, result) = promise_result();
+        um.on_get_is_premium_required_to_contact_users(vec![UserId::new(5)], Vec::new(), promise);
+        assert!(
+            matches!(*result.lock().unwrap(), Some(tdutils::status::Result::Err(ref s)) if s.code() == 500)
+        );
+
+        // allow_send_message_to_user clears the premium flag only
+        um.allow_send_message_to_user(&env, UserId::new(6));
+        assert_eq!(um.user_full_contact_price.get(&6), Some(&0));
+        um.allow_send_message_to_user(&env, UserId::new(7));
+        assert_eq!(um.user_full_contact_price.get(&7), Some(&15));
     }
 }

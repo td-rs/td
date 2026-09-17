@@ -82,20 +82,22 @@ impl FormattedDate {
                 }
                 td_api::DateTimeFormattingType::dateTimeFormattingTypeAbsolute(type_) => {
                     match &type_.time_precision {
-                        td_api::DateTimePartPrecision::dateTimePartPrecisionNone(_) => {}
-                        td_api::DateTimePartPrecision::dateTimePartPrecisionShort(_) => {
+                        Some(td_api::DateTimePartPrecision::dateTimePartPrecisionNone(_))
+                        | None => {}
+                        Some(td_api::DateTimePartPrecision::dateTimePartPrecisionShort(_)) => {
                             date_flags |= date_flags::SHORT_TIME;
                         }
-                        td_api::DateTimePartPrecision::dateTimePartPrecisionLong(_) => {
+                        Some(td_api::DateTimePartPrecision::dateTimePartPrecisionLong(_)) => {
                             date_flags |= date_flags::LONG_TIME;
                         }
                     }
                     match &type_.date_precision {
-                        td_api::DateTimePartPrecision::dateTimePartPrecisionNone(_) => {}
-                        td_api::DateTimePartPrecision::dateTimePartPrecisionShort(_) => {
+                        Some(td_api::DateTimePartPrecision::dateTimePartPrecisionNone(_))
+                        | None => {}
+                        Some(td_api::DateTimePartPrecision::dateTimePartPrecisionShort(_)) => {
                             date_flags |= date_flags::SHORT_DATE;
                         }
-                        td_api::DateTimePartPrecision::dateTimePartPrecisionLong(_) => {
+                        Some(td_api::DateTimePartPrecision::dateTimePartPrecisionLong(_)) => {
                             date_flags |= date_flags::LONG_DATE;
                         }
                     }
@@ -165,8 +167,8 @@ impl FormattedDate {
         let show_day_of_week = (self.date_flags & date_flags::DAY_OF_WEEK) != 0;
         Some(DateTimeFormattingType::dateTimeFormattingTypeAbsolute(
             dateTimeFormattingTypeAbsolute {
-                time_precision,
-                date_precision,
+                time_precision: Some(time_precision),
+                date_precision: Some(date_precision),
                 show_day_of_week,
             },
         ))
@@ -203,7 +205,7 @@ impl FormattedDate {
             short_date: (self.date_flags & date_flags::SHORT_DATE) != 0,
             long_date: (self.date_flags & date_flags::LONG_DATE) != 0,
             day_of_week: (self.date_flags & date_flags::DAY_OF_WEEK) != 0,
-            text,
+            text: Some(text),
             date: self.date,
         }
     }
@@ -260,8 +262,8 @@ mod tests {
             _ => DateTimePartPrecision::dateTimePartPrecisionNone(dateTimePartPrecisionNone {}),
         };
         DateTimeFormattingType::dateTimeFormattingTypeAbsolute(dateTimeFormattingTypeAbsolute {
-            time_precision: precision(time),
-            date_precision: precision(date),
+            time_precision: Some(precision(time)),
+            date_precision: Some(precision(date)),
             show_day_of_week: day_of_week,
         })
     }

@@ -40,6 +40,8 @@ pub enum SetOptionAction {
 pub const API_VERSION: &str = "1.8.67";
 
 /// `OptionManager::get_synchronous_options`: `{"version", "commit_hash"}`.
+pub const VERSION: &str = "1.8.67";
+
 pub fn get_synchronous_options() -> &'static [&'static str] {
     &["version", "commit_hash"]
 }
@@ -302,9 +304,11 @@ impl OptionManager {
         self.pending_updates
             .push(td_api::Object::updateOption(td_api::updateOption {
                 name: "unix_time".to_string(),
-                value: OptionValue::optionValueInteger(td_api::optionValueInteger {
-                    value: unix_time as i64,
-                }),
+                value: Some(OptionValue::optionValueInteger(
+                    td_api::optionValueInteger {
+                        value: unix_time as i64,
+                    },
+                )),
             }));
     }
 
@@ -334,7 +338,7 @@ impl OptionManager {
             self.pending_updates
                 .push(td_api::Object::updateOption(td_api::updateOption {
                     name: name.to_string(),
-                    value: Self::get_option_value_object(&self.get_option(name)),
+                    value: Some(Self::get_option_value_object(&self.get_option(name))),
                 }));
         }
         true
@@ -884,7 +888,9 @@ impl OptionManager {
             if !is_internal_option(name) {
                 updates.push(td_api::Object::updateOption(td_api::updateOption {
                     name: name.to_string(),
-                    value: OptionValue::optionValueInteger(td_api::optionValueInteger { value }),
+                    value: Some(OptionValue::optionValueInteger(
+                        td_api::optionValueInteger { value },
+                    )),
                 }));
             }
         };
@@ -1188,7 +1194,7 @@ impl OptionManager {
             if let Some(value) = get_option_synchronously(option_name) {
                 updates.push(td_api::Object::updateOption(td_api::updateOption {
                     name: (*option_name).to_string(),
-                    value,
+                    value: Some(value),
                 }));
             }
         }
@@ -1203,20 +1209,24 @@ impl OptionManager {
         // `td_->online_manager_->is_online()` — TODO (Wave 1), interim false.
         updates.push(td_api::Object::updateOption(td_api::updateOption {
             name: "online".to_string(),
-            value: OptionValue::optionValueBoolean(td_api::optionValueBoolean { value: false }),
+            value: Some(OptionValue::optionValueBoolean(
+                td_api::optionValueBoolean { value: false },
+            )),
         }));
         updates.push(td_api::Object::updateOption(td_api::updateOption {
             name: "unix_time".to_string(),
-            value: OptionValue::optionValueInteger(td_api::optionValueInteger {
-                value: unix_time as i64,
-            }),
+            value: Some(OptionValue::optionValueInteger(
+                td_api::optionValueInteger {
+                    value: unix_time as i64,
+                },
+            )),
         }));
 
         for (name, value) in self.options.get_all() {
             if !is_internal_option(&name) {
                 updates.push(td_api::Object::updateOption(td_api::updateOption {
                     name: name.clone(),
-                    value: Self::get_option_value_object(&value),
+                    value: Some(Self::get_option_value_object(&value)),
                 }));
             }
             // Internal options emit their dedicated updates
@@ -1239,21 +1249,20 @@ fn value_constructor_id(value: &OptionValue) -> i32 {
 }
 
 /// `Clocks::tz_offset()`: the local UTC offset in seconds (east positive),
-/// computed once per manager like the C++ `Clocks::update`.
+/// computed once per manager like the C++ `Clocks::update` — the
+/// `tm_gmtoff` field straight from `localtime_r` (the C++ reads the same
+/// glibc field).
 fn tz_offset() -> i32 {
     let now = std::time::SystemTime::now();
     let unix = now
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| d.as_secs() as libc::time_t)
         .unwrap_or(0);
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    // localtime_r: break `unix` into local time fields; mktime re-assembles
-    // them under the local zone — the difference is the UTC offset.
-    let local_secs = unsafe {
+    unsafe {
         libc::localtime_r(&unix, &mut tm);
-        libc::mktime(&mut tm)
-    };
-    (unix - local_secs) as i32
+    }
+    tm.tm_gmtoff as i32
 }
 
 #[cfg(test)]

@@ -415,14 +415,11 @@ impl MessageEntity {
             ),
             Type::FormattedDate => {
                 // The C++ passes `get_date_time_formatting_type_object()`,
-                // which is null when no formatting was requested; the
-                // generated td_api cannot represent null, so the stand-in
-                // is the default (Relative) formatting type — the same
-                // unrepresentable-null convention as M.3.9.2.
-                let formatting_type = self
-                    .date
-                    .get_date_time_formatting_type_object()
-                    .unwrap_or_default();
+                // which is null when no formatting was requested; since the
+                // M.10 union the generated td_api carries the `Option`
+                // through, so the null is passed on exactly like the C++
+                // (the S09-era default-Relative stand-in is gone).
+                let formatting_type = self.date.get_date_time_formatting_type_object();
                 TextEntityType::textEntityTypeDateTime(textEntityTypeDateTime {
                     unix_time: self.date.get_date(),
                     formatting_type,
@@ -439,7 +436,7 @@ impl MessageEntity {
         td_api::TextEntity {
             offset: self.offset,
             length: self.length,
-            r#type: self.get_text_entity_type_object(user_manager),
+            r#type: Some(self.get_text_entity_type_object(user_manager)),
         }
     }
 
@@ -788,7 +785,7 @@ pub fn get_message_entities<U: UserManagerLike + ?Sized>(
     for input_entity in input_entities {
         let offset = input_entity.offset;
         let length = input_entity.length;
-        match input_entity.r#type {
+        match input_entity.r#type.as_ref().unwrap() {
             td_api::TextEntityType::textEntityTypeMention(_) => {
                 entities.push(MessageEntity::new(Type::Mention, offset, length));
             }
@@ -913,7 +910,7 @@ pub fn get_message_entities<U: UserManagerLike + ?Sized>(
             td_api::TextEntityType::textEntityTypeDateTime(entity) => {
                 let date = FormattedDate::get_formatted_date(
                     entity.unix_time,
-                    Some(&entity.formatting_type),
+                    entity.formatting_type.as_ref(),
                 )?;
                 entities.push(MessageEntity::formatted_date(offset, length, date));
             }
@@ -5396,7 +5393,7 @@ pub fn get_input_message_entities<U: UserManagerLike + ?Sized>(
                     telegram_api::inputMessageEntityMentionName {
                         offset: entity.offset,
                         length: entity.length,
-                        user_id: input_user,
+                        user_id: Some(input_user),
                     },
                 ));
             }
@@ -9123,21 +9120,25 @@ mod tests {
             td_api::TextEntity {
                 offset: 0,
                 length: 2,
-                r#type: td_api::TextEntityType::textEntityTypeBold(td_api::textEntityTypeBold {}),
+                r#type: Some(td_api::TextEntityType::textEntityTypeBold(
+                    td_api::textEntityTypeBold {},
+                )),
             },
             td_api::TextEntity {
                 offset: 3,
                 length: 4,
-                r#type: td_api::TextEntityType::textEntityTypePreCode(
+                r#type: Some(td_api::TextEntityType::textEntityTypePreCode(
                     td_api::textEntityTypePreCode {
                         language: "rust".to_owned(),
                     },
-                ),
+                )),
             },
             td_api::TextEntity {
                 offset: 8,
                 length: 9,
-                r#type: td_api::TextEntityType::textEntityTypeUrl(td_api::textEntityTypeUrl {}),
+                r#type: Some(td_api::TextEntityType::textEntityTypeUrl(
+                    td_api::textEntityTypeUrl {},
+                )),
             },
         ];
         let entities = get_message_entities::<()>(None, input.clone(), true).unwrap();
@@ -9157,7 +9158,7 @@ mod tests {
             vec![td_api::TextEntity {
                 offset: 0,
                 length: 2,
-                r#type,
+                r#type: Some(r#type),
             }]
         };
         // Url is not a user entity: dropped without allow_all.
@@ -9193,9 +9194,11 @@ mod tests {
         let input = vec![td_api::TextEntity {
             offset: 0,
             length: 5,
-            r#type: td_api::TextEntityType::textEntityTypeTextUrl(td_api::textEntityTypeTextUrl {
-                url: "https://t.me".to_owned(),
-            }),
+            r#type: Some(td_api::TextEntityType::textEntityTypeTextUrl(
+                td_api::textEntityTypeTextUrl {
+                    url: "https://t.me".to_owned(),
+                },
+            )),
         }];
         // The plain URL keeps the TextUrl type with the checked link
         // (check_link appends the trailing '/').
@@ -9207,9 +9210,11 @@ mod tests {
         let bad = vec![td_api::TextEntity {
             offset: 0,
             length: 5,
-            r#type: td_api::TextEntityType::textEntityTypeTextUrl(td_api::textEntityTypeTextUrl {
-                url: "http://localhost/".to_owned(),
-            }),
+            r#type: Some(td_api::TextEntityType::textEntityTypeTextUrl(
+                td_api::textEntityTypeTextUrl {
+                    url: "http://localhost/".to_owned(),
+                },
+            )),
         }];
         let error = get_message_entities::<()>(None, bad, true).unwrap_err();
         assert_eq!(error.code(), 400);
@@ -9246,9 +9251,11 @@ mod tests {
         let tg_user = vec![td_api::TextEntity {
             offset: 0,
             length: 5,
-            r#type: td_api::TextEntityType::textEntityTypeTextUrl(td_api::textEntityTypeTextUrl {
-                url: "tg://user?id=123456789".to_owned(),
-            }),
+            r#type: Some(td_api::TextEntityType::textEntityTypeTextUrl(
+                td_api::textEntityTypeTextUrl {
+                    url: "tg://user?id=123456789".to_owned(),
+                },
+            )),
         }];
         let ok = get_message_entities(Some(&mut ValidatingManager(true)), tg_user.clone(), true)
             .unwrap();
@@ -9267,11 +9274,11 @@ mod tests {
         let media = vec![td_api::TextEntity {
             offset: 0,
             length: 2,
-            r#type: td_api::TextEntityType::textEntityTypeMediaTimestamp(
+            r#type: Some(td_api::TextEntityType::textEntityTypeMediaTimestamp(
                 td_api::textEntityTypeMediaTimestamp {
                     media_timestamp: -1,
                 },
-            ),
+            )),
         }];
         let error = get_message_entities::<()>(None, media, true).unwrap_err();
         assert_eq!(
@@ -9282,9 +9289,9 @@ mod tests {
         let emoji = vec![td_api::TextEntity {
             offset: 0,
             length: 2,
-            r#type: td_api::TextEntityType::textEntityTypeCustomEmoji(
+            r#type: Some(td_api::TextEntityType::textEntityTypeCustomEmoji(
                 td_api::textEntityTypeCustomEmoji { custom_emoji_id: 0 },
-            ),
+            )),
         }];
         let error = get_message_entities::<()>(None, emoji, true).unwrap_err();
         assert_eq!(error.message(), "Invalid custom emoji identifier specified");
@@ -9293,12 +9300,12 @@ mod tests {
         let date = vec![td_api::TextEntity {
             offset: 0,
             length: 2,
-            r#type: td_api::TextEntityType::textEntityTypeDateTime(
+            r#type: Some(td_api::TextEntityType::textEntityTypeDateTime(
                 td_api::textEntityTypeDateTime {
                     unix_time: 0,
-                    formatting_type: td_api::DateTimeFormattingType::default(),
+                    formatting_type: Some(td_api::DateTimeFormattingType::default()),
                 },
-            ),
+            )),
         }];
         let error = get_message_entities::<()>(None, date, true).unwrap_err();
         assert_eq!(error.message(), "Invalid date specified");
@@ -10461,7 +10468,7 @@ mod tests {
             td_api::TextEntity {
                 offset,
                 length,
-                r#type,
+                r#type: Some(r#type),
             }
         }
         let bold = || td_api::TextEntityType::textEntityTypeBold(td_api::textEntityTypeBold {});
@@ -10854,10 +10861,11 @@ mod tests {
                         td_api::TextEntityType::textEntityTypeDateTime(
                             td_api::textEntityTypeDateTime {
                                 unix_time: 1_000_000_000,
-                                formatting_type:
+                                formatting_type: Some(
                                     td_api::DateTimeFormattingType::dateTimeFormattingTypeRelative(
                                         td_api::dateTimeFormattingTypeRelative {},
                                     ),
+                                ),
                             },
                         ),
                     )],
@@ -11051,10 +11059,11 @@ mod tests {
                     td_api::TextEntityType::textEntityTypeDateTime(
                         td_api::textEntityTypeDateTime {
                             unix_time: 1_000_000_000,
-                            formatting_type:
+                            formatting_type: Some(
                                 td_api::DateTimeFormattingType::dateTimeFormattingTypeRelative(
                                     td_api::dateTimeFormattingTypeRelative {},
                                 ),
+                            ),
                         },
                     ),
                 ),

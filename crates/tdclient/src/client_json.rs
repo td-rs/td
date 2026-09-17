@@ -17,10 +17,10 @@ use tdutils::status::Result;
 /// `ClientJson.cpp:get_return_error_function`.
 fn return_error_function(error_message: String) -> Function {
     Function::testReturnError(td_api::testReturnError {
-        error: td_api::Error {
+        error: Some(td_api::Error {
             code: 400,
             message: error_message,
-        },
+        }),
     })
 }
 
@@ -261,14 +261,14 @@ mod tests {
         let Function::testReturnError(request) = function else {
             panic!("expected testReturnError");
         };
-        assert_eq!(request.error.code, 400);
+        let error = request.error.expect("error");
+        assert_eq!(error.code, 400);
         assert!(
-            request
-                .error
+            error
                 .message
                 .starts_with("Failed to parse request as JSON object: "),
             "got: {}",
-            request.error.message
+            error.message
         );
         assert!(extra.is_empty());
     }
@@ -279,7 +279,10 @@ mod tests {
         let Function::testReturnError(request) = function else {
             panic!("expected testReturnError");
         };
-        assert_eq!(request.error.message, "Expected a JSON object");
+        assert_eq!(
+            request.error.expect("error").message,
+            "Expected a JSON object"
+        );
     }
 
     #[test]
@@ -289,7 +292,7 @@ mod tests {
             panic!("expected testReturnError");
         };
         assert_eq!(
-            request.error.message,
+            request.error.expect("error").message,
             "Failed to parse JSON object as TDLib request: Unknown class \"nope\""
         );
         assert!(extra.is_empty());

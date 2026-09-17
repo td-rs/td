@@ -1075,6 +1075,13 @@ impl SchedulerState {
             let Some(TimeoutEntry(_, id, generation)) = entry else {
                 break;
             };
+            // the entry may outlive the actor: destroy_actor frees the
+            // ActorInfo once `alive` is published false, and a canceled
+            // timeout leaves its (generation-stale) heap entry behind — skip
+            // dead actors before touching the slot
+            if !id.is_alive() {
+                continue;
+            }
             let info = self.info(&id);
             if info.timeout_gen.get() == generation {
                 info.deadline.set(None);
@@ -1278,6 +1285,16 @@ impl Scheduler {
     /// must stay usable in direct-call tests) check this first.
     pub fn in_scheduler_context() -> bool {
         Self::try_instance().is_some()
+    }
+
+    /// A thread-safe handle to this thread's scheduler, for building a
+    /// [`SchedulerGuard`] on another thread — the actor-side capture
+    /// counterpart of [`ConcurrentScheduler::send_scheduler`](ConcurrentScheduler::send_scheduler).
+    /// Sends routed through it reach any actor (the destination's scheduler
+    /// is resolved per actor id), so a worker thread can deliver results
+    /// into the actor system.
+    pub fn instance_ptr() -> SchedulerPtr {
+        SchedulerPtr(Self::instance() as *const SchedulerState)
     }
 
     pub(crate) fn try_instance() -> Option<&'static SchedulerState> {

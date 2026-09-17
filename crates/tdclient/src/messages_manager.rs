@@ -197,6 +197,10 @@ impl MessageId {
         MessageId(i64::from(i32::MAX) << MessageId::SERVER_ID_SHIFT)
     }
 
+    /// The `max()` value as a constant, for bounds like the database
+    /// `from_message_id` clamps.
+    pub const MAX: MessageId = MessageId((i32::MAX as i64) << MessageId::SERVER_ID_SHIFT);
+
     /// `MessageId::get_message_id` (MessageId.cpp:28-49).
     pub fn get_message_id(message: &telegram_api::Message, is_scheduled: bool) -> MessageId {
         match message {
@@ -510,6 +514,12 @@ impl MessageId {
         parser.fetch_end()?;
         Ok(MessageId(id))
     }
+
+    /// `td::parse(MessageId, Parser)` — the parser form the database layers
+    /// use (raw i64, no gate, like the C++ `parse`).
+    pub fn parse_from(parser: &mut Parser) -> Result<MessageId, &'static str> {
+        Ok(MessageId::new(parser.i64_()?))
+    }
 }
 
 // The C++ relational operators (MessageId.h:172-190) CHECK that both sides
@@ -618,7 +628,7 @@ pub enum DialogType {
 /// users `1..2^40-1`, basic chats `-1..-MAX_CHAT_ID`, channels
 /// `ZERO_CHANNEL_ID - channel_id` including the monoforum band above the
 /// secret-chat reservation, secret chats `ZERO_SECRET_CHAT_ID + secret_chat_id`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DialogId(i64);
 
 impl DialogId {
@@ -703,11 +713,11 @@ impl DialogId {
                 if m.flags & 1 == 0 {
                     DialogId::default()
                 } else {
-                    DialogId::from_peer(&m.peer_id)
+                    DialogId::from_peer(m.peer_id.as_ref().unwrap())
                 }
             }
-            telegram_api::Message::message(m) => DialogId::from_peer(&m.peer_id),
-            telegram_api::Message::messageService(m) => DialogId::from_peer(&m.peer_id),
+            telegram_api::Message::message(m) => DialogId::from_peer(m.peer_id.as_ref().unwrap()),
+            telegram_api::Message::messageService(m) => DialogId::from_peer(m.peer_id.as_ref().unwrap()),
         }
     }
 
@@ -782,6 +792,12 @@ impl DialogId {
         parser.fetch_end()?;
         Ok(DialogId(id))
     }
+
+    /// `td::parse(DialogId, Parser)` — the parser form the database layers
+    /// use.
+    pub fn parse_from(parser: &mut Parser) -> Result<DialogId, &'static str> {
+        Ok(DialogId::new(parser.i64_()?))
+    }
 }
 
 // The C++ band-continuity static_asserts (DialogId.cpp:21-24).
@@ -803,7 +819,7 @@ impl std::fmt::Display for DialogId {
 }
 
 /// `td::MessageFullId` (MessageFullId.h) — the (dialog, message) pair key.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct MessageFullId {
     dialog_id: DialogId,
     message_id: MessageId,
@@ -853,6 +869,15 @@ impl MessageFullId {
             MessageId(message_id),
         ))
     }
+
+    /// `td::parse(MessageFullId, Parser)` — the parser form the database
+    /// layers use (dialog then message, two i64s).
+    pub fn parse_from(parser: &mut Parser) -> Result<MessageFullId, &'static str> {
+        Ok(MessageFullId::new(
+            DialogId::parse_from(parser)?,
+            MessageId::parse_from(parser)?,
+        ))
+    }
 }
 
 /// `td::NotificationGroupId` (NotificationGroupId.h).
@@ -881,6 +906,12 @@ impl NotificationGroupId {
         let id = parser.i32_()?;
         parser.fetch_end()?;
         Ok(NotificationGroupId(id))
+    }
+
+    /// `td::parse(NotificationGroupId, Parser)` — the parser form the
+    /// database layers use.
+    pub fn parse_from(parser: &mut Parser) -> Result<NotificationGroupId, &'static str> {
+        Ok(NotificationGroupId::new(parser.i32_()?))
     }
 }
 
@@ -920,6 +951,12 @@ impl NotificationId {
         let id = parser.i32_()?;
         parser.fetch_end()?;
         Ok(NotificationId(id))
+    }
+
+    /// `td::parse(NotificationId, Parser)` — the parser form the database
+    /// layers use.
+    pub fn parse_from(parser: &mut Parser) -> Result<NotificationId, &'static str> {
+        Ok(NotificationId::new(parser.i32_()?))
     }
 }
 
@@ -1338,7 +1375,7 @@ impl InputDialogId {
             if let Some(input_peer) = input_dialog_id.get_input_peer() {
                 result.push(telegram_api::InputDialogPeer::inputDialogPeer(
                     telegram_api::inputDialogPeer {
-                        peer: Box::new(input_peer),
+                        peer: Some(Box::new(input_peer)),
                     },
                 ));
             }
@@ -1939,7 +1976,7 @@ impl std::fmt::Display for DialogFilterId {
 
 /// `td::FolderId` (FolderId.h) — the archive/main dialog folder; the only
 /// valid non-main folder is 1.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct FolderId(i32);
 
 impl FolderId {
@@ -1973,6 +2010,83 @@ impl FolderId {
         parser.fetch_end()?;
         Ok(FolderId::new(id))
     }
+
+    /// The archive/main folder constants, the Rust-idiomatic form of the
+    /// `main()`/`archive()` constructors.
+    pub const MAIN: FolderId = FolderId(0);
+    pub const ARCHIVE: FolderId = FolderId(1);
+}
+
+/// `td::MessageSearchFilter` (MessageSearchFilter.h:18-41) — append only
+/// before `Size`; the discriminants index the per-filter database
+/// statements and the `message_index_<i>` partial-index mask space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(i32)]
+pub enum MessageSearchFilter {
+    Empty = 0,
+    Animation,
+    Audio,
+    Document,
+    Photo,
+    Video,
+    VoiceNote,
+    PhotoAndVideo,
+    Url,
+    ChatPhoto,
+    Call,
+    MissedCall,
+    VideoNote,
+    VoiceAndVideoNote,
+    Mention,
+    UnreadMention,
+    FailedToSend,
+    Pinned,
+    UnreadReaction,
+    Poll,
+    UnreadPollVote,
+}
+
+impl MessageSearchFilter {
+    /// `MessageSearchFilter::Size` — one past the last real filter.
+    pub const SIZE: i32 = 21;
+
+    pub fn as_i32(self) -> i32 {
+        self as i32
+    }
+}
+
+/// The C++ struct members default to `MessageSearchFilter::Empty`.
+impl Default for MessageSearchFilter {
+    fn default() -> MessageSearchFilter {
+        MessageSearchFilter::Empty
+    }
+}
+
+/// `message_search_filter_count` (MessageSearchFilter.h:43-45).
+pub fn message_search_filter_count() -> usize {
+    (MessageSearchFilter::SIZE - 1) as usize
+}
+
+/// `message_search_filter_index` (MessageSearchFilter.h:47-50) — `CHECK`s
+/// non-empty, returns the zero-based statement slot.
+pub fn message_search_filter_index(filter: MessageSearchFilter) -> i32 {
+    assert!(filter != MessageSearchFilter::Empty);
+    filter.as_i32() - 1
+}
+
+/// `message_search_filter_index_mask` (MessageSearchFilter.h:52-57).
+pub fn message_search_filter_index_mask(filter: MessageSearchFilter) -> i32 {
+    if filter == MessageSearchFilter::Empty {
+        return 0;
+    }
+    1 << message_search_filter_index(filter)
+}
+
+/// `call_message_search_filter_index` (MessageSearchFilter.h:59-62) — the
+/// `full_message_index_<i>` slot (0 for Call, 1 for MissedCall).
+pub fn call_message_search_filter_index(filter: MessageSearchFilter) -> i32 {
+    assert!(filter == MessageSearchFilter::Call || filter == MessageSearchFilter::MissedCall);
+    filter.as_i32() - MessageSearchFilter::Call.as_i32()
 }
 
 impl std::fmt::Display for FolderId {
@@ -4242,7 +4356,7 @@ mod tests {
                 telegram_api::message {
                     id: 1,
                     date: 1,
-                    peer_id: peer.clone(),
+                    peer_id: Some(peer.clone()),
                     ..Default::default()
                 }
             )),
@@ -4261,14 +4375,14 @@ mod tests {
         let empty_with_peer = telegram_api::Message::messageEmpty(telegram_api::messageEmpty {
             flags: 1,
             id: 1,
-            peer_id: peer.clone(),
+            peer_id: Some(peer.clone()),
         });
         assert_eq!(DialogId::get_message_dialog_id(&empty_with_peer), user);
 
         let service = telegram_api::Message::messageService(telegram_api::messageService {
             id: 1,
             date: 1,
-            peer_id: peer,
+            peer_id: Some(peer),
             ..Default::default()
         });
         assert_eq!(DialogId::get_message_dialog_id(&service), user);
@@ -4303,7 +4417,7 @@ mod tests {
         let wire = telegram_api::Message::message(telegram_api::message {
             id: 42,
             date: 1000,
-            peer_id: telegram_api::Peer::peerUser(telegram_api::peerUser { user_id: 7 }),
+            peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser { user_id: 7 })),
             ..Default::default()
         });
         assert_eq!(

@@ -120,7 +120,7 @@ impl StickerPhotoSize {
             telegram_api::VideoSize::videoSizeStickerMarkup(size) => {
                 result.type_ = StickerPhotoSizeType::Sticker;
                 result.sticker_set_id = match &size.stickerset {
-                    telegram_api::InputStickerSet::inputStickerSetID(input) => input.id,
+                    Some(telegram_api::InputStickerSet::inputStickerSetID(input)) => input.id,
                     // add_sticker_set — with the StickersManager step
                     _ => 0,
                 };
@@ -182,8 +182,8 @@ impl StickerPhotoSize {
             }
         };
         td_api::ChatPhotoSticker {
-            r#type,
-            background_fill,
+            r#type: Some(r#type),
+            background_fill: Some(background_fill),
         }
     }
 }
@@ -493,7 +493,7 @@ fn get_photo_size_object(photo_size: &PhotoSize) -> td_api::PhotoSize {
         } else {
             String::new()
         },
-        photo: td_api::File::default(),
+        photo: Some(td_api::File::default()),
         width: photo_size.dimensions.width as i32,
         height: photo_size.dimensions.height as i32,
         progressive_sizes: photo_size.progressive_sizes.clone(),
@@ -518,12 +518,12 @@ pub fn get_animated_chat_photo_object(
     match animation_size {
         Some(animation) if animation.photo_size.file_id.is_valid() => td_api::AnimatedChatPhoto {
             length: animation.photo_size.dimensions.width as i32,
-            file: td_api::File::default(),
+            file: Some(td_api::File::default()),
             main_frame_timestamp: animation.main_frame_timestamp,
         },
         _ => td_api::AnimatedChatPhoto {
             length: 0,
-            file: td_api::File::default(),
+            file: Some(td_api::File::default()),
             main_frame_timestamp: 0.0,
         },
     }
@@ -537,18 +537,20 @@ pub fn get_chat_photo_object(photo: &Photo) -> td_api::ChatPhoto {
         return td_api::ChatPhoto {
             id: 0,
             added_date: 0,
-            minithumbnail: get_minithumbnail_object(&[]),
+            minithumbnail: Some(get_minithumbnail_object(&[])),
             sizes: Vec::new(),
-            animation: get_animated_chat_photo_object(None),
-            small_animation: get_animated_chat_photo_object(None),
-            sticker: td_api::ChatPhotoSticker {
-                r#type: td_api::ChatPhotoStickerType::chatPhotoStickerTypeCustomEmoji(
-                    td_api::chatPhotoStickerTypeCustomEmoji { custom_emoji_id: 0 },
+            animation: Some(get_animated_chat_photo_object(None)),
+            small_animation: Some(get_animated_chat_photo_object(None)),
+            sticker: Some(td_api::ChatPhotoSticker {
+                r#type: Some(
+                    td_api::ChatPhotoStickerType::chatPhotoStickerTypeCustomEmoji(
+                        td_api::chatPhotoStickerTypeCustomEmoji { custom_emoji_id: 0 },
+                    ),
                 ),
-                background_fill: td_api::BackgroundFill::backgroundFillSolid(
+                background_fill: Some(td_api::BackgroundFill::backgroundFillSolid(
                     td_api::backgroundFillSolid { color: 0 },
-                ),
-            },
+                )),
+            }),
         };
     }
 
@@ -573,21 +575,23 @@ pub fn get_chat_photo_object(photo: &Photo) -> td_api::ChatPhoto {
         .as_ref()
         .map(|sticker| sticker.get_chat_photo_sticker_object())
         .unwrap_or(td_api::ChatPhotoSticker {
-            r#type: td_api::ChatPhotoStickerType::chatPhotoStickerTypeCustomEmoji(
-                td_api::chatPhotoStickerTypeCustomEmoji { custom_emoji_id: 0 },
+            r#type: Some(
+                td_api::ChatPhotoStickerType::chatPhotoStickerTypeCustomEmoji(
+                    td_api::chatPhotoStickerTypeCustomEmoji { custom_emoji_id: 0 },
+                ),
             ),
-            background_fill: td_api::BackgroundFill::backgroundFillSolid(
+            background_fill: Some(td_api::BackgroundFill::backgroundFillSolid(
                 td_api::backgroundFillSolid { color: 0 },
-            ),
+            )),
         });
     td_api::ChatPhoto {
         id: photo.id,
         added_date: photo.date,
-        minithumbnail: get_minithumbnail_object(photo.minithumbnail.as_bytes()),
+        minithumbnail: Some(get_minithumbnail_object(photo.minithumbnail.as_bytes())),
         sizes: get_photo_sizes_object(&photo.photos),
-        animation: get_animated_chat_photo_object(big_animation),
-        small_animation: get_animated_chat_photo_object(small_animation),
-        sticker,
+        animation: Some(get_animated_chat_photo_object(big_animation)),
+        small_animation: Some(get_animated_chat_photo_object(small_animation)),
+        sticker: Some(sticker),
     }
 }
 
@@ -816,7 +820,10 @@ mod tests {
         assert_eq!(object.sizes.len(), 1);
         assert_eq!(object.sizes[0].r#type, "m");
         assert_eq!(object.sizes[0].progressive_sizes, vec![1, 2]);
-        assert_eq!(object.minithumbnail.height, 90);
+        assert_eq!(
+            object.minithumbnail.as_ref().expect("minithumbnail").height,
+            90
+        );
 
         // a small 'p' animation without its 'u' counterpart is dropped
         photo.animations = vec![AnimationSize {
@@ -833,8 +840,15 @@ mod tests {
             main_frame_timestamp: 0.25,
         }];
         let object = get_chat_photo_object(&photo);
-        assert_eq!(object.animation.length, 0);
-        assert_eq!(object.small_animation.length, 0);
+        assert_eq!(object.animation.as_ref().expect("animation").length, 0);
+        assert_eq!(
+            object
+                .small_animation
+                .as_ref()
+                .expect("small animation")
+                .length,
+            0
+        );
     }
 
     #[test]
@@ -849,11 +863,11 @@ mod tests {
         let object = sticker.get_chat_photo_sticker_object();
         assert!(matches!(
             object.r#type,
-            td_api::ChatPhotoStickerType::chatPhotoStickerTypeCustomEmoji(_)
+            Some(td_api::ChatPhotoStickerType::chatPhotoStickerTypeCustomEmoji(_))
         ));
         assert!(matches!(
             object.background_fill,
-            td_api::BackgroundFill::backgroundFillGradient(_)
+            Some(td_api::BackgroundFill::backgroundFillGradient(_))
         ));
 
         // invalid ids / color counts drop the size
@@ -880,11 +894,11 @@ mod tests {
             StickerPhotoSize::get_sticker_photo_size(
                 telegram_api::VideoSize::videoSizeStickerMarkup(
                     telegram_api::videoSizeStickerMarkup {
-                        stickerset: telegram_api::InputStickerSet::inputStickerSetShortName(
+                        stickerset: Some(telegram_api::InputStickerSet::inputStickerSetShortName(
                             telegram_api::inputStickerSetShortName {
                                 short_name: "x".to_owned(),
                             },
-                        ),
+                        ),),
                         sticker_id: 1,
                         background_colors: vec![1],
                     }
@@ -903,9 +917,9 @@ mod tests {
         let object = sticker.get_chat_photo_sticker_object();
         assert!(matches!(
             object.background_fill,
-            td_api::BackgroundFill::backgroundFillSolid(td_api::backgroundFillSolid {
-                color: 0xFF0000
-            })
+            Some(td_api::BackgroundFill::backgroundFillSolid(
+                td_api::backgroundFillSolid { color: 0xFF0000 }
+            ))
         ));
     }
 

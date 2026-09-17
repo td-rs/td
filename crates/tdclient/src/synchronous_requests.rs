@@ -120,7 +120,7 @@ fn get_json_value_object(json_value: &JsonValue) -> TdJsonValue {
             object.foreach(|name, value| {
                 members.push(Box::new(td_api::JsonObjectMember {
                     key: name.to_string(),
-                    value: Box::new(get_json_value_object(value)),
+                    value: Some(Box::new(get_json_value_object(value))),
                 }));
             });
             TdJsonValue::jsonValueObject(td_api::jsonValueObject { members })
@@ -156,10 +156,16 @@ fn json_value_to_json(json_value: &TdJsonValue) -> JsonValue {
                 .collect(),
         ),
         TdJsonValue::jsonValueObject(v) => {
+            let default_value = TdJsonValue::default();
             JsonValue::Object(tdutils::json::JsonObject::from_fields(
                 v.members
                     .iter()
-                    .map(|member| (member.key.clone(), json_value_to_json(&member.value)))
+                    .map(|member| {
+                        (
+                            member.key.clone(),
+                            json_value_to_json(member.value.as_deref().unwrap_or(&default_value)),
+                        )
+                    })
                     .collect(),
             ))
         }
@@ -185,13 +191,18 @@ pub fn run_request(function: Function) -> Object {
             Result::Ok(value) => json_value_object(value),
             Result::Err(status) => make_error(400, status.message()),
         },
-        Function::getJsonString(request) => Object::text(td_api::Text {
-            text: get_json_string(&request.json_value),
-        }),
-        Function::setLogStream(request) => match set_current_stream(request.log_stream) {
-            std::result::Result::Ok(()) => Object::ok(td_api::Ok),
-            std::result::Result::Err(message) => make_error(400, &message),
-        },
+        Function::getJsonString(request) => {
+            let default_json = td_api::JsonValue::default();
+            Object::text(td_api::Text {
+                text: get_json_string(request.json_value.as_deref().unwrap_or(&default_json)),
+            })
+        }
+        Function::setLogStream(request) => {
+            match set_current_stream(request.log_stream.unwrap_or_default()) {
+                std::result::Result::Ok(()) => Object::ok(td_api::Ok),
+                std::result::Result::Err(message) => make_error(400, &message),
+            }
+        }
         Function::getLogStream(_) => get_current_stream(),
         Function::setLogVerbosityLevel(request) => {
             if (0..=tdutils::logging::NEVER).contains(&request.new_verbosity_level) {
@@ -226,7 +237,7 @@ pub fn run_request(function: Function) -> Object {
             tdutils::log_impl!(level, "", "{}", request.text);
             Object::ok(td_api::Ok)
         }
-        Function::testReturnError(request) => Object::error(request.error),
+        Function::testReturnError(request) => Object::error(request.error.unwrap_or_default()),
         Function::getTextEntities(request) => {
             if !tdutils::utf8::check_utf8(request.text.as_bytes()) {
                 return make_error(400, "Text must be encoded in UTF-8");
@@ -247,7 +258,9 @@ pub fn run_request(function: Function) -> Object {
                 return make_error(400, "Text must be encoded in UTF-8");
             }
 
-            let parse_mode_version = match &request.parse_mode {
+            // The null bridge above already rejected an absent parse_mode
+            // with the C++ error, so `None` is unreachable here.
+            let parse_mode_version = match request.parse_mode.as_ref().unwrap() {
                 td_api::TextParseMode::textParseModeHTML(_) => None,
                 td_api::TextParseMode::textParseModeMarkdown(markdown) => Some(markdown.version),
             };
@@ -281,9 +294,10 @@ pub fn run_request(function: Function) -> Object {
             })
         }
         Function::parseMarkdown(request) => {
-            let mut text = request.text.text;
+            let text_struct = request.text.unwrap();
+            let mut text = text_struct.text;
             let entities =
-                match message_entity::get_message_entities::<()>(None, request.text.entities, true)
+                match message_entity::get_message_entities::<()>(None, text_struct.entities, true)
                 {
                     std::result::Result::Ok(entities) => entities,
                     std::result::Result::Err(status) => return make_error(400, status.message()),
@@ -326,10 +340,11 @@ pub fn run_request(function: Function) -> Object {
             ))
         }
         Function::getMarkdownText(request) => {
-            let mut text = request.text.text;
+            let text_struct = request.text.unwrap();
+            let mut text = text_struct.text;
             let entities = match message_entity::get_message_entities::<()>(
                 None,
-                request.text.entities,
+                text_struct.entities,
                 false,
             ) {
                 std::result::Result::Ok(entities) => entities,
@@ -364,15 +379,15 @@ pub fn run_request(function: Function) -> Object {
     }
 }
 
-/// The flattened-model null bridge. The generated td_api model (S09)
-/// decodes a null or absent object field to its default variant, while the
-/// C++ keeps `object_ptr` nulls and checks them in
-/// `SynchronousRequests::do_request`. The checks that change the observable
-/// output cannot be expressed in `run_request` (the nullness is already
-/// lost), so `client_json.rs::to_request` applies them at the JSON
-/// boundary, where every request passes. The returned `testReturnError`
-/// serializes to the same `td_api::error` the C++ `make_error` response
-/// does, keeping the output byte-identical (including the `@extra` splice).
+/// The flattened-model null bridge. The C++ keeps `object_ptr` nulls and
+/// checks them in `SynchronousRequests::do_request` with request-specific
+/// error strings. Since the M.10 union the generated td_api model carries
+/// `Option` object fields (the S76-era codegen), so the nullness would
+/// survive into `run_request`; the checks are still applied here at the
+/// JSON boundary, where every request passes, to keep the m8-gated
+/// byte-identical error delivery (including the `@extra` splice) — the
+/// `run_request` arms then `unwrap` the fields, which the bridge makes
+/// unreachable for JSON input.
 ///
 /// `SynchronousRequests.cpp:188/215`: `parseMarkdown`/`getMarkdownText`
 /// require a non-null `text`; `SynchronousRequests.cpp:153`:
@@ -389,10 +404,10 @@ pub fn null_pointer_request_error(request: &JsonValue) -> Option<Function> {
         |field: &str| matches!(object.get_field(field), None | Some(JsonValue::Null));
     let error = |message: &str| {
         Some(Function::testReturnError(td_api::testReturnError {
-            error: td_api::Error {
+            error: Some(td_api::Error {
                 code: 400,
                 message: message.to_string(),
-            },
+            }),
         }))
     };
     match type_name {
@@ -689,7 +704,7 @@ mod tests {
             value: "hi".to_string(),
         });
         let function = Function::getJsonString(td_api::getJsonString {
-            json_value: Box::new(value),
+            json_value: Some(Box::new(value)),
         });
         let response = run_request(function);
         assert_eq!(response.to_json(), r#"{"@type":"text","text":"\"hi\""}"#);
@@ -772,10 +787,10 @@ mod tests {
     #[test]
     fn test_return_error_passes_through() {
         let function = Function::testReturnError(td_api::testReturnError {
-            error: td_api::Error {
+            error: Some(td_api::Error {
                 code: 418,
                 message: "teapot".to_string(),
-            },
+            }),
         });
         assert_eq!(
             run_request(function).to_json(),
@@ -793,7 +808,7 @@ mod tests {
             r#"{"@type":"logStreamDefault"}"#
         );
         let function = Function::setLogStream(td_api::setLogStream {
-            log_stream: td_api::LogStream::logStreamEmpty(td_api::logStreamEmpty),
+            log_stream: Some(td_api::LogStream::logStreamEmpty(td_api::logStreamEmpty)),
         });
         assert_eq!(run_request(function).to_json(), r#"{"@type":"ok"}"#);
         let function = Function::getLogStream(td_api::getLogStream);
@@ -803,7 +818,9 @@ mod tests {
         );
         // back to the default stream
         let function = Function::setLogStream(td_api::setLogStream {
-            log_stream: td_api::LogStream::logStreamDefault(td_api::logStreamDefault),
+            log_stream: Some(td_api::LogStream::logStreamDefault(
+                td_api::logStreamDefault,
+            )),
         });
         assert_eq!(run_request(function).to_json(), r#"{"@type":"ok"}"#);
         let function = Function::getLogStream(td_api::getLogStream);

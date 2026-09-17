@@ -362,8 +362,8 @@ impl SendCodeHelper {
     pub fn get_authentication_code_info_object(&self, now: f64) -> td_api::AuthenticationCodeInfo {
         td_api::AuthenticationCodeInfo {
             phone_number: self.phone_number.clone(),
-            r#type: code_type_object(&self.sent_code_info),
-            next_type: code_type_object(&self.next_code_info),
+            r#type: Some(code_type_object(&self.sent_code_info)),
+            next_type: Some(code_type_object(&self.next_code_info)),
             timeout: ((self.next_code_timestamp - now + 1.0 - 1e-9) as i32).max(0),
         }
     }
@@ -610,12 +610,17 @@ pub enum AuthNetQuery {
         phone_code_hash: String,
         code: String,
     },
+    BotToken {
+        /// The bot token — `auth.importBotAuthorization` (reusable, unlike
+        /// phone codes — the S76 harness relies on exactly this).
+        token: String,
+    },
     LogOut,
     GetPassword,
     CheckPassword {
-        srp_id: i64,
-        a: Vec<u8>,
-        m1: Vec<u8>,
+        /// The password to check — the SRP math runs in the sender (the
+        /// C++ `PasswordManager::get_input_check_password`).
+        password: String,
     },
 }
 
@@ -684,6 +689,14 @@ impl AuthManager {
     /// `AuthManager::is_authorized`.
     pub fn is_authorized(&self) -> bool {
         self.state == State::Ok
+    }
+
+    /// Test-only: the authorized state without the sign-in query (the
+    /// td.rs dispatch tests need a client past the 401 gate; the real
+    /// transition rides check_authentication_code's Authorization answer).
+    #[cfg(test)]
+    pub(crate) fn force_authorized_for_test(&mut self) {
+        self.update_state(State::Ok);
     }
 
     /// The api_id/api_hash half of `setTdlibParameters` (Td passes them
@@ -757,7 +770,23 @@ impl AuthManager {
         if self.state == State::None {
             None
         } else {
-            Some(self.get_authorization_state_object().authorization_state)
+            self.get_authorization_state_object().authorization_state
+        }
+    }
+
+    /// The fresh-DB ctor tail (AuthManager.cpp:362-365): the first
+    /// broadcast state — `authorizationStateWaitPhoneNumber`.
+    pub fn start_wait_phone_number(&mut self) {
+        if self.state == State::None {
+            self.update_state(State::WaitPhoneNumber);
+        }
+    }
+
+    /// The authorized-DB resume (AuthManager.cpp:349-358): straight to
+    /// `authorizationStateReady` with zero network.
+    pub fn set_state_ok(&mut self) {
+        if self.state != State::Ok {
+            self.update_state(State::Ok);
         }
     }
 
@@ -802,20 +831,22 @@ impl AuthManager {
                     allow_google_id: self.db_state_google_id(),
                     // TODO: the email code info and the reset-state timers land
                     // with the email verification flow.
-                    code_info: td_api::EmailAddressAuthenticationCodeInfo {
+                    code_info: Some(td_api::EmailAddressAuthenticationCodeInfo {
                         email_address_pattern: String::new(),
                         length: 0,
-                    },
-                    email_address_reset_state:
+                    }),
+                    email_address_reset_state: Some(
                         td_api::EmailAddressResetState::emailAddressResetStateAvailable(
                             td_api::emailAddressResetStateAvailable { wait_period: 0 },
                         ),
+                    ),
                 })
             }
             State::WaitCode => A::authorizationStateWaitCode(td_api::authorizationStateWaitCode {
-                code_info: self
-                    .send_code_helper
-                    .get_authentication_code_info_object(tdutils::time::now()),
+                code_info: Some(
+                    self.send_code_helper
+                        .get_authentication_code_info_object(tdutils::time::now()),
+                ),
             }),
             State::WaitQrCodeConfirmation => A::authorizationStateWaitOtherDeviceConfirmation(
                 td_api::authorizationStateWaitOtherDeviceConfirmation {
@@ -838,7 +869,9 @@ impl AuthManager {
             }
             State::WaitRegistration => {
                 A::authorizationStateWaitRegistration(td_api::authorizationStateWaitRegistration {
-                    terms_of_service: terms_of_service_object(self.terms_of_service.as_deref()),
+                    terms_of_service: Some(terms_of_service_object(
+                        self.terms_of_service.as_deref(),
+                    )),
                 })
             }
             State::Ok => A::authorizationStateReady(td_api::authorizationStateReady),
@@ -848,7 +881,7 @@ impl AuthManager {
             State::Closing => A::authorizationStateClosing(td_api::authorizationStateClosing),
         };
         td_api::updateAuthorizationState {
-            authorization_state,
+            authorization_state: Some(authorization_state),
         }
     }
 
@@ -976,9 +1009,7 @@ impl AuthManager {
             return Err("Password must be non-empty".to_string());
         }
         match sender.send(AuthNetQuery::CheckPassword {
-            srp_id: self.wait_password_state.srp_id,
-            a: Vec::new(),
-            m1: Vec::new(),
+            password: password.to_string(),
         })? {
             AuthNetResult::PasswordOk => {
                 self.update_state(State::Ok);
@@ -986,6 +1017,34 @@ impl AuthManager {
             }
             other => Err(format!(
                 "Unexpected result for checkPassword: {:?}",
+                std::mem::discriminant(&other)
+            )),
+        }
+    }
+
+    /// `AuthManager::check_bot_token` (cpp:818-842): the bot login —
+    /// `auth.importBotAuthorization` over the sender. Reachable from any
+    /// pre-Ready state (the C++ queues it until the encryption key).
+    pub fn check_authentication_bot_token(
+        &mut self,
+        token: &str,
+        sender: &mut dyn AuthQuerySender,
+    ) -> Result<(), String> {
+        if token.is_empty() {
+            return Err("Bot token must be non-empty".to_string());
+        }
+        match sender.send(AuthNetQuery::BotToken {
+            token: token.to_string(),
+        })? {
+            AuthNetResult::Authorization {
+                user_id: Some(_), ..
+            } => {
+                self.state = State::Ok;
+                self.update_state(State::Ok);
+                Ok(())
+            }
+            other => Err(format!(
+                "Unexpected result for bot token: {:?}",
                 std::mem::discriminant(&other)
             )),
         }
@@ -1123,24 +1182,26 @@ fn code_type_object(info: &AuthenticationCodeInfo) -> td_api::AuthenticationCode
         }),
         CodeType::FirebaseAndroidSafetyNet => {
             T::authenticationCodeTypeFirebaseAndroid(td_api::authenticationCodeTypeFirebaseAndroid {
-                device_verification_parameters:
+                device_verification_parameters: Some(
                     td_api::FirebaseDeviceVerificationParameters::firebaseDeviceVerificationParametersSafetyNet(
                         td_api::firebaseDeviceVerificationParametersSafetyNet {
                             nonce: info.pattern.as_bytes().to_vec(),
                         },
                     ),
+                ),
                 length: info.length,
             })
         }
         CodeType::FirebaseAndroidPlayIntegrity => {
             T::authenticationCodeTypeFirebaseAndroid(td_api::authenticationCodeTypeFirebaseAndroid {
-                device_verification_parameters:
+                device_verification_parameters: Some(
                     td_api::FirebaseDeviceVerificationParameters::firebaseDeviceVerificationParametersPlayIntegrity(
                         td_api::firebaseDeviceVerificationParametersPlayIntegrity {
                             nonce: base64url_encode(&info.pattern),
                             cloud_project_number: info.cloud_project_number,
                         },
                     ),
+                ),
                 length: info.length,
             })
         }
@@ -1193,10 +1254,10 @@ fn base64url_encode(data: &str) -> String {
 fn terms_of_service_object(terms_of_service: Option<&str>) -> td_api::TermsOfService {
     let text = terms_of_service.unwrap_or_default().to_string();
     td_api::TermsOfService {
-        text: td_api::FormattedText {
+        text: Some(td_api::FormattedText {
             text,
             entities: Vec::new(),
-        },
+        }),
         min_user_age: 0,
         show_popup: false,
     }
@@ -1260,7 +1321,7 @@ mod tests {
         assert!(matches!(
             &updates[1],
             Object::updateAuthorizationState(u)
-                if matches!(u.authorization_state, td_api::AuthorizationState::authorizationStateWaitCode(_))
+                if matches!(u.authorization_state, Some(td_api::AuthorizationState::authorizationStateWaitCode(_)))
         ));
     }
 
@@ -1307,7 +1368,7 @@ mod tests {
             matches!(
                 update,
                 Object::updateAuthorizationState(u)
-                    if matches!(u.authorization_state, td_api::AuthorizationState::authorizationStateReady(_))
+                    if matches!(u.authorization_state, Some(td_api::AuthorizationState::authorizationStateReady(_)))
             )
         }));
     }
@@ -1352,7 +1413,7 @@ mod tests {
                 Object::updateAuthorizationState(u)
                     if matches!(
                         &u.authorization_state,
-                        td_api::AuthorizationState::authorizationStateWaitPassword(p)
+                        Some(td_api::AuthorizationState::authorizationStateWaitPassword(p))
                             if p.password_hint == "hint" && p.has_recovery_email_address
                     )
             )
