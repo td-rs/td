@@ -73,10 +73,10 @@ pub(crate) fn gen_mtproto_header(
             .iter_mut()
             .find(|member| member.key == "tz_offset")
         {
-            Some(member) => *member.value = tz_number(),
+            Some(member) => member.value = Some(Box::new(tz_number())),
             None => object.value.push(Box::new(telegram_api::JSONObjectValue {
                 key: "tz_offset".to_string(),
-                value: Box::new(tz_number()),
+                value: Some(Box::new(tz_number())),
             })),
         }
     }
@@ -88,7 +88,7 @@ pub(crate) fn gen_mtproto_header(
     let mut out = Vec::new();
     telegram_api::invokeWithLayer {
         layer: MTPROTO_LAYER,
-        query: Box::new(telegram_api::Function::initConnection(
+        query: Some(Box::new(telegram_api::Function::initConnection(
             telegram_api::initConnection {
                 flags,
                 api_id: options.api_id,
@@ -98,18 +98,18 @@ pub(crate) fn gen_mtproto_header(
                 system_lang_code: options.system_language_code.clone(),
                 lang_pack,
                 lang_code,
-                proxy: telegram_api::InputClientProxy {
+                proxy: Some(telegram_api::InputClientProxy {
                     address: String::new(),
                     port: 0,
-                },
-                params: Box::new(json_value),
+                }),
+                params: Some(Box::new(json_value)),
                 // A unit function keeps the placeholder exactly one
                 // constructor word long.
-                query: Box::new(telegram_api::Function::help_getConfig(
+                query: Some(Box::new(telegram_api::Function::help_getConfig(
                     telegram_api::help_getConfig,
-                )),
+                ))),
             },
-        )),
+        ))),
     }
     .store_boxed(&mut out);
     out.truncate(out.len() - 4);

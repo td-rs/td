@@ -67,15 +67,19 @@ impl DcCompletedQueue {
 }
 
 /// The export/import completion callback — the C++
-/// `actor_shared(this, dc.dc_id.get_raw_id())` receiver.
+/// `actor_shared(this, dc.dc_id.get_raw_id())` receiver. Parks the answer
+/// and nudges the `Td` actor (the C++ closure delivery), which drains the
+/// queue into `DcAuthManager::on_result`.
 struct DcAuthCallback {
     raw_dc_id: i32,
     completed: DcCompletedQueue,
+    shared: Arc<NetShared>,
 }
 
 impl NetQueryCallback for DcAuthCallback {
     fn on_result(&mut self, query: NetQuery) {
         self.completed.push(self.raw_dc_id, query);
+        self.shared.wake_td();
     }
 }
 
@@ -203,18 +207,16 @@ impl DcAuthManager {
     /// `DcAuthManager::check_authorization_is_ok` (:247-249). The C++
     /// caller is `NetQueryDispatcher::check_authorization_is_ok`
     /// (NetQueryDispatcher.cpp:447-452), driven by the AuthManager
-    /// restore path (AuthManager.cpp:355) — the auth-net slice wires it.
-    #[allow(dead_code)]
+    /// restore path (AuthManager.cpp:355).
     pub(crate) fn check_authorization_is_ok(&mut self) {
         self.need_check_authorization_is_ok = true;
     }
 
     /// `DcAuthManager::destroy`'s flag half (:197-201); the completion
-    /// promise is unwired. The C++ caller is
+    /// promise is unwired (the C++ resolves it when every DC key is
+    /// Empty and then destroys the Td). The C++ caller is
     /// `NetQueryDispatcher::destroy_auth_keys` (:316-332), driven by the
-    /// AuthManager logout paths (AuthManager.cpp:373, 1459) — the
-    /// auth-net slice wires it.
-    #[allow(dead_code)]
+    /// AuthManager logout paths (AuthManager.cpp:373, 1459).
     pub(crate) fn destroy(&mut self) {
         self.need_destroy_auth_key = true;
     }
@@ -310,6 +312,7 @@ impl DcAuthManager {
                     Box::new(DcAuthCallback {
                         raw_dc_id,
                         completed: self.completed.clone(),
+                        shared: self.shared.clone(),
                     }),
                 );
                 dc.wait_id = id;
@@ -346,6 +349,7 @@ impl DcAuthManager {
                     Box::new(DcAuthCallback {
                         raw_dc_id,
                         completed: self.completed.clone(),
+                        shared: self.shared.clone(),
                     }),
                 );
                 dc.wait_id = id;

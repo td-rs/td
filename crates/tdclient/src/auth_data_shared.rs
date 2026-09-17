@@ -17,11 +17,14 @@
 use parking_lot::Mutex;
 use std::sync::Arc;
 
+use tdactor::{ActorId, SchedulerPtr};
 use tddb::binlog_key_value::BinlogKeyValue;
 use tdmtproto::auth_data::{ServerSalt, store_server_salt};
 use tdmtproto::auth_key::AuthKey;
 use tdmtproto::mtproto_api::tl;
 use tdnet::net_query::{DcId, NetQuery};
+
+use crate::td::Td;
 
 /// `AuthKeyState` (AuthKeyState.h:16) and `get_auth_key_state`
 /// (:18-26): the key emptiness plus the persisted auth flag.
@@ -165,21 +168,68 @@ impl std::fmt::Debug for NetEvent {
 }
 
 /// The driver→`Td` event mailbox (the `send_closure_later(G()->td(), ...)`
-/// hop, as a queue the actor drains at its pump points).
+/// hop, as a queue the actor drains at its pump points). Every push fires
+/// the attached wake so the actor pumps promptly; without one (the
+/// net-inert tests) the queue is inert.
 #[derive(Clone, Default)]
-pub(crate) struct NetEventQueue(Arc<Mutex<Vec<NetEvent>>>);
+pub(crate) struct NetEventQueue {
+    inner: Arc<QueueInner>,
+}
+
+#[derive(Default)]
+struct QueueInner {
+    events: Mutex<Vec<NetEvent>>,
+    /// The `Td` wake — attached by `Td::init` once the scheduler context
+    /// is known.
+    waker: Mutex<QueueWaker>,
+}
+
+/// The wake target cloned out of the `NetShared` (the scheduler and the
+/// actor id, so the queue doesn't hold an `Arc` cycle back to the
+/// `NetShared`).
+#[derive(Clone, Default)]
+pub(crate) struct QueueWaker {
+    scheduler: Option<SchedulerPtr>,
+    td: Option<ActorId<Td>>,
+}
+
+impl QueueWaker {
+    /// The `Td::init` construction site (`Td` + scheduler context).
+    pub(crate) fn new(scheduler: Option<SchedulerPtr>, td: Option<ActorId<Td>>) -> Self {
+        Self { scheduler, td }
+    }
+
+    fn wake(&self) {
+        let (Some(scheduler), Some(td)) = (self.scheduler.as_ref(), self.td.as_ref()) else {
+            return;
+        };
+        let _guard = scheduler.guard(false);
+        tdactor::send_closure_later(td.clone(), crate::td::TdMessage::DrainNetEvents);
+    }
+}
 
 impl NetEventQueue {
     pub(crate) fn new() -> Self {
-        Self(Arc::new(Mutex::new(Vec::new())))
+        Self {
+            inner: Arc::default(),
+        }
+    }
+
+    /// Attach the wake target (`Td::init`, where the scheduler context is
+    /// known).
+    pub(crate) fn set_waker(&self, waker: QueueWaker) {
+        *self.inner.waker.lock() = waker;
     }
 
     pub(crate) fn push(&self, event: NetEvent) {
-        self.0.lock().push(event);
+        self.inner.events.lock().push(event);
+        // Clone out (the lock must not be held across the wake).
+        let waker = self.inner.waker.lock().clone();
+        waker.wake();
     }
 
     pub(crate) fn take(&self) -> Vec<NetEvent> {
-        std::mem::take(&mut self.0.lock())
+        std::mem::take(&mut self.inner.events.lock())
     }
 }
 

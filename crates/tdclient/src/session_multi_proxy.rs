@@ -206,11 +206,11 @@ pub(crate) struct NetShared {
 impl NetShared {
     /// The `send_closure_later(G()->td(), ...)` hop from a driver thread.
     pub(crate) fn push_event(&self, event: NetEvent) {
+        // The queue's push fires the actor wake itself.
         self.events.push(event);
-        self.wake_td();
     }
 
-    fn wake_td(&self) {
+    pub(crate) fn wake_td(&self) {
         let (Some(scheduler), Some(td)) = (self.scheduler.as_ref(), self.td.as_ref()) else {
             return;
         };

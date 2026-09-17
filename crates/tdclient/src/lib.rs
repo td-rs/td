@@ -8,6 +8,7 @@
 //! Options manager S69.
 
 pub mod auth_data_shared;
+pub mod auth_dispatch;
 pub mod auth_manager;
 pub mod birthdate;
 pub mod chat_manager;
@@ -28,7 +29,6 @@ pub mod manager_option_states;
 pub mod message_id;
 pub mod misc;
 pub mod mtproto_header;
-pub mod net;
 pub mod option_manager;
 pub mod peer_color;
 pub mod photo;

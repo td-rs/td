@@ -5,13 +5,13 @@
 //! (`request_set_`), the `send_result`/`send_error` semantics and the
 //! close/destroy machine.
 //!
-//! S76 adds the walking-skeleton live path: the [`NetBridge`](crate::net)
-//! session (spawned by `init`, updates flowing back through `OnNetUpdate`),
-//! the authorization requests over the bridge (phone → code → 2FA → Ready,
-//! or the persisted-state resume), `getMe`, the Saved-Messages text
-//! `sendMessage` (the temporary-message flow) and the update receive path
-//! (`updateUser`/`updateNewChat`/`updateChatReadInbox`/`updateNewMessage`/
-//! `updateChatLastMessage`).
+//! The net step replaces the S76 walking-skeleton bridge with the C++
+//! actor-shaped stack: the queries dispatch through the client-side
+//! `NetQueryDispatcher`, whose `SessionSink`/`DcInitSink` are the
+//! `NetRouter` pools (`session_multi_proxy.rs`, the `SessionMultiProxy`
+//! port), the auth queries ride the same dispatcher with the
+//! `DcAuthManager` gating DC init, and updates flow back through the
+//! shared `NetEventQueue` (drained by the actor pump).
 //!
 //! Divergences (each arrives with its Wave-1 step):
 //! - the database opens synchronously in the actor; the C++ hops to a
@@ -27,9 +27,9 @@
 //!   the Td's own actor timeout slot; the ConfigRecoverer rides with it —
 //!   created at the manager's `start_up`, its dispatched fetches parked
 //!   until their executors, its wakeup sharing the same timeout slot.
-//! - the S76 bridge is one dedicated thread with a blocking query API (the
-//!   C++ runs the net stack as actors; the observable JSON behavior is
-//!   identical for the single-client skeleton).
+//! - the session drivers are plain threads over the shared `NetShared`
+//!   (the C++ runs the net stack as actors; the observable JSON behavior
+//!   is identical for the single-client skeleton).
 
 use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap};
@@ -39,15 +39,21 @@ use std::sync::Arc;
 use tdactor::{Actor, ActorOwn, Scheduler, actor_messages, send_closure_later};
 use tddb::td_db::{OpenedDatabase, Parameters as DbParameters, TdDb};
 use tdmtproto::telegram_api;
-use tdnet::net_query::{DcId, NetQuery, NetQueryDispatcher};
+use tdnet::net_query::{
+    AuthFlag, DcId, GzipFlag, NetQuery, NetQueryCallback, NetQueryDispatcher, NetQueryType,
+};
 use tdutils::promise::Promise;
 use tdutils::status::Status;
 
 use crate::auth_data_shared::{
-    AuthDataShared, AuthDataSnapshot, NetEvent, NetEventQueue, load_auth_key_from_pmc,
+    AuthDataShared, AuthDataSnapshot, NetEvent, NetEventQueue, QueueWaker, load_auth_key_from_pmc,
     load_salts_from_pmc, save_auth_key_to_pmc, save_salts_to_pmc,
 };
-use crate::auth_manager::{AuthManager, AuthQuerySender};
+use crate::auth_dispatch::{
+    AuthAnswer, AuthPendingKind, build_auth_net_function, build_check_password_function,
+    parse_auth_answer,
+};
+use crate::auth_manager::AuthManager;
 use crate::config_dispatch::{
     CompletedNetQueries, ConfigQueryCallback, TdConfigSink, build_config_net_query,
 };
@@ -66,7 +72,6 @@ use crate::global::Global;
 use crate::link_manager::LinkManager;
 use crate::manager_option_states::ManagerOptionStates;
 use crate::mtproto_header::gen_default_header;
-use crate::net::{AuthSender, BridgeConfig, NetBridge, QueryAnswer};
 use crate::option_manager::OptionManager;
 use crate::query_merger::QueryMerger;
 use crate::requests;
@@ -128,6 +133,36 @@ struct PendingSend {
     local_id: i64,
     chat_id: i64,
     text: String,
+}
+
+/// The walking-skeleton + auth in-flight net kinds: a dispatched query's
+/// token maps back to one of these on the answer drain (the C++ delivers
+/// through the query's promise; the skeleton parks the pair instead).
+enum PendingNetKind {
+    Auth(AuthPendingKind),
+    GetMe,
+    GetState,
+    SendMessage { random_id: i64 },
+}
+
+/// The dispatcher callback for the parked queries: files the completed
+/// `NetQuery` under its token and nudges the `Td` actor (the C++
+/// callback's `send_closure(Td, &Td::on_result)`); the nudge drains the
+/// parked answers through `dispatch_completed_walking`.
+struct NetDispatchCallback {
+    token: u64,
+    completed: Arc<Mutex<Vec<(u64, NetQuery)>>>,
+    /// The actor wake — `None` in the net-inert tests.
+    shared: Option<Arc<NetShared>>,
+}
+
+impl NetQueryCallback for NetDispatchCallback {
+    fn on_result(&mut self, query: NetQuery) {
+        self.completed.lock().push((self.token, query));
+        if let Some(shared) = &self.shared {
+            shared.wake_td();
+        }
+    }
 }
 
 /// The collecting sink under the S72 UpdatesManager — Td drains it and
@@ -246,9 +281,6 @@ pub struct Td {
     /// `RecovererSimpleConfigResult`/`RecovererFullConfigResult` messages,
     /// which tests and the executors alike deliver).
     pub(crate) pending_recoverer_fetches: Vec<RecovererFetch>,
-    /// Live `telegram_api::Updates` packets from the session drivers —
-    /// parked for the UpdatesManager fan-out flips (M.7.12-M.7.15).
-    pub(crate) pending_net_updates: Vec<Vec<u8>>,
     /// The recoverer's armed wakeup (`set_timeout_at` source, sharing the
     /// single Td timeout slot with the config expire time — the earliest
     /// wins, and the fired timeout re-loops both state machines).
@@ -293,10 +325,13 @@ pub struct Td {
     /// promise completions push here and the actor drains at the end of the
     /// turn (the `flush_deferred_results` send_closure hop).
     deferred_results: DeferredResults,
-    /// The S76 network bridge (spawned by `init`; updates flow back through
-    /// `OnNetUpdate`). Idle until the first query, so offline tests stay
-    /// offline.
-    bridge: Option<NetBridge>,
+    /// The parked auth + walking-skeleton net requests: dispatch token →
+    /// (request_id, kind).
+    pending_net: HashMap<u64, (u64, PendingNetKind)>,
+    /// The callback-parked answers: token → the raw query.
+    net_completed: Arc<Mutex<Vec<(u64, NetQuery)>>>,
+    /// The net dispatch token allocator.
+    net_dispatch_token: u64,
     /// The authorized self id (from `auth.authorization`).
     my_id: i64,
     /// The self access hash — `inputPeerUser` for the Saved Messages peer
@@ -358,7 +393,6 @@ impl Td {
             inert_net: false,
             dc_auth_manager: None,
             dc_completed_queries: DcCompletedQueue::new(),
-            pending_net_updates: Vec::new(),
             completed_config_queries: Arc::new(Mutex::new(Vec::new())),
             config_recoverer: None,
             pending_recoverer_fetches: Vec::new(),
@@ -374,7 +408,9 @@ impl Td {
             premium_required_contact_merger: None,
             stop_cnt: 2,
             deferred_results: Arc::new(Mutex::new(Vec::new())),
-            bridge: None,
+            pending_net: HashMap::new(),
+            net_completed: Arc::new(Mutex::new(Vec::new())),
+            net_dispatch_token: 1,
             my_id: 0,
             my_access_hash: 0,
             users: HashMap::new(),
@@ -546,39 +582,6 @@ impl Td {
 
         self.global.init(opened_database.database);
 
-        // The S76 bridge thread (updates flow back through OnNetUpdate).
-        // Idle until the first query, so the offline tests stay offline.
-        // Spawned only under an actor scheduler (the live runs); the
-        // direct-call tests drive `Td::init` without one, and both
-        // `actor_id_of` and `instance_ptr` need the scheduler TLS.
-        if Scheduler::in_scheduler_context() {
-            let actor_id = self.actor_id_of::<Td>();
-            let config = BridgeConfig {
-                api_id: parameters.api_id,
-                api_hash: parameters.api_hash.clone(),
-                use_test_dc: parameters.use_test_dc,
-                database_directory: parameters.database_directory.clone(),
-                device_model: self.header_options.device_model.clone(),
-                system_version: self.header_options.system_version.clone(),
-                application_version: self.header_options.application_version.clone(),
-                system_language_code: self.header_options.system_language_code.clone(),
-            };
-            self.bridge = Some(NetBridge::spawn(
-                config,
-                actor_id,
-                Scheduler::instance_ptr(),
-            ));
-        }
-
-        // A persisted walking-skeleton session resumes straight to Ready
-        // (the C++ AuthManager ctor reading the binlog "auth" key — zero
-        // network); the self user is re-queried over the bridge.
-        let resumed_user = if NetBridge::has_persisted_state(&parameters.database_directory) {
-            self.query_users_me()
-        } else {
-            None
-        };
-
         // init_options_and_network, the M.1 + ConfigManager subset: the
         // OptionManager over the db config pmc, then the ConfigManager
         // (StateManager/OnlineManager arrive with their steps; the
@@ -593,11 +596,6 @@ impl Td {
             let unix_time = self.global.unix_time();
             let mut option_manager = OptionManager::new(is_test_dc);
             option_manager.attach_pmc(config_pmc, unix_time);
-            if let Some(user) = &resumed_user {
-                // `UserManager::set_my_id` — the C++ config pmc persists it
-                // and the option storm on reopen carries it.
-                option_manager.set_option_integer("my_id", user.id);
-            }
             self.option_manager = Some(option_manager);
         }
         // The option storm starts with unix_time (the C++ ctor broadcasts
@@ -698,6 +696,10 @@ impl Td {
         } else {
             None
         };
+        // The queue's pushes wake the actor (the C++
+        // `send_closure_later(G()->td(), ...)` hop); inert without the
+        // scheduler context (the direct-call tests pump manually).
+        net_events.set_waker(QueueWaker::new(scheduler, td_actor_id.clone()));
         // The constructor's binlog restore (NetQueryDispatcher.cpp:373-376
         // + DcAuthManager.cpp:30-42): the pmc `"main_dc_id"`, defaulting
         // to 1.
@@ -791,17 +793,16 @@ impl Td {
         // restore (AuthManager.cpp:337-366).
         self.auth_manager
             .set_api_credentials(parameters.api_id, parameters.api_hash.clone());
-        if let Some(user) = resumed_user {
-            // The walking-skeleton resume: Ready + the cached self user (the
-            // C++ emits Ready from the binlog restore and reads the user
-            // from the UserManager cache — no updateUser broadcast).
-            self.auth_manager.set_state_ok();
-            self.apply_self_user(&user, false);
-        } else {
+        {
             let binlog_pmc = self.global.binlog_pmc();
             let auth_str = binlog_pmc.get("auth");
             match auth_str.as_str() {
                 "ok" => {
+                    // AuthManager.cpp:355 — the restore path checks the
+                    // authorization on the sessions.
+                    if let Some(dc_auth_manager) = self.dc_auth_manager.as_mut() {
+                        dc_auth_manager.check_authorization_is_ok();
+                    }
                     let is_bot = binlog_pmc.get("auth_is_bot") == "true";
                     // `UserManager::load_my_id()` + the my_id option
                     // (AuthManager.cpp:342-348); the fallback
@@ -827,6 +828,13 @@ impl Td {
                     tracing::warn!("Continue to destroy auth keys");
                     self.auth_manager
                         .restore_from_pmc("destroy", false, String::new());
+                    // AuthManager.cpp:373-377 + `start_up`: the continued
+                    // destroy runs `destroy_auth_keys` — the DcAuthManager
+                    // flag half (the promise→`Td::destroy` half is the
+                    // close machine's).
+                    if let Some(dc_auth_manager) = self.dc_auth_manager.as_mut() {
+                        dc_auth_manager.destroy();
+                    }
                 }
                 _ => {
                     // `if (!load_state()) update_state(State::WaitPhoneNumber)`
@@ -1667,7 +1675,11 @@ impl Td {
         };
         let is_bot = self.auth_manager.is_bot();
         let (net_query, token) = build_config_net_query(&query, dispatcher.next_query_id(), is_bot);
-        let callback = ConfigQueryCallback::new(token, self.completed_config_queries.clone());
+        let callback = ConfigQueryCallback::with_wake(
+            token,
+            self.completed_config_queries.clone(),
+            self.net_shared.clone(),
+        );
         dispatcher.dispatch_with_callback(net_query, Box::new(callback));
     }
 
@@ -1682,7 +1694,11 @@ impl Td {
         };
         for event in shared.events.take() {
             match event {
-                NetEvent::UpdatePacket(packet) => self.pending_net_updates.push(packet),
+                NetEvent::UpdatePacket(packet) => {
+                    // The walking-skeleton intake (the M.7 engine consumes
+                    // these once it lands; the skeleton converts them).
+                    self.on_net_update(packet);
+                }
                 NetEvent::ServerTimeDifference {
                     raw_dc_id,
                     diff,
@@ -1748,9 +1764,11 @@ impl Td {
                 }
                 NetEvent::Unauthorized { message } => {
                     // Session.cpp:963-967's `G()->log_out(message)` — the
-                    // auth-side log-out machinery rides the auth-net
-                    // slice; the state flag is already flipped on the
-                    // session's key.
+                    // auth-side destroy keys (AuthManager.cpp:1452-1466).
+                    self.auth_manager.destroy_auth_keys_impl();
+                    if let Some(dc_auth_manager) = self.dc_auth_manager.as_mut() {
+                        dc_auth_manager.destroy();
+                    }
                     tracing::warn!("Log out: {message}");
                 }
                 NetEvent::QueryResult(query) => {
@@ -1770,6 +1788,176 @@ impl Td {
             dc_auth_manager.on_result(raw_dc_id, query);
         }
         dc_auth_manager.loop_(dispatcher, || dispatcher.next_query_id());
+        // The callback-parked completions (each callback nudged us here):
+        // the M.3.8.2 config token dispatch, then the auth +
+        // walking-skeleton answers.
+        self.drain_config_net_query_completions();
+        self.dispatch_completed_walking();
+    }
+
+    /// Drain the callback-parked auth + walking-skeleton answers (the
+    /// driver threads park them; the actor pump routes them here).
+    pub(crate) fn dispatch_completed_walking(&mut self) {
+        let completed = std::mem::take(&mut *self.net_completed.lock());
+        for (token, query) in completed {
+            let Some((request_id, kind)) = self.pending_net.remove(&token) else {
+                continue;
+            };
+            self.on_walking_answer(request_id, kind, query);
+        }
+    }
+
+    /// Route one walking-skeleton answer by kind.
+    fn on_walking_answer(&mut self, request_id: u64, kind: PendingNetKind, query: NetQuery) {
+        let answer: Option<&[u8]> = if query.is_error() {
+            None
+        } else {
+            Some(query.ok())
+        };
+        let error_message: Option<String> = if query.is_error() {
+            Some(query.error().message().to_string())
+        } else {
+            None
+        };
+        let error: Option<&str> = if query.is_error() {
+            Some(query.error().message())
+        } else {
+            None
+        };
+        match kind {
+            PendingNetKind::Auth(kind) => self.on_auth_answer(request_id, kind, answer, error),
+            PendingNetKind::GetMe => {
+                let Some(data) = answer else {
+                    let message =
+                        error_message.unwrap_or_else(|| "the answer is missing".to_string());
+                    return self.send_error_impl(request_id, 500, &message);
+                };
+                match parse_vector_user(data).and_then(|mut users| users.pop()) {
+                    Some(user) => {
+                        self.apply_self_user(&user, false);
+                        if let Some(user) = self.users.get(&self.my_id).cloned() {
+                            self.send_result(request_id, Object::user(user));
+                        } else {
+                            self.send_error_impl(request_id, 500, "Failed to get self user");
+                        }
+                    }
+                    None => self.send_error_impl(
+                        request_id,
+                        500,
+                        "Failed to get information about the user",
+                    ),
+                }
+            }
+            PendingNetKind::GetState => {
+                if let Some(data) = answer
+                    && let Ok(m) = telegram_api::updates_State::parse(data)
+                {
+                    self.updates.set_pts(m.pts);
+                    self.updates.set_qts(m.qts);
+                    self.updates.set_seq(m.seq);
+                }
+            }
+            PendingNetKind::SendMessage { random_id } => {
+                if let Some(data) = answer
+                    && let Ok(answer) = telegram_api::Updates::parse(data)
+                {
+                    self.on_send_answer(random_id, answer);
+                } else if let Some(message) = error_message {
+                    self.on_send_failed(random_id, 400, &message);
+                }
+            }
+        }
+    }
+
+    /// Route one auth answer (the two-step `CheckPassword` re-dispatches
+    /// inside).
+    fn on_auth_answer(
+        &mut self,
+        request_id: u64,
+        kind: AuthPendingKind,
+        answer: Option<&[u8]>,
+        error: Option<&str>,
+    ) {
+        // The sign-in `SESSION_PASSWORD_NEEDED` turn: the C++ fetches the
+        // password state (`account.getPassword`) and answers WaitPassword.
+        if matches!(kind, AuthPendingKind::SignIn) && error == Some("SESSION_PASSWORD_NEEDED") {
+            let function =
+                telegram_api::Function::account_getPassword(telegram_api::account_getPassword);
+            let token = self.park_net(
+                request_id,
+                PendingNetKind::Auth(AuthPendingKind::GetPassword),
+            );
+            return self.dispatch_walking_query(token, function, AuthFlag::On);
+        }
+        match parse_auth_answer(&kind, answer, error) {
+            tdutils::status::Result::Ok(AuthAnswer::SentCode(result)) => {
+                match self.auth_manager.on_sent_code_result(result) {
+                    Ok(()) => {
+                        self.flush_auth_updates();
+                        self.send_result(request_id, ok_object());
+                    }
+                    Err(message) => self.send_error_impl(request_id, 400, &message),
+                }
+            }
+            tdutils::status::Result::Ok(AuthAnswer::Authorization { user_id, user }) => {
+                let result = crate::auth_manager::AuthNetResult::Authorization {
+                    user_id,
+                    terms_of_service: None,
+                };
+                let applied = match kind {
+                    AuthPendingKind::SignIn => self.auth_manager.on_authorization_result(result),
+                    AuthPendingKind::BotToken => self.auth_manager.on_bot_token_result(result),
+                    _ => unreachable!("authorization from an unexpected auth step"),
+                };
+                match applied {
+                    Ok(()) => {
+                        if self.auth_manager.is_authorized() {
+                            self.complete_authorization(request_id, user.as_ref());
+                        } else {
+                            // WaitRegistration — updates then ok.
+                            self.flush_auth_updates();
+                            self.send_result(request_id, ok_object());
+                        }
+                    }
+                    Err(message) => self.send_error_impl(request_id, 400, &message),
+                }
+            }
+            tdutils::status::Result::Ok(AuthAnswer::PasswordSrp { srp }) => {
+                let function = build_check_password_function(srp);
+                let token = self.park_net(
+                    request_id,
+                    PendingNetKind::Auth(AuthPendingKind::CheckPasswordStep2),
+                );
+                self.dispatch_walking_query(token, function, AuthFlag::On);
+            }
+            tdutils::status::Result::Ok(AuthAnswer::PasswordOk { user }) => {
+                match self
+                    .auth_manager
+                    .on_password_result(crate::auth_manager::AuthNetResult::PasswordOk)
+                {
+                    Ok(()) => self.complete_authorization(request_id, user.as_ref()),
+                    Err(message) => self.send_error_impl(request_id, 400, &message),
+                }
+            }
+            tdutils::status::Result::Ok(AuthAnswer::PasswordState {
+                wait_password_state,
+            }) => {
+                self.auth_manager.on_password_needed(wait_password_state);
+                self.flush_auth_updates();
+                self.send_result(request_id, ok_object());
+            }
+            tdutils::status::Result::Ok(AuthAnswer::LoggedOut) => {
+                self.auth_manager.on_logged_out();
+                if let Some(dc_auth_manager) = self.dc_auth_manager.as_mut() {
+                    dc_auth_manager.destroy();
+                }
+                self.flush_auth_updates();
+                self.send_result(request_id, ok_object());
+            }
+            tdutils::status::Result::Err(status) => {
+                self.send_error_impl(request_id, 400, status.message())
+            }
+        }
     }
 
     /// `G()->unix_time()` — the server-time-corrected wall clock; the value
@@ -2092,11 +2280,74 @@ impl Td {
     }
 
     // --------------------------------------------------------------------
-    // The S76 walking-skeleton live paths.
+    // The walking-skeleton live paths (the auth-net slice + the messaging
+    // queries over the NetQueryDispatcher).
     // --------------------------------------------------------------------
 
+    /// The `api_id`/`api_hash` pair for the auth queries.
+    fn auth_params(&self) -> (i32, String) {
+        let parameters = self.parameters.as_ref().expect("parameters");
+        (parameters.api_id, parameters.api_hash.clone())
+    }
+
+    /// Allocate a dispatch token and park the request.
+    fn park_net(&mut self, request_id: u64, kind: PendingNetKind) -> u64 {
+        let token = self.net_dispatch_token;
+        self.net_dispatch_token += 1;
+        self.pending_net.insert(token, (request_id, kind));
+        token
+    }
+
+    /// Serialize + dispatch one walking-skeleton query (the session
+    /// prepends the shared `MtprotoHeader`).
+    fn dispatch_walking_query(
+        &mut self,
+        token: u64,
+        function: telegram_api::Function,
+        auth_flag: AuthFlag,
+    ) {
+        let mut bytes = Vec::new();
+        function.store(&mut bytes);
+        let tl_constructor = i32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let dispatcher = self
+            .net_query_dispatcher
+            .as_ref()
+            .expect("the net dispatcher exists");
+        let net_query = NetQuery::new(
+            token,
+            DcId::main(),
+            NetQueryType::Common,
+            auth_flag,
+            GzipFlag::Off,
+            tl_constructor,
+            bytes,
+            u32::MAX,
+            60 * 60 * 24,
+        );
+        let callback = NetDispatchCallback {
+            token,
+            completed: self.net_completed.clone(),
+            shared: self.net_shared.clone(),
+        };
+        dispatcher.dispatch_with_callback(net_query, Box::new(callback));
+    }
+
+    /// Dispatch a prepared `AuthNetQuery` and park the request.
+    fn dispatch_auth(
+        &mut self,
+        request_id: u64,
+        kind: AuthPendingKind,
+        query: &crate::auth_manager::AuthNetQuery,
+    ) {
+        let (api_id, api_hash) = self.auth_params();
+        let function = build_auth_net_function(query, api_id, &api_hash);
+        let token = self.park_net(request_id, PendingNetKind::Auth(kind));
+        self.dispatch_walking_query(token, function, AuthFlag::Off);
+    }
+
     /// `setAuthenticationPhoneNumber` (Requests.cpp:1786-1794): the clean
-    /// check, then `AuthManager::set_phone_number` over the bridge.
+    /// check, then `AuthManager::set_phone_number` over the dispatcher —
+    /// the request parks until the `auth.sendCode` answer applies.
     pub(crate) fn set_authentication_phone_number(&mut self, request_id: u64, phone: String) {
         let phone = match crate::misc::clean_input_string(&phone) {
             Some(phone) => phone,
@@ -2104,21 +2355,9 @@ impl Td {
                 return self.send_error_impl(request_id, 400, "Strings must be encoded in UTF-8");
             }
         };
-        let bridge = self.bridge.as_ref().expect("bridge").handle();
-        let params = self.parameters.as_ref().expect("parameters");
-        let mut sender = AuthSender::new(
-            &bridge,
-            params.api_id,
-            params.api_hash.clone(),
-            String::new(),
-        );
-        match self
-            .auth_manager
-            .set_authentication_phone_number(&phone, &mut sender)
-        {
-            Ok(()) => {
-                self.flush_auth_updates();
-                self.send_result(request_id, ok_object());
+        match self.auth_manager.prepare_authentication_phone_number(phone) {
+            Ok(query) => {
+                self.dispatch_auth(request_id, AuthPendingKind::SendCode, &query);
             }
             Err(message) => self.send_error_impl(request_id, 400, &message),
         }
@@ -2131,9 +2370,15 @@ impl Td {
                 return self.send_error_impl(request_id, 400, "Strings must be encoded in UTF-8");
             }
         };
-        self.check_code_or_password(request_id, |sender, auth| {
-            auth.check_authentication_bot_token(&token, sender)
-        });
+        match self
+            .auth_manager
+            .prepare_check_authentication_bot_token(token)
+        {
+            Ok(query) => {
+                self.dispatch_auth(request_id, AuthPendingKind::BotToken, &query);
+            }
+            Err(message) => self.send_error_impl(request_id, 400, &message),
+        }
     }
 
     pub(crate) fn check_authentication_code(&mut self, request_id: u64, code: String) {
@@ -2143,9 +2388,28 @@ impl Td {
                 return self.send_error_impl(request_id, 400, "Strings must be encoded in UTF-8");
             }
         };
-        self.check_code_or_password(request_id, |sender, auth| {
-            auth.check_authentication_code(&code, sender)
-        });
+        match self.auth_manager.prepare_check_authentication_code(code) {
+            Ok(query) => {
+                self.dispatch_auth(request_id, AuthPendingKind::SignIn, &query);
+            }
+            Err(message) => self.send_error_impl(request_id, 400, &message),
+        }
+    }
+
+    /// `logOut` (Requests.cpp:1795-1805 + `AuthManager::log_out` over the
+    /// dispatcher).
+    pub(crate) fn log_out(&mut self, request_id: u64) {
+        match self.auth_manager.prepare_log_out() {
+            Ok(Some(query)) => {
+                self.dispatch_auth(request_id, AuthPendingKind::LogOut, &query);
+            }
+            Ok(None) => {
+                // The destroy path without a network round-trip.
+                self.flush_auth_updates();
+                self.send_result(request_id, ok_object());
+            }
+            Err(message) => self.send_error_impl(request_id, 400, &message),
+        }
     }
 
     pub(crate) fn check_authentication_password(&mut self, request_id: u64, password: String) {
@@ -2155,51 +2419,16 @@ impl Td {
                 return self.send_error_impl(request_id, 400, "Strings must be encoded in UTF-8");
             }
         };
-        self.check_code_or_password(request_id, |sender, auth| {
-            auth.check_authentication_password(&password, sender)
-        });
-    }
-
-    /// `checkAuthenticationCode` / `checkAuthenticationPassword` — the
-    /// shared completion: the authorization updates BEFORE the ok, the
-    /// success sequence of `AuthManager::on_get_authorization`
-    /// (authorization_date, my_id, updateUser(self), Ready).
-    fn check_code_or_password(
-        &mut self,
-        request_id: u64,
-        run: impl FnOnce(&mut dyn AuthQuerySender, &mut AuthManager) -> Result<(), String>,
-    ) {
-        let bridge = self.bridge.as_ref().expect("bridge").handle();
-        let params = self.parameters.as_ref().expect("parameters");
-        let mut sender = AuthSender::new(
-            &bridge,
-            params.api_id,
-            params.api_hash.clone(),
-            String::new(),
-        );
-        // The password for the SRP step rides the checkAuthenticationPassword
-        // request; check_authentication_password carries it through the
-        // query (the sender re-fetches account.getPassword for fresh salts).
-        let result = {
-            let mut auth = std::mem::take(&mut self.auth_manager);
-            let outcome = run(&mut sender, &mut auth);
-            self.auth_manager = auth;
-            outcome
-        };
-        match result {
-            Ok(()) => {
-                if self.auth_manager.is_authorized() {
-                    // The ConfigManager's `help.getConfig` step: the
-                    // config-derived options come from the live reply. A
-                    // failed fetch skips them, as in the C++ client when
-                    // the config has not arrived yet.
-                    let config = sender.get_config().ok();
-                    self.complete_authorization(request_id, &sender, config.as_ref());
-                } else {
-                    // WaitRegistration / WaitPassword — updates then ok.
-                    self.flush_auth_updates();
-                    self.send_result(request_id, ok_object());
-                }
+        match self
+            .auth_manager
+            .prepare_check_authentication_password(password.clone())
+        {
+            Ok(query) => {
+                self.dispatch_auth(
+                    request_id,
+                    AuthPendingKind::CheckPassword { password },
+                    &query,
+                );
             }
             Err(message) => self.send_error_impl(request_id, 400, &message),
         }
@@ -2210,12 +2439,7 @@ impl Td {
     /// options, authorization_date, my_id, the self user, Ready — then the
     /// ok, `connectionStateUpdating`, the default reaction type and
     /// `connectionStateReady`.
-    fn complete_authorization(
-        &mut self,
-        request_id: u64,
-        sender: &AuthSender<'_>,
-        config: Option<&telegram_api::Config>,
-    ) {
+    fn complete_authorization(&mut self, request_id: u64, user: Option<&telegram_api::user>) {
         self.send_update(Object::updateOption(td_api::updateOption {
             name: "unix_time".to_string(),
             value: Some(td_api::OptionValue::optionValueInteger(
@@ -2225,43 +2449,9 @@ impl Td {
             )),
         }));
 
-        // The ConfigManager-applied options: the `help.getConfig`-derived
-        // subset in the C++ `process_config` emission order the recorder
-        // pins; the search-bot options are app-config sourced.
-        if let Some(option_manager) = self.option_manager.as_mut() {
-            if let Some(config) = config {
-                option_manager.set_option_boolean("test_mode", config.test_mode);
-                option_manager.set_option_integer(
-                    "forwarded_message_count_max",
-                    config.forwarded_count_max as i64,
-                );
-                option_manager
-                    .set_option_integer("basic_group_size_max", config.chat_size_max as i64);
-                option_manager
-                    .set_option_integer("supergroup_size_max", config.megagroup_size_max as i64);
-                option_manager.set_option_boolean("expect_blocking", config.blocked_mode);
-                if !config.me_url_prefix.is_empty() {
-                    let mut url = config.me_url_prefix.clone();
-                    if !url.ends_with('/') {
-                        url.push('/');
-                    }
-                    option_manager.set_option_string("t_me_url", &url);
-                }
-                option_manager.set_option_integer(
-                    "call_connect_timeout_ms",
-                    config.call_connect_timeout_ms as i64,
-                );
-                option_manager.set_option_integer(
-                    "call_packet_timeout_ms",
-                    config.call_packet_timeout_ms as i64,
-                );
-            }
-            option_manager.set_option_string("animation_search_bot_username", "contextbot");
-            option_manager.set_option_string("venue_search_bot_username", "foursquarebot");
-            option_manager.set_option_string("photo_search_bot_username", "imagebot");
-        }
-        self.flush_option_updates();
-
+        // The config-derived options arrive from the ConfigManager's own
+        // `help.getConfig` fetch (dispatched at init — the M.3.8 wiring);
+        // the recorder pins their position, the manager their order.
         self.send_update(Object::updateOption(td_api::updateOption {
             name: "authorization_date".to_string(),
             value: Some(td_api::OptionValue::optionValueInteger(
@@ -2270,7 +2460,7 @@ impl Td {
                 },
             )),
         }));
-        if let Some(user) = sender.last_user() {
+        if let Some(user) = user {
             self.apply_self_user(user, true);
         }
         self.flush_auth_updates();
@@ -2302,19 +2492,9 @@ impl Td {
 
         // The post-Ready position: `updates.getState` seeds the pts (the
         // C++ get_difference chain; the skeleton keeps the position).
-        if let Some(owner) = self.bridge.as_ref() {
-            let bridge = owner.handle();
-            let state = telegram_api::Function::updates_getState(telegram_api::updates_getState);
-            if let QueryAnswer::Ok(data) = bridge.query(state)
-                && let Ok(m) = telegram_api::updates_State::parse(&data)
-            {
-                self.updates.set_pts(m.pts);
-                self.updates.set_qts(m.qts);
-                self.updates.set_seq(m.seq);
-            }
-            bridge.mark_authorized();
-            bridge.persist();
-        }
+        let function = telegram_api::Function::updates_getState(telegram_api::updates_getState);
+        let token = self.park_net(0, PendingNetKind::GetState);
+        self.dispatch_walking_query(token, function, AuthFlag::On);
     }
 
     /// Store + broadcast the self user: `UserManager::set_my_id` (the
@@ -2340,21 +2520,9 @@ impl Td {
     }
 
     /// One `users.getUsers[inputUserSelf]` round-trip (the wire `getMe`).
-    fn query_users_me(&mut self) -> Option<telegram_api::user> {
-        let bridge = self.bridge.as_ref()?.handle();
-        let query = telegram_api::Function::users_getUsers(telegram_api::users_getUsers {
-            id: vec![telegram_api::InputUser::inputUserSelf(
-                telegram_api::inputUserSelf,
-            )],
-        });
-        match bridge.query(query) {
-            QueryAnswer::Ok(data) => parse_vector_user(&data).and_then(|mut users| users.pop()),
-            _ => None,
-        }
-    }
-
     /// `getMe` (Requests.cpp): the cached self user, the UserManager store
-    /// (the M.4 surface), or one `users.getUsers` round-trip over the bridge.
+    /// (the M.4 surface), or one `users.getUsers` round-trip over the
+    /// dispatcher.
     pub(crate) fn get_me(&mut self, request_id: u64) {
         if !self.auth_manager.is_authorized() {
             return self.send_error_impl(request_id, 401, "Unauthorized");
@@ -2363,8 +2531,8 @@ impl Td {
             return self.send_result(request_id, Object::user(user));
         }
         // The UserManager store answers first when it has the self user
-        // (the M.4 surface — also the offline unit-test path); the live
-        // bridge round-trip fires only on a cache miss.
+        // (the M.4 surface — also the offline unit-test path); the
+        // dispatcher round-trip fires only on a cache miss.
         {
             let mut env = UserEnv {
                 global: &mut self.global,
@@ -2388,19 +2556,13 @@ impl Td {
                 return self.send_result(request_id, Object::user(user));
             }
         }
-        match self.query_users_me() {
-            Some(user) => {
-                self.apply_self_user(&user, false);
-                if let Some(user) = self.users.get(&self.my_id).cloned() {
-                    self.send_result(request_id, Object::user(user));
-                } else {
-                    self.send_error_impl(request_id, 500, "Failed to get self user");
-                }
-            }
-            None => {
-                self.send_error_impl(request_id, 500, "Failed to get information about the user")
-            }
-        }
+        let function = telegram_api::Function::users_getUsers(telegram_api::users_getUsers {
+            id: vec![telegram_api::InputUser::inputUserSelf(
+                telegram_api::inputUserSelf,
+            )],
+        });
+        let token = self.park_net(request_id, PendingNetKind::GetMe);
+        self.dispatch_walking_query(token, function, AuthFlag::On);
     }
 
     /// The text `sendMessage` (MessagesManager.cpp:21721+): the temporary
@@ -2488,20 +2650,8 @@ impl Td {
                 rich_message: None,
                 suggested_post: None,
             });
-        let Some(owner) = self.bridge.as_ref() else {
-            return;
-        };
-        let bridge = owner.handle();
-        match bridge.query(query) {
-            QueryAnswer::Ok(data) => {
-                if let Ok(answer) = telegram_api::Updates::parse(&data) {
-                    self.on_send_answer(random_id, answer);
-                }
-            }
-            QueryAnswer::Err(code, message) => {
-                self.on_send_failed(random_id, code, &message);
-            }
-        }
+        let token = self.park_net(0, PendingNetKind::SendMessage { random_id });
+        self.dispatch_walking_query(token, query, AuthFlag::On);
     }
 
     /// The `messages.sendMessage` ack: `updateShortSentMessage` (the plain
@@ -2682,12 +2832,8 @@ impl Td {
         }));
     }
 
-    /// `Td` close: dropping the callback sends the close notification; the
-    /// bridge thread stops (persisting the auth state).
+    /// `Td` close: dropping the callback sends the close notification.
     fn close(&mut self) {
-        if let Some(bridge) = self.bridge.take() {
-            bridge.shutdown();
-        }
         drop(self.callback.take());
     }
 }
@@ -2748,10 +2894,6 @@ actor_messages! {
         /// `ConfigRecoverer::on_full_config`; the M.3.7.4 executor is the
         /// production sender.
         RecovererFullConfigResult { result: Result<telegram_api::Config, Status>, } => on_recoverer_full_config_result(result),
-        /// A raw update packet from the net bridge (the `Updates`
-        /// umbrella) — forwarded from the bridge thread over the captured
-        /// `SchedulerPtr`.
-        OnNetUpdate { data: Vec<u8>, } => on_net_update(data),
     }
 }
 
@@ -2806,6 +2948,8 @@ impl Actor for Td {
         // The driver events (salts persists, key changes, updates) pump
         // through the same slot when no DrainNetEvents nudge beat it.
         self.drain_net_events();
+        // The callback-parked auth + walking-skeleton answers.
+        self.dispatch_completed_walking();
         self.flush_deferred_results();
     }
 

@@ -24,6 +24,7 @@ use tdnet::net_query::{
 };
 
 use crate::config_manager::ConfigQuery;
+use crate::session_multi_proxy::NetShared;
 
 /// Queries that passed the dispatcher's DC-init gate, parked with their
 /// resolved DC by [`TdSessionSink`]. Test-only: production routes
@@ -111,22 +112,49 @@ pub(crate) fn build_config_net_query(
 
 /// The `actor_shared(this, token)` receiver — the ConfigManager side of
 /// `dispatch_with_callback`. Its `on_result` parks the completed query with
-/// the token; M.3.8.2 routes the deliveries into
-/// `Td::on_config_query_result` with the C++ `on_result` token dispatch.
+/// the token and nudges the `Td` actor (the C++ callback's
+/// `send_closure(G()->td(), ...)`); M.3.8.2 routes the parked deliveries
+/// into `Td::on_config_query_result` with the C++ `on_result` token
+/// dispatch.
 pub(crate) struct ConfigQueryCallback {
     token: u64,
     completed: CompletedNetQueries,
+    /// The actor wake — `None` in the net-inert tests.
+    wake: Option<Arc<NetShared>>,
 }
 
 impl ConfigQueryCallback {
+    /// The test form: no actor wake (the tests drain manually).
+    #[cfg(test)]
     pub(crate) fn new(token: u64, completed: CompletedNetQueries) -> Self {
-        Self { token, completed }
+        Self {
+            token,
+            completed,
+            wake: None,
+        }
+    }
+
+    /// The production form: the completion also wakes the `Td` actor to
+    /// drain the parked completions.
+    pub(crate) fn with_wake(
+        token: u64,
+        completed: CompletedNetQueries,
+        wake: Option<Arc<NetShared>>,
+    ) -> Self {
+        Self {
+            token,
+            completed,
+            wake,
+        }
     }
 }
 
 impl NetQueryCallback for ConfigQueryCallback {
     fn on_result(&mut self, query: NetQuery) {
         self.completed.lock().push((self.token, query));
+        if let Some(wake) = &self.wake {
+            wake.wake_td();
+        }
     }
 }
 

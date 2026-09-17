@@ -895,12 +895,13 @@ impl AuthManager {
         false
     }
 
-    /// `AuthManager::set_phone_number` (cpp:638-683).
-    pub fn set_authentication_phone_number(
+    /// `AuthManager::set_phone_number` (cpp:638-683), phase 1: the
+    /// validation + the query (the auth-net slice dispatches it; the
+    /// answer applies through [`Self::on_sent_code_result`]).
+    pub fn prepare_authentication_phone_number(
         &mut self,
-        phone_number: &str,
-        sender: &mut dyn AuthQuerySender,
-    ) -> Result<(), String> {
+        phone_number: String,
+    ) -> Result<AuthNetQuery, String> {
         if self.state != State::WaitPhoneNumber {
             return Err("Call to setAuthenticationPhoneNumber unexpected".to_string());
         }
@@ -916,12 +917,17 @@ impl AuthManager {
         if phone_number != self.phone_number {
             self.clear_auth_state();
         }
-        self.send_code_helper.phone_number = phone_number.to_string();
-        self.phone_number = phone_number.to_string();
+        self.send_code_helper.phone_number = phone_number.clone();
+        self.phone_number = phone_number;
 
-        match sender.send(AuthNetQuery::SendCode {
-            phone_number: phone_number.to_string(),
-        })? {
+        Ok(AuthNetQuery::SendCode {
+            phone_number: self.phone_number.clone(),
+        })
+    }
+
+    /// Phase 2: apply the `auth.sentCode` answer.
+    pub fn on_sent_code_result(&mut self, result: AuthNetResult) -> Result<(), String> {
+        match result {
             AuthNetResult::SentCode {
                 phone_code_hash,
                 kind,
@@ -951,21 +957,36 @@ impl AuthManager {
         }
     }
 
-    /// `AuthManager::check_code` + `on_authentication_result` +
-    /// `on_get_authorization` (cpp:848-858, 1401-1410, 1487-1562).
-    pub fn check_authentication_code(
+    /// The blocking form (the MockSender tests).
+    pub fn set_authentication_phone_number(
         &mut self,
-        code: &str,
+        phone_number: &str,
         sender: &mut dyn AuthQuerySender,
     ) -> Result<(), String> {
+        let query = self.prepare_authentication_phone_number(phone_number.to_string())?;
+        self.on_sent_code_result(sender.send(query)?)
+    }
+
+    /// `AuthManager::check_code` + `on_authentication_result` +
+    /// `on_get_authorization` (cpp:848-858, 1401-1410, 1487-1562).
+    pub fn prepare_check_authentication_code(
+        &mut self,
+        code: String,
+    ) -> Result<AuthNetQuery, String> {
         if self.state != State::WaitCode {
             return Err("Call to checkAuthenticationCode unexpected".to_string());
         }
-        match sender.send(AuthNetQuery::SignIn {
+        Ok(AuthNetQuery::SignIn {
             phone_number: self.phone_number.clone(),
             phone_code_hash: self.send_code_helper.phone_code_hash.clone(),
-            code: code.to_string(),
-        })? {
+            code,
+        })
+    }
+
+    /// `AuthManager::check_code` + `on_authentication_result` +
+    /// `on_get_authorization` (cpp:848-858, 1401-1410, 1487-1562).
+    pub fn on_authorization_result(&mut self, result: AuthNetResult) -> Result<(), String> {
+        match result {
             AuthNetResult::Authorization {
                 user_id: Some(_), ..
             } => {
@@ -995,22 +1016,32 @@ impl AuthManager {
         }
     }
 
-    /// `AuthManager::check_password` (cpp:877-891): the SRP query. The
-    /// bignum SRP math lands with the session sender (PasswordManager).
-    pub fn check_authentication_password(
+    pub fn check_authentication_code(
         &mut self,
-        password: &str,
+        code: &str,
         sender: &mut dyn AuthQuerySender,
     ) -> Result<(), String> {
+        let query = self.prepare_check_authentication_code(code.to_string())?;
+        self.on_authorization_result(sender.send(query)?)
+    }
+
+    /// `AuthManager::check_password` (cpp:877-891): the SRP query. The
+    /// bignum SRP math lands with the session sender (PasswordManager).
+    pub fn prepare_check_authentication_password(
+        &mut self,
+        password: String,
+    ) -> Result<AuthNetQuery, String> {
         if self.state != State::WaitPassword {
             return Err("Call to checkAuthenticationPassword unexpected".to_string());
         }
         if password.is_empty() {
             return Err("Password must be non-empty".to_string());
         }
-        match sender.send(AuthNetQuery::CheckPassword {
-            password: password.to_string(),
-        })? {
+        Ok(AuthNetQuery::CheckPassword { password })
+    }
+
+    pub fn on_password_result(&mut self, result: AuthNetResult) -> Result<(), String> {
+        match result {
             AuthNetResult::PasswordOk => {
                 self.update_state(State::Ok);
                 Ok(())
@@ -1022,20 +1053,30 @@ impl AuthManager {
         }
     }
 
+    pub fn check_authentication_password(
+        &mut self,
+        password: &str,
+        sender: &mut dyn AuthQuerySender,
+    ) -> Result<(), String> {
+        let query = self.prepare_check_authentication_password(password.to_string())?;
+        self.on_password_result(sender.send(query)?)
+    }
+
     /// `AuthManager::check_bot_token` (cpp:818-842): the bot login —
     /// `auth.importBotAuthorization` over the sender. Reachable from any
     /// pre-Ready state (the C++ queues it until the encryption key).
-    pub fn check_authentication_bot_token(
+    pub fn prepare_check_authentication_bot_token(
         &mut self,
-        token: &str,
-        sender: &mut dyn AuthQuerySender,
-    ) -> Result<(), String> {
+        token: String,
+    ) -> Result<AuthNetQuery, String> {
         if token.is_empty() {
             return Err("Bot token must be non-empty".to_string());
         }
-        match sender.send(AuthNetQuery::BotToken {
-            token: token.to_string(),
-        })? {
+        Ok(AuthNetQuery::BotToken { token })
+    }
+
+    pub fn on_bot_token_result(&mut self, result: AuthNetResult) -> Result<(), String> {
+        match result {
             AuthNetResult::Authorization {
                 user_id: Some(_), ..
             } => {
@@ -1050,27 +1091,60 @@ impl AuthManager {
         }
     }
 
-    /// `AuthManager::log_out` (cpp:933-953).
-    pub fn log_out(&mut self, sender: &mut dyn AuthQuerySender) -> Result<(), String> {
+    pub fn check_authentication_bot_token(
+        &mut self,
+        token: &str,
+        sender: &mut dyn AuthQuerySender,
+    ) -> Result<(), String> {
+        let query = self.prepare_check_authentication_bot_token(token.to_string())?;
+        self.on_bot_token_result(sender.send(query)?)
+    }
+
+    /// `AuthManager::log_out` (cpp:933-953), phase 1: the state check +
+    /// the query (`None` — the destroy path without a network round-trip).
+    pub fn prepare_log_out(&mut self) -> Result<Option<AuthNetQuery>, String> {
         match self.state {
-            State::Closing => return Err("Already logged out".to_string()),
-            State::LoggingOut | State::DestroyingKeys => {
-                return Err("Already logging out".to_string());
-            }
+            State::Closing => Err("Already logged out".to_string()),
+            State::LoggingOut | State::DestroyingKeys => Err("Already logging out".to_string()),
             State::Ok => {
                 self.update_state(State::LoggingOut);
-                sender.send(AuthNetQuery::LogOut)?;
+                Ok(Some(AuthNetQuery::LogOut))
             }
             _ => {
                 self.destroy_auth_keys();
+                Ok(None)
             }
+        }
+    }
+
+    /// Phase 2: the `auth.logOut` answer.
+    pub fn on_logged_out(&mut self) {
+        self.destroy_auth_keys();
+    }
+
+    /// The SESSION_PASSWORD_NEEDED / `getPassword` answer: park the
+    /// `WaitPasswordState` and move to WaitPassword.
+    pub fn on_password_needed(&mut self, wait_password_state: WaitPasswordState) {
+        self.wait_password_state = wait_password_state;
+        self.update_state(State::WaitPassword);
+    }
+
+    /// The blocking form (the MockSender tests).
+    pub fn log_out(&mut self, sender: &mut dyn AuthQuerySender) -> Result<(), String> {
+        if let Some(query) = self.prepare_log_out()? {
+            sender.send(query)?;
+            self.on_logged_out();
         }
         Ok(())
     }
 
     /// `AuthManager::destroy_auth_keys` (cpp:1452-1466).
-    fn destroy_auth_keys(&mut self) {
+    pub(crate) fn destroy_auth_keys_impl(&mut self) {
         self.update_state(State::DestroyingKeys);
+    }
+
+    fn destroy_auth_keys(&mut self) {
+        self.destroy_auth_keys_impl();
     }
 
     /// `AuthManager::on_closing(destroy_flag)` (cpp:996-1001).
