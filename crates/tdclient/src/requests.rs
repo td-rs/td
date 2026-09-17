@@ -11,6 +11,7 @@
 //! "TDLib function is not implemented yet"; the interim handlers below the
 //! `-- interim --` marker get their real bodies as their managers land.
 
+use crate::chat_manager::{ChannelId, ChatId, DialogId};
 use crate::td::Td;
 use crate::td_api::{self, Function, Object};
 
@@ -101,6 +102,24 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             let unix_time = td.global.unix_time();
             if let Some(option_manager) = td.option_manager.as_mut() {
                 option_manager.get_current_state(&mut updates, unix_time);
+            }
+
+            // the ChatManager state block (M.5.47): unknown placeholders,
+            // then channels before chats, then fulls — see
+            // ChatManager::get_current_state
+            if let Some(options) = td.option_manager.as_mut() {
+                let mut env = crate::user_manager::UserEnv {
+                    global: &mut td.global,
+                    options,
+                    auth_is_bot: td.auth_manager.is_bot(),
+                };
+                let mut chat_updates = Vec::new();
+                td.chat_manager.get_current_state(
+                    &mut td.user_manager,
+                    &mut env,
+                    &mut chat_updates,
+                );
+                updates.extend(chat_updates.into_iter().map(Object::from));
             }
 
             if let Some(authorization_state) =
@@ -198,11 +217,158 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
 
+        // --- the chat-manager request family (M.5.47) ---
+        // Each local-validating entry settles its promise synchronously;
+        // the net queries terminate in the blocked-net 500 until the net
+        // step lands.
+        Function::setChatDescription(request) => {
+            let (promise, recorded) = record_unit_promise();
+            let description =
+                crate::misc::clean_input_string(&request.description).unwrap_or_default();
+            let chat_id = ChatId::new(request.chat_id);
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.set_chat_description(
+                user_manager,
+                &mut env,
+                chat_id,
+                &description,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::setSupergroupUsername(request) => {
+            let (promise, recorded) = record_unit_promise();
+            let username = crate::misc::clean_input_string(&request.username).unwrap_or_default();
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.set_channel_username(
+                user_manager,
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                &username,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::toggleSupergroupUsernameIsActive(request) => {
+            let (promise, recorded) = record_unit_promise();
+            let username = crate::misc::clean_input_string(&request.username).unwrap_or_default();
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.toggle_channel_username_is_active(
+                user_manager,
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                username,
+                request.is_active,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::setChatLocation(request) => {
+            let (promise, recorded) = record_unit_promise();
+            let location = crate::chat_manager::DialogLocation::from_td_api(&request.location);
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.set_channel_location(
+                user_manager,
+                &mut env,
+                ChannelId::new(request.chat_id),
+                &location,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::setChatSlowModeDelay(request) => {
+            let (promise, recorded) = record_unit_promise();
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.set_channel_slow_mode_delay(
+                user_manager,
+                &mut env,
+                DialogId::from_channel_id(ChannelId::new(request.chat_id)),
+                request.slow_mode_delay,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::toggleSupergroupIsForum(request) => {
+            let (promise, recorded) = record_unit_promise();
+            let (mut env, _user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.toggle_channel_is_forum(
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                request.is_forum,
+                request.has_forum_tabs,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::deleteChat(request) => {
+            let (promise, recorded) = record_unit_promise();
+            let (mut env, _user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.delete_chat(&mut env, ChatId::new(request.chat_id), promise);
+            finish_unit_request(id, td, recorded);
+        }
         // Everything else waits for its manager step.
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
     }
+}
+
+type RecordedUnitResult = std::sync::Arc<parking_lot::Mutex<Option<tdutils::status::Result<()>>>>;
+
+/// The recording-promise bridge for synchronously-settling manager
+/// requests (Requests.cpp's `PromiseActor` hops collapse here): the
+/// manager errors or resolves the promise before this returns, and the
+/// recorded result forwards to `send_result`/`send_error`.
+fn record_unit_promise() -> (tdutils::promise::Promise<()>, RecordedUnitResult) {
+    let recorded = std::sync::Arc::new(parking_lot::Mutex::new(None));
+    let sink = recorded.clone();
+    let promise = tdutils::promise::PromiseCreator::lambda_result(
+        move |result: tdutils::status::Result<()>| {
+            *sink.lock() = Some(result);
+        },
+    );
+    (promise, recorded)
+}
+
+fn finish_unit_request(
+    id: u64,
+    td: &mut Td,
+    recorded: std::sync::Arc<parking_lot::Mutex<Option<tdutils::status::Result<()>>>>,
+) {
+    match &*recorded.lock() {
+        Some(tdutils::status::Result::Ok(())) => td.send_result(id, ok_object()),
+        Some(tdutils::status::Result::Err(status)) => {
+            td.send_error_impl(id, status.code(), status.message());
+        }
+        other => panic!("request {id} never settled: {other:?}"),
+    }
+}
+
+/// Field-split the `Td` for the manager calls that take `user_manager`
+/// plus an `env` borrowing `global`/`option_manager`.
+fn chat_env_split(
+    td: &mut Td,
+) -> (
+    crate::user_manager::UserEnv<'_>,
+    &mut crate::user_manager::UserManager,
+    &mut crate::chat_manager::ChatManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        chat_manager,
+        ..
+    } = td;
+    let env = crate::user_manager::UserEnv {
+        global,
+        options: option_manager
+            .as_mut()
+            .expect("option manager exists after init"),
+        auth_is_bot: auth_manager.is_bot(),
+    };
+    (env, user_manager, chat_manager)
 }
 
 fn ok_object() -> Object {

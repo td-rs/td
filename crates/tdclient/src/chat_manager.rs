@@ -3158,6 +3158,23 @@ impl DialogLocation {
         self.location_.is_empty() && self.address_.is_empty()
     }
 
+    /// `as_dialog_location` (Td.cpp conversions) — the td_api chatLocation
+    /// into the internal record. The access hash is a Files-step stub (0).
+    pub fn from_td_api(chat_location: &td_api::ChatLocation) -> DialogLocation {
+        let mut result = DialogLocation::default();
+        let l = &chat_location.location;
+        result.location_ =
+            Location::from_geo_point(telegram_api::GeoPoint::geoPoint(telegram_api::geoPoint {
+                flags: 0,
+                lat: l.latitude,
+                long: l.longitude,
+                accuracy_radius: l.horizontal_accuracy as i32,
+                access_hash: 0,
+            }));
+        result.address_ = chat_location.address.clone();
+        result
+    }
+
     /// `get_address`.
     pub fn get_address(&self) -> &str {
         &self.address_
