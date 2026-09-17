@@ -9475,6 +9475,185 @@ mod tests {
         );
     }
 
+    /// M.8.6 golden vectors: the parse_markdown battery whose td_execute
+    /// outputs are recorded as the last 41 entries of
+    /// `testdata/message_entity_cpp_golden.jsonl` (all offsets/lengths are
+    /// UTF-16 code units). The six bare-bracket entries hold the
+    /// source-true answers — `fd53a8160`'s in-place compaction reads
+    /// overwritten bytes there in the pinned C++ (and thus in the oracle),
+    /// a read-after-overwrite bug the port deliberately does not copy (see
+    /// the conformance test comment).
+    #[test]
+    fn parse_markdown_v1_golden_vectors() {
+        fn parse(text: &str) -> (String, Vec<MessageEntity>) {
+            let mut owned = text.to_owned();
+            let entities = parse_markdown(&mut owned).unwrap();
+            (owned, entities)
+        }
+        let bold = |offset, length| MessageEntity::new(Type::Bold, offset, length);
+        let code = |offset, length| MessageEntity::new(Type::Code, offset, length);
+        let pre = |offset, length| MessageEntity::new(Type::Pre, offset, length);
+        let pre_code = |offset, length, language: &str| {
+            MessageEntity::with_argument(Type::PreCode, offset, length, language.to_owned())
+        };
+        let text_url = |offset, length, url: &str| {
+            MessageEntity::with_argument(Type::TextUrl, offset, length, url.to_owned())
+        };
+
+        // A `**`/`__` opener closes immediately (empty content) — the
+        // trailing pairs delimit empty entities, so nothing is emitted.
+        assert_eq!(
+            parse("**bold** __underline__"),
+            ("bold underline".to_owned(), vec![])
+        );
+        // Empty entity pairs are dropped entirely.
+        for text in ["__", "**", "``", "[]"] {
+            assert_eq!(parse(text), (String::new(), vec![]));
+        }
+        // Empty `` pairs inside plain text.
+        assert_eq!(parse("a `` b"), ("a  b".to_owned(), vec![]));
+        assert_eq!(
+            parse("`code` and `` ``"),
+            ("code and  ".to_owned(), vec![code(0, 4)])
+        );
+
+        // Pre blocks: language, one-newline skip (LF and CRLF), content.
+        assert_eq!(
+            parse("```python\nprint(1)\n```"),
+            ("print(1)\n".to_owned(), vec![pre_code(0, 9, "python")])
+        );
+        assert_eq!(
+            parse("```\r\nwin line\r\n```"),
+            ("win line\r\n".to_owned(), vec![pre(0, 10)])
+        );
+        // The language ends at the space; the space starts the content.
+        assert_eq!(
+            parse("```lang code```"),
+            (" code".to_owned(), vec![pre_code(0, 5, "lang")])
+        );
+        // Empty pre content emits no entity.
+        assert_eq!(parse("```c\n```"), (String::new(), vec![]));
+        assert_eq!(
+            parse("x ``` y ``` z"),
+            ("x  y  z".to_owned(), vec![pre(2, 3)])
+        );
+        // The second opener's newline is skipped and the next ``` closes an
+        // empty pre (the C++ fd53a8160 behavior the oracle agrees on).
+        assert_eq!(parse("```a\n```b```\n```"), ("b".to_owned(), vec![]));
+
+        // UTF-16 offsets: 4-byte emoji count as 2, combining chars as 1.
+        assert_eq!(
+            parse("\u{1f600}*bold* \u{1f400}`code`"),
+            (
+                "\u{1f600}bold \u{1f400}code".to_owned(),
+                vec![bold(2, 4), code(9, 4)]
+            )
+        );
+        assert_eq!(parse("а́*б*"), ("а́б".to_owned(), vec![bold(2, 1)]));
+
+        // Escapes drop the backslash before _ * ` [; other backslashes stay.
+        assert_eq!(parse("\\_ \\* \\` \\["), ("_ * ` [".to_owned(), vec![]));
+        assert_eq!(parse("\\\\_"), ("\\_".to_owned(), vec![]));
+        assert_eq!(parse("\\x"), ("\\x".to_owned(), vec![]));
+        assert_eq!(parse("abc\\"), ("abc\\".to_owned(), vec![]));
+
+        // Nested markers are not parsed in v1 — the inner `_` is content.
+        assert_eq!(
+            parse("*bold _italic_ bold*"),
+            ("bold _italic_ bold".to_owned(), vec![bold(0, 18)])
+        );
+
+        // Link entities: the explicit-url form reads the pristine `(url)`.
+        assert_eq!(
+            parse("[link](https://example.com/path?q=1&x=2)"),
+            (
+                "link".to_owned(),
+                vec![text_url(0, 4, "https://example.com/path?q=1&x=2")]
+            )
+        );
+        // mailto: the userinfo host split keeps the whole userinfo.
+        assert_eq!(
+            parse("[x](mailto:a@b.com)"),
+            (
+                "x".to_owned(),
+                vec![text_url(0, 1, "http://mailto:a@b.com/")]
+            )
+        );
+        assert_eq!(
+            parse("[a](tg://resolve?domain=x)"),
+            (
+                "a".to_owned(),
+                vec![text_url(0, 1, "tg://resolve?domain=x")]
+            )
+        );
+        // Invalid URLs emit no entity.
+        assert_eq!(parse("[x]()"), ("x".to_owned(), vec![]));
+        assert_eq!(parse("**[t](u)**"), ("t".to_owned(), vec![]));
+
+        // Unclosed entities are 400 errors with the byte offset.
+        for (text, offset) in [
+            ("*abc", 0),
+            ("`abc", 0),
+            ("[abc", 0),
+            ("x [abc", 2),
+            ("x `abc", 2),
+            ("x _abc", 2),
+        ] {
+            let mut owned = text.to_owned();
+            let error = parse_markdown(&mut owned).unwrap_err();
+            assert_eq!(
+                (error.code(), error.message()),
+                (
+                    400,
+                    format!("Can't find end of the entity starting at byte offset {offset}")
+                        .as_str()
+                )
+            );
+        }
+
+        // Bare brackets use the bracket content as the URL (source-true).
+        assert_eq!(
+            parse("[t.me]"),
+            ("t.me".to_owned(), vec![text_url(0, 4, "http://t.me/")])
+        );
+        assert_eq!(
+            parse("[https://example.com]"),
+            (
+                "https://example.com".to_owned(),
+                vec![text_url(0, 19, "https://example.com/")]
+            )
+        );
+        assert_eq!(
+            parse("[example.com/path]"),
+            (
+                "example.com/path".to_owned(),
+                vec![text_url(0, 16, "http://example.com/path")]
+            )
+        );
+        // tg://user links become MentionNames.
+        assert_eq!(
+            parse("[tg://user?id=42]"),
+            (
+                "tg://user?id=42".to_owned(),
+                vec![MessageEntity::mention_name(0, 15, UserId::new(42))]
+            )
+        );
+        assert_eq!(
+            parse("[tg://emoji?id=5]"),
+            (
+                "tg://emoji?id=5".to_owned(),
+                vec![text_url(0, 15, "tg://emoji?id=5")]
+            )
+        );
+        assert_eq!(
+            parse("[ton://resolve?domain=x]"),
+            (
+                "ton://resolve?domain=x".to_owned(),
+                vec![text_url(0, 22, "ton://resolve?domain=x")]
+            )
+        );
+    }
+
     // ===== M.8.2 — input converters + fix_entities =====
 
     /// td_api::FormattedText → FormattedText (`get_formatted_text_of_input`)
