@@ -12,6 +12,8 @@
 //! `-- interim --` marker get their real bodies as their managers land.
 
 use crate::contact::Contact;
+use crate::notification::{NotificationGroupId, NotificationId, NotificationObjectId};
+use crate::td::NotificationEnv;
 use crate::td::Td;
 use crate::td_api::{self, Function, Object};
 use crate::user_manager::{FileId, PendingUserRequest, SecretChatId, UserEnv, UserId};
@@ -153,6 +155,20 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 td.user_manager.get_current_state(&mut env, &mut updates);
             }
 
+            // NotificationManager::get_current_state (Requests.cpp:2229 —
+            // deep in the authorized block, after user/chat)
+            if td.auth_manager.is_authorized() && !td.auth_manager.is_bot() {
+                let env = NotificationEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_authorized: true,
+                    auth_is_bot: false,
+                    updates: &mut td.notification_updates,
+                };
+                td.notification_manager
+                    .get_current_state(&env, &mut updates);
+            }
+
             // ConnectionStateManager and the remaining authorized-manager
             // state blocks (connection/chat/background/...) accumulate here
             // as their managers land.
@@ -225,6 +241,70 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             // `CHECK_IS_USER` — bots are rejected; is_bot is false until
             // the AuthManager net step, so the request reaches the manager.
             td.get_application_config(id);
+        }
+
+        // -- the notification set (M.13.8): the manager-backed request
+        //    family (Requests.cpp:4123/4131/2403) --
+        Function::removeNotification(request) => {
+            // `Requests.cpp:4123`: is_permanent = false, force_update =
+            // true
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let mut env = NotificationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.notification_updates,
+            };
+            td.notification_manager.remove_notification(
+                &mut env,
+                NotificationGroupId::new(request.notification_group_id),
+                NotificationId::new(request.notification_id),
+                false,
+                true,
+                promise,
+                "td_api::removeNotification",
+            );
+        }
+        Function::removeNotificationGroup(request) => {
+            // `Requests.cpp:4131`: the request exposes no max object id —
+            // the C++ passes an invalid one; force_update = true
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let mut env = NotificationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.notification_updates,
+            };
+            td.notification_manager.remove_notification_group(
+                &mut env,
+                NotificationGroupId::new(request.notification_group_id),
+                NotificationId::new(request.max_notification_id),
+                NotificationObjectId::default(),
+                -1,
+                true,
+                promise,
+            );
+        }
+        Function::processPushNotification(request) => {
+            // `Requests.cpp:2403`: CHECK_IS_USER, the payload string is
+            // cleaned, then NotificationManager::process_push_notification
+            // parses the push payload and synthesizes the message — the
+            // pipeline needs MessagesManager/MessageDb and the secret-chat
+            // decryption ([blocked: M.13.6b, M.6/M.10]); the C++ answers ok
+            // only after processing.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _ = crate::misc::clean_input_string(&request.payload);
+            td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
 
         // -- the auth set (S76): the real `AuthManager` handlers over the
