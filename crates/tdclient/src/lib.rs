@@ -22,6 +22,7 @@ pub mod formatted_date;
 pub mod global;
 pub mod link_manager;
 pub mod manager_option_states;
+pub mod message_content;
 pub mod message_entity;
 pub mod misc;
 pub mod option_manager;
