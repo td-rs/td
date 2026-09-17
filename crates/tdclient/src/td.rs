@@ -61,6 +61,7 @@ use crate::global::Global;
 use crate::link_manager::LinkManager;
 use crate::manager_option_states::ManagerOptionStates;
 use crate::net::{AuthSender, BridgeConfig, NetBridge, QueryAnswer};
+use crate::notification_manager::NotificationManager;
 use crate::option_manager::OptionManager;
 use crate::query_merger::QueryMerger;
 use crate::requests;
@@ -245,6 +246,12 @@ pub struct Td {
     /// `Td::user_manager_` — the user/secret-chat cache (created with Td,
     /// loaded from the binlog pmc in `init` like the C++ constructor).
     pub(crate) user_manager: UserManager,
+    /// `Td::notification_manager_` (`Td.cpp:1251`).
+    pub(crate) notification_manager: NotificationManager,
+    /// The notification manager's `send_update` outbox — the collapsed
+    /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) notification_updates: Vec<td_api::Update>,
     /// The premium-required-to-contact QueryMerger actor (a UserManager
     /// member in the C++; the Rust merger is an actor created by `init` —
     /// the `ActorOwn` keeps it alive, dropping it would hang the merged
@@ -328,6 +335,8 @@ impl Td {
             link_manager: None,
             auth_manager: AuthManager::new(),
             user_manager: UserManager::new(),
+            notification_manager: NotificationManager::default(),
+            notification_updates: Vec::new(),
             premium_required_contact_merger: None,
             stop_cnt: 2,
             deferred_results: Arc::new(Mutex::new(Vec::new())),
@@ -641,6 +650,7 @@ impl Td {
             // from the UserManager cache — no updateUser broadcast).
             self.auth_manager.set_state_ok();
             self.apply_self_user(&user, false);
+            self.init_notification_manager();
         } else {
             let binlog_pmc = self.global.binlog_pmc();
             let auth_str = binlog_pmc.get("auth");
@@ -661,6 +671,7 @@ impl Td {
                     }
                     self.auth_manager
                         .restore_from_pmc("ok", is_bot, String::new());
+                    self.init_notification_manager();
                 }
                 "logout" => {
                     tracing::warn!("Continue to log out");
@@ -976,6 +987,25 @@ impl Td {
             self.close_flag = 2;
         }
 
+        // `Td::clear` (Td.cpp:653-658): flush or destroy the active
+        // notifications before the managers reset
+        if !self.auth_manager.is_bot() {
+            let mut env = NotificationEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+                auth_is_authorized: self.auth_manager.is_authorized(),
+                auth_is_bot: self.auth_manager.is_bot(),
+                updates: &mut self.notification_updates,
+            };
+            if self.destroy_flag {
+                self.notification_manager
+                    .destroy_all_notifications(&mut env);
+            } else {
+                self.notification_manager.flush_all_notifications(&mut env);
+            }
+            self.flush_user_updates();
+        }
+
         // G()->net_query_creator().stop_check() / result_handlers_ /
         // StateManager — with the net step.
         self.clear_requests();
@@ -1263,6 +1293,13 @@ impl Td {
             && (expire_time == 0.0 || user_deadline < expire_time)
         {
             expire_time = user_deadline;
+        }
+        // The NotificationManager's two timeout families share the same
+        // slot (M.13): the fired timeout runs `tick_timeouts`.
+        if let Some(notification_deadline) = self.notification_manager.next_deadline()
+            && (expire_time == 0.0 || notification_deadline < expire_time)
+        {
+            expire_time = notification_deadline;
         }
         if expire_time == 0.0 {
             self.cancel_timeout();
@@ -1626,6 +1663,23 @@ impl Td {
         for update in self.user_manager.take_updates() {
             self.send_update(update.into());
         }
+        let notification_updates = std::mem::take(&mut self.notification_updates);
+        for update in notification_updates {
+            self.send_update(update.into());
+        }
+    }
+
+    /// `td_->notification_manager_->init()` (AuthManager.cpp:1545) —
+    /// idempotent; the manager no-ops while disabled.
+    fn init_notification_manager(&mut self) {
+        let mut env = NotificationEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            updates: &mut self.notification_updates,
+        };
+        self.notification_manager.init(&mut env);
     }
 
     /// The deferred-response outbox drain — the `send_closure(td_id_,
@@ -2051,6 +2105,11 @@ impl Td {
             bridge.mark_authorized();
             bridge.persist();
         }
+
+        // the live `on_get_authorization` init (AuthManager.cpp:1545); the
+        // C++ fires it after every manager init above — the notification
+        // manager is the only one on this tree
+        self.init_notification_manager();
     }
 
     /// Store + broadcast the self user: `UserManager::set_my_id` (the
@@ -2506,6 +2565,18 @@ impl Actor for Td {
     /// slot at the earliest deadline through `sync_config_timeout`.
     fn timeout_expired(&mut self) {
         let close_flag = self.close_flag != 0;
+        // The NotificationManager's two timeout families (M.13): the C++
+        // `on_flush_*_timeout_callback`s collapse into `tick_timeouts`.
+        {
+            let mut env = NotificationEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+                auth_is_authorized: self.auth_manager.is_authorized(),
+                auth_is_bot: self.auth_manager.is_bot(),
+                updates: &mut self.notification_updates,
+            };
+            self.notification_manager.tick_timeouts(&mut env);
+        }
         let actions = self
             .config_manager
             .as_mut()
@@ -2543,6 +2614,85 @@ impl Actor for Td {
 
     // No `loop_`: the pending-query poll arrives with the net step (the
     // C++ `Td::loop` yields to drive the NetQueryDispatcher).
+}
+
+/// The `G()`/manager slice the collapsed NotificationManager reads through
+/// (the C++ manager reads the same surfaces off its `Td *td_` directly).
+/// The `send_update`s buffer into [`Td::notification_updates`] and Td
+/// drains them — the collapsed `send_closure(G()->td(), &Td::send_update)`
+/// hop.
+pub(crate) struct NotificationEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    /// `None` once the option manager is torn down; the getters answer
+    /// their defaults, matching the C++ close ordering closely enough for
+    /// the destroy path.
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl<'a> NotificationEnv<'a> {
+    // construct via the struct literal: the fields borrow `Td` disjointly,
+    // so the manager call can proceed while the env is alive
+}
+
+impl crate::notification::NotificationTypeEnv for NotificationEnv<'_> {
+    // every NotificationTypeEnv surface is a seam until M.10; the defaults
+    // (unloaded messages, no senders/animations) are the C++ answers for a
+    // database that cannot hold those objects yet
+}
+
+impl crate::notification_manager::NotificationManagerEnv for NotificationEnv<'_> {
+    /// `G()->close_flag() || !td_->auth_manager_->is_authorized() ||
+    /// td_->auth_manager_->is_bot()` (NotificationManager.cpp:170-172).
+    fn is_disabled(&self) -> bool {
+        self.global.close_flag() || !self.auth_is_authorized || self.auth_is_bot
+    }
+
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_integer(name, default_value)
+        })
+    }
+
+    fn get_option_boolean(&self, name: &str, default_value: bool) -> bool {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_boolean(name, default_value)
+        })
+    }
+
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn now(&self) -> f64 {
+        tdutils::time::now()
+    }
+
+    fn server_time(&self) -> f64 {
+        self.global.server_time()
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn pmc_get(&mut self, key: &str) -> String {
+        self.global.binlog_pmc().get(key)
+    }
+
+    fn pmc_set(&mut self, key: &str, value: &str) {
+        self.global.binlog_pmc().set(key, value);
+    }
+
+    fn pmc_erase(&mut self, key: &str) {
+        self.global.binlog_pmc().erase(key);
+    }
 }
 
 /// The premium-required-to-contact QueryMerger merge function: build the
