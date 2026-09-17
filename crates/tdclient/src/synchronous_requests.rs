@@ -516,7 +516,7 @@ mod tests {
             assert_eq!(actual, *expected_response, "diverged on request: {request}");
             checked += 1;
         }
-        assert_eq!(checked, 234, "the corpus shrank");
+        assert_eq!(checked, 255, "the corpus shrank");
     }
 
     #[test]

@@ -5907,8 +5907,7 @@ pub fn parse_markdown_v2(text: &mut String) -> Result<Vec<MessageEntity>, Status
         }
 
         // MessageEntity.cpp:2085: "_*[]()~`>#+-=|{}.!\n".
-        let mut reserved_characters: &[u8] = b"_*[]
-()~`>#+-=|{}.!\n";
+        let mut reserved_characters: &[u8] = b"_*[]()~`>#+-=|{}.!\n";
         if let Some(back) = nested_entities.last() {
             match back.r#type {
                 Type::Code | Type::Pre | Type::PreCode => reserved_characters = b"`",
@@ -8090,6 +8089,202 @@ mod tests {
         for (r#type, priority) in PRIORITIES {
             assert_eq!(MessageEntity::type_priority(r#type), priority, "{type:?}");
         }
+    }
+
+    /// The M.8.3 matcher battery — the exact inputs whose C++ `td_execute`
+    /// `getTextEntities` outputs are recorded as the last 21 entries of
+    /// `testdata/message_entity_cpp_golden.jsonl`.
+    fn matcher_battery() -> Vec<String> {
+        let mut battery: Vec<String> = [
+            // mentions
+            "@ab @abc @gif @durov @a @verylongusername1234567890123456",
+            "@abcdefghijklmnopqrstuvwxyz012345 @durov_2 @durov@mention",
+            "(@durov) @gif. @ufc- @vid, @nft! @pic?",
+            "x@durov @user\u{e9} а@bot @@gif @",
+            // bot commands
+            "/start /start@my_bot /a /start@b /a_b /123 /",
+            "a/start /start/next </start> >/cmd",
+            "",
+            "/start@bot_name@x /help@my_bot_2",
+            // hashtags
+            "#tag #tag2 #123 #a_b #tag- #tag#x ##a #ТГ #привет_2 #tag\u{200c}x",
+            "#tag@botname #tag@b #x#y",
+            "",
+            // cashtags
+            "$USD $usd $1INCH $AB $ABCDEFGHI $USD@bot $USD@ $USDx $$USD x$USD $5 $9A",
+            "$TON $NOTCOIN $1inch",
+            // media timestamps
+            "1:23 12:34:56 0:00 9999:59 12:60 1:2 1:234",
+            "a1:23 1:23b :23 1: 1::23 00:00:00 100:00:00 99:99:99 1:23:45:67",
+            // bank cards
+            "4242424242424242 4242 4242 4242 4242 4242-4242-4242-4242 1234567812345678",
+            "5555555555554444 378282246310005 6212345678901232 2201382000000013 4222222222222",
+            "x4242424242424242 4242424242424242x tel:4242424242424242 +1-4242-4242-4242-4242",
+            "4242424242424242 123 4 2 4 2 4 2 4 2 4 2 4 2 4 2 4 2",
+            // emails (is_email_address feeds the EmailAddress entities)
+            "a@b.co a@b.c a.b+c-d@sub.domain.example.org x@y.z user@sub_domain.example.com user@-sub.example.com",
+            // combined matcher line (no URLs)
+            "@durov #tag $USD /cmd 1:23 4242424242424242",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        battery[6] = format!("/{} /{}", "a".repeat(64), "a".repeat(65));
+        battery[10] = format!("#{} #{}", "a".repeat(256), "a".repeat(257));
+        battery
+    }
+
+    /// M.8.3 property test: every extraction of every matcher over the
+    /// battery is a substring of the input, extractions are ordered and
+    /// non-overlapping, and the structural shape of each family holds.
+    #[test]
+    fn matcher_extractions_are_substrings_of_the_input() {
+        fn check(text: &str, extractions: &[&str]) {
+            let mut last_end = 0usize;
+            for &extraction in extractions {
+                let pos = text[last_end..]
+                    .find(extraction)
+                    .map(|pos| pos + last_end)
+                    .unwrap_or_else(|| {
+                        panic!("extraction {extraction:?} is not a substring of {text:?}")
+                    });
+                assert!(
+                    pos >= last_end,
+                    "extractions overlap or go backwards in {text:?}"
+                );
+                last_end = pos + extraction.len();
+            }
+        }
+
+        for text in matcher_battery() {
+            check(&text, &match_mentions(&text));
+            check(&text, &match_bot_commands(&text));
+            check(&text, &match_hashtags(&text));
+            check(&text, &match_cashtags(&text));
+            check(&text, &match_media_timestamps(&text));
+            check(&text, &match_bank_card_numbers(&text));
+
+            let mentions = find_mentions(&text);
+            check(&text, &mentions);
+            assert!(mentions.iter().all(|m| m.starts_with('@')));
+
+            let commands = find_bot_commands(&text);
+            check(&text, &commands);
+            assert!(commands.iter().all(|command| command.starts_with('/')));
+
+            let hashtags = find_hashtags(&text);
+            check(&text, &hashtags);
+            assert!(hashtags.iter().all(|hashtag| hashtag.starts_with('#')));
+
+            let cashtags = find_cashtags(&text);
+            check(&text, &cashtags);
+            assert!(cashtags.iter().all(|cashtag| cashtag.starts_with('$')));
+
+            let media_timestamps = find_media_timestamps(&text);
+            let slices: Vec<&str> = media_timestamps.iter().map(|&(slice, _)| slice).collect();
+            check(&text, &slices);
+            assert!(media_timestamps.iter().all(|&(slice, _)| {
+                !slice.is_empty()
+                    && slice.contains(':')
+                    && slice.chars().all(|c| c.is_ascii_digit() || c == ':')
+            }));
+
+            let bank_cards = find_bank_card_numbers(&text);
+            check(&text, &bank_cards);
+            assert!(bank_cards.iter().all(|bank_card| {
+                bank_card
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || b == b' ' || b == b'-')
+                    && bank_card.bytes().filter(|b| b.is_ascii_digit()).count() >= 13
+                    && is_valid_bank_card(bank_card)
+            }));
+        }
+    }
+
+    /// M.8.3 golden vectors: extraction lists hand-checked against the C++
+    /// matcher semantics; they are byte-identical to the recorded C++
+    /// `getTextEntities` outputs for the same inputs
+    /// (`testdata/message_entity_cpp_golden.jsonl`).
+    #[test]
+    fn matcher_extraction_golden_vectors() {
+        assert_eq!(
+            find_mentions("@ab @abc @gif @durov @a @verylongusername1234567890123456"),
+            ["@gif", "@durov", "@verylongusername1234567890123456"]
+        );
+        assert_eq!(
+            find_mentions("(@durov) @gif. @ufc- @vid, @nft! @pic?"),
+            ["@durov", "@gif", "@ufc", "@vid", "@nft", "@pic"]
+        );
+        assert_eq!(
+            find_bot_commands("/start /start@my_bot /a /start@b /a_b /123 /"),
+            ["/start", "/start@my_bot", "/a", "/a_b", "/123"]
+        );
+        assert_eq!(
+            find_hashtags("#tag #tag2 #123 #a_b #tag- #tag#x ##a #ТГ #привет_2 #tag\u{200c}x"),
+            [
+                "#tag",
+                "#tag2",
+                "#a_b",
+                "#tag",
+                "#a",
+                "#ТГ",
+                "#привет_2",
+                "#tag\u{200c}x"
+            ]
+        );
+        assert_eq!(
+            find_cashtags(
+                "$USD $usd $1INCH $AB $ABCDEFGHI $USD@bot $USD@ $USDx $$USD x$USD $5 $9A"
+            ),
+            ["$USD", "$1INCH", "$AB", "$USD@bot", "$USD"]
+        );
+        assert_eq!(
+            find_media_timestamps("1:23 12:34:56 0:00 9999:59 12:60 1:2 1:234"),
+            [
+                ("1:23", 83),
+                ("12:34:56", 45296),
+                ("0:00", 0),
+                ("9999:59", 599999)
+            ]
+        );
+        assert_eq!(
+            find_media_timestamps(
+                "a1:23 1:23b :23 1: 1::23 00:00:00 100:00:00 99:99:99 1:23:45:67"
+            ),
+            [("00:00:00", 0)]
+        );
+        // The card after the first one is consumed by the 32-digit run the
+        // scanner keeps merging, so only the first card survives.
+        assert_eq!(
+            find_bank_card_numbers(
+                "4242424242424242 4242 4242 4242 4242 4242-4242-4242-4242 1234567812345678"
+            ),
+            ["4242424242424242"]
+        );
+        assert_eq!(
+            find_bank_card_numbers(
+                "5555555555554444 378282246310005 6212345678901232 2201382000000013 4222222222222"
+            ),
+            ["5555555555554444"]
+        );
+        // The match_* layer keeps candidates the find_* layer drops: short
+        // non-reserved usernames are removed by find_mentions only.
+        assert_eq!(match_mentions("@abc"), ["@abc"]);
+        assert_eq!(find_mentions("@abc"), Vec::<&str>::new());
+        // A media timestamp directly before a card: the seconds digits join
+        // the card scan run, the merged run fails Luhn, nothing is found.
+        assert_eq!(
+            find_media_timestamps("12:34 4242424242424242"),
+            [("12:34", 754)]
+        );
+        assert_eq!(
+            find_bank_card_numbers("12:34 4242424242424242"),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            find_bank_card_numbers("4242424242424242 1:23"),
+            ["4242424242424242"]
+        );
     }
 
     #[test]
