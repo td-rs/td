@@ -44,6 +44,7 @@ use crate::config_recoverer::{
 };
 use crate::config_result;
 use crate::connection_creator::ConnectionCreator;
+use crate::dialog_manager::DialogManager;
 use crate::global::Global;
 use crate::link_manager::LinkManager;
 use crate::manager_option_states::ManagerOptionStates;
@@ -183,6 +184,9 @@ pub struct Td {
     /// queries).
     #[allow(dead_code)]
     premium_required_contact_merger: Option<ActorOwn<QueryMerger>>,
+    /// `Td::dialog_manager_` — the M.6 facade state (recent-dialog lists +
+    /// search hints); the actor-dependent halves land with M.6.18+.
+    pub(crate) dialog_manager: DialogManager,
     /// `Td::stop_cnt_` — the hangup and the close completion each drop one.
     stop_cnt: i32,
     /// The deferred-response outbox. The C++ request promises re-enter the
@@ -241,6 +245,7 @@ impl Td {
             auth_manager: AuthManager::new(),
             user_manager: UserManager::new(),
             premium_required_contact_merger: None,
+            dialog_manager: DialogManager::new(),
             stop_cnt: 2,
             deferred_results: Arc::new(Mutex::new(Vec::new())),
         }
@@ -395,6 +400,7 @@ impl Td {
         let since_last_open = opened_database.since_last_open;
         let user_events = std::mem::take(&mut opened_database.user_events);
         let secret_chat_events = std::mem::take(&mut opened_database.secret_chat_events);
+        let dialog_manager_events = std::mem::take(&mut opened_database.dialog_manager_events);
 
         if self.state == State::Close {
             // Close asynchronously opened database
@@ -697,6 +703,9 @@ impl Td {
                 self.user_manager
                     .on_binlog_secret_chat_event(&mut env, event);
             }
+        }
+        for event in &dialog_manager_events {
+            crate::dialog_manager::on_binlog_dialog_events(self, std::slice::from_ref(event));
         }
         self.flush_user_updates();
 

@@ -16,7 +16,7 @@ use crate::td::Td;
 use crate::td_api::{self, Function, Object};
 use crate::user_manager::{FileId, PendingUserRequest, SecretChatId, UserEnv, UserId};
 use tdutils::promise::Promise;
-use tdutils::status::Status;
+use tdutils::status::{Result, Status};
 
 /// The interim message of the S70 skeleton, kept for the not-yet-ported
 /// handlers until the Waves complete.
@@ -887,6 +887,374 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
 
+        // ------------------------------------------------------------------
+        // M.6.20: the DialogManager-served requests
+        // (Requests.cpp:3425-3530, :3667, :5781-5873, :6096, :6608, :7842).
+        Function::searchPublicChat(request) => {
+            // the C++ has no CHECK_IS_USER here (Requests.cpp:3429-3432) —
+            // bots may resolve public chats
+            let Some(username) = clean_or_utf8_error(td, id, &request.username) else {
+                return;
+            };
+            // SearchPublicChatRequest: set_tries(4); get_tries() < 3 →
+            // false on the first try. The result object is the
+            // MessagesManager chat (the builder lands with M.10; on this
+            // base every reachable path errors first — stub inventory).
+            let (promise, slot) = unit_request_promise();
+            let _dialog_id =
+                crate::dialog_manager::search_public_dialog(td, &username, false, promise);
+            if fail_from_slot(td, id, &slot) {
+                return;
+            }
+            td.send_error_impl(id, 500, "Chat info not found");
+        }
+        Function::searchPublicChats(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let (promise, slot) = unit_request_promise();
+            let dialog_ids = crate::dialog_manager::search_public_dialogs(
+                td,
+                &query,
+                Some(&request.type_filter),
+                promise,
+            );
+            if fail_from_slot(td, id, &slot) {
+                return;
+            }
+            let chats =
+                crate::dialog_manager::get_chats_object(-1, &dialog_ids, "searchPublicChats");
+            td.send_result(id, Object::chats(chats));
+        }
+        Function::searchChats(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let (promise, slot) = unit_request_promise();
+            let (total_count, dialog_ids) = crate::dialog_manager::search_dialogs(
+                td,
+                &query,
+                Some(&request.type_filter),
+                request.limit,
+                promise,
+            );
+            if fail_from_slot(td, id, &slot) {
+                return;
+            }
+            let chats =
+                crate::dialog_manager::get_chats_object(total_count, &dialog_ids, "searchChats");
+            td.send_result(id, Object::chats(chats));
+        }
+        Function::searchChatsOnServer(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let (promise, slot) = unit_request_promise();
+            let dialog_ids = crate::dialog_manager::search_dialogs_on_server(
+                td,
+                &query,
+                Some(&request.type_filter),
+                request.limit,
+                promise,
+            );
+            if fail_from_slot(td, id, &slot) {
+                return;
+            }
+            let chats =
+                crate::dialog_manager::get_chats_object(-1, &dialog_ids, "searchChatsOnServer");
+            td.send_result(id, Object::chats(chats));
+        }
+        Function::searchRecentlyFoundChats(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let (promise, slot) = unit_request_promise();
+            let (total_count, dialog_ids) = crate::dialog_manager::search_recently_found_dialogs(
+                td,
+                &query,
+                Some(&request.type_filter),
+                request.limit,
+                promise,
+            );
+            if fail_from_slot(td, id, &slot) {
+                return;
+            }
+            let chats = crate::dialog_manager::get_chats_object(
+                total_count,
+                &dialog_ids,
+                "searchRecentlyFoundChats",
+            );
+            td.send_result(id, Object::chats(chats));
+        }
+        Function::getRecentlyOpenedChats(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, slot) = unit_request_promise();
+            let (total_count, dialog_ids) =
+                crate::dialog_manager::get_recently_opened_dialogs(td, request.limit, promise);
+            if fail_from_slot(td, id, &slot) {
+                return;
+            }
+            let chats = crate::dialog_manager::get_chats_object(
+                total_count,
+                &dialog_ids,
+                "getRecentlyOpenedChats",
+            );
+            td.send_result(id, Object::chats(chats));
+        }
+        Function::checkChatUsername(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(username) = clean_or_utf8_error(td, id, &request.username) else {
+                return;
+            };
+            let (promise, slot) = object_request_promise();
+            crate::dialog_manager::check_dialog_username(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                &username,
+                false,
+                promise,
+            );
+            finish_object_slot(td, id, slot);
+        }
+        Function::checkBotUsername(request) => {
+            let Some(username) = clean_or_utf8_error(td, id, &request.username) else {
+                return;
+            };
+            let (promise, slot) = object_request_promise();
+            crate::dialog_manager::check_dialog_username(
+                td,
+                crate::dialog_id::DialogId::new(0),
+                &username,
+                true,
+                promise,
+            );
+            finish_object_slot(td, id, slot);
+        }
+        Function::addRecentlyFoundChat(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            match crate::dialog_manager::add_recently_found_dialog(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+            ) {
+                Result::Ok(()) => td.send_result(id, ok_object()),
+                Result::Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::removeRecentlyFoundChat(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            match crate::dialog_manager::remove_recently_found_dialog(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+            ) {
+                Result::Ok(()) => td.send_result(id, ok_object()),
+                Result::Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::clearRecentlyFoundChats(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            crate::dialog_manager::clear_recently_found_dialogs(td);
+            td.send_result(id, ok_object());
+        }
+        Function::deleteChat(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, slot) = unit_request_promise();
+            crate::dialog_manager::delete_dialog(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                promise,
+            );
+            finish_unit_slot(td, id, slot);
+        }
+        Function::upgradeBasicGroupChatToSupergroupChat(request) => {
+            // Requests.cpp:5543 — `migrate_dialog_to_megagroup`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, slot) = object_request_promise();
+            crate::dialog_manager::migrate_dialog_to_megagroup(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                promise,
+            );
+            finish_object_slot(td, id, slot);
+        }
+        Function::setChatTitle(request) => {
+            // the C++ has no CHECK_IS_USER here (Requests.cpp:5778-5782) —
+            // bots set basic-group titles through this method
+            let Some(title) = clean_or_utf8_error(td, id, &request.title) else {
+                return;
+            };
+            let (promise, slot) = unit_request_promise();
+            crate::dialog_manager::set_dialog_title(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                &title,
+                promise,
+            );
+            finish_unit_slot(td, id, slot);
+        }
+        Function::setChatPhoto(request) => {
+            // the C++ has no CHECK_IS_USER here (Requests.cpp:5784-5787)
+            let (promise, slot) = unit_request_promise();
+            crate::dialog_manager::set_dialog_photo(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                Some(&request.photo),
+                promise,
+            );
+            finish_unit_slot(td, id, slot);
+        }
+        Function::setChatAccentColor(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, slot) = unit_request_promise();
+            crate::dialog_manager::set_dialog_accent_color(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                crate::peer_color::AccentColorId::new(request.accent_color_id),
+                crate::emoji_status::CustomEmojiId::new(request.background_custom_emoji_id),
+                promise,
+            );
+            finish_unit_slot(td, id, slot);
+        }
+        Function::setChatProfileAccentColor(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, slot) = unit_request_promise();
+            crate::dialog_manager::set_dialog_profile_accent_color(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                crate::peer_color::AccentColorId::new(request.profile_accent_color_id),
+                crate::emoji_status::CustomEmojiId::new(request.profile_background_custom_emoji_id),
+                promise,
+            );
+            finish_unit_slot(td, id, slot);
+        }
+        Function::setChatPermissions(request) => {
+            // the C++ has no CHECK_IS_USER here (Requests.cpp:5818-5821)
+            let (promise, slot) = unit_request_promise();
+            crate::dialog_manager::set_dialog_permissions(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                Some(&request.permissions),
+                promise,
+            );
+            finish_unit_slot(td, id, slot);
+        }
+        Function::toggleChatHasProtectedContent(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, slot) = unit_request_promise();
+            crate::dialog_manager::toggle_dialog_has_protected_content(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                None,
+                request.has_protected_content,
+                promise,
+            );
+            finish_unit_slot(td, id, slot);
+        }
+        Function::processChatHasProtectedContentDisableRequest(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, slot) = unit_request_promise();
+            crate::dialog_manager::toggle_dialog_has_protected_content(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                Some(crate::chat_manager::MessageId::new(
+                    request.request_message_id,
+                )),
+                !request.approve,
+                promise,
+            );
+            finish_unit_slot(td, id, slot);
+        }
+        Function::setChatDescription(request) => {
+            // the C++ has no CHECK_IS_USER here (Requests.cpp:6093-6097)
+            let Some(description) = clean_or_utf8_error(td, id, &request.description) else {
+                return;
+            };
+            let (promise, slot) = unit_request_promise();
+            crate::dialog_manager::set_dialog_description(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                &description,
+                promise,
+            );
+            finish_unit_slot(td, id, slot);
+        }
+        Function::getBlockedMessageSenders(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, slot) = object_request_promise();
+            crate::dialog_manager::get_blocked_dialogs(
+                td,
+                Some(&request.block_list),
+                request.offset,
+                request.limit,
+                promise,
+            );
+            finish_object_slot(td, id, slot);
+        }
+        Function::reportChat(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(text) = clean_or_utf8_error(td, id, &request.text) else {
+                return;
+            };
+            let option_id = String::from_utf8_lossy(&request.option_id).into_owned();
+            let message_ids: Vec<crate::chat_manager::MessageId> = request
+                .message_ids
+                .iter()
+                .map(|&message_id| crate::chat_manager::MessageId::new(message_id))
+                .collect();
+            let (promise, slot) = object_request_promise();
+            crate::dialog_manager::report_dialog(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                &option_id,
+                &message_ids,
+                &text,
+                promise,
+            );
+            finish_object_slot(td, id, slot);
+        }
+
+        // setChatEmojiStatus needs the td_api emojiStatus → EmojiStatus
+        // conversion (the collectible variants arrive with the emoji-status
+        // read surface), and reportChatPhoto needs ReportReason — both stay
+        // interim with those gaps.
+
         // Everything else waits for its manager step.
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
@@ -953,6 +1321,84 @@ fn get_contacts(imported: &[td_api::ImportedContact]) -> Result<Vec<Contact>, St
         contacts.push(contact);
     }
     Ok(contacts)
+}
+
+/// `CLEAN_INPUT_STRING` (Requests.cpp:1989-1992) — `None` means the error
+/// was sent.
+fn clean_or_utf8_error(td: &mut Td, id: u64, s: &str) -> Option<String> {
+    match crate::misc::clean_input_string(s) {
+        Some(cleaned) => Some(cleaned),
+        None => {
+            td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            None
+        }
+    }
+}
+
+/// The unit-shaped slot half of the collapse, aliased to match `ObjectSlot`.
+type UnitSlot = std::sync::Arc<std::sync::Mutex<Option<Result<()>>>>;
+
+/// The synchronous collapse of `CREATE_REQUEST_PROMISE` for `Promise<Unit>`
+/// requests: the promise error surface lands in the slot; successes are
+/// signaled by an empty slot and the caller sends the result itself.
+fn unit_request_promise() -> (tdutils::promise::Promise<()>, UnitSlot) {
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let capture = std::sync::Arc::clone(&slot);
+    let promise = tdutils::promise::PromiseCreator::lambda_result(move |result: Result<()>| {
+        *capture.lock().unwrap() = Some(result);
+    });
+    (promise, slot)
+}
+
+/// The same collapse for object-returning requests: the value is the result.
+type ObjectSlot = std::sync::Arc<std::sync::Mutex<Option<Result<crate::td_api::Object>>>>;
+
+fn object_request_promise() -> (tdutils::promise::Promise<crate::td_api::Object>, ObjectSlot) {
+    let slot: ObjectSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let capture = std::sync::Arc::clone(&slot);
+    let promise = tdutils::promise::PromiseCreator::lambda_result(
+        move |result: Result<crate::td_api::Object>| {
+            *capture.lock().unwrap() = Some(result);
+        },
+    );
+    (promise, slot)
+}
+
+/// Send the slot's error, if any; `true` means the error was sent.
+fn fail_from_slot(td: &mut Td, id: u64, slot: &std::sync::Mutex<Option<Result<()>>>) -> bool {
+    let outcome = slot.lock().unwrap().take();
+    match outcome {
+        Some(Result::Err(status)) => {
+            td.send_error_impl(id, status.code(), status.message());
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The synchronous collapse of `CREATE_OK_REQUEST_PROMISE`
+/// (Requests.cpp:1923-1930): the error is sent as-is, and a success sends
+/// `ok` — the C++ `create_ok_request_promise` answers `send_result(id, ok)`
+/// on `set_value`.
+fn finish_unit_slot(
+    td: &mut Td,
+    id: u64,
+    slot: std::sync::Arc<std::sync::Mutex<Option<Result<()>>>>,
+) {
+    match slot.lock().unwrap().take() {
+        Some(Result::Ok(())) => td.send_result(id, ok_object()),
+        Some(Result::Err(status)) => td.send_error_impl(id, status.code(), status.message()),
+        None => {}
+    }
+}
+
+/// Send the object slot's result or error.
+fn finish_object_slot(td: &mut Td, id: u64, slot: ObjectSlot) {
+    match slot.lock().unwrap().take() {
+        Some(Result::Ok(object)) => td.send_result(id, object),
+        Some(Result::Err(status)) => td.send_error_impl(id, status.code(), status.message()),
+        None => {}
+    }
 }
 
 fn ok_object() -> Object {
