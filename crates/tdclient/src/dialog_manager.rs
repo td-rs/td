@@ -220,7 +220,7 @@ pub fn get_input_dialog_peer(
             let peer = get_input_peer(td, dialog_id, access_rights)?;
             Some(telegram_api::InputDialogPeer::inputDialogPeer(
                 telegram_api::inputDialogPeer {
-                    peer: Box::new(peer),
+                    peer: Some(Box::new(peer)),
                 },
             ))
         }
@@ -1820,15 +1820,18 @@ pub fn on_get_blocked_dialogs(
         // function is only fed by the blocked-dialogs query result, which
         // cannot arrive before the net step.
         let peer_dialog_id = match blocked_peer.peer_id {
-            tdmtproto::telegram_api::Peer::peerUser(peer) => {
+            Some(tdmtproto::telegram_api::Peer::peerUser(peer)) => {
                 DialogId::from_user_id(crate::user_manager::UserId::new(peer.user_id))
             }
-            tdmtproto::telegram_api::Peer::peerChat(peer) => {
+            Some(tdmtproto::telegram_api::Peer::peerChat(peer)) => {
                 DialogId::from_chat_id(crate::chat_manager::ChatId::new(peer.chat_id))
             }
-            tdmtproto::telegram_api::Peer::peerChannel(peer) => {
+            Some(tdmtproto::telegram_api::Peer::peerChannel(peer)) => {
                 DialogId::from_channel_id(crate::chat_manager::ChannelId::new(peer.channel_id))
             }
+            // the generated model's absent-peer case; the C++ dereference
+            // cannot see it — skip the entry
+            None => continue,
         };
         if peer_dialog_id.is_valid() {
             dialog_ids.push(peer_dialog_id);
@@ -4824,9 +4827,9 @@ mod tests {
             (p, s)
         };
         let blocked = vec![tdmtproto::telegram_api::PeerBlocked {
-            peer_id: tdmtproto::telegram_api::Peer::peerUser(tdmtproto::telegram_api::peerUser {
-                user_id: 11,
-            }),
+            peer_id: Some(tdmtproto::telegram_api::Peer::peerUser(
+                tdmtproto::telegram_api::peerUser { user_id: 11 },
+            )),
             date: 0,
         }];
         on_get_blocked_dialogs(&mut td, 0, 1, 1, blocked, object_promise);
