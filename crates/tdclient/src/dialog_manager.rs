@@ -138,9 +138,7 @@ pub fn get_input_peer(
     match dialog_id.get_type() {
         crate::dialog_id::DialogType::User => {
             let user_id = dialog_id.get_user_id();
-            let Some(options) = td.option_manager.as_mut() else {
-                return None;
-            };
+            let options = td.option_manager.as_mut()?;
             let env = UserEnv {
                 global: &mut td.global,
                 options,
@@ -418,11 +416,10 @@ pub fn have_dialog_info_force(td: &mut Td, dialog_id: DialogId, source: &str) ->
                 .have_user_force(&mut env, dialog_id.get_user_id(), source)
         }
         crate::dialog_id::DialogType::Chat | crate::dialog_id::DialogType::Channel => false,
-        crate::dialog_id::DialogType::SecretChat => td.user_manager.have_secret_chat_force(
-            &mut env,
-            dialog_id.get_secret_chat_id(),
-            source,
-        ),
+        crate::dialog_id::DialogType::SecretChat => {
+            td.user_manager
+                .have_secret_chat_force(&mut env, dialog_id.get_secret_chat_id(), source)
+        }
         crate::dialog_id::DialogType::None => false,
     }
 }
@@ -691,28 +688,40 @@ pub fn is_megagroup_channel(_channel_id: crate::chat_manager::ChannelId) -> bool
 /// channel read is stubbed to `false` (stub inventory).
 pub fn is_forum_channel(td: &mut Td, dialog_id: DialogId) -> bool {
     let _ = td;
-    dialog_id.get_type() == crate::dialog_id::DialogType::Channel && false
+    if dialog_id.get_type() != crate::dialog_id::DialogType::Channel {
+        return false;
+    }
+    false
 }
 
 /// `DialogManager::is_forum_tabs_channel` (DialogManager.cpp:1958-1961) —
 /// stubbed to `false` (stub inventory).
 pub fn is_forum_tabs_channel(td: &mut Td, dialog_id: DialogId) -> bool {
     let _ = td;
-    dialog_id.get_type() == crate::dialog_id::DialogType::Channel && false
+    if dialog_id.get_type() != crate::dialog_id::DialogType::Channel {
+        return false;
+    }
+    false
 }
 
 /// `DialogManager::is_monoforum_channel` (DialogManager.cpp:1963-1966) —
 /// stubbed to `false` (stub inventory).
 pub fn is_monoforum_channel(td: &mut Td, dialog_id: DialogId) -> bool {
     let _ = td;
-    dialog_id.get_type() == crate::dialog_id::DialogType::Channel && false
+    if dialog_id.get_type() != crate::dialog_id::DialogType::Channel {
+        return false;
+    }
+    false
 }
 
 /// `DialogManager::is_admined_monoforum_channel` (DialogManager.cpp:1968-1971)
 /// — stubbed to `false` (stub inventory).
 pub fn is_admined_monoforum_channel(td: &mut Td, dialog_id: DialogId) -> bool {
     let _ = td;
-    dialog_id.get_type() == crate::dialog_id::DialogType::Channel && false
+    if dialog_id.get_type() != crate::dialog_id::DialogType::Channel {
+        return false;
+    }
+    false
 }
 
 /// `DialogManager::is_broadcast_channel` (DialogManager.cpp:1973-1982) —
@@ -1168,7 +1177,7 @@ impl DialogManager {
             let dialog_ids: Vec<DialogId> =
                 result.1.iter().map(|&key| DialogId::new(-key)).collect();
             promise.set_value(());
-            return (result.0 as i32, dialog_ids);
+            return (result.0, dialog_ids);
         }
         let dialog_ids: Vec<DialogId> = keys.iter().map(|&key| DialogId::new(-key)).collect();
 
@@ -1449,7 +1458,8 @@ pub fn migrate_dialog_to_megagroup(
     // the unloaded-chat status is `Banned(0, "")` (ChatManager.cpp:8559-8562),
     // whose is_creator() is false (stub inventory). The gate answers the
     // same "not creator" decision.
-    let is_creator = crate::chat_manager::DialogParticipantStatus::banned(0, String::new()).is_creator();
+    let is_creator =
+        crate::chat_manager::DialogParticipantStatus::banned(0, String::new()).is_creator();
     if !is_creator {
         promise.set_error(Status::error(400, "Need creator rights in the chat"));
         return;
@@ -1582,10 +1592,7 @@ pub fn is_dialog_action_unneeded(td: &mut Td, dialog_id: DialogId) -> bool {
                 options,
                 auth_is_bot: td.auth_manager.is_bot(),
             };
-            if !td
-                .user_manager
-                .is_user_online_of(&env, user_id, 30, 0)
-            {
+            if !td.user_manager.is_user_online_of(&env, user_id, 30, 0) {
                 return true;
             }
             // C++ else: `// return true;` — deliberately commented out
@@ -1600,7 +1607,12 @@ pub fn is_dialog_action_unneeded(td: &mut Td, dialog_id: DialogId) -> bool {
 /// inventory); until it can run, the pmc flag stays unset exactly like the
 /// C++ before a successful fetch.
 pub fn load_dialog_marks_as_unread(td: &mut Td) {
-    if td.global.binlog_pmc().get("fetched_marks_as_unread").is_empty() {
+    if td
+        .global
+        .binlog_pmc()
+        .get("fetched_marks_as_unread")
+        .is_empty()
+    {
         tracing::info!("Fetch dialog unread marks — [blocked: net]");
     }
 }
@@ -1642,8 +1654,7 @@ pub fn report_dialog(
     _text: &str,
     mut promise: Promise<crate::td_api::Object>,
 ) {
-    let mut access =
-        check_dialog_access(td, dialog_id, true, AccessRights::Read, "report_dialog");
+    let mut access = check_dialog_access(td, dialog_id, true, AccessRights::Read, "report_dialog");
     if access.is_error() {
         promise.set_error(access.move_as_error());
         return;
@@ -1675,8 +1686,13 @@ pub fn report_dialog_photo(
     _file_id: crate::user_manager::FileId,
     mut promise: Promise<()>,
 ) {
-    let mut access =
-        check_dialog_access(td, dialog_id, false, AccessRights::Read, "report_dialog_photo");
+    let mut access = check_dialog_access(
+        td,
+        dialog_id,
+        false,
+        AccessRights::Read,
+        "report_dialog_photo",
+    );
     if access.is_error() {
         promise.set_error(access.move_as_error());
         return;
@@ -1765,7 +1781,11 @@ pub(crate) fn get_message_sender_object(
                 auth_is_bot: td.auth_manager.is_bot(),
             };
             td_api::MessageSender::messageSenderUser(td_api::messageSenderUser {
-                user_id: td.user_manager.get_user_id_object(&mut env, dialog_id.get_user_id(), source),
+                user_id: td.user_manager.get_user_id_object(
+                    &mut env,
+                    dialog_id.get_user_id(),
+                    source,
+                ),
             })
         }
         _ => td_api::MessageSender::messageSenderChat(td_api::messageSenderChat {
@@ -1806,9 +1826,9 @@ pub fn on_get_blocked_dialogs(
             tdmtproto::telegram_api::Peer::peerChat(peer) => {
                 DialogId::from_chat_id(crate::chat_manager::ChatId::new(peer.chat_id))
             }
-            tdmtproto::telegram_api::Peer::peerChannel(peer) => DialogId::from_channel_id(
-                crate::chat_manager::ChannelId::new(peer.channel_id),
-            ),
+            tdmtproto::telegram_api::Peer::peerChannel(peer) => {
+                DialogId::from_channel_id(crate::chat_manager::ChannelId::new(peer.channel_id))
+            }
         };
         if peer_dialog_id.is_valid() {
             dialog_ids.push(peer_dialog_id);
@@ -1819,8 +1839,7 @@ pub fn on_get_blocked_dialogs(
     // the C++ compares `offset + dialog_ids.size() >
     // static_cast<size_t>(total_count)` — the size_t cast means a negative
     // server count never triggers the fix
-    if !dialog_ids.is_empty()
-        && (offset + dialog_ids.len() as i32) as usize > total_count as usize
+    if !dialog_ids.is_empty() && (offset + dialog_ids.len() as i32) as usize > total_count as usize
     {
         tracing::error!(
             "Fix total count of blocked chats from {} to {}",
@@ -1834,16 +1853,20 @@ pub fn on_get_blocked_dialogs(
         .iter()
         .map(|&dialog_id| get_message_sender_object(td, dialog_id, "on_get_blocked_dialogs"))
         .collect();
-    promise.set_value(crate::td_api::Object::messageSenders(crate::td_api::MessageSenders {
-        total_count,
-        senders,
-    }));
+    promise.set_value(crate::td_api::Object::messageSenders(
+        crate::td_api::MessageSenders {
+            total_count,
+            senders,
+        },
+    ));
 }
 
 /// `DialogManager::reget_peer_settings` (DialogManager.cpp:3480-3485) — the
 /// `GetPeerSettingsQuery` send is [blocked: net] (stub inventory).
 pub fn reget_peer_settings(td: &mut Td, dialog_id: DialogId) {
-    if !have_input_peer(td, dialog_id, false, AccessRights::Read) || is_monoforum_channel(td, dialog_id) {
+    if !have_input_peer(td, dialog_id, false, AccessRights::Read)
+        || is_monoforum_channel(td, dialog_id)
+    {
         return;
     }
     tracing::info!("Get peer settings — [blocked: net]");
@@ -1874,7 +1897,9 @@ impl ReorderPinnedDialogsOnServerLogEvent {
         }
     }
 
-    fn parse(data: &[u8]) -> std::result::Result<ReorderPinnedDialogsOnServerLogEvent, &'static str> {
+    fn parse(
+        data: &[u8],
+    ) -> std::result::Result<ReorderPinnedDialogsOnServerLogEvent, &'static str> {
         let mut parser = crate::store_parse::Parser::new_log_event(data)?;
         let folder_id = if parser.version() >= LOG_EVENT_ADD_FOLDERS_VERSION {
             parser.i32_()?
@@ -1890,7 +1915,10 @@ impl ReorderPinnedDialogsOnServerLogEvent {
             dialog_ids.push(DialogId::new(parser.i64_()?));
         }
         parser.fetch_end()?;
-        Ok(ReorderPinnedDialogsOnServerLogEvent { folder_id, dialog_ids })
+        Ok(ReorderPinnedDialogsOnServerLogEvent {
+            folder_id,
+            dialog_ids,
+        })
     }
 }
 
@@ -1909,12 +1937,17 @@ impl ToggleDialogReportSpamStateOnServerLogEvent {
         crate::store_parse::store_bool(out, self.is_spam_dialog);
     }
 
-    fn parse(data: &[u8]) -> std::result::Result<ToggleDialogReportSpamStateOnServerLogEvent, &'static str> {
+    fn parse(
+        data: &[u8],
+    ) -> std::result::Result<ToggleDialogReportSpamStateOnServerLogEvent, &'static str> {
         let mut parser = crate::store_parse::Parser::new_log_event(data)?;
         let dialog_id = DialogId::new(parser.i64_()?);
         let is_spam_dialog = parser.bool()?;
         parser.fetch_end()?;
-        Ok(ToggleDialogReportSpamStateOnServerLogEvent { dialog_id, is_spam_dialog })
+        Ok(ToggleDialogReportSpamStateOnServerLogEvent {
+            dialog_id,
+            is_spam_dialog,
+        })
     }
 }
 
@@ -1934,7 +1967,9 @@ impl ToggleDialogIsBlockedOnServerLogEvent {
         crate::store_parse::store_i64(out, self.dialog_id.get());
     }
 
-    fn parse(data: &[u8]) -> std::result::Result<ToggleDialogIsBlockedOnServerLogEvent, &'static str> {
+    fn parse(
+        data: &[u8],
+    ) -> std::result::Result<ToggleDialogIsBlockedOnServerLogEvent, &'static str> {
         let mut parser = crate::store_parse::Parser::new_log_event(data)?;
         let [is_blocked, is_blocked_for_stories] = parser.parse_flags()?;
         let dialog_id = DialogId::new(parser.i64_()?);
@@ -1972,7 +2007,9 @@ impl ToggleDialogTopicPropertyOnServerLogEvent {
         }
     }
 
-    fn parse(data: &[u8]) -> std::result::Result<ToggleDialogTopicPropertyOnServerLogEvent, &'static str> {
+    fn parse(
+        data: &[u8],
+    ) -> std::result::Result<ToggleDialogTopicPropertyOnServerLogEvent, &'static str> {
         let mut parser = crate::store_parse::Parser::new_log_event(data)?;
         let [value, has_saved_messages_topic_id] = parser.parse_flags()?;
         let dialog_id = DialogId::new(parser.i64_()?);
@@ -2006,7 +2043,9 @@ impl ToggleDialogPropertyOnServerLogEvent {
         crate::store_parse::store_i64(out, self.dialog_id.get());
     }
 
-    fn parse(data: &[u8]) -> std::result::Result<ToggleDialogPropertyOnServerLogEvent, &'static str> {
+    fn parse(
+        data: &[u8],
+    ) -> std::result::Result<ToggleDialogPropertyOnServerLogEvent, &'static str> {
         let mut parser = crate::store_parse::Parser::new_log_event(data)?;
         let [value] = parser.parse_flags()?;
         let dialog_id = DialogId::new(parser.i64_()?);
@@ -2028,10 +2067,10 @@ pub(crate) fn save_reorder_pinned_dialogs_on_server_log_event(
     };
     let mut data = Vec::new();
     log_event.store(&mut data);
-    td.global
-        .td_db()
-        .binlog()
-        .add(tddb::td_db::LOG_EVENT_HANDLER_TYPE_REORDER_PINNED_DIALOGS_ON_SERVER, &data)
+    td.global.td_db().binlog().add(
+        tddb::td_db::LOG_EVENT_HANDLER_TYPE_REORDER_PINNED_DIALOGS_ON_SERVER,
+        &data,
+    )
 }
 
 /// `DialogManager::save_toggle_dialog_report_spam_state_on_server_log_event`
@@ -2041,7 +2080,10 @@ pub(crate) fn save_toggle_dialog_report_spam_state_on_server_log_event(
     dialog_id: DialogId,
     is_spam_dialog: bool,
 ) -> u64 {
-    let log_event = ToggleDialogReportSpamStateOnServerLogEvent { dialog_id, is_spam_dialog };
+    let log_event = ToggleDialogReportSpamStateOnServerLogEvent {
+        dialog_id,
+        is_spam_dialog,
+    };
     let mut data = Vec::new();
     log_event.store(&mut data);
     td.global.td_db().binlog().add(
@@ -2065,10 +2107,10 @@ pub(crate) fn save_toggle_dialog_is_blocked_on_server_log_event(
     };
     let mut data = Vec::new();
     log_event.store(&mut data);
-    td.global
-        .td_db()
-        .binlog()
-        .add(tddb::td_db::LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_BLOCKED_ON_SERVER, &data)
+    td.global.td_db().binlog().add(
+        tddb::td_db::LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_BLOCKED_ON_SERVER,
+        &data,
+    )
 }
 
 /// `DialogManager::save_toggle_dialog_is_marked_as_unread_on_server_log_event`
@@ -2379,11 +2421,7 @@ pub fn on_binlog_dialog_events(td: &mut Td, events: &[tddb::binlog::event::Binlo
     if td.global.close_flag() {
         return;
     }
-    let have_old_message_database = td
-        .global
-        .td_db()
-        .parameters()
-        .use_message_database
+    let have_old_message_database = td.global.td_db().parameters().use_message_database
         && !td.global.td_db().was_dialog_db_created();
     for event in events {
         assert!(event.id != 0);
@@ -2393,7 +2431,8 @@ pub fn on_binlog_dialog_events(td: &mut Td, events: &[tddb::binlog::event::Binlo
                     td.global.td_db().binlog().erase(event.id);
                     continue;
                 }
-                let Ok(log_event) = ReorderPinnedDialogsOnServerLogEvent::parse(event.get_data()) else {
+                let Ok(log_event) = ReorderPinnedDialogsOnServerLogEvent::parse(event.get_data())
+                else {
                     continue; // log_event_parse(...).ensure() aborts upstream; a
                               // bad event here is a foreign binlog
                 };
@@ -2442,7 +2481,8 @@ pub fn on_binlog_dialog_events(td: &mut Td, events: &[tddb::binlog::event::Binlo
                     td.global.td_db().binlog().erase(event.id);
                     continue;
                 }
-                let Ok(log_event) = ToggleDialogTopicPropertyOnServerLogEvent::parse(event.get_data())
+                let Ok(log_event) =
+                    ToggleDialogTopicPropertyOnServerLogEvent::parse(event.get_data())
                 else {
                     continue;
                 };
@@ -2495,7 +2535,8 @@ pub fn on_binlog_dialog_events(td: &mut Td, events: &[tddb::binlog::event::Binlo
                     td.global.td_db().binlog().erase(event.id);
                     continue;
                 }
-                let Ok(log_event) = ToggleDialogReportSpamStateOnServerLogEvent::parse(event.get_data())
+                let Ok(log_event) =
+                    ToggleDialogReportSpamStateOnServerLogEvent::parse(event.get_data())
                 else {
                     continue;
                 };
@@ -2679,7 +2720,7 @@ pub fn set_dialog_photo(
     }
 
     const MAX_ANIMATION_DURATION: f64 = 10.0;
-    if main_frame_timestamp < 0.0 || main_frame_timestamp > MAX_ANIMATION_DURATION {
+    if !(0.0..=MAX_ANIMATION_DURATION).contains(&main_frame_timestamp) {
         promise.set_error(Status::error(400, "Wrong main frame timestamp specified"));
         return;
     }
@@ -2704,19 +2745,17 @@ pub fn set_dialog_accent_color(
     }
 
     match dialog_id.get_type() {
-        crate::dialog_id::DialogType::User => {
-            if dialog_id == get_my_dialog_id(td) {
-                // user_manager_->set_accent_color — the local half; the
-                // account.updateColor send is [blocked: net].
-                match td
-                    .user_manager
-                    .set_accent_color_local(accent_color_id, background_custom_emoji_id)
-                {
-                    Ok(_) => promise_unimplemented(&mut promise),
-                    Err(status) => promise.set_error(status),
-                }
-                return;
+        crate::dialog_id::DialogType::User if dialog_id == get_my_dialog_id(td) => {
+            // user_manager_->set_accent_color — the local half; the
+            // account.updateColor send is [blocked: net].
+            match td
+                .user_manager
+                .set_accent_color_local(accent_color_id, background_custom_emoji_id)
+            {
+                Ok(_) => promise_unimplemented(&mut promise),
+                Err(status) => promise.set_error(status),
             }
+            return;
         }
         crate::dialog_id::DialogType::Channel => {
             // chat_manager_->set_channel_accent_color — the ChatManager
@@ -2745,15 +2784,13 @@ pub fn set_dialog_profile_accent_color(
     }
 
     match dialog_id.get_type() {
-        crate::dialog_id::DialogType::User => {
-            if dialog_id == get_my_dialog_id(td) {
-                // user_manager_->set_profile_accent_color — its local half
-                // arrives with the profile-colors step; the query tail is
-                // the net-blocked error (stub inventory).
-                let _ = (profile_accent_color_id, profile_background_custom_emoji_id);
-                promise_unimplemented(&mut promise);
-                return;
-            }
+        crate::dialog_id::DialogType::User if dialog_id == get_my_dialog_id(td) => {
+            // user_manager_->set_profile_accent_color — its local half
+            // arrives with the profile-colors step; the query tail is
+            // the net-blocked error (stub inventory).
+            let _ = (profile_accent_color_id, profile_background_custom_emoji_id);
+            promise_unimplemented(&mut promise);
+            return;
         }
         crate::dialog_id::DialogType::Channel => {
             // chat_manager_->set_channel_profile_accent_color — M.5.44+
@@ -2763,7 +2800,10 @@ pub fn set_dialog_profile_accent_color(
         }
         _ => {}
     }
-    promise.set_error(Status::error(400, "Can't change profile accent color in the chat"));
+    promise.set_error(Status::error(
+        400,
+        "Can't change profile accent color in the chat",
+    ));
 }
 
 /// `DialogManager::set_dialog_permissions` (DialogManager.cpp:2648-2695).
@@ -2778,8 +2818,13 @@ pub fn set_dialog_permissions(
     permissions: Option<&crate::td_api::ChatPermissions>,
     mut promise: Promise<()>,
 ) {
-    let mut access =
-        check_dialog_access(td, dialog_id, false, AccessRights::Write, "set_dialog_permissions");
+    let mut access = check_dialog_access(
+        td,
+        dialog_id,
+        false,
+        AccessRights::Write,
+        "set_dialog_permissions",
+    );
     if access.is_error() {
         promise.set_error(access.move_as_error());
         return;
@@ -2799,7 +2844,10 @@ pub fn set_dialog_permissions(
         crate::dialog_id::DialogType::Chat => {
             // get_chat_permissions — the unloaded default cannot restrict
             // (stub inventory).
-            promise.set_error(Status::error(400, "Not enough rights to change chat permissions"));
+            promise.set_error(Status::error(
+                400,
+                "Not enough rights to change chat permissions",
+            ));
             return;
         }
         crate::dialog_id::DialogType::Channel => {
@@ -2809,7 +2857,10 @@ pub fn set_dialog_permissions(
             }
             // get_channel_permissions — the unloaded default (stub
             // inventory); the C++ proceeds with ChannelType::Megagroup.
-            promise.set_error(Status::error(400, "Not enough rights to change chat permissions"));
+            promise.set_error(Status::error(
+                400,
+                "Not enough rights to change chat permissions",
+            ));
             return;
         }
         crate::dialog_id::DialogType::SecretChat | crate::dialog_id::DialogType::None => {
@@ -2822,8 +2873,10 @@ pub fn set_dialog_permissions(
     // unloaded `restrict_all()`, stub inventory); the
     // EditChatDefaultBannedRightsQuery send is [blocked: net].
     {
-        let _new_permissions =
-            crate::chat_manager::RestrictedRights::from_chat_permissions(Some(permissions), channel_type);
+        let _new_permissions = crate::chat_manager::RestrictedRights::from_chat_permissions(
+            Some(permissions),
+            channel_type,
+        );
         promise_unimplemented(&mut promise);
     }
 }
@@ -2847,32 +2900,30 @@ pub fn set_dialog_emoji_status(
     }
 
     match dialog_id.get_type() {
-        crate::dialog_id::DialogType::User => {
-            if dialog_id == get_my_dialog_id(td) {
-                // user_manager_->set_emoji_status — the premium gate is the
-                // local half. `add_recent_emoji_status` (UserManager.cpp:6750-6752)
-                // and `on_set_emoji_status` + the `UpdateEmojiStatusQuery`
-                // send ride their steps (stub inventory): on_set_emoji_status
-                // runs only from the query-success callback in the C++.
-                let Some(options) = td.option_manager.as_mut() else {
-                    // unreachable through the request gate — the manager is
-                    // pinned by Td::init
-                    promise_unimplemented(&mut promise);
-                    return;
-                };
-                let env = UserEnv {
-                    global: &mut td.global,
-                    options,
-                    auth_is_bot: td.auth_manager.is_bot(),
-                };
-                if let Err(status) = td.user_manager.set_emoji_status_local(&env) {
-                    promise.set_error(status);
-                    return;
-                }
-                let _ = emoji_status;
+        crate::dialog_id::DialogType::User if dialog_id == get_my_dialog_id(td) => {
+            // user_manager_->set_emoji_status — the premium gate is the
+            // local half. `add_recent_emoji_status` (UserManager.cpp:6750-6752)
+            // and `on_set_emoji_status` + the `UpdateEmojiStatusQuery`
+            // send ride their steps (stub inventory): on_set_emoji_status
+            // runs only from the query-success callback in the C++.
+            let Some(options) = td.option_manager.as_mut() else {
+                // unreachable through the request gate — the manager is
+                // pinned by Td::init
                 promise_unimplemented(&mut promise);
                 return;
+            };
+            let env = UserEnv {
+                global: &mut td.global,
+                options,
+                auth_is_bot: td.auth_manager.is_bot(),
+            };
+            if let Err(status) = td.user_manager.set_emoji_status_local(&env) {
+                promise.set_error(status);
+                return;
             }
+            let _ = emoji_status;
+            promise_unimplemented(&mut promise);
+            return;
         }
         crate::dialog_id::DialogType::Channel => {
             // chat_manager_->set_channel_emoji_status — M.5.44+ (stub
@@ -2975,12 +3026,10 @@ pub fn can_delete_all_dialog_messages_by_sender(td: &mut Td, dialog_id: DialogId
         crate::dialog_id::DialogType::User
         | crate::dialog_id::DialogType::Chat
         | crate::dialog_id::DialogType::SecretChat
-        | crate::dialog_id::DialogType::None => {
-            Result::from_status(Status::error(
-                400,
-                "All messages from a sender can be deleted only in supergroup chats",
-            ))
-        }
+        | crate::dialog_id::DialogType::None => Result::from_status(Status::error(
+            400,
+            "All messages from a sender can be deleted only in supergroup chats",
+        )),
         crate::dialog_id::DialogType::Channel => {
             let channel_id = dialog_id.get_channel_id();
             // is_megagroup_channel/is_monoforum_channel — unloaded `false`
@@ -3118,7 +3167,6 @@ pub fn on_update_dialog_bot_commands(
         crate::dialog_id::DialogType::User => {
             if DialogId::from_user_id(bot_user_id) != dialog_id {
                 tracing::error!("Receive commands of {bot_user_id:?} in {dialog_id:?}");
-                return;
             }
             // user_manager_->on_update_user_commands — M.8 (stub inventory).
         }
@@ -3135,7 +3183,9 @@ pub fn on_update_dialog_bot_commands(
 /// `DialogManager::get_dialog_title` (DialogManager.cpp:2051-2065).
 pub fn get_dialog_title(td: &mut Td, dialog_id: DialogId) -> String {
     match dialog_id.get_type() {
-        crate::dialog_id::DialogType::User => td.user_manager.get_user_title_of(dialog_id.get_user_id()),
+        crate::dialog_id::DialogType::User => {
+            td.user_manager.get_user_title_of(dialog_id.get_user_id())
+        }
         // chat_manager_->get_chat_title / get_channel_title — the unloaded
         // `""` (stub inventory).
         crate::dialog_id::DialogType::Chat | crate::dialog_id::DialogType::Channel => String::new(),
@@ -3160,7 +3210,8 @@ pub fn get_dialog_about(td: &mut Td, dialog_id: DialogId) -> String {
                 options,
                 auth_is_bot: td.auth_manager.is_bot(),
             };
-            td.user_manager.get_user_about(&mut env, dialog_id.get_user_id())
+            td.user_manager
+                .get_user_about(&mut env, dialog_id.get_user_id())
         }
         // chat_manager_->get_chat_about / get_channel_about — the unloaded
         // `""` (stub inventory).
@@ -3188,11 +3239,14 @@ pub fn get_dialog_about(td: &mut Td, dialog_id: DialogId) -> String {
 /// to `Option<&ProfilePhoto>` (the user_manager.rs substitution). The
 /// chat/channel/secret halves need the ChatManager/secret-chat photo read
 /// surface: the unloaded `None` (the C++ `nullptr`, stub inventory).
-pub fn get_dialog_photo(td: &Td, dialog_id: DialogId) -> Option<&crate::user_manager::ProfilePhoto> {
+pub fn get_dialog_photo(
+    td: &Td,
+    dialog_id: DialogId,
+) -> Option<&crate::user_manager::ProfilePhoto> {
     match dialog_id.get_type() {
-        crate::dialog_id::DialogType::User => {
-            td.user_manager.get_user_dialog_photo(dialog_id.get_user_id())
-        }
+        crate::dialog_id::DialogType::User => td
+            .user_manager
+            .get_user_dialog_photo(dialog_id.get_user_id()),
         crate::dialog_id::DialogType::Chat
         | crate::dialog_id::DialogType::Channel
         | crate::dialog_id::DialogType::SecretChat => None,
@@ -3385,9 +3439,9 @@ pub fn get_dialog_emoji_status_object(
     dialog_id: DialogId,
 ) -> Option<crate::td_api::EmojiStatus> {
     match dialog_id.get_type() {
-        crate::dialog_id::DialogType::User => {
-            td.user_manager.get_user_emoji_status_object_of(dialog_id.get_user_id())
-        }
+        crate::dialog_id::DialogType::User => td
+            .user_manager
+            .get_user_emoji_status_object_of(dialog_id.get_user_id()),
         crate::dialog_id::DialogType::Chat | crate::dialog_id::DialogType::Channel => None,
         crate::dialog_id::DialogType::SecretChat => td
             .user_manager
@@ -3424,7 +3478,8 @@ impl DialogManager {
         for username in old_usernames {
             let cleaned_username = clean_username(username);
             self.resolved_usernames.remove(&cleaned_username);
-            self.inaccessible_resolved_usernames.remove(&cleaned_username);
+            self.inaccessible_resolved_usernames
+                .remove(&cleaned_username);
         }
 
         self.on_dialog_usernames_received(dialog_id, new_usernames, false);
@@ -3532,9 +3587,9 @@ pub fn get_check_chat_username_result_object(
 ) -> crate::td_api::Object {
     use crate::td_api;
     match result {
-        CheckDialogUsernameResult::Ok => td_api::Object::checkChatUsernameResultOk(
-            td_api::checkChatUsernameResultOk {},
-        ),
+        CheckDialogUsernameResult::Ok => {
+            td_api::Object::checkChatUsernameResultOk(td_api::checkChatUsernameResultOk {})
+        }
         CheckDialogUsernameResult::Invalid => {
             td_api::Object::checkChatUsernameResultUsernameInvalid(
                 td_api::checkChatUsernameResultUsernameInvalid {},
@@ -3571,10 +3626,11 @@ pub fn get_check_chat_username_result_object(
 impl DialogManager {
     pub(crate) fn get_resolved_dialog_by_username(&self, username: &str) -> DialogId {
         let cleaned_username = clean_username(username);
-        if let Some(resolved_username) = self.resolved_usernames.get(&cleaned_username) {
-            if resolved_username.dialog_id.is_valid() {
+        match self.resolved_usernames.get(&cleaned_username) {
+            Some(resolved_username) if resolved_username.dialog_id.is_valid() => {
                 return resolved_username.dialog_id;
             }
+            _ => {}
         }
 
         self.inaccessible_resolved_usernames
@@ -3595,8 +3651,8 @@ impl DialogManager {
         username: &str,
         promise: &mut Promise<()>,
     ) -> DialogId {
-        if let Some(resolved_username) = self.resolved_usernames.get(username) {
-            if resolved_username.dialog_id.is_valid() {
+        match self.resolved_usernames.get(username) {
+            Some(resolved_username) if resolved_username.dialog_id.is_valid() => {
                 let dialog_id = resolved_username.dialog_id;
                 if resolved_username.expires_at < time::now() {
                     // the refresh query with an empty promise — [blocked:
@@ -3605,6 +3661,7 @@ impl DialogManager {
                 }
                 return dialog_id;
             }
+            _ => {}
         }
         let dialog_id = self
             .inaccessible_resolved_usernames
@@ -3627,10 +3684,12 @@ pub fn drop_username(td: &mut Td, username: &str) {
     }
 
     let mut manager = std::mem::take(&mut td.dialog_manager);
-    manager.inaccessible_resolved_usernames.remove(&cleaned_username);
+    manager
+        .inaccessible_resolved_usernames
+        .remove(&cleaned_username);
 
-    if let Some(resolved_username) = manager.resolved_usernames.get(&cleaned_username) {
-        if resolved_username.dialog_id.is_valid() {
+    match manager.resolved_usernames.get(&cleaned_username) {
+        Some(resolved_username) if resolved_username.dialog_id.is_valid() => {
             let dialog_id = resolved_username.dialog_id;
             if have_input_peer(td, dialog_id, false, AccessRights::Read) {
                 reload_dialog_info_full(td, dialog_id, "drop_username");
@@ -3638,6 +3697,7 @@ pub fn drop_username(td: &mut Td, username: &str) {
 
             manager.resolved_usernames.remove(&cleaned_username);
         }
+        _ => {}
     }
     td.dialog_manager = manager;
 }
@@ -3652,7 +3712,9 @@ pub fn reload_video_chat_on_search(td: &mut Td, username: &str) {
     let cleaned_username = clean_username(username);
     if !cleaned_username.is_empty() {
         let mut manager = std::mem::take(&mut td.dialog_manager);
-        manager.reload_video_chat_on_search_usernames.insert(cleaned_username);
+        manager
+            .reload_video_chat_on_search_usernames
+            .insert(cleaned_username);
         td.dialog_manager = manager;
     }
 }
@@ -3685,14 +3747,17 @@ pub fn search_public_dialog(
 
     if have_input_peer(td, dialog_id, false, AccessRights::Read) {
         let mut manager = std::mem::take(&mut td.dialog_manager);
-        if !force && manager.reload_video_chat_on_search_usernames.remove(&username) {
-            if dialog_id.get_type() == crate::dialog_id::DialogType::Channel {
-                // chat_manager_->reload_channel_full — the promise completes
-                // with the net-blocked error (stub inventory).
-                td.dialog_manager = manager;
-                promise.set_error(Status::error(500, "Network is not implemented yet"));
-                return DialogId::new(0);
-            }
+        if !force
+            && manager
+                .reload_video_chat_on_search_usernames
+                .remove(&username)
+            && dialog_id.get_type() == crate::dialog_id::DialogType::Channel
+        {
+            // chat_manager_->reload_channel_full — the promise completes
+            // with the net-blocked error (stub inventory).
+            td.dialog_manager = manager;
+            promise.set_error(Status::error(500, "Network is not implemented yet"));
+            return DialogId::new(0);
         }
         td.dialog_manager = manager;
 
@@ -3739,8 +3804,7 @@ pub fn search_public_dialogs(
                 let username = short_username;
                 let dialog_id = {
                     let mut manager = std::mem::take(&mut td.dialog_manager);
-                    let dialog_id =
-                        manager.resolve_dialog_username(td, username, &mut promise);
+                    let dialog_id = manager.resolve_dialog_username(td, username, &mut promise);
                     td.dialog_manager = manager;
                     dialog_id
                 };
@@ -3834,7 +3898,6 @@ pub fn search_dialogs_on_server(
 /// `on_failed_public_dialogs_search` (DialogManager.cpp:3449-3479) — the
 /// cache fills land with the net step; the negative-cache shape is recorded
 /// here for the integration.
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3901,14 +3964,12 @@ mod tests {
             Some(tdmtproto::telegram_api::InputDialogPeer::inputDialogPeer(_))
         ));
         // secret chats never produce an input dialog peer
-        assert!(
-            get_input_dialog_peer(
-                &mut td,
-                DialogId::from_secret_chat_id(crate::user_manager::SecretChatId::new(1)),
-                AccessRights::Read
-            )
-            .is_none()
-        );
+        assert!(get_input_dialog_peer(
+            &mut td,
+            DialogId::from_secret_chat_id(crate::user_manager::SecretChatId::new(1)),
+            AccessRights::Read
+        )
+        .is_none());
     }
 
     #[test]
@@ -4103,12 +4164,16 @@ mod tests {
         );
         assert!(status.is_member());
         assert!(!status.is_banned());
-        let status =
-            get_dialog_status(&td, DialogId::from_chat_id(crate::chat_manager::ChatId::new(5)));
+        let status = get_dialog_status(
+            &td,
+            DialogId::from_chat_id(crate::chat_manager::ChatId::new(5)),
+        );
         assert!(!status.is_member());
         assert!(status.is_banned());
-        let permissions =
-            get_dialog_permissions(&td, DialogId::from_channel_id(crate::chat_manager::ChannelId::new(5)));
+        let permissions = get_dialog_permissions(
+            &td,
+            DialogId::from_channel_id(crate::chat_manager::ChannelId::new(5)),
+        );
         assert!(permissions.is_banned());
 
         // default permissions are restrict_all on every unloaded arm
@@ -4145,9 +4210,7 @@ mod tests {
 
         // groups have no gift colors / emoji status / background emoji
         let chat_dialog = DialogId::from_chat_id(crate::chat_manager::ChatId::new(5));
-        assert!(
-            get_dialog_upgraded_gift_colors_object(&td, chat_dialog).is_none()
-        );
+        assert!(get_dialog_upgraded_gift_colors_object(&td, chat_dialog).is_none());
         assert!(get_dialog_emoji_status_object(&td, chat_dialog).is_none());
         assert_eq!(
             get_dialog_background_custom_emoji_id(&td, chat_dialog),
@@ -4236,7 +4299,6 @@ mod tests {
             "test",
         );
         assert_eq!(seeded, user_id);
-        drop(env);
 
         let dialog_id = DialogId::from_user_id(user_id);
         add_recently_found_dialog(&mut td, dialog_id).unwrap();
@@ -4297,7 +4359,6 @@ mod tests {
             }),
             "test",
         );
-        drop(env);
 
         let dialog_id = DialogId::from_user_id(user_id);
         add_dialog_to_hints(&mut td, dialog_id);
@@ -4346,8 +4407,13 @@ mod tests {
 
     use std::sync::{Arc, Mutex};
 
+    /// The slot half of the request-promise collapse, aliased to match
+    /// requests.rs `ObjectSlot`.
+    type UnitSlot = Arc<Mutex<Option<Result<()>>>>;
+    type ObjectSlot = Arc<Mutex<Option<Result<crate::td_api::Object>>>>;
+
     /// The requests.rs unit-request-promise collapse, for tests.
-    fn capture_unit_promise() -> (Promise<()>, Arc<Mutex<Option<Result<()>>>>) {
+    fn capture_unit_promise() -> (Promise<()>, UnitSlot) {
         let slot = Arc::new(Mutex::new(None));
         let capture = Arc::clone(&slot);
         let promise = PromiseCreator::lambda_result(move |result: Result<()>| {
@@ -4366,13 +4432,13 @@ mod tests {
 
     /// The object-shaped counterpart of `capture_unit_promise`, for the
     /// td_api handler entry points that answer with `Promise<Object>`.
-    fn capture_object_promise(
-    ) -> (Promise<crate::td_api::Object>, Arc<Mutex<Option<Result<crate::td_api::Object>>>>) {
+    fn capture_object_promise() -> (Promise<crate::td_api::Object>, ObjectSlot) {
         let slot = Arc::new(Mutex::new(None));
         let capture = Arc::clone(&slot);
-        let promise = PromiseCreator::lambda_result(move |result: Result<crate::td_api::Object>| {
-            *capture.lock().unwrap() = Some(result);
-        });
+        let promise =
+            PromiseCreator::lambda_result(move |result: Result<crate::td_api::Object>| {
+                *capture.lock().unwrap() = Some(result);
+            });
         (promise, slot)
     }
 
@@ -4580,12 +4646,7 @@ mod tests {
         assert_eq!(captured_status(&slot).message(), "Chat not found");
 
         let (promise, slot) = capture_unit_promise();
-        set_dialog_permissions(
-            &mut td,
-            DialogId::new(0),
-            None,
-            promise,
-        );
+        set_dialog_permissions(&mut td, DialogId::new(0), None, promise);
         let status = captured_status(&slot);
         assert_eq!(status.code(), 400);
         assert_eq!(status.message(), "Invalid chat identifier specified");
@@ -4650,19 +4711,13 @@ mod tests {
         let (promise, slot) = {
             let slot = Arc::new(Mutex::new(None::<Result<crate::td_api::Object>>));
             let capture = Arc::clone(&slot);
-            let promise = PromiseCreator::lambda_result(move |result: Result<crate::td_api::Object>| {
-                *capture.lock().unwrap() = Some(result);
-            });
+            let promise =
+                PromiseCreator::lambda_result(move |result: Result<crate::td_api::Object>| {
+                    *capture.lock().unwrap() = Some(result);
+                });
             (promise, slot)
         };
-        crate::dialog_manager::report_dialog(
-            &mut td,
-            DialogId::new(0),
-            "",
-            &[],
-            "",
-            promise,
-        );
+        crate::dialog_manager::report_dialog(&mut td, DialogId::new(0), "", &[], "", promise);
         match slot.lock().unwrap().take() {
             Some(Result::Err(status)) => {
                 assert_eq!(status.message(), "Invalid chat identifier specified")
@@ -4682,11 +4737,9 @@ mod tests {
         let (object_promise, object_slot) = {
             let s = Arc::new(Mutex::new(None::<Result<crate::td_api::Object>>));
             let c = Arc::clone(&s);
-            let p = PromiseCreator::lambda_result(
-                move |result: Result<crate::td_api::Object>| {
-                    *c.lock().unwrap() = Some(result);
-                },
-            );
+            let p = PromiseCreator::lambda_result(move |result: Result<crate::td_api::Object>| {
+                *c.lock().unwrap() = Some(result);
+            });
             (p, s)
         };
         let _ = (promise, slot);
@@ -4701,11 +4754,9 @@ mod tests {
         let (object_promise, object_slot) = {
             let s = Arc::new(Mutex::new(None::<Result<crate::td_api::Object>>));
             let c = Arc::clone(&s);
-            let p = PromiseCreator::lambda_result(
-                move |result: Result<crate::td_api::Object>| {
-                    *c.lock().unwrap() = Some(result);
-                },
-            );
+            let p = PromiseCreator::lambda_result(move |result: Result<crate::td_api::Object>| {
+                *c.lock().unwrap() = Some(result);
+            });
             (p, s)
         };
         get_blocked_dialogs(&mut td, Some(&block_list), 0, 0, object_promise);
@@ -4720,11 +4771,9 @@ mod tests {
         let (object_promise, object_slot) = {
             let s = Arc::new(Mutex::new(None::<Result<crate::td_api::Object>>));
             let c = Arc::clone(&s);
-            let p = PromiseCreator::lambda_result(
-                move |result: Result<crate::td_api::Object>| {
-                    *c.lock().unwrap() = Some(result);
-                },
-            );
+            let p = PromiseCreator::lambda_result(move |result: Result<crate::td_api::Object>| {
+                *c.lock().unwrap() = Some(result);
+            });
             (p, s)
         };
         get_blocked_dialogs(&mut td, Some(&block_list), 0, 10, object_promise);
@@ -4767,17 +4816,15 @@ mod tests {
         let (object_promise, object_slot) = {
             let s = Arc::new(Mutex::new(None::<Result<crate::td_api::Object>>));
             let c = Arc::clone(&s);
-            let p = PromiseCreator::lambda_result(
-                move |result: Result<crate::td_api::Object>| {
-                    *c.lock().unwrap() = Some(result);
-                },
-            );
+            let p = PromiseCreator::lambda_result(move |result: Result<crate::td_api::Object>| {
+                *c.lock().unwrap() = Some(result);
+            });
             (p, s)
         };
         let blocked = vec![tdmtproto::telegram_api::PeerBlocked {
-            peer_id: tdmtproto::telegram_api::Peer::peerUser(
-                tdmtproto::telegram_api::peerUser { user_id: 11 },
-            ),
+            peer_id: tdmtproto::telegram_api::Peer::peerUser(tdmtproto::telegram_api::peerUser {
+                user_id: 11,
+            }),
             date: 0,
         }];
         on_get_blocked_dialogs(&mut td, 0, 1, 1, blocked, object_promise);
@@ -4843,7 +4890,9 @@ mod tests {
         }
         .store(&mut data);
         assert_eq!(
-            ToggleDialogTopicPropertyOnServerLogEvent::parse(&data).unwrap().saved_messages_topic_id,
+            ToggleDialogTopicPropertyOnServerLogEvent::parse(&data)
+                .unwrap()
+                .saved_messages_topic_id,
             0
         );
 
@@ -4867,7 +4916,10 @@ mod tests {
         };
         let mut data = Vec::new();
         reorder.store(&mut data);
-        assert_eq!(ReorderPinnedDialogsOnServerLogEvent::parse(&data).unwrap(), reorder);
+        assert_eq!(
+            ReorderPinnedDialogsOnServerLogEvent::parse(&data).unwrap(),
+            reorder
+        );
 
         // the pre-AddFolders (version < 23) form has no folder id
         let mut legacy = Vec::new();
@@ -4950,16 +5002,12 @@ mod tests {
         }
     }
 
-    fn new_object_slot() -> (
-        Promise<td_api::Object>,
-        Arc<Mutex<Option<Result<td_api::Object>>>>,
-    ) {
+    fn new_object_slot() -> (Promise<td_api::Object>, ObjectSlot) {
         let slot = Arc::new(Mutex::new(None));
         let capture = Arc::clone(&slot);
-        let promise =
-            PromiseCreator::lambda_result(move |result: Result<td_api::Object>| {
-                *capture.lock().unwrap() = Some(result);
-            });
+        let promise = PromiseCreator::lambda_result(move |result: Result<td_api::Object>| {
+            *capture.lock().unwrap() = Some(result);
+        });
         (promise, slot)
     }
 
@@ -4989,7 +5037,10 @@ mod tests {
             promise,
         );
         assert!(found.is_empty());
-        assert_eq!(captured_status(&slot).message(), "Network is not implemented yet");
+        assert_eq!(
+            captured_status(&slot).message(),
+            "Network is not implemented yet"
+        );
 
         // a cached short username resolves and passes the filter checks
         td.dialog_manager
@@ -5000,7 +5051,10 @@ mod tests {
         let (promise, slot) = capture_unit_promise();
         let found = search_public_dialogs(&mut td, "gi", None, promise);
         assert!(found.is_empty());
-        assert_eq!(captured_status(&slot).message(), "Network is not implemented yet");
+        assert_eq!(
+            captured_status(&slot).message(),
+            "Network is not implemented yet"
+        );
     }
 
     #[test]
@@ -5011,11 +5065,8 @@ mod tests {
         // the C++ short-circuits on the type first (cpp:3382-3383)
         let channel_dialog =
             DialogId::from_channel_id(crate::chat_manager::ChannelId::new(500_000_000));
-        td.dialog_manager.on_dialog_usernames_received(
-            channel_dialog,
-            &["gif".to_string()],
-            false,
-        );
+        td.dialog_manager
+            .on_dialog_usernames_received(channel_dialog, &["gif".to_string()], false);
         let (promise, slot) = capture_unit_promise();
         let found = search_public_dialogs(&mut td, "gi", None, promise);
         assert_eq!(found, vec![channel_dialog]);
@@ -5028,7 +5079,10 @@ mod tests {
         let (promise, slot) = capture_unit_promise();
         let found = search_dialogs_on_server(&mut td, "query", None, -1, promise);
         assert!(found.is_empty());
-        assert_eq!(captured_status(&slot).message(), "Limit must be non-negative");
+        assert_eq!(
+            captured_status(&slot).message(),
+            "Limit must be non-negative"
+        );
 
         // an empty query succeeds with no results
         let (promise, slot) = capture_unit_promise();
@@ -5137,7 +5191,8 @@ mod tests {
             &[],
         );
         assert_eq!(
-            td.dialog_manager.get_resolved_dialog_by_username("somebody"),
+            td.dialog_manager
+                .get_resolved_dialog_by_username("somebody"),
             DialogId::new(0)
         );
 

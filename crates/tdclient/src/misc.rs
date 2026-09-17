@@ -458,7 +458,10 @@ mod misc_helper_tests {
 
     #[test]
     fn valid_short_usernames_match_the_cpp_table() {
-        assert_eq!(get_valid_short_usernames(), &["gif", "nft", "pic", "ufc", "vid"]);
+        assert_eq!(
+            get_valid_short_usernames(),
+            &["gif", "nft", "pic", "ufc", "vid"]
+        );
     }
 
     #[test]
