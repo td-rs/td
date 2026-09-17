@@ -6015,11 +6015,213 @@ impl ChatManager {
         }
     }
 
-    /// `repair_chat_participants` (ChatManager.cpp) — the C++ re-requests
-    /// the chat full through the net layer; [blocked: net] (M.5.44).
+    /// `repair_chat_participants` (ChatManager.cpp:6995-6997) — re-requests
+    /// the full through GetFullChat; [blocked: net] (M.5.44).
     fn repair_chat_participants(&mut self, env: &mut UserEnv, chat_id: ChatId) {
-        let _ = env;
-        tdutils::log_info!("Repair participants of {chat_id:?} — [blocked: net]");
+        self.send_get_chat_full_query(env, chat_id, Promise::default(), "repair_chat_participants");
+    }
+
+    /// `on_get_chat_participants` (ChatManager.cpp:6273-6344).
+    pub fn on_get_chat_participants(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        participants: telegram_api::ChatParticipants,
+        from_update: bool,
+    ) {
+        match participants {
+            telegram_api::ChatParticipants::chatParticipantsForbidden(p) => {
+                let chat_id = ChatId::new(p.chat_id);
+                if !chat_id.is_valid() {
+                    tdutils::log_error!("Receive invalid {chat_id:?}");
+                    return;
+                }
+                if !self.have_chat_force(user_manager, env, chat_id, "on_get_chat_participants") {
+                    tdutils::log_error!("{chat_id:?} not found");
+                    return;
+                }
+                if from_update {
+                    self.drop_chat_full(user_manager, env, chat_id);
+                }
+            }
+            telegram_api::ChatParticipants::chatParticipants(p) => {
+                let chat_id = ChatId::new(p.chat_id);
+                if !chat_id.is_valid() {
+                    tdutils::log_error!("Receive invalid {chat_id:?}");
+                    return;
+                }
+                if self
+                    .get_chat_force(user_manager, env, chat_id, "chatParticipants")
+                    .is_none()
+                {
+                    tdutils::log_error!("{chat_id:?} not found");
+                    return;
+                }
+                // snapshot the record fields the participant conversion needs
+                let (chat_date, chat_is_creator) = {
+                    let c = self.get_chat(chat_id).expect("force-loaded above");
+                    (c.date, c.status.is_creator())
+                };
+                if self
+                    .get_chat_full_force(
+                        user_manager,
+                        env,
+                        chat_id,
+                        "telegram_api::chatParticipants",
+                    )
+                    .is_none()
+                {
+                    tdutils::log_info!("Ignore update of members for unknown full {chat_id:?}");
+                    return;
+                }
+
+                let mut new_creator_user_id = UserId::default();
+                let mut new_participants = Vec::with_capacity(p.participants.len());
+                for participant_ptr in p.participants {
+                    let mut dialog_participant = DialogParticipant::from_chat_participant(
+                        participant_ptr,
+                        chat_date,
+                        chat_is_creator,
+                    );
+                    if !dialog_participant.is_valid() {
+                        tdutils::log_error!("Receive invalid {dialog_participant:?}");
+                        continue;
+                    }
+                    // LOG_IF(ERROR, !have_dialog_info) — the DialogManager
+                    // stub (M.6) answers from local caches; emit nothing.
+                    let inviter = dialog_participant.inviter_user_id_;
+                    if !user_manager.have_min_user(inviter) {
+                        tdutils::log_error!(
+                            "Have no information about {inviter:?} as a member of {chat_id:?}"
+                        );
+                    }
+                    if dialog_participant.joined_date_ < chat_date {
+                        if dialog_participant.joined_date_ < chat_date - 30
+                            && chat_date >= 1_486_000_000
+                        {
+                            tdutils::log_error!(
+                                "Wrong join date = {} for {:?}, {chat_id:?} was created at {chat_date}",
+                                dialog_participant.joined_date_,
+                                dialog_participant.dialog_id_
+                            );
+                        }
+                        dialog_participant.joined_date_ = chat_date;
+                    }
+                    if dialog_participant.status_.is_creator()
+                        && dialog_participant.dialog_id_.get_type() == DialogType::User
+                    {
+                        new_creator_user_id = dialog_participant.dialog_id_.get_user_id();
+                    }
+                    new_participants.push(dialog_participant);
+                }
+
+                if let Some(f) = self.chats_full.get_mut(&chat_id.get())
+                    && f.creator_user_id != new_creator_user_id
+                {
+                    f.creator_user_id = new_creator_user_id;
+                    f.is_changed = true;
+                }
+                self.on_update_chat_full_participants(
+                    user_manager,
+                    env,
+                    chat_id,
+                    new_participants,
+                    p.version,
+                    from_update,
+                );
+                if from_update {
+                    self.update_chat_full(
+                        user_manager,
+                        env,
+                        chat_id,
+                        "on_get_chat_participants",
+                        false,
+                    );
+                }
+            }
+        }
+    }
+
+    /// `on_update_chat_full_participants` (ChatManager.cpp:7548-7574).
+    fn on_update_chat_full_participants(
+        &mut self,
+        user_manager: &mut UserManager,
+        env: &mut UserEnv,
+        chat_id: ChatId,
+        participants: Vec<DialogParticipant>,
+        version: i32,
+        from_update: bool,
+    ) {
+        if version <= -1 {
+            tdutils::log_error!("Receive members with wrong version {version} in {chat_id:?}");
+            return;
+        }
+        let Some(f) = self.chats_full.get_mut(&chat_id.get()) else {
+            debug_assert!(
+                false,
+                "Missing full {chat_id:?} in on_update_chat_full_participants"
+            );
+            return;
+        };
+        if version < f.version {
+            tdutils::log_warning!(
+                "Receive members of {chat_id:?} with version {version} but current version is {}",
+                f.version
+            );
+            return;
+        }
+        if (f.participants.len() != participants.len() && version == f.version)
+            || (from_update && version != f.version + 1)
+        {
+            tdutils::log_info!("Members of {chat_id:?} has changed");
+            self.repair_chat_participants(env, chat_id);
+            return;
+        }
+        if let Some(f) = self.chats_full.get_mut(&chat_id.get()) {
+            f.participants = participants;
+            f.version = version;
+            f.is_changed = true;
+        }
+        self.update_chat_online_member_count_full(user_manager, env, chat_id, true);
+    }
+
+    /// `update_chat_online_member_count(ChatFull *, ...)` — the
+    /// DialogParticipantManager counter is the wave-2 stub.
+    fn update_chat_online_member_count_full(
+        &mut self,
+        _user_manager: &mut UserManager,
+        _env: &mut UserEnv,
+        _chat_id: ChatId,
+        _is_from_server: bool,
+    ) {
+    }
+
+    /// `get_chat_participant` (ChatManager.cpp:6358-6363) — the local
+    /// accessor.
+    #[allow(dead_code)] // promise form lands with the net step (M.5.44)
+    fn get_chat_participant(&self, chat_id: ChatId, user_id: UserId) -> Option<&DialogParticipant> {
+        let chat_full = self.get_chat_full(chat_id)?;
+        let dialog_id = DialogId::from_user_id(user_id);
+        self.get_chat_full_participant(chat_full, dialog_id)
+    }
+
+    /// `get_chat_full_participant` (ChatManager.cpp:6366-6373).
+    #[allow(dead_code)] // consumed through get_chat_participant (M.5.44)
+    fn get_chat_full_participant<'a>(
+        &self,
+        chat_full: &'a ChatFull,
+        dialog_id: DialogId,
+    ) -> Option<&'a DialogParticipant> {
+        chat_full
+            .participants
+            .iter()
+            .find(|p| p.dialog_id_ == dialog_id)
+    }
+
+    /// `get_chat_participants` (ChatManager.cpp:6375-6381).
+    #[allow(dead_code)] // read-surface callers land with M.5.36/M.5.47
+    fn get_chat_participants(&self, chat_id: ChatId) -> Option<&Vec<DialogParticipant>> {
+        self.get_chat_full(chat_id).map(|f| &f.participants)
     }
 
     /// `on_update_chat_photo` (ChatManager.cpp:7446-7452) — the
