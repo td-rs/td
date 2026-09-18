@@ -25,5 +25,4 @@ pub mod translit;
 pub mod unicode;
 pub mod utf8;
 
-mod unicode_simple_category_tables;
 mod unicode_tables;
