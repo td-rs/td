@@ -2694,6 +2694,42 @@ pub trait MessageContentStorage {
     fn store_background(&self, background_id: BackgroundId, out: &mut Vec<u8>);
     /// `BackgroundManager::parse_background`.
     fn parse_background(&mut self, parser: &mut Parser) -> Result<BackgroundId, &'static str>;
+    /// `MessageReactions::store` (MessageReactions plane, Wave 2) — the
+    /// reactions record the M.10 message serialization points at.
+    fn store_reactions(
+        &mut self,
+        reactions: &crate::messages_manager::MessageReactions,
+        out: &mut Vec<u8>,
+    );
+    /// `MessageReactions::parse`.
+    fn parse_reactions(
+        &mut self,
+        input: &mut Parser,
+    ) -> Result<crate::messages_manager::MessageReactions, &'static str>;
+    /// The `store(reply_markup)` TL-object serialization of a generated
+    /// `telegram_api` value (the tl-codegen store plane).
+    fn store_reply_markup(
+        &mut self,
+        reply_markup: &tdmtproto::telegram_api::ReplyMarkup,
+        out: &mut Vec<u8>,
+    );
+    /// The `parse(reply_markup)` reader.
+    fn parse_reply_markup(
+        &mut self,
+        input: &mut Parser,
+    ) -> Result<tdmtproto::telegram_api::ReplyMarkup, &'static str>;
+    /// `store(const MinChannel &)` (MinChannel.hpp:18-...) — the record
+    /// carries a DialogPhoto + AccentColorId (Wave 2 owners).
+    fn store_min_channel(
+        &mut self,
+        min_channel: &crate::messages_manager::MinChannel,
+        out: &mut Vec<u8>,
+    );
+    /// `parse(const MinChannel &)`.
+    fn parse_min_channel(
+        &mut self,
+        input: &mut Parser,
+    ) -> Result<crate::messages_manager::MinChannel, &'static str>;
     /// `WebPagesManager::on_load_web_page_url_from_database` — the
     /// `MessageText::parse` side effect (MessageContent.cpp:3225-3228).
     fn on_load_web_page_url_from_database(&mut self, web_page_id: WebPageId, url: &str);
@@ -8981,8 +9017,66 @@ mod tests {
             Ok(BackgroundId::new(parser.i64_()?))
         }
 
+        fn store_reactions(
+            &mut self,
+            _reactions: &crate::messages_manager::MessageReactions,
+            out: &mut Vec<u8>,
+        ) {
+            store_i32(out, TAG_REACTIONS);
+        }
+        fn parse_reactions(
+            &mut self,
+            input: &mut Parser,
+        ) -> Result<crate::messages_manager::MessageReactions, &'static str> {
+            let tag = input.i32_()?;
+            if tag != TAG_REACTIONS {
+                return Err("wrong manager record tag");
+            }
+            Ok(crate::messages_manager::MessageReactions::default())
+        }
+        fn store_reply_markup(
+            &mut self,
+            _reply_markup: &tdmtproto::telegram_api::ReplyMarkup,
+            out: &mut Vec<u8>,
+        ) {
+            store_i32(out, TAG_REPLY_MARKUP);
+        }
+        fn parse_reply_markup(
+            &mut self,
+            input: &mut Parser,
+        ) -> Result<tdmtproto::telegram_api::ReplyMarkup, &'static str> {
+            let tag = input.i32_()?;
+            if tag != TAG_REPLY_MARKUP {
+                return Err("wrong manager record tag");
+            }
+            Ok(tdmtproto::telegram_api::ReplyMarkup::replyInlineMarkup(
+                tdmtproto::telegram_api::replyInlineMarkup::default(),
+            ))
+        }
+        fn store_min_channel(
+            &mut self,
+            _min_channel: &crate::messages_manager::MinChannel,
+            out: &mut Vec<u8>,
+        ) {
+            store_i32(out, TAG_MIN_CHANNEL);
+        }
+        fn parse_min_channel(
+            &mut self,
+            input: &mut Parser,
+        ) -> Result<crate::messages_manager::MinChannel, &'static str> {
+            let tag = input.i32_()?;
+            if tag != TAG_MIN_CHANNEL {
+                return Err("wrong manager record tag");
+            }
+            Ok(crate::messages_manager::MinChannel::default())
+        }
+
         fn on_load_web_page_url_from_database(&mut self, _web_page_id: WebPageId, _url: &str) {}
     }
+
+    const TAG_REACTIONS: i32 = 10;
+    const TAG_REPLY_MARKUP: i32 = 11;
+    const TAG_MIN_CHANNEL: i32 = 12;
 
     /// The representative populated model of every modeled variant —
     /// non-default field values wherever the type carries any, so the
