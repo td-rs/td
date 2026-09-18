@@ -12,7 +12,7 @@ const LENGTH_LIMIT: usize = 35000;
 
 /// `replace_offending_characters` (misc.cpp:62-77):
 /// `(U+200F|U+200E){N}(U+200F|U+200E)` -> `(U+200C){N}$2`.
-fn replace_offending_characters(s: &mut [u8]) {
+pub(crate) fn replace_offending_characters(s: &mut [u8]) {
     // The C++ reads up to two bytes past `pos` unconditionally (safe on
     // NUL-terminated strings); out-of-bounds reads are modeled as 0.
     fn at(s: &[u8], i: usize) -> u8 {
@@ -174,9 +174,11 @@ fn is_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\r' | b'\n' | 0 | 0x0b)
 }
 
-/// `td::trim` (tdutils/misc.h:133) over the shared whitespace set.
+/// `td::trim` (tdutils/misc.h:133) over the shared whitespace set; the
+/// ASCII gate keeps the byte-based C++ semantics (`is_space` is defined on
+/// bytes only, so no multi-byte character can be trimmed).
 fn trim(s: &str) -> &str {
-    s.trim_matches(|c: char| is_space(c as u8))
+    s.trim_matches(|c: char| c.is_ascii() && is_space(c as u8))
 }
 
 /// `td::to_lower` (tdutils/misc.h:64-85) — ASCII-only.
@@ -255,7 +257,7 @@ pub fn clean_name(s: &str, max_length: usize) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out[..new_len])
-        .trim_matches(|c: char| is_space(c as u8))
+        .trim_matches(|c: char| c.is_ascii() && is_space(c as u8))
         .to_owned()
 }
 
@@ -368,6 +370,11 @@ pub fn strip_empty_characters(s: &str, max_length: usize, strip_rtlo: bool) -> S
     trimmed.to_owned()
 }
 
+/// `td::is_empty_string` (misc.cpp:256-258).
+pub fn is_empty_string(s: &str) -> bool {
+    strip_empty_characters(s, s.len(), false).is_empty()
+}
+
 /// `td::is_valid_username` (misc.cpp:260-282).
 pub fn is_valid_username(username: &str) -> bool {
     let bytes = username.as_bytes();
@@ -426,12 +433,43 @@ pub fn is_allowed_username(username: &str) -> bool {
     true
 }
 
+/// `td::clean_username` (misc.cpp:52-56): remove all dots, ASCII-lowercase,
+/// trim the C whitespace set from both ends.
+pub fn clean_username(str: &str) -> String {
+    let without_dots: String = str.chars().filter(|&c| c != '.').collect();
+    let trimmed = without_dots.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r'));
+    trimmed.to_ascii_lowercase()
+}
+
+/// `td::get_valid_short_usernames` (MessageEntity.cpp:1347-1350) — the
+/// mention-usable usernames shorter than the 4-character minimum. The data
+/// table is standalone; the rest of MessageEntity arrives with M.8.
+pub fn get_valid_short_usernames() -> &'static [&'static str] {
+    &["gif", "nft", "pic", "ufc", "vid"]
+}
+
 #[cfg(test)]
 mod misc_helper_tests {
     use super::{
-        clean_name, is_allowed_username, is_valid_username, replace_with_spaces,
-        strip_empty_characters,
+        clean_name, clean_username, get_valid_short_usernames, is_allowed_username,
+        is_valid_username, replace_with_spaces, strip_empty_characters,
     };
+
+    #[test]
+    fn clean_username_strips_dots_lowercases_and_trims() {
+        // misc.cpp:52-56.
+        assert_eq!(clean_username("Ab.C..D"), "abcd");
+        assert_eq!(clean_username("  User\tname \n"), "user\tname");
+        assert_eq!(clean_username(""), "");
+    }
+
+    #[test]
+    fn valid_short_usernames_match_the_cpp_table() {
+        assert_eq!(
+            get_valid_short_usernames(),
+            &["gif", "nft", "pic", "ufc", "vid"]
+        );
+    }
 
     #[test]
     fn clean_name_collapses_and_trims() {
