@@ -11544,6 +11544,269 @@ pub fn process_input_message_invoice(
     Ok(result)
 }
 
+// ---------------------------------------------------------------------------
+// M.9.5 — get_input_message_content + the media-group checks
+// (MessageContent.cpp:5164-5302, 5378-5408) with the classification
+// helpers (MessageContentType.cpp:224-238/330-356). The file prelude rides
+// the get_input_file_id/get_input_thumbnail_photo_size seams; the caption
+// flows through the td_api get_formatted_text entry. get_input_poll_media
+// lands with the M.9.4d poll arm.
+// ---------------------------------------------------------------------------
+
+/// `is_allowed_media_group_content` (MessageContentType.cpp:224-328).
+pub fn is_allowed_media_group_content(content_type: MessageContentType) -> bool {
+    matches!(
+        content_type,
+        MessageContentType::Audio
+            | MessageContentType::Document
+            | MessageContentType::Photo
+            | MessageContentType::Video
+            | MessageContentType::ExpiredPhoto
+            | MessageContentType::ExpiredVideo
+    )
+}
+
+/// `is_homogenous_media_group_content` (MessageContentType.cpp:330-332).
+pub fn is_homogenous_media_group_content(content_type: MessageContentType) -> bool {
+    content_type == MessageContentType::Audio || content_type == MessageContentType::Document
+}
+
+/// `is_allowed_poll_content` (MessageContentType.cpp:334-347).
+pub fn is_allowed_poll_content(content_type: MessageContentType) -> bool {
+    matches!(
+        content_type,
+        MessageContentType::Animation
+            | MessageContentType::Audio
+            | MessageContentType::Document
+            | MessageContentType::Location
+            | MessageContentType::Photo
+            | MessageContentType::Venue
+            | MessageContentType::Video
+    )
+}
+
+/// `is_allowed_poll_option_content` (MessageContentType.cpp:349-362).
+pub fn is_allowed_poll_option_content(content_type: MessageContentType) -> bool {
+    matches!(
+        content_type,
+        MessageContentType::Animation
+            | MessageContentType::Location
+            | MessageContentType::Photo
+            | MessageContentType::Sticker
+            | MessageContentType::Text
+            | MessageContentType::Venue
+            | MessageContentType::Video
+    )
+}
+
+/// `get_input_message_content` (MessageContent.cpp:5164-5302).
+pub fn get_input_message_content(
+    td: &mut dyn MessageContentContext,
+    dialog_id: DialogId,
+    input_message_content: td_api::InputMessageContent,
+    is_premium: bool,
+) -> Result<InputMessageContent, Status> {
+    let mut input_file = None;
+    let mut file_type = crate::files::FileType::None;
+    let mut allow_get_by_hash = false;
+    let mut input_thumbnail = None;
+    let mut sticker_file_ids: Vec<FileId> = Vec::new();
+    let mut input_message_content = input_message_content;
+    match &mut input_message_content {
+        td_api::InputMessageContent::inputMessageAnimation(input_message) => {
+            let Some(animation) = input_message.animation.as_ref() else {
+                return Err(Status::error(400, "Animation must be non-empty"));
+            };
+            file_type = crate::files::FileType::Animation;
+            input_file = animation.animation.clone();
+            allow_get_by_hash = true;
+            input_thumbnail = animation.thumbnail.clone();
+            if !animation.added_sticker_file_ids.is_empty() {
+                sticker_file_ids =
+                    td.get_attached_sticker_file_ids(animation.added_sticker_file_ids.clone());
+            }
+        }
+        td_api::InputMessageContent::inputMessageAudio(input_message) => {
+            let Some(audio) = input_message.audio.as_ref() else {
+                return Err(Status::error(400, "Audio must be non-empty"));
+            };
+            file_type = crate::files::FileType::Audio;
+            input_file = audio.audio.clone();
+            input_thumbnail = audio.album_cover_thumbnail.clone();
+        }
+        td_api::InputMessageContent::inputMessageDocument(input_message) => {
+            let Some(document) = input_message.document.as_ref() else {
+                return Err(Status::error(400, "Document must be non-empty"));
+            };
+            file_type = if document.disable_content_type_detection {
+                crate::files::FileType::DocumentAsFile
+            } else {
+                crate::files::FileType::Document
+            };
+            input_file = document.document.clone();
+            allow_get_by_hash = true;
+            input_thumbnail = document.thumbnail.clone();
+        }
+        td_api::InputMessageContent::inputMessagePhoto(input_message) => {
+            let Some(photo) = input_message.photo.as_ref() else {
+                return Err(Status::error(400, "Photo must be non-empty"));
+            };
+            file_type = if input_message.self_destruct_type.is_some() {
+                crate::files::FileType::SelfDestructingPhoto
+            } else {
+                crate::files::FileType::Photo
+            };
+            input_file = photo.photo.clone();
+            input_thumbnail = photo.thumbnail.clone();
+            if !photo.added_sticker_file_ids.is_empty() {
+                sticker_file_ids =
+                    td.get_attached_sticker_file_ids(photo.added_sticker_file_ids.clone());
+            }
+        }
+        td_api::InputMessageContent::inputMessageSticker(input_message) => {
+            let Some(sticker) = input_message.sticker.as_ref() else {
+                return Err(Status::error(400, "Sticker must be non-empty"));
+            };
+            file_type = crate::files::FileType::Sticker;
+            input_file = sticker.sticker.clone();
+            input_thumbnail = sticker.thumbnail.clone();
+        }
+        td_api::InputMessageContent::inputMessageVideo(input_message) => {
+            let Some(video) = input_message.video.as_ref() else {
+                return Err(Status::error(400, "Video must be non-empty"));
+            };
+            file_type = if input_message.self_destruct_type.is_some() {
+                crate::files::FileType::SelfDestructingVideo
+            } else {
+                crate::files::FileType::Video
+            };
+            input_file = video.video.clone();
+            input_thumbnail = video.thumbnail.clone();
+            if !video.added_sticker_file_ids.is_empty() {
+                sticker_file_ids =
+                    td.get_attached_sticker_file_ids(video.added_sticker_file_ids.clone());
+            }
+        }
+        td_api::InputMessageContent::inputMessageVideoNote(input_message) => {
+            let Some(video_note) = input_message.video_note.as_ref() else {
+                return Err(Status::error(400, "Video note must be non-empty"));
+            };
+            file_type = if input_message.self_destruct_type.is_some() {
+                crate::files::FileType::SelfDestructingVideoNote
+            } else {
+                crate::files::FileType::VideoNote
+            };
+            input_file = video_note.video_note.clone();
+            input_thumbnail = video_note.thumbnail.clone();
+        }
+        td_api::InputMessageContent::inputMessageVoiceNote(input_message) => {
+            let Some(voice_note) = input_message.voice_note.as_ref() else {
+                return Err(Status::error(400, "Voice note must be non-empty"));
+            };
+            file_type = if input_message.self_destruct_type.is_some() {
+                crate::files::FileType::SelfDestructingVoiceNote
+            } else {
+                crate::files::FileType::VoiceNote
+            };
+            input_file = voice_note.voice_note.clone();
+        }
+        _ => {}
+    }
+    // TODO path of files must be stored in bytes instead of UTF-8 string
+
+    let is_secret = dialog_id.get_type() == DialogType::SecretChat;
+
+    let mut file_id = FileId::default();
+    if file_type != crate::files::FileType::None {
+        file_id = td.get_input_file_id(
+            file_type,
+            input_file,
+            dialog_id,
+            allow_get_by_hash,
+            is_secret,
+        )?;
+        assert!(file_id.is_valid());
+    }
+
+    let is_bot = td.is_bot();
+    let caption = extract_input_caption(&mut input_message_content);
+    let caption = crate::message_entity::get_formatted_text_of_input(
+        Some(&mut ContextUserManager { td }),
+        to_message_entity_dialog_id(dialog_id),
+        caption,
+        is_bot,
+        true,
+        false,
+        false,
+        None,
+        td.get_option_boolean("always_parse_markdown"),
+        td.get_option_integer("session_count", 0) as i32,
+        Some(&mut |custom_emoji_id, is_premium| {
+            is_premium || td.is_premium_custom_emoji(custom_emoji_id)
+        }),
+        td.can_use_premium_custom_emoji_in_dialog(dialog_id),
+    )?;
+    if is_bot
+        && tdutils::utf8::utf8_length(&caption.text) as i64
+            > td.get_option_integer("message_caption_length_max", 0)
+    {
+        return Err(Status::error(400, "Message caption is too long"));
+    }
+    let thumbnail = td.get_input_thumbnail_photo_size(input_thumbnail, dialog_id, is_secret)?;
+    create_input_message_content(
+        td,
+        dialog_id,
+        input_message_content,
+        caption,
+        file_id,
+        thumbnail,
+        sticker_file_ids,
+        is_premium,
+    )
+}
+
+/// `check_message_group_message_contents` (MessageContent.cpp:5378-5408).
+pub fn check_message_group_message_contents(
+    message_contents: &[InputMessageContent],
+) -> Result<(), Status> {
+    const MAX_GROUPED_MESSAGES: usize = 10; // server-side limit
+    if message_contents.len() > MAX_GROUPED_MESSAGES {
+        return Err(Status::error(400, "Too many messages to send as an album"));
+    }
+    if message_contents.is_empty() {
+        return Err(Status::error(400, "There are no messages to send"));
+    }
+
+    let mut message_content_types: Vec<MessageContentType> = Vec::new();
+    for message_content in message_contents {
+        let message_content_type = message_content.content.get_type();
+        if !is_allowed_media_group_content(message_content_type) {
+            return Err(Status::error(400, "Invalid message content type"));
+        }
+        if message_content.invert_media != message_contents[0].invert_media {
+            return Err(Status::error(
+                400,
+                "Parameter show_caption_above_media must be the same for all messages",
+            ));
+        }
+        if !message_content_types.contains(&message_content_type) {
+            message_content_types.push(message_content_type);
+        }
+    }
+    if message_content_types.len() > 1 {
+        for message_content_type in message_content_types {
+            if is_homogenous_media_group_content(message_content_type) {
+                return Err(Status::error(
+                    400,
+                    format!("{message_content_type:?} can't be mixed with other media types")
+                        .as_str(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -18072,5 +18335,151 @@ mod tests {
             &*result.content,
             MessageContent::PaidMedia(m) if m.media.len() == 1 && m.star_count == 5 && m.payload == "payload"
         ));
+    }
+
+    #[test]
+    fn media_group_classification_tables() {
+        assert!(is_allowed_media_group_content(MessageContentType::Photo));
+        assert!(is_allowed_media_group_content(
+            MessageContentType::ExpiredVideo
+        ));
+        assert!(!is_allowed_media_group_content(MessageContentType::Text));
+        assert!(is_homogenous_media_group_content(MessageContentType::Audio));
+        assert!(is_homogenous_media_group_content(
+            MessageContentType::Document
+        ));
+        assert!(!is_homogenous_media_group_content(
+            MessageContentType::Photo
+        ));
+        assert!(is_allowed_poll_content(MessageContentType::Video));
+        assert!(!is_allowed_poll_content(MessageContentType::Sticker));
+        assert!(is_allowed_poll_option_content(MessageContentType::Sticker));
+        assert!(is_allowed_poll_option_content(MessageContentType::Text));
+        assert!(!is_allowed_poll_option_content(MessageContentType::Audio));
+    }
+
+    #[test]
+    fn check_message_group_message_contents_rules() {
+        let photo = || {
+            InputMessageContent::new(MessageContent::Photo(MessagePhoto {
+                photo: Photo {
+                    id: 0,
+                    ..Photo::default()
+                },
+                ..MessagePhoto::default()
+            }))
+        };
+        let audio = || {
+            InputMessageContent::new(MessageContent::Audio(MessageAudio {
+                file_id: FileId::new(1, 0),
+                ..MessageAudio::default()
+            }))
+        };
+
+        assert!(check_message_group_message_contents(&[]).is_err());
+        assert!(check_message_group_message_contents(&[photo(), photo()]).is_ok());
+
+        // audio cannot mix with photos
+        let error = check_message_group_message_contents(&[photo(), audio()]).unwrap_err();
+        assert!(error.message().contains("can't be mixed"));
+
+        // a text content is not allowed at all
+        let error = check_message_group_message_contents(&[InputMessageContent::new(
+            MessageContent::Text(MessageText::default()),
+        )])
+        .unwrap_err();
+        assert_eq!(error.message(), "Invalid message content type");
+
+        // differing invert flags are rejected
+        let mut inverted = photo();
+        inverted.invert_media = true;
+        let error = check_message_group_message_contents(&[photo(), inverted]).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "Parameter show_caption_above_media must be the same for all messages"
+        );
+
+        // more than 10 is too many
+        let too_many: Vec<InputMessageContent> = (0..11).map(|_| photo()).collect();
+        let error = check_message_group_message_contents(&too_many).unwrap_err();
+        assert_eq!(error.message(), "Too many messages to send as an album");
+    }
+
+    #[test]
+    fn get_input_message_content_extracts_the_file_and_runs_the_switch() {
+        let user_dialog = DialogId::from_user_id(UserId::new(7));
+        let mut td = input_td();
+
+        // a photo input: the file id is registered, the caption parsed
+        let result = get_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessagePhoto(td_api::inputMessagePhoto {
+                photo: Some(td_api::InputPhoto {
+                    photo: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                        id: 42,
+                    })),
+                    width: 100,
+                    height: 200,
+                    ..td_api::InputPhoto::default()
+                }),
+                caption: Some(td_api_text("caption")),
+                ..td_api::inputMessagePhoto::default()
+            }),
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            &*result.content,
+            MessageContent::Photo(m) if m.caption.text == "caption" && m.photo.photos[0].file_id.is_valid()
+        ));
+        assert!(
+            td.register_log
+                .iter()
+                .any(|entry| entry.contains("get_input_file_id(Photo)"))
+        );
+
+        // a self-destructing photo maps to the self-destruct file type
+        let mut td = input_td();
+        let _ = get_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessagePhoto(td_api::inputMessagePhoto {
+                photo: Some(td_api::InputPhoto {
+                    photo: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                        id: 42,
+                    })),
+                    ..td_api::InputPhoto::default()
+                }),
+                self_destruct_type: Some(
+                    td_api::MessageSelfDestructType::messageSelfDestructTypeTimer(
+                        td_api::messageSelfDestructTypeTimer {
+                            self_destruct_time: 30,
+                        },
+                    ),
+                ),
+                ..td_api::inputMessagePhoto::default()
+            }),
+            false,
+        )
+        .unwrap();
+        assert!(
+            td.register_log
+                .iter()
+                .any(|entry| entry.contains("get_input_file_id(SelfDestructingPhoto)"))
+        );
+
+        // a missing photo is rejected
+        let error = get_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessagePhoto(td_api::inputMessagePhoto {
+                photo: None,
+                ..td_api::inputMessagePhoto::default()
+            }),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.message(), "Photo must be non-empty");
     }
 }
