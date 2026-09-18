@@ -264,6 +264,37 @@ impl BinlogKeyValue {
         seq_no
     }
 
+    /// `BinlogKeyValue::erase_by_prefix` (BinlogKeyValue.h:241) — erases
+    /// every key beginning with the prefix. The C++ batch-allocates the
+    /// binlog sequence numbers (`next_event_id(count)`); sequential single
+    /// allocations produce the same id sequence.
+    pub fn erase_by_prefix(&mut self, prefix: &[u8]) {
+        let Some(binlog) = self.binlog.clone() else {
+            panic!("BinlogKeyValue is not initialized");
+        };
+        let keys: Vec<Vec<u8>> = self
+            .map
+            .keys()
+            .filter(|key| key.starts_with(prefix))
+            .cloned()
+            .collect();
+        for key in keys {
+            let Some((_, event_id)) = self.map.remove(&key) else {
+                continue;
+            };
+            let seq_no = binlog.next_event_id();
+            binlog.add_raw_event(
+                seq_no,
+                BinlogEvent::create_raw(
+                    event_id,
+                    BinlogEvent::TYPE_EMPTY,
+                    BinlogEvent::FLAG_REWRITE,
+                    &[],
+                ),
+            );
+        }
+    }
+
     /// `BinlogKeyValue::isset`
     pub fn isset(&self, key: &str) -> bool {
         self.map.contains_key(key.as_bytes())
