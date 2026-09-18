@@ -101,11 +101,12 @@ use crate::chat_manager::{ChannelId, ChannelType, ChatId, MessageId, RestrictedR
 use crate::contact::Contact;
 use crate::emoji_status::CustomEmojiId;
 use crate::message_entity::{
-    FormattedText, MessageEntity, Type, find_entities, remove_empty_entities,
+    FormattedText, MessageEntity, Type, UserManagerLike, find_entities, remove_empty_entities,
 };
 use crate::messages_manager::{
     DialogId, DialogType, EphemeralMessageFullId, MessageFullId, MessageSearchFilter,
-    QuickReplyMessageFullId, StoryFullId, StoryId, message_search_filter_index_mask,
+    MessageSelfDestructType, QuickReplyMessageFullId, StoryFullId, StoryId,
+    message_search_filter_index_mask,
 };
 use crate::misc::is_empty_string;
 use crate::photo::{AnimationSize, Dimensions, Photo, PhotoSize, StickerPhotoSize};
@@ -113,6 +114,7 @@ use crate::store_parse::{
     Parser, store_bool, store_f64, store_flags, store_i32, store_i32_vec, store_i64, store_string,
     store_string_vec, store_u32, version,
 };
+use crate::td_api;
 use crate::user_manager::{FileId, SecretChatId, UserId};
 use tdmtproto::telegram_api;
 use tdutils::promise::Promise;
@@ -631,6 +633,17 @@ impl Location {
         self.is_empty
     }
 
+    /// `Location(const td_api::location &)` (Location.cpp:62-68) — the
+    /// input-plane constructor; the access hash starts empty.
+    pub fn from_td_api(location: &td_api::Location) -> Location {
+        Location::new(
+            location.latitude,
+            location.longitude,
+            location.horizontal_accuracy,
+            0,
+        )
+    }
+
     /// `Location::is_valid_map_point` (Location.cpp:77-80).
     pub fn is_valid_map_point(&self) -> bool {
         const MAX_VALID_MAP_LATITUDE: f64 = 85.05112877;
@@ -711,6 +724,24 @@ impl Venue {
     /// `Venue::empty` (Venue.cpp:42-44) — only the location decides.
     pub fn is_empty(&self) -> bool {
         self.location.is_empty()
+    }
+
+    /// `Venue(const td_api::venue &)` (Venue.cpp:25-32) — the input-plane
+    /// constructor.
+    pub fn from_td_api(venue: &td_api::Venue) -> Venue {
+        Venue {
+            location: Location::from_td_api(
+                venue
+                    .location
+                    .as_ref()
+                    .unwrap_or(&td_api::Location::default()),
+            ),
+            title: venue.title.clone(),
+            address: venue.address.clone(),
+            provider: venue.provider.clone(),
+            id: venue.id.clone(),
+            r#type: venue.r#type.clone(),
+        }
     }
 
     /// `Venue::is_same` (Venue.h:40-42).
@@ -1150,6 +1181,25 @@ pub struct Game {
 }
 
 impl Game {
+    /// `Game(UserId, string)` (Game.cpp:58-63) — the input-plane
+    /// constructor: an invalid bot id resets and the photo id is 0 to
+    /// prevent a null photo in td_api.
+    pub fn new(bot_user_id: UserId, short_name: String) -> Game {
+        let mut bot_user_id = bot_user_id;
+        if !bot_user_id.is_valid() {
+            bot_user_id = UserId::default();
+        }
+        Game {
+            bot_user_id,
+            short_name,
+            photo: Photo {
+                id: 0,
+                ..Photo::default()
+            },
+            ..Game::default()
+        }
+    }
+
     /// `Game::is_empty` (Game.cpp).
     pub fn is_empty(&self) -> bool {
         self.short_name.is_empty()
@@ -7048,6 +7098,29 @@ pub trait MessageContentContext {
     fn have_web_page(&self, web_page_id: WebPageId) -> bool;
     /// `FileManager::try_merge_documents` (MessageContent.cpp:8899-8900).
     fn try_merge_documents(&mut self, new_file_id: FileId, old_file_id: FileId);
+
+    // -- Input family (MessageContent.cpp:4766-5408) --
+    /// `td->option_manager_->get_option_boolean(name)`.
+    fn get_option_boolean(&self, name: &str) -> bool;
+    /// `UserManager::get_secret_chat_layer` (MessageEntity.cpp:4880).
+    fn get_secret_chat_layer(&self, secret_chat_id: SecretChatId) -> i32;
+    /// `UserManager::get_secret_chat_user_id` (MessageEntity.cpp:4736).
+    fn get_secret_chat_user_id(&self, secret_chat_id: SecretChatId) -> UserId;
+    /// `UserManager::can_use_premium_custom_emoji_in_dialog`.
+    fn can_use_premium_custom_emoji_in_dialog(&self, dialog_id: DialogId) -> bool;
+    /// `UserManager::is_premium_custom_emoji`.
+    fn is_premium_custom_emoji(&self, custom_emoji_id: CustomEmojiId) -> bool;
+    /// `ChatManager::get_channel_permissions(...).can_add_web_page_previews()`
+    /// (MessageContent.cpp:4814-4816).
+    fn get_channel_can_add_web_page_previews(&self, channel_id: ChannelId) -> bool;
+    /// `WebPagesManager::get_web_page_by_url` (MessageContent.cpp:4820-4821).
+    fn get_web_page_by_url(&self, url: &str) -> WebPageId;
+    /// `UserManager::have_user_force` (Contact.cpp:132).
+    fn have_user_force(&self, user_id: UserId, source: &str) -> bool;
+    /// `UserManager::get_input_user`, validation half (Game.cpp:125).
+    fn ensure_input_user(&self, user_id: UserId) -> Result<(), Status>;
+    /// `UserManager::get_my_id` (MessageContent.cpp:5040-5042).
+    fn get_my_id(&self) -> UserId;
 }
 
 /// `is_local_poll_id` (PollManager.cpp:449-452) — the local (unsent)
@@ -10000,6 +10073,529 @@ pub fn merge_and_compare_message_contents(
     }
 }
 
+// ---------------------------------------------------------------------------
+// M.9.4a — the input-plane value converters + the InputMessageContent
+// carrier (MessageContent.cpp:4649-4764, the companions InputMessageText.cpp,
+// Location.cpp:158-218, Venue.cpp:100-132, Contact.cpp:126-172,
+// Game.cpp:118-139, ToDoList.cpp:34-76, ToDoItem.cpp:28-47). The td_api
+// get_formatted_text entry lives in message_entity.rs
+// (`get_formatted_text_of_input`); the seam adapter feeds it the
+// user-manager reads. The create_input_message_content switch itself and
+// the media/poll/invoice/paid-media arms land in the following slices.
+// ---------------------------------------------------------------------------
+
+/// The `UserManagerLike` adapter over the [`MessageContentContext`] seam —
+/// only the entity-rule reads are reachable (is_user_bot, the secret-chat
+/// reads); the rest are the C++ nullptr-shape stubs.
+struct ContextUserManager<'a> {
+    td: &'a dyn MessageContentContext,
+}
+
+impl UserManagerLike for ContextUserManager<'_> {
+    fn resolve_user_id_object(&mut self, user_id: UserId, _source: &str) -> i64 {
+        user_id.get()
+    }
+
+    fn ensure_input_user(&mut self, user_id: UserId) -> Result<(), Status> {
+        self.td.ensure_input_user(user_id)
+    }
+
+    fn have_min_user(&self, _user_id: UserId) -> bool {
+        false
+    }
+
+    fn get_input_user_force(&mut self, _user_id: UserId) -> tdmtproto::telegram_api::InputUser {
+        unreachable!("the C++ CHECK(user_manager != nullptr) fired")
+    }
+
+    fn is_user_bot(&self, user_id: UserId) -> bool {
+        self.td.is_user_bot(user_id)
+    }
+
+    fn get_secret_chat_user_id(&self, secret_chat_id: SecretChatId) -> UserId {
+        self.td.get_secret_chat_user_id(secret_chat_id)
+    }
+
+    fn get_secret_chat_layer(&self, secret_chat_id: SecretChatId) -> i32 {
+        self.td.get_secret_chat_layer(secret_chat_id)
+    }
+}
+
+/// The pre-integration DialogId bridge (the M.8 module carries its own
+/// minimal enum until the integrator collapses them).
+fn to_message_entity_dialog_id(dialog_id: DialogId) -> crate::message_entity::DialogId {
+    match dialog_id.get_type() {
+        DialogType::User => crate::message_entity::DialogId::User(dialog_id.get_user_id()),
+        DialogType::SecretChat => {
+            crate::message_entity::DialogId::SecretChat(dialog_id.get_secret_chat_id())
+        }
+        DialogType::Chat => crate::message_entity::DialogId::Chat(dialog_id.get_chat_id()),
+        DialogType::Channel => crate::message_entity::DialogId::Channel(dialog_id.get_channel_id()),
+        DialogType::None => crate::message_entity::DialogId::None,
+    }
+}
+
+/// `td::InputMessageText` (InputMessageText.h:22-30).
+#[derive(Clone, Debug, PartialEq)]
+pub struct InputMessageText {
+    pub text: FormattedText,
+    pub web_page_url: String,
+    pub disable_web_page_preview: bool,
+    pub force_small_media: bool,
+    pub force_large_media: bool,
+    pub show_above_text: bool,
+    pub clear_draft: bool,
+}
+
+/// `process_input_message_text` (InputMessageText.cpp:26-61).
+pub fn process_input_message_text(
+    td: &dyn MessageContentContext,
+    dialog_id: DialogId,
+    input_message_content: td_api::InputMessageContent,
+    is_bot: bool,
+    for_draft: bool,
+) -> Result<InputMessageText, Status> {
+    let td_api::InputMessageContent::inputMessageText(input_message_text) = input_message_content
+    else {
+        unreachable!(
+            "the C++ CHECK(input_message_content->get_id() == inputMessageText::ID) fired"
+        );
+    };
+    let mut web_page_url = String::new();
+    let mut disable_web_page_preview = false;
+    let mut force_small_media = false;
+    let mut force_large_media = false;
+    let mut show_above_text = false;
+    if let Some(mut options) = input_message_text.link_preview_options {
+        web_page_url = std::mem::take(&mut options.url);
+        disable_web_page_preview = options.is_disabled;
+        force_small_media = options.force_small_media;
+        force_large_media = options.force_large_media;
+        show_above_text = options.show_above_text;
+
+        if crate::misc::clean_input_string(&web_page_url).is_none() {
+            return Err(Status::error(
+                400,
+                "Link preview URL must be encoded in UTF-8",
+            ));
+        }
+
+        if disable_web_page_preview
+            || (dialog_id.get_type() == DialogType::Channel
+                && !td.get_channel_can_add_web_page_previews(dialog_id.get_channel_id()))
+        {
+            web_page_url.clear();
+        }
+        if web_page_url.is_empty() {
+            force_small_media = false;
+            force_large_media = false;
+        }
+    }
+    let text = crate::message_entity::get_formatted_text_of_input(
+        Some(&mut ContextUserManager { td }),
+        to_message_entity_dialog_id(dialog_id),
+        input_message_text.text,
+        is_bot,
+        for_draft || !web_page_url.is_empty(),
+        for_draft,
+        for_draft,
+        None,
+        td.get_option_boolean("always_parse_markdown"),
+        td.get_option_integer("session_count", 0) as i32,
+        Some(&mut |custom_emoji_id, is_premium| {
+            is_premium || td.is_premium_custom_emoji(custom_emoji_id)
+        }),
+        td.can_use_premium_custom_emoji_in_dialog(dialog_id),
+    )?;
+    if !disable_web_page_preview
+        && web_page_url.is_empty()
+        && dialog_id.get_type() == DialogType::SecretChat
+    {
+        web_page_url = crate::message_entity::get_first_url(&text).to_string();
+    }
+    Ok(InputMessageText {
+        text,
+        web_page_url,
+        disable_web_page_preview,
+        force_small_media,
+        force_large_media,
+        show_above_text,
+        clear_draft: input_message_text.clear_draft,
+    })
+}
+
+/// `td::InputMessageLocation` (Location.h:127-136).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InputMessageLocation {
+    pub location: Location,
+    pub live_period: i32,
+    pub heading: i32,
+    pub proximity_alert_radius: i32,
+}
+
+/// `process_input_message_location` (Location.cpp:158-179).
+pub fn process_input_message_location(
+    input_message_content: td_api::InputMessageContent,
+) -> Result<InputMessageLocation, Status> {
+    match input_message_content {
+        td_api::InputMessageContent::inputMessageLocation(input_location) => {
+            let location = Location::from_td_api(
+                input_location
+                    .location
+                    .as_ref()
+                    .unwrap_or(&td_api::Location::default()),
+            );
+            if location.is_empty() {
+                return Err(Status::error(400, "Invalid location specified"));
+            }
+            Ok(InputMessageLocation {
+                location,
+                ..InputMessageLocation::default()
+            })
+        }
+        td_api::InputMessageContent::inputMessageLiveLocation(input_live_location) => {
+            process_live_location(input_live_location.location, false)
+        }
+        _ => {
+            unreachable!("the C++ default arm is UNREACHABLE()")
+        }
+    }
+}
+
+/// `process_live_location` (Location.cpp:183-218).
+pub fn process_live_location(
+    live_location: Option<td_api::LiveLocation>,
+    for_edit: bool,
+) -> Result<InputMessageLocation, Status> {
+    let Some(live_location) = live_location else {
+        if for_edit {
+            return Ok(InputMessageLocation::default());
+        }
+        return Err(Status::error(400, "Live location must be non-empty"));
+    };
+    let location = Location::from_td_api(
+        live_location
+            .location
+            .as_ref()
+            .unwrap_or(&td_api::Location::default()),
+    );
+    if location.is_empty() {
+        return Err(Status::error(400, "Invalid live location specified"));
+    }
+
+    const MIN_LIVE_LOCATION_PERIOD: i32 = 60; // seconds, server-side limit
+    const MAX_LIVE_LOCATION_PERIOD: i32 = 86400; // seconds, server-side limit
+
+    let period = live_location.live_period;
+    if !for_edit
+        && period != i32::MAX
+        && !(MIN_LIVE_LOCATION_PERIOD..=MAX_LIVE_LOCATION_PERIOD).contains(&period)
+    {
+        return Err(Status::error(400, "Wrong live location period specified"));
+    }
+
+    const MIN_LIVE_LOCATION_HEADING: i32 = 1; // degrees, server-side limit
+    const MAX_LIVE_LOCATION_HEADING: i32 = 360; // degrees, server-side limit
+
+    let heading = live_location.heading;
+    if heading != 0 && !(MIN_LIVE_LOCATION_HEADING..=MAX_LIVE_LOCATION_HEADING).contains(&heading) {
+        return Err(Status::error(400, "Wrong live location heading specified"));
+    }
+
+    const MAX_PROXIMITY_ALERT_RADIUS: i32 = 100000; // meters, server-side limit
+    let proximity_alert_radius = live_location.proximity_alert_radius;
+    if !(0..=MAX_PROXIMITY_ALERT_RADIUS).contains(&proximity_alert_radius) {
+        return Err(Status::error(
+            400,
+            "Wrong live location proximity alert radius specified",
+        ));
+    }
+
+    Ok(InputMessageLocation {
+        location,
+        live_period: period,
+        heading,
+        proximity_alert_radius,
+    })
+}
+
+/// `process_input_message_venue` (Venue.cpp:100-132).
+pub fn process_input_message_venue(
+    input_message_content: td_api::InputMessageContent,
+) -> Result<Venue, Status> {
+    let td_api::InputMessageContent::inputMessageVenue(input_venue) = input_message_content else {
+        unreachable!(
+            "the C++ CHECK(input_message_content->get_id() == inputMessageVenue::ID) fired"
+        );
+    };
+    let Some(venue) = input_venue.venue else {
+        return Err(Status::error(400, "Venue must be non-empty"));
+    };
+
+    if crate::misc::clean_input_string(&venue.title).is_none() {
+        return Err(Status::error(400, "Venue title must be encoded in UTF-8"));
+    }
+    if crate::misc::clean_input_string(&venue.address).is_none() {
+        return Err(Status::error(400, "Venue address must be encoded in UTF-8"));
+    }
+    if crate::misc::clean_input_string(&venue.provider).is_none() {
+        return Err(Status::error(
+            400,
+            "Venue provider must be encoded in UTF-8",
+        ));
+    }
+    if crate::misc::clean_input_string(&venue.id).is_none() {
+        return Err(Status::error(
+            400,
+            "Venue identifier must be encoded in UTF-8",
+        ));
+    }
+    if crate::misc::clean_input_string(&venue.r#type).is_none() {
+        return Err(Status::error(400, "Venue type must be encoded in UTF-8"));
+    }
+
+    let result = Venue::from_td_api(&venue);
+    if result.is_empty() {
+        return Err(Status::error(400, "Wrong venue location specified"));
+    }
+
+    Ok(result)
+}
+
+/// `get_contact(const td_api::contact &)` (Contact.cpp:126-150).
+pub fn get_contact(
+    td: &dyn MessageContentContext,
+    contact: Option<td_api::Contact>,
+) -> Result<crate::contact::Contact, Status> {
+    let Some(contact) = contact else {
+        return Err(Status::error(400, "Contact must be non-empty"));
+    };
+    let user_id = UserId::new(contact.user_id);
+    if user_id != UserId::default() && !td.have_user_force(user_id, "get_contact") {
+        return Err(Status::error(400, "User not found"));
+    }
+
+    let mut result = crate::contact::Contact::new(
+        contact.phone_number,
+        contact.first_name,
+        contact.last_name,
+        contact.vcard,
+        user_id,
+    );
+    result.validate()?;
+    Ok(result)
+}
+
+/// `process_input_message_contact` (Contact.cpp:166-172).
+pub fn process_input_message_contact(
+    td: &dyn MessageContentContext,
+    input_message_content: td_api::InputMessageContent,
+) -> Result<crate::contact::Contact, Status> {
+    let td_api::InputMessageContent::inputMessageContact(input_contact) = input_message_content
+    else {
+        unreachable!(
+            "the C++ CHECK(input_message_content->get_id() == inputMessageContact::ID) fired"
+        );
+    };
+    get_contact(td, input_contact.contact)
+}
+
+/// `process_input_message_game` (Game.cpp:118-139).
+pub fn process_input_message_game(
+    td: &dyn MessageContentContext,
+    input_message_content: td_api::InputMessageContent,
+) -> Result<Game, Status> {
+    let td_api::InputMessageContent::inputMessageGame(input_message_game) = input_message_content
+    else {
+        unreachable!(
+            "the C++ CHECK(input_message_content->get_id() == inputMessageGame::ID) fired"
+        );
+    };
+
+    let bot_user_id = UserId::new(input_message_game.bot_user_id);
+    td.ensure_input_user(bot_user_id)?;
+
+    if crate::misc::clean_input_string(&input_message_game.game_short_name).is_none() {
+        return Err(Status::error(
+            400,
+            "Game short name must be encoded in UTF-8",
+        ));
+    }
+
+    // TODO validate game_short_name
+    if input_message_game.game_short_name.is_empty() {
+        return Err(Status::error(400, "Game short name must be non-empty"));
+    }
+
+    Ok(Game::new(bot_user_id, input_message_game.game_short_name))
+}
+
+/// `ToDoItem::get_to_do_item` (ToDoItem.cpp:28-47). The C++ null-task
+/// check collapses: the generated checklist carries non-option tasks.
+pub fn get_to_do_item(
+    td: &dyn MessageContentContext,
+    dialog_id: DialogId,
+    task: td_api::InputChecklistTask,
+) -> Result<ToDoItem, Status> {
+    let mut title = crate::message_entity::get_formatted_text_of_input(
+        Some(&mut ContextUserManager { td }),
+        to_message_entity_dialog_id(dialog_id),
+        task.text,
+        td.is_bot(),
+        false,
+        true,
+        false,
+        None,
+        td.get_option_boolean("always_parse_markdown"),
+        td.get_option_integer("session_count", 0) as i32,
+        Some(&mut |custom_emoji_id, is_premium| {
+            is_premium || td.is_premium_custom_emoji(custom_emoji_id)
+        }),
+        td.can_use_premium_custom_emoji_in_dialog(dialog_id),
+    )?;
+    let max_length = td.get_option_integer("checklist_task_text_length_max", 0);
+    if tdutils::utf8::utf8_length(&title.text) as i64 > max_length {
+        return Err(Status::error(
+            400,
+            "Checklist task text length must not exceed 0",
+        ));
+    }
+    if task.id <= 0 {
+        return Err(Status::error(
+            400,
+            "Checklist task identifier must be positive",
+        ));
+    }
+    crate::misc::replace_with_spaces(&mut title.text, "\n");
+    crate::message_entity::remove_unallowed_quote_user_entities(&mut title, true, true);
+    Ok(ToDoItem { id: task.id, title })
+}
+
+/// `ToDoList::get_to_do_list` (ToDoList.cpp:34-76).
+pub fn get_to_do_list(
+    td: &dyn MessageContentContext,
+    dialog_id: DialogId,
+    list: Option<td_api::InputChecklist>,
+) -> Result<ToDoList, Status> {
+    let Some(list) = list else {
+        return Err(Status::error(400, "Checklist must be non-empty"));
+    };
+    let mut title = crate::message_entity::get_formatted_text_of_input(
+        Some(&mut ContextUserManager { td }),
+        to_message_entity_dialog_id(dialog_id),
+        list.title,
+        td.is_bot(),
+        false,
+        true,
+        false,
+        None,
+        td.get_option_boolean("always_parse_markdown"),
+        td.get_option_integer("session_count", 0) as i32,
+        Some(&mut |custom_emoji_id, is_premium| {
+            is_premium || td.is_premium_custom_emoji(custom_emoji_id)
+        }),
+        td.can_use_premium_custom_emoji_in_dialog(dialog_id),
+    )?;
+    let max_length = td.get_option_integer("checklist_title_length_max", 0);
+    if tdutils::utf8::utf8_length(&title.text) as i64 > max_length {
+        return Err(Status::error(
+            400,
+            "Checklist title length must not exceed 0",
+        ));
+    }
+    crate::message_entity::remove_unallowed_quote_entities(&mut title);
+
+    let mut items = Vec::with_capacity(list.tasks.len());
+    for task in list.tasks {
+        items.push(get_to_do_item(td, dialog_id, task)?);
+    }
+    if items.is_empty() {
+        return Err(Status::error(400, "Checklist must have at least 1 task"));
+    }
+    let max_task_count = td.get_option_integer("checklist_task_count_max", 0);
+    if items.len() as i64 > max_task_count {
+        return Err(Status::error(400, "Checklist must have at most 0 tasks"));
+    }
+    Ok(ToDoList {
+        title,
+        items,
+        others_can_append: list.others_can_add_tasks,
+        others_can_complete: list.others_can_mark_tasks_as_done,
+    })
+}
+
+/// `td::InputMessageContent` (MessageContent.h:74-84) — the internal
+/// carrier the create_input_message_content switch returns.
+#[derive(Clone, Debug)]
+pub struct InputMessageContent {
+    pub content: Box<MessageContent>,
+    pub disable_web_page_preview: bool,
+    pub invert_media: bool,
+    pub clear_draft: bool,
+    pub ttl: MessageSelfDestructType,
+    pub via_bot_user_id: UserId,
+    pub emoji: String,
+}
+
+impl InputMessageContent {
+    pub fn new(content: MessageContent) -> InputMessageContent {
+        InputMessageContent {
+            content: Box::new(content),
+            disable_web_page_preview: false,
+            invert_media: false,
+            clear_draft: false,
+            ttl: MessageSelfDestructType::default(),
+            via_bot_user_id: UserId::default(),
+            emoji: String::new(),
+        }
+    }
+}
+
+/// `extract_input_caption` (MessageContent.cpp:4699-4740) — the C++ moves
+/// the caption out; the port takes it.
+pub fn extract_input_caption(
+    input_message_content: &mut td_api::InputMessageContent,
+) -> Option<td_api::FormattedText> {
+    match input_message_content {
+        td_api::InputMessageContent::inputMessageAnimation(input_animation) => {
+            input_animation.caption.take()
+        }
+        td_api::InputMessageContent::inputMessageAudio(input_audio) => input_audio.caption.take(),
+        td_api::InputMessageContent::inputMessageDocument(input_document) => {
+            input_document.caption.take()
+        }
+        td_api::InputMessageContent::inputMessagePaidMedia(input_paid_media) => {
+            input_paid_media.caption.take()
+        }
+        td_api::InputMessageContent::inputMessagePhoto(input_photo) => input_photo.caption.take(),
+        td_api::InputMessageContent::inputMessagePoll(input_poll) => input_poll.description.take(),
+        td_api::InputMessageContent::inputMessageVideo(input_video) => input_video.caption.take(),
+        td_api::InputMessageContent::inputMessageVoiceNote(input_voice_note) => {
+            input_voice_note.caption.take()
+        }
+        _ => None,
+    }
+}
+
+/// `extract_input_invert_media` (MessageContent.cpp:4743-4764).
+pub fn extract_input_invert_media(input_message_content: &td_api::InputMessageContent) -> bool {
+    match input_message_content {
+        td_api::InputMessageContent::inputMessageAnimation(input_animation) => {
+            input_animation.show_caption_above_media
+        }
+        td_api::InputMessageContent::inputMessagePaidMedia(input_paid_media) => {
+            input_paid_media.show_caption_above_media
+        }
+        td_api::InputMessageContent::inputMessagePhoto(input_photo) => {
+            input_photo.show_caption_above_media
+        }
+        td_api::InputMessageContent::inputMessageVideo(input_video) => {
+            input_video.show_caption_above_media
+        }
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12218,6 +12814,17 @@ mod tests {
         poll_contents: Vec<MessageContent>,
         poll_contents_2: Vec<MessageContent>,
         have_web_pages: Vec<WebPageId>,
+        always_parse_markdown: bool,
+        secret_chat_layer: i32,
+        secret_chat_user_id: UserId,
+        premium_custom_emoji: bool,
+        dialog_premium: bool,
+        channel_can_add_web_page_previews: bool,
+        web_page_by_url: WebPageId,
+        known_users: Vec<UserId>,
+        my_id: UserId,
+        checklist_title_max: i64,
+        checklist_task_text_max: i64,
         register_log: Vec<String>,
     }
 
@@ -12261,6 +12868,17 @@ mod tests {
                 poll_contents: Vec::new(),
                 poll_contents_2: Vec::new(),
                 have_web_pages: Vec::new(),
+                always_parse_markdown: false,
+                secret_chat_layer: 0,
+                secret_chat_user_id: UserId::default(),
+                premium_custom_emoji: false,
+                dialog_premium: true,
+                channel_can_add_web_page_previews: true,
+                web_page_by_url: WebPageId::default(),
+                known_users: Vec::new(),
+                my_id: UserId::new(1000),
+                checklist_title_max: 100,
+                checklist_task_text_max: 100,
                 register_log: Vec::new(),
             }
         }
@@ -12386,10 +13004,11 @@ mod tests {
         }
 
         fn get_option_integer(&self, name: &str, default: i64) -> i64 {
-            if name == "checklist_task_count_max" {
-                self.checklist_max
-            } else {
-                default
+            match name {
+                "checklist_task_count_max" => self.checklist_max,
+                "checklist_title_length_max" => self.checklist_title_max,
+                "checklist_task_text_length_max" => self.checklist_task_text_max,
+                _ => default,
             }
         }
 
@@ -12761,6 +13380,50 @@ mod tests {
                 new_file_id.get(),
                 old_file_id.get()
             ));
+        }
+
+        fn get_option_boolean(&self, name: &str) -> bool {
+            name == "always_parse_markdown" && self.always_parse_markdown
+        }
+
+        fn get_secret_chat_layer(&self, _secret_chat_id: SecretChatId) -> i32 {
+            self.secret_chat_layer
+        }
+
+        fn get_secret_chat_user_id(&self, _secret_chat_id: SecretChatId) -> UserId {
+            self.secret_chat_user_id
+        }
+
+        fn can_use_premium_custom_emoji_in_dialog(&self, _dialog_id: DialogId) -> bool {
+            self.dialog_premium
+        }
+
+        fn is_premium_custom_emoji(&self, _custom_emoji_id: CustomEmojiId) -> bool {
+            self.premium_custom_emoji
+        }
+
+        fn get_channel_can_add_web_page_previews(&self, _channel_id: ChannelId) -> bool {
+            self.channel_can_add_web_page_previews
+        }
+
+        fn get_web_page_by_url(&self, _url: &str) -> WebPageId {
+            self.web_page_by_url
+        }
+
+        fn have_user_force(&self, user_id: UserId, _source: &str) -> bool {
+            self.known_users.contains(&user_id)
+        }
+
+        fn ensure_input_user(&self, user_id: UserId) -> Result<(), Status> {
+            if self.known_users.contains(&user_id) {
+                Ok(())
+            } else {
+                Err(Status::error(400, "USER_NOT_FOUND"))
+            }
+        }
+
+        fn get_my_id(&self) -> UserId {
+            self.my_id
         }
     }
 
@@ -15247,5 +15910,311 @@ mod tests {
         );
         assert!(!changed && !update);
         assert!(td.register_log.is_empty());
+    }
+
+    fn td_api_text(text: &str) -> td_api::FormattedText {
+        td_api::FormattedText {
+            text: text.to_string(),
+            entities: vec![],
+        }
+    }
+
+    #[test]
+    fn process_input_message_text_follows_the_link_preview_rules() {
+        let user_dialog = DialogId::from_user_id(UserId::new(7));
+        let td = TestContext::default();
+
+        // plain text, no preview options
+        let result = process_input_message_text(
+            &td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessageText(td_api::inputMessageText {
+                text: Some(td_api_text("hello")),
+                link_preview_options: None,
+                clear_draft: true,
+            }),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.text.text, "hello");
+        assert!(result.web_page_url.is_empty());
+        assert!(result.clear_draft);
+
+        // a link preview url survives on a user dialog
+        let result = process_input_message_text(
+            &td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessageText(td_api::inputMessageText {
+                text: Some(td_api_text("hello https://example.com")),
+                link_preview_options: Some(td_api::LinkPreviewOptions {
+                    url: "https://example.com".to_string(),
+                    ..td_api::LinkPreviewOptions::default()
+                }),
+                clear_draft: false,
+            }),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.web_page_url, "https://example.com");
+
+        // a channel without the permission drops the url
+        let channel_dialog = DialogId::from_channel_id(ChannelId::new(3));
+        let td = TestContext {
+            channel_can_add_web_page_previews: false,
+            ..TestContext::default()
+        };
+        let result = process_input_message_text(
+            &td,
+            channel_dialog,
+            td_api::InputMessageContent::inputMessageText(td_api::inputMessageText {
+                text: Some(td_api_text("hello")),
+                link_preview_options: Some(td_api::LinkPreviewOptions {
+                    url: "https://example.com".to_string(),
+                    ..td_api::LinkPreviewOptions::default()
+                }),
+                clear_draft: false,
+            }),
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(result.web_page_url.is_empty());
+
+        // a secret chat without a preview takes the first url from the text
+        let secret_dialog = DialogId::from_secret_chat_id(SecretChatId::new(9));
+        let result = process_input_message_text(
+            &TestContext::default(),
+            secret_dialog,
+            td_api::InputMessageContent::inputMessageText(td_api::inputMessageText {
+                text: Some(td_api_text("check https://example.com")),
+                link_preview_options: None,
+                clear_draft: false,
+            }),
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.web_page_url, "https://example.com");
+    }
+
+    #[test]
+    fn process_input_message_location_validates() {
+        let location = td_api::Location {
+            latitude: 1.0,
+            longitude: 2.0,
+            horizontal_accuracy: 0.0,
+        };
+        let result = process_input_message_location(
+            td_api::InputMessageContent::inputMessageLocation(td_api::inputMessageLocation {
+                location: Some(location.clone()),
+            }),
+        )
+        .unwrap();
+        assert!(!result.location.is_empty());
+        assert_eq!(result.live_period, 0);
+
+        // an out-of-range coordinate is rejected
+        let bad_location = td_api::Location {
+            latitude: 100.0,
+            longitude: 2.0,
+            horizontal_accuracy: 0.0,
+        };
+        let error = process_input_message_location(
+            td_api::InputMessageContent::inputMessageLocation(td_api::inputMessageLocation {
+                location: Some(bad_location),
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(error.message(), "Invalid location specified");
+
+        // a live location with a wrong period is rejected
+        let error =
+            process_input_message_location(td_api::InputMessageContent::inputMessageLiveLocation(
+                td_api::inputMessageLiveLocation {
+                    location: Some(td_api::LiveLocation {
+                        location: Some(location.clone()),
+                        live_period: 10,
+                        heading: 0,
+                        proximity_alert_radius: 0,
+                    }),
+                },
+            ))
+            .unwrap_err();
+        assert_eq!(error.message(), "Wrong live location period specified");
+
+        // the edit path tolerates a missing live location
+        let result = process_live_location(None, true).unwrap();
+        assert!(result.location.is_empty());
+    }
+
+    #[test]
+    fn process_input_message_venue_and_contact_validate() {
+        let td = TestContext::default();
+        let venue = td_api::Venue {
+            location: Some(td_api::Location {
+                latitude: 1.0,
+                longitude: 2.0,
+                horizontal_accuracy: 0.0,
+            }),
+            title: "Place".to_string(),
+            address: "Street".to_string(),
+            provider: "foursquare".to_string(),
+            id: "1".to_string(),
+            r#type: "cafe".to_string(),
+        };
+        let result = process_input_message_venue(td_api::InputMessageContent::inputMessageVenue(
+            td_api::inputMessageVenue { venue: Some(venue) },
+        ))
+        .unwrap();
+        assert_eq!(result.title, "Place");
+        assert_eq!(result.r#type, "cafe");
+
+        // an empty location is rejected
+        let error = process_input_message_venue(td_api::InputMessageContent::inputMessageVenue(
+            td_api::inputMessageVenue { venue: None },
+        ))
+        .unwrap_err();
+        assert_eq!(error.message(), "Venue must be non-empty");
+
+        // an unknown contact user is rejected
+        let error = process_input_message_contact(
+            &td,
+            td_api::InputMessageContent::inputMessageContact(td_api::inputMessageContact {
+                contact: Some(td_api::Contact {
+                    user_id: 5,
+                    ..td_api::Contact::default()
+                }),
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(error.message(), "User not found");
+
+        // a known contact user passes
+        let td = TestContext {
+            known_users: vec![UserId::new(5)],
+            ..TestContext::default()
+        };
+        let result = process_input_message_contact(
+            &td,
+            td_api::InputMessageContent::inputMessageContact(td_api::inputMessageContact {
+                contact: Some(td_api::Contact {
+                    phone_number: "+15551234567".to_string(),
+                    first_name: "John".to_string(),
+                    user_id: 5,
+                    ..td_api::Contact::default()
+                }),
+            }),
+        )
+        .unwrap();
+        assert_eq!(result.get_first_name(), "John");
+    }
+
+    #[test]
+    fn process_input_message_game_validates() {
+        let td = TestContext {
+            known_users: vec![UserId::new(9)],
+            my_id: UserId::new(9),
+            ..TestContext::default()
+        };
+        let result = process_input_message_game(
+            &td,
+            td_api::InputMessageContent::inputMessageGame(td_api::inputMessageGame {
+                bot_user_id: 9,
+                game_short_name: "chess".to_string(),
+            }),
+        )
+        .unwrap();
+        assert_eq!(result.get_bot_user_id(), UserId::new(9));
+        assert_eq!(result.short_name, "chess");
+
+        // an unknown bot is rejected
+        let error = process_input_message_game(
+            &td,
+            td_api::InputMessageContent::inputMessageGame(td_api::inputMessageGame {
+                bot_user_id: 10,
+                game_short_name: "chess".to_string(),
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), 400);
+
+        // an empty short name is rejected
+        let error = process_input_message_game(
+            &td,
+            td_api::InputMessageContent::inputMessageGame(td_api::inputMessageGame {
+                bot_user_id: 9,
+                game_short_name: String::new(),
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(error.message(), "Game short name must be non-empty");
+    }
+
+    #[test]
+    fn get_to_do_list_validates() {
+        let td = TestContext::default();
+        let dialog_id = DialogId::from_user_id(UserId::new(7));
+        let list = td_api::InputChecklist {
+            title: Some(td_api_text("checklist")),
+            tasks: vec![td_api::InputChecklistTask {
+                id: 1,
+                text: Some(td_api_text("task 1")),
+            }],
+            others_can_add_tasks: true,
+            others_can_mark_tasks_as_done: false,
+        };
+        let result = get_to_do_list(&td, dialog_id, Some(list)).unwrap();
+        assert_eq!(result.title.text, "checklist");
+        assert_eq!(result.items.len(), 1);
+        assert!(result.others_can_append);
+        assert!(!result.others_can_complete);
+
+        // no tasks is rejected
+        let error = get_to_do_list(
+            &td,
+            dialog_id,
+            Some(td_api::InputChecklist {
+                title: Some(td_api_text("checklist")),
+                tasks: vec![],
+                others_can_add_tasks: false,
+                others_can_mark_tasks_as_done: false,
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(error.message(), "Checklist must have at least 1 task");
+
+        // a missing checklist is rejected
+        let error = get_to_do_list(&td, dialog_id, None).unwrap_err();
+        assert_eq!(error.message(), "Checklist must be non-empty");
+    }
+
+    #[test]
+    fn extract_input_caption_and_invert_media_table() {
+        let mut input = td_api::InputMessageContent::inputMessagePhoto(td_api::inputMessagePhoto {
+            caption: Some(td_api_text("cap")),
+            show_caption_above_media: true,
+            ..td_api::inputMessagePhoto::default()
+        });
+        assert_eq!(
+            extract_input_caption(&mut input).unwrap().text,
+            "cap".to_string()
+        );
+        assert!(extract_input_invert_media(&input));
+
+        // the caption is taken out
+        let td_api::InputMessageContent::inputMessagePhoto(input_photo) = input else {
+            panic!()
+        };
+        assert!(input_photo.caption.is_none());
+
+        let mut input = td_api::InputMessageContent::inputMessageText(td_api::inputMessageText {
+            text: Some(td_api_text("hello")),
+            link_preview_options: None,
+            clear_draft: false,
+        });
+        assert!(extract_input_caption(&mut input).is_none());
+        assert!(!extract_input_invert_media(&input));
     }
 }
