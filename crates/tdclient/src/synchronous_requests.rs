@@ -113,7 +113,7 @@ fn get_json_value_object(json_value: &JsonValue) -> TdJsonValue {
             object.foreach(|name, value| {
                 members.push(Box::new(td_api::JsonObjectMember {
                     key: name.to_string(),
-                    value: Box::new(get_json_value_object(value)),
+                    value: Some(Box::new(get_json_value_object(value))),
                 }));
             });
             TdJsonValue::jsonValueObject(td_api::jsonValueObject { members })
@@ -149,10 +149,16 @@ fn json_value_to_json(json_value: &TdJsonValue) -> JsonValue {
                 .collect(),
         ),
         TdJsonValue::jsonValueObject(v) => {
+            let default_value = TdJsonValue::default();
             JsonValue::Object(tdutils::json::JsonObject::from_fields(
                 v.members
                     .iter()
-                    .map(|member| (member.key.clone(), json_value_to_json(&member.value)))
+                    .map(|member| {
+                        (
+                            member.key.clone(),
+                            json_value_to_json(member.value.as_deref().unwrap_or(&default_value)),
+                        )
+                    })
                     .collect(),
             ))
         }
@@ -178,13 +184,18 @@ pub fn run_request(function: Function) -> Object {
             Result::Ok(value) => json_value_object(value),
             Result::Err(status) => make_error(400, status.message()),
         },
-        Function::getJsonString(request) => Object::text(td_api::Text {
-            text: get_json_string(&request.json_value),
-        }),
-        Function::setLogStream(request) => match set_current_stream(request.log_stream) {
-            std::result::Result::Ok(()) => Object::ok(td_api::Ok),
-            std::result::Result::Err(message) => make_error(400, &message),
-        },
+        Function::getJsonString(request) => {
+            let default_json = td_api::JsonValue::default();
+            Object::text(td_api::Text {
+                text: get_json_string(request.json_value.as_deref().unwrap_or(&default_json)),
+            })
+        }
+        Function::setLogStream(request) => {
+            match set_current_stream(request.log_stream.unwrap_or_default()) {
+                std::result::Result::Ok(()) => Object::ok(td_api::Ok),
+                std::result::Result::Err(message) => make_error(400, &message),
+            }
+        }
         Function::getLogStream(_) => get_current_stream(),
         Function::setLogVerbosityLevel(request) => {
             if (0..=tdutils::logging::NEVER).contains(&request.new_verbosity_level) {
@@ -219,7 +230,7 @@ pub fn run_request(function: Function) -> Object {
             tdutils::log_impl!(level, "", "{}", request.text);
             Object::ok(td_api::Ok)
         }
-        Function::testReturnError(request) => Object::error(request.error),
+        Function::testReturnError(request) => Object::error(request.error.unwrap_or_default()),
         _ => make_error(400, "The method can't be executed synchronously"),
     }
 }
@@ -387,7 +398,7 @@ mod tests {
             value: "hi".to_string(),
         });
         let function = Function::getJsonString(td_api::getJsonString {
-            json_value: Box::new(value),
+            json_value: Some(Box::new(value)),
         });
         let response = run_request(function);
         assert_eq!(response.to_json(), r#"{"@type":"text","text":"\"hi\""}"#);
@@ -470,10 +481,10 @@ mod tests {
     #[test]
     fn test_return_error_passes_through() {
         let function = Function::testReturnError(td_api::testReturnError {
-            error: td_api::Error {
+            error: Some(td_api::Error {
                 code: 418,
                 message: "teapot".to_string(),
-            },
+            }),
         });
         assert_eq!(
             run_request(function).to_json(),
@@ -491,7 +502,7 @@ mod tests {
             r#"{"@type":"logStreamDefault"}"#
         );
         let function = Function::setLogStream(td_api::setLogStream {
-            log_stream: td_api::LogStream::logStreamEmpty(td_api::logStreamEmpty),
+            log_stream: Some(td_api::LogStream::logStreamEmpty(td_api::logStreamEmpty)),
         });
         assert_eq!(run_request(function).to_json(), r#"{"@type":"ok"}"#);
         let function = Function::getLogStream(td_api::getLogStream);
@@ -501,7 +512,9 @@ mod tests {
         );
         // back to the default stream
         let function = Function::setLogStream(td_api::setLogStream {
-            log_stream: td_api::LogStream::logStreamDefault(td_api::logStreamDefault),
+            log_stream: Some(td_api::LogStream::logStreamDefault(
+                td_api::logStreamDefault,
+            )),
         });
         assert_eq!(run_request(function).to_json(), r#"{"@type":"ok"}"#);
         let function = Function::getLogStream(td_api::getLogStream);

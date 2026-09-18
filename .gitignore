@@ -2,6 +2,8 @@
 /target-clippy
 /conformance/target
 /conformance/target-clippy
+# S76 live-recorder output: contains the bot token, never commit it
+/conformance/recorder/corpus/s76_*
 /target-conformance/
 /conformance/target/
 fuzz/corpus/

@@ -1518,14 +1518,16 @@ impl<S: UpdatesSink> UpdatesManager<S> {
             if let telegram_api::Updates::updateShort(short) = updates
                 && !env.close_flag()
             {
-                let update_id = update_id_and_name(&short.update).0;
+                let update = short.update.clone().unwrap_or_default();
+                let update_id = update_id_and_name(&update).0;
                 if update_id == telegram_api::updateLoginToken::ID {
                     self.sink.on_update_login_token();
                     return;
                 }
                 if update_id == telegram_api::updateSentPhoneCode::ID {
-                    if let telegram_api::Update::updateSentPhoneCode(update) = short.update {
-                        self.sink.on_update_sent_code(update.sent_code);
+                    if let telegram_api::Update::updateSentPhoneCode(update) = update {
+                        self.sink
+                            .on_update_sent_code(update.sent_code.unwrap_or_default());
                     }
                     return;
                 }
@@ -1542,7 +1544,7 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                         | telegram_api::updateLangPack::ID
                 ) {
                     tdutils::log_info!("Apply without authorization");
-                    self.on_update(env, short.update.into(), std::mem::take(promise));
+                    self.on_update(env, update.into(), std::mem::take(promise));
                     return;
                 }
             }
@@ -1566,12 +1568,12 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                     media_unread: update.media_unread,
                     silent: update.silent,
                     id: update.id,
-                    from_id: telegram_api::Peer::peerUser(telegram_api::peerUser {
+                    from_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
                         user_id: from_id,
-                    }),
-                    peer_id: telegram_api::Peer::peerUser(telegram_api::peerUser {
+                    })),
+                    peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
                         user_id: update.user_id,
-                    }),
+                    })),
                     fwd_from: update.fwd_from,
                     via_bot_id: update.via_bot_id,
                     reply_to: update.reply_to,
@@ -1585,7 +1587,7 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                     env,
                     PendingUpdate::Wire(telegram_api::Update::updateNewMessage(
                         telegram_api::updateNewMessage {
-                            message,
+                            message: Some(message),
                             pts: update.pts,
                             pts_count: update.pts_count,
                         },
@@ -1602,12 +1604,12 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                     media_unread: update.media_unread,
                     silent: update.silent,
                     id: update.id,
-                    from_id: telegram_api::Peer::peerUser(telegram_api::peerUser {
+                    from_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
                         user_id: update.from_id,
-                    }),
-                    peer_id: telegram_api::Peer::peerChat(telegram_api::peerChat {
+                    })),
+                    peer_id: Some(telegram_api::Peer::peerChat(telegram_api::peerChat {
                         chat_id: update.chat_id,
-                    }),
+                    })),
                     fwd_from: update.fwd_from,
                     via_bot_id: update.via_bot_id,
                     reply_to: update.reply_to,
@@ -1621,7 +1623,7 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                     env,
                     PendingUpdate::Wire(telegram_api::Update::updateNewMessage(
                         telegram_api::updateNewMessage {
-                            message,
+                            message: Some(message),
                             pts: update.pts,
                             pts_count: update.pts_count,
                         },
@@ -1633,17 +1635,17 @@ impl<S: UpdatesSink> UpdatesManager<S> {
             }
             telegram_api::Updates::updateShort(short) => {
                 tdutils::log_debug!("Receive updateShort");
-                if !self.is_acceptable_update(env, &short.update) {
+                let short_update = short.update.unwrap_or_default();
+                if !self.is_acceptable_update(env, &short_update) {
                     tdutils::log_error!(
                         "Receive unacceptable short update: {}",
-                        update_id_and_name(&short.update).1
+                        update_id_and_name(&short_update).1
                     );
                     self.get_difference(env, "unacceptable short update");
                     return;
                 }
                 self.short_update_date = short.date;
-                let update = short.update;
-                self.on_update(env, update.into(), std::mem::take(promise));
+                self.on_update(env, short_update.into(), std::mem::take(promise));
                 self.short_update_date = 0;
             }
             telegram_api::Updates::updatesCombined(combined) => {
@@ -1912,7 +1914,10 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                                 );
                                 continue;
                             }
-                            if !matches!(message, telegram_api::Message::messageService(_)) {
+                            if !matches!(
+                                message.as_ref(),
+                                Some(telegram_api::Message::messageService(_))
+                            ) {
                                 // don't replace service messages, because
                                 // they can be about bot's kicking
                                 tdutils::log_info!(
@@ -1947,7 +1952,7 @@ impl<S: UpdatesSink> UpdatesManager<S> {
             && updates.len() == 1
             && let Some(PendingUpdate::Wire(telegram_api::Update::updateReadHistoryOutbox(update))) =
                 &updates[0]
-            && let telegram_api::Peer::peerUser(peer) = &update.peer
+            && let Some(telegram_api::Peer::peerUser(peer)) = &update.peer
             && is_valid_user_id(peer.user_id)
         {
             self.sink
@@ -2534,7 +2539,8 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                 update
             {
                 self.add_qts(env, qts);
-                self.sink.on_new_encrypted_message(encrypted.message);
+                self.sink
+                    .on_new_encrypted_message(encrypted.message.unwrap_or_default());
             }
         } else if env.is_bot() {
             let (id, name) = match &update {
@@ -3402,7 +3408,11 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                         "Get difference has run while processing get difference updates"
                     );
                 } else {
-                    self.on_get_updates_state(env, difference.state, "get difference");
+                    self.on_get_updates_state(
+                        env,
+                        difference.state.unwrap_or_default(),
+                        "get difference",
+                    );
                 }
             }
             telegram_api::updates_Difference::updates_differenceSlice(difference) => {
@@ -3466,7 +3476,7 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                     let old_qts = self.get_qts();
                     self.on_get_updates_state(
                         env,
-                        difference.intermediate_state,
+                        difference.intermediate_state.unwrap_or_default(),
                         "get difference slice",
                     );
 
@@ -3677,7 +3687,7 @@ impl<S: UpdatesSink> UpdatesManager<S> {
         for message in difference.new_messages {
             updates.push(Some(PendingUpdate::Wire(
                 telegram_api::Update::updateNewMessage(telegram_api::updateNewMessage {
-                    message,
+                    message: Some(message),
                     pts,
                     pts_count: 1,
                 }),
@@ -4248,7 +4258,8 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                 promise.set_value(());
             }
             PendingUpdate::Wire(telegram_api::Update::updateNewScheduledMessage(update)) => {
-                self.sink.on_get_message_scheduled(update.message);
+                self.sink
+                    .on_get_message_scheduled(update.message.unwrap_or_default());
                 promise.set_value(());
             }
             PendingUpdate::Wire(telegram_api::Update::updateChannelTooLong(update)) => {
@@ -4325,7 +4336,7 @@ impl<S: UpdatesSink> UpdatesManager<S> {
             // ---- M.7.12 — the UserManager group (real) ---------------
             PendingUpdate::Wire(telegram_api::Update::updateUserStatus(update)) => {
                 self.sink
-                    .on_update_user_status(update.user_id, update.status);
+                    .on_update_user_status(update.user_id, update.status.unwrap_or_default());
                 promise.set_value(());
             }
             PendingUpdate::Wire(telegram_api::Update::updateUserName(update)) => {
@@ -4346,8 +4357,10 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                 promise.set_value(());
             }
             PendingUpdate::Wire(telegram_api::Update::updateUserEmojiStatus(update)) => {
-                self.sink
-                    .on_update_user_emoji_status(update.user_id, update.emoji_status);
+                self.sink.on_update_user_emoji_status(
+                    update.user_id,
+                    update.emoji_status.unwrap_or_default(),
+                );
                 promise.set_value(());
             }
             PendingUpdate::Wire(telegram_api::Update::updateContactsReset(_)) => {
@@ -4367,20 +4380,20 @@ impl<S: UpdatesSink> UpdatesManager<S> {
 
             // ---- M.7.13 — the ephemeral-message family ---------------
             PendingUpdate::Wire(telegram_api::Update::updateNewEphemeralMessage(update)) => {
-                let is_welcome = update.message.welcome_template;
-                self.sink
-                    .on_new_ephemeral_message(update.message, is_welcome);
+                let message = update.message.unwrap_or_default();
+                let is_welcome = message.welcome_template;
+                self.sink.on_new_ephemeral_message(message, is_welcome);
                 promise.set_value(());
             }
             PendingUpdate::Wire(telegram_api::Update::updateEditEphemeralMessage(update)) => {
-                let is_welcome = update.message.welcome_template;
-                self.sink
-                    .on_edited_ephemeral_message(update.message, is_welcome);
+                let message = update.message.unwrap_or_default();
+                let is_welcome = message.welcome_template;
+                self.sink.on_edited_ephemeral_message(message, is_welcome);
                 promise.set_value(());
             }
             PendingUpdate::Wire(telegram_api::Update::updateDeleteEphemeralMessages(update)) => {
                 self.sink
-                    .on_delete_ephemeral_messages(update.peer, update.ids);
+                    .on_delete_ephemeral_messages(update.peer.unwrap_or_default(), update.ids);
                 promise.set_value(());
             }
 
@@ -5534,7 +5547,7 @@ impl<S: UpdatesSink> UpdatesManager<S> {
         };
         for row in &markup.rows {
             for button in &row.buttons {
-                if let telegram_api::InlineButtonType::inlineButtonTypeUserProfile(button) =
+                if let Some(telegram_api::InlineButtonType::inlineButtonTypeUserProfile(button)) =
                     &button.r#type
                     && (!self.sink.is_acceptable_user(button.user_id)
                         || !self.sink.can_get_input_user(button.user_id))
@@ -5553,14 +5566,31 @@ impl<S: UpdatesSink> UpdatesManager<S> {
     ) -> bool {
         match header {
             telegram_api::MessageReplyHeader::messageReplyHeader(header) => {
-                self.is_acceptable_peer(&header.reply_to_peer_id)
-                    && self.is_acceptable_message_forward_header(&header.reply_from)
-                    && self.is_acceptable_message_entities(&header.quote_entities)
-                    && self.is_acceptable_message_media(&header.reply_media)
+                self.is_acceptable_peer(
+                    header
+                        .reply_to_peer_id
+                        .as_ref()
+                        .unwrap_or(&telegram_api::Peer::default()),
+                ) && self.is_acceptable_message_forward_header(
+                    header
+                        .reply_from
+                        .as_ref()
+                        .unwrap_or(&telegram_api::MessageFwdHeader::default()),
+                ) && self.is_acceptable_message_entities(&header.quote_entities)
+                    && self.is_acceptable_message_media(
+                        header
+                            .reply_media
+                            .as_deref()
+                            .unwrap_or(&telegram_api::MessageMedia::default()),
+                    )
             }
-            telegram_api::MessageReplyHeader::messageReplyStoryHeader(header) => {
-                self.is_acceptable_peer(&header.peer)
-            }
+            telegram_api::MessageReplyHeader::messageReplyStoryHeader(header) => self
+                .is_acceptable_peer(
+                    header
+                        .peer
+                        .as_ref()
+                        .unwrap_or(&telegram_api::Peer::default()),
+                ),
         }
     }
 
@@ -5569,7 +5599,17 @@ impl<S: UpdatesSink> UpdatesManager<S> {
         &mut self,
         header: &telegram_api::MessageFwdHeader,
     ) -> bool {
-        self.is_acceptable_peer(&header.from_id) && self.is_acceptable_peer(&header.saved_from_peer)
+        self.is_acceptable_peer(
+            header
+                .from_id
+                .as_ref()
+                .unwrap_or(&telegram_api::Peer::default()),
+        ) && self.is_acceptable_peer(
+            header
+                .saved_from_peer
+                .as_ref()
+                .unwrap_or(&telegram_api::Peer::default()),
+        )
     }
 
     /// `UpdatesManager::is_acceptable_message_media` (cpp:839) — the
@@ -5580,9 +5620,12 @@ impl<S: UpdatesSink> UpdatesManager<S> {
             telegram_api::MessageMedia::messageMediaContact(media) => {
                 media.user_id == 0 || self.sink.is_acceptable_user(media.user_id)
             }
-            telegram_api::MessageMedia::messageMediaStory(media) => {
-                self.is_acceptable_peer(&media.peer)
-            }
+            telegram_api::MessageMedia::messageMediaStory(media) => self.is_acceptable_peer(
+                media
+                    .peer
+                    .as_ref()
+                    .unwrap_or(&telegram_api::Peer::default()),
+            ),
             telegram_api::MessageMedia::messageMediaGiveaway(media) => media
                 .channels
                 .iter()
@@ -5607,22 +5650,62 @@ impl<S: UpdatesSink> UpdatesManager<S> {
         match message {
             telegram_api::Message::messageEmpty(_) => true,
             telegram_api::Message::message(message) => {
-                self.is_acceptable_peer(&message.peer_id)
-                    && self.is_acceptable_peer(&message.from_id)
-                    && self.is_acceptable_message_reply_header(&message.reply_to)
-                    && self.is_acceptable_message_forward_header(&message.fwd_from)
-                    && (message.via_bot_id == 0 || self.sink.is_acceptable_user(message.via_bot_id))
+                self.is_acceptable_peer(
+                    message
+                        .peer_id
+                        .as_ref()
+                        .unwrap_or(&telegram_api::Peer::default()),
+                ) && self.is_acceptable_peer(
+                    message
+                        .from_id
+                        .as_ref()
+                        .unwrap_or(&telegram_api::Peer::default()),
+                ) && self.is_acceptable_message_reply_header(
+                    message
+                        .reply_to
+                        .as_ref()
+                        .unwrap_or(&telegram_api::MessageReplyHeader::default()),
+                ) && self.is_acceptable_message_forward_header(
+                    message
+                        .fwd_from
+                        .as_ref()
+                        .unwrap_or(&telegram_api::MessageFwdHeader::default()),
+                ) && (message.via_bot_id == 0 || self.sink.is_acceptable_user(message.via_bot_id))
                     && self.is_acceptable_message_entities(&message.entities)
-                    && self.is_acceptable_message_media(&message.media)
-                    && self.is_acceptable_reply_markup(&message.reply_markup)
+                    && self.is_acceptable_message_media(
+                        message
+                            .media
+                            .as_deref()
+                            .unwrap_or(&telegram_api::MessageMedia::default()),
+                    )
+                    && self.is_acceptable_reply_markup(
+                        message
+                            .reply_markup
+                            .as_ref()
+                            .unwrap_or(&telegram_api::ReplyMarkup::default()),
+                    )
             }
             telegram_api::Message::messageService(message) => {
-                if !self.is_acceptable_peer(&message.peer_id)
-                    || !self.is_acceptable_peer(&message.from_id)
-                {
+                if !self.is_acceptable_peer(
+                    message
+                        .peer_id
+                        .as_ref()
+                        .unwrap_or(&telegram_api::Peer::default()),
+                ) || !self.is_acceptable_peer(
+                    message
+                        .from_id
+                        .as_ref()
+                        .unwrap_or(&telegram_api::Peer::default()),
+                ) {
                     return false;
                 }
-                self.is_acceptable_message_action(env, &message.action)
+                self.is_acceptable_message_action(
+                    env,
+                    message
+                        .action
+                        .as_ref()
+                        .unwrap_or(&telegram_api::MessageAction::default()),
+                )
             }
         }
     }
@@ -5709,7 +5792,17 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                 self.sink.is_acceptable_chat(action.chat_id)
             }
             MA::messageActionGeoProximityReached(action) => {
-                self.is_acceptable_peer(&action.from_id) && self.is_acceptable_peer(&action.to_id)
+                self.is_acceptable_peer(
+                    action
+                        .from_id
+                        .as_ref()
+                        .unwrap_or(&telegram_api::Peer::default()),
+                ) && self.is_acceptable_peer(
+                    action
+                        .to_id
+                        .as_ref()
+                        .unwrap_or(&telegram_api::Peer::default()),
+                )
             }
             MA::messageActionInviteToGroupCall(action) => action
                 .users
@@ -5726,8 +5819,18 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                         .iter()
                         .all(|peer| self.is_acceptable_peer(peer))
             }
-            MA::messageActionGiftCode(action) => self.is_acceptable_peer(&action.boost_peer),
-            MA::messageActionPaymentRefunded(action) => self.is_acceptable_peer(&action.peer),
+            MA::messageActionGiftCode(action) => self.is_acceptable_peer(
+                action
+                    .boost_peer
+                    .as_ref()
+                    .unwrap_or(&telegram_api::Peer::default()),
+            ),
+            MA::messageActionPaymentRefunded(action) => self.is_acceptable_peer(
+                action
+                    .peer
+                    .as_ref()
+                    .unwrap_or(&telegram_api::Peer::default()),
+            ),
             MA::messageActionConferenceCall(action) => action
                 .other_participants
                 .iter()
@@ -5762,7 +5865,12 @@ impl<S: UpdatesSink> UpdatesManager<S> {
             telegram_api::Update::updateEditChannelMessage(update) => &update.message,
             _ => return true,
         };
-        self.is_acceptable_message(env, message)
+        self.is_acceptable_message(
+            env,
+            message
+                .as_ref()
+                .unwrap_or(&telegram_api::Message::default()),
+        )
     }
 
     // ------------------------------------------------------------------
@@ -6046,7 +6154,7 @@ fn message_id_from_message(message: &telegram_api::Message, is_scheduled: bool) 
 
 /// `DialogId::get_message_dialog_id(message)` — the peer of any message
 /// carrier; `messageEmpty` yields the invalid dialog.
-fn message_dialog_id(message: &telegram_api::Message) -> DialogId {
+fn message_dialog_id(message: &Option<telegram_api::Message>) -> DialogId {
     match message_peer_id(message) {
         Some(peer) => DialogId::from_peer(peer),
         None => DialogId::new(0),
@@ -6055,10 +6163,15 @@ fn message_dialog_id(message: &telegram_api::Message) -> DialogId {
 
 /// `MessageFullId::get_message_full_id(message, is_scheduled)` — the
 /// (dialog, message-id) pair; `messageEmpty` carries the invalid dialog.
-fn message_full_id(message: &telegram_api::Message, is_scheduled: bool) -> (DialogId, i64) {
+fn message_full_id(message: &Option<telegram_api::Message>, is_scheduled: bool) -> (DialogId, i64) {
     (
         message_dialog_id(message),
-        message_id_from_message(message, is_scheduled),
+        message_id_from_message(
+            message
+                .as_ref()
+                .unwrap_or(&telegram_api::Message::default()),
+            is_scheduled,
+        ),
     )
 }
 
@@ -6171,7 +6284,7 @@ pub fn get_message_by_random_id(
             if result.is_some() {
                 return None;
             }
-            result = Some(message);
+            result = message.as_ref();
         }
     }
     result
@@ -6184,7 +6297,7 @@ pub fn is_additional_service_message(message: &telegram_api::Message) -> bool {
     match message {
         telegram_api::Message::messageService(message) => matches!(
             message.action,
-            telegram_api::MessageAction::messageActionSetMessagesTTL(_)
+            Some(telegram_api::MessageAction::messageActionSetMessagesTTL(_))
         ),
         _ => false,
     }
@@ -6200,10 +6313,17 @@ pub fn get_new_messages(updates: &telegram_api::Updates) -> Vec<(&telegram_api::
     };
     for update in updates_vec {
         let (message, is_scheduled) = match update {
-            telegram_api::Update::updateNewMessage(update) => (&update.message, false),
-            telegram_api::Update::updateNewChannelMessage(update) => (&update.message, false),
-            telegram_api::Update::updateNewScheduledMessage(update) => (&update.message, true),
+            telegram_api::Update::updateNewMessage(update) => (update.message.as_ref(), false),
+            telegram_api::Update::updateNewChannelMessage(update) => {
+                (update.message.as_ref(), false)
+            }
+            telegram_api::Update::updateNewScheduledMessage(update) => {
+                (update.message.as_ref(), true)
+            }
             _ => continue,
+        };
+        let Some(message) = message else {
+            continue;
         };
         if !is_additional_service_message(message) {
             messages.push((message, is_scheduled));
@@ -6221,8 +6341,10 @@ pub fn get_new_ephemeral_messages(
         return messages;
     };
     for update in updates_vec {
-        if let telegram_api::Update::updateNewEphemeralMessage(update) = update {
-            messages.push(&update.message);
+        if let telegram_api::Update::updateNewEphemeralMessage(update) = update
+            && let Some(message) = update.message.as_ref()
+        {
+            messages.push(message);
         }
     }
     messages
@@ -6238,7 +6360,7 @@ pub fn get_update_new_group_call_id(updates: &telegram_api::Updates) -> Option<(
         for update in updates_vec {
             let mut input_group_call_id: Option<(i64, i64)> = None;
             if let telegram_api::Update::updateGroupCall(update) = update
-                && let telegram_api::GroupCall::groupCall(group_call) = &update.call
+                && let Some(telegram_api::GroupCall::groupCall(group_call)) = &update.call
             {
                 input_group_call_id = Some((group_call.id, group_call.access_hash));
             }
@@ -6316,7 +6438,7 @@ pub fn extract_join_group_call_presentation_params(updates: &mut telegram_api::U
     else {
         unreachable!("the position was matched above")
     };
-    update.params.data
+    update.params.unwrap_or_default().data
 }
 
 /// `UpdatesManager::extract_star_gift_craft_fail` (cpp:1640) — removes the
@@ -6381,14 +6503,16 @@ pub fn extract_story(
     }
     let position = updates_vec.iter().position(|update| {
         matches!(update, telegram_api::Update::updateStory(update)
-            if DialogId::from_peer(&update.peer) == owner_dialog_id
-                && (is_business || matches!(&*update.story, telegram_api::StoryItem::storyItem(_))))
+            if DialogId::from_peer(update.peer.as_ref().unwrap_or(&telegram_api::Peer::default()))
+                == owner_dialog_id
+                && (is_business
+                    || matches!(update.story.as_deref(), Some(telegram_api::StoryItem::storyItem(_)))))
     });
     let position = position?;
     let telegram_api::Update::updateStory(update) = updates_vec.remove(position) else {
         unreachable!("the position was matched above")
     };
-    Some(*update.story)
+    update.story.map(|boxed| *boxed)
 }
 
 /// `UpdatesManager::get_update_notify_settings_dialog_ids` (cpp:1697) —
@@ -6403,9 +6527,14 @@ pub fn get_update_notify_settings_dialog_ids(updates: &telegram_api::Updates) ->
     for update in updates_vec {
         let mut dialog_id = DialogId::new(0);
         if let telegram_api::Update::updateNotifySettings(update) = update
-            && let telegram_api::NotifyPeer::notifyPeer(notify_peer) = &update.peer
+            && let Some(telegram_api::NotifyPeer::notifyPeer(notify_peer)) = &update.peer
         {
-            dialog_id = DialogId::from_peer(&notify_peer.peer);
+            dialog_id = DialogId::from_peer(
+                notify_peer
+                    .peer
+                    .as_ref()
+                    .unwrap_or(&telegram_api::Peer::default()),
+            );
         }
         if dialog_id.is_valid() {
             dialog_ids.push(dialog_id);
@@ -6431,7 +6560,15 @@ pub fn get_update_ids(updates: &telegram_api::Updates) -> Vec<i32> {
             return vec![telegram_api::updateShortSentMessage::ID];
         }
         telegram_api::Updates::updateShort(update) => {
-            return vec![update_id_and_name(&update.update).0];
+            return vec![
+                update_id_and_name(
+                    update
+                        .update
+                        .as_ref()
+                        .unwrap_or(&telegram_api::Update::default()),
+                )
+                .0,
+            ];
         }
         telegram_api::Updates::updatesCombined(updates) => &updates.updates,
         telegram_api::Updates::updates(updates) => &updates.updates,
@@ -6665,10 +6802,10 @@ fn is_immediately_applied_update(id: i32) -> bool {
 
 /// `DialogId::get_message_dialog_id` — the peer of any message carrier
 /// (`messageEmpty` carries none).
-fn message_peer_id(message: &telegram_api::Message) -> Option<&telegram_api::Peer> {
-    match message {
-        telegram_api::Message::message(m) => Some(&m.peer_id),
-        telegram_api::Message::messageService(m) => Some(&m.peer_id),
+fn message_peer_id(message: &Option<telegram_api::Message>) -> Option<&telegram_api::Peer> {
+    match message.as_ref()? {
+        telegram_api::Message::message(m) => m.peer_id.as_ref(),
+        telegram_api::Message::messageService(m) => m.peer_id.as_ref(),
         telegram_api::Message::messageEmpty(_) => None,
     }
 }
@@ -6695,13 +6832,13 @@ fn check_pts_update(update: &PendingUpdate) -> bool {
             (u.pts, u.pts_count)
         }
         PendingUpdate::Wire(telegram_api::Update::updateReadHistoryInbox(u)) => {
-            if !check_pts_update_peer(&u.peer) {
+            if !check_pts_update_peer(u.peer.as_ref().unwrap_or(&telegram_api::Peer::default())) {
                 return false;
             }
             (u.pts, u.pts_count)
         }
         PendingUpdate::Wire(telegram_api::Update::updateReadHistoryOutbox(u)) => {
-            if !check_pts_update_peer(&u.peer) {
+            if !check_pts_update_peer(u.peer.as_ref().unwrap_or(&telegram_api::Peer::default())) {
                 return false;
             }
             (u.pts, u.pts_count)
@@ -6713,7 +6850,7 @@ fn check_pts_update(update: &PendingUpdate) -> bool {
             (u.pts, u.pts_count)
         }
         PendingUpdate::Wire(telegram_api::Update::updatePinnedMessages(u)) => {
-            if !check_pts_update_peer(&u.peer) {
+            if !check_pts_update_peer(u.peer.as_ref().unwrap_or(&telegram_api::Peer::default())) {
                 return false;
             }
             (u.pts, u.pts_count)
@@ -6893,10 +7030,10 @@ mod tests {
             // applied kind
             let marker = match &update {
                 PendingUpdate::Wire(telegram_api::Update::updateNewMessage(u)) => {
-                    match &u.message {
-                        telegram_api::Message::message(m) => m.id,
-                        telegram_api::Message::messageService(m) => m.id,
-                        telegram_api::Message::messageEmpty(_) => 0,
+                    match u.message.as_ref() {
+                        Some(telegram_api::Message::message(m)) => m.id,
+                        Some(telegram_api::Message::messageService(m)) => m.id,
+                        Some(telegram_api::Message::messageEmpty(_)) | None => 0,
                     }
                 }
                 PendingUpdate::Wire(telegram_api::Update::updateDeleteMessages(u)) => {
@@ -7118,11 +7255,13 @@ mod tests {
 
     fn new_message_update(id: i32, pts: i32, pts_count: i32) -> telegram_api::Update {
         telegram_api::Update::updateNewMessage(telegram_api::updateNewMessage {
-            message: telegram_api::Message::message(telegram_api::message {
+            message: Some(telegram_api::Message::message(telegram_api::message {
                 id,
-                peer_id: telegram_api::Peer::peerUser(telegram_api::peerUser { user_id: 100 }),
+                peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                    user_id: 100,
+                })),
                 ..telegram_api::message::default()
-            }),
+            })),
             pts,
             pts_count,
         })
@@ -7571,7 +7710,9 @@ mod tests {
         manager.on_get_updates(
             &mut env,
             telegram_api::Updates::updateShort(telegram_api::updateShort {
-                update: telegram_api::Update::updateLoginToken(telegram_api::updateLoginToken),
+                update: Some(telegram_api::Update::updateLoginToken(
+                    telegram_api::updateLoginToken,
+                )),
                 date: 1,
             }),
             Promise::default(),
@@ -7582,7 +7723,9 @@ mod tests {
         manager.on_get_updates(
             &mut env,
             telegram_api::Updates::updateShort(telegram_api::updateShort {
-                update: telegram_api::Update::updateConfig(telegram_api::updateConfig),
+                update: Some(telegram_api::Update::updateConfig(
+                    telegram_api::updateConfig,
+                )),
                 date: 1,
             }),
             Promise::default(),
@@ -7593,7 +7736,9 @@ mod tests {
         manager.on_get_updates(
             &mut env,
             telegram_api::Updates::updateShort(telegram_api::updateShort {
-                update: telegram_api::Update::updateUser(telegram_api::updateUser { user_id: 1 }),
+                update: Some(telegram_api::Update::updateUser(telegram_api::updateUser {
+                    user_id: 1,
+                })),
                 date: 1,
             }),
             Promise::default(),
@@ -7635,13 +7780,13 @@ mod tests {
             updates_container(
                 vec![telegram_api::Update::updateNewChannelMessage(
                     telegram_api::updateNewChannelMessage {
-                        message: telegram_api::Message::message(telegram_api::message {
+                        message: Some(telegram_api::Message::message(telegram_api::message {
                             id: 5,
-                            peer_id: telegram_api::Peer::peerChannel(telegram_api::peerChannel {
-                                channel_id: 900,
-                            }),
+                            peer_id: Some(telegram_api::Peer::peerChannel(
+                                telegram_api::peerChannel { channel_id: 900 },
+                            )),
                             ..Default::default()
-                        }),
+                        })),
                         pts: 3,
                         pts_count: 1,
                     },
@@ -7735,17 +7880,17 @@ mod tests {
             &mut env,
             PendingUpdate::Wire(telegram_api::Update::updateNewEncryptedMessage(
                 telegram_api::updateNewEncryptedMessage {
-                    message: telegram_api::EncryptedMessage::encryptedMessage(
+                    message: Some(telegram_api::EncryptedMessage::encryptedMessage(
                         telegram_api::encryptedMessage {
                             random_id: 1,
                             chat_id: 5,
                             date: 10,
                             bytes: vec![1, 2, 3],
-                            file: telegram_api::EncryptedFile::encryptedFileEmpty(
+                            file: Some(telegram_api::EncryptedFile::encryptedFileEmpty(
                                 telegram_api::encryptedFileEmpty {},
-                            ),
+                            )),
                         },
-                    ),
+                    )),
                     qts: 4,
                 },
             )),
@@ -8039,13 +8184,13 @@ mod tests {
                     other_updates: vec![new_message_update(78, 11, 1)],
                     chats: vec![chat(3)],
                     users: vec![user(2)],
-                    state: telegram_api::updates_State {
+                    state: Some(telegram_api::updates_State {
                         pts: 11,
                         qts: 6,
                         date: 900,
                         seq: 5,
                         unread_count: 0,
-                    },
+                    }),
                 },
             ),
         );
@@ -8080,13 +8225,13 @@ mod tests {
                     other_updates: vec![],
                     chats: vec![],
                     users: vec![],
-                    intermediate_state: telegram_api::updates_State {
+                    intermediate_state: Some(telegram_api::updates_State {
                         pts: 10,
                         qts: 2,
                         date: 0,
                         seq: 0,
                         unread_count: 0,
-                    },
+                    }),
                 },
             ),
         );
@@ -8113,13 +8258,13 @@ mod tests {
                     other_updates: vec![],
                     chats: vec![],
                     users: vec![],
-                    intermediate_state: telegram_api::updates_State {
+                    intermediate_state: Some(telegram_api::updates_State {
                         pts: 11,
                         qts: 2,
                         date: 0,
                         seq: 0,
                         unread_count: 0,
-                    },
+                    }),
                 },
             ),
         );
@@ -8165,13 +8310,13 @@ mod tests {
                     other_updates: vec![],
                     chats: vec![],
                     users: vec![],
-                    state: telegram_api::updates_State {
+                    state: Some(telegram_api::updates_State {
                         pts: 11,
                         qts: 1,
                         date: 1,
                         seq: 1,
                         unread_count: 0,
-                    },
+                    }),
                 },
             ),
         );
@@ -8215,13 +8360,13 @@ mod tests {
                     other_updates: vec![new_message_update(9, 3, 1)],
                     chats: vec![],
                     users: vec![],
-                    intermediate_state: telegram_api::updates_State {
+                    intermediate_state: Some(telegram_api::updates_State {
                         pts: 0,
                         qts: 0,
                         date: 0,
                         seq: 0,
                         unread_count: 0,
-                    },
+                    }),
                 },
             ),
         );
@@ -8250,7 +8395,7 @@ mod tests {
     fn message_for(user_id: i64, id: i32) -> telegram_api::Message {
         telegram_api::Message::message(telegram_api::message {
             id,
-            peer_id: peer_user(user_id),
+            peer_id: Some(peer_user(user_id)),
             ..telegram_api::message::default()
         })
     }
@@ -8268,7 +8413,9 @@ mod tests {
         )));
         assert!(!are_empty_updates(&telegram_api::Updates::updateShort(
             telegram_api::updateShort {
-                update: telegram_api::Update::updateConfig(telegram_api::updateConfig {}),
+                update: Some(telegram_api::Update::updateConfig(
+                    telegram_api::updateConfig {}
+                )),
                 date: 0,
             },
         )));
@@ -8277,18 +8424,20 @@ mod tests {
     #[test]
     fn statics_extract_new_messages_and_filter_service_ttl() {
         let ttl_service = telegram_api::Update::updateNewMessage(telegram_api::updateNewMessage {
-            message: telegram_api::Message::messageService(telegram_api::messageService {
-                id: 9,
-                peer_id: peer_user(100),
-                action: telegram_api::MessageAction::messageActionSetMessagesTTL(
-                    telegram_api::messageActionSetMessagesTTL {
-                        flags: 0,
-                        period: 60,
-                        auto_setting_from: 0,
-                    },
-                ),
-                ..telegram_api::messageService::default()
-            }),
+            message: Some(telegram_api::Message::messageService(
+                telegram_api::messageService {
+                    id: 9,
+                    peer_id: Some(peer_user(100)),
+                    action: Some(telegram_api::MessageAction::messageActionSetMessagesTTL(
+                        telegram_api::messageActionSetMessagesTTL {
+                            flags: 0,
+                            period: 60,
+                            auto_setting_from: 0,
+                        },
+                    )),
+                    ..telegram_api::messageService::default()
+                },
+            )),
             pts: 2,
             pts_count: 1,
         });
@@ -8298,7 +8447,7 @@ mod tests {
                 ttl_service,
                 telegram_api::Update::updateNewScheduledMessage(
                     telegram_api::updateNewScheduledMessage {
-                        message: message_for(100, 7),
+                        message: Some(message_for(100, 7)),
                     },
                 ),
                 new_message_update(6, 5, 1),
@@ -8366,7 +8515,9 @@ mod tests {
         assert_eq!(
             get_update_ids(&telegram_api::Updates::updateShort(
                 telegram_api::updateShort {
-                    update: telegram_api::Update::updateConfig(telegram_api::updateConfig {}),
+                    update: Some(telegram_api::Update::updateConfig(
+                        telegram_api::updateConfig {}
+                    )),
                     date: 0,
                 }
             )),
@@ -8453,9 +8604,9 @@ mod tests {
                     telegram_api::updateGroupCallConnection {
                         flags: 0,
                         presentation: true,
-                        params: telegram_api::DataJSON {
+                        params: Some(telegram_api::DataJSON {
                             data: "params".to_string(),
-                        },
+                        }),
                     },
                 ),
                 new_message_update(5, 4, 1),
@@ -8479,9 +8630,9 @@ mod tests {
                 telegram_api::updateGroupCallConnection {
                     flags: 0,
                     presentation: false,
-                    params: telegram_api::DataJSON {
+                    params: Some(telegram_api::DataJSON {
                         data: "main".to_string(),
-                    },
+                    }),
                 },
             )],
             0,
@@ -8501,10 +8652,10 @@ mod tests {
                 new_message_update(5, 4, 1),
                 telegram_api::Update::updateGroupCallMessage(
                     telegram_api::updateGroupCallMessage {
-                        call: telegram_api::InputGroupCall::inputGroupCall(
+                        call: Some(telegram_api::InputGroupCall::inputGroupCall(
                             telegram_api::inputGroupCall::default(),
-                        ),
-                        message: telegram_api::GroupCallMessage::default(),
+                        )),
+                        message: Some(telegram_api::GroupCallMessage::default()),
                     },
                 ),
                 telegram_api::Update::updateStarGiftCraftFail(
@@ -8526,13 +8677,13 @@ mod tests {
         let make = |is_business_count: usize| {
             let mut entries = vec![telegram_api::Update::updateStory(
                 telegram_api::updateStory {
-                    peer: peer_user(7),
-                    story: Box::new(telegram_api::StoryItem::storyItemSkipped(
+                    peer: Some(peer_user(7)),
+                    story: Some(Box::new(telegram_api::StoryItem::storyItemSkipped(
                         telegram_api::storyItemSkipped {
                             id: 3,
                             ..telegram_api::storyItemSkipped::default()
                         },
-                    )),
+                    ))),
                 },
             )];
             for extra in 0..is_business_count {
@@ -8570,18 +8721,18 @@ mod tests {
         let updates = updates_container(
             vec![
                 telegram_api::Update::updateEditMessage(telegram_api::updateEditMessage {
-                    message: message_for(100, 5),
+                    message: Some(message_for(100, 5)),
                     pts: 12,
                     pts_count: 1,
                 }),
                 telegram_api::Update::updateNewScheduledMessage(
                     telegram_api::updateNewScheduledMessage {
-                        message: telegram_api::Message::message(telegram_api::message {
+                        message: Some(telegram_api::Message::message(telegram_api::message {
                             id: 8,
                             date: scheduled_date,
-                            peer_id: peer_user(100),
+                            peer_id: Some(peer_user(100)),
                             ..telegram_api::message::default()
-                        }),
+                        })),
                     },
                 ),
             ],
@@ -8608,12 +8759,12 @@ mod tests {
         let plural = updates_container(
             vec![
                 telegram_api::Update::updateEditMessage(telegram_api::updateEditMessage {
-                    message: message_for(100, 5),
+                    message: Some(message_for(100, 5)),
                     pts: 12,
                     pts_count: 1,
                 }),
                 telegram_api::Update::updateEditMessage(telegram_api::updateEditMessage {
-                    message: message_for(100, 5),
+                    message: Some(message_for(100, 5)),
                     pts: 13,
                     pts_count: 1,
                 }),
@@ -8785,7 +8936,7 @@ mod tests {
         // drop counter (the updateEditChannelMessage arm of cpp:3870).
         let edit = telegram_api::Update::updateEditChannelMessage(
             telegram_api::updateEditChannelMessage {
-                message: message_for(100, 5),
+                message: Some(message_for(100, 5)),
                 pts: 6,
                 pts_count: 2,
             },
@@ -8865,7 +9016,7 @@ mod tests {
         let mut manager = UpdatesManager::new(RecordingSink::default());
         // The harness cache is populated: a regular new message passes.
         let update = telegram_api::Update::updateNewMessage(telegram_api::updateNewMessage {
-            message: message_for(100, 5),
+            message: Some(message_for(100, 5)),
             pts: 4,
             pts_count: 1,
         });
@@ -8874,7 +9025,7 @@ mod tests {
         // The empty cache: the message peer user 100 is unknown.
         let mut manager = UpdatesManager::new(EmptyCacheSink);
         let update = telegram_api::Update::updateNewMessage(telegram_api::updateNewMessage {
-            message: message_for(100, 5),
+            message: Some(message_for(100, 5)),
             pts: 4,
             pts_count: 1,
         });
@@ -8883,12 +9034,12 @@ mod tests {
         // A zero-id peer is the absent mark and passes even on the empty
         // cache.
         let update = telegram_api::Update::updateNewMessage(telegram_api::updateNewMessage {
-            message: telegram_api::Message::message(telegram_api::message {
+            message: Some(telegram_api::Message::message(telegram_api::message {
                 id: 5,
-                peer_id: peer_user(0),
-                from_id: peer_user(0),
+                peer_id: Some(peer_user(0)),
+                from_id: Some(peer_user(0)),
                 ..telegram_api::message::default()
-            }),
+            })),
             pts: 4,
             pts_count: 1,
         });
@@ -8907,14 +9058,14 @@ mod tests {
 
         let update =
             telegram_api::Update::updateNewChannelMessage(telegram_api::updateNewChannelMessage {
-                message: telegram_api::Message::message(telegram_api::message {
+                message: Some(telegram_api::Message::message(telegram_api::message {
                     id: 5,
-                    peer_id: telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                    peer_id: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
                         channel_id: 55,
-                    }),
-                    from_id: peer_user(100),
+                    })),
+                    from_id: Some(peer_user(100)),
                     ..telegram_api::message::default()
-                }),
+                })),
                 pts: 6,
                 pts_count: 2,
             });
