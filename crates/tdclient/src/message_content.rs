@@ -7264,6 +7264,11 @@ pub trait MessageContentContext {
         close_date: i32,
         is_closed: bool,
     ) -> PollId;
+    /// `StoryManager::have_story_force` (MessageContent.cpp:5136).
+    fn have_story_force(&self, story_full_id: StoryFullId) -> bool;
+    /// `dialog_manager_->get_input_peer(story_sender_dialog_id,
+    /// AccessRights::Read) != nullptr` (MessageContent.cpp:5141).
+    fn has_read_access_input_peer(&self, dialog_id: DialogId) -> bool;
 }
 
 /// `is_local_poll_id` (PollManager.cpp:449-452) — the local (unsent)
@@ -11335,9 +11340,23 @@ pub fn create_input_message_content(
                 attached_media: media.map(Box::new),
             });
         }
-        // M.9.4e.
-        td_api::InputMessageContent::inputMessageStory(_) => {
-            return Err(Status::error(400, "Story input is not supported yet"));
+        td_api::InputMessageContent::inputMessageStory(input_story) => {
+            let story_sender_dialog_id = DialogId::new(input_story.story_poster_chat_id);
+            let story_id = StoryId::new(input_story.story_id);
+            let story_full_id = StoryFullId::new(story_sender_dialog_id, story_id);
+            if !td.have_story_force(story_full_id) {
+                return Err(Status::error(400, "Story not found"));
+            }
+            if !story_id.is_server() {
+                return Err(Status::error(400, "Story can't be forwarded"));
+            }
+            if !td.has_read_access_input_peer(story_sender_dialog_id) {
+                return Err(Status::error(400, "Can't access the story"));
+            }
+            content = MessageContent::Story(MessageStory {
+                story_full_id,
+                via_mention: false,
+            });
         }
         // The MessagesManager forward path expands inputMessageForwarded
         // before this switch (MessagesManager.cpp:21746-21747); the C++
@@ -14403,6 +14422,8 @@ mod tests {
         file_view_details: HashMap<FileId, (String, String, String)>,
         input_file_counter: i32,
         poll_counter: i64,
+        known_stories: Vec<StoryFullId>,
+        read_access_dialogs: Vec<DialogId>,
         register_log: Vec<String>,
     }
 
@@ -14463,6 +14484,8 @@ mod tests {
                 file_view_details: HashMap::new(),
                 input_file_counter: 0,
                 poll_counter: 0,
+                known_stories: Vec::new(),
+                read_access_dialogs: Vec::new(),
                 register_log: Vec::new(),
             }
         }
@@ -15302,6 +15325,14 @@ mod tests {
                 self.poll_counter
             ));
             PollId::new(self.poll_counter)
+        }
+
+        fn have_story_force(&self, story_full_id: StoryFullId) -> bool {
+            self.known_stories.contains(&story_full_id)
+        }
+
+        fn has_read_access_input_peer(&self, dialog_id: DialogId) -> bool {
+            self.read_access_dialogs.contains(&dialog_id)
         }
     }
 
@@ -19104,5 +19135,54 @@ mod tests {
             error.message(),
             "Poll voters can be restricted only in channel chats"
         );
+    }
+
+    #[test]
+    fn create_input_message_content_story_arm() {
+        let user_dialog = DialogId::from_user_id(UserId::new(7));
+        let story_full_id =
+            StoryFullId::new(DialogId::from_user_id(UserId::new(5)), StoryId::new(42));
+        let td = TestContext {
+            known_stories: vec![story_full_id],
+            read_access_dialogs: vec![DialogId::from_user_id(UserId::new(5))],
+            ..TestContext::default()
+        };
+        let mut td = td;
+
+        let result = create_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessageStory(td_api::inputMessageStory {
+                story_poster_chat_id: 5,
+                story_id: 42,
+            }),
+            FormattedText::default(),
+            FileId::default(),
+            PhotoSize::default(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            &*result.content,
+            MessageContent::Story(m) if m.story_full_id == story_full_id && !m.via_mention
+        ));
+
+        // an unknown story is rejected
+        let error = create_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessageStory(td_api::inputMessageStory {
+                story_poster_chat_id: 5,
+                story_id: 43,
+            }),
+            FormattedText::default(),
+            FileId::default(),
+            PhotoSize::default(),
+            vec![],
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.message(), "Story not found");
     }
 }
