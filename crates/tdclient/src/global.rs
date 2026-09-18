@@ -117,7 +117,11 @@ impl Global {
             dialog_db_async: None,
             close_flag: false,
             is_test_dc: false,
-            server_time_difference: 0.0,
+            // the C++ atomic defaults to 0 harmlessly (its `Time::now` is
+            // wall-clock-based); the process-anchored Rust clock needs the
+            // `Global::init` default already pre-init, or `server_time()`
+            // collapses to ~0 and `unix_time` fails its LOG_CHECK range
+            server_time_difference: tdutils::time::system() - tdutils::time::now(),
             server_time_difference_was_updated: false,
             dns_time_difference: 0.0,
             dns_time_difference_was_updated: false,

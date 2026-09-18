@@ -858,7 +858,6 @@ impl TdDb {
         config_pmc.external_init_begin(CONFIG_PMC_MAGIC);
 
         // The combined replay callback: each pmc consumes only the events
-        // The combined replay callback: each pmc consumes only the events
         // written with its own magic; the Users, SecretChatInfos, Chats and
         // Channels events collect for their managers, the
         // notification-settings on-server events for the settings manager
