@@ -7237,6 +7237,33 @@ pub trait MessageContentContext {
         persistent_id: &str,
         file_type: crate::files::FileType,
     ) -> Result<FileId, Status>;
+    /// `DialogManager::is_broadcast_channel(DialogId)`
+    /// (DialogManager.h:156).
+    fn is_broadcast_channel_dialog(&self, dialog_id: DialogId) -> bool;
+    /// `PollManager::create_poll` (MessageContent.cpp:5125-5131) — the
+    /// full Poll value class lands with the Wave-2 PollManager; the seam
+    /// returns the created poll id.
+    #[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+    fn create_poll(
+        &mut self,
+        question: FormattedText,
+        options: Vec<PollOption>,
+        is_anonymous: bool,
+        allows_multiple_answers: bool,
+        has_open_answers: bool,
+        fixed_answers: bool,
+        members_only: bool,
+        country_codes: Vec<String>,
+        shuffle_options: bool,
+        hide_results_until_closes: bool,
+        is_quiz: bool,
+        correct_option_ids: Vec<i32>,
+        explanation: FormattedText,
+        explanation_media: Option<Box<MessageContent>>,
+        open_period: i32,
+        close_date: i32,
+        is_closed: bool,
+    ) -> PollId;
 }
 
 /// `is_local_poll_id` (PollManager.cpp:449-452) — the local (unsent)
@@ -11190,9 +11217,123 @@ pub fn create_input_message_content(
                 process_input_message_invoice(td, input_message_content, dialog_id)?;
             content = MessageContent::Invoice(MessageInvoice { input_invoice });
         }
-        // M.9.4d.
-        td_api::InputMessageContent::inputMessagePoll(_) => {
-            return Err(Status::error(400, "Poll input is not supported yet"));
+        td_api::InputMessageContent::inputMessagePoll(input_poll) => {
+            const MAX_POLL_QUESTION_LENGTH: usize = 255; // server-side limit
+            let question = crate::message_entity::get_formatted_text_of_input(
+                Some(&mut ContextUserManager { td }),
+                to_message_entity_dialog_id(dialog_id),
+                input_poll.question,
+                is_bot,
+                false,
+                true,
+                false,
+                None,
+                td.get_option_boolean("always_parse_markdown"),
+                td.get_option_integer("session_count", 0) as i32,
+                Some(&mut |custom_emoji_id, is_premium| {
+                    is_premium || td.is_premium_custom_emoji(custom_emoji_id)
+                }),
+                td.can_use_premium_custom_emoji_in_dialog(dialog_id),
+            )?;
+            if tdutils::utf8::utf8_length(&question.text) > MAX_POLL_QUESTION_LENGTH {
+                return Err(Status::error(
+                    400,
+                    "Poll question length must not exceed 255",
+                ));
+            }
+            let media = get_input_poll_media(td, dialog_id, input_poll.media, false)?;
+            let options = get_poll_options(td, dialog_id, input_poll.options)?;
+
+            let mut is_quiz = false;
+            let mut has_open_answers = false;
+            let mut correct_option_ids = Vec::new();
+            let mut explanation = FormattedText::default();
+            let mut explanation_media = None;
+            let Some(poll_type) = input_poll.r#type else {
+                return Err(Status::error(400, "Poll type must be non-empty"));
+            };
+            match poll_type {
+                td_api::InputPollType::inputPollTypeRegular(poll_type) => {
+                    has_open_answers = poll_type.allow_adding_options;
+                }
+                td_api::InputPollType::inputPollTypeQuiz(poll_type) => {
+                    is_quiz = true;
+                    correct_option_ids = poll_type.correct_option_ids;
+                    check_quiz_correct_option_ids(&correct_option_ids, options.len(), false)?;
+                    explanation = crate::message_entity::get_formatted_text_of_input(
+                        Some(&mut ContextUserManager { td }),
+                        to_message_entity_dialog_id(dialog_id),
+                        poll_type.explanation,
+                        is_bot,
+                        true,
+                        true,
+                        false,
+                        None,
+                        td.get_option_boolean("always_parse_markdown"),
+                        td.get_option_integer("session_count", 0) as i32,
+                        Some(&mut |custom_emoji_id, is_premium| {
+                            is_premium || td.is_premium_custom_emoji(custom_emoji_id)
+                        }),
+                        td.can_use_premium_custom_emoji_in_dialog(dialog_id),
+                    )?;
+                    explanation_media =
+                        get_input_poll_media(td, dialog_id, poll_type.explanation_media, false)?
+                            .map(Box::new);
+                }
+            }
+            for country_code in &input_poll.country_codes {
+                let is_uppercase_pair = country_code.len() == 2
+                    && country_code.is_ascii()
+                    && country_code.bytes().all(|byte| byte.is_ascii_uppercase());
+                if !is_uppercase_pair {
+                    return Err(Status::error(400, "Invalid country code specified"));
+                }
+            }
+            if input_poll.country_codes.len() as i64
+                > td.get_option_integer("poll_country_count_max", 0)
+            {
+                return Err(Status::error(400, "Too many countries specified"));
+            }
+            if !td.is_broadcast_channel_dialog(dialog_id)
+                && (input_poll.members_only || !input_poll.country_codes.is_empty())
+            {
+                return Err(Status::error(
+                    400,
+                    "Poll voters can be restricted only in channel chats",
+                ));
+            }
+
+            let open_period = input_poll.open_period;
+            let close_date = if open_period != 0 {
+                0
+            } else {
+                input_poll.close_date
+            };
+            let is_closed = if is_bot { input_poll.is_closed } else { false };
+            let poll_id = td.create_poll(
+                question,
+                options,
+                input_poll.is_anonymous,
+                input_poll.allows_multiple_answers,
+                has_open_answers,
+                !input_poll.allows_revoting,
+                input_poll.members_only,
+                input_poll.country_codes,
+                input_poll.shuffle_options,
+                input_poll.hide_results_until_closes,
+                is_quiz,
+                correct_option_ids,
+                explanation,
+                explanation_media,
+                open_period,
+                close_date,
+                is_closed,
+            );
+            content = MessageContent::Poll(MessagePoll {
+                poll_id,
+                caption,
+                attached_media: media.map(Box::new),
+            });
         }
         // M.9.4e.
         td_api::InputMessageContent::inputMessageStory(_) => {
@@ -11802,6 +11943,227 @@ pub fn check_message_group_message_contents(
                         .as_str(),
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// M.9.4d — the poll arm (MessageContent.cpp:5060-5132, 5302-5378) with the
+// PollOption input plane (PollOption.h, PollOption.cpp:53-97) and the quiz
+// validator (PollManager.cpp:453-468). The Poll VALUE class stays with the
+// Wave-2 PollManager — the create_poll seam carries the extracted
+// parameters and returns the poll id.
+// ---------------------------------------------------------------------------
+
+/// `td::PollOption` (PollOption.h:29-63) — the input-plane subset; the
+/// receive-path constructor and the voter bookkeeping land with the
+/// Wave-2 PollManager.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PollOption {
+    pub text: FormattedText,
+    pub media: Option<Box<MessageContent>>,
+    pub data: String,
+    pub added_by_dialog_id: DialogId,
+    pub recent_voter_dialog_ids: Vec<DialogId>,
+    pub added_date: i32,
+    pub voter_count: i32,
+    pub is_chosen: bool,
+}
+
+/// `PollOption::get_poll_option` (PollOption.cpp:53-73).
+pub fn get_poll_option(
+    td: &mut dyn MessageContentContext,
+    dialog_id: DialogId,
+    input_poll_option: td_api::InputPollOption,
+) -> Result<PollOption, Status> {
+    let mut text = crate::message_entity::get_formatted_text_of_input(
+        Some(&mut ContextUserManager { td }),
+        to_message_entity_dialog_id(dialog_id),
+        input_poll_option.text,
+        td.is_bot(),
+        false,
+        true,
+        false,
+        None,
+        td.get_option_boolean("always_parse_markdown"),
+        td.get_option_integer("session_count", 0) as i32,
+        Some(&mut |custom_emoji_id, is_premium| {
+            is_premium || td.is_premium_custom_emoji(custom_emoji_id)
+        }),
+        td.can_use_premium_custom_emoji_in_dialog(dialog_id),
+    )?;
+    const MAX_POLL_OPTION_LENGTH: usize = 100; // server-side limit
+    if tdutils::utf8::utf8_length(&text.text) > MAX_POLL_OPTION_LENGTH {
+        return Err(Status::error(
+            400,
+            "Poll options length must not exceed 100",
+        ));
+    }
+    let media = get_input_poll_media(td, dialog_id, input_poll_option.media, true)?;
+
+    crate::message_entity::keep_only_custom_emoji(&mut text);
+    Ok(PollOption {
+        text,
+        media: media.map(Box::new),
+        ..PollOption::default()
+    })
+}
+
+/// `PollOption::get_poll_options` (PollOption.cpp:75-91).
+pub fn get_poll_options(
+    td: &mut dyn MessageContentContext,
+    dialog_id: DialogId,
+    input_poll_options: Vec<td_api::InputPollOption>,
+) -> Result<Vec<PollOption>, Status> {
+    if input_poll_options.is_empty() {
+        return Err(Status::error(
+            400,
+            "Poll must have at least one answer option",
+        ));
+    }
+    let max_poll_options = td.get_option_integer("poll_answer_count_max", 12);
+    if input_poll_options.len() as i64 > max_poll_options {
+        return Err(Status::error(
+            400,
+            format!("Poll can't have more than {max_poll_options} options").as_str(),
+        ));
+    }
+    let mut options = Vec::with_capacity(input_poll_options.len());
+    for input_option in input_poll_options {
+        options.push(get_poll_option(td, dialog_id, input_option)?);
+    }
+    Ok(options)
+}
+
+/// `get_input_poll_media` (MessageContent.cpp:5302-5378).
+pub fn get_input_poll_media(
+    td: &mut dyn MessageContentContext,
+    dialog_id: DialogId,
+    input_poll_media: Option<td_api::InputPollMedia>,
+    for_option: bool,
+) -> Result<Option<MessageContent>, Status> {
+    let Some(input_poll_media) = input_poll_media else {
+        return Ok(None);
+    };
+    if let td_api::InputPollMedia::inputPollMediaLink(content) = input_poll_media {
+        if !for_option {
+            return Err(Status::error(
+                400,
+                "Invalid poll option media content specified",
+            ));
+        }
+        if content.url.is_empty() {
+            return Err(Status::error(400, "Poll option link must be non-empty"));
+        }
+        let web_page_id = if !td.is_bot() {
+            td.get_web_page_by_url(&content.url)
+        } else {
+            WebPageId::default()
+        };
+        return Ok(Some(MessageContent::Text(MessageText::new(
+            FormattedText::default(),
+            web_page_id,
+            false,
+            false,
+            false,
+            content.url,
+        ))));
+    }
+    let input_message_content = match input_poll_media {
+        td_api::InputPollMedia::inputPollMediaAnimation(content) => {
+            td_api::InputMessageContent::inputMessageAnimation(td_api::inputMessageAnimation {
+                animation: content.animation,
+                caption: None,
+                has_spoiler: false,
+                show_caption_above_media: false,
+            })
+        }
+        td_api::InputPollMedia::inputPollMediaAudio(content) => {
+            td_api::InputMessageContent::inputMessageAudio(td_api::inputMessageAudio {
+                audio: content.audio,
+                caption: None,
+            })
+        }
+        td_api::InputPollMedia::inputPollMediaDocument(content) => {
+            td_api::InputMessageContent::inputMessageDocument(td_api::inputMessageDocument {
+                document: content.document,
+                caption: None,
+            })
+        }
+        td_api::InputPollMedia::inputPollMediaLocation(content) => {
+            td_api::InputMessageContent::inputMessageLocation(td_api::inputMessageLocation {
+                location: content.location,
+            })
+        }
+        td_api::InputPollMedia::inputPollMediaPhoto(content) => {
+            td_api::InputMessageContent::inputMessagePhoto(td_api::inputMessagePhoto {
+                photo: content.photo,
+                caption: None,
+                has_spoiler: false,
+                self_destruct_type: None,
+                show_caption_above_media: false,
+            })
+        }
+        td_api::InputPollMedia::inputPollMediaSticker(content) => {
+            td_api::InputMessageContent::inputMessageSticker(td_api::inputMessageSticker {
+                sticker: content.sticker,
+                emoji: String::new(),
+            })
+        }
+        td_api::InputPollMedia::inputPollMediaVenue(content) => {
+            td_api::InputMessageContent::inputMessageVenue(td_api::inputMessageVenue {
+                venue: content.venue,
+            })
+        }
+        td_api::InputPollMedia::inputPollMediaVideo(content) => {
+            td_api::InputMessageContent::inputMessageVideo(td_api::inputMessageVideo {
+                video: content.video,
+                caption: None,
+                has_spoiler: false,
+                self_destruct_type: None,
+                show_caption_above_media: false,
+            })
+        }
+        td_api::InputPollMedia::inputPollMediaLink(_) => unreachable!(),
+    };
+    let media_content = get_input_message_content(td, dialog_id, input_message_content, false)?;
+    if for_option {
+        if !is_allowed_poll_option_content(media_content.content.get_type()) {
+            return Err(Status::error(
+                400,
+                "Invalid poll option media content specified",
+            ));
+        }
+    } else if !is_allowed_poll_content(media_content.content.get_type()) {
+        return Err(Status::error(400, "Invalid poll media content specified"));
+    }
+    Ok(Some(*media_content.content))
+}
+
+/// `PollManager::check_quiz_correct_option_ids` (PollManager.cpp:453-468).
+pub fn check_quiz_correct_option_ids(
+    correct_option_ids: &[i32],
+    option_count: usize,
+    allow_empty: bool,
+) -> Result<(), Status> {
+    if !allow_empty && correct_option_ids.is_empty() {
+        return Err(Status::error(
+            400,
+            "Correct quiz option list must be non-empty",
+        ));
+    }
+    for i in 0..correct_option_ids.len().saturating_sub(1) {
+        if correct_option_ids[i] >= correct_option_ids[i + 1] {
+            return Err(Status::error(
+                400,
+                "Correct quiz option list must be increasing",
+            ));
+        }
+    }
+    for &correct_option_id in correct_option_ids {
+        if correct_option_id < 0 || correct_option_id >= option_count as i32 {
+            return Err(Status::error(500, "Wrong quiz correct_option_id"));
         }
     }
     Ok(())
@@ -14036,8 +14398,11 @@ mod tests {
         checklist_title_max: i64,
         checklist_task_text_max: i64,
         paid_media_star_count_max: i64,
+        poll_country_count_max: i64,
+        poll_answer_count_max: i64,
         file_view_details: HashMap<FileId, (String, String, String)>,
         input_file_counter: i32,
+        poll_counter: i64,
         register_log: Vec<String>,
     }
 
@@ -14093,8 +14458,11 @@ mod tests {
                 checklist_title_max: 100,
                 checklist_task_text_max: 100,
                 paid_media_star_count_max: 1000,
+                poll_country_count_max: 100,
+                poll_answer_count_max: 12,
                 file_view_details: HashMap::new(),
                 input_file_counter: 0,
+                poll_counter: 0,
                 register_log: Vec::new(),
             }
         }
@@ -14225,6 +14593,8 @@ mod tests {
                 "checklist_title_length_max" => self.checklist_title_max,
                 "checklist_task_text_length_max" => self.checklist_task_text_max,
                 "paid_media_message_star_count_max" => self.paid_media_star_count_max,
+                "poll_country_count_max" => self.poll_country_count_max,
+                "poll_answer_count_max" => self.poll_answer_count_max,
                 _ => default,
             }
         }
@@ -14884,6 +15254,54 @@ mod tests {
             _file_type: crate::files::FileType,
         ) -> Result<FileId, Status> {
             Ok(FileId::new(7000, 0))
+        }
+
+        fn is_broadcast_channel_dialog(&self, dialog_id: DialogId) -> bool {
+            dialog_id.get_type() == DialogType::Channel && self.broadcast
+        }
+
+        fn create_poll(
+            &mut self,
+            question: FormattedText,
+            options: Vec<PollOption>,
+            is_anonymous: bool,
+            allows_multiple_answers: bool,
+            has_open_answers: bool,
+            fixed_answers: bool,
+            members_only: bool,
+            country_codes: Vec<String>,
+            shuffle_options: bool,
+            hide_results_until_closes: bool,
+            is_quiz: bool,
+            correct_option_ids: Vec<i32>,
+            explanation: FormattedText,
+            _explanation_media: Option<Box<MessageContent>>,
+            open_period: i32,
+            close_date: i32,
+            is_closed: bool,
+        ) -> PollId {
+            self.poll_counter += 1;
+            self.register_log.push(format!(
+                "create_poll({},{},{},{},{},{},{},{:?},{},{},{},{:?},{},{},{},{},{})",
+                question.text,
+                options.len(),
+                is_anonymous,
+                allows_multiple_answers,
+                has_open_answers,
+                fixed_answers,
+                members_only,
+                country_codes,
+                shuffle_options,
+                hide_results_until_closes,
+                is_quiz,
+                correct_option_ids,
+                explanation.text,
+                open_period,
+                close_date,
+                is_closed,
+                self.poll_counter
+            ));
+            PollId::new(self.poll_counter)
         }
     }
 
@@ -18481,5 +18899,210 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.message(), "Photo must be non-empty");
+    }
+
+    #[test]
+    fn quiz_correct_option_ids_table() {
+        assert!(check_quiz_correct_option_ids(&[0, 1], 2, false).is_ok());
+        let error = check_quiz_correct_option_ids(&[], 2, false).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "Correct quiz option list must be non-empty"
+        );
+        assert!(check_quiz_correct_option_ids(&[], 2, true).is_ok());
+        let error = check_quiz_correct_option_ids(&[1, 0], 2, false).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "Correct quiz option list must be increasing"
+        );
+        let error = check_quiz_correct_option_ids(&[2], 2, false).unwrap_err();
+        assert_eq!(error.message(), "Wrong quiz correct_option_id");
+    }
+
+    #[test]
+    fn get_poll_options_validates() {
+        let user_dialog = DialogId::from_user_id(UserId::new(7));
+        let mut td = input_td();
+
+        let error = get_poll_options(&mut td, user_dialog, vec![]).unwrap_err();
+        assert_eq!(error.message(), "Poll must have at least one answer option");
+
+        let options = get_poll_options(
+            &mut td,
+            user_dialog,
+            vec![
+                td_api::InputPollOption {
+                    text: Some(td_api_text("yes")),
+                    media: None,
+                },
+                td_api::InputPollOption {
+                    text: Some(td_api_text("no")),
+                    media: None,
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(options.len(), 2);
+        assert_eq!(options[0].text.text, "yes");
+        assert!(options[0].media.is_none());
+
+        // a poll media link lands a Text content with the web page
+        let media = get_input_poll_media(
+            &mut td,
+            user_dialog,
+            Some(td_api::InputPollMedia::inputPollMediaLink(
+                td_api::inputPollMediaLink {
+                    url: "https://example.com".to_string(),
+                },
+            )),
+            true,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            media,
+            MessageContent::Text(m) if m.web_page_url == "https://example.com"
+        ));
+
+        // a link on the poll itself is rejected
+        let error = get_input_poll_media(
+            &mut td,
+            user_dialog,
+            Some(td_api::InputPollMedia::inputPollMediaLink(
+                td_api::inputPollMediaLink {
+                    url: "https://example.com".to_string(),
+                },
+            )),
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.message(),
+            "Invalid poll option media content specified"
+        );
+    }
+
+    #[test]
+    fn create_input_message_content_poll_arm() {
+        let user_dialog = DialogId::from_user_id(UserId::new(7));
+        let mut td = input_td();
+
+        let result = create_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessagePoll(td_api::inputMessagePoll {
+                question: Some(td_api_text("question")),
+                options: vec![
+                    td_api::InputPollOption {
+                        text: Some(td_api_text("yes")),
+                        media: None,
+                    },
+                    td_api::InputPollOption {
+                        text: Some(td_api_text("no")),
+                        media: None,
+                    },
+                ],
+                r#type: Some(td_api::InputPollType::inputPollTypeRegular(
+                    td_api::inputPollTypeRegular {
+                        allow_adding_options: true,
+                    },
+                )),
+                ..td_api::inputMessagePoll::default()
+            }),
+            FormattedText::default(),
+            FileId::default(),
+            PhotoSize::default(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            &*result.content,
+            MessageContent::Poll(m) if m.poll_id.is_valid()
+        ));
+        assert!(
+            td.register_log
+                .iter()
+                .any(|entry| entry.contains("create_poll(question,2"))
+        );
+
+        // a missing poll type is rejected
+        let error = create_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessagePoll(td_api::inputMessagePoll {
+                question: Some(td_api_text("question")),
+                options: vec![td_api::InputPollOption {
+                    text: Some(td_api_text("yes")),
+                    media: None,
+                }],
+                r#type: None,
+                ..td_api::inputMessagePoll::default()
+            }),
+            FormattedText::default(),
+            FileId::default(),
+            PhotoSize::default(),
+            vec![],
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.message(), "Poll type must be non-empty");
+
+        // a quiz with a bad correct-option list is rejected
+        let error = create_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessagePoll(td_api::inputMessagePoll {
+                question: Some(td_api_text("question")),
+                options: vec![td_api::InputPollOption {
+                    text: Some(td_api_text("yes")),
+                    media: None,
+                }],
+                r#type: Some(td_api::InputPollType::inputPollTypeQuiz(
+                    td_api::inputPollTypeQuiz {
+                        correct_option_ids: vec![5],
+                        ..td_api::inputPollTypeQuiz::default()
+                    },
+                )),
+                ..td_api::inputMessagePoll::default()
+            }),
+            FormattedText::default(),
+            FileId::default(),
+            PhotoSize::default(),
+            vec![],
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.message(), "Wrong quiz correct_option_id");
+
+        // country codes need a broadcast channel
+        let error = create_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessagePoll(td_api::inputMessagePoll {
+                question: Some(td_api_text("question")),
+                options: vec![td_api::InputPollOption {
+                    text: Some(td_api_text("yes")),
+                    media: None,
+                }],
+                country_codes: vec!["US".to_string()],
+                r#type: Some(td_api::InputPollType::inputPollTypeRegular(
+                    td_api::inputPollTypeRegular {
+                        allow_adding_options: false,
+                    },
+                )),
+                ..td_api::inputMessagePoll::default()
+            }),
+            FormattedText::default(),
+            FileId::default(),
+            PhotoSize::default(),
+            vec![],
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.message(),
+            "Poll voters can be restricted only in channel chats"
+        );
     }
 }
