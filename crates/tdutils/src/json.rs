@@ -72,6 +72,15 @@ impl JsonObject {
             .map(|(_, value)| value)
     }
 
+    /// Mutable field access (a Rust-side helper; the C++ class only
+    /// exposes the destructive `extract_field`).
+    pub fn get_mut_field(&mut self, name: &str) -> Option<&mut JsonValue> {
+        self.field_values
+            .iter_mut()
+            .find(|(field, _)| field == name)
+            .map(|(_, value)| value)
+    }
+
     /// Read-only iteration over the fields, in insertion order.
     pub fn iter_fields(&self) -> impl Iterator<Item = (&str, &JsonValue)> {
         self.field_values
