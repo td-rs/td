@@ -7219,6 +7219,24 @@ pub trait MessageContentContext {
         allow_get_by_hash: bool,
         is_secret: bool,
     ) -> Result<FileId, Status>;
+    /// `StickersManager::get_attached_sticker_file_ids`
+    /// (MessageContent.cpp:5300/5306).
+    fn get_attached_sticker_file_ids(&self, sticker_file_ids: Vec<i32>) -> Vec<FileId>;
+    /// `get_input_thumbnail_photo_size` (Photo.cpp:67-96); M.12.2.
+    fn get_input_thumbnail_photo_size(
+        &mut self,
+        thumbnail: Option<td_api::InputThumbnail>,
+        dialog_id: DialogId,
+        is_secret: bool,
+    ) -> Result<PhotoSize, Status>;
+    /// `FileManager::from_persistent_id` (InputInvoice.cpp:153); M.12.2.
+    /// The C++ member-function name carries over.
+    #[allow(clippy::wrong_self_convention)]
+    fn from_persistent_id(
+        &self,
+        persistent_id: &str,
+        file_type: crate::files::FileType,
+    ) -> Result<FileId, Status>;
 }
 
 /// `is_local_poll_id` (PollManager.cpp:449-452) — the local (unsent)
@@ -10704,17 +10722,13 @@ pub fn extract_input_invert_media(input_message_content: &td_api::InputMessageCo
 // seam.
 // ---------------------------------------------------------------------------
 
-/// `check_currency_amount` (misc.cpp:390-393). The M.9.4c invoice arm is
-/// the consumer.
-#[allow(dead_code)]
+/// `check_currency_amount` (misc.cpp:390-393).
 fn check_currency_amount(amount: i64) -> bool {
     const MAX_AMOUNT: i64 = 9999_9999_9999;
     (-MAX_AMOUNT..=MAX_AMOUNT).contains(&amount)
 }
 
 /// `LabeledPricePart::get_labeled_price_parts` (LabeledPricePart.cpp:24-56).
-/// The M.9.4c invoice arm is the consumer.
-#[allow(dead_code)]
 fn get_labeled_price_parts(
     parts: Vec<td_api::LabeledPricePart>,
 ) -> Result<(Vec<LabeledPricePart>, i64), Status> {
@@ -11134,13 +11148,47 @@ pub fn create_input_message_content(
                 "Rich message input is not supported yet",
             ));
         }
-        // M.9.4c.
-        td_api::InputMessageContent::inputMessagePaidMedia(_) => {
-            return Err(Status::error(400, "Paid media input is not supported yet"));
+        td_api::InputMessageContent::inputMessagePaidMedia(input_paid_media) => {
+            invert_media = input_paid_media.show_caption_above_media && !is_secret;
+
+            if input_paid_media.star_count <= 0
+                || input_paid_media.star_count
+                    > if is_bot {
+                        1000000
+                    } else {
+                        td.get_option_integer("paid_media_message_star_count_max", 0)
+                    }
+            {
+                return Err(Status::error(400, "Invalid media price specified"));
+            }
+            let mut extended_media = Vec::with_capacity(input_paid_media.paid_media.len());
+            for paid_media in input_paid_media.paid_media {
+                let media = get_message_extended_media(td, Some(paid_media), dialog_id)?;
+                if media.is_empty() {
+                    return Err(Status::error(400, "Paid media must be non-empty"));
+                }
+                extended_media.push(media);
+            }
+            const MAX_PAID_MEDIA: usize = 10; // server-side limit
+            if extended_media.is_empty() || extended_media.len() > MAX_PAID_MEDIA {
+                return Err(Status::error(400, "Invalid number of paid media specified"));
+            }
+
+            content = MessageContent::PaidMedia(MessagePaidMedia {
+                media: extended_media,
+                caption,
+                star_count: input_paid_media.star_count,
+                payload: input_paid_media.payload,
+            });
         }
-        // M.9.4c.
         td_api::InputMessageContent::inputMessageInvoice(_) => {
-            return Err(Status::error(400, "Invoice input is not supported yet"));
+            if !is_bot {
+                return Err(Status::error(400, "Invoices can be sent only by bots"));
+            }
+
+            let input_invoice =
+                process_input_message_invoice(td, input_message_content, dialog_id)?;
+            content = MessageContent::Invoice(MessageInvoice { input_invoice });
         }
         // M.9.4d.
         td_api::InputMessageContent::inputMessagePoll(_) => {
@@ -11175,6 +11223,325 @@ pub fn create_input_message_content(
         via_bot_user_id,
         emoji,
     })
+}
+
+// ---------------------------------------------------------------------------
+// M.9.4c — the paid-media and invoice arms
+// (MessageExtendedMedia::get_message_extended_media,
+// MessageExtendedMedia.cpp:130-216; InputInvoice::process_input_message_invoice,
+// InputInvoice.cpp:107-230). The FileManager reads ride the seams from the
+// create section.
+// ---------------------------------------------------------------------------
+
+/// `MessageExtendedMedia::get_message_extended_media`
+/// (MessageExtendedMedia.cpp:130-216).
+pub fn get_message_extended_media(
+    td: &mut dyn MessageContentContext,
+    paid_media: Option<td_api::InputPaidMedia>,
+    owner_dialog_id: DialogId,
+) -> Result<MessageExtendedMedia, Status> {
+    let Some(paid_media) = paid_media else {
+        return Ok(MessageExtendedMedia::default());
+    };
+    if !owner_dialog_id.is_valid() {
+        return Err(Status::error(
+            400,
+            "Extended media can't be added to the invoice",
+        ));
+    }
+    let Some(media_type) = paid_media.r#type else {
+        return Err(Status::error(400, "Paid media type must be non-empty"));
+    };
+
+    let mut result = MessageExtendedMedia::default();
+
+    let file_type = match media_type {
+        td_api::InputPaidMediaType::inputPaidMediaTypePhoto(_) => {
+            result.r#type = MessageExtendedMediaType::Photo;
+            crate::files::FileType::Photo
+        }
+        td_api::InputPaidMediaType::inputPaidMediaTypeVideo(_) => {
+            result.r#type = MessageExtendedMediaType::Video;
+            crate::files::FileType::Video
+        }
+    };
+
+    let file_id =
+        td.get_input_file_id(file_type, paid_media.media, owner_dialog_id, false, false)?;
+    assert!(file_id.is_valid());
+
+    let sticker_file_ids = td.get_attached_sticker_file_ids(paid_media.added_sticker_file_ids);
+    let thumbnail =
+        td.get_input_thumbnail_photo_size(paid_media.thumbnail, owner_dialog_id, false)?;
+
+    match media_type {
+        td_api::InputPaidMediaType::inputPaidMediaTypePhoto(media_type) => {
+            let photo = td.create_photo_input(
+                file_id,
+                thumbnail,
+                paid_media.width,
+                paid_media.height,
+                sticker_file_ids,
+            )?;
+            result.photo = photo;
+            if media_type.video.is_some() {
+                let video_file_id = td.get_input_file_id(
+                    crate::files::FileType::LivePhoto,
+                    media_type.video,
+                    owner_dialog_id,
+                    false,
+                    false,
+                )?;
+                td.create_video(
+                    video_file_id,
+                    PhotoSize::default(),
+                    false,
+                    Vec::new(),
+                    String::new(),
+                    "video/mp4".to_string(),
+                    0,
+                    crate::photo::get_dimensions(
+                        paid_media.width,
+                        paid_media.height,
+                        "inputPaidMedia",
+                    ),
+                    false,
+                );
+                result.video_file_id = video_file_id;
+            }
+        }
+        td_api::InputPaidMediaType::inputPaidMediaTypeVideo(media_type) => {
+            let cover_file_id = td.get_input_file_id(
+                crate::files::FileType::Photo,
+                media_type.cover,
+                owner_dialog_id,
+                true,
+                false,
+            )?;
+            let cover = if cover_file_id.is_valid() {
+                td.create_photo_input(
+                    cover_file_id,
+                    PhotoSize::default(),
+                    paid_media.width,
+                    paid_media.height,
+                    Vec::new(),
+                )?
+            } else {
+                Photo::default()
+            };
+
+            let Some((file_name, mime_type, _extension)) = td.get_file_view_details(file_id) else {
+                return Err(Status::error(400, "Wrong file identifier specified"));
+            };
+
+            let has_stickers = !sticker_file_ids.is_empty();
+            td.create_video(
+                file_id,
+                thumbnail,
+                has_stickers,
+                sticker_file_ids,
+                file_name,
+                mime_type,
+                media_type.duration,
+                crate::photo::get_dimensions(paid_media.width, paid_media.height, "inputPaidMedia"),
+                media_type.supports_streaming,
+            );
+            result.video_file_id = file_id;
+            result.photo = cover;
+            result.start_timestamp = std::cmp::max(0, media_type.start_timestamp);
+        }
+    }
+    Ok(result)
+}
+
+/// `InputInvoice::process_input_message_invoice` (InputInvoice.cpp:107-230).
+pub fn process_input_message_invoice(
+    td: &mut dyn MessageContentContext,
+    input_message_content: td_api::InputMessageContent,
+    owner_dialog_id: DialogId,
+) -> Result<InputInvoice, Status> {
+    let td_api::InputMessageContent::inputMessageInvoice(input_invoice) = input_message_content
+    else {
+        unreachable!(
+            "the C++ CHECK(input_message_content->get_id() == inputMessageInvoice::ID) fired"
+        );
+    };
+    let Some(invoice) = input_invoice.invoice else {
+        return Err(Status::error(400, "Invoice must be non-empty"));
+    };
+
+    if crate::misc::clean_input_string(&input_invoice.title).is_none() {
+        return Err(Status::error(400, "Invoice title must be encoded in UTF-8"));
+    }
+    if crate::misc::clean_input_string(&input_invoice.description).is_none() {
+        return Err(Status::error(
+            400,
+            "Invoice description must be encoded in UTF-8",
+        ));
+    }
+    if crate::misc::clean_input_string(&input_invoice.photo_url).is_none() {
+        return Err(Status::error(
+            400,
+            "Invoice photo URL must be encoded in UTF-8",
+        ));
+    }
+    if crate::misc::clean_input_string(&input_invoice.start_parameter).is_none() {
+        return Err(Status::error(
+            400,
+            "Invoice bot start parameter must be encoded in UTF-8",
+        ));
+    }
+    if crate::misc::clean_input_string(&input_invoice.provider_token).is_none() {
+        return Err(Status::error(
+            400,
+            "Invoice provider token must be encoded in UTF-8",
+        ));
+    }
+    if crate::misc::clean_input_string(&input_invoice.provider_data).is_none() {
+        return Err(Status::error(
+            400,
+            "Invoice provider data must be encoded in UTF-8",
+        ));
+    }
+    if crate::misc::clean_input_string(&invoice.currency).is_none() {
+        return Err(Status::error(
+            400,
+            "Invoice currency must be encoded in UTF-8",
+        ));
+    }
+    if crate::misc::clean_input_string(&invoice.recurring_payment_terms_of_service_url).is_none() {
+        return Err(Status::error(
+            400,
+            "Invoice terms of service URL must be encoded in UTF-8",
+        ));
+    }
+    if crate::misc::clean_input_string(&invoice.terms_of_service_url).is_none() {
+        return Err(Status::error(
+            400,
+            "Invoice terms of service URL must be encoded in UTF-8",
+        ));
+    }
+
+    let mut result = InputInvoice {
+        title: input_invoice.title,
+        description: input_invoice.description,
+        ..InputInvoice::default()
+    };
+
+    match tdutils::http_url::parse_url(&input_invoice.photo_url) {
+        tdutils::status::Result::Ok(http_url) => {
+            let url = http_url.get_url();
+            match td.from_persistent_id(&url, crate::files::FileType::Temp) {
+                Ok(invoice_file_id) => {
+                    result.photo.id = 0;
+                    result.photo.photos.push(PhotoSize {
+                        size_type: 'n' as i32,
+                        size: input_invoice.photo_size,
+                        dimensions: crate::photo::get_dimensions(
+                            input_invoice.photo_width,
+                            input_invoice.photo_height,
+                            "inputMessageInvoice",
+                        ),
+                        file_id: invoice_file_id,
+                        ..PhotoSize::default()
+                    });
+                }
+                Err(_) => {
+                    tdutils::log_info!("Can't register URL {url}");
+                }
+            }
+        }
+        tdutils::status::Result::Err(_) => {
+            if !input_invoice.photo_url.is_empty() {
+                tdutils::log_info!("Can't register URL {}", input_invoice.photo_url);
+            }
+        }
+    }
+    result.start_parameter = input_invoice.start_parameter;
+
+    let (price_parts, total_amount) = get_labeled_price_parts(invoice.price_parts)?;
+    result.invoice.currency = invoice.currency;
+    result.invoice.price_parts = price_parts;
+    result.total_amount = total_amount;
+    result.invoice.subscription_period = std::cmp::max(invoice.subscription_period, 0);
+
+    if invoice.max_tip_amount < 0 || !check_currency_amount(invoice.max_tip_amount) {
+        return Err(Status::error(
+            400,
+            "Invalid max_tip_amount of the currency specified",
+        ));
+    }
+    for tip_amount in &invoice.suggested_tip_amounts {
+        if *tip_amount <= 0 {
+            return Err(Status::error(400, "Suggested tip amount must be positive"));
+        }
+        if *tip_amount > invoice.max_tip_amount {
+            return Err(Status::error(
+                400,
+                "Suggested tip amount can't be bigger than max_tip_amount",
+            ));
+        }
+    }
+    if invoice.suggested_tip_amounts.len() > 4 {
+        return Err(Status::error(
+            400,
+            "There can be at most 4 suggested tip amounts",
+        ));
+    }
+
+    result.invoice.max_tip_amount = invoice.max_tip_amount;
+    result.invoice.suggested_tip_amounts = invoice.suggested_tip_amounts;
+    result.invoice.recurring_payment_terms_of_service_url =
+        invoice.recurring_payment_terms_of_service_url;
+    result.invoice.terms_of_service_url = invoice.terms_of_service_url;
+    result.invoice.is_test = invoice.is_test;
+    result.invoice.need_name = invoice.need_name;
+    result.invoice.need_phone_number = invoice.need_phone_number;
+    result.invoice.need_email_address = invoice.need_email_address;
+    result.invoice.need_shipping_address = invoice.need_shipping_address;
+    result.invoice.send_phone_number_to_provider = invoice.send_phone_number_to_provider;
+    result.invoice.send_email_address_to_provider = invoice.send_email_address_to_provider;
+    result.invoice.is_flexible = invoice.is_flexible;
+    if result.invoice.send_phone_number_to_provider {
+        result.invoice.need_phone_number = true;
+    }
+    if result.invoice.send_email_address_to_provider {
+        result.invoice.need_email_address = true;
+    }
+    if result.invoice.is_flexible {
+        result.invoice.need_shipping_address = true;
+    }
+
+    // The C++ `string` payload is a byte container; the port's String
+    // keeps the documented UTF-8 divergence.
+    result.payload = String::from_utf8_lossy(&input_invoice.payload).into_owned();
+    result.provider_token = input_invoice.provider_token;
+    result.provider_data = input_invoice.provider_data;
+
+    let extended_media = get_message_extended_media(td, input_invoice.paid_media, owner_dialog_id)?;
+    result.extended_media = extended_media;
+    if !result.extended_media.is_empty() {
+        let is_bot = td.is_bot();
+        let extended_media_caption = crate::message_entity::get_formatted_text_of_input(
+            Some(&mut ContextUserManager { td }),
+            to_message_entity_dialog_id(owner_dialog_id),
+            input_invoice.paid_media_caption,
+            is_bot,
+            true,
+            false,
+            false,
+            None,
+            td.get_option_boolean("always_parse_markdown"),
+            td.get_option_integer("session_count", 0) as i32,
+            Some(&mut |custom_emoji_id, is_premium| {
+                is_premium || td.is_premium_custom_emoji(custom_emoji_id)
+            }),
+            td.can_use_premium_custom_emoji_in_dialog(owner_dialog_id),
+        )?;
+        result.extended_media_caption = extended_media_caption;
+    }
+
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -13405,6 +13772,7 @@ mod tests {
         my_id: UserId,
         checklist_title_max: i64,
         checklist_task_text_max: i64,
+        paid_media_star_count_max: i64,
         file_view_details: HashMap<FileId, (String, String, String)>,
         input_file_counter: i32,
         register_log: Vec<String>,
@@ -13461,6 +13829,7 @@ mod tests {
                 my_id: UserId::new(1000),
                 checklist_title_max: 100,
                 checklist_task_text_max: 100,
+                paid_media_star_count_max: 1000,
                 file_view_details: HashMap::new(),
                 input_file_counter: 0,
                 register_log: Vec::new(),
@@ -13592,6 +13961,7 @@ mod tests {
                 "checklist_task_count_max" => self.checklist_max,
                 "checklist_title_length_max" => self.checklist_title_max,
                 "checklist_task_text_length_max" => self.checklist_task_text_max,
+                "paid_media_message_star_count_max" => self.paid_media_star_count_max,
                 _ => default,
             }
         }
@@ -14011,7 +14381,17 @@ mod tests {
         }
 
         fn get_file_view_details(&self, file_id: FileId) -> Option<(String, String, String)> {
-            self.file_view_details.get(&file_id).cloned()
+            self.file_view_details.get(&file_id).cloned().or_else(|| {
+                if file_id.is_valid() {
+                    Some((
+                        "file.mp4".to_string(),
+                        "video/mp4".to_string(),
+                        "mp4".to_string(),
+                    ))
+                } else {
+                    None
+                }
+            })
         }
 
         fn create_animation(
@@ -14199,6 +14579,48 @@ mod tests {
                 file_id.get()
             ));
             Ok(file_id)
+        }
+
+        fn get_attached_sticker_file_ids(&self, sticker_file_ids: Vec<i32>) -> Vec<FileId> {
+            sticker_file_ids
+                .into_iter()
+                .map(|id| FileId::new(id, 0))
+                .collect()
+        }
+
+        fn get_input_thumbnail_photo_size(
+            &mut self,
+            thumbnail: Option<td_api::InputThumbnail>,
+            _dialog_id: DialogId,
+            _is_secret: bool,
+        ) -> Result<PhotoSize, Status> {
+            self.input_file_counter += 1;
+            let file_id = FileId::new(9000 + self.input_file_counter, 0);
+            let (width, height) = thumbnail
+                .map(|thumbnail| (thumbnail.width, thumbnail.height))
+                .unwrap_or_default();
+            self.register_log.push(format!(
+                "get_input_thumbnail_photo_size -> {}",
+                file_id.get()
+            ));
+            Ok(PhotoSize {
+                size_type: 't' as i32,
+                size: 0,
+                dimensions: Dimensions {
+                    width: width.max(0) as u16,
+                    height: height.max(0) as u16,
+                },
+                file_id,
+                ..PhotoSize::default()
+            })
+        }
+
+        fn from_persistent_id(
+            &self,
+            _persistent_id: &str,
+            _file_type: crate::files::FileType,
+        ) -> Result<FileId, Status> {
+            Ok(FileId::new(7000, 0))
         }
     }
 
@@ -17402,5 +17824,253 @@ mod tests {
             .unwrap_err();
             assert_eq!(error.code(), 400);
         }
+    }
+
+    #[test]
+    fn get_message_extended_media_validates_and_builds() {
+        let dialog_id = DialogId::from_user_id(UserId::new(7));
+
+        // a missing paid media is an empty medium
+        let mut td = TestContext::default();
+        assert!(
+            get_message_extended_media(&mut td, None, dialog_id)
+                .unwrap()
+                .is_empty()
+        );
+
+        // an invalid owner dialog is rejected
+        let error = get_message_extended_media(
+            &mut td,
+            Some(td_api::InputPaidMedia {
+                ..td_api::InputPaidMedia::default()
+            }),
+            DialogId::default(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.message(),
+            "Extended media can't be added to the invoice"
+        );
+
+        // a missing type is rejected
+        let error = get_message_extended_media(
+            &mut td,
+            Some(td_api::InputPaidMedia {
+                ..td_api::InputPaidMedia::default()
+            }),
+            dialog_id,
+        )
+        .unwrap_err();
+        assert_eq!(error.message(), "Paid media type must be non-empty");
+
+        // a photo medium
+        let mut td = TestContext::default();
+        let media = get_message_extended_media(
+            &mut td,
+            Some(td_api::InputPaidMedia {
+                r#type: Some(td_api::InputPaidMediaType::inputPaidMediaTypePhoto(
+                    td_api::inputPaidMediaTypePhoto { video: None },
+                )),
+                media: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                    id: 42,
+                })),
+                width: 100,
+                height: 200,
+                ..td_api::InputPaidMedia::default()
+            }),
+            dialog_id,
+        )
+        .unwrap();
+        assert_eq!(media.r#type, MessageExtendedMediaType::Photo);
+        assert!(!media.photo.photos.is_empty());
+        assert!(!media.video_file_id.is_valid());
+
+        // a video medium with a cover
+        let mut td = input_td();
+        let media = get_message_extended_media(
+            &mut td,
+            Some(td_api::InputPaidMedia {
+                r#type: Some(td_api::InputPaidMediaType::inputPaidMediaTypeVideo(
+                    td_api::inputPaidMediaTypeVideo {
+                        cover: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                            id: 43,
+                        })),
+                        start_timestamp: -5,
+                        duration: 9,
+                        supports_streaming: true,
+                    },
+                )),
+                media: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                    id: 42,
+                })),
+                width: 100,
+                height: 200,
+                ..td_api::InputPaidMedia::default()
+            }),
+            dialog_id,
+        )
+        .unwrap();
+        assert_eq!(media.r#type, MessageExtendedMediaType::Video);
+        assert!(media.video_file_id.is_valid());
+        assert_eq!(media.start_timestamp, 0);
+    }
+
+    #[test]
+    fn process_input_message_invoice_validates_and_builds() {
+        let dialog_id = DialogId::from_user_id(UserId::new(7));
+        let valid_invoice = || {
+            td_api::InputMessageContent::inputMessageInvoice(td_api::inputMessageInvoice {
+                invoice: Some(td_api::Invoice {
+                    currency: "USD".to_string(),
+                    price_parts: vec![td_api::LabeledPricePart {
+                        label: "item".to_string(),
+                        amount: 100,
+                    }],
+                    ..td_api::Invoice::default()
+                }),
+                title: "Thing".to_string(),
+                description: "A thing".to_string(),
+                photo_url: String::new(),
+                start_parameter: String::new(),
+                provider_token: "token".to_string(),
+                provider_data: String::new(),
+                payload: vec![1, 2, 3],
+                paid_media: None,
+                paid_media_caption: None,
+                ..td_api::inputMessageInvoice::default()
+            })
+        };
+
+        let mut td = TestContext::default();
+        let result = process_input_message_invoice(&mut td, valid_invoice(), dialog_id).unwrap();
+        assert_eq!(result.title, "Thing");
+        assert_eq!(result.invoice.currency, "USD");
+        assert_eq!(result.total_amount, 100);
+        assert_eq!(result.payload, "\u{1}\u{2}\u{3}");
+
+        // a missing invoice is rejected
+        let error = process_input_message_invoice(
+            &mut td,
+            td_api::InputMessageContent::inputMessageInvoice(td_api::inputMessageInvoice {
+                invoice: None,
+                ..td_api::inputMessageInvoice::default()
+            }),
+            dialog_id,
+        )
+        .unwrap_err();
+        assert_eq!(error.message(), "Invoice must be non-empty");
+
+        // empty price parts are rejected
+        let error = process_input_message_invoice(
+            &mut td,
+            td_api::InputMessageContent::inputMessageInvoice(td_api::inputMessageInvoice {
+                invoice: Some(td_api::Invoice {
+                    currency: "USD".to_string(),
+                    price_parts: vec![],
+                    ..td_api::Invoice::default()
+                }),
+                ..td_api::inputMessageInvoice::default()
+            }),
+            dialog_id,
+        )
+        .unwrap_err();
+        assert_eq!(error.message(), "There must be at least one price part");
+
+        // a too-big tip is rejected
+        let error = process_input_message_invoice(
+            &mut td,
+            td_api::InputMessageContent::inputMessageInvoice(td_api::inputMessageInvoice {
+                invoice: Some(td_api::Invoice {
+                    currency: "USD".to_string(),
+                    price_parts: vec![td_api::LabeledPricePart {
+                        label: "item".to_string(),
+                        amount: 100,
+                    }],
+                    max_tip_amount: 50,
+                    suggested_tip_amounts: vec![100],
+                    ..td_api::Invoice::default()
+                }),
+                ..td_api::inputMessageInvoice::default()
+            }),
+            dialog_id,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.message(),
+            "Suggested tip amount can't be bigger than max_tip_amount"
+        );
+    }
+
+    #[test]
+    fn create_input_message_content_paid_media_and_invoice_arms() {
+        let user_dialog = DialogId::from_user_id(UserId::new(7));
+        let file_id = input_file_id();
+
+        // a non-bot cannot send invoices
+        let mut td = input_td();
+        let error = create_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessageInvoice(td_api::inputMessageInvoice {
+                ..td_api::inputMessageInvoice::default()
+            }),
+            FormattedText::default(),
+            file_id,
+            PhotoSize::default(),
+            vec![],
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.message(), "Invoices can be sent only by bots");
+
+        // a negative paid-media price is rejected
+        let error = create_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessagePaidMedia(td_api::inputMessagePaidMedia {
+                star_count: -1,
+                ..td_api::inputMessagePaidMedia::default()
+            }),
+            FormattedText::default(),
+            file_id,
+            PhotoSize::default(),
+            vec![],
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.message(), "Invalid media price specified");
+
+        // paid media builds through the extended-media converter
+        let mut td = input_td();
+        let result = create_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessagePaidMedia(td_api::inputMessagePaidMedia {
+                star_count: 5,
+                paid_media: vec![td_api::InputPaidMedia {
+                    r#type: Some(td_api::InputPaidMediaType::inputPaidMediaTypePhoto(
+                        td_api::inputPaidMediaTypePhoto { video: None },
+                    )),
+                    media: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                        id: 42,
+                    })),
+                    width: 10,
+                    height: 20,
+                    ..td_api::InputPaidMedia::default()
+                }],
+                payload: "payload".to_string(),
+                ..td_api::inputMessagePaidMedia::default()
+            }),
+            FormattedText::default(),
+            file_id,
+            PhotoSize::default(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            &*result.content,
+            MessageContent::PaidMedia(m) if m.media.len() == 1 && m.star_count == 5 && m.payload == "payload"
+        ));
     }
 }
