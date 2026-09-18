@@ -227,6 +227,22 @@ int main(int argc, char *argv[]) {
     db.set_user_version(current_db_version()).ensure();
   }
   db.exec("COMMIT TRANSACTION").ensure();
+
+  // TdDb.cpp:469-476 — a freshly created dialog database resets three keys
+  // of the sqlite pmc; the first get_sqlite_sync_pmc() call materializes the
+  // "common" table (SqliteKeyValueSafe is a lazy scheduler-local storage).
+  // The erase_by_prefix form is the SqliteKeyValue.cpp:29-33 statement.
+  {
+    db.exec("CREATE TABLE IF NOT EXISTS common (k BLOB PRIMARY KEY, v BLOB)")
+        .ensure();
+    db.exec("DELETE FROM common WHERE k = 'calls_db_state'").ensure();
+    db.exec("DELETE FROM common WHERE k = 'di_active_live_location_messages'")
+        .ensure();
+    db.exec("DELETE FROM common WHERE 'channel_recommendations' <= k AND k < "
+            "'channel_recommendationt'")
+        .ensure();
+  }
+
   db.close();
   LOG(PLAIN) << "OK user_version=" << current_db_version();
   return 0;

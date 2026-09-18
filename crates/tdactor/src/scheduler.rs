@@ -1075,6 +1075,13 @@ impl SchedulerState {
             let Some(TimeoutEntry(_, id, generation)) = entry else {
                 break;
             };
+            // the entry may outlive the actor: destroy_actor frees the
+            // ActorInfo once `alive` is published false, and a canceled
+            // timeout leaves its (generation-stale) heap entry behind — skip
+            // dead actors before touching the slot
+            if !id.is_alive() {
+                continue;
+            }
             let info = self.info(&id);
             if info.timeout_gen.get() == generation {
                 info.deadline.set(None);

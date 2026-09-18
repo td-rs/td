@@ -57,6 +57,7 @@ use crate::config_recoverer::{
 use crate::config_result;
 use crate::connection_creator::ConnectionCreator;
 use crate::convert::{self, MessageSpec};
+use crate::dialog_manager::DialogManager;
 use crate::global::Global;
 use crate::link_manager::LinkManager;
 use crate::manager_option_states::ManagerOptionStates;
@@ -263,6 +264,13 @@ pub struct Td {
     /// queries).
     #[allow(dead_code)]
     premium_required_contact_merger: Option<ActorOwn<QueryMerger>>,
+    /// `Td::chat_manager_` — the basic-group/supergroup cache (created with
+    /// Td; its binlog replay rides the same `process_binlog_events` pass as
+    /// the users, in the C++ users→chats→channels order).
+    pub(crate) chat_manager: crate::chat_manager::ChatManager,
+    /// `Td::dialog_manager_` — the M.6 facade state (recent-dialog lists +
+    /// search hints); the actor-dependent halves land with M.6.18+.
+    pub(crate) dialog_manager: DialogManager,
     /// `Td::stop_cnt_` — the hangup and the close completion each drop one.
     stop_cnt: i32,
     /// The deferred-response outbox. The C++ request promises re-enter the
@@ -346,6 +354,8 @@ impl Td {
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
             notification_updates: Vec::new(),
             premium_required_contact_merger: None,
+            chat_manager: crate::chat_manager::ChatManager::new(),
+            dialog_manager: DialogManager::new(),
             stop_cnt: 2,
             deferred_results: Arc::new(Mutex::new(Vec::new())),
             bridge: None,
@@ -512,6 +522,9 @@ impl Td {
         let secret_chat_events = std::mem::take(&mut opened_database.secret_chat_events);
         let notification_settings_events =
             std::mem::take(&mut opened_database.notification_settings_events);
+        let chat_events = std::mem::take(&mut opened_database.chat_events);
+        let channel_events = std::mem::take(&mut opened_database.channel_events);
+        let dialog_manager_events = std::mem::take(&mut opened_database.dialog_manager_events);
 
         if self.state == State::Close {
             // Close asynchronously opened database
@@ -890,6 +903,21 @@ impl Td {
                 self.user_manager
                     .on_binlog_secret_chat_event(&mut env, event);
             }
+            // the C++ replays the chats vector, then the channels vector
+            // (Td.cpp:966-990, users→chats→channels order); the chat
+            // handlers ride the M.5.18 diff machine, the channel handlers
+            // run the save fan-out directly until M.5.19 lands
+            for event in &chat_events {
+                self.chat_manager
+                    .on_binlog_chat_event(&mut self.user_manager, &mut env, event);
+            }
+            for event in &channel_events {
+                self.chat_manager
+                    .on_binlog_channel_event(&mut self.user_manager, &mut env, event);
+            }
+        }
+        for event in &dialog_manager_events {
+            crate::dialog_manager::on_binlog_dialog_events(self, std::slice::from_ref(event));
         }
         self.flush_user_updates();
 
@@ -1324,6 +1352,13 @@ impl Td {
         {
             expire_time = user_deadline;
         }
+        // The ChatManager's channel deadlines join the same slot (M.5.14):
+        // the earliest of the four sources wins.
+        if let Some(chat_deadline) = self.chat_manager.next_deadline()
+            && (expire_time == 0.0 || chat_deadline < expire_time)
+        {
+            expire_time = chat_deadline;
+        }
         // The NotificationManager's two timeout families share the same
         // slot (M.13): the fired timeout runs `tick_timeouts`.
         if let Some(notification_deadline) = self.notification_manager.next_deadline()
@@ -1701,8 +1736,13 @@ impl Td {
 
     /// Drain the UserManager's queued `updateUser`-class broadcasts (the
     /// C++ sends them straight to `Td::send_update` from the manager).
+    /// Drain the managers' queued update broadcasts (the C++ sends them
+    /// straight to `Td::send_update` from the managers).
     pub(crate) fn flush_user_updates(&mut self) {
         for update in self.user_manager.take_updates() {
+            self.send_update(update.into());
+        }
+        for update in self.chat_manager.take_updates() {
             self.send_update(update.into());
         }
         let notification_updates = std::mem::take(&mut self.notification_updates);
@@ -2621,6 +2661,10 @@ impl Actor for Td {
     /// re-requests the expired config, re-runs the recoverer's loop and
     /// ticks the user timeouts; every arm/cancel point then re-arms the
     /// slot at the earliest deadline through `sync_config_timeout`.
+    /// The member MultiTimeouts (the user online/emoji-status pair and the
+    /// ChatManager channel trio) fire here — their C++ callbacks hop back
+    /// into the manager actors; the sweep then re-arms at the next
+    /// deadline, like the MultiTimeouts' set/cancel re-arm.
     fn timeout_expired(&mut self) {
         let close_flag = self.close_flag != 0;
         // The NotificationManager's two timeout families (M.13): the C++
@@ -2662,6 +2706,8 @@ impl Actor for Td {
                 auth_is_bot: self.auth_manager.is_bot(),
             };
             self.user_manager.tick_timeouts(&mut env);
+            self.chat_manager
+                .tick_timeouts(&mut self.user_manager, &mut env);
         }
         self.flush_user_updates();
         self.rearm_user_timeouts();
