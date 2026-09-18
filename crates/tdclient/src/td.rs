@@ -2854,10 +2854,9 @@ impl Actor for Td {
 
         // The update engine's timers (the gap fills, the throttled pmc
         // saves, the getDifference retry and the data reloaders; M.7.18).
-        {
-            let Some(options) = self.option_manager.as_mut() else {
-                return;
-            };
+        // Pre-init the ticks skip — the tail flush below must still run:
+        // a pre-init alarm settles its parked promise through it.
+        if let Some(options) = self.option_manager.as_mut() {
             let mut env = TdUpdatesEnv {
                 global: &mut self.global,
                 options,
