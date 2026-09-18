@@ -312,6 +312,15 @@ pub fn photo_get_file_ids(photo: &Photo) -> Vec<FileId> {
     file_ids
 }
 
+/// `get_photo_any_file_id` (Photo.cpp:451-457) — the file id of the last
+/// size, i.e. the best full representation.
+pub fn get_photo_any_file_id(photo: &Photo) -> FileId {
+    if let Some(last) = photo.photos.last() {
+        return last.file_id;
+    }
+    FileId::default()
+}
+
 /// `photo_append_file_ids` (Photo.cpp:440).
 fn photo_append_file_ids(photo: &Photo, file_ids: &mut Vec<FileId>) {
     for photo_size in &photo.photos {

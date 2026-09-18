@@ -72,6 +72,16 @@
 //! port takes `&mut MessageContent` for the old side. The Text-arm
 //! change logs stand in with a collapsed repr until M.9.16.
 //!
+//! M.9.11 is the compare machinery: [`are_message_contents_same`] /
+//! [`compare_message_contents`] / [`merge_and_compare_message_contents`]
+//! and the file-id remotes (MessageContent.cpp:7959-8942), with
+//! `get_message_content_any_file_id(s)` (MessageContent.cpp:12596-12654)
+//! landed ahead of their M.9.17 region as the dependency. The compare
+//! switch is exhaustive over the modeled variants; the C++ no-op arms
+//! collapse into the catch-all. The Poll-arm reads ride the owned seam
+//! (the in-place write-back of poll-stored option media lands with the
+//! Wave-2 PollManager ref overload — recorded divergence).
+//!
 //! The td_api/telegram_api
 //! conversions arrive with their own slices. Value companions living here
 //! that later move to their owners' modules: `Location`/`Venue` (the
@@ -1260,6 +1270,36 @@ impl MessageExtendedMedia {
         }
     }
 
+    /// `MessageExtendedMedia::is_equal_but_different`
+    /// (MessageExtendedMedia.cpp:449-452).
+    pub fn is_equal_but_different(&self, other: &MessageExtendedMedia) -> bool {
+        self.r#type == MessageExtendedMediaType::Unsupported
+            && other.r#type == MessageExtendedMediaType::Unsupported
+            && self.unsupported_version != other.unsupported_version
+    }
+
+    /// `MessageExtendedMedia::get_any_file_id` (MessageExtendedMedia.cpp:324-336).
+    pub fn get_any_file_id(&self) -> FileId {
+        match self.r#type {
+            MessageExtendedMediaType::Photo => crate::photo::get_photo_any_file_id(&self.photo),
+            MessageExtendedMediaType::Video => self.video_file_id,
+            MessageExtendedMediaType::Empty
+            | MessageExtendedMediaType::Unsupported
+            | MessageExtendedMediaType::Preview => FileId::default(),
+        }
+    }
+
+    /// `MessageExtendedMedia::update_file_id_remote`
+    /// (MessageExtendedMedia.cpp:375-382).
+    pub fn update_file_id_remote(&mut self, file_id: FileId) {
+        if file_id.get_remote() == 0 || self.r#type != MessageExtendedMediaType::Video {
+            return;
+        }
+        if self.video_file_id == file_id && self.video_file_id.get_remote() == 0 {
+            self.video_file_id = file_id;
+        }
+    }
+
     /// `MessageExtendedMedia::merge_files` (MessageExtendedMedia.cpp:429-447).
     pub fn merge_files(
         &self,
@@ -1354,6 +1394,11 @@ impl InputInvoice {
     pub fn update_from(&mut self, old_input_invoice: &InputInvoice) {
         self.extended_media
             .update_from(&old_input_invoice.extended_media);
+    }
+
+    /// `InputInvoice::get_any_file_id` (InputInvoice.cpp:379-381).
+    pub fn get_any_file_id(&self) -> FileId {
+        self.extended_media.get_any_file_id()
     }
 
     /// `InputInvoice::get_caption` (InputInvoice.cpp) — the caption of the
@@ -6997,6 +7042,12 @@ pub trait MessageContentContext {
     /// comparison and `register_remote` — lands with the M.12.2
     /// FileManager.
     fn merge_photo_files(&mut self, old_photo: &Photo, new_photo: &Photo, dialog_id: DialogId);
+
+    // -- Compare family (MessageContent.cpp:7959-8942) --
+    /// `WebPagesManager::have_web_page` (MessageContent.cpp:7984-7985).
+    fn have_web_page(&self, web_page_id: WebPageId) -> bool;
+    /// `FileManager::try_merge_documents` (MessageContent.cpp:8899-8900).
+    fn try_merge_documents(&mut self, new_file_id: FileId, old_file_id: FileId);
 }
 
 /// `is_local_poll_id` (PollManager.cpp:449-452) — the local (unsent)
@@ -9054,6 +9105,899 @@ pub fn merge_message_content_file_id(
         }
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// M.9.11 — are_message_contents_same / compare_message_contents + the
+// file-id remotes + merge_and_compare_message_contents
+// (MessageContent.cpp:7959-8942), plus get_message_content_any_file_id(s)
+// (MessageContent.cpp:12596-12654, the M.9.17 region — landed here as the
+// dependency). The Poll arms read through the owned
+// [`MessageContentContext::get_poll_individual_message_contents`] seam;
+// the C++ in-place remote update of poll-stored option media writes back
+// when the Wave-2 PollManager implements the ref-returning overload (the
+// owned copies are compared/merged, the write-back is a recorded
+// divergence until then). The StarGift/RichText/ChatSetTheme arms are
+// deferred with the unmodeled variants.
+// ---------------------------------------------------------------------------
+
+/// `get_message_content_any_file_id` (MessageContent.cpp:12596-12626) —
+/// the file id of the content's main media, if any.
+pub fn get_message_content_any_file_id(content: &MessageContent) -> FileId {
+    match content {
+        MessageContent::Animation(m) => m.file_id,
+        MessageContent::Audio(m) => m.file_id,
+        MessageContent::Document(m) => m.file_id,
+        MessageContent::Invoice(m) => m.input_invoice.get_any_file_id(),
+        MessageContent::Photo(m) => crate::photo::get_photo_any_file_id(&m.photo),
+        MessageContent::Sticker(m) => m.file_id,
+        MessageContent::Video(m) => m.file_id,
+        MessageContent::VideoNote(m) => m.file_id,
+        MessageContent::VoiceNote(m) => m.file_id,
+        _ => FileId::default(),
+    }
+}
+
+/// `get_message_content_any_file_ids` (MessageContent.cpp:12628-12654).
+pub fn get_message_content_any_file_ids(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> Vec<FileId> {
+    match content {
+        MessageContent::PaidMedia(m) => m
+            .media
+            .iter()
+            .map(|media| media.get_any_file_id())
+            .collect(),
+        MessageContent::Poll(m) => td
+            .get_poll_individual_message_contents(m.poll_id, m.attached_media.as_deref())
+            .iter()
+            .map(get_message_content_any_file_id)
+            .collect(),
+        _ => {
+            let file_id = get_message_content_any_file_id(content);
+            if file_id.is_valid() {
+                vec![file_id]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// `are_message_contents_same` (MessageContent.cpp:7959-7964).
+pub fn are_message_contents_same(
+    td: Option<&dyn MessageContentContext>,
+    lhs_content: Option<&MessageContent>,
+    rhs_content: Option<&MessageContent>,
+) -> bool {
+    let mut is_content_changed = false;
+    let mut need_update = false;
+    compare_message_contents(
+        td,
+        lhs_content,
+        rhs_content,
+        &mut is_content_changed,
+        &mut need_update,
+    );
+    !is_content_changed && !need_update
+}
+
+/// `compare_message_contents` (MessageContent.cpp:7966-8802). The C++
+/// `Td *` may be null — `td` is an option. The no-op C++ arm list
+/// collapses into the catch-all; the StarGift-family and RichText and
+/// ChatSetTheme arms are deferred with the unmodeled variants. The
+/// single-`if` arms mirror the C++ case bodies 1-to-1, hence the
+/// collapsible-match allow.
+#[allow(clippy::collapsible_match)]
+pub fn compare_message_contents(
+    td: Option<&dyn MessageContentContext>,
+    old_content: Option<&MessageContent>,
+    new_content: Option<&MessageContent>,
+    is_content_changed: &mut bool,
+    need_update: &mut bool,
+) {
+    let Some(old) = old_content else {
+        if new_content.is_some() {
+            *need_update = true;
+        }
+        return;
+    };
+    let content_type = old.get_type();
+    let Some(new) = new_content else {
+        *need_update = true;
+        return;
+    };
+    if new.get_type() != content_type {
+        *need_update = true;
+        return;
+    }
+
+    match (old, new) {
+        (MessageContent::Text(lhs), MessageContent::Text(rhs)) => {
+            if lhs.text.text != rhs.text.text
+                || lhs.text.entities != rhs.text.entities
+                || lhs.web_page_url != rhs.web_page_url
+                || lhs.force_small_media != rhs.force_small_media
+                || lhs.force_large_media != rhs.force_large_media
+            {
+                *need_update = true;
+            } else if lhs.web_page_id != rhs.web_page_id
+                || lhs.skip_web_page_confirmation != rhs.skip_web_page_confirmation
+            {
+                *is_content_changed = true;
+                let have_web_page =
+                    |web_page_id: WebPageId| td.is_some_and(|td| td.have_web_page(web_page_id));
+                if td.is_none() || have_web_page(lhs.web_page_id) || have_web_page(rhs.web_page_id)
+                {
+                    *need_update = true;
+                }
+            }
+        }
+        (MessageContent::Animation(lhs), MessageContent::Animation(rhs)) => {
+            if lhs.file_id != rhs.file_id
+                || lhs.caption != rhs.caption
+                || lhs.has_spoiler != rhs.has_spoiler
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::Audio(lhs), MessageContent::Audio(rhs)) => {
+            if lhs.file_id != rhs.file_id || lhs.caption != rhs.caption {
+                *need_update = true;
+            }
+        }
+        (MessageContent::Contact(lhs), MessageContent::Contact(rhs)) => {
+            if lhs.contact != rhs.contact {
+                *need_update = true;
+            }
+        }
+        (MessageContent::Document(lhs), MessageContent::Document(rhs)) => {
+            if lhs.file_id != rhs.file_id || lhs.caption != rhs.caption {
+                *need_update = true;
+            }
+        }
+        (MessageContent::Game(lhs), MessageContent::Game(rhs)) => {
+            if lhs.game != rhs.game {
+                *need_update = true;
+            }
+        }
+        (MessageContent::Invoice(lhs), MessageContent::Invoice(rhs)) => {
+            if lhs.input_invoice != rhs.input_invoice {
+                *need_update = true;
+            } else if lhs
+                .input_invoice
+                .extended_media
+                .is_equal_but_different(&rhs.input_invoice.extended_media)
+            {
+                *is_content_changed = true;
+            }
+        }
+        (MessageContent::LiveLocation(lhs), MessageContent::LiveLocation(rhs)) => {
+            if lhs.location != rhs.location
+                || lhs.period != rhs.period
+                || lhs.heading != rhs.heading
+                || lhs.proximity_alert_radius != rhs.proximity_alert_radius
+            {
+                *need_update = true;
+            } else if lhs.location.get_access_hash() != rhs.location.get_access_hash() {
+                *is_content_changed = true;
+            }
+        }
+        (MessageContent::Location(lhs), MessageContent::Location(rhs)) => {
+            if lhs.location != rhs.location {
+                *need_update = true;
+            } else if lhs.location.get_access_hash() != rhs.location.get_access_hash() {
+                *is_content_changed = true;
+            }
+        }
+        (MessageContent::Photo(lhs), MessageContent::Photo(rhs)) => {
+            if lhs.video_file_id != rhs.video_file_id
+                || lhs.caption != rhs.caption
+                || lhs.has_spoiler != rhs.has_spoiler
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::Sticker(lhs), MessageContent::Sticker(rhs)) => {
+            if lhs.file_id != rhs.file_id || lhs.is_premium != rhs.is_premium {
+                *need_update = true;
+            }
+        }
+        (MessageContent::Venue(lhs), MessageContent::Venue(rhs)) => {
+            if lhs.venue != rhs.venue {
+                *need_update = true;
+            } else if lhs.venue.location.get_access_hash() != rhs.venue.location.get_access_hash() {
+                *is_content_changed = true;
+            }
+        }
+        (MessageContent::Video(lhs), MessageContent::Video(rhs)) => {
+            if lhs.file_id != rhs.file_id
+                || lhs.alternative_file_ids != rhs.alternative_file_ids
+                || lhs.hls_file_ids != rhs.hls_file_ids
+                || lhs.storyboard_file_ids != rhs.storyboard_file_ids
+                || lhs.storyboard_map_file_ids != rhs.storyboard_map_file_ids
+                || lhs.cover != rhs.cover
+                || lhs.start_timestamp != rhs.start_timestamp
+                || lhs.caption != rhs.caption
+                || lhs.has_spoiler != rhs.has_spoiler
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::VideoNote(lhs), MessageContent::VideoNote(rhs)) => {
+            if lhs.file_id != rhs.file_id || lhs.is_viewed != rhs.is_viewed {
+                *need_update = true;
+            }
+        }
+        (MessageContent::VoiceNote(lhs), MessageContent::VoiceNote(rhs)) => {
+            if lhs.file_id != rhs.file_id
+                || lhs.caption != rhs.caption
+                || lhs.is_listened != rhs.is_listened
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::ChatCreate(lhs), MessageContent::ChatCreate(rhs)) => {
+            if lhs.title != rhs.title || lhs.participant_user_ids != rhs.participant_user_ids {
+                *need_update = true;
+            }
+        }
+        (MessageContent::ChatChangeTitle(lhs), MessageContent::ChatChangeTitle(rhs)) => {
+            if lhs.title != rhs.title {
+                *need_update = true;
+            }
+        }
+        (MessageContent::ChatChangePhoto(lhs), MessageContent::ChatChangePhoto(rhs)) => {
+            if lhs.photo != rhs.photo {
+                *need_update = true;
+            }
+        }
+        (MessageContent::ChatAddUsers(lhs), MessageContent::ChatAddUsers(rhs)) => {
+            if lhs.user_ids != rhs.user_ids {
+                *need_update = true;
+            }
+        }
+        (MessageContent::ChatJoinedByLink(lhs), MessageContent::ChatJoinedByLink(rhs)) => {
+            if lhs.is_approved != rhs.is_approved {
+                *need_update = true;
+            }
+        }
+        (MessageContent::ChatDeleteUser(lhs), MessageContent::ChatDeleteUser(rhs)) => {
+            if lhs.user_id != rhs.user_id {
+                *need_update = true;
+            }
+        }
+        (MessageContent::ChatMigrateTo(lhs), MessageContent::ChatMigrateTo(rhs)) => {
+            if lhs.migrated_to_channel_id != rhs.migrated_to_channel_id {
+                *need_update = true;
+            }
+        }
+        (MessageContent::ChannelCreate(lhs), MessageContent::ChannelCreate(rhs)) => {
+            if lhs.title != rhs.title {
+                *need_update = true;
+            }
+        }
+        (MessageContent::ChannelMigrateFrom(lhs), MessageContent::ChannelMigrateFrom(rhs)) => {
+            if lhs.title != rhs.title || lhs.migrated_from_chat_id != rhs.migrated_from_chat_id {
+                *need_update = true;
+            }
+        }
+        (MessageContent::PinMessage(lhs), MessageContent::PinMessage(rhs)) => {
+            if lhs.message_id != rhs.message_id {
+                *need_update = true;
+            }
+        }
+        (MessageContent::GameScore(lhs), MessageContent::GameScore(rhs)) => {
+            if lhs.game_message_id != rhs.game_message_id
+                || lhs.game_id != rhs.game_id
+                || lhs.score != rhs.score
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::ChatSetTtl(lhs), MessageContent::ChatSetTtl(rhs)) => {
+            if lhs.ttl != rhs.ttl || lhs.from_user_id != rhs.from_user_id {
+                *need_update = true;
+            }
+        }
+        (MessageContent::Call(lhs), MessageContent::Call(rhs)) => {
+            if lhs.duration != rhs.duration
+                || lhs.discard_reason != rhs.discard_reason
+                || lhs.is_video != rhs.is_video
+                || lhs.call_id != rhs.call_id
+                || lhs.call_access_hash != rhs.call_access_hash
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::PaymentSuccessful(lhs), MessageContent::PaymentSuccessful(rhs)) => {
+            if lhs.invoice_dialog_id != rhs.invoice_dialog_id
+                || lhs.invoice_message_id != rhs.invoice_message_id
+                || lhs.currency != rhs.currency
+                || lhs.total_amount != rhs.total_amount
+                || lhs.invoice_payload != rhs.invoice_payload
+                || lhs.shipping_option_id != rhs.shipping_option_id
+                || lhs.telegram_payment_charge_id != rhs.telegram_payment_charge_id
+                || lhs.provider_payment_charge_id != rhs.provider_payment_charge_id
+                || lhs.order_info != rhs.order_info
+                || lhs.is_recurring != rhs.is_recurring
+                || lhs.is_first_recurring != rhs.is_first_recurring
+                || lhs.subscription_until_date != rhs.subscription_until_date
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::CustomServiceAction(lhs), MessageContent::CustomServiceAction(rhs)) => {
+            if lhs.message != rhs.message {
+                *need_update = true;
+            }
+        }
+        (MessageContent::WebsiteConnected(lhs), MessageContent::WebsiteConnected(rhs)) => {
+            if lhs.domain_name != rhs.domain_name {
+                *need_update = true;
+            }
+        }
+        (MessageContent::PassportDataSent(lhs), MessageContent::PassportDataSent(rhs)) => {
+            if lhs.types != rhs.types {
+                *need_update = true;
+            }
+        }
+        (MessageContent::PassportDataReceived(lhs), MessageContent::PassportDataReceived(rhs)) => {
+            if lhs.values != rhs.values || lhs.credentials != rhs.credentials {
+                *need_update = true;
+            }
+        }
+        (MessageContent::Poll(lhs), MessageContent::Poll(rhs)) => {
+            if lhs.poll_id != rhs.poll_id || lhs.caption != rhs.caption {
+                *need_update = true;
+            }
+            compare_message_contents(
+                td,
+                lhs.attached_media.as_deref(),
+                rhs.attached_media.as_deref(),
+                is_content_changed,
+                need_update,
+            );
+        }
+        (MessageContent::Dice(lhs), MessageContent::Dice(rhs)) => {
+            if lhs.emoji != rhs.emoji
+                || lhs.dice_value != rhs.dice_value
+                || lhs.is_stake != rhs.is_stake
+                || lhs.stake_ton_count != rhs.stake_ton_count
+                || lhs.prize_ton_count != rhs.prize_ton_count
+            {
+                *need_update = true;
+            } else if lhs.seed != rhs.seed || lhs.state_hash != rhs.state_hash {
+                *is_content_changed = true;
+            }
+        }
+        (
+            MessageContent::ProximityAlertTriggered(lhs),
+            MessageContent::ProximityAlertTriggered(rhs),
+        ) => {
+            if lhs.traveler_dialog_id != rhs.traveler_dialog_id
+                || lhs.watcher_dialog_id != rhs.watcher_dialog_id
+                || lhs.distance != rhs.distance
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::GroupCall(lhs), MessageContent::GroupCall(rhs)) => {
+            if lhs.input_group_call_id != rhs.input_group_call_id
+                || lhs.duration != rhs.duration
+                || lhs.schedule_date != rhs.schedule_date
+            {
+                *need_update = true;
+            } else if !lhs
+                .input_group_call_id
+                .is_identical(rhs.input_group_call_id)
+            {
+                *is_content_changed = true;
+            }
+        }
+        (MessageContent::InviteToGroupCall(lhs), MessageContent::InviteToGroupCall(rhs)) => {
+            if lhs.input_group_call_id != rhs.input_group_call_id || lhs.user_ids != rhs.user_ids {
+                *need_update = true;
+            } else if !lhs
+                .input_group_call_id
+                .is_identical(rhs.input_group_call_id)
+            {
+                *is_content_changed = true;
+            }
+        }
+        (MessageContent::WebViewDataSent(lhs), MessageContent::WebViewDataSent(rhs)) => {
+            if lhs.button_text != rhs.button_text {
+                *need_update = true;
+            }
+        }
+        (MessageContent::WebViewDataReceived(lhs), MessageContent::WebViewDataReceived(rhs)) => {
+            if lhs.button_text != rhs.button_text || lhs.data != rhs.data {
+                *need_update = true;
+            }
+        }
+        (MessageContent::GiftPremium(lhs), MessageContent::GiftPremium(rhs)) => {
+            if lhs.text != rhs.text
+                || lhs.currency != rhs.currency
+                || lhs.amount != rhs.amount
+                || lhs.crypto_currency != rhs.crypto_currency
+                || lhs.crypto_amount != rhs.crypto_amount
+                || lhs.days != rhs.days
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::TopicCreate(lhs), MessageContent::TopicCreate(rhs)) => {
+            if lhs.title != rhs.title
+                || lhs.icon != rhs.icon
+                || lhs.title_missing != rhs.title_missing
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::TopicEdit(lhs), MessageContent::TopicEdit(rhs)) => {
+            if lhs.edited_data != rhs.edited_data {
+                *need_update = true;
+            }
+        }
+        (MessageContent::Unsupported(lhs), MessageContent::Unsupported(rhs)) => {
+            if lhs.version != rhs.version {
+                *is_content_changed = true;
+            }
+        }
+        (MessageContent::SuggestProfilePhoto(lhs), MessageContent::SuggestProfilePhoto(rhs)) => {
+            if lhs.photo != rhs.photo {
+                *need_update = true;
+            }
+        }
+        (MessageContent::RequestedDialog(lhs), MessageContent::RequestedDialog(rhs)) => {
+            if lhs.shared_dialog_ids != rhs.shared_dialog_ids || lhs.button_id != rhs.button_id {
+                *need_update = true;
+            }
+        }
+        (
+            MessageContent::WebViewWriteAccessAllowed(lhs),
+            MessageContent::WebViewWriteAccessAllowed(rhs),
+        ) => {
+            if lhs.web_app != rhs.web_app {
+                *need_update = true;
+            }
+        }
+        (MessageContent::SetBackground(lhs), MessageContent::SetBackground(rhs)) => {
+            if lhs.old_message_id != rhs.old_message_id
+                || lhs.background_info != rhs.background_info
+                || lhs.for_both != rhs.for_both
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::Story(lhs), MessageContent::Story(rhs)) => {
+            if lhs.story_full_id != rhs.story_full_id || lhs.via_mention != rhs.via_mention {
+                *need_update = true;
+            }
+        }
+        (MessageContent::GiftCode(lhs), MessageContent::GiftCode(rhs)) => {
+            if lhs.creator_dialog_id != rhs.creator_dialog_id
+                || lhs.text != rhs.text
+                || lhs.days != rhs.days
+                || lhs.currency != rhs.currency
+                || lhs.amount != rhs.amount
+                || lhs.crypto_currency != rhs.crypto_currency
+                || lhs.crypto_amount != rhs.crypto_amount
+                || lhs.via_giveaway != rhs.via_giveaway
+                || lhs.is_unclaimed != rhs.is_unclaimed
+                || lhs.code != rhs.code
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::Giveaway(lhs), MessageContent::Giveaway(rhs)) => {
+            if lhs.giveaway_parameters != rhs.giveaway_parameters
+                || lhs.quantity != rhs.quantity
+                || lhs.months != rhs.months
+                || lhs.star_count != rhs.star_count
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::GiveawayLaunch(lhs), MessageContent::GiveawayLaunch(rhs)) => {
+            if lhs.star_count != rhs.star_count {
+                *need_update = true;
+            }
+        }
+        (MessageContent::GiveawayResults(lhs), MessageContent::GiveawayResults(rhs)) => {
+            if lhs.giveaway_message_id != rhs.giveaway_message_id
+                || lhs.winner_count != rhs.winner_count
+                || lhs.unclaimed_count != rhs.unclaimed_count
+                || lhs.is_star_giveaway != rhs.is_star_giveaway
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::GiveawayWinners(lhs), MessageContent::GiveawayWinners(rhs)) => {
+            if lhs.giveaway_message_id != rhs.giveaway_message_id
+                || lhs.boosted_channel_id != rhs.boosted_channel_id
+                || lhs.additional_dialog_count != rhs.additional_dialog_count
+                || lhs.month_count != rhs.month_count
+                || lhs.star_count != rhs.star_count
+                || lhs.prize_description != rhs.prize_description
+                || lhs.winners_selection_date != rhs.winners_selection_date
+                || lhs.only_new_subscribers != rhs.only_new_subscribers
+                || lhs.was_refunded != rhs.was_refunded
+                || lhs.winner_count != rhs.winner_count
+                || lhs.unclaimed_count != rhs.unclaimed_count
+                || lhs.winner_user_ids != rhs.winner_user_ids
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::BoostApply(lhs), MessageContent::BoostApply(rhs)) => {
+            if lhs.boost_count != rhs.boost_count {
+                *need_update = true;
+            }
+        }
+        (MessageContent::DialogShared(lhs), MessageContent::DialogShared(rhs)) => {
+            if lhs.shared_dialogs != rhs.shared_dialogs || lhs.button_id != rhs.button_id {
+                *need_update = true;
+            }
+        }
+        (MessageContent::PaidMedia(lhs), MessageContent::PaidMedia(rhs)) => {
+            if lhs.caption != rhs.caption
+                || lhs.star_count != rhs.star_count
+                || lhs.media.len() != rhs.media.len()
+            {
+                *need_update = true;
+            } else {
+                for i in 0..lhs.media.len() {
+                    if lhs.media[i] != rhs.media[i] {
+                        *need_update = true;
+                    } else if lhs.media[i].is_equal_but_different(&rhs.media[i]) {
+                        *is_content_changed = true;
+                    }
+                }
+                if lhs.payload != rhs.payload {
+                    *is_content_changed = true;
+                }
+            }
+        }
+        (MessageContent::PaymentRefunded(lhs), MessageContent::PaymentRefunded(rhs)) => {
+            if lhs.dialog_id != rhs.dialog_id
+                || lhs.currency != rhs.currency
+                || lhs.total_amount != rhs.total_amount
+                || lhs.invoice_payload != rhs.invoice_payload
+                || lhs.telegram_payment_charge_id != rhs.telegram_payment_charge_id
+                || lhs.provider_payment_charge_id != rhs.provider_payment_charge_id
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::GiftStars(lhs), MessageContent::GiftStars(rhs)) => {
+            if lhs.currency != rhs.currency
+                || lhs.amount != rhs.amount
+                || lhs.crypto_currency != rhs.crypto_currency
+                || lhs.crypto_amount != rhs.crypto_amount
+                || lhs.star_count != rhs.star_count
+                || lhs.transaction_id != rhs.transaction_id
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::PrizeStars(lhs), MessageContent::PrizeStars(rhs)) => {
+            if lhs.star_count != rhs.star_count
+                || lhs.transaction_id != rhs.transaction_id
+                || lhs.boosted_dialog_id != rhs.boosted_dialog_id
+                || lhs.giveaway_message_id != rhs.giveaway_message_id
+                || lhs.is_unclaimed != rhs.is_unclaimed
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::PaidMessagesRefunded(lhs), MessageContent::PaidMessagesRefunded(rhs)) => {
+            if lhs.message_count != rhs.message_count || lhs.star_count != rhs.star_count {
+                *need_update = true;
+            }
+        }
+        (MessageContent::PaidMessagesPrice(lhs), MessageContent::PaidMessagesPrice(rhs)) => {
+            if lhs.star_count != rhs.star_count
+                || lhs.broadcast_messages_allowed != rhs.broadcast_messages_allowed
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::ConferenceCall(lhs), MessageContent::ConferenceCall(rhs)) => {
+            if lhs.duration != rhs.duration
+                || lhs.other_participant_dialog_ids != rhs.other_participant_dialog_ids
+                || lhs.is_active != rhs.is_active
+                || lhs.is_video != rhs.is_video
+                || lhs.was_missed != rhs.was_missed
+            {
+                *need_update = true;
+            } else if lhs.call_id != rhs.call_id {
+                *is_content_changed = true;
+            }
+        }
+        (MessageContent::ToDoList(lhs), MessageContent::ToDoList(rhs)) => {
+            if lhs.list != rhs.list || lhs.completions != rhs.completions {
+                *need_update = true;
+            }
+        }
+        (MessageContent::TodoCompletions(lhs), MessageContent::TodoCompletions(rhs)) => {
+            if lhs.to_do_message_id != rhs.to_do_message_id
+                || lhs.completed_task_ids != rhs.completed_task_ids
+                || lhs.incompleted_task_ids != rhs.incompleted_task_ids
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::TodoAppendTasks(lhs), MessageContent::TodoAppendTasks(rhs)) => {
+            if lhs.to_do_message_id != rhs.to_do_message_id || lhs.items != rhs.items {
+                *need_update = true;
+            }
+        }
+        (MessageContent::GiftTon(lhs), MessageContent::GiftTon(rhs)) => {
+            if lhs.currency != rhs.currency
+                || lhs.amount != rhs.amount
+                || lhs.crypto_currency != rhs.crypto_currency
+                || lhs.crypto_amount != rhs.crypto_amount
+                || lhs.transaction_id != rhs.transaction_id
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::SuggestedPostSuccess(lhs), MessageContent::SuggestedPostSuccess(rhs)) => {
+            if lhs.suggested_post_message_id != rhs.suggested_post_message_id
+                || lhs.amount != rhs.amount
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::SuggestedPostRefund(lhs), MessageContent::SuggestedPostRefund(rhs)) => {
+            if lhs.suggested_post_message_id != rhs.suggested_post_message_id
+                || lhs.is_payer_initiated != rhs.is_payer_initiated
+            {
+                *need_update = true;
+            }
+        }
+        (
+            MessageContent::SuggestedPostApproval(lhs),
+            MessageContent::SuggestedPostApproval(rhs),
+        ) => {
+            if lhs.suggested_post_message_id != rhs.suggested_post_message_id
+                || lhs.price != rhs.price
+                || lhs.comment != rhs.comment
+                || lhs.send_date != rhs.send_date
+                || lhs.is_rejected != rhs.is_rejected
+                || lhs.is_balance_too_low != rhs.is_balance_too_low
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::SuggestBirthday(lhs), MessageContent::SuggestBirthday(rhs)) => {
+            if lhs.birthdate != rhs.birthdate {
+                *need_update = true;
+            }
+        }
+        (MessageContent::NewCreatorPending(lhs), MessageContent::NewCreatorPending(rhs)) => {
+            if lhs.new_creator_user_id != rhs.new_creator_user_id {
+                *need_update = true;
+            }
+        }
+        (MessageContent::ChangeCreator(lhs), MessageContent::ChangeCreator(rhs)) => {
+            if lhs.new_creator_user_id != rhs.new_creator_user_id {
+                *need_update = true;
+            }
+        }
+        (MessageContent::NoForwardsToggle(lhs), MessageContent::NoForwardsToggle(rhs)) => {
+            if lhs.request_message_id != rhs.request_message_id
+                || lhs.prev_value != rhs.prev_value
+                || lhs.new_value != rhs.new_value
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::NoForwardsRequest(lhs), MessageContent::NoForwardsRequest(rhs)) => {
+            if lhs.is_expired != rhs.is_expired {
+                *need_update = true;
+            } else if lhs.prev_value != rhs.prev_value || lhs.new_value != rhs.new_value {
+                *is_content_changed = true;
+            }
+        }
+        (MessageContent::ManagedBotCreated(lhs), MessageContent::ManagedBotCreated(rhs)) => {
+            if lhs.bot_user_id != rhs.bot_user_id {
+                *need_update = true;
+            }
+        }
+        (MessageContent::PollAppendAnswer(lhs), MessageContent::PollAppendAnswer(rhs)) => {
+            if lhs.poll_message_id != rhs.poll_message_id
+                || lhs.text != rhs.text
+                || lhs.data != rhs.data
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::PollDeleteAnswer(lhs), MessageContent::PollDeleteAnswer(rhs)) => {
+            if lhs.poll_message_id != rhs.poll_message_id
+                || lhs.text != rhs.text
+                || lhs.data != rhs.data
+            {
+                *need_update = true;
+            }
+        }
+        (MessageContent::ChangeCommunity(lhs), MessageContent::ChangeCommunity(rhs)) => {
+            if lhs.community_id != rhs.community_id {
+                *need_update = true;
+            }
+        }
+        (
+            MessageContent::ChatJoinedViaCommunity(lhs),
+            MessageContent::ChatJoinedViaCommunity(rhs),
+        ) => {
+            if lhs.community_id != rhs.community_id {
+                *need_update = true;
+            }
+        }
+        // The C++ no-op arm list (ChatDeletePhoto, ChatDeleteHistory,
+        // ScreenshotTaken, ContactRegistered, ExpiredPhoto, ExpiredVideo,
+        // ExpiredVideoNote, ExpiredVoiceNote, WriteAccessAllowed,
+        // WriteAccessAllowedByRequest) collapses here, exactly like the
+        // C++ `break` arms.
+        _ => {}
+    }
+}
+
+/// `update_message_content_file_id_remote` (MessageContent.cpp:8804-8838).
+fn update_message_content_file_id_remote(content: &mut MessageContent, file_id: FileId) {
+    if file_id.get_remote() == 0 {
+        return;
+    }
+    let old_file_id = match content {
+        MessageContent::Animation(m) => &mut m.file_id,
+        MessageContent::Audio(m) => &mut m.file_id,
+        MessageContent::Document(m) => &mut m.file_id,
+        MessageContent::Sticker(m) => &mut m.file_id,
+        MessageContent::Video(m) => &mut m.file_id,
+        MessageContent::VideoNote(m) => &mut m.file_id,
+        MessageContent::VoiceNote(m) => &mut m.file_id,
+        _ => return,
+    };
+    if *old_file_id == file_id && old_file_id.get_remote() == 0 {
+        *old_file_id = file_id;
+    }
+}
+
+/// `update_message_content_file_id_remotes` (MessageContent.cpp:8840-8882).
+/// The Poll arm's in-place update of the poll-stored option media writes
+/// back when the Wave-2 PollManager implements the ref-returning overload;
+/// the size gate still runs against the owned seam copies.
+fn update_message_content_file_id_remotes(
+    td: &dyn MessageContentContext,
+    content: &mut MessageContent,
+    file_ids: &[FileId],
+) {
+    match content {
+        MessageContent::PaidMedia(m) => {
+            if file_ids.len() != m.media.len() {
+                return;
+            }
+            for (media, file_id) in m.media.iter_mut().zip(file_ids) {
+                media.update_file_id_remote(*file_id);
+            }
+        }
+        MessageContent::Poll(m) => {
+            let contents =
+                td.get_poll_individual_message_contents(m.poll_id, m.attached_media.as_deref());
+            if file_ids.len() == contents.len() {
+                // the C++ updates each poll-stored media in place; the
+                // owned seam copies cannot write back — deferred to the
+                // Wave-2 PollManager ref-returning overload (recorded
+                // divergence, module doc).
+                tdutils::log_debug!(
+                    "Deferred remote file id update for poll {} ({} file ids)",
+                    m.poll_id.get(),
+                    file_ids.len()
+                );
+            }
+        }
+        _ => {
+            if file_ids.len() != 1 {
+                return;
+            }
+            update_message_content_file_id_remote(content, file_ids[0]);
+        }
+    }
+}
+
+/// `try_merge_document_message_contents` (MessageContent.cpp:8884-8901).
+fn try_merge_document_message_contents(
+    td: &mut dyn MessageContentContext,
+    old_content: &MessageContent,
+    new_content: &MessageContent,
+    old_file_upload_ids: &[crate::messages_manager::FileUploadId],
+) {
+    let old_content_type = old_content.get_type();
+    let new_content_type = new_content.get_type();
+    assert_ne!(old_content_type, new_content_type);
+    let new_file_ids = get_message_content_any_file_ids(td, new_content);
+    if new_file_ids.len() != old_file_upload_ids.len() {
+        return;
+    }
+    for (new_file_id, old_file_upload_id) in new_file_ids.iter().zip(old_file_upload_ids) {
+        td.try_merge_documents(*new_file_id, old_file_upload_id.get_file_id());
+    }
+}
+
+/// `merge_and_compare_message_contents` (MessageContent.cpp:8903-8940) —
+/// the get_difference entry point. The C++ `bool *is_content_secret` is an
+/// option.
+#[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+pub fn merge_and_compare_message_contents(
+    td: &mut dyn MessageContentContext,
+    old_content: &mut MessageContent,
+    new_content: &mut MessageContent,
+    need_message_changed_warning: bool,
+    dialog_id: DialogId,
+    need_merge_files: bool,
+    old_file_upload_ids: &[crate::messages_manager::FileUploadId],
+    ttl: crate::messages_manager::MessageSelfDestructType,
+    ttl_expires_at: f64,
+    is_content_secret: Option<&mut bool>,
+    is_content_changed: &mut bool,
+    need_update: &mut bool,
+) {
+    let old_content_type = old_content.get_type();
+    let new_content_type = new_content.get_type();
+    if old_content_type != new_content_type {
+        if ttl.is_valid()
+            && ttl_expires_at > 0.0
+            && is_expired_message_content(new_content_type)
+            && get_expired_message_content_type(old_content_type) == new_content_type
+        {
+            tdutils::log_info!("Do not apply expired message content early");
+        } else {
+            *need_update = true;
+            tdutils::log_info!(
+                "Message content has changed type from {:?} to {:?}",
+                old_content_type,
+                new_content_type
+            );
+            if let Some(is_content_secret) = is_content_secret {
+                *is_content_secret = ttl.is_secret_message_content(new_content_type);
+            }
+        }
+
+        if need_merge_files {
+            try_merge_document_message_contents(td, old_content, new_content, old_file_upload_ids);
+        }
+    } else {
+        merge_message_contents(
+            td,
+            old_content,
+            new_content,
+            need_message_changed_warning,
+            dialog_id,
+            need_merge_files,
+            is_content_changed,
+            need_update,
+        );
+        compare_message_contents(
+            Some(td),
+            Some(&*old_content),
+            Some(&*new_content),
+            is_content_changed,
+            need_update,
+        );
+    }
+
+    if *is_content_changed || *need_update {
+        let file_ids: Vec<FileId> = old_file_upload_ids
+            .iter()
+            .map(|file_upload_id| file_upload_id.get_file_id())
+            .collect();
+        update_message_content_file_id_remotes(td, new_content, &file_ids);
+    } else {
+        let file_ids = get_message_content_any_file_ids(td, new_content);
+        update_message_content_file_id_remotes(td, old_content, &file_ids);
+    }
 }
 
 #[cfg(test)]
@@ -11273,6 +12217,7 @@ mod tests {
         checklist_max: i64,
         poll_contents: Vec<MessageContent>,
         poll_contents_2: Vec<MessageContent>,
+        have_web_pages: Vec<WebPageId>,
         register_log: Vec<String>,
     }
 
@@ -11315,6 +12260,7 @@ mod tests {
                 checklist_max: 100,
                 poll_contents: Vec::new(),
                 poll_contents_2: Vec::new(),
+                have_web_pages: Vec::new(),
                 register_log: Vec::new(),
             }
         }
@@ -11802,6 +12748,18 @@ mod tests {
             self.register_log.push(format!(
                 "merge_photo_files({:?},{:?})",
                 old_photo.id, new_photo.id
+            ));
+        }
+
+        fn have_web_page(&self, web_page_id: WebPageId) -> bool {
+            self.have_web_pages.contains(&web_page_id)
+        }
+
+        fn try_merge_documents(&mut self, new_file_id: FileId, old_file_id: FileId) {
+            self.register_log.push(format!(
+                "try_merge_documents({},{})",
+                new_file_id.get(),
+                old_file_id.get()
             ));
         }
     }
@@ -13878,6 +14836,416 @@ mod tests {
             &mut content,
             new_file
         ));
+        assert!(td.register_log.is_empty());
+    }
+
+    #[test]
+    fn get_message_content_any_file_ids_matches_the_cpp() {
+        let file_id = FileId::new(7, 0);
+        let content = MessageContent::Animation(MessageAnimation {
+            file_id,
+            ..MessageAnimation::default()
+        });
+        assert_eq!(
+            get_message_content_any_file_ids(&TestContext::default(), &content),
+            vec![file_id]
+        );
+        assert!(
+            get_message_content_any_file_ids(
+                &TestContext::default(),
+                &MessageContent::Text(MessageText::new(
+                    FormattedText::default(),
+                    WebPageId::default(),
+                    false,
+                    false,
+                    false,
+                    String::new(),
+                ))
+            )
+            .is_empty()
+        );
+
+        // the photo arm returns the last size
+        let photo_content = MessageContent::Photo(MessagePhoto {
+            photo: Photo {
+                photos: vec![photo_size('t' as i32, 1), photo_size('i' as i32, 5)],
+                ..Photo::default()
+            },
+            ..MessagePhoto::default()
+        });
+        assert_eq!(
+            get_message_content_any_file_ids(&TestContext::default(), &photo_content),
+            vec![FileId::new(5, 0)]
+        );
+
+        // paid media returns one id per medium
+        let paid = MessageContent::PaidMedia(MessagePaidMedia {
+            media: vec![
+                MessageExtendedMedia {
+                    r#type: MessageExtendedMediaType::Video,
+                    video_file_id: FileId::new(3, 0),
+                    ..MessageExtendedMedia::default()
+                },
+                MessageExtendedMedia {
+                    r#type: MessageExtendedMediaType::Photo,
+                    photo: Photo {
+                        photos: vec![photo_size('i' as i32, 4)],
+                        ..Photo::default()
+                    },
+                    ..MessageExtendedMedia::default()
+                },
+            ],
+            ..MessagePaidMedia::default()
+        });
+        assert_eq!(
+            get_message_content_any_file_ids(&TestContext::default(), &paid),
+            vec![FileId::new(3, 0), FileId::new(4, 0)]
+        );
+    }
+
+    #[test]
+    fn are_message_contents_same_covers_nulls_and_changes() {
+        let td = TestContext::default();
+        let content = || {
+            MessageContent::Animation(MessageAnimation {
+                file_id: FileId::new(1, 0),
+                ..MessageAnimation::default()
+            })
+        };
+        let lhs = content();
+        let rhs = content();
+        assert!(are_message_contents_same(Some(&td), Some(&lhs), Some(&rhs)));
+        assert!(!are_message_contents_same(Some(&td), None, Some(&rhs)));
+        assert!(are_message_contents_same(Some(&td), None, None));
+
+        let other = MessageContent::Audio(MessageAudio {
+            file_id: FileId::new(2, 0),
+            ..MessageAudio::default()
+        });
+        assert!(!are_message_contents_same(
+            Some(&td),
+            Some(&lhs),
+            Some(&other)
+        ));
+    }
+
+    #[test]
+    fn compare_message_contents_decision_table() {
+        let td = TestContext::default();
+        let mut changed = false;
+        let mut update = false;
+        let text = |web_page_id: i64| {
+            MessageContent::Text(MessageText::new(
+                plain_text("hello"),
+                WebPageId::new(web_page_id),
+                false,
+                false,
+                false,
+                String::new(),
+            ))
+        };
+
+        // identical — nothing
+        compare_message_contents(
+            Some(&td),
+            Some(&text(0)),
+            Some(&text(0)),
+            &mut changed,
+            &mut update,
+        );
+        assert!(!changed && !update);
+
+        // web page id change without a registered page — content changed;
+        // a null td forces the update like the C++
+        compare_message_contents(
+            None,
+            Some(&text(1)),
+            Some(&text(2)),
+            &mut changed,
+            &mut update,
+        );
+        assert!(changed && update);
+        changed = false;
+        update = false;
+
+        // web page id change with the page loaded — needs an update
+        let with_page = TestContext {
+            have_web_pages: vec![WebPageId::new(1)],
+            ..TestContext::default()
+        };
+        compare_message_contents(
+            Some(&with_page),
+            Some(&text(1)),
+            Some(&text(2)),
+            &mut changed,
+            &mut update,
+        );
+        assert!(changed && update);
+        changed = false;
+        update = false;
+
+        // dice seed change — content changed; emoji change — update
+        let dice = |emoji: &str, seed: &str| {
+            MessageContent::Dice(MessageDice {
+                emoji: emoji.to_string(),
+                seed: seed.to_string(),
+                dice_value: 4,
+                ..MessageDice::default()
+            })
+        };
+        compare_message_contents(
+            Some(&td),
+            Some(&dice("🎯", "a")),
+            Some(&dice("🎯", "b")),
+            &mut changed,
+            &mut update,
+        );
+        assert!(changed && !update);
+        changed = false;
+        update = false;
+        compare_message_contents(
+            Some(&td),
+            Some(&dice("🎯", "a")),
+            Some(&dice("🎲", "a")),
+            &mut changed,
+            &mut update,
+        );
+        assert!(!changed && update);
+        changed = false;
+        update = false;
+
+        // unsupported version change — content changed
+        compare_message_contents(
+            Some(&td),
+            Some(&MessageContent::Unsupported(MessageUnsupported {
+                version: 1,
+            })),
+            Some(&MessageContent::Unsupported(MessageUnsupported {
+                version: 2,
+            })),
+            &mut changed,
+            &mut update,
+        );
+        assert!(changed && !update);
+        changed = false;
+        update = false;
+
+        // conference call id change — content changed; duration — update
+        let call = |call_id: i64, duration: i32| {
+            MessageContent::ConferenceCall(MessageConferenceCall {
+                call_id,
+                duration,
+                ..MessageConferenceCall::default()
+            })
+        };
+        compare_message_contents(
+            Some(&td),
+            Some(&call(1, 60)),
+            Some(&call(2, 60)),
+            &mut changed,
+            &mut update,
+        );
+        assert!(changed && !update);
+        changed = false;
+        update = false;
+        compare_message_contents(
+            Some(&td),
+            Some(&call(1, 60)),
+            Some(&call(1, 61)),
+            &mut changed,
+            &mut update,
+        );
+        assert!(!changed && update);
+        changed = false;
+        update = false;
+
+        // noforwards request: expired flag — update; values — changed
+        let request = |is_expired: bool, prev: bool, new: bool| {
+            MessageContent::NoForwardsRequest(MessageNoForwardsRequest {
+                is_expired,
+                prev_value: prev,
+                new_value: new,
+            })
+        };
+        compare_message_contents(
+            Some(&td),
+            Some(&request(false, true, false)),
+            Some(&request(true, true, false)),
+            &mut changed,
+            &mut update,
+        );
+        assert!(!changed && update);
+        changed = false;
+        update = false;
+        compare_message_contents(
+            Some(&td),
+            Some(&request(false, true, false)),
+            Some(&request(false, true, true)),
+            &mut changed,
+            &mut update,
+        );
+        assert!(changed && !update);
+        changed = false;
+        update = false;
+
+        // paid media payload — content changed
+        let paid = |payload: &str| {
+            MessageContent::PaidMedia(MessagePaidMedia {
+                payload: payload.to_string(),
+                ..MessagePaidMedia::default()
+            })
+        };
+        compare_message_contents(
+            Some(&td),
+            Some(&paid("a")),
+            Some(&paid("b")),
+            &mut changed,
+            &mut update,
+        );
+        assert!(changed && !update);
+        changed = false;
+        update = false;
+
+        // poll attached media recurses
+        let poll_with_media = |file_id| {
+            MessageContent::Poll(MessagePoll {
+                poll_id: PollId::new(1),
+                attached_media: Some(Box::new(MessageContent::Animation(MessageAnimation {
+                    file_id,
+                    ..MessageAnimation::default()
+                }))),
+                ..MessagePoll::default()
+            })
+        };
+        compare_message_contents(
+            Some(&td),
+            Some(&poll_with_media(FileId::new(1, 0))),
+            Some(&poll_with_media(FileId::new(2, 0))),
+            &mut changed,
+            &mut update,
+        );
+        assert!(!changed && update);
+    }
+
+    #[test]
+    fn merge_and_compare_flows_match_the_cpp() {
+        let new_td = || TestContext::default();
+        let ttl = crate::messages_manager::MessageSelfDestructType::with_ttl(1, false);
+        let upload_ids = [crate::messages_manager::FileUploadId::new(
+            FileId::new(5, 9),
+            0,
+        )];
+        let animation = |remote_id| {
+            MessageContent::Animation(MessageAnimation {
+                file_id: FileId::new(5, remote_id),
+                ..MessageAnimation::default()
+            })
+        };
+
+        // same type, caption changed — need_update and the remote flows
+        // from the upload id into the new content
+        let mut td = new_td();
+        let mut old = animation(0);
+        let mut new = MessageContent::Animation(MessageAnimation {
+            file_id: FileId::new(5, 0),
+            caption: plain_text("new"),
+            has_spoiler: false,
+        });
+        let mut changed = false;
+        let mut update = false;
+        merge_and_compare_message_contents(
+            &mut td,
+            &mut old,
+            &mut new,
+            true,
+            DialogId::default(),
+            true,
+            &upload_ids,
+            ttl,
+            0.0,
+            None,
+            &mut changed,
+            &mut update,
+        );
+        assert!(update);
+        assert!(matches!(new, MessageContent::Animation(m) if m.file_id.get_remote() == 9));
+
+        // same type, id-equal contents — nothing flagged, and the old
+        // content picks up the new content's remote id
+        let mut td = new_td();
+        let mut old = animation(0);
+        let mut new = animation(9);
+        let mut changed = false;
+        let mut update = false;
+        merge_and_compare_message_contents(
+            &mut td,
+            &mut old,
+            &mut new,
+            true,
+            DialogId::default(),
+            true,
+            &upload_ids,
+            ttl,
+            0.0,
+            None,
+            &mut changed,
+            &mut update,
+        );
+        assert!(!changed && !update);
+        assert!(matches!(old, MessageContent::Animation(m) if m.file_id.get_remote() == 9));
+
+        // type change — need_update + the document merge attempt + the
+        // secret flag
+        let mut td = new_td();
+        let mut old = animation(0);
+        let mut new = MessageContent::VoiceNote(MessageVoiceNote {
+            file_id: FileId::new(5, 0),
+            caption: FormattedText::default(),
+            is_listened: false,
+        });
+        let mut changed = false;
+        let mut update = false;
+        let mut secret = false;
+        merge_and_compare_message_contents(
+            &mut td,
+            &mut old,
+            &mut new,
+            true,
+            DialogId::default(),
+            true,
+            &upload_ids,
+            ttl,
+            0.0,
+            Some(&mut secret),
+            &mut changed,
+            &mut update,
+        );
+        assert!(update);
+        assert!(secret, "voice notes are secret-message capable");
+        assert_eq!(td.register_log, vec!["try_merge_documents(5,5)"]);
+
+        // the expired-early path: a normal content turning into its
+        // expired form with a valid ttl does not apply early
+        let mut td = new_td();
+        let mut old = MessageContent::Photo(MessagePhoto::default());
+        let mut new = MessageContent::ExpiredPhoto(MessageExpiredPhoto);
+        let mut changed = false;
+        let mut update = false;
+        merge_and_compare_message_contents(
+            &mut td,
+            &mut old,
+            &mut new,
+            true,
+            DialogId::default(),
+            true,
+            &upload_ids,
+            ttl,
+            10.0,
+            None,
+            &mut changed,
+            &mut update,
+        );
+        assert!(!changed && !update);
         assert!(td.register_log.is_empty());
     }
 }

@@ -30,7 +30,7 @@ use crate::message_entity::FormattedText;
 use crate::restriction_reason::RestrictionReason;
 use crate::store_parse::{Parser, store_flags, store_i32, store_i64, store_string};
 use crate::td_api;
-use crate::user_manager::{SecretChatId, UserId};
+use crate::user_manager::{FileId, SecretChatId, UserId};
 use std::collections::{HashMap, HashSet};
 use tdmtproto::telegram_api;
 use tdutils::hash::{combine_hashes, hash_int64, hash_uint32};
@@ -2861,18 +2861,35 @@ pub struct MessageReactions {
 // ---------------------------------------------------------------------------
 
 /// `td::FileUploadId` (files/FileUploadId.h) — the FileManager-assigned
-/// upload id; only the raw value is modeled here (the Files slice owns the
-/// registry).
+/// (file, internal upload id) pair. `get_file_upload_ids` (the
+/// FileManager registry static) lands with the Files slices.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub struct FileUploadId(i64);
+pub struct FileUploadId {
+    file_id: FileId,
+    internal_upload_id: i64,
+}
 
 impl FileUploadId {
-    pub fn new(id: i64) -> FileUploadId {
-        FileUploadId(id)
+    pub fn new(file_id: FileId, internal_upload_id: i64) -> FileUploadId {
+        FileUploadId {
+            file_id,
+            internal_upload_id,
+        }
     }
 
-    pub fn get(self) -> i64 {
-        self.0
+    /// `FileUploadId::is_valid` (FileUploadId.h:26-28).
+    pub fn is_valid(self) -> bool {
+        self.file_id.is_valid()
+    }
+
+    /// `FileUploadId::get_file_id` (FileUploadId.h:31-33).
+    pub fn get_file_id(self) -> FileId {
+        self.file_id
+    }
+
+    /// `FileUploadId::get_internal_upload_id` (FileUploadId.h:35-37).
+    pub fn get_internal_upload_id(self) -> i64 {
+        self.internal_upload_id
     }
 }
 
