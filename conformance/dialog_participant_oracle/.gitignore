@@ -1,0 +1,3 @@
+// M.5.4 oracle build artifacts — regenerable via ./build.sh
+oracle
+oracle.out

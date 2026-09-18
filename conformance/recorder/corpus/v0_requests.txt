@@ -6,3 +6,11 @@
 {"@type":"getMe"}
 {"@type":"testReturnError","error":{"@type":"error","code":418,"message":"teapot"}}
 {"@type":"getOption","name":"message_caption_length_max"}
+{"@type":"getTextEntities","text":"@durov check #tdlib and $TSLA for 12:30:45, mail a@b.co, visit https://telegram.org/blog, card 4111 1111 1111 1111, /start@durov_bot"}
+{"@type":"getTextEntities","text":"1:30 12:30 12:30:59 23:59:59 0:00 at 9:07 #a $b @c d@e.f https://g.co tg://emoji?id=5368324170671202286"}
+{"@type":"parseTextEntities","text":"**b** `c` https://t.me/x @d #e $f 12:30:45","parse_mode":{"@type":"textParseModeMarkdown","version":1}}
+{"@type":"parseTextEntities","text":"<b>b</b> <code>c</code> <a href=\"https://t.me/x\">l</a> @d #e $f 12:30:45","parse_mode":{"@type":"textParseModeHTML"}}
+{"@type":"parseMarkdown","text":{"@type":"formattedText","text":"**bold** `code` and https://t.me/x @durov #tdlib $TSLA","entities":[]}}
+{"@type":"getMarkdownText","text":{"@type":"formattedText","text":"Hello @durov and #tdlib $TSLA https://t.me/x a@b.co 12:30:45","entities":[{"@type":"textEntity","offset":6,"length":6,"type":{"@type":"textEntityTypeMention"}},{"@type":"textEntity","offset":17,"length":6,"type":{"@type":"textEntityTypeHashtag"}},{"@type":"textEntity","offset":24,"length":5,"type":{"@type":"textEntityTypeCashtag"}},{"@type":"textEntity","offset":30,"length":13,"type":{"@type":"textEntityTypeUrl"}},{"@type":"textEntity","offset":44,"length":6,"type":{"@type":"textEntityTypeEmailAddress"}}]}}
+{"@type":"parseMarkdown"}
+{"@type":"parseTextEntities","text":"*a*","parse_mode":{"@type":"textParseModeMarkdown","version":3}}
