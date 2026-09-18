@@ -109,6 +109,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::birthdate::Birthdate;
+use crate::chat_manager::{ChannelType, RestrictedRights};
 use crate::contact::Contact;
 use crate::emoji_status::{CustomEmojiId, EmojiStatus};
 use crate::global::Global;
@@ -6711,9 +6712,81 @@ impl UserManager {
         self.get_user_title_of(c.user_id)
     }
 
-    // `get_user_default_permissions`/`get_secret_chat_default_permissions`
-    // (UserManager.cpp:5609-5627) carry `RestrictedRights` from
-    // `DialogParticipant.h` — they land with the ChatManager slice.
+    /// `UserManager::get_user_default_permissions`
+    /// (UserManager.cpp:5610-5618). The C++ `get_replies_bot_user_id`
+    /// instance method reads the test-DC flag through `G()`, so the port
+    /// takes it as a parameter. Lands with M.9.7 (its first consumer is
+    /// `can_send_message_content`), not the ChatManager slice.
+    pub fn get_user_default_permissions_of(
+        &self,
+        is_test_dc: bool,
+        user_id: UserId,
+    ) -> RestrictedRights {
+        let u = self.get_user(user_id);
+        if (u.is_none() && user_id != self.get_my_id())
+            || user_id == Self::get_replies_bot_user_id(is_test_dc)
+            || user_id == Self::get_verification_codes_bot_user_id()
+        {
+            return RestrictedRights::restrict_all();
+        }
+        RestrictedRights::from_bools(
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            false,
+            false,
+            true,
+            false,
+            false,
+            true,
+            true,
+            ChannelType::Unknown,
+        )
+    }
+
+    /// `UserManager::get_secret_chat_default_permissions`
+    /// (UserManager.cpp:5620-5627).
+    pub fn get_secret_chat_default_permissions_of(
+        &self,
+        secret_chat_id: SecretChatId,
+    ) -> RestrictedRights {
+        if self.get_secret_chat(secret_chat_id).is_none() {
+            return RestrictedRights::restrict_all();
+        }
+        RestrictedRights::from_bools(
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            ChannelType::Unknown,
+        )
+    }
 
     /// `UserManager::get_user_emoji_status_object`
     /// (UserManager.cpp:5629-5635); `None` is the C++ `nullptr`.

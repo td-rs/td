@@ -62,17 +62,26 @@ use std::hash::{Hash, Hasher};
 use tdutils::emoji::remove_emoji_modifiers;
 
 use crate::birthdate::Birthdate;
-use crate::chat_manager::{ChannelId, ChatId, MessageId};
+use crate::chat_manager::{ChannelId, ChannelType, ChatId, MessageId, RestrictedRights};
 use crate::contact::Contact;
 use crate::emoji_status::CustomEmojiId;
-use crate::message_entity::{FormattedText, MessageEntity, find_entities, remove_empty_entities};
-use crate::messages_manager::{DialogId, StoryFullId, StoryId};
+use crate::message_entity::{
+    FormattedText, MessageEntity, Type, find_entities, remove_empty_entities,
+};
+use crate::messages_manager::{
+    DialogId, DialogType, MessageFullId, MessageSearchFilter, StoryFullId, StoryId,
+    message_search_filter_index_mask,
+};
+use crate::misc::is_empty_string;
 use crate::photo::{AnimationSize, Dimensions, Photo, PhotoSize, StickerPhotoSize};
 use crate::store_parse::{
     Parser, store_bool, store_f64, store_flags, store_i32, store_i32_vec, store_i64, store_string,
     store_string_vec, store_u32, version,
 };
-use crate::user_manager::{FileId, UserId};
+use crate::user_manager::{FileId, SecretChatId, UserId};
+use tdmtproto::telegram_api;
+use tdutils::promise::Promise;
+use tdutils::status::Status;
 
 /// `td::MessageContentType` (MessageContentType.h:15-113) — the discriminant
 /// order is the C++ enum order; `MessageUnsupported::CURRENT_VERSION` bumps
@@ -190,6 +199,83 @@ pub fn can_be_secret_message_content(content_type: MessageContentType) -> bool {
         content_type,
         Animation | Audio | Photo | Video | VideoNote | VoiceNote
     )
+}
+
+/// `is_service_message_content` (MessageContentType.cpp:623-731) — the C++
+/// switch enumerates all 97 types (28 returning false, the rest true), so
+/// the `default: UNREACHABLE()` arm covers nothing. The two unmodeled
+/// members keep their C++ answers recorded here: `RichText` is a
+/// non-service type and `ChatSetTheme` is a service type; both land with
+/// their value planes.
+pub fn is_service_message_content(content_type: MessageContentType) -> bool {
+    use MessageContentType::*;
+    !matches!(
+        content_type,
+        Animation
+            | Audio
+            | Contact
+            | Dice
+            | Document
+            | ExpiredPhoto
+            | ExpiredVideo
+            | ExpiredVideoNote
+            | ExpiredVoiceNote
+            | Game
+            | Giveaway
+            | GiveawayWinners
+            | Invoice
+            | LiveLocation
+            | Location
+            | PaidMedia
+            | Photo
+            | Poll
+            | Sticker
+            | Story
+            | Text
+            | ToDoList
+            | Unsupported
+            | Venue
+            | Video
+            | VideoNote
+            | VoiceNote
+    )
+}
+
+/// `is_expired_message_content` (MessageContentType.cpp:886-895).
+pub fn is_expired_message_content(content_type: MessageContentType) -> bool {
+    use MessageContentType::*;
+    matches!(
+        content_type,
+        ExpiredPhoto | ExpiredVideo | ExpiredVideoNote | ExpiredVoiceNote
+    )
+}
+
+/// `get_expired_message_content_type` (MessageContentType.cpp:897-909).
+pub fn get_expired_message_content_type(content_type: MessageContentType) -> MessageContentType {
+    use MessageContentType::*;
+    match content_type {
+        Photo => ExpiredPhoto,
+        Video => ExpiredVideo,
+        VideoNote => ExpiredVideoNote,
+        VoiceNote => ExpiredVoiceNote,
+        _ => None,
+    }
+}
+
+/// `can_send_message_content_to_secret_chat` (MessageContentType.cpp:1019-1121).
+/// The C++ third group — `None`, the service types, `Unsupported` and the
+/// expired types — is `default: UNREACHABLE()`: those contents are never
+/// offered for sending, and the Rust mirrors the abort. `RichText` (a
+/// false-group member) is unmodeled and lands with WebPageBlock.
+pub fn can_send_message_content_to_secret_chat(content_type: MessageContentType) -> bool {
+    use MessageContentType::*;
+    match content_type {
+        Animation | Audio | Contact | Document | LiveLocation | Location | Photo | Sticker
+        | Text | Venue | Video | VideoNote | VoiceNote => true,
+        Dice | Game | Giveaway | GiveawayWinners | Invoice | PaidMedia | Poll | Story
+        | ToDoList => false,
+        _ => unreachable!(),
+    }
 }
 
 impl MessageContentType {
@@ -1003,6 +1089,14 @@ impl GiveawayParameters {
         }
         self.boosted_channel_id.is_valid() && self.date > 0
     }
+
+    /// `GiveawayParameters::get_channel_ids` (GiveawayParameters.cpp) —
+    /// the additional channels first, then the boosted one.
+    pub fn get_channel_ids(&self) -> Vec<ChannelId> {
+        let mut result = self.additional_channel_ids.clone();
+        result.push(self.boosted_channel_id);
+        result
+    }
 }
 
 /// `td::Game` (Game.h:18-29). The wire/td_api conversions and the
@@ -1024,6 +1118,16 @@ impl Game {
     /// `Game::is_empty` (Game.cpp).
     pub fn is_empty(&self) -> bool {
         self.short_name.is_empty()
+    }
+
+    /// `Game::get_text` (Game.h:55).
+    pub fn get_text(&self) -> &FormattedText {
+        &self.text
+    }
+
+    /// `Game::get_bot_user_id` (Game.cpp).
+    pub fn get_bot_user_id(&self) -> UserId {
+        self.bot_user_id
     }
 }
 
@@ -1132,6 +1236,42 @@ impl MessageExtendedMedia {
     pub fn has_media_timestamp(&self) -> bool {
         self.r#type == MessageExtendedMediaType::Video
     }
+
+    /// `MessageExtendedMedia::get_message_content` (MessageExtendedMedia.cpp)
+    /// — the per-type content the paid-media album splat produces. The C++
+    /// `default: UNREACHABLE()` covers Empty/Unsupported/Preview, which the
+    /// caller (`get_individual_message_contents`) never sees for a real
+    /// paid media.
+    pub fn get_message_content(&self) -> MessageContent {
+        match self.r#type {
+            MessageExtendedMediaType::Photo => {
+                create_photo_message_content(self.photo.clone(), self.video_file_id)
+            }
+            MessageExtendedMediaType::Video => create_video_message_content(
+                self.video_file_id,
+                self.photo.clone(),
+                self.start_timestamp,
+            ),
+            MessageExtendedMediaType::Empty
+            | MessageExtendedMediaType::Unsupported
+            | MessageExtendedMediaType::Preview => {
+                unreachable!()
+            }
+        }
+    }
+}
+
+impl InputInvoice {
+    /// `InputInvoice::has_media_timestamp` (InputInvoice.cpp).
+    pub fn has_media_timestamp(&self) -> bool {
+        self.extended_media.has_media_timestamp()
+    }
+
+    /// `InputInvoice::get_caption` (InputInvoice.cpp) — the caption of the
+    /// extended media, never null.
+    pub fn get_caption(&self) -> &FormattedText {
+        &self.extended_media_caption
+    }
 }
 
 /// `td::ToDoItem` (ToDoItem.h:14-17). The wire/td_api constructors and
@@ -1149,6 +1289,18 @@ pub struct ToDoList {
     pub items: Vec<ToDoItem>,
     pub others_can_append: bool,
     pub others_can_complete: bool,
+}
+
+impl ToDoList {
+    /// `ToDoList::get_can_append_items` (ToDoList.cpp:65-74). The C++
+    /// reads the `checklist_task_count_max` option through `td` at the
+    /// call site, so the resolved maximum is a parameter here.
+    pub fn get_can_append_items(&self, max_task_count: i64, item_count: i32) -> bool {
+        if item_count < 0 {
+            return false;
+        }
+        (self.items.len() as i64) + i64::from(item_count) <= max_task_count
+    }
 }
 
 /// `td::ToDoCompletion` (ToDoCompletion.h:18-24). The wire constructor,
@@ -6412,6 +6564,1187 @@ fn parse_formatted_text(parser: &mut Parser) -> Result<FormattedText, &'static s
     FormattedText::parse(parser)
 }
 
+// ---------------------------------------------------------------------------
+// M.9.7/M.9.8/M.9.9 — the classification, policy and accessor planes
+// (MessageContentType.cpp, MessageContent.cpp:6207-7415). The manager
+// reads go through the [`MessageContentContext`] seam — the Rust shape of
+// the `const Td *td` parameter these C++ functions take.
+// ---------------------------------------------------------------------------
+
+/// `td::StickerType` (StickerType.h:17). Owned by StickersManager (the
+/// Wave-2/3 stickers slice); the value lands here because
+/// [`get_message_content_sticker_type`] is its first consumer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum StickerType {
+    #[default]
+    Regular = 0,
+    Mask,
+    CustomEmoji,
+}
+
+/// The `const Td *td` surface of the M.9.7/M.9.8/M.9.9 planes — the
+/// manager queries the C++ free functions make through `td`. Real
+/// implementations land with each owner (the UserManager reads with the
+/// Td wiring of this line, ChatManager with M.5, PollManager with
+/// Wave 2, StickersManager/WebPagesManager with their slices); tests use
+/// a table stand-in the way the store/parse plane uses `RawIdStorage`.
+pub trait MessageContentContext {
+    // -- UserManager (UserManager.cpp:5387/5610/5620/5720) --
+    fn get_user_default_permissions(&self, user_id: UserId) -> RestrictedRights;
+    fn get_secret_chat_default_permissions(&self, secret_chat_id: SecretChatId)
+    -> RestrictedRights;
+    /// `UserManager::is_user_bot` (UserManager.cpp:5387-5393).
+    fn is_user_bot(&self, user_id: UserId) -> bool;
+    /// `UserManager::get_user_voice_messages_forbidden`
+    /// (UserManager.cpp:5720-5729).
+    fn get_user_voice_messages_forbidden(&self, user_id: UserId) -> bool;
+
+    // -- ChatManager (M.5) --
+    /// `td->chat_manager_->get_chat_permissions(chat_id)
+    /// .get_effective_restricted_rights()` (MessageContent.cpp:6218-6220).
+    fn get_chat_effective_restricted_rights(&self, chat_id: ChatId) -> RestrictedRights;
+    /// The channel twin of the chat read (MessageContent.cpp:6221-6222).
+    fn get_channel_effective_restricted_rights(&self, channel_id: ChannelId) -> RestrictedRights;
+    /// `ChatManager::is_broadcast_channel`.
+    fn is_broadcast_channel(&self, channel_id: ChannelId) -> bool;
+    /// `ChatManager::is_monoforum_channel`.
+    fn is_monoforum_channel(&self, channel_id: ChannelId) -> bool;
+
+    // -- AuthManager / DialogManager --
+    /// `td->auth_manager_->is_bot()`.
+    fn is_bot(&self) -> bool;
+    /// `td->dialog_manager_->get_my_dialog_id()`.
+    fn get_my_dialog_id(&self) -> DialogId;
+
+    // -- PollManager (Wave 2) --
+    fn get_poll_is_anonymous(&self, poll_id: PollId) -> bool;
+    fn get_poll_is_closed(&self, poll_id: PollId) -> bool;
+    fn get_poll_can_add_option(&self, poll_id: PollId) -> bool;
+    fn get_poll_can_view_stats(&self, poll_id: PollId) -> bool;
+    fn get_poll_has_unread_votes(&self, poll_id: PollId) -> bool;
+    fn remove_poll_has_unread_votes(&self, poll_id: PollId);
+    /// `PollManager::has_input_media` (the forward gate,
+    /// MessageContent.cpp:6503-6506).
+    fn has_input_media_poll(&self, poll_id: PollId) -> bool;
+    /// `PollManager::get_individual_message_contents`
+    /// (MessageContent.cpp:6702-6705); `attached_media` is the stored
+    /// `MessagePoll::attached_media` of the message.
+    fn get_poll_individual_message_contents(
+        &self,
+        poll_id: PollId,
+        attached_media: Option<&MessageContent>,
+    ) -> Vec<MessageContent>;
+    /// `PollManager::get_poll_option_properties`
+    /// (PollManager.cpp:1147) — the td_api request arm.
+    #[allow(clippy::too_many_arguments)] // the C++ handler has the same shape
+    fn get_poll_option_properties(
+        &self,
+        poll_id: PollId,
+        option_id: &str,
+        dialog_id: DialogId,
+        message_id: MessageId,
+        can_be_replied: bool,
+        can_be_replied_in_another_chat: bool,
+        can_get_link: bool,
+        is_forward: bool,
+        is_outgoing: bool,
+        promise: Promise<crate::td_api::PollOptionProperties>,
+    );
+
+    // -- StickersManager (Wave 2/3) --
+    /// `StickersManager::get_sticker_type(file_id)`
+    /// (MessageContent.cpp:6714-6717).
+    fn get_sticker_type(&self, file_id: FileId) -> StickerType;
+
+    // -- WebPagesManager (Wave 2) --
+    /// `WebPagesManager::get_web_page_user_ids`
+    /// (MessageContent.cpp:6902-6905).
+    fn get_web_page_user_ids(&self, web_page_id: WebPageId) -> Vec<UserId>;
+    /// `WebPagesManager::get_web_page_channel_ids`
+    /// (MessageContent.cpp:7207-7212).
+    fn get_web_page_channel_ids(&self, web_page_id: WebPageId) -> Vec<ChannelId>;
+
+    // -- OptionManager --
+    /// `td->option_manager_->get_option_integer(name, default)` — the
+    /// `checklist_task_count_max` read of
+    /// `ToDoList::get_can_append_items` (ToDoList.cpp:70).
+    fn get_option_integer(&self, name: &str, default: i64) -> i64;
+}
+
+/// `is_local_poll_id` (PollManager.cpp:449-452) — the local (unsent)
+/// poll-id range; a pure helper, so it ports ahead of its Wave-2 owner.
+fn is_local_poll_id(poll_id: PollId) -> bool {
+    poll_id.get() < 0 && poll_id.get() > i32::MIN as i64
+}
+
+/// The pre-integration line carries the M.5.3 `chat_manager::MessageId`
+/// beside the M.10.1a `messages_manager::MessageId`; the integrator
+/// collapses them, and this bridge keeps the replied-id arms 1-to-1
+/// until then.
+fn to_messages_manager_message_id(message_id: MessageId) -> crate::messages_manager::MessageId {
+    crate::messages_manager::MessageId::new(message_id.get())
+}
+
+/// `can_send_message_content` (MessageContent.cpp:6207-6481). The
+/// `RichText` arm (`RichMessage::can_send`) is deferred with the
+/// unmodeled variant; the `ChatSetTheme` service arm is part of the
+/// `UNREACHABLE()` tail, which aborts exactly like the C++.
+pub fn can_send_message_content(
+    td: &dyn MessageContentContext,
+    dialog_id: DialogId,
+    content: &MessageContent,
+    is_forward: bool,
+    check_permissions: bool,
+) -> Result<(), Status> {
+    let dialog_type = dialog_id.get_type();
+    let permissions = if !check_permissions {
+        RestrictedRights::from_bools(
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            ChannelType::Unknown,
+        )
+    } else {
+        match dialog_type {
+            DialogType::User => td.get_user_default_permissions(dialog_id.get_user_id()),
+            DialogType::Chat => td.get_chat_effective_restricted_rights(dialog_id.get_chat_id()),
+            DialogType::Channel => {
+                td.get_channel_effective_restricted_rights(dialog_id.get_channel_id())
+            }
+            DialogType::SecretChat => {
+                td.get_secret_chat_default_permissions(dialog_id.get_secret_chat_id())
+            }
+            DialogType::None => unreachable!(),
+        }
+    };
+
+    let content_type = content.get_type();
+    if dialog_type == DialogType::SecretChat
+        && !can_send_message_content_to_secret_chat(content_type)
+    {
+        return Err(Status::error(400, "Message can't be sent to a secret chat"));
+    }
+    match content_type {
+        MessageContentType::Animation => {
+            if !permissions.can_send_animations() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send animations to the chat",
+                ));
+            }
+        }
+        MessageContentType::Audio => {
+            if !permissions.can_send_audios() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send music to the chat",
+                ));
+            }
+        }
+        MessageContentType::Contact => {
+            if !permissions.can_send_messages() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send contacts to the chat",
+                ));
+            }
+        }
+        MessageContentType::Dice => {
+            if !permissions.can_send_stickers() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send dice to the chat",
+                ));
+            }
+        }
+        MessageContentType::Document => {
+            if !permissions.can_send_documents() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send documents to the chat",
+                ));
+            }
+        }
+        MessageContentType::Game => {
+            if dialog_type == DialogType::Channel {
+                let channel_id = dialog_id.get_channel_id();
+                if td.is_broadcast_channel(channel_id) {
+                    // return Status::Error(400, "Games can't be sent to channel chats");
+                }
+                if td.is_monoforum_channel(channel_id) {
+                    return Err(Status::error(
+                        400,
+                        "Games can't be sent to channel direct messages chats",
+                    ));
+                }
+            }
+            if !permissions.can_send_games() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send games to the chat",
+                ));
+            }
+        }
+        MessageContentType::Giveaway => {
+            if !permissions.can_send_messages() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send giveaways to the chat",
+                ));
+            }
+        }
+        MessageContentType::GiveawayWinners => {
+            if !permissions.can_send_messages() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send giveaway winners to the chat",
+                ));
+            }
+        }
+        MessageContentType::Invoice => {
+            if !permissions.can_send_messages() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send invoice messages to the chat",
+                ));
+            }
+        }
+        MessageContentType::LiveLocation => {
+            if !permissions.can_send_messages() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send live locations to the chat",
+                ));
+            }
+        }
+        MessageContentType::Location => {
+            if !permissions.can_send_messages() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send locations to the chat",
+                ));
+            }
+        }
+        MessageContentType::PaidMedia => {
+            if is_forward {
+                if !permissions.can_send_photos() || !permissions.can_send_videos() {
+                    return Err(Status::error(
+                        400,
+                        "Not enough rights to send paid media to the chat",
+                    ));
+                }
+            } else if !td.is_bot()
+                && (dialog_type != DialogType::Channel
+                    || !td.is_broadcast_channel(dialog_id.get_channel_id()))
+            {
+                return Err(Status::error(
+                    400,
+                    "Paid media can be sent only in channel chats",
+                ));
+            }
+        }
+        MessageContentType::Photo => {
+            if !permissions.can_send_photos() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send photos to the chat",
+                ));
+            }
+        }
+        MessageContentType::Poll => {
+            if !permissions.can_send_polls() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send polls to the chat",
+                ));
+            }
+            if dialog_type == DialogType::Channel {
+                let channel_id = dialog_id.get_channel_id();
+                let MessageContent::Poll(m) = content else {
+                    unreachable!()
+                };
+                if td.is_broadcast_channel(channel_id) && !td.get_poll_is_anonymous(m.poll_id) {
+                    return Err(Status::error(
+                        400,
+                        "Non-anonymous polls can't be sent to channel chats",
+                    ));
+                }
+                if td.is_monoforum_channel(channel_id) {
+                    return Err(Status::error(
+                        400,
+                        "Polls can't be sent to channel direct messages chats",
+                    ));
+                }
+            }
+            if dialog_type == DialogType::User
+                && !is_forward
+                && !td.is_bot()
+                && !td.is_user_bot(dialog_id.get_user_id())
+                && dialog_id != td.get_my_dialog_id()
+            {
+                return Err(Status::error(
+                    400,
+                    "Polls can't be sent to the private chat",
+                ));
+            }
+        }
+        MessageContentType::Sticker => {
+            if !permissions.can_send_stickers() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send stickers to the chat",
+                ));
+            }
+            if get_message_content_sticker_type(td, content) == StickerType::CustomEmoji {
+                return Err(Status::error(400, "Can't send emoji stickers in messages"));
+            }
+        }
+        MessageContentType::Story => {
+            if !permissions.can_send_photos() || !permissions.can_send_videos() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send stories to the chat",
+                ));
+            }
+        }
+        MessageContentType::Text => {
+            if !permissions.can_send_messages() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send text messages to the chat",
+                ));
+            }
+        }
+        MessageContentType::ToDoList => {
+            if !permissions.can_send_polls() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send checklists to the chat",
+                ));
+            }
+            if dialog_type == DialogType::Channel {
+                let channel_id = dialog_id.get_channel_id();
+                if td.is_broadcast_channel(channel_id) {
+                    return Err(Status::error(
+                        400,
+                        "Checklists can't be sent to channel chats",
+                    ));
+                }
+                if td.is_monoforum_channel(channel_id) {
+                    return Err(Status::error(
+                        400,
+                        "Checklists can't be sent to channel direct messages chats",
+                    ));
+                }
+            }
+        }
+        MessageContentType::Venue => {
+            if !permissions.can_send_messages() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send venues to the chat",
+                ));
+            }
+        }
+        MessageContentType::Video => {
+            if !permissions.can_send_videos() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send videos to the chat",
+                ));
+            }
+        }
+        MessageContentType::VideoNote => {
+            if !permissions.can_send_video_notes() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send video notes to the chat",
+                ));
+            }
+            if dialog_type == DialogType::User
+                && td.get_user_voice_messages_forbidden(dialog_id.get_user_id())
+            {
+                return Err(Status::error(
+                    400,
+                    "User restricted receiving of video note messages",
+                ));
+            }
+        }
+        MessageContentType::VoiceNote => {
+            if !permissions.can_send_voice_notes() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send voice notes to the chat",
+                ));
+            }
+            if dialog_type == DialogType::User
+                && td.get_user_voice_messages_forbidden(dialog_id.get_user_id())
+            {
+                return Err(Status::error(
+                    400,
+                    "User restricted receiving of voice note messages",
+                ));
+            }
+        }
+        MessageContentType::Unsupported => {}
+        // The C++ tail is the enumerated service types plus
+        // `ChatSetTheme`, all `UNREACHABLE()`: sending never offers them.
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+/// `can_forward_message_content` (MessageContent.cpp:6483-6512). The
+/// `RichText` arm is deferred with the unmodeled variant.
+pub fn can_forward_message_content(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+    is_copy: bool,
+) -> bool {
+    let content_type = content.get_type();
+    if content_type == MessageContentType::Text {
+        let MessageContent::Text(text) = content else {
+            unreachable!()
+        };
+        // text must be non-empty if there is no link preview
+        return !is_empty_string(&text.text.text)
+            || text.web_page_id.is_valid()
+            || !text.web_page_url.is_empty();
+    }
+    if content_type == MessageContentType::Poll {
+        let MessageContent::Poll(poll) = content else {
+            unreachable!()
+        };
+        return !is_local_poll_id(poll.poll_id);
+    }
+    if is_copy {
+        if matches!(
+            content_type,
+            MessageContentType::Giveaway
+                | MessageContentType::GiveawayWinners
+                | MessageContentType::PaidMedia
+                | MessageContentType::Invoice
+        ) {
+            return false;
+        }
+        if content_type == MessageContentType::Poll {
+            let MessageContent::Poll(poll) = content else {
+                unreachable!()
+            };
+            if !td.has_input_media_poll(poll.poll_id) {
+                return false;
+            }
+        }
+    }
+
+    !is_service_message_content(content_type)
+        && content_type != MessageContentType::Unsupported
+        && !is_expired_message_content(content_type)
+}
+
+/// `update_opened_message_content` (MessageContent.cpp:6514-6531).
+pub fn update_opened_message_content(content: &mut MessageContent) -> bool {
+    match content {
+        MessageContent::VideoNote(video_note) => {
+            if video_note.is_viewed {
+                return false;
+            }
+            video_note.is_viewed = true;
+            true
+        }
+        MessageContent::VoiceNote(voice_note) => {
+            if voice_note.is_listened {
+                return false;
+            }
+            voice_note.is_listened = true;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// `get_message_content_caption` (MessageContent.cpp) — the private
+/// caption lookup `get_message_content_text` falls back to.
+fn get_message_content_caption(content: &MessageContent) -> Option<&FormattedText> {
+    match content {
+        MessageContent::Animation(m) => Some(&m.caption),
+        MessageContent::Audio(m) => Some(&m.caption),
+        MessageContent::Document(m) => Some(&m.caption),
+        MessageContent::Invoice(m) => Some(m.input_invoice.get_caption()),
+        MessageContent::PaidMedia(m) => Some(&m.caption),
+        MessageContent::Photo(m) => Some(&m.caption),
+        MessageContent::Video(m) => Some(&m.caption),
+        MessageContent::VoiceNote(m) => Some(&m.caption),
+        _ => None,
+    }
+}
+
+/// `get_message_content_text` (MessageContent.cpp) — the text every
+/// search-index and min-id consumer shares; `StarGift` (an unmodeled
+/// text-carrying type) lands with its arm.
+pub fn get_message_content_text(content: &MessageContent) -> Option<&FormattedText> {
+    match content {
+        MessageContent::Text(m) => Some(&m.text),
+        MessageContent::Game(m) => Some(m.game.get_text()),
+        MessageContent::GiftPremium(m) => Some(&m.text),
+        MessageContent::GiftCode(m) => Some(&m.text),
+        MessageContent::Poll(m) => Some(&m.caption),
+        _ => get_message_content_caption(content),
+    }
+}
+
+/// `get_message_content_text_index_mask` (MessageContent.cpp:6537-6559).
+fn get_message_content_text_index_mask(content: &MessageContent) -> i32 {
+    let text = get_message_content_text(content);
+    match text {
+        Some(text) if content.get_type() != MessageContentType::Game => {
+            for entity in &text.entities {
+                if matches!(
+                    entity.r#type,
+                    Some(Type::Url) | Some(Type::EmailAddress) | Some(Type::TextUrl)
+                ) {
+                    return message_search_filter_index_mask(MessageSearchFilter::Url);
+                }
+            }
+            0
+        }
+        _ => 0,
+    }
+}
+
+/// `get_message_content_media_index_mask` (MessageContent.cpp:6561-6685).
+/// The C++ `td` only feeds the `RichText` arm, which lands with the
+/// unmodeled variant.
+fn get_message_content_media_index_mask(
+    _td: &dyn MessageContentContext,
+    content: &MessageContent,
+    is_outgoing: bool,
+) -> i32 {
+    match content {
+        MessageContent::Animation(_) => {
+            message_search_filter_index_mask(MessageSearchFilter::Animation)
+        }
+        MessageContent::Audio(_) => message_search_filter_index_mask(MessageSearchFilter::Audio),
+        MessageContent::Document(_) => {
+            message_search_filter_index_mask(MessageSearchFilter::Document)
+        }
+        MessageContent::Photo(_) => {
+            message_search_filter_index_mask(MessageSearchFilter::Photo)
+                | message_search_filter_index_mask(MessageSearchFilter::PhotoAndVideo)
+        }
+        MessageContent::Video(_) => {
+            message_search_filter_index_mask(MessageSearchFilter::Video)
+                | message_search_filter_index_mask(MessageSearchFilter::PhotoAndVideo)
+        }
+        MessageContent::VideoNote(_) => {
+            message_search_filter_index_mask(MessageSearchFilter::VideoNote)
+                | message_search_filter_index_mask(MessageSearchFilter::VoiceAndVideoNote)
+        }
+        MessageContent::VoiceNote(_) => {
+            message_search_filter_index_mask(MessageSearchFilter::VoiceNote)
+                | message_search_filter_index_mask(MessageSearchFilter::VoiceAndVideoNote)
+        }
+        MessageContent::ChatChangePhoto(_) => {
+            message_search_filter_index_mask(MessageSearchFilter::ChatPhoto)
+        }
+        MessageContent::Call(m) => {
+            let mut index_mask = message_search_filter_index_mask(MessageSearchFilter::Call);
+            if !is_outgoing
+                && (m.discard_reason.r#type == CallDiscardReasonType::Declined
+                    || m.discard_reason.r#type == CallDiscardReasonType::Missed)
+            {
+                index_mask |= message_search_filter_index_mask(MessageSearchFilter::MissedCall);
+            }
+            index_mask
+        }
+        MessageContent::ConferenceCall(m) => {
+            let mut index_mask = message_search_filter_index_mask(MessageSearchFilter::Call);
+            if !is_outgoing && m.was_missed {
+                index_mask |= message_search_filter_index_mask(MessageSearchFilter::MissedCall);
+            }
+            index_mask
+        }
+        MessageContent::Poll(_) => message_search_filter_index_mask(MessageSearchFilter::Poll),
+        // The C++ zero tail enumerates every remaining type explicitly;
+        // the modeled set matches it exactly.
+        _ => 0,
+    }
+}
+
+/// `get_message_content_index_mask` (MessageContent.cpp:6687-6691).
+pub fn get_message_content_index_mask(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+    is_outgoing: bool,
+) -> i32 {
+    get_message_content_text_index_mask(content)
+        | get_message_content_media_index_mask(td, content, is_outgoing)
+}
+
+/// `get_individual_message_contents` (MessageContent.cpp:6693-6712) —
+/// the album splat. The `Poll` arm delegates through the seam; the
+/// `RichText` arm lands with the unmodeled variant.
+pub fn get_individual_message_contents(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> Vec<MessageContent> {
+    match content {
+        MessageContent::PaidMedia(m) => m
+            .media
+            .iter()
+            .map(MessageExtendedMedia::get_message_content)
+            .collect(),
+        MessageContent::Poll(m) => {
+            td.get_poll_individual_message_contents(m.poll_id, m.attached_media.as_deref())
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// `get_message_content_sticker_type` (MessageContent.cpp:6714-6718).
+pub fn get_message_content_sticker_type(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> StickerType {
+    assert!(matches!(content, MessageContent::Sticker(_)));
+    match content {
+        MessageContent::Sticker(m) => td.get_sticker_type(m.file_id),
+        _ => unreachable!(),
+    }
+}
+
+/// `get_message_content_pinned_message_id` (MessageContent.cpp:6720-6728).
+pub fn get_message_content_pinned_message_id(content: &MessageContent) -> MessageId {
+    match content {
+        MessageContent::PinMessage(m) => m.message_id,
+        _ => MessageId::default(),
+    }
+}
+
+/// `get_message_content_my_background_info` (MessageContent.cpp:6730-6754).
+pub fn get_message_content_my_background_info(
+    content: &MessageContent,
+    is_outgoing: bool,
+) -> BackgroundInfo {
+    match content {
+        MessageContent::SetBackground(set_background) => {
+            if is_outgoing || set_background.for_both {
+                return set_background.background_info.clone();
+            }
+            BackgroundInfo::default()
+        }
+        _ => BackgroundInfo::default(),
+    }
+}
+
+// `get_message_content_chat_theme` (MessageContent.cpp:6756-6764) is
+// deferred with the unmodeled `ChatSetTheme` variant.
+
+/// `get_message_content_replied_message_full_id` (MessageContent.cpp:6766-6872).
+/// The `StarGiftUnique` arm lands with the unmodeled variant.
+pub fn get_message_content_replied_message_full_id(
+    dialog_id: DialogId,
+    content: &MessageContent,
+) -> MessageFullId {
+    match content {
+        MessageContent::PinMessage(m) => {
+            MessageFullId::new(dialog_id, to_messages_manager_message_id(m.message_id))
+        }
+        MessageContent::GameScore(m) => {
+            MessageFullId::new(dialog_id, to_messages_manager_message_id(m.game_message_id))
+        }
+        MessageContent::PaymentSuccessful(m) => {
+            if !m.invoice_message_id.is_valid() {
+                return MessageFullId::default();
+            }
+            let reply_in_dialog_id = if m.invoice_dialog_id.is_valid() {
+                m.invoice_dialog_id
+            } else {
+                dialog_id
+            };
+            MessageFullId::new(
+                reply_in_dialog_id,
+                to_messages_manager_message_id(m.invoice_message_id),
+            )
+        }
+        MessageContent::SetBackground(m) => {
+            if !m.old_message_id.is_valid() {
+                return MessageFullId::default();
+            }
+            MessageFullId::new(dialog_id, to_messages_manager_message_id(m.old_message_id))
+        }
+        MessageContent::GiveawayResults(m) => {
+            if !m.giveaway_message_id.is_valid() {
+                return MessageFullId::default();
+            }
+            MessageFullId::new(
+                dialog_id,
+                to_messages_manager_message_id(m.giveaway_message_id),
+            )
+        }
+        MessageContent::TodoCompletions(m) => {
+            if !m.to_do_message_id.is_valid() {
+                return MessageFullId::default();
+            }
+            MessageFullId::new(
+                dialog_id,
+                to_messages_manager_message_id(m.to_do_message_id),
+            )
+        }
+        MessageContent::TodoAppendTasks(m) => {
+            if !m.to_do_message_id.is_valid() {
+                return MessageFullId::default();
+            }
+            MessageFullId::new(
+                dialog_id,
+                to_messages_manager_message_id(m.to_do_message_id),
+            )
+        }
+        MessageContent::SuggestedPostSuccess(m) => {
+            if !m.suggested_post_message_id.is_valid() {
+                return MessageFullId::default();
+            }
+            MessageFullId::new(
+                dialog_id,
+                to_messages_manager_message_id(m.suggested_post_message_id),
+            )
+        }
+        MessageContent::SuggestedPostRefund(m) => {
+            if !m.suggested_post_message_id.is_valid() {
+                return MessageFullId::default();
+            }
+            MessageFullId::new(
+                dialog_id,
+                to_messages_manager_message_id(m.suggested_post_message_id),
+            )
+        }
+        MessageContent::SuggestedPostApproval(m) => {
+            if !m.suggested_post_message_id.is_valid() {
+                return MessageFullId::default();
+            }
+            MessageFullId::new(
+                dialog_id,
+                to_messages_manager_message_id(m.suggested_post_message_id),
+            )
+        }
+        MessageContent::NoForwardsToggle(m) => {
+            if !m.request_message_id.is_valid() {
+                return MessageFullId::default();
+            }
+            MessageFullId::new(
+                dialog_id,
+                to_messages_manager_message_id(m.request_message_id),
+            )
+        }
+        MessageContent::PollAppendAnswer(m) => {
+            if !m.poll_message_id.is_valid() {
+                return MessageFullId::default();
+            }
+            MessageFullId::new(dialog_id, to_messages_manager_message_id(m.poll_message_id))
+        }
+        MessageContent::PollDeleteAnswer(m) => {
+            if !m.poll_message_id.is_valid() {
+                return MessageFullId::default();
+            }
+            MessageFullId::new(dialog_id, to_messages_manager_message_id(m.poll_message_id))
+        }
+        // update getRepliedMessage documentation
+        _ => MessageFullId::default(),
+    }
+}
+
+/// `get_message_content_group_call_info` (MessageContent.cpp:6874-6881).
+pub fn get_message_content_group_call_info(content: &MessageContent) -> (InputGroupCallId, bool) {
+    assert!(matches!(content, MessageContent::GroupCall(_)));
+    match content {
+        MessageContent::GroupCall(m) => (m.input_group_call_id, m.duration >= 0),
+        _ => unreachable!(),
+    }
+}
+
+/// `get_formatted_text_user_ids` (MessageContent.cpp:6883-6895).
+fn get_formatted_text_user_ids(formatted_text: Option<&FormattedText>) -> Vec<UserId> {
+    let mut user_ids = Vec::new();
+    if let Some(formatted_text) = formatted_text {
+        for entity in &formatted_text.entities {
+            if entity.user_id.is_valid() {
+                user_ids.push(entity.user_id);
+            }
+        }
+    }
+    user_ids
+}
+
+/// `td::combine` (td/utils/algorithm.h) — append, sort, unique; both
+/// inputs are sorted-unique vectors at the call sites.
+fn combine_sorted_unique<T: Ord>(mut first: Vec<T>, mut second: Vec<T>) -> Vec<T> {
+    first.append(&mut second);
+    first.sort_unstable();
+    first.dedup();
+    first
+}
+
+/// `get_message_content_min_user_ids` (MessageContent.cpp:6897-7204).
+/// The `Text` web-page arm reads through the seam; the `RichText` arm
+/// lands with the unmodeled variant. Every modeled type is the C++
+/// `break` arm falling through to the formatted-text fallback.
+pub fn get_message_content_min_user_ids(
+    td: &dyn MessageContentContext,
+    message_content: &MessageContent,
+) -> Vec<UserId> {
+    match message_content {
+        MessageContent::Text(content) => {
+            let mut user_ids = get_formatted_text_user_ids(Some(&content.text));
+            if content.web_page_id.is_valid() {
+                user_ids =
+                    combine_sorted_unique(user_ids, td.get_web_page_user_ids(content.web_page_id));
+            }
+            user_ids
+        }
+        MessageContent::Contact(content) => {
+            let user_id = content.contact.get_user_id();
+            if user_id.is_valid() {
+                return vec![user_id];
+            }
+            get_formatted_text_user_ids(get_message_content_text(message_content))
+        }
+        MessageContent::Game(content) => {
+            let user_id = content.game.get_bot_user_id();
+            if user_id.is_valid() {
+                return vec![user_id];
+            }
+            get_formatted_text_user_ids(get_message_content_text(message_content))
+        }
+        MessageContent::ChatCreate(content) => content.participant_user_ids.clone(),
+        MessageContent::ChatAddUsers(content) => content.user_ids.clone(),
+        MessageContent::ChatDeleteUser(content) => vec![content.user_id],
+        MessageContent::ProximityAlertTriggered(content) => {
+            let mut user_ids = Vec::new();
+            if content.traveler_dialog_id.get_type() == DialogType::User {
+                user_ids.push(content.traveler_dialog_id.get_user_id());
+            }
+            if content.watcher_dialog_id.get_type() == DialogType::User {
+                user_ids.push(content.watcher_dialog_id.get_user_id());
+            }
+            user_ids
+        }
+        MessageContent::InviteToGroupCall(content) => content.user_ids.clone(),
+        MessageContent::Story(content) => {
+            let dialog_id = content.story_full_id.get_dialog_id();
+            if dialog_id.get_type() == DialogType::User {
+                return vec![dialog_id.get_user_id()];
+            }
+            get_formatted_text_user_ids(get_message_content_text(message_content))
+        }
+        MessageContent::GiveawayWinners(content) => content.winner_user_ids.clone(),
+        MessageContent::NewCreatorPending(content) => {
+            if content.new_creator_user_id.is_valid() {
+                return vec![content.new_creator_user_id];
+            }
+            get_formatted_text_user_ids(get_message_content_text(message_content))
+        }
+        MessageContent::ChangeCreator(content) => vec![content.new_creator_user_id],
+        MessageContent::ManagedBotCreated(content) => vec![content.bot_user_id],
+        // `ChatSetTtl` keeps its C++ comment: the `from_user_id` user
+        // can't be min. The "private chats only" types (DialogShared,
+        // PaymentRefunded, PrizeStars, the StarGift family,
+        // ConferenceCall) fall through the same way.
+        _ => get_formatted_text_user_ids(get_message_content_text(message_content)),
+    }
+}
+
+/// `get_message_content_min_channel_ids` (MessageContent.cpp:7206-7238).
+pub fn get_message_content_min_channel_ids(
+    td: &dyn MessageContentContext,
+    message_content: &MessageContent,
+) -> Vec<ChannelId> {
+    match message_content {
+        MessageContent::Text(content) => {
+            if content.web_page_id.is_valid() {
+                return td.get_web_page_channel_ids(content.web_page_id);
+            }
+            Vec::new()
+        }
+        MessageContent::ProximityAlertTriggered(content) => {
+            let mut channel_ids = Vec::new();
+            if content.traveler_dialog_id.get_type() == DialogType::Channel {
+                channel_ids.push(content.traveler_dialog_id.get_channel_id());
+            }
+            if content.watcher_dialog_id.get_type() == DialogType::Channel {
+                channel_ids.push(content.watcher_dialog_id.get_channel_id());
+            }
+            channel_ids
+        }
+        MessageContent::Story(content) => {
+            let dialog_id = content.story_full_id.get_dialog_id();
+            if dialog_id.get_type() == DialogType::Channel {
+                return vec![dialog_id.get_channel_id()];
+            }
+            Vec::new()
+        }
+        MessageContent::Giveaway(content) => content.giveaway_parameters.get_channel_ids(),
+        MessageContent::GiveawayWinners(content) => vec![content.boosted_channel_id],
+        _ => Vec::new(),
+    }
+}
+
+/// `get_message_content_added_user_ids` (MessageContent.cpp:7240-7245).
+pub fn get_message_content_added_user_ids(content: &MessageContent) -> Vec<UserId> {
+    assert!(matches!(content, MessageContent::ChatAddUsers(_)));
+    match content {
+        MessageContent::ChatAddUsers(m) => m.user_ids.clone(),
+        _ => unreachable!(),
+    }
+}
+
+/// `get_message_content_deleted_user_id` (MessageContent.cpp:7247-7255).
+pub fn get_message_content_deleted_user_id(content: &MessageContent) -> UserId {
+    match content {
+        MessageContent::ChatDeleteUser(m) => m.user_id,
+        _ => UserId::default(),
+    }
+}
+
+/// `get_message_content_input_phone_call` (MessageContent.cpp:7257-7266).
+pub fn get_message_content_input_phone_call(
+    content: &MessageContent,
+) -> Option<telegram_api::InputPhoneCall> {
+    assert!(matches!(content, MessageContent::Call(_)));
+    match content {
+        MessageContent::Call(call) => {
+            if call.call_access_hash == 0 {
+                return None;
+            }
+            Some(telegram_api::InputPhoneCall {
+                id: call.call_id,
+                access_hash: call.call_access_hash,
+            })
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// `get_message_content_live_location_period` (MessageContent.cpp:7268-7276).
+pub fn get_message_content_live_location_period(content: &MessageContent) -> i32 {
+    match content {
+        MessageContent::LiveLocation(m) => m.period,
+        _ => 0,
+    }
+}
+
+/// `get_message_content_poll_id` (MessageContent.cpp:7278-7286).
+pub fn get_message_content_poll_id(content: &MessageContent) -> PollId {
+    match content {
+        MessageContent::Poll(m) => m.poll_id,
+        _ => PollId::default(),
+    }
+}
+
+/// `get_message_content_poll_is_anonymous` (MessageContent.cpp:7288-7296).
+pub fn get_message_content_poll_is_anonymous(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> bool {
+    match content {
+        MessageContent::Poll(m) => td.get_poll_is_anonymous(m.poll_id),
+        _ => false,
+    }
+}
+
+/// `get_message_content_poll_is_closed` (MessageContent.cpp:7298-7306).
+pub fn get_message_content_poll_is_closed(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> bool {
+    match content {
+        MessageContent::Poll(m) => td.get_poll_is_closed(m.poll_id),
+        _ => true,
+    }
+}
+
+/// `get_message_content_poll_can_add_option` (MessageContent.cpp:7308-7316).
+pub fn get_message_content_poll_can_add_option(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> bool {
+    match content {
+        MessageContent::Poll(m) => td.get_poll_can_add_option(m.poll_id),
+        _ => false,
+    }
+}
+
+/// `get_message_content_poll_can_view_stats` (MessageContent.cpp:7318-7326).
+pub fn get_message_content_poll_can_view_stats(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> bool {
+    match content {
+        MessageContent::Poll(m) => td.get_poll_can_view_stats(m.poll_id),
+        _ => false,
+    }
+}
+
+/// `get_message_content_poll_has_unread_votes` (MessageContent.cpp:7328-7336).
+pub fn get_message_content_poll_has_unread_votes(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> bool {
+    match content {
+        MessageContent::Poll(m) => td.get_poll_has_unread_votes(m.poll_id),
+        _ => false,
+    }
+}
+
+/// `remove_message_content_poll_has_unread_votes` (MessageContent.cpp:7338-7346).
+pub fn remove_message_content_poll_has_unread_votes(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) {
+    if let MessageContent::Poll(m) = content {
+        td.remove_poll_has_unread_votes(m.poll_id);
+    }
+}
+
+/// `get_message_content_poll_option_properties` (MessageContent.cpp:7348-7359).
+#[allow(clippy::too_many_arguments)] // the C++ handler has the same shape
+pub fn get_message_content_poll_option_properties(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+    option_id: &str,
+    dialog_id: DialogId,
+    message_id: MessageId,
+    can_be_replied: bool,
+    can_be_replied_in_another_chat: bool,
+    can_get_link: bool,
+    is_forward: bool,
+    is_outgoing: bool,
+    promise: Promise<crate::td_api::PollOptionProperties>,
+) {
+    assert!(matches!(content, MessageContent::Poll(_)));
+    match content {
+        MessageContent::Poll(m) => td.get_poll_option_properties(
+            m.poll_id,
+            option_id,
+            dialog_id,
+            message_id,
+            can_be_replied,
+            can_be_replied_in_another_chat,
+            can_get_link,
+            is_forward,
+            is_outgoing,
+            promise,
+        ),
+        _ => unreachable!(),
+    }
+}
+
+/// `get_message_content_to_do_list_others_can_append`
+/// (MessageContent.cpp:7361-7369).
+pub fn get_message_content_to_do_list_others_can_append(content: &MessageContent) -> bool {
+    match content {
+        MessageContent::ToDoList(m) => m.list.others_can_append,
+        _ => false,
+    }
+}
+
+/// `get_message_content_to_do_list_can_append_items`
+/// (MessageContent.cpp:7371-7379) — the C++ reads the
+/// `checklist_task_count_max` option through `td`.
+pub fn get_message_content_to_do_list_can_append_items(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+    item_count: i32,
+) -> bool {
+    match content {
+        MessageContent::ToDoList(m) => {
+            let max_task_count = td.get_option_integer("checklist_task_count_max", 0);
+            m.list.get_can_append_items(max_task_count, item_count)
+        }
+        _ => false,
+    }
+}
+
+/// `get_message_content_to_do_list_others_can_complete`
+/// (MessageContent.cpp:7381-7389).
+pub fn get_message_content_to_do_list_others_can_complete(content: &MessageContent) -> bool {
+    match content {
+        MessageContent::ToDoList(m) => m.list.others_can_complete,
+        _ => false,
+    }
+}
+
+/// `get_message_content_photo` (MessageContent.cpp:7391-7399).
+pub fn get_message_content_photo(content: &MessageContent) -> Option<&Photo> {
+    match content {
+        MessageContent::Photo(m) => Some(&m.photo),
+        _ => None,
+    }
+}
+
+/// `get_message_content_venue` (MessageContent.cpp:7401-7409).
+pub fn get_message_content_venue(content: &MessageContent) -> Option<&Venue> {
+    match content {
+        MessageContent::Venue(m) => Some(&m.venue),
+        _ => None,
+    }
+}
+
+/// `get_message_content_web_page_id` (MessageContent.cpp:7411-7415) —
+/// the C++ takes a nullable content.
+pub fn get_message_content_web_page_id(content: Option<&MessageContent>) -> WebPageId {
+    if let Some(MessageContent::Text(m)) = content {
+        return m.web_page_id;
+    }
+    WebPageId::default()
+}
+
+/// `has_message_content_web_page` (MessageContent.cpp:7417-7423).
+pub fn has_message_content_web_page(content: &MessageContent) -> bool {
+    matches!(content, MessageContent::Text(m) if m.web_page_id.is_valid())
+}
+
+/// `remove_message_content_web_page` (MessageContent.cpp:7425-7434).
+pub fn remove_message_content_web_page(content: &mut MessageContent) {
+    assert!(matches!(content, MessageContent::Text(_)));
+    if let MessageContent::Text(message_text) = content {
+        message_text.web_page_id = WebPageId::default();
+        message_text.force_small_media = false;
+        message_text.force_large_media = false;
+        message_text.skip_web_page_confirmation = false;
+        message_text.web_page_url = String::new();
+    }
+}
+
+/// `can_message_content_have_media_timestamp` (MessageContent.cpp:7436-7452).
+pub fn can_message_content_have_media_timestamp(content: &MessageContent) -> bool {
+    match content {
+        MessageContent::Audio(_)
+        | MessageContent::Story(_)
+        | MessageContent::Video(_)
+        | MessageContent::VideoNote(_)
+        | MessageContent::VoiceNote(_) => true,
+        MessageContent::Invoice(m) => m.input_invoice.has_media_timestamp(),
+        _ => has_message_content_web_page(content),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8543,5 +9876,1187 @@ mod tests {
             .chain((-1i64).to_le_bytes())
             .collect();
         assert_eq!(out, expected);
+    }
+
+    // ------------------------------------------------------------------
+    // M.9.7/M.9.8/M.9.9 — the classification, policy and accessor planes.
+    // ------------------------------------------------------------------
+
+    /// The `MessageContentContext` stand-in: a permission table over a
+    /// restricted rights word, plus flags for the manager seams the
+    /// policy plane reads. Manager reads without a test default
+    /// `log_error!` and answer like an empty manager would.
+    struct TestContext {
+        rights: RestrictedRights,
+        is_bot: bool,
+        my_dialog_id: DialogId,
+        broadcast: bool,
+        monoforum: bool,
+        voice_forbidden: bool,
+        poll_anonymous: bool,
+        sticker_type: StickerType,
+        web_page_user_ids: Vec<UserId>,
+        web_page_channel_ids: Vec<ChannelId>,
+        poll_input_media: bool,
+        checklist_max: i64,
+        poll_contents: Vec<MessageContent>,
+    }
+
+    impl Default for TestContext {
+        fn default() -> Self {
+            TestContext {
+                rights: RestrictedRights::from_bools(
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    ChannelType::Unknown,
+                ),
+                is_bot: false,
+                my_dialog_id: DialogId::default(),
+                broadcast: false,
+                monoforum: false,
+                voice_forbidden: false,
+                poll_anonymous: true,
+                sticker_type: StickerType::Regular,
+                web_page_user_ids: Vec::new(),
+                web_page_channel_ids: Vec::new(),
+                poll_input_media: true,
+                checklist_max: 100,
+                poll_contents: Vec::new(),
+            }
+        }
+    }
+
+    impl TestContext {
+        fn restricted(&mut self, flags: u64) -> &mut Self {
+            self.rights = RestrictedRights::from_flags(flags);
+            self
+        }
+    }
+
+    impl MessageContentContext for TestContext {
+        fn get_user_default_permissions(&self, _user_id: UserId) -> RestrictedRights {
+            self.rights
+        }
+
+        fn get_secret_chat_default_permissions(
+            &self,
+            _secret_chat_id: SecretChatId,
+        ) -> RestrictedRights {
+            self.rights
+        }
+
+        fn is_user_bot(&self, _user_id: UserId) -> bool {
+            false
+        }
+
+        fn get_user_voice_messages_forbidden(&self, _user_id: UserId) -> bool {
+            self.voice_forbidden
+        }
+
+        fn get_chat_effective_restricted_rights(&self, _chat_id: ChatId) -> RestrictedRights {
+            self.rights
+        }
+
+        fn get_channel_effective_restricted_rights(
+            &self,
+            _channel_id: ChannelId,
+        ) -> RestrictedRights {
+            self.rights
+        }
+
+        fn is_broadcast_channel(&self, _channel_id: ChannelId) -> bool {
+            self.broadcast
+        }
+
+        fn is_monoforum_channel(&self, _channel_id: ChannelId) -> bool {
+            self.monoforum
+        }
+
+        fn is_bot(&self) -> bool {
+            self.is_bot
+        }
+
+        fn get_my_dialog_id(&self) -> DialogId {
+            self.my_dialog_id
+        }
+
+        fn get_poll_is_anonymous(&self, _poll_id: PollId) -> bool {
+            self.poll_anonymous
+        }
+
+        fn get_poll_is_closed(&self, _poll_id: PollId) -> bool {
+            false
+        }
+
+        fn get_poll_can_add_option(&self, _poll_id: PollId) -> bool {
+            false
+        }
+
+        fn get_poll_can_view_stats(&self, _poll_id: PollId) -> bool {
+            false
+        }
+
+        fn get_poll_has_unread_votes(&self, _poll_id: PollId) -> bool {
+            true
+        }
+
+        fn remove_poll_has_unread_votes(&self, _poll_id: PollId) {}
+
+        fn has_input_media_poll(&self, _poll_id: PollId) -> bool {
+            self.poll_input_media
+        }
+
+        fn get_poll_individual_message_contents(
+            &self,
+            _poll_id: PollId,
+            _attached_media: Option<&MessageContent>,
+        ) -> Vec<MessageContent> {
+            self.poll_contents.clone()
+        }
+
+        fn get_poll_option_properties(
+            &self,
+            _poll_id: PollId,
+            _option_id: &str,
+            _dialog_id: DialogId,
+            _message_id: MessageId,
+            _can_be_replied: bool,
+            _can_be_replied_in_another_chat: bool,
+            _can_get_link: bool,
+            _is_forward: bool,
+            _is_outgoing: bool,
+            _promise: Promise<crate::td_api::PollOptionProperties>,
+        ) {
+        }
+
+        fn get_sticker_type(&self, _file_id: FileId) -> StickerType {
+            self.sticker_type
+        }
+
+        fn get_web_page_user_ids(&self, _web_page_id: WebPageId) -> Vec<UserId> {
+            self.web_page_user_ids.clone()
+        }
+
+        fn get_web_page_channel_ids(&self, _web_page_id: WebPageId) -> Vec<ChannelId> {
+            self.web_page_channel_ids.clone()
+        }
+
+        fn get_option_integer(&self, name: &str, default: i64) -> i64 {
+            if name == "checklist_task_count_max" {
+                self.checklist_max
+            } else {
+                default
+            }
+        }
+    }
+
+    fn simple_text(text: &str) -> MessageContent {
+        MessageContent::Text(MessageText::new(
+            FormattedText {
+                text: text.to_string(),
+                entities: Vec::new(),
+            },
+            WebPageId::default(),
+            false,
+            false,
+            false,
+            String::new(),
+        ))
+    }
+
+    /// The modeled C++ false-set of `is_service_message_content`
+    /// (MessageContentType.cpp:623-731): 27 of the 28 `false` arms
+    /// (`RichText` unmodeled); everything else is service.
+    #[test]
+    fn service_classification_partitions_like_the_cpp() {
+        let non_service = [
+            MessageContentType::Animation,
+            MessageContentType::Audio,
+            MessageContentType::Contact,
+            MessageContentType::Dice,
+            MessageContentType::Document,
+            MessageContentType::ExpiredPhoto,
+            MessageContentType::ExpiredVideo,
+            MessageContentType::ExpiredVideoNote,
+            MessageContentType::ExpiredVoiceNote,
+            MessageContentType::Game,
+            MessageContentType::Giveaway,
+            MessageContentType::GiveawayWinners,
+            MessageContentType::Invoice,
+            MessageContentType::LiveLocation,
+            MessageContentType::Location,
+            MessageContentType::PaidMedia,
+            MessageContentType::Photo,
+            MessageContentType::Poll,
+            MessageContentType::Sticker,
+            MessageContentType::Story,
+            MessageContentType::Text,
+            MessageContentType::ToDoList,
+            MessageContentType::Unsupported,
+            MessageContentType::Venue,
+            MessageContentType::Video,
+            MessageContentType::VideoNote,
+            MessageContentType::VoiceNote,
+        ];
+        assert_eq!(non_service.len(), 27);
+        for content_type in non_service {
+            assert!(!is_service_message_content(content_type));
+        }
+        // the expired four are non-service and expired at the same time;
+        // everything else non-service is not expired
+        for content_type in [
+            MessageContentType::Animation,
+            MessageContentType::Audio,
+            MessageContentType::Contact,
+            MessageContentType::Dice,
+            MessageContentType::Document,
+            MessageContentType::Game,
+            MessageContentType::Giveaway,
+            MessageContentType::GiveawayWinners,
+            MessageContentType::Invoice,
+            MessageContentType::LiveLocation,
+            MessageContentType::Location,
+            MessageContentType::PaidMedia,
+            MessageContentType::Photo,
+            MessageContentType::Poll,
+            MessageContentType::Sticker,
+            MessageContentType::Story,
+            MessageContentType::Text,
+            MessageContentType::ToDoList,
+            MessageContentType::Unsupported,
+            MessageContentType::Venue,
+            MessageContentType::Video,
+            MessageContentType::VideoNote,
+            MessageContentType::VoiceNote,
+        ] {
+            assert!(!is_expired_message_content(content_type));
+        }
+        for content_type in [
+            MessageContentType::ExpiredPhoto,
+            MessageContentType::ExpiredVideo,
+            MessageContentType::ExpiredVideoNote,
+            MessageContentType::ExpiredVoiceNote,
+        ] {
+            assert!(is_expired_message_content(content_type));
+        }
+        assert!(is_service_message_content(MessageContentType::ChatCreate));
+        assert!(is_service_message_content(MessageContentType::Call));
+        assert!(is_service_message_content(
+            MessageContentType::PollAppendAnswer
+        ));
+        // C++ UNREACHABLEs on `None` (it enumerates only real types); the
+        // complement answers "service" — the can_be_secret_message_content
+        // degradation precedent.
+        assert!(is_service_message_content(MessageContentType::None));
+    }
+
+    /// `get_expired_message_content_type` (MessageContentType.cpp:897-909).
+    #[test]
+    fn expired_content_type_mapping_matches_the_cpp() {
+        assert_eq!(
+            get_expired_message_content_type(MessageContentType::Photo),
+            MessageContentType::ExpiredPhoto
+        );
+        assert_eq!(
+            get_expired_message_content_type(MessageContentType::Video),
+            MessageContentType::ExpiredVideo
+        );
+        assert_eq!(
+            get_expired_message_content_type(MessageContentType::VideoNote),
+            MessageContentType::ExpiredVideoNote
+        );
+        assert_eq!(
+            get_expired_message_content_type(MessageContentType::VoiceNote),
+            MessageContentType::ExpiredVoiceNote
+        );
+        for content_type in [
+            MessageContentType::Text,
+            MessageContentType::ExpiredPhoto,
+            MessageContentType::None,
+            MessageContentType::Unsupported,
+        ] {
+            assert_eq!(
+                get_expired_message_content_type(content_type),
+                MessageContentType::None
+            );
+        }
+    }
+
+    /// `can_send_message_content_to_secret_chat`
+    /// (MessageContentType.cpp:1019-1121): the 13 true types, the 9
+    /// modeled false types (`RichText` is the tenth, unmodeled).
+    #[test]
+    fn secret_chat_sendable_types_match_the_cpp() {
+        for content_type in [
+            MessageContentType::Animation,
+            MessageContentType::Audio,
+            MessageContentType::Contact,
+            MessageContentType::Document,
+            MessageContentType::LiveLocation,
+            MessageContentType::Location,
+            MessageContentType::Photo,
+            MessageContentType::Sticker,
+            MessageContentType::Text,
+            MessageContentType::Venue,
+            MessageContentType::Video,
+            MessageContentType::VideoNote,
+            MessageContentType::VoiceNote,
+        ] {
+            assert!(can_send_message_content_to_secret_chat(content_type));
+        }
+        for content_type in [
+            MessageContentType::Dice,
+            MessageContentType::Game,
+            MessageContentType::Giveaway,
+            MessageContentType::GiveawayWinners,
+            MessageContentType::Invoice,
+            MessageContentType::PaidMedia,
+            MessageContentType::Poll,
+            MessageContentType::Story,
+            MessageContentType::ToDoList,
+        ] {
+            assert!(!can_send_message_content_to_secret_chat(content_type));
+        }
+    }
+
+    /// The index-mask families (MessageContent.cpp:6537-6691): the media
+    /// bits, the missed-call extras and the Game text exemption.
+    #[test]
+    fn index_masks_match_the_cpp_tables() {
+        let td = TestContext::default();
+        let photo = MessageContent::Photo(MessagePhoto {
+            photo: Photo::default(),
+            video_file_id: FileId::default(),
+            caption: FormattedText::default(),
+            has_spoiler: false,
+        });
+        let expected_photo = message_search_filter_index_mask(MessageSearchFilter::Photo)
+            | message_search_filter_index_mask(MessageSearchFilter::PhotoAndVideo);
+        assert_eq!(
+            get_message_content_index_mask(&td, &photo, true),
+            expected_photo
+        );
+
+        let video = MessageContent::Video(MessageVideo {
+            file_id: FileId::default(),
+            alternative_file_ids: Vec::new(),
+            hls_file_ids: Vec::new(),
+            storyboard_file_ids: Vec::new(),
+            storyboard_map_file_ids: Vec::new(),
+            cover: Photo::default(),
+            start_timestamp: 0,
+            caption: FormattedText::default(),
+            has_spoiler: false,
+        });
+        let expected_video = message_search_filter_index_mask(MessageSearchFilter::Video)
+            | message_search_filter_index_mask(MessageSearchFilter::PhotoAndVideo);
+        assert_eq!(
+            get_message_content_index_mask(&td, &video, false),
+            expected_video
+        );
+
+        let declined_call = MessageContent::Call(MessageCall {
+            call_id: 1,
+            call_access_hash: -1,
+            duration: -1,
+            discard_reason: CallDiscardReason {
+                r#type: CallDiscardReasonType::Declined,
+                slug: String::new(),
+            },
+            is_video: false,
+        });
+        let call_bit = message_search_filter_index_mask(MessageSearchFilter::Call);
+        let missed_bit = message_search_filter_index_mask(MessageSearchFilter::MissedCall);
+        assert_eq!(
+            get_message_content_index_mask(&td, &declined_call, false),
+            call_bit | missed_bit
+        );
+        assert_eq!(
+            get_message_content_index_mask(&td, &declined_call, true),
+            call_bit
+        );
+
+        let missed_conference = MessageContent::ConferenceCall(MessageConferenceCall {
+            call_id: 1,
+            duration: -1,
+            other_participant_dialog_ids: Vec::new(),
+            is_active: false,
+            is_video: false,
+            was_missed: true,
+        });
+        assert_eq!(
+            get_message_content_index_mask(&td, &missed_conference, false),
+            call_bit | missed_bit
+        );
+
+        let with_url = MessageContent::Text(MessageText::new(
+            FormattedText {
+                text: "a https://example.com b".to_string(),
+                entities: vec![MessageEntity::new(Type::TextUrl, 2, 18)],
+            },
+            WebPageId::default(),
+            false,
+            false,
+            false,
+            String::new(),
+        ));
+        assert_eq!(
+            get_message_content_index_mask(&td, &with_url, true),
+            message_search_filter_index_mask(MessageSearchFilter::Url)
+        );
+
+        let game = MessageContent::Game(MessageGame {
+            game: Game {
+                id: 1,
+                access_hash: 2,
+                bot_user_id: UserId::default(),
+                short_name: "g".to_string(),
+                title: "T".to_string(),
+                description: String::new(),
+                photo: Photo::default(),
+                animation_file_id: FileId::default(),
+                text: with_url_text(),
+            },
+        });
+        assert_eq!(get_message_content_index_mask(&td, &game, true), 0);
+    }
+
+    fn with_url_text() -> FormattedText {
+        FormattedText {
+            text: "https://example.com".to_string(),
+            entities: vec![MessageEntity::new(Type::Url, 0, 19)],
+        }
+    }
+
+    /// `can_forward_message_content` (MessageContent.cpp:6483-6512).
+    #[test]
+    fn forwardability_matches_the_cpp_rules() {
+        let td = TestContext::default();
+        assert!(!can_forward_message_content(&td, &simple_text(""), false));
+        assert!(can_forward_message_content(&td, &simple_text("hi"), false));
+
+        let with_preview = MessageContent::Text(MessageText::new(
+            FormattedText::default(),
+            WebPageId::new(7),
+            false,
+            false,
+            false,
+            "https://example.com".to_string(),
+        ));
+        assert!(can_forward_message_content(&td, &with_preview, false));
+
+        let local_poll = MessageContent::Poll(MessagePoll {
+            poll_id: PollId::new(-3),
+            caption: FormattedText::default(),
+            attached_media: None,
+        });
+        assert!(!can_forward_message_content(&td, &local_poll, false));
+        let server_poll = MessageContent::Poll(MessagePoll {
+            poll_id: PollId::new(3),
+            caption: FormattedText::default(),
+            attached_media: None,
+        });
+        assert!(can_forward_message_content(&td, &server_poll, false));
+        // the C++ early-returns for every poll, so the trailing is_copy
+        // poll arm below it is shadowed — non-local polls are forwardable
+        // even without stored input media
+        assert!(can_forward_message_content(&td, &server_poll, true));
+
+        let invoice = MessageContent::Invoice(MessageInvoice {
+            input_invoice: InputInvoice::default(),
+        });
+        assert!(!can_forward_message_content(&td, &invoice, true));
+        assert!(can_forward_message_content(&td, &invoice, false));
+
+        assert!(!can_forward_message_content(&td, &expired_photo(), false));
+    }
+
+    fn expired_photo() -> MessageContent {
+        MessageContent::ExpiredPhoto(MessageExpiredPhoto {})
+    }
+
+    /// `update_opened_message_content` (MessageContent.cpp:6514-6531).
+    #[test]
+    fn opened_content_flips_once_like_the_cpp() {
+        let mut video_note = MessageContent::VideoNote(MessageVideoNote {
+            file_id: FileId::new(9, 0),
+            is_viewed: false,
+        });
+        assert!(update_opened_message_content(&mut video_note));
+        assert!(!update_opened_message_content(&mut video_note));
+        match &video_note {
+            MessageContent::VideoNote(m) => assert!(m.is_viewed),
+            _ => unreachable!(),
+        }
+
+        let mut voice_note = MessageContent::VoiceNote(MessageVoiceNote {
+            file_id: FileId::new(10, 0),
+            caption: FormattedText::default(),
+            is_listened: false,
+        });
+        assert!(update_opened_message_content(&mut voice_note));
+        assert!(!update_opened_message_content(&mut voice_note));
+
+        let mut text = simple_text("hi");
+        assert!(!update_opened_message_content(&mut text));
+    }
+
+    /// The paid-media album splat (MessageContent.cpp:6693-6700) keeps
+    /// the `MessageExtendedMedia` order and routes the poll arm through
+    /// the seam.
+    #[test]
+    fn individual_contents_splat_paid_media_in_order() {
+        let td = TestContext::default();
+        let paid_media = MessageContent::PaidMedia(MessagePaidMedia {
+            media: vec![
+                MessageExtendedMedia {
+                    r#type: MessageExtendedMediaType::Photo,
+                    photo: Photo::default(),
+                    ..Default::default()
+                },
+                MessageExtendedMedia {
+                    r#type: MessageExtendedMediaType::Video,
+                    video_file_id: FileId::new(4, 1),
+                    start_timestamp: 33,
+                    ..Default::default()
+                },
+            ],
+            caption: FormattedText::default(),
+            star_count: 10,
+            payload: String::new(),
+        });
+        let individual = get_individual_message_contents(&td, &paid_media);
+        assert_eq!(individual.len(), 2);
+        assert!(matches!(individual[0], MessageContent::Photo(_)));
+        match &individual[1] {
+            MessageContent::Video(m) => {
+                assert_eq!(m.file_id, FileId::new(4, 1));
+                assert_eq!(m.start_timestamp, 33);
+                assert!(m.cover.is_empty());
+            }
+            _ => panic!("expected the video splat"),
+        }
+
+        let poll_td = TestContext {
+            poll_contents: vec![simple_text("poll")],
+            ..Default::default()
+        };
+        let poll = MessageContent::Poll(MessagePoll {
+            poll_id: PollId::new(5),
+            caption: FormattedText::default(),
+            attached_media: None,
+        });
+        assert_eq!(get_individual_message_contents(&poll_td, &poll).len(), 1);
+    }
+
+    /// `can_send_message_content` (MessageContent.cpp:6207-6481): the
+    /// rights mapping, the secret-chat gate and the per-type extras.
+    #[test]
+    fn can_send_follows_the_cpp_decision_table() {
+        let user_id = UserId::new(7);
+        let dialog_id = DialogId::from_user_id(user_id);
+        let channel_id = ChannelId::new(77);
+        let channel_dialog = DialogId::from_channel_id(channel_id);
+
+        // check_permissions = false allows everything sendable.
+        let mut td = TestContext::default();
+        td.restricted(0);
+        assert!(can_send_message_content(&td, dialog_id, &simple_text("hi"), false, false).is_ok());
+
+        // Text with no can_send_messages right (an empty rights word).
+        let mut td = TestContext::default();
+        td.restricted(0);
+        let error =
+            can_send_message_content(&td, dialog_id, &simple_text("hi"), false, true).unwrap_err();
+        assert_eq!(error.code(), 400);
+        assert_eq!(
+            error.message(),
+            "Not enough rights to send text messages to the chat"
+        );
+
+        // Dice rides the stickers right; animations denied separately.
+        let stickers_bit = 1u64 << 18;
+        let animations_bit = 1u64 << 19;
+        let mut td = TestContext::default();
+        td.restricted(stickers_bit);
+        let dice = MessageContent::Dice(MessageDice::new(
+            MessageDice::DEFAULT_EMOJI,
+            0,
+            false,
+            String::new(),
+            String::new(),
+            0,
+            0,
+        ));
+        assert!(can_send_message_content(&td, dialog_id, &dice, false, true).is_ok());
+        let animation = MessageContent::Animation(MessageAnimation {
+            file_id: FileId::new(1, 0),
+            caption: FormattedText::default(),
+            has_spoiler: false,
+        });
+        let error = can_send_message_content(&td, dialog_id, &animation, false, true).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "Not enough rights to send animations to the chat"
+        );
+        let mut td = TestContext::default();
+        td.restricted(animations_bit);
+        assert!(can_send_message_content(&td, dialog_id, &animation, false, true).is_ok());
+
+        // Secret-chat gate wins over the rights table.
+        let secret_chat_id = SecretChatId::new(9);
+        let secret_dialog = DialogId::from_secret_chat_id(secret_chat_id);
+        let poll = MessageContent::Poll(MessagePoll {
+            poll_id: PollId::new(5),
+            caption: FormattedText::default(),
+            attached_media: None,
+        });
+        let td = TestContext::default();
+        assert_eq!(
+            can_send_message_content(&td, secret_dialog, &poll, false, true)
+                .unwrap_err()
+                .message(),
+            "Message can't be sent to a secret chat"
+        );
+        // a default context answers like an existing secret chat, whose
+        // default permissions allow text
+        let td = TestContext::default();
+        assert!(
+            can_send_message_content(&td, secret_dialog, &simple_text("hi"), false, true).is_ok()
+        );
+
+        // Paid media: forward needs photo+video; direct send is
+        // broadcast-channels-only for users.
+        let photos_bit = 1u64 << 34;
+        let paid_media = MessageContent::PaidMedia(MessagePaidMedia {
+            media: Vec::new(),
+            caption: FormattedText::default(),
+            star_count: 5,
+            payload: String::new(),
+        });
+        let mut td = TestContext::default();
+        td.restricted(photos_bit);
+        let error = can_send_message_content(&td, dialog_id, &paid_media, true, true).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "Not enough rights to send paid media to the chat"
+        );
+        let td = TestContext::default();
+        let error = can_send_message_content(&td, dialog_id, &paid_media, false, true).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "Paid media can be sent only in channel chats"
+        );
+        let td = TestContext {
+            broadcast: true,
+            ..Default::default()
+        };
+        assert!(can_send_message_content(&td, channel_dialog, &paid_media, false, true).is_ok());
+
+        // Non-anonymous polls can't go to broadcast channels; polls
+        // can't go to private chats from users.
+        let td = TestContext {
+            broadcast: true,
+            poll_anonymous: false,
+            ..Default::default()
+        };
+        let error = can_send_message_content(&td, channel_dialog, &poll, false, true).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "Non-anonymous polls can't be sent to channel chats"
+        );
+        let td = TestContext::default();
+        let error = can_send_message_content(&td, dialog_id, &poll, false, true).unwrap_err();
+        assert_eq!(error.message(), "Polls can't be sent to the private chat");
+        let td = TestContext {
+            is_bot: true,
+            ..Default::default()
+        };
+        assert!(can_send_message_content(&td, dialog_id, &poll, false, true).is_ok());
+
+        // Video notes to a user that restricted voice messages.
+        let video_note = MessageContent::VideoNote(MessageVideoNote {
+            file_id: FileId::new(3, 0),
+            is_viewed: false,
+        });
+        let td = TestContext {
+            voice_forbidden: true,
+            ..Default::default()
+        };
+        let error = can_send_message_content(&td, dialog_id, &video_note, false, true).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "User restricted receiving of video note messages"
+        );
+
+        // Custom-emoji stickers can't be sent as messages.
+        let sticker = MessageContent::Sticker(MessageSticker {
+            file_id: FileId::new(2, 0),
+            is_premium: false,
+        });
+        let td = TestContext {
+            sticker_type: StickerType::CustomEmoji,
+            ..Default::default()
+        };
+        let error = can_send_message_content(&td, dialog_id, &sticker, false, true).unwrap_err();
+        assert_eq!(error.message(), "Can't send emoji stickers in messages");
+
+        // Checklists can't go to broadcast channels and ride the poll
+        // right.
+        let todo = MessageContent::ToDoList(MessageToDoList {
+            list: ToDoList::default(),
+            completions: Vec::new(),
+        });
+        let td = TestContext {
+            broadcast: true,
+            ..Default::default()
+        };
+        let error = can_send_message_content(&td, channel_dialog, &todo, false, true).unwrap_err();
+        assert_eq!(error.message(), "Checklists can't be sent to channel chats");
+        let polls_bit = 1u64 << 23;
+        let mut td = TestContext::default();
+        td.restricted(polls_bit);
+        assert!(can_send_message_content(&td, dialog_id, &todo, false, true).is_ok());
+
+        // Games can't go to monoforum channel direct messages chats.
+        let game = MessageContent::Game(MessageGame {
+            game: Game::default(),
+        });
+        let td = TestContext {
+            monoforum: true,
+            ..Default::default()
+        };
+        let error = can_send_message_content(&td, channel_dialog, &game, false, true).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "Games can't be sent to channel direct messages chats"
+        );
+    }
+
+    /// The replied-message id extraction (MessageContent.cpp:6766-6872).
+    #[test]
+    fn replied_message_full_ids_match_the_cpp_arms() {
+        let user_id = UserId::new(7);
+        let dialog_id = DialogId::from_user_id(user_id);
+        let other_dialog = DialogId::from_channel_id(ChannelId::new(50));
+        let full_id = |dialog_id, message_id: MessageId| {
+            MessageFullId::new(dialog_id, to_messages_manager_message_id(message_id))
+        };
+
+        let pin = MessageContent::PinMessage(MessagePinMessage {
+            message_id: MessageId::new(11),
+        });
+        assert_eq!(
+            get_message_content_replied_message_full_id(dialog_id, &pin),
+            full_id(dialog_id, MessageId::new(11))
+        );
+
+        // the validity-checked arms need full-form ids: a server message
+        // id has empty type bits (`MessageId::is_valid`, MessageId.cpp:104)
+        let payment = MessageContent::PaymentSuccessful(MessagePaymentSuccessful {
+            invoice_dialog_id: other_dialog,
+            invoice_message_id: MessageId::new(12 << 20),
+            ..Default::default()
+        });
+        assert_eq!(
+            get_message_content_replied_message_full_id(dialog_id, &payment),
+            full_id(other_dialog, MessageId::new(12 << 20))
+        );
+        let own_payment = MessageContent::PaymentSuccessful(MessagePaymentSuccessful {
+            invoice_dialog_id: DialogId::default(),
+            invoice_message_id: MessageId::new(13 << 20),
+            ..Default::default()
+        });
+        assert_eq!(
+            get_message_content_replied_message_full_id(dialog_id, &own_payment),
+            full_id(dialog_id, MessageId::new(13 << 20))
+        );
+        let invalid_payment = MessageContent::PaymentSuccessful(MessagePaymentSuccessful {
+            invoice_dialog_id: DialogId::default(),
+            invoice_message_id: MessageId::default(),
+            ..Default::default()
+        });
+        assert_eq!(
+            get_message_content_replied_message_full_id(dialog_id, &invalid_payment),
+            MessageFullId::default()
+        );
+
+        for content in [
+            simple_text("hi"),
+            MessageContent::ScreenshotTaken(MessageScreenshotTaken {}),
+        ] {
+            assert_eq!(
+                get_message_content_replied_message_full_id(dialog_id, &content),
+                MessageFullId::default()
+            );
+        }
+
+        let background = MessageContent::SetBackground(MessageSetBackground {
+            old_message_id: MessageId::new(21 << 20),
+            background_info: BackgroundInfo::default(),
+            for_both: false,
+        });
+        assert_eq!(
+            get_message_content_replied_message_full_id(dialog_id, &background),
+            full_id(dialog_id, MessageId::new(21 << 20))
+        );
+    }
+
+    /// `MessagePaymentSuccessful::Default` — the C++ field-initializer
+    /// defaults the M.10.1b plane pinned.
+    #[test]
+    fn min_user_ids_follow_the_cpp_arms() {
+        let user_id = UserId::new(7);
+        let other_user_id = UserId::new(8);
+        let dialog_id = DialogId::from_user_id(user_id);
+        let td = TestContext::default();
+
+        let chat_create = MessageContent::ChatCreate(MessageChatCreate {
+            title: "t".to_string(),
+            participant_user_ids: vec![other_user_id, user_id],
+        });
+        assert_eq!(
+            get_message_content_min_user_ids(&td, &chat_create),
+            vec![other_user_id, user_id]
+        );
+
+        let proximity = MessageContent::ProximityAlertTriggered(MessageProximityAlertTriggered {
+            traveler_dialog_id: DialogId::from_user_id(user_id),
+            watcher_dialog_id: DialogId::from_channel_id(ChannelId::new(5)),
+            distance: 10,
+        });
+        assert_eq!(
+            get_message_content_min_user_ids(&td, &proximity),
+            vec![user_id]
+        );
+        assert_eq!(
+            get_message_content_min_channel_ids(&td, &proximity),
+            vec![ChannelId::new(5)]
+        );
+
+        let story = MessageContent::Story(MessageStory {
+            story_full_id: StoryFullId::new(dialog_id, StoryId::new(3)),
+            via_mention: false,
+        });
+        assert_eq!(get_message_content_min_user_ids(&td, &story), vec![user_id]);
+        assert_eq!(
+            get_message_content_min_channel_ids(&td, &story),
+            Vec::<ChannelId>::new()
+        );
+        let channel_story = MessageContent::Story(MessageStory {
+            story_full_id: StoryFullId::new(
+                DialogId::from_channel_id(ChannelId::new(6)),
+                StoryId::new(3),
+            ),
+            via_mention: false,
+        });
+        assert_eq!(
+            get_message_content_min_channel_ids(&td, &channel_story),
+            vec![ChannelId::new(6)]
+        );
+
+        let giveaway = MessageContent::Giveaway(MessageGiveaway {
+            giveaway_parameters: GiveawayParameters {
+                boosted_channel_id: ChannelId::new(2),
+                additional_channel_ids: vec![ChannelId::new(4), ChannelId::new(3)],
+                ..Default::default()
+            },
+            quantity: 1,
+            months: 2,
+            star_count: 0,
+        });
+        assert_eq!(
+            get_message_content_min_channel_ids(&td, &giveaway),
+            vec![ChannelId::new(4), ChannelId::new(3), ChannelId::new(2)]
+        );
+
+        let contact = MessageContent::Contact(MessageContact {
+            contact: Contact::new(
+                "+15551234567".to_string(),
+                "J".to_string(),
+                "D".to_string(),
+                String::new(),
+                user_id,
+            ),
+        });
+        assert_eq!(
+            get_message_content_min_user_ids(&td, &contact),
+            vec![user_id]
+        );
+
+        // Text min ids combine the formatted-text entities with the web
+        // page ids, sorted-unique; the entity user_id is invalid here,
+        // so only the web page ids survive the combination.
+        let td = TestContext {
+            web_page_user_ids: vec![user_id, UserId::new(100)],
+            ..Default::default()
+        };
+        let text = MessageContent::Text(MessageText::new(
+            FormattedText {
+                text: "hi @a".to_string(),
+                entities: vec![MessageEntity {
+                    r#type: Some(Type::MentionName),
+                    offset: 3,
+                    length: 2,
+                    ..Default::default()
+                }],
+            },
+            WebPageId::new(9),
+            false,
+            false,
+            false,
+            String::new(),
+        ));
+        assert_eq!(
+            get_message_content_min_user_ids(&td, &text),
+            vec![user_id, UserId::new(100)]
+        );
+    }
+
+    /// The named user-id accessors (MessageContent.cpp:7240-7255).
+    #[test]
+    fn added_and_deleted_user_ids_match_the_cpp() {
+        let user_id = UserId::new(7);
+        let other_user_id = UserId::new(9);
+        let added = MessageContent::ChatAddUsers(MessageChatAddUsers {
+            user_ids: vec![user_id, other_user_id],
+        });
+        assert_eq!(
+            get_message_content_added_user_ids(&added),
+            vec![user_id, other_user_id]
+        );
+        let deleted = MessageContent::ChatDeleteUser(MessageChatDeleteUser {
+            user_id: other_user_id,
+        });
+        assert_eq!(get_message_content_deleted_user_id(&deleted), other_user_id);
+        assert_eq!(
+            get_message_content_deleted_user_id(&simple_text("hi")),
+            UserId::default()
+        );
+    }
+
+    /// The phone-call/live-location/poll/to-do accessor families
+    /// (MessageContent.cpp:7257-7389).
+    #[test]
+    fn small_accessors_match_the_cpp_defaults() {
+        let td = TestContext::default();
+
+        let call = MessageContent::Call(MessageCall {
+            call_id: 42,
+            call_access_hash: -7,
+            duration: 60,
+            discard_reason: CallDiscardReason::default(),
+            is_video: false,
+        });
+        match get_message_content_input_phone_call(&call) {
+            Some(telegram_api::InputPhoneCall { id, access_hash }) => {
+                assert_eq!(id, 42);
+                assert_eq!(access_hash, -7);
+            }
+            _ => panic!("expected inputPhoneCall"),
+        }
+        let no_hash_call = MessageContent::Call(MessageCall {
+            call_id: 42,
+            call_access_hash: 0,
+            ..Default::default()
+        });
+        assert!(get_message_content_input_phone_call(&no_hash_call).is_none());
+
+        let live_location = MessageContent::LiveLocation(MessageLiveLocation {
+            location: Location::default(),
+            period: 900,
+            heading: -1,
+            proximity_alert_radius: 0,
+        });
+        assert_eq!(
+            get_message_content_live_location_period(&live_location),
+            900
+        );
+        assert_eq!(
+            get_message_content_live_location_period(&simple_text("hi")),
+            0
+        );
+
+        let poll = MessageContent::Poll(MessagePoll {
+            poll_id: PollId::new(5),
+            caption: FormattedText::default(),
+            attached_media: None,
+        });
+        assert_eq!(get_message_content_poll_id(&poll), PollId::new(5));
+        assert_eq!(
+            get_message_content_poll_id(&simple_text("hi")),
+            PollId::default()
+        );
+        assert!(get_message_content_poll_is_anonymous(&td, &poll));
+        assert!(get_message_content_poll_is_closed(&td, &simple_text("hi")));
+        assert!(get_message_content_poll_has_unread_votes(&td, &poll));
+
+        let todo = MessageContent::ToDoList(MessageToDoList {
+            list: ToDoList {
+                title: FormattedText::default(),
+                items: vec![ToDoItem::default(); 3],
+                others_can_append: true,
+                others_can_complete: false,
+            },
+            completions: Vec::new(),
+        });
+        assert!(get_message_content_to_do_list_others_can_append(&todo));
+        assert!(!get_message_content_to_do_list_others_can_complete(&todo));
+        assert!(get_message_content_to_do_list_can_append_items(
+            &td, &todo, 97
+        ));
+        assert!(!get_message_content_to_do_list_can_append_items(
+            &td, &todo, 98
+        ));
+        assert!(!get_message_content_to_do_list_can_append_items(
+            &td, &todo, -1
+        ));
+        assert!(!get_message_content_to_do_list_can_append_items(
+            &td,
+            &simple_text("hi"),
+            1
+        ));
+    }
+
+    /// The media accessors (MessageContent.cpp:7391-7452) and the
+    /// background-info gate (MessageContent.cpp:6730-6754).
+    #[test]
+    fn media_accessors_and_background_info_match_the_cpp() {
+        let photo = MessageContent::Photo(MessagePhoto {
+            photo: Photo::default(),
+            video_file_id: FileId::default(),
+            caption: FormattedText::default(),
+            has_spoiler: false,
+        });
+        assert!(get_message_content_photo(&photo).is_some());
+        assert!(get_message_content_photo(&simple_text("hi")).is_none());
+        assert!(get_message_content_venue(&photo).is_none());
+
+        let text_with_preview = MessageContent::Text(MessageText::new(
+            FormattedText::default(),
+            WebPageId::new(12),
+            true,
+            true,
+            true,
+            "https://example.com".to_string(),
+        ));
+        assert!(has_message_content_web_page(&text_with_preview));
+        assert_eq!(
+            get_message_content_web_page_id(Some(&text_with_preview)),
+            WebPageId::new(12)
+        );
+        assert_eq!(get_message_content_web_page_id(None), WebPageId::default());
+        assert!(can_message_content_have_media_timestamp(&text_with_preview));
+
+        let mut text = text_with_preview;
+        remove_message_content_web_page(&mut text);
+        match &text {
+            MessageContent::Text(m) => {
+                assert_eq!(m.web_page_id, WebPageId::default());
+                assert!(!m.force_small_media);
+                assert!(!m.force_large_media);
+                assert!(!m.skip_web_page_confirmation);
+                assert!(m.web_page_url.is_empty());
+            }
+            _ => unreachable!(),
+        }
+
+        let audio = MessageContent::Audio(MessageAudio {
+            file_id: FileId::new(1, 0),
+            caption: FormattedText::default(),
+        });
+        assert!(can_message_content_have_media_timestamp(&audio));
+        assert!(!can_message_content_have_media_timestamp(&simple_text(
+            "hi"
+        )));
+
+        let background_info = BackgroundInfo {
+            background_id: BackgroundId::new(3),
+            background_type: BackgroundType::default(),
+        };
+        let set_background = MessageContent::SetBackground(MessageSetBackground {
+            old_message_id: MessageId::default(),
+            background_info: background_info.clone(),
+            for_both: false,
+        });
+        assert_eq!(
+            get_message_content_my_background_info(&set_background, true),
+            background_info
+        );
+        assert_eq!(
+            get_message_content_my_background_info(&set_background, false),
+            BackgroundInfo::default()
+        );
+        let for_both = MessageContent::SetBackground(MessageSetBackground {
+            old_message_id: MessageId::default(),
+            background_info: background_info.clone(),
+            for_both: true,
+        });
+        assert_eq!(
+            get_message_content_my_background_info(&for_both, false),
+            background_info
+        );
+    }
+
+    /// The value helpers the accessors consume: Game/GiveawayParameters/
+    /// InputInvoice/ToDoList.
+    #[test]
+    fn value_helpers_match_the_cpp() {
+        let user_id = UserId::new(7);
+        let game = Game {
+            bot_user_id: user_id,
+            text: with_url_text(),
+            ..Default::default()
+        };
+        assert_eq!(game.get_bot_user_id(), user_id);
+        assert_eq!(game.get_text().text, "https://example.com");
+
+        let parameters = GiveawayParameters {
+            boosted_channel_id: ChannelId::new(2),
+            additional_channel_ids: vec![ChannelId::new(4), ChannelId::new(3)],
+            ..Default::default()
+        };
+        assert_eq!(
+            parameters.get_channel_ids(),
+            vec![ChannelId::new(4), ChannelId::new(3), ChannelId::new(2)]
+        );
+
+        let mut invoice = InputInvoice::default();
+        invoice.extended_media.r#type = MessageExtendedMediaType::Video;
+        assert!(invoice.has_media_timestamp());
+        invoice.extended_media.r#type = MessageExtendedMediaType::Photo;
+        assert!(!invoice.has_media_timestamp());
+        invoice.extended_media_caption = with_url_text();
+        assert_eq!(invoice.get_caption().text, "https://example.com");
+
+        let list = ToDoList {
+            title: FormattedText::default(),
+            items: vec![ToDoItem::default(); 3],
+            others_can_append: false,
+            others_can_complete: true,
+        };
+        assert!(list.get_can_append_items(100, 97));
+        assert!(!list.get_can_append_items(100, 98));
+        assert!(list.get_can_append_items(3, 0));
+        assert!(!list.get_can_append_items(3, 1));
+        assert!(!list.get_can_append_items(100, -1));
     }
 }
