@@ -87,6 +87,16 @@ pub const LOG_EVENT_HANDLER_TYPE_USERS: i32 = 2;
 /// secret chat is unsaved (`SecretChatLogEvent`). Distinct from
 /// `SecretChats` = 1, which routes to the Wave-3 `SecretChatsManager`.
 pub const LOG_EVENT_HANDLER_TYPE_SECRET_CHAT_INFOS: i32 = 5;
+/// `LogEvent::HandlerType::UpdateScopeNotificationSettingsOnServer`
+/// (logevent/LogEvent.h:89) — the un-acked scope settings server update.
+pub const LOG_EVENT_HANDLER_TYPE_UPDATE_SCOPE_NOTIFICATION_SETTINGS_ON_SERVER: i32 = 0x110;
+/// `LogEvent::HandlerType::ResetAllNotificationSettingsOnServer`
+/// (logevent/LogEvent.h:90) — the un-acked reset-all server update.
+pub const LOG_EVENT_HANDLER_TYPE_RESET_ALL_NOTIFICATION_SETTINGS_ON_SERVER: i32 = 0x111;
+/// `LogEvent::HandlerType::UpdateReactionNotificationSettingsOnServer`
+/// (logevent/LogEvent.h:108) — the un-acked reaction settings server
+/// update.
+pub const LOG_EVENT_HANDLER_TYPE_UPDATE_REACTION_NOTIFICATION_SETTINGS_ON_SERVER: i32 = 0x129;
 
 /// `TdDb::OpenedDatabase` — the database plus the open metadata the Td actor
 /// consumes (`since_last_open`; the per-manager binlog event vectors arrive
@@ -102,6 +112,11 @@ pub struct OpenedDatabase {
     /// binlog event with the SecretChatInfos handler type, in binlog order,
     /// for `UserManager::on_binlog_secret_chat_event`.
     pub secret_chat_events: Vec<BinlogEvent>,
+    /// The on-server notification settings log events (Td.cpp:1034) — the
+    /// UpdateScopeNotificationSettingsOnServer / ResetAllNotificationSettings
+    /// OnServer / UpdateReactionNotificationSettingsOnServer events, in
+    /// binlog order, for `NotificationSettingsManager::on_binlog_events`.
+    pub notification_settings_events: Vec<BinlogEvent>,
 }
 
 /// `get_binlog_path` — `{database_directory}td{_test}.binlog`.
@@ -602,21 +617,29 @@ impl TdDb {
 
         // The combined replay callback: each pmc consumes only the events
         // written with its own magic; the Users and SecretChatInfos events
-        // collect for the user manager (the remaining handlers wait for
+        // collect for the user manager, the notification-settings on-server
+        // events for the settings manager (the remaining handlers wait for
         // their owners).
         let mut user_events: Vec<BinlogEvent> = Vec::new();
         let mut secret_chat_events: Vec<BinlogEvent> = Vec::new();
+        let mut notification_settings_events: Vec<BinlogEvent> = Vec::new();
         let mut binlog = ConcurrentBinlog::new();
         {
             let binlog_pmc = &mut binlog_pmc;
             let config_pmc = &mut config_pmc;
             let user_events = &mut user_events;
             let secret_chat_events = &mut secret_chat_events;
+            let notification_settings_events = &mut notification_settings_events;
             let callback = |event: &BinlogEvent| match event.type_ {
                 BINLOG_PMC_MAGIC => binlog_pmc.external_init_handle(event),
                 CONFIG_PMC_MAGIC => config_pmc.external_init_handle(event),
                 LOG_EVENT_HANDLER_TYPE_USERS => user_events.push(event.clone()),
                 LOG_EVENT_HANDLER_TYPE_SECRET_CHAT_INFOS => secret_chat_events.push(event.clone()),
+                LOG_EVENT_HANDLER_TYPE_UPDATE_SCOPE_NOTIFICATION_SETTINGS_ON_SERVER
+                | LOG_EVENT_HANDLER_TYPE_RESET_ALL_NOTIFICATION_SETTINGS_ON_SERVER
+                | LOG_EVENT_HANDLER_TYPE_UPDATE_REACTION_NOTIFICATION_SETTINGS_ON_SERVER => {
+                    notification_settings_events.push(event.clone())
+                }
                 _ => {}
             };
             let init_status = binlog.init(
@@ -687,6 +710,7 @@ impl TdDb {
             since_last_open,
             user_events,
             secret_chat_events,
+            notification_settings_events,
         })
     }
 
