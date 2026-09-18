@@ -61,6 +61,17 @@
 //! unmodeled variants; the `register_gift`/`on_get_star_gift` seam
 //! methods land with them.
 //!
+//! M.9.10 is the merge machinery: [`merge_message_contents`] /
+//! [`merge_message_content_file_id`] (MessageContent.cpp:7415-7958) with
+//! the companions [`merge_photos`] (Photo.cpp:210-302),
+//! `MessageExtendedMedia::merge_files`/`update_from`,
+//! `InputInvoice::update_from`. The per-manager file merges ride the
+//! [`MessageContentContext`] merge section; the merge_photos FileManager
+//! block is the `merge_photo_files` seam (M.12.2). The C++ mutates the
+//! old content's location access hash through `mutable` members, so the
+//! port takes `&mut MessageContent` for the old side. The Text-arm
+//! change logs stand in with a collapsed repr until M.9.16.
+//!
 //! The td_api/telegram_api
 //! conversions arrive with their own slices. Value companions living here
 //! that later move to their owners' modules: `Location`/`Venue` (the
@@ -1235,6 +1246,63 @@ impl MessageExtendedMedia {
         self.r#type == MessageExtendedMediaType::Unsupported
     }
 
+    /// `MessageExtendedMedia::is_media` (MessageExtendedMedia.h:53-55).
+    pub fn is_media(&self) -> bool {
+        self.r#type != MessageExtendedMediaType::Empty
+            && self.r#type != MessageExtendedMediaType::Preview
+    }
+
+    /// `MessageExtendedMedia::update_from` (MessageExtendedMedia.cpp:218-222)
+    /// — an old media value fills a not-yet-loaded slot.
+    pub fn update_from(&mut self, old_extended_media: &MessageExtendedMedia) {
+        if !self.is_media() && old_extended_media.is_media() {
+            *self = old_extended_media.clone();
+        }
+    }
+
+    /// `MessageExtendedMedia::merge_files` (MessageExtendedMedia.cpp:429-447).
+    pub fn merge_files(
+        &self,
+        td: &mut dyn MessageContentContext,
+        other: &mut MessageExtendedMedia,
+        dialog_id: DialogId,
+        need_merge_files: bool,
+        is_content_changed: &mut bool,
+        need_update: &mut bool,
+    ) {
+        if !self.has_input_media() || !other.has_input_media() {
+            return;
+        }
+        if self.r#type != other.r#type {
+            tdutils::log_error!("Type of paid media has changed");
+            return;
+        }
+        match self.r#type {
+            MessageExtendedMediaType::Photo => {
+                merge_photos(
+                    td,
+                    &self.photo,
+                    &mut other.photo,
+                    dialog_id,
+                    need_merge_files,
+                    is_content_changed,
+                    need_update,
+                );
+            }
+            MessageExtendedMediaType::Video => {
+                if self.video_file_id != other.video_file_id && need_merge_files {
+                    td.merge_videos(other.video_file_id, self.video_file_id);
+                }
+            }
+            MessageExtendedMediaType::Empty
+            | MessageExtendedMediaType::Preview
+            | MessageExtendedMediaType::Unsupported => {
+                // the C++ `default:` arm is `UNREACHABLE()` — abort the same way.
+                unreachable!("Unexpected paid media type to merge");
+            }
+        }
+    }
+
     /// `MessageExtendedMedia::need_reget` (MessageExtendedMedia.h).
     pub fn need_reget(&self) -> bool {
         self.r#type == MessageExtendedMediaType::Unsupported
@@ -1279,6 +1347,13 @@ impl InputInvoice {
     /// `InputInvoice::has_media_timestamp` (InputInvoice.cpp).
     pub fn has_media_timestamp(&self) -> bool {
         self.extended_media.has_media_timestamp()
+    }
+
+    /// `InputInvoice::update_from` (InputInvoice.cpp:387-389) — keep the
+    /// old media when the new invoice has none.
+    pub fn update_from(&mut self, old_input_invoice: &InputInvoice) {
+        self.extended_media
+            .update_from(&old_input_invoice.extended_media);
     }
 
     /// `InputInvoice::get_caption` (InputInvoice.cpp) — the caption of the
@@ -6896,6 +6971,32 @@ pub trait MessageContentContext {
     fn register_noforwards_request(&mut self, message_full_id: MessageFullId, message_date: i32);
     /// `UserManager::unregister_noforwards_request` (UserManager.h:564).
     fn unregister_noforwards_request(&mut self, message_full_id: MessageFullId);
+
+    // -- Merge family (MessageContent.cpp:7490-7958) — the per-manager
+    // file merges the merge paths call; Wave-2/3 owners are no-op
+    // stand-ins until they land. --
+    /// `AnimationsManager::merge_animations` (AnimationsManager.h).
+    fn merge_animations(&mut self, new_file_id: FileId, old_file_id: FileId);
+    /// `AudiosManager::merge_audios` (AudiosManager.h).
+    fn merge_audios(&mut self, new_file_id: FileId, old_file_id: FileId);
+    /// `DocumentsManager::merge_documents` (DocumentsManager.h).
+    fn merge_documents(&mut self, new_file_id: FileId, old_file_id: FileId);
+    /// `StickersManager::merge_stickers` (StickersManager.h).
+    fn merge_stickers(&mut self, new_file_id: FileId, old_file_id: FileId);
+    /// `VideosManager::merge_videos` (VideosManager.h).
+    fn merge_videos(&mut self, new_file_id: FileId, old_file_id: FileId);
+    /// `VideoNotesManager::merge_video_notes` (VideoNotesManager.h).
+    fn merge_video_notes(&mut self, new_file_id: FileId, old_file_id: FileId);
+    /// `VoiceNotesManager::merge_voice_notes` (VoiceNotesManager.h).
+    fn merge_voice_notes(&mut self, new_file_id: FileId, old_file_id: FileId);
+    /// `FileManager::merge` (the merge_photos and
+    /// merge_message_content_file_id blocks).
+    fn merge_files(&mut self, new_file_id: FileId, old_file_id: FileId);
+    /// The `merge_photos` FileManager block (Photo.cpp:266-299): the
+    /// old-'i'-size/new-full-size file views, the remote-location
+    /// comparison and `register_remote` — lands with the M.12.2
+    /// FileManager.
+    fn merge_photo_files(&mut self, old_photo: &Photo, new_photo: &Photo, dialog_id: DialogId);
 }
 
 /// `is_local_poll_id` (PollManager.cpp:449-452) — the local (unsent)
@@ -8453,6 +8554,506 @@ pub fn unregister_welcome_message_content(
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// M.9.10 — merge_message_contents + merge_message_content_file_id
+// (MessageContent.cpp:7415-7958, the get_difference idempotency core) plus
+// the companions: merge_photos (Photo.cpp:210-302),
+// MessageExtendedMedia::merge_files/update_from
+// (MessageExtendedMedia.cpp:429-447/218-222), InputInvoice::update_from
+// (InputInvoice.cpp:387-389). The per-manager file merges go through the
+// [`MessageContentContext`] merge section; the FileManager file-view block
+// of merge_photos is the `merge_photo_files` seam (M.12.2). The Text-arm
+// change logs stand in with a collapsed content repr until M.9.16's
+// `get_message_content_object` lands. The C++ mutates the old content's
+// location access hash through `mutable` members — the port takes
+// `old_content: &mut MessageContent` for that.
+// ---------------------------------------------------------------------------
+
+/// `begins_with` (misc.h:56-58) — the tdutils slice helper.
+fn begins_with(str: &str, prefix: &str) -> bool {
+    prefix.len() <= str.len() && str.starts_with(prefix)
+}
+
+/// `ends_with` (misc.h:60-62) — the tdutils slice helper.
+fn ends_with(str: &str, suffix: &str) -> bool {
+    suffix.len() <= str.len() && str.ends_with(suffix)
+}
+
+/// `merge_location_access_hash` (MessageContent.cpp:7415-7421) — the C++
+/// mutates both locations through `mutable` members, hence the `&mut` pair.
+fn merge_location_access_hash(first: &mut Location, second: &mut Location) {
+    if second.get_access_hash() != 0 {
+        first.set_access_hash(second.get_access_hash());
+    } else {
+        second.set_access_hash(first.get_access_hash());
+    }
+}
+
+/// `need_message_text_changed_warning` (MessageContent.cpp:7423-7446).
+fn need_message_text_changed_warning(old_content: &MessageText, new_content: &MessageText) -> bool {
+    const MAX_CUSTOM_ENTITY_COUNT: usize = 100; // server-side limit
+    if old_content.text.entities.len() > MAX_CUSTOM_ENTITY_COUNT {
+        return false;
+    }
+    if new_content.text.text == "Unsupported characters"
+        || new_content.text.text
+            == "This channel is blocked because it was used to spread pornographic content."
+        || begins_with(
+            &new_content.text.text,
+            "This group has been temporarily suspended to give its moderators time to clean up after \
+             users who posted illegal pornographic content.",
+        )
+    {
+        // message contained unsupported characters or is restricted, text is replaced
+        return false;
+    }
+    if !old_content.text.entities.is_empty()
+        && old_content.text.entities[0].offset == 0
+        && (new_content.text.entities.is_empty()
+            || new_content.text.entities[0] != old_content.text.entities[0])
+        && old_content.text.text != new_content.text.text
+        && ends_with(&old_content.text.text, &new_content.text.text)
+    {
+        // server has deleted first entity and left-trimed the message
+        return false;
+    }
+    true
+}
+
+/// `need_message_entities_changed_warning` (MessageContent.cpp:7448-7488).
+fn need_message_entities_changed_warning(
+    old_entities: &[MessageEntity],
+    new_entities: &[MessageEntity],
+) -> bool {
+    let mut old_pos = 0;
+    let mut new_pos = 0;
+    // compare entities, skipping some known to be different
+    while old_pos < old_entities.len() || new_pos < new_entities.len() {
+        // TODO remove after find_phone_numbers is implemented
+        while new_pos < new_entities.len()
+            && new_entities[new_pos].r#type == Some(Type::PhoneNumber)
+        {
+            new_pos += 1;
+        }
+
+        if old_pos < old_entities.len()
+            && new_pos < new_entities.len()
+            && old_entities[old_pos] == new_entities[new_pos]
+        {
+            old_pos += 1;
+            new_pos += 1;
+            continue;
+        }
+        if old_pos < old_entities.len()
+            && new_pos < new_entities.len()
+            && (old_entities[old_pos].r#type == Some(Type::Pre)
+                || old_entities[old_pos].r#type == Some(Type::PreCode))
+            && new_entities[new_pos].r#type == Some(Type::PreCode)
+            && old_entities[old_pos].argument.is_empty()
+            && old_entities[old_pos].offset == new_entities[new_pos].offset
+            && old_entities[old_pos].length == new_entities[new_pos].length
+        {
+            // server can add recognized language code
+            old_pos += 1;
+            new_pos += 1;
+            continue;
+        }
+
+        if old_pos < old_entities.len()
+            && (old_entities[old_pos].r#type == Some(Type::MentionName)
+                || old_entities[old_pos].r#type == Some(Type::CustomEmoji))
+        {
+            // server can delete some MentionName and CustomEmoji entities
+            old_pos += 1;
+            continue;
+        }
+
+        if old_pos < old_entities.len() || new_pos < new_entities.len() {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// `merge_photos` (Photo.cpp:210-302) — the size-list splice is exact;
+/// the file-manager block is the `merge_photo_files` seam (M.12.2).
+pub fn merge_photos(
+    td: &mut dyn MessageContentContext,
+    old_photo: &Photo,
+    new_photo: &mut Photo,
+    dialog_id: DialogId,
+    need_merge_files: bool,
+    is_content_changed: &mut bool,
+    need_update: &mut bool,
+) {
+    if old_photo.date != new_photo.date {
+        tdutils::log_debug!(
+            "Photo date has changed from {} to {}",
+            old_photo.date,
+            new_photo.date
+        );
+        *is_content_changed = true;
+    }
+    if old_photo.id != new_photo.id || old_photo.minithumbnail != new_photo.minithumbnail {
+        *need_update = true;
+    }
+    if old_photo.photos != new_photo.photos {
+        tdutils::log_debug!(
+            "Merge photos {:?} and {:?}, need_merge_files = {}",
+            old_photo.photos,
+            new_photo.photos,
+            need_merge_files
+        );
+        let new_photos_size = new_photo.photos.len();
+        let old_photos_size = old_photo.photos.len();
+        let is_type = |photo_size: &PhotoSize, type_: i32| photo_size.size_type == type_;
+
+        let mut need_merge = false;
+        if need_merge_files
+            && (old_photos_size == 1
+                || (old_photos_size == 2 && is_type(&old_photo.photos[0], 't' as i32)))
+            && is_type(old_photo.photos.last().unwrap(), 'i' as i32)
+        {
+            // first time get info about sent photo
+            if let Some(last) = new_photo.photos.last()
+                && is_type(last, 'i' as i32)
+            {
+                // remove previous 'i' size for the photo if any
+                new_photo.photos.pop();
+            }
+            if let Some(last) = new_photo.photos.last()
+                && is_type(last, 't' as i32)
+            {
+                // remove previous 't' size for the photo if any
+                new_photo.photos.pop();
+            }
+
+            // add back 't' and 'i' sizes
+            if old_photos_size == 2 {
+                new_photo.photos.push(old_photo.photos[0].clone());
+            }
+            new_photo
+                .photos
+                .push(old_photo.photos.last().unwrap().clone());
+            need_merge = true;
+            *need_update = true;
+        } else {
+            // get sent photo again
+            if old_photos_size == 2 + new_photos_size
+                && is_type(&old_photo.photos[new_photos_size], 't' as i32)
+            {
+                new_photo
+                    .photos
+                    .push(old_photo.photos[new_photos_size].clone());
+            }
+            if old_photos_size == 1 + new_photo.photos.len()
+                && is_type(old_photo.photos.last().unwrap(), 'i' as i32)
+            {
+                new_photo
+                    .photos
+                    .push(old_photo.photos.last().unwrap().clone());
+                need_merge = true;
+            }
+            if old_photo.photos != new_photo.photos {
+                // return previous size, because we shouldn't add local photo sizes
+                new_photo.photos.truncate(new_photos_size);
+                need_merge = false;
+                *need_update = true;
+            }
+        }
+
+        tdutils::log_debug!(
+            "Merge photos {:?} and {:?} with new photos size = {}, need_merge = {}, need_update = {}",
+            old_photo.photos,
+            new_photo.photos,
+            new_photos_size,
+            need_merge,
+            *need_update
+        );
+        if need_merge && new_photos_size != 0 {
+            td.merge_photo_files(old_photo, new_photo, dialog_id);
+        }
+    }
+}
+
+/// The collapsed stand-in for the C++ Text-arm change logs — the full
+/// `to_string(get_message_content_object(...))` repr arrives with M.9.16.
+fn content_log_repr(content: &MessageContent) -> String {
+    if let MessageContent::Text(text) = content {
+        format!("{:?} {:?}", content.get_type(), text.text.text)
+    } else {
+        format!("{:?}", content.get_type())
+    }
+}
+
+/// `merge_message_contents` (MessageContent.cpp:7490-7774). The C++
+/// null-slot checks of the Poll arm collapse: the seam returns owned
+/// non-null contents. The RichText arm is the C++ commented-out block —
+/// ported as a comment. The StarGift-family arms are deferred with the
+/// unmodeled variants.
+#[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+pub fn merge_message_contents(
+    td: &mut dyn MessageContentContext,
+    old_content: &mut MessageContent,
+    new_content: &mut MessageContent,
+    need_message_changed_warning: bool,
+    dialog_id: DialogId,
+    need_merge_files: bool,
+    is_content_changed: &mut bool,
+    need_update: &mut bool,
+) {
+    let content_type = new_content.get_type();
+    assert_eq!(old_content.get_type(), content_type);
+
+    match (old_content, new_content) {
+        (MessageContent::Text(old_), MessageContent::Text(new_)) => {
+            if old_.text.text != new_.text.text
+                && need_message_changed_warning
+                && need_message_text_changed_warning(old_, new_)
+            {
+                tdutils::log_error!(
+                    "Message text has changed for a message in {} from {} to {}",
+                    dialog_id,
+                    content_log_repr(&MessageContent::Text(old_.clone())),
+                    content_log_repr(&MessageContent::Text(new_.clone()))
+                );
+            }
+            if old_.text.entities != new_.text.entities
+                && need_message_changed_warning
+                && need_message_text_changed_warning(old_, new_)
+                && need_message_entities_changed_warning(&old_.text.entities, &new_.text.entities)
+                && td.get_option_integer("session_count", 0) <= 1
+            {
+                tdutils::log_warning!(
+                    "Entities have changed for a message in {} from {} to {}",
+                    dialog_id,
+                    content_log_repr(&MessageContent::Text(old_.clone())),
+                    content_log_repr(&MessageContent::Text(new_.clone()))
+                );
+            }
+        }
+        (MessageContent::Animation(old_), MessageContent::Animation(new_))
+            if old_.file_id != new_.file_id && need_merge_files =>
+        {
+            td.merge_animations(new_.file_id, old_.file_id);
+        }
+        (MessageContent::Audio(old_), MessageContent::Audio(new_))
+            if old_.file_id != new_.file_id && need_merge_files =>
+        {
+            td.merge_audios(new_.file_id, old_.file_id);
+        }
+        (MessageContent::Document(old_), MessageContent::Document(new_))
+            if old_.file_id != new_.file_id && need_merge_files =>
+        {
+            td.merge_documents(new_.file_id, old_.file_id);
+        }
+        (MessageContent::Invoice(old_), MessageContent::Invoice(new_)) => {
+            new_.input_invoice.update_from(&old_.input_invoice);
+        }
+        (MessageContent::LiveLocation(old_), MessageContent::LiveLocation(new_))
+            if old_.location.get_access_hash() != new_.location.get_access_hash() =>
+        {
+            merge_location_access_hash(&mut old_.location, &mut new_.location);
+        }
+        (MessageContent::Location(old_), MessageContent::Location(new_))
+            if old_.location.get_access_hash() != new_.location.get_access_hash() =>
+        {
+            merge_location_access_hash(&mut old_.location, &mut new_.location);
+        }
+        (MessageContent::PaidMedia(old_), MessageContent::PaidMedia(new_)) => {
+            if old_.media.len() != new_.media.len() {
+                tdutils::log_error!(
+                    "Had {} paid media, but now have {}",
+                    old_.media.len(),
+                    new_.media.len()
+                );
+            } else {
+                for i in 0..old_.media.len() {
+                    old_.media[i].merge_files(
+                        td,
+                        &mut new_.media[i],
+                        dialog_id,
+                        need_merge_files,
+                        is_content_changed,
+                        need_update,
+                    );
+                }
+            }
+        }
+        (MessageContent::Photo(old_), MessageContent::Photo(new_)) => {
+            merge_photos(
+                td,
+                &old_.photo,
+                &mut new_.photo,
+                dialog_id,
+                need_merge_files,
+                is_content_changed,
+                need_update,
+            );
+        }
+        (MessageContent::Poll(old_), MessageContent::Poll(new_)) => {
+            let mut old_contents = td
+                .get_poll_individual_message_contents(old_.poll_id, old_.attached_media.as_deref());
+            let mut new_contents = td
+                .get_poll_individual_message_contents(new_.poll_id, new_.attached_media.as_deref());
+            if old_contents.len() != new_contents.len() {
+                tdutils::log_error!(
+                    "Had {} poll media, but now have {}",
+                    old_contents.len(),
+                    new_contents.len()
+                );
+            } else {
+                for i in 0..old_contents.len() {
+                    if old_contents[i].get_type() != new_contents[i].get_type() {
+                        tdutils::log_info!(
+                            "Have {:?} as old content, but {:?} as new content",
+                            old_contents[i].get_type(),
+                            new_contents[i].get_type()
+                        );
+                        continue;
+                    }
+                    merge_message_contents(
+                        td,
+                        &mut old_contents[i],
+                        &mut new_contents[i],
+                        need_message_changed_warning,
+                        dialog_id,
+                        need_merge_files,
+                        is_content_changed,
+                        need_update,
+                    );
+                }
+            }
+        }
+        (MessageContent::Sticker(old_), MessageContent::Sticker(new_))
+            if old_.file_id != new_.file_id && need_merge_files =>
+        {
+            td.merge_stickers(new_.file_id, old_.file_id);
+        }
+        (MessageContent::Venue(old_), MessageContent::Venue(new_))
+            if old_.venue.location.get_access_hash() != new_.venue.location.get_access_hash() =>
+        {
+            merge_location_access_hash(&mut old_.venue.location, &mut new_.venue.location);
+        }
+        (MessageContent::Video(old_), MessageContent::Video(new_))
+            if old_.file_id != new_.file_id && need_merge_files =>
+        {
+            td.merge_videos(new_.file_id, old_.file_id);
+        }
+        (MessageContent::VideoNote(old_), MessageContent::VideoNote(new_)) => {
+            if old_.file_id != new_.file_id && need_merge_files {
+                td.merge_video_notes(new_.file_id, old_.file_id);
+            }
+            if old_.is_viewed {
+                new_.is_viewed = true;
+            }
+        }
+        (MessageContent::VoiceNote(old_), MessageContent::VoiceNote(new_)) => {
+            if old_.file_id != new_.file_id && need_merge_files {
+                td.merge_voice_notes(new_.file_id, old_.file_id);
+            }
+            if old_.is_listened {
+                new_.is_listened = true;
+            }
+        }
+        // The C++ no-op arm list and the commented-out RichText block:
+        // every other same-type pair (all modeled variants) falls here.
+        _ => {}
+    }
+}
+
+/// `merge_message_content_file_id` (MessageContent.cpp:7776-7941) — secret
+/// chats only. The FileManager `merge` of the Photo arm is the seam; the
+/// no-op arm list logs exactly like the C++.
+pub fn merge_message_content_file_id(
+    td: &mut dyn MessageContentContext,
+    message_content: &mut MessageContent,
+    new_file_id: FileId,
+) -> bool {
+    if !new_file_id.is_valid() {
+        return false;
+    }
+
+    tdutils::log_info!(
+        "Merge message content of a message with file {}",
+        new_file_id.get()
+    );
+    let content_type = message_content.get_type();
+    match message_content {
+        MessageContent::Animation(content) => {
+            if new_file_id != content.file_id {
+                td.merge_animations(new_file_id, content.file_id);
+                content.file_id = new_file_id;
+                return true;
+            }
+        }
+        MessageContent::Audio(content) => {
+            if new_file_id != content.file_id {
+                td.merge_audios(new_file_id, content.file_id);
+                content.file_id = new_file_id;
+                return true;
+            }
+        }
+        MessageContent::Document(content) => {
+            if new_file_id != content.file_id {
+                td.merge_documents(new_file_id, content.file_id);
+                content.file_id = new_file_id;
+                return true;
+            }
+        }
+        MessageContent::Photo(content) => {
+            let photo = &mut content.photo;
+            if let Some(last) = photo.photos.last_mut()
+                && last.size_type == 'i' as i32
+            {
+                let old_file_id = last.file_id;
+                if old_file_id != new_file_id {
+                    td.merge_files(new_file_id, old_file_id);
+                    last.file_id = new_file_id;
+                    return true;
+                }
+            }
+        }
+        MessageContent::Sticker(content) => {
+            if new_file_id != content.file_id {
+                td.merge_stickers(new_file_id, content.file_id);
+                content.file_id = new_file_id;
+                return true;
+            }
+        }
+        MessageContent::Video(content) => {
+            if new_file_id != content.file_id {
+                td.merge_videos(new_file_id, content.file_id);
+                content.file_id = new_file_id;
+                return true;
+            }
+        }
+        MessageContent::VideoNote(content) => {
+            if new_file_id != content.file_id {
+                td.merge_video_notes(new_file_id, content.file_id);
+                content.file_id = new_file_id;
+                return true;
+            }
+        }
+        MessageContent::VoiceNote(content) => {
+            if new_file_id != content.file_id {
+                td.merge_voice_notes(new_file_id, content.file_id);
+                content.file_id = new_file_id;
+                return true;
+            }
+        }
+        _ => {
+            tdutils::log_error!(
+                "Receive new file {} in a sent message of the type {:?}",
+                new_file_id.get(),
+                content_type
+            );
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -10671,6 +11272,7 @@ mod tests {
         poll_input_media: bool,
         checklist_max: i64,
         poll_contents: Vec<MessageContent>,
+        poll_contents_2: Vec<MessageContent>,
         register_log: Vec<String>,
     }
 
@@ -10712,6 +11314,7 @@ mod tests {
                 poll_input_media: true,
                 checklist_max: 100,
                 poll_contents: Vec::new(),
+                poll_contents_2: Vec::new(),
                 register_log: Vec::new(),
             }
         }
@@ -10799,10 +11402,14 @@ mod tests {
 
         fn get_poll_individual_message_contents(
             &self,
-            _poll_id: PollId,
+            poll_id: PollId,
             _attached_media: Option<&MessageContent>,
         ) -> Vec<MessageContent> {
-            self.poll_contents.clone()
+            if poll_id.get() == 2 {
+                self.poll_contents_2.clone()
+            } else {
+                self.poll_contents.clone()
+            }
         }
 
         fn get_poll_option_properties(
@@ -11120,6 +11727,82 @@ mod tests {
         fn unregister_noforwards_request(&mut self, _message_full_id: MessageFullId) {
             self.register_log
                 .push("unregister_noforwards_request()".to_string());
+        }
+
+        fn merge_animations(&mut self, new_file_id: FileId, old_file_id: FileId) {
+            self.register_log.push(format!(
+                "merge_animations({},{})",
+                new_file_id.get(),
+                old_file_id.get()
+            ));
+        }
+
+        fn merge_audios(&mut self, new_file_id: FileId, old_file_id: FileId) {
+            self.register_log.push(format!(
+                "merge_audios({},{})",
+                new_file_id.get(),
+                old_file_id.get()
+            ));
+        }
+
+        fn merge_documents(&mut self, new_file_id: FileId, old_file_id: FileId) {
+            self.register_log.push(format!(
+                "merge_documents({},{})",
+                new_file_id.get(),
+                old_file_id.get()
+            ));
+        }
+
+        fn merge_stickers(&mut self, new_file_id: FileId, old_file_id: FileId) {
+            self.register_log.push(format!(
+                "merge_stickers({},{})",
+                new_file_id.get(),
+                old_file_id.get()
+            ));
+        }
+
+        fn merge_videos(&mut self, new_file_id: FileId, old_file_id: FileId) {
+            self.register_log.push(format!(
+                "merge_videos({},{})",
+                new_file_id.get(),
+                old_file_id.get()
+            ));
+        }
+
+        fn merge_video_notes(&mut self, new_file_id: FileId, old_file_id: FileId) {
+            self.register_log.push(format!(
+                "merge_video_notes({},{})",
+                new_file_id.get(),
+                old_file_id.get()
+            ));
+        }
+
+        fn merge_voice_notes(&mut self, new_file_id: FileId, old_file_id: FileId) {
+            self.register_log.push(format!(
+                "merge_voice_notes({},{})",
+                new_file_id.get(),
+                old_file_id.get()
+            ));
+        }
+
+        fn merge_files(&mut self, new_file_id: FileId, old_file_id: FileId) {
+            self.register_log.push(format!(
+                "merge_files({},{})",
+                new_file_id.get(),
+                old_file_id.get()
+            ));
+        }
+
+        fn merge_photo_files(
+            &mut self,
+            old_photo: &Photo,
+            new_photo: &Photo,
+            _dialog_id: DialogId,
+        ) {
+            self.register_log.push(format!(
+                "merge_photo_files({:?},{:?})",
+                old_photo.id, new_photo.id
+            ));
         }
     }
 
@@ -12766,5 +13449,435 @@ mod tests {
         assert_eq!(get_premium_duration_month_count(31), 1);
         assert_eq!(get_premium_duration_month_count(60), 2);
         assert_eq!(get_premium_duration_month_count(-10), 1);
+    }
+
+    fn photo_size(type_: i32, file_id: i32) -> PhotoSize {
+        PhotoSize {
+            size_type: type_,
+            size: file_id,
+            file_id: FileId::new(file_id, 0),
+            ..PhotoSize::default()
+        }
+    }
+
+    #[test]
+    fn merge_location_access_hash_fills_the_missing_side() {
+        // second has the hash — first takes it
+        let mut first = Location::default();
+        first.set_access_hash(3);
+        let mut second = Location::default();
+        second.set_access_hash(5);
+        merge_location_access_hash(&mut first, &mut second);
+        assert_eq!(first.get_access_hash(), 5);
+        assert_eq!(second.get_access_hash(), 5);
+
+        let mut first = Location::default();
+        let mut second = Location::default();
+        second.set_access_hash(5);
+        merge_location_access_hash(&mut first, &mut second);
+        assert_eq!(first.get_access_hash(), 5);
+        assert_eq!(second.get_access_hash(), 5);
+
+        // only first has the hash — second takes it
+        let mut first = Location::default();
+        first.set_access_hash(3);
+        let mut second = Location::default();
+        merge_location_access_hash(&mut first, &mut second);
+        assert_eq!(first.get_access_hash(), 3);
+        assert_eq!(second.get_access_hash(), 3);
+    }
+
+    #[test]
+    fn need_message_text_changed_warning_decision_table() {
+        let old = |text: &str, entities: Vec<MessageEntity>| {
+            MessageText::new(
+                FormattedText {
+                    text: text.to_string(),
+                    entities,
+                },
+                WebPageId::default(),
+                false,
+                false,
+                false,
+                String::new(),
+            )
+        };
+
+        assert!(need_message_text_changed_warning(
+            &old("hello", vec![]),
+            &old("world", vec![])
+        ));
+        assert!(need_message_text_changed_warning(
+            &old("hello", vec![]),
+            &old("hello", vec![])
+        ));
+        assert!(!need_message_text_changed_warning(
+            &old("hello", vec![]),
+            &old("Unsupported characters", vec![])
+        ));
+        assert!(!need_message_text_changed_warning(
+            &old("hello", vec![]),
+            &old(
+                "This group has been temporarily suspended to give its moderators time to clean up after users \
+                 who posted illegal pornographic content.",
+                vec![]
+            )
+        ));
+
+        // >100 entities — the server-side limit silences the warning
+        let many_entities: Vec<MessageEntity> = (0..101)
+            .map(|_| MessageEntity::new(Type::Bold, 0, 1))
+            .collect();
+        assert!(!need_message_text_changed_warning(
+            &old("hello", many_entities),
+            &old("world", vec![])
+        ));
+
+        // server deleted the first entity and left-trimmed the message
+        assert!(!need_message_text_changed_warning(
+            &old("xyzhello", vec![MessageEntity::new(Type::Bold, 0, 3)]),
+            &old("hello", vec![])
+        ));
+    }
+
+    #[test]
+    fn need_message_entities_changed_warning_decision_table() {
+        // identical lists
+        assert!(!need_message_entities_changed_warning(
+            &[MessageEntity::new(Type::Bold, 0, 1)],
+            &[MessageEntity::new(Type::Bold, 0, 1)]
+        ));
+        // phone numbers the server adds are skipped
+        assert!(!need_message_entities_changed_warning(
+            &[MessageEntity::new(Type::Bold, 0, 1)],
+            &[
+                MessageEntity::new(Type::PhoneNumber, 1, 2),
+                MessageEntity::new(Type::Bold, 0, 1)
+            ]
+        ));
+        // Pre -> PreCode with the server-added language code
+        assert!(!need_message_entities_changed_warning(
+            &[MessageEntity::new(Type::Pre, 0, 1)],
+            &[MessageEntity::with_argument(
+                Type::PreCode,
+                0,
+                1,
+                "rust".to_string()
+            )]
+        ));
+        // deleted MentionName entities are skipped
+        assert!(!need_message_entities_changed_warning(
+            &[
+                MessageEntity::mention_name(0, 1, UserId::new(5)),
+                MessageEntity::new(Type::Bold, 1, 1)
+            ],
+            &[MessageEntity::new(Type::Bold, 1, 1)]
+        ));
+        // a real difference warns
+        assert!(need_message_entities_changed_warning(
+            &[MessageEntity::new(Type::Bold, 0, 1)],
+            &[MessageEntity::new(Type::Italic, 0, 1)]
+        ));
+        // a deleted trailing entity warns
+        assert!(need_message_entities_changed_warning(
+            &[
+                MessageEntity::new(Type::Bold, 0, 1),
+                MessageEntity::new(Type::Italic, 1, 1)
+            ],
+            &[MessageEntity::new(Type::Bold, 0, 1)]
+        ));
+    }
+
+    #[test]
+    fn merge_photos_splices_the_sent_photo_sizes() {
+        // the first-time-info path: old = [t, i], new = [m]
+        let old_photo = Photo {
+            id: 11,
+            photos: vec![photo_size('t' as i32, 1), photo_size('i' as i32, 2)],
+            ..Photo::default()
+        };
+        let mut new_photo = Photo {
+            id: 22,
+            photos: vec![photo_size('m' as i32, 3)],
+            ..Photo::default()
+        };
+        let mut td = TestContext::default();
+        let mut is_content_changed = false;
+        let mut need_update = false;
+        merge_photos(
+            &mut td,
+            &old_photo,
+            &mut new_photo,
+            DialogId::default(),
+            true,
+            &mut is_content_changed,
+            &mut need_update,
+        );
+        assert_eq!(
+            new_photo
+                .photos
+                .iter()
+                .map(|s| s.size_type)
+                .collect::<Vec<_>>(),
+            vec!['m' as i32, 't' as i32, 'i' as i32]
+        );
+        assert!(need_update);
+        assert_eq!(td.register_log, vec!["merge_photo_files(11,22)"]);
+
+        // the local-sizes path rolls back: without need_merge_files the
+        // else branch pushes the old 'i' size, then the mismatch resizes
+        // back to the previous sizes
+        let old_photo = Photo {
+            id: 11,
+            photos: vec![photo_size('t' as i32, 1), photo_size('i' as i32, 2)],
+            ..Photo::default()
+        };
+        let mut new_photo = Photo {
+            id: 22,
+            photos: vec![photo_size('m' as i32, 3)],
+            ..Photo::default()
+        };
+        let mut td = TestContext::default();
+        let mut need_update = false;
+        merge_photos(
+            &mut td,
+            &old_photo,
+            &mut new_photo,
+            DialogId::default(),
+            false,
+            &mut false,
+            &mut need_update,
+        );
+        assert_eq!(
+            new_photo
+                .photos
+                .iter()
+                .map(|s| s.size_type)
+                .collect::<Vec<_>>(),
+            vec!['m' as i32]
+        );
+        assert!(need_update);
+        assert!(td.register_log.is_empty());
+
+        // a date change marks the content changed
+        let old_photo = Photo {
+            date: 1,
+            ..Photo::default()
+        };
+        let mut new_photo = Photo {
+            date: 2,
+            ..Photo::default()
+        };
+        let mut td = TestContext::default();
+        let mut is_content_changed = false;
+        merge_photos(
+            &mut td,
+            &old_photo,
+            &mut new_photo,
+            DialogId::default(),
+            true,
+            &mut is_content_changed,
+            &mut false,
+        );
+        assert!(is_content_changed);
+    }
+
+    #[test]
+    fn merge_message_contents_merges_files_and_flags() {
+        let dialog_id = DialogId::default();
+        let old_file = FileId::new(1, 0);
+        let new_file = FileId::new(2, 0);
+
+        // different animation files merge
+        let mut td = TestContext::default();
+        let mut old = MessageContent::Animation(MessageAnimation {
+            file_id: old_file,
+            ..MessageAnimation::default()
+        });
+        let mut new = MessageContent::Animation(MessageAnimation {
+            file_id: new_file,
+            ..MessageAnimation::default()
+        });
+        merge_message_contents(
+            &mut td, &mut old, &mut new, true, dialog_id, true, &mut false, &mut false,
+        );
+        assert_eq!(td.register_log, vec!["merge_animations(2,1)"]);
+        // same file — no merge
+        let mut td = TestContext::default();
+        let mut old = MessageContent::Animation(MessageAnimation {
+            file_id: old_file,
+            ..MessageAnimation::default()
+        });
+        let mut new = MessageContent::Animation(MessageAnimation {
+            file_id: old_file,
+            ..MessageAnimation::default()
+        });
+        merge_message_contents(
+            &mut td, &mut old, &mut new, true, dialog_id, true, &mut false, &mut false,
+        );
+        assert!(td.register_log.is_empty());
+
+        // video-note viewed flag propagates
+        let mut td = TestContext::default();
+        let mut old = MessageContent::VideoNote(MessageVideoNote {
+            file_id: old_file,
+            is_viewed: true,
+        });
+        let mut new = MessageContent::VideoNote(MessageVideoNote {
+            file_id: old_file,
+            is_viewed: false,
+        });
+        merge_message_contents(
+            &mut td, &mut old, &mut new, true, dialog_id, true, &mut false, &mut false,
+        );
+        assert!(matches!(new, MessageContent::VideoNote(m) if m.is_viewed));
+
+        // voice-note listened flag propagates
+        let mut td = TestContext::default();
+        let mut old = MessageContent::VoiceNote(MessageVoiceNote {
+            file_id: old_file,
+            caption: FormattedText::default(),
+            is_listened: true,
+        });
+        let mut new = MessageContent::VoiceNote(MessageVoiceNote {
+            file_id: old_file,
+            caption: FormattedText::default(),
+            is_listened: false,
+        });
+        merge_message_contents(
+            &mut td, &mut old, &mut new, true, dialog_id, true, &mut false, &mut false,
+        );
+        assert!(matches!(new, MessageContent::VoiceNote(m) if m.is_listened));
+
+        // invoice keeps the old media
+        let mut old = MessageContent::Invoice(MessageInvoice {
+            input_invoice: InputInvoice {
+                extended_media: MessageExtendedMedia {
+                    r#type: MessageExtendedMediaType::Video,
+                    ..MessageExtendedMedia::default()
+                },
+                ..InputInvoice::default()
+            },
+        });
+        let mut new = MessageContent::Invoice(MessageInvoice::default());
+        let mut td = TestContext::default();
+        merge_message_contents(
+            &mut td, &mut old, &mut new, true, dialog_id, true, &mut false, &mut false,
+        );
+        assert!(matches!(
+            new,
+            MessageContent::Invoice(m)
+                if m.input_invoice.extended_media.r#type == MessageExtendedMediaType::Video
+        ));
+
+        // live location access hash fills into the old content
+        let old_location = Location::new(1.0, 2.0, 0.0, 7);
+        let mut old = MessageContent::LiveLocation(MessageLiveLocation::default());
+        let mut new = MessageContent::LiveLocation(MessageLiveLocation {
+            location: old_location,
+            ..MessageLiveLocation::default()
+        });
+        let mut td = TestContext::default();
+        merge_message_contents(
+            &mut td, &mut old, &mut new, true, dialog_id, true, &mut false, &mut false,
+        );
+        assert!(matches!(
+            old,
+            MessageContent::LiveLocation(m) if m.location.get_access_hash() == 7
+        ));
+
+        // poll media merge recurses over the seam contents
+        let mut td = TestContext {
+            poll_contents: vec![MessageContent::Animation(MessageAnimation {
+                file_id: old_file,
+                ..MessageAnimation::default()
+            })],
+            poll_contents_2: vec![MessageContent::Animation(MessageAnimation {
+                file_id: new_file,
+                ..MessageAnimation::default()
+            })],
+            ..TestContext::default()
+        };
+        let mut old = MessageContent::Poll(MessagePoll {
+            poll_id: PollId::new(1),
+            ..MessagePoll::default()
+        });
+        let mut new = MessageContent::Poll(MessagePoll {
+            poll_id: PollId::new(2),
+            ..MessagePoll::default()
+        });
+        merge_message_contents(
+            &mut td, &mut old, &mut new, true, dialog_id, true, &mut false, &mut false,
+        );
+        assert_eq!(td.register_log, vec!["merge_animations(2,1)"]);
+    }
+
+    #[test]
+    fn merge_message_content_file_id_replaces_and_reports() {
+        let old_file = FileId::new(1, 0);
+        let new_file = FileId::new(2, 0);
+
+        // invalid new id — no-op
+        let mut td = TestContext::default();
+        let mut content = MessageContent::Animation(MessageAnimation {
+            file_id: old_file,
+            ..MessageAnimation::default()
+        });
+        assert!(!merge_message_content_file_id(
+            &mut td,
+            &mut content,
+            FileId::default()
+        ));
+
+        // animation: merged and replaced
+        let mut td = TestContext::default();
+        let mut content = MessageContent::Animation(MessageAnimation {
+            file_id: old_file,
+            ..MessageAnimation::default()
+        });
+        assert!(merge_message_content_file_id(
+            &mut td,
+            &mut content,
+            new_file
+        ));
+        assert!(matches!(content, MessageContent::Animation(m) if m.file_id == new_file));
+        assert_eq!(td.register_log, vec!["merge_animations(2,1)"]);
+
+        // photo: the 'i' size swaps and the FileManager merge fires
+        let mut td = TestContext::default();
+        let mut content = MessageContent::Photo(MessagePhoto {
+            photo: Photo {
+                photos: vec![photo_size('i' as i32, 1)],
+                ..Photo::default()
+            },
+            ..MessagePhoto::default()
+        });
+        assert!(merge_message_content_file_id(
+            &mut td,
+            &mut content,
+            new_file
+        ));
+        assert!(matches!(
+            &content,
+            MessageContent::Photo(m) if m.photo.photos[0].file_id == new_file
+        ));
+        assert_eq!(td.register_log, vec!["merge_files(2,1)"]);
+
+        // text: reports and returns false
+        let mut td = TestContext::default();
+        let mut content = MessageContent::Text(MessageText::new(
+            FormattedText::default(),
+            WebPageId::default(),
+            false,
+            false,
+            false,
+            String::new(),
+        ));
+        assert!(!merge_message_content_file_id(
+            &mut td,
+            &mut content,
+            new_file
+        ));
+        assert!(td.register_log.is_empty());
     }
 }
