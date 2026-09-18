@@ -85,14 +85,16 @@ pub enum StickerPhotoSizeType {
     CustomEmoji,
 }
 
-/// `td::StickerPhotoSize` (StickerPhotoSize.h:20).
+/// `td::StickerPhotoSize` (StickerPhotoSize.h:20). The fields are
+/// crate-visible for the member-style `parse` (the C++ parse is a
+/// member template doing the same).
 #[derive(Clone, Debug, PartialEq)]
 pub struct StickerPhotoSize {
-    type_: StickerPhotoSizeType,
-    custom_emoji_id: i64,
-    sticker_set_id: i64,
-    sticker_id: i64,
-    background_colors: Vec<i32>,
+    pub(crate) type_: StickerPhotoSizeType,
+    pub(crate) custom_emoji_id: i64,
+    pub(crate) sticker_set_id: i64,
+    pub(crate) sticker_id: i64,
+    pub(crate) background_colors: Vec<i32>,
 }
 
 impl StickerPhotoSize {
@@ -102,6 +104,41 @@ impl StickerPhotoSize {
     /// stand-in until the StickersManager step: only `inputStickerSetID`
     /// yields an id, every other InputStickerSet form is "invalid" and
     /// drops the size like the C++ validity check does.
+    /// `StickerPhotoSize::get_type` (StickerPhotoSize.h).
+    pub fn get_type(&self) -> StickerPhotoSizeType {
+        self.type_
+    }
+
+    pub fn get_custom_emoji_id(&self) -> i64 {
+        self.custom_emoji_id
+    }
+
+    pub fn get_sticker_set_id(&self) -> i64 {
+        self.sticker_set_id
+    }
+
+    pub fn get_sticker_id(&self) -> i64 {
+        self.sticker_id
+    }
+
+    pub fn get_background_colors(&self) -> &[i32] {
+        &self.background_colors
+    }
+}
+
+impl Default for StickerPhotoSize {
+    fn default() -> Self {
+        StickerPhotoSize {
+            type_: StickerPhotoSizeType::CustomEmoji,
+            custom_emoji_id: 0,
+            sticker_set_id: 0,
+            sticker_id: 0,
+            background_colors: Vec::new(),
+        }
+    }
+}
+
+impl StickerPhotoSize {
     pub fn get_sticker_photo_size(size_ptr: telegram_api::VideoSize) -> Option<StickerPhotoSize> {
         let mut result = StickerPhotoSize {
             type_: StickerPhotoSizeType::CustomEmoji,
@@ -189,8 +226,8 @@ impl StickerPhotoSize {
 }
 
 /// `td::Photo` (Photo.h:32). The empty id sentinel is the
-/// `MovableValue<int64, -2>` default; `sticker_file_ids` stays out until
-/// the Files step (nothing in the listing path reads it).
+/// `MovableValue<int64, -2>` default; `sticker_file_ids` (Photo.h:39)
+/// joins now that the Files step landed its `FileId`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Photo {
     pub id: i64,
@@ -200,6 +237,7 @@ pub struct Photo {
     pub animations: Vec<AnimationSize>,
     pub sticker_photo_size: Option<StickerPhotoSize>,
     pub has_stickers: bool,
+    pub sticker_file_ids: Vec<FileId>,
 }
 
 impl Default for Photo {
@@ -212,6 +250,7 @@ impl Default for Photo {
             animations: Vec::new(),
             sticker_photo_size: None,
             has_stickers: false,
+            sticker_file_ids: Vec::new(),
         }
     }
 }
@@ -813,6 +852,7 @@ mod tests {
             animations: Vec::new(),
             sticker_photo_size: None,
             has_stickers: false,
+            sticker_file_ids: Vec::new(),
         };
         let object = get_chat_photo_object(&photo);
         assert_eq!(object.id, 42);

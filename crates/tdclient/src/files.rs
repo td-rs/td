@@ -3608,9 +3608,7 @@ impl PartsManager {
                 self.part_size *= 2;
             }
         }
-        self.part_count = ready_parts
-            .iter()
-            .fold(0, |a, &b| a.max(b.wrapping_add(1)));
+        self.part_count = ready_parts.iter().fold(0, |a, &b| a.max(b.wrapping_add(1)));
 
         self.init_common(ready_parts)
     }
@@ -3625,7 +3623,8 @@ impl PartsManager {
         self.part_status = vec![PartStatus::Empty; self.part_count as usize];
 
         for &i in ready_parts {
-            if self.known_prefix_flag && i >= (self.known_prefix_size / self.part_size as i64) as i32
+            if self.known_prefix_flag
+                && i >= (self.known_prefix_size / self.part_size as i64) as i32
             {
                 assert!(self.is_upload);
                 return TdResult::from_status(Status::error_message("FILE_UPLOAD_RESTART"));
@@ -3637,7 +3636,9 @@ impl PartsManager {
                 0 <= i && i < self.part_count,
                 "[i:{}][real part_count:{}] {}",
                 i,
-                ready_parts.iter().fold(0i32, |a, &b| a.max(b.wrapping_add(1))),
+                ready_parts
+                    .iter()
+                    .fold(0i32, |a, &b| a.max(b.wrapping_add(1))),
                 self
             );
             self.part_status[i as usize] = PartStatus::Ready;
@@ -3760,9 +3761,8 @@ impl PartsManager {
             return true;
         }
 
-        let is_intersect_with = |begin: i64, end: i64| {
-            begin.max(offset_begin) < end.min(offset_end)
-        };
+        let is_intersect_with =
+            |begin: i64, end: i64| begin.max(offset_begin) < end.min(offset_end);
 
         let streaming_begin = self.streaming_offset;
         let streaming_end = self.streaming_offset + self.streaming_limit;
@@ -3810,7 +3810,8 @@ impl PartsManager {
         if part_id == self.part_count {
             if self.unknown_size_flag {
                 self.part_count += 1;
-                let max_part_count = MAX_PART_COUNT_PREMIUM + if self.use_part_count_limit { 0 } else { 64 };
+                let max_part_count =
+                    MAX_PART_COUNT_PREMIUM + if self.use_part_count_limit { 0 } else { 64 };
                 if self.part_count > max_part_count {
                     if !self.is_upload {
                         // Caller will try to increase part size if it is possible
@@ -3892,7 +3893,12 @@ impl PartsManager {
     }
 
     /// `PartsManager::on_part_ok` (PartsManager.cpp:343-397).
-    pub fn on_part_ok(&mut self, part_id: i32, part_size: usize, actual_size: usize) -> TdResult<()> {
+    pub fn on_part_ok(
+        &mut self,
+        part_id: i32,
+        part_size: usize,
+        actual_size: usize,
+    ) -> TdResult<()> {
         assert!(
             (part_id as usize) < self.part_status.len(),
             "{} {} {} {}",
@@ -4006,8 +4012,8 @@ impl PartsManager {
                     round_up(self.streaming_offset + self.streaming_limit).min(self.size);
                 streaming_size = streaming_end - streaming_begin;
             } else if self.streaming_offset < self.size {
-                let prefix =
-                    round_up(self.streaming_offset + self.streaming_limit - self.size).min(self.size);
+                let prefix = round_up(self.streaming_offset + self.streaming_limit - self.size)
+                    .min(self.size);
                 let suffix = self.size - streaming_begin;
                 streaming_size = self.size.min(prefix + suffix);
             }
@@ -4359,7 +4365,9 @@ pub struct ResourceManagerHandle {
 impl ResourceManagerHandle {
     /// `ResourceManager::update_priority` (ResourceManager.cpp:34-43).
     pub fn update_priority(&self, priority: i8) {
-        self.manager.borrow_mut().update_priority(self.node_id, priority);
+        self.manager
+            .borrow_mut()
+            .update_priority(self.node_id, priority);
     }
 
     /// `ResourceManager::update_resources` (ResourceManager.cpp:45-66).
@@ -4507,12 +4515,19 @@ impl ResourceManager {
         if self.stop_flag {
             return;
         }
-        if self.nodes.get((node_id - 1) as usize).and_then(Option::as_ref).is_none() {
+        if self
+            .nodes
+            .get((node_id - 1) as usize)
+            .and_then(Option::as_ref)
+            .is_none()
+        {
             return;
         }
         let before = self.node(node_id).resource_state.clone();
         self.resource_state -= &before;
-        self.node_mut(node_id).resource_state.update_master(resource_state);
+        self.node_mut(node_id)
+            .resource_state
+            .update_master(resource_state);
         let after = self.node(node_id).resource_state.clone();
         self.resource_state += &after;
 
@@ -4530,7 +4545,12 @@ impl ResourceManager {
 
     /// `ResourceManager::hangup_shared` (ResourceManager.cpp:73-88).
     pub fn disconnect_worker(&mut self, node_id: u64) {
-        if self.nodes.get((node_id - 1) as usize).and_then(Option::as_ref).is_none() {
+        if self
+            .nodes
+            .get((node_id - 1) as usize)
+            .and_then(Option::as_ref)
+            .is_none()
+        {
             return;
         }
         if self.node(node_id).in_heap {
@@ -5002,7 +5022,9 @@ mod tests {
         // (PhotoSizeSource.cpp:74-78)
         assert_eq!(
             full_legacy.get_unique(),
-            [0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x0d, 0x0c, 0x0b, 0x0a]
+            [
+                0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x0d, 0x0c, 0x0b, 0x0a
+            ]
         );
         assert!(PhotoSizeSource::unique_equal(
             &full_legacy,
@@ -5866,7 +5888,10 @@ mod tests {
         state.start_use(60);
         state.stop_use(60); // used = 60, using = 0
         assert!(state.update_estimated_limit(50));
-        assert!(!state.update_estimated_limit(50), "same estimate is a no-op");
+        assert!(
+            !state.update_estimated_limit(50),
+            "same estimate is a no-op"
+        );
         // the 110 estimate covers the used 60 plus the 50 need: 10 beyond
         // the 100 limit
         assert_eq!(state.estimated_extra(), 10);
@@ -5964,7 +5989,14 @@ mod tests {
         assert!(!pm.ready());
 
         let part = pm.start_part().unwrap();
-        assert_eq!(part, Part { id: 0, offset: 0, size: 128 });
+        assert_eq!(
+            part,
+            Part {
+                id: 0,
+                offset: 0,
+                size: 128
+            }
+        );
         let part2 = pm.start_part().unwrap();
         assert_eq!(part2.id, 1);
 
@@ -5994,7 +6026,14 @@ mod tests {
         assert_eq!(pm.get_estimated_extra(), 0);
 
         // nothing left to request
-        assert_eq!(pm.start_part().unwrap(), Part { id: -1, offset: 0, size: 0 });
+        assert_eq!(
+            pm.start_part().unwrap(),
+            Part {
+                id: -1,
+                offset: 0,
+                size: 0
+            }
+        );
     }
 
     #[test]
@@ -6103,8 +6142,7 @@ mod tests {
 
         // the upload variant reports the size as untransferable
         let mut pm = PartsManager::default();
-        pm.init(0, 1_000_000, true, 65536, &[], true, true)
-            .unwrap();
+        pm.init(0, 1_000_000, true, 65536, &[], true, true).unwrap();
         for _ in 0..8000 {
             pm.start_part().unwrap();
         }
@@ -6172,8 +6210,16 @@ mod tests {
 
         // a wrapping window over an already-complete file just finishes
         let mut pm = PartsManager::default();
-        pm.init(1000, 1000, true, 128, &[0, 1, 2, 3, 4, 5, 6, 7], false, false)
-            .unwrap();
+        pm.init(
+            1000,
+            1000,
+            true,
+            128,
+            &[0, 1, 2, 3, 4, 5, 6, 7],
+            false,
+            false,
+        )
+        .unwrap();
         pm.set_streaming_offset(900, 200);
         assert!(pm.ready());
         pm.finish().unwrap();
@@ -6243,7 +6289,11 @@ mod tests {
         }
 
         fn last_grant_active_limit(&self) -> i64 {
-            self.grants.borrow().last().expect("no grant recorded").active_limit()
+            self.grants
+                .borrow()
+                .last()
+                .expect("no grant recorded")
+                .active_limit()
         }
 
         /// Report a need of `estimated_limit` bytes in `unit_size`-byte
@@ -6259,7 +6309,12 @@ mod tests {
         /// Consume `x` bytes of the last grant (a part completed) and
         /// report the mutated state back.
         fn complete_part_and_report(&self, x: i64) {
-            let mut state = self.grants.borrow().last().expect("no grant recorded").clone();
+            let mut state = self
+                .grants
+                .borrow()
+                .last()
+                .expect("no grant recorded")
+                .clone();
             state.start_use(x);
             state.stop_use(x);
             self.update(&state);
@@ -6284,8 +6339,10 @@ mod tests {
 
     #[test]
     fn resource_manager_greedy_satisfies_smallest_first() {
-        let manager =
-            Rc::new(RefCell::new(ResourceManager::new(1000, ResourceManagerMode::Greedy)));
+        let manager = Rc::new(RefCell::new(ResourceManager::new(
+            1000,
+            ResourceManagerMode::Greedy,
+        )));
         let (worker_a, driver_a) = FakeWorker::new();
         let (worker_b, driver_b) = FakeWorker::new();
         ResourceManager::register_worker(&manager, Box::new(worker_a), 0);
@@ -6318,8 +6375,10 @@ mod tests {
 
     #[test]
     fn resource_manager_baseline_serves_priority_order() {
-        let manager =
-            Rc::new(RefCell::new(ResourceManager::new(350, ResourceManagerMode::Baseline)));
+        let manager = Rc::new(RefCell::new(ResourceManager::new(
+            350,
+            ResourceManagerMode::Baseline,
+        )));
         let (worker0, driver0) = FakeWorker::new();
         let (worker1, driver1) = FakeWorker::new();
         let (worker2, driver2) = FakeWorker::new();
