@@ -13,7 +13,7 @@
 //! `ToDoCompletion`/`SharedDialog`/`CommunityId`/`Address`/`OrderInfo`
 //! companions they need). 89 of the 96 variants are modeled.
 //!
-//! The remaining 7 variants are pinned by companion types that do not
+//! The remaining 6 variants are pinned by companion types that do not
 //! exist on this line yet and land with them:
 //! - the `StarGift` family (`StarGift`, `StarGiftUnique`,
 //!   `StarGiftPurchaseOffer`, `StarGiftPurchaseOfferDeclined`) — M.9.1b
@@ -23,15 +23,31 @@
 //!   `DialogId`s M.9.1 recorded; the value plane is the Wave-3
 //!   Gifts/Stickers slice (`StarGiftResalePrice`, the only other missing
 //!   piece, is trivial and lands with its consumers).
-//! - `Contact` — needs `td::Contact`: M.4.14's `contact.rs` landed on the
-//!   master line *after* this branch's base (`85af8aa`), so the value
-//!   arrives with the master-line integration, not with this slice.
 //! - `ChatSetTheme` — needs `StarGift` + `ThemeSettings` (ChatTheme.h).
 //! - `RichText` — needs the `WebPageBlock`/`RichMessageMedia` machinery
 //!   (RichMessage.h); Wave-2 WebPages scope. `create_rich_message_content`
 //!   is deferred with it.
 //!
-//! The db `store`/`parse` paths are M.9.2/M.9.3; the td_api/telegram_api
+//! M.9.2/M.9.3 are the db `store`/`parse` paths (the M.6 MessageDb
+//! byte-compat bar, D1): [`store_message_content`]/[`parse_message_content`]
+//! mirror the C++ `store`/`parse` template dispatchers byte for byte, with
+//! the manager-mediated FileId calls going through the
+//! [`MessageContentStorage`] seam — the Rust shape of the C++
+//! `storer.context()->td()` indirection. FileId bytes stay
+//! FileManager-mediated in the C++ (`FileManager::store_file`, the full
+//! file-view plane), so they are gated until the M.12.2 FileManager, exactly
+//! like the photo structures' file-id stores; the media metadata helpers
+//! (`store_animation`/`store_sticker`/...) are gated with them because the
+//! `Animation`/`Sticker`/`Document`/`Video`/`Audio`/`VideoNote`/
+//! `VoiceNote` metadata value structs are the M.9.5/M.12 media plane.
+//! Everything else — flags blocks, version gates, id wrappers, the Photo/
+//! PhotoSize/Invoice/Game/SecureValue/... companion formats — is exact.
+//! `Photo::sticker_file_ids` (present in the C++ `Photo`, not yet in the
+//! Rust model) is stored as an empty vector and read-and-discarded on
+//! parse, which keeps the byte layout parseable in both directions.
+//! `Contact` is modeled since M.9.2 (the value landed in `contact.rs`).
+//!
+//! The td_api/telegram_api
 //! conversions arrive with their own slices. Value companions living here
 //! that later move to their owners' modules: `Location`/`Venue` (the
 //! DialogManager/m54-union geo plane), `BackgroundId`/`BackgroundFill`/
@@ -47,11 +63,15 @@ use tdutils::emoji::remove_emoji_modifiers;
 
 use crate::birthdate::Birthdate;
 use crate::chat_manager::{ChannelId, ChatId, MessageId};
+use crate::contact::Contact;
 use crate::emoji_status::CustomEmojiId;
-use crate::message_entity::{FormattedText, MessageEntity};
-use crate::messages_manager::{DialogId, StoryFullId};
-use crate::photo::{Dimensions, Photo};
-use crate::store_parse::{Parser, store_i64};
+use crate::message_entity::{FormattedText, MessageEntity, find_entities, remove_empty_entities};
+use crate::messages_manager::{DialogId, StoryFullId, StoryId};
+use crate::photo::{AnimationSize, Dimensions, Photo, PhotoSize, StickerPhotoSize};
+use crate::store_parse::{
+    Parser, store_bool, store_f64, store_flags, store_i32, store_i32_vec, store_i64, store_string,
+    store_string_vec, store_u32, version,
+};
 use crate::user_manager::{FileId, UserId};
 
 /// `td::MessageContentType` (MessageContentType.h:15-113) — the discriminant
@@ -172,6 +192,126 @@ pub fn can_be_secret_message_content(content_type: MessageContentType) -> bool {
     )
 }
 
+impl MessageContentType {
+    /// The int the C++ `store(content_type, storer)` writes and the
+    /// `parse` dispatcher switches on; `None` (never a real content) and
+    /// anything a newer binary inserted return `None`, which the parse
+    /// dispatcher degrades to `MessageUnsupported(0)` like the C++
+    /// `default:` arm.
+    pub(crate) fn from_raw(raw: i32) -> Option<MessageContentType> {
+        MessageContentType::try_from(raw).ok()
+    }
+}
+
+impl TryFrom<i32> for MessageContentType {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        // Explicit, like the pinned-discriminant-order test: a C++
+        // insertion re-orders everything after it and both must fail loudly.
+        match value {
+            -1 => Ok(MessageContentType::None),
+            0 => Ok(MessageContentType::Text),
+            1 => Ok(MessageContentType::Animation),
+            2 => Ok(MessageContentType::Audio),
+            3 => Ok(MessageContentType::Document),
+            4 => Ok(MessageContentType::Photo),
+            5 => Ok(MessageContentType::Sticker),
+            6 => Ok(MessageContentType::Video),
+            7 => Ok(MessageContentType::VoiceNote),
+            8 => Ok(MessageContentType::Contact),
+            9 => Ok(MessageContentType::Location),
+            10 => Ok(MessageContentType::Venue),
+            11 => Ok(MessageContentType::ChatCreate),
+            12 => Ok(MessageContentType::ChatChangeTitle),
+            13 => Ok(MessageContentType::ChatChangePhoto),
+            14 => Ok(MessageContentType::ChatDeletePhoto),
+            15 => Ok(MessageContentType::ChatDeleteHistory),
+            16 => Ok(MessageContentType::ChatAddUsers),
+            17 => Ok(MessageContentType::ChatJoinedByLink),
+            18 => Ok(MessageContentType::ChatDeleteUser),
+            19 => Ok(MessageContentType::ChatMigrateTo),
+            20 => Ok(MessageContentType::ChannelCreate),
+            21 => Ok(MessageContentType::ChannelMigrateFrom),
+            22 => Ok(MessageContentType::PinMessage),
+            23 => Ok(MessageContentType::Game),
+            24 => Ok(MessageContentType::GameScore),
+            25 => Ok(MessageContentType::ScreenshotTaken),
+            26 => Ok(MessageContentType::ChatSetTtl),
+            27 => Ok(MessageContentType::Unsupported),
+            28 => Ok(MessageContentType::Call),
+            29 => Ok(MessageContentType::Invoice),
+            30 => Ok(MessageContentType::PaymentSuccessful),
+            31 => Ok(MessageContentType::VideoNote),
+            32 => Ok(MessageContentType::ContactRegistered),
+            33 => Ok(MessageContentType::ExpiredPhoto),
+            34 => Ok(MessageContentType::ExpiredVideo),
+            35 => Ok(MessageContentType::LiveLocation),
+            36 => Ok(MessageContentType::CustomServiceAction),
+            37 => Ok(MessageContentType::WebsiteConnected),
+            38 => Ok(MessageContentType::PassportDataSent),
+            39 => Ok(MessageContentType::PassportDataReceived),
+            40 => Ok(MessageContentType::Poll),
+            41 => Ok(MessageContentType::Dice),
+            42 => Ok(MessageContentType::ProximityAlertTriggered),
+            43 => Ok(MessageContentType::GroupCall),
+            44 => Ok(MessageContentType::InviteToGroupCall),
+            45 => Ok(MessageContentType::ChatSetTheme),
+            46 => Ok(MessageContentType::WebViewDataSent),
+            47 => Ok(MessageContentType::WebViewDataReceived),
+            48 => Ok(MessageContentType::GiftPremium),
+            49 => Ok(MessageContentType::TopicCreate),
+            50 => Ok(MessageContentType::TopicEdit),
+            51 => Ok(MessageContentType::SuggestProfilePhoto),
+            52 => Ok(MessageContentType::WriteAccessAllowed),
+            53 => Ok(MessageContentType::RequestedDialog),
+            54 => Ok(MessageContentType::WebViewWriteAccessAllowed),
+            55 => Ok(MessageContentType::SetBackground),
+            56 => Ok(MessageContentType::Story),
+            57 => Ok(MessageContentType::WriteAccessAllowedByRequest),
+            58 => Ok(MessageContentType::GiftCode),
+            59 => Ok(MessageContentType::Giveaway),
+            60 => Ok(MessageContentType::GiveawayLaunch),
+            61 => Ok(MessageContentType::GiveawayResults),
+            62 => Ok(MessageContentType::GiveawayWinners),
+            63 => Ok(MessageContentType::ExpiredVideoNote),
+            64 => Ok(MessageContentType::ExpiredVoiceNote),
+            65 => Ok(MessageContentType::BoostApply),
+            66 => Ok(MessageContentType::DialogShared),
+            67 => Ok(MessageContentType::PaidMedia),
+            68 => Ok(MessageContentType::PaymentRefunded),
+            69 => Ok(MessageContentType::GiftStars),
+            70 => Ok(MessageContentType::PrizeStars),
+            71 => Ok(MessageContentType::StarGift),
+            72 => Ok(MessageContentType::StarGiftUnique),
+            73 => Ok(MessageContentType::PaidMessagesRefunded),
+            74 => Ok(MessageContentType::PaidMessagesPrice),
+            75 => Ok(MessageContentType::ConferenceCall),
+            76 => Ok(MessageContentType::ToDoList),
+            77 => Ok(MessageContentType::TodoCompletions),
+            78 => Ok(MessageContentType::TodoAppendTasks),
+            79 => Ok(MessageContentType::GiftTon),
+            80 => Ok(MessageContentType::SuggestedPostSuccess),
+            81 => Ok(MessageContentType::SuggestedPostRefund),
+            82 => Ok(MessageContentType::SuggestedPostApproval),
+            83 => Ok(MessageContentType::SuggestBirthday),
+            84 => Ok(MessageContentType::StarGiftPurchaseOffer),
+            85 => Ok(MessageContentType::StarGiftPurchaseOfferDeclined),
+            86 => Ok(MessageContentType::NewCreatorPending),
+            87 => Ok(MessageContentType::ChangeCreator),
+            88 => Ok(MessageContentType::NoForwardsToggle),
+            89 => Ok(MessageContentType::NoForwardsRequest),
+            90 => Ok(MessageContentType::ManagedBotCreated),
+            91 => Ok(MessageContentType::PollAppendAnswer),
+            92 => Ok(MessageContentType::PollDeleteAnswer),
+            93 => Ok(MessageContentType::RichText),
+            94 => Ok(MessageContentType::ChangeCommunity),
+            95 => Ok(MessageContentType::ChatJoinedViaCommunity),
+            _ => Err(()),
+        }
+    }
+}
+
 /// `td::WebPageId` (WebPageId.h:17-50) — the instant-view page id; `0` is
 /// the "no web page" sentinel. The store/parse is the raw `int64`
 /// (WebPageId.h:41-48) and lands with M.9.2.
@@ -253,6 +393,12 @@ impl InputGroupCallId {
     pub fn is_identical(self, other: InputGroupCallId) -> bool {
         self.group_call_id == other.group_call_id && self.access_hash == other.access_hash
     }
+
+    /// The access-hash half of the C++ `store`/`parse`
+    /// (InputGroupCallId.h:55-65).
+    pub fn get_access_hash(self) -> i64 {
+        self.access_hash
+    }
 }
 
 impl PartialEq for InputGroupCallId {
@@ -272,6 +418,21 @@ pub enum CallDiscardReasonType {
     HungUp,
     Declined,
     UpgradeToGroupCall,
+}
+
+impl CallDiscardReasonType {
+    /// The enum `td::parse` (tl_helpers.h:244-248) is a raw cast; an
+    /// out-of-range stored int (garbage in a corrupted blob) falls back to
+    /// `Empty` with a log instead of holding an unrepresentable value.
+    pub(crate) fn from_raw(raw: i32) -> CallDiscardReasonType {
+        match CallDiscardReasonType::try_from(raw) {
+            Ok(value) => value,
+            Err(_) => {
+                tdutils::log_error!("Wrong call discard reason {raw}");
+                CallDiscardReasonType::Empty
+            }
+        }
+    }
 }
 
 /// `td::CallDiscardReason` (CallDiscardReason.h:16-19). The conversions
@@ -365,6 +526,31 @@ impl Location {
 
     pub fn get_access_hash(&self) -> i64 {
         self.access_hash
+    }
+
+    /// The C++ private-field read the `store` overload needs
+    /// (Location.h:81-98): the packed horizontal accuracy.
+    pub fn get_horizontal_accuracy(&self) -> f64 {
+        self.horizontal_accuracy
+    }
+
+    /// `Location::parse` (Location.h:101-119) — the stored-shape
+    /// constructor: the C++ parser assigns the private fields directly, so
+    /// the `fix_accuracy` normalization of `Location::init` does not run.
+    pub(crate) fn from_stored(
+        is_empty: bool,
+        latitude: f64,
+        longitude: f64,
+        horizontal_accuracy: f64,
+        access_hash: i64,
+    ) -> Location {
+        Location {
+            is_empty,
+            latitude,
+            longitude,
+            horizontal_accuracy,
+            access_hash,
+        }
     }
 
     /// `Location::set_access_hash` (Location.h:66-68).
@@ -1208,6 +1394,14 @@ pub struct MessageDocument {
     pub caption: FormattedText,
 }
 
+/// `MessageContact` (MessageContent.cpp:317-326) — landed with M.9.2: the
+/// `td::Contact` value lives in `contact.rs` (the M.4.14 master-line
+/// module this branch merged).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessageContact {
+    pub contact: Contact,
+}
+
 /// `MessagePhoto` (MessageContent.cpp:233-249).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MessagePhoto {
@@ -1981,6 +2175,7 @@ pub enum MessageContent {
     Video(MessageVideo),
     VoiceNote(MessageVoiceNote),
     VideoNote(MessageVideoNote),
+    Contact(MessageContact),
     ChatCreate(MessageChatCreate),
     ChatChangeTitle(MessageChatChangeTitle),
     ChatChangePhoto(MessageChatChangePhoto),
@@ -2081,6 +2276,7 @@ impl MessageContent {
             MessageContent::Video(_) => MessageContentType::Video,
             MessageContent::VoiceNote(_) => MessageContentType::VoiceNote,
             MessageContent::VideoNote(_) => MessageContentType::VideoNote,
+            MessageContent::Contact(_) => MessageContentType::Contact,
             MessageContent::ChatCreate(_) => MessageContentType::ChatCreate,
             MessageContent::ChatChangeTitle(_) => MessageContentType::ChatChangeTitle,
             MessageContent::ChatChangePhoto(_) => MessageContentType::ChatChangePhoto,
@@ -2259,6 +2455,12 @@ pub fn create_voice_note_message_content(voice_note_file_id: FileId) -> MessageC
     })
 }
 
+/// `create_contact_message_content` (MessageContent.cpp:4681 region) —
+/// the M.9.2 addition with the `Contact` value.
+pub fn create_contact_message_content(contact: Contact) -> MessageContent {
+    MessageContent::Contact(MessageContact { contact })
+}
+
 /// `create_contact_registered_message_content` (MessageContent.cpp:4694-4696).
 pub fn create_contact_registered_message_content() -> MessageContent {
     MessageContent::ContactRegistered(MessageContactRegistered)
@@ -2272,6 +2474,3942 @@ pub fn create_screenshot_taken_message_content() -> MessageContent {
 /// `create_chat_set_ttl_message_content` (MessageContent.cpp:4702-4704).
 pub fn create_chat_set_ttl_message_content(ttl: i32, from_user_id: UserId) -> MessageContent {
     MessageContent::ChatSetTtl(MessageChatSetTtl { ttl, from_user_id })
+}
+
+// ==== M.9.2/M.9.3: the db store/parse paths ====
+//
+// `store`/`parse` (MessageContent.cpp:1831-3021 and 3021-4507) plus the
+// `store_message_content`/`parse_message_content` entries (4507-4516) and
+// the companion `td::store`/`td::parse` overloads from the value headers
+// (Photo.hpp, PhotoSize.hpp, Location.h, Venue.h, Game.hpp, WebApp.hpp,
+// InputInvoice.hpp, OrderInfo.hpp, BackgroundType.hpp, BackgroundInfo.hpp,
+// GiveawayParameters.hpp, ForumTopic{,Icon,EditedData}.hpp, ToDoList.hpp,
+// ToDoItem.hpp, ToDoCompletion.hpp, SecureValue.hpp, CurrencyAmount.hpp,
+// SuggestedPostPrice.hpp, MessageExtendedMedia.hpp, StickerPhotoSize.hpp,
+// SharedDialog.hpp and the id wrappers).
+
+/// The manager-mediated serialization calls — the Rust shape of the C++
+/// `storer.context()->td()` indirection the `store`/`parse` templates go
+/// through. Every method is a 1-to-1 port seam for the named C++ manager
+/// helper; the default real implementations land with their owners
+/// (FileManager store/parse is the M.12.2 FileManager, the media metadata
+/// helpers are the M.9.5/M.12 media plane, `store_poll` is Wave-2
+/// PollManager, `store_background` is Wave-3 Backgrounds).
+pub trait MessageContentStorage {
+    /// `FileManager::store_file(file_id, storer)` (FileManager.hpp:30) —
+    /// the FileView-based serialization the raw `store(FileId, ...)`
+    /// overload routes through.
+    fn store_file(&self, file_id: FileId, out: &mut Vec<u8>);
+    /// `FileManager::parse_file(parser)` (FileManager.hpp:135); the
+    /// pre-`Version::StoreFileId` empty-FileId legacy is handled here.
+    fn parse_file(&mut self, parser: &mut Parser) -> Result<FileId, &'static str>;
+    /// `AnimationsManager::store_animation` (AnimationsManager.hpp:21).
+    fn store_animation(&self, file_id: FileId, out: &mut Vec<u8>);
+    /// `AnimationsManager::parse_animation`.
+    fn parse_animation(&mut self, parser: &mut Parser) -> Result<FileId, &'static str>;
+    /// `AudiosManager::store_audio`.
+    fn store_audio(&self, file_id: FileId, out: &mut Vec<u8>);
+    /// `AudiosManager::parse_audio`.
+    fn parse_audio(&mut self, parser: &mut Parser) -> Result<FileId, &'static str>;
+    /// `DocumentsManager::store_document`.
+    fn store_document(&self, file_id: FileId, out: &mut Vec<u8>);
+    /// `DocumentsManager::parse_document`.
+    fn parse_document(&mut self, parser: &mut Parser) -> Result<FileId, &'static str>;
+    /// `VideosManager::store_video`.
+    fn store_video(&self, file_id: FileId, out: &mut Vec<u8>);
+    /// `VideosManager::parse_video`.
+    fn parse_video(&mut self, parser: &mut Parser) -> Result<FileId, &'static str>;
+    /// `VideoNotesManager::store_video_note`.
+    fn store_video_note(&self, file_id: FileId, out: &mut Vec<u8>);
+    /// `VideoNotesManager::parse_video_note`.
+    fn parse_video_note(&mut self, parser: &mut Parser) -> Result<FileId, &'static str>;
+    /// `VoiceNotesManager::store_voice_note`.
+    fn store_voice_note(&self, file_id: FileId, out: &mut Vec<u8>);
+    /// `VoiceNotesManager::parse_voice_note`.
+    fn parse_voice_note(&mut self, parser: &mut Parser) -> Result<FileId, &'static str>;
+    /// `StickersManager::store_sticker(file_id, false, storer, source)` —
+    /// message stickers always store with `in_sticker_set = false`
+    /// (MessageContent.cpp:1929).
+    fn store_sticker(&self, file_id: FileId, out: &mut Vec<u8>);
+    /// `StickersManager::parse_sticker(false, parser)`.
+    fn parse_sticker(&mut self, parser: &mut Parser) -> Result<FileId, &'static str>;
+    /// `PollManager::store_poll` (PollManager.hpp:226).
+    fn store_poll(&self, poll_id: PollId, out: &mut Vec<u8>);
+    /// `PollManager::parse_poll`.
+    fn parse_poll(&mut self, parser: &mut Parser) -> Result<PollId, &'static str>;
+    /// `BackgroundManager::store_background` (BackgroundManager.cpp:480).
+    fn store_background(&self, background_id: BackgroundId, out: &mut Vec<u8>);
+    /// `BackgroundManager::parse_background`.
+    fn parse_background(&mut self, parser: &mut Parser) -> Result<BackgroundId, &'static str>;
+    /// `WebPagesManager::on_load_web_page_url_from_database` — the
+    /// `MessageText::parse` side effect (MessageContent.cpp:3225-3228).
+    fn on_load_web_page_url_from_database(&mut self, web_page_id: WebPageId, url: &str);
+}
+
+/// `get_premium_duration_day_count` (misc.cpp:423-429) — the legacy
+/// month-to-day conversion the `!has_days` GiftPremium/GiftCode parses run.
+fn get_premium_duration_day_count(month_count: i32) -> i32 {
+    if month_count <= 0 || month_count > 10_000_000 {
+        return 7;
+    }
+    month_count * 30 + month_count / 3 + month_count / 12
+}
+
+/// The `td::parse` enum cast (tl_helpers.h:244-248) for the small
+/// value-plane enums is a raw cast; out-of-range stored ints fall back to
+/// the default with a log instead of holding an unrepresentable value.
+impl TryFrom<i32> for SecureValueType {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(SecureValueType::None),
+            1 => Ok(SecureValueType::PersonalDetails),
+            2 => Ok(SecureValueType::Passport),
+            3 => Ok(SecureValueType::DriverLicense),
+            4 => Ok(SecureValueType::IdentityCard),
+            5 => Ok(SecureValueType::InternalPassport),
+            6 => Ok(SecureValueType::Address),
+            7 => Ok(SecureValueType::UtilityBill),
+            8 => Ok(SecureValueType::BankStatement),
+            9 => Ok(SecureValueType::RentalAgreement),
+            10 => Ok(SecureValueType::PassportRegistration),
+            11 => Ok(SecureValueType::TemporaryRegistration),
+            12 => Ok(SecureValueType::PhoneNumber),
+            13 => Ok(SecureValueType::EmailAddress),
+            _ => Err(()),
+        }
+    }
+}
+
+impl TryFrom<i32> for BackgroundTypeType {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(BackgroundTypeType::Wallpaper),
+            1 => Ok(BackgroundTypeType::Pattern),
+            2 => Ok(BackgroundTypeType::Fill),
+            3 => Ok(BackgroundTypeType::ChatTheme),
+            _ => Err(()),
+        }
+    }
+}
+
+impl TryFrom<i32> for CurrencyAmountType {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(CurrencyAmountType::None),
+            1 => Ok(CurrencyAmountType::Star),
+            2 => Ok(CurrencyAmountType::Ton),
+            _ => Err(()),
+        }
+    }
+}
+
+impl TryFrom<i32> for SuggestedPostPriceType {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(SuggestedPostPriceType::None),
+            1 => Ok(SuggestedPostPriceType::Star),
+            2 => Ok(SuggestedPostPriceType::Ton),
+            _ => Err(()),
+        }
+    }
+}
+
+impl TryFrom<i32> for MessageExtendedMediaType {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(MessageExtendedMediaType::Empty),
+            1 => Ok(MessageExtendedMediaType::Unsupported),
+            2 => Ok(MessageExtendedMediaType::Preview),
+            3 => Ok(MessageExtendedMediaType::Photo),
+            4 => Ok(MessageExtendedMediaType::Video),
+            _ => Err(()),
+        }
+    }
+}
+
+impl TryFrom<i32> for CallDiscardReasonType {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(CallDiscardReasonType::Empty),
+            1 => Ok(CallDiscardReasonType::Missed),
+            2 => Ok(CallDiscardReasonType::Disconnected),
+            3 => Ok(CallDiscardReasonType::HungUp),
+            4 => Ok(CallDiscardReasonType::Declined),
+            5 => Ok(CallDiscardReasonType::UpgradeToGroupCall),
+            _ => Err(()),
+        }
+    }
+}
+
+/// `store(Dimensions, ...)` (Dimensions.hpp:16-18) — the packed
+/// `(width << 16) | height` uint32.
+fn store_dimensions(dimensions: Dimensions, out: &mut Vec<u8>) {
+    store_u32(
+        out,
+        ((dimensions.width as u32) << 16) | dimensions.height as u32,
+    );
+}
+
+/// `parse(Dimensions &, ...)` (Dimensions.hpp:21-26).
+fn parse_dimensions(parser: &mut Parser) -> Result<Dimensions, &'static str> {
+    let width_height = parser.u32_()?;
+    Ok(Dimensions {
+        width: (width_height >> 16) as u16,
+        height: (width_height & 0xFFFF) as u16,
+    })
+}
+
+/// `Location::store` (Location.h:81-98).
+fn store_location(location: &Location, out: &mut Vec<u8>) {
+    let has_access_hash = location.get_access_hash() != 0;
+    let has_horizontal_accuracy = location.get_horizontal_accuracy() > 0.0;
+    store_flags(
+        out,
+        [
+            location.is_empty(),
+            has_access_hash,
+            has_horizontal_accuracy,
+        ],
+    );
+    store_f64(out, location.get_latitude());
+    store_f64(out, location.get_longitude());
+    if has_access_hash {
+        store_i64(out, location.get_access_hash());
+    }
+    if has_horizontal_accuracy {
+        store_f64(out, location.get_horizontal_accuracy());
+    }
+}
+
+/// `Location::parse` (Location.h:101-119). The C++ access-hash registration
+/// side effect (`G()->add_location_access_hash`) belongs to the wire-intake
+/// path and is not repeated here (the module doc records the split).
+fn parse_location(parser: &mut Parser) -> Result<Location, &'static str> {
+    let flags = parser.parse_flags::<3>()?;
+    let latitude = parser.f64_()?;
+    let longitude = parser.f64_()?;
+    let mut access_hash = 0;
+    if flags[1] {
+        access_hash = parser.i64_()?;
+    }
+    let mut horizontal_accuracy = 0.0;
+    if flags[2] {
+        horizontal_accuracy = parser.f64_()?;
+    }
+    Ok(Location::from_stored(
+        flags[0],
+        latitude,
+        longitude,
+        horizontal_accuracy,
+        access_hash,
+    ))
+}
+
+/// `Venue::store` (Venue.h:69-77).
+fn store_venue(venue: &Venue, out: &mut Vec<u8>) {
+    store_location(&venue.location, out);
+    store_string(out, &venue.title);
+    store_string(out, &venue.address);
+    store_string(out, &venue.provider);
+    store_string(out, &venue.id);
+    store_string(out, &venue.r#type);
+}
+
+/// `Venue::parse` (Venue.h:80-88).
+fn parse_venue(parser: &mut Parser) -> Result<Venue, &'static str> {
+    let location = parse_location(parser)?;
+    let title = parser.string()?;
+    let address = parser.string()?;
+    let provider = parser.string()?;
+    let id = parser.string()?;
+    let r#type = parser.string()?;
+    Ok(Venue {
+        location,
+        title,
+        address,
+        provider,
+        id,
+        r#type,
+    })
+}
+
+/// `PhotoSize::store` (PhotoSize.hpp:20-26). The `file_id` store is
+/// FileManager-mediated (the module doc records the M.12.2 gate).
+fn store_photo_size(photo_size: &PhotoSize, ctx: &dyn MessageContentStorage, out: &mut Vec<u8>) {
+    store_i32(out, photo_size.size_type);
+    store_dimensions(photo_size.dimensions, out);
+    store_i32(out, photo_size.size);
+    ctx.store_file(photo_size.file_id, out);
+    store_i32_vec(out, &photo_size.progressive_sizes);
+}
+
+/// `PhotoSize::parse` (PhotoSize.hpp:29-39).
+fn parse_photo_size(
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
+) -> Result<PhotoSize, &'static str> {
+    let size_type = parser.i32_()?;
+    let dimensions = parse_dimensions(parser)?;
+    let size = parser.i32_()?;
+    let file_id = ctx.parse_file(parser)?;
+    let progressive_sizes = if parser.version() >= version::ADD_PHOTO_PROGRESSIVE_SIZES {
+        parser.i32_vec()?
+    } else {
+        Vec::new()
+    };
+    Ok(PhotoSize {
+        size_type,
+        size,
+        dimensions,
+        file_id,
+        progressive_sizes,
+    })
+}
+
+/// `AnimationSize::store` (PhotoSize.hpp:42-45).
+fn store_animation_size(
+    animation_size: &AnimationSize,
+    ctx: &dyn MessageContentStorage,
+    out: &mut Vec<u8>,
+) {
+    store_photo_size(&animation_size.photo_size, ctx, out);
+    store_f64(out, animation_size.main_frame_timestamp);
+}
+
+/// `AnimationSize::parse` (PhotoSize.hpp:48-55).
+fn parse_animation_size(
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
+) -> Result<AnimationSize, &'static str> {
+    let photo_size = parse_photo_size(parser, ctx)?;
+    let main_frame_timestamp = if parser.version() >= version::ADD_DIALOG_PHOTO_HAS_ANIMATION {
+        parser.f64_()?
+    } else {
+        0.0
+    };
+    Ok(AnimationSize {
+        photo_size,
+        main_frame_timestamp,
+    })
+}
+
+/// `StickerPhotoSize::store` (StickerPhotoSize.hpp:16-30) — lives on the
+/// value in `photo.rs`.
+fn store_sticker_photo_size(size: &StickerPhotoSize, out: &mut Vec<u8>) {
+    size.store(out);
+}
+
+/// `StickerPhotoSize::parse` (StickerPhotoSize.hpp:33-51).
+fn parse_sticker_photo_size(parser: &mut Parser) -> Result<StickerPhotoSize, &'static str> {
+    StickerPhotoSize::parse_from(parser)
+}
+
+/// `Photo::is_bad` (Photo.h:49-59).
+fn photo_is_bad(photo: &Photo) -> bool {
+    if photo.is_empty() {
+        return true;
+    }
+    for photo_size in &photo.photos {
+        if !photo_size.file_id.is_valid() {
+            return true;
+        }
+    }
+    false
+}
+
+/// `store(const Photo &, ...)` (Photo.hpp:19-44). `sticker_file_ids` has no
+/// Rust model yet (photo.rs documents the stand-in): the store writes the
+/// empty vector, keeping the layout parseable.
+fn store_photo(photo: &Photo, ctx: &dyn MessageContentStorage, out: &mut Vec<u8>) {
+    let has_minithumbnail = !photo.minithumbnail.is_empty();
+    let has_animations = !photo.animations.is_empty();
+    let has_sticker_photo_size = photo.sticker_photo_size.is_some();
+    store_flags(
+        out,
+        [
+            photo.has_stickers,
+            has_minithumbnail,
+            has_animations,
+            has_sticker_photo_size,
+        ],
+    );
+    store_i64(out, photo.id);
+    store_i32(out, photo.date);
+    store_i32(out, photo.photos.len() as i32);
+    for photo_size in &photo.photos {
+        store_photo_size(photo_size, ctx, out);
+    }
+    if photo.has_stickers {
+        store_i32(out, 0); // sticker_file_ids — not modeled yet
+    }
+    if has_minithumbnail {
+        store_string(out, &photo.minithumbnail);
+    }
+    if has_animations {
+        store_i32(out, photo.animations.len() as i32);
+        for animation_size in &photo.animations {
+            store_animation_size(animation_size, ctx, out);
+        }
+    }
+    if has_sticker_photo_size {
+        store_sticker_photo_size(photo.sticker_photo_size.as_ref().unwrap(), out);
+    }
+}
+
+/// `parse(Photo &, ...)` (Photo.hpp:47-74). `sticker_file_ids` is
+/// read-and-discarded while the has_stickers vector is present.
+fn parse_photo(
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
+) -> Result<Photo, &'static str> {
+    let flags = parser.parse_flags::<4>()?;
+    let id = parser.i64_()?;
+    let date = parser.i32_()?;
+    let photos_len = parser.i32_()?;
+    if photos_len < 0 || parser.left_len() < photos_len as usize {
+        return Err("Wrong vector length");
+    }
+    let mut photos = Vec::with_capacity(photos_len as usize);
+    for _ in 0..photos_len {
+        photos.push(parse_photo_size(parser, ctx)?);
+    }
+    if flags[0] {
+        let sticker_file_ids_len = parser.i32_()?;
+        if sticker_file_ids_len < 0 || parser.left_len() < sticker_file_ids_len as usize {
+            return Err("Wrong vector length");
+        }
+        for _ in 0..sticker_file_ids_len {
+            ctx.parse_file(parser)?;
+        }
+    }
+    let minithumbnail = if flags[1] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let animations_len = if flags[2] { parser.i32_()? } else { 0 };
+    if animations_len < 0 || parser.left_len() < animations_len as usize {
+        return Err("Wrong vector length");
+    }
+    let mut animations = Vec::with_capacity(animations_len as usize);
+    for _ in 0..animations_len {
+        animations.push(parse_animation_size(parser, ctx)?);
+    }
+    let sticker_photo_size = if flags[3] {
+        Some(parse_sticker_photo_size(parser)?)
+    } else {
+        None
+    };
+    Ok(Photo {
+        id,
+        date,
+        minithumbnail,
+        photos,
+        animations,
+        sticker_photo_size,
+        has_stickers: flags[0],
+    })
+}
+
+/// `Game::store` (Game.hpp:22-39).
+fn store_game(game: &Game, ctx: &dyn MessageContentStorage, out: &mut Vec<u8>) {
+    let has_animation = game.animation_file_id.is_valid();
+    store_flags(out, [has_animation]);
+    store_i64(out, game.id);
+    store_i64(out, game.access_hash);
+    store_i64(out, game.bot_user_id.get());
+    store_string(out, &game.short_name);
+    store_string(out, &game.title);
+    store_string(out, &game.description);
+    store_photo(&game.photo, ctx, out);
+    if has_animation {
+        ctx.store_animation(game.animation_file_id, out);
+    }
+    game.text.store(out);
+}
+
+/// `Game::parse` (Game.hpp:42-61).
+fn parse_game(
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
+) -> Result<Game, &'static str> {
+    let has_animation = if parser.version() >= version::FIX_STORE_GAME_WITHOUT_ANIMATION {
+        parser.parse_flags::<1>()?[0]
+    } else {
+        true
+    };
+    let id = parser.i64_()?;
+    let access_hash = parser.i64_()?;
+    let bot_user_id = parse_user_id(parser)?;
+    let short_name = parser.string()?;
+    let title = parser.string()?;
+    let description = parser.string()?;
+    let photo = parse_photo(parser, ctx)?;
+    let animation_file_id = if has_animation {
+        ctx.parse_animation(parser)?
+    } else {
+        FileId::default()
+    };
+    let text = parse_formatted_text(parser)?;
+    Ok(Game {
+        id,
+        access_hash,
+        bot_user_id,
+        short_name,
+        title,
+        description,
+        photo,
+        animation_file_id,
+        text,
+    })
+}
+
+/// `WebApp::store` (WebApp.hpp:21-37).
+fn store_web_app(web_app: &WebApp, ctx: &dyn MessageContentStorage, out: &mut Vec<u8>) {
+    let has_animation = web_app.animation_file_id.is_valid();
+    store_flags(out, [has_animation]);
+    store_i64(out, web_app.id);
+    store_i64(out, web_app.access_hash);
+    store_string(out, &web_app.short_name);
+    store_string(out, &web_app.title);
+    store_string(out, &web_app.description);
+    store_photo(&web_app.photo, ctx, out);
+    if has_animation {
+        ctx.store_animation(web_app.animation_file_id, out);
+    }
+    store_i64(out, web_app.hash);
+}
+
+/// `WebApp::parse` (WebApp.hpp:40-56).
+fn parse_web_app(
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
+) -> Result<WebApp, &'static str> {
+    let has_animation = parser.parse_flags::<1>()?[0];
+    let id = parser.i64_()?;
+    let access_hash = parser.i64_()?;
+    let short_name = parser.string()?;
+    let title = parser.string()?;
+    let description = parser.string()?;
+    let photo = parse_photo(parser, ctx)?;
+    let animation_file_id = if has_animation {
+        ctx.parse_animation(parser)?
+    } else {
+        FileId::default()
+    };
+    let hash = parser.i64_()?;
+    Ok(WebApp {
+        id,
+        access_hash,
+        short_name,
+        title,
+        description,
+        photo,
+        animation_file_id,
+        hash,
+    })
+}
+
+/// `BackgroundType::store` (BackgroundType.hpp:16-52).
+fn store_background_type(background_type: &BackgroundType, out: &mut Vec<u8>) {
+    let has_fill = background_type.fill.top_color != 0 || background_type.fill.bottom_color != 0;
+    let has_intensity = background_type.intensity != 0;
+    let fill_type = background_type.fill.get_type();
+    let is_gradient = fill_type == BackgroundFillType::Gradient;
+    let is_freeform_gradient = fill_type == BackgroundFillType::FreeformGradient;
+    let has_theme_name = !background_type.theme_name.is_empty();
+    store_flags(
+        out,
+        [
+            background_type.is_blurred,
+            background_type.is_moving,
+            has_fill,
+            has_intensity,
+            is_gradient,
+            is_freeform_gradient,
+            has_theme_name,
+        ],
+    );
+    store_i32(out, background_type.r#type as i32);
+    if is_freeform_gradient {
+        store_i32(out, background_type.fill.top_color);
+        store_i32(out, background_type.fill.bottom_color);
+        store_i32(out, background_type.fill.third_color);
+        store_i32(out, background_type.fill.fourth_color);
+    } else if has_fill {
+        store_i32(out, background_type.fill.top_color);
+        if is_gradient {
+            store_i32(out, background_type.fill.bottom_color);
+            store_i32(out, background_type.fill.rotation_angle);
+        }
+    }
+    if has_intensity {
+        store_i32(out, background_type.intensity);
+    }
+    if has_theme_name {
+        store_string(out, &background_type.theme_name);
+    }
+}
+
+/// `BackgroundType::parse` (BackgroundType.hpp:55-92+). An out-of-range
+/// type int (garbage in a corrupted blob; the C++ cast would hold it
+/// unchecked) falls back to the enum default with a log.
+fn parse_background_type(parser: &mut Parser) -> Result<BackgroundType, &'static str> {
+    let flags = parser.parse_flags::<7>()?;
+    let type_raw = parser.i32_()?;
+    let r#type = match BackgroundTypeType::try_from(type_raw) {
+        Ok(value) => value,
+        Err(_) => {
+            tdutils::log_error!("Wrong background type {type_raw}");
+            BackgroundTypeType::default()
+        }
+    };
+    let mut fill = BackgroundFill::default();
+    if flags[5] {
+        fill.top_color = parser.i32_()?;
+        fill.bottom_color = parser.i32_()?;
+        fill.third_color = parser.i32_()?;
+        fill.fourth_color = parser.i32_()?;
+    } else if flags[2] {
+        fill.top_color = parser.i32_()?;
+        if flags[4] {
+            fill.bottom_color = parser.i32_()?;
+            fill.rotation_angle = parser.i32_()?;
+        } else {
+            fill.bottom_color = fill.top_color;
+        }
+    }
+    let intensity = if flags[3] { parser.i32_()? } else { 0 };
+    let theme_name = if flags[6] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    Ok(BackgroundType {
+        r#type,
+        is_blurred: flags[0],
+        is_moving: flags[1],
+        intensity,
+        fill,
+        theme_name,
+    })
+}
+
+/// `BackgroundInfo::store` (BackgroundInfo.hpp:19-22). The id goes through
+/// the BackgroundManager seam; the type is stored inline.
+fn store_background_info(
+    background_info: &BackgroundInfo,
+    ctx: &dyn MessageContentStorage,
+    out: &mut Vec<u8>,
+) {
+    ctx.store_background(background_info.background_id, out);
+    store_background_type(&background_info.background_type, out);
+}
+
+/// `BackgroundInfo::parse` (BackgroundInfo.hpp:25-28).
+fn parse_background_info(
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
+) -> Result<BackgroundInfo, &'static str> {
+    let background_id = ctx.parse_background(parser)?;
+    let background_type = parse_background_type(parser)?;
+    Ok(BackgroundInfo {
+        background_id,
+        background_type,
+    })
+}
+
+/// `GiveawayParameters::store` (GiveawayParameters.hpp:16-38). The
+/// `ChannelId` store is the raw `store_long`.
+fn store_giveaway_parameters(parameters: &GiveawayParameters, out: &mut Vec<u8>) {
+    let has_additional_channel_ids = !parameters.additional_channel_ids.is_empty();
+    let has_country_codes = !parameters.country_codes.is_empty();
+    let has_prize_description = !parameters.prize_description.is_empty();
+    store_flags(
+        out,
+        [
+            parameters.only_new_subscribers,
+            has_additional_channel_ids,
+            has_country_codes,
+            parameters.winners_are_visible,
+            has_prize_description,
+        ],
+    );
+    store_i64(out, parameters.boosted_channel_id.get());
+    if has_additional_channel_ids {
+        store_i32(out, parameters.additional_channel_ids.len() as i32);
+        for channel_id in &parameters.additional_channel_ids {
+            store_i64(out, channel_id.get());
+        }
+    }
+    store_i32(out, parameters.date);
+    if has_country_codes {
+        store_string_vec(out, &parameters.country_codes);
+    }
+    if has_prize_description {
+        store_string(out, &parameters.prize_description);
+    }
+}
+
+/// `GiveawayParameters::parse` (GiveawayParameters.hpp:41-63).
+fn parse_giveaway_parameters(parser: &mut Parser) -> Result<GiveawayParameters, &'static str> {
+    let flags = parser.parse_flags::<5>()?;
+    let boosted_channel_id = parse_channel_id(parser)?;
+    let additional_channel_ids = if flags[1] {
+        let len = parser.i32_()?;
+        if len < 0 || parser.left_len() < len as usize {
+            return Err("Wrong vector length");
+        }
+        let mut channel_ids = Vec::with_capacity(len as usize);
+        for _ in 0..len {
+            channel_ids.push(parse_channel_id(parser)?);
+        }
+        channel_ids
+    } else {
+        Vec::new()
+    };
+    let date = parser.i32_()?;
+    let country_codes = if flags[2] {
+        parser.string_vec()?
+    } else {
+        Vec::new()
+    };
+    let prize_description = if flags[4] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    Ok(GiveawayParameters {
+        boosted_channel_id,
+        additional_channel_ids,
+        only_new_subscribers: flags[0],
+        winners_are_visible: flags[3],
+        date,
+        country_codes,
+        prize_description,
+    })
+}
+
+/// `ForumTopicIcon::store` (ForumTopicIcon.hpp:17-26).
+fn store_forum_topic_icon(icon: &ForumTopicIcon, out: &mut Vec<u8>) {
+    let has_custom_emoji_id = icon.get_custom_emoji_id().get() != 0;
+    store_flags(out, [has_custom_emoji_id]);
+    store_i32(out, icon.get_color());
+    if has_custom_emoji_id {
+        store_i64(out, icon.get_custom_emoji_id().get());
+    }
+}
+
+/// `ForumTopicIcon::parse` (ForumTopicIcon.hpp:29-38).
+fn parse_forum_topic_icon(parser: &mut Parser) -> Result<ForumTopicIcon, &'static str> {
+    let has_custom_emoji_id = parser.parse_flags::<1>()?[0];
+    let color = parser.i32_()?;
+    let mut icon = ForumTopicIcon::new(color, CustomEmojiId::default());
+    if has_custom_emoji_id {
+        icon.edit_custom_emoji_id(CustomEmojiId::new(parser.i64_()?));
+    }
+    Ok(icon)
+}
+
+/// `ForumTopicEditedData::store` (ForumTopicEditedData.hpp:17-34).
+fn store_forum_topic_edited_data(data: &ForumTopicEditedData, out: &mut Vec<u8>) {
+    let has_title = !data.title.is_empty();
+    let has_icon_custom_emoji_id = data.icon_custom_emoji_id.get() != 0;
+    store_flags(
+        out,
+        [
+            data.edit_icon_custom_emoji_id,
+            data.edit_is_closed,
+            data.is_closed,
+            has_title,
+            has_icon_custom_emoji_id,
+            data.is_hidden,
+        ],
+    );
+    if has_title {
+        store_string(out, &data.title);
+    }
+    if has_icon_custom_emoji_id {
+        store_i64(out, data.icon_custom_emoji_id.get());
+    }
+}
+
+/// `ForumTopicEditedData::parse` (ForumTopicEditedData.hpp:37-54).
+fn parse_forum_topic_edited_data(
+    parser: &mut Parser,
+) -> Result<ForumTopicEditedData, &'static str> {
+    let flags = parser.parse_flags::<6>()?;
+    let title = if flags[3] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let icon_custom_emoji_id = if flags[4] {
+        CustomEmojiId::new(parser.i64_()?)
+    } else {
+        CustomEmojiId::default()
+    };
+    Ok(ForumTopicEditedData {
+        title,
+        icon_custom_emoji_id,
+        edit_icon_custom_emoji_id: flags[0],
+        edit_is_closed: flags[1],
+        is_closed: flags[2],
+        edit_is_hidden: flags[5],
+        is_hidden: flags[5],
+    })
+}
+
+/// `ToDoItem::store` (ToDoItem.hpp:18-23).
+fn store_to_do_item(item: &ToDoItem, out: &mut Vec<u8>) {
+    store_flags::<0>(out, []);
+    store_i32(out, item.id);
+    item.title.store(out);
+}
+
+/// `ToDoItem::parse` (ToDoItem.hpp:26-32). The C++ `validate(0, "parse")`
+/// tail mutates only under `check_utf8` failures a Rust `String` cannot
+/// carry, so it is a no-op here.
+fn parse_to_do_item(parser: &mut Parser) -> Result<ToDoItem, &'static str> {
+    parser.parse_flags::<0>()?;
+    let id = parser.i32_()?;
+    let title = parse_formatted_text(parser)?;
+    Ok(ToDoItem { id, title })
+}
+
+/// `ToDoList::store` (ToDoList.hpp:19-26).
+fn store_to_do_list(list: &ToDoList, out: &mut Vec<u8>) {
+    store_flags(out, [list.others_can_append, list.others_can_complete]);
+    list.title.store(out);
+    store_i32(out, list.items.len() as i32);
+    for item in &list.items {
+        store_to_do_item(item, out);
+    }
+}
+
+/// `ToDoList::parse` (ToDoList.hpp:29-37). The C++ `validate` tail drops
+/// unallowed quote entities from the title; the entity filter lands with
+/// the Wave-2 to-do consumers (logged divergence, layout-identical).
+fn parse_to_do_list(parser: &mut Parser) -> Result<ToDoList, &'static str> {
+    let flags = parser.parse_flags::<2>()?;
+    let title = parse_formatted_text(parser)?;
+    let items_len = parser.i32_()?;
+    if items_len < 0 || parser.left_len() < items_len as usize {
+        return Err("Wrong vector length");
+    }
+    let mut items = Vec::with_capacity(items_len as usize);
+    for _ in 0..items_len {
+        items.push(parse_to_do_item(parser)?);
+    }
+    Ok(ToDoList {
+        title,
+        items,
+        others_can_append: flags[0],
+        others_can_complete: flags[1],
+    })
+}
+
+/// `ToDoCompletion::store` (ToDoCompletion.hpp:17-29).
+fn store_to_do_completion(completion: &ToDoCompletion, out: &mut Vec<u8>) {
+    let is_completed_by_dialog =
+        completion.completed_by_dialog_id.get_type() != crate::messages_manager::DialogType::User;
+    store_flags(out, [is_completed_by_dialog]);
+    store_i32(out, completion.id);
+    if is_completed_by_dialog {
+        store_i64(out, completion.completed_by_dialog_id.get());
+    } else {
+        store_i64(out, completion.completed_by_dialog_id.get_user_id().get());
+    }
+    store_i32(out, completion.date);
+}
+
+/// `ToDoCompletion::parse` (ToDoCompletion.hpp:32-46).
+fn parse_to_do_completion(parser: &mut Parser) -> Result<ToDoCompletion, &'static str> {
+    let is_completed_by_dialog = parser.parse_flags::<1>()?[0];
+    let id = parser.i32_()?;
+    let completed_by_dialog_id = if is_completed_by_dialog {
+        parse_dialog_id(parser)?
+    } else {
+        DialogId::from_user_id(parse_user_id(parser)?)
+    };
+    let date = parser.i32_()?;
+    Ok(ToDoCompletion {
+        id,
+        completed_by_dialog_id,
+        date,
+    })
+}
+
+/// `store(DatedFile, ...)` (SecureValue.hpp:18-21).
+fn store_dated_file(file: &DatedFile, ctx: &dyn MessageContentStorage, out: &mut Vec<u8>) {
+    ctx.store_file(file.file_id, out);
+    store_i32(out, file.date);
+}
+
+/// `parse(DatedFile &, ...)`.
+fn parse_dated_file(
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
+) -> Result<DatedFile, &'static str> {
+    let file_id = ctx.parse_file(parser)?;
+    let date = parser.i32_()?;
+    Ok(DatedFile { file_id, date })
+}
+
+/// `store(EncryptedSecureFile, ...)` (SecureValue.hpp:30-34).
+fn store_encrypted_secure_file(
+    file: &EncryptedSecureFile,
+    ctx: &dyn MessageContentStorage,
+    out: &mut Vec<u8>,
+) {
+    store_dated_file(&file.file, ctx, out);
+    store_string(out, &file.file_hash);
+    store_string(out, &file.encrypted_secret);
+}
+
+/// `parse(EncryptedSecureFile &, ...)`.
+fn parse_encrypted_secure_file(
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
+) -> Result<EncryptedSecureFile, &'static str> {
+    let file = parse_dated_file(parser, ctx)?;
+    let file_hash = parser.string()?;
+    let encrypted_secret = parser.string()?;
+    Ok(EncryptedSecureFile {
+        file,
+        file_hash,
+        encrypted_secret,
+    })
+}
+
+/// `store(const EncryptedSecureData &, ...)` (SecureValue.hpp:44-48).
+fn store_encrypted_secure_data(data: &EncryptedSecureData, out: &mut Vec<u8>) {
+    store_string(out, &data.data);
+    store_string(out, &data.hash);
+    store_string(out, &data.encrypted_secret);
+}
+
+/// `parse(const EncryptedSecureData &, ...)`.
+fn parse_encrypted_secure_data(parser: &mut Parser) -> Result<EncryptedSecureData, &'static str> {
+    let data = parser.string()?;
+    let hash = parser.string()?;
+    let encrypted_secret = parser.string()?;
+    Ok(EncryptedSecureData {
+        data,
+        hash,
+        encrypted_secret,
+    })
+}
+
+/// `store(const EncryptedSecureValue &, ...)` (SecureValue.hpp:72-113).
+fn store_encrypted_secure_value(
+    value: &EncryptedSecureValue,
+    ctx: &dyn MessageContentStorage,
+    out: &mut Vec<u8>,
+) {
+    let has_data_hash = !value.data.hash.is_empty();
+    let has_files = !value.files.is_empty();
+    let has_front_side = value.front_side.file.file_id.is_valid();
+    let has_reverse_side = value.reverse_side.file.file_id.is_valid();
+    let has_selfie = value.selfie.file.file_id.is_valid();
+    let has_hash = !value.hash.is_empty();
+    let has_translations = !value.translations.is_empty();
+    store_flags(
+        out,
+        [
+            has_data_hash,
+            has_files,
+            has_front_side,
+            has_reverse_side,
+            has_selfie,
+            has_hash,
+            has_translations,
+        ],
+    );
+    store_i32(out, value.r#type as i32);
+    if has_data_hash {
+        store_encrypted_secure_data(&value.data, out);
+    } else {
+        store_string(out, &value.data.data);
+    }
+    if has_files {
+        store_i32(out, value.files.len() as i32);
+        for file in &value.files {
+            store_encrypted_secure_file(file, ctx, out);
+        }
+    }
+    if has_front_side {
+        store_encrypted_secure_file(&value.front_side, ctx, out);
+    }
+    if has_reverse_side {
+        store_encrypted_secure_file(&value.reverse_side, ctx, out);
+    }
+    if has_selfie {
+        store_encrypted_secure_file(&value.selfie, ctx, out);
+    }
+    if has_hash {
+        store_string(out, &value.hash);
+    }
+    if has_translations {
+        store_i32(out, value.translations.len() as i32);
+        for file in &value.translations {
+            store_encrypted_secure_file(file, ctx, out);
+        }
+    }
+}
+
+/// `parse(const EncryptedSecureValue &, ...)` (SecureValue.hpp:116-157).
+fn parse_encrypted_secure_value(
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
+) -> Result<EncryptedSecureValue, &'static str> {
+    let flags = parser.parse_flags::<7>()?;
+    let type_raw = parser.i32_()?;
+    let r#type = match SecureValueType::try_from(type_raw) {
+        Ok(value) => value,
+        Err(_) => {
+            tdutils::log_error!("Wrong secure value type {type_raw}");
+            SecureValueType::None
+        }
+    };
+    let data = if flags[0] {
+        parse_encrypted_secure_data(parser)?
+    } else {
+        EncryptedSecureData {
+            data: parser.string()?,
+            hash: String::new(),
+            encrypted_secret: String::new(),
+        }
+    };
+    let files_len = if flags[1] { parser.i32_()? } else { 0 };
+    if files_len < 0 || parser.left_len() < files_len as usize {
+        return Err("Wrong vector length");
+    }
+    let mut files = Vec::with_capacity(files_len as usize);
+    for _ in 0..files_len {
+        files.push(parse_encrypted_secure_file(parser, ctx)?);
+    }
+    let front_side = if flags[2] {
+        parse_encrypted_secure_file(parser, ctx)?
+    } else {
+        EncryptedSecureFile::default()
+    };
+    let reverse_side = if flags[3] {
+        parse_encrypted_secure_file(parser, ctx)?
+    } else {
+        EncryptedSecureFile::default()
+    };
+    let selfie = if flags[4] {
+        parse_encrypted_secure_file(parser, ctx)?
+    } else {
+        EncryptedSecureFile::default()
+    };
+    let hash = if flags[5] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let translations_len = if flags[6] { parser.i32_()? } else { 0 };
+    if translations_len < 0 || parser.left_len() < translations_len as usize {
+        return Err("Wrong vector length");
+    }
+    let mut translations = Vec::with_capacity(translations_len as usize);
+    for _ in 0..translations_len {
+        translations.push(parse_encrypted_secure_file(parser, ctx)?);
+    }
+    Ok(EncryptedSecureValue {
+        r#type,
+        data,
+        files,
+        front_side,
+        reverse_side,
+        selfie,
+        translations,
+        hash,
+    })
+}
+
+/// `store(const EncryptedSecureCredentials &, ...)` (SecureValue.hpp:58-62).
+fn store_encrypted_secure_credentials(credentials: &EncryptedSecureCredentials, out: &mut Vec<u8>) {
+    store_string(out, &credentials.data);
+    store_string(out, &credentials.hash);
+    store_string(out, &credentials.encrypted_secret);
+}
+
+/// `parse(const EncryptedSecureCredentials &, ...)`.
+fn parse_encrypted_secure_credentials(
+    parser: &mut Parser,
+) -> Result<EncryptedSecureCredentials, &'static str> {
+    let data = parser.string()?;
+    let hash = parser.string()?;
+    let encrypted_secret = parser.string()?;
+    Ok(EncryptedSecureCredentials {
+        data,
+        hash,
+        encrypted_secret,
+    })
+}
+
+/// `StarAmount::store` (StarAmount.hpp).
+fn store_star_amount(amount: &StarAmount, out: &mut Vec<u8>) {
+    store_i64(out, amount.star_count);
+    store_i32(out, amount.nanostar_count);
+}
+
+/// `StarAmount::parse`.
+fn parse_star_amount(parser: &mut Parser) -> Result<StarAmount, &'static str> {
+    let star_count = parser.i64_()?;
+    let nanostar_count = parser.i32_()?;
+    Ok(StarAmount {
+        star_count,
+        nanostar_count,
+    })
+}
+
+/// `TonAmount::store` (TonAmount.hpp).
+fn store_ton_amount(amount: &TonAmount, out: &mut Vec<u8>) {
+    store_i64(out, amount.ton_amount);
+}
+
+/// `TonAmount::parse`.
+fn parse_ton_amount(parser: &mut Parser) -> Result<TonAmount, &'static str> {
+    Ok(TonAmount {
+        ton_amount: parser.i64_()?,
+    })
+}
+
+/// `CurrencyAmount::store` (CurrencyAmount.hpp:18-32).
+fn store_currency_amount(amount: &CurrencyAmount, out: &mut Vec<u8>) {
+    let has_star_amount = amount.star_amount != StarAmount::default();
+    let has_ton_amount = amount.ton_amount != TonAmount::default();
+    store_flags(out, [has_star_amount, has_ton_amount]);
+    store_i32(out, amount.r#type as i32);
+    if has_star_amount {
+        store_star_amount(&amount.star_amount, out);
+    }
+    if has_ton_amount {
+        store_ton_amount(&amount.ton_amount, out);
+    }
+}
+
+/// `CurrencyAmount::parse` (CurrencyAmount.hpp:35-49).
+fn parse_currency_amount(parser: &mut Parser) -> Result<CurrencyAmount, &'static str> {
+    let flags = parser.parse_flags::<2>()?;
+    let type_raw = parser.i32_()?;
+    let r#type = match CurrencyAmountType::try_from(type_raw) {
+        Ok(value) => value,
+        Err(_) => {
+            tdutils::log_error!("Wrong currency amount type {type_raw}");
+            CurrencyAmountType::None
+        }
+    };
+    let star_amount = if flags[0] {
+        parse_star_amount(parser)?
+    } else {
+        StarAmount::default()
+    };
+    let ton_amount = if flags[1] {
+        parse_ton_amount(parser)?
+    } else {
+        TonAmount::default()
+    };
+    Ok(CurrencyAmount {
+        r#type,
+        star_amount,
+        ton_amount,
+    })
+}
+
+/// `SuggestedPostPrice::store` (SuggestedPostPrice.hpp:16-25).
+fn store_suggested_post_price(price: &SuggestedPostPrice, out: &mut Vec<u8>) {
+    let has_amount = price.amount != 0;
+    store_flags(out, [has_amount]);
+    store_i32(out, price.r#type as i32);
+    if has_amount {
+        store_i64(out, price.amount);
+    }
+}
+
+/// `SuggestedPostPrice::parse` (SuggestedPostPrice.hpp:28-37).
+fn parse_suggested_post_price(parser: &mut Parser) -> Result<SuggestedPostPrice, &'static str> {
+    let has_amount = parser.parse_flags::<1>()?[0];
+    let type_raw = parser.i32_()?;
+    let r#type = match SuggestedPostPriceType::try_from(type_raw) {
+        Ok(value) => value,
+        Err(_) => {
+            tdutils::log_error!("Wrong suggested post price type {type_raw}");
+            SuggestedPostPriceType::None
+        }
+    };
+    let amount = if has_amount { parser.i64_()? } else { 0 };
+    Ok(SuggestedPostPrice { r#type, amount })
+}
+
+/// `MessageExtendedMedia::store` (MessageExtendedMedia.hpp:20-61).
+fn store_message_extended_media(
+    media: &MessageExtendedMedia,
+    ctx: &dyn MessageContentStorage,
+    out: &mut Vec<u8>,
+) {
+    let has_unsupported_version = media.unsupported_version != 0;
+    let has_duration = media.duration != 0;
+    let has_dimensions = media.dimensions.width != 0 || media.dimensions.height != 0;
+    let has_minithumbnail = !media.minithumbnail.is_empty();
+    let has_photo = !media.photo.is_empty();
+    let has_video = media.video_file_id.is_valid();
+    let has_start_timestamp = media.start_timestamp != 0;
+    store_flags(
+        out,
+        [
+            false, // has_caption — the legacy field, never stored
+            has_unsupported_version,
+            has_duration,
+            has_dimensions,
+            has_minithumbnail,
+            has_photo,
+            has_video,
+            has_start_timestamp,
+        ],
+    );
+    store_i32(out, media.r#type as i32);
+    if has_unsupported_version {
+        store_i32(out, media.unsupported_version);
+    }
+    if has_duration {
+        store_i32(out, media.duration);
+    }
+    if has_dimensions {
+        store_dimensions(media.dimensions, out);
+    }
+    if has_minithumbnail {
+        store_string(out, &media.minithumbnail);
+    }
+    if has_photo {
+        store_photo(&media.photo, ctx, out);
+    }
+    if has_video {
+        ctx.store_video(media.video_file_id, out);
+    }
+    if has_start_timestamp {
+        store_i32(out, media.start_timestamp);
+    }
+}
+
+/// `MessageExtendedMedia::parse` (MessageExtendedMedia.hpp:64-127).
+fn parse_message_extended_media(
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
+) -> Result<MessageExtendedMedia, &'static str> {
+    let flags = parser.parse_flags::<8>()?;
+    let type_raw = parser.i32_()?;
+    let r#type = match MessageExtendedMediaType::try_from(type_raw) {
+        Ok(value) => value,
+        Err(_) => {
+            tdutils::log_error!("Wrong extended media type {type_raw}");
+            MessageExtendedMediaType::Empty
+        }
+    };
+    if flags[0] {
+        // has_caption — parsed and dropped, like the C++ local.
+        parse_formatted_text(parser)?;
+    }
+    let unsupported_version = if flags[1] { parser.i32_()? } else { 0 };
+    let duration = if flags[2] { parser.i32_()? } else { 0 };
+    let dimensions = if flags[3] {
+        parse_dimensions(parser)?
+    } else {
+        Dimensions::default()
+    };
+    let minithumbnail = if flags[4] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let mut is_bad = false;
+    let photo = if flags[5] {
+        let photo = parse_photo(parser, ctx)?;
+        is_bad |= photo_is_bad(&photo);
+        photo
+    } else {
+        if r#type == MessageExtendedMediaType::Photo {
+            is_bad = true;
+        }
+        Photo::default()
+    };
+    let video_file_id = if flags[6] {
+        let file_id = ctx.parse_video(parser)?;
+        is_bad = !file_id.is_valid();
+        file_id
+    } else {
+        if r#type == MessageExtendedMediaType::Video {
+            is_bad = true;
+        }
+        FileId::default()
+    };
+    let start_timestamp = if flags[7] { parser.i32_()? } else { 0 };
+    if is_bad || flags[0] {
+        if is_bad {
+            tdutils::log_error!("Failed to parse MessageExtendedMedia");
+        }
+        return Ok(MessageExtendedMedia {
+            r#type: MessageExtendedMediaType::Unsupported,
+            unsupported_version: 0,
+            duration,
+            dimensions,
+            minithumbnail,
+            photo: Photo::default(),
+            video_file_id: FileId::default(),
+            start_timestamp,
+        });
+    }
+    Ok(MessageExtendedMedia {
+        r#type,
+        unsupported_version,
+        duration,
+        dimensions,
+        minithumbnail,
+        photo,
+        video_file_id,
+        start_timestamp,
+    })
+}
+
+/// `InputInvoice::Invoice::store` (InputInvoice.hpp:21-56).
+fn store_invoice(invoice: &Invoice, out: &mut Vec<u8>) {
+    let has_tip = invoice.max_tip_amount != 0;
+    let is_recurring = !invoice.recurring_payment_terms_of_service_url.is_empty();
+    let has_terms_of_service = !invoice.terms_of_service_url.is_empty();
+    let has_subscription_period = invoice.subscription_period != 0;
+    store_flags(
+        out,
+        [
+            invoice.is_test,
+            invoice.need_name,
+            invoice.need_phone_number,
+            invoice.need_email_address,
+            invoice.need_shipping_address,
+            invoice.is_flexible,
+            invoice.send_phone_number_to_provider,
+            invoice.send_email_address_to_provider,
+            has_tip,
+            is_recurring,
+            has_terms_of_service,
+            has_subscription_period,
+        ],
+    );
+    store_string(out, &invoice.currency);
+    store_i32(out, invoice.price_parts.len() as i32);
+    for part in &invoice.price_parts {
+        // `LabeledPricePart::store` (LabeledPricePart.h:41-44).
+        store_string(out, &part.label);
+        store_i64(out, part.amount);
+    }
+    if has_tip {
+        store_i64(out, invoice.max_tip_amount);
+        store_i32(out, invoice.suggested_tip_amounts.len() as i32);
+        for amount in &invoice.suggested_tip_amounts {
+            store_i64(out, *amount);
+        }
+    }
+    if is_recurring {
+        store_string(out, &invoice.recurring_payment_terms_of_service_url);
+    }
+    if has_terms_of_service {
+        store_string(out, &invoice.terms_of_service_url);
+    }
+    if has_subscription_period {
+        store_i32(out, invoice.subscription_period);
+    }
+}
+
+/// `InputInvoice::Invoice::parse` (InputInvoice.hpp:59-94).
+fn parse_invoice(parser: &mut Parser) -> Result<Invoice, &'static str> {
+    let flags = parser.parse_flags::<12>()?;
+    let currency = parser.string()?;
+    let price_parts_len = parser.i32_()?;
+    if price_parts_len < 0 || parser.left_len() < price_parts_len as usize {
+        return Err("Wrong vector length");
+    }
+    let mut price_parts = Vec::with_capacity(price_parts_len as usize);
+    for _ in 0..price_parts_len {
+        let label = parser.string()?;
+        let amount = parser.i64_()?;
+        price_parts.push(LabeledPricePart { label, amount });
+    }
+    let max_tip_amount = if flags[8] { parser.i64_()? } else { 0 };
+    let suggested_tip_amounts = if flags[8] {
+        let len = parser.i32_()?;
+        if len < 0 || parser.left_len() < len as usize {
+            return Err("Wrong vector length");
+        }
+        let mut amounts = Vec::with_capacity(len as usize);
+        for _ in 0..len {
+            amounts.push(parser.i64_()?);
+        }
+        amounts
+    } else {
+        Vec::new()
+    };
+    let recurring_payment_terms_of_service_url = if flags[9] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let terms_of_service_url = if flags[10] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let subscription_period = if flags[11] { parser.i32_()? } else { 0 };
+    Ok(Invoice {
+        currency,
+        price_parts,
+        subscription_period,
+        max_tip_amount,
+        suggested_tip_amounts,
+        recurring_payment_terms_of_service_url,
+        terms_of_service_url,
+        is_test: flags[0],
+        need_name: flags[1],
+        need_phone_number: flags[2],
+        need_email_address: flags[3],
+        need_shipping_address: flags[4],
+        send_phone_number_to_provider: flags[6],
+        send_email_address_to_provider: flags[7],
+        is_flexible: flags[5],
+    })
+}
+
+/// `InputInvoice::store` (InputInvoice.hpp:97-153).
+fn store_input_invoice(invoice: &InputInvoice, ctx: &dyn MessageContentStorage, out: &mut Vec<u8>) {
+    let has_description = !invoice.description.is_empty();
+    let has_photo = !invoice.photo.is_empty();
+    let has_start_parameter = !invoice.start_parameter.is_empty();
+    let has_payload = !invoice.payload.is_empty();
+    let has_provider_token = !invoice.provider_token.is_empty();
+    let has_provider_data = !invoice.provider_data.is_empty();
+    let has_total_amount = invoice.total_amount != 0;
+    let has_receipt_message_id = invoice.receipt_message_id.is_valid();
+    let has_extended_media = !invoice.extended_media.is_empty();
+    let has_extended_media_caption = !invoice.extended_media_caption.text.is_empty();
+    store_flags(
+        out,
+        [
+            has_description,
+            has_photo,
+            has_start_parameter,
+            has_payload,
+            has_provider_token,
+            has_provider_data,
+            has_total_amount,
+            has_receipt_message_id,
+            has_extended_media,
+            has_extended_media_caption,
+        ],
+    );
+    store_string(out, &invoice.title);
+    if has_description {
+        store_string(out, &invoice.description);
+    }
+    if has_photo {
+        store_photo(&invoice.photo, ctx, out);
+    }
+    if has_start_parameter {
+        store_string(out, &invoice.start_parameter);
+    }
+    store_invoice(&invoice.invoice, out);
+    if has_payload {
+        store_string(out, &invoice.payload);
+    }
+    if has_provider_token {
+        store_string(out, &invoice.provider_token);
+    }
+    if has_provider_data {
+        store_string(out, &invoice.provider_data);
+    }
+    if has_total_amount {
+        store_i64(out, invoice.total_amount);
+    }
+    if has_receipt_message_id {
+        store_i64(out, invoice.receipt_message_id.get());
+    }
+    if has_extended_media {
+        store_message_extended_media(&invoice.extended_media, ctx, out);
+    }
+    if has_extended_media_caption {
+        invoice.extended_media_caption.store(out);
+    }
+}
+
+/// `InputInvoice::parse` (InputInvoice.hpp:156-224) with the legacy
+/// pre-`AddInputInvoiceFlags` branch.
+fn parse_input_invoice(
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
+) -> Result<InputInvoice, &'static str> {
+    let (flags, has_provider_data) = if parser.version() >= version::ADD_INPUT_INVOICE_FLAGS {
+        (parser.parse_flags::<10>()?, true)
+    } else {
+        (
+            [true, true, true, true, true, true, true, true, false, false],
+            parser.version() >= version::ADD_MESSAGE_INVOICE_PROVIDER_DATA,
+        )
+    };
+    let title = parser.string()?;
+    let description = if flags[0] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let photo = if flags[1] {
+        parse_photo(parser, ctx)?
+    } else {
+        Photo::default()
+    };
+    let start_parameter = if flags[2] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let invoice = parse_invoice(parser)?;
+    let payload = if flags[3] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let provider_token = if flags[4] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let provider_data = if has_provider_data {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let total_amount = if flags[6] { parser.i64_()? } else { 0 };
+    let receipt_message_id = if flags[7] {
+        parse_message_id(parser)?
+    } else {
+        MessageId::default()
+    };
+    let extended_media = if flags[8] {
+        parse_message_extended_media(parser, ctx)?
+    } else {
+        MessageExtendedMedia::default()
+    };
+    let extended_media_caption = if flags[9] {
+        parse_formatted_text(parser)?
+    } else {
+        FormattedText::default()
+    };
+    Ok(InputInvoice {
+        title,
+        description,
+        photo,
+        start_parameter,
+        invoice,
+        payload,
+        provider_token,
+        provider_data,
+        extended_media,
+        extended_media_caption,
+        total_amount,
+        receipt_message_id,
+    })
+}
+
+/// `store(const Address &)`/`store(const OrderInfo &)`
+/// (OrderInfo.hpp:16-59).
+fn store_order_info(order_info: &OrderInfo, out: &mut Vec<u8>) {
+    let has_name = !order_info.name.is_empty();
+    let has_phone_number = !order_info.phone_number.is_empty();
+    let has_email_address = !order_info.email_address.is_empty();
+    let has_shipping_address = order_info.shipping_address.is_some();
+    store_flags(
+        out,
+        [
+            has_name,
+            has_phone_number,
+            has_email_address,
+            has_shipping_address,
+        ],
+    );
+    if has_name {
+        store_string(out, &order_info.name);
+    }
+    if has_phone_number {
+        store_string(out, &order_info.phone_number);
+    }
+    if has_email_address {
+        store_string(out, &order_info.email_address);
+    }
+    if let Some(shipping_address) = &order_info.shipping_address {
+        store_string(out, &shipping_address.country_code);
+        store_string(out, &shipping_address.state);
+        store_string(out, &shipping_address.city);
+        store_string(out, &shipping_address.street_line1);
+        store_string(out, &shipping_address.street_line2);
+        store_string(out, &shipping_address.postal_code);
+    }
+}
+
+/// `parse(Address &)`/`parse(OrderInfo &)` (OrderInfo.hpp:26-85).
+fn parse_order_info(parser: &mut Parser) -> Result<OrderInfo, &'static str> {
+    let flags = parser.parse_flags::<4>()?;
+    let name = if flags[0] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let phone_number = if flags[1] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let email_address = if flags[2] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let shipping_address = if flags[3] {
+        Some(Box::new(Address {
+            country_code: parser.string()?,
+            state: parser.string()?,
+            city: parser.string()?,
+            street_line1: parser.string()?,
+            street_line2: parser.string()?,
+            postal_code: parser.string()?,
+        }))
+    } else {
+        None
+    };
+    Ok(OrderInfo {
+        name,
+        phone_number,
+        email_address,
+        shipping_address,
+    })
+}
+
+/// `SharedDialog::store` (SharedDialog.hpp:16-43).
+fn store_shared_dialog(
+    shared_dialog: &SharedDialog,
+    ctx: &dyn MessageContentStorage,
+    out: &mut Vec<u8>,
+) {
+    let has_first_name = !shared_dialog.first_name.is_empty();
+    let has_last_name = !shared_dialog.last_name.is_empty();
+    let has_username = !shared_dialog.username.is_empty();
+    let has_photo = !shared_dialog.photo.is_empty();
+    store_flags(
+        out,
+        [has_first_name, has_last_name, has_username, has_photo],
+    );
+    store_i64(out, shared_dialog.dialog_id.get());
+    if has_first_name {
+        store_string(out, &shared_dialog.first_name);
+    }
+    if has_last_name {
+        store_string(out, &shared_dialog.last_name);
+    }
+    if has_username {
+        store_string(out, &shared_dialog.username);
+    }
+    if has_photo {
+        store_photo(&shared_dialog.photo, ctx, out);
+    }
+}
+
+/// `SharedDialog::parse` (SharedDialog.hpp:46-72).
+fn parse_shared_dialog(
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
+) -> Result<SharedDialog, &'static str> {
+    let flags = parser.parse_flags::<4>()?;
+    let dialog_id = parse_dialog_id(parser)?;
+    let first_name = if flags[0] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let last_name = if flags[1] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let username = if flags[2] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let photo = if flags[3] {
+        parse_photo(parser, ctx)?
+    } else {
+        Photo::default()
+    };
+    Ok(SharedDialog {
+        dialog_id,
+        first_name,
+        last_name,
+        username,
+        photo,
+    })
+}
+
+/// The id-wrapper stores: `store_long`/`fetch_long` with the pre-64-bit
+/// int32 legacy the C++ wrappers keep (`UserId.h:57-64`, `ChannelId.h:61`,
+/// `ChatId.h:54`); `DialogId`/`MessageId`/`WebPageId` are unconditionally
+/// 64-bit.
+fn store_user_id(user_id: UserId, out: &mut Vec<u8>) {
+    store_i64(out, user_id.get());
+}
+
+fn parse_user_id(parser: &mut Parser) -> Result<UserId, &'static str> {
+    Ok(UserId::new(
+        if parser.version() >= version::SUPPORT_64_BIT_IDS {
+            parser.i64_()?
+        } else {
+            parser.i32_()? as i64
+        },
+    ))
+}
+
+fn store_channel_id(channel_id: ChannelId, out: &mut Vec<u8>) {
+    store_i64(out, channel_id.get());
+}
+
+fn parse_channel_id(parser: &mut Parser) -> Result<ChannelId, &'static str> {
+    Ok(ChannelId::new(
+        if parser.version() >= version::SUPPORT_64_BIT_IDS {
+            parser.i64_()?
+        } else {
+            parser.i32_()? as i64
+        },
+    ))
+}
+
+fn store_chat_id(chat_id: ChatId, out: &mut Vec<u8>) {
+    store_i64(out, chat_id.get());
+}
+
+fn parse_chat_id(parser: &mut Parser) -> Result<ChatId, &'static str> {
+    Ok(ChatId::new(
+        if parser.version() >= version::SUPPORT_64_BIT_IDS {
+            parser.i64_()?
+        } else {
+            parser.i32_()? as i64
+        },
+    ))
+}
+
+fn parse_dialog_id(parser: &mut Parser) -> Result<DialogId, &'static str> {
+    Ok(DialogId::new(parser.i64_()?))
+}
+
+fn parse_message_id(parser: &mut Parser) -> Result<MessageId, &'static str> {
+    Ok(MessageId::new(parser.i64_()?))
+}
+
+/// `parse_caption` (MessageContent.cpp:3021-3032): the pre-`AddCaptionEntities`
+/// legacy re-derives the entities; the `check_utf8` half of that branch is
+/// unreachable on a Rust `String` (invalid UTF-8 fails the read instead).
+fn parse_caption(parser: &mut Parser) -> Result<FormattedText, &'static str> {
+    let text = parser.string()?;
+    if parser.version() >= version::ADD_CAPTION_ENTITIES {
+        let entities_len = parser.i32_()?;
+        if entities_len < 0 || parser.left_len() < entities_len as usize {
+            return Err("Wrong vector length");
+        }
+        let mut entities = Vec::with_capacity(entities_len as usize);
+        for _ in 0..entities_len {
+            entities.push(MessageEntity::parse(parser)?);
+        }
+        remove_empty_entities(&mut entities);
+        Ok(FormattedText { text, entities })
+    } else {
+        let entities = find_entities(&text, false, true);
+        Ok(FormattedText { text, entities })
+    }
+}
+
+/// `store(const MessageContent *, ...)` (MessageContent.cpp:1831-3021): the
+/// per-type store switch after the `MessageContentType` int.
+pub fn store_message_content(
+    content: &MessageContent,
+    ctx: &dyn MessageContentStorage,
+    out: &mut Vec<u8>,
+) {
+    let content_type = content.get_type();
+    store_i32(out, content_type as i32);
+    match content {
+        MessageContent::Animation(m) => {
+            ctx.store_animation(m.file_id, out);
+            store_flags(out, [m.has_spoiler]);
+            m.caption.store(out);
+        }
+        MessageContent::Audio(m) => {
+            ctx.store_audio(m.file_id, out);
+            m.caption.store(out);
+            store_bool(out, true);
+        }
+        MessageContent::Contact(m) => {
+            m.contact.store(out);
+        }
+        MessageContent::Document(m) => {
+            ctx.store_document(m.file_id, out);
+            m.caption.store(out);
+        }
+        MessageContent::Game(m) => {
+            store_game(&m.game, ctx, out);
+        }
+        MessageContent::Invoice(m) => {
+            store_input_invoice(&m.input_invoice, ctx, out);
+        }
+        MessageContent::LiveLocation(m) => {
+            store_location(&m.location, out);
+            store_i32(out, m.period);
+            store_i32(out, m.heading);
+            store_i32(out, m.proximity_alert_radius);
+        }
+        MessageContent::Location(m) => {
+            store_location(&m.location, out);
+        }
+        MessageContent::Photo(m) => {
+            let has_video_file_id = m.video_file_id.is_valid();
+            store_photo(&m.photo, ctx, out);
+            store_flags(out, [m.has_spoiler, has_video_file_id]);
+            m.caption.store(out);
+            if has_video_file_id {
+                ctx.store_video(m.video_file_id, out);
+            }
+        }
+        MessageContent::Sticker(m) => {
+            ctx.store_sticker(m.file_id, out);
+            store_flags(out, [m.is_premium]);
+        }
+        MessageContent::Text(m) => {
+            let has_web_page_id = m.web_page_id.is_valid();
+            let has_web_page_url = !m.web_page_url.is_empty();
+            store_flags(
+                out,
+                [
+                    has_web_page_id,
+                    m.force_small_media,
+                    m.force_large_media,
+                    has_web_page_url,
+                    m.skip_web_page_confirmation,
+                ],
+            );
+            m.text.store(out);
+            if has_web_page_id {
+                store_i64(out, m.web_page_id.get());
+            }
+            if has_web_page_url {
+                store_string(out, &m.web_page_url);
+            }
+        }
+        MessageContent::Unsupported(m) => {
+            store_i32(out, m.version);
+        }
+        MessageContent::Venue(m) => {
+            store_venue(&m.venue, out);
+        }
+        MessageContent::Video(m) => {
+            ctx.store_video(m.file_id, out);
+            let has_alternative_videos = !m.alternative_file_ids.is_empty();
+            let has_hls_files = !m.hls_file_ids.is_empty();
+            let has_cover = !m.cover.is_empty();
+            let has_start_timestamp = m.start_timestamp != 0;
+            let has_storyboard_files = !m.storyboard_file_ids.is_empty();
+            let has_storyboard_map_files = !m.storyboard_map_file_ids.is_empty();
+            store_flags(
+                out,
+                [
+                    m.has_spoiler,
+                    has_alternative_videos,
+                    has_hls_files,
+                    has_cover,
+                    has_start_timestamp,
+                    has_storyboard_files,
+                    has_storyboard_map_files,
+                ],
+            );
+            m.caption.store(out);
+            if has_alternative_videos {
+                store_i32(out, m.alternative_file_ids.len() as i32);
+                for file_id in &m.alternative_file_ids {
+                    ctx.store_video(*file_id, out);
+                }
+            }
+            if has_hls_files {
+                store_i32(out, m.hls_file_ids.len() as i32);
+                for file_id in &m.hls_file_ids {
+                    ctx.store_document(*file_id, out);
+                }
+            }
+            if has_cover {
+                store_photo(&m.cover, ctx, out);
+            }
+            if has_start_timestamp {
+                store_i32(out, m.start_timestamp);
+            }
+            if has_storyboard_files {
+                store_i32(out, m.storyboard_file_ids.len() as i32);
+                for file_id in &m.storyboard_file_ids {
+                    ctx.store_document(*file_id, out);
+                }
+            }
+            if has_storyboard_map_files {
+                store_i32(out, m.storyboard_map_file_ids.len() as i32);
+                for file_id in &m.storyboard_map_file_ids {
+                    ctx.store_document(*file_id, out);
+                }
+            }
+        }
+        MessageContent::VideoNote(m) => {
+            ctx.store_video_note(m.file_id, out);
+            store_bool(out, m.is_viewed);
+        }
+        MessageContent::VoiceNote(m) => {
+            ctx.store_voice_note(m.file_id, out);
+            m.caption.store(out);
+            store_bool(out, m.is_listened);
+        }
+        MessageContent::ChatCreate(m) => {
+            store_string(out, &m.title);
+            store_i32(out, m.participant_user_ids.len() as i32);
+            for user_id in &m.participant_user_ids {
+                store_user_id(*user_id, out);
+            }
+        }
+        MessageContent::ChatChangeTitle(m) => {
+            store_string(out, &m.title);
+        }
+        MessageContent::ChatChangePhoto(m) => {
+            store_photo(&m.photo, ctx, out);
+        }
+        MessageContent::ChatDeletePhoto(_) => {}
+        MessageContent::ChatDeleteHistory(_) => {}
+        MessageContent::ChatAddUsers(m) => {
+            store_i32(out, m.user_ids.len() as i32);
+            for user_id in &m.user_ids {
+                store_user_id(*user_id, out);
+            }
+        }
+        MessageContent::ChatJoinedByLink(m) => {
+            store_flags(out, [m.is_approved]);
+        }
+        MessageContent::ChatDeleteUser(m) => {
+            store_user_id(m.user_id, out);
+        }
+        MessageContent::ChatMigrateTo(m) => {
+            store_channel_id(m.migrated_to_channel_id, out);
+        }
+        MessageContent::ChannelCreate(m) => {
+            store_string(out, &m.title);
+        }
+        MessageContent::ChannelMigrateFrom(m) => {
+            store_string(out, &m.title);
+            store_chat_id(m.migrated_from_chat_id, out);
+        }
+        MessageContent::PinMessage(m) => {
+            store_i64(out, m.message_id.get());
+        }
+        MessageContent::GameScore(m) => {
+            store_i64(out, m.game_message_id.get());
+            store_i64(out, m.game_id);
+            store_i32(out, m.score);
+        }
+        MessageContent::ScreenshotTaken(_) => {}
+        MessageContent::ChatSetTtl(m) => {
+            let has_from_user_id = m.from_user_id.is_valid();
+            store_flags(out, [has_from_user_id]);
+            store_i32(out, m.ttl);
+            if has_from_user_id {
+                store_user_id(m.from_user_id, out);
+            }
+        }
+        MessageContent::Call(m) => {
+            let has_call_access_hash = m.call_access_hash != 0;
+            store_flags(out, [m.is_video, has_call_access_hash]);
+            store_i64(out, m.call_id);
+            store_i32(out, m.duration);
+            store_i32(out, m.discard_reason.r#type as i32);
+            if has_call_access_hash {
+                store_i64(out, m.call_access_hash);
+            }
+        }
+        MessageContent::PaymentSuccessful(m) => {
+            let has_payload = !m.invoice_payload.is_empty();
+            let has_shipping_option_id = !m.shipping_option_id.is_empty();
+            let has_order_info = m.order_info.is_some();
+            let has_telegram_payment_charge_id = !m.telegram_payment_charge_id.is_empty();
+            let has_provider_payment_charge_id = !m.provider_payment_charge_id.is_empty();
+            let has_invoice_message_id = m.invoice_message_id.is_valid();
+            let is_correctly_stored = true;
+            let has_invoice_dialog_id = m.invoice_dialog_id.is_valid();
+            let has_subscription_until_date = m.subscription_until_date != 0;
+            store_flags(
+                out,
+                [
+                    has_payload,
+                    has_shipping_option_id,
+                    has_order_info,
+                    has_telegram_payment_charge_id,
+                    has_provider_payment_charge_id,
+                    has_invoice_message_id,
+                    is_correctly_stored,
+                    has_invoice_dialog_id,
+                    m.is_recurring,
+                    m.is_first_recurring,
+                    has_subscription_until_date,
+                ],
+            );
+            store_string(out, &m.currency);
+            store_i64(out, m.total_amount);
+            if has_payload {
+                store_string(out, &m.invoice_payload);
+            }
+            if has_shipping_option_id {
+                store_string(out, &m.shipping_option_id);
+            }
+            if has_order_info {
+                store_order_info(m.order_info.as_ref().unwrap(), out);
+            }
+            if has_telegram_payment_charge_id {
+                store_string(out, &m.telegram_payment_charge_id);
+            }
+            if has_provider_payment_charge_id {
+                store_string(out, &m.provider_payment_charge_id);
+            }
+            if has_invoice_message_id {
+                store_i64(out, m.invoice_message_id.get());
+            }
+            if has_invoice_dialog_id {
+                store_i64(out, m.invoice_dialog_id.get());
+            }
+            if has_subscription_until_date {
+                store_i32(out, m.subscription_until_date);
+            }
+        }
+        MessageContent::ContactRegistered(_) => {}
+        MessageContent::ExpiredPhoto(_) => {}
+        MessageContent::ExpiredVideo(_) => {}
+        MessageContent::CustomServiceAction(m) => {
+            store_string(out, &m.message);
+        }
+        MessageContent::WebsiteConnected(m) => {
+            store_string(out, &m.domain_name);
+        }
+        MessageContent::PassportDataSent(m) => {
+            store_i32(out, m.types.len() as i32);
+            for secure_value_type in &m.types {
+                store_i32(out, *secure_value_type as i32);
+            }
+        }
+        MessageContent::PassportDataReceived(m) => {
+            store_i32(out, m.values.len() as i32);
+            for value in &m.values {
+                store_encrypted_secure_value(value, ctx, out);
+            }
+            store_encrypted_secure_credentials(&m.credentials, out);
+        }
+        MessageContent::Poll(m) => {
+            let has_caption = !m.caption.text.is_empty();
+            let has_attached_media = m.attached_media.is_some();
+            store_flags(out, [has_caption, has_attached_media]);
+            ctx.store_poll(m.poll_id, out);
+            if has_caption {
+                m.caption.store(out);
+            }
+            if let Some(attached_media) = &m.attached_media {
+                store_message_content(attached_media, ctx, out);
+            }
+        }
+        MessageContent::Dice(m) => {
+            let has_seed = !m.seed.is_empty();
+            let has_stake_ton_count = m.stake_ton_count != 0;
+            let has_prize_ton_count = m.prize_ton_count != 0;
+            let has_state_hash = !m.state_hash.is_empty();
+            store_flags(
+                out,
+                [
+                    m.is_stake,
+                    has_seed,
+                    has_stake_ton_count,
+                    has_prize_ton_count,
+                    has_state_hash,
+                ],
+            );
+            store_string(out, &m.emoji);
+            store_i32(out, m.dice_value);
+            if has_seed {
+                store_string(out, &m.seed);
+            }
+            if has_stake_ton_count {
+                store_i64(out, m.stake_ton_count);
+            }
+            if has_prize_ton_count {
+                store_i64(out, m.prize_ton_count);
+            }
+            if has_state_hash {
+                store_string(out, &m.state_hash);
+            }
+        }
+        MessageContent::ProximityAlertTriggered(m) => {
+            store_i64(out, m.traveler_dialog_id.get());
+            store_i64(out, m.watcher_dialog_id.get());
+            store_i32(out, m.distance);
+        }
+        MessageContent::GroupCall(m) => {
+            let has_duration = m.duration >= 0;
+            let has_schedule_date = m.schedule_date > 0;
+            store_flags(out, [has_duration, has_schedule_date]);
+            store_i64(out, m.input_group_call_id.get_group_call_id());
+            store_i64(out, m.input_group_call_id.get_access_hash());
+            if has_duration {
+                store_i32(out, m.duration);
+            }
+            if has_schedule_date {
+                store_i32(out, m.schedule_date);
+            }
+        }
+        MessageContent::InviteToGroupCall(m) => {
+            store_i64(out, m.input_group_call_id.get_group_call_id());
+            store_i64(out, m.input_group_call_id.get_access_hash());
+            store_i32(out, m.user_ids.len() as i32);
+            for user_id in &m.user_ids {
+                store_user_id(*user_id, out);
+            }
+        }
+        MessageContent::WebViewDataSent(m) => {
+            store_string(out, &m.button_text);
+        }
+        MessageContent::WebViewDataReceived(m) => {
+            store_string(out, &m.button_text);
+            store_string(out, &m.data);
+        }
+        MessageContent::GiftPremium(m) => {
+            let has_crypto_amount = !m.crypto_currency.is_empty();
+            let has_text = !m.text.text.is_empty();
+            let has_days = true;
+            store_flags(out, [has_crypto_amount, has_text, has_days]);
+            store_string(out, &m.currency);
+            store_i64(out, m.amount);
+            store_i32(out, m.days);
+            if has_crypto_amount {
+                store_string(out, &m.crypto_currency);
+                store_i64(out, m.crypto_amount);
+            }
+            if has_text {
+                m.text.store(out);
+            }
+        }
+        MessageContent::TopicCreate(m) => {
+            store_flags(out, [m.title_missing]);
+            store_string(out, &m.title);
+            store_forum_topic_icon(&m.icon, out);
+        }
+        MessageContent::TopicEdit(m) => {
+            store_forum_topic_edited_data(&m.edited_data, out);
+        }
+        MessageContent::SuggestProfilePhoto(m) => {
+            store_photo(&m.photo, ctx, out);
+        }
+        MessageContent::WriteAccessAllowed(_) => {}
+        MessageContent::RequestedDialog(m) => {
+            let has_one_shared_dialog = m.shared_dialog_ids.len() == 1;
+            store_flags(out, [has_one_shared_dialog]);
+            if has_one_shared_dialog {
+                store_i64(out, m.shared_dialog_ids[0].get());
+            } else {
+                store_i32(out, m.shared_dialog_ids.len() as i32);
+                for dialog_id in &m.shared_dialog_ids {
+                    store_i64(out, dialog_id.get());
+                }
+            }
+            store_i32(out, m.button_id);
+        }
+        MessageContent::WebViewWriteAccessAllowed(m) => {
+            store_web_app(&m.web_app, ctx, out);
+        }
+        MessageContent::SetBackground(m) => {
+            let has_message_id = m.old_message_id.is_valid();
+            store_flags(out, [has_message_id, m.for_both]);
+            if has_message_id {
+                store_i64(out, m.old_message_id.get());
+            }
+            store_background_info(&m.background_info, ctx, out);
+        }
+        MessageContent::Story(m) => {
+            store_flags(out, [m.via_mention]);
+            m.story_full_id.store(out);
+        }
+        MessageContent::WriteAccessAllowedByRequest(_) => {}
+        MessageContent::GiftCode(m) => {
+            let has_creator_dialog_id = m.creator_dialog_id.is_valid();
+            let has_currency = !m.currency.is_empty();
+            let has_amount = m.amount > 0;
+            let has_crypto_currency = !m.crypto_currency.is_empty();
+            let has_crypto_amount = m.crypto_amount > 0;
+            let has_text = !m.text.text.is_empty();
+            let has_days = true;
+            store_flags(
+                out,
+                [
+                    m.via_giveaway,
+                    has_creator_dialog_id,
+                    m.is_unclaimed,
+                    has_currency,
+                    has_amount,
+                    has_crypto_currency,
+                    has_crypto_amount,
+                    has_text,
+                    has_days,
+                ],
+            );
+            if has_creator_dialog_id {
+                store_i64(out, m.creator_dialog_id.get());
+            }
+            store_i32(out, m.days);
+            store_string(out, &m.code);
+            if has_currency {
+                store_string(out, &m.currency);
+            }
+            if has_amount {
+                store_i64(out, m.amount);
+            }
+            if has_crypto_currency {
+                store_string(out, &m.crypto_currency);
+            }
+            if has_crypto_amount {
+                store_i64(out, m.crypto_amount);
+            }
+            if has_text {
+                m.text.store(out);
+            }
+        }
+        MessageContent::Giveaway(m) => {
+            let has_star_count = m.star_count != 0;
+            store_flags(out, [has_star_count]);
+            store_giveaway_parameters(&m.giveaway_parameters, out);
+            store_i32(out, m.quantity);
+            store_i32(out, m.months);
+            if has_star_count {
+                store_i64(out, m.star_count);
+            }
+        }
+        MessageContent::GiveawayLaunch(m) => {
+            let has_star_count = m.star_count != 0;
+            store_flags(out, [has_star_count]);
+            if has_star_count {
+                store_i64(out, m.star_count);
+            }
+        }
+        MessageContent::GiveawayResults(m) => {
+            let has_winner_count = m.winner_count != 0;
+            let has_unclaimed_count = m.unclaimed_count != 0;
+            let has_giveaway_message_id = m.giveaway_message_id.is_valid();
+            store_flags(
+                out,
+                [
+                    has_winner_count,
+                    has_unclaimed_count,
+                    has_giveaway_message_id,
+                    m.is_star_giveaway,
+                ],
+            );
+            if has_winner_count {
+                store_i32(out, m.winner_count);
+            }
+            if has_unclaimed_count {
+                store_i32(out, m.unclaimed_count);
+            }
+            if has_giveaway_message_id {
+                store_i64(out, m.giveaway_message_id.get());
+            }
+        }
+        MessageContent::GiveawayWinners(m) => {
+            let has_giveaway_message_id = m.giveaway_message_id.is_valid();
+            let has_boosted_channel_id = m.boosted_channel_id.is_valid();
+            let has_additional_dialog_count = m.additional_dialog_count != 0;
+            let has_month_count = m.month_count != 0;
+            let has_prize_description = !m.prize_description.is_empty();
+            let has_winners_selection_date = m.winners_selection_date != 0;
+            let has_winner_count = m.winner_count != 0;
+            let has_unclaimed_count = m.unclaimed_count != 0;
+            let has_winner_user_ids = !m.winner_user_ids.is_empty();
+            let has_star_count = m.star_count != 0;
+            store_flags(
+                out,
+                [
+                    m.only_new_subscribers,
+                    m.was_refunded,
+                    has_giveaway_message_id,
+                    has_boosted_channel_id,
+                    has_additional_dialog_count,
+                    has_month_count,
+                    has_prize_description,
+                    has_winners_selection_date,
+                    has_winner_count,
+                    has_unclaimed_count,
+                    has_winner_user_ids,
+                    has_star_count,
+                ],
+            );
+            if has_giveaway_message_id {
+                store_i64(out, m.giveaway_message_id.get());
+            }
+            if has_boosted_channel_id {
+                store_i64(out, m.boosted_channel_id.get());
+            }
+            if has_additional_dialog_count {
+                store_i32(out, m.additional_dialog_count);
+            }
+            if has_month_count {
+                store_i32(out, m.month_count);
+            }
+            if has_prize_description {
+                store_string(out, &m.prize_description);
+            }
+            if has_winners_selection_date {
+                store_i32(out, m.winners_selection_date);
+            }
+            if has_winner_count {
+                store_i32(out, m.winner_count);
+            }
+            if has_unclaimed_count {
+                store_i32(out, m.unclaimed_count);
+            }
+            if has_winner_user_ids {
+                store_i32(out, m.winner_user_ids.len() as i32);
+                for user_id in &m.winner_user_ids {
+                    store_user_id(*user_id, out);
+                }
+            }
+            if has_star_count {
+                store_i64(out, m.star_count);
+            }
+        }
+        MessageContent::ExpiredVideoNote(_) => {}
+        MessageContent::ExpiredVoiceNote(_) => {}
+        MessageContent::BoostApply(m) => {
+            store_flags::<0>(out, []);
+            store_i32(out, m.boost_count);
+        }
+        MessageContent::DialogShared(m) => {
+            store_flags::<0>(out, []);
+            store_i32(out, m.shared_dialogs.len() as i32);
+            for shared_dialog in &m.shared_dialogs {
+                store_shared_dialog(shared_dialog, ctx, out);
+            }
+            store_i32(out, m.button_id);
+        }
+        MessageContent::PaidMedia(m) => {
+            let has_caption = !m.caption.text.is_empty();
+            let has_payload = !m.payload.is_empty();
+            store_flags(out, [has_caption, has_payload]);
+            store_i32(out, m.media.len() as i32);
+            for media in &m.media {
+                store_message_extended_media(media, ctx, out);
+            }
+            if has_caption {
+                m.caption.store(out);
+            }
+            store_i64(out, m.star_count);
+            if has_payload {
+                store_string(out, &m.payload);
+            }
+        }
+        MessageContent::PaymentRefunded(m) => {
+            let has_invoice_payload = !m.invoice_payload.is_empty();
+            store_flags(out, [has_invoice_payload]);
+            store_i64(out, m.dialog_id.get());
+            store_string(out, &m.currency);
+            store_i64(out, m.total_amount);
+            if has_invoice_payload {
+                store_string(out, &m.invoice_payload);
+            }
+            store_string(out, &m.telegram_payment_charge_id);
+            store_string(out, &m.provider_payment_charge_id);
+        }
+        MessageContent::GiftStars(m) => {
+            let has_crypto_amount = !m.crypto_currency.is_empty();
+            let has_transaction_id = !m.transaction_id.is_empty();
+            store_flags(out, [has_crypto_amount, has_transaction_id]);
+            store_string(out, &m.currency);
+            store_i64(out, m.amount);
+            store_i64(out, m.star_count);
+            if has_crypto_amount {
+                store_string(out, &m.crypto_currency);
+                store_i64(out, m.crypto_amount);
+            }
+            if has_transaction_id {
+                store_string(out, &m.transaction_id);
+            }
+        }
+        MessageContent::PrizeStars(m) => {
+            store_flags(out, [m.is_unclaimed]);
+            store_i64(out, m.star_count);
+            store_string(out, &m.transaction_id);
+            store_i64(out, m.boosted_dialog_id.get());
+            store_i64(out, m.giveaway_message_id.get());
+        }
+        MessageContent::PaidMessagesRefunded(m) => {
+            store_flags::<0>(out, []);
+            store_i32(out, m.message_count);
+            store_i64(out, m.star_count);
+        }
+        MessageContent::PaidMessagesPrice(m) => {
+            store_flags(out, [m.broadcast_messages_allowed]);
+            store_i64(out, m.star_count);
+        }
+        MessageContent::ConferenceCall(m) => {
+            let has_duration = m.duration != 0;
+            let has_other_participant_dialog_ids = !m.other_participant_dialog_ids.is_empty();
+            store_flags(
+                out,
+                [
+                    m.is_active,
+                    m.is_video,
+                    m.was_missed,
+                    has_duration,
+                    has_other_participant_dialog_ids,
+                ],
+            );
+            store_i64(out, m.call_id);
+            if has_duration {
+                store_i32(out, m.duration);
+            }
+            if has_other_participant_dialog_ids {
+                store_i32(out, m.other_participant_dialog_ids.len() as i32);
+                for dialog_id in &m.other_participant_dialog_ids {
+                    store_i64(out, dialog_id.get());
+                }
+            }
+        }
+        MessageContent::ToDoList(m) => {
+            store_flags::<0>(out, []);
+            store_to_do_list(&m.list, out);
+            store_i32(out, m.completions.len() as i32);
+            for completion in &m.completions {
+                store_to_do_completion(completion, out);
+            }
+        }
+        MessageContent::TodoCompletions(m) => {
+            let has_to_do_message_id = m.to_do_message_id.is_valid();
+            let has_completed_task_ids = !m.completed_task_ids.is_empty();
+            let has_incompleted_task_ids = !m.incompleted_task_ids.is_empty();
+            store_flags(
+                out,
+                [
+                    has_to_do_message_id,
+                    has_completed_task_ids,
+                    has_incompleted_task_ids,
+                ],
+            );
+            if has_to_do_message_id {
+                store_i64(out, m.to_do_message_id.get());
+            }
+            if has_completed_task_ids {
+                store_i32_vec(out, &m.completed_task_ids);
+            }
+            if has_incompleted_task_ids {
+                store_i32_vec(out, &m.incompleted_task_ids);
+            }
+        }
+        MessageContent::TodoAppendTasks(m) => {
+            let has_to_do_message_id = m.to_do_message_id.is_valid();
+            let has_items = !m.items.is_empty();
+            store_flags(out, [has_to_do_message_id, has_items]);
+            if has_to_do_message_id {
+                store_i64(out, m.to_do_message_id.get());
+            }
+            if has_items {
+                store_i32(out, m.items.len() as i32);
+                for item in &m.items {
+                    store_to_do_item(item, out);
+                }
+            }
+        }
+        MessageContent::GiftTon(m) => {
+            let has_transaction_id = !m.transaction_id.is_empty();
+            store_flags(out, [has_transaction_id]);
+            store_string(out, &m.currency);
+            store_i64(out, m.amount);
+            store_string(out, &m.crypto_currency);
+            store_i64(out, m.crypto_amount);
+            if has_transaction_id {
+                store_string(out, &m.transaction_id);
+            }
+        }
+        MessageContent::SuggestedPostSuccess(m) => {
+            let has_suggested_post_message_id = m.suggested_post_message_id.is_valid();
+            let has_amount = m.amount != CurrencyAmount::default();
+            store_flags(out, [has_suggested_post_message_id, has_amount]);
+            if has_suggested_post_message_id {
+                store_i64(out, m.suggested_post_message_id.get());
+            }
+            if has_amount {
+                store_currency_amount(&m.amount, out);
+            }
+        }
+        MessageContent::SuggestedPostRefund(m) => {
+            let has_suggested_post_message_id = m.suggested_post_message_id.is_valid();
+            store_flags(out, [has_suggested_post_message_id, m.is_payer_initiated]);
+            if has_suggested_post_message_id {
+                store_i64(out, m.suggested_post_message_id.get());
+            }
+        }
+        MessageContent::SuggestedPostApproval(m) => {
+            let has_suggested_post_message_id = m.suggested_post_message_id.is_valid();
+            let has_comment = !m.comment.is_empty();
+            let has_price = !m.price.is_empty();
+            let has_send_date = m.send_date != 0;
+            store_flags(
+                out,
+                [
+                    has_suggested_post_message_id,
+                    has_price,
+                    has_comment,
+                    has_send_date,
+                    m.is_rejected,
+                    m.is_balance_too_low,
+                ],
+            );
+            if has_suggested_post_message_id {
+                store_i64(out, m.suggested_post_message_id.get());
+            }
+            if has_price {
+                store_suggested_post_price(&m.price, out);
+            }
+            if has_comment {
+                store_string(out, &m.comment);
+            }
+            if has_send_date {
+                store_i32(out, m.send_date);
+            }
+        }
+        MessageContent::SuggestBirthday(m) => {
+            store_flags::<0>(out, []);
+            m.birthdate.store(out);
+        }
+        MessageContent::NewCreatorPending(m) => {
+            let has_new_creator_user_id = m.new_creator_user_id.is_valid();
+            store_flags(out, [has_new_creator_user_id]);
+            if has_new_creator_user_id {
+                store_user_id(m.new_creator_user_id, out);
+            }
+        }
+        MessageContent::ChangeCreator(m) => {
+            store_flags::<0>(out, []);
+            store_user_id(m.new_creator_user_id, out);
+        }
+        MessageContent::NoForwardsToggle(m) => {
+            let has_request_message_id = m.request_message_id.is_valid();
+            store_flags(out, [m.prev_value, m.new_value, has_request_message_id]);
+            if has_request_message_id {
+                store_i64(out, m.request_message_id.get());
+            }
+        }
+        MessageContent::NoForwardsRequest(m) => {
+            store_flags(out, [m.is_expired, m.prev_value, m.new_value]);
+        }
+        MessageContent::ManagedBotCreated(m) => {
+            store_flags::<0>(out, []);
+            store_user_id(m.bot_user_id, out);
+        }
+        MessageContent::PollAppendAnswer(m) => {
+            let has_poll_message_id = m.poll_message_id.is_valid();
+            store_flags(out, [has_poll_message_id]);
+            if has_poll_message_id {
+                store_i64(out, m.poll_message_id.get());
+            }
+            m.text.store(out);
+            store_string(out, &m.data);
+        }
+        MessageContent::PollDeleteAnswer(m) => {
+            let has_poll_message_id = m.poll_message_id.is_valid();
+            store_flags(out, [has_poll_message_id]);
+            if has_poll_message_id {
+                store_i64(out, m.poll_message_id.get());
+            }
+            m.text.store(out);
+            store_string(out, &m.data);
+        }
+        MessageContent::ChangeCommunity(m) => {
+            let has_community_id = m.community_id.is_valid();
+            store_flags(out, [has_community_id]);
+            if has_community_id {
+                m.community_id.store(out);
+            }
+        }
+        MessageContent::ChatJoinedViaCommunity(m) => {
+            store_flags::<0>(out, []);
+            m.community_id.store(out);
+        }
+    }
+}
+
+/// `parse(unique_ptr<MessageContent> &, ...)` (MessageContent.cpp:3034-4506):
+/// the per-type parse switch after the `MessageContentType` int. Unknown
+/// types return `MessageUnsupported(0)` with the remainder unconsumed, like
+/// the C++ `default:` arm; a truncated blob is a hard `Err`.
+pub fn parse_message_content(
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
+) -> Result<MessageContent, &'static str> {
+    let type_raw = parser.i32_()?;
+    let content_type = MessageContentType::from_raw(type_raw);
+    let Some(content_type) = content_type else {
+        // The C++ `default: is_bad = true` arm (MessageContent.cpp:4499) —
+        // known-to-a-newer-binary and the six unmodeled types land here.
+        tdutils::log_error!("Load a message with an invalid content of type {type_raw}");
+        return Ok(MessageContent::Unsupported(MessageUnsupported {
+            version: 0,
+        }));
+    };
+    let mut is_bad = false;
+    let content = match content_type {
+        MessageContentType::Animation => {
+            let file_id = ctx.parse_animation(parser)?;
+            let mut has_spoiler = false;
+            if parser.version() >= version::ADD_MESSAGE_MEDIA_SPOILER {
+                has_spoiler = parser.parse_flags::<1>()?[0];
+            }
+            let caption = parse_caption(parser)?;
+            is_bad = !file_id.is_valid();
+            MessageContent::Animation(MessageAnimation {
+                file_id,
+                caption,
+                has_spoiler,
+            })
+        }
+        MessageContentType::Audio => {
+            let file_id = ctx.parse_audio(parser)?;
+            let caption = parse_caption(parser)?;
+            let _legacy_is_listened = parser.bool()?;
+            is_bad = !file_id.is_valid();
+            MessageContent::Audio(MessageAudio { file_id, caption })
+        }
+        MessageContentType::Contact => {
+            let contact = Contact::parse_from(parser)?;
+            MessageContent::Contact(MessageContact { contact })
+        }
+        MessageContentType::Document => {
+            let file_id = ctx.parse_document(parser)?;
+            let caption = parse_caption(parser)?;
+            is_bad = !file_id.is_valid();
+            MessageContent::Document(MessageDocument { file_id, caption })
+        }
+        MessageContentType::Game => MessageContent::Game(MessageGame {
+            game: parse_game(parser, ctx)?,
+        }),
+        MessageContentType::Invoice => MessageContent::Invoice(MessageInvoice {
+            input_invoice: parse_input_invoice(parser, ctx)?,
+        }),
+        MessageContentType::LiveLocation => {
+            let location = parse_location(parser)?;
+            let period = parser.i32_()?;
+            let heading = if parser.version() >= version::ADD_LIVE_LOCATION_HEADING {
+                parser.i32_()?
+            } else {
+                0
+            };
+            let proximity_alert_radius =
+                if parser.version() >= version::ADD_LIVE_LOCATION_PROXIMITY_ALERT_DISTANCE {
+                    parser.i32_()?
+                } else {
+                    0
+                };
+            if period <= 0 {
+                is_bad = true;
+            }
+            MessageContent::LiveLocation(MessageLiveLocation {
+                location,
+                period,
+                heading,
+                proximity_alert_radius,
+            })
+        }
+        MessageContentType::Location => MessageContent::Location(MessageLocation {
+            location: parse_location(parser)?,
+        }),
+        MessageContentType::Photo => {
+            let photo = parse_photo(parser, ctx)?;
+            is_bad |= photo_is_bad(&photo);
+            let mut has_spoiler = false;
+            let mut has_video_file_id = false;
+            if parser.version() >= version::ADD_MESSAGE_MEDIA_SPOILER {
+                let flags = parser.parse_flags::<2>()?;
+                has_spoiler = flags[0];
+                has_video_file_id = flags[1];
+            }
+            let caption = parse_caption(parser)?;
+            let video_file_id = if has_video_file_id {
+                ctx.parse_video(parser)?
+            } else {
+                FileId::default()
+            };
+            MessageContent::Photo(MessagePhoto {
+                photo,
+                video_file_id,
+                caption,
+                has_spoiler,
+            })
+        }
+        MessageContentType::Sticker => {
+            let file_id = ctx.parse_sticker(parser)?;
+            let mut is_premium = false;
+            if parser.version() >= version::ADD_MESSAGE_STICKER_FLAGS {
+                is_premium = parser.parse_flags::<1>()?[0];
+            }
+            is_bad = !file_id.is_valid();
+            MessageContent::Sticker(MessageSticker {
+                file_id,
+                is_premium,
+            })
+        }
+        MessageContentType::Text => {
+            let mut has_web_page_id = true;
+            let mut force_small_media = false;
+            let mut force_large_media = false;
+            let mut has_web_page_url = false;
+            let mut skip_web_page_confirmation = false;
+            if parser.version() >= version::ADD_MESSAGE_TEXT_FLAGS {
+                let flags = parser.parse_flags::<5>()?;
+                has_web_page_id = flags[0];
+                force_small_media = flags[1];
+                force_large_media = flags[2];
+                has_web_page_url = flags[3];
+                skip_web_page_confirmation = flags[4];
+            }
+            let text = parse_formatted_text(parser)?;
+            let web_page_id = if has_web_page_id {
+                WebPageId::new(parser.i64_()?)
+            } else {
+                WebPageId::default()
+            };
+            let web_page_url = if has_web_page_url {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            if has_web_page_url && has_web_page_id {
+                ctx.on_load_web_page_url_from_database(web_page_id, &web_page_url);
+            }
+            MessageContent::Text(MessageText {
+                text,
+                web_page_id,
+                force_small_media,
+                force_large_media,
+                skip_web_page_confirmation,
+                web_page_url,
+            })
+        }
+        MessageContentType::Unsupported => {
+            let version_ = if parser.version() >= version::ADD_MESSAGE_UNSUPPORTED_VERSION {
+                parser.i32_()?
+            } else {
+                0
+            };
+            MessageContent::Unsupported(MessageUnsupported { version: version_ })
+        }
+        MessageContentType::Venue => MessageContent::Venue(MessageVenue {
+            venue: parse_venue(parser)?,
+        }),
+        MessageContentType::Video => {
+            let file_id = ctx.parse_video(parser)?;
+            let mut has_spoiler = false;
+            let mut has_alternative_videos = false;
+            let mut has_hls_files = false;
+            let mut has_cover = false;
+            let mut has_start_timestamp = false;
+            let mut has_storyboard_files = false;
+            let mut has_storyboard_map_files = false;
+            if parser.version() >= version::ADD_MESSAGE_MEDIA_SPOILER {
+                let flags = parser.parse_flags::<7>()?;
+                has_spoiler = flags[0];
+                has_alternative_videos = flags[1];
+                has_hls_files = flags[2];
+                has_cover = flags[3];
+                has_start_timestamp = flags[4];
+                has_storyboard_files = flags[5];
+                has_storyboard_map_files = flags[6];
+            }
+            let caption = parse_caption(parser)?;
+            let mut alternative_file_ids = Vec::new();
+            if has_alternative_videos {
+                let video_count = parser.i32_()?;
+                if video_count < 0 || parser.left_len() < video_count as usize {
+                    return Err("Wrong vector length");
+                }
+                for _ in 0..video_count {
+                    let file_id = ctx.parse_video(parser)?;
+                    if !file_id.is_valid() {
+                        is_bad = true;
+                    } else {
+                        alternative_file_ids.push(file_id);
+                    }
+                }
+            }
+            let mut hls_file_ids = Vec::new();
+            if has_hls_files {
+                let file_count = parser.i32_()?;
+                if file_count < 0 || parser.left_len() < file_count as usize {
+                    return Err("Wrong vector length");
+                }
+                for _ in 0..file_count {
+                    let file_id = ctx.parse_document(parser)?;
+                    if !file_id.is_valid() {
+                        is_bad = true;
+                    } else {
+                        hls_file_ids.push(file_id);
+                    }
+                }
+            }
+            let cover = if has_cover {
+                parse_photo(parser, ctx)?
+            } else {
+                Photo::default()
+            };
+            let start_timestamp = if has_start_timestamp {
+                parser.i32_()?
+            } else {
+                0
+            };
+            let mut storyboard_file_ids = Vec::new();
+            if has_storyboard_files {
+                let file_count = parser.i32_()?;
+                if file_count < 0 || parser.left_len() < file_count as usize {
+                    return Err("Wrong vector length");
+                }
+                for _ in 0..file_count {
+                    let file_id = ctx.parse_document(parser)?;
+                    if !file_id.is_valid() {
+                        is_bad = true;
+                    } else {
+                        storyboard_file_ids.push(file_id);
+                    }
+                }
+            }
+            let mut storyboard_map_file_ids = Vec::new();
+            if has_storyboard_map_files {
+                let file_count = parser.i32_()?;
+                if file_count < 0 || parser.left_len() < file_count as usize {
+                    return Err("Wrong vector length");
+                }
+                for _ in 0..file_count {
+                    let file_id = ctx.parse_document(parser)?;
+                    if !file_id.is_valid() {
+                        is_bad = true;
+                    } else {
+                        storyboard_map_file_ids.push(file_id);
+                    }
+                }
+            }
+            if !file_id.is_valid() {
+                is_bad = true;
+            }
+            MessageContent::Video(MessageVideo {
+                file_id,
+                alternative_file_ids,
+                hls_file_ids,
+                storyboard_file_ids,
+                storyboard_map_file_ids,
+                cover,
+                start_timestamp,
+                caption,
+                has_spoiler,
+            })
+        }
+        MessageContentType::VideoNote => {
+            let file_id = ctx.parse_video_note(parser)?;
+            let is_viewed = parser.bool()?;
+            is_bad = !file_id.is_valid();
+            MessageContent::VideoNote(MessageVideoNote { file_id, is_viewed })
+        }
+        MessageContentType::VoiceNote => {
+            let file_id = ctx.parse_voice_note(parser)?;
+            let caption = parse_caption(parser)?;
+            let is_listened = parser.bool()?;
+            is_bad = !file_id.is_valid();
+            MessageContent::VoiceNote(MessageVoiceNote {
+                file_id,
+                caption,
+                is_listened,
+            })
+        }
+        MessageContentType::ChatCreate => {
+            let title = parser.string()?;
+            let participant_user_ids = parse_user_id_vec(parser)?;
+            MessageContent::ChatCreate(MessageChatCreate {
+                title,
+                participant_user_ids,
+            })
+        }
+        MessageContentType::ChatChangeTitle => {
+            MessageContent::ChatChangeTitle(MessageChatChangeTitle {
+                title: parser.string()?,
+            })
+        }
+        MessageContentType::ChatChangePhoto => {
+            let photo = parse_photo(parser, ctx)?;
+            if photo.is_empty() {
+                is_bad = true;
+            }
+            MessageContent::ChatChangePhoto(MessageChatChangePhoto { photo })
+        }
+        MessageContentType::ChatDeletePhoto => {
+            MessageContent::ChatDeletePhoto(MessageChatDeletePhoto)
+        }
+        MessageContentType::ChatDeleteHistory => {
+            MessageContent::ChatDeleteHistory(MessageChatDeleteHistory)
+        }
+        MessageContentType::ChatAddUsers => MessageContent::ChatAddUsers(MessageChatAddUsers {
+            user_ids: parse_user_id_vec(parser)?,
+        }),
+        MessageContentType::ChatJoinedByLink => {
+            let is_approved = if parser.version() >= version::ADD_INVITE_LINKS_REQUIRING_APPROVAL {
+                parser.parse_flags::<1>()?[0]
+            } else {
+                false
+            };
+            MessageContent::ChatJoinedByLink(MessageChatJoinedByLink { is_approved })
+        }
+        MessageContentType::ChatDeleteUser => {
+            MessageContent::ChatDeleteUser(MessageChatDeleteUser {
+                user_id: parse_user_id(parser)?,
+            })
+        }
+        MessageContentType::ChatMigrateTo => MessageContent::ChatMigrateTo(MessageChatMigrateTo {
+            migrated_to_channel_id: parse_channel_id(parser)?,
+        }),
+        MessageContentType::ChannelCreate => MessageContent::ChannelCreate(MessageChannelCreate {
+            title: parser.string()?,
+        }),
+        MessageContentType::ChannelMigrateFrom => {
+            let title = parser.string()?;
+            let migrated_from_chat_id = parse_chat_id(parser)?;
+            MessageContent::ChannelMigrateFrom(MessageChannelMigrateFrom {
+                title,
+                migrated_from_chat_id,
+            })
+        }
+        MessageContentType::PinMessage => MessageContent::PinMessage(MessagePinMessage {
+            message_id: parse_message_id(parser)?,
+        }),
+        MessageContentType::GameScore => {
+            let game_message_id = parse_message_id(parser)?;
+            let game_id = parser.i64_()?;
+            let score = parser.i32_()?;
+            MessageContent::GameScore(MessageGameScore {
+                game_message_id,
+                game_id,
+                score,
+            })
+        }
+        MessageContentType::ScreenshotTaken => {
+            MessageContent::ScreenshotTaken(MessageScreenshotTaken)
+        }
+        MessageContentType::ChatSetTtl => {
+            let mut has_from_user_id = false;
+            if parser.version() >= version::ADD_MESSAGE_CHAT_SET_TTL_FLAGS {
+                has_from_user_id = parser.parse_flags::<1>()?[0];
+            }
+            let ttl = parser.i32_()?;
+            let from_user_id = if has_from_user_id {
+                parse_user_id(parser)?
+            } else {
+                UserId::default()
+            };
+            MessageContent::ChatSetTtl(MessageChatSetTtl { ttl, from_user_id })
+        }
+        MessageContentType::Call => {
+            let mut is_video = false;
+            let mut has_call_access_hash = false;
+            if parser.version() >= version::ADD_VIDEO_CALLS_SUPPORT {
+                let flags = parser.parse_flags::<2>()?;
+                is_video = flags[0];
+                has_call_access_hash = flags[1];
+            }
+            let call_id = parser.i64_()?;
+            let duration = parser.i32_()?;
+            let discard_reason_type_raw = parser.i32_()?;
+            let discard_reason = CallDiscardReason {
+                r#type: CallDiscardReasonType::from_raw(discard_reason_type_raw),
+                slug: String::new(),
+            };
+            let call_access_hash = if has_call_access_hash {
+                parser.i64_()?
+            } else {
+                0
+            };
+            MessageContent::Call(MessageCall {
+                call_id,
+                call_access_hash,
+                duration,
+                discard_reason,
+                is_video,
+            })
+        }
+        MessageContentType::PaymentSuccessful => {
+            let flags = parser.parse_flags::<11>()?;
+            let currency = parser.string()?;
+            let mut total_amount = parser.i64_()?;
+            // The legacy `is_correctly_stored = false` layout stored
+            // `total_amount` in the payload slot and `invoice_payload` in
+            // the shipping slot (MessageContent.cpp:3720-3728).
+            let invoice_payload;
+            let shipping_option_id;
+            if flags[6] {
+                invoice_payload = if flags[0] {
+                    parser.string()?
+                } else {
+                    String::new()
+                };
+                shipping_option_id = if flags[1] {
+                    parser.string()?
+                } else {
+                    String::new()
+                };
+            } else {
+                if flags[0] {
+                    total_amount = parser.i64_()?;
+                }
+                invoice_payload = if flags[1] {
+                    parser.string()?
+                } else {
+                    String::new()
+                };
+                shipping_option_id = String::new();
+            }
+            let order_info = if flags[2] {
+                Some(parse_order_info(parser)?)
+            } else {
+                None
+            };
+            let telegram_payment_charge_id = if flags[3] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let provider_payment_charge_id = if flags[4] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let invoice_message_id = if flags[5] {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            let invoice_dialog_id = if flags[7] {
+                parse_dialog_id(parser)?
+            } else {
+                DialogId::default()
+            };
+            let subscription_until_date = if flags[10] { parser.i32_()? } else { 0 };
+            if !flags[6] {
+                return Ok(MessageContent::Unsupported(MessageUnsupported {
+                    version: 0,
+                }));
+            }
+            MessageContent::PaymentSuccessful(MessagePaymentSuccessful {
+                invoice_dialog_id,
+                invoice_message_id,
+                currency,
+                total_amount,
+                invoice_payload,
+                subscription_until_date,
+                is_recurring: flags[8],
+                is_first_recurring: flags[9],
+                shipping_option_id,
+                order_info,
+                telegram_payment_charge_id,
+                provider_payment_charge_id,
+            })
+        }
+        MessageContentType::ContactRegistered => {
+            MessageContent::ContactRegistered(MessageContactRegistered)
+        }
+        MessageContentType::ExpiredPhoto => MessageContent::ExpiredPhoto(MessageExpiredPhoto),
+        MessageContentType::ExpiredVideo => MessageContent::ExpiredVideo(MessageExpiredVideo),
+        MessageContentType::CustomServiceAction => {
+            MessageContent::CustomServiceAction(MessageCustomServiceAction {
+                message: parser.string()?,
+            })
+        }
+        MessageContentType::WebsiteConnected => {
+            MessageContent::WebsiteConnected(MessageWebsiteConnected {
+                domain_name: parser.string()?,
+            })
+        }
+        MessageContentType::PassportDataSent => {
+            let types_len = parser.i32_()?;
+            if types_len < 0 || parser.left_len() < types_len as usize {
+                return Err("Wrong vector length");
+            }
+            let mut types = Vec::with_capacity(types_len as usize);
+            for _ in 0..types_len {
+                let raw = parser.i32_()?;
+                types.push(match SecureValueType::try_from(raw) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        tdutils::log_error!("Wrong secure value type {raw}");
+                        SecureValueType::None
+                    }
+                });
+            }
+            MessageContent::PassportDataSent(MessagePassportDataSent { types })
+        }
+        MessageContentType::PassportDataReceived => {
+            let values_len = parser.i32_()?;
+            if values_len < 0 || parser.left_len() < values_len as usize {
+                return Err("Wrong vector length");
+            }
+            let mut values = Vec::with_capacity(values_len as usize);
+            for _ in 0..values_len {
+                values.push(parse_encrypted_secure_value(parser, ctx)?);
+            }
+            let credentials = parse_encrypted_secure_credentials(parser)?;
+            MessageContent::PassportDataReceived(MessagePassportDataReceived {
+                values,
+                credentials,
+            })
+        }
+        MessageContentType::Poll => {
+            let mut has_caption = false;
+            let mut has_attached_media = false;
+            if parser.version() >= version::ADD_POLL_CAPTION {
+                let flags = parser.parse_flags::<2>()?;
+                has_caption = flags[0];
+                has_attached_media = flags[1];
+            }
+            let poll_id = ctx.parse_poll(parser)?;
+            let caption = if has_caption {
+                parse_caption(parser)?
+            } else {
+                FormattedText::default()
+            };
+            let attached_media = if has_attached_media {
+                Some(Box::new(parse_message_content(parser, ctx)?))
+            } else {
+                None
+            };
+            is_bad = !poll_id.is_valid();
+            MessageContent::Poll(MessagePoll {
+                poll_id,
+                caption,
+                attached_media,
+            })
+        }
+        MessageContentType::Dice => {
+            let mut is_stake = false;
+            let mut has_seed = false;
+            let mut has_stake_ton_count = false;
+            let mut has_prize_ton_count = false;
+            let mut has_state_hash = false;
+            if parser.version() >= version::ADD_DICE_FLAGS {
+                let flags = parser.parse_flags::<5>()?;
+                is_stake = flags[0];
+                has_seed = flags[1];
+                has_stake_ton_count = flags[2];
+                has_prize_ton_count = flags[3];
+                has_state_hash = flags[4];
+            }
+            let emoji = if parser.version() >= version::ADD_DICE_EMOJI {
+                remove_emoji_modifiers(&parser.string()?, true)
+            } else {
+                MessageDice::DEFAULT_EMOJI.to_string()
+            };
+            let dice_value = parser.i32_()?;
+            let seed = if has_seed {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let stake_ton_count = if has_stake_ton_count {
+                parser.i64_()?
+            } else {
+                0
+            };
+            let prize_ton_count = if has_prize_ton_count {
+                parser.i64_()?
+            } else {
+                0
+            };
+            let state_hash = if has_state_hash {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let dice = MessageDice {
+                emoji,
+                dice_value,
+                is_stake,
+                seed,
+                state_hash,
+                stake_ton_count,
+                prize_ton_count,
+            };
+            is_bad = !dice.is_valid();
+            MessageContent::Dice(dice)
+        }
+        MessageContentType::ProximityAlertTriggered => {
+            let traveler_dialog_id = parse_dialog_id(parser)?;
+            let watcher_dialog_id = parse_dialog_id(parser)?;
+            let distance = parser.i32_()?;
+            MessageContent::ProximityAlertTriggered(MessageProximityAlertTriggered {
+                traveler_dialog_id,
+                watcher_dialog_id,
+                distance,
+            })
+        }
+        MessageContentType::GroupCall => {
+            let flags = parser.parse_flags::<2>()?;
+            let group_call_id = parser.i64_()?;
+            let access_hash = parser.i64_()?;
+            let duration = if flags[0] { parser.i32_()? } else { -1 };
+            let schedule_date = if flags[1] { parser.i32_()? } else { -1 };
+            MessageContent::GroupCall(MessageGroupCall {
+                input_group_call_id: InputGroupCallId::new(group_call_id, access_hash),
+                duration,
+                schedule_date,
+            })
+        }
+        MessageContentType::InviteToGroupCall => {
+            let group_call_id = parser.i64_()?;
+            let access_hash = parser.i64_()?;
+            let user_ids = parse_user_id_vec(parser)?;
+            MessageContent::InviteToGroupCall(MessageInviteToGroupCall {
+                input_group_call_id: InputGroupCallId::new(group_call_id, access_hash),
+                user_ids,
+            })
+        }
+        MessageContentType::WebViewDataSent => {
+            MessageContent::WebViewDataSent(MessageWebViewDataSent {
+                button_text: parser.string()?,
+            })
+        }
+        MessageContentType::WebViewDataReceived => {
+            let button_text = parser.string()?;
+            let data = parser.string()?;
+            MessageContent::WebViewDataReceived(MessageWebViewDataReceived { button_text, data })
+        }
+        MessageContentType::GiftPremium => {
+            let flags = parser.parse_flags::<3>()?;
+            let currency = parser.string()?;
+            let amount = parser.i64_()?;
+            let mut days = parser.i32_()?;
+            if !flags[2] {
+                days = get_premium_duration_day_count(days);
+            }
+            let crypto_currency = if flags[0] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let crypto_amount = if flags[0] { parser.i64_()? } else { 0 };
+            let text = if flags[1] {
+                parse_formatted_text(parser)?
+            } else {
+                FormattedText::default()
+            };
+            MessageContent::GiftPremium(MessageGiftPremium {
+                text,
+                currency,
+                amount,
+                crypto_currency,
+                crypto_amount,
+                days,
+            })
+        }
+        MessageContentType::TopicCreate => {
+            let mut title_missing = false;
+            if parser.version() >= version::SUPPORT_BOT_TOPICS {
+                title_missing = parser.parse_flags::<1>()?[0];
+            }
+            let title = parser.string()?;
+            let icon = parse_forum_topic_icon(parser)?;
+            MessageContent::TopicCreate(MessageTopicCreate {
+                title,
+                icon,
+                title_missing,
+            })
+        }
+        MessageContentType::TopicEdit => MessageContent::TopicEdit(MessageTopicEdit {
+            edited_data: parse_forum_topic_edited_data(parser)?,
+        }),
+        MessageContentType::SuggestProfilePhoto => {
+            let photo = parse_photo(parser, ctx)?;
+            if photo.is_empty() {
+                is_bad = true;
+            }
+            MessageContent::SuggestProfilePhoto(MessageSuggestProfilePhoto { photo })
+        }
+        MessageContentType::WriteAccessAllowed => {
+            MessageContent::WriteAccessAllowed(MessageWriteAccessAllowed)
+        }
+        MessageContentType::RequestedDialog => {
+            let mut has_one_shared_dialog = true;
+            if parser.version() >= version::SUPPORT_MULTIPLE_SHARED_USERS {
+                has_one_shared_dialog = parser.parse_flags::<1>()?[0];
+            }
+            let shared_dialog_ids = if has_one_shared_dialog {
+                vec![parse_dialog_id(parser)?]
+            } else {
+                let len = parser.i32_()?;
+                if len < 0 || parser.left_len() < len as usize {
+                    return Err("Wrong vector length");
+                }
+                let mut dialog_ids = Vec::with_capacity(len as usize);
+                for _ in 0..len {
+                    dialog_ids.push(parse_dialog_id(parser)?);
+                }
+                if dialog_ids.len() > 1 {
+                    for dialog_id in &dialog_ids {
+                        if dialog_id.get_type() != crate::messages_manager::DialogType::User {
+                            is_bad = true;
+                        }
+                    }
+                }
+                dialog_ids
+            };
+            if shared_dialog_ids.is_empty() || !shared_dialog_ids[0].is_valid() {
+                is_bad = true;
+            }
+            let button_id = parser.i32_()?;
+            MessageContent::RequestedDialog(MessageRequestedDialog {
+                shared_dialog_ids,
+                button_id,
+            })
+        }
+        MessageContentType::WebViewWriteAccessAllowed => {
+            MessageContent::WebViewWriteAccessAllowed(MessageWebViewWriteAccessAllowed {
+                web_app: parse_web_app(parser, ctx)?,
+            })
+        }
+        MessageContentType::SetBackground => {
+            let flags = parser.parse_flags::<2>()?;
+            let old_message_id = if flags[0] {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            let background_info = parse_background_info(parser, ctx)?;
+            MessageContent::SetBackground(MessageSetBackground {
+                old_message_id,
+                background_info,
+                for_both: flags[1],
+            })
+        }
+        MessageContentType::Story => {
+            let via_mention = parser.parse_flags::<1>()?[0];
+            let dialog_id = parse_dialog_id(parser)?;
+            let story_raw = parser.i32_()?;
+            let story_full_id = StoryFullId::new(dialog_id, StoryId::new(story_raw));
+            if !story_full_id.is_server() {
+                is_bad = true;
+            }
+            MessageContent::Story(MessageStory {
+                story_full_id,
+                via_mention,
+            })
+        }
+        MessageContentType::WriteAccessAllowedByRequest => {
+            MessageContent::WriteAccessAllowedByRequest(MessageWriteAccessAllowedByRequest)
+        }
+        MessageContentType::GiftCode => {
+            let flags = parser.parse_flags::<9>()?;
+            let creator_dialog_id = if flags[1] {
+                parse_dialog_id(parser)?
+            } else {
+                DialogId::default()
+            };
+            let mut days = parser.i32_()?;
+            if !flags[8] {
+                days = get_premium_duration_day_count(days);
+            }
+            let code = parser.string()?;
+            let currency = if flags[3] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let amount = if flags[4] { parser.i64_()? } else { 0 };
+            let crypto_currency = if flags[5] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let crypto_amount = if flags[6] { parser.i64_()? } else { 0 };
+            let text = if flags[7] {
+                parse_formatted_text(parser)?
+            } else {
+                FormattedText::default()
+            };
+            MessageContent::GiftCode(MessageGiftCode {
+                creator_dialog_id,
+                text,
+                days,
+                currency,
+                amount,
+                crypto_currency,
+                crypto_amount,
+                via_giveaway: flags[0],
+                is_unclaimed: flags[2],
+                code,
+            })
+        }
+        MessageContentType::Giveaway => {
+            let has_star_count = parser.parse_flags::<1>()?[0];
+            let giveaway_parameters = parse_giveaway_parameters(parser)?;
+            let quantity = parser.i32_()?;
+            let months = parser.i32_()?;
+            let star_count = if has_star_count { parser.i64_()? } else { 0 };
+            if !giveaway_parameters.is_valid() {
+                is_bad = true;
+            }
+            MessageContent::Giveaway(MessageGiveaway {
+                giveaway_parameters,
+                quantity,
+                months,
+                star_count,
+            })
+        }
+        MessageContentType::GiveawayLaunch => {
+            let mut has_star_count = false;
+            if parser.version() >= version::SUPPORT_STAR_GIVEAWAYS {
+                has_star_count = parser.parse_flags::<1>()?[0];
+            }
+            let star_count = if has_star_count { parser.i64_()? } else { 0 };
+            MessageContent::GiveawayLaunch(MessageGiveawayLaunch { star_count })
+        }
+        MessageContentType::GiveawayResults => {
+            let flags = parser.parse_flags::<4>()?;
+            let winner_count = if flags[0] { parser.i32_()? } else { 0 };
+            let unclaimed_count = if flags[1] { parser.i32_()? } else { 0 };
+            let giveaway_message_id = if flags[2] {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            if winner_count < 0 || unclaimed_count < 0 {
+                is_bad = true;
+            }
+            MessageContent::GiveawayResults(MessageGiveawayResults {
+                giveaway_message_id,
+                winner_count,
+                unclaimed_count,
+                is_star_giveaway: flags[3],
+            })
+        }
+        MessageContentType::GiveawayWinners => {
+            let flags = parser.parse_flags::<12>()?;
+            let giveaway_message_id = if flags[2] {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            let boosted_channel_id = if flags[3] {
+                parse_channel_id(parser)?
+            } else {
+                ChannelId::default()
+            };
+            let additional_dialog_count = if flags[4] { parser.i32_()? } else { 0 };
+            let month_count = if flags[5] { parser.i32_()? } else { 0 };
+            let prize_description = if flags[6] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let winners_selection_date = if flags[7] { parser.i32_()? } else { 0 };
+            let winner_count = if flags[8] { parser.i32_()? } else { 0 };
+            let unclaimed_count = if flags[9] { parser.i32_()? } else { 0 };
+            let winner_user_ids = if flags[10] {
+                parse_user_id_vec(parser)?
+            } else {
+                Vec::new()
+            };
+            let star_count = if flags[11] { parser.i64_()? } else { 0 };
+            if winner_count < 0 || unclaimed_count < 0 {
+                is_bad = true;
+            }
+            MessageContent::GiveawayWinners(MessageGiveawayWinners {
+                giveaway_message_id,
+                boosted_channel_id,
+                additional_dialog_count,
+                month_count,
+                star_count,
+                prize_description,
+                winners_selection_date,
+                only_new_subscribers: flags[0],
+                was_refunded: flags[1],
+                winner_count,
+                unclaimed_count,
+                winner_user_ids,
+            })
+        }
+        MessageContentType::ExpiredVideoNote => {
+            MessageContent::ExpiredVideoNote(MessageExpiredVideoNote)
+        }
+        MessageContentType::ExpiredVoiceNote => {
+            MessageContent::ExpiredVoiceNote(MessageExpiredVoiceNote)
+        }
+        MessageContentType::BoostApply => {
+            parser.parse_flags::<0>()?;
+            let boost_count = parser.i32_()?;
+            if boost_count < 0 {
+                is_bad = true;
+            }
+            MessageContent::BoostApply(MessageBoostApply { boost_count })
+        }
+        MessageContentType::DialogShared => {
+            parser.parse_flags::<0>()?;
+            let len = parser.i32_()?;
+            if len < 0 || parser.left_len() < len as usize {
+                return Err("Wrong vector length");
+            }
+            let mut shared_dialogs = Vec::with_capacity(len as usize);
+            for _ in 0..len {
+                shared_dialogs.push(parse_shared_dialog(parser, ctx)?);
+            }
+            if shared_dialogs.is_empty() || shared_dialogs.iter().any(|d| !d.is_valid()) {
+                is_bad = true;
+            }
+            let button_id = parser.i32_()?;
+            MessageContent::DialogShared(MessageDialogShared {
+                shared_dialogs,
+                button_id,
+            })
+        }
+        MessageContentType::PaidMedia => {
+            let flags = parser.parse_flags::<2>()?;
+            let media_len = parser.i32_()?;
+            if media_len < 0 || parser.left_len() < media_len as usize {
+                return Err("Wrong vector length");
+            }
+            let mut media = Vec::with_capacity(media_len as usize);
+            for _ in 0..media_len {
+                media.push(parse_message_extended_media(parser, ctx)?);
+            }
+            let caption = if flags[0] {
+                parse_caption(parser)?
+            } else {
+                FormattedText::default()
+            };
+            let star_count = parser.i64_()?;
+            let payload = if flags[1] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            for media_item in &media {
+                if media_item.is_empty() {
+                    is_bad = true;
+                }
+            }
+            MessageContent::PaidMedia(MessagePaidMedia {
+                media,
+                caption,
+                star_count,
+                payload,
+            })
+        }
+        MessageContentType::PaymentRefunded => {
+            let has_invoice_payload = parser.parse_flags::<1>()?[0];
+            let dialog_id = parse_dialog_id(parser)?;
+            let currency = parser.string()?;
+            let total_amount = parser.i64_()?;
+            let invoice_payload = if has_invoice_payload {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let telegram_payment_charge_id = parser.string()?;
+            let provider_payment_charge_id = parser.string()?;
+            MessageContent::PaymentRefunded(MessagePaymentRefunded {
+                dialog_id,
+                currency,
+                total_amount,
+                invoice_payload,
+                telegram_payment_charge_id,
+                provider_payment_charge_id,
+            })
+        }
+        MessageContentType::GiftStars => {
+            let flags = parser.parse_flags::<2>()?;
+            let currency = parser.string()?;
+            let amount = parser.i64_()?;
+            let star_count = parser.i64_()?;
+            let crypto_currency = if flags[0] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let crypto_amount = if flags[0] { parser.i64_()? } else { 0 };
+            let transaction_id = if flags[1] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            MessageContent::GiftStars(MessageGiftStars {
+                currency,
+                amount,
+                crypto_currency,
+                crypto_amount,
+                star_count,
+                transaction_id,
+            })
+        }
+        MessageContentType::PrizeStars => {
+            let is_unclaimed = parser.parse_flags::<1>()?[0];
+            let star_count = parser.i64_()?;
+            let transaction_id = parser.string()?;
+            let boosted_dialog_id = parse_dialog_id(parser)?;
+            let giveaway_message_id = parse_message_id(parser)?;
+            MessageContent::PrizeStars(MessagePrizeStars {
+                star_count,
+                transaction_id,
+                boosted_dialog_id,
+                giveaway_message_id,
+                is_unclaimed,
+            })
+        }
+        MessageContentType::PaidMessagesRefunded => {
+            parser.parse_flags::<0>()?;
+            let message_count = parser.i32_()?;
+            let star_count = parser.i64_()?;
+            MessageContent::PaidMessagesRefunded(MessagePaidMessagesRefunded {
+                message_count,
+                star_count,
+            })
+        }
+        MessageContentType::PaidMessagesPrice => {
+            let broadcast_messages_allowed = parser.parse_flags::<1>()?[0];
+            let star_count = parser.i64_()?;
+            MessageContent::PaidMessagesPrice(MessagePaidMessagesPrice {
+                star_count,
+                broadcast_messages_allowed,
+            })
+        }
+        MessageContentType::ConferenceCall => {
+            let flags = parser.parse_flags::<5>()?;
+            let call_id = parser.i64_()?;
+            let duration = if flags[3] { parser.i32_()? } else { 0 };
+            let other_participant_dialog_ids = if flags[4] {
+                let len = parser.i32_()?;
+                if len < 0 || parser.left_len() < len as usize {
+                    return Err("Wrong vector length");
+                }
+                let mut dialog_ids = Vec::with_capacity(len as usize);
+                for _ in 0..len {
+                    dialog_ids.push(parse_dialog_id(parser)?);
+                }
+                dialog_ids
+            } else {
+                Vec::new()
+            };
+            MessageContent::ConferenceCall(MessageConferenceCall {
+                call_id,
+                duration,
+                other_participant_dialog_ids,
+                is_active: flags[0],
+                is_video: flags[1],
+                was_missed: flags[2],
+            })
+        }
+        MessageContentType::ToDoList => {
+            parser.parse_flags::<0>()?;
+            let list = parse_to_do_list(parser)?;
+            let completions_len = parser.i32_()?;
+            if completions_len < 0 || parser.left_len() < completions_len as usize {
+                return Err("Wrong vector length");
+            }
+            let mut completions = Vec::with_capacity(completions_len as usize);
+            for _ in 0..completions_len {
+                completions.push(parse_to_do_completion(parser)?);
+            }
+            MessageContent::ToDoList(MessageToDoList { list, completions })
+        }
+        MessageContentType::TodoCompletions => {
+            let flags = parser.parse_flags::<3>()?;
+            let to_do_message_id = if flags[0] {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            let completed_task_ids = if flags[1] {
+                parser.i32_vec()?
+            } else {
+                Vec::new()
+            };
+            let incompleted_task_ids = if flags[2] {
+                parser.i32_vec()?
+            } else {
+                Vec::new()
+            };
+            MessageContent::TodoCompletions(MessageTodoCompletions {
+                to_do_message_id,
+                completed_task_ids,
+                incompleted_task_ids,
+            })
+        }
+        MessageContentType::TodoAppendTasks => {
+            let flags = parser.parse_flags::<2>()?;
+            let to_do_message_id = if flags[0] {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            let items = if flags[1] {
+                let len = parser.i32_()?;
+                if len < 0 || parser.left_len() < len as usize {
+                    return Err("Wrong vector length");
+                }
+                let mut items = Vec::with_capacity(len as usize);
+                for _ in 0..len {
+                    items.push(parse_to_do_item(parser)?);
+                }
+                items
+            } else {
+                Vec::new()
+            };
+            MessageContent::TodoAppendTasks(MessageTodoAppendTasks {
+                to_do_message_id,
+                items,
+            })
+        }
+        MessageContentType::GiftTon => {
+            let has_transaction_id = parser.parse_flags::<1>()?[0];
+            let currency = parser.string()?;
+            let amount = parser.i64_()?;
+            let crypto_currency = parser.string()?;
+            let crypto_amount = parser.i64_()?;
+            let transaction_id = if has_transaction_id {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            MessageContent::GiftTon(MessageGiftTon {
+                currency,
+                amount,
+                crypto_currency,
+                crypto_amount,
+                transaction_id,
+            })
+        }
+        MessageContentType::SuggestedPostSuccess => {
+            let flags = parser.parse_flags::<2>()?;
+            let suggested_post_message_id = if flags[0] {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            let amount = if flags[1] {
+                parse_currency_amount(parser)?
+            } else {
+                CurrencyAmount::default()
+            };
+            MessageContent::SuggestedPostSuccess(MessageSuggestedPostSuccess {
+                suggested_post_message_id,
+                amount,
+            })
+        }
+        MessageContentType::SuggestedPostRefund => {
+            let flags = parser.parse_flags::<2>()?;
+            let suggested_post_message_id = if flags[0] {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            MessageContent::SuggestedPostRefund(MessageSuggestedPostRefund {
+                suggested_post_message_id,
+                is_payer_initiated: flags[1],
+            })
+        }
+        MessageContentType::SuggestedPostApproval => {
+            let flags = parser.parse_flags::<6>()?;
+            let suggested_post_message_id = if flags[0] {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            let price = if flags[1] {
+                parse_suggested_post_price(parser)?
+            } else {
+                SuggestedPostPrice::default()
+            };
+            let comment = if flags[2] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let send_date = if flags[3] { parser.i32_()? } else { 0 };
+            MessageContent::SuggestedPostApproval(MessageSuggestedPostApproval {
+                suggested_post_message_id,
+                price,
+                comment,
+                send_date,
+                is_rejected: flags[4],
+                is_balance_too_low: flags[5],
+            })
+        }
+        MessageContentType::SuggestBirthday => {
+            parser.parse_flags::<0>()?;
+            MessageContent::SuggestBirthday(MessageSuggestBirthday {
+                birthdate: Birthdate::parse_from(parser)?,
+            })
+        }
+        MessageContentType::NewCreatorPending => {
+            let has_new_creator_user_id = parser.parse_flags::<1>()?[0];
+            let new_creator_user_id = if has_new_creator_user_id {
+                parse_user_id(parser)?
+            } else {
+                UserId::default()
+            };
+            MessageContent::NewCreatorPending(MessageNewCreatorPending {
+                new_creator_user_id,
+            })
+        }
+        MessageContentType::ChangeCreator => {
+            parser.parse_flags::<0>()?;
+            let new_creator_user_id = parse_user_id(parser)?;
+            if !new_creator_user_id.is_valid() {
+                is_bad = true;
+            }
+            MessageContent::ChangeCreator(MessageChangeCreator {
+                new_creator_user_id,
+            })
+        }
+        MessageContentType::NoForwardsToggle => {
+            let flags = parser.parse_flags::<3>()?;
+            let request_message_id = if flags[2] {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            MessageContent::NoForwardsToggle(MessageNoForwardsToggle {
+                request_message_id,
+                prev_value: flags[0],
+                new_value: flags[1],
+            })
+        }
+        MessageContentType::NoForwardsRequest => {
+            let flags = parser.parse_flags::<3>()?;
+            MessageContent::NoForwardsRequest(MessageNoForwardsRequest {
+                is_expired: flags[0],
+                prev_value: flags[1],
+                new_value: flags[2],
+            })
+        }
+        MessageContentType::ManagedBotCreated => {
+            parser.parse_flags::<0>()?;
+            let bot_user_id = parse_user_id(parser)?;
+            if !bot_user_id.is_valid() {
+                is_bad = true;
+            }
+            MessageContent::ManagedBotCreated(MessageManagedBotCreated { bot_user_id })
+        }
+        MessageContentType::PollAppendAnswer => {
+            let has_poll_message_id = parser.parse_flags::<1>()?[0];
+            let poll_message_id = if has_poll_message_id {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            let text = parse_formatted_text(parser)?;
+            let data = parser.string()?;
+            MessageContent::PollAppendAnswer(MessagePollAppendAnswer {
+                poll_message_id,
+                text,
+                data,
+            })
+        }
+        MessageContentType::PollDeleteAnswer => {
+            let has_poll_message_id = parser.parse_flags::<1>()?[0];
+            let poll_message_id = if has_poll_message_id {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            let text = parse_formatted_text(parser)?;
+            let data = parser.string()?;
+            MessageContent::PollDeleteAnswer(MessagePollDeleteAnswer {
+                poll_message_id,
+                text,
+                data,
+            })
+        }
+        MessageContentType::ChangeCommunity => {
+            let has_community_id = parser.parse_flags::<1>()?[0];
+            let community_id = if has_community_id {
+                CommunityId::new(parser.i64_()?)
+            } else {
+                CommunityId::default()
+            };
+            MessageContent::ChangeCommunity(MessageChangeCommunity { community_id })
+        }
+        MessageContentType::ChatJoinedViaCommunity => {
+            parser.parse_flags::<0>()?;
+            let community_id = CommunityId::new(parser.i64_()?);
+            MessageContent::ChatJoinedViaCommunity(MessageChatJoinedViaCommunity { community_id })
+        }
+        // The unmodeled six: StarGift/StarGiftUnique/StarGiftPurchaseOffer/
+        // StarGiftPurchaseOfferDeclined/ChatSetTheme/RichText.
+        MessageContentType::StarGift
+        | MessageContentType::StarGiftUnique
+        | MessageContentType::StarGiftPurchaseOffer
+        | MessageContentType::StarGiftPurchaseOfferDeclined
+        | MessageContentType::ChatSetTheme
+        | MessageContentType::RichText
+        | MessageContentType::None => {
+            tdutils::log_error!("Load a message with an unmodeled content of type {type_raw}");
+            return Ok(MessageContent::Unsupported(MessageUnsupported {
+                version: 0,
+            }));
+        }
+    };
+    if is_bad {
+        tdutils::log_error!(
+            "Load a message with an invalid content of type {}",
+            content_type as i32
+        );
+        return Ok(MessageContent::Unsupported(MessageUnsupported {
+            version: 0,
+        }));
+    }
+    Ok(content)
+}
+
+fn parse_user_id_vec(parser: &mut Parser) -> Result<Vec<UserId>, &'static str> {
+    let len = parser.i32_()?;
+    if len < 0 || parser.left_len() < len as usize {
+        return Err("Wrong vector length");
+    }
+    let mut user_ids = Vec::with_capacity(len as usize);
+    for _ in 0..len {
+        user_ids.push(parse_user_id(parser)?);
+    }
+    Ok(user_ids)
+}
+
+fn parse_formatted_text(parser: &mut Parser) -> Result<FormattedText, &'static str> {
+    FormattedText::parse(parser)
 }
 
 #[cfg(test)]
@@ -3410,5 +7548,1000 @@ mod tests {
         assert!(completion.is_valid());
         completion.date = 0;
         assert!(!completion.is_valid());
+    }
+
+    // ==== M.9.2/M.9.3 tests ====
+
+    /// The raw-id storage stand-in: every mediated call round-trips the
+    /// raw id. Byte-compatible with the C++ only once the real managers
+    /// back the seam (the module doc records the M.12.2 gate).
+    struct RawIdStorage;
+
+    impl MessageContentStorage for RawIdStorage {
+        fn store_file(&self, file_id: FileId, out: &mut Vec<u8>) {
+            store_i32(out, file_id.get());
+        }
+
+        fn parse_file(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+            Ok(FileId::new(parser.i32_()?, 0))
+        }
+
+        fn store_animation(&self, file_id: FileId, out: &mut Vec<u8>) {
+            self.store_file(file_id, out);
+        }
+
+        fn parse_animation(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+            self.parse_file(parser)
+        }
+
+        fn store_audio(&self, file_id: FileId, out: &mut Vec<u8>) {
+            self.store_file(file_id, out);
+        }
+
+        fn parse_audio(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+            self.parse_file(parser)
+        }
+
+        fn store_document(&self, file_id: FileId, out: &mut Vec<u8>) {
+            self.store_file(file_id, out);
+        }
+
+        fn parse_document(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+            self.parse_file(parser)
+        }
+
+        fn store_video(&self, file_id: FileId, out: &mut Vec<u8>) {
+            self.store_file(file_id, out);
+        }
+
+        fn parse_video(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+            self.parse_file(parser)
+        }
+
+        fn store_video_note(&self, file_id: FileId, out: &mut Vec<u8>) {
+            self.store_file(file_id, out);
+        }
+
+        fn parse_video_note(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+            self.parse_file(parser)
+        }
+
+        fn store_voice_note(&self, file_id: FileId, out: &mut Vec<u8>) {
+            self.store_file(file_id, out);
+        }
+
+        fn parse_voice_note(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+            self.parse_file(parser)
+        }
+
+        fn store_sticker(&self, file_id: FileId, out: &mut Vec<u8>) {
+            self.store_file(file_id, out);
+        }
+
+        fn parse_sticker(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+            self.parse_file(parser)
+        }
+
+        fn store_poll(&self, poll_id: PollId, out: &mut Vec<u8>) {
+            store_i64(out, poll_id.get());
+        }
+
+        fn parse_poll(&mut self, parser: &mut Parser) -> Result<PollId, &'static str> {
+            Ok(PollId::new(parser.i64_()?))
+        }
+
+        fn store_background(&self, background_id: BackgroundId, out: &mut Vec<u8>) {
+            store_i64(out, background_id.get());
+        }
+
+        fn parse_background(&mut self, parser: &mut Parser) -> Result<BackgroundId, &'static str> {
+            Ok(BackgroundId::new(parser.i64_()?))
+        }
+
+        fn on_load_web_page_url_from_database(&mut self, _web_page_id: WebPageId, _url: &str) {}
+    }
+
+    /// The representative populated model of every modeled variant —
+    /// non-default field values wherever the type carries any, so the
+    /// round-trip exercises flags and conditionals, not just defaults.
+    fn sample_contents() -> Vec<MessageContent> {
+        let user_id = UserId::new(7);
+        let dialog_id = DialogId::from_user_id(user_id);
+        let message_id = MessageId::new(4242);
+        let file_id = FileId::new(11, 3);
+        let text = |s: &str| FormattedText {
+            text: s.to_string(),
+            entities: vec![MessageEntity::new(
+                crate::message_entity::Type::Italic,
+                0,
+                2,
+            )],
+        };
+        vec![
+            MessageContent::Text(MessageText::new(
+                text("hello"),
+                WebPageId::new(99),
+                true,
+                false,
+                true,
+                "https://example.com".to_string(),
+            )),
+            MessageContent::Animation(MessageAnimation {
+                file_id,
+                caption: text("cap"),
+                has_spoiler: true,
+            }),
+            MessageContent::Audio(MessageAudio {
+                file_id,
+                caption: text("cap"),
+            }),
+            MessageContent::Contact(MessageContact {
+                contact: Contact::new(
+                    "+15551234567".to_string(),
+                    "John".to_string(),
+                    "Doe".to_string(),
+                    String::new(),
+                    user_id,
+                ),
+            }),
+            MessageContent::Document(MessageDocument {
+                file_id,
+                caption: text("cap"),
+            }),
+            MessageContent::Game(MessageGame {
+                game: Game {
+                    id: 5,
+                    access_hash: -6,
+                    bot_user_id: user_id,
+                    short_name: "game".to_string(),
+                    title: "The Game".to_string(),
+                    description: "desc".to_string(),
+                    photo: Photo::default(),
+                    animation_file_id: file_id,
+                    text: text("game text"),
+                },
+            }),
+            MessageContent::Invoice(MessageInvoice {
+                input_invoice: InputInvoice {
+                    title: "t".to_string(),
+                    description: "d".to_string(),
+                    photo: Photo::default(),
+                    start_parameter: "sp".to_string(),
+                    invoice: Invoice {
+                        currency: "USD".to_string(),
+                        price_parts: vec![LabeledPricePart {
+                            label: "part".to_string(),
+                            amount: 250,
+                        }],
+                        subscription_period: 30,
+                        max_tip_amount: 10,
+                        suggested_tip_amounts: vec![5, 20],
+                        recurring_payment_terms_of_service_url: "r".to_string(),
+                        terms_of_service_url: "tos".to_string(),
+                        is_test: true,
+                        need_name: true,
+                        need_phone_number: true,
+                        need_email_address: true,
+                        need_shipping_address: true,
+                        send_phone_number_to_provider: true,
+                        send_email_address_to_provider: true,
+                        is_flexible: true,
+                    },
+                    payload: "payload".to_string(),
+                    provider_token: "tok".to_string(),
+                    provider_data: "pdata".to_string(),
+                    extended_media: MessageExtendedMedia {
+                        r#type: MessageExtendedMediaType::Preview,
+                        unsupported_version: 1,
+                        duration: 3,
+                        dimensions: crate::photo::get_dimensions(10, 20, "test"),
+                        minithumbnail: "mini".to_string(),
+                        photo: Photo::default(),
+                        video_file_id: FileId::default(),
+                        start_timestamp: 9,
+                    },
+                    extended_media_caption: text("caption"),
+                    total_amount: 250,
+                    receipt_message_id: message_id,
+                },
+            }),
+            MessageContent::LiveLocation(MessageLiveLocation::new(
+                Location::new(1.5, -2.5, 30.0, -7),
+                90,
+                180,
+                1500,
+            )),
+            MessageContent::Location(MessageLocation {
+                location: Location::new(10.0, 20.0, 5.0, -8),
+            }),
+            MessageContent::Venue(MessageVenue {
+                venue: Venue {
+                    location: Location::new(30.0, 40.0, 0.0, -9),
+                    title: "Title".to_string(),
+                    address: "Address".to_string(),
+                    provider: "provider".to_string(),
+                    id: "venue-id".to_string(),
+                    r#type: "venue-type".to_string(),
+                },
+            }),
+            MessageContent::Photo(MessagePhoto {
+                photo: Photo {
+                    id: 123,
+                    date: 1000,
+                    minithumbnail: "mini".to_string(),
+                    photos: vec![crate::photo::PhotoSize {
+                        size_type: b'x' as i32,
+                        size: 42,
+                        dimensions: crate::photo::get_dimensions(100, 200, "test"),
+                        file_id,
+                        progressive_sizes: vec![1, 2, 3],
+                    }],
+                    animations: Vec::new(),
+                    sticker_photo_size: None,
+                    has_stickers: true,
+                },
+                video_file_id: file_id,
+                caption: text("cap"),
+                has_spoiler: true,
+            }),
+            MessageContent::Sticker(MessageSticker {
+                file_id,
+                is_premium: true,
+            }),
+            MessageContent::Video(MessageVideo {
+                file_id,
+                alternative_file_ids: vec![FileId::new(12, 0)],
+                hls_file_ids: vec![FileId::new(13, 0)],
+                storyboard_file_ids: vec![FileId::new(14, 0)],
+                storyboard_map_file_ids: vec![FileId::new(15, 0)],
+                cover: Photo::default(),
+                start_timestamp: 33,
+                caption: text("cap"),
+                has_spoiler: true,
+            }),
+            MessageContent::VideoNote(MessageVideoNote {
+                file_id,
+                is_viewed: true,
+            }),
+            MessageContent::VoiceNote(MessageVoiceNote {
+                file_id,
+                caption: text("cap"),
+                is_listened: true,
+            }),
+            MessageContent::ChatCreate(MessageChatCreate {
+                title: "chat".to_string(),
+                participant_user_ids: vec![user_id, UserId::new(9)],
+            }),
+            MessageContent::ChatChangeTitle(MessageChatChangeTitle {
+                title: "renamed".to_string(),
+            }),
+            MessageContent::ChatChangePhoto(MessageChatChangePhoto {
+                photo: Photo {
+                    id: 77,
+                    date: 1001,
+                    minithumbnail: String::new(),
+                    photos: vec![],
+                    animations: vec![crate::photo::AnimationSize {
+                        photo_size: crate::photo::PhotoSize {
+                            size_type: b's' as i32,
+                            size: 7,
+                            dimensions: crate::photo::get_dimensions(8, 8, "test"),
+                            file_id,
+                            progressive_sizes: Vec::new(),
+                        },
+                        main_frame_timestamp: 0.5,
+                    }],
+                    sticker_photo_size: None,
+                    has_stickers: false,
+                },
+            }),
+            MessageContent::ChatAddUsers(MessageChatAddUsers {
+                user_ids: vec![user_id],
+            }),
+            MessageContent::ChatJoinedByLink(MessageChatJoinedByLink { is_approved: true }),
+            MessageContent::ChatDeleteUser(MessageChatDeleteUser { user_id }),
+            MessageContent::ChatMigrateTo(MessageChatMigrateTo {
+                migrated_to_channel_id: crate::chat_manager::ChannelId::new(1001),
+            }),
+            MessageContent::ChannelCreate(MessageChannelCreate {
+                title: "channel".to_string(),
+            }),
+            MessageContent::ChannelMigrateFrom(MessageChannelMigrateFrom {
+                title: "old".to_string(),
+                migrated_from_chat_id: ChatId::new(42),
+            }),
+            MessageContent::PinMessage(MessagePinMessage { message_id }),
+            MessageContent::GameScore(MessageGameScore {
+                game_message_id: message_id,
+                game_id: 123456789,
+                score: 1000,
+            }),
+            MessageContent::ChatSetTtl(MessageChatSetTtl {
+                ttl: 86400,
+                from_user_id: user_id,
+            }),
+            MessageContent::Unsupported(MessageUnsupported { version: 3 }),
+            MessageContent::Call(MessageCall {
+                call_id: 777,
+                call_access_hash: -12345,
+                duration: 65,
+                discard_reason: CallDiscardReason {
+                    r#type: CallDiscardReasonType::HungUp,
+                    slug: String::new(),
+                },
+                is_video: true,
+            }),
+            MessageContent::PaymentSuccessful(MessagePaymentSuccessful {
+                invoice_dialog_id: dialog_id,
+                invoice_message_id: message_id,
+                currency: "USD".to_string(),
+                total_amount: 999,
+                invoice_payload: "pl".to_string(),
+                subscription_until_date: 2000,
+                is_recurring: true,
+                is_first_recurring: true,
+                shipping_option_id: "opt".to_string(),
+                order_info: Some(OrderInfo {
+                    name: "John Doe".to_string(),
+                    phone_number: "+1555".to_string(),
+                    email_address: "a@b.c".to_string(),
+                    shipping_address: Some(Box::new(Address {
+                        country_code: "US".to_string(),
+                        state: "CA".to_string(),
+                        city: "SF".to_string(),
+                        street_line1: "1 st".to_string(),
+                        street_line2: String::new(),
+                        postal_code: "94100".to_string(),
+                    })),
+                }),
+                telegram_payment_charge_id: "tc".to_string(),
+                provider_payment_charge_id: "pc".to_string(),
+            }),
+            MessageContent::CustomServiceAction(MessageCustomServiceAction {
+                message: "action".to_string(),
+            }),
+            MessageContent::WebsiteConnected(MessageWebsiteConnected {
+                domain_name: "example.com".to_string(),
+            }),
+            MessageContent::PassportDataSent(MessagePassportDataSent {
+                types: vec![SecureValueType::Passport, SecureValueType::EmailAddress],
+            }),
+            MessageContent::PassportDataReceived(MessagePassportDataReceived {
+                values: vec![EncryptedSecureValue {
+                    r#type: SecureValueType::Address,
+                    data: EncryptedSecureData {
+                        data: "d".to_string(),
+                        hash: "h".to_string(),
+                        encrypted_secret: "s".to_string(),
+                    },
+                    files: vec![EncryptedSecureFile {
+                        file: DatedFile {
+                            file_id,
+                            date: 1000,
+                        },
+                        file_hash: "fh".to_string(),
+                        encrypted_secret: "es".to_string(),
+                    }],
+                    front_side: EncryptedSecureFile::default(),
+                    reverse_side: EncryptedSecureFile::default(),
+                    selfie: EncryptedSecureFile::default(),
+                    translations: Vec::new(),
+                    hash: "vh".to_string(),
+                }],
+                credentials: EncryptedSecureCredentials {
+                    data: "d".to_string(),
+                    hash: "h".to_string(),
+                    encrypted_secret: "s".to_string(),
+                },
+            }),
+            MessageContent::Poll(MessagePoll {
+                poll_id: PollId::new(555),
+                caption: text("poll cap"),
+                attached_media: Some(Box::new(MessageContent::Unsupported(MessageUnsupported {
+                    version: 1,
+                }))),
+            }),
+            MessageContent::Dice(MessageDice {
+                emoji: "🎲".to_string(),
+                dice_value: 5,
+                is_stake: false,
+                seed: "seed".to_string(),
+                state_hash: "hash".to_string(),
+                stake_ton_count: 0,
+                prize_ton_count: 0,
+            }),
+            MessageContent::ProximityAlertTriggered(MessageProximityAlertTriggered {
+                traveler_dialog_id: dialog_id,
+                watcher_dialog_id: DialogId::from_user_id(UserId::new(8)),
+                distance: 42,
+            }),
+            MessageContent::GroupCall(MessageGroupCall {
+                input_group_call_id: InputGroupCallId::new(11, -22),
+                duration: 30,
+                schedule_date: 2000,
+            }),
+            MessageContent::InviteToGroupCall(MessageInviteToGroupCall {
+                input_group_call_id: InputGroupCallId::new(12, -23),
+                user_ids: vec![user_id],
+            }),
+            MessageContent::WebViewDataSent(MessageWebViewDataSent {
+                button_text: "btn".to_string(),
+            }),
+            MessageContent::WebViewDataReceived(MessageWebViewDataReceived {
+                button_text: "btn".to_string(),
+                data: "data".to_string(),
+            }),
+            MessageContent::GiftPremium(MessageGiftPremium {
+                text: text("gift"),
+                currency: "USD".to_string(),
+                amount: 5,
+                crypto_currency: "TON".to_string(),
+                crypto_amount: 1,
+                days: 30,
+            }),
+            MessageContent::TopicCreate(MessageTopicCreate {
+                title: "topic".to_string(),
+                icon: ForumTopicIcon::new(0xFF0000, crate::emoji_status::CustomEmojiId::new(9)),
+                title_missing: true,
+            }),
+            MessageContent::TopicEdit(MessageTopicEdit {
+                edited_data: ForumTopicEditedData {
+                    title: "new".to_string(),
+                    icon_custom_emoji_id: crate::emoji_status::CustomEmojiId::new(3),
+                    edit_icon_custom_emoji_id: true,
+                    edit_is_closed: true,
+                    is_closed: true,
+                    edit_is_hidden: true,
+                    is_hidden: true,
+                },
+            }),
+            MessageContent::SuggestProfilePhoto(MessageSuggestProfilePhoto {
+                photo: Photo {
+                    id: 88,
+                    date: 1002,
+                    minithumbnail: String::new(),
+                    photos: vec![crate::photo::PhotoSize {
+                        size_type: b'x' as i32,
+                        size: 9,
+                        dimensions: crate::photo::get_dimensions(50, 50, "test"),
+                        file_id: FileId::new(31, 0),
+                        progressive_sizes: Vec::new(),
+                    }],
+                    animations: Vec::new(),
+                    sticker_photo_size: None,
+                    has_stickers: false,
+                },
+            }),
+            MessageContent::RequestedDialog(MessageRequestedDialog {
+                shared_dialog_ids: vec![dialog_id],
+                button_id: 5,
+            }),
+            MessageContent::WebViewWriteAccessAllowed(MessageWebViewWriteAccessAllowed {
+                web_app: WebApp {
+                    id: 1,
+                    access_hash: -2,
+                    short_name: "app".to_string(),
+                    title: "App".to_string(),
+                    description: "d".to_string(),
+                    photo: Photo::default(),
+                    animation_file_id: FileId::default(),
+                    hash: 99,
+                },
+            }),
+            MessageContent::SetBackground(MessageSetBackground {
+                old_message_id: message_id,
+                background_info: BackgroundInfo {
+                    background_id: BackgroundId::new(44),
+                    background_type: BackgroundType::pattern(
+                        true,
+                        BackgroundFill::gradient(1, 2, 135),
+                        50,
+                    ),
+                },
+                for_both: true,
+            }),
+            MessageContent::Story(MessageStory {
+                story_full_id: StoryFullId::new(dialog_id, StoryId::new(10)),
+                via_mention: true,
+            }),
+            MessageContent::GiftCode(MessageGiftCode {
+                creator_dialog_id: dialog_id,
+                text: text("giftcode"),
+                days: 3,
+                currency: "USD".to_string(),
+                amount: 10,
+                crypto_currency: "TON".to_string(),
+                crypto_amount: 2,
+                via_giveaway: true,
+                is_unclaimed: true,
+                code: "CODE".to_string(),
+            }),
+            MessageContent::Giveaway(MessageGiveaway {
+                giveaway_parameters: GiveawayParameters {
+                    boosted_channel_id: crate::chat_manager::ChannelId::new(1002),
+                    additional_channel_ids: vec![crate::chat_manager::ChannelId::new(1003)],
+                    only_new_subscribers: true,
+                    winners_are_visible: true,
+                    date: 2000,
+                    country_codes: vec!["US".to_string()],
+                    prize_description: "prize".to_string(),
+                },
+                quantity: 5,
+                months: 3,
+                star_count: 100,
+            }),
+            MessageContent::GiveawayLaunch(MessageGiveawayLaunch { star_count: 50 }),
+            MessageContent::GiveawayResults(MessageGiveawayResults {
+                giveaway_message_id: message_id,
+                winner_count: 3,
+                unclaimed_count: 1,
+                is_star_giveaway: true,
+            }),
+            MessageContent::GiveawayWinners(MessageGiveawayWinners {
+                giveaway_message_id: message_id,
+                boosted_channel_id: crate::chat_manager::ChannelId::new(1004),
+                additional_dialog_count: 2,
+                month_count: 1,
+                star_count: 10,
+                prize_description: "p".to_string(),
+                winners_selection_date: 2100,
+                only_new_subscribers: true,
+                was_refunded: true,
+                winner_count: 2,
+                unclaimed_count: 1,
+                winner_user_ids: vec![user_id],
+            }),
+            MessageContent::BoostApply(MessageBoostApply { boost_count: 3 }),
+            MessageContent::DialogShared(MessageDialogShared {
+                shared_dialogs: vec![SharedDialog {
+                    dialog_id: DialogId::from_user_id(UserId::new(6)),
+                    first_name: "A".to_string(),
+                    ..SharedDialog::default()
+                }],
+                button_id: 7,
+            }),
+            MessageContent::PaidMedia(MessagePaidMedia {
+                media: vec![MessageExtendedMedia {
+                    r#type: MessageExtendedMediaType::Video,
+                    unsupported_version: 0,
+                    duration: 5,
+                    dimensions: crate::photo::get_dimensions(0, 0, "test"),
+                    minithumbnail: String::new(),
+                    photo: Photo::default(),
+                    video_file_id: FileId::new(21, 0),
+                    start_timestamp: 2,
+                }],
+                caption: text("paid"),
+                star_count: 15,
+                payload: "pay".to_string(),
+            }),
+            MessageContent::PaymentRefunded(MessagePaymentRefunded {
+                dialog_id,
+                currency: "USD".to_string(),
+                total_amount: 50,
+                invoice_payload: "pl".to_string(),
+                telegram_payment_charge_id: "tc".to_string(),
+                provider_payment_charge_id: "pc".to_string(),
+            }),
+            MessageContent::GiftStars(MessageGiftStars {
+                currency: "USD".to_string(),
+                amount: 5,
+                crypto_currency: "TON".to_string(),
+                crypto_amount: 1,
+                star_count: 100,
+                transaction_id: "tx".to_string(),
+            }),
+            MessageContent::PrizeStars(MessagePrizeStars {
+                star_count: 20,
+                transaction_id: "tx".to_string(),
+                boosted_dialog_id: DialogId::from_channel_id(crate::chat_manager::ChannelId::new(
+                    1005,
+                )),
+                giveaway_message_id: message_id,
+                is_unclaimed: true,
+            }),
+            MessageContent::PaidMessagesRefunded(MessagePaidMessagesRefunded {
+                message_count: 4,
+                star_count: 40,
+            }),
+            MessageContent::PaidMessagesPrice(MessagePaidMessagesPrice {
+                star_count: 10,
+                broadcast_messages_allowed: true,
+            }),
+            MessageContent::ConferenceCall(MessageConferenceCall {
+                call_id: 31,
+                duration: 120,
+                other_participant_dialog_ids: vec![dialog_id],
+                is_active: true,
+                is_video: true,
+                was_missed: true,
+            }),
+            MessageContent::ToDoList(MessageToDoList {
+                list: ToDoList {
+                    title: text("todo"),
+                    items: vec![ToDoItem {
+                        id: 1,
+                        title: text("task"),
+                    }],
+                    others_can_append: true,
+                    others_can_complete: true,
+                },
+                completions: vec![ToDoCompletion {
+                    id: 1,
+                    completed_by_dialog_id: DialogId::from_user_id(UserId::new(7)),
+                    date: 1500,
+                }],
+            }),
+            MessageContent::TodoCompletions(MessageTodoCompletions {
+                to_do_message_id: message_id,
+                completed_task_ids: vec![1],
+                incompleted_task_ids: vec![2, 3],
+            }),
+            MessageContent::TodoAppendTasks(MessageTodoAppendTasks {
+                to_do_message_id: message_id,
+                items: vec![ToDoItem {
+                    id: 2,
+                    title: text("task2"),
+                }],
+            }),
+            MessageContent::GiftTon(MessageGiftTon {
+                currency: "USD".to_string(),
+                amount: 5,
+                crypto_currency: "TON".to_string(),
+                crypto_amount: 1,
+                transaction_id: "tx".to_string(),
+            }),
+            MessageContent::SuggestedPostSuccess(MessageSuggestedPostSuccess {
+                suggested_post_message_id: message_id,
+                amount: CurrencyAmount {
+                    r#type: CurrencyAmountType::Star,
+                    star_amount: StarAmount {
+                        star_count: 5,
+                        nanostar_count: 1,
+                    },
+                    ton_amount: TonAmount::default(),
+                },
+            }),
+            MessageContent::SuggestedPostRefund(MessageSuggestedPostRefund {
+                suggested_post_message_id: message_id,
+                is_payer_initiated: true,
+            }),
+            MessageContent::SuggestedPostApproval(MessageSuggestedPostApproval {
+                suggested_post_message_id: message_id,
+                price: SuggestedPostPrice {
+                    r#type: SuggestedPostPriceType::Ton,
+                    amount: 7_000_000,
+                },
+                comment: "ok".to_string(),
+                send_date: 2500,
+                is_rejected: true,
+                is_balance_too_low: true,
+            }),
+            MessageContent::SuggestBirthday(MessageSuggestBirthday {
+                birthdate: crate::birthdate::Birthdate::new(29, 2, 1990),
+            }),
+            MessageContent::NewCreatorPending(MessageNewCreatorPending {
+                new_creator_user_id: user_id,
+            }),
+            MessageContent::ChangeCreator(MessageChangeCreator {
+                new_creator_user_id: user_id,
+            }),
+            MessageContent::NoForwardsToggle(MessageNoForwardsToggle {
+                request_message_id: message_id,
+                prev_value: true,
+                new_value: false,
+            }),
+            MessageContent::NoForwardsRequest(MessageNoForwardsRequest {
+                is_expired: true,
+                prev_value: true,
+                new_value: false,
+            }),
+            MessageContent::ManagedBotCreated(MessageManagedBotCreated {
+                bot_user_id: user_id,
+            }),
+            MessageContent::PollAppendAnswer(MessagePollAppendAnswer {
+                poll_message_id: message_id,
+                text: text("answer"),
+                data: "data".to_string(),
+            }),
+            MessageContent::PollDeleteAnswer(MessagePollDeleteAnswer {
+                poll_message_id: message_id,
+                text: text("answer"),
+                data: "data".to_string(),
+            }),
+            MessageContent::ChangeCommunity(MessageChangeCommunity {
+                community_id: CommunityId::new(77),
+            }),
+            MessageContent::ChatJoinedViaCommunity(MessageChatJoinedViaCommunity {
+                community_id: CommunityId::new(78),
+            }),
+            // The field-less variants.
+            MessageContent::ChatDeletePhoto(MessageChatDeletePhoto),
+            MessageContent::ChatDeleteHistory(MessageChatDeleteHistory),
+            MessageContent::ContactRegistered(MessageContactRegistered),
+            MessageContent::ExpiredPhoto(MessageExpiredPhoto),
+            MessageContent::ExpiredVideo(MessageExpiredVideo),
+            MessageContent::ExpiredVideoNote(MessageExpiredVideoNote),
+            MessageContent::ExpiredVoiceNote(MessageExpiredVoiceNote),
+            MessageContent::ScreenshotTaken(MessageScreenshotTaken),
+            MessageContent::WriteAccessAllowed(MessageWriteAccessAllowed),
+            MessageContent::WriteAccessAllowedByRequest(MessageWriteAccessAllowedByRequest),
+        ]
+    }
+
+    #[test]
+    fn every_modeled_variant_round_trips_through_the_db_format() {
+        let contents = sample_contents();
+        assert_eq!(contents.len(), 90, "one sample per modeled variant");
+        for content in contents {
+            let mut out = Vec::new();
+            store_message_content(&content, &RawIdStorage, &mut out);
+            let mut parser = Parser::new(&out);
+            let parsed = parse_message_content(&mut parser, &mut RawIdStorage).unwrap();
+            parser.fetch_end().unwrap();
+            assert_eq!(
+                parsed.get_type(),
+                content.get_type(),
+                "round trip changed the content type"
+            );
+            assert_eq!(
+                parsed,
+                content,
+                "round trip changed the bytes of {:?}",
+                content.get_type()
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_content_stores_the_type_int_and_version() {
+        let mut out = Vec::new();
+        store_message_content(
+            &MessageContent::Unsupported(MessageUnsupported { version: 5 }),
+            &RawIdStorage,
+            &mut out,
+        );
+        // Type int 27 (`Unsupported`), then the version — the whole blob.
+        assert_eq!(out, [0x1b, 0, 0, 0, 5, 0, 0, 0]);
+
+        // A pre-`AddMessageUnsupportedVersion` (16) blob carries no version.
+        let blob = [0x1bu8, 0, 0, 0];
+        let mut parser = Parser::new_with_version(&blob, 15);
+        match parse_message_content(&mut parser, &mut RawIdStorage).unwrap() {
+            MessageContent::Unsupported(m) => assert_eq!(m.version, 0),
+            _ => panic!("wrong type"),
+        }
+    }
+
+    #[test]
+    fn unknown_and_unmodeled_types_degrade_to_unsupported_without_consuming() {
+        // Type int 93 is `RichText` — known to the C++ binary but unmodeled
+        // here; the C++ `default:`/is_bad arm returns `MessageUnsupported(0)`
+        // and leaves the remainder unconsumed.
+        let blob = [93u8, 0, 0, 0, 1, 2, 3, 4];
+        let mut parser = Parser::new_with_version(&blob, 61);
+        let parsed = parse_message_content(&mut parser, &mut RawIdStorage).unwrap();
+        assert!(matches!(parsed, MessageContent::Unsupported(m) if m.version == 0));
+        assert_eq!(parser.left_len(), 4, "the trailing bytes must stay");
+    }
+
+    #[test]
+    fn legacy_version_branches_match_the_cpp() {
+        // Dice pre-AddDiceEmoji (25)/AddDiceFlags (57): no flags block, no
+        // emoji — the default die emoji is the C++ fallback.
+        let mut blob = Vec::new();
+        store_i32(&mut blob, MessageContentType::Dice as i32);
+        store_i32(&mut blob, 3);
+        let mut parser = Parser::new_with_version(&blob, 24);
+        match parse_message_content(&mut parser, &mut RawIdStorage).unwrap() {
+            MessageContent::Dice(d) => {
+                assert_eq!(d.emoji, MessageDice::DEFAULT_EMOJI);
+                assert_eq!(d.dice_value, 3);
+                assert!(!d.is_stake);
+            }
+            _ => panic!("wrong type"),
+        }
+
+        // GiftPremium with has_days=false runs the month-to-day conversion:
+        // 12 months -> 12*30 + 12/3 + 12/12 = 365.
+        let mut blob = Vec::new();
+        store_i32(&mut blob, MessageContentType::GiftPremium as i32);
+        store_flags(&mut blob, [false, false, false]);
+        store_string(&mut blob, "USD");
+        store_i64(&mut blob, 5);
+        store_i32(&mut blob, 12);
+        let mut parser = Parser::new_with_version(&blob, 61);
+        match parse_message_content(&mut parser, &mut RawIdStorage).unwrap() {
+            MessageContent::GiftPremium(g) => assert_eq!(g.days, 365),
+            _ => panic!("wrong type"),
+        }
+
+        // Call pre-AddVideoCallsSupport (20): no flags, is_video=false.
+        let mut blob = Vec::new();
+        store_i32(&mut blob, MessageContentType::Call as i32);
+        store_i64(&mut blob, 99);
+        store_i32(&mut blob, 30);
+        store_i32(&mut blob, CallDiscardReasonType::Missed as i32);
+        let mut parser = Parser::new_with_version(&blob, 19);
+        match parse_message_content(&mut parser, &mut RawIdStorage).unwrap() {
+            MessageContent::Call(c) => {
+                assert!(!c.is_video);
+                assert_eq!(c.call_access_hash, 0);
+                assert_eq!(c.discard_reason.r#type, CallDiscardReasonType::Missed);
+            }
+            _ => panic!("wrong type"),
+        }
+
+        // LiveLocation pre-heading (29)/proximity (30): both default to 0.
+        let mut blob = Vec::new();
+        store_i32(&mut blob, MessageContentType::LiveLocation as i32);
+        store_flags(&mut blob, [false, false, false]);
+        store_f64(&mut blob, 0.0);
+        store_f64(&mut blob, 0.0);
+        store_i32(&mut blob, 60);
+        let mut parser = Parser::new_with_version(&blob, 28);
+        match parse_message_content(&mut parser, &mut RawIdStorage).unwrap() {
+            MessageContent::LiveLocation(l) => {
+                assert_eq!(l.period, 60);
+                assert_eq!(l.heading, 0);
+                assert_eq!(l.proximity_alert_radius, 0);
+            }
+            _ => panic!("wrong type"),
+        }
+
+        // ChatSetTtl pre-AddMessageChatSetTtlFlags (44): no from_user_id.
+        let mut blob = Vec::new();
+        store_i32(&mut blob, MessageContentType::ChatSetTtl as i32);
+        store_i32(&mut blob, 60);
+        let mut parser = Parser::new_with_version(&blob, 43);
+        match parse_message_content(&mut parser, &mut RawIdStorage).unwrap() {
+            MessageContent::ChatSetTtl(m) => {
+                assert_eq!(m.ttl, 60);
+                assert!(!m.from_user_id.is_valid());
+            }
+            _ => panic!("wrong type"),
+        }
+
+        // GiveawayLaunch pre-SupportStarGiveaways (54): no flags, no stars.
+        let mut blob = Vec::new();
+        store_i32(&mut blob, MessageContentType::GiveawayLaunch as i32);
+        let mut parser = Parser::new_with_version(&blob, 53);
+        match parse_message_content(&mut parser, &mut RawIdStorage).unwrap() {
+            MessageContent::GiveawayLaunch(m) => assert_eq!(m.star_count, 0),
+            _ => panic!("wrong type"),
+        }
+
+        // RequestedDialog pre-SupportMultipleSharedUsers (52): one dialog,
+        // no flags block.
+        let mut blob = Vec::new();
+        store_i32(&mut blob, MessageContentType::RequestedDialog as i32);
+        store_i64(&mut blob, DialogId::from_user_id(UserId::new(7)).get());
+        store_i32(&mut blob, 3);
+        let mut parser = Parser::new_with_version(&blob, 51);
+        match parse_message_content(&mut parser, &mut RawIdStorage).unwrap() {
+            MessageContent::RequestedDialog(m) => {
+                assert_eq!(m.shared_dialog_ids.len(), 1);
+                assert_eq!(m.button_id, 3);
+            }
+            _ => panic!("wrong type"),
+        }
+
+        // Text pre-AddMessageTextFlags (49): has_web_page_id defaults true,
+        // so the web page id still follows the text.
+        let mut blob = Vec::new();
+        store_i32(&mut blob, MessageContentType::Text as i32);
+        store_string(&mut blob, "text");
+        store_i32(&mut blob, 0);
+        store_i64(&mut blob, 7);
+        let mut parser = Parser::new_with_version(&blob, 48);
+        match parse_message_content(&mut parser, &mut RawIdStorage).unwrap() {
+            MessageContent::Text(m) => {
+                assert_eq!(m.web_page_id, WebPageId::new(7));
+                assert!(m.web_page_url.is_empty());
+            }
+            _ => panic!("wrong type"),
+        }
+    }
+
+    #[test]
+    fn caption_parse_re_derives_entities_pre_add_caption_entities() {
+        // An Audio caption blob written before AddCaptionEntities (13)
+        // stores only the text; find_entities re-derives the URL entity.
+        let mut blob = Vec::new();
+        store_i32(&mut blob, MessageContentType::Audio as i32);
+        store_i32(&mut blob, 77); // the raw-id audio file id
+        store_string(&mut blob, "see a.com here");
+        store_i32(&mut blob, 1); // the legacy is_listened dummy
+        let mut parser = Parser::new_with_version(&blob, 12);
+        match parse_message_content(&mut parser, &mut RawIdStorage).unwrap() {
+            MessageContent::Audio(a) => {
+                assert_eq!(a.caption.text, "see a.com here");
+                assert!(!a.caption.entities.is_empty());
+                assert!(a.file_id.is_valid());
+            }
+            _ => panic!("wrong type"),
+        }
+    }
+
+    #[test]
+    fn invalid_content_degrades_to_unsupported() {
+        // A ChatChangePhoto with an empty photo is is_bad.
+        let mut out = Vec::new();
+        store_message_content(
+            &MessageContent::ChatChangePhoto(MessageChatChangePhoto {
+                photo: Photo::default(),
+            }),
+            &RawIdStorage,
+            &mut out,
+        );
+        let parsed = parse_message_content(&mut Parser::new(&out), &mut RawIdStorage).unwrap();
+        assert!(matches!(parsed, MessageContent::Unsupported(m) if m.version == 0));
+
+        // A non-server story id is is_bad.
+        let mut out = Vec::new();
+        store_message_content(
+            &MessageContent::Story(MessageStory {
+                story_full_id: StoryFullId::new(
+                    DialogId::from_user_id(UserId::new(1)),
+                    StoryId::new(2_000_000_000),
+                ),
+                via_mention: false,
+            }),
+            &RawIdStorage,
+            &mut out,
+        );
+        let parsed = parse_message_content(&mut Parser::new(&out), &mut RawIdStorage).unwrap();
+        assert!(matches!(parsed, MessageContent::Unsupported(_)));
+
+        // A live location with period 0 is is_bad.
+        let mut out = Vec::new();
+        store_message_content(
+            &MessageContent::LiveLocation(MessageLiveLocation {
+                location: Location::default(),
+                period: 0,
+                heading: 0,
+                proximity_alert_radius: 0,
+            }),
+            &RawIdStorage,
+            &mut out,
+        );
+        let parsed = parse_message_content(&mut Parser::new(&out), &mut RawIdStorage).unwrap();
+        assert!(matches!(parsed, MessageContent::Unsupported(_)));
+
+        // A negative boost count is is_bad.
+        let mut out = Vec::new();
+        store_message_content(
+            &MessageContent::BoostApply(MessageBoostApply { boost_count: -1 }),
+            &RawIdStorage,
+            &mut out,
+        );
+        let parsed = parse_message_content(&mut Parser::new(&out), &mut RawIdStorage).unwrap();
+        assert!(matches!(parsed, MessageContent::Unsupported(_)));
+    }
+
+    #[test]
+    fn call_bytes_pin_the_flag_layout() {
+        let call = MessageContent::Call(MessageCall {
+            call_id: 1,
+            call_access_hash: -1,
+            duration: 2,
+            discard_reason: CallDiscardReason {
+                r#type: CallDiscardReasonType::Declined,
+                slug: String::new(),
+            },
+            is_video: true,
+        });
+        let mut out = Vec::new();
+        store_message_content(&call, &RawIdStorage, &mut out);
+        let expected: Vec<u8> = (MessageContentType::Call as i32)
+            .to_le_bytes()
+            .into_iter()
+            .chain(0b11u32.to_le_bytes()) // is_video | has_call_access_hash
+            .chain(1i64.to_le_bytes())
+            .chain(2i32.to_le_bytes())
+            .chain((CallDiscardReasonType::Declined as i32).to_le_bytes())
+            .chain((-1i64).to_le_bytes())
+            .collect();
+        assert_eq!(out, expected);
     }
 }
