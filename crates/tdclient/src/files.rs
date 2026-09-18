@@ -39,9 +39,11 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
 use std::fmt;
+use std::fs::File;
+use std::os::unix::fs::FileExt;
 use std::rc::Rc;
 
-use crate::chat_manager::{ChatId, ChannelId, DcId};
+use crate::chat_manager::{ChannelId, ChatId, DcId};
 use crate::message_id::{DialogId, DialogType, MessageFullId, MessageId};
 use crate::store_parse::{self, Parser};
 use crate::td_api;
@@ -2806,6 +2808,22 @@ impl FileEncryptionKey {
         &self.key_iv[32..]
     }
 
+    /// `FileEncryptionKey::FileEncryptionKey(const secure_storage::Secret &)`
+    /// (FileEncryptionKey.cpp:29-32) — a secure key wrapping the secret.
+    pub fn from_secret(secret: &[u8]) -> FileEncryptionKey {
+        FileEncryptionKey {
+            key_iv: secret.to_vec(),
+            type_: FileEncryptionKeyType::Secure,
+        }
+    }
+
+    /// `FileEncryptionKey::secret` (FileEncryptionKey.h) — the secure-file
+    /// secret payload.
+    pub fn secret(&self) -> &[u8] {
+        assert!(self.is_secure());
+        &self.key_iv
+    }
+
     /// `FileEncryptionKey::calc_fingerprint` (FileEncryptionKey.cpp:85-90).
     pub fn calc_fingerprint(&self) -> i32 {
         assert!(self.is_secret());
@@ -3070,7 +3088,10 @@ pub struct StoryFullId {
 
 impl StoryFullId {
     pub fn new(dialog_id: DialogId, story_id: StoryId) -> StoryFullId {
-        StoryFullId { dialog_id, story_id }
+        StoryFullId {
+            dialog_id,
+            story_id,
+        }
     }
 
     pub fn get_dialog_id(self) -> DialogId {
@@ -3091,7 +3112,10 @@ impl StoryFullId {
     pub fn parse_from(parser: &mut Parser) -> Result<StoryFullId, &'static str> {
         let dialog_id = DialogId::parse_from(parser)?;
         let story_id = StoryId::new(parser.i32_()?);
-        Ok(StoryFullId { dialog_id, story_id })
+        Ok(StoryFullId {
+            dialog_id,
+            story_id,
+        })
     }
 }
 
@@ -3172,7 +3196,10 @@ pub struct QuickReplyMessageFullId {
 }
 
 impl QuickReplyMessageFullId {
-    pub fn new(quick_reply_shortcut_id: QuickReplyShortcutId, message_id: MessageId) -> QuickReplyMessageFullId {
+    pub fn new(
+        quick_reply_shortcut_id: QuickReplyShortcutId,
+        message_id: MessageId,
+    ) -> QuickReplyMessageFullId {
         QuickReplyMessageFullId {
             quick_reply_shortcut_id,
             message_id,
@@ -3320,7 +3347,10 @@ impl MessageTopic {
     }
 
     /// `MessageTopic::monoforum` (MessageTopic.cpp:122-128).
-    pub fn monoforum(dialog_id: DialogId, saved_messages_topic_id: SavedMessagesTopicId) -> MessageTopic {
+    pub fn monoforum(
+        dialog_id: DialogId,
+        saved_messages_topic_id: SavedMessagesTopicId,
+    ) -> MessageTopic {
         MessageTopic {
             type_: MessageTopicType::MONOFORUM,
             dialog_id,
@@ -3330,7 +3360,10 @@ impl MessageTopic {
     }
 
     /// `MessageTopic::saved_messages` (MessageTopic.cpp:130-136).
-    pub fn saved_messages(dialog_id: DialogId, saved_messages_topic_id: SavedMessagesTopicId) -> MessageTopic {
+    pub fn saved_messages(
+        dialog_id: DialogId,
+        saved_messages_topic_id: SavedMessagesTopicId,
+    ) -> MessageTopic {
         MessageTopic {
             type_: MessageTopicType::SAVED_MESSAGES,
             dialog_id,
@@ -3376,8 +3409,13 @@ impl MessageTopic {
 
     /// `MessageTopic::parse` (MessageTopic.hpp:47-81).
     pub fn parse_from(parser: &mut Parser) -> Result<MessageTopic, &'static str> {
-        let [has_type, has_dialog_id, has_top_thread_message_id, has_forum_topic_id, has_saved_messages_topic_id] =
-            parser.parse_flags::<5>()?;
+        let [
+            has_type,
+            has_dialog_id,
+            has_top_thread_message_id,
+            has_forum_topic_id,
+            has_saved_messages_topic_id,
+        ] = parser.parse_flags::<5>()?;
         let type_ = if has_type {
             MessageTopicType::from_raw(parser.i32_()?)
         } else {
@@ -3419,30 +3457,55 @@ impl MessageTopic {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum FileSource {
     Message(MessageFullId),
-    UserPhoto { user_id: UserId, photo_id: i64 },
+    UserPhoto {
+        user_id: UserId,
+        photo_id: i64,
+    },
     ChatPhoto(ChatId),
     ChannelPhoto(ChannelId),
     Wallpapers,
     WebPage(String),
     SavedAnimations,
-    RecentStickers { is_attached: bool },
+    RecentStickers {
+        is_attached: bool,
+    },
     FavoriteStickers,
-    Background { background_id: BackgroundId, access_hash: i64 },
+    Background {
+        background_id: BackgroundId,
+        access_hash: i64,
+    },
     ChatFull(ChatId),
     ChannelFull(ChannelId),
     AppConfig,
     SavedRingtones,
     UserFull(UserId),
     AttachMenuBot(UserId),
-    WebApp { user_id: UserId, short_name: String },
+    WebApp {
+        user_id: UserId,
+        short_name: String,
+    },
     Story(StoryFullId),
     QuickReplyMessage(QuickReplyMessageFullId),
-    StarTransaction { dialog_id: DialogId, transaction_id: String, is_refund: bool },
+    StarTransaction {
+        dialog_id: DialogId,
+        transaction_id: String,
+        is_refund: bool,
+    },
     BotMediaPreview(UserId),
-    BotMediaPreviewInfo { bot_user_id: UserId, language_code: String },
+    BotMediaPreviewInfo {
+        bot_user_id: UserId,
+        language_code: String,
+    },
     StoryAlbum(StoryAlbumFullId),
-    UserSavedMusic { user_id: UserId, document_id: i64, access_hash: i64 },
-    DraftMessage { dialog_id: DialogId, topic: MessageTopic },
+    UserSavedMusic {
+        user_id: UserId,
+        document_id: i64,
+        access_hash: i64,
+    },
+    DraftMessage {
+        dialog_id: DialogId,
+        topic: MessageTopic,
+    },
     RichMessage(MessageFullId),
     WelcomeMessages(DialogId),
     CommunityFull(CommunityId),
@@ -3495,10 +3558,15 @@ impl FileSource {
             }
             FileSource::ChatPhoto(chat_id) => store_parse::store_i64(out, chat_id.get()),
             FileSource::ChannelPhoto(channel_id) => store_parse::store_i64(out, channel_id.get()),
-            FileSource::Wallpapers | FileSource::SavedAnimations | FileSource::FavoriteStickers
-            | FileSource::AppConfig | FileSource::SavedRingtones => {}
+            FileSource::Wallpapers
+            | FileSource::SavedAnimations
+            | FileSource::FavoriteStickers
+            | FileSource::AppConfig
+            | FileSource::SavedRingtones => {}
             FileSource::WebPage(url) => store_parse::store_string(out, url),
-            FileSource::RecentStickers { is_attached } => store_parse::store_i32(out, i32::from(*is_attached)),
+            FileSource::RecentStickers { is_attached } => {
+                store_parse::store_i32(out, i32::from(*is_attached))
+            }
             FileSource::Background {
                 background_id,
                 access_hash,
@@ -3508,10 +3576,15 @@ impl FileSource {
             }
             FileSource::ChatFull(chat_id) => store_parse::store_i64(out, chat_id.get()),
             FileSource::ChannelFull(channel_id) => store_parse::store_i64(out, channel_id.get()),
-            FileSource::UserFull(user_id) | FileSource::AttachMenuBot(user_id) | FileSource::BotMediaPreview(user_id) => {
+            FileSource::UserFull(user_id)
+            | FileSource::AttachMenuBot(user_id)
+            | FileSource::BotMediaPreview(user_id) => {
                 store_parse::store_i64(out, user_id.get());
             }
-            FileSource::WebApp { user_id, short_name } => {
+            FileSource::WebApp {
+                user_id,
+                short_name,
+            } => {
                 store_parse::store_i64(out, user_id.get());
                 store_parse::store_string(out, short_name);
             }
@@ -3549,7 +3622,9 @@ impl FileSource {
             }
             FileSource::RichMessage(message_full_id) => message_full_id.store(out),
             FileSource::WelcomeMessages(dialog_id) => dialog_id.store(out),
-            FileSource::CommunityFull(community_id) => store_parse::store_i64(out, community_id.get()),
+            FileSource::CommunityFull(community_id) => {
+                store_parse::store_i64(out, community_id.get())
+            }
         }
     }
 
@@ -3587,7 +3662,9 @@ impl FileSource {
                 short_name: parser.string()?,
             }),
             17 => Ok(FileSource::Story(StoryFullId::parse_from(parser)?)),
-            18 => Ok(FileSource::QuickReplyMessage(QuickReplyMessageFullId::parse_from(parser)?)),
+            18 => Ok(FileSource::QuickReplyMessage(
+                QuickReplyMessageFullId::parse_from(parser)?,
+            )),
             19 => Ok(FileSource::StarTransaction {
                 dialog_id: DialogId::parse_from(parser)?,
                 transaction_id: parser.string()?,
@@ -3598,7 +3675,9 @@ impl FileSource {
                 bot_user_id: UserId::new(parser.i64_()?),
                 language_code: parser.string()?,
             }),
-            22 => Ok(FileSource::StoryAlbum(StoryAlbumFullId::parse_from(parser)?)),
+            22 => Ok(FileSource::StoryAlbum(StoryAlbumFullId::parse_from(
+                parser,
+            )?)),
             23 => Ok(FileSource::UserSavedMusic {
                 user_id: UserId::new(parser.i64_()?),
                 document_id: parser.i64_()?,
@@ -3994,7 +4073,10 @@ pub struct NewRemoteFileLocation {
 impl NewRemoteFileLocation {
     /// `NewRemoteFileLocation(RemoteFileLocation, FileLocationSource)`
     /// (FileManager.cpp:117-134).
-    pub fn from_remote(remote: RemoteFileLocation, source: FileLocationSource) -> NewRemoteFileLocation {
+    pub fn from_remote(
+        remote: RemoteFileLocation,
+        source: FileLocationSource,
+    ) -> NewRemoteFileLocation {
         match remote {
             RemoteFileLocation::Empty => NewRemoteFileLocation::default(),
             RemoteFileLocation::Partial(partial) => NewRemoteFileLocation {
@@ -4145,7 +4227,6 @@ fn merge_choose_generate_location(
     }
     2
 }
-
 
 /// `merge_choose_size` (FileManager.cpp:2107-2119) — `-1` is the conflict
 /// error.
@@ -4355,7 +4436,11 @@ impl FileNode {
         let new_local_ready_prefix_size = if self.download_offset == prefix_offset {
             ready_prefix_size
         } else {
-            Bitmask::from_decode(ready_bitmask).get_ready_prefix_size(self.download_offset, *part_size, self.size)
+            Bitmask::from_decode(ready_bitmask).get_ready_prefix_size(
+                self.download_offset,
+                *part_size,
+                self.size,
+            )
         };
         if new_local_ready_prefix_size != self.local_ready_prefix_size {
             self.local_ready_prefix_size = new_local_ready_prefix_size;
@@ -4366,7 +4451,9 @@ impl FileNode {
     /// `FileNode::init_ready_size` (FileManager.cpp:598-606).
     fn init_ready_size(&mut self) {
         let (ready_bitmask, part_size) = match &self.local {
-            LocalFileLocation::Partial(partial) => (partial.ready_bitmask.clone(), partial.part_size),
+            LocalFileLocation::Partial(partial) => {
+                (partial.ready_bitmask.clone(), partial.part_size)
+            }
             _ => return,
         };
         let bitmask = Bitmask::from_decode(&ready_bitmask);
@@ -4378,7 +4465,9 @@ impl FileNode {
 
     /// `FileNode::set_download_offset` (FileManager.cpp:608-622).
     pub fn set_download_offset(&mut self, download_offset: i64) {
-        if !(0..=MAX_FILE_SIZE).contains(&download_offset) || download_offset == self.download_offset {
+        if !(0..=MAX_FILE_SIZE).contains(&download_offset)
+            || download_offset == self.download_offset
+        {
             return;
         }
         self.download_offset = download_offset;
@@ -4429,7 +4518,12 @@ impl FileNode {
     }
 
     /// `FileNode::set_local_location` (FileManager.cpp:666-675).
-    pub fn set_local_location(&mut self, local: LocalFileLocation, prefix_offset: i64, ready_prefix_size: i64) {
+    pub fn set_local_location(
+        &mut self,
+        local: LocalFileLocation,
+        prefix_offset: i64,
+        ready_prefix_size: i64,
+    ) {
         if self.local != local {
             self.local = local;
             self.recalc_ready_prefix_size(prefix_offset, ready_prefix_size);
@@ -4654,7 +4748,9 @@ impl FileNode {
             return true;
         }
         if matches!(self.local, LocalFileLocation::Full(_))
-            && (has_generate_location || self.remote.full.is_some() || self.remote.partial.is_some())
+            && (has_generate_location
+                || self.remote.full.is_some()
+                || self.remote.partial.is_some())
         {
             return true;
         }
@@ -4721,8 +4817,11 @@ impl FileNode {
                     // file is not decrypted and verified yet
                     return 0;
                 }
-                Bitmask::from_decode(&partial.ready_bitmask)
-                    .get_ready_prefix_size(offset, partial.part_size, self.size)
+                Bitmask::from_decode(&partial.ready_bitmask).get_ready_prefix_size(
+                    offset,
+                    partial.part_size,
+                    self.size,
+                )
             }
         }
     }
@@ -4759,7 +4858,9 @@ impl FileNode {
 
     /// `FileNode::is_uploading` (FileManager.cpp:1106-1108).
     pub fn is_uploading(&self) -> bool {
-        self.upload_priority != 0 || self.generate_upload_priority != 0 || self.upload_pause.is_valid()
+        self.upload_priority != 0
+            || self.generate_upload_priority != 0
+            || self.upload_pause.is_valid()
     }
 
     /// `FileNode::remote_size` (FileManager.cpp:1114-1122).
@@ -4943,7 +5044,8 @@ impl<'a> FileView<'a> {
         let Some(full_remote_location) = self.get_full_remote_location() else {
             return false;
         };
-        if full_remote_location.file_type == FileType::Encrypted && self.node.encryption_key.empty() {
+        if full_remote_location.file_type == FileType::Encrypted && self.node.encryption_key.empty()
+        {
             return false;
         }
         if full_remote_location.is_web() {
@@ -4990,7 +5092,9 @@ impl<'a> FileView<'a> {
 
     pub fn is_encrypted(&self) -> bool {
         let type_ = self.get_type();
-        type_ == FileType::Encrypted || type_ == FileType::SecureEncrypted || type_ == FileType::SecureDecrypted
+        type_ == FileType::Encrypted
+            || type_ == FileType::SecureEncrypted
+            || type_ == FileType::SecureDecrypted
     }
 
     pub fn encryption_key(&self) -> &FileEncryptionKey {
@@ -5008,7 +5112,9 @@ impl<'a> FileView<'a> {
         let type_ = full_remote_location.get_source().get_type();
         !matches!(
             type_,
-            PhotoSizeSourceType::Legacy | PhotoSizeSourceType::FullLegacy | PhotoSizeSourceType::Thumbnail
+            PhotoSizeSourceType::Legacy
+                | PhotoSizeSourceType::FullLegacy
+                | PhotoSizeSourceType::Thumbnail
         )
     }
 }
@@ -5096,7 +5202,12 @@ impl FileManager {
     /// `create_file_node` — appends a node and re-keys its file ids to it.
     /// The C++ id allocation (`create_file_id`) stays with the callers for
     /// now; both the main id and the node are handed in.
-    pub fn register_file_node(&mut self, main_file_id: FileId, main_file_id_priority: i8, mut node: FileNode) -> usize {
+    pub fn register_file_node(
+        &mut self,
+        main_file_id: FileId,
+        main_file_id_priority: i8,
+        mut node: FileNode,
+    ) -> usize {
         node.main_file_id = main_file_id;
         node.main_file_id_priority = main_file_id_priority;
         if !node.file_ids.contains(&main_file_id) {
@@ -5181,22 +5292,28 @@ impl FileManager {
 
         // the C++ only LOG(ERROR)s a dc-id change between two full FromServer
         // locations here
-        let drop_last_successful_force_reupload_time = nodes[0].last_successful_force_reupload_time <= 0.
+        let drop_last_successful_force_reupload_time = nodes[0].last_successful_force_reupload_time
+            <= 0.
             && nodes[0].remote.full.is_some()
             && nodes[0].remote.full_source == FileLocationSource::FromServer;
 
-        let trusted_by_source =
-            merge_choose_file_source_location(nodes[0].remote.full_source, nodes[1].remote.full_source);
+        let trusted_by_source = merge_choose_file_source_location(
+            nodes[0].remote.full_source,
+            nodes[1].remote.full_source,
+        );
 
         let local_i = merge_choose_local_location(&nodes[0].local, &nodes[1].local);
         let remote_i = merge_choose_remote_location(&nodes[0].remote, &nodes[1].remote);
-        let generate_i = merge_choose_generate_location(nodes[0].generate.as_ref(), nodes[1].generate.as_ref());
+        let generate_i =
+            merge_choose_generate_location(nodes[0].generate.as_ref(), nodes[1].generate.as_ref());
         let size_i = merge_choose_size(nodes[0].size, nodes[1].size);
-        let mut expected_size_i = merge_choose_expected_size(nodes[0].expected_size, nodes[1].expected_size);
+        let mut expected_size_i =
+            merge_choose_expected_size(nodes[0].expected_size, nodes[1].expected_size);
         let mut remote_name_i = merge_choose_name(&nodes[0].remote_name, &nodes[1].remote_name);
         let mut url_i = merge_choose_name(&nodes[0].url, &nodes[1].url);
         let owner_i = merge_choose_owner(nodes[0].owner_dialog_id, nodes[1].owner_dialog_id);
-        let mut encryption_key_i = merge_choose_encryption_key(&nodes[0].encryption_key, &nodes[1].encryption_key);
+        let mut encryption_key_i =
+            merge_choose_encryption_key(&nodes[0].encryption_key, &nodes[1].encryption_key);
         let main_file_id_i = merge_choose_main_file_id(
             nodes[0].main_file_id,
             nodes[0].main_file_id_priority,
@@ -5211,7 +5328,12 @@ impl FileManager {
                 400,
                 format!(
                     "Can't merge files {} / {} and {} / {}. Different size: {} and {}",
-                    nodes[0].local, nodes[0].remote, nodes[1].local, nodes[1].remote, nodes[0].size, nodes[1].size
+                    nodes[0].local,
+                    nodes[0].remote,
+                    nodes[1].local,
+                    nodes[1].remote,
+                    nodes[0].size,
+                    nodes[1].size
                 )
                 .as_str(),
             ));
@@ -5227,7 +5349,10 @@ impl FileManager {
             } else {
                 self.try_flush_node_info(x_node_id);
                 self.try_flush_node_info(y_node_id);
-                return Err(Status::error(400, "Can't merge files. Different encryption keys"));
+                return Err(Status::error(
+                    400,
+                    "Can't merge files. Different encryption keys",
+                ));
             }
         }
 
@@ -5260,7 +5385,8 @@ impl FileManager {
         let mut events: Vec<MergeEvent> = Vec::new();
         {
             let [a, b] = &mut nodes;
-            let (node, other): (&mut FileNode, &mut FileNode) = if node_i == 0 { (a, b) } else { (b, a) };
+            let (node, other): (&mut FileNode, &mut FileNode) =
+                if node_i == 0 { (a, b) } else { (b, a) };
 
             if local_i as usize == other_node_i {
                 events.push(MergeEvent::CancelDownload(Box::new(node.clone())));
@@ -5306,7 +5432,10 @@ impl FileManager {
                 let other_generate = std::mem::take(&mut other.generate);
                 node.set_generate_location(other_generate);
                 node.generate_id = other.generate_id;
-                node.set_generate_priority(other.generate_download_priority, other.generate_upload_priority);
+                node.set_generate_priority(
+                    other.generate_download_priority,
+                    other.generate_upload_priority,
+                );
                 other.generate_id = 0;
                 other.generate_priority = 0;
                 other.generate_download_priority = 0;
@@ -5345,16 +5474,25 @@ impl FileManager {
 
             if drop_last_successful_force_reupload_time {
                 node.last_successful_force_reupload_time = -1e10;
-            } else if other.last_successful_force_reupload_time > node.last_successful_force_reupload_time {
-                node.last_successful_force_reupload_time = other.last_successful_force_reupload_time;
+            } else if other.last_successful_force_reupload_time
+                > node.last_successful_force_reupload_time
+            {
+                node.last_successful_force_reupload_time =
+                    other.last_successful_force_reupload_time;
             }
 
             if main_file_id_i as usize == other_node_i {
-                events.push(MergeEvent::OnMergeFiles(other.main_file_id, node.main_file_id));
+                events.push(MergeEvent::OnMergeFiles(
+                    other.main_file_id,
+                    node.main_file_id,
+                ));
                 node.main_file_id = other.main_file_id;
                 node.main_file_id_priority = other.main_file_id_priority;
             } else {
-                events.push(MergeEvent::OnMergeFiles(node.main_file_id, other.main_file_id));
+                events.push(MergeEvent::OnMergeFiles(
+                    node.main_file_id,
+                    other.main_file_id,
+                ));
             }
         }
 
@@ -5419,7 +5557,9 @@ impl FileManager {
                 MergeEvent::CancelDownload(node) => worker.cancel_download(&node),
                 MergeEvent::CancelUpload(node) => worker.cancel_upload(&node),
                 MergeEvent::CancelGenerate(node) => worker.cancel_generate(&node),
-                MergeEvent::OnMergeFiles(from_file_id, to_file_id) => worker.on_merge_files(from_file_id, to_file_id),
+                MergeEvent::OnMergeFiles(from_file_id, to_file_id) => {
+                    worker.on_merge_files(from_file_id, to_file_id)
+                }
                 MergeEvent::FinishQueries {
                     with_downloads,
                     with_uploads,
@@ -5441,7 +5581,9 @@ impl FileManager {
                     new_local,
                     new_generate,
                     other_pmc_id,
-                } => worker.flush_node_full(&node, new_remote, new_local, new_generate, other_pmc_id),
+                } => {
+                    worker.flush_node_full(&node, new_remote, new_local, new_generate, other_pmc_id)
+                }
             }
         }
 
@@ -6026,9 +6168,7 @@ impl PartsManager {
                 self.part_size *= 2;
             }
         }
-        self.part_count = ready_parts
-            .iter()
-            .fold(0, |a, &b| a.max(b.wrapping_add(1)));
+        self.part_count = ready_parts.iter().fold(0, |a, &b| a.max(b.wrapping_add(1)));
 
         self.init_common(ready_parts)
     }
@@ -6043,7 +6183,8 @@ impl PartsManager {
         self.part_status = vec![PartStatus::Empty; self.part_count as usize];
 
         for &i in ready_parts {
-            if self.known_prefix_flag && i >= (self.known_prefix_size / self.part_size as i64) as i32
+            if self.known_prefix_flag
+                && i >= (self.known_prefix_size / self.part_size as i64) as i32
             {
                 assert!(self.is_upload);
                 return TdResult::from_status(Status::error_message("FILE_UPLOAD_RESTART"));
@@ -6055,7 +6196,9 @@ impl PartsManager {
                 0 <= i && i < self.part_count,
                 "[i:{}][real part_count:{}] {}",
                 i,
-                ready_parts.iter().fold(0i32, |a, &b| a.max(b.wrapping_add(1))),
+                ready_parts
+                    .iter()
+                    .fold(0i32, |a, &b| a.max(b.wrapping_add(1))),
                 self
             );
             self.part_status[i as usize] = PartStatus::Ready;
@@ -6178,9 +6321,8 @@ impl PartsManager {
             return true;
         }
 
-        let is_intersect_with = |begin: i64, end: i64| {
-            begin.max(offset_begin) < end.min(offset_end)
-        };
+        let is_intersect_with =
+            |begin: i64, end: i64| begin.max(offset_begin) < end.min(offset_end);
 
         let streaming_begin = self.streaming_offset;
         let streaming_end = self.streaming_offset + self.streaming_limit;
@@ -6228,7 +6370,8 @@ impl PartsManager {
         if part_id == self.part_count {
             if self.unknown_size_flag {
                 self.part_count += 1;
-                let max_part_count = MAX_PART_COUNT_PREMIUM + if self.use_part_count_limit { 0 } else { 64 };
+                let max_part_count =
+                    MAX_PART_COUNT_PREMIUM + if self.use_part_count_limit { 0 } else { 64 };
                 if self.part_count > max_part_count {
                     if !self.is_upload {
                         // Caller will try to increase part size if it is possible
@@ -6310,7 +6453,12 @@ impl PartsManager {
     }
 
     /// `PartsManager::on_part_ok` (PartsManager.cpp:343-397).
-    pub fn on_part_ok(&mut self, part_id: i32, part_size: usize, actual_size: usize) -> TdResult<()> {
+    pub fn on_part_ok(
+        &mut self,
+        part_id: i32,
+        part_size: usize,
+        actual_size: usize,
+    ) -> TdResult<()> {
         assert!(
             (part_id as usize) < self.part_status.len(),
             "{} {} {} {}",
@@ -6424,8 +6572,8 @@ impl PartsManager {
                     round_up(self.streaming_offset + self.streaming_limit).min(self.size);
                 streaming_size = streaming_end - streaming_begin;
             } else if self.streaming_offset < self.size {
-                let prefix =
-                    round_up(self.streaming_offset + self.streaming_limit - self.size).min(self.size);
+                let prefix = round_up(self.streaming_offset + self.streaming_limit - self.size)
+                    .min(self.size);
                 let suffix = self.size - streaming_begin;
                 streaming_size = self.size.min(prefix + suffix);
             }
@@ -6777,7 +6925,9 @@ pub struct ResourceManagerHandle {
 impl ResourceManagerHandle {
     /// `ResourceManager::update_priority` (ResourceManager.cpp:34-43).
     pub fn update_priority(&self, priority: i8) {
-        self.manager.borrow_mut().update_priority(self.node_id, priority);
+        self.manager
+            .borrow_mut()
+            .update_priority(self.node_id, priority);
     }
 
     /// `ResourceManager::update_resources` (ResourceManager.cpp:45-66).
@@ -6925,12 +7075,19 @@ impl ResourceManager {
         if self.stop_flag {
             return;
         }
-        if self.nodes.get((node_id - 1) as usize).and_then(Option::as_ref).is_none() {
+        if self
+            .nodes
+            .get((node_id - 1) as usize)
+            .and_then(Option::as_ref)
+            .is_none()
+        {
             return;
         }
         let before = self.node(node_id).resource_state.clone();
         self.resource_state -= &before;
-        self.node_mut(node_id).resource_state.update_master(resource_state);
+        self.node_mut(node_id)
+            .resource_state
+            .update_master(resource_state);
         let after = self.node(node_id).resource_state.clone();
         self.resource_state += &after;
 
@@ -6948,7 +7105,12 @@ impl ResourceManager {
 
     /// `ResourceManager::hangup_shared` (ResourceManager.cpp:73-88).
     pub fn disconnect_worker(&mut self, node_id: u64) {
-        if self.nodes.get((node_id - 1) as usize).and_then(Option::as_ref).is_none() {
+        if self
+            .nodes
+            .get((node_id - 1) as usize)
+            .and_then(Option::as_ref)
+            .is_none()
+        {
             return;
         }
         if self.node(node_id).in_heap {
@@ -7071,9 +7233,911 @@ impl ResourceManager {
     }
 }
 
+// ==== FileUploader / FileHashUploader (M.12.6) ====
+
+/// `NetQuery::Error::Canceled` (net/NetQuery.h:57) — a canceled upload-part
+/// query restarts its part instead of failing the upload.
+pub const NET_QUERY_CANCELED: i32 = 203;
+
+/// The wire query `FileUploader::start_part` would send
+/// (FileUploader.cpp:278-286); the TL codegen surface lands with the net
+/// integration.
+#[derive(Clone, Debug, PartialEq)]
+pub enum UploadPartQuery {
+    /// `upload_saveFilePart`
+    SaveFilePart {
+        file_id: i64,
+        part_id: i32,
+        bytes: Vec<u8>,
+    },
+    /// `upload_saveBigFilePart`; `part_count` is the C++
+    /// `local_is_ready ? part_count : -1`.
+    SaveBigFilePart {
+        file_id: i64,
+        part_id: i32,
+        part_count: i32,
+        bytes: Vec<u8>,
+    },
+}
+
+/// The net seam of the collapsed [`FileUploader`]: the C++
+/// `start_part` + `dispatch_with_callback` + `on_result` + `process_part`
+/// quartet folded into one call that sends the query and fetches its `Bool`
+/// result. Uploads are sequential here; the in-flight pipelining of the C++
+/// actor loop is a scheduler property and returns with it (M.12.7).
+pub trait FileUploaderNet {
+    /// `Ok(false)` is the C++ `!result.ok()` 500 path. `Err` with
+    /// [`NET_QUERY_CANCELED`] restarts the part; any other `Err` fails the
+    /// upload.
+    fn upload_part(&mut self, query: UploadPartQuery) -> Result<bool, Status>;
+
+    /// `open_temp_file` + `secure_storage::encrypt_file`
+    /// (FileUploader.cpp:156-165) — the Wave-3 secure-storage seam; the
+    /// default always fails, so secure-file uploads error out like any
+    /// other storage failure.
+    fn encrypt_file_for_secure_upload(
+        &mut self,
+        _secret: &[u8],
+        _path: &str,
+    ) -> Result<(String, Vec<u8>), Status> {
+        Err(Status::error_message(
+            "Secure file encryption is not available yet",
+        ))
+    }
+}
+
+/// `FileUploader::Callback` (FileUploader.h:32-42).
+pub trait FileUploaderCallback {
+    /// The hash of a just-encrypted secure file.
+    fn on_hash(&mut self, hash: Vec<u8>);
+    fn on_partial_upload(&mut self, partial_remote: PartialRemoteFileLocation);
+    fn on_ok(&mut self, file_type: FileType, partial_remote: PartialRemoteFileLocation);
+    fn on_error(&mut self, status: Status);
+}
+
+/// `td::FileUploader` (FileUploader.h) collapsed per the single-scheduler
+/// convention: the actor loop becomes a synchronous `loop_` over the net
+/// seam, the `part_map_` of in-flight queries disappears with the pipeline,
+/// and the ResourceManager link is the [`ResourceManagerWorker`] trait.
+pub struct FileUploader {
+    local: LocalFileLocation,
+    remote: RemoteFileLocation,
+    expected_size: i64,
+    encryption_key: FileEncryptionKey,
+    bad_parts: Vec<i32>,
+    callback: Box<dyn FileUploaderCallback>,
+    net: Box<dyn FileUploaderNet>,
+
+    local_size: i64,
+    local_is_ready: bool,
+    file_type: FileType,
+
+    iv_map: Vec<[u8; 32]>,
+    iv: [u8; 32],
+    generate_iv: Vec<u8>,
+    generate_offset: i64,
+    next_offset: i64,
+
+    fd: Option<File>,
+    fd_path: String,
+    file_id: i64,
+    is_temp: bool,
+    big_flag: bool,
+    keep_fd: bool,
+    stop_flag: bool,
+
+    resource_manager: Option<ResourceManagerHandle>,
+    resource_state: ResourceState,
+    parts_manager: PartsManager,
+}
+
+/// `FileUploader::PrefixInfo` (FileUploader.h:93-96).
+#[derive(Clone, Copy, Debug)]
+struct PrefixInfo {
+    size: i64,
+    is_ready: bool,
+}
+
+impl FileUploader {
+    /// The `FileUploader` constructor (FileUploader.cpp:28-45).
+    pub fn new(
+        local: LocalFileLocation,
+        remote: RemoteFileLocation,
+        expected_size: i64,
+        encryption_key: FileEncryptionKey,
+        bad_parts: Vec<i32>,
+        callback: Box<dyn FileUploaderCallback>,
+        net: Box<dyn FileUploaderNet>,
+    ) -> FileUploader {
+        let mut iv = [0u8; 32];
+        let mut generate_iv = Vec::new();
+        if encryption_key.is_secret() {
+            iv.copy_from_slice(encryption_key.iv_slice());
+            generate_iv = encryption_key.iv_slice().to_vec();
+        }
+        let mut remote = remote;
+        if let RemoteFileLocation::Partial(partial) = &remote
+            && encryption_key.is_secure()
+            && partial.part_count != partial.ready_part_count
+        {
+            remote = RemoteFileLocation::Empty;
+        }
+        FileUploader {
+            local,
+            remote,
+            expected_size,
+            encryption_key,
+            bad_parts,
+            callback,
+            net,
+            local_size: 0,
+            local_is_ready: false,
+            file_type: FileType::Temp,
+            iv_map: Vec::new(),
+            iv,
+            generate_iv,
+            generate_offset: 0,
+            next_offset: 0,
+            fd: None,
+            fd_path: String::new(),
+            file_id: 0,
+            is_temp: false,
+            big_flag: false,
+            keep_fd: false,
+            stop_flag: false,
+            resource_manager: None,
+            resource_state: ResourceState::default(),
+            parts_manager: PartsManager::default(),
+        }
+    }
+
+    /// `FileUploader::start_up` (FileUploader.cpp:47-117).
+    pub fn start(&mut self) {
+        if matches!(self.remote, RemoteFileLocation::Full(_)) {
+            return self.on_error(Status::error_message("File is already uploaded"));
+        }
+
+        // file_size is needed only for partial local locations, but for
+        // uploaded partial files size is yet unknown or local location is
+        // full, so we can always pass 0 here
+        let local = self.local.clone();
+        let prefix_info = match self.on_update_local_location(&local, 0) {
+            Ok(info) => info,
+            Err(status) => return self.on_error(status),
+        };
+        let _ = prefix_info;
+
+        let mut offset = 0i32;
+        let mut part_size = 0i32;
+        if let RemoteFileLocation::Partial(partial) = &self.remote {
+            self.file_id = partial.file_id;
+            part_size = partial.part_size;
+            self.big_flag = partial.is_big != 0;
+            offset = partial.ready_part_count;
+        } else {
+            self.file_id = tdutils::random::secure_int64();
+            self.big_flag = is_file_big(self.file_type, self.expected_size);
+        }
+
+        let mut ok = vec![true; offset.max(0) as usize];
+        for &bad_id in &self.bad_parts {
+            if bad_id >= 0 && bad_id < offset {
+                ok[bad_id as usize] = false;
+            }
+        }
+        let mut ready_parts: Vec<i32> = (0..offset).filter(|&i| ok[i as usize]).collect();
+        if !ok.is_empty() && !ok[0] {
+            ready_parts.clear();
+            part_size = 0;
+            self.remote = RemoteFileLocation::Empty;
+            self.file_id = tdutils::random::secure_int64();
+            self.big_flag = is_file_big(self.file_type, self.expected_size);
+        }
+
+        let expected_size = self.local_size.max(self.expected_size);
+        let init_result = self.parts_manager.init(
+            self.local_size,
+            expected_size,
+            self.local_is_ready,
+            part_size.max(0) as usize,
+            &ready_parts,
+            true,
+            true,
+        );
+        if let tdutils::status::Result::Err(status) = init_result {
+            return self.on_error(status);
+        }
+        self.resource_state
+            .set_unit_size(self.parts_manager.get_part_size());
+        self.update_estimated_limit();
+        self.on_progress();
+        self.loop_();
+    }
+
+    /// `FileUploader::on_update_local_location` (FileUploader.cpp:119-215)
+    /// with the `try_release_fd` scope exit.
+    fn on_update_local_location(
+        &mut self,
+        location: &LocalFileLocation,
+        file_size: i64,
+    ) -> Result<PrefixInfo, Status> {
+        let result = self.on_update_local_location_impl(location, file_size);
+        self.try_release_fd();
+        result
+    }
+
+    fn on_update_local_location_impl(
+        &mut self,
+        location: &LocalFileLocation,
+        file_size: i64,
+    ) -> Result<PrefixInfo, Status> {
+        if self.encryption_key.is_secure() && !self.fd_path.is_empty() {
+            return Err(Status::error_message(
+                "Can't change local location for Secure file",
+            ));
+        }
+
+        let mut path = String::new();
+        let mut local_size = -1i64;
+        let mut local_is_ready = false;
+        match location {
+            LocalFileLocation::Empty => {
+                local_size = 0;
+                self.file_type = FileType::Temp;
+            }
+            LocalFileLocation::Partial(partial) => {
+                if self.encryption_key.is_secure() {
+                    local_size = 0;
+                    self.file_type = FileType::Temp;
+                } else {
+                    path = partial.path.clone();
+                    local_size = Bitmask::from_decode(&partial.ready_bitmask)
+                        .get_ready_prefix_size(0, partial.part_size, file_size);
+                    self.file_type = partial.file_type;
+                }
+            }
+            LocalFileLocation::Full(full) => {
+                path = full.path.clone();
+                if path.is_empty() {
+                    return Err(Status::error_message(
+                        "FullLocalFileLocation with empty path",
+                    ));
+                }
+                local_is_ready = true;
+                self.file_type = full.file_type;
+            }
+        }
+
+        let mut is_temp = false;
+        if self.encryption_key.is_secure()
+            && local_is_ready
+            && matches!(self.remote, RemoteFileLocation::Empty)
+        {
+            let (new_path, hash) = self
+                .net
+                .encrypt_file_for_secure_upload(self.encryption_key.secret(), &path)?;
+            self.callback.as_mut().on_hash(hash);
+            path = new_path;
+            is_temp = true;
+        }
+
+        if !path.is_empty() && (path != self.fd_path || self.fd.is_none()) {
+            let res_fd = File::open(&path)
+                .map_err(|e| Status::error_message(format!("Failed to open: {e}").as_str()));
+
+            // race: partial location could be already deleted; just ignore
+            // such locations
+            let res_fd = match res_fd {
+                Ok(fd) => Ok(fd),
+                Err(err) => {
+                    if matches!(location, LocalFileLocation::Partial(_)) {
+                        return Ok(PrefixInfo {
+                            size: self.local_size,
+                            is_ready: self.local_is_ready,
+                        });
+                    }
+                    Err(err)
+                }
+            }?;
+
+            self.fd = Some(res_fd);
+            self.fd_path = path;
+            self.is_temp = is_temp;
+        }
+        if local_is_ready {
+            assert!(self.fd.is_some());
+            local_size = self.fd.as_ref().expect("fd").metadata().unwrap().len() as i64;
+            if local_size == 0 {
+                return Err(Status::error_message("Can't upload empty file"));
+            }
+        } else if let Some(fd) = &self.fd {
+            let real_local_size = fd.metadata().unwrap().len() as i64;
+            if real_local_size < local_size {
+                return Ok(PrefixInfo {
+                    size: self.local_size,
+                    is_ready: self.local_is_ready,
+                });
+            }
+        }
+
+        self.local_size = local_size;
+        if self.expected_size < self.local_size
+            && (self.expected_size != (10 << 20) || self.local_size >= (30 << 20))
+        {
+            self.expected_size = self.local_size;
+        }
+        self.local_is_ready = local_is_ready;
+
+        Ok(PrefixInfo {
+            size: self.local_size,
+            is_ready: self.local_is_ready,
+        })
+    }
+
+    /// `FileUploader::on_error` (FileUploader.cpp:217-225).
+    fn on_error(&mut self, status: Status) {
+        self.fd = None;
+        if self.is_temp {
+            let _ = std::fs::remove_file(&self.fd_path);
+        }
+        self.stop_flag = true;
+        self.callback.as_mut().on_error(status);
+    }
+
+    /// `FileUploader::generate_iv_map` (FileUploader.cpp:227-248).
+    fn generate_iv_map(&mut self) -> Result<(), Status> {
+        let part_size = self.parts_manager.get_part_size();
+        let key = *self.encryption_key.key();
+        let mut iv: [u8; 32] = self
+            .generate_iv
+            .as_slice()
+            .try_into()
+            .map_err(|_| Status::error_message("Bad iv length"))?;
+        if self.iv_map.is_empty() {
+            self.iv_map.push(iv);
+        }
+        let mut bytes = vec![0u8; part_size];
+        while (self.generate_offset + part_size as i64) < self.local_size {
+            let read_size = pread_at(
+                self.fd
+                    .as_ref()
+                    .ok_or_else(|| Status::error_message("No fd"))?,
+                &mut bytes,
+                self.generate_offset as u64,
+            )?;
+            if read_size != part_size {
+                return Err(Status::error_message(
+                    "Failed to read file part (for iv_map)",
+                ));
+            }
+            tdutils::crypto::aes_ige_encrypt_in_place(&key, &mut iv, &mut bytes);
+            self.iv_map.push(iv);
+            self.generate_offset += part_size as i64;
+        }
+        self.generate_iv = iv.to_vec();
+        Ok(())
+    }
+
+    /// `FileUploader::start_part` (FileUploader.cpp:250-289) up to the query
+    /// construction.
+    fn start_part(&mut self, part: Part) -> Result<UploadPartQuery, Status> {
+        let mut padded_size = part.size;
+        if self.encryption_key.is_secret() {
+            padded_size = (padded_size + 15) & !15;
+        }
+        let mut bytes = vec![0u8; padded_size];
+        let size = pread_at(
+            self.fd
+                .as_ref()
+                .ok_or_else(|| Status::error_message("No fd"))?,
+            &mut bytes[..part.size],
+            part.offset as u64,
+        )?;
+        if self.encryption_key.is_secret() {
+            tdutils::random::secure_bytes(&mut bytes[part.size..]);
+            if self.next_offset == part.offset {
+                let key = *self.encryption_key.key();
+                let mut iv = self.iv;
+                tdutils::crypto::aes_ige_encrypt_in_place(&key, &mut iv, &mut bytes);
+                self.iv = iv;
+                self.next_offset += bytes.len() as i64;
+            } else {
+                if part.id < 0 || part.id as usize >= self.iv_map.len() {
+                    self.generate_iv_map()?;
+                }
+                assert!((part.id as usize) < self.iv_map.len());
+                let mut iv = self.iv_map[part.id as usize];
+                tdutils::crypto::aes_ige_encrypt_in_place(
+                    self.encryption_key.key(),
+                    &mut iv,
+                    &mut bytes,
+                );
+            }
+        }
+
+        if size != part.size {
+            return Err(Status::error_message("Failed to read file part"));
+        }
+
+        if self.big_flag {
+            Ok(UploadPartQuery::SaveBigFilePart {
+                file_id: self.file_id,
+                part_id: part.id,
+                part_count: if self.local_is_ready {
+                    self.parts_manager.get_part_count()
+                } else {
+                    -1
+                },
+                bytes,
+            })
+        } else {
+            Ok(UploadPartQuery::SaveFilePart {
+                file_id: self.file_id,
+                part_id: part.id,
+                bytes,
+            })
+        }
+    }
+
+    /// `FileUploader::on_progress` (FileUploader.cpp:309-319).
+    fn on_progress(&mut self) {
+        let part_count = self.parts_manager.get_part_count();
+        let part_size = self.parts_manager.get_part_size() as i32;
+        let ready_part_count = self.parts_manager.get_ready_prefix_count();
+        self.callback
+            .as_mut()
+            .on_partial_upload(PartialRemoteFileLocation {
+                file_id: self.file_id,
+                part_count,
+                part_size,
+                ready_part_count,
+                is_big: i32::from(self.big_flag),
+                ready_size: self.parts_manager.get_ready_size(),
+            });
+        if self.parts_manager.ready() {
+            self.callback.as_mut().on_ok(
+                self.file_type,
+                PartialRemoteFileLocation {
+                    file_id: self.file_id,
+                    part_count,
+                    part_size,
+                    ready_part_count,
+                    is_big: i32::from(self.big_flag),
+                    ready_size: self.local_size,
+                },
+            );
+        }
+    }
+
+    /// `FileUploader::try_release_fd` (FileUploader.cpp:321-325).
+    fn try_release_fd(&mut self) {
+        if !self.keep_fd && self.fd.is_some() {
+            self.fd = None;
+        }
+    }
+
+    /// `FileUploader::acquire_fd` (FileUploader.cpp:327-332).
+    fn acquire_fd(&mut self) -> Result<(), Status> {
+        if self.fd.is_none() {
+            self.fd = Some(File::open(&self.fd_path).map_err(|e| {
+                Status::error_message(format!("Failed to open {}: {e}", self.fd_path).as_str())
+            })?);
+        }
+        Ok(())
+    }
+
+    /// `FileUploader::update_local_file_location` (FileUploader.cpp:349-360).
+    pub fn update_local_file_location(&mut self, local: &LocalFileLocation) {
+        let prefix_info =
+            match self.on_update_local_location(local, self.parts_manager.get_size_or_zero()) {
+                Ok(info) => info,
+                Err(status) => return self.on_error(status),
+            };
+        if let tdutils::status::Result::Err(status) = self
+            .parts_manager
+            .set_known_prefix(prefix_info.size, prefix_info.is_ready)
+        {
+            return self.on_error(status);
+        }
+        self.loop_();
+    }
+
+    /// `FileUploader::loop` (FileUploader.cpp:362-373); a `-1` status means
+    /// "wait for the location to appear".
+    fn loop_(&mut self) {
+        if self.stop_flag {
+            return;
+        }
+        if let Err(status) = self.do_loop() {
+            if status.code() == -1 {
+                return;
+            }
+            self.on_error(status);
+        }
+    }
+
+    /// `FileUploader::do_loop` (FileUploader.cpp:375-417) — the in-flight
+    /// pipeline collapsed into the sequential send-and-wait; the C++
+    /// `on_result` tail re-enters `loop()`, which the may-finish check after
+    /// each part does here.
+    fn do_loop(&mut self) -> Result<(), Status> {
+        if self.parts_manager.may_finish() {
+            return self.finish_upload();
+        }
+
+        if let Err(status) = self.acquire_fd() {
+            if !self.local_is_ready {
+                return Err(Status::error(-1, "Can't open temporary file"));
+            }
+            return Err(status);
+        }
+
+        let result = self.drive_parts();
+        self.try_release_fd();
+        result
+    }
+
+    /// `FileUploader::finish` path — `may_finish` + `finish` + the temp-file
+    /// cleanup of `do_loop`.
+    fn finish_upload(&mut self) -> Result<(), Status> {
+        if let tdutils::status::Result::Err(status) = self.parts_manager.finish() {
+            return Err(status);
+        }
+        self.fd = None;
+        if self.is_temp {
+            let _ = std::fs::remove_file(&self.fd_path);
+        }
+        self.stop_flag = true;
+        Ok(())
+    }
+
+    fn drive_parts(&mut self) -> Result<(), Status> {
+        loop {
+            if self.resource_state.unused() < self.parts_manager.get_part_size() as i64 {
+                break;
+            }
+            let part = match self.parts_manager.start_part() {
+                tdutils::status::Result::Ok(part) => part,
+                tdutils::status::Result::Err(status) => return Err(status),
+            };
+            if part.size == 0 {
+                break;
+            }
+            self.resource_state.start_use(part.size as i64);
+
+            let query = self.start_part(part)?;
+            match self.net.upload_part(query) {
+                Ok(true) => {
+                    self.resource_state.stop_use(part.size as i64);
+                    if let tdutils::status::Result::Err(status) =
+                        self.parts_manager.on_part_ok(part.id, part.size, part.size)
+                    {
+                        return Err(status);
+                    }
+                    self.on_progress();
+                }
+                Ok(false) => {
+                    return Err(Status::error(
+                        500,
+                        "Internal Server Error during file upload",
+                    ));
+                }
+                Err(status) if status.code() == NET_QUERY_CANCELED => {
+                    self.resource_state.stop_use(part.size as i64);
+                    self.parts_manager.on_part_failed(part.id);
+                }
+                Err(status) => return Err(status),
+            }
+            self.update_estimated_limit();
+            if self.parts_manager.may_finish() {
+                return self.finish_upload();
+            }
+        }
+        Ok(())
+    }
+
+    /// `FileUploader::update_estimated_limit` (FileUploader.cpp:425-437).
+    fn update_estimated_limit(&mut self) {
+        if self.stop_flag {
+            return;
+        }
+        let estimated_extra = self.parts_manager.get_estimated_extra();
+        self.resource_state.update_estimated_limit(estimated_extra);
+        if self.resource_manager.is_some() {
+            self.keep_fd =
+                self.resource_state.active_limit() as usize >= self.parts_manager.get_part_size();
+            self.try_release_fd();
+            if let Some(handle) = self.resource_manager.clone() {
+                handle.update_resources(&self.resource_state);
+            }
+        }
+    }
+
+    /// `FileUploader::update_priority` (FileUploader.cpp:339-341).
+    pub fn update_priority(&mut self, priority: i8) {
+        if let Some(handle) = &self.resource_manager {
+            handle.update_priority(priority);
+        }
+    }
+
+    pub fn remote(&self) -> &RemoteFileLocation {
+        &self.remote
+    }
+
+    pub fn file_id(&self) -> i64 {
+        self.file_id
+    }
+
+    pub fn stop_flag(&self) -> bool {
+        self.stop_flag
+    }
+}
+
+impl ResourceManagerWorker for FileUploader {
+    /// `FileUploader::set_resource_manager` (FileUploader.cpp:334-337).
+    fn set_resource_manager(&mut self, handle: ResourceManagerHandle) {
+        handle.update_resources(&self.resource_state);
+        self.resource_manager = Some(handle);
+    }
+
+    /// `FileUploader::update_resources` (FileUploader.cpp:343-347).
+    fn update_resources(&mut self, resource_state: ResourceState) {
+        self.resource_state.update_slave(&resource_state);
+        self.loop_();
+    }
+}
+
+/// `pread` (FileFd) — a positional read filling the buffer; a zero read is
+/// the end of file.
+fn pread_at(fd: &File, buf: &mut [u8], offset: u64) -> Result<usize, Status> {
+    let mut total = 0usize;
+    while total < buf.len() {
+        let n = fd
+            .read_at(&mut buf[total..], offset + total as u64)
+            .map_err(|e| Status::error_message(format!("Failed to read: {e}").as_str()))?;
+        if n == 0 {
+            break;
+        }
+        total += n;
+    }
+    Ok(total)
+}
+
+/// The `messages_getDocumentByHash` result variants the hash uploader
+/// distinguishes (FileHashUploader.cpp:125-146).
+#[derive(Clone, Debug, PartialEq)]
+pub enum DocumentByHash {
+    /// `documentEmpty`
+    Empty,
+    /// `document`
+    Document {
+        id: i64,
+        access_hash: i64,
+        dc_id: i32,
+        file_reference: Vec<u8>,
+    },
+}
+
+/// The net seam of the collapsed [`FileHashUploader`]: the C++
+/// `dispatch_with_callback` + `on_result` + `fetch_result` folded into one
+/// call.
+pub trait FileHashUploaderNet {
+    /// Sends `messages_getDocumentByHash` and fetches the result.
+    fn get_document_by_hash(
+        &mut self,
+        sha256: [u8; 32],
+        size: i64,
+        mime_type: String,
+    ) -> Result<DocumentByHash, Status>;
+}
+
+/// `FileHashUploader::Callback` (FileHashUploader.h:25-34).
+pub trait FileHashUploaderCallback {
+    fn on_ok(&mut self, location: FullRemoteFileLocation);
+    fn on_error(&mut self, status: Status);
+}
+
+/// `td::FileHashUploader` (FileHashUploader.h) — hashes a local file and
+/// asks the server whether it already knows the document.
+pub struct FileHashUploader {
+    resource_state: ResourceState,
+    fd: Option<File>,
+    fd_read_pos: u64,
+
+    local: FullLocalFileLocation,
+    size: i64,
+    size_left: i64,
+    callback: Box<dyn FileHashUploaderCallback>,
+    net: Box<dyn FileHashUploaderNet>,
+    resource_manager: Option<ResourceManagerHandle>,
+
+    state: HashUploaderState,
+    stop_flag: bool,
+    sha256_state: tdutils::crypto::Sha256State,
+}
+
+/// `FileHashUploader::State` (FileHashUploader.h:51).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HashUploaderState {
+    CalcSha,
+    NetRequest,
+    WaitNetResult,
+}
+
+/// `MimeType::from_extension` — the tdutils MIME table is not ported; every
+/// extension falls back to the C++ default.
+fn mime_type_from_extension(_path: &str, default: &str) -> String {
+    default.to_owned()
+}
+
+impl FileHashUploader {
+    /// The `FileHashUploader` constructor (FileHashUploader.h:36-38).
+    pub fn new(
+        local: FullLocalFileLocation,
+        size: i64,
+        callback: Box<dyn FileHashUploaderCallback>,
+        net: Box<dyn FileHashUploaderNet>,
+    ) -> FileHashUploader {
+        FileHashUploader {
+            resource_state: ResourceState::default(),
+            fd: None,
+            fd_read_pos: 0,
+            size_left: size,
+            local,
+            size,
+            callback,
+            net,
+            resource_manager: None,
+            state: HashUploaderState::CalcSha,
+            stop_flag: false,
+            sha256_state: tdutils::crypto::Sha256State::new(),
+        }
+    }
+
+    /// `FileHashUploader::start_up` + `init` (FileHashUploader.cpp:28-49).
+    pub fn start(&mut self) {
+        if let Err(status) = self.init() {
+            self.callback.as_mut().on_error(status);
+            self.stop_flag = true;
+        }
+    }
+
+    fn init(&mut self) -> Result<(), Status> {
+        let fd = File::open(&self.local.path)
+            .map_err(|e| Status::error_message(format!("Failed to open: {e}").as_str()))?;
+        let file_size = fd.metadata().unwrap().len() as i64;
+        if file_size != self.size {
+            return Err(Status::error_message("Size mismatch"));
+        }
+        self.fd = Some(fd);
+        self.sha256_state.init();
+
+        self.resource_state.set_unit_size(1024);
+        self.resource_state.update_estimated_limit(self.size);
+        Ok(())
+    }
+
+    /// `FileHashUploader::loop` (FileHashUploader.cpp:51-62).
+    pub fn loop_(&mut self) {
+        if self.stop_flag {
+            return;
+        }
+        if let Err(status) = self.loop_impl() {
+            self.callback.as_mut().on_error(status);
+            self.stop_flag = true;
+        }
+    }
+
+    /// `FileHashUploader::loop_impl` (FileHashUploader.cpp:64-80) — the
+    /// WaitNetResult wait collapsed into the net call.
+    fn loop_impl(&mut self) -> Result<(), Status> {
+        if self.state == HashUploaderState::CalcSha {
+            self.loop_sha()?;
+        }
+        if self.state == HashUploaderState::NetRequest {
+            let mut hash = [0u8; 32];
+            self.sha256_state.extract(&mut hash, true);
+            let mime_type = mime_type_from_extension(&self.local.path, "image/gif");
+            self.state = HashUploaderState::WaitNetResult;
+            match self.net.get_document_by_hash(hash, self.size, mime_type)? {
+                DocumentByHash::Empty => {
+                    return Err(Status::error_message("Document is not found by hash"));
+                }
+                DocumentByHash::Document {
+                    id,
+                    access_hash,
+                    dc_id,
+                    file_reference,
+                } => {
+                    if !DcId::is_valid_raw(dc_id) {
+                        return Err(Status::error_message("Found document has invalid DcId"));
+                    }
+                    // file references are server-issued ASCII; a lossy
+                    // conversion matches the C++ byte copy for real data
+                    let file_reference = String::from_utf8_lossy(&file_reference).into_owned();
+                    self.callback
+                        .as_mut()
+                        .on_ok(FullRemoteFileLocation::from_document(
+                            FileType::Document,
+                            id,
+                            access_hash,
+                            DcId::internal(dc_id),
+                            file_reference,
+                        ));
+                    self.stop_flag = true;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `FileHashUploader::loop_sha` (FileHashUploader.cpp:82-114).
+    fn loop_sha(&mut self) -> Result<(), Status> {
+        let mut limit = self.resource_state.unused();
+        if limit == 0 {
+            return Ok(());
+        }
+        if limit > self.size_left {
+            limit = self.size_left;
+        }
+        self.resource_state.start_use(limit);
+
+        let mut bytes = vec![0u8; limit as usize];
+        let read_size = pread_at(
+            self.fd
+                .as_ref()
+                .ok_or_else(|| Status::error_message("No fd"))?,
+            &mut bytes,
+            self.fd_read_pos,
+        )?;
+        if read_size != limit as usize {
+            return Err(Status::error_message("Unexpected end of file"));
+        }
+        self.sha256_state.feed(&bytes);
+        self.resource_state.stop_use(limit);
+
+        self.fd_read_pos += limit as u64;
+        self.size_left -= limit;
+        assert!(self.size_left >= 0);
+        if self.size_left == 0 {
+            self.state = HashUploaderState::NetRequest;
+        }
+        Ok(())
+    }
+
+    /// `FileHashUploader::update_priority` (FileHashUploader.h:60-62).
+    pub fn update_priority(&mut self, priority: i8) {
+        if let Some(handle) = &self.resource_manager {
+            handle.update_priority(priority);
+        }
+    }
+
+    pub fn stop_flag(&self) -> bool {
+        self.stop_flag
+    }
+}
+
+impl ResourceManagerWorker for FileHashUploader {
+    /// `FileHashUploader::set_resource_manager` (FileHashUploader.h:55-58).
+    fn set_resource_manager(&mut self, handle: ResourceManagerHandle) {
+        handle.update_resources(&self.resource_state);
+        self.resource_manager = Some(handle);
+    }
+
+    /// `FileHashUploader::update_resources` (FileHashUploader.h:64-70).
+    fn update_resources(&mut self, resource_state: ResourceState) {
+        if self.stop_flag {
+            return;
+        }
+        self.resource_state.update_slave(&resource_state);
+        self.loop_();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use tddb::td_db::{Parameters, TdDb};
 
     /// A stand-in `FileReferenceManager` for the serialization tests: the
@@ -7420,7 +8484,9 @@ mod tests {
         // (PhotoSizeSource.cpp:74-78)
         assert_eq!(
             full_legacy.get_unique(),
-            [0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x0d, 0x0c, 0x0b, 0x0a]
+            [
+                0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0x0d, 0x0c, 0x0b, 0x0a
+            ]
         );
         assert!(PhotoSizeSource::unique_equal(
             &full_legacy,
@@ -8284,7 +9350,10 @@ mod tests {
         state.start_use(60);
         state.stop_use(60); // used = 60, using = 0
         assert!(state.update_estimated_limit(50));
-        assert!(!state.update_estimated_limit(50), "same estimate is a no-op");
+        assert!(
+            !state.update_estimated_limit(50),
+            "same estimate is a no-op"
+        );
         // the 110 estimate covers the used 60 plus the 50 need: 10 beyond
         // the 100 limit
         assert_eq!(state.estimated_extra(), 10);
@@ -8382,7 +9451,14 @@ mod tests {
         assert!(!pm.ready());
 
         let part = pm.start_part().unwrap();
-        assert_eq!(part, Part { id: 0, offset: 0, size: 128 });
+        assert_eq!(
+            part,
+            Part {
+                id: 0,
+                offset: 0,
+                size: 128
+            }
+        );
         let part2 = pm.start_part().unwrap();
         assert_eq!(part2.id, 1);
 
@@ -8412,7 +9488,14 @@ mod tests {
         assert_eq!(pm.get_estimated_extra(), 0);
 
         // nothing left to request
-        assert_eq!(pm.start_part().unwrap(), Part { id: -1, offset: 0, size: 0 });
+        assert_eq!(
+            pm.start_part().unwrap(),
+            Part {
+                id: -1,
+                offset: 0,
+                size: 0
+            }
+        );
     }
 
     #[test]
@@ -8521,8 +9604,7 @@ mod tests {
 
         // the upload variant reports the size as untransferable
         let mut pm = PartsManager::default();
-        pm.init(0, 1_000_000, true, 65536, &[], true, true)
-            .unwrap();
+        pm.init(0, 1_000_000, true, 65536, &[], true, true).unwrap();
         for _ in 0..8000 {
             pm.start_part().unwrap();
         }
@@ -8590,8 +9672,16 @@ mod tests {
 
         // a wrapping window over an already-complete file just finishes
         let mut pm = PartsManager::default();
-        pm.init(1000, 1000, true, 128, &[0, 1, 2, 3, 4, 5, 6, 7], false, false)
-            .unwrap();
+        pm.init(
+            1000,
+            1000,
+            true,
+            128,
+            &[0, 1, 2, 3, 4, 5, 6, 7],
+            false,
+            false,
+        )
+        .unwrap();
         pm.set_streaming_offset(900, 200);
         assert!(pm.ready());
         pm.finish().unwrap();
@@ -8661,7 +9751,11 @@ mod tests {
         }
 
         fn last_grant_active_limit(&self) -> i64 {
-            self.grants.borrow().last().expect("no grant recorded").active_limit()
+            self.grants
+                .borrow()
+                .last()
+                .expect("no grant recorded")
+                .active_limit()
         }
 
         /// Report a need of `estimated_limit` bytes in `unit_size`-byte
@@ -8677,7 +9771,12 @@ mod tests {
         /// Consume `x` bytes of the last grant (a part completed) and
         /// report the mutated state back.
         fn complete_part_and_report(&self, x: i64) {
-            let mut state = self.grants.borrow().last().expect("no grant recorded").clone();
+            let mut state = self
+                .grants
+                .borrow()
+                .last()
+                .expect("no grant recorded")
+                .clone();
             state.start_use(x);
             state.stop_use(x);
             self.update(&state);
@@ -8702,8 +9801,10 @@ mod tests {
 
     #[test]
     fn resource_manager_greedy_satisfies_smallest_first() {
-        let manager =
-            Rc::new(RefCell::new(ResourceManager::new(1000, ResourceManagerMode::Greedy)));
+        let manager = Rc::new(RefCell::new(ResourceManager::new(
+            1000,
+            ResourceManagerMode::Greedy,
+        )));
         let (worker_a, driver_a) = FakeWorker::new();
         let (worker_b, driver_b) = FakeWorker::new();
         ResourceManager::register_worker(&manager, Box::new(worker_a), 0);
@@ -8736,8 +9837,10 @@ mod tests {
 
     #[test]
     fn resource_manager_baseline_serves_priority_order() {
-        let manager =
-            Rc::new(RefCell::new(ResourceManager::new(350, ResourceManagerMode::Baseline)));
+        let manager = Rc::new(RefCell::new(ResourceManager::new(
+            350,
+            ResourceManagerMode::Baseline,
+        )));
         let (worker0, driver0) = FakeWorker::new();
         let (worker1, driver1) = FakeWorker::new();
         let (worker2, driver2) = FakeWorker::new();
@@ -8799,7 +9902,10 @@ mod tests {
         dialog_id.store(&mut expected);
         MessageId::new(5 << 20).store(&mut expected);
         assert_eq!(out, expected);
-        assert_eq!(MessageTopic::parse_from(&mut Parser::new(&out)).unwrap(), topic);
+        assert_eq!(
+            MessageTopic::parse_from(&mut Parser::new(&out)).unwrap(),
+            topic
+        );
 
         // forum: the forum topic flag joins the bitmask
         let topic = MessageTopic::forum(dialog_id, ForumTopicId::new(7));
@@ -8811,7 +9917,10 @@ mod tests {
         dialog_id.store(&mut expected);
         ForumTopicId::new(7).store(&mut expected);
         assert_eq!(out, expected);
-        assert_eq!(MessageTopic::parse_from(&mut Parser::new(&out)).unwrap(), topic);
+        assert_eq!(
+            MessageTopic::parse_from(&mut Parser::new(&out)).unwrap(),
+            topic
+        );
 
         // monoforum and saved messages keep the dialog in both the flag and
         // the SavedMessagesTopicId payload
@@ -8822,7 +9931,10 @@ mod tests {
         ] {
             let mut out = Vec::new();
             topic.store(&mut out);
-            assert_eq!(MessageTopic::parse_from(&mut Parser::new(&out)).unwrap(), topic);
+            assert_eq!(
+                MessageTopic::parse_from(&mut Parser::new(&out)).unwrap(),
+                topic
+            );
         }
     }
 
@@ -8832,7 +9944,10 @@ mod tests {
         let user_id = UserId::new(42);
         vec![
             FileSource::Message(MessageFullId::new(dialog_id, MessageId::new(11 << 20))),
-            FileSource::UserPhoto { user_id, photo_id: 99 },
+            FileSource::UserPhoto {
+                user_id,
+                photo_id: 99,
+            },
             FileSource::ChatPhoto(ChatId::new(500)),
             FileSource::ChannelPhoto(ChannelId::new(1100)),
             FileSource::Wallpapers,
@@ -8895,8 +10010,14 @@ mod tests {
         for (tag, source) in sources.iter().enumerate() {
             let mut out = Vec::new();
             source.store(&mut out);
-            assert_eq!(i32::from_le_bytes(out[0..4].try_into().unwrap()), tag as i32);
-            assert_eq!(&FileSource::parse_from(&mut Parser::new(&out)).unwrap(), source);
+            assert_eq!(
+                i32::from_le_bytes(out[0..4].try_into().unwrap()),
+                tag as i32
+            );
+            assert_eq!(
+                &FileSource::parse_from(&mut Parser::new(&out)).unwrap(),
+                source
+            );
         }
 
         // a concrete byte pin: tag 7 then the int32 bool
@@ -9119,7 +10240,8 @@ mod tests {
 
     #[test]
     fn file_data_sources_survive_the_real_registry() {
-        let message_full_id = MessageFullId::new(DialogId::new(-100200300), MessageId::new(11 << 20));
+        let message_full_id =
+            MessageFullId::new(DialogId::new(-100200300), MessageId::new(11 << 20));
         let mut manager = FileReferenceManager::new();
         let ids = vec![
             manager.intern(FileSource::Message(message_full_id)),
@@ -9151,7 +10273,11 @@ mod tests {
         let parsed = FileData::parse_from(&mut Parser::new(&out), true, Some(&mut fresh)).unwrap();
         assert_eq!(
             parsed.file_source_ids,
-            [FileSourceId::new(1), FileSourceId::new(2), FileSourceId::new(3)]
+            [
+                FileSourceId::new(1),
+                FileSourceId::new(2),
+                FileSourceId::new(3)
+            ]
         );
         assert_eq!(parsed.remote_name, "a.jpg");
     }
@@ -9170,15 +10296,24 @@ mod tests {
         assert_eq!(merge_choose_local_location(&empty, &empty), 2);
 
         assert_eq!(
-            merge_choose_file_source_location(FileLocationSource::FromDatabase, FileLocationSource::FromServer),
+            merge_choose_file_source_location(
+                FileLocationSource::FromDatabase,
+                FileLocationSource::FromServer
+            ),
             1
         );
         assert_eq!(
-            merge_choose_file_source_location(FileLocationSource::FromServer, FileLocationSource::FromDatabase),
+            merge_choose_file_source_location(
+                FileLocationSource::FromServer,
+                FileLocationSource::FromDatabase
+            ),
             0
         );
         assert_eq!(
-            merge_choose_file_source_location(FileLocationSource::FromServer, FileLocationSource::FromServer),
+            merge_choose_file_source_location(
+                FileLocationSource::FromServer,
+                FileLocationSource::FromServer
+            ),
             0
         );
 
@@ -9201,15 +10336,33 @@ mod tests {
         assert_eq!(merge_choose_owner(DialogId::new(1), DialogId::new(2)), 2);
 
         // equal priorities: the lower id wins; different: the higher priority
-        assert_eq!(merge_choose_main_file_id(FileId::new(1, 0), 0, FileId::new(2, 0), 0), 0);
-        assert_eq!(merge_choose_main_file_id(FileId::new(2, 0), 0, FileId::new(1, 0), 0), 1);
-        assert_eq!(merge_choose_main_file_id(FileId::new(1, 0), 0, FileId::new(2, 0), 5), 1);
-        assert_eq!(merge_choose_main_file_id(FileId::new(2, 0), 5, FileId::new(1, 0), 0), 0);
+        assert_eq!(
+            merge_choose_main_file_id(FileId::new(1, 0), 0, FileId::new(2, 0), 0),
+            0
+        );
+        assert_eq!(
+            merge_choose_main_file_id(FileId::new(2, 0), 0, FileId::new(1, 0), 0),
+            1
+        );
+        assert_eq!(
+            merge_choose_main_file_id(FileId::new(1, 0), 0, FileId::new(2, 0), 5),
+            1
+        );
+        assert_eq!(
+            merge_choose_main_file_id(FileId::new(2, 0), 5, FileId::new(1, 0), 0),
+            0
+        );
 
         let key1 = FileEncryptionKey::new(&[1u8; 32], &[2u8; 32]);
         let key2 = FileEncryptionKey::new(&[3u8; 32], &[4u8; 32]);
-        assert_eq!(merge_choose_encryption_key(&FileEncryptionKey::default(), &key1), 1);
-        assert_eq!(merge_choose_encryption_key(&key1, &FileEncryptionKey::default()), 0);
+        assert_eq!(
+            merge_choose_encryption_key(&FileEncryptionKey::default(), &key1),
+            1
+        );
+        assert_eq!(
+            merge_choose_encryption_key(&key1, &FileEncryptionKey::default()),
+            0
+        );
         assert_eq!(merge_choose_encryption_key(&key1, &key1), 2);
         assert_eq!(merge_choose_encryption_key(&key1, &key2), -1);
     }
@@ -9218,46 +10371,107 @@ mod tests {
     fn merge_choose_remote_and_generate_tables() {
         // a web location loses to a common one regardless of anything else:
         // the result is the index of the non-web side
-        let web = FullRemoteFileLocation::from_web(FileType::Document, "https://example.com/a".to_owned(), 7);
-        let common =
-            FullRemoteFileLocation::from_document(FileType::Document, 10, 11, DcId::internal(2), String::new());
+        let web = FullRemoteFileLocation::from_web(
+            FileType::Document,
+            "https://example.com/a".to_owned(),
+            7,
+        );
+        let common = FullRemoteFileLocation::from_document(
+            FileType::Document,
+            10,
+            11,
+            DcId::internal(2),
+            String::new(),
+        );
         assert_eq!(
-            merge_choose_full_remote_location(&web, FileLocationSource::FromUser, &common, FileLocationSource::FromUser),
+            merge_choose_full_remote_location(
+                &web,
+                FileLocationSource::FromUser,
+                &common,
+                FileLocationSource::FromUser
+            ),
             1
         );
         assert_eq!(
-            merge_choose_full_remote_location(&common, FileLocationSource::FromUser, &web, FileLocationSource::FromUser),
+            merge_choose_full_remote_location(
+                &common,
+                FileLocationSource::FromUser,
+                &web,
+                FileLocationSource::FromUser
+            ),
             0
         );
 
         // an existing reference beats a dropped one ("#" after deletion;
         // a literal "#" cannot reach the registry, it is cleared at
         // construction), everything else equal
-        let with_ref =
-            FullRemoteFileLocation::from_document(FileType::Document, 10, 11, DcId::internal(2), "r".to_owned());
-        let mut no_ref =
-            FullRemoteFileLocation::from_document(FileType::Document, 10, 11, DcId::internal(2), "r".to_owned());
+        let with_ref = FullRemoteFileLocation::from_document(
+            FileType::Document,
+            10,
+            11,
+            DcId::internal(2),
+            "r".to_owned(),
+        );
+        let mut no_ref = FullRemoteFileLocation::from_document(
+            FileType::Document,
+            10,
+            11,
+            DcId::internal(2),
+            "r".to_owned(),
+        );
         assert!(no_ref.delete_file_reference(b"r"));
         assert_eq!(
-            merge_choose_full_remote_location(&with_ref, FileLocationSource::FromUser, &no_ref, FileLocationSource::FromUser),
+            merge_choose_full_remote_location(
+                &with_ref,
+                FileLocationSource::FromUser,
+                &no_ref,
+                FileLocationSource::FromUser
+            ),
             0
         );
         assert_eq!(
-            merge_choose_full_remote_location(&no_ref, FileLocationSource::FromUser, &with_ref, FileLocationSource::FromUser),
+            merge_choose_full_remote_location(
+                &no_ref,
+                FileLocationSource::FromUser,
+                &with_ref,
+                FileLocationSource::FromUser
+            ),
             1
         );
 
         // same reference: access_hash mismatch with a source mismatch picks
         // the more trusted source
-        let hash11 = FullRemoteFileLocation::from_document(FileType::Document, 10, 11, DcId::internal(2), "r".to_owned());
-        let hash12 = FullRemoteFileLocation::from_document(FileType::Document, 10, 12, DcId::internal(2), "r".to_owned());
+        let hash11 = FullRemoteFileLocation::from_document(
+            FileType::Document,
+            10,
+            11,
+            DcId::internal(2),
+            "r".to_owned(),
+        );
+        let hash12 = FullRemoteFileLocation::from_document(
+            FileType::Document,
+            10,
+            12,
+            DcId::internal(2),
+            "r".to_owned(),
+        );
         assert_eq!(
-            merge_choose_full_remote_location(&hash11, FileLocationSource::FromUser, &hash12, FileLocationSource::FromServer),
+            merge_choose_full_remote_location(
+                &hash11,
+                FileLocationSource::FromUser,
+                &hash12,
+                FileLocationSource::FromServer
+            ),
             1
         );
         // but identical locations leave both in place
         assert_eq!(
-            merge_choose_full_remote_location(&hash11, FileLocationSource::FromServer, &hash11, FileLocationSource::FromServer),
+            merge_choose_full_remote_location(
+                &hash11,
+                FileLocationSource::FromServer,
+                &hash11,
+                FileLocationSource::FromServer
+            ),
             2
         );
 
@@ -9295,9 +10509,18 @@ mod tests {
         };
         assert_eq!(merge_choose_generate_location(None, Some(&gen_a)), 1);
         assert_eq!(merge_choose_generate_location(Some(&gen_a), None), 0);
-        assert_eq!(merge_choose_generate_location(Some(&gen_a), Some(&gen_b)), 0);
-        assert_eq!(merge_choose_generate_location(Some(&gen_b), Some(&gen_a)), 1);
-        assert_eq!(merge_choose_generate_location(Some(&gen_a), Some(&gen_a)), 2);
+        assert_eq!(
+            merge_choose_generate_location(Some(&gen_a), Some(&gen_b)),
+            0
+        );
+        assert_eq!(
+            merge_choose_generate_location(Some(&gen_b), Some(&gen_a)),
+            1
+        );
+        assert_eq!(
+            merge_choose_generate_location(Some(&gen_a), Some(&gen_a)),
+            2
+        );
     }
 
     /// A partial-local document with the first two of four 1024-byte parts.
@@ -9356,8 +10579,13 @@ mod tests {
         // the SecureEncrypted gate hides the prefix until verified; the type
         // comes from the full remote location (get_type never reads a
         // partial local)
-        let encrypted_remote =
-            FullRemoteFileLocation::from_document(FileType::SecureEncrypted, 10, 11, DcId::internal(2), "r".to_owned());
+        let encrypted_remote = FullRemoteFileLocation::from_document(
+            FileType::SecureEncrypted,
+            10,
+            11,
+            DcId::internal(2),
+            "r".to_owned(),
+        );
         let encrypted_local = LocalFileLocation::Partial(PartialLocalFileLocation {
             file_type: FileType::SecureEncrypted,
             part_size: 1024,
@@ -9368,7 +10596,10 @@ mod tests {
         });
         let encrypted = FileNode::new(
             encrypted_local,
-            NewRemoteFileLocation::from_remote(RemoteFileLocation::Full(encrypted_remote), FileLocationSource::FromServer),
+            NewRemoteFileLocation::from_remote(
+                RemoteFileLocation::Full(encrypted_remote),
+                FileLocationSource::FromServer,
+            ),
             None,
             4096,
             0,
@@ -9440,11 +10671,23 @@ mod tests {
 
     #[test]
     fn file_view_accessors_match_the_cpp() {
-        let common =
-            FullRemoteFileLocation::from_document(FileType::Document, 10, 11, DcId::internal(2), "r".to_owned());
+        let common = FullRemoteFileLocation::from_document(
+            FileType::Document,
+            10,
+            11,
+            DcId::internal(2),
+            "r".to_owned(),
+        );
         let mut node = FileNode::new(
-            LocalFileLocation::Full(FullLocalFileLocation::new(FileType::Photo, "/photos/a".to_owned(), 0)),
-            NewRemoteFileLocation::from_remote(RemoteFileLocation::Full(common), FileLocationSource::FromServer),
+            LocalFileLocation::Full(FullLocalFileLocation::new(
+                FileType::Photo,
+                "/photos/a".to_owned(),
+                0,
+            )),
+            NewRemoteFileLocation::from_remote(
+                RemoteFileLocation::Full(common),
+                FileLocationSource::FromServer,
+            ),
             None,
             500,
             0,
@@ -9483,7 +10726,13 @@ mod tests {
         // a dead non-encrypted location whose reference has been dropped
         // (deletion leaves the "#" sentinel) and which is no longer alive is
         // not downloadable
-        let mut dead = FullRemoteFileLocation::from_document(FileType::Document, 10, 11, DcId::internal(2), "r".to_owned());
+        let mut dead = FullRemoteFileLocation::from_document(
+            FileType::Document,
+            10,
+            11,
+            DcId::internal(2),
+            "r".to_owned(),
+        );
         assert!(dead.delete_file_reference(b"r"));
         let dead_node = FileNode::new(
             LocalFileLocation::Empty,
@@ -9506,8 +10755,13 @@ mod tests {
         assert!(!FileView::new(&dead_node).can_download_from_server());
 
         // an encrypted file needs its key before the server can be asked
-        let encrypted_remote =
-            FullRemoteFileLocation::from_document(FileType::Encrypted, 10, 11, DcId::internal(2), "r".to_owned());
+        let encrypted_remote = FullRemoteFileLocation::from_document(
+            FileType::Encrypted,
+            10,
+            11,
+            DcId::internal(2),
+            "r".to_owned(),
+        );
         let encrypted_alive = NewRemoteFileLocation::from_remote(
             RemoteFileLocation::Full(encrypted_remote),
             FileLocationSource::FromServer,
@@ -9579,7 +10833,10 @@ mod tests {
 
     impl RecordingWorker {
         fn record(&self, event: &str, main_file_id: FileId) {
-            self.log.0.borrow_mut().push(format!("{event} {main_file_id}"));
+            self.log
+                .0
+                .borrow_mut()
+                .push(format!("{event} {main_file_id}"));
         }
     }
 
@@ -9623,7 +10880,10 @@ mod tests {
         );
         FileNode::new(
             LocalFileLocation::Empty,
-            NewRemoteFileLocation::from_remote(RemoteFileLocation::Full(remote), FileLocationSource::FromServer),
+            NewRemoteFileLocation::from_remote(
+                RemoteFileLocation::Full(remote),
+                FileLocationSource::FromServer,
+            ),
             None,
             size,
             0,
@@ -9642,18 +10902,34 @@ mod tests {
         let log = EventLog::default();
         file_manager.set_worker(Box::new(RecordingWorker { log: log.clone() }));
 
-        file_manager.register_file_node(FileId::new(1, 0), 0, document_node(FileId::new(1, 0), 100, "ref"));
-        file_manager.register_file_node(FileId::new(2, 0), 0, document_node(FileId::new(2, 0), 100, "ref"));
+        file_manager.register_file_node(
+            FileId::new(1, 0),
+            0,
+            document_node(FileId::new(1, 0), 100, "ref"),
+        );
+        file_manager.register_file_node(
+            FileId::new(2, 0),
+            0,
+            document_node(FileId::new(2, 0), 100, "ref"),
+        );
 
-        file_manager.merge(FileId::new(1, 0), FileId::new(2, 0)).unwrap();
+        file_manager
+            .merge(FileId::new(1, 0), FileId::new(2, 0))
+            .unwrap();
 
         // both ids resolve to the survivor node, whose main id is x's
         assert_eq!(
-            file_manager.get_file_node(FileId::new(1, 0)).unwrap().get_main_file_id(),
+            file_manager
+                .get_file_node(FileId::new(1, 0))
+                .unwrap()
+                .get_main_file_id(),
             FileId::new(1, 0)
         );
         assert_eq!(
-            file_manager.get_file_node(FileId::new(2, 0)).unwrap().get_main_file_id(),
+            file_manager
+                .get_file_node(FileId::new(2, 0))
+                .unwrap()
+                .get_main_file_id(),
             FileId::new(1, 0)
         );
 
@@ -9674,7 +10950,9 @@ mod tests {
         );
 
         // merging again is a same-node no-op
-        file_manager.merge(FileId::new(1, 0), FileId::new(2, 0)).unwrap();
+        file_manager
+            .merge(FileId::new(1, 0), FileId::new(2, 0))
+            .unwrap();
         assert_eq!(log.0.borrow().len(), 7);
     }
 
@@ -9684,16 +10962,30 @@ mod tests {
         let log = EventLog::default();
         file_manager.set_worker(Box::new(RecordingWorker { log: log.clone() }));
 
-        file_manager.register_file_node(FileId::new(1, 0), 0, document_node(FileId::new(1, 0), 100, "ref"));
-        file_manager.register_file_node(FileId::new(2, 0), 0, document_node(FileId::new(2, 0), 200, "ref"));
+        file_manager.register_file_node(
+            FileId::new(1, 0),
+            0,
+            document_node(FileId::new(1, 0), 100, "ref"),
+        );
+        file_manager.register_file_node(
+            FileId::new(2, 0),
+            0,
+            document_node(FileId::new(2, 0), 200, "ref"),
+        );
         let err = file_manager
             .merge(FileId::new(1, 0), FileId::new(2, 0))
             .unwrap_err();
         assert_eq!(err.code(), 400);
         assert!(err.message().contains("Different size: 100 and 200"));
         // both nodes stay intact
-        assert_eq!(file_manager.get_file_node(FileId::new(1, 0)).unwrap().size, 100);
-        assert_eq!(file_manager.get_file_node(FileId::new(2, 0)).unwrap().size, 200);
+        assert_eq!(
+            file_manager.get_file_node(FileId::new(1, 0)).unwrap().size,
+            100
+        );
+        assert_eq!(
+            file_manager.get_file_node(FileId::new(2, 0)).unwrap().size,
+            200
+        );
         // only the two gated info-flush probes ran; no merge effects fired
         assert!(log.0.borrow().is_empty());
 
@@ -9720,7 +11012,10 @@ mod tests {
             .merge(FileId::new(1, 0), FileId::new(2, 0))
             .unwrap_err();
         assert_eq!(err.code(), 400);
-        assert_eq!(err.message(), "Can't merge files. Different encryption keys");
+        assert_eq!(
+            err.message(),
+            "Can't merge files. Different encryption keys"
+        );
     }
 
     #[test]
@@ -9731,10 +11026,16 @@ mod tests {
 
         let mut wide = document_node(FileId::new(2, 0), 100, "ref");
         wide.file_ids.push(FileId::new(5, 0)); // the tests share the node module
-        file_manager.register_file_node(FileId::new(1, 0), 0, document_node(FileId::new(1, 0), 100, "ref"));
+        file_manager.register_file_node(
+            FileId::new(1, 0),
+            0,
+            document_node(FileId::new(1, 0), 100, "ref"),
+        );
         file_manager.register_file_node(FileId::new(2, 0), 0, wide);
 
-        file_manager.merge(FileId::new(1, 0), FileId::new(2, 0)).unwrap();
+        file_manager
+            .merge(FileId::new(1, 0), FileId::new(2, 0))
+            .unwrap();
 
         // y had two ids, so its node survives and x's id re-keys into it...
         let survivor = file_manager.get_file_node(FileId::new(1, 0)).unwrap();
@@ -9745,5 +11046,676 @@ mod tests {
         // ...but main_file_id_i chose x's lower id, so the survivor adopts it
         assert_eq!(survivor.get_main_file_id(), FileId::new(1, 0));
         assert_eq!(log.0.borrow().last().unwrap(), "run_node 1(0)");
+    }
+
+    // ==== M.12.6: FileUploader / FileHashUploader ====
+
+    fn temp_file(contents: &[u8]) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "tdrs-m12-upload-{}-{}",
+            std::process::id(),
+            tdutils::random::secure_int64() as u64
+        ));
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn full_local(path: &std::path::Path) -> LocalFileLocation {
+        LocalFileLocation::Full(FullLocalFileLocation::new(
+            FileType::Document,
+            path.to_string_lossy().into_owned(),
+            0,
+        ))
+    }
+
+    #[derive(Clone, Default)]
+    struct UploadLog {
+        events: Rc<RefCell<Vec<String>>>,
+        partials: Rc<RefCell<Vec<PartialRemoteFileLocation>>>,
+        oks: Rc<RefCell<Vec<PartialRemoteFileLocation>>>,
+        error: Rc<RefCell<Option<(i32, String)>>>,
+    }
+
+    struct RecordingUploadCallback {
+        log: UploadLog,
+    }
+
+    impl FileUploaderCallback for RecordingUploadCallback {
+        fn on_hash(&mut self, hash: Vec<u8>) {
+            self.log
+                .events
+                .borrow_mut()
+                .push(format!("hash {} bytes", hash.len()));
+        }
+        fn on_partial_upload(&mut self, partial: PartialRemoteFileLocation) {
+            self.log.partials.borrow_mut().push(partial);
+        }
+        fn on_ok(&mut self, _file_type: FileType, partial: PartialRemoteFileLocation) {
+            self.log.oks.borrow_mut().push(partial);
+        }
+        fn on_error(&mut self, status: Status) {
+            *self.log.error.borrow_mut() = Some((status.code(), status.message().to_owned()));
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeUploadNet {
+        queries: Rc<RefCell<Vec<UploadPartQuery>>>,
+        results: Rc<RefCell<VecDeque<std::result::Result<bool, Status>>>>,
+    }
+
+    impl Default for FakeUploadNet {
+        fn default() -> FakeUploadNet {
+            FakeUploadNet {
+                queries: Rc::new(RefCell::new(Vec::new())),
+                results: Rc::new(RefCell::new(VecDeque::new())),
+            }
+        }
+    }
+
+    impl FakeUploadNet {
+        fn with_results(results: Vec<std::result::Result<bool, Status>>) -> FakeUploadNet {
+            let net = FakeUploadNet::default();
+            *net.results.borrow_mut() = results.into_iter().collect();
+            net
+        }
+    }
+
+    impl FileUploaderNet for FakeUploadNet {
+        fn upload_part(&mut self, query: UploadPartQuery) -> std::result::Result<bool, Status> {
+            self.queries.borrow_mut().push(query);
+            self.results.borrow_mut().pop_front().unwrap_or(Ok(true))
+        }
+    }
+
+    fn grant(limit: i64) -> ResourceState {
+        let mut state = ResourceState::default();
+        state.set_unit_size(1024);
+        state.update_limit(limit);
+        state
+    }
+
+    /// The C++ ResourceManager ping-pong, collapsed: every part the uploader
+    /// completes consumes its allowance (`update_estimated_limit` raises
+    /// `used` up to the estimate), the worker notifies the manager, and the
+    /// manager answers with a fresh grant until the upload stops.
+    fn drive_upload(uploader: &mut FileUploader, log: &UploadLog) {
+        let mut allowance = 1i64 << 20;
+        for _ in 0..64 {
+            if uploader.stop_flag() || log.error.borrow().is_some() {
+                return;
+            }
+            allowance += 1 << 20;
+            uploader.update_resources(grant(allowance));
+        }
+        panic!("the uploader did not settle in 64 grant rounds");
+    }
+
+    #[test]
+    fn file_uploader_rejects_already_uploaded_files() {
+        let log = UploadLog::default();
+        let remote = RemoteFileLocation::Full(FullRemoteFileLocation::from_document(
+            FileType::Document,
+            10,
+            11,
+            DcId::internal(2),
+            "r".to_owned(),
+        ));
+        let mut uploader = FileUploader::new(
+            LocalFileLocation::Empty,
+            remote,
+            0,
+            FileEncryptionKey::default(),
+            Vec::new(),
+            Box::new(RecordingUploadCallback { log: log.clone() }),
+            Box::new(FakeUploadNet::default()),
+        );
+        uploader.start();
+        let (code, message) = log.error.borrow().clone().expect("error");
+        assert_eq!((code, message.as_str()), (0, "File is already uploaded"));
+        assert!(uploader.stop_flag());
+    }
+
+    #[test]
+    fn file_uploader_resets_incomplete_secure_partials() {
+        // a secure upload whose partial remote is incomplete restarts from
+        // scratch (the constructor drops the remote)
+        let key = FileEncryptionKey::from_secret(b"the-secure-secret".to_vec().as_slice());
+        let partial = PartialRemoteFileLocation {
+            file_id: 4242,
+            part_count: 5,
+            part_size: 256,
+            ready_part_count: 2,
+            is_big: 0,
+            ready_size: 0,
+        };
+        let uploader = FileUploader::new(
+            LocalFileLocation::Empty,
+            RemoteFileLocation::Partial(partial),
+            0,
+            key,
+            Vec::new(),
+            Box::new(RecordingUploadCallback {
+                log: UploadLog::default(),
+            }),
+            Box::new(FakeUploadNet::default()),
+        );
+        assert!(matches!(uploader.remote(), RemoteFileLocation::Empty));
+
+        // the same partial under a non-secure key is kept
+        let partial = PartialRemoteFileLocation {
+            file_id: 4242,
+            part_count: 5,
+            part_size: 256,
+            ready_part_count: 2,
+            is_big: 0,
+            ready_size: 0,
+        };
+        let uploader = FileUploader::new(
+            LocalFileLocation::Empty,
+            RemoteFileLocation::Partial(partial),
+            0,
+            FileEncryptionKey::default(),
+            Vec::new(),
+            Box::new(RecordingUploadCallback {
+                log: UploadLog::default(),
+            }),
+            Box::new(FakeUploadNet::default()),
+        );
+        assert!(matches!(uploader.remote(), RemoteFileLocation::Partial(_)));
+    }
+
+    #[test]
+    fn file_uploader_uploads_a_small_file() {
+        let contents = vec![7u8; 600];
+        let path = temp_file(&contents);
+        let log = UploadLog::default();
+        let net = FakeUploadNet::default();
+        let mut uploader = FileUploader::new(
+            full_local(&path),
+            RemoteFileLocation::Empty,
+            0,
+            FileEncryptionKey::default(),
+            Vec::new(),
+            Box::new(RecordingUploadCallback { log: log.clone() }),
+            Box::new(net.clone()),
+        );
+
+        // start reports the empty progress; nothing is sent without resources
+        uploader.start();
+        assert_eq!(net.queries.borrow().len(), 0);
+        assert_eq!(log.partials.borrow().len(), 1);
+
+        // the manager grant drives the upload
+        drive_upload(&mut uploader, &log);
+
+        // a single small part carrying the whole file
+        let queries = net.queries.borrow();
+        assert_eq!(queries.len(), 1);
+        match &queries[0] {
+            UploadPartQuery::SaveFilePart {
+                file_id,
+                part_id,
+                bytes,
+            } => {
+                assert_eq!(*file_id, uploader.file_id());
+                assert_ne!(*file_id, 0);
+                assert_eq!(*part_id, 0);
+                assert_eq!(bytes, &contents);
+            }
+            _ => panic!("expected a small-file part query"),
+        }
+
+        // the final ok carries the full size
+        assert_eq!(log.partials.borrow().len(), 2);
+        assert_eq!(log.oks.borrow().len(), 1);
+        let ok = &log.oks.borrow()[0];
+        assert_eq!(ok.file_id, uploader.file_id());
+        assert_eq!(ok.ready_size, 600);
+        assert_eq!(ok.ready_part_count, 1);
+        assert_eq!(ok.is_big, 0);
+        assert!(uploader.stop_flag());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_uploader_resumes_from_a_partial_remote() {
+        // parts 0 and 1 of a 3-part upload are on the server; part 1 is bad
+        let contents = vec![9u8; 600];
+        let path = temp_file(&contents);
+        let log = UploadLog::default();
+        let net = FakeUploadNet::default();
+        let mut uploader = FileUploader::new(
+            full_local(&path),
+            RemoteFileLocation::Partial(PartialRemoteFileLocation {
+                file_id: 4242,
+                part_count: 3,
+                part_size: 256,
+                ready_part_count: 2,
+                is_big: 0,
+                ready_size: 512,
+            }),
+            0,
+            FileEncryptionKey::default(),
+            vec![1],
+            Box::new(RecordingUploadCallback { log: log.clone() }),
+            Box::new(net.clone()),
+        );
+        uploader.start();
+        drive_upload(&mut uploader, &log);
+
+        // only parts 1 and 2 are sent, under the kept file id
+        let queries = net.queries.borrow();
+        assert_eq!(queries.len(), 2);
+        for (i, query) in queries.iter().enumerate() {
+            match query {
+                UploadPartQuery::SaveFilePart {
+                    file_id,
+                    part_id,
+                    bytes,
+                } => {
+                    assert_eq!(*file_id, 4242);
+                    assert_eq!(*part_id, i as i32 + 1);
+                    let expected_len = if i == 0 { 256 } else { 88 };
+                    assert_eq!(bytes.len(), expected_len);
+                }
+                _ => panic!("expected a small-file part query"),
+            }
+        }
+        assert_eq!(log.oks.borrow().len(), 1);
+        assert_eq!(log.oks.borrow()[0].file_id, 4242);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_uploader_restarts_when_the_first_part_is_bad() {
+        // bad part 0 invalidates the whole partial remote: a fresh file id
+        // replaces it and the file uploads from scratch
+        let contents = vec![9u8; 600];
+        let path = temp_file(&contents);
+        let log = UploadLog::default();
+        let net = FakeUploadNet::default();
+        let mut uploader = FileUploader::new(
+            full_local(&path),
+            RemoteFileLocation::Partial(PartialRemoteFileLocation {
+                file_id: 4242,
+                part_count: 3,
+                part_size: 256,
+                ready_part_count: 2,
+                is_big: 0,
+                ready_size: 512,
+            }),
+            0,
+            FileEncryptionKey::default(),
+            vec![0],
+            Box::new(RecordingUploadCallback { log: log.clone() }),
+            Box::new(net.clone()),
+        );
+        uploader.start();
+        assert!(matches!(uploader.remote(), RemoteFileLocation::Empty));
+        drive_upload(&mut uploader, &log);
+
+        let queries = net.queries.borrow();
+        assert_eq!(queries.len(), 1);
+        match &queries[0] {
+            UploadPartQuery::SaveFilePart {
+                file_id,
+                part_id,
+                bytes,
+            } => {
+                assert_ne!(*file_id, 4242);
+                assert_eq!(*part_id, 0);
+                assert_eq!(bytes.len(), 600);
+            }
+            _ => panic!("expected a small-file part query"),
+        }
+        assert_eq!(log.oks.borrow()[0].file_id, uploader.file_id());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_uploader_pads_and_chains_the_iv_for_secret_files() {
+        let contents: Vec<u8> = (0..40).map(|i| i as u8).collect();
+        let path = temp_file(&contents);
+        let log = UploadLog::default();
+        let net = FakeUploadNet::default();
+        let key = FileEncryptionKey::new(&[1u8; 32], &[2u8; 32]);
+        let mut uploader = FileUploader::new(
+            full_local(&path),
+            RemoteFileLocation::Empty,
+            0,
+            key.clone(),
+            Vec::new(),
+            Box::new(RecordingUploadCallback { log: log.clone() }),
+            Box::new(net.clone()),
+        );
+        uploader.start();
+        drive_upload(&mut uploader, &log);
+
+        // one part, padded to the 16-byte boundary
+        let recorded = net.queries.borrow();
+        assert_eq!(recorded.len(), 1);
+        let cipher = match &recorded[0] {
+            UploadPartQuery::SaveFilePart { bytes, .. } => bytes.clone(),
+            _ => panic!("expected a small-file part query"),
+        };
+        assert_eq!(cipher.len(), 48);
+        assert_ne!(cipher[..40], contents);
+
+        // the chained iv decrypts back to the file contents
+        let mut iv = [2u8; 32];
+        let mut plain = cipher.clone();
+        tdutils::crypto::aes_ige_decrypt_in_place(&[1u8; 32], &mut iv, &mut plain);
+        assert_eq!(&plain[..40], &contents[..]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_uploader_handles_net_restarts_and_failures() {
+        let contents = vec![1u8; 600];
+        let path = temp_file(&contents);
+
+        // a canceled part query restarts the same part
+        let log = UploadLog::default();
+        let net = FakeUploadNet::with_results(vec![
+            Err(Status::error(NET_QUERY_CANCELED, "Canceled")),
+            Ok(true),
+        ]);
+        let mut uploader = FileUploader::new(
+            full_local(&path),
+            RemoteFileLocation::Empty,
+            0,
+            FileEncryptionKey::default(),
+            Vec::new(),
+            Box::new(RecordingUploadCallback { log: log.clone() }),
+            Box::new(net.clone()),
+        );
+        uploader.start();
+        drive_upload(&mut uploader, &log);
+        {
+            let queries = net.queries.borrow();
+            assert_eq!(queries.len(), 2);
+            let part_id = |query: &UploadPartQuery| match query {
+                UploadPartQuery::SaveFilePart { part_id, .. } => *part_id,
+                UploadPartQuery::SaveBigFilePart { part_id, .. } => *part_id,
+            };
+            assert_eq!(part_id(&queries[0]), 0);
+            assert_eq!(part_id(&queries[1]), 0);
+        }
+        assert_eq!(log.oks.borrow().len(), 1);
+        assert!(log.error.borrow().is_none());
+
+        // a server Bool(false) is the 500 error
+        let log = UploadLog::default();
+        let net = FakeUploadNet::with_results(vec![Ok(false)]);
+        let mut uploader = FileUploader::new(
+            full_local(&path),
+            RemoteFileLocation::Empty,
+            0,
+            FileEncryptionKey::default(),
+            Vec::new(),
+            Box::new(RecordingUploadCallback { log: log.clone() }),
+            Box::new(net),
+        );
+        uploader.start();
+        drive_upload(&mut uploader, &log);
+        let (code, message) = log.error.borrow().clone().expect("error");
+        assert_eq!(
+            (code, message.as_str()),
+            (500, "Internal Server Error during file upload")
+        );
+
+        // any other net error fails the upload verbatim
+        let log = UploadLog::default();
+        let net = FakeUploadNet::with_results(vec![Err(Status::error(400, "FILE_PART_INVALID"))]);
+        let mut uploader = FileUploader::new(
+            full_local(&path),
+            RemoteFileLocation::Empty,
+            0,
+            FileEncryptionKey::default(),
+            Vec::new(),
+            Box::new(RecordingUploadCallback { log: log.clone() }),
+            Box::new(net),
+        );
+        uploader.start();
+        drive_upload(&mut uploader, &log);
+        let (code, message) = log.error.borrow().clone().expect("error");
+        assert_eq!((code, message.as_str()), (400, "FILE_PART_INVALID"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_uploader_enforces_the_expected_size_bump_rule() {
+        // the 10 MB default estimate is only bumped once the local size
+        // passes 30 MB; any other estimate follows the local size at once
+        let cases: Vec<(i64, i64, i64)> = vec![
+            (10 << 20, 15 << 20, 10 << 20), // default estimate, small growth: no bump
+            (10 << 20, 31 << 20, 31 << 20), // past 30 MB: bump
+            (5 << 20, 6 << 20, 6 << 20),    // a real estimate: bump
+        ];
+        for (expected_size, local_size, want) in cases {
+            let contents = vec![0u8; local_size as usize];
+            let path = temp_file(&contents);
+            let mut uploader = FileUploader::new(
+                full_local(&path),
+                RemoteFileLocation::Empty,
+                expected_size,
+                FileEncryptionKey::default(),
+                Vec::new(),
+                Box::new(RecordingUploadCallback {
+                    log: UploadLog::default(),
+                }),
+                Box::new(FakeUploadNet::default()),
+            );
+            let local = full_local(&path);
+            uploader.on_update_local_location(&local, 0).unwrap();
+            assert_eq!(uploader.expected_size, want);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct HashNetState {
+        queries: Rc<RefCell<Vec<([u8; 32], i64, String)>>>,
+        result: Rc<RefCell<Option<std::result::Result<DocumentByHash, Status>>>>,
+    }
+
+    struct FakeHashNet {
+        state: HashNetState,
+    }
+
+    impl FileHashUploaderNet for FakeHashNet {
+        fn get_document_by_hash(
+            &mut self,
+            sha256: [u8; 32],
+            size: i64,
+            mime_type: String,
+        ) -> std::result::Result<DocumentByHash, Status> {
+            self.state
+                .queries
+                .borrow_mut()
+                .push((sha256, size, mime_type));
+            self.state
+                .result
+                .borrow_mut()
+                .take()
+                .unwrap_or(Ok(DocumentByHash::Empty))
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct HashLog {
+        ok: Rc<RefCell<Option<FullRemoteFileLocation>>>,
+        error: Rc<RefCell<Option<String>>>,
+    }
+
+    struct RecordingHashCallback {
+        log: HashLog,
+    }
+
+    impl FileHashUploaderCallback for RecordingHashCallback {
+        fn on_ok(&mut self, location: FullRemoteFileLocation) {
+            *self.log.ok.borrow_mut() = Some(location);
+        }
+        fn on_error(&mut self, status: Status) {
+            *self.log.error.borrow_mut() = Some(status.message().to_owned());
+        }
+    }
+
+    #[test]
+    fn file_hash_uploader_hashes_then_queries_the_server() {
+        let contents: Vec<u8> = (0..1000).map(|i| (i % 251) as u8).collect();
+        let path = temp_file(&contents);
+        let state = HashNetState::default();
+        let log = HashLog::default();
+        let mut uploader = FileHashUploader::new(
+            FullLocalFileLocation::new(FileType::Document, path.to_string_lossy().into_owned(), 0),
+            1000,
+            Box::new(RecordingHashCallback { log: log.clone() }),
+            Box::new(FakeHashNet {
+                state: state.clone(),
+            }),
+        );
+        uploader.start();
+
+        // no hashing without a resource grant
+        uploader.loop_();
+        assert_eq!(state.queries.borrow().len(), 0);
+
+        // the server answer waiting on the seam
+        *state.result.borrow_mut() = Some(Ok(DocumentByHash::Document {
+            id: 77,
+            access_hash: 88,
+            dc_id: 2,
+            file_reference: b"ref".to_vec(),
+        }));
+
+        // the grant drives the sha pass and then the query
+        uploader.update_resources(grant(1 << 20));
+        let queries = state.queries.borrow();
+        assert_eq!(queries.len(), 1);
+        let (hash, size, mime_type) = &queries[0];
+        assert_eq!(*hash, tdutils::crypto::sha256(&contents));
+        assert_eq!(*size, 1000);
+        assert_eq!(mime_type, "image/gif");
+
+        // the server found the document: on_ok carries the remote location
+        let expected = FullRemoteFileLocation::from_document(
+            FileType::Document,
+            77,
+            88,
+            DcId::internal(2),
+            "ref".to_owned(),
+        );
+        assert_eq!(log.ok.borrow().as_ref(), Some(&expected));
+        assert!(uploader.stop_flag());
+        assert!(log.error.borrow().is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_hash_uploader_reports_empty_and_invalid_dc() {
+        let contents = vec![3u8; 1000];
+        let path = temp_file(&contents);
+
+        // documentEmpty
+        let state = HashNetState::default();
+        let log = HashLog::default();
+        let mut uploader = FileHashUploader::new(
+            FullLocalFileLocation::new(FileType::Document, path.to_string_lossy().into_owned(), 0),
+            1000,
+            Box::new(RecordingHashCallback { log: log.clone() }),
+            Box::new(FakeHashNet {
+                state: state.clone(),
+            }),
+        );
+        uploader.start();
+        uploader.update_resources(grant(1 << 20));
+        assert_eq!(
+            log.error.borrow().as_deref(),
+            Some("Document is not found by hash")
+        );
+        assert!(uploader.stop_flag());
+
+        // a document on an invalid dc
+        let state = HashNetState::default();
+        *state.result.borrow_mut() = Some(Ok(DocumentByHash::Document {
+            id: 1,
+            access_hash: 2,
+            dc_id: 0,
+            file_reference: b"ref".to_vec(),
+        }));
+        let log = HashLog::default();
+        let mut uploader = FileHashUploader::new(
+            FullLocalFileLocation::new(FileType::Document, path.to_string_lossy().into_owned(), 0),
+            1000,
+            Box::new(RecordingHashCallback { log: log.clone() }),
+            Box::new(FakeHashNet { state }),
+        );
+        uploader.start();
+        uploader.update_resources(grant(1 << 20));
+        assert_eq!(
+            log.error.borrow().as_deref(),
+            Some("Found document has invalid DcId")
+        );
+
+        // a declared size that mismatches the file fails at init
+        let log = HashLog::default();
+        let mut uploader = FileHashUploader::new(
+            FullLocalFileLocation::new(FileType::Document, path.to_string_lossy().into_owned(), 0),
+            999,
+            Box::new(RecordingHashCallback { log: log.clone() }),
+            Box::new(FakeHashNet {
+                state: HashNetState::default(),
+            }),
+        );
+        uploader.start();
+        assert_eq!(log.error.borrow().as_deref(), Some("Size mismatch"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn file_hash_uploader_streams_the_hash_across_grants() {
+        let contents: Vec<u8> = (0..1000).map(|i| (i % 253) as u8).collect();
+        let path = temp_file(&contents);
+        let state = HashNetState::default();
+        let log = HashLog::default();
+        let mut uploader = FileHashUploader::new(
+            FullLocalFileLocation::new(FileType::Document, path.to_string_lossy().into_owned(), 0),
+            1000,
+            Box::new(RecordingHashCallback { log: log.clone() }),
+            Box::new(FakeHashNet {
+                state: state.clone(),
+            }),
+        );
+        uploader.start();
+
+        // two half-size grants: the hash streams across both, one query
+        uploader.update_resources(grant(500));
+        assert_eq!(state.queries.borrow().len(), 0);
+        uploader.update_resources(grant(1000));
+        assert_eq!(state.queries.borrow().len(), 1);
+        assert_eq!(
+            state.queries.borrow()[0].0,
+            tdutils::crypto::sha256(&contents)
+        );
+
+        // the document answer completes the upload
+        *state.result.borrow_mut() = Some(Ok(DocumentByHash::Document {
+            id: 5,
+            access_hash: 6,
+            dc_id: 2,
+            file_reference: b"r".to_vec(),
+        }));
+        let mut uploader2 = FileHashUploader::new(
+            FullLocalFileLocation::new(FileType::Document, path.to_string_lossy().into_owned(), 0),
+            1000,
+            Box::new(RecordingHashCallback { log: log.clone() }),
+            Box::new(FakeHashNet { state }),
+        );
+        uploader2.start();
+        uploader2.update_resources(grant(1 << 20));
+        assert!(log.ok.borrow().is_some());
+        let _ = std::fs::remove_file(&path);
     }
 }
