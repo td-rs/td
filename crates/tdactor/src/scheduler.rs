@@ -1044,6 +1044,13 @@ impl SchedulerState {
     fn next_timeout(&self) -> Option<Instant> {
         let mut heap = self.timeouts.borrow_mut();
         while let Some(TimeoutEntry(Reverse(at), id, generation)) = heap.peek() {
+            if !id.is_alive() {
+                // The actor died with an armed timeout: `destroy_actor`
+                // bumped the generation (so the entry is stale) and freed
+                // the `ActorInfo` in place — pop it without the deref.
+                heap.pop();
+                continue;
+            }
             let info = self.info(id);
             if info.timeout_gen.get() == *generation {
                 return Some(*at);
