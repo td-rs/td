@@ -48,6 +48,19 @@
 //! FileId framing itself is the M.12.2 `FileManager` gate.
 //! `Contact` is modeled since M.9.2 (the value landed in `contact.rs`).
 //!
+//! M.9.12 is the register/unregister family (MessageContent.cpp:8965-9374):
+//! [`register_message_content`]/[`reregister_message_content`]/
+//! [`unregister_message_content`] plus the reply/quick-reply/welcome
+//! twins. The C++ calls into the owner managers through `Td`; here the
+//! registry calls go through the [`MessageContentContext`] registration
+//! section — real implementations land with each owner (WebPagesManager,
+//! StickersManager, TranscriptionManager, PollManager with their
+//! Wave-2 slices, StoryManager/StarGiftManager/GroupCallManager with
+//! Wave 3; the UserManager noforwards/suggested-profile-photo calls are
+//! real on this line). The StarGift-family arms are deferred with the
+//! unmodeled variants; the `register_gift`/`on_get_star_gift` seam
+//! methods land with them.
+//!
 //! The td_api/telegram_api
 //! conversions arrive with their own slices. Value companions living here
 //! that later move to their owners' modules: `Location`/`Venue` (the
@@ -70,8 +83,8 @@ use crate::message_entity::{
     FormattedText, MessageEntity, Type, find_entities, remove_empty_entities,
 };
 use crate::messages_manager::{
-    DialogId, DialogType, MessageFullId, MessageSearchFilter, StoryFullId, StoryId,
-    message_search_filter_index_mask,
+    DialogId, DialogType, EphemeralMessageFullId, MessageFullId, MessageSearchFilter,
+    QuickReplyMessageFullId, StoryFullId, StoryId, message_search_filter_index_mask,
 };
 use crate::misc::is_empty_string;
 use crate::photo::{AnimationSize, Dimensions, Photo, PhotoSize, StickerPhotoSize};
@@ -2742,6 +2755,12 @@ fn get_premium_duration_day_count(month_count: i32) -> i32 {
         return 7;
     }
     month_count * 30 + month_count / 3 + month_count / 12
+}
+
+/// `get_premium_duration_month_count` (misc.cpp:419-421) — the
+/// day-to-month rounding the gift registrations compare by.
+fn get_premium_duration_month_count(day_count: i32) -> i32 {
+    std::cmp::max(1, day_count / 30)
 }
 
 /// The `td::parse` enum cast (tl_helpers.h:244-248) for the small
@@ -6715,6 +6734,168 @@ pub trait MessageContentContext {
     /// `checklist_task_count_max` read of
     /// `ToDoList::get_can_append_items` (ToDoList.cpp:70).
     fn get_option_integer(&self, name: &str, default: i64) -> i64;
+
+    // -- Registration family (MessageContent.cpp:8965-9374) — the
+    // register/unregister seams into the owner managers; the Wave 2/3
+    // registries are no-op stand-ins until their owners land, the
+    // UserManager calls are real on this line. --
+    /// `WebPagesManager::register_web_page` (WebPagesManager.h:68).
+    fn register_web_page(
+        &mut self,
+        web_page_id: WebPageId,
+        message_full_id: MessageFullId,
+        source: &str,
+    );
+    /// `WebPagesManager::unregister_web_page` (WebPagesManager.h:70).
+    fn unregister_web_page(
+        &mut self,
+        web_page_id: WebPageId,
+        message_full_id: MessageFullId,
+        source: &str,
+    );
+    /// `WebPagesManager::register_quick_reply_web_page`
+    /// (WebPagesManager.h:72).
+    fn register_quick_reply_web_page(
+        &mut self,
+        web_page_id: WebPageId,
+        message_full_id: QuickReplyMessageFullId,
+        source: &str,
+    );
+    /// `WebPagesManager::unregister_quick_reply_web_page`
+    /// (WebPagesManager.h:75).
+    fn unregister_quick_reply_web_page(
+        &mut self,
+        web_page_id: WebPageId,
+        message_full_id: QuickReplyMessageFullId,
+        source: &str,
+    );
+    /// `WebPagesManager::register_welcome_message_web_page`
+    /// (WebPagesManager.h:78).
+    fn register_welcome_message_web_page(
+        &mut self,
+        web_page_id: WebPageId,
+        message_full_id: EphemeralMessageFullId,
+        source: &str,
+    );
+    /// `WebPagesManager::unregister_welcome_message_web_page`
+    /// (WebPagesManager.h:81).
+    fn unregister_welcome_message_web_page(
+        &mut self,
+        web_page_id: WebPageId,
+        message_full_id: EphemeralMessageFullId,
+        source: &str,
+    );
+    /// `StickersManager::register_premium_gift` (StickersManager.h:123).
+    fn register_premium_gift(
+        &mut self,
+        months: i32,
+        star_count: i64,
+        message_full_id: MessageFullId,
+        source: &str,
+    );
+    /// `StickersManager::unregister_premium_gift` (StickersManager.h:125).
+    fn unregister_premium_gift(
+        &mut self,
+        months: i32,
+        star_count: i64,
+        message_full_id: MessageFullId,
+        source: &str,
+    );
+    /// `StickersManager::register_ton_gift` (StickersManager.h:131).
+    fn register_ton_gift(&mut self, ton_count: i64, message_full_id: MessageFullId, source: &str);
+    /// `StickersManager::unregister_ton_gift` (StickersManager.h:133).
+    fn unregister_ton_gift(&mut self, ton_count: i64, message_full_id: MessageFullId, source: &str);
+    /// `StickersManager::register_dice` (StickersManager.h:135-136).
+    fn register_dice(
+        &mut self,
+        emoji: &str,
+        value: i32,
+        message_full_id: MessageFullId,
+        quick_reply_message_full_id: QuickReplyMessageFullId,
+        source: &str,
+    );
+    /// `StickersManager::unregister_dice` (StickersManager.h:138-139).
+    fn unregister_dice(
+        &mut self,
+        emoji: &str,
+        value: i32,
+        message_full_id: MessageFullId,
+        quick_reply_message_full_id: QuickReplyMessageFullId,
+        source: &str,
+    );
+    /// `StickersManager::register_emoji` (StickersManager.h:141-143).
+    #[allow(clippy::too_many_arguments)] // the C++ handler has the same shape
+    fn register_emoji(
+        &mut self,
+        emoji: &str,
+        custom_emoji_id: CustomEmojiId,
+        message_full_id: MessageFullId,
+        quick_reply_message_full_id: QuickReplyMessageFullId,
+        ephemeral_message_full_id: EphemeralMessageFullId,
+        source: &str,
+    );
+    /// `StickersManager::unregister_emoji` (StickersManager.h:145-147).
+    #[allow(clippy::too_many_arguments)] // the C++ handler has the same shape
+    fn unregister_emoji(
+        &mut self,
+        emoji: &str,
+        custom_emoji_id: CustomEmojiId,
+        message_full_id: MessageFullId,
+        quick_reply_message_full_id: QuickReplyMessageFullId,
+        ephemeral_message_full_id: EphemeralMessageFullId,
+        source: &str,
+    );
+    /// `TranscriptionManager::register_voice` (TranscriptionManager.h:44-45).
+    fn register_voice(
+        &mut self,
+        file_id: FileId,
+        content_type: MessageContentType,
+        message_full_id: MessageFullId,
+        source: &str,
+    );
+    /// `TranscriptionManager::unregister_voice` (TranscriptionManager.h:47-48).
+    fn unregister_voice(
+        &mut self,
+        file_id: FileId,
+        content_type: MessageContentType,
+        message_full_id: MessageFullId,
+        source: &str,
+    );
+    /// `PollManager::register_poll` (PollManager.h:69).
+    fn register_poll(&mut self, poll_id: PollId, message_full_id: MessageFullId, source: &str);
+    /// `PollManager::unregister_poll` (PollManager.h:71).
+    fn unregister_poll(&mut self, poll_id: PollId, message_full_id: MessageFullId, source: &str);
+    /// `PollManager::register_reply_poll` (PollManager.h:73).
+    fn register_reply_poll(&mut self, poll_id: PollId);
+    /// `PollManager::unregister_reply_poll` (PollManager.h:75).
+    fn unregister_reply_poll(&mut self, poll_id: PollId);
+    /// `StoryManager::register_story` (StoryManager.h:409-410).
+    fn register_story(
+        &mut self,
+        story_full_id: StoryFullId,
+        message_full_id: MessageFullId,
+        quick_reply_message_full_id: QuickReplyMessageFullId,
+        source: &str,
+    );
+    /// `StoryManager::unregister_story` (StoryManager.h:412-413).
+    fn unregister_story(
+        &mut self,
+        story_full_id: StoryFullId,
+        message_full_id: MessageFullId,
+        quick_reply_message_full_id: QuickReplyMessageFullId,
+        source: &str,
+    );
+    /// `GroupCallManager::register_group_call` (GroupCallManager.h:247).
+    fn register_group_call(&mut self, message_full_id: MessageFullId, source: &str);
+    /// `GroupCallManager::unregister_group_call` (GroupCallManager.h:249).
+    fn unregister_group_call(&mut self, message_full_id: MessageFullId, source: &str);
+    /// `UserManager::register_suggested_profile_photo`
+    /// (UserManager.h:137).
+    fn register_suggested_profile_photo(&mut self, photo: &Photo);
+    /// `UserManager::register_noforwards_request` (UserManager.h:562).
+    fn register_noforwards_request(&mut self, message_full_id: MessageFullId, message_date: i32);
+    /// `UserManager::unregister_noforwards_request` (UserManager.h:564).
+    fn unregister_noforwards_request(&mut self, message_full_id: MessageFullId);
 }
 
 /// `is_local_poll_id` (PollManager.cpp:449-452) — the local (unsent)
@@ -7788,6 +7969,489 @@ pub fn can_message_content_have_media_timestamp(content: &MessageContent) -> boo
         | MessageContent::VoiceNote(_) => true,
         MessageContent::Invoice(m) => m.input_invoice.has_media_timestamp(),
         _ => has_message_content_web_page(content),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M.9.12 — the register/unregister family (MessageContent.cpp:8942-9374).
+// The C++ functions fan out through `Td` into the owner managers; the Rust
+// ports route the registry calls through the [`MessageContentContext`]
+// registration section. The Wave-2/3 registries (web pages, stickers,
+// transcription, polls, stories, group calls) are no-op stand-ins in the
+// test context until their owners land; the pure decision logic — the bot
+// gate, the animated-emoji test, the reregister equality checks — is
+// exact. The StarGift-family arms are deferred with the unmodeled variants
+// (module doc).
+// ---------------------------------------------------------------------------
+
+/// `can_be_animated_emoji` (MessageContent.cpp:8942-8955) — whether the
+/// text is a single emoji, optionally with one covering CustomEmoji entity.
+pub fn can_be_animated_emoji(text: &FormattedText) -> bool {
+    if !tdutils::emoji::is_emoji(&text.text) {
+        return false;
+    }
+    if text.entities.is_empty() {
+        return true;
+    }
+    if text.entities.len() == 1
+        && text.entities[0].r#type == Some(Type::CustomEmoji)
+        && text.entities[0].offset == 0
+        && text.entities[0].length as usize == tdutils::utf8::utf8_utf16_length(&text.text)
+        && text.entities[0].custom_emoji_id.is_valid()
+    {
+        return true;
+    }
+    false
+}
+
+/// `get_custom_emoji_id` (MessageContent.cpp:8957-8959).
+fn get_custom_emoji_id(text: &FormattedText) -> CustomEmojiId {
+    if text.entities.is_empty() {
+        CustomEmojiId::default()
+    } else {
+        text.entities[0].custom_emoji_id
+    }
+}
+
+/// `need_register_message_content_for_bots` (MessageContent.cpp:8961-8963).
+fn need_register_message_content_for_bots(content_type: MessageContentType) -> bool {
+    content_type == MessageContentType::Poll
+}
+
+/// `register_message_content` (MessageContent.cpp:8965-9062).
+pub fn register_message_content(
+    td: &mut dyn MessageContentContext,
+    content: &MessageContent,
+    message_full_id: MessageFullId,
+    message_date: i32,
+    source: &str,
+) {
+    let content_type = content.get_type();
+    if td.is_bot() && !need_register_message_content_for_bots(content_type) {
+        return;
+    }
+    match content {
+        MessageContent::Text(text) => {
+            if text.web_page_id.is_valid() {
+                td.register_web_page(text.web_page_id, message_full_id, source);
+            } else if can_be_animated_emoji(&text.text) {
+                td.register_emoji(
+                    &text.text.text,
+                    get_custom_emoji_id(&text.text),
+                    message_full_id,
+                    QuickReplyMessageFullId::default(),
+                    EphemeralMessageFullId::default(),
+                    source,
+                );
+            }
+        }
+        MessageContent::VideoNote(video_note) => {
+            td.register_voice(video_note.file_id, content_type, message_full_id, source);
+        }
+        MessageContent::VoiceNote(voice_note) => {
+            td.register_voice(voice_note.file_id, content_type, message_full_id, source);
+        }
+        MessageContent::Poll(poll) => {
+            td.register_poll(poll.poll_id, message_full_id, source);
+        }
+        MessageContent::Dice(dice) => {
+            td.register_dice(
+                &dice.emoji,
+                dice.dice_value,
+                message_full_id,
+                QuickReplyMessageFullId::default(),
+                source,
+            );
+        }
+        MessageContent::GiftPremium(gift_premium) => {
+            td.register_premium_gift(
+                get_premium_duration_month_count(gift_premium.days),
+                0,
+                message_full_id,
+                source,
+            );
+        }
+        MessageContent::GiftCode(gift_code) => {
+            td.register_premium_gift(
+                get_premium_duration_month_count(gift_code.days),
+                0,
+                message_full_id,
+                source,
+            );
+        }
+        MessageContent::Giveaway(giveaway) => {
+            td.register_premium_gift(
+                giveaway.months,
+                giveaway.star_count,
+                message_full_id,
+                source,
+            );
+        }
+        MessageContent::SuggestProfilePhoto(suggest) => {
+            td.register_suggested_profile_photo(&suggest.photo);
+        }
+        MessageContent::Story(story) => {
+            td.register_story(
+                story.story_full_id,
+                message_full_id,
+                QuickReplyMessageFullId::default(),
+                source,
+            );
+        }
+        MessageContent::GiftStars(gift_stars) => {
+            td.register_premium_gift(0, gift_stars.star_count, message_full_id, source);
+        }
+        MessageContent::PrizeStars(prize_stars) => {
+            td.register_premium_gift(0, prize_stars.star_count, message_full_id, source);
+        }
+        MessageContent::ConferenceCall(_) => {
+            td.register_group_call(message_full_id, source);
+        }
+        MessageContent::GiftTon(gift_ton) => {
+            td.register_ton_gift(gift_ton.crypto_amount, message_full_id, source);
+        }
+        MessageContent::NoForwardsRequest(no_forwards_request)
+            if !no_forwards_request.is_expired =>
+        {
+            td.register_noforwards_request(message_full_id, message_date);
+        }
+        _ => {}
+    }
+}
+
+/// `reregister_message_content` (MessageContent.cpp:9063-9177). The
+/// StarGift-family same-type arms are deferred with the unmodeled variants.
+pub fn reregister_message_content(
+    td: &mut dyn MessageContentContext,
+    old_content: &MessageContent,
+    new_content: &MessageContent,
+    message_full_id: MessageFullId,
+    message_date: i32,
+    source: &str,
+) {
+    let old_content_type = old_content.get_type();
+    let new_content_type = new_content.get_type();
+    if old_content_type == new_content_type {
+        if td.is_bot() && !need_register_message_content_for_bots(new_content_type) {
+            return;
+        }
+        let same = match (old_content, new_content) {
+            (MessageContent::Text(old_text), MessageContent::Text(new_text)) => {
+                old_text.web_page_id == new_text.web_page_id
+                    && (old_text.text == new_text.text
+                        || (!can_be_animated_emoji(&old_text.text)
+                            && !can_be_animated_emoji(&new_text.text)))
+            }
+            (
+                MessageContent::VideoNote(old_video_note),
+                MessageContent::VideoNote(new_video_note),
+            ) => old_video_note.file_id == new_video_note.file_id,
+            (
+                MessageContent::VoiceNote(old_voice_note),
+                MessageContent::VoiceNote(new_voice_note),
+            ) => old_voice_note.file_id == new_voice_note.file_id,
+            (MessageContent::Poll(old_poll), MessageContent::Poll(new_poll)) => {
+                old_poll.poll_id == new_poll.poll_id
+            }
+            (MessageContent::Dice(old_dice), MessageContent::Dice(new_dice)) => {
+                old_dice.emoji == new_dice.emoji && old_dice.dice_value == new_dice.dice_value
+            }
+            (MessageContent::GiftPremium(old_gift), MessageContent::GiftPremium(new_gift)) => {
+                get_premium_duration_month_count(old_gift.days)
+                    == get_premium_duration_month_count(new_gift.days)
+            }
+            (MessageContent::GiftCode(old_gift), MessageContent::GiftCode(new_gift)) => {
+                get_premium_duration_month_count(old_gift.days)
+                    == get_premium_duration_month_count(new_gift.days)
+            }
+            (MessageContent::Giveaway(old_giveaway), MessageContent::Giveaway(new_giveaway)) => {
+                old_giveaway.months == new_giveaway.months
+                    && old_giveaway.star_count == new_giveaway.star_count
+            }
+            (MessageContent::SuggestProfilePhoto(_), MessageContent::SuggestProfilePhoto(_)) => {
+                false
+            }
+            (MessageContent::Story(old_story), MessageContent::Story(new_story)) => {
+                old_story.story_full_id == new_story.story_full_id
+            }
+            (MessageContent::GiftStars(old_gift), MessageContent::GiftStars(new_gift)) => {
+                old_gift.star_count == new_gift.star_count
+            }
+            (MessageContent::PrizeStars(old_gift), MessageContent::PrizeStars(new_gift)) => {
+                old_gift.star_count == new_gift.star_count
+            }
+            // the C++ ConferenceCall arm returns unconditionally — no need
+            // to reregister the call (MessageContent.cpp:9124-9126).
+            (MessageContent::ConferenceCall(_), MessageContent::ConferenceCall(_)) => true,
+            (MessageContent::GiftTon(old_gift), MessageContent::GiftTon(new_gift)) => {
+                old_gift.crypto_amount == new_gift.crypto_amount
+            }
+            // the NoForwardsRequest arm always falls through — the
+            // registration depends on the current date
+            // (MessageContent.cpp:9143-9145).
+            (MessageContent::NoForwardsRequest(_), MessageContent::NoForwardsRequest(_)) => false,
+            _ => true,
+        };
+        if same {
+            return;
+        }
+    }
+    unregister_message_content(td, old_content, message_full_id, source);
+    register_message_content(td, new_content, message_full_id, message_date, source);
+}
+
+/// `unregister_message_content` (MessageContent.cpp:9178-9258).
+pub fn unregister_message_content(
+    td: &mut dyn MessageContentContext,
+    content: &MessageContent,
+    message_full_id: MessageFullId,
+    source: &str,
+) {
+    let content_type = content.get_type();
+    if td.is_bot() && !need_register_message_content_for_bots(content_type) {
+        return;
+    }
+    match content {
+        MessageContent::Text(text) => {
+            if text.web_page_id.is_valid() {
+                td.unregister_web_page(text.web_page_id, message_full_id, source);
+            } else if can_be_animated_emoji(&text.text) {
+                td.unregister_emoji(
+                    &text.text.text,
+                    get_custom_emoji_id(&text.text),
+                    message_full_id,
+                    QuickReplyMessageFullId::default(),
+                    EphemeralMessageFullId::default(),
+                    source,
+                );
+            }
+        }
+        MessageContent::VideoNote(video_note) => {
+            td.unregister_voice(video_note.file_id, content_type, message_full_id, source);
+        }
+        MessageContent::VoiceNote(voice_note) => {
+            td.unregister_voice(voice_note.file_id, content_type, message_full_id, source);
+        }
+        MessageContent::Poll(poll) => {
+            td.unregister_poll(poll.poll_id, message_full_id, source);
+        }
+        MessageContent::Dice(dice) => {
+            td.unregister_dice(
+                &dice.emoji,
+                dice.dice_value,
+                message_full_id,
+                QuickReplyMessageFullId::default(),
+                source,
+            );
+        }
+        MessageContent::GiftPremium(gift_premium) => {
+            td.unregister_premium_gift(
+                get_premium_duration_month_count(gift_premium.days),
+                0,
+                message_full_id,
+                source,
+            );
+        }
+        MessageContent::GiftCode(gift_code) => {
+            td.unregister_premium_gift(
+                get_premium_duration_month_count(gift_code.days),
+                0,
+                message_full_id,
+                source,
+            );
+        }
+        MessageContent::Giveaway(giveaway) => {
+            td.unregister_premium_gift(
+                giveaway.months,
+                giveaway.star_count,
+                message_full_id,
+                source,
+            );
+        }
+        MessageContent::Story(story) => {
+            td.unregister_story(
+                story.story_full_id,
+                message_full_id,
+                QuickReplyMessageFullId::default(),
+                source,
+            );
+        }
+        MessageContent::GiftStars(gift_stars) => {
+            td.unregister_premium_gift(0, gift_stars.star_count, message_full_id, source);
+        }
+        MessageContent::PrizeStars(prize_stars) => {
+            td.unregister_premium_gift(0, prize_stars.star_count, message_full_id, source);
+        }
+        MessageContent::ConferenceCall(_) => {
+            td.unregister_group_call(message_full_id, source);
+        }
+        MessageContent::GiftTon(gift_ton) => {
+            td.unregister_ton_gift(gift_ton.crypto_amount, message_full_id, source);
+        }
+        MessageContent::NoForwardsRequest(no_forwards_request)
+            if !no_forwards_request.is_expired =>
+        {
+            td.unregister_noforwards_request(message_full_id);
+        }
+        _ => {}
+    }
+}
+
+/// `register_reply_message_content` (MessageContent.cpp:9259-9267).
+pub fn register_reply_message_content(
+    td: &mut dyn MessageContentContext,
+    content: &MessageContent,
+) {
+    if let MessageContent::Poll(poll) = content {
+        td.register_reply_poll(poll.poll_id);
+    }
+}
+
+/// `unregister_reply_message_content` (MessageContent.cpp:9269-9277).
+pub fn unregister_reply_message_content(
+    td: &mut dyn MessageContentContext,
+    content: &MessageContent,
+) {
+    if let MessageContent::Poll(poll) = content {
+        td.unregister_reply_poll(poll.poll_id);
+    }
+}
+
+/// `register_quick_reply_message_content` (MessageContent.cpp:9279-9305).
+pub fn register_quick_reply_message_content(
+    td: &mut dyn MessageContentContext,
+    content: &MessageContent,
+    message_full_id: QuickReplyMessageFullId,
+    source: &str,
+) {
+    match content {
+        MessageContent::Text(text) => {
+            if text.web_page_id.is_valid() {
+                td.register_quick_reply_web_page(text.web_page_id, message_full_id, source);
+            } else if can_be_animated_emoji(&text.text) {
+                td.register_emoji(
+                    &text.text.text,
+                    get_custom_emoji_id(&text.text),
+                    MessageFullId::default(),
+                    message_full_id,
+                    EphemeralMessageFullId::default(),
+                    source,
+                );
+            }
+        }
+        MessageContent::Poll(poll) => {
+            td.register_reply_poll(poll.poll_id);
+        }
+        MessageContent::Dice(dice) => {
+            td.register_dice(
+                &dice.emoji,
+                dice.dice_value,
+                MessageFullId::default(),
+                message_full_id,
+                source,
+            );
+        }
+        MessageContent::Story(story) => {
+            td.register_story(
+                story.story_full_id,
+                MessageFullId::default(),
+                message_full_id,
+                source,
+            );
+        }
+        _ => {}
+    }
+}
+
+/// `unregister_quick_reply_message_content` (MessageContent.cpp:9307-9333).
+pub fn unregister_quick_reply_message_content(
+    td: &mut dyn MessageContentContext,
+    content: &MessageContent,
+    message_full_id: QuickReplyMessageFullId,
+    source: &str,
+) {
+    match content {
+        MessageContent::Text(text) => {
+            if text.web_page_id.is_valid() {
+                td.unregister_quick_reply_web_page(text.web_page_id, message_full_id, source);
+            } else if can_be_animated_emoji(&text.text) {
+                td.unregister_emoji(
+                    &text.text.text,
+                    get_custom_emoji_id(&text.text),
+                    MessageFullId::default(),
+                    message_full_id,
+                    EphemeralMessageFullId::default(),
+                    source,
+                );
+            }
+        }
+        MessageContent::Poll(poll) => {
+            td.unregister_reply_poll(poll.poll_id);
+        }
+        MessageContent::Dice(dice) => {
+            td.unregister_dice(
+                &dice.emoji,
+                dice.dice_value,
+                MessageFullId::default(),
+                message_full_id,
+                source,
+            );
+        }
+        MessageContent::Story(story) => {
+            td.unregister_story(
+                story.story_full_id,
+                MessageFullId::default(),
+                message_full_id,
+                source,
+            );
+        }
+        _ => {}
+    }
+}
+
+/// `register_welcome_message_content` (MessageContent.cpp:9335-9352).
+pub fn register_welcome_message_content(
+    td: &mut dyn MessageContentContext,
+    content: &MessageContent,
+    message_full_id: EphemeralMessageFullId,
+    source: &str,
+) {
+    if let MessageContent::Text(text) = content {
+        if text.web_page_id.is_valid() {
+            td.register_welcome_message_web_page(text.web_page_id, message_full_id, source);
+        } else if can_be_animated_emoji(&text.text) {
+            td.register_emoji(
+                &text.text.text,
+                get_custom_emoji_id(&text.text),
+                MessageFullId::default(),
+                QuickReplyMessageFullId::default(),
+                message_full_id,
+                source,
+            );
+        }
+    }
+}
+
+/// `unregister_welcome_message_content` (MessageContent.cpp:9354-9374).
+pub fn unregister_welcome_message_content(
+    td: &mut dyn MessageContentContext,
+    content: &MessageContent,
+    message_full_id: EphemeralMessageFullId,
+    source: &str,
+) {
+    if let MessageContent::Text(text) = content {
+        if text.web_page_id.is_valid() {
+            td.unregister_welcome_message_web_page(text.web_page_id, message_full_id, source);
+        } else if can_be_animated_emoji(&text.text) {
+            td.unregister_emoji(
+                &text.text.text,
+                get_custom_emoji_id(&text.text),
+                MessageFullId::default(),
+                QuickReplyMessageFullId::default(),
+                message_full_id,
+                source,
+            );
+        }
     }
 }
 
@@ -10007,6 +10671,7 @@ mod tests {
         poll_input_media: bool,
         checklist_max: i64,
         poll_contents: Vec<MessageContent>,
+        register_log: Vec<String>,
     }
 
     impl Default for TestContext {
@@ -10047,6 +10712,7 @@ mod tests {
                 poll_input_media: true,
                 checklist_max: 100,
                 poll_contents: Vec::new(),
+                register_log: Vec::new(),
             }
         }
     }
@@ -10172,6 +10838,288 @@ mod tests {
             } else {
                 default
             }
+        }
+
+        fn register_web_page(
+            &mut self,
+            web_page_id: WebPageId,
+            _message_full_id: MessageFullId,
+            _source: &str,
+        ) {
+            self.register_log
+                .push(format!("register_web_page({})", web_page_id.get()));
+        }
+
+        fn unregister_web_page(
+            &mut self,
+            web_page_id: WebPageId,
+            _message_full_id: MessageFullId,
+            _source: &str,
+        ) {
+            self.register_log
+                .push(format!("unregister_web_page({})", web_page_id.get()));
+        }
+
+        fn register_quick_reply_web_page(
+            &mut self,
+            web_page_id: WebPageId,
+            _message_full_id: QuickReplyMessageFullId,
+            _source: &str,
+        ) {
+            self.register_log.push(format!(
+                "register_quick_reply_web_page({})",
+                web_page_id.get()
+            ));
+        }
+
+        fn unregister_quick_reply_web_page(
+            &mut self,
+            web_page_id: WebPageId,
+            _message_full_id: QuickReplyMessageFullId,
+            _source: &str,
+        ) {
+            self.register_log.push(format!(
+                "unregister_quick_reply_web_page({})",
+                web_page_id.get()
+            ));
+        }
+
+        fn register_welcome_message_web_page(
+            &mut self,
+            web_page_id: WebPageId,
+            _message_full_id: EphemeralMessageFullId,
+            _source: &str,
+        ) {
+            self.register_log.push(format!(
+                "register_welcome_message_web_page({})",
+                web_page_id.get()
+            ));
+        }
+
+        fn unregister_welcome_message_web_page(
+            &mut self,
+            web_page_id: WebPageId,
+            _message_full_id: EphemeralMessageFullId,
+            _source: &str,
+        ) {
+            self.register_log.push(format!(
+                "unregister_welcome_message_web_page({})",
+                web_page_id.get()
+            ));
+        }
+
+        fn register_premium_gift(
+            &mut self,
+            months: i32,
+            star_count: i64,
+            _message_full_id: MessageFullId,
+            _source: &str,
+        ) {
+            self.register_log
+                .push(format!("register_premium_gift({},{})", months, star_count));
+        }
+
+        fn unregister_premium_gift(
+            &mut self,
+            months: i32,
+            star_count: i64,
+            _message_full_id: MessageFullId,
+            _source: &str,
+        ) {
+            self.register_log.push(format!(
+                "unregister_premium_gift({},{})",
+                months, star_count
+            ));
+        }
+
+        fn register_ton_gift(
+            &mut self,
+            ton_count: i64,
+            _message_full_id: MessageFullId,
+            _source: &str,
+        ) {
+            self.register_log
+                .push(format!("register_ton_gift({})", ton_count));
+        }
+
+        fn unregister_ton_gift(
+            &mut self,
+            ton_count: i64,
+            _message_full_id: MessageFullId,
+            _source: &str,
+        ) {
+            self.register_log
+                .push(format!("unregister_ton_gift({})", ton_count));
+        }
+
+        fn register_dice(
+            &mut self,
+            emoji: &str,
+            value: i32,
+            _message_full_id: MessageFullId,
+            _quick_reply_message_full_id: QuickReplyMessageFullId,
+            _source: &str,
+        ) {
+            self.register_log
+                .push(format!("register_dice({},{})", emoji, value));
+        }
+
+        fn unregister_dice(
+            &mut self,
+            emoji: &str,
+            value: i32,
+            _message_full_id: MessageFullId,
+            _quick_reply_message_full_id: QuickReplyMessageFullId,
+            _source: &str,
+        ) {
+            self.register_log
+                .push(format!("unregister_dice({},{})", emoji, value));
+        }
+
+        fn register_emoji(
+            &mut self,
+            emoji: &str,
+            custom_emoji_id: CustomEmojiId,
+            _message_full_id: MessageFullId,
+            _quick_reply_message_full_id: QuickReplyMessageFullId,
+            _ephemeral_message_full_id: EphemeralMessageFullId,
+            _source: &str,
+        ) {
+            self.register_log.push(format!(
+                "register_emoji({},{})",
+                emoji,
+                custom_emoji_id.get()
+            ));
+        }
+
+        fn unregister_emoji(
+            &mut self,
+            emoji: &str,
+            custom_emoji_id: CustomEmojiId,
+            _message_full_id: MessageFullId,
+            _quick_reply_message_full_id: QuickReplyMessageFullId,
+            _ephemeral_message_full_id: EphemeralMessageFullId,
+            _source: &str,
+        ) {
+            self.register_log.push(format!(
+                "unregister_emoji({},{})",
+                emoji,
+                custom_emoji_id.get()
+            ));
+        }
+
+        fn register_voice(
+            &mut self,
+            file_id: FileId,
+            content_type: MessageContentType,
+            _message_full_id: MessageFullId,
+            _source: &str,
+        ) {
+            self.register_log.push(format!(
+                "register_voice({},{:?})",
+                file_id.get(),
+                content_type
+            ));
+        }
+
+        fn unregister_voice(
+            &mut self,
+            file_id: FileId,
+            content_type: MessageContentType,
+            _message_full_id: MessageFullId,
+            _source: &str,
+        ) {
+            self.register_log.push(format!(
+                "unregister_voice({},{:?})",
+                file_id.get(),
+                content_type
+            ));
+        }
+
+        fn register_poll(
+            &mut self,
+            poll_id: PollId,
+            _message_full_id: MessageFullId,
+            _source: &str,
+        ) {
+            self.register_log
+                .push(format!("register_poll({})", poll_id.get()));
+        }
+
+        fn unregister_poll(
+            &mut self,
+            poll_id: PollId,
+            _message_full_id: MessageFullId,
+            _source: &str,
+        ) {
+            self.register_log
+                .push(format!("unregister_poll({})", poll_id.get()));
+        }
+
+        fn register_reply_poll(&mut self, poll_id: PollId) {
+            self.register_log
+                .push(format!("register_reply_poll({})", poll_id.get()));
+        }
+
+        fn unregister_reply_poll(&mut self, poll_id: PollId) {
+            self.register_log
+                .push(format!("unregister_reply_poll({})", poll_id.get()));
+        }
+
+        fn register_story(
+            &mut self,
+            story_full_id: StoryFullId,
+            _message_full_id: MessageFullId,
+            _quick_reply_message_full_id: QuickReplyMessageFullId,
+            _source: &str,
+        ) {
+            self.register_log.push(format!(
+                "register_story({},{})",
+                story_full_id.dialog_id.get(),
+                story_full_id.story_id.get()
+            ));
+        }
+
+        fn unregister_story(
+            &mut self,
+            story_full_id: StoryFullId,
+            _message_full_id: MessageFullId,
+            _quick_reply_message_full_id: QuickReplyMessageFullId,
+            _source: &str,
+        ) {
+            self.register_log.push(format!(
+                "unregister_story({},{})",
+                story_full_id.dialog_id.get(),
+                story_full_id.story_id.get()
+            ));
+        }
+
+        fn register_group_call(&mut self, _message_full_id: MessageFullId, _source: &str) {
+            self.register_log.push("register_group_call()".to_string());
+        }
+
+        fn unregister_group_call(&mut self, _message_full_id: MessageFullId, _source: &str) {
+            self.register_log
+                .push("unregister_group_call()".to_string());
+        }
+
+        fn register_suggested_profile_photo(&mut self, _photo: &Photo) {
+            self.register_log
+                .push("register_suggested_profile_photo()".to_string());
+        }
+
+        fn register_noforwards_request(
+            &mut self,
+            _message_full_id: MessageFullId,
+            _message_date: i32,
+        ) {
+            self.register_log
+                .push("register_noforwards_request()".to_string());
+        }
+
+        fn unregister_noforwards_request(&mut self, _message_full_id: MessageFullId) {
+            self.register_log
+                .push("unregister_noforwards_request()".to_string());
         }
     }
 
@@ -11165,5 +12113,658 @@ mod tests {
         assert!(list.get_can_append_items(3, 0));
         assert!(!list.get_can_append_items(3, 1));
         assert!(!list.get_can_append_items(100, -1));
+    }
+
+    fn plain_text(s: &str) -> FormattedText {
+        FormattedText {
+            text: s.to_string(),
+            entities: vec![],
+        }
+    }
+
+    fn message_full_id() -> MessageFullId {
+        MessageFullId::new(
+            DialogId::from_user_id(UserId::new(7)),
+            crate::messages_manager::MessageId::new(4242),
+        )
+    }
+
+    #[test]
+    fn animated_emoji_decision_table_matches_the_cpp() {
+        assert!(!can_be_animated_emoji(&plain_text("hi")));
+        assert!(can_be_animated_emoji(&plain_text("🎲")));
+
+        let id = CustomEmojiId::new(5);
+        let mut covering = plain_text("🎲");
+        covering.entities = vec![MessageEntity::custom_emoji(0, 2, id)];
+        assert!(can_be_animated_emoji(&covering));
+
+        let mut two_entities = covering.clone();
+        two_entities
+            .entities
+            .push(MessageEntity::new(Type::Bold, 0, 1));
+        assert!(!can_be_animated_emoji(&two_entities));
+
+        let mut non_custom = plain_text("🎲");
+        non_custom.entities = vec![MessageEntity::new(Type::Bold, 0, 2)];
+        assert!(!can_be_animated_emoji(&non_custom));
+
+        let mut bad_offset = plain_text("🎲");
+        bad_offset.entities = vec![MessageEntity::custom_emoji(1, 1, id)];
+        assert!(!can_be_animated_emoji(&bad_offset));
+
+        let mut bad_length = plain_text("🎲");
+        bad_length.entities = vec![MessageEntity::custom_emoji(0, 1, id)];
+        assert!(!can_be_animated_emoji(&bad_length));
+
+        let mut invalid_id = plain_text("🎲");
+        invalid_id.entities = vec![MessageEntity::custom_emoji(0, 2, CustomEmojiId::default())];
+        assert!(!can_be_animated_emoji(&invalid_id));
+
+        assert!(!get_custom_emoji_id(&plain_text("🎲")).is_valid());
+        assert_eq!(get_custom_emoji_id(&covering).get(), 5);
+    }
+
+    #[test]
+    fn register_message_content_routes_each_content_type_to_its_owner() {
+        let mfid = message_full_id();
+        let source = "test";
+        let file_id = FileId::new(11, 3);
+        let user_id = UserId::new(7);
+
+        let cases: Vec<(&str, MessageContent)> = vec![
+            (
+                "register_web_page(99)",
+                MessageContent::Text(MessageText::new(
+                    plain_text("hello"),
+                    WebPageId::new(99),
+                    false,
+                    false,
+                    false,
+                    String::new(),
+                )),
+            ),
+            (
+                "register_emoji(🎲,0)",
+                MessageContent::Text(MessageText::new(
+                    plain_text("🎲"),
+                    WebPageId::default(),
+                    false,
+                    false,
+                    false,
+                    String::new(),
+                )),
+            ),
+            (
+                "register_voice(11,VideoNote)",
+                MessageContent::VideoNote(MessageVideoNote {
+                    file_id,
+                    is_viewed: false,
+                }),
+            ),
+            (
+                "register_voice(11,VoiceNote)",
+                MessageContent::VoiceNote(MessageVoiceNote {
+                    file_id,
+                    caption: plain_text("cap"),
+                    is_listened: false,
+                }),
+            ),
+            (
+                "register_poll(5)",
+                MessageContent::Poll(MessagePoll {
+                    poll_id: PollId::new(5),
+                    caption: plain_text("poll"),
+                    attached_media: None,
+                }),
+            ),
+            (
+                "register_dice(🎯,4)",
+                MessageContent::Dice(MessageDice {
+                    emoji: "🎯".to_string(),
+                    dice_value: 4,
+                    ..MessageDice::default()
+                }),
+            ),
+            (
+                "register_premium_gift(2,0)",
+                MessageContent::GiftPremium(MessageGiftPremium {
+                    days: 60,
+                    ..MessageGiftPremium::default()
+                }),
+            ),
+            (
+                "register_premium_gift(1,0)",
+                MessageContent::GiftCode(MessageGiftCode {
+                    days: 35,
+                    ..MessageGiftCode::default()
+                }),
+            ),
+            (
+                "register_premium_gift(3,50)",
+                MessageContent::Giveaway(MessageGiveaway {
+                    months: 3,
+                    star_count: 50,
+                    ..MessageGiveaway::default()
+                }),
+            ),
+            (
+                "register_suggested_profile_photo()",
+                MessageContent::SuggestProfilePhoto(MessageSuggestProfilePhoto {
+                    photo: Photo::default(),
+                }),
+            ),
+            (
+                "register_story(7,42)",
+                MessageContent::Story(MessageStory {
+                    story_full_id: StoryFullId::new(
+                        DialogId::from_user_id(user_id),
+                        StoryId::new(42),
+                    ),
+                    via_mention: false,
+                }),
+            ),
+            (
+                "register_premium_gift(0,9)",
+                MessageContent::GiftStars(MessageGiftStars {
+                    star_count: 9,
+                    ..MessageGiftStars::default()
+                }),
+            ),
+            (
+                "register_premium_gift(0,3)",
+                MessageContent::PrizeStars(MessagePrizeStars {
+                    star_count: 3,
+                    ..MessagePrizeStars::default()
+                }),
+            ),
+            (
+                "register_group_call()",
+                MessageContent::ConferenceCall(MessageConferenceCall::default()),
+            ),
+            (
+                "register_ton_gift(12)",
+                MessageContent::GiftTon(MessageGiftTon {
+                    crypto_amount: 12,
+                    ..MessageGiftTon::default()
+                }),
+            ),
+            (
+                "register_noforwards_request()",
+                MessageContent::NoForwardsRequest(MessageNoForwardsRequest {
+                    is_expired: false,
+                    ..MessageNoForwardsRequest::default()
+                }),
+            ),
+        ];
+
+        for (expected, content) in cases {
+            let mut td = TestContext::default();
+            register_message_content(&mut td, &content, mfid, 0, source);
+            assert_eq!(
+                td.register_log,
+                vec![expected.to_string()],
+                "content mismatch"
+            );
+        }
+
+        // the expired noforwards request is not registered
+        let mut td = TestContext::default();
+        register_message_content(
+            &mut td,
+            &MessageContent::NoForwardsRequest(MessageNoForwardsRequest {
+                is_expired: true,
+                ..MessageNoForwardsRequest::default()
+            }),
+            mfid,
+            0,
+            source,
+        );
+        assert!(td.register_log.is_empty());
+
+        // a type without a C++ arm is a no-op
+        let mut td = TestContext::default();
+        register_message_content(
+            &mut td,
+            &MessageContent::Animation(MessageAnimation {
+                file_id,
+                caption: plain_text("cap"),
+                has_spoiler: false,
+            }),
+            mfid,
+            0,
+            source,
+        );
+        assert!(td.register_log.is_empty());
+    }
+
+    #[test]
+    fn bot_gate_skips_everything_but_polls() {
+        let mfid = message_full_id();
+        let mut td = TestContext {
+            is_bot: true,
+            ..TestContext::default()
+        };
+
+        register_message_content(
+            &mut td,
+            &MessageContent::Text(MessageText::new(
+                plain_text("hello"),
+                WebPageId::new(99),
+                false,
+                false,
+                false,
+                String::new(),
+            )),
+            mfid,
+            0,
+            "test",
+        );
+        assert!(td.register_log.is_empty());
+
+        register_message_content(
+            &mut td,
+            &MessageContent::Poll(MessagePoll {
+                poll_id: PollId::new(5),
+                caption: plain_text("poll"),
+                attached_media: None,
+            }),
+            mfid,
+            0,
+            "test",
+        );
+        assert_eq!(td.register_log, vec!["register_poll(5)"]);
+
+        let mut td = TestContext {
+            is_bot: true,
+            ..TestContext::default()
+        };
+        unregister_message_content(
+            &mut td,
+            &MessageContent::Text(MessageText::new(
+                plain_text("hello"),
+                WebPageId::new(99),
+                false,
+                false,
+                false,
+                String::new(),
+            )),
+            mfid,
+            "test",
+        );
+        assert!(td.register_log.is_empty());
+    }
+
+    #[test]
+    fn unregister_message_content_mirrors_register() {
+        let mfid = message_full_id();
+        let mut td = TestContext::default();
+        unregister_message_content(
+            &mut td,
+            &MessageContent::Text(MessageText::new(
+                plain_text("hello"),
+                WebPageId::new(99),
+                false,
+                false,
+                false,
+                String::new(),
+            )),
+            mfid,
+            "test",
+        );
+        unregister_message_content(
+            &mut td,
+            &MessageContent::Dice(MessageDice {
+                emoji: "🎯".to_string(),
+                dice_value: 4,
+                ..MessageDice::default()
+            }),
+            mfid,
+            "test",
+        );
+        assert_eq!(
+            td.register_log,
+            vec!["unregister_web_page(99)", "unregister_dice(🎯,4)"]
+        );
+    }
+
+    #[test]
+    fn reregister_skips_when_the_cpp_equality_checks_hold() {
+        let mfid = message_full_id();
+        let source = "test";
+        let text = |web_page_id: i64, s: &str| {
+            MessageContent::Text(MessageText::new(
+                plain_text(s),
+                WebPageId::new(web_page_id),
+                false,
+                false,
+                false,
+                String::new(),
+            ))
+        };
+
+        // identical content — no re-registration
+        let mut td = TestContext::default();
+        reregister_message_content(
+            &mut td,
+            &text(99, "hello"),
+            &text(99, "hello"),
+            mfid,
+            0,
+            source,
+        );
+        assert!(td.register_log.is_empty());
+
+        // different non-emoji text with the same web page — no re-registration
+        let mut td = TestContext::default();
+        reregister_message_content(
+            &mut td,
+            &text(99, "hello"),
+            &text(99, "world"),
+            mfid,
+            0,
+            source,
+        );
+        assert!(td.register_log.is_empty());
+
+        // the text becomes an animated emoji — unregister the old text
+        // (which was not registered as emoji) and register the new one
+        let mut td = TestContext::default();
+        reregister_message_content(&mut td, &text(0, "hello"), &text(0, "🎲"), mfid, 0, source);
+        assert_eq!(td.register_log, vec!["register_emoji(🎲,0)"]);
+
+        // web page id changes — unregister the old, register the new
+        let mut td = TestContext::default();
+        reregister_message_content(
+            &mut td,
+            &text(99, "hello"),
+            &text(100, "hello"),
+            mfid,
+            0,
+            source,
+        );
+        assert_eq!(
+            td.register_log,
+            vec!["unregister_web_page(99)", "register_web_page(100)"]
+        );
+
+        // different content types — unregister + register
+        let mut td = TestContext::default();
+        reregister_message_content(
+            &mut td,
+            &text(99, "hello"),
+            &MessageContent::Poll(MessagePoll {
+                poll_id: PollId::new(5),
+                caption: plain_text("poll"),
+                attached_media: None,
+            }),
+            mfid,
+            0,
+            source,
+        );
+        assert_eq!(
+            td.register_log,
+            vec!["unregister_web_page(99)", "register_poll(5)"]
+        );
+
+        // conference calls are never reregistered
+        let mut td = TestContext::default();
+        let call = MessageContent::ConferenceCall(MessageConferenceCall::default());
+        reregister_message_content(&mut td, &call, &call, mfid, 0, source);
+        assert!(td.register_log.is_empty());
+
+        // noforwards requests are always reregistered (date-dependent)
+        let mut td = TestContext::default();
+        let request = MessageContent::NoForwardsRequest(MessageNoForwardsRequest {
+            is_expired: false,
+            ..MessageNoForwardsRequest::default()
+        });
+        reregister_message_content(&mut td, &request, &request, mfid, 0, source);
+        assert_eq!(
+            td.register_log,
+            vec![
+                "unregister_noforwards_request()",
+                "register_noforwards_request()"
+            ]
+        );
+
+        // same voice-note file — no re-registration; a different file does
+        let file_id = FileId::new(11, 3);
+        let other_file_id = FileId::new(12, 3);
+        let voice_note = |file_id| {
+            MessageContent::VoiceNote(MessageVoiceNote {
+                file_id,
+                caption: plain_text("cap"),
+                is_listened: false,
+            })
+        };
+        let mut td = TestContext::default();
+        reregister_message_content(
+            &mut td,
+            &voice_note(file_id),
+            &voice_note(file_id),
+            mfid,
+            0,
+            source,
+        );
+        assert!(td.register_log.is_empty());
+        let mut td = TestContext::default();
+        reregister_message_content(
+            &mut td,
+            &voice_note(file_id),
+            &voice_note(other_file_id),
+            mfid,
+            0,
+            source,
+        );
+        assert_eq!(
+            td.register_log,
+            vec![
+                "unregister_voice(11,VoiceNote)",
+                "register_voice(12,VoiceNote)"
+            ]
+        );
+
+        // same giveaway month/star counts — no re-registration
+        let giveaway = |months: i32, star_count: i64| {
+            MessageContent::Giveaway(MessageGiveaway {
+                months,
+                star_count,
+                ..MessageGiveaway::default()
+            })
+        };
+        let mut td = TestContext::default();
+        reregister_message_content(&mut td, &giveaway(3, 50), &giveaway(3, 50), mfid, 0, source);
+        assert!(td.register_log.is_empty());
+        let mut td = TestContext::default();
+        reregister_message_content(&mut td, &giveaway(3, 50), &giveaway(4, 50), mfid, 0, source);
+        assert_eq!(
+            td.register_log,
+            vec![
+                "unregister_premium_gift(3,50)",
+                "register_premium_gift(4,50)"
+            ]
+        );
+
+        // the bot gate applies inside reregister too
+        let mut td = TestContext {
+            is_bot: true,
+            ..TestContext::default()
+        };
+        reregister_message_content(
+            &mut td,
+            &text(99, "hello"),
+            &text(99, "hello"),
+            mfid,
+            0,
+            source,
+        );
+        assert!(td.register_log.is_empty());
+    }
+
+    #[test]
+    fn reply_quick_reply_and_welcome_registrations_follow_the_cpp_arms() {
+        let source = "test";
+        let user_id = UserId::new(7);
+        let poll = MessageContent::Poll(MessagePoll {
+            poll_id: PollId::new(5),
+            caption: plain_text("poll"),
+            attached_media: None,
+        });
+
+        // reply: polls only
+        let mut td = TestContext::default();
+        register_reply_message_content(&mut td, &poll);
+        register_reply_message_content(
+            &mut td,
+            &MessageContent::Text(MessageText::new(
+                plain_text("hello"),
+                WebPageId::default(),
+                false,
+                false,
+                false,
+                String::new(),
+            )),
+        );
+        unregister_reply_message_content(&mut td, &poll);
+        assert_eq!(
+            td.register_log,
+            vec!["register_reply_poll(5)", "unregister_reply_poll(5)"]
+        );
+
+        // quick reply: web pages, polls (as reply polls, per the C++),
+        // dice and stories
+        let quick_reply_id = QuickReplyMessageFullId::new(
+            crate::messages_manager::QuickReplyShortcutId::new(3),
+            crate::messages_manager::MessageId::new(99),
+        );
+        let mut td = TestContext::default();
+        register_quick_reply_message_content(
+            &mut td,
+            &MessageContent::Text(MessageText::new(
+                plain_text("hello"),
+                WebPageId::new(77),
+                false,
+                false,
+                false,
+                String::new(),
+            )),
+            quick_reply_id,
+            source,
+        );
+        register_quick_reply_message_content(&mut td, &poll, quick_reply_id, source);
+        register_quick_reply_message_content(
+            &mut td,
+            &MessageContent::Dice(MessageDice {
+                emoji: "🎯".to_string(),
+                dice_value: 4,
+                ..MessageDice::default()
+            }),
+            quick_reply_id,
+            source,
+        );
+        register_quick_reply_message_content(
+            &mut td,
+            &MessageContent::Story(MessageStory {
+                story_full_id: StoryFullId::new(DialogId::from_user_id(user_id), StoryId::new(42)),
+                via_mention: false,
+            }),
+            quick_reply_id,
+            source,
+        );
+        assert_eq!(
+            td.register_log,
+            vec![
+                "register_quick_reply_web_page(77)",
+                "register_reply_poll(5)",
+                "register_dice(🎯,4)",
+                "register_story(7,42)",
+            ]
+        );
+        let mut td = TestContext::default();
+        unregister_quick_reply_message_content(
+            &mut td,
+            &MessageContent::Text(MessageText::new(
+                plain_text("hello"),
+                WebPageId::new(77),
+                false,
+                false,
+                false,
+                String::new(),
+            )),
+            quick_reply_id,
+            source,
+        );
+        assert_eq!(td.register_log, vec!["unregister_quick_reply_web_page(77)"]);
+
+        // welcome: web pages and animated emoji only
+        let ephemeral_id = EphemeralMessageFullId::new(
+            DialogId::from_user_id(user_id),
+            crate::messages_manager::EphemeralMessageId::new(8),
+        );
+        let mut td = TestContext::default();
+        register_welcome_message_content(
+            &mut td,
+            &MessageContent::Text(MessageText::new(
+                plain_text("hello"),
+                WebPageId::new(77),
+                false,
+                false,
+                false,
+                String::new(),
+            )),
+            ephemeral_id,
+            source,
+        );
+        register_welcome_message_content(
+            &mut td,
+            &MessageContent::Text(MessageText::new(
+                plain_text("🎲"),
+                WebPageId::default(),
+                false,
+                false,
+                false,
+                String::new(),
+            )),
+            ephemeral_id,
+            source,
+        );
+        register_welcome_message_content(&mut td, &poll, ephemeral_id, source);
+        assert_eq!(
+            td.register_log,
+            vec![
+                "register_welcome_message_web_page(77)",
+                "register_emoji(🎲,0)"
+            ]
+        );
+
+        let mut td = TestContext::default();
+        unregister_welcome_message_content(
+            &mut td,
+            &MessageContent::Text(MessageText::new(
+                plain_text("hello"),
+                WebPageId::new(77),
+                false,
+                false,
+                false,
+                String::new(),
+            )),
+            ephemeral_id,
+            source,
+        );
+        assert_eq!(
+            td.register_log,
+            vec!["unregister_welcome_message_web_page(77)"]
+        );
+    }
+
+    #[test]
+    fn premium_duration_month_count_rounds_like_the_cpp() {
+        assert_eq!(get_premium_duration_month_count(0), 1);
+        assert_eq!(get_premium_duration_month_count(29), 1);
+        assert_eq!(get_premium_duration_month_count(30), 1);
+        assert_eq!(get_premium_duration_month_count(31), 1);
+        assert_eq!(get_premium_duration_month_count(60), 2);
+        assert_eq!(get_premium_duration_month_count(-10), 1);
     }
 }

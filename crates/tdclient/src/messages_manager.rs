@@ -882,6 +882,167 @@ impl MessageFullId {
     }
 }
 
+/// `td::QuickReplyShortcutId` (QuickReplyShortcutId.h).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct QuickReplyShortcutId(i32);
+
+impl QuickReplyShortcutId {
+    pub const MAX_SERVER_SHORTCUT_ID: i32 = 1999999999;
+
+    pub fn new(id: i32) -> QuickReplyShortcutId {
+        QuickReplyShortcutId(id)
+    }
+
+    pub fn get(self) -> i32 {
+        self.0
+    }
+
+    /// `QuickReplyShortcutId::get_input_quick_reply_shortcut_ids`
+    /// (QuickReplyShortcutId.h:34-43).
+    pub fn get_input_quick_reply_shortcut_ids(
+        quick_reply_shortcut_ids: &[QuickReplyShortcutId],
+    ) -> Vec<i32> {
+        quick_reply_shortcut_ids
+            .iter()
+            .map(|&id| id.get())
+            .collect()
+    }
+
+    /// `QuickReplyShortcutId::get_quick_reply_shortcut_ids`
+    /// (QuickReplyShortcutId.h:45-53).
+    pub fn get_quick_reply_shortcut_ids(shortcut_ids: &[i32]) -> Vec<QuickReplyShortcutId> {
+        shortcut_ids
+            .iter()
+            .map(|&id| QuickReplyShortcutId(id))
+            .collect()
+    }
+
+    /// `QuickReplyShortcutId::is_valid` (QuickReplyShortcutId.h:65-67).
+    pub fn is_valid(self) -> bool {
+        self.0 > 0
+    }
+
+    /// `QuickReplyShortcutId::is_server` (QuickReplyShortcutId.h:69-71).
+    pub fn is_server(self) -> bool {
+        self.0 > 0 && self.0 <= QuickReplyShortcutId::MAX_SERVER_SHORTCUT_ID
+    }
+
+    /// `QuickReplyShortcutId::is_local` (QuickReplyShortcutId.h:73-75).
+    pub fn is_local(self) -> bool {
+        self.0 > QuickReplyShortcutId::MAX_SERVER_SHORTCUT_ID
+    }
+
+    /// `QuickReplyShortcutId::store` (QuickReplyShortcutId.h:77-79).
+    pub fn store(self, out: &mut Vec<u8>) {
+        store_i32(out, self.0);
+    }
+
+    /// `td::parse(QuickReplyShortcutId, Parser)` (QuickReplyShortcutId.h:82-84).
+    pub fn parse_from(parser: &mut Parser) -> Result<QuickReplyShortcutId, &'static str> {
+        Ok(QuickReplyShortcutId(parser.i32_()?))
+    }
+}
+
+/// `td::QuickReplyMessageFullId` (QuickReplyMessageFullId.h) — the
+/// (shortcut, message) pair key.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct QuickReplyMessageFullId {
+    quick_reply_shortcut_id: QuickReplyShortcutId,
+    message_id: MessageId,
+}
+
+impl QuickReplyMessageFullId {
+    pub fn new(
+        quick_reply_shortcut_id: QuickReplyShortcutId,
+        message_id: MessageId,
+    ) -> QuickReplyMessageFullId {
+        QuickReplyMessageFullId {
+            quick_reply_shortcut_id,
+            message_id,
+        }
+    }
+
+    pub fn get_quick_reply_shortcut_id(self) -> QuickReplyShortcutId {
+        self.quick_reply_shortcut_id
+    }
+
+    pub fn get_message_id(self) -> MessageId {
+        self.message_id
+    }
+
+    /// `QuickReplyMessageFullId::is_valid` (QuickReplyMessageFullId.h:47-49).
+    pub fn is_valid(self) -> bool {
+        self.quick_reply_shortcut_id.is_valid() && self.message_id.is_valid()
+    }
+
+    /// `QuickReplyMessageFullId::is_server` (QuickReplyMessageFullId.h:51-53).
+    pub fn is_server(self) -> bool {
+        self.quick_reply_shortcut_id.is_valid() && self.message_id.is_server()
+    }
+
+    /// `QuickReplyMessageFullId::store` (QuickReplyMessageFullId.h:55-59).
+    pub fn store(self, out: &mut Vec<u8>) {
+        self.quick_reply_shortcut_id.store(out);
+        self.message_id.store(out);
+    }
+
+    /// `td::parse(QuickReplyMessageFullId, Parser)`
+    /// (QuickReplyMessageFullId.h:62-66).
+    pub fn parse_from(parser: &mut Parser) -> Result<QuickReplyMessageFullId, &'static str> {
+        Ok(QuickReplyMessageFullId::new(
+            QuickReplyShortcutId::parse_from(parser)?,
+            MessageId::parse_from(parser)?,
+        ))
+    }
+}
+
+/// `td::EphemeralMessageFullId` (EphemeralMessageFullId.h) — the
+/// (dialog, ephemeral message) pair key.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EphemeralMessageFullId {
+    dialog_id: DialogId,
+    ephemeral_message_id: EphemeralMessageId,
+}
+
+impl EphemeralMessageFullId {
+    pub fn new(
+        dialog_id: DialogId,
+        ephemeral_message_id: EphemeralMessageId,
+    ) -> EphemeralMessageFullId {
+        EphemeralMessageFullId {
+            dialog_id,
+            ephemeral_message_id,
+        }
+    }
+
+    pub fn get_dialog_id(self) -> DialogId {
+        self.dialog_id
+    }
+
+    pub fn get_ephemeral_message_id(self) -> EphemeralMessageId {
+        self.ephemeral_message_id
+    }
+
+    /// `EphemeralMessageFullId::is_valid` (EphemeralMessageFullId.h:38-40).
+    pub fn is_valid(self) -> bool {
+        self.dialog_id.is_valid() && self.ephemeral_message_id.is_valid()
+    }
+
+    /// `EphemeralMessageFullId::store` (EphemeralMessageFullId.h:42-46).
+    pub fn store(self, out: &mut Vec<u8>) {
+        self.dialog_id.store(out);
+        self.ephemeral_message_id.store(out);
+    }
+
+    /// `td::parse(EphemeralMessageFullId, Parser)` (EphemeralMessageFullId.h:49-53).
+    pub fn parse_from(parser: &mut Parser) -> Result<EphemeralMessageFullId, &'static str> {
+        Ok(EphemeralMessageFullId::new(
+            DialogId::parse_from(parser)?,
+            EphemeralMessageId(parser.i32_()?),
+        ))
+    }
+}
+
 /// `td::NotificationGroupId` (NotificationGroupId.h).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NotificationGroupId(i32);
