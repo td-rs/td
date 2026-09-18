@@ -3967,6 +3967,1488 @@ impl FileSourceStorage for FileReferenceManager {
     }
 }
 
+// ==== FileNode / merge machine (M.12.2b) ====
+
+/// `td::FileLocationSource` (FileManager.h:58) — the order is the
+/// `merge_choose_file_source_location` trust order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum FileLocationSource {
+    #[default]
+    None,
+    FromUser,
+    FromBinlog,
+    FromDatabase,
+    FromServer,
+}
+
+/// `td::NewRemoteFileLocation` (FileManager.h:60-72) — the per-node remote
+/// location: at most one of the full or partial form is present.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NewRemoteFileLocation {
+    pub partial: Option<PartialRemoteFileLocation>,
+    pub full: Option<FullRemoteFileLocation>,
+    pub is_full_alive: bool,
+    pub full_source: FileLocationSource,
+}
+
+impl NewRemoteFileLocation {
+    /// `NewRemoteFileLocation(RemoteFileLocation, FileLocationSource)`
+    /// (FileManager.cpp:117-134).
+    pub fn from_remote(remote: RemoteFileLocation, source: FileLocationSource) -> NewRemoteFileLocation {
+        match remote {
+            RemoteFileLocation::Empty => NewRemoteFileLocation::default(),
+            RemoteFileLocation::Partial(partial) => NewRemoteFileLocation {
+                partial: Some(partial),
+                ..NewRemoteFileLocation::default()
+            },
+            RemoteFileLocation::Full(full) => NewRemoteFileLocation {
+                partial: None,
+                full: Some(full),
+                full_source: source,
+                is_full_alive: true,
+            },
+        }
+    }
+
+    /// `NewRemoteFileLocation::partial_or_empty` (FileManager.cpp:134-140).
+    pub fn partial_or_empty(&self) -> RemoteFileLocation {
+        match &self.partial {
+            Some(partial) => RemoteFileLocation::Partial(partial.clone()),
+            None => RemoteFileLocation::Empty,
+        }
+    }
+}
+
+impl fmt::Display for FileLocationSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            FileLocationSource::None => "None",
+            FileLocationSource::FromUser => "FromUser",
+            FileLocationSource::FromBinlog => "FromBinlog",
+            FileLocationSource::FromDatabase => "FromDatabase",
+            FileLocationSource::FromServer => "FromServer",
+        };
+        f.write_str(name)
+    }
+}
+
+/// The C++ `operator<<` (FileManager.cpp) — alive/full/no-location plus the
+/// source.
+impl fmt::Display for NewRemoteFileLocation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_full_alive {
+            f.write_str("alive ")?;
+        }
+        match &self.full {
+            Some(full) => write!(f, "{full}")?,
+            None => f.write_str("[no location]")?,
+        }
+        write!(f, " from {}", self.full_source)
+    }
+}
+
+/// `LocalFileLocation::Type` (FileLocation.h:768) — the discriminant the
+/// merge chooses on.
+fn local_location_type_tag(location: &LocalFileLocation) -> i32 {
+    match location {
+        LocalFileLocation::Empty => 0,
+        LocalFileLocation::Partial(_) => 1,
+        LocalFileLocation::Full(_) => 2,
+    }
+}
+
+/// `merge_choose_local_location` (FileManager.cpp:2038-2045): 0 = keep x,
+/// 1 = take y, 2 = both are equal.
+fn merge_choose_local_location(x: &LocalFileLocation, y: &LocalFileLocation) -> i32 {
+    let x_type = local_location_type_tag(x);
+    let y_type = local_location_type_tag(y);
+    if x_type != y_type {
+        return i32::from(x_type < y_type);
+    }
+    2
+}
+
+/// `merge_choose_file_source_location` (FileManager.cpp:2047-2049).
+fn merge_choose_file_source_location(x: FileLocationSource, y: FileLocationSource) -> i32 {
+    i32::from(x < y)
+}
+
+/// `merge_choose_remote_location` over full locations
+/// (FileManager.cpp:2051-2072).
+fn merge_choose_full_remote_location(
+    x: &FullRemoteFileLocation,
+    x_source: FileLocationSource,
+    y: &FullRemoteFileLocation,
+    y_source: FileLocationSource,
+) -> i32 {
+    if x.is_web() != y.is_web() {
+        return i32::from(x.is_web()); // prefer non-web
+    }
+    let x_ref = x.has_file_reference();
+    let y_ref = y.has_file_reference();
+    if x_ref || y_ref {
+        if x_ref != y_ref {
+            return i32::from(!x_ref);
+        }
+        if x.get_file_reference() != y.get_file_reference() {
+            return merge_choose_file_source_location(x_source, y_source);
+        }
+    }
+    if (x.get_access_hash() != y.get_access_hash() || x.get_source() != y.get_source())
+        && (x_source != y_source || x.is_web() || x.get_id() == y.get_id())
+    {
+        return merge_choose_file_source_location(x_source, y_source);
+    }
+    2
+}
+
+/// `merge_choose_remote_location` over node locations
+/// (FileManager.cpp:2074-2085).
+fn merge_choose_remote_location(x: &NewRemoteFileLocation, y: &NewRemoteFileLocation) -> i32 {
+    if x.is_full_alive != y.is_full_alive {
+        return i32::from(!x.is_full_alive);
+    }
+    if x.is_full_alive {
+        return merge_choose_full_remote_location(
+            x.full.as_ref().expect("is_full_alive"),
+            x.full_source,
+            y.full.as_ref().expect("is_full_alive"),
+            y.full_source,
+        );
+    }
+    if x.partial.is_some() != y.partial.is_some() {
+        return i32::from(x.partial.is_none());
+    }
+    2
+}
+
+/// `merge_choose_generate_location` (FileManager.cpp:2087-2105).
+fn merge_choose_generate_location(
+    x: Option<&FullGenerateFileLocation>,
+    y: Option<&FullGenerateFileLocation>,
+) -> i32 {
+    let x_empty = x.is_none();
+    let y_empty = y.is_none();
+    if x_empty != y_empty {
+        return i32::from(x_empty);
+    }
+    if let (Some(x), Some(y)) = (x, y)
+        && x != y
+    {
+        let x_has_mtime = x.conversion.starts_with("#mtime#");
+        let y_has_mtime = y.conversion.starts_with("#mtime#");
+        if x_has_mtime != y_has_mtime {
+            return i32::from(!x_has_mtime);
+        }
+        // the bigger conversion, the bigger mtime or at least a stable choice
+        return if x.conversion >= y.conversion { 0 } else { 1 };
+    }
+    2
+}
+
+
+/// `merge_choose_size` (FileManager.cpp:2107-2119) — `-1` is the conflict
+/// error.
+fn merge_choose_size(x: i64, y: i64) -> i32 {
+    if x == 0 {
+        return 1;
+    }
+    if y == 0 {
+        return 0;
+    }
+    if x != y {
+        return -1;
+    }
+    2
+}
+
+/// `merge_choose_expected_size` (FileManager.cpp:2121-2129).
+fn merge_choose_expected_size(x: i64, y: i64) -> i32 {
+    if x == 0 {
+        return 1;
+    }
+    if y == 0 {
+        return 0;
+    }
+    2
+}
+
+/// `merge_choose_name` (FileManager.cpp:2131-2136).
+fn merge_choose_name(x: &str, y: &str) -> i32 {
+    if x.is_empty() != y.is_empty() {
+        return i32::from(x.is_empty());
+    }
+    2
+}
+
+/// `merge_choose_owner` (FileManager.cpp:2138-2143).
+fn merge_choose_owner(x_owner_dialog_id: DialogId, y_owner_dialog_id: DialogId) -> i32 {
+    if x_owner_dialog_id.is_valid() != y_owner_dialog_id.is_valid() {
+        return i32::from(!x_owner_dialog_id.is_valid());
+    }
+    2
+}
+
+/// `merge_choose_main_file_id` (FileManager.cpp:2145-2150).
+fn merge_choose_main_file_id(a: FileId, a_priority: i8, b: FileId, b_priority: i8) -> i32 {
+    if a_priority != b_priority {
+        return i32::from(a_priority < b_priority);
+    }
+    i32::from(a.get() > b.get())
+}
+
+/// `merge_choose_encryption_key` (FileManager.cpp:2152-2160) — `-1` is the
+/// conflict error.
+fn merge_choose_encryption_key(a: &FileEncryptionKey, b: &FileEncryptionKey) -> i32 {
+    if a.empty() != b.empty() {
+        return i32::from(a.empty());
+    }
+    if a != b {
+        return -1;
+    }
+    2
+}
+
+/// The per-file registry record: `td::FileNode` (FileManager.h:76-238),
+/// data plus pure logic. The download/upload/generate query ids stay as
+/// plain fields; their manager round-trips are the [`FileManagerWorker`]
+/// seam until M.12.4-8 land.
+#[derive(Clone, Debug)]
+pub struct FileNode {
+    local: LocalFileLocation,
+    upload_id: u64,
+    download_offset: i64,
+    private_download_limit: i64,
+    /// `local_ready_prefix_size_` — Partial-local only.
+    local_ready_prefix_size: i64,
+
+    remote: NewRemoteFileLocation,
+
+    download_id: u64,
+
+    generate: Option<FullGenerateFileLocation>,
+    generate_id: u64,
+
+    size: i64,
+    expected_size: i64,
+    remote_name: String,
+    url: String,
+    owner_dialog_id: DialogId,
+    encryption_key: FileEncryptionKey,
+    pmc_id: FileDbId,
+    file_ids: Vec<FileId>,
+
+    main_file_id: FileId,
+
+    last_successful_force_reupload_time: f64,
+
+    upload_pause: FileId,
+
+    upload_priority: i8,
+    download_priority: i8,
+    generate_priority: i8,
+
+    generate_download_priority: i8,
+    generate_upload_priority: i8,
+
+    main_file_id_priority: i8,
+
+    is_download_offset_dirty: bool,
+    is_download_limit_dirty: bool,
+
+    get_by_hash: bool,
+    can_search_locally: bool,
+    #[allow(dead_code)] // read by the photo reload path (M.12.5)
+    need_reload_photo: bool,
+
+    is_download_started: bool,
+
+    #[allow(dead_code)] // read by the generate flow (M.12.8)
+    generate_was_update: bool,
+
+    need_load_from_pmc: bool,
+
+    pmc_changed_flag: bool,
+    info_changed_flag: bool,
+
+    upload_was_update_file_reference: bool,
+    download_was_update_file_reference: bool,
+
+    upload_prefer_small: bool,
+
+    ignore_download_limit: bool,
+}
+
+impl FileNode {
+    /// The `FileNode` constructor (FileManager.h:78-94).
+    #[allow(clippy::too_many_arguments)] // the C++ constructor arity
+    pub fn new(
+        local: LocalFileLocation,
+        remote: NewRemoteFileLocation,
+        generate: Option<FullGenerateFileLocation>,
+        size: i64,
+        expected_size: i64,
+        remote_name: String,
+        url: String,
+        owner_dialog_id: DialogId,
+        encryption_key: FileEncryptionKey,
+        main_file_id: FileId,
+        main_file_id_priority: i8,
+    ) -> FileNode {
+        let mut node = FileNode {
+            local,
+            upload_id: 0,
+            download_offset: 0,
+            private_download_limit: 0,
+            local_ready_prefix_size: 0,
+            remote,
+            download_id: 0,
+            generate,
+            generate_id: 0,
+            size,
+            expected_size,
+            remote_name,
+            url,
+            owner_dialog_id,
+            encryption_key,
+            pmc_id: FileDbId::default(),
+            file_ids: Vec::new(),
+            main_file_id,
+            last_successful_force_reupload_time: -1e10,
+            upload_pause: FileId::default(),
+            upload_priority: 0,
+            download_priority: 0,
+            generate_priority: 0,
+            generate_download_priority: 0,
+            generate_upload_priority: 0,
+            main_file_id_priority,
+            is_download_offset_dirty: false,
+            is_download_limit_dirty: false,
+            get_by_hash: false,
+            can_search_locally: true,
+            need_reload_photo: false,
+            is_download_started: false,
+            generate_was_update: false,
+            need_load_from_pmc: false,
+            pmc_changed_flag: false,
+            info_changed_flag: false,
+            upload_was_update_file_reference: false,
+            download_was_update_file_reference: false,
+            upload_prefer_small: false,
+            ignore_download_limit: false,
+        };
+        node.init_ready_size();
+        node.file_ids.push(main_file_id);
+        node
+    }
+
+    /// `FileNode::recalc_ready_prefix_size` (FileManager.cpp:579-596).
+    fn recalc_ready_prefix_size(&mut self, prefix_offset: i64, ready_prefix_size: i64) {
+        let PartialLocalFileLocation {
+            ready_bitmask,
+            part_size,
+            ..
+        } = match &self.local {
+            LocalFileLocation::Partial(partial) => partial,
+            _ => return,
+        };
+        let new_local_ready_prefix_size = if self.download_offset == prefix_offset {
+            ready_prefix_size
+        } else {
+            Bitmask::from_decode(ready_bitmask).get_ready_prefix_size(self.download_offset, *part_size, self.size)
+        };
+        if new_local_ready_prefix_size != self.local_ready_prefix_size {
+            self.local_ready_prefix_size = new_local_ready_prefix_size;
+            self.on_info_changed();
+        }
+    }
+
+    /// `FileNode::init_ready_size` (FileManager.cpp:598-606).
+    fn init_ready_size(&mut self) {
+        let (ready_bitmask, part_size) = match &self.local {
+            LocalFileLocation::Partial(partial) => (partial.ready_bitmask.clone(), partial.part_size),
+            _ => return,
+        };
+        let bitmask = Bitmask::from_decode(&ready_bitmask);
+        self.local_ready_prefix_size = bitmask.get_ready_prefix_size(0, part_size, self.size);
+        if let LocalFileLocation::Partial(partial) = &mut self.local {
+            partial.ready_size = bitmask.get_total_size(part_size, self.size);
+        }
+    }
+
+    /// `FileNode::set_download_offset` (FileManager.cpp:608-622).
+    pub fn set_download_offset(&mut self, download_offset: i64) {
+        if !(0..=MAX_FILE_SIZE).contains(&download_offset) || download_offset == self.download_offset {
+            return;
+        }
+        self.download_offset = download_offset;
+        self.is_download_offset_dirty = true;
+        self.recalc_ready_prefix_size(-1, -1);
+        self.on_info_changed();
+    }
+
+    /// `FileNode::get_download_limit` (FileManager.cpp:624-629).
+    pub fn get_download_limit(&self) -> i64 {
+        if self.ignore_download_limit {
+            return 0;
+        }
+        self.private_download_limit
+    }
+
+    /// `FileNode::update_effective_download_limit` (FileManager.cpp:631-642).
+    fn update_effective_download_limit(&mut self, old_download_limit: i64) {
+        if self.get_download_limit() == old_download_limit {
+            return;
+        }
+        self.is_download_limit_dirty = true;
+    }
+
+    /// `FileNode::set_download_limit` (FileManager.cpp:644-654).
+    pub fn set_download_limit(&mut self, mut download_limit: i64) {
+        if download_limit < 0 {
+            return;
+        }
+        if download_limit > MAX_FILE_SIZE {
+            download_limit = MAX_FILE_SIZE;
+        }
+        let old_download_limit = self.get_download_limit();
+        self.private_download_limit = download_limit;
+        self.update_effective_download_limit(old_download_limit);
+    }
+
+    /// `FileNode::set_ignore_download_limit` (FileManager.cpp:656-660).
+    pub fn set_ignore_download_limit(&mut self, ignore_download_limit: bool) {
+        let old_download_limit = self.get_download_limit();
+        self.ignore_download_limit = ignore_download_limit;
+        self.update_effective_download_limit(old_download_limit);
+    }
+
+    /// `FileNode::drop_local_location` (FileManager.cpp:662-664).
+    pub fn drop_local_location(&mut self) {
+        self.set_local_location(LocalFileLocation::Empty, -1, -1);
+    }
+
+    /// `FileNode::set_local_location` (FileManager.cpp:666-675).
+    pub fn set_local_location(&mut self, local: LocalFileLocation, prefix_offset: i64, ready_prefix_size: i64) {
+        if self.local != local {
+            self.local = local;
+            self.recalc_ready_prefix_size(prefix_offset, ready_prefix_size);
+            self.on_changed();
+        }
+    }
+
+    /// `FileNode::set_new_remote_location` (FileManager.cpp:677-707).
+    pub fn set_new_remote_location(&mut self, new_remote: NewRemoteFileLocation) {
+        if let Some(full) = &new_remote.full {
+            if let Some(old_full) = &self.remote.full {
+                if old_full == full
+                    && (old_full.get_access_hash() != full.get_access_hash()
+                        || old_full.get_file_reference() != full.get_file_reference()
+                        || old_full.get_source() != full.get_source())
+                {
+                    self.on_pmc_changed();
+                }
+            } else {
+                self.on_changed();
+            }
+            self.remote.full = new_remote.full;
+            self.remote.full_source = new_remote.full_source;
+            self.remote.is_full_alive = new_remote.is_full_alive;
+        } else if self.remote.full.is_some() {
+            self.remote.full = None;
+            self.remote.is_full_alive = false;
+            self.remote.full_source = FileLocationSource::None;
+            self.on_changed();
+        }
+
+        if let Some(partial) = new_remote.partial {
+            self.set_partial_remote_location(partial);
+        } else {
+            self.delete_partial_remote_location();
+        }
+    }
+
+    /// `FileNode::delete_partial_remote_location` (FileManager.cpp:708-714).
+    pub fn delete_partial_remote_location(&mut self) {
+        if self.remote.partial.is_some() {
+            self.remote.partial = None;
+            self.on_changed();
+        }
+    }
+
+    /// `FileNode::set_partial_remote_location` (FileManager.cpp:716-735).
+    pub fn set_partial_remote_location(&mut self, remote: PartialRemoteFileLocation) {
+        if self.remote.is_full_alive {
+            return;
+        }
+        if let Some(old_partial) = &self.remote.partial {
+            if *old_partial == remote {
+                return;
+            }
+        } else if remote.ready_part_count == 0 {
+            // empty partial remote is equal to empty remote
+            return;
+        }
+        self.remote.partial = Some(remote);
+        self.on_changed();
+    }
+
+    /// `FileNode::delete_file_reference` (FileManager.cpp:737-754).
+    pub fn delete_file_reference(&mut self, file_reference: &[u8]) -> bool {
+        let Some(full) = &mut self.remote.full else {
+            return false;
+        };
+        if !full.delete_file_reference(file_reference) {
+            return false;
+        }
+        self.upload_was_update_file_reference = false;
+        self.download_was_update_file_reference = false;
+        self.on_pmc_changed();
+        true
+    }
+
+    /// `FileNode::set_generate_location` (FileManager.cpp:756-762).
+    pub fn set_generate_location(&mut self, generate: Option<FullGenerateFileLocation>) {
+        let is_changed = match (&self.generate, &generate) {
+            (None, None) => false,
+            (None, Some(_)) | (Some(_), None) => true,
+            (Some(old), Some(new)) => old != new,
+        };
+        if is_changed {
+            self.generate = generate;
+            self.on_pmc_changed();
+        }
+    }
+
+    /// `FileNode::set_size` (FileManager.cpp:764-770).
+    pub fn set_size(&mut self, size: i64) {
+        if self.size != size {
+            self.size = size;
+            self.on_changed();
+        }
+    }
+
+    /// `FileNode::set_expected_size` (FileManager.cpp:772-778).
+    pub fn set_expected_size(&mut self, expected_size: i64) {
+        if self.expected_size != expected_size {
+            self.expected_size = expected_size;
+            self.on_changed();
+        }
+    }
+
+    /// `FileNode::set_remote_name` (FileManager.cpp:780-785).
+    pub fn set_remote_name(&mut self, remote_name: String) {
+        if self.remote_name != remote_name {
+            self.remote_name = remote_name;
+            self.on_pmc_changed();
+        }
+    }
+
+    /// `FileNode::set_url` (FileManager.cpp:787-793).
+    pub fn set_url(&mut self, url: String) {
+        if self.url != url {
+            self.url = url;
+            self.on_changed();
+        }
+    }
+
+    /// `FileNode::set_owner_dialog_id` (FileManager.cpp:795-800).
+    pub fn set_owner_dialog_id(&mut self, owner_id: DialogId) {
+        if self.owner_dialog_id != owner_id {
+            self.owner_dialog_id = owner_id;
+            self.on_pmc_changed();
+        }
+    }
+
+    /// `FileNode::set_encryption_key` (FileManager.cpp:802-807).
+    pub fn set_encryption_key(&mut self, key: FileEncryptionKey) {
+        if self.encryption_key != key {
+            self.encryption_key = key;
+            self.on_pmc_changed();
+        }
+    }
+
+    /// `FileNode::set_upload_pause` (FileManager.cpp:809-817).
+    pub fn set_upload_pause(&mut self, upload_pause: FileId) {
+        if self.upload_pause != upload_pause {
+            if self.upload_pause.is_valid() != upload_pause.is_valid() {
+                self.on_info_changed();
+            }
+            self.upload_pause = upload_pause;
+        }
+    }
+
+    /// `FileNode::set_download_priority` (FileManager.cpp:819-825).
+    pub fn set_download_priority(&mut self, priority: i8) {
+        if (self.download_priority == 0) != (priority == 0) {
+            self.on_info_changed();
+        }
+        self.download_priority = priority;
+    }
+
+    /// `FileNode::set_upload_priority` (FileManager.cpp:827-833).
+    pub fn set_upload_priority(&mut self, priority: i8) {
+        if !self.remote.is_full_alive && (self.upload_priority == 0) != (priority == 0) {
+            self.on_info_changed();
+        }
+        self.upload_priority = priority;
+    }
+
+    /// `FileNode::set_generate_priority` (FileManager.cpp:835-845).
+    pub fn set_generate_priority(&mut self, download_priority: i8, upload_priority: i8) {
+        if (self.generate_download_priority == 0) != (download_priority == 0)
+            || (self.generate_upload_priority == 0) != (upload_priority == 0)
+        {
+            self.on_info_changed();
+        }
+        self.generate_priority = download_priority.max(upload_priority);
+        self.generate_download_priority = download_priority;
+        self.generate_upload_priority = upload_priority;
+    }
+
+    /// `FileNode::on_changed` (FileManager.cpp:847-850).
+    pub fn on_changed(&mut self) {
+        self.on_pmc_changed();
+        self.on_info_changed();
+    }
+
+    /// `FileNode::on_info_changed` (FileManager.cpp:852-854).
+    pub fn on_info_changed(&mut self) {
+        self.info_changed_flag = true;
+    }
+
+    /// `FileNode::on_pmc_changed` (FileManager.cpp:856-858).
+    pub fn on_pmc_changed(&mut self) {
+        self.pmc_changed_flag = true;
+    }
+
+    /// `FileNode::need_info_flush` (FileManager.cpp:860-862).
+    pub fn need_info_flush(&self) -> bool {
+        self.info_changed_flag
+    }
+
+    /// `FileNode::need_pmc_flush` (FileManager.cpp:864-898).
+    pub fn need_pmc_flush(&self) -> bool {
+        if !self.pmc_changed_flag {
+            return false;
+        }
+        // already in pmc
+        if self.pmc_id.is_valid() {
+            return true;
+        }
+        // we must save encryption key
+        if !self.encryption_key.empty() {
+            return true;
+        }
+
+        let mut has_generate_location = self.generate.is_some();
+        // do not save "#file_id#" conversion
+        if let Some(generate) = &self.generate
+            && generate.conversion.starts_with("#file_id#")
+        {
+            has_generate_location = false;
+        }
+
+        // we need to always save file sources
+        if self.remote.full.is_some() {
+            return true;
+        }
+        if matches!(self.local, LocalFileLocation::Full(_))
+            && (has_generate_location || self.remote.full.is_some() || self.remote.partial.is_some())
+        {
+            return true;
+        }
+        false
+    }
+
+    /// `FileNode::on_pmc_flushed` (FileManager.cpp:900-902).
+    pub fn on_pmc_flushed(&mut self) {
+        self.pmc_changed_flag = false;
+    }
+
+    /// `FileNode::on_info_flushed` (FileManager.cpp:903-905).
+    pub fn on_info_flushed(&mut self) {
+        self.info_changed_flag = false;
+    }
+
+    /// `FileNode::get_type` (FileManager.h:216-227).
+    pub fn get_type(&self) -> FileType {
+        if let LocalFileLocation::Full(full) = &self.local {
+            return full.file_type;
+        }
+        if let Some(full) = &self.remote.full {
+            return full.file_type;
+        }
+        if let Some(generate) = &self.generate {
+            return generate.file_type;
+        }
+        FileType::Temp
+    }
+
+    /// `FileNode::expected_size` (FileManager.cpp:1012-1024).
+    pub fn expected_size(&self, may_guess: bool) -> i64 {
+        if self.size != 0 {
+            return self.size;
+        }
+        let mut current_size = self.local_total_size(); // TODO: this is not the best approximation
+        if self.expected_size != 0 {
+            return current_size.max(self.expected_size);
+        }
+        if may_guess && matches!(self.local, LocalFileLocation::Partial(_)) {
+            current_size *= 3;
+        }
+        current_size
+    }
+
+    /// `FileNode::is_downloading` (FileManager.cpp:1030-1032).
+    pub fn is_downloading(&self) -> bool {
+        self.download_priority != 0 || self.generate_download_priority != 0
+    }
+
+    /// `FileNode::downloaded_prefix` (FileManager.cpp:1042-1062).
+    pub fn downloaded_prefix(&self, offset: i64) -> i64 {
+        match &self.local {
+            LocalFileLocation::Empty => 0,
+            LocalFileLocation::Full(_) => {
+                if offset < self.size {
+                    self.size - offset
+                } else {
+                    0
+                }
+            }
+            LocalFileLocation::Partial(partial) => {
+                if self.get_type() == FileType::SecureEncrypted {
+                    // file is not decrypted and verified yet
+                    return 0;
+                }
+                Bitmask::from_decode(&partial.ready_bitmask)
+                    .get_ready_prefix_size(offset, partial.part_size, self.size)
+            }
+        }
+    }
+
+    /// `FileNode::local_prefix_size` (FileManager.cpp:1068-1082).
+    pub fn local_prefix_size(&self) -> i64 {
+        match &self.local {
+            LocalFileLocation::Full(_) => {
+                if self.download_offset <= self.size {
+                    self.size - self.download_offset
+                } else {
+                    0
+                }
+            }
+            LocalFileLocation::Partial(_) => {
+                if self.get_type() == FileType::SecureEncrypted {
+                    // file is not decrypted and verified yet
+                    return 0;
+                }
+                self.local_ready_prefix_size
+            }
+            LocalFileLocation::Empty => 0,
+        }
+    }
+
+    /// `FileNode::local_total_size` (FileManager.cpp:1088-1100).
+    pub fn local_total_size(&self) -> i64 {
+        match &self.local {
+            LocalFileLocation::Empty => 0,
+            LocalFileLocation::Full(_) => self.size,
+            LocalFileLocation::Partial(partial) => partial.ready_size,
+        }
+    }
+
+    /// `FileNode::is_uploading` (FileManager.cpp:1106-1108).
+    pub fn is_uploading(&self) -> bool {
+        self.upload_priority != 0 || self.generate_upload_priority != 0 || self.upload_pause.is_valid()
+    }
+
+    /// `FileNode::remote_size` (FileManager.cpp:1114-1122).
+    pub fn remote_size(&self) -> i64 {
+        if self.remote.is_full_alive {
+            return self.size;
+        }
+        if let Some(partial) = &self.remote.partial {
+            return partial.ready_size;
+        }
+        0
+    }
+
+    /// `FileNode::path` (FileManager.cpp:1128-1137).
+    pub fn path(&self) -> &str {
+        match &self.local {
+            LocalFileLocation::Full(full) => &full.path,
+            LocalFileLocation::Partial(partial) => &partial.path,
+            LocalFileLocation::Empty => "",
+        }
+    }
+
+    pub fn get_main_file_id(&self) -> FileId {
+        self.main_file_id
+    }
+
+    /// `FileView::download_offset` over the node record.
+    pub fn download_offset(&self) -> i64 {
+        self.download_offset
+    }
+
+    pub fn get_main_file_id_priority(&self) -> i8 {
+        self.main_file_id_priority
+    }
+}
+
+/// `td::FileView` (FileManager.h:288-...) — the read-only projection over a
+/// [`FileNode`]; only the context-free accessors are here, `suggested_path`,
+/// `can_delete` and the persistent/unique id strings need the options and
+/// serialization surfaces of later slices.
+#[derive(Clone, Copy, Debug)]
+pub struct FileView<'a> {
+    node: &'a FileNode,
+}
+
+impl<'a> FileView<'a> {
+    pub fn new(node: &'a FileNode) -> FileView<'a> {
+        FileView { node }
+    }
+
+    pub fn has_full_local_location(&self) -> bool {
+        matches!(self.node.local, LocalFileLocation::Full(_))
+    }
+
+    pub fn get_full_local_location(&self) -> Option<&FullLocalFileLocation> {
+        match &self.node.local {
+            LocalFileLocation::Full(full) => Some(full),
+            _ => None,
+        }
+    }
+
+    pub fn has_generate_location(&self) -> bool {
+        self.node.generate.is_some()
+    }
+
+    pub fn get_generate_location(&self) -> Option<&FullGenerateFileLocation> {
+        self.node.generate.as_ref()
+    }
+
+    pub fn has_full_remote_location(&self) -> bool {
+        self.node.remote.full.is_some()
+    }
+
+    pub fn has_alive_remote_location(&self) -> bool {
+        self.node.remote.is_full_alive
+    }
+
+    /// `FileView::has_active_upload_remote_location` (FileManager.cpp).
+    pub fn has_active_upload_remote_location(&self) -> bool {
+        let Some(main_remote_location) = self.get_main_remote_location() else {
+            return false;
+        };
+        if !self.has_alive_remote_location() {
+            return false;
+        }
+        if main_remote_location.is_encrypted_any() {
+            return true;
+        }
+        main_remote_location.has_file_reference()
+    }
+
+    /// `FileView::has_active_download_remote_location` (FileManager.cpp).
+    pub fn has_active_download_remote_location(&self) -> bool {
+        let Some(full_remote_location) = self.get_full_remote_location() else {
+            return false;
+        };
+        if full_remote_location.is_encrypted_any() {
+            return true;
+        }
+        full_remote_location.has_file_reference()
+    }
+
+    pub fn get_full_remote_location(&self) -> Option<&FullRemoteFileLocation> {
+        self.node.remote.full.as_ref()
+    }
+
+    pub fn get_main_remote_location(&self) -> Option<&FullRemoteFileLocation> {
+        self.node.remote.full.as_ref()
+    }
+
+    pub fn has_url(&self) -> bool {
+        !self.node.url.is_empty()
+    }
+
+    pub fn get_url(&self) -> Option<&str> {
+        if self.node.url.is_empty() {
+            return None;
+        }
+        Some(&self.node.url)
+    }
+
+    pub fn remote_name(&self) -> &str {
+        &self.node.remote_name
+    }
+
+    pub fn owner_dialog_id(&self) -> DialogId {
+        self.node.owner_dialog_id
+    }
+
+    pub fn get_by_hash(&self) -> bool {
+        self.node.get_by_hash
+    }
+
+    pub fn get_main_file_id(&self) -> FileId {
+        self.node.main_file_id
+    }
+
+    pub fn size(&self) -> i64 {
+        self.node.size
+    }
+
+    pub fn expected_size(&self, may_guess: bool) -> i64 {
+        self.node.expected_size(may_guess)
+    }
+
+    pub fn is_downloading(&self) -> bool {
+        self.node.is_downloading()
+    }
+
+    pub fn download_offset(&self) -> i64 {
+        self.node.download_offset
+    }
+
+    pub fn downloaded_prefix(&self, offset: i64) -> i64 {
+        self.node.downloaded_prefix(offset)
+    }
+
+    pub fn local_prefix_size(&self) -> i64 {
+        self.node.local_prefix_size()
+    }
+
+    pub fn local_total_size(&self) -> i64 {
+        self.node.local_total_size()
+    }
+
+    pub fn is_uploading(&self) -> bool {
+        self.node.is_uploading()
+    }
+
+    pub fn remote_size(&self) -> i64 {
+        self.node.remote_size()
+    }
+
+    pub fn path(&self) -> &str {
+        self.node.path()
+    }
+
+    /// `FileView::can_download_from_server` (FileManager.cpp) without the
+    /// null-node path (a `FileView` always carries a node here).
+    pub fn can_download_from_server(&self) -> bool {
+        let Some(full_remote_location) = self.get_full_remote_location() else {
+            return false;
+        };
+        if full_remote_location.file_type == FileType::Encrypted && self.node.encryption_key.empty() {
+            return false;
+        }
+        if full_remote_location.is_web() {
+            return true;
+        }
+        if full_remote_location.get_dc_id().is_empty() {
+            return false;
+        }
+        if !full_remote_location.is_encrypted_any()
+            && !full_remote_location.has_file_reference()
+            && ((self.node.download_id == 0 && self.node.download_was_update_file_reference)
+                || !self.node.remote.is_full_alive)
+        {
+            return false;
+        }
+        true
+    }
+
+    pub fn can_generate(&self) -> bool {
+        self.has_generate_location()
+    }
+
+    pub fn get_type(&self) -> FileType {
+        self.node.get_type()
+    }
+
+    pub fn is_encrypted_secret(&self) -> bool {
+        self.get_type() == FileType::Encrypted
+    }
+
+    pub fn is_encrypted_secure(&self) -> bool {
+        self.get_type() == FileType::SecureEncrypted
+    }
+
+    pub fn is_secure(&self) -> bool {
+        let type_ = self.get_type();
+        type_ == FileType::SecureEncrypted || type_ == FileType::SecureDecrypted
+    }
+
+    pub fn is_encrypted_any(&self) -> bool {
+        let type_ = self.get_type();
+        type_ == FileType::Encrypted || type_ == FileType::SecureEncrypted
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        let type_ = self.get_type();
+        type_ == FileType::Encrypted || type_ == FileType::SecureEncrypted || type_ == FileType::SecureDecrypted
+    }
+
+    pub fn encryption_key(&self) -> &FileEncryptionKey {
+        &self.node.encryption_key
+    }
+
+    /// `FileView::may_reload_photo` (FileManager.h:373-384).
+    pub fn may_reload_photo(&self) -> bool {
+        let Some(full_remote_location) = self.get_full_remote_location() else {
+            return false;
+        };
+        if !full_remote_location.is_photo() {
+            return false;
+        }
+        let type_ = full_remote_location.get_source().get_type();
+        !matches!(
+            type_,
+            PhotoSizeSourceType::Legacy | PhotoSizeSourceType::FullLegacy | PhotoSizeSourceType::Thumbnail
+        )
+    }
+}
+
+/// The actor-effect seam of the collapsed [`FileManager`]: the C++
+/// `do_cancel_*`/`run_*`/`finish_*`/`try_flush_node_*` calls and
+/// `Context::on_merge_files`. Every method is a no-op by default; the real
+/// implementations land with the download/upload/generate managers and the
+/// database flush loop (M.12.4-8).
+pub trait FileManagerWorker {
+    /// `FileManager::do_cancel_download`.
+    fn cancel_download(&mut self, _node: &FileNode) {}
+    /// `FileManager::do_cancel_upload`.
+    fn cancel_upload(&mut self, _node: &FileNode) {}
+    /// `FileManager::do_cancel_generate`.
+    fn cancel_generate(&mut self, _node: &FileNode) {}
+    /// `FileManager::finish_downloads(file_id, Status::OK())` post-merge.
+    fn finish_download(&mut self, _file_id: FileId) {}
+    /// `FileManager::finish_uploads(file_id, Status::OK())` post-merge.
+    fn finish_upload(&mut self, _file_id: FileId) {}
+    /// `FileManager::run_generate` + `run_download` + `run_upload`.
+    fn run_node(&mut self, _node: &FileNode) {}
+    /// The `flush_node_info` half of `FileManager::try_flush_node_info`.
+    fn flush_node_info(&mut self, _node: &FileNode) {}
+    /// `FileManager::try_flush_node_full`.
+    fn flush_node_full(
+        &mut self,
+        _node: &FileNode,
+        _new_remote: bool,
+        _new_local: bool,
+        _new_generate: bool,
+        _other_pmc_id: FileDbId,
+    ) {
+    }
+    /// `Context::on_merge_files`.
+    fn on_merge_files(&mut self, _from_file_id: FileId, _to_file_id: FileId) {}
+}
+
+/// A hook call recorded while the merge mutates its two nodes; replayed
+/// against the [`FileManagerWorker`] in call order afterwards.
+enum MergeEvent {
+    CancelDownload(Box<FileNode>),
+    CancelUpload(Box<FileNode>),
+    CancelGenerate(Box<FileNode>),
+    OnMergeFiles(FileId, FileId),
+    FinishQueries {
+        with_downloads: bool,
+        with_uploads: bool,
+        file_ids: Vec<FileId>,
+    },
+    RunNode(Box<FileNode>),
+    FlushFull {
+        node: Box<FileNode>,
+        new_remote: bool,
+        new_local: bool,
+        new_generate: bool,
+        other_pmc_id: FileDbId,
+    },
+}
+
+/// `td::FileManager` (FileManager.h:397) collapsed per the single-scheduler
+/// convention: the node registry and the merge machine as plain methods, the
+/// actor effects behind [`FileManagerWorker`]. The database round-trip that
+/// C++ does in `get_sync_file_node` stays with the caller; `merge` operates
+/// on already-loaded nodes.
+#[derive(Default)]
+pub struct FileManager {
+    /// `file_nodes_` — index is the node id.
+    file_nodes: Vec<Option<FileNode>>,
+    /// `file_id_info_` — file id → node id.
+    file_id_node: HashMap<FileId, usize>,
+    worker: Option<Box<dyn FileManagerWorker>>,
+}
+
+impl FileManager {
+    pub fn new() -> FileManager {
+        FileManager::default()
+    }
+
+    /// Registers the worker; replaces the previous one.
+    pub fn set_worker(&mut self, worker: Box<dyn FileManagerWorker>) {
+        self.worker = Some(worker);
+    }
+
+    /// `create_file_node` — appends a node and re-keys its file ids to it.
+    /// The C++ id allocation (`create_file_id`) stays with the callers for
+    /// now; both the main id and the node are handed in.
+    pub fn register_file_node(&mut self, main_file_id: FileId, main_file_id_priority: i8, mut node: FileNode) -> usize {
+        node.main_file_id = main_file_id;
+        node.main_file_id_priority = main_file_id_priority;
+        if !node.file_ids.contains(&main_file_id) {
+            node.file_ids.push(main_file_id);
+        }
+        let node_id = self.file_nodes.len();
+        for file_id in &node.file_ids {
+            self.file_id_node.insert(*file_id, node_id);
+        }
+        self.file_nodes.push(Some(node));
+        node_id
+    }
+
+    /// `get_file_node` — the node a file id currently points to.
+    pub fn get_file_node(&self, file_id: FileId) -> Option<&FileNode> {
+        self.file_id_node
+            .get(&file_id)
+            .and_then(|&node_id| self.file_nodes[node_id].as_ref())
+    }
+
+    /// `FileManager::try_flush_node_info` (FileManager.cpp) — the gated
+    /// half: flush only when `need_info_flush`, then reset the flag.
+    fn try_flush_node_info(&mut self, node_id: usize) {
+        let need_flush = self.file_nodes[node_id]
+            .as_ref()
+            .is_some_and(|node| node.need_info_flush());
+        if !need_flush {
+            return;
+        }
+        if let Some(node) = self.file_nodes[node_id].as_ref()
+            && let Some(worker) = self.worker.as_deref_mut()
+        {
+            worker.flush_node_info(node);
+        }
+        if let Some(node) = self.file_nodes[node_id].as_mut() {
+            node.on_info_flushed();
+        }
+    }
+
+    /// `FileManager::merge` (FileManager.cpp:2193-2455) — the decision flow
+    /// and re-keying; the cancel/run/flush effects are recorded in call
+    /// order and replayed through [`FileManagerWorker`].
+    pub fn merge(&mut self, x_file_id: FileId, y_file_id: FileId) -> Result<(), Status> {
+        if !x_file_id.is_valid() {
+            return Err(Status::error(400, "First file_id is invalid"));
+        }
+        let x_node_id = match self.file_id_node.get(&x_file_id) {
+            Some(&node_id) => node_id,
+            None => {
+                return Err(Status::error(
+                    400,
+                    "Can't merge files. First identifier is invalid",
+                ));
+            }
+        };
+
+        if !y_file_id.is_valid() {
+            return Ok(()); // the C++ "Old file is invalid" early-out
+        }
+        let y_node_id = match self.file_id_node.get(&y_file_id) {
+            Some(&node_id) => node_id,
+            None => {
+                return Err(Status::error(
+                    400,
+                    "Can't merge files. Second identifier is invalid",
+                ));
+            }
+        };
+
+        if x_node_id == y_node_id {
+            self.try_flush_node_info(x_node_id);
+            return Ok(());
+        }
+
+        // the C++ merge runs on live node pointers into file_nodes_; the
+        // port clones the pair, replays the mutation flow on the locals
+        // exactly as the C++ statements chain, then writes back
+        let mut nodes = [
+            self.file_nodes[x_node_id].clone().expect("node"),
+            self.file_nodes[y_node_id].clone().expect("node"),
+        ];
+
+        // the C++ only LOG(ERROR)s a dc-id change between two full FromServer
+        // locations here
+        let drop_last_successful_force_reupload_time = nodes[0].last_successful_force_reupload_time <= 0.
+            && nodes[0].remote.full.is_some()
+            && nodes[0].remote.full_source == FileLocationSource::FromServer;
+
+        let trusted_by_source =
+            merge_choose_file_source_location(nodes[0].remote.full_source, nodes[1].remote.full_source);
+
+        let local_i = merge_choose_local_location(&nodes[0].local, &nodes[1].local);
+        let remote_i = merge_choose_remote_location(&nodes[0].remote, &nodes[1].remote);
+        let generate_i = merge_choose_generate_location(nodes[0].generate.as_ref(), nodes[1].generate.as_ref());
+        let size_i = merge_choose_size(nodes[0].size, nodes[1].size);
+        let mut expected_size_i = merge_choose_expected_size(nodes[0].expected_size, nodes[1].expected_size);
+        let mut remote_name_i = merge_choose_name(&nodes[0].remote_name, &nodes[1].remote_name);
+        let mut url_i = merge_choose_name(&nodes[0].url, &nodes[1].url);
+        let owner_i = merge_choose_owner(nodes[0].owner_dialog_id, nodes[1].owner_dialog_id);
+        let mut encryption_key_i = merge_choose_encryption_key(&nodes[0].encryption_key, &nodes[1].encryption_key);
+        let main_file_id_i = merge_choose_main_file_id(
+            nodes[0].main_file_id,
+            nodes[0].main_file_id_priority,
+            nodes[1].main_file_id,
+            nodes[1].main_file_id_priority,
+        );
+
+        if size_i == -1 {
+            self.try_flush_node_info(x_node_id);
+            self.try_flush_node_info(y_node_id);
+            return Err(Status::error(
+                400,
+                format!(
+                    "Can't merge files {} / {} and {} / {}. Different size: {} and {}",
+                    nodes[0].local, nodes[0].remote, nodes[1].local, nodes[1].remote, nodes[0].size, nodes[1].size
+                )
+                .as_str(),
+            ));
+        }
+        if encryption_key_i == -1 {
+            // FileNodePtr nodes[] = {x_node, y_node, x_node}: index 2 re-reads x
+            let node_at = |i: i32| &nodes[usize::try_from(i).map_or(0, |i| i.min(1))];
+            if node_at(remote_i).remote.full.is_some()
+                && !matches!(node_at(local_i).local, LocalFileLocation::Partial(_))
+            {
+                // the C++ LOG(ERROR)s and keeps the key of the remote location
+                encryption_key_i = remote_i;
+            } else {
+                self.try_flush_node_info(x_node_id);
+                self.try_flush_node_info(y_node_id);
+                return Err(Status::error(400, "Can't merge files. Different encryption keys"));
+            }
+        }
+
+        // prefer more trusted source
+        if remote_name_i == 2 {
+            remote_name_i = trusted_by_source;
+        }
+        if url_i == 2 {
+            url_i = trusted_by_source;
+        }
+        if expected_size_i == 2 {
+            expected_size_i = trusted_by_source;
+        }
+
+        let node_i = usize::from(
+            (
+                nodes[1].pmc_id.is_valid(),
+                nodes[0].pmc_id,
+                nodes[1].file_ids.len(),
+                main_file_id_i == 1,
+            ) > (
+                nodes[0].pmc_id.is_valid(),
+                nodes[1].pmc_id,
+                nodes[0].file_ids.len(),
+                main_file_id_i == 0,
+            ),
+        );
+        let other_node_i = 1 - node_i;
+
+        let mut events: Vec<MergeEvent> = Vec::new();
+        {
+            let [a, b] = &mut nodes;
+            let (node, other): (&mut FileNode, &mut FileNode) = if node_i == 0 { (a, b) } else { (b, a) };
+
+            if local_i as usize == other_node_i {
+                events.push(MergeEvent::CancelDownload(Box::new(node.clone())));
+                node.set_download_offset(other.download_offset);
+                node.set_local_location(
+                    other.local.clone(),
+                    other.download_offset,
+                    other.local_ready_prefix_size,
+                );
+                node.download_id = other.download_id;
+                node.download_was_update_file_reference = other.download_was_update_file_reference;
+                node.is_download_started |= other.is_download_started;
+                node.set_download_priority(other.download_priority);
+                other.download_id = 0;
+                other.download_was_update_file_reference = false;
+                other.is_download_started = false;
+                other.download_priority = 0;
+                other.download_offset = 0;
+                other.local_ready_prefix_size = 0;
+                // the C++ generate-move block here is commented out
+            } else {
+                events.push(MergeEvent::CancelDownload(Box::new(other.clone())));
+            }
+
+            if remote_i as usize == other_node_i {
+                events.push(MergeEvent::CancelUpload(Box::new(node.clone())));
+                let other_remote = std::mem::take(&mut other.remote);
+                node.set_new_remote_location(other_remote);
+                node.upload_id = other.upload_id;
+                node.upload_was_update_file_reference = other.upload_was_update_file_reference;
+                node.set_upload_priority(other.upload_priority);
+                node.set_upload_pause(other.upload_pause);
+                other.upload_id = 0;
+                other.upload_was_update_file_reference = false;
+                other.upload_priority = 0;
+                other.upload_pause = FileId::default();
+            } else {
+                events.push(MergeEvent::CancelUpload(Box::new(other.clone())));
+            }
+
+            if generate_i as usize == other_node_i {
+                events.push(MergeEvent::CancelGenerate(Box::new(node.clone())));
+                let other_generate = std::mem::take(&mut other.generate);
+                node.set_generate_location(other_generate);
+                node.generate_id = other.generate_id;
+                node.set_generate_priority(other.generate_download_priority, other.generate_upload_priority);
+                other.generate_id = 0;
+                other.generate_priority = 0;
+                other.generate_download_priority = 0;
+                other.generate_upload_priority = 0;
+            } else {
+                events.push(MergeEvent::CancelGenerate(Box::new(other.clone())));
+            }
+
+            if size_i as usize == other_node_i {
+                node.set_size(other.size);
+            }
+            if expected_size_i as usize == other_node_i {
+                node.set_expected_size(other.expected_size);
+            }
+            if remote_name_i as usize == other_node_i {
+                node.set_remote_name(other.remote_name.clone());
+            }
+            if url_i as usize == other_node_i {
+                node.set_url(other.url.clone());
+            }
+            if owner_i as usize == other_node_i {
+                node.set_owner_dialog_id(other.owner_dialog_id);
+            }
+            if encryption_key_i as usize == other_node_i {
+                let key = other.encryption_key.clone();
+                node.set_encryption_key(key.clone());
+                // the C++ assigns twice: nodes[node_i] from
+                // nodes[encryption_key_i], and the branch guard makes that
+                // the same node pair
+                node.set_encryption_key(key);
+            }
+
+            node.need_load_from_pmc |= other.need_load_from_pmc;
+            node.can_search_locally &= other.can_search_locally;
+            node.upload_prefer_small |= other.upload_prefer_small;
+
+            if drop_last_successful_force_reupload_time {
+                node.last_successful_force_reupload_time = -1e10;
+            } else if other.last_successful_force_reupload_time > node.last_successful_force_reupload_time {
+                node.last_successful_force_reupload_time = other.last_successful_force_reupload_time;
+            }
+
+            if main_file_id_i as usize == other_node_i {
+                events.push(MergeEvent::OnMergeFiles(other.main_file_id, node.main_file_id));
+                node.main_file_id = other.main_file_id;
+                node.main_file_id_priority = other.main_file_id_priority;
+            } else {
+                events.push(MergeEvent::OnMergeFiles(node.main_file_id, other.main_file_id));
+            }
+        }
+
+        self.file_nodes[x_node_id] = Some(nodes[0].clone());
+        self.file_nodes[y_node_id] = Some(nodes[1].clone());
+
+        let other_pmc_id = nodes[other_node_i].pmc_id;
+        let other_file_ids = nodes[other_node_i].file_ids.clone();
+        self.file_nodes[node_i]
+            .as_mut()
+            .expect("node")
+            .file_ids
+            .extend(other_file_ids.iter().copied());
+        for file_id in &other_file_ids {
+            self.file_id_node.insert(*file_id, node_i);
+        }
+
+        // the C++ "check if some download/upload queries are ready" loop
+        {
+            let node = self.file_nodes[node_i].as_ref().expect("node");
+            let view = FileView::new(node);
+            let with_downloads = view.has_full_local_location();
+            let with_uploads = view.has_active_upload_remote_location();
+            if with_downloads || with_uploads {
+                events.push(MergeEvent::FinishQueries {
+                    with_downloads,
+                    with_uploads,
+                    file_ids: node.file_ids.clone(),
+                });
+            }
+        }
+
+        let other_node_id = if node_i == 0 { y_node_id } else { x_node_id };
+        self.file_nodes[other_node_id] = None;
+
+        events.push(MergeEvent::RunNode(Box::new(
+            self.file_nodes[node_i].as_ref().expect("node").clone(),
+        )));
+
+        if other_pmc_id.is_valid() {
+            self.file_nodes[node_i]
+                .as_mut()
+                .expect("node")
+                .on_pmc_changed();
+        }
+        {
+            let node = self.file_nodes[node_i].as_ref().expect("node");
+            events.push(MergeEvent::FlushFull {
+                node: Box::new(node.clone()),
+                new_remote: node_i != remote_i as usize,
+                new_local: node_i != local_i as usize,
+                new_generate: node_i != generate_i as usize,
+                other_pmc_id,
+            });
+        }
+
+        for event in events {
+            let Some(worker) = self.worker.as_deref_mut() else {
+                break; // no worker registered: the events are no-ops anyway
+            };
+            match event {
+                MergeEvent::CancelDownload(node) => worker.cancel_download(&node),
+                MergeEvent::CancelUpload(node) => worker.cancel_upload(&node),
+                MergeEvent::CancelGenerate(node) => worker.cancel_generate(&node),
+                MergeEvent::OnMergeFiles(from_file_id, to_file_id) => worker.on_merge_files(from_file_id, to_file_id),
+                MergeEvent::FinishQueries {
+                    with_downloads,
+                    with_uploads,
+                    file_ids,
+                } => {
+                    for file_id in file_ids {
+                        if with_downloads {
+                            worker.finish_download(file_id);
+                        }
+                        if with_uploads {
+                            worker.finish_upload(file_id);
+                        }
+                    }
+                }
+                MergeEvent::RunNode(node) => worker.run_node(&node),
+                MergeEvent::FlushFull {
+                    node,
+                    new_remote,
+                    new_local,
+                    new_generate,
+                    other_pmc_id,
+                } => worker.flush_node_full(&node, new_remote, new_local, new_generate, other_pmc_id),
+            }
+        }
+
+        Ok(())
+    }
+}
+
 // ==== FileDb ====
 
 /// The key an entry is indexed under: the location's `KEY_MAGIC` plus
@@ -7672,5 +9154,596 @@ mod tests {
             [FileSourceId::new(1), FileSourceId::new(2), FileSourceId::new(3)]
         );
         assert_eq!(parsed.remote_name, "a.jpg");
+    }
+
+    #[test]
+    fn merge_choose_helpers_match_the_cpp_tables() {
+        // 0 = keep x, 1 = take y, 2 = equal, -1 = conflict
+        let empty = LocalFileLocation::Empty;
+        let full = LocalFileLocation::Full(FullLocalFileLocation::new(
+            FileType::Document,
+            "/tmp/a".to_owned(),
+            0,
+        ));
+        assert_eq!(merge_choose_local_location(&empty, &full), 1);
+        assert_eq!(merge_choose_local_location(&full, &empty), 0);
+        assert_eq!(merge_choose_local_location(&empty, &empty), 2);
+
+        assert_eq!(
+            merge_choose_file_source_location(FileLocationSource::FromDatabase, FileLocationSource::FromServer),
+            1
+        );
+        assert_eq!(
+            merge_choose_file_source_location(FileLocationSource::FromServer, FileLocationSource::FromDatabase),
+            0
+        );
+        assert_eq!(
+            merge_choose_file_source_location(FileLocationSource::FromServer, FileLocationSource::FromServer),
+            0
+        );
+
+        assert_eq!(merge_choose_size(0, 5), 1);
+        assert_eq!(merge_choose_size(5, 0), 0);
+        assert_eq!(merge_choose_size(5, 5), 2);
+        assert_eq!(merge_choose_size(5, 6), -1);
+
+        assert_eq!(merge_choose_expected_size(0, 5), 1);
+        assert_eq!(merge_choose_expected_size(5, 0), 0);
+        // unlike the real size, a mismatch is not an error here
+        assert_eq!(merge_choose_expected_size(5, 6), 2);
+
+        assert_eq!(merge_choose_name("", "a"), 1);
+        assert_eq!(merge_choose_name("a", ""), 0);
+        assert_eq!(merge_choose_name("a", "b"), 2);
+
+        assert_eq!(merge_choose_owner(DialogId::default(), DialogId::new(1)), 1);
+        assert_eq!(merge_choose_owner(DialogId::new(1), DialogId::default()), 0);
+        assert_eq!(merge_choose_owner(DialogId::new(1), DialogId::new(2)), 2);
+
+        // equal priorities: the lower id wins; different: the higher priority
+        assert_eq!(merge_choose_main_file_id(FileId::new(1, 0), 0, FileId::new(2, 0), 0), 0);
+        assert_eq!(merge_choose_main_file_id(FileId::new(2, 0), 0, FileId::new(1, 0), 0), 1);
+        assert_eq!(merge_choose_main_file_id(FileId::new(1, 0), 0, FileId::new(2, 0), 5), 1);
+        assert_eq!(merge_choose_main_file_id(FileId::new(2, 0), 5, FileId::new(1, 0), 0), 0);
+
+        let key1 = FileEncryptionKey::new(&[1u8; 32], &[2u8; 32]);
+        let key2 = FileEncryptionKey::new(&[3u8; 32], &[4u8; 32]);
+        assert_eq!(merge_choose_encryption_key(&FileEncryptionKey::default(), &key1), 1);
+        assert_eq!(merge_choose_encryption_key(&key1, &FileEncryptionKey::default()), 0);
+        assert_eq!(merge_choose_encryption_key(&key1, &key1), 2);
+        assert_eq!(merge_choose_encryption_key(&key1, &key2), -1);
+    }
+
+    #[test]
+    fn merge_choose_remote_and_generate_tables() {
+        // a web location loses to a common one regardless of anything else:
+        // the result is the index of the non-web side
+        let web = FullRemoteFileLocation::from_web(FileType::Document, "https://example.com/a".to_owned(), 7);
+        let common =
+            FullRemoteFileLocation::from_document(FileType::Document, 10, 11, DcId::internal(2), String::new());
+        assert_eq!(
+            merge_choose_full_remote_location(&web, FileLocationSource::FromUser, &common, FileLocationSource::FromUser),
+            1
+        );
+        assert_eq!(
+            merge_choose_full_remote_location(&common, FileLocationSource::FromUser, &web, FileLocationSource::FromUser),
+            0
+        );
+
+        // an existing reference beats a dropped one ("#" after deletion;
+        // a literal "#" cannot reach the registry, it is cleared at
+        // construction), everything else equal
+        let with_ref =
+            FullRemoteFileLocation::from_document(FileType::Document, 10, 11, DcId::internal(2), "r".to_owned());
+        let mut no_ref =
+            FullRemoteFileLocation::from_document(FileType::Document, 10, 11, DcId::internal(2), "r".to_owned());
+        assert!(no_ref.delete_file_reference(b"r"));
+        assert_eq!(
+            merge_choose_full_remote_location(&with_ref, FileLocationSource::FromUser, &no_ref, FileLocationSource::FromUser),
+            0
+        );
+        assert_eq!(
+            merge_choose_full_remote_location(&no_ref, FileLocationSource::FromUser, &with_ref, FileLocationSource::FromUser),
+            1
+        );
+
+        // same reference: access_hash mismatch with a source mismatch picks
+        // the more trusted source
+        let hash11 = FullRemoteFileLocation::from_document(FileType::Document, 10, 11, DcId::internal(2), "r".to_owned());
+        let hash12 = FullRemoteFileLocation::from_document(FileType::Document, 10, 12, DcId::internal(2), "r".to_owned());
+        assert_eq!(
+            merge_choose_full_remote_location(&hash11, FileLocationSource::FromUser, &hash12, FileLocationSource::FromServer),
+            1
+        );
+        // but identical locations leave both in place
+        assert_eq!(
+            merge_choose_full_remote_location(&hash11, FileLocationSource::FromServer, &hash11, FileLocationSource::FromServer),
+            2
+        );
+
+        // the alive check dominates the NewRemote choice
+        let full_alive = NewRemoteFileLocation::from_remote(
+            RemoteFileLocation::Full(hash11.clone()),
+            FileLocationSource::FromServer,
+        );
+        let partial = NewRemoteFileLocation::from_remote(
+            RemoteFileLocation::Partial(PartialRemoteFileLocation {
+                file_id: 1,
+                part_count: 4,
+                part_size: 1024,
+                ready_part_count: 2,
+                is_big: 1,
+                ready_size: 0,
+            }),
+            FileLocationSource::FromUser,
+        );
+        assert_eq!(merge_choose_remote_location(&full_alive, &partial), 0);
+        assert_eq!(merge_choose_remote_location(&partial, &full_alive), 1);
+        assert_eq!(merge_choose_remote_location(&partial, &partial), 2);
+
+        // generate: some beats none, an #mtime# conversion wins, otherwise the
+        // bigger conversion is the stable choice
+        let gen_a = FullGenerateFileLocation {
+            file_type: FileType::Document,
+            original_path: "/a".to_owned(),
+            conversion: "#mtime#1".to_owned(),
+        };
+        let gen_b = FullGenerateFileLocation {
+            file_type: FileType::Document,
+            original_path: "/b".to_owned(),
+            conversion: "map".to_owned(),
+        };
+        assert_eq!(merge_choose_generate_location(None, Some(&gen_a)), 1);
+        assert_eq!(merge_choose_generate_location(Some(&gen_a), None), 0);
+        assert_eq!(merge_choose_generate_location(Some(&gen_a), Some(&gen_b)), 0);
+        assert_eq!(merge_choose_generate_location(Some(&gen_b), Some(&gen_a)), 1);
+        assert_eq!(merge_choose_generate_location(Some(&gen_a), Some(&gen_a)), 2);
+    }
+
+    /// A partial-local document with the first two of four 1024-byte parts.
+    fn partial_local_node(main_file_id: FileId) -> FileNode {
+        let local = LocalFileLocation::Partial(PartialLocalFileLocation {
+            file_type: FileType::Document,
+            part_size: 1024,
+            path: "/tmp/partial".to_owned(),
+            iv: String::new(),
+            ready_bitmask: Bitmask::from_ones(2).encode(-1),
+            ready_size: 0,
+        });
+        FileNode::new(
+            local,
+            NewRemoteFileLocation::default(),
+            None,
+            4096,
+            0,
+            String::new(),
+            String::new(),
+            DialogId::default(),
+            FileEncryptionKey::default(),
+            main_file_id,
+            0,
+        )
+    }
+
+    #[test]
+    fn file_node_tracks_local_progress_and_limits() {
+        let mut node = partial_local_node(FileId::new(1, 0));
+
+        // init_ready_size derived both counters from the bitmask
+        assert_eq!(node.local_prefix_size(), 2048);
+        assert_eq!(node.local_total_size(), 2048);
+        assert_eq!(node.downloaded_prefix(0), 2048);
+        assert_eq!(node.downloaded_prefix(1024), 1024);
+        assert_eq!(node.path(), "/tmp/partial");
+
+        // the offset shift re-derives the prefix from the bitmask
+        node.set_download_offset(1024);
+        assert_eq!(node.local_prefix_size(), 1024);
+        // out-of-range offsets are dropped
+        node.set_download_offset(-1);
+        assert_eq!(node.download_offset(), 1024);
+        node.set_download_offset(MAX_FILE_SIZE + 1);
+        assert_eq!(node.download_offset(), 1024);
+
+        // download limits clamp at MAX_FILE_SIZE and the ignore switch
+        node.set_download_limit(-1);
+        assert_eq!(node.get_download_limit(), 0);
+        node.set_download_limit(MAX_FILE_SIZE + 1);
+        assert!(node.get_download_limit() <= MAX_FILE_SIZE);
+        node.set_ignore_download_limit(true);
+        assert_eq!(node.get_download_limit(), 0);
+
+        // the SecureEncrypted gate hides the prefix until verified; the type
+        // comes from the full remote location (get_type never reads a
+        // partial local)
+        let encrypted_remote =
+            FullRemoteFileLocation::from_document(FileType::SecureEncrypted, 10, 11, DcId::internal(2), "r".to_owned());
+        let encrypted_local = LocalFileLocation::Partial(PartialLocalFileLocation {
+            file_type: FileType::SecureEncrypted,
+            part_size: 1024,
+            path: "/tmp/enc".to_owned(),
+            iv: String::new(),
+            ready_bitmask: Bitmask::from_ones(4).encode(-1),
+            ready_size: 0,
+        });
+        let encrypted = FileNode::new(
+            encrypted_local,
+            NewRemoteFileLocation::from_remote(RemoteFileLocation::Full(encrypted_remote), FileLocationSource::FromServer),
+            None,
+            4096,
+            0,
+            String::new(),
+            String::new(),
+            DialogId::default(),
+            FileEncryptionKey::default(),
+            FileId::new(2, 0),
+            0,
+        );
+        assert_eq!(encrypted.local_prefix_size(), 0);
+        assert_eq!(encrypted.downloaded_prefix(0), 0);
+        assert_eq!(encrypted.local_total_size(), 4096);
+    }
+
+    #[test]
+    fn file_node_flush_flags_match_the_cpp_gates() {
+        let mut node = FileNode::new(
+            LocalFileLocation::Empty,
+            NewRemoteFileLocation::default(),
+            None,
+            0,
+            0,
+            String::new(),
+            String::new(),
+            DialogId::default(),
+            FileEncryptionKey::default(),
+            FileId::new(1, 0),
+            0,
+        );
+        assert!(!node.need_info_flush());
+        assert!(!node.need_pmc_flush());
+
+        // a bare full-local location alone is not worth a pmc row... unless
+        // something else is present; the C++ gate needs the company
+        node.set_local_location(
+            LocalFileLocation::Full(FullLocalFileLocation::new(
+                FileType::Document,
+                "/tmp/a".to_owned(),
+                0,
+            )),
+            -1,
+            -1,
+        );
+        node.on_pmc_flushed();
+        assert!(!node.need_pmc_flush());
+
+        // the "#file_id#" conversion is explicitly not saved
+        node.set_generate_location(Some(FullGenerateFileLocation {
+            file_type: FileType::Document,
+            original_path: "/a".to_owned(),
+            conversion: "#file_id#123".to_owned(),
+        }));
+        assert!(!node.need_pmc_flush());
+
+        // but a real conversion is
+        node.set_generate_location(Some(FullGenerateFileLocation {
+            file_type: FileType::Document,
+            original_path: "/a".to_owned(),
+            conversion: "#mtime#9".to_owned(),
+        }));
+        assert!(node.need_pmc_flush());
+        node.on_pmc_flushed();
+
+        // the encryption key always flushes
+        node.set_encryption_key(FileEncryptionKey::new(&[1u8; 32], &[2u8; 32]));
+        assert!(node.need_pmc_flush());
+    }
+
+    #[test]
+    fn file_view_accessors_match_the_cpp() {
+        let common =
+            FullRemoteFileLocation::from_document(FileType::Document, 10, 11, DcId::internal(2), "r".to_owned());
+        let mut node = FileNode::new(
+            LocalFileLocation::Full(FullLocalFileLocation::new(FileType::Photo, "/photos/a".to_owned(), 0)),
+            NewRemoteFileLocation::from_remote(RemoteFileLocation::Full(common), FileLocationSource::FromServer),
+            None,
+            500,
+            0,
+            "a.jpg".to_owned(),
+            String::new(),
+            DialogId::new(-100200300),
+            FileEncryptionKey::default(),
+            FileId::new(1, 0),
+            0,
+        );
+        let view = FileView::new(&node);
+
+        // the local location's type wins over the remote one
+        assert_eq!(view.get_type(), FileType::Photo);
+        assert!(!view.is_encrypted());
+        assert!(view.has_full_local_location());
+        assert!(view.has_alive_remote_location());
+        assert!(view.has_active_upload_remote_location());
+        assert_eq!(view.remote_name(), "a.jpg");
+        assert_eq!(view.owner_dialog_id(), DialogId::new(-100200300));
+        assert_eq!(view.size(), 500);
+        assert_eq!(view.downloaded_prefix(100), 400);
+        assert_eq!(view.remote_size(), 500);
+
+        // web locations are always downloadable
+        node.set_new_remote_location(NewRemoteFileLocation::from_remote(
+            RemoteFileLocation::Full(FullRemoteFileLocation::from_web(
+                FileType::Document,
+                "https://example.com/a".to_owned(),
+                7,
+            )),
+            FileLocationSource::FromUser,
+        ));
+        assert!(FileView::new(&node).can_download_from_server());
+
+        // a dead non-encrypted location whose reference has been dropped
+        // (deletion leaves the "#" sentinel) and which is no longer alive is
+        // not downloadable
+        let mut dead = FullRemoteFileLocation::from_document(FileType::Document, 10, 11, DcId::internal(2), "r".to_owned());
+        assert!(dead.delete_file_reference(b"r"));
+        let dead_node = FileNode::new(
+            LocalFileLocation::Empty,
+            NewRemoteFileLocation {
+                partial: None,
+                full: Some(dead),
+                is_full_alive: false,
+                full_source: FileLocationSource::FromDatabase,
+            },
+            None,
+            500,
+            0,
+            String::new(),
+            String::new(),
+            DialogId::default(),
+            FileEncryptionKey::default(),
+            FileId::new(2, 0),
+            0,
+        );
+        assert!(!FileView::new(&dead_node).can_download_from_server());
+
+        // an encrypted file needs its key before the server can be asked
+        let encrypted_remote =
+            FullRemoteFileLocation::from_document(FileType::Encrypted, 10, 11, DcId::internal(2), "r".to_owned());
+        let encrypted_alive = NewRemoteFileLocation::from_remote(
+            RemoteFileLocation::Full(encrypted_remote),
+            FileLocationSource::FromServer,
+        );
+        let no_key = FileNode::new(
+            LocalFileLocation::Empty,
+            encrypted_alive.clone(),
+            None,
+            500,
+            0,
+            String::new(),
+            String::new(),
+            DialogId::default(),
+            FileEncryptionKey::default(),
+            FileId::new(3, 0),
+            0,
+        );
+        assert!(!FileView::new(&no_key).can_download_from_server());
+        assert!(FileView::new(&no_key).is_encrypted_any());
+        let with_key = FileNode::new(
+            LocalFileLocation::Empty,
+            encrypted_alive,
+            None,
+            500,
+            0,
+            String::new(),
+            String::new(),
+            DialogId::default(),
+            FileEncryptionKey::new(&[1u8; 32], &[2u8; 32]),
+            FileId::new(3, 0),
+            0,
+        );
+        assert!(FileView::new(&with_key).can_download_from_server());
+
+        // may_reload_photo: the thumbnail source is a legacy-class one
+        let legacy_photo = NewRemoteFileLocation::from_remote(
+            RemoteFileLocation::Full(FullRemoteFileLocation::from_photo(
+                PhotoSizeSource::thumbnail(FileType::Photo, b'a' as i32),
+                9,
+                3,
+                DcId::internal(2),
+                "r".to_owned(),
+            )),
+            FileLocationSource::FromServer,
+        );
+        let legacy_node = FileNode::new(
+            LocalFileLocation::Empty,
+            legacy_photo,
+            None,
+            0,
+            0,
+            String::new(),
+            String::new(),
+            DialogId::default(),
+            FileEncryptionKey::default(),
+            FileId::new(4, 0),
+            0,
+        );
+        assert!(!FileView::new(&legacy_node).may_reload_photo());
+    }
+
+    /// Records the merge hook calls; the C++ ordering is the test payload.
+    #[derive(Clone, Default)]
+    struct EventLog(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
+
+    struct RecordingWorker {
+        log: EventLog,
+    }
+
+    impl RecordingWorker {
+        fn record(&self, event: &str, main_file_id: FileId) {
+            self.log.0.borrow_mut().push(format!("{event} {main_file_id}"));
+        }
+    }
+
+    impl FileManagerWorker for RecordingWorker {
+        fn cancel_download(&mut self, node: &FileNode) {
+            self.record("cancel_download", node.get_main_file_id());
+        }
+        fn cancel_upload(&mut self, node: &FileNode) {
+            self.record("cancel_upload", node.get_main_file_id());
+        }
+        fn cancel_generate(&mut self, node: &FileNode) {
+            self.record("cancel_generate", node.get_main_file_id());
+        }
+        fn finish_download(&mut self, file_id: FileId) {
+            self.record("finish_download", file_id);
+        }
+        fn finish_upload(&mut self, file_id: FileId) {
+            self.record("finish_upload", file_id);
+        }
+        fn run_node(&mut self, node: &FileNode) {
+            self.record("run_node", node.get_main_file_id());
+        }
+        fn flush_node_info(&mut self, node: &FileNode) {
+            self.record("flush_info", node.get_main_file_id());
+        }
+        fn on_merge_files(&mut self, from_file_id: FileId, to_file_id: FileId) {
+            self.log
+                .0
+                .borrow_mut()
+                .push(format!("on_merge_files {from_file_id} -> {to_file_id}"));
+        }
+    }
+
+    fn document_node(main_file_id: FileId, size: i64, file_reference: &str) -> FileNode {
+        let remote = FullRemoteFileLocation::from_document(
+            FileType::Document,
+            10,
+            11,
+            DcId::internal(2),
+            file_reference.to_owned(),
+        );
+        FileNode::new(
+            LocalFileLocation::Empty,
+            NewRemoteFileLocation::from_remote(RemoteFileLocation::Full(remote), FileLocationSource::FromServer),
+            None,
+            size,
+            0,
+            "doc.pdf".to_owned(),
+            String::new(),
+            DialogId::default(),
+            FileEncryptionKey::default(),
+            main_file_id,
+            0,
+        )
+    }
+
+    #[test]
+    fn merge_duplicate_download_yields_a_single_file() {
+        let mut file_manager = FileManager::new();
+        let log = EventLog::default();
+        file_manager.set_worker(Box::new(RecordingWorker { log: log.clone() }));
+
+        file_manager.register_file_node(FileId::new(1, 0), 0, document_node(FileId::new(1, 0), 100, "ref"));
+        file_manager.register_file_node(FileId::new(2, 0), 0, document_node(FileId::new(2, 0), 100, "ref"));
+
+        file_manager.merge(FileId::new(1, 0), FileId::new(2, 0)).unwrap();
+
+        // both ids resolve to the survivor node, whose main id is x's
+        assert_eq!(
+            file_manager.get_file_node(FileId::new(1, 0)).unwrap().get_main_file_id(),
+            FileId::new(1, 0)
+        );
+        assert_eq!(
+            file_manager.get_file_node(FileId::new(2, 0)).unwrap().get_main_file_id(),
+            FileId::new(1, 0)
+        );
+
+        // hook order: the dropped node's queries cancel, the managers learn
+        // about the re-key, the finished uploads drain, then the survivor
+        // restarts and flushes
+        assert_eq!(
+            log.0.borrow().clone(),
+            [
+                "cancel_download 2(0)".to_owned(),
+                "cancel_upload 2(0)".to_owned(),
+                "cancel_generate 2(0)".to_owned(),
+                "on_merge_files 1(0) -> 2(0)".to_owned(),
+                "finish_upload 1(0)".to_owned(),
+                "finish_upload 2(0)".to_owned(),
+                "run_node 1(0)".to_owned(),
+            ]
+        );
+
+        // merging again is a same-node no-op
+        file_manager.merge(FileId::new(1, 0), FileId::new(2, 0)).unwrap();
+        assert_eq!(log.0.borrow().len(), 7);
+    }
+
+    #[test]
+    fn merge_rejects_conflicting_sizes_and_keys() {
+        let mut file_manager = FileManager::new();
+        let log = EventLog::default();
+        file_manager.set_worker(Box::new(RecordingWorker { log: log.clone() }));
+
+        file_manager.register_file_node(FileId::new(1, 0), 0, document_node(FileId::new(1, 0), 100, "ref"));
+        file_manager.register_file_node(FileId::new(2, 0), 0, document_node(FileId::new(2, 0), 200, "ref"));
+        let err = file_manager
+            .merge(FileId::new(1, 0), FileId::new(2, 0))
+            .unwrap_err();
+        assert_eq!(err.code(), 400);
+        assert!(err.message().contains("Different size: 100 and 200"));
+        // both nodes stay intact
+        assert_eq!(file_manager.get_file_node(FileId::new(1, 0)).unwrap().size, 100);
+        assert_eq!(file_manager.get_file_node(FileId::new(2, 0)).unwrap().size, 200);
+        // only the two gated info-flush probes ran; no merge effects fired
+        assert!(log.0.borrow().is_empty());
+
+        // different keys without a full remote location to consult
+        let keyed = |key: [u8; 32], main_file_id: FileId| {
+            FileNode::new(
+                LocalFileLocation::Empty,
+                NewRemoteFileLocation::default(),
+                None,
+                100,
+                0,
+                String::new(),
+                String::new(),
+                DialogId::default(),
+                FileEncryptionKey::new(&key, &[0u8; 32]),
+                main_file_id,
+                0,
+            )
+        };
+        let mut file_manager = FileManager::new();
+        file_manager.register_file_node(FileId::new(1, 0), 0, keyed([1u8; 32], FileId::new(1, 0)));
+        file_manager.register_file_node(FileId::new(2, 0), 0, keyed([3u8; 32], FileId::new(2, 0)));
+        let err = file_manager
+            .merge(FileId::new(1, 0), FileId::new(2, 0))
+            .unwrap_err();
+        assert_eq!(err.code(), 400);
+        assert_eq!(err.message(), "Can't merge files. Different encryption keys");
+    }
+
+    #[test]
+    fn merge_prefers_the_node_with_more_file_ids_as_survivor() {
+        let mut file_manager = FileManager::new();
+        let log = EventLog::default();
+        file_manager.set_worker(Box::new(RecordingWorker { log: log.clone() }));
+
+        let mut wide = document_node(FileId::new(2, 0), 100, "ref");
+        wide.file_ids.push(FileId::new(5, 0)); // the tests share the node module
+        file_manager.register_file_node(FileId::new(1, 0), 0, document_node(FileId::new(1, 0), 100, "ref"));
+        file_manager.register_file_node(FileId::new(2, 0), 0, wide);
+
+        file_manager.merge(FileId::new(1, 0), FileId::new(2, 0)).unwrap();
+
+        // y had two ids, so its node survives and x's id re-keys into it...
+        let survivor = file_manager.get_file_node(FileId::new(1, 0)).unwrap();
+        assert_eq!(
+            survivor.file_ids,
+            [FileId::new(2, 0), FileId::new(5, 0), FileId::new(1, 0)]
+        );
+        // ...but main_file_id_i chose x's lower id, so the survivor adopts it
+        assert_eq!(survivor.get_main_file_id(), FileId::new(1, 0));
+        assert_eq!(log.0.borrow().last().unwrap(), "run_node 1(0)");
     }
 }
