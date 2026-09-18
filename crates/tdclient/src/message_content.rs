@@ -112,7 +112,7 @@ use crate::misc::is_empty_string;
 use crate::photo::{AnimationSize, Dimensions, Photo, PhotoSize, StickerPhotoSize};
 use crate::store_parse::{
     Parser, store_bool, store_f64, store_flags, store_i32, store_i32_vec, store_i64, store_string,
-    store_string_vec, store_u32, version,
+    store_string_bytes, store_string_vec, store_u32, version,
 };
 use crate::td_api;
 use crate::user_manager::{FileId, SecretChatId, UserId};
@@ -1938,7 +1938,10 @@ pub struct MessageDice {
     pub emoji: String,
     pub dice_value: i32,
     pub is_stake: bool,
-    pub seed: String,
+    /// The C++ `string` is a byte container (the raw 32-byte client
+    /// seed) — the port stores the bytes exactly (the Files
+    /// `FileEncryptionKey` precedent).
+    pub seed: Vec<u8>,
     pub state_hash: String,
     pub stake_ton_count: i64,
     pub prize_ton_count: i64,
@@ -1956,7 +1959,7 @@ impl MessageDice {
         emoji: &str,
         dice_value: i32,
         is_stake: bool,
-        seed: String,
+        seed: Vec<u8>,
         state_hash: String,
         stake_ton_count: i64,
         prize_ton_count: i64,
@@ -4944,7 +4947,7 @@ pub fn store_message_content(
             store_string(out, &m.emoji);
             store_i32(out, m.dice_value);
             if has_seed {
-                store_string(out, &m.seed);
+                store_string_bytes(out, &m.seed);
             }
             if has_stake_ton_count {
                 store_i64(out, m.stake_ton_count);
@@ -6025,9 +6028,9 @@ pub fn parse_message_content(
             };
             let dice_value = parser.i32_()?;
             let seed = if has_seed {
-                parser.string()?
+                parser.string_bytes()?
             } else {
-                String::new()
+                Vec::new()
             };
             let stake_ton_count = if has_stake_ton_count {
                 parser.i64_()?
@@ -7121,6 +7124,101 @@ pub trait MessageContentContext {
     fn ensure_input_user(&self, user_id: UserId) -> Result<(), Status>;
     /// `UserManager::get_my_id` (MessageContent.cpp:5040-5042).
     fn get_my_id(&self) -> UserId;
+
+    // -- Create family (the M.9.4 media arms; the manager create_*
+    // signatures with the always-constant args — empty minithumbnail,
+    // empty animated thumbnail, `replace = false`, `date = 0` —
+    // collapsed) --
+    /// The `get_file_view` prelude of create_input_message_content
+    /// (MessageContent.cpp:4773-4784): `(file_name, mime_type,
+    /// extension)` from the suggested path. M.12.2 FileManager.
+    fn get_file_view_details(&self, file_id: FileId) -> Option<(String, String, String)>;
+    /// `AnimationsManager::create_animation` (AnimationsManager.h:44-47).
+    #[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+    fn create_animation(
+        &mut self,
+        file_id: FileId,
+        thumbnail: PhotoSize,
+        has_stickers: bool,
+        sticker_file_ids: Vec<FileId>,
+        file_name: String,
+        mime_type: String,
+        duration: i32,
+        dimensions: Dimensions,
+    );
+    /// `AudiosManager::create_audio` (AudiosManager.h:40-42).
+    #[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+    fn create_audio(
+        &mut self,
+        file_id: FileId,
+        thumbnail: PhotoSize,
+        file_name: String,
+        mime_type: String,
+        duration: i32,
+        title: String,
+        performer: String,
+    );
+    /// `DocumentsManager::create_document` (DocumentsManager.h:97-98).
+    fn create_document(
+        &mut self,
+        file_id: FileId,
+        thumbnail: PhotoSize,
+        file_name: String,
+        mime_type: String,
+    );
+    /// `StickersManager::create_sticker` (StickersManager.h:185-188).
+    fn create_sticker(&mut self, file_id: FileId, thumbnail: PhotoSize, dimensions: Dimensions);
+    /// `VideosManager::create_video` (VideosManager.h:47-51); the
+    /// `precise_duration` collapses into `duration` at both call sites.
+    #[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+    fn create_video(
+        &mut self,
+        file_id: FileId,
+        thumbnail: PhotoSize,
+        has_stickers: bool,
+        sticker_file_ids: Vec<FileId>,
+        file_name: String,
+        mime_type: String,
+        duration: i32,
+        dimensions: Dimensions,
+        supports_streaming: bool,
+    );
+    /// `VideoNotesManager::create_video_note` (VideoNotesManager.h:42-43).
+    fn create_video_note(
+        &mut self,
+        file_id: FileId,
+        thumbnail: PhotoSize,
+        duration: i32,
+        dimensions: Dimensions,
+    );
+    /// `VoiceNotesManager::create_voice_note` (VoiceNotesManager.h:39).
+    fn create_voice_note(
+        &mut self,
+        file_id: FileId,
+        mime_type: String,
+        duration: i32,
+        waveform: Vec<u8>,
+    );
+    /// `create_photo(file_manager, ...)` (Photo.cpp:128-146) — the
+    /// FileManager-flavor photo builder; M.12.2.
+    fn create_photo_input(
+        &mut self,
+        file_id: FileId,
+        thumbnail: PhotoSize,
+        width: i32,
+        height: i32,
+        sticker_file_ids: Vec<FileId>,
+    ) -> Result<Photo, Status>;
+    /// `FileManager::get_input_file_id` (MessageContent.cpp:4922-4923);
+    /// M.12.2.
+    fn get_input_file_id(
+        &mut self,
+        file_type: crate::files::FileType,
+        input_file: Option<td_api::InputFile>,
+        dialog_id: DialogId,
+        allow_get_by_hash: bool,
+        is_secret: bool,
+    ) -> Result<FileId, Status>;
 }
 
 /// `is_local_poll_id` (PollManager.cpp:449-452) — the local (unsent)
@@ -10596,9 +10694,493 @@ pub fn extract_input_invert_media(input_message_content: &td_api::InputMessageCo
     }
 }
 
+// ---------------------------------------------------------------------------
+// M.9.4b — create_input_message_content (MessageContent.cpp:4766-5164).
+// The media-manager create_* calls ride the MessageContentContext create
+// section, the file-view prelude is the get_file_view_details seam, and
+// the invoice/paid-media/poll/story arms land in the following slices
+// (their interim arms reject with a recorded note). The C++ global clock
+// `G()->unix_time()` of the photo arm lives inside the create_photo_input
+// seam.
+// ---------------------------------------------------------------------------
+
+/// `check_currency_amount` (misc.cpp:390-393). The M.9.4c invoice arm is
+/// the consumer.
+#[allow(dead_code)]
+fn check_currency_amount(amount: i64) -> bool {
+    const MAX_AMOUNT: i64 = 9999_9999_9999;
+    (-MAX_AMOUNT..=MAX_AMOUNT).contains(&amount)
+}
+
+/// `LabeledPricePart::get_labeled_price_parts` (LabeledPricePart.cpp:24-56).
+/// The M.9.4c invoice arm is the consumer.
+#[allow(dead_code)]
+fn get_labeled_price_parts(
+    parts: Vec<td_api::LabeledPricePart>,
+) -> Result<(Vec<LabeledPricePart>, i64), Status> {
+    if parts.is_empty() {
+        return Err(Status::error(400, "There must be at least one price part"));
+    }
+    let mut result = Vec::with_capacity(parts.len());
+    let mut total_amount = 0;
+    for part in parts {
+        if crate::misc::clean_input_string(&part.label).is_none() {
+            return Err(Status::error(
+                400,
+                "Price part label must be encoded in UTF-8",
+            ));
+        }
+        if !check_currency_amount(part.amount) {
+            return Err(Status::error(
+                400,
+                "Too big amount of the currency specified",
+            ));
+        }
+        result.push(LabeledPricePart {
+            label: part.label,
+            amount: part.amount,
+        });
+        total_amount += part.amount;
+    }
+    if total_amount <= 0 {
+        return Err(Status::error(400, "Total price must be positive"));
+    }
+    if !check_currency_amount(total_amount) {
+        return Err(Status::error(400, "Total price is too big"));
+    }
+    Ok((result, total_amount))
+}
+
+/// `create_input_message_content` (MessageContent.cpp:4766-5164). The
+/// RichMessage arm is deferred with the unmodeled RichMessage/WebPageBlock
+/// machinery; the PaidMedia, Invoice, Poll and Story arms land in the
+/// M.9.4c/d/e slices.
+#[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+pub fn create_input_message_content(
+    td: &mut dyn MessageContentContext,
+    dialog_id: DialogId,
+    input_message_content: td_api::InputMessageContent,
+    caption: FormattedText,
+    file_id: FileId,
+    thumbnail: PhotoSize,
+    sticker_file_ids: Vec<FileId>,
+    is_premium: bool,
+) -> Result<InputMessageContent, Status> {
+    tdutils::log_info!(
+        "Create InputMessageContent with file {} and thumbnail {}",
+        file_id.get(),
+        thumbnail.file_id.get()
+    );
+
+    let mut file_name = String::new();
+    let mut mime_type = String::new();
+    if file_id.is_valid() {
+        let Some((suggested_file_name, suggested_mime_type, extension)) =
+            td.get_file_view_details(file_id)
+        else {
+            return Err(Status::error(400, "Wrong file identifier specified"));
+        };
+        file_name = suggested_file_name;
+        mime_type = suggested_mime_type;
+        if !tdutils::utf8::check_utf8(file_name.as_bytes()) {
+            if extension.is_empty() {
+                file_name = format!("file.{extension}");
+            } else {
+                file_name = "file".to_string();
+            }
+        }
+    }
+
+    let mut disable_web_page_preview = false;
+    let mut invert_media = false;
+    let mut clear_draft = false;
+    let content;
+    let mut via_bot_user_id = UserId::default();
+    let mut self_destruct_type = None;
+    let mut emoji = String::new();
+    let is_bot = td.is_bot();
+    let is_secret = dialog_id.get_type() == DialogType::SecretChat;
+    match input_message_content {
+        td_api::InputMessageContent::inputMessageText(_) => {
+            let input_message_text =
+                process_input_message_text(td, dialog_id, input_message_content, is_bot, false)?;
+            let web_page_url = input_message_text.web_page_url;
+            disable_web_page_preview = input_message_text.disable_web_page_preview;
+            invert_media = input_message_text.show_above_text;
+            clear_draft = input_message_text.clear_draft;
+
+            if is_bot
+                && tdutils::utf8::utf8_length(&input_message_text.text.text) as i64
+                    > td.get_option_integer("message_text_length_max", 0)
+            {
+                return Err(Status::error(400, "Message is too long"));
+            }
+
+            let can_add_web_page_previews = dialog_id.get_type() != DialogType::Channel
+                || td.get_channel_can_add_web_page_previews(dialog_id.get_channel_id());
+            let web_page_id = if !is_bot && !disable_web_page_preview && can_add_web_page_previews {
+                let url = if web_page_url.is_empty() {
+                    crate::message_entity::get_first_url(&input_message_text.text).to_string()
+                } else {
+                    web_page_url.clone()
+                };
+                td.get_web_page_by_url(&url)
+            } else {
+                WebPageId::default()
+            };
+            content = MessageContent::Text(MessageText::new(
+                input_message_text.text,
+                web_page_id,
+                input_message_text.force_small_media,
+                input_message_text.force_large_media,
+                false,
+                web_page_url,
+            ));
+        }
+        td_api::InputMessageContent::inputMessageDice(input_dice) => {
+            if crate::misc::clean_input_string(&input_dice.emoji).is_none() {
+                return Err(Status::error(400, "Dice emoji must be encoded in UTF-8"));
+            }
+            content = MessageContent::Dice(MessageDice::new(
+                &input_dice.emoji,
+                0,
+                false,
+                Vec::new(),
+                String::new(),
+                0,
+                0,
+            ));
+            clear_draft = input_dice.clear_draft;
+        }
+        td_api::InputMessageContent::inputMessageStakeDice(input_dice) => {
+            if crate::misc::clean_input_string(&input_dice.state_hash).is_none() {
+                return Err(Status::error(400, "State hash must be encoded in UTF-8"));
+            }
+            if input_dice.state_hash.is_empty() {
+                return Err(Status::error(400, "State hash must be non-empty"));
+            }
+            let mut client_seed = vec![0u8; 32];
+            tdutils::random::secure_bytes(&mut client_seed);
+            content = MessageContent::Dice(MessageDice::new(
+                MessageDice::DEFAULT_EMOJI,
+                0,
+                true,
+                client_seed,
+                input_dice.state_hash,
+                input_dice.stake_gram_amount,
+                -1,
+            ));
+            clear_draft = input_dice.clear_draft;
+        }
+        td_api::InputMessageContent::inputMessageLocation(_) => {
+            let location = process_input_message_location(input_message_content)?;
+            content = MessageContent::Location(MessageLocation {
+                location: location.location,
+            });
+        }
+        td_api::InputMessageContent::inputMessageLiveLocation(_) => {
+            let location = process_input_message_location(input_message_content)?;
+            content = MessageContent::LiveLocation(MessageLiveLocation {
+                location: location.location,
+                period: location.live_period,
+                heading: location.heading,
+                proximity_alert_radius: location.proximity_alert_radius,
+            });
+        }
+        td_api::InputMessageContent::inputMessageVenue(_) => {
+            let venue = process_input_message_venue(input_message_content)?;
+            content = MessageContent::Venue(MessageVenue { venue });
+        }
+        td_api::InputMessageContent::inputMessageContact(_) => {
+            let contact = process_input_message_contact(td, input_message_content)?;
+            content = MessageContent::Contact(MessageContact { contact });
+        }
+        td_api::InputMessageContent::inputMessageGame(_) => {
+            let game = process_input_message_game(td, input_message_content)?;
+            via_bot_user_id = game.get_bot_user_id();
+            if via_bot_user_id == td.get_my_id() {
+                via_bot_user_id = UserId::default();
+            }
+
+            content = MessageContent::Game(MessageGame { game });
+        }
+        td_api::InputMessageContent::inputMessageChecklist(input_to_do_list) => {
+            let to_do_list = get_to_do_list(td, dialog_id, input_to_do_list.checklist)?;
+            content = MessageContent::ToDoList(MessageToDoList {
+                list: to_do_list,
+                completions: Vec::new(),
+            });
+        }
+        td_api::InputMessageContent::inputMessageAnimation(input_animation) => {
+            invert_media = input_animation.show_caption_above_media && !is_secret;
+
+            let has_stickers = !sticker_file_ids.is_empty();
+            let Some(animation) = input_animation.animation else {
+                return Err(Status::error(400, "Animation must be non-empty"));
+            };
+            td.create_animation(
+                file_id,
+                thumbnail,
+                has_stickers,
+                sticker_file_ids,
+                file_name,
+                mime_type,
+                animation.duration,
+                crate::photo::get_dimensions(
+                    animation.width,
+                    animation.height,
+                    "inputMessageAnimation",
+                ),
+            );
+
+            content = MessageContent::Animation(MessageAnimation {
+                file_id,
+                caption,
+                has_spoiler: input_animation.has_spoiler && !is_secret,
+            });
+        }
+        td_api::InputMessageContent::inputMessageAudio(input_audio) => {
+            let Some(audio) = input_audio.audio else {
+                return Err(Status::error(400, "Audio must be non-empty"));
+            };
+            if crate::misc::clean_input_string(&audio.title).is_none() {
+                return Err(Status::error(400, "Audio title must be encoded in UTF-8"));
+            }
+            if crate::misc::clean_input_string(&audio.performer).is_none() {
+                return Err(Status::error(
+                    400,
+                    "Audio performer must be encoded in UTF-8",
+                ));
+            }
+
+            td.create_audio(
+                file_id,
+                thumbnail,
+                file_name,
+                mime_type,
+                audio.duration,
+                audio.title,
+                audio.performer,
+            );
+
+            content = MessageContent::Audio(MessageAudio { file_id, caption });
+        }
+        td_api::InputMessageContent::inputMessageDocument(_) => {
+            td.create_document(file_id, thumbnail, file_name, mime_type);
+
+            content = MessageContent::Document(MessageDocument { file_id, caption });
+        }
+        td_api::InputMessageContent::inputMessageSticker(input_sticker) => {
+            emoji = input_sticker.emoji;
+            let Some(sticker) = input_sticker.sticker else {
+                return Err(Status::error(400, "Sticker must be non-empty"));
+            };
+
+            td.create_sticker(
+                file_id,
+                thumbnail,
+                crate::photo::get_dimensions(sticker.width, sticker.height, "inputMessageSticker"),
+            );
+
+            content = MessageContent::Sticker(MessageSticker {
+                file_id,
+                is_premium,
+            });
+        }
+        td_api::InputMessageContent::inputMessageVideo(input_video) => {
+            invert_media = input_video.show_caption_above_media && !is_secret;
+            self_destruct_type = input_video.self_destruct_type;
+            let Some(video) = input_video.video else {
+                return Err(Status::error(400, "Video must be non-empty"));
+            };
+
+            let mut cover = Photo::default();
+            if !is_secret && self_destruct_type.is_none() {
+                let cover_file_id = td.get_input_file_id(
+                    crate::files::FileType::Photo,
+                    video.cover,
+                    dialog_id,
+                    true,
+                    is_secret,
+                )?;
+                if cover_file_id.is_valid() {
+                    cover = td.create_photo_input(
+                        cover_file_id,
+                        PhotoSize::default(),
+                        video.width,
+                        video.height,
+                        Vec::new(),
+                    )?;
+                }
+            }
+
+            let has_stickers = !sticker_file_ids.is_empty();
+            td.create_video(
+                file_id,
+                thumbnail,
+                has_stickers,
+                sticker_file_ids,
+                file_name,
+                mime_type,
+                video.duration,
+                crate::photo::get_dimensions(video.width, video.height, "inputMessageVideo"),
+                video.supports_streaming,
+            );
+
+            content = MessageContent::Video(MessageVideo {
+                file_id,
+                cover,
+                start_timestamp: std::cmp::max(0, video.start_timestamp),
+                caption,
+                has_spoiler: input_video.has_spoiler && !is_secret,
+                ..MessageVideo::default()
+            });
+        }
+        td_api::InputMessageContent::inputMessageVideoNote(input_video_note) => {
+            self_destruct_type = input_video_note.self_destruct_type;
+            let Some(video_note) = input_video_note.video_note else {
+                return Err(Status::error(400, "Video note must be non-empty"));
+            };
+
+            let length = video_note.length;
+            if !(0..=640).contains(&length) {
+                return Err(Status::error(400, "Wrong video note length"));
+            }
+
+            td.create_video_note(
+                file_id,
+                thumbnail,
+                video_note.duration,
+                crate::photo::get_dimensions(length, length, "inputMessageVideoNote"),
+            );
+
+            content = MessageContent::VideoNote(MessageVideoNote {
+                file_id,
+                is_viewed: false,
+            });
+        }
+        td_api::InputMessageContent::inputMessageVoiceNote(input_voice_note) => {
+            self_destruct_type = input_voice_note.self_destruct_type;
+            let Some(voice_note) = input_voice_note.voice_note else {
+                return Err(Status::error(400, "Voice note must be non-empty"));
+            };
+
+            td.create_voice_note(file_id, mime_type, voice_note.duration, voice_note.waveform);
+
+            content = MessageContent::VoiceNote(MessageVoiceNote {
+                file_id,
+                caption,
+                is_listened: false,
+            });
+        }
+        td_api::InputMessageContent::inputMessagePhoto(input_photo) => {
+            invert_media = input_photo.show_caption_above_media && !is_secret;
+            self_destruct_type = input_photo.self_destruct_type;
+            let has_spoiler = input_photo.has_spoiler && !is_secret;
+            let Some(photo_input) = input_photo.photo else {
+                return Err(Status::error(400, "Photo must be non-empty"));
+            };
+
+            let photo = td.create_photo_input(
+                file_id,
+                thumbnail,
+                photo_input.width,
+                photo_input.height,
+                sticker_file_ids,
+            )?;
+
+            let mut video_file_id = FileId::default();
+            if photo_input.video.is_some() {
+                let video_file_type = if self_destruct_type.is_some() {
+                    crate::files::FileType::SelfDestructingLivePhoto
+                } else {
+                    crate::files::FileType::LivePhoto
+                };
+                video_file_id = td.get_input_file_id(
+                    video_file_type,
+                    photo_input.video,
+                    dialog_id,
+                    false,
+                    is_secret,
+                )?;
+                td.create_video(
+                    video_file_id,
+                    PhotoSize::default(),
+                    false,
+                    Vec::new(),
+                    String::new(),
+                    "video/mp4".to_string(),
+                    0,
+                    crate::photo::get_dimensions(
+                        photo_input.width,
+                        photo_input.height,
+                        "inputMessagePhoto",
+                    ),
+                    false,
+                );
+            }
+            content = MessageContent::Photo(MessagePhoto {
+                photo,
+                video_file_id,
+                caption,
+                has_spoiler,
+            });
+        }
+        // Deferred with the unmodeled RichMessage/WebPageBlock machinery
+        // (module doc).
+        td_api::InputMessageContent::inputMessageRichMessage(_) => {
+            return Err(Status::error(
+                400,
+                "Rich message input is not supported yet",
+            ));
+        }
+        // M.9.4c.
+        td_api::InputMessageContent::inputMessagePaidMedia(_) => {
+            return Err(Status::error(400, "Paid media input is not supported yet"));
+        }
+        // M.9.4c.
+        td_api::InputMessageContent::inputMessageInvoice(_) => {
+            return Err(Status::error(400, "Invoice input is not supported yet"));
+        }
+        // M.9.4d.
+        td_api::InputMessageContent::inputMessagePoll(_) => {
+            return Err(Status::error(400, "Poll input is not supported yet"));
+        }
+        // M.9.4e.
+        td_api::InputMessageContent::inputMessageStory(_) => {
+            return Err(Status::error(400, "Story input is not supported yet"));
+        }
+        // The MessagesManager forward path expands inputMessageForwarded
+        // before this switch (MessagesManager.cpp:21746-21747); the C++
+        // default arm is UNREACHABLE().
+        td_api::InputMessageContent::inputMessageForwarded(_) => {
+            unreachable!("the C++ default arm is UNREACHABLE()");
+        }
+    }
+
+    let ttl = MessageSelfDestructType::get_message_self_destruct_type(self_destruct_type)?;
+    if !ttl.is_empty() && dialog_id.get_type() != DialogType::User {
+        return Err(Status::error(
+            400,
+            "Messages can self-destruct only in private chats",
+        ));
+    }
+
+    Ok(InputMessageContent {
+        content: Box::new(content),
+        disable_web_page_preview,
+        invert_media,
+        clear_draft,
+        ttl,
+        via_bot_user_id,
+        emoji,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     /// The full C++ discriminant order (MessageContentType.h:15-113):
     /// `None = -1`, then the content types from `Text = 0` in declaration
@@ -11022,11 +11604,11 @@ mod tests {
     /// decision table (MessageContent.cpp:787-825).
     #[test]
     fn dice_emoji_normalizes_and_validates() {
-        let default_emoji = MessageDice::new("", 3, false, String::new(), String::new(), 0, 0);
+        let default_emoji = MessageDice::new("", 3, false, Vec::new(), String::new(), 0, 0);
         assert_eq!(default_emoji.emoji, MessageDice::DEFAULT_EMOJI);
 
         // The C++ default `remove_selectors = true`.
-        let stripped = MessageDice::new("🎲\u{fe0f}", 3, false, String::new(), String::new(), 0, 0);
+        let stripped = MessageDice::new("🎲\u{fe0f}", 3, false, Vec::new(), String::new(), 0, 0);
         assert_eq!(stripped.emoji, MessageDice::DEFAULT_EMOJI);
 
         assert!(
@@ -11034,7 +11616,7 @@ mod tests {
                 MessageDice::DEFAULT_EMOJI,
                 6,
                 false,
-                String::new(),
+                Vec::new(),
                 String::new(),
                 0,
                 0
@@ -11046,20 +11628,18 @@ mod tests {
                 MessageDice::DEFAULT_EMOJI,
                 7,
                 false,
-                String::new(),
+                Vec::new(),
                 String::new(),
                 0,
                 0
             )
             .is_valid()
         );
-        assert!(MessageDice::new("🎯", 6, false, String::new(), String::new(), 0, 0).is_valid());
-        assert!(!MessageDice::new("🎯", 7, false, String::new(), String::new(), 0, 0).is_valid());
-        assert!(MessageDice::new("⚽", 1000, false, String::new(), String::new(), 0, 0).is_valid());
-        assert!(
-            !MessageDice::new("⚽", 1001, false, String::new(), String::new(), 0, 0).is_valid()
-        );
-        assert!(!MessageDice::new("⚽", -1, false, String::new(), String::new(), 0, 0).is_valid());
+        assert!(MessageDice::new("🎯", 6, false, Vec::new(), String::new(), 0, 0).is_valid());
+        assert!(!MessageDice::new("🎯", 7, false, Vec::new(), String::new(), 0, 0).is_valid());
+        assert!(MessageDice::new("⚽", 1000, false, Vec::new(), String::new(), 0, 0).is_valid());
+        assert!(!MessageDice::new("⚽", 1001, false, Vec::new(), String::new(), 0, 0).is_valid());
+        assert!(!MessageDice::new("⚽", -1, false, Vec::new(), String::new(), 0, 0).is_valid());
 
         // A stake with a value needs the default die, a seed and a positive
         // stake amount.
@@ -11068,7 +11648,7 @@ mod tests {
                 MessageDice::DEFAULT_EMOJI,
                 3,
                 true,
-                "seed".to_string(),
+                b"seed".to_vec(),
                 String::new(),
                 10,
                 0
@@ -11076,14 +11656,14 @@ mod tests {
             .is_valid()
         );
         assert!(
-            !MessageDice::new("⚽", 3, true, "seed".to_string(), String::new(), 10, 0).is_valid()
+            !MessageDice::new("⚽", 3, true, b"seed".to_vec(), String::new(), 10, 0).is_valid()
         );
         assert!(
             !MessageDice::new(
                 MessageDice::DEFAULT_EMOJI,
                 3,
                 true,
-                String::new(),
+                Vec::new(),
                 String::new(),
                 10,
                 0
@@ -11095,7 +11675,7 @@ mod tests {
                 MessageDice::DEFAULT_EMOJI,
                 3,
                 true,
-                "seed".to_string(),
+                b"seed".to_vec(),
                 String::new(),
                 0,
                 0
@@ -11107,7 +11687,7 @@ mod tests {
                 MessageDice::DEFAULT_EMOJI,
                 3,
                 true,
-                "seed".to_string(),
+                b"seed".to_vec(),
                 String::new(),
                 10,
                 -1
@@ -11121,7 +11701,7 @@ mod tests {
                 MessageDice::DEFAULT_EMOJI,
                 0,
                 true,
-                "01234567890123456789012345678901".to_string(),
+                b"01234567890123456789012345678901".to_vec(),
                 "state".to_string(),
                 0,
                 0
@@ -11133,7 +11713,7 @@ mod tests {
                 MessageDice::DEFAULT_EMOJI,
                 0,
                 true,
-                "0123456789012345678901234567890123456789".to_string(),
+                b"0123456789012345678901234567890123456789".to_vec(),
                 "state".to_string(),
                 0,
                 0
@@ -11145,7 +11725,7 @@ mod tests {
                 MessageDice::DEFAULT_EMOJI,
                 0,
                 true,
-                "short seed".to_string(),
+                b"short seed".to_vec(),
                 "state".to_string(),
                 0,
                 0
@@ -12189,7 +12769,7 @@ mod tests {
                 emoji: "🎲".to_string(),
                 dice_value: 5,
                 is_stake: false,
-                seed: "seed".to_string(),
+                seed: b"seed".to_vec(),
                 state_hash: "hash".to_string(),
                 stake_ton_count: 0,
                 prize_ton_count: 0,
@@ -12825,6 +13405,8 @@ mod tests {
         my_id: UserId,
         checklist_title_max: i64,
         checklist_task_text_max: i64,
+        file_view_details: HashMap<FileId, (String, String, String)>,
+        input_file_counter: i32,
         register_log: Vec<String>,
     }
 
@@ -12879,6 +13461,8 @@ mod tests {
                 my_id: UserId::new(1000),
                 checklist_title_max: 100,
                 checklist_task_text_max: 100,
+                file_view_details: HashMap::new(),
+                input_file_counter: 0,
                 register_log: Vec::new(),
             }
         }
@@ -13425,6 +14009,197 @@ mod tests {
         fn get_my_id(&self) -> UserId {
             self.my_id
         }
+
+        fn get_file_view_details(&self, file_id: FileId) -> Option<(String, String, String)> {
+            self.file_view_details.get(&file_id).cloned()
+        }
+
+        fn create_animation(
+            &mut self,
+            file_id: FileId,
+            thumbnail: PhotoSize,
+            has_stickers: bool,
+            sticker_file_ids: Vec<FileId>,
+            file_name: String,
+            mime_type: String,
+            duration: i32,
+            dimensions: Dimensions,
+        ) {
+            self.register_log.push(format!(
+                "create_animation({},{},{},{:?},{},{},{},{:?},{:?})",
+                file_id.get(),
+                thumbnail.file_id.get(),
+                has_stickers,
+                sticker_file_ids,
+                file_name,
+                mime_type,
+                duration,
+                dimensions.width,
+                dimensions.height
+            ));
+        }
+
+        fn create_audio(
+            &mut self,
+            file_id: FileId,
+            thumbnail: PhotoSize,
+            file_name: String,
+            mime_type: String,
+            duration: i32,
+            title: String,
+            performer: String,
+        ) {
+            self.register_log.push(format!(
+                "create_audio({},{},{},{},{},{},{})",
+                file_id.get(),
+                thumbnail.file_id.get(),
+                file_name,
+                mime_type,
+                duration,
+                title,
+                performer
+            ));
+        }
+
+        fn create_document(
+            &mut self,
+            file_id: FileId,
+            thumbnail: PhotoSize,
+            file_name: String,
+            mime_type: String,
+        ) {
+            self.register_log.push(format!(
+                "create_document({},{},{},{})",
+                file_id.get(),
+                thumbnail.file_id.get(),
+                file_name,
+                mime_type
+            ));
+        }
+
+        fn create_sticker(
+            &mut self,
+            file_id: FileId,
+            thumbnail: PhotoSize,
+            dimensions: Dimensions,
+        ) {
+            self.register_log.push(format!(
+                "create_sticker({},{},{:?},{:?})",
+                file_id.get(),
+                thumbnail.file_id.get(),
+                dimensions.width,
+                dimensions.height
+            ));
+        }
+
+        fn create_video(
+            &mut self,
+            file_id: FileId,
+            thumbnail: PhotoSize,
+            has_stickers: bool,
+            sticker_file_ids: Vec<FileId>,
+            file_name: String,
+            mime_type: String,
+            duration: i32,
+            dimensions: Dimensions,
+            supports_streaming: bool,
+        ) {
+            self.register_log.push(format!(
+                "create_video({},{},{},{:?},{},{},{},{:?},{:?},{})",
+                file_id.get(),
+                thumbnail.file_id.get(),
+                has_stickers,
+                sticker_file_ids,
+                file_name,
+                mime_type,
+                duration,
+                dimensions.width,
+                dimensions.height,
+                supports_streaming
+            ));
+        }
+
+        fn create_video_note(
+            &mut self,
+            file_id: FileId,
+            thumbnail: PhotoSize,
+            duration: i32,
+            dimensions: Dimensions,
+        ) {
+            self.register_log.push(format!(
+                "create_video_note({},{},{},{:?},{:?})",
+                file_id.get(),
+                thumbnail.file_id.get(),
+                duration,
+                dimensions.width,
+                dimensions.height
+            ));
+        }
+
+        fn create_voice_note(
+            &mut self,
+            file_id: FileId,
+            mime_type: String,
+            duration: i32,
+            waveform: Vec<u8>,
+        ) {
+            self.register_log.push(format!(
+                "create_voice_note({},{},{},{})",
+                file_id.get(),
+                mime_type,
+                duration,
+                waveform.len()
+            ));
+        }
+
+        fn create_photo_input(
+            &mut self,
+            file_id: FileId,
+            thumbnail: PhotoSize,
+            width: i32,
+            height: i32,
+            sticker_file_ids: Vec<FileId>,
+        ) -> Result<Photo, Status> {
+            self.register_log.push(format!(
+                "create_photo_input({},{},{},{},{:?})",
+                file_id.get(),
+                thumbnail.file_id.get(),
+                width,
+                height,
+                sticker_file_ids
+            ));
+            Ok(Photo {
+                id: 0,
+                photos: vec![PhotoSize {
+                    size_type: 'i' as i32,
+                    size: 0,
+                    dimensions: Dimensions {
+                        width: width.max(0) as u16,
+                        height: height.max(0) as u16,
+                    },
+                    file_id,
+                    ..PhotoSize::default()
+                }],
+                ..Photo::default()
+            })
+        }
+
+        fn get_input_file_id(
+            &mut self,
+            file_type: crate::files::FileType,
+            _input_file: Option<td_api::InputFile>,
+            _dialog_id: DialogId,
+            _allow_get_by_hash: bool,
+            _is_secret: bool,
+        ) -> Result<FileId, Status> {
+            self.input_file_counter += 1;
+            let file_id = FileId::new(9000 + self.input_file_counter, 0);
+            self.register_log.push(format!(
+                "get_input_file_id({file_type:?}) -> {}",
+                file_id.get()
+            ));
+            Ok(file_id)
+        }
     }
 
     fn simple_text(text: &str) -> MessageContent {
@@ -13860,7 +14635,7 @@ mod tests {
             MessageDice::DEFAULT_EMOJI,
             0,
             false,
-            String::new(),
+            Vec::new(),
             String::new(),
             0,
             0,
@@ -15648,18 +16423,18 @@ mod tests {
         update = false;
 
         // dice seed change — content changed; emoji change — update
-        let dice = |emoji: &str, seed: &str| {
+        let dice = |emoji: &str, seed: &[u8]| {
             MessageContent::Dice(MessageDice {
                 emoji: emoji.to_string(),
-                seed: seed.to_string(),
+                seed: seed.to_vec(),
                 dice_value: 4,
                 ..MessageDice::default()
             })
         };
         compare_message_contents(
             Some(&td),
-            Some(&dice("🎯", "a")),
-            Some(&dice("🎯", "b")),
+            Some(&dice("🎯", b"a")),
+            Some(&dice("🎯", b"b")),
             &mut changed,
             &mut update,
         );
@@ -15668,8 +16443,8 @@ mod tests {
         update = false;
         compare_message_contents(
             Some(&td),
-            Some(&dice("🎯", "a")),
-            Some(&dice("🎲", "a")),
+            Some(&dice("🎯", b"a")),
+            Some(&dice("🎲", b"a")),
             &mut changed,
             &mut update,
         );
@@ -16216,5 +16991,416 @@ mod tests {
         });
         assert!(extract_input_caption(&mut input).is_none());
         assert!(!extract_input_invert_media(&input));
+    }
+
+    fn input_td() -> TestContext {
+        TestContext {
+            file_view_details: HashMap::from([(
+                FileId::new(5, 0),
+                (
+                    "movie.mp4".to_string(),
+                    "video/mp4".to_string(),
+                    "mp4".to_string(),
+                ),
+            )]),
+            known_users: vec![UserId::new(9)],
+            ..TestContext::default()
+        }
+    }
+
+    fn input_file_id() -> FileId {
+        FileId::new(5, 0)
+    }
+
+    #[test]
+    fn create_input_message_content_builds_the_pure_arms() {
+        let user_dialog = DialogId::from_user_id(UserId::new(7));
+        let caption = FormattedText::default();
+        let no_file = FileId::default();
+        let no_thumbnail = PhotoSize::default();
+
+        // text
+        let mut td = input_td();
+        let result = create_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessageText(td_api::inputMessageText {
+                text: Some(td_api_text("hello")),
+                link_preview_options: None,
+                clear_draft: true,
+            }),
+            caption.clone(),
+            no_file,
+            no_thumbnail.clone(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(&*result.content, MessageContent::Text(_)));
+        assert!(result.clear_draft);
+
+        // dice
+        let result = create_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessageDice(td_api::inputMessageDice {
+                emoji: "🎯".to_string(),
+                clear_draft: false,
+            }),
+            caption.clone(),
+            no_file,
+            no_thumbnail.clone(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            &*result.content,
+            MessageContent::Dice(d) if d.emoji == "🎯" && d.dice_value == 0
+        ));
+
+        // stake dice carries a 32-byte random seed and the state hash
+        let result = create_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessageStakeDice(td_api::inputMessageStakeDice {
+                state_hash: "hash".to_string(),
+                stake_gram_amount: 10,
+                clear_draft: true,
+            }),
+            caption.clone(),
+            no_file,
+            no_thumbnail.clone(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            &*result.content,
+            MessageContent::Dice(d)
+                if d.is_stake
+                    && d.seed.len() == 32
+                    && d.stake_ton_count == 10
+                    && d.prize_ton_count == -1
+        ));
+        assert!(result.clear_draft);
+
+        // an empty state hash is rejected
+        let error = create_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessageStakeDice(td_api::inputMessageStakeDice {
+                state_hash: String::new(),
+                stake_gram_amount: 10,
+                clear_draft: false,
+            }),
+            caption.clone(),
+            no_file,
+            no_thumbnail.clone(),
+            vec![],
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.message(), "State hash must be non-empty");
+
+        // location
+        let result = create_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessageLocation(td_api::inputMessageLocation {
+                location: Some(td_api::Location {
+                    latitude: 1.0,
+                    longitude: 2.0,
+                    horizontal_accuracy: 0.0,
+                }),
+            }),
+            caption.clone(),
+            no_file,
+            no_thumbnail.clone(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(&*result.content, MessageContent::Location(_)));
+
+        // game sets the via bot user id, cleared for my own id
+        let result = create_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessageGame(td_api::inputMessageGame {
+                bot_user_id: 9,
+                game_short_name: "chess".to_string(),
+            }),
+            caption.clone(),
+            no_file,
+            no_thumbnail,
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(&*result.content, MessageContent::Game(_)));
+        assert_eq!(result.via_bot_user_id, UserId::new(9));
+    }
+
+    #[test]
+    fn create_input_message_content_routes_the_media_arms() {
+        let user_dialog = DialogId::from_user_id(UserId::new(7));
+        let caption = FormattedText::default();
+        let file_id = input_file_id();
+        let thumbnail = PhotoSize {
+            size_type: 't' as i32,
+            file_id: FileId::new(8, 0),
+            ..PhotoSize::default()
+        };
+
+        // animation
+        let mut td = input_td();
+        let result = create_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessageAnimation(td_api::inputMessageAnimation {
+                animation: Some(td_api::InputAnimation {
+                    animation: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                        id: 42,
+                    })),
+                    duration: 7,
+                    width: 640,
+                    height: 480,
+                    ..td_api::InputAnimation::default()
+                }),
+                show_caption_above_media: true,
+                ..td_api::inputMessageAnimation::default()
+            }),
+            caption,
+            file_id,
+            thumbnail.clone(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            &*result.content,
+            MessageContent::Animation(m) if m.file_id == file_id && !m.has_spoiler
+        ));
+        assert!(result.invert_media);
+        assert_eq!(
+            td.register_log,
+            vec!["create_animation(5,8,false,[],movie.mp4,video/mp4,7,640,480)"]
+        );
+
+        // audio rides the create_audio seam
+        let result = create_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessageAudio(td_api::inputMessageAudio {
+                audio: Some(td_api::InputAudio {
+                    title: "Song".to_string(),
+                    performer: "Artist".to_string(),
+                    duration: 120,
+                    ..td_api::InputAudio::default()
+                }),
+                ..td_api::inputMessageAudio::default()
+            }),
+            FormattedText::default(),
+            file_id,
+            thumbnail.clone(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(&*result.content, MessageContent::Audio(_)));
+        assert_eq!(
+            td.register_log.last().map(String::as_str),
+            Some("create_audio(5,8,movie.mp4,video/mp4,120,Song,Artist)")
+        );
+
+        // video: cover + video creation, spoiler masked in secret chats
+        let mut td = input_td();
+        let secret_dialog = DialogId::from_secret_chat_id(SecretChatId::new(3));
+        let result = create_input_message_content(
+            &mut td,
+            secret_dialog,
+            td_api::InputMessageContent::inputMessageVideo(td_api::inputMessageVideo {
+                video: Some(td_api::InputVideo {
+                    video: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                        id: 42,
+                    })),
+                    duration: 10,
+                    width: 320,
+                    height: 240,
+                    supports_streaming: true,
+                    ..td_api::InputVideo::default()
+                }),
+                has_spoiler: true,
+                ..td_api::inputMessageVideo::default()
+            }),
+            FormattedText::default(),
+            file_id,
+            thumbnail,
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            &*result.content,
+            MessageContent::Video(m) if !m.has_spoiler && m.start_timestamp == 0
+        ));
+        let video_created = td
+            .register_log
+            .iter()
+            .any(|entry| entry.contains("create_video(5"));
+        assert!(video_created);
+
+        // a too-long video note is rejected
+        let error = create_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessageVideoNote(td_api::inputMessageVideoNote {
+                video_note: Some(td_api::InputVideoNote {
+                    length: 641,
+                    ..td_api::InputVideoNote::default()
+                }),
+                ..td_api::inputMessageVideoNote::default()
+            }),
+            FormattedText::default(),
+            file_id,
+            PhotoSize::default(),
+            vec![],
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error.message(), "Wrong video note length");
+    }
+
+    #[test]
+    fn create_input_message_content_photo_and_ttl_paths() {
+        let user_dialog = DialogId::from_user_id(UserId::new(7));
+        let file_id = input_file_id();
+
+        // a plain photo
+        let mut td = input_td();
+        let result = create_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessagePhoto(td_api::inputMessagePhoto {
+                photo: Some(td_api::InputPhoto {
+                    photo: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                        id: 42,
+                    })),
+                    width: 100,
+                    height: 200,
+                    ..td_api::InputPhoto::default()
+                }),
+                has_spoiler: true,
+                ..td_api::inputMessagePhoto::default()
+            }),
+            FormattedText::default(),
+            file_id,
+            PhotoSize::default(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            &*result.content,
+            MessageContent::Photo(m) if m.has_spoiler
+        ));
+        let photo_created = td
+            .register_log
+            .iter()
+            .any(|entry| entry.contains("create_photo_input(5"));
+        assert!(photo_created);
+
+        // a live photo registers the video file id through the seam
+        let mut td = input_td();
+        let result = create_input_message_content(
+            &mut td,
+            user_dialog,
+            td_api::InputMessageContent::inputMessagePhoto(td_api::inputMessagePhoto {
+                photo: Some(td_api::InputPhoto {
+                    photo: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                        id: 42,
+                    })),
+                    video: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                        id: 43,
+                    })),
+                    width: 100,
+                    height: 200,
+                    ..td_api::InputPhoto::default()
+                }),
+                ..td_api::inputMessagePhoto::default()
+            }),
+            FormattedText::default(),
+            file_id,
+            PhotoSize::default(),
+            vec![],
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            &*result.content,
+            MessageContent::Photo(m) if m.video_file_id.is_valid()
+        ));
+        let live_photo_registered = td
+            .register_log
+            .iter()
+            .any(|entry| entry.contains("get_input_file_id(LivePhoto)"));
+        assert!(live_photo_registered);
+
+        // self-destruct only in private chats
+        let chat_dialog = DialogId::from_chat_id(ChatId::new(4));
+        let error = create_input_message_content(
+            &mut td,
+            chat_dialog,
+            td_api::InputMessageContent::inputMessagePhoto(td_api::inputMessagePhoto {
+                photo: Some(td_api::InputPhoto {
+                    photo: Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+                        id: 42,
+                    })),
+                    ..td_api::InputPhoto::default()
+                }),
+                self_destruct_type: Some(
+                    td_api::MessageSelfDestructType::messageSelfDestructTypeTimer(
+                        td_api::messageSelfDestructTypeTimer {
+                            self_destruct_time: 30,
+                        },
+                    ),
+                ),
+                ..td_api::inputMessagePhoto::default()
+            }),
+            FormattedText::default(),
+            file_id,
+            PhotoSize::default(),
+            vec![],
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.message(),
+            "Messages can self-destruct only in private chats"
+        );
+
+        // the deferred arms reject with the recorded interim errors
+        for input in [
+            td_api::InputMessageContent::inputMessagePoll(td_api::inputMessagePoll {
+                ..td_api::inputMessagePoll::default()
+            }),
+            td_api::InputMessageContent::inputMessageInvoice(td_api::inputMessageInvoice {
+                ..td_api::inputMessageInvoice::default()
+            }),
+        ] {
+            let error = create_input_message_content(
+                &mut td,
+                user_dialog,
+                input,
+                FormattedText::default(),
+                file_id,
+                PhotoSize::default(),
+                vec![],
+                false,
+            )
+            .unwrap_err();
+            assert_eq!(error.code(), 400);
+        }
     }
 }
