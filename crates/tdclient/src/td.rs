@@ -68,7 +68,7 @@ use crate::requests;
 use crate::synchronous_requests;
 use crate::td_api::{self, Function, Object};
 use crate::time_zone_manager::TimeZoneManager;
-use crate::updates_manager::{UpdatesManager, UpdatesSink};
+use crate::updates_manager::{PendingUpdate, UpdatesManager, UpdatesManagerEnv, UpdatesSink};
 use crate::user_manager::{UserEnv, UserId, UserManager};
 
 #[cfg(target_endian = "big")]
@@ -124,15 +124,16 @@ struct PendingSend {
     text: String,
 }
 
-/// The collecting sink under the S72 UpdatesManager — Td drains it and
-/// converts/emits (the pts machine semantics stay in the manager).
+/// The collecting sink under the S76 walking-skeleton path — Td drains it
+/// and converts/emits. The S72 fan-outs became the M.7 engine's
+/// `process_pts_update` switch; the interim runs this second engine
+/// instance beside the Td-level one until MessagesManager lands (M.10)
+/// and retires the skeleton converter.
 #[derive(Default)]
 struct TdSink {
     users: Vec<tdmtproto::telegram_api::User>,
     chats: Vec<tdmtproto::telegram_api::Chat>,
     new_messages: Vec<tdmtproto::telegram_api::Message>,
-    message_ids: Vec<(i32, i64)>,
-    gap: bool,
 }
 
 impl UpdatesSink for TdSink {
@@ -142,27 +143,22 @@ impl UpdatesSink for TdSink {
     fn on_chat(&mut self, chat: tdmtproto::telegram_api::Chat) {
         self.chats.push(chat);
     }
-    fn on_new_message(
+    fn process_pts_update(&mut self, update: PendingUpdate) {
+        if let PendingUpdate::Wire(telegram_api::Update::updateNewMessage(new_message)) = update
+            && let Some(message) = new_message.message
+        {
+            self.new_messages.push(message);
+        }
+    }
+    fn add_pending_channel_update(
         &mut self,
-        message: tdmtproto::telegram_api::Message,
+        _peer: Option<tdmtproto::telegram_api::Peer>,
+        _update: PendingUpdate,
         _pts: i32,
         _pts_count: i32,
+        _promise: Promise<()>,
+        _source: &str,
     ) {
-        self.new_messages.push(message);
-    }
-    fn on_new_channel_message(
-        &mut self,
-        _message: tdmtproto::telegram_api::Message,
-        _pts: i32,
-        _pts_count: i32,
-    ) {
-    }
-    fn on_delete_messages(&mut self, _messages: Vec<i32>, _pts: i32, _pts_count: i32) {}
-    fn on_message_id(&mut self, id: i32, random_id: i64) {
-        self.message_ids.push((id, random_id));
-    }
-    fn on_gap(&mut self) {
-        self.gap = true;
     }
 }
 
@@ -268,6 +264,12 @@ pub struct Td {
     /// `Td::dialog_manager_` — the M.6 facade state (recent-dialog lists +
     /// search hints); the actor-dependent halves land with M.6.18+.
     pub(crate) dialog_manager: DialogManager,
+    /// `Td::updates_manager_` (`create_actor` at `Td.cpp:1319-1321`, after
+    /// the config) — the update engine. The binlog-pmc state loads lazily
+    /// on the first pts access (`init_state`), and the pmc writes flush
+    /// through `timeout_expired` exactly like the C++ actor's
+    /// `MAX_PTS_SAVE_DELAY` throttle.
+    pub(crate) updates_manager: UpdatesManager<TdUpdatesSink>,
     /// `Td::stop_cnt_` — the hangup and the close completion each drop one.
     stop_cnt: i32,
     /// The deferred-response outbox. The C++ request promises re-enter the
@@ -310,6 +312,145 @@ pub(crate) enum RecovererFetch {
     Full(crate::config_recoverer::FullConfigFetch),
 }
 
+/// The td-level [`UpdatesSink`]: the manager fan-outs land here as their
+/// slices land — the M.7.12 user-group intakes call into `user_manager`
+/// with its env (the M.3.9 manager convention), the message-family seams
+/// call the landed MessagesManager. Until then the trait defaults apply;
+/// the live update flow itself arrives with the net step (the session
+/// intake of `Td.cpp:404-408`), so the defaults are unobservable today.
+pub(crate) struct TdUpdatesSink;
+
+impl UpdatesSink for TdUpdatesSink {
+    /// `UserManager::on_get_users` — the users pre-application flips here
+    /// with the sink-state refactor (the ZST cannot reach the managers;
+    /// no live update flow exists before the net step, so nothing is
+    /// dropped today).
+    fn on_user(&mut self, _user: telegram_api::User) {}
+
+    /// `ChatManager::on_get_chats` — the M.5 flip, as `on_user`.
+    fn on_chat(&mut self, _chat: telegram_api::Chat) {}
+
+    /// `MessagesManager::process_pts_update` — the MessagesManager flip.
+    fn process_pts_update(&mut self, _update: PendingUpdate) {}
+
+    /// `MessagesManager::add_pending_channel_update` — the
+    /// MessagesManager flip.
+    fn add_pending_channel_update(
+        &mut self,
+        _peer: Option<telegram_api::Peer>,
+        _update: PendingUpdate,
+        _pts: i32,
+        _pts_count: i32,
+        _promise: Promise<()>,
+        _source: &str,
+    ) {
+    }
+}
+
+/// The [`UpdatesManagerEnv`] over the `Td` fields: built per drive with
+/// the field-split borrows (the `UserEnv` convention), never held across
+/// calls.
+pub(crate) struct TdUpdatesEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: &'a mut OptionManager,
+    auth_is_authorized: bool,
+    auth_is_bot: bool,
+    my_id: i64,
+    can_ignore_background_updates: bool,
+}
+
+impl UpdatesManagerEnv for TdUpdatesEnv<'_> {
+    fn now(&mut self) -> f64 {
+        tdutils::time::now()
+    }
+
+    fn unix_time(&mut self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn close_flag(&mut self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn is_authorized(&mut self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn is_bot(&mut self) -> bool {
+        self.auth_is_bot
+    }
+
+    /// `Td::ignore_background_updates()` — the option-gated td flag lands
+    /// with the background-updates step; the C++ default is false.
+    fn ignore_background_updates(&mut self) -> bool {
+        false
+    }
+
+    fn can_ignore_background_updates(&mut self) -> bool {
+        self.can_ignore_background_updates
+    }
+
+    fn get_option_integer(&mut self, name: &str) -> i64 {
+        self.options.get_option_integer(name, 0)
+    }
+
+    fn set_option_empty(&mut self, name: &str) {
+        self.options.set_option_empty(name);
+    }
+
+    fn pmc_get(&mut self, key: &str) -> String {
+        self.global.binlog_pmc().get(key)
+    }
+
+    fn pmc_set(&mut self, key: &str, value: &str) {
+        self.global.binlog_pmc().set(key, value);
+    }
+
+    fn pmc_erase(&mut self, key: &str) {
+        self.global.binlog_pmc().erase(key);
+    }
+
+    fn get_my_id(&mut self) -> i64 {
+        self.my_id
+    }
+
+    /// The `GetDifferenceQuery` — `[blocked: net]` until the S76
+    /// bridge↔dispatcher reconciliation; the recorded intent replaces the
+    /// query send.
+    fn send_get_difference(&mut self, pts: i32, date: i32, qts: i32) {
+        tdutils::log_info!(
+            "Send GetDifference(pts = {pts}, date = {date}, qts = {qts}) — [blocked: net]"
+        );
+    }
+
+    /// The `GetUpdatesStateQuery` — `[blocked: net]`.
+    fn send_get_updates_state(&mut self) {
+        tdutils::log_info!("Send GetUpdatesState — [blocked: net]");
+    }
+
+    /// The `ConfirmPtsQtsQuery` — `[blocked: net]`.
+    fn send_confirm_pts_qts(&mut self, pts: i32, qts: i32) {
+        tdutils::log_info!("Send ConfirmPtsQts(pts = {pts}, qts = {qts}) — [blocked: net]");
+    }
+
+    /// The `GetPtsUpdateQuery` — `[blocked: net]`.
+    fn send_get_pts_update(&mut self, pts: i32) {
+        tdutils::log_info!("Send GetPtsUpdate(pts = {pts}) — [blocked: net]");
+    }
+
+    /// The `PingServerQuery` — `[blocked: net]`.
+    fn send_ping_server(&mut self) {
+        tdutils::log_info!("Send PingServer — [blocked: net]");
+    }
+
+    /// `td_->online_manager_->is_online()` — the online manager lands
+    /// with the net step; offline is the safe default for the reloader
+    /// gate.
+    fn is_online(&mut self) -> bool {
+        false
+    }
+}
+
 /// The deferred-response outbox shared with the request promises (see the
 /// field docs).
 type DeferredResults = Arc<Mutex<Vec<(u64, Result<Object, Status>)>>>;
@@ -350,6 +491,7 @@ impl Td {
             premium_required_contact_merger: None,
             chat_manager: crate::chat_manager::ChatManager::new(),
             dialog_manager: DialogManager::new(),
+            updates_manager: UpdatesManager::new(TdUpdatesSink),
             stop_cnt: 2,
             deferred_results: Arc::new(Mutex::new(Vec::new())),
             bridge: None,
@@ -360,7 +502,7 @@ impl Td {
             peer_access: HashMap::new(),
             next_local_message_id: -1,
             pending_sends: HashMap::new(),
-            updates: UpdatesManager::new(TdSink::default(), 0),
+            updates: UpdatesManager::new(TdSink::default()),
         }
     }
 
@@ -891,8 +1033,28 @@ impl Td {
         }
         self.flush_user_updates();
 
-        // The init ping: country code pre-auth / get_difference post-auth —
-        // both need the net step.
+        // The init ping: country code pre-auth — needs the net step. The
+        // authorized branch is real (Td.cpp:951): the engine replays the
+        // pmc state and, with the senders `[blocked: net]`, records the
+        // GetDifference intent instead of sending it.
+        if !self.auth_manager.is_authorized() {
+            // country_info_manager_->get_current_country_code — Wave 2.
+        } else {
+            let global = &mut self.global;
+            let options = self
+                .option_manager
+                .as_mut()
+                .expect("option manager exists after init");
+            let mut env = TdUpdatesEnv {
+                global,
+                options,
+                auth_is_authorized: self.auth_manager.is_authorized(),
+                auth_is_bot: self.auth_manager.is_bot(),
+                my_id: self.user_manager.get_my_id().get(),
+                can_ignore_background_updates: self.can_ignore_background_updates,
+            };
+            self.updates_manager.get_difference(&mut env, "init");
+        }
 
         tracing::info!("Finish initialization");
 
@@ -997,8 +1159,25 @@ impl Td {
             self.auth_manager.on_closing(self.destroy_flag);
             self.flush_auth_updates();
             self.flush_user_updates();
-            // updates_manager_->timeout_expired() (save PTS and QTS) and the
-            // request-actor drain arrive with their steps.
+            // updates_manager_->timeout_expired() — save PTS and QTS
+            // before the teardown (Td.cpp:757 resets the actor; the pmc
+            // flush is the observable part).
+            {
+                let global = &mut self.global;
+                let options = self
+                    .option_manager
+                    .as_mut()
+                    .expect("option manager exists after init");
+                let mut env = TdUpdatesEnv {
+                    global,
+                    options,
+                    auth_is_authorized: self.auth_manager.is_authorized(),
+                    auth_is_bot: self.auth_manager.is_bot(),
+                    my_id: self.user_manager.get_my_id().get(),
+                    can_ignore_background_updates: self.can_ignore_background_updates,
+                };
+                self.updates_manager.timeout_expired(&mut env);
+            }
         }
         // The C++ hops through the request-actor refcount into clear(); the
         // M.1 has no request actors, so the teardown is direct.
@@ -1328,6 +1507,13 @@ impl Td {
             && (expire_time == 0.0 || alarm_deadline < expire_time)
         {
             expire_time = alarm_deadline;
+        }
+        // The UpdatesManager's gap/save/retry/reload timers join the same
+        // slot (M.7.18).
+        if let Some(updates_deadline) = self.updates_manager.next_deadline()
+            && (expire_time == 0.0 || updates_deadline < expire_time)
+        {
+            expire_time = updates_deadline;
         }
         if expire_time == 0.0 {
             self.cancel_timeout();
@@ -2159,9 +2345,24 @@ impl Td {
             if let QueryAnswer::Ok(data) = bridge.query(state)
                 && let Ok(m) = telegram_api::updates_State::parse(&data)
             {
-                self.updates.set_pts(m.pts);
-                self.updates.set_qts(m.qts);
-                self.updates.set_seq(m.seq);
+                // The M.7 engine: `updates.getState` replays through
+                // on_get_updates_state (the C++ get_difference chain);
+                // the S72 set_pts/set_qts/set_seq calls are superseded.
+                let global = &mut self.global;
+                let options = self
+                    .option_manager
+                    .as_mut()
+                    .expect("option manager exists after init");
+                let mut env = TdUpdatesEnv {
+                    global,
+                    options,
+                    auth_is_authorized: self.auth_manager.is_authorized(),
+                    auth_is_bot: self.auth_manager.is_bot(),
+                    my_id: self.user_manager.get_my_id().get(),
+                    can_ignore_background_updates: self.can_ignore_background_updates,
+                };
+                self.updates
+                    .on_get_updates_state(&mut env, m, "updates.getState");
             }
             bridge.mark_authorized();
             bridge.persist();
@@ -2446,35 +2647,28 @@ impl Td {
         }));
     }
 
-    /// The bridge's raw update packets — the `Updates` umbrella through
-    /// the S72 manager (pts bookkeeping, container users first), then the
-    /// td_api emission.
+    /// The bridge's raw update packets — the whole `Updates` umbrella
+    /// through the M.7 engine (the S72 partial switch over the plain
+    /// containers is superseded: shorts, updatesTooLong and the
+    /// users/chats pre-application route through on_get_updates), then
+    /// the td_api emission.
     fn on_net_update(&mut self, data: Vec<u8>) {
         let Ok(umbrella) = telegram_api::Updates::parse(&data) else {
             return;
         };
-        let now = tdutils::time::now();
-        match umbrella {
-            telegram_api::Updates::updatesTooLong(_) => {
-                // getDifference is Track I; the walking skeleton logs the gap.
-            }
-            telegram_api::Updates::updateShort(_) => {
-                // Non-pts shorts (config, etc.) — Track I surface.
-            }
-            telegram_api::Updates::updatesCombined(m) => {
-                self.updates.process_updates_combined(m, now);
-            }
-            telegram_api::Updates::updates(m) => {
-                self.updates.process_updates(m, now);
-            }
-            telegram_api::Updates::updateShortMessage(_) => {
-                // Private-chat messages arrive here; Saved Messages uses
-                // the updateNewMessage container path (Track I handles the
-                // short forms).
-            }
-            telegram_api::Updates::updateShortChatMessage(_) => {}
-            telegram_api::Updates::updateShortSentMessage(_) => {}
-        }
+        let Some(options) = self.option_manager.as_mut() else {
+            return;
+        };
+        let mut env = TdUpdatesEnv {
+            global: &mut self.global,
+            options,
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            my_id: self.user_manager.get_my_id().get(),
+            can_ignore_background_updates: self.can_ignore_background_updates,
+        };
+        self.updates
+            .on_get_updates(&mut env, umbrella, Promise::default());
         self.drain_sink();
     }
 
@@ -2657,6 +2851,23 @@ impl Actor for Td {
         }
         self.flush_user_updates();
         self.rearm_user_timeouts();
+
+        // The update engine's timers (the gap fills, the throttled pmc
+        // saves, the getDifference retry and the data reloaders; M.7.18).
+        {
+            let Some(options) = self.option_manager.as_mut() else {
+                return;
+            };
+            let mut env = TdUpdatesEnv {
+                global: &mut self.global,
+                options,
+                auth_is_authorized: self.auth_manager.is_authorized(),
+                auth_is_bot: self.auth_manager.is_bot(),
+                my_id: self.user_manager.get_my_id().get(),
+                can_ignore_background_updates: self.can_ignore_background_updates,
+            };
+            self.updates_manager.tick_timeouts(&mut env);
+        }
         self.flush_deferred_results();
     }
 
