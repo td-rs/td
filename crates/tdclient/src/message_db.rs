@@ -26,7 +26,7 @@ use tdutils::status::{Result, Status};
 use tdutils::time::now_cached;
 use tdutils::try_result;
 use tdutils::unicode::{UnicodeSimpleCategory, get_unicode_simple_category};
-use tdutils::utf8::{next_utf8_unsafe, utf8_truncate};
+use tdutils::utf8::{next_utf8_unsafe, utf8_truncated_len};
 
 /// `MESSAGE_DB_INDEX_COUNT` (MessageDb.cpp:41).
 const MESSAGE_DB_INDEX_COUNT: i32 = 30;
@@ -1138,7 +1138,7 @@ impl MessageDbImpl {
     /// raw query into FTS5 quoted words. The C++ StringBuilder overflow
     /// branch is unreachable with a growable `String`.
     fn prepare_query(query: &str) -> String {
-        let max_len = utf8_truncate(query.as_bytes(), 1024);
+        let max_len = utf8_truncated_len(query.as_bytes(), 1024);
         let query = &query[..max_len];
 
         let mut sb = String::with_capacity(query.len() * 4 + 100);

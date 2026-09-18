@@ -2,17 +2,11 @@
 //! used by the search machinery (M.4.4, `Hints`): `prepare_search_character`
 //! and `remove_diacritics`. The backing tables live in the generated
 //! [`crate::unicode_tables`] module (byte-extracted from tdlib 1.8.67).
-//!
-//! The C++ `to_lower_table`/`to_lower_ranges` pair (behind `unicode_to_lower`,
-//! consumed by `utf8_to_lower` and the misc string helpers) has no M.4.4
-//! consumer and is not carried yet; add it with its first user.
 
-use crate::unicode_simple_category_tables::{
-    SIMPLE_CATEGORY_JUMP_POS, SIMPLE_CATEGORY_RANGES, SIMPLE_CATEGORY_TABLE,
-};
 use crate::unicode_tables::{
-    PREPARE_SEARCH_CHARACTER_RANGES, PREPARE_SEARCH_CHARACTER_TABLE, WITHOUT_DIACRITICS_RANGES,
-    WITHOUT_DIACRITICS_TABLE,
+    PREPARE_SEARCH_CHARACTER_RANGES, PREPARE_SEARCH_CHARACTER_TABLE, TO_LOWER_RANGES,
+    TO_LOWER_TABLE, UNICODE_SIMPLE_CATEGORY_JUMP_POS, UNICODE_SIMPLE_CATEGORY_RANGES,
+    UNICODE_SIMPLE_CATEGORY_TABLE, WITHOUT_DIACRITICS_RANGES, WITHOUT_DIACRITICS_TABLE,
 };
 
 /// The C++ `TABLE_SIZE`: codes below it hit the direct tables, the rest the
@@ -84,9 +78,18 @@ pub fn remove_diacritics(code: u32) -> u32 {
     }
 }
 
-/// `td::UnicodeSimpleCategory` (unicode.h:13) — the discriminants are the
-/// table codes; `Separator` = 4.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// C++ `unicode_to_lower` (unicode.cpp:1345-1352): the single-code-point
+/// lowercase mapping behind `utf8_to_lower`.
+pub fn unicode_to_lower(code: u32) -> u32 {
+    if code < TABLE_SIZE {
+        TO_LOWER_TABLE[code as usize] as u32
+    } else {
+        binary_search_ranges(TO_LOWER_RANGES, code)
+    }
+}
+
+/// `td::UnicodeSimpleCategory` (tdutils/unicode.h:13).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UnicodeSimpleCategory {
     Unknown,
     Letter,
@@ -95,37 +98,74 @@ pub enum UnicodeSimpleCategory {
     Separator,
 }
 
-fn simple_category_from_code(code: u32) -> UnicodeSimpleCategory {
-    match code {
+fn simple_category_from_byte(byte: u8) -> UnicodeSimpleCategory {
+    match byte {
         0 => UnicodeSimpleCategory::Unknown,
         1 => UnicodeSimpleCategory::Letter,
         2 => UnicodeSimpleCategory::DecimalNumber,
         3 => UnicodeSimpleCategory::Number,
         4 => UnicodeSimpleCategory::Separator,
-        // the committed tables only encode 0-4
-        _ => panic!("bad simple-category code {code}"),
+        _ => unreachable!("unicode_simple_category_table carries only 0..=4"),
     }
 }
 
-/// C++ `get_unicode_simple_category` (unicode.cpp:1281-1294): the direct
-/// 128-entry table, then the jump-point-accelerated walk over the
-/// pair-encoded `(base << 5 | category)` ranges ending in the
-/// `0xFFFFFFFF` sentinel; the transform `(code << 5) + 30` keeps the
-/// walk's `<=` comparison equivalent to "greatest base not exceeding the
-/// code".
+/// `td::get_unicode_simple_category` (tdutils/unicode.cpp:1281-1294): the
+/// ASCII table below 128, then a jump-indexed scan over the encoded
+/// `(code << 5) | category` range list.
 pub fn get_unicode_simple_category(code: u32) -> UnicodeSimpleCategory {
     if code < 128 {
-        return simple_category_from_code(SIMPLE_CATEGORY_TABLE[code as usize] as u32);
+        return simple_category_from_byte(UNICODE_SIMPLE_CATEGORY_TABLE[code as usize]);
     }
     let jump_pos_index = if code <= 0x20000 {
         (code >> 7) as usize
     } else {
         ((0x20000 >> 7) - (0x20000 >> 16) + (code >> 16)) as usize
     };
-    let mut it = SIMPLE_CATEGORY_JUMP_POS[jump_pos_index] as usize;
-    let transformed = (code << 5) + 30;
-    while SIMPLE_CATEGORY_RANGES[it] <= transformed {
-        it += 1;
+    let mut idx = UNICODE_SIMPLE_CATEGORY_JUMP_POS[jump_pos_index] as usize;
+    let encoded = (code << 5) + 30;
+    while UNICODE_SIMPLE_CATEGORY_RANGES[idx] <= encoded {
+        idx += 1;
     }
-    simple_category_from_code(SIMPLE_CATEGORY_RANGES[it - 1] & 31)
+    simple_category_from_byte((UNICODE_SIMPLE_CATEGORY_RANGES[idx - 1] & 31) as u8)
+}
+
+#[cfg(test)]
+mod simple_category_tests {
+    use super::*;
+
+    /// Pins verified against the extracted table (the C++ algorithm, run in
+    /// lockstep): ASCII classes, a non-ASCII Nd, a No, an astral letter,
+    /// the plane-2 boundary and the hashtag-special characters.
+    #[test]
+    fn categories_match_unicode() {
+        use UnicodeSimpleCategory::*;
+        assert_eq!(get_unicode_simple_category(b'a' as u32), Letter);
+        assert_eq!(get_unicode_simple_category(b'Z' as u32), Letter);
+        assert_eq!(get_unicode_simple_category(b'7' as u32), DecimalNumber);
+        assert_eq!(get_unicode_simple_category(b'_' as u32), Unknown);
+        assert_eq!(get_unicode_simple_category(b' ' as u32), Separator);
+        assert_eq!(
+            get_unicode_simple_category(0x0660),
+            DecimalNumber,
+            "Arabic-Indic zero"
+        );
+        assert_eq!(
+            get_unicode_simple_category(0x00B2),
+            Number,
+            "superscript two"
+        );
+        assert_eq!(get_unicode_simple_category(0x05D0), Letter, "alef");
+        assert_eq!(get_unicode_simple_category(0x1F42D), Unknown, "emoji is So");
+        assert_eq!(
+            get_unicode_simple_category(0x0305),
+            Unknown,
+            "combining marks are Unknown here"
+        );
+        assert_eq!(get_unicode_simple_category(0x20000), Letter, "plane-2 CJK");
+        assert_eq!(get_unicode_simple_category(0x20001), Letter);
+        assert_eq!(get_unicode_simple_category(0x200C), Unknown, "ZWJ");
+        assert_eq!(get_unicode_simple_category(0x00B7), Unknown, "middle dot");
+        assert_eq!(get_unicode_simple_category(0xD800), Unknown, "surrogate");
+        assert_eq!(get_unicode_simple_category(0x10FFFF), Unknown);
+    }
 }
