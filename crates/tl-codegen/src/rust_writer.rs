@@ -605,7 +605,7 @@ fn sample_expr(
         FieldType::Vector { inner, .. } => {
             format!(
                 "if {depth} == 0 {{ Vec::new() }} else {{ vec![{}] }}",
-                sample_expr(p, m, opts, fields, inner, &format!("{depth} - 1"))
+                element_expr(p, m, opts, fields, inner, &format!("{depth} - 1"))
             )
         }
         FieldType::FixedArray { len, inner } => {
@@ -613,10 +613,55 @@ fn sample_expr(
             // so the repeat form builds all N elements.
             format!("[{}; {len}]", sample_expr(p, m, opts, fields, inner, depth))
         }
-        FieldType::Conditional { inner, .. } => sample_expr(p, m, opts, fields, inner, depth),
+        FieldType::Conditional { inner, .. } => {
+            // The element form never wraps, so a flag-gated class field
+            // takes exactly one `Some` (here) — not one per recursion level.
+            let expr = element_expr(p, m, opts, fields, inner, depth);
+            if is_object_field(m, ty) {
+                format!("Some({expr})")
+            } else {
+                expr
+            }
+        }
         FieldType::Boxed(t) | FieldType::Bare(t) => {
             // Parenthesized: depth may already be an expression like
-            // `depth - 1` inside vector elements.
+            // `depth - 1` inside vector elements. Class fields are
+            // `Option` — samples always carry a present object; the fixed
+            // word types (int128/int256/int512) stay bare values.
+            let expr = format!("t_{}(({depth}).saturating_sub(1))", m.type_name(p, *t));
+            let expr = if m.cyclic[*t] {
+                format!("Box::new({expr})")
+            } else {
+                expr
+            };
+            if is_class(m, ty) {
+                format!("Some({expr})")
+            } else {
+                expr
+            }
+        }
+        FieldType::Function => {
+            format!(
+                "Some(Box::new(t_{}(({depth}).saturating_sub(1))))",
+                opts.umbrella
+            )
+        }
+    }
+}
+
+/// The synthesizer expression for a vector ELEMENT: class references stay
+/// bare (a `vector<T>` holds `T` values, never `Option<T>`).
+fn element_expr(
+    p: &TlProgram,
+    m: &SchemeModel,
+    opts: &WriterOpts,
+    fields: &[Field],
+    ty: &FieldType,
+    depth: &str,
+) -> String {
+    match ty {
+        FieldType::Conditional { inner, .. } => element_expr(p, m, opts, fields, inner, depth),
+        FieldType::Boxed(t) | FieldType::Bare(t) => {
             let expr = format!("t_{}(({depth}).saturating_sub(1))", m.type_name(p, *t));
             if m.cyclic[*t] {
                 format!("Box::new({expr})")
@@ -624,9 +669,7 @@ fn sample_expr(
                 expr
             }
         }
-        FieldType::Function => {
-            format!("Box::new(t_{}(({depth}).saturating_sub(1)))", opts.umbrella)
-        }
+        _ => sample_expr(p, m, opts, fields, ty, depth),
     }
 }
 
@@ -723,7 +766,7 @@ fn emit_struct(
             out.push_str(&format!(
                 "    pub {}: {},\n",
                 field_ident(&f.name),
-                rust_field_type(p, m, opts, &f.ty)
+                field_decl_type(p, m, opts, &f.ty)
             ));
         }
         out.push_str("}\n\n");
@@ -794,11 +837,11 @@ fn emit_struct(
 /// above the BMP); vectors are arrays (a direct `vector<int64>` quotes its
 /// elements, deeper int64s do not).
 ///
-/// Divergence from C++, deliberate: td's nullable `object_ptr` fields are
-/// omitted when null; the Rust model materializes a default object instead,
-/// so object fields are always emitted. Binary store/parse (S10/S11) never
-/// encodes null either — nullability becomes observable only with the
-/// dynamic JSON layer (S16/S68).
+/// Nullability (S76): td's nullable `object_ptr` fields are `Option<T>` in
+/// the model — the JSON key is omitted when `None` (td's
+/// `if (object.x_) jo(...)`), while the binary store/parse materializes a
+/// default object (td's generated classes default-construct members; the
+/// wire never encodes null).
 fn emit_struct_json(
     out: &mut String,
     p: &TlProgram,
@@ -816,6 +859,7 @@ fn emit_struct_json(
         p.ctors[c].id
     ));
     JsonStoreWriter {
+        m,
         depth: 2,
         var_counter: 0,
     }
@@ -1088,12 +1132,13 @@ fn emit_enum_json(out: &mut String, p: &TlProgram, ctors: &[usize]) {
 /// value in td's exact encoding. The `flags:#` word is never serialized;
 /// conditional fields are emitted unconditionally (td's writer gates only
 /// object null-ness, never the flag bit).
-struct JsonStoreWriter {
+struct JsonStoreWriter<'a> {
+    m: &'a SchemeModel,
     depth: usize,
     var_counter: usize,
 }
 
-impl JsonStoreWriter {
+impl JsonStoreWriter<'_> {
     fn indent(&self) -> String {
         " ".repeat(self.depth * 4)
     }
@@ -1103,6 +1148,25 @@ impl JsonStoreWriter {
             if let FieldType::Prim(Prim::Nat) = f.ty {
                 // The flags word has no JSON representation (td's tl_simple
                 // drops it from the arg list entirely).
+                continue;
+            }
+            if is_object_field(self.m, &f.ty) {
+                // td's nullable `object_ptr` fields: the key (and value) is
+                // omitted entirely when null — `if (object.x_) jo(...)`.
+                let ind = self.indent();
+                let var = format!("__o{}", self.var_counter);
+                self.var_counter += 1;
+                let field = field_ident(&f.name);
+                out.push_str(&format!("{ind}if let Some({var}) = &self.{field} {{\n"));
+                self.depth += 1;
+                out.push_str(&format!(
+                    "{}out.push_str(\",{}:\");\n",
+                    self.indent(),
+                    json_key(&f.name)
+                ));
+                out.push_str(&format!("{}{var}.to_json_into(out);\n", self.indent()));
+                self.depth -= 1;
+                out.push_str(&format!("{ind}}}\n"));
                 continue;
             }
             out.push_str(&format!(
@@ -1240,14 +1304,29 @@ impl JsonLoadWriter<'_> {
             self.var_counter += 1;
             let elem_var = format!("__e{}", self.var_counter);
             self.var_counter += 1;
+            // Top-level expressions already carry their own `?` (boxing
+            // consumes it inside `Box::new(..?)`). Class fields wrap in
+            // `Some` — an explicit JSON `null` stays `None`, td's
+            // object_ptr-from-null rule. The null check rides the `if let`
+            // condition (a nested `if` trips `clippy::collapsible_if` on
+            // the generated code).
+            let object = is_object_field(self.m, &f.ty);
+            let null_guard = if object {
+                format!(" && !matches!({var}, tl_json::Json::Null)")
+            } else {
+                String::new()
+            };
             out.push_str(&format!(
-                "{ind}if let Some({var}) = tl_json::field(o, \"{}\") {{\n",
+                "{ind}if let Some({var}) = tl_json::field(o, \"{}\"){null_guard} {{\n",
                 f.name
             ));
             self.depth += 1;
-            // Top-level expressions already carry their own `?` (boxing
-            // consumes it inside `Box::new(..?)`).
             let expr = self.read_expr(p, &var, &elem_var, &f.ty, false);
+            let expr = if object {
+                format!("Some({expr})")
+            } else {
+                expr
+            };
             out.push_str(&format!("{}{target} = {expr};\n", self.indent()));
             self.depth -= 1;
             out.push_str(&format!("{ind}}}\n"));
@@ -1416,6 +1495,43 @@ fn emit_enum(
     }
 }
 
+/// The declared struct-field type: class fields are `Option<...>`
+/// (`None` = td's null `object_ptr`, omitted from the JSON output);
+/// everything else (primitives, vectors — including vectors of classes)
+/// stays a plain value, exactly the fields td's JSON emitter writes
+/// unconditionally. Flag-gated class fields are nullable the same way.
+fn field_decl_type(p: &TlProgram, m: &SchemeModel, opts: &WriterOpts, ty: &FieldType) -> String {
+    let base = rust_field_type(p, m, opts, ty);
+    if is_object_field(m, ty) {
+        format!("Option<{base}>")
+    } else {
+        base
+    }
+}
+
+/// Whether the type is a scheme-class reference — every such field is a
+/// nullable `object_ptr<T>` in td's C++ model (null when the JSON key is
+/// absent; the binary store materializes a default object, exactly like
+/// td's generated classes default-construct members).
+fn is_class(m: &SchemeModel, ty: &FieldType) -> bool {
+    match ty {
+        // The fixed word types (int128/int256/int512) are embedded values
+        // in td's C++ model — never nullable object_ptr.
+        FieldType::Boxed(t) | FieldType::Bare(t) => !m.is_word_type[*t],
+        FieldType::Function => true,
+        _ => false,
+    }
+}
+
+/// Whether a field is a (possibly flag-gated) scheme-class reference — the
+/// JSON-omittable `object_ptr` set.
+fn is_object_field(m: &SchemeModel, ty: &FieldType) -> bool {
+    match ty {
+        FieldType::Conditional { inner, .. } => is_object_field(m, inner),
+        t => is_class(m, t),
+    }
+}
+
 fn rust_field_type(p: &TlProgram, m: &SchemeModel, opts: &WriterOpts, ty: &FieldType) -> String {
     match ty {
         FieldType::Prim(prim) => {
@@ -1515,6 +1631,7 @@ impl StoreWriter<'_> {
                     bit_mask(*bit)
                 ));
                 self.depth += 1;
+                let expr = self.materialize_class(out, &expr, inner);
                 self.emit_value(out, &expr, inner);
                 self.depth -= 1;
                 out.push_str(&format!("{}}}\n", self.indent()));
@@ -1530,6 +1647,7 @@ impl StoreWriter<'_> {
                     cap.as_deref().unwrap_or(&expr)
                 ));
             } else {
+                let expr = self.materialize_class(out, &expr, &f.ty);
                 self.emit_value(out, &expr, &f.ty);
             }
         }
@@ -1640,6 +1758,24 @@ impl StoreWriter<'_> {
             FieldType::Conditional { .. } => unreachable!("conditionals are handled per-field"),
         }
     }
+
+    /// A class field's `Option<T>` materializes for the binary store (td's
+    /// object_ptr members default-construct; the wire never encodes null):
+    /// binds `expr` to a `&T` place (default when `None`) and returns the
+    /// local's name for [`Self::emit_value`].
+    fn materialize_class(&mut self, out: &mut String, expr: &str, ty: &FieldType) -> String {
+        if !is_object_field(self.m, ty) {
+            return expr.to_owned();
+        }
+        let ind = self.indent();
+        let n = self.var_counter;
+        self.var_counter += 1;
+        let (default, local) = (format!("__d{n}"), format!("__m{n}"));
+        out.push_str(&format!(
+            "{ind}let {default} = Default::default();\n{ind}let {local} = {expr}.as_ref().unwrap_or(&{default});\n"
+        ));
+        local
+    }
 }
 
 /// Emits a `read_bare` body, mirroring td's generated ctor-from-parser:
@@ -1703,12 +1839,20 @@ impl ReadWriter<'_> {
                         // is not read.
                         out.push_str(&format!(
                             "{ind}let {local}: {} = if ({flags_local} & {}) != 0 {{\n",
-                            rust_field_type(p, self.m, self.opts, inner),
+                            field_decl_type(p, self.m, self.opts, inner),
                             bit_mask(*bit)
                         ));
                         self.depth += 1;
                         let mut prelude = String::new();
                         let expr = self.emit_read(&mut prelude, p, inner);
+                        // Class fields wrap in `Some` — the cleared branch's
+                        // `Default::default()` is then `None`, exactly td's
+                        // object_ptr that simply stays null.
+                        let expr = if is_class(self.m, inner) {
+                            format!("Some({expr})")
+                        } else {
+                            expr
+                        };
                         out.push_str(&prelude);
                         out.push_str(&format!("{}{expr}\n", self.indent()));
                         self.depth -= 1;
@@ -1722,10 +1866,15 @@ impl ReadWriter<'_> {
                     // flush it before this field's own statement.
                     let mut prelude = String::new();
                     let expr = self.emit_read(&mut prelude, p, &f.ty);
+                    let expr = if is_class(self.m, &f.ty) {
+                        format!("Some({expr})")
+                    } else {
+                        expr
+                    };
                     out.push_str(&prelude);
                     out.push_str(&format!(
                         "{ind}let {local}: {} = {expr};\n",
-                        rust_field_type(p, self.m, self.opts, &f.ty)
+                        field_decl_type(p, self.m, self.opts, &f.ty)
                     ));
                 }
             }

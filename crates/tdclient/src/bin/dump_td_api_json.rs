@@ -67,7 +67,9 @@ fn main() {
             entities: vec![td_api::TextEntity {
                 offset: 2,
                 length: 3,
-                r#type: td_api::TextEntityType::textEntityTypeBold(td_api::textEntityTypeBold),
+                r#type: Some(td_api::TextEntityType::textEntityTypeBold(
+                    td_api::textEntityTypeBold,
+                )),
             }],
         };
         dump2(
@@ -82,36 +84,36 @@ fn main() {
             id: 7,
             size: 1234567890123,
             expected_size: 9876543210987,
-            local: td_api::LocalFile {
+            local: Some(td_api::LocalFile {
                 path: "/tmp/x.bin".to_owned(),
                 is_downloading_active: true,
                 downloaded_size: 4096,
                 ..Default::default()
-            },
-            remote: td_api::RemoteFile {
+            }),
+            remote: Some(td_api::RemoteFile {
                 unique_id: "AQID".to_owned(),
                 ..Default::default()
-            },
+            }),
         };
         dump2("file", &obj.to_json(), td_api::Object::file(obj));
     }
 
     {
         let obj = td_api::MessageForwardInfo {
-            origin: td_api::MessageOrigin::messageOriginUser(td_api::messageOriginUser {
-                sender_user_id: 42,
-            }),
+            origin: Some(td_api::MessageOrigin::messageOriginUser(
+                td_api::messageOriginUser { sender_user_id: 42 },
+            )),
             date: 1700000123,
-            source: td_api::ForwardSource {
+            source: Some(td_api::ForwardSource {
                 chat_id: -1001234567890,
                 message_id: 555,
-                sender_id: td_api::MessageSender::messageSenderChat(td_api::messageSenderChat {
-                    chat_id: -99,
-                }),
+                sender_id: Some(td_api::MessageSender::messageSenderChat(
+                    td_api::messageSenderChat { chat_id: -99 },
+                )),
                 sender_name: "fwd".to_owned(),
                 date: 7,
                 is_outgoing: true,
-            },
+            }),
             public_service_announcement_type: "psa".to_owned(),
         };
         dump2(
@@ -156,10 +158,10 @@ fn main() {
     {
         let obj = td_api::Poll {
             id: -9007199254740993,
-            question: td_api::FormattedText {
+            question: Some(td_api::FormattedText {
                 text: "q?".to_owned(),
                 entities: Vec::new(),
-            },
+            }),
             options: Vec::new(),
             total_voter_count: 4,
             recent_voter_ids: vec![td_api::MessageSender::messageSenderUser(
@@ -173,14 +175,15 @@ fn main() {
             members_only: true,
             country_codes: vec!["EN".to_owned(), String::new()],
             option_order: vec![0],
-            r#type: td_api::PollType::pollTypeRegular(td_api::pollTypeRegular),
+            r#type: Some(td_api::PollType::pollTypeRegular(td_api::pollTypeRegular)),
             open_period: 300,
             close_date: 0,
             is_closed: false,
-            vote_restriction_reason:
+            vote_restriction_reason: Some(
                 td_api::PollVoteRestrictionReason::pollVoteRestrictionReasonClosed(
                     td_api::pollVoteRestrictionReasonClosed,
                 ),
+            ),
         };
         dump2("poll", &obj.to_json(), td_api::Object::poll(obj));
     }

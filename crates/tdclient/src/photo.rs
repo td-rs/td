@@ -120,7 +120,7 @@ impl StickerPhotoSize {
             telegram_api::VideoSize::videoSizeStickerMarkup(size) => {
                 result.type_ = StickerPhotoSizeType::Sticker;
                 result.sticker_set_id = match &size.stickerset {
-                    telegram_api::InputStickerSet::inputStickerSetID(input) => input.id,
+                    Some(telegram_api::InputStickerSet::inputStickerSetID(input)) => input.id,
                     // add_sticker_set — with the StickersManager step
                     _ => 0,
                 };
@@ -182,8 +182,8 @@ impl StickerPhotoSize {
             }
         };
         td_api::ChatPhotoSticker {
-            r#type,
-            background_fill,
+            r#type: Some(r#type),
+            background_fill: Some(background_fill),
         }
     }
 }
@@ -493,7 +493,7 @@ fn get_photo_size_object(photo_size: &PhotoSize) -> td_api::PhotoSize {
         } else {
             String::new()
         },
-        photo: td_api::File::default(),
+        photo: Some(td_api::File::default()),
         width: photo_size.dimensions.width as i32,
         height: photo_size.dimensions.height as i32,
         progressive_sizes: photo_size.progressive_sizes.clone(),
@@ -518,12 +518,12 @@ pub fn get_animated_chat_photo_object(
     match animation_size {
         Some(animation) if animation.photo_size.file_id.is_valid() => td_api::AnimatedChatPhoto {
             length: animation.photo_size.dimensions.width as i32,
-            file: td_api::File::default(),
+            file: Some(td_api::File::default()),
             main_frame_timestamp: animation.main_frame_timestamp,
         },
         _ => td_api::AnimatedChatPhoto {
             length: 0,
-            file: td_api::File::default(),
+            file: Some(td_api::File::default()),
             main_frame_timestamp: 0.0,
         },
     }
@@ -537,18 +537,20 @@ pub fn get_chat_photo_object(photo: &Photo) -> td_api::ChatPhoto {
         return td_api::ChatPhoto {
             id: 0,
             added_date: 0,
-            minithumbnail: get_minithumbnail_object(&[]),
+            minithumbnail: Some(get_minithumbnail_object(&[])),
             sizes: Vec::new(),
-            animation: get_animated_chat_photo_object(None),
-            small_animation: get_animated_chat_photo_object(None),
-            sticker: td_api::ChatPhotoSticker {
-                r#type: td_api::ChatPhotoStickerType::chatPhotoStickerTypeCustomEmoji(
-                    td_api::chatPhotoStickerTypeCustomEmoji { custom_emoji_id: 0 },
+            animation: Some(get_animated_chat_photo_object(None)),
+            small_animation: Some(get_animated_chat_photo_object(None)),
+            sticker: Some(td_api::ChatPhotoSticker {
+                r#type: Some(
+                    td_api::ChatPhotoStickerType::chatPhotoStickerTypeCustomEmoji(
+                        td_api::chatPhotoStickerTypeCustomEmoji { custom_emoji_id: 0 },
+                    ),
                 ),
-                background_fill: td_api::BackgroundFill::backgroundFillSolid(
+                background_fill: Some(td_api::BackgroundFill::backgroundFillSolid(
                     td_api::backgroundFillSolid { color: 0 },
-                ),
-            },
+                )),
+            }),
         };
     }
 
@@ -573,22 +575,109 @@ pub fn get_chat_photo_object(photo: &Photo) -> td_api::ChatPhoto {
         .as_ref()
         .map(|sticker| sticker.get_chat_photo_sticker_object())
         .unwrap_or(td_api::ChatPhotoSticker {
-            r#type: td_api::ChatPhotoStickerType::chatPhotoStickerTypeCustomEmoji(
-                td_api::chatPhotoStickerTypeCustomEmoji { custom_emoji_id: 0 },
+            r#type: Some(
+                td_api::ChatPhotoStickerType::chatPhotoStickerTypeCustomEmoji(
+                    td_api::chatPhotoStickerTypeCustomEmoji { custom_emoji_id: 0 },
+                ),
             ),
-            background_fill: td_api::BackgroundFill::backgroundFillSolid(
+            background_fill: Some(td_api::BackgroundFill::backgroundFillSolid(
                 td_api::backgroundFillSolid { color: 0 },
-            ),
+            )),
         });
     td_api::ChatPhoto {
         id: photo.id,
         added_date: photo.date,
-        minithumbnail: get_minithumbnail_object(photo.minithumbnail.as_bytes()),
+        minithumbnail: Some(get_minithumbnail_object(photo.minithumbnail.as_bytes())),
         sizes: get_photo_sizes_object(&photo.photos),
-        animation: get_animated_chat_photo_object(big_animation),
-        small_animation: get_animated_chat_photo_object(small_animation),
-        sticker,
+        animation: Some(get_animated_chat_photo_object(big_animation)),
+        small_animation: Some(get_animated_chat_photo_object(small_animation)),
+        sticker: Some(sticker),
     }
+}
+
+/// `td::DialogPhoto` (DialogPhoto.h:23) — the chat-photo handle the basic
+/// group/channel records carry (`ProfilePhoto` is this plus the photo id).
+/// The two `FileId`s stay placeholders until the Files step, with the same
+/// consequences the module docs describe for the photo sizes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DialogPhoto {
+    pub small_file_id: FileId,
+    pub big_file_id: FileId,
+    pub minithumbnail: String,
+    pub has_animation: bool,
+    pub is_personal: bool,
+}
+
+impl DialogPhoto {
+    /// `get_dialog_photo` (DialogPhoto.cpp:90-130): a null/`chatPhotoEmpty`
+    /// yields the empty photo; a `chatPhoto` contributes the stripped
+    /// minithumbnail, the animation flag and the dc id (kept for the
+    /// invalid-value parity of `DcId::create`). The two
+    /// `register_photo_size` calls are the documented Files-step no-op —
+    /// both file ids stay invalid placeholders.
+    pub fn get_dialog_photo(chat_photo: Option<telegram_api::ChatPhoto>) -> DialogPhoto {
+        let mut result = DialogPhoto::default();
+        match chat_photo {
+            None => {}
+            Some(telegram_api::ChatPhoto::chatPhotoEmpty(_)) => {}
+            Some(telegram_api::ChatPhoto::chatPhoto(chat_photo)) => {
+                let _dc_id = crate::chat_manager::DcId::create(chat_photo.dc_id);
+                result.has_animation = chat_photo.has_video;
+                result.is_personal = false;
+                result.minithumbnail =
+                    String::from_utf8_lossy(&chat_photo.stripped_thumb).into_owned();
+            }
+        }
+        result
+    }
+
+    /// `need_update_dialog_photo` (DialogPhoto.cpp:212) — the minithumbnail
+    /// is deliberately not compared, like the C++.
+    pub fn need_update(&self, to: &DialogPhoto) -> bool {
+        self.small_file_id != to.small_file_id
+            || self.big_file_id != to.big_file_id
+            || self.has_animation != to.has_animation
+            || self.is_personal != to.is_personal
+    }
+
+    /// `as_fake_dialog_photo` (DialogPhoto.cpp:144-160): the 'a'/'c' size
+    /// selection, the minithumbnail and the animation flag. The C++
+    /// "Failed to convert" error fires when either selected size carries no
+    /// valid file id — a condition the placeholders cannot express until the
+    /// Files step, so the selected fields are kept instead (module docs).
+    pub fn as_fake_dialog_photo(
+        photo: &Photo,
+        _dialog_id: crate::chat_manager::DialogId,
+        is_personal: bool,
+    ) -> DialogPhoto {
+        let mut result = DialogPhoto::default();
+        if !photo.is_empty() {
+            for size in &photo.photos {
+                if size.size_type == b'a' as i32 {
+                    result.small_file_id = size.file_id;
+                } else if size.size_type == b'c' as i32 {
+                    result.big_file_id = size.file_id;
+                }
+            }
+            result.minithumbnail = photo.minithumbnail.clone();
+            result.has_animation = !photo.animations.is_empty();
+            result.is_personal = is_personal;
+        }
+        result
+    }
+}
+
+/// `dialog_photo_get_file_ids` (DialogPhoto.cpp:133-139) — the valid file
+/// ids, small then big; placeholders never qualify.
+pub fn dialog_photo_get_file_ids(dialog_photo: &DialogPhoto) -> Vec<FileId> {
+    let mut result = Vec::new();
+    if dialog_photo.small_file_id.is_valid() {
+        result.push(dialog_photo.small_file_id);
+    }
+    if dialog_photo.big_file_id.is_valid() {
+        result.push(dialog_photo.big_file_id);
+    }
+    result
 }
 
 #[cfg(test)]
@@ -816,7 +905,10 @@ mod tests {
         assert_eq!(object.sizes.len(), 1);
         assert_eq!(object.sizes[0].r#type, "m");
         assert_eq!(object.sizes[0].progressive_sizes, vec![1, 2]);
-        assert_eq!(object.minithumbnail.height, 90);
+        assert_eq!(
+            object.minithumbnail.as_ref().expect("minithumbnail").height,
+            90
+        );
 
         // a small 'p' animation without its 'u' counterpart is dropped
         photo.animations = vec![AnimationSize {
@@ -833,8 +925,15 @@ mod tests {
             main_frame_timestamp: 0.25,
         }];
         let object = get_chat_photo_object(&photo);
-        assert_eq!(object.animation.length, 0);
-        assert_eq!(object.small_animation.length, 0);
+        assert_eq!(object.animation.as_ref().expect("animation").length, 0);
+        assert_eq!(
+            object
+                .small_animation
+                .as_ref()
+                .expect("small animation")
+                .length,
+            0
+        );
     }
 
     #[test]
@@ -849,11 +948,11 @@ mod tests {
         let object = sticker.get_chat_photo_sticker_object();
         assert!(matches!(
             object.r#type,
-            td_api::ChatPhotoStickerType::chatPhotoStickerTypeCustomEmoji(_)
+            Some(td_api::ChatPhotoStickerType::chatPhotoStickerTypeCustomEmoji(_))
         ));
         assert!(matches!(
             object.background_fill,
-            td_api::BackgroundFill::backgroundFillGradient(_)
+            Some(td_api::BackgroundFill::backgroundFillGradient(_))
         ));
 
         // invalid ids / color counts drop the size
@@ -880,11 +979,11 @@ mod tests {
             StickerPhotoSize::get_sticker_photo_size(
                 telegram_api::VideoSize::videoSizeStickerMarkup(
                     telegram_api::videoSizeStickerMarkup {
-                        stickerset: telegram_api::InputStickerSet::inputStickerSetShortName(
+                        stickerset: Some(telegram_api::InputStickerSet::inputStickerSetShortName(
                             telegram_api::inputStickerSetShortName {
                                 short_name: "x".to_owned(),
                             },
-                        ),
+                        ),),
                         sticker_id: 1,
                         background_colors: vec![1],
                     }
@@ -903,9 +1002,9 @@ mod tests {
         let object = sticker.get_chat_photo_sticker_object();
         assert!(matches!(
             object.background_fill,
-            td_api::BackgroundFill::backgroundFillSolid(td_api::backgroundFillSolid {
-                color: 0xFF0000
-            })
+            Some(td_api::BackgroundFill::backgroundFillSolid(
+                td_api::backgroundFillSolid { color: 0xFF0000 }
+            ))
         ));
     }
 
@@ -946,5 +1045,97 @@ mod tests {
             }),
             320 * 240
         );
+    }
+
+    #[test]
+    fn get_dialog_photo_matches_the_cpp_mapping() {
+        // null and chatPhotoEmpty yield the empty photo
+        assert_eq!(DialogPhoto::default(), DialogPhoto::get_dialog_photo(None));
+        assert_eq!(
+            DialogPhoto::default(),
+            DialogPhoto::get_dialog_photo(Some(telegram_api::ChatPhoto::chatPhotoEmpty(
+                telegram_api::chatPhotoEmpty {}
+            )))
+        );
+
+        // a chatPhoto keeps the stripped minithumbnail, the animation flag and
+        // the not-personal default; the file ids stay invalid placeholders
+        // and an out-of-range dc id degrades to invalid (DcId::create parity)
+        let photo = DialogPhoto::get_dialog_photo(Some(telegram_api::ChatPhoto::chatPhoto(
+            telegram_api::chatPhoto {
+                flags: 1,
+                has_video: true,
+                photo_id: 1234567890,
+                stripped_thumb: b"abc".to_vec(),
+                dc_id: 99999,
+            },
+        )));
+        assert!(photo.has_animation);
+        assert!(!photo.is_personal);
+        assert_eq!(photo.minithumbnail, "abc");
+        assert!(!photo.small_file_id.is_valid());
+        assert!(!photo.big_file_id.is_valid());
+        assert!(dialog_photo_get_file_ids(&photo).is_empty());
+    }
+
+    #[test]
+    fn need_update_dialog_photo_ignores_the_minithumbnail() {
+        let from = DialogPhoto {
+            small_file_id: FileId::default(),
+            big_file_id: FileId::default(),
+            minithumbnail: "old".to_owned(),
+            has_animation: false,
+            is_personal: false,
+        };
+        let mut to = from.clone();
+        to.minithumbnail = "new".to_owned();
+        assert!(!from.need_update(&to));
+
+        to.has_animation = true;
+        assert!(from.need_update(&to));
+        to.has_animation = false;
+        to.is_personal = true;
+        assert!(from.need_update(&to));
+        to.is_personal = false;
+        to.small_file_id = FileId::default();
+        assert!(!from.need_update(&to));
+    }
+
+    #[test]
+    fn as_fake_dialog_photo_selects_the_a_and_c_sizes() {
+        use crate::chat_manager::DialogId;
+
+        // an empty photo stays empty
+        let empty = DialogPhoto::as_fake_dialog_photo(&Photo::default(), DialogId::new(0), true);
+        assert_eq!(DialogPhoto::default(), empty);
+
+        let photo = Photo {
+            id: 1,
+            date: 100,
+            minithumbnail: "mini".to_owned(),
+            photos: vec![
+                PhotoSize {
+                    size_type: b'x' as i32,
+                    file_id: FileId::default(),
+                    ..Default::default()
+                },
+                PhotoSize {
+                    size_type: b'a' as i32,
+                    file_id: FileId::default(),
+                    ..Default::default()
+                },
+                PhotoSize {
+                    size_type: b'c' as i32,
+                    file_id: FileId::default(),
+                    ..Default::default()
+                },
+            ],
+            animations: vec![AnimationSize::default()],
+            ..Default::default()
+        };
+        let fake = DialogPhoto::as_fake_dialog_photo(&photo, DialogId::new(-1001000000002), true);
+        assert_eq!(fake.minithumbnail, "mini");
+        assert!(fake.has_animation);
+        assert!(fake.is_personal);
     }
 }

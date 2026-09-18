@@ -1280,6 +1280,16 @@ impl Scheduler {
         Self::try_instance().is_some()
     }
 
+    /// A thread-safe handle to this thread's scheduler, for building a
+    /// [`SchedulerGuard`] on another thread — the actor-side capture
+    /// counterpart of [`ConcurrentScheduler::send_scheduler`](ConcurrentScheduler::send_scheduler).
+    /// Sends routed through it reach any actor (the destination's scheduler
+    /// is resolved per actor id), so a worker thread can deliver results
+    /// into the actor system.
+    pub fn instance_ptr() -> SchedulerPtr {
+        SchedulerPtr(Self::instance() as *const SchedulerState)
+    }
+
     pub(crate) fn try_instance() -> Option<&'static SchedulerState> {
         TLS.with(|tls| {
             let ptr = tls.scheduler.get();

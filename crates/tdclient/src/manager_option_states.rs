@@ -241,25 +241,31 @@ impl GroupCallMessageLimit {
         for value in &object.value {
             match value.key.as_str() {
                 "stars" => {
-                    result.star_count = get_star_count(get_json_value_long(&value.value, "stars"));
+                    result.star_count = get_star_count(get_json_value_long(
+                        value.value.as_deref().unwrap(),
+                        "stars",
+                    ));
                 }
                 "pin_period" => {
-                    result.pin_duration = get_json_value_int(&value.value, "pin_period");
+                    result.pin_duration =
+                        get_json_value_int(value.value.as_deref().unwrap(), "pin_period");
                 }
                 "text_length_max" => {
-                    result.max_text_length = get_json_value_int(&value.value, "text_length_max");
+                    result.max_text_length =
+                        get_json_value_int(value.value.as_deref().unwrap(), "text_length_max");
                 }
                 "emoji_max" => {
-                    result.max_emoji_count = get_json_value_int(&value.value, "emoji_max");
+                    result.max_emoji_count =
+                        get_json_value_int(value.value.as_deref().unwrap(), "emoji_max");
                 }
                 "color1" => {
-                    result.color1 = get_color(&value.value, "color1");
+                    result.color1 = get_color(value.value.as_deref().unwrap(), "color1");
                 }
                 "color2" => {
-                    result.color2 = get_color(&value.value, "color2");
+                    result.color2 = get_color(value.value.as_deref().unwrap(), "color2");
                 }
                 "color_bg" => {
-                    result.color_bg = get_color(&value.value, "color_bg");
+                    result.color_bg = get_color(value.value.as_deref().unwrap(), "color_bg");
                 }
                 _ => {}
             }
@@ -507,7 +513,7 @@ pub enum ManagerUpdate {
     /// `GroupCallManager::on_update_group_call_message_limits`
     /// (ConfigManager.cpp:1976-1978) — the raw JSON value; the manager
     /// constructs the limits from it.
-    GroupCallMessageLimits(Box<telegram_api::JSONValue>),
+    GroupCallMessageLimits(Option<Box<telegram_api::JSONValue>>),
 }
 
 impl ManagerOptionStates {
@@ -544,7 +550,7 @@ impl ManagerOptionStates {
                 self.on_age_verification_parameters(pmc, parameters)
             }
             ManagerUpdate::GroupCallMessageLimits(limits) => {
-                self.on_group_call_message_limits(pmc, &limits)
+                self.on_group_call_message_limits(pmc, limits.as_deref())
             }
         }
     }
@@ -653,7 +659,7 @@ impl ManagerOptionStates {
             .get_age_verification_parameters_object()
             .map(|parameters| {
                 Object::updateAgeVerificationParameters(td_api::updateAgeVerificationParameters {
-                    parameters,
+                    parameters: Some(parameters),
                 })
             })
     }
@@ -663,9 +669,13 @@ impl ManagerOptionStates {
     fn on_group_call_message_limits(
         &mut self,
         pmc: &mut BinlogKeyValue,
-        limits: &telegram_api::JSONValue,
+        limits: Option<&telegram_api::JSONValue>,
     ) -> Option<td_api::Object> {
-        let new_limits = GroupCallMessageLimits::from_json_value(limits);
+        // A null value (the C++ object_ptr) leaves the empty limits.
+        let new_limits = match limits {
+            Some(limits) => GroupCallMessageLimits::from_json_value(limits),
+            None => GroupCallMessageLimits::default(),
+        };
         if new_limits == self.message_limits {
             return None;
         }
@@ -967,7 +977,7 @@ mod tests {
                 .map(|(key, value)| {
                     Box::new(telegram_api::JSONObjectValue {
                         key: key.to_string(),
-                        value: Box::new(value),
+                        value: Some(Box::new(value)),
                     })
                 })
                 .collect(),
@@ -1297,7 +1307,14 @@ mod tests {
         let Object::updateAgeVerificationParameters(update) = update else {
             panic!("age verification update");
         };
-        assert_eq!(update.parameters.min_age, 18);
+        assert_eq!(
+            update
+                .parameters
+                .as_ref()
+                .expect("age verification parameters")
+                .min_age,
+            18
+        );
         assert!(pmc.pmc.get_raw(b"age_verification").len() > 4);
         // Unchanged: no update.
         assert_eq!(
@@ -1321,7 +1338,7 @@ mod tests {
         // The basic fallback is NOT equal to the empty default state, so
         // even an empty array produces an update and a pmc write.
         let update = states
-            .on_group_call_message_limits(&mut pmc.pmc, &json_array(vec![]))
+            .on_group_call_message_limits(&mut pmc.pmc, Some(&json_array(vec![])))
             .expect("changed");
         let Object::updateGroupCallMessageLevels(update) = update else {
             panic!("group call message levels update");
@@ -1331,7 +1348,7 @@ mod tests {
         assert!(pmc.pmc.get_raw(b"group_call_message_limits").len() > 8);
         // The same value again: no update.
         assert_eq!(
-            states.on_group_call_message_limits(&mut pmc.pmc, &json_array(vec![])),
+            states.on_group_call_message_limits(&mut pmc.pmc, Some(&json_array(vec![]))),
             None
         );
     }
@@ -1361,7 +1378,7 @@ mod tests {
             &mut pmc.pmc,
             AgeVerificationParameters::new(true, "bot".into(), "DE".into(), 18),
         );
-        states.on_group_call_message_limits(&mut pmc.pmc, &json_array(vec![]));
+        states.on_group_call_message_limits(&mut pmc.pmc, Some(&json_array(vec![])));
         states.on_trial_parameters(&mut pmc.pmc, 5, 300, 2000, true, false, 1000);
         states.on_freeze_state(&mut pmc.pmc, 100, 200, "url".into());
         let mut restored = ManagerOptionStates::default();
