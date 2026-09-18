@@ -1548,7 +1548,9 @@ fn clean_phone_number(phone_number: &mut String) {
 /// canonical-decimal parse: the C++ round-trips the parsed value through its
 /// minimal decimal form, rejecting leading `+`, leading zeros, `-0`,
 /// embedded garbage and out-of-range values that `to_integer` would wrap.
-fn to_integer_safe_i64(str: &str) -> Option<i64> {
+/// The canonical implementation for every `to_integer_safe` site
+/// (decision M.3.10.1).
+pub(crate) fn to_integer_safe_i64(str: &str) -> Option<i64> {
     let bytes = str.as_bytes();
     let digits = match bytes.first() {
         Some(b'-') => &bytes[1..],
