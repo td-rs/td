@@ -19,6 +19,7 @@
 /// `td/telegram/Version.h` — the entries the ported formats branch on.
 /// Keep in sync with the C++ enum; `Version::Next` is the one-past value.
 pub mod version {
+    pub const STORE_FILE_ID: i32 = 1;
     pub const ADD_KEY_HASH_TO_SECRET_CHAT: i32 = 2;
     pub const FIX_STORE_GAME_WITHOUT_ANIMATION: i32 = 4;
     pub const ADD_ACCESS_HASH_TO_SECRET_CHAT: i32 = 5;
@@ -180,6 +181,19 @@ impl<'a> Parser<'a> {
             return Err("Wrong version");
         }
         Ok(parser)
+    }
+
+    /// A reader over a bare value with an explicit writer version — the
+    /// shape the content store/parse paths see once the M.10 event layer
+    /// frames a message blob. Tests use it to drive the legacy branches;
+    /// the M.10.2 event layer un-gates it.
+    #[cfg(test)]
+    pub(crate) fn new_with_version(data: &'a [u8], version: i32) -> Parser<'a> {
+        Parser {
+            data,
+            pos: 0,
+            version,
+        }
     }
 
     pub fn version(&self) -> i32 {

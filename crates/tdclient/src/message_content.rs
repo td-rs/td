@@ -13,7 +13,7 @@
 //! `ToDoCompletion`/`SharedDialog`/`CommunityId`/`Address`/`OrderInfo`
 //! companions they need). 89 of the 96 variants are modeled.
 //!
-//! The remaining 7 variants are pinned by companion types that do not
+//! The remaining 6 variants are pinned by companion types that do not
 //! exist on this line yet and land with them:
 //! - the `StarGift` family (`StarGift`, `StarGiftUnique`,
 //!   `StarGiftPurchaseOffer`, `StarGiftPurchaseOfferDeclined`) — M.9.1b
@@ -23,15 +23,32 @@
 //!   `DialogId`s M.9.1 recorded; the value plane is the Wave-3
 //!   Gifts/Stickers slice (`StarGiftResalePrice`, the only other missing
 //!   piece, is trivial and lands with its consumers).
-//! - `Contact` — needs `td::Contact`: M.4.14's `contact.rs` landed on the
-//!   master line *after* this branch's base (`85af8aa`), so the value
-//!   arrives with the master-line integration, not with this slice.
 //! - `ChatSetTheme` — needs `StarGift` + `ThemeSettings` (ChatTheme.h).
 //! - `RichText` — needs the `WebPageBlock`/`RichMessageMedia` machinery
 //!   (RichMessage.h); Wave-2 WebPages scope. `create_rich_message_content`
 //!   is deferred with it.
 //!
-//! The db `store`/`parse` paths are M.9.2/M.9.3; the td_api/telegram_api
+//! M.9.2/M.9.3 are the db `store`/`parse` paths (the M.6 MessageDb
+//! byte-compat bar, D1): [`store_message_content`]/[`parse_message_content`]
+//! mirror the C++ `store`/`parse` template dispatchers byte for byte, with
+//! the manager-mediated FileId calls going through the
+//! [`MessageContentStorage`] seam — the Rust shape of the C++
+//! `storer.context()->td()` indirection. FileId bytes stay
+//! FileManager-mediated in the C++ (`FileManager::store_file`, the full
+//! file-view plane), so they are gated until the M.12.2 FileManager, exactly
+//! like the photo structures' file-id stores; the media metadata helpers
+//! (`store_animation`/`store_sticker`/...) are gated with them because the
+//! `Animation`/`Sticker`/`Document`/`Video`/`Audio`/`VideoNote`/
+//! `VoiceNote` metadata value structs are the M.9.5/M.12 media plane.
+//! Everything else — flags blocks, version gates, id wrappers, the Photo/
+//! PhotoSize/Invoice/Game/SecureValue/... companion formats — is exact.
+//! `Photo::sticker_file_ids` (Photo.h:39) round-trips through the
+//! `store_file`/`parse_file` seam exactly like the C++
+//! `store(const FileId &, ...)` overload (FileId.hpp:17-25); the byte-exact
+//! FileId framing itself is the M.12.2 `FileManager` gate.
+//! `Contact` is modeled since M.9.2 (the value landed in `contact.rs`).
+//!
+//! The td_api/telegram_api
 //! conversions arrive with their own slices. Value companions living here
 //! that later move to their owners' modules: `Location`/`Venue` (the
 //! DialogManager/m54-union geo plane), `BackgroundId`/`BackgroundFill`/
@@ -46,18 +63,26 @@ use std::hash::{Hash, Hasher};
 use tdutils::emoji::remove_emoji_modifiers;
 
 use crate::birthdate::Birthdate;
-use crate::chat_manager::{ChannelId, ChatId, MessageId};
+use crate::chat_manager::{ChannelId, ChannelType, ChatId, MessageId, RestrictedRights};
+use crate::contact::Contact;
 use crate::emoji_status::CustomEmojiId;
-use crate::message_entity::{FormattedText, MessageEntity, find_entities, remove_empty_entities};
-use crate::messages_manager::{DialogId, DialogType, StoryFullId, StoryId};
-use crate::photo::{
-    AnimationSize, Dimensions, Photo, PhotoSize, StickerPhotoSize, StickerPhotoSizeType,
+use crate::message_entity::{
+    FormattedText, MessageEntity, Type, find_entities, remove_empty_entities,
 };
+use crate::messages_manager::{
+    DialogId, DialogType, MessageFullId, MessageSearchFilter, StoryFullId, StoryId,
+    message_search_filter_index_mask,
+};
+use crate::misc::is_empty_string;
+use crate::photo::{AnimationSize, Dimensions, Photo, PhotoSize, StickerPhotoSize};
 use crate::store_parse::{
     Parser, store_bool, store_f64, store_flags, store_i32, store_i32_vec, store_i64, store_string,
     store_string_vec, store_u32, version,
 };
-use crate::user_manager::{FileId, UserId};
+use crate::user_manager::{FileId, SecretChatId, UserId};
+use tdmtproto::telegram_api;
+use tdutils::promise::Promise;
+use tdutils::status::Status;
 
 /// `td::MessageContentType` (MessageContentType.h:15-113) — the discriminant
 /// order is the C++ enum order; `MessageUnsupported::CURRENT_VERSION` bumps
@@ -177,6 +202,203 @@ pub fn can_be_secret_message_content(content_type: MessageContentType) -> bool {
     )
 }
 
+/// `is_service_message_content` (MessageContentType.cpp:623-731) — the C++
+/// switch enumerates all 97 types (28 returning false, the rest true), so
+/// the `default: UNREACHABLE()` arm covers nothing. The two unmodeled
+/// members keep their C++ answers recorded here: `RichText` is a
+/// non-service type and `ChatSetTheme` is a service type; both land with
+/// their value planes.
+pub fn is_service_message_content(content_type: MessageContentType) -> bool {
+    use MessageContentType::*;
+    !matches!(
+        content_type,
+        Animation
+            | Audio
+            | Contact
+            | Dice
+            | Document
+            | ExpiredPhoto
+            | ExpiredVideo
+            | ExpiredVideoNote
+            | ExpiredVoiceNote
+            | Game
+            | Giveaway
+            | GiveawayWinners
+            | Invoice
+            | LiveLocation
+            | Location
+            | PaidMedia
+            | Photo
+            | Poll
+            | Sticker
+            | Story
+            | Text
+            | ToDoList
+            | Unsupported
+            | Venue
+            | Video
+            | VideoNote
+            | VoiceNote
+    )
+}
+
+/// `is_expired_message_content` (MessageContentType.cpp:886-895).
+pub fn is_expired_message_content(content_type: MessageContentType) -> bool {
+    use MessageContentType::*;
+    matches!(
+        content_type,
+        ExpiredPhoto | ExpiredVideo | ExpiredVideoNote | ExpiredVoiceNote
+    )
+}
+
+/// `get_expired_message_content_type` (MessageContentType.cpp:897-909).
+pub fn get_expired_message_content_type(content_type: MessageContentType) -> MessageContentType {
+    use MessageContentType::*;
+    match content_type {
+        Photo => ExpiredPhoto,
+        Video => ExpiredVideo,
+        VideoNote => ExpiredVideoNote,
+        VoiceNote => ExpiredVoiceNote,
+        _ => None,
+    }
+}
+
+/// `can_send_message_content_to_secret_chat` (MessageContentType.cpp:1019-1121).
+/// The C++ third group — `None`, the service types, `Unsupported` and the
+/// expired types — is `default: UNREACHABLE()`: those contents are never
+/// offered for sending, and the Rust mirrors the abort. `RichText` (a
+/// false-group member) is unmodeled and lands with WebPageBlock.
+pub fn can_send_message_content_to_secret_chat(content_type: MessageContentType) -> bool {
+    use MessageContentType::*;
+    match content_type {
+        Animation | Audio | Contact | Document | LiveLocation | Location | Photo | Sticker
+        | Text | Venue | Video | VideoNote | VoiceNote => true,
+        Dice | Game | Giveaway | GiveawayWinners | Invoice | PaidMedia | Poll | Story
+        | ToDoList => false,
+        _ => unreachable!(),
+    }
+}
+
+impl MessageContentType {
+    /// The int the C++ `store(content_type, storer)` writes and the
+    /// `parse` dispatcher switches on; `None` (never a real content) and
+    /// anything a newer binary inserted return `None`, which the parse
+    /// dispatcher degrades to `MessageUnsupported(0)` like the C++
+    /// `default:` arm.
+    pub(crate) fn from_raw(raw: i32) -> Option<MessageContentType> {
+        MessageContentType::try_from(raw).ok()
+    }
+}
+
+impl TryFrom<i32> for MessageContentType {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        // Explicit, like the pinned-discriminant-order test: a C++
+        // insertion re-orders everything after it and both must fail loudly.
+        match value {
+            -1 => Ok(MessageContentType::None),
+            0 => Ok(MessageContentType::Text),
+            1 => Ok(MessageContentType::Animation),
+            2 => Ok(MessageContentType::Audio),
+            3 => Ok(MessageContentType::Document),
+            4 => Ok(MessageContentType::Photo),
+            5 => Ok(MessageContentType::Sticker),
+            6 => Ok(MessageContentType::Video),
+            7 => Ok(MessageContentType::VoiceNote),
+            8 => Ok(MessageContentType::Contact),
+            9 => Ok(MessageContentType::Location),
+            10 => Ok(MessageContentType::Venue),
+            11 => Ok(MessageContentType::ChatCreate),
+            12 => Ok(MessageContentType::ChatChangeTitle),
+            13 => Ok(MessageContentType::ChatChangePhoto),
+            14 => Ok(MessageContentType::ChatDeletePhoto),
+            15 => Ok(MessageContentType::ChatDeleteHistory),
+            16 => Ok(MessageContentType::ChatAddUsers),
+            17 => Ok(MessageContentType::ChatJoinedByLink),
+            18 => Ok(MessageContentType::ChatDeleteUser),
+            19 => Ok(MessageContentType::ChatMigrateTo),
+            20 => Ok(MessageContentType::ChannelCreate),
+            21 => Ok(MessageContentType::ChannelMigrateFrom),
+            22 => Ok(MessageContentType::PinMessage),
+            23 => Ok(MessageContentType::Game),
+            24 => Ok(MessageContentType::GameScore),
+            25 => Ok(MessageContentType::ScreenshotTaken),
+            26 => Ok(MessageContentType::ChatSetTtl),
+            27 => Ok(MessageContentType::Unsupported),
+            28 => Ok(MessageContentType::Call),
+            29 => Ok(MessageContentType::Invoice),
+            30 => Ok(MessageContentType::PaymentSuccessful),
+            31 => Ok(MessageContentType::VideoNote),
+            32 => Ok(MessageContentType::ContactRegistered),
+            33 => Ok(MessageContentType::ExpiredPhoto),
+            34 => Ok(MessageContentType::ExpiredVideo),
+            35 => Ok(MessageContentType::LiveLocation),
+            36 => Ok(MessageContentType::CustomServiceAction),
+            37 => Ok(MessageContentType::WebsiteConnected),
+            38 => Ok(MessageContentType::PassportDataSent),
+            39 => Ok(MessageContentType::PassportDataReceived),
+            40 => Ok(MessageContentType::Poll),
+            41 => Ok(MessageContentType::Dice),
+            42 => Ok(MessageContentType::ProximityAlertTriggered),
+            43 => Ok(MessageContentType::GroupCall),
+            44 => Ok(MessageContentType::InviteToGroupCall),
+            45 => Ok(MessageContentType::ChatSetTheme),
+            46 => Ok(MessageContentType::WebViewDataSent),
+            47 => Ok(MessageContentType::WebViewDataReceived),
+            48 => Ok(MessageContentType::GiftPremium),
+            49 => Ok(MessageContentType::TopicCreate),
+            50 => Ok(MessageContentType::TopicEdit),
+            51 => Ok(MessageContentType::SuggestProfilePhoto),
+            52 => Ok(MessageContentType::WriteAccessAllowed),
+            53 => Ok(MessageContentType::RequestedDialog),
+            54 => Ok(MessageContentType::WebViewWriteAccessAllowed),
+            55 => Ok(MessageContentType::SetBackground),
+            56 => Ok(MessageContentType::Story),
+            57 => Ok(MessageContentType::WriteAccessAllowedByRequest),
+            58 => Ok(MessageContentType::GiftCode),
+            59 => Ok(MessageContentType::Giveaway),
+            60 => Ok(MessageContentType::GiveawayLaunch),
+            61 => Ok(MessageContentType::GiveawayResults),
+            62 => Ok(MessageContentType::GiveawayWinners),
+            63 => Ok(MessageContentType::ExpiredVideoNote),
+            64 => Ok(MessageContentType::ExpiredVoiceNote),
+            65 => Ok(MessageContentType::BoostApply),
+            66 => Ok(MessageContentType::DialogShared),
+            67 => Ok(MessageContentType::PaidMedia),
+            68 => Ok(MessageContentType::PaymentRefunded),
+            69 => Ok(MessageContentType::GiftStars),
+            70 => Ok(MessageContentType::PrizeStars),
+            71 => Ok(MessageContentType::StarGift),
+            72 => Ok(MessageContentType::StarGiftUnique),
+            73 => Ok(MessageContentType::PaidMessagesRefunded),
+            74 => Ok(MessageContentType::PaidMessagesPrice),
+            75 => Ok(MessageContentType::ConferenceCall),
+            76 => Ok(MessageContentType::ToDoList),
+            77 => Ok(MessageContentType::TodoCompletions),
+            78 => Ok(MessageContentType::TodoAppendTasks),
+            79 => Ok(MessageContentType::GiftTon),
+            80 => Ok(MessageContentType::SuggestedPostSuccess),
+            81 => Ok(MessageContentType::SuggestedPostRefund),
+            82 => Ok(MessageContentType::SuggestedPostApproval),
+            83 => Ok(MessageContentType::SuggestBirthday),
+            84 => Ok(MessageContentType::StarGiftPurchaseOffer),
+            85 => Ok(MessageContentType::StarGiftPurchaseOfferDeclined),
+            86 => Ok(MessageContentType::NewCreatorPending),
+            87 => Ok(MessageContentType::ChangeCreator),
+            88 => Ok(MessageContentType::NoForwardsToggle),
+            89 => Ok(MessageContentType::NoForwardsRequest),
+            90 => Ok(MessageContentType::ManagedBotCreated),
+            91 => Ok(MessageContentType::PollAppendAnswer),
+            92 => Ok(MessageContentType::PollDeleteAnswer),
+            93 => Ok(MessageContentType::RichText),
+            94 => Ok(MessageContentType::ChangeCommunity),
+            95 => Ok(MessageContentType::ChatJoinedViaCommunity),
+            _ => Err(()),
+        }
+    }
+}
+
 /// `td::WebPageId` (WebPageId.h:17-50) — the instant-view page id; `0` is
 /// the "no web page" sentinel. The store/parse is the raw `int64`
 /// (WebPageId.h:41-48) and lands with M.9.2.
@@ -249,10 +471,6 @@ impl InputGroupCallId {
         self.group_call_id
     }
 
-    pub fn get_access_hash(self) -> i64 {
-        self.access_hash
-    }
-
     /// `InputGroupCallId::is_valid` (InputGroupCallId.h:39-41).
     pub fn is_valid(self) -> bool {
         self.group_call_id != 0
@@ -261,6 +479,12 @@ impl InputGroupCallId {
     /// `InputGroupCallId::is_identical` (InputGroupCallId.h:35-37).
     pub fn is_identical(self, other: InputGroupCallId) -> bool {
         self.group_call_id == other.group_call_id && self.access_hash == other.access_hash
+    }
+
+    /// The access-hash half of the C++ `store`/`parse`
+    /// (InputGroupCallId.h:55-65).
+    pub fn get_access_hash(self) -> i64 {
+        self.access_hash
     }
 }
 
@@ -281,6 +505,21 @@ pub enum CallDiscardReasonType {
     HungUp,
     Declined,
     UpgradeToGroupCall,
+}
+
+impl CallDiscardReasonType {
+    /// The enum `td::parse` (tl_helpers.h:244-248) is a raw cast; an
+    /// out-of-range stored int (garbage in a corrupted blob) falls back to
+    /// `Empty` with a log instead of holding an unrepresentable value.
+    pub(crate) fn from_raw(raw: i32) -> CallDiscardReasonType {
+        match CallDiscardReasonType::try_from(raw) {
+            Ok(value) => value,
+            Err(_) => {
+                tdutils::log_error!("Wrong call discard reason {raw}");
+                CallDiscardReasonType::Empty
+            }
+        }
+    }
 }
 
 /// `td::CallDiscardReason` (CallDiscardReason.h:16-19). The conversions
@@ -374,6 +613,31 @@ impl Location {
 
     pub fn get_access_hash(&self) -> i64 {
         self.access_hash
+    }
+
+    /// The C++ private-field read the `store` overload needs
+    /// (Location.h:81-98): the packed horizontal accuracy.
+    pub fn get_horizontal_accuracy(&self) -> f64 {
+        self.horizontal_accuracy
+    }
+
+    /// `Location::parse` (Location.h:101-119) — the stored-shape
+    /// constructor: the C++ parser assigns the private fields directly, so
+    /// the `fix_accuracy` normalization of `Location::init` does not run.
+    pub(crate) fn from_stored(
+        is_empty: bool,
+        latitude: f64,
+        longitude: f64,
+        horizontal_accuracy: f64,
+        access_hash: i64,
+    ) -> Location {
+        Location {
+            is_empty,
+            latitude,
+            longitude,
+            horizontal_accuracy,
+            access_hash,
+        }
     }
 
     /// `Location::set_access_hash` (Location.h:66-68).
@@ -826,6 +1090,14 @@ impl GiveawayParameters {
         }
         self.boosted_channel_id.is_valid() && self.date > 0
     }
+
+    /// `GiveawayParameters::get_channel_ids` (GiveawayParameters.cpp) —
+    /// the additional channels first, then the boosted one.
+    pub fn get_channel_ids(&self) -> Vec<ChannelId> {
+        let mut result = self.additional_channel_ids.clone();
+        result.push(self.boosted_channel_id);
+        result
+    }
 }
 
 /// `td::Game` (Game.h:18-29). The wire/td_api conversions and the
@@ -847,6 +1119,16 @@ impl Game {
     /// `Game::is_empty` (Game.cpp).
     pub fn is_empty(&self) -> bool {
         self.short_name.is_empty()
+    }
+
+    /// `Game::get_text` (Game.h:55).
+    pub fn get_text(&self) -> &FormattedText {
+        &self.text
+    }
+
+    /// `Game::get_bot_user_id` (Game.cpp).
+    pub fn get_bot_user_id(&self) -> UserId {
+        self.bot_user_id
     }
 }
 
@@ -955,6 +1237,42 @@ impl MessageExtendedMedia {
     pub fn has_media_timestamp(&self) -> bool {
         self.r#type == MessageExtendedMediaType::Video
     }
+
+    /// `MessageExtendedMedia::get_message_content` (MessageExtendedMedia.cpp)
+    /// — the per-type content the paid-media album splat produces. The C++
+    /// `default: UNREACHABLE()` covers Empty/Unsupported/Preview, which the
+    /// caller (`get_individual_message_contents`) never sees for a real
+    /// paid media.
+    pub fn get_message_content(&self) -> MessageContent {
+        match self.r#type {
+            MessageExtendedMediaType::Photo => {
+                create_photo_message_content(self.photo.clone(), self.video_file_id)
+            }
+            MessageExtendedMediaType::Video => create_video_message_content(
+                self.video_file_id,
+                self.photo.clone(),
+                self.start_timestamp,
+            ),
+            MessageExtendedMediaType::Empty
+            | MessageExtendedMediaType::Unsupported
+            | MessageExtendedMediaType::Preview => {
+                unreachable!()
+            }
+        }
+    }
+}
+
+impl InputInvoice {
+    /// `InputInvoice::has_media_timestamp` (InputInvoice.cpp).
+    pub fn has_media_timestamp(&self) -> bool {
+        self.extended_media.has_media_timestamp()
+    }
+
+    /// `InputInvoice::get_caption` (InputInvoice.cpp) — the caption of the
+    /// extended media, never null.
+    pub fn get_caption(&self) -> &FormattedText {
+        &self.extended_media_caption
+    }
 }
 
 /// `td::ToDoItem` (ToDoItem.h:14-17). The wire/td_api constructors and
@@ -972,6 +1290,18 @@ pub struct ToDoList {
     pub items: Vec<ToDoItem>,
     pub others_can_append: bool,
     pub others_can_complete: bool,
+}
+
+impl ToDoList {
+    /// `ToDoList::get_can_append_items` (ToDoList.cpp:65-74). The C++
+    /// reads the `checklist_task_count_max` option through `td` at the
+    /// call site, so the resolved maximum is a parameter here.
+    pub fn get_can_append_items(&self, max_task_count: i64, item_count: i32) -> bool {
+        if item_count < 0 {
+            return false;
+        }
+        (self.items.len() as i64) + i64::from(item_count) <= max_task_count
+    }
 }
 
 /// `td::ToDoCompletion` (ToDoCompletion.h:18-24). The wire constructor,
@@ -1215,6 +1545,14 @@ pub struct MessageAudio {
 pub struct MessageDocument {
     pub file_id: FileId,
     pub caption: FormattedText,
+}
+
+/// `MessageContact` (MessageContent.cpp:317-326) — landed with M.9.2: the
+/// `td::Contact` value lives in `contact.rs` (the M.4.14 master-line
+/// module this branch merged).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessageContact {
+    pub contact: Contact,
 }
 
 /// `MessagePhoto` (MessageContent.cpp:233-249).
@@ -1990,6 +2328,7 @@ pub enum MessageContent {
     Video(MessageVideo),
     VoiceNote(MessageVoiceNote),
     VideoNote(MessageVideoNote),
+    Contact(MessageContact),
     ChatCreate(MessageChatCreate),
     ChatChangeTitle(MessageChatChangeTitle),
     ChatChangePhoto(MessageChatChangePhoto),
@@ -2090,6 +2429,7 @@ impl MessageContent {
             MessageContent::Video(_) => MessageContentType::Video,
             MessageContent::VoiceNote(_) => MessageContentType::VoiceNote,
             MessageContent::VideoNote(_) => MessageContentType::VideoNote,
+            MessageContent::Contact(_) => MessageContentType::Contact,
             MessageContent::ChatCreate(_) => MessageContentType::ChatCreate,
             MessageContent::ChatChangeTitle(_) => MessageContentType::ChatChangeTitle,
             MessageContent::ChatChangePhoto(_) => MessageContentType::ChatChangePhoto,
@@ -2268,6 +2608,12 @@ pub fn create_voice_note_message_content(voice_note_file_id: FileId) -> MessageC
     })
 }
 
+/// `create_contact_message_content` (MessageContent.cpp:4681 region) —
+/// the M.9.2 addition with the `Contact` value.
+pub fn create_contact_message_content(contact: Contact) -> MessageContent {
+    MessageContent::Contact(MessageContact { contact })
+}
+
 /// `create_contact_registered_message_content` (MessageContent.cpp:4694-4696).
 pub fn create_contact_registered_message_content() -> MessageContent {
     MessageContent::ContactRegistered(MessageContactRegistered)
@@ -2283,148 +2629,248 @@ pub fn create_chat_set_ttl_message_content(ttl: i32, from_user_id: UserId) -> Me
     MessageContent::ChatSetTtl(MessageChatSetTtl { ttl, from_user_id })
 }
 
-// ---------------------------------------------------------------------
-// M.9.2/M.9.3 — the database/log-event serialization plane
-// (`store_message_content`/`parse_message_content` from
-// MessageContent.cpp:1830-3035/3035-4505 plus every companion-type
-// store/parse template the two dispatchers call through).
+// ==== M.9.2/M.9.3: the db store/parse paths ====
 //
-// The C++ walks file-bearing types through the owning manager
-// (`animations_manager_->store_animation(...)` and friends), which
-// serializes the manager-side record and ends in
-// `FileManager::store_file`. Those manager records are the owners'
-// slices (M.12.2 for the file plane, the sticker/animations/... manager
-// slices for their records, Waves 2/3), so they stay behind the
-// [`ContentStoreContext`] seam — byte-format-exact elsewhere.
-// ---------------------------------------------------------------------
+// `store`/`parse` (MessageContent.cpp:1831-3021 and 3021-4507) plus the
+// `store_message_content`/`parse_message_content` entries (4507-4516) and
+// the companion `td::store`/`td::parse` overloads from the value headers
+// (Photo.hpp, PhotoSize.hpp, Location.h, Venue.h, Game.hpp, WebApp.hpp,
+// InputInvoice.hpp, OrderInfo.hpp, BackgroundType.hpp, BackgroundInfo.hpp,
+// GiveawayParameters.hpp, ForumTopic{,Icon,EditedData}.hpp, ToDoList.hpp,
+// ToDoItem.hpp, ToDoCompletion.hpp, SecureValue.hpp, CurrencyAmount.hpp,
+// SuggestedPostPrice.hpp, MessageExtendedMedia.hpp, StickerPhotoSize.hpp,
+// SharedDialog.hpp and the id wrappers).
 
-/// The manager-mediated half of the content serialization — the Rust
-/// stand-in for the `Td *` context the C++ pulls out of the storer.
-///
-/// Every method here is byte-exact in the C++ but owned by a slice that
-/// has not landed on this line yet; the round-trip test implementation
-/// covers the dispatcher plumbing until they land.
-pub trait ContentStoreContext {
-    /// `AnimationsManager::store_animation` (AnimationsManager.hpp:21-41).
-    fn store_animation(&mut self, file_id: FileId, out: &mut Vec<u8>);
-    /// `AnimationsManager::parse_animation` (AnimationsManager.hpp:43-...).
-    fn parse_animation(&mut self, input: &mut Parser) -> Result<FileId, &'static str>;
+/// The manager-mediated serialization calls — the Rust shape of the C++
+/// `storer.context()->td()` indirection the `store`/`parse` templates go
+/// through. Every method is a 1-to-1 port seam for the named C++ manager
+/// helper; the default real implementations land with their owners
+/// (FileManager store/parse is the M.12.2 FileManager, the media metadata
+/// helpers are the M.9.5/M.12 media plane, `store_poll` is Wave-2
+/// PollManager, `store_background` is Wave-3 Backgrounds).
+pub trait MessageContentStorage {
+    /// `FileManager::store_file(file_id, storer)` (FileManager.hpp:30) —
+    /// the FileView-based serialization the raw `store(FileId, ...)`
+    /// overload routes through.
+    fn store_file(&self, file_id: FileId, out: &mut Vec<u8>);
+    /// `FileManager::parse_file(parser)` (FileManager.hpp:135); the
+    /// pre-`Version::StoreFileId` empty-FileId legacy is handled here.
+    fn parse_file(&mut self, parser: &mut Parser) -> Result<FileId, &'static str>;
+    /// `AnimationsManager::store_animation` (AnimationsManager.hpp:21).
+    fn store_animation(&self, file_id: FileId, out: &mut Vec<u8>);
+    /// `AnimationsManager::parse_animation`.
+    fn parse_animation(&mut self, parser: &mut Parser) -> Result<FileId, &'static str>;
     /// `AudiosManager::store_audio`.
-    fn store_audio(&mut self, file_id: FileId, out: &mut Vec<u8>);
+    fn store_audio(&self, file_id: FileId, out: &mut Vec<u8>);
     /// `AudiosManager::parse_audio`.
-    fn parse_audio(&mut self, input: &mut Parser) -> Result<FileId, &'static str>;
+    fn parse_audio(&mut self, parser: &mut Parser) -> Result<FileId, &'static str>;
     /// `DocumentsManager::store_document`.
-    fn store_document(&mut self, file_id: FileId, out: &mut Vec<u8>);
+    fn store_document(&self, file_id: FileId, out: &mut Vec<u8>);
     /// `DocumentsManager::parse_document`.
-    fn parse_document(&mut self, input: &mut Parser) -> Result<FileId, &'static str>;
-    /// `StickersManager::store_sticker` — the content dispatcher always
-    /// passes `in_sticker_set = false` (MessageContent.cpp:1905).
-    fn store_sticker(&mut self, file_id: FileId, in_sticker_set: bool, out: &mut Vec<u8>);
-    /// `StickersManager::parse_sticker`.
-    fn parse_sticker(
-        &mut self,
-        in_sticker_set: bool,
-        input: &mut Parser,
-    ) -> Result<FileId, &'static str>;
+    fn parse_document(&mut self, parser: &mut Parser) -> Result<FileId, &'static str>;
     /// `VideosManager::store_video`.
-    fn store_video(&mut self, file_id: FileId, out: &mut Vec<u8>);
+    fn store_video(&self, file_id: FileId, out: &mut Vec<u8>);
     /// `VideosManager::parse_video`.
-    fn parse_video(&mut self, input: &mut Parser) -> Result<FileId, &'static str>;
+    fn parse_video(&mut self, parser: &mut Parser) -> Result<FileId, &'static str>;
     /// `VideoNotesManager::store_video_note`.
-    fn store_video_note(&mut self, file_id: FileId, out: &mut Vec<u8>);
+    fn store_video_note(&self, file_id: FileId, out: &mut Vec<u8>);
     /// `VideoNotesManager::parse_video_note`.
-    fn parse_video_note(&mut self, input: &mut Parser) -> Result<FileId, &'static str>;
+    fn parse_video_note(&mut self, parser: &mut Parser) -> Result<FileId, &'static str>;
     /// `VoiceNotesManager::store_voice_note`.
-    fn store_voice_note(&mut self, file_id: FileId, out: &mut Vec<u8>);
+    fn store_voice_note(&self, file_id: FileId, out: &mut Vec<u8>);
     /// `VoiceNotesManager::parse_voice_note`.
-    fn parse_voice_note(&mut self, input: &mut Parser) -> Result<FileId, &'static str>;
-    /// `FileManager::store_file` (FileManager.hpp:30-131) — the
-    /// `store(FileId)` overload every photo-side structure ends in.
-    fn store_file(&mut self, file_id: FileId, out: &mut Vec<u8>);
-    /// `FileManager::parse_file` (FileManager.hpp:135-...).
-    fn parse_file(&mut self, input: &mut Parser) -> Result<FileId, &'static str>;
-    /// `BackgroundManager::store_background` (BackgroundInfo.hpp:8-12).
-    fn store_background_id(&mut self, background_id: BackgroundId, out: &mut Vec<u8>);
+    fn parse_voice_note(&mut self, parser: &mut Parser) -> Result<FileId, &'static str>;
+    /// `StickersManager::store_sticker(file_id, false, storer, source)` —
+    /// message stickers always store with `in_sticker_set = false`
+    /// (MessageContent.cpp:1929).
+    fn store_sticker(&self, file_id: FileId, out: &mut Vec<u8>);
+    /// `StickersManager::parse_sticker(false, parser)`.
+    fn parse_sticker(&mut self, parser: &mut Parser) -> Result<FileId, &'static str>;
+    /// `PollManager::store_poll` (PollManager.hpp:226).
+    fn store_poll(&self, poll_id: PollId, out: &mut Vec<u8>);
+    /// `PollManager::parse_poll`.
+    fn parse_poll(&mut self, parser: &mut Parser) -> Result<PollId, &'static str>;
+    /// `BackgroundManager::store_background` (BackgroundManager.cpp:480).
+    fn store_background(&self, background_id: BackgroundId, out: &mut Vec<u8>);
     /// `BackgroundManager::parse_background`.
-    fn parse_background_id(&mut self, input: &mut Parser) -> Result<BackgroundId, &'static str>;
+    fn parse_background(&mut self, parser: &mut Parser) -> Result<BackgroundId, &'static str>;
     /// `WebPagesManager::on_load_web_page_url_from_database` — the
-    /// side-effect of `MessageText` parse (MessageContent.cpp:3174-3176);
-    /// the cache update is the WebPages slice (Wave 2).
-    fn on_loaded_web_page_url(&mut self, _web_page_id: WebPageId, _url: &str) {}
+    /// `MessageText::parse` side effect (MessageContent.cpp:3225-3228).
+    fn on_load_web_page_url_from_database(&mut self, web_page_id: WebPageId, url: &str);
 }
 
-/// `td::store(vector<int64>)` framing (i32 size + elements), which
-/// [`store_parse`] has no shared helper for.
-fn store_i64_vec(out: &mut Vec<u8>, values: &[i64]) {
-    store_i32(out, values.len() as i32);
-    for value in values {
-        store_i64(out, *value);
-    }
-}
-
-/// The [`store_i64_vec`] reader (`"Wrong vector length"` on a negative
-/// size, like the shared helpers).
-fn parse_i64_vec(input: &mut Parser) -> Result<Vec<i64>, &'static str> {
-    let len = input.i32_()?;
-    if len < 0 {
-        return Err("Wrong vector length");
-    }
-    let mut result = Vec::with_capacity(len as usize);
-    for _ in 0..len {
-        result.push(input.i64_()?);
-    }
-    Ok(result)
-}
-
-/// `get_premium_duration_day_count` (misc.cpp:423-428).
-pub(crate) fn get_premium_duration_day_count(month_count: i32) -> i32 {
+/// `get_premium_duration_day_count` (misc.cpp:423-429) — the legacy
+/// month-to-day conversion the `!has_days` GiftPremium/GiftCode parses run.
+fn get_premium_duration_day_count(month_count: i32) -> i32 {
     if month_count <= 0 || month_count > 10_000_000 {
         return 7;
     }
     month_count * 30 + month_count / 3 + month_count / 12
 }
 
-/// `Location::store` (Location.h:60-77).
-fn store_location(location: &Location, out: &mut Vec<u8>) {
-    let has_access_hash = location.access_hash != 0;
-    let has_horizontal_accuracy = location.horizontal_accuracy > 0.0;
-    store_flags::<3>(
-        out,
-        [location.is_empty, has_access_hash, has_horizontal_accuracy],
-    );
-    store_f64(out, location.latitude);
-    store_f64(out, location.longitude);
-    if has_access_hash {
-        store_i64(out, location.access_hash);
-    }
-    if has_horizontal_accuracy {
-        store_f64(out, location.horizontal_accuracy);
+/// The `td::parse` enum cast (tl_helpers.h:244-248) for the small
+/// value-plane enums is a raw cast; out-of-range stored ints fall back to
+/// the default with a log instead of holding an unrepresentable value.
+impl TryFrom<i32> for SecureValueType {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(SecureValueType::None),
+            1 => Ok(SecureValueType::PersonalDetails),
+            2 => Ok(SecureValueType::Passport),
+            3 => Ok(SecureValueType::DriverLicense),
+            4 => Ok(SecureValueType::IdentityCard),
+            5 => Ok(SecureValueType::InternalPassport),
+            6 => Ok(SecureValueType::Address),
+            7 => Ok(SecureValueType::UtilityBill),
+            8 => Ok(SecureValueType::BankStatement),
+            9 => Ok(SecureValueType::RentalAgreement),
+            10 => Ok(SecureValueType::PassportRegistration),
+            11 => Ok(SecureValueType::TemporaryRegistration),
+            12 => Ok(SecureValueType::PhoneNumber),
+            13 => Ok(SecureValueType::EmailAddress),
+            _ => Err(()),
+        }
     }
 }
 
-/// `Location::parse` (Location.h:79-100). The C++ also feeds parsed
-/// access hashes into the Global cache (`add_location_access_hash`);
-/// that cache is the Global slice, and the omission is byte-invisible.
-fn parse_location(input: &mut Parser) -> Result<Location, &'static str> {
-    let [is_empty, has_access_hash, has_horizontal_accuracy] = input.parse_flags::<3>()?;
-    let latitude = input.f64_()?;
-    let longitude = input.f64_()?;
-    let access_hash = if has_access_hash { input.i64_()? } else { 0 };
-    let horizontal_accuracy = if has_horizontal_accuracy {
-        input.f64_()?
-    } else {
-        0.0
-    };
-    Ok(Location {
-        is_empty,
+impl TryFrom<i32> for BackgroundTypeType {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(BackgroundTypeType::Wallpaper),
+            1 => Ok(BackgroundTypeType::Pattern),
+            2 => Ok(BackgroundTypeType::Fill),
+            3 => Ok(BackgroundTypeType::ChatTheme),
+            _ => Err(()),
+        }
+    }
+}
+
+impl TryFrom<i32> for CurrencyAmountType {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(CurrencyAmountType::None),
+            1 => Ok(CurrencyAmountType::Star),
+            2 => Ok(CurrencyAmountType::Ton),
+            _ => Err(()),
+        }
+    }
+}
+
+impl TryFrom<i32> for SuggestedPostPriceType {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(SuggestedPostPriceType::None),
+            1 => Ok(SuggestedPostPriceType::Star),
+            2 => Ok(SuggestedPostPriceType::Ton),
+            _ => Err(()),
+        }
+    }
+}
+
+impl TryFrom<i32> for MessageExtendedMediaType {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(MessageExtendedMediaType::Empty),
+            1 => Ok(MessageExtendedMediaType::Unsupported),
+            2 => Ok(MessageExtendedMediaType::Preview),
+            3 => Ok(MessageExtendedMediaType::Photo),
+            4 => Ok(MessageExtendedMediaType::Video),
+            _ => Err(()),
+        }
+    }
+}
+
+impl TryFrom<i32> for CallDiscardReasonType {
+    type Error = ();
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(CallDiscardReasonType::Empty),
+            1 => Ok(CallDiscardReasonType::Missed),
+            2 => Ok(CallDiscardReasonType::Disconnected),
+            3 => Ok(CallDiscardReasonType::HungUp),
+            4 => Ok(CallDiscardReasonType::Declined),
+            5 => Ok(CallDiscardReasonType::UpgradeToGroupCall),
+            _ => Err(()),
+        }
+    }
+}
+
+/// `store(Dimensions, ...)` (Dimensions.hpp:16-18) — the packed
+/// `(width << 16) | height` uint32.
+fn store_dimensions(dimensions: Dimensions, out: &mut Vec<u8>) {
+    store_u32(
+        out,
+        ((dimensions.width as u32) << 16) | dimensions.height as u32,
+    );
+}
+
+/// `parse(Dimensions &, ...)` (Dimensions.hpp:21-26).
+fn parse_dimensions(parser: &mut Parser) -> Result<Dimensions, &'static str> {
+    let width_height = parser.u32_()?;
+    Ok(Dimensions {
+        width: (width_height >> 16) as u16,
+        height: (width_height & 0xFFFF) as u16,
+    })
+}
+
+/// `Location::store` (Location.h:81-98).
+fn store_location(location: &Location, out: &mut Vec<u8>) {
+    let has_access_hash = location.get_access_hash() != 0;
+    let has_horizontal_accuracy = location.get_horizontal_accuracy() > 0.0;
+    store_flags(
+        out,
+        [
+            location.is_empty(),
+            has_access_hash,
+            has_horizontal_accuracy,
+        ],
+    );
+    store_f64(out, location.get_latitude());
+    store_f64(out, location.get_longitude());
+    if has_access_hash {
+        store_i64(out, location.get_access_hash());
+    }
+    if has_horizontal_accuracy {
+        store_f64(out, location.get_horizontal_accuracy());
+    }
+}
+
+/// `Location::parse` (Location.h:101-119). The C++ access-hash registration
+/// side effect (`G()->add_location_access_hash`) belongs to the wire-intake
+/// path and is not repeated here (the module doc records the split).
+fn parse_location(parser: &mut Parser) -> Result<Location, &'static str> {
+    let flags = parser.parse_flags::<3>()?;
+    let latitude = parser.f64_()?;
+    let longitude = parser.f64_()?;
+    let mut access_hash = 0;
+    if flags[1] {
+        access_hash = parser.i64_()?;
+    }
+    let mut horizontal_accuracy = 0.0;
+    if flags[2] {
+        horizontal_accuracy = parser.f64_()?;
+    }
+    Ok(Location::from_stored(
+        flags[0],
         latitude,
         longitude,
         horizontal_accuracy,
         access_hash,
-    })
+    ))
 }
 
-/// `Venue::store` (Venue.h:66-80).
+/// `Venue::store` (Venue.h:69-77).
 fn store_venue(venue: &Venue, out: &mut Vec<u8>) {
     store_location(&venue.location, out);
     store_string(out, &venue.title);
@@ -2434,16 +2880,15 @@ fn store_venue(venue: &Venue, out: &mut Vec<u8>) {
     store_string(out, &venue.r#type);
 }
 
-/// `Venue::parse` (Venue.h:82-95) — the type rides the
-/// `Version::AddVenueType` gate.
-fn parse_venue(input: &mut Parser) -> Result<Venue, &'static str> {
-    let location = parse_location(input)?;
-    let title = input.string()?;
-    let address = input.string()?;
-    let provider = input.string()?;
-    let id = input.string()?;
-    let r#type = if input.version() >= version::ADD_VENUE_TYPE {
-        input.string()?
+/// `Venue::parse` (Venue.h:80-88).
+fn parse_venue(parser: &mut Parser) -> Result<Venue, &'static str> {
+    let location = parse_location(parser)?;
+    let title = parser.string()?;
+    let address = parser.string()?;
+    let provider = parser.string()?;
+    let id = parser.string()?;
+    let r#type = if parser.version() >= version::ADD_VENUE_TYPE {
+        parser.string()?
     } else {
         String::new()
     };
@@ -2457,45 +2902,27 @@ fn parse_venue(input: &mut Parser) -> Result<Venue, &'static str> {
     })
 }
 
-/// `store(Dimensions)` (Dimensions.hpp:8-11).
-fn store_dimensions(dimensions: &Dimensions, out: &mut Vec<u8>) {
-    let packed = (dimensions.width as u32) << 16 | dimensions.height as u32;
-    store_u32(out, packed);
-}
-
-/// `parse(Dimensions)` (Dimensions.hpp:13-19).
-fn parse_dimensions(input: &mut Parser) -> Result<Dimensions, &'static str> {
-    let width_height = input.u32_()?;
-    Ok(Dimensions {
-        width: (width_height >> 16) as u16,
-        height: (width_height & 0xFFFF) as u16,
-    })
-}
-
-/// `PhotoSize::store` (PhotoSize.hpp:6-13).
-fn store_photo_size(photo_size: &PhotoSize, ctx: &mut dyn ContentStoreContext, out: &mut Vec<u8>) {
+/// `PhotoSize::store` (PhotoSize.hpp:20-26). The `file_id` store is
+/// FileManager-mediated (the module doc records the M.12.2 gate).
+fn store_photo_size(photo_size: &PhotoSize, ctx: &dyn MessageContentStorage, out: &mut Vec<u8>) {
     store_i32(out, photo_size.size_type);
-    store_dimensions(&photo_size.dimensions, out);
+    store_dimensions(photo_size.dimensions, out);
     store_i32(out, photo_size.size);
     ctx.store_file(photo_size.file_id, out);
     store_i32_vec(out, &photo_size.progressive_sizes);
 }
 
-/// `PhotoSize::parse` (PhotoSize.hpp:15-26) — the progressive sizes
-/// ride `Version::AddPhotoProgressiveSizes`.
+/// `PhotoSize::parse` (PhotoSize.hpp:29-39).
 fn parse_photo_size(
-    ctx: &mut dyn ContentStoreContext,
-    input: &mut Parser,
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
 ) -> Result<PhotoSize, &'static str> {
-    let size_type = input.i32_()?;
-    if !(0..128).contains(&size_type) {
-        return Err("Wrong photo size type");
-    }
-    let dimensions = parse_dimensions(input)?;
-    let size = input.i32_()?;
-    let file_id = ctx.parse_file(input)?;
-    let progressive_sizes = if input.version() >= version::ADD_PHOTO_PROGRESSIVE_SIZES {
-        input.i32_vec()?
+    let size_type = parser.i32_()?;
+    let dimensions = parse_dimensions(parser)?;
+    let size = parser.i32_()?;
+    let file_id = ctx.parse_file(parser)?;
+    let progressive_sizes = if parser.version() >= version::ADD_PHOTO_PROGRESSIVE_SIZES {
+        parser.i32_vec()?
     } else {
         Vec::new()
     };
@@ -2508,25 +2935,24 @@ fn parse_photo_size(
     })
 }
 
-/// `AnimationSize::store` (PhotoSize.hpp:28-33).
+/// `AnimationSize::store` (PhotoSize.hpp:42-45).
 fn store_animation_size(
     animation_size: &AnimationSize,
-    ctx: &mut dyn ContentStoreContext,
+    ctx: &dyn MessageContentStorage,
     out: &mut Vec<u8>,
 ) {
     store_photo_size(&animation_size.photo_size, ctx, out);
     store_f64(out, animation_size.main_frame_timestamp);
 }
 
-/// `AnimationSize::parse` (PhotoSize.hpp:35-44) — the stream start
-/// rides `Version::AddDialogPhotoHasAnimation`.
+/// `AnimationSize::parse` (PhotoSize.hpp:48-55).
 fn parse_animation_size(
-    ctx: &mut dyn ContentStoreContext,
-    input: &mut Parser,
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
 ) -> Result<AnimationSize, &'static str> {
-    let photo_size = parse_photo_size(ctx, input)?;
-    let main_frame_timestamp = if input.version() >= version::ADD_DIALOG_PHOTO_HAS_ANIMATION {
-        input.f64_()?
+    let photo_size = parse_photo_size(parser, ctx)?;
+    let main_frame_timestamp = if parser.version() >= version::ADD_DIALOG_PHOTO_HAS_ANIMATION {
+        parser.f64_()?
     } else {
         0.0
     };
@@ -2536,42 +2962,38 @@ fn parse_animation_size(
     })
 }
 
-/// `StickerPhotoSize::store` (StickerPhotoSize.hpp:15-30).
-fn store_sticker_photo_size(sticker_photo_size: &StickerPhotoSize, out: &mut Vec<u8>) {
-    let is_custom_emoji = sticker_photo_size.get_type() == StickerPhotoSizeType::CustomEmoji;
-    let is_sticker = sticker_photo_size.get_type() == StickerPhotoSizeType::Sticker;
-    store_flags::<2>(out, [is_custom_emoji, is_sticker]);
-    if is_custom_emoji {
-        store_i64(out, sticker_photo_size.get_custom_emoji_id());
-    } else if is_sticker {
-        store_i64(out, sticker_photo_size.get_sticker_set_id());
-        store_i64(out, sticker_photo_size.get_sticker_id());
-    }
-    store_i32_vec(out, sticker_photo_size.get_background_colors());
+/// `StickerPhotoSize::store` (StickerPhotoSize.hpp:16-30) — lives on the
+/// value in `photo.rs`.
+fn store_sticker_photo_size(size: &StickerPhotoSize, out: &mut Vec<u8>) {
+    size.store(out);
 }
 
-/// `StickerPhotoSize::parse` (StickerPhotoSize.hpp:32-...).
-fn parse_sticker_photo_size(input: &mut Parser) -> Result<StickerPhotoSize, &'static str> {
-    let [is_custom_emoji, is_sticker] = input.parse_flags::<2>()?;
-    let mut sticker_photo_size = StickerPhotoSize::default();
-    if is_custom_emoji {
-        sticker_photo_size.type_ = StickerPhotoSizeType::CustomEmoji;
-        sticker_photo_size.custom_emoji_id = input.i64_()?;
-    } else if is_sticker {
-        sticker_photo_size.type_ = StickerPhotoSizeType::Sticker;
-        sticker_photo_size.sticker_set_id = input.i64_()?;
-        sticker_photo_size.sticker_id = input.i64_()?;
-    }
-    sticker_photo_size.background_colors = input.i32_vec()?;
-    Ok(sticker_photo_size)
+/// `StickerPhotoSize::parse` (StickerPhotoSize.hpp:33-51).
+fn parse_sticker_photo_size(parser: &mut Parser) -> Result<StickerPhotoSize, &'static str> {
+    StickerPhotoSize::parse_from(parser)
 }
 
-/// `Photo::store` (Photo.hpp:19-44).
-fn store_photo(photo: &Photo, ctx: &mut dyn ContentStoreContext, out: &mut Vec<u8>) {
+/// `Photo::is_bad` (Photo.h:49-59).
+fn photo_is_bad(photo: &Photo) -> bool {
+    if photo.is_empty() {
+        return true;
+    }
+    for photo_size in &photo.photos {
+        if !photo_size.file_id.is_valid() {
+            return true;
+        }
+    }
+    false
+}
+
+/// `store(const Photo &, ...)` (Photo.hpp:19-44). The `sticker_file_ids`
+/// FileId bytes ride the `store_file` seam (FileId.hpp:17-20), the M.12.2
+/// `FileManager` gate.
+fn store_photo(photo: &Photo, ctx: &dyn MessageContentStorage, out: &mut Vec<u8>) {
     let has_minithumbnail = !photo.minithumbnail.is_empty();
     let has_animations = !photo.animations.is_empty();
     let has_sticker_photo_size = photo.sticker_photo_size.is_some();
-    store_flags::<4>(
+    store_flags(
         out,
         [
             photo.has_stickers,
@@ -2587,7 +3009,10 @@ fn store_photo(photo: &Photo, ctx: &mut dyn ContentStoreContext, out: &mut Vec<u
         store_photo_size(photo_size, ctx, out);
     }
     if photo.has_stickers {
-        store_file_id_vec(&photo.sticker_file_ids, ctx, out);
+        store_i32(out, photo.sticker_file_ids.len() as i32);
+        for file_id in &photo.sticker_file_ids {
+            ctx.store_file(*file_id, out);
+        }
     }
     if has_minithumbnail {
         store_string(out, &photo.minithumbnail);
@@ -2598,57 +3023,53 @@ fn store_photo(photo: &Photo, ctx: &mut dyn ContentStoreContext, out: &mut Vec<u
             store_animation_size(animation_size, ctx, out);
         }
     }
-    if let Some(sticker_photo_size) = &photo.sticker_photo_size {
-        store_sticker_photo_size(sticker_photo_size, out);
+    if has_sticker_photo_size {
+        store_sticker_photo_size(photo.sticker_photo_size.as_ref().unwrap(), out);
     }
 }
 
-/// `Photo::parse` (Photo.hpp:47-74).
+/// `parse(Photo &, ...)` (Photo.hpp:47-74). The FileIds come back through
+/// the `parse_file` seam (FileId.hpp:22-25), the M.12.2 `FileManager` gate.
 fn parse_photo(
-    ctx: &mut dyn ContentStoreContext,
-    input: &mut Parser,
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
 ) -> Result<Photo, &'static str> {
-    let [
-        has_stickers,
-        has_minithumbnail,
-        has_animations,
-        has_sticker_photo_size,
-    ] = input.parse_flags::<4>()?;
-    let id = input.i64_()?;
-    let date = input.i32_()?;
-    let photos_len = input.i32_()?;
-    if photos_len < 0 {
+    let flags = parser.parse_flags::<4>()?;
+    let id = parser.i64_()?;
+    let date = parser.i32_()?;
+    let photos_len = parser.i32_()?;
+    if photos_len < 0 || parser.left_len() < photos_len as usize {
         return Err("Wrong vector length");
     }
     let mut photos = Vec::with_capacity(photos_len as usize);
     for _ in 0..photos_len {
-        photos.push(parse_photo_size(ctx, input)?);
+        photos.push(parse_photo_size(parser, ctx)?);
     }
-    let sticker_file_ids = if has_stickers {
-        parse_i64_file_id_vec(ctx, input)?
-    } else {
-        Vec::new()
-    };
-    let minithumbnail = if has_minithumbnail {
-        input.string()?
+    let mut sticker_file_ids = Vec::new();
+    if flags[0] {
+        let sticker_file_ids_len = parser.i32_()?;
+        if sticker_file_ids_len < 0 || parser.left_len() < sticker_file_ids_len as usize {
+            return Err("Wrong vector length");
+        }
+        for _ in 0..sticker_file_ids_len {
+            sticker_file_ids.push(ctx.parse_file(parser)?);
+        }
+    }
+    let minithumbnail = if flags[1] {
+        parser.string()?
     } else {
         String::new()
     };
-    let animations = if has_animations {
-        let len = input.i32_()?;
-        if len < 0 {
-            return Err("Wrong vector length");
-        }
-        let mut sizes = Vec::with_capacity(len as usize);
-        for _ in 0..len {
-            sizes.push(parse_animation_size(ctx, input)?);
-        }
-        sizes
-    } else {
-        Vec::new()
-    };
-    let sticker_photo_size = if has_sticker_photo_size {
-        Some(parse_sticker_photo_size(input)?)
+    let animations_len = if flags[2] { parser.i32_()? } else { 0 };
+    if animations_len < 0 || parser.left_len() < animations_len as usize {
+        return Err("Wrong vector length");
+    }
+    let mut animations = Vec::with_capacity(animations_len as usize);
+    for _ in 0..animations_len {
+        animations.push(parse_animation_size(parser, ctx)?);
+    }
+    let sticker_photo_size = if flags[3] {
+        Some(parse_sticker_photo_size(parser)?)
     } else {
         None
     };
@@ -2659,141 +3080,226 @@ fn parse_photo(
         photos,
         animations,
         sticker_photo_size,
-        has_stickers,
         sticker_file_ids,
+        has_stickers: flags[0],
     })
 }
 
-/// `td::store(vector<FileId>)` through the file seam — the
-/// `Photo::sticker_file_ids` framing.
-fn store_file_id_vec(file_ids: &[FileId], ctx: &mut dyn ContentStoreContext, out: &mut Vec<u8>) {
-    store_i32(out, file_ids.len() as i32);
-    for file_id in file_ids {
-        ctx.store_file(*file_id, out);
+/// `Game::store` (Game.hpp:22-39).
+fn store_game(game: &Game, ctx: &dyn MessageContentStorage, out: &mut Vec<u8>) {
+    let has_animation = game.animation_file_id.is_valid();
+    store_flags(out, [has_animation]);
+    store_i64(out, game.id);
+    store_i64(out, game.access_hash);
+    store_i64(out, game.bot_user_id.get());
+    store_string(out, &game.short_name);
+    store_string(out, &game.title);
+    store_string(out, &game.description);
+    store_photo(&game.photo, ctx, out);
+    if has_animation {
+        ctx.store_animation(game.animation_file_id, out);
     }
+    game.text.store(out);
 }
 
-/// The [`store_file_id_vec`] reader.
-fn parse_i64_file_id_vec(
-    ctx: &mut dyn ContentStoreContext,
-    input: &mut Parser,
-) -> Result<Vec<FileId>, &'static str> {
-    let len = input.i32_()?;
-    if len < 0 {
-        return Err("Wrong vector length");
-    }
-    let mut result = Vec::with_capacity(len as usize);
-    for _ in 0..len {
-        result.push(ctx.parse_file(input)?);
-    }
-    Ok(result)
-}
-
-/// `ForumTopicIcon::store` (ForumTopicIcon.hpp:8-19).
-fn store_forum_topic_icon(icon: &ForumTopicIcon, out: &mut Vec<u8>) {
-    let has_custom_emoji_id = icon.custom_emoji_id.is_valid();
-    store_flags::<1>(out, [has_custom_emoji_id]);
-    store_i32(out, icon.get_color());
-    if has_custom_emoji_id {
-        store_i64(out, icon.custom_emoji_id.get());
-    }
-}
-
-/// `ForumTopicIcon::parse` (ForumTopicIcon.hpp:21-...).
-fn parse_forum_topic_icon(input: &mut Parser) -> Result<ForumTopicIcon, &'static str> {
-    let [has_custom_emoji_id] = input.parse_flags::<1>()?;
-    let color = input.i32_()?;
-    let custom_emoji_id = if has_custom_emoji_id {
-        CustomEmojiId::new(input.i64_()?)
+/// `Game::parse` (Game.hpp:42-61).
+fn parse_game(
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
+) -> Result<Game, &'static str> {
+    let has_animation = if parser.version() >= version::FIX_STORE_GAME_WITHOUT_ANIMATION {
+        parser.parse_flags::<1>()?[0]
     } else {
-        CustomEmojiId::default()
+        true
     };
-    Ok(ForumTopicIcon::new(color, custom_emoji_id))
-}
-
-/// `ToDoItem::store` (ToDoItem.hpp:6-11).
-fn store_to_do_item(item: &ToDoItem, out: &mut Vec<u8>) {
-    store_flags::<0>(out, []);
-    store_i32(out, item.id);
-    item.title.store(out);
-}
-
-/// `ToDoItem::parse` (ToDoItem.hpp:13-...).
-fn parse_to_do_item(input: &mut Parser) -> Result<ToDoItem, &'static str> {
-    input.parse_flags::<0>()?;
-    let id = input.i32_()?;
-    let title = FormattedText::parse(input)?;
-    Ok(ToDoItem { id, title })
-}
-
-/// `ToDoList::store` (ToDoList.hpp:6-13) — the flags head is cut off in
-/// the read above; the C++ stores `others_can_append_`/`others_can_complete_`
-/// then title and items.
-fn store_to_do_list(list: &ToDoList, out: &mut Vec<u8>) {
-    store_flags::<2>(out, [list.others_can_append, list.others_can_complete]);
-    list.title.store(out);
-    store_i32(out, list.items.len() as i32);
-    for item in &list.items {
-        store_to_do_item(item, out);
-    }
-}
-
-/// `ToDoList::parse` (ToDoList.hpp:15-...).
-fn parse_to_do_list(input: &mut Parser) -> Result<ToDoList, &'static str> {
-    let [others_can_append, others_can_complete] = input.parse_flags::<2>()?;
-    let title = FormattedText::parse(input)?;
-    let len = input.i32_()?;
-    if len < 0 {
-        return Err("Wrong vector length");
-    }
-    let mut items = Vec::with_capacity(len as usize);
-    for _ in 0..len {
-        items.push(parse_to_do_item(input)?);
-    }
-    Ok(ToDoList {
-        title,
-        items,
-        others_can_append,
-        others_can_complete,
-    })
-}
-
-/// `ToDoCompletion::store` (ToDoCompletion.hpp:6-20).
-fn store_to_do_completion(completion: &ToDoCompletion, out: &mut Vec<u8>) {
-    let is_completed_by_dialog = completion.completed_by_dialog_id.get_type() != DialogType::User;
-    store_flags::<1>(out, [is_completed_by_dialog]);
-    store_i32(out, completion.id);
-    if is_completed_by_dialog {
-        store_i64(out, completion.completed_by_dialog_id.get());
+    let id = parser.i64_()?;
+    let access_hash = parser.i64_()?;
+    let bot_user_id = parse_user_id(parser)?;
+    let short_name = parser.string()?;
+    let title = parser.string()?;
+    let description = parser.string()?;
+    let photo = parse_photo(parser, ctx)?;
+    let animation_file_id = if has_animation {
+        ctx.parse_animation(parser)?
     } else {
-        store_i64(out, completion.completed_by_dialog_id.get_user_id().get());
-    }
-    store_i32(out, completion.date);
-}
-
-/// `ToDoCompletion::parse` (ToDoCompletion.hpp:22-...).
-fn parse_to_do_completion(input: &mut Parser) -> Result<ToDoCompletion, &'static str> {
-    let [is_completed_by_dialog] = input.parse_flags::<1>()?;
-    let id = input.i32_()?;
-    let completed_by_dialog_id = if is_completed_by_dialog {
-        DialogId::new(input.i64_()?)
-    } else {
-        DialogId::from_user_id(UserId::new(input.i64_()?))
+        FileId::default()
     };
-    let date = input.i32_()?;
-    Ok(ToDoCompletion {
+    let text = parse_formatted_text(parser)?;
+    Ok(Game {
         id,
-        completed_by_dialog_id,
-        date,
+        access_hash,
+        bot_user_id,
+        short_name,
+        title,
+        description,
+        photo,
+        animation_file_id,
+        text,
     })
 }
 
-/// `GiveawayParameters::store` (GiveawayParameters.hpp:7-31).
+/// `WebApp::store` (WebApp.hpp:21-37).
+fn store_web_app(web_app: &WebApp, ctx: &dyn MessageContentStorage, out: &mut Vec<u8>) {
+    let has_animation = web_app.animation_file_id.is_valid();
+    store_flags(out, [has_animation]);
+    store_i64(out, web_app.id);
+    store_i64(out, web_app.access_hash);
+    store_string(out, &web_app.short_name);
+    store_string(out, &web_app.title);
+    store_string(out, &web_app.description);
+    store_photo(&web_app.photo, ctx, out);
+    if has_animation {
+        ctx.store_animation(web_app.animation_file_id, out);
+    }
+    store_i64(out, web_app.hash);
+}
+
+/// `WebApp::parse` (WebApp.hpp:40-56).
+fn parse_web_app(
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
+) -> Result<WebApp, &'static str> {
+    let has_animation = parser.parse_flags::<1>()?[0];
+    let id = parser.i64_()?;
+    let access_hash = parser.i64_()?;
+    let short_name = parser.string()?;
+    let title = parser.string()?;
+    let description = parser.string()?;
+    let photo = parse_photo(parser, ctx)?;
+    let animation_file_id = if has_animation {
+        ctx.parse_animation(parser)?
+    } else {
+        FileId::default()
+    };
+    let hash = parser.i64_()?;
+    Ok(WebApp {
+        id,
+        access_hash,
+        short_name,
+        title,
+        description,
+        photo,
+        animation_file_id,
+        hash,
+    })
+}
+
+/// `BackgroundType::store` (BackgroundType.hpp:16-52).
+fn store_background_type(background_type: &BackgroundType, out: &mut Vec<u8>) {
+    let has_fill = background_type.fill.top_color != 0 || background_type.fill.bottom_color != 0;
+    let has_intensity = background_type.intensity != 0;
+    let fill_type = background_type.fill.get_type();
+    let is_gradient = fill_type == BackgroundFillType::Gradient;
+    let is_freeform_gradient = fill_type == BackgroundFillType::FreeformGradient;
+    let has_theme_name = !background_type.theme_name.is_empty();
+    store_flags(
+        out,
+        [
+            background_type.is_blurred,
+            background_type.is_moving,
+            has_fill,
+            has_intensity,
+            is_gradient,
+            is_freeform_gradient,
+            has_theme_name,
+        ],
+    );
+    store_i32(out, background_type.r#type as i32);
+    if is_freeform_gradient {
+        store_i32(out, background_type.fill.top_color);
+        store_i32(out, background_type.fill.bottom_color);
+        store_i32(out, background_type.fill.third_color);
+        store_i32(out, background_type.fill.fourth_color);
+    } else if has_fill {
+        store_i32(out, background_type.fill.top_color);
+        if is_gradient {
+            store_i32(out, background_type.fill.bottom_color);
+            store_i32(out, background_type.fill.rotation_angle);
+        }
+    }
+    if has_intensity {
+        store_i32(out, background_type.intensity);
+    }
+    if has_theme_name {
+        store_string(out, &background_type.theme_name);
+    }
+}
+
+/// `BackgroundType::parse` (BackgroundType.hpp:55-92+). An out-of-range
+/// type int (garbage in a corrupted blob; the C++ cast would hold it
+/// unchecked) falls back to the enum default with a log.
+fn parse_background_type(parser: &mut Parser) -> Result<BackgroundType, &'static str> {
+    let flags = parser.parse_flags::<7>()?;
+    let type_raw = parser.i32_()?;
+    let r#type = match BackgroundTypeType::try_from(type_raw) {
+        Ok(value) => value,
+        Err(_) => {
+            tdutils::log_error!("Wrong background type {type_raw}");
+            BackgroundTypeType::default()
+        }
+    };
+    let mut fill = BackgroundFill::default();
+    if flags[5] {
+        fill.top_color = parser.i32_()?;
+        fill.bottom_color = parser.i32_()?;
+        fill.third_color = parser.i32_()?;
+        fill.fourth_color = parser.i32_()?;
+    } else if flags[2] {
+        fill.top_color = parser.i32_()?;
+        if flags[4] {
+            fill.bottom_color = parser.i32_()?;
+            fill.rotation_angle = parser.i32_()?;
+        } else {
+            fill.bottom_color = fill.top_color;
+        }
+    }
+    let intensity = if flags[3] { parser.i32_()? } else { 0 };
+    let theme_name = if flags[6] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    Ok(BackgroundType {
+        r#type,
+        is_blurred: flags[0],
+        is_moving: flags[1],
+        intensity,
+        fill,
+        theme_name,
+    })
+}
+
+/// `BackgroundInfo::store` (BackgroundInfo.hpp:19-22). The id goes through
+/// the BackgroundManager seam; the type is stored inline.
+fn store_background_info(
+    background_info: &BackgroundInfo,
+    ctx: &dyn MessageContentStorage,
+    out: &mut Vec<u8>,
+) {
+    ctx.store_background(background_info.background_id, out);
+    store_background_type(&background_info.background_type, out);
+}
+
+/// `BackgroundInfo::parse` (BackgroundInfo.hpp:25-28).
+fn parse_background_info(
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
+) -> Result<BackgroundInfo, &'static str> {
+    let background_id = ctx.parse_background(parser)?;
+    let background_type = parse_background_type(parser)?;
+    Ok(BackgroundInfo {
+        background_id,
+        background_type,
+    })
+}
+
+/// `GiveawayParameters::store` (GiveawayParameters.hpp:16-38). The
+/// `ChannelId` store is the raw `store_long`.
 fn store_giveaway_parameters(parameters: &GiveawayParameters, out: &mut Vec<u8>) {
     let has_additional_channel_ids = !parameters.additional_channel_ids.is_empty();
     let has_country_codes = !parameters.country_codes.is_empty();
     let has_prize_description = !parameters.prize_description.is_empty();
-    store_flags::<5>(
+    store_flags(
         out,
         [
             parameters.only_new_subscribers,
@@ -2819,822 +3325,215 @@ fn store_giveaway_parameters(parameters: &GiveawayParameters, out: &mut Vec<u8>)
     }
 }
 
-/// `GiveawayParameters::parse` (GiveawayParameters.hpp:33-...).
-fn parse_giveaway_parameters(input: &mut Parser) -> Result<GiveawayParameters, &'static str> {
-    let [
-        only_new_subscribers,
-        has_additional_channel_ids,
-        has_country_codes,
-        winners_are_visible,
-        has_prize_description,
-    ] = input.parse_flags::<5>()?;
-    let boosted_channel_id = ChannelId::new(input.i64_()?);
-    let additional_channel_ids = if has_additional_channel_ids {
-        let len = input.i32_()?;
-        if len < 0 {
+/// `GiveawayParameters::parse` (GiveawayParameters.hpp:41-63).
+fn parse_giveaway_parameters(parser: &mut Parser) -> Result<GiveawayParameters, &'static str> {
+    let flags = parser.parse_flags::<5>()?;
+    let boosted_channel_id = parse_channel_id(parser)?;
+    let additional_channel_ids = if flags[1] {
+        let len = parser.i32_()?;
+        if len < 0 || parser.left_len() < len as usize {
             return Err("Wrong vector length");
         }
-        let mut result = Vec::with_capacity(len as usize);
+        let mut channel_ids = Vec::with_capacity(len as usize);
         for _ in 0..len {
-            result.push(ChannelId::new(input.i64_()?));
+            channel_ids.push(parse_channel_id(parser)?);
         }
-        result
+        channel_ids
     } else {
         Vec::new()
     };
-    let date = input.i32_()?;
-    let country_codes = if has_country_codes {
-        input.string_vec()?
+    let date = parser.i32_()?;
+    let country_codes = if flags[2] {
+        parser.string_vec()?
     } else {
         Vec::new()
     };
-    let prize_description = if has_prize_description {
-        input.string()?
+    let prize_description = if flags[4] {
+        parser.string()?
     } else {
         String::new()
     };
     Ok(GiveawayParameters {
         boosted_channel_id,
         additional_channel_ids,
-        only_new_subscribers,
-        winners_are_visible,
+        only_new_subscribers: flags[0],
+        winners_are_visible: flags[3],
         date,
         country_codes,
         prize_description,
     })
 }
 
-/// `store(Address)` (OrderInfo.hpp:5-18).
-fn store_address(address: &Address, out: &mut Vec<u8>) {
-    store_string(out, &address.country_code);
-    store_string(out, &address.state);
-    store_string(out, &address.city);
-    store_string(out, &address.street_line1);
-    store_string(out, &address.street_line2);
-    store_string(out, &address.postal_code);
+/// `ForumTopicIcon::store` (ForumTopicIcon.hpp:17-26).
+fn store_forum_topic_icon(icon: &ForumTopicIcon, out: &mut Vec<u8>) {
+    let has_custom_emoji_id = icon.get_custom_emoji_id().get() != 0;
+    store_flags(out, [has_custom_emoji_id]);
+    store_i32(out, icon.get_color());
+    if has_custom_emoji_id {
+        store_i64(out, icon.get_custom_emoji_id().get());
+    }
 }
 
-/// `parse(Address)` (OrderInfo.hpp:20-31).
-fn parse_address(input: &mut Parser) -> Result<Address, &'static str> {
-    Ok(Address {
-        country_code: input.string()?,
-        state: input.string()?,
-        city: input.string()?,
-        street_line1: input.string()?,
-        street_line2: input.string()?,
-        postal_code: input.string()?,
-    })
+/// `ForumTopicIcon::parse` (ForumTopicIcon.hpp:29-38).
+fn parse_forum_topic_icon(parser: &mut Parser) -> Result<ForumTopicIcon, &'static str> {
+    let has_custom_emoji_id = parser.parse_flags::<1>()?[0];
+    let color = parser.i32_()?;
+    let mut icon = ForumTopicIcon::new(color, CustomEmojiId::default());
+    if has_custom_emoji_id {
+        icon.edit_custom_emoji_id(CustomEmojiId::new(parser.i64_()?));
+    }
+    Ok(icon)
 }
 
-/// `store(OrderInfo)` (OrderInfo.hpp:33-55).
-fn store_order_info(order_info: &OrderInfo, out: &mut Vec<u8>) {
-    let has_name = !order_info.name.is_empty();
-    let has_phone_number = !order_info.phone_number.is_empty();
-    let has_email_address = !order_info.email_address.is_empty();
-    let has_shipping_address = order_info.shipping_address.is_some();
-    store_flags::<4>(
+/// `ForumTopicEditedData::store` (ForumTopicEditedData.hpp:17-34).
+fn store_forum_topic_edited_data(data: &ForumTopicEditedData, out: &mut Vec<u8>) {
+    let has_title = !data.title.is_empty();
+    let has_icon_custom_emoji_id = data.icon_custom_emoji_id.get() != 0;
+    store_flags(
         out,
         [
-            has_name,
-            has_phone_number,
-            has_email_address,
-            has_shipping_address,
-        ],
-    );
-    if has_name {
-        store_string(out, &order_info.name);
-    }
-    if has_phone_number {
-        store_string(out, &order_info.phone_number);
-    }
-    if has_email_address {
-        store_string(out, &order_info.email_address);
-    }
-    if let Some(shipping_address) = &order_info.shipping_address {
-        store_address(shipping_address, out);
-    }
-}
-
-/// `parse(OrderInfo)` (OrderInfo.hpp:57-...).
-fn parse_order_info(input: &mut Parser) -> Result<OrderInfo, &'static str> {
-    let [
-        has_name,
-        has_phone_number,
-        has_email_address,
-        has_shipping_address,
-    ] = input.parse_flags::<4>()?;
-    let name = if has_name {
-        input.string()?
-    } else {
-        String::new()
-    };
-    let phone_number = if has_phone_number {
-        input.string()?
-    } else {
-        String::new()
-    };
-    let email_address = if has_email_address {
-        input.string()?
-    } else {
-        String::new()
-    };
-    let shipping_address = if has_shipping_address {
-        Some(Box::new(parse_address(input)?))
-    } else {
-        None
-    };
-    Ok(OrderInfo {
-        name,
-        phone_number,
-        email_address,
-        shipping_address,
-    })
-}
-
-/// `CurrencyAmount::store` (CurrencyAmount.hpp:6-24).
-fn store_currency_amount(amount: &CurrencyAmount, out: &mut Vec<u8>) {
-    let has_star_amount = amount.star_amount != StarAmount::default();
-    let has_ton_amount = amount.ton_amount != TonAmount::default();
-    store_flags::<2>(out, [has_star_amount, has_ton_amount]);
-    store_i32(out, amount.r#type as i32);
-    if has_star_amount {
-        store_i64(out, amount.star_amount.star_count);
-        store_i32(out, amount.star_amount.nanostar_count);
-    }
-    if has_ton_amount {
-        store_i64(out, amount.ton_amount.ton_amount);
-    }
-}
-
-/// `CurrencyAmount::parse` (CurrencyAmount.hpp:26-...).
-fn parse_currency_amount(input: &mut Parser) -> Result<CurrencyAmount, &'static str> {
-    let [has_star_amount, has_ton_amount] = input.parse_flags::<2>()?;
-    let type_raw = input.i32_()?;
-    let r#type = match type_raw {
-        0 => CurrencyAmountType::None,
-        1 => CurrencyAmountType::Star,
-        2 => CurrencyAmountType::Ton,
-        _ => CurrencyAmountType::default(),
-    };
-    let star_amount = if has_star_amount {
-        StarAmount {
-            star_count: input.i64_()?,
-            nanostar_count: input.i32_()?,
-        }
-    } else {
-        StarAmount::default()
-    };
-    let ton_amount = if has_ton_amount {
-        TonAmount {
-            ton_amount: input.i64_()?,
-        }
-    } else {
-        TonAmount::default()
-    };
-    Ok(CurrencyAmount {
-        r#type,
-        star_amount,
-        ton_amount,
-    })
-}
-
-/// `SharedDialog::store` (SharedDialog.hpp:6-28).
-fn store_shared_dialog(
-    shared_dialog: &SharedDialog,
-    ctx: &mut dyn ContentStoreContext,
-    out: &mut Vec<u8>,
-) {
-    let has_first_name = !shared_dialog.first_name.is_empty();
-    let has_last_name = !shared_dialog.last_name.is_empty();
-    let has_username = !shared_dialog.username.is_empty();
-    let has_photo = !shared_dialog.photo.is_empty();
-    store_flags::<4>(
-        out,
-        [has_first_name, has_last_name, has_username, has_photo],
-    );
-    store_i64(out, shared_dialog.dialog_id.get());
-    if has_first_name {
-        store_string(out, &shared_dialog.first_name);
-    }
-    if has_last_name {
-        store_string(out, &shared_dialog.last_name);
-    }
-    if has_username {
-        store_string(out, &shared_dialog.username);
-    }
-    if has_photo {
-        store_photo(&shared_dialog.photo, ctx, out);
-    }
-}
-
-/// `SharedDialog::parse` (SharedDialog.hpp:30-...).
-fn parse_shared_dialog(
-    ctx: &mut dyn ContentStoreContext,
-    input: &mut Parser,
-) -> Result<SharedDialog, &'static str> {
-    let [has_first_name, has_last_name, has_username, has_photo] = input.parse_flags::<4>()?;
-    let dialog_id = DialogId::new(input.i64_()?);
-    let first_name = if has_first_name {
-        input.string()?
-    } else {
-        String::new()
-    };
-    let last_name = if has_last_name {
-        input.string()?
-    } else {
-        String::new()
-    };
-    let username = if has_username {
-        input.string()?
-    } else {
-        String::new()
-    };
-    let photo = if has_photo {
-        parse_photo(ctx, input)?
-    } else {
-        Photo::default()
-    };
-    Ok(SharedDialog {
-        dialog_id,
-        first_name,
-        last_name,
-        username,
-        photo,
-    })
-}
-
-/// `ForumTopicEditedData::store` (ForumTopicEditedData.hpp:7-24).
-fn store_forum_topic_edited_data(edited_data: &ForumTopicEditedData, out: &mut Vec<u8>) {
-    let has_title = !edited_data.title.is_empty();
-    let has_icon_custom_emoji_id = edited_data.icon_custom_emoji_id.is_valid();
-    store_flags::<6>(
-        out,
-        [
-            edited_data.edit_icon_custom_emoji_id,
-            edited_data.edit_is_closed,
-            edited_data.is_closed,
+            data.edit_icon_custom_emoji_id,
+            data.edit_is_closed,
+            data.is_closed,
             has_title,
             has_icon_custom_emoji_id,
-            edited_data.is_hidden,
+            data.is_hidden,
         ],
     );
     if has_title {
-        store_string(out, &edited_data.title);
+        store_string(out, &data.title);
     }
     if has_icon_custom_emoji_id {
-        store_i64(out, edited_data.icon_custom_emoji_id.get());
+        store_i64(out, data.icon_custom_emoji_id.get());
     }
 }
 
-/// `ForumTopicEditedData::parse` (ForumTopicEditedData.hpp:26-...).
-fn parse_forum_topic_edited_data(input: &mut Parser) -> Result<ForumTopicEditedData, &'static str> {
-    let [
-        edit_icon_custom_emoji_id,
-        edit_is_closed,
-        is_closed,
-        has_title,
-        has_icon_custom_emoji_id,
-        is_hidden,
-    ] = input.parse_flags::<6>()?;
-    let title = if has_title {
-        input.string()?
+/// `ForumTopicEditedData::parse` (ForumTopicEditedData.hpp:37-54).
+fn parse_forum_topic_edited_data(
+    parser: &mut Parser,
+) -> Result<ForumTopicEditedData, &'static str> {
+    let flags = parser.parse_flags::<6>()?;
+    let title = if flags[3] {
+        parser.string()?
     } else {
         String::new()
     };
-    let icon_custom_emoji_id = if has_icon_custom_emoji_id {
-        CustomEmojiId::new(input.i64_()?)
+    let icon_custom_emoji_id = if flags[4] {
+        CustomEmojiId::new(parser.i64_()?)
     } else {
         CustomEmojiId::default()
     };
     Ok(ForumTopicEditedData {
         title,
         icon_custom_emoji_id,
-        edit_icon_custom_emoji_id,
-        edit_is_closed,
-        is_closed,
-        edit_is_hidden: false,
-        is_hidden,
+        edit_icon_custom_emoji_id: flags[0],
+        edit_is_closed: flags[1],
+        is_closed: flags[2],
+        edit_is_hidden: flags[5],
+        is_hidden: flags[5],
     })
 }
 
-/// `WebApp::store` (WebApp.hpp:10-36).
-fn store_web_app(web_app: &WebApp, ctx: &mut dyn ContentStoreContext, out: &mut Vec<u8>) {
-    let has_animation = web_app.animation_file_id.is_valid();
-    store_flags::<1>(out, [has_animation]);
-    store_i64(out, web_app.id);
-    store_i64(out, web_app.access_hash);
-    store_string(out, &web_app.short_name);
-    store_string(out, &web_app.title);
-    store_string(out, &web_app.description);
-    store_photo(&web_app.photo, ctx, out);
-    if has_animation {
-        ctx.store_animation(web_app.animation_file_id, out);
-    }
-    store_i64(out, web_app.hash);
+/// `ToDoItem::store` (ToDoItem.hpp:18-23).
+fn store_to_do_item(item: &ToDoItem, out: &mut Vec<u8>) {
+    store_flags::<0>(out, []);
+    store_i32(out, item.id);
+    item.title.store(out);
 }
 
-/// `WebApp::parse` (WebApp.hpp:38-...).
-fn parse_web_app(
-    ctx: &mut dyn ContentStoreContext,
-    input: &mut Parser,
-) -> Result<WebApp, &'static str> {
-    let [has_animation] = input.parse_flags::<1>()?;
-    let id = input.i64_()?;
-    let access_hash = input.i64_()?;
-    let short_name = input.string()?;
-    let title = input.string()?;
-    let description = input.string()?;
-    let photo = parse_photo(ctx, input)?;
-    let animation_file_id = if has_animation {
-        ctx.parse_animation(input)?
-    } else {
-        FileId::default()
-    };
-    let hash = input.i64_()?;
-    Ok(WebApp {
-        id,
-        access_hash,
-        short_name,
-        title,
-        description,
-        photo,
-        animation_file_id,
-        hash,
-    })
+/// `ToDoItem::parse` (ToDoItem.hpp:26-32). The C++ `validate(0, "parse")`
+/// tail mutates only under `check_utf8` failures a Rust `String` cannot
+/// carry, so it is a no-op here.
+fn parse_to_do_item(parser: &mut Parser) -> Result<ToDoItem, &'static str> {
+    parser.parse_flags::<0>()?;
+    let id = parser.i32_()?;
+    let title = parse_formatted_text(parser)?;
+    Ok(ToDoItem { id, title })
 }
 
-/// `Game::store` (Game.hpp:8-27).
-fn store_game(game: &Game, ctx: &mut dyn ContentStoreContext, out: &mut Vec<u8>) {
-    let has_animation = game.animation_file_id.is_valid();
-    store_flags::<1>(out, [has_animation]);
-    store_i64(out, game.id);
-    store_i64(out, game.access_hash);
-    store_i64(out, game.bot_user_id.get());
-    store_string(out, &game.short_name);
-    store_string(out, &game.title);
-    store_string(out, &game.description);
-    store_photo(&game.photo, ctx, out);
-    if has_animation {
-        ctx.store_animation(game.animation_file_id, out);
-    }
-    game.text.store(out);
-}
-
-/// `Game::parse` (Game.hpp:29-...) — the animation flag rides
-/// `Version::FixStoreGameWithoutAnimation`.
-fn parse_game(ctx: &mut dyn ContentStoreContext, input: &mut Parser) -> Result<Game, &'static str> {
-    let has_animation = if input.version() >= version::FIX_STORE_GAME_WITHOUT_ANIMATION {
-        input.parse_flags::<1>()?[0]
-    } else {
-        true
-    };
-    let id = input.i64_()?;
-    let access_hash = input.i64_()?;
-    let bot_user_id = UserId::new(input.i64_()?);
-    let short_name = input.string()?;
-    let title = input.string()?;
-    let description = input.string()?;
-    let photo = parse_photo(ctx, input)?;
-    let animation_file_id = if has_animation {
-        ctx.parse_animation(input)?
-    } else {
-        FileId::default()
-    };
-    let text = FormattedText::parse(input)?;
-    Ok(Game {
-        id,
-        access_hash,
-        bot_user_id,
-        short_name,
-        title,
-        description,
-        photo,
-        animation_file_id,
-        text,
-    })
-}
-
-/// `InputInvoice::Invoice::store` (InputInvoice.hpp:8-38).
-fn store_invoice(invoice: &Invoice, out: &mut Vec<u8>) {
-    let has_tip = invoice.max_tip_amount != 0;
-    let is_recurring = !invoice.recurring_payment_terms_of_service_url.is_empty();
-    let has_terms_of_service = !invoice.terms_of_service_url.is_empty();
-    let has_subscription_period = invoice.subscription_period != 0;
-    store_flags::<12>(
-        out,
-        [
-            invoice.is_test,
-            invoice.need_name,
-            invoice.need_phone_number,
-            invoice.need_email_address,
-            invoice.need_shipping_address,
-            invoice.is_flexible,
-            invoice.send_phone_number_to_provider,
-            invoice.send_email_address_to_provider,
-            has_tip,
-            is_recurring,
-            has_terms_of_service,
-            has_subscription_period,
-        ],
-    );
-    store_string(out, &invoice.currency);
-    store_i32(out, invoice.price_parts.len() as i32);
-    for part in &invoice.price_parts {
-        store_string(out, &part.label);
-        store_i64(out, part.amount);
-    }
-    if has_tip {
-        store_i64(out, invoice.max_tip_amount);
-        store_i64_vec(out, &invoice.suggested_tip_amounts);
-    }
-    if is_recurring {
-        store_string(out, &invoice.recurring_payment_terms_of_service_url);
-    }
-    if has_terms_of_service {
-        store_string(out, &invoice.terms_of_service_url);
-    }
-    if has_subscription_period {
-        store_i32(out, invoice.subscription_period);
+/// `ToDoList::store` (ToDoList.hpp:19-26).
+fn store_to_do_list(list: &ToDoList, out: &mut Vec<u8>) {
+    store_flags(out, [list.others_can_append, list.others_can_complete]);
+    list.title.store(out);
+    store_i32(out, list.items.len() as i32);
+    for item in &list.items {
+        store_to_do_item(item, out);
     }
 }
 
-/// `InputInvoice::Invoice::parse` (InputInvoice.hpp:40-...).
-fn parse_invoice(input: &mut Parser) -> Result<Invoice, &'static str> {
-    let [
-        is_test,
-        need_name,
-        need_phone_number,
-        need_email_address,
-        need_shipping_address,
-        is_flexible,
-        send_phone_number_to_provider,
-        send_email_address_to_provider,
-        has_tip,
-        is_recurring,
-        has_terms_of_service,
-        has_subscription_period,
-    ] = input.parse_flags::<12>()?;
-    let currency = input.string()?;
-    let price_parts_len = input.i32_()?;
-    if price_parts_len < 0 {
+/// `ToDoList::parse` (ToDoList.hpp:29-37). The C++ `validate` tail drops
+/// unallowed quote entities from the title; the entity filter lands with
+/// the Wave-2 to-do consumers (logged divergence, layout-identical).
+fn parse_to_do_list(parser: &mut Parser) -> Result<ToDoList, &'static str> {
+    let flags = parser.parse_flags::<2>()?;
+    let title = parse_formatted_text(parser)?;
+    let items_len = parser.i32_()?;
+    if items_len < 0 || parser.left_len() < items_len as usize {
         return Err("Wrong vector length");
     }
-    let mut price_parts = Vec::with_capacity(price_parts_len as usize);
-    for _ in 0..price_parts_len {
-        let label = input.string()?;
-        let amount = input.i64_()?;
-        price_parts.push(LabeledPricePart { label, amount });
+    let mut items = Vec::with_capacity(items_len as usize);
+    for _ in 0..items_len {
+        items.push(parse_to_do_item(parser)?);
     }
-    let max_tip_amount = if has_tip { input.i64_()? } else { 0 };
-    let suggested_tip_amounts = if has_tip {
-        parse_i64_vec(input)?
-    } else {
-        Vec::new()
-    };
-    let recurring_payment_terms_of_service_url = if is_recurring {
-        input.string()?
-    } else {
-        String::new()
-    };
-    let terms_of_service_url = if has_terms_of_service {
-        input.string()?
-    } else {
-        String::new()
-    };
-    let subscription_period = if has_subscription_period {
-        input.i32_()?
-    } else {
-        0
-    };
-    Ok(Invoice {
-        currency,
-        price_parts,
-        subscription_period,
-        max_tip_amount,
-        suggested_tip_amounts,
-        recurring_payment_terms_of_service_url,
-        terms_of_service_url,
-        is_test,
-        need_name,
-        need_phone_number,
-        need_email_address,
-        need_shipping_address,
-        send_phone_number_to_provider,
-        send_email_address_to_provider,
-        is_flexible,
-    })
-}
-
-/// `InputInvoice::store` (InputInvoice.hpp:65-115).
-fn store_input_invoice(
-    input_invoice: &InputInvoice,
-    ctx: &mut dyn ContentStoreContext,
-    out: &mut Vec<u8>,
-) {
-    let has_description = !input_invoice.description.is_empty();
-    let has_photo = !input_invoice.photo.is_empty();
-    let has_start_parameter = !input_invoice.start_parameter.is_empty();
-    let has_payload = !input_invoice.payload.is_empty();
-    let has_provider_token = !input_invoice.provider_token.is_empty();
-    let has_provider_data = !input_invoice.provider_data.is_empty();
-    let has_total_amount = input_invoice.total_amount != 0;
-    let has_receipt_message_id = input_invoice.receipt_message_id.is_valid();
-    let has_extended_media = !input_invoice.extended_media.is_empty();
-    let has_extended_media_caption = !input_invoice.extended_media_caption.text.is_empty();
-    store_flags::<10>(
-        out,
-        [
-            has_description,
-            has_photo,
-            has_start_parameter,
-            has_payload,
-            has_provider_token,
-            has_provider_data,
-            has_total_amount,
-            has_receipt_message_id,
-            has_extended_media,
-            has_extended_media_caption,
-        ],
-    );
-    store_string(out, &input_invoice.title);
-    if has_description {
-        store_string(out, &input_invoice.description);
-    }
-    if has_photo {
-        store_photo(&input_invoice.photo, ctx, out);
-    }
-    if has_start_parameter {
-        store_string(out, &input_invoice.start_parameter);
-    }
-    store_invoice(&input_invoice.invoice, out);
-    if has_payload {
-        store_string(out, &input_invoice.payload);
-    }
-    if has_provider_token {
-        store_string(out, &input_invoice.provider_token);
-    }
-    if has_provider_data {
-        store_string(out, &input_invoice.provider_data);
-    }
-    if has_total_amount {
-        store_i64(out, input_invoice.total_amount);
-    }
-    if has_receipt_message_id {
-        store_i32(out, input_invoice.receipt_message_id.get() as i32);
-    }
-    if has_extended_media {
-        store_message_extended_media(&input_invoice.extended_media, ctx, out);
-    }
-    if has_extended_media_caption {
-        input_invoice.extended_media_caption.store(out);
-    }
-}
-
-/// `InputInvoice::parse` (InputInvoice.hpp:117-...) — the flags block
-/// rides `Version::AddInputInvoiceFlags`; pre-flags records fall back to
-/// the positional fields, with provider data gated on
-/// `Version::AddMessageInvoiceProviderData`.
-fn parse_input_invoice(
-    ctx: &mut dyn ContentStoreContext,
-    input: &mut Parser,
-) -> Result<InputInvoice, &'static str> {
-    let (
-        has_description,
-        has_photo,
-        has_start_parameter,
-        has_payload,
-        has_provider_token,
-        has_provider_data,
-        has_total_amount,
-        has_receipt_message_id,
-        has_extended_media,
-        has_extended_media_caption,
-    ) = if input.version() >= version::ADD_INPUT_INVOICE_FLAGS {
-        let flags = input.parse_flags::<10>()?;
-        (
-            flags[0], flags[1], flags[2], flags[3], flags[4], flags[5], flags[6], flags[7],
-            flags[8], flags[9],
-        )
-    } else {
-        (
-            true,
-            true,
-            true,
-            true,
-            true,
-            input.version() >= version::ADD_MESSAGE_INVOICE_PROVIDER_DATA,
-            true,
-            true,
-            false,
-            false,
-        )
-    };
-    let title = input.string()?;
-    let description = if has_description {
-        input.string()?
-    } else {
-        String::new()
-    };
-    let photo = if has_photo {
-        parse_photo(ctx, input)?
-    } else {
-        Photo::default()
-    };
-    let start_parameter = if has_start_parameter {
-        input.string()?
-    } else {
-        String::new()
-    };
-    let invoice = parse_invoice(input)?;
-    let payload = if has_payload {
-        input.string()?
-    } else {
-        String::new()
-    };
-    let provider_token = if has_provider_token {
-        input.string()?
-    } else {
-        String::new()
-    };
-    let provider_data = if has_provider_data {
-        input.string()?
-    } else {
-        String::new()
-    };
-    let total_amount = if has_total_amount { input.i64_()? } else { 0 };
-    let receipt_message_id = if has_receipt_message_id {
-        parse_message_id(input)?
-    } else {
-        MessageId::default()
-    };
-    let extended_media = if has_extended_media {
-        parse_message_extended_media(ctx, input)?
-    } else {
-        MessageExtendedMedia::default()
-    };
-    let extended_media_caption = if has_extended_media_caption {
-        FormattedText::parse(input)?
-    } else {
-        FormattedText::default()
-    };
-    Ok(InputInvoice {
+    Ok(ToDoList {
         title,
-        description,
-        photo,
-        start_parameter,
-        invoice,
-        payload,
-        provider_token,
-        provider_data,
-        extended_media,
-        extended_media_caption,
-        total_amount,
-        receipt_message_id,
+        items,
+        others_can_append: flags[0],
+        others_can_complete: flags[1],
     })
 }
 
-/// `MessageExtendedMedia::store` (MessageExtendedMedia.hpp:14-56).
-fn store_message_extended_media(
-    extended_media: &MessageExtendedMedia,
-    ctx: &mut dyn ContentStoreContext,
-    out: &mut Vec<u8>,
-) {
-    let has_unsupported_version = extended_media.unsupported_version != 0;
-    let has_duration = extended_media.duration != 0;
-    let has_dimensions =
-        extended_media.dimensions.width != 0 || extended_media.dimensions.height != 0;
-    let has_minithumbnail = !extended_media.minithumbnail.is_empty();
-    let has_photo = !extended_media.photo.is_empty();
-    let has_video = extended_media.video_file_id.is_valid();
-    let has_start_timestamp = extended_media.start_timestamp != 0;
-    // STORE_FLAG(false); // has_caption — the legacy caption slot.
-    store_flags::<8>(
-        out,
-        [
-            false,
-            has_unsupported_version,
-            has_duration,
-            has_dimensions,
-            has_minithumbnail,
-            has_photo,
-            has_video,
-            has_start_timestamp,
-        ],
-    );
-    store_i32(out, extended_media.r#type as i32);
-    if has_unsupported_version {
-        store_i32(out, extended_media.unsupported_version);
+/// `ToDoCompletion::store` (ToDoCompletion.hpp:17-29).
+fn store_to_do_completion(completion: &ToDoCompletion, out: &mut Vec<u8>) {
+    let is_completed_by_dialog =
+        completion.completed_by_dialog_id.get_type() != crate::messages_manager::DialogType::User;
+    store_flags(out, [is_completed_by_dialog]);
+    store_i32(out, completion.id);
+    if is_completed_by_dialog {
+        store_i64(out, completion.completed_by_dialog_id.get());
+    } else {
+        store_i64(out, completion.completed_by_dialog_id.get_user_id().get());
     }
-    if has_duration {
-        store_i32(out, extended_media.duration);
-    }
-    if has_dimensions {
-        store_dimensions(&extended_media.dimensions, out);
-    }
-    if has_minithumbnail {
-        store_string(out, &extended_media.minithumbnail);
-    }
-    if has_photo {
-        store_photo(&extended_media.photo, ctx, out);
-    }
-    if has_video {
-        ctx.store_video(extended_media.video_file_id, out);
-    }
-    if has_start_timestamp {
-        store_i32(out, extended_media.start_timestamp);
-    }
+    store_i32(out, completion.date);
 }
 
-/// `MessageExtendedMedia::parse` (MessageExtendedMedia.hpp:58-...) — the
-/// legacy caption slot is parsed and dropped, and a Photo-typed record
-/// without a photo degrades to Unsupported by the caller's `is_bad`
-/// check (the C++ sets `type_ = Type::Unsupported` there).
-fn parse_message_extended_media(
-    ctx: &mut dyn ContentStoreContext,
-    input: &mut Parser,
-) -> Result<MessageExtendedMedia, &'static str> {
-    let [
-        has_caption,
-        has_unsupported_version,
-        has_duration,
-        has_dimensions,
-        has_minithumbnail,
-        has_photo,
-        has_video,
-        has_start_timestamp,
-    ] = input.parse_flags::<8>()?;
-    let type_raw = input.i32_()?;
-    let r#type = message_extended_media_type_from_raw(type_raw);
-    if has_caption {
-        FormattedText::parse(input)?;
-    }
-    let unsupported_version = if has_unsupported_version {
-        input.i32_()?
+/// `ToDoCompletion::parse` (ToDoCompletion.hpp:32-46).
+fn parse_to_do_completion(parser: &mut Parser) -> Result<ToDoCompletion, &'static str> {
+    let is_completed_by_dialog = parser.parse_flags::<1>()?[0];
+    let id = parser.i32_()?;
+    let completed_by_dialog_id = if is_completed_by_dialog {
+        parse_dialog_id(parser)?
     } else {
-        0
+        DialogId::from_user_id(parse_user_id(parser)?)
     };
-    let duration = if has_duration { input.i32_()? } else { 0 };
-    let dimensions = if has_dimensions {
-        parse_dimensions(input)?
-    } else {
-        Dimensions::default()
-    };
-    let minithumbnail = if has_minithumbnail {
-        input.string()?
-    } else {
-        String::new()
-    };
-    let photo = if has_photo {
-        parse_photo(ctx, input)?
-    } else {
-        Photo::default()
-    };
-    let video_file_id = if has_video {
-        ctx.parse_video(input)?
-    } else {
-        FileId::default()
-    };
-    let start_timestamp = if has_start_timestamp {
-        input.i32_()?
-    } else {
-        0
-    };
-    let mut result = MessageExtendedMedia {
-        r#type,
-        unsupported_version,
-        duration,
-        dimensions,
-        minithumbnail,
-        photo,
-        video_file_id,
-        start_timestamp,
-    };
-    if !has_photo && r#type == MessageExtendedMediaType::Photo {
-        result.r#type = MessageExtendedMediaType::Unsupported;
-    }
-    Ok(result)
+    let date = parser.i32_()?;
+    Ok(ToDoCompletion {
+        id,
+        completed_by_dialog_id,
+        date,
+    })
 }
 
-/// `DatedFile::store` (SecureValue.hpp:6-11).
-fn store_dated_file(file: &DatedFile, ctx: &mut dyn ContentStoreContext, out: &mut Vec<u8>) {
+/// `store(DatedFile, ...)` (SecureValue.hpp:18-21).
+fn store_dated_file(file: &DatedFile, ctx: &dyn MessageContentStorage, out: &mut Vec<u8>) {
     ctx.store_file(file.file_id, out);
     store_i32(out, file.date);
 }
 
-/// `DatedFile::parse` (SecureValue.hpp:13-17).
+/// `parse(DatedFile &, ...)`.
 fn parse_dated_file(
-    ctx: &mut dyn ContentStoreContext,
-    input: &mut Parser,
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
 ) -> Result<DatedFile, &'static str> {
-    let file_id = ctx.parse_file(input)?;
-    let date = input.i32_()?;
+    let file_id = ctx.parse_file(parser)?;
+    let date = parser.i32_()?;
     Ok(DatedFile { file_id, date })
 }
 
-/// `EncryptedSecureFile::store` (SecureValue.hpp:19-25).
+/// `store(EncryptedSecureFile, ...)` (SecureValue.hpp:30-34).
 fn store_encrypted_secure_file(
     file: &EncryptedSecureFile,
-    ctx: &mut dyn ContentStoreContext,
+    ctx: &dyn MessageContentStorage,
     out: &mut Vec<u8>,
 ) {
     store_dated_file(&file.file, ctx, out);
@@ -3642,14 +3541,14 @@ fn store_encrypted_secure_file(
     store_string(out, &file.encrypted_secret);
 }
 
-/// `EncryptedSecureFile::parse` (SecureValue.hpp:27-...).
+/// `parse(EncryptedSecureFile &, ...)`.
 fn parse_encrypted_secure_file(
-    ctx: &mut dyn ContentStoreContext,
-    input: &mut Parser,
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
 ) -> Result<EncryptedSecureFile, &'static str> {
-    let file = parse_dated_file(ctx, input)?;
-    let file_hash = input.string()?;
-    let encrypted_secret = input.string()?;
+    let file = parse_dated_file(parser, ctx)?;
+    let file_hash = parser.string()?;
+    let encrypted_secret = parser.string()?;
     Ok(EncryptedSecureFile {
         file,
         file_hash,
@@ -3657,44 +3556,29 @@ fn parse_encrypted_secure_file(
     })
 }
 
-/// `EncryptedSecureData::store` (SecureValue.hpp:29-35).
+/// `store(const EncryptedSecureData &, ...)` (SecureValue.hpp:44-48).
 fn store_encrypted_secure_data(data: &EncryptedSecureData, out: &mut Vec<u8>) {
     store_string(out, &data.data);
     store_string(out, &data.hash);
     store_string(out, &data.encrypted_secret);
 }
 
-/// `EncryptedSecureData::parse` (SecureValue.hpp:37-...).
-fn parse_encrypted_secure_data(input: &mut Parser) -> Result<EncryptedSecureData, &'static str> {
+/// `parse(const EncryptedSecureData &, ...)`.
+fn parse_encrypted_secure_data(parser: &mut Parser) -> Result<EncryptedSecureData, &'static str> {
+    let data = parser.string()?;
+    let hash = parser.string()?;
+    let encrypted_secret = parser.string()?;
     Ok(EncryptedSecureData {
-        data: input.string()?,
-        hash: input.string()?,
-        encrypted_secret: input.string()?,
+        data,
+        hash,
+        encrypted_secret,
     })
 }
 
-/// `EncryptedSecureCredentials::store` (SecureValue.hpp:43-49).
-fn store_encrypted_secure_credentials(credentials: &EncryptedSecureCredentials, out: &mut Vec<u8>) {
-    store_string(out, &credentials.data);
-    store_string(out, &credentials.hash);
-    store_string(out, &credentials.encrypted_secret);
-}
-
-/// `EncryptedSecureCredentials::parse` (SecureValue.hpp:51-...).
-fn parse_encrypted_secure_credentials(
-    input: &mut Parser,
-) -> Result<EncryptedSecureCredentials, &'static str> {
-    Ok(EncryptedSecureCredentials {
-        data: input.string()?,
-        hash: input.string()?,
-        encrypted_secret: input.string()?,
-    })
-}
-
-/// `EncryptedSecureValue::store` (SecureValue.hpp:55-94).
+/// `store(const EncryptedSecureValue &, ...)` (SecureValue.hpp:72-113).
 fn store_encrypted_secure_value(
     value: &EncryptedSecureValue,
-    ctx: &mut dyn ContentStoreContext,
+    ctx: &dyn MessageContentStorage,
     out: &mut Vec<u8>,
 ) {
     let has_data_hash = !value.data.hash.is_empty();
@@ -3704,7 +3588,7 @@ fn store_encrypted_secure_value(
     let has_selfie = value.selfie.file.file_id.is_valid();
     let has_hash = !value.hash.is_empty();
     let has_translations = !value.translations.is_empty();
-    store_flags::<7>(
+    store_flags(
         out,
         [
             has_data_hash,
@@ -3748,77 +3632,65 @@ fn store_encrypted_secure_value(
     }
 }
 
-/// `EncryptedSecureValue::parse` (SecureValue.hpp:96-...).
+/// `parse(const EncryptedSecureValue &, ...)` (SecureValue.hpp:116-157).
 fn parse_encrypted_secure_value(
-    ctx: &mut dyn ContentStoreContext,
-    input: &mut Parser,
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
 ) -> Result<EncryptedSecureValue, &'static str> {
-    let [
-        has_data_hash,
-        has_files,
-        has_front_side,
-        has_reverse_side,
-        has_selfie,
-        has_hash,
-        has_translations,
-    ] = input.parse_flags::<7>()?;
-    let type_raw = input.i32_()?;
-    let r#type = secure_value_type_from_raw(type_raw);
-    let data = if has_data_hash {
-        parse_encrypted_secure_data(input)?
+    let flags = parser.parse_flags::<7>()?;
+    let type_raw = parser.i32_()?;
+    let r#type = match SecureValueType::try_from(type_raw) {
+        Ok(value) => value,
+        Err(_) => {
+            tdutils::log_error!("Wrong secure value type {type_raw}");
+            SecureValueType::None
+        }
+    };
+    let data = if flags[0] {
+        parse_encrypted_secure_data(parser)?
     } else {
         EncryptedSecureData {
-            data: input.string()?,
+            data: parser.string()?,
             hash: String::new(),
             encrypted_secret: String::new(),
         }
     };
-    let files = if has_files {
-        let len = input.i32_()?;
-        if len < 0 {
-            return Err("Wrong vector length");
-        }
-        let mut result = Vec::with_capacity(len as usize);
-        for _ in 0..len {
-            result.push(parse_encrypted_secure_file(ctx, input)?);
-        }
-        result
-    } else {
-        Vec::new()
-    };
-    let front_side = if has_front_side {
-        parse_encrypted_secure_file(ctx, input)?
+    let files_len = if flags[1] { parser.i32_()? } else { 0 };
+    if files_len < 0 || parser.left_len() < files_len as usize {
+        return Err("Wrong vector length");
+    }
+    let mut files = Vec::with_capacity(files_len as usize);
+    for _ in 0..files_len {
+        files.push(parse_encrypted_secure_file(parser, ctx)?);
+    }
+    let front_side = if flags[2] {
+        parse_encrypted_secure_file(parser, ctx)?
     } else {
         EncryptedSecureFile::default()
     };
-    let reverse_side = if has_reverse_side {
-        parse_encrypted_secure_file(ctx, input)?
+    let reverse_side = if flags[3] {
+        parse_encrypted_secure_file(parser, ctx)?
     } else {
         EncryptedSecureFile::default()
     };
-    let selfie = if has_selfie {
-        parse_encrypted_secure_file(ctx, input)?
+    let selfie = if flags[4] {
+        parse_encrypted_secure_file(parser, ctx)?
     } else {
         EncryptedSecureFile::default()
     };
-    let hash = if has_hash {
-        input.string()?
+    let hash = if flags[5] {
+        parser.string()?
     } else {
         String::new()
     };
-    let translations = if has_translations {
-        let len = input.i32_()?;
-        if len < 0 {
-            return Err("Wrong vector length");
-        }
-        let mut result = Vec::with_capacity(len as usize);
-        for _ in 0..len {
-            result.push(parse_encrypted_secure_file(ctx, input)?);
-        }
-        result
-    } else {
-        Vec::new()
-    };
+    let translations_len = if flags[6] { parser.i32_()? } else { 0 };
+    if translations_len < 0 || parser.left_len() < translations_len as usize {
+        return Err("Wrong vector length");
+    }
+    let mut translations = Vec::with_capacity(translations_len as usize);
+    for _ in 0..translations_len {
+        translations.push(parse_encrypted_secure_file(parser, ctx)?);
+    }
     Ok(EncryptedSecureValue {
         r#type,
         data,
@@ -3831,163 +3703,732 @@ fn parse_encrypted_secure_value(
     })
 }
 
-/// `parse_caption` (MessageContent.cpp:3031-3047) — entities ride
-/// `Version::AddCaptionEntities`; older records re-run the entity search
-/// over the raw text (with the utf8 sanity check).
-fn parse_caption(input: &mut Parser) -> Result<FormattedText, &'static str> {
-    if input.version() >= version::ADD_CAPTION_ENTITIES {
-        let text = input.string()?;
-        let len = input.i32_()?;
-        if len < 0 {
+/// `store(const EncryptedSecureCredentials &, ...)` (SecureValue.hpp:58-62).
+fn store_encrypted_secure_credentials(credentials: &EncryptedSecureCredentials, out: &mut Vec<u8>) {
+    store_string(out, &credentials.data);
+    store_string(out, &credentials.hash);
+    store_string(out, &credentials.encrypted_secret);
+}
+
+/// `parse(const EncryptedSecureCredentials &, ...)`.
+fn parse_encrypted_secure_credentials(
+    parser: &mut Parser,
+) -> Result<EncryptedSecureCredentials, &'static str> {
+    let data = parser.string()?;
+    let hash = parser.string()?;
+    let encrypted_secret = parser.string()?;
+    Ok(EncryptedSecureCredentials {
+        data,
+        hash,
+        encrypted_secret,
+    })
+}
+
+/// `StarAmount::store` (StarAmount.hpp).
+fn store_star_amount(amount: &StarAmount, out: &mut Vec<u8>) {
+    store_i64(out, amount.star_count);
+    store_i32(out, amount.nanostar_count);
+}
+
+/// `StarAmount::parse`.
+fn parse_star_amount(parser: &mut Parser) -> Result<StarAmount, &'static str> {
+    let star_count = parser.i64_()?;
+    let nanostar_count = parser.i32_()?;
+    Ok(StarAmount {
+        star_count,
+        nanostar_count,
+    })
+}
+
+/// `TonAmount::store` (TonAmount.hpp).
+fn store_ton_amount(amount: &TonAmount, out: &mut Vec<u8>) {
+    store_i64(out, amount.ton_amount);
+}
+
+/// `TonAmount::parse`.
+fn parse_ton_amount(parser: &mut Parser) -> Result<TonAmount, &'static str> {
+    Ok(TonAmount {
+        ton_amount: parser.i64_()?,
+    })
+}
+
+/// `CurrencyAmount::store` (CurrencyAmount.hpp:18-32).
+fn store_currency_amount(amount: &CurrencyAmount, out: &mut Vec<u8>) {
+    let has_star_amount = amount.star_amount != StarAmount::default();
+    let has_ton_amount = amount.ton_amount != TonAmount::default();
+    store_flags(out, [has_star_amount, has_ton_amount]);
+    store_i32(out, amount.r#type as i32);
+    if has_star_amount {
+        store_star_amount(&amount.star_amount, out);
+    }
+    if has_ton_amount {
+        store_ton_amount(&amount.ton_amount, out);
+    }
+}
+
+/// `CurrencyAmount::parse` (CurrencyAmount.hpp:35-49).
+fn parse_currency_amount(parser: &mut Parser) -> Result<CurrencyAmount, &'static str> {
+    let flags = parser.parse_flags::<2>()?;
+    let type_raw = parser.i32_()?;
+    let r#type = match CurrencyAmountType::try_from(type_raw) {
+        Ok(value) => value,
+        Err(_) => {
+            tdutils::log_error!("Wrong currency amount type {type_raw}");
+            CurrencyAmountType::None
+        }
+    };
+    let star_amount = if flags[0] {
+        parse_star_amount(parser)?
+    } else {
+        StarAmount::default()
+    };
+    let ton_amount = if flags[1] {
+        parse_ton_amount(parser)?
+    } else {
+        TonAmount::default()
+    };
+    Ok(CurrencyAmount {
+        r#type,
+        star_amount,
+        ton_amount,
+    })
+}
+
+/// `SuggestedPostPrice::store` (SuggestedPostPrice.hpp:16-25).
+fn store_suggested_post_price(price: &SuggestedPostPrice, out: &mut Vec<u8>) {
+    let has_amount = price.amount != 0;
+    store_flags(out, [has_amount]);
+    store_i32(out, price.r#type as i32);
+    if has_amount {
+        store_i64(out, price.amount);
+    }
+}
+
+/// `SuggestedPostPrice::parse` (SuggestedPostPrice.hpp:28-37).
+fn parse_suggested_post_price(parser: &mut Parser) -> Result<SuggestedPostPrice, &'static str> {
+    let has_amount = parser.parse_flags::<1>()?[0];
+    let type_raw = parser.i32_()?;
+    let r#type = match SuggestedPostPriceType::try_from(type_raw) {
+        Ok(value) => value,
+        Err(_) => {
+            tdutils::log_error!("Wrong suggested post price type {type_raw}");
+            SuggestedPostPriceType::None
+        }
+    };
+    let amount = if has_amount { parser.i64_()? } else { 0 };
+    Ok(SuggestedPostPrice { r#type, amount })
+}
+
+/// `MessageExtendedMedia::store` (MessageExtendedMedia.hpp:20-61).
+fn store_message_extended_media(
+    media: &MessageExtendedMedia,
+    ctx: &dyn MessageContentStorage,
+    out: &mut Vec<u8>,
+) {
+    let has_unsupported_version = media.unsupported_version != 0;
+    let has_duration = media.duration != 0;
+    let has_dimensions = media.dimensions.width != 0 || media.dimensions.height != 0;
+    let has_minithumbnail = !media.minithumbnail.is_empty();
+    let has_photo = !media.photo.is_empty();
+    let has_video = media.video_file_id.is_valid();
+    let has_start_timestamp = media.start_timestamp != 0;
+    store_flags(
+        out,
+        [
+            false, // has_caption — the legacy field, never stored
+            has_unsupported_version,
+            has_duration,
+            has_dimensions,
+            has_minithumbnail,
+            has_photo,
+            has_video,
+            has_start_timestamp,
+        ],
+    );
+    store_i32(out, media.r#type as i32);
+    if has_unsupported_version {
+        store_i32(out, media.unsupported_version);
+    }
+    if has_duration {
+        store_i32(out, media.duration);
+    }
+    if has_dimensions {
+        store_dimensions(media.dimensions, out);
+    }
+    if has_minithumbnail {
+        store_string(out, &media.minithumbnail);
+    }
+    if has_photo {
+        store_photo(&media.photo, ctx, out);
+    }
+    if has_video {
+        ctx.store_video(media.video_file_id, out);
+    }
+    if has_start_timestamp {
+        store_i32(out, media.start_timestamp);
+    }
+}
+
+/// `MessageExtendedMedia::parse` (MessageExtendedMedia.hpp:64-127).
+fn parse_message_extended_media(
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
+) -> Result<MessageExtendedMedia, &'static str> {
+    let flags = parser.parse_flags::<8>()?;
+    let type_raw = parser.i32_()?;
+    let r#type = match MessageExtendedMediaType::try_from(type_raw) {
+        Ok(value) => value,
+        Err(_) => {
+            tdutils::log_error!("Wrong extended media type {type_raw}");
+            MessageExtendedMediaType::Empty
+        }
+    };
+    if flags[0] {
+        // has_caption — parsed and dropped, like the C++ local.
+        parse_formatted_text(parser)?;
+    }
+    let unsupported_version = if flags[1] { parser.i32_()? } else { 0 };
+    let duration = if flags[2] { parser.i32_()? } else { 0 };
+    let dimensions = if flags[3] {
+        parse_dimensions(parser)?
+    } else {
+        Dimensions::default()
+    };
+    let minithumbnail = if flags[4] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let mut is_bad = false;
+    let photo = if flags[5] {
+        let photo = parse_photo(parser, ctx)?;
+        is_bad |= photo_is_bad(&photo);
+        photo
+    } else {
+        if r#type == MessageExtendedMediaType::Photo {
+            is_bad = true;
+        }
+        Photo::default()
+    };
+    let video_file_id = if flags[6] {
+        let file_id = ctx.parse_video(parser)?;
+        is_bad = !file_id.is_valid();
+        file_id
+    } else {
+        if r#type == MessageExtendedMediaType::Video {
+            is_bad = true;
+        }
+        FileId::default()
+    };
+    let start_timestamp = if flags[7] { parser.i32_()? } else { 0 };
+    if is_bad || flags[0] {
+        if is_bad {
+            tdutils::log_error!("Failed to parse MessageExtendedMedia");
+        }
+        return Ok(MessageExtendedMedia {
+            r#type: MessageExtendedMediaType::Unsupported,
+            unsupported_version: 0,
+            duration,
+            dimensions,
+            minithumbnail,
+            photo: Photo::default(),
+            video_file_id: FileId::default(),
+            start_timestamp,
+        });
+    }
+    Ok(MessageExtendedMedia {
+        r#type,
+        unsupported_version,
+        duration,
+        dimensions,
+        minithumbnail,
+        photo,
+        video_file_id,
+        start_timestamp,
+    })
+}
+
+/// `InputInvoice::Invoice::store` (InputInvoice.hpp:21-56).
+fn store_invoice(invoice: &Invoice, out: &mut Vec<u8>) {
+    let has_tip = invoice.max_tip_amount != 0;
+    let is_recurring = !invoice.recurring_payment_terms_of_service_url.is_empty();
+    let has_terms_of_service = !invoice.terms_of_service_url.is_empty();
+    let has_subscription_period = invoice.subscription_period != 0;
+    store_flags(
+        out,
+        [
+            invoice.is_test,
+            invoice.need_name,
+            invoice.need_phone_number,
+            invoice.need_email_address,
+            invoice.need_shipping_address,
+            invoice.is_flexible,
+            invoice.send_phone_number_to_provider,
+            invoice.send_email_address_to_provider,
+            has_tip,
+            is_recurring,
+            has_terms_of_service,
+            has_subscription_period,
+        ],
+    );
+    store_string(out, &invoice.currency);
+    store_i32(out, invoice.price_parts.len() as i32);
+    for part in &invoice.price_parts {
+        // `LabeledPricePart::store` (LabeledPricePart.h:41-44).
+        store_string(out, &part.label);
+        store_i64(out, part.amount);
+    }
+    if has_tip {
+        store_i64(out, invoice.max_tip_amount);
+        store_i32(out, invoice.suggested_tip_amounts.len() as i32);
+        for amount in &invoice.suggested_tip_amounts {
+            store_i64(out, *amount);
+        }
+    }
+    if is_recurring {
+        store_string(out, &invoice.recurring_payment_terms_of_service_url);
+    }
+    if has_terms_of_service {
+        store_string(out, &invoice.terms_of_service_url);
+    }
+    if has_subscription_period {
+        store_i32(out, invoice.subscription_period);
+    }
+}
+
+/// `InputInvoice::Invoice::parse` (InputInvoice.hpp:59-94).
+fn parse_invoice(parser: &mut Parser) -> Result<Invoice, &'static str> {
+    let flags = parser.parse_flags::<12>()?;
+    let currency = parser.string()?;
+    let price_parts_len = parser.i32_()?;
+    if price_parts_len < 0 || parser.left_len() < price_parts_len as usize {
+        return Err("Wrong vector length");
+    }
+    let mut price_parts = Vec::with_capacity(price_parts_len as usize);
+    for _ in 0..price_parts_len {
+        let label = parser.string()?;
+        let amount = parser.i64_()?;
+        price_parts.push(LabeledPricePart { label, amount });
+    }
+    let max_tip_amount = if flags[8] { parser.i64_()? } else { 0 };
+    let suggested_tip_amounts = if flags[8] {
+        let len = parser.i32_()?;
+        if len < 0 || parser.left_len() < len as usize {
             return Err("Wrong vector length");
         }
-        let mut entities = Vec::with_capacity(len as usize);
+        let mut amounts = Vec::with_capacity(len as usize);
         for _ in 0..len {
-            entities.push(MessageEntity::parse(input)?);
+            amounts.push(parser.i64_()?);
+        }
+        amounts
+    } else {
+        Vec::new()
+    };
+    let recurring_payment_terms_of_service_url = if flags[9] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let terms_of_service_url = if flags[10] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let subscription_period = if flags[11] { parser.i32_()? } else { 0 };
+    Ok(Invoice {
+        currency,
+        price_parts,
+        subscription_period,
+        max_tip_amount,
+        suggested_tip_amounts,
+        recurring_payment_terms_of_service_url,
+        terms_of_service_url,
+        is_test: flags[0],
+        need_name: flags[1],
+        need_phone_number: flags[2],
+        need_email_address: flags[3],
+        need_shipping_address: flags[4],
+        send_phone_number_to_provider: flags[6],
+        send_email_address_to_provider: flags[7],
+        is_flexible: flags[5],
+    })
+}
+
+/// `InputInvoice::store` (InputInvoice.hpp:97-153).
+fn store_input_invoice(invoice: &InputInvoice, ctx: &dyn MessageContentStorage, out: &mut Vec<u8>) {
+    let has_description = !invoice.description.is_empty();
+    let has_photo = !invoice.photo.is_empty();
+    let has_start_parameter = !invoice.start_parameter.is_empty();
+    let has_payload = !invoice.payload.is_empty();
+    let has_provider_token = !invoice.provider_token.is_empty();
+    let has_provider_data = !invoice.provider_data.is_empty();
+    let has_total_amount = invoice.total_amount != 0;
+    let has_receipt_message_id = invoice.receipt_message_id.is_valid();
+    let has_extended_media = !invoice.extended_media.is_empty();
+    let has_extended_media_caption = !invoice.extended_media_caption.text.is_empty();
+    store_flags(
+        out,
+        [
+            has_description,
+            has_photo,
+            has_start_parameter,
+            has_payload,
+            has_provider_token,
+            has_provider_data,
+            has_total_amount,
+            has_receipt_message_id,
+            has_extended_media,
+            has_extended_media_caption,
+        ],
+    );
+    store_string(out, &invoice.title);
+    if has_description {
+        store_string(out, &invoice.description);
+    }
+    if has_photo {
+        store_photo(&invoice.photo, ctx, out);
+    }
+    if has_start_parameter {
+        store_string(out, &invoice.start_parameter);
+    }
+    store_invoice(&invoice.invoice, out);
+    if has_payload {
+        store_string(out, &invoice.payload);
+    }
+    if has_provider_token {
+        store_string(out, &invoice.provider_token);
+    }
+    if has_provider_data {
+        store_string(out, &invoice.provider_data);
+    }
+    if has_total_amount {
+        store_i64(out, invoice.total_amount);
+    }
+    if has_receipt_message_id {
+        store_i64(out, invoice.receipt_message_id.get());
+    }
+    if has_extended_media {
+        store_message_extended_media(&invoice.extended_media, ctx, out);
+    }
+    if has_extended_media_caption {
+        invoice.extended_media_caption.store(out);
+    }
+}
+
+/// `InputInvoice::parse` (InputInvoice.hpp:156-224) with the legacy
+/// pre-`AddInputInvoiceFlags` branch.
+fn parse_input_invoice(
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
+) -> Result<InputInvoice, &'static str> {
+    let (flags, has_provider_data) = if parser.version() >= version::ADD_INPUT_INVOICE_FLAGS {
+        (parser.parse_flags::<10>()?, true)
+    } else {
+        (
+            [true, true, true, true, true, true, true, true, false, false],
+            parser.version() >= version::ADD_MESSAGE_INVOICE_PROVIDER_DATA,
+        )
+    };
+    let title = parser.string()?;
+    let description = if flags[0] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let photo = if flags[1] {
+        parse_photo(parser, ctx)?
+    } else {
+        Photo::default()
+    };
+    let start_parameter = if flags[2] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let invoice = parse_invoice(parser)?;
+    let payload = if flags[3] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let provider_token = if flags[4] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let provider_data = if has_provider_data {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let total_amount = if flags[6] { parser.i64_()? } else { 0 };
+    let receipt_message_id = if flags[7] {
+        parse_message_id(parser)?
+    } else {
+        MessageId::default()
+    };
+    let extended_media = if flags[8] {
+        parse_message_extended_media(parser, ctx)?
+    } else {
+        MessageExtendedMedia::default()
+    };
+    let extended_media_caption = if flags[9] {
+        parse_formatted_text(parser)?
+    } else {
+        FormattedText::default()
+    };
+    Ok(InputInvoice {
+        title,
+        description,
+        photo,
+        start_parameter,
+        invoice,
+        payload,
+        provider_token,
+        provider_data,
+        extended_media,
+        extended_media_caption,
+        total_amount,
+        receipt_message_id,
+    })
+}
+
+/// `store(const Address &)`/`store(const OrderInfo &)`
+/// (OrderInfo.hpp:16-59).
+fn store_order_info(order_info: &OrderInfo, out: &mut Vec<u8>) {
+    let has_name = !order_info.name.is_empty();
+    let has_phone_number = !order_info.phone_number.is_empty();
+    let has_email_address = !order_info.email_address.is_empty();
+    let has_shipping_address = order_info.shipping_address.is_some();
+    store_flags(
+        out,
+        [
+            has_name,
+            has_phone_number,
+            has_email_address,
+            has_shipping_address,
+        ],
+    );
+    if has_name {
+        store_string(out, &order_info.name);
+    }
+    if has_phone_number {
+        store_string(out, &order_info.phone_number);
+    }
+    if has_email_address {
+        store_string(out, &order_info.email_address);
+    }
+    if let Some(shipping_address) = &order_info.shipping_address {
+        store_string(out, &shipping_address.country_code);
+        store_string(out, &shipping_address.state);
+        store_string(out, &shipping_address.city);
+        store_string(out, &shipping_address.street_line1);
+        store_string(out, &shipping_address.street_line2);
+        store_string(out, &shipping_address.postal_code);
+    }
+}
+
+/// `parse(Address &)`/`parse(OrderInfo &)` (OrderInfo.hpp:26-85).
+fn parse_order_info(parser: &mut Parser) -> Result<OrderInfo, &'static str> {
+    let flags = parser.parse_flags::<4>()?;
+    let name = if flags[0] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let phone_number = if flags[1] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let email_address = if flags[2] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let shipping_address = if flags[3] {
+        Some(Box::new(Address {
+            country_code: parser.string()?,
+            state: parser.string()?,
+            city: parser.string()?,
+            street_line1: parser.string()?,
+            street_line2: parser.string()?,
+            postal_code: parser.string()?,
+        }))
+    } else {
+        None
+    };
+    Ok(OrderInfo {
+        name,
+        phone_number,
+        email_address,
+        shipping_address,
+    })
+}
+
+/// `SharedDialog::store` (SharedDialog.hpp:16-43).
+fn store_shared_dialog(
+    shared_dialog: &SharedDialog,
+    ctx: &dyn MessageContentStorage,
+    out: &mut Vec<u8>,
+) {
+    let has_first_name = !shared_dialog.first_name.is_empty();
+    let has_last_name = !shared_dialog.last_name.is_empty();
+    let has_username = !shared_dialog.username.is_empty();
+    let has_photo = !shared_dialog.photo.is_empty();
+    store_flags(
+        out,
+        [has_first_name, has_last_name, has_username, has_photo],
+    );
+    store_i64(out, shared_dialog.dialog_id.get());
+    if has_first_name {
+        store_string(out, &shared_dialog.first_name);
+    }
+    if has_last_name {
+        store_string(out, &shared_dialog.last_name);
+    }
+    if has_username {
+        store_string(out, &shared_dialog.username);
+    }
+    if has_photo {
+        store_photo(&shared_dialog.photo, ctx, out);
+    }
+}
+
+/// `SharedDialog::parse` (SharedDialog.hpp:46-72).
+fn parse_shared_dialog(
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
+) -> Result<SharedDialog, &'static str> {
+    let flags = parser.parse_flags::<4>()?;
+    let dialog_id = parse_dialog_id(parser)?;
+    let first_name = if flags[0] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let last_name = if flags[1] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let username = if flags[2] {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    let photo = if flags[3] {
+        parse_photo(parser, ctx)?
+    } else {
+        Photo::default()
+    };
+    Ok(SharedDialog {
+        dialog_id,
+        first_name,
+        last_name,
+        username,
+        photo,
+    })
+}
+
+/// The id-wrapper stores: `store_long`/`fetch_long` with the pre-64-bit
+/// int32 legacy the C++ wrappers keep (`UserId.h:57-64`, `ChannelId.h:61`,
+/// `ChatId.h:54`); `DialogId`/`MessageId`/`WebPageId` are unconditionally
+/// 64-bit.
+fn store_user_id(user_id: UserId, out: &mut Vec<u8>) {
+    store_i64(out, user_id.get());
+}
+
+fn parse_user_id(parser: &mut Parser) -> Result<UserId, &'static str> {
+    Ok(UserId::new(
+        if parser.version() >= version::SUPPORT_64_BIT_IDS {
+            parser.i64_()?
+        } else {
+            parser.i32_()? as i64
+        },
+    ))
+}
+
+fn store_channel_id(channel_id: ChannelId, out: &mut Vec<u8>) {
+    store_i64(out, channel_id.get());
+}
+
+fn parse_channel_id(parser: &mut Parser) -> Result<ChannelId, &'static str> {
+    Ok(ChannelId::new(
+        if parser.version() >= version::SUPPORT_64_BIT_IDS {
+            parser.i64_()?
+        } else {
+            parser.i32_()? as i64
+        },
+    ))
+}
+
+fn store_chat_id(chat_id: ChatId, out: &mut Vec<u8>) {
+    store_i64(out, chat_id.get());
+}
+
+fn parse_chat_id(parser: &mut Parser) -> Result<ChatId, &'static str> {
+    Ok(ChatId::new(
+        if parser.version() >= version::SUPPORT_64_BIT_IDS {
+            parser.i64_()?
+        } else {
+            parser.i32_()? as i64
+        },
+    ))
+}
+
+fn parse_dialog_id(parser: &mut Parser) -> Result<DialogId, &'static str> {
+    Ok(DialogId::new(parser.i64_()?))
+}
+
+fn parse_message_id(parser: &mut Parser) -> Result<MessageId, &'static str> {
+    Ok(MessageId::new(parser.i64_()?))
+}
+
+/// `parse_caption` (MessageContent.cpp:3021-3032): the pre-`AddCaptionEntities`
+/// legacy re-derives the entities; the `check_utf8` half of that branch is
+/// unreachable on a Rust `String` (invalid UTF-8 fails the read instead).
+fn parse_caption(parser: &mut Parser) -> Result<FormattedText, &'static str> {
+    let text = parser.string()?;
+    if parser.version() >= version::ADD_CAPTION_ENTITIES {
+        let entities_len = parser.i32_()?;
+        if entities_len < 0 || parser.left_len() < entities_len as usize {
+            return Err("Wrong vector length");
+        }
+        let mut entities = Vec::with_capacity(entities_len as usize);
+        for _ in 0..entities_len {
+            entities.push(MessageEntity::parse(parser)?);
         }
         remove_empty_entities(&mut entities);
         Ok(FormattedText { text, entities })
     } else {
-        let mut text = input.string()?;
-        if !tdutils::utf8::check_utf8(text.as_bytes()) {
-            text.clear();
-        }
         let entities = find_entities(&text, false, true);
         Ok(FormattedText { text, entities })
     }
 }
 
-/// The `MessageContentType` value reader for [`parse_message_content`] —
-/// the inverse of the `as i32` the store writes. `None`/out-of-range
-/// values return `None` and degrade to `MessageUnsupported`, matching
-/// the C++ `default: is_bad = true` path.
-fn content_type_from_raw(raw: i32) -> Option<MessageContentType> {
-    let content_type = match raw {
-        0 => MessageContentType::Text,
-        1 => MessageContentType::Animation,
-        2 => MessageContentType::Audio,
-        3 => MessageContentType::Document,
-        4 => MessageContentType::Photo,
-        5 => MessageContentType::Sticker,
-        6 => MessageContentType::Video,
-        7 => MessageContentType::VoiceNote,
-        8 => MessageContentType::Contact,
-        9 => MessageContentType::Location,
-        10 => MessageContentType::Venue,
-        11 => MessageContentType::ChatCreate,
-        12 => MessageContentType::ChatChangeTitle,
-        13 => MessageContentType::ChatChangePhoto,
-        14 => MessageContentType::ChatDeletePhoto,
-        15 => MessageContentType::ChatDeleteHistory,
-        16 => MessageContentType::ChatAddUsers,
-        17 => MessageContentType::ChatJoinedByLink,
-        18 => MessageContentType::ChatDeleteUser,
-        19 => MessageContentType::ChatMigrateTo,
-        20 => MessageContentType::ChannelCreate,
-        21 => MessageContentType::ChannelMigrateFrom,
-        22 => MessageContentType::PinMessage,
-        23 => MessageContentType::Game,
-        24 => MessageContentType::GameScore,
-        25 => MessageContentType::ScreenshotTaken,
-        26 => MessageContentType::ChatSetTtl,
-        27 => MessageContentType::Unsupported,
-        28 => MessageContentType::Call,
-        29 => MessageContentType::Invoice,
-        30 => MessageContentType::PaymentSuccessful,
-        31 => MessageContentType::VideoNote,
-        32 => MessageContentType::ContactRegistered,
-        33 => MessageContentType::ExpiredPhoto,
-        34 => MessageContentType::ExpiredVideo,
-        35 => MessageContentType::LiveLocation,
-        36 => MessageContentType::CustomServiceAction,
-        37 => MessageContentType::WebsiteConnected,
-        38 => MessageContentType::PassportDataSent,
-        39 => MessageContentType::PassportDataReceived,
-        40 => MessageContentType::Poll,
-        41 => MessageContentType::Dice,
-        42 => MessageContentType::ProximityAlertTriggered,
-        43 => MessageContentType::GroupCall,
-        44 => MessageContentType::InviteToGroupCall,
-        45 => MessageContentType::ChatSetTheme,
-        46 => MessageContentType::WebViewDataSent,
-        47 => MessageContentType::WebViewDataReceived,
-        48 => MessageContentType::GiftPremium,
-        49 => MessageContentType::TopicCreate,
-        50 => MessageContentType::TopicEdit,
-        51 => MessageContentType::SuggestProfilePhoto,
-        52 => MessageContentType::WriteAccessAllowed,
-        53 => MessageContentType::RequestedDialog,
-        54 => MessageContentType::WebViewWriteAccessAllowed,
-        55 => MessageContentType::SetBackground,
-        56 => MessageContentType::Story,
-        57 => MessageContentType::WriteAccessAllowedByRequest,
-        58 => MessageContentType::GiftCode,
-        59 => MessageContentType::Giveaway,
-        60 => MessageContentType::GiveawayLaunch,
-        61 => MessageContentType::GiveawayResults,
-        62 => MessageContentType::GiveawayWinners,
-        63 => MessageContentType::ExpiredVideoNote,
-        64 => MessageContentType::ExpiredVoiceNote,
-        65 => MessageContentType::BoostApply,
-        66 => MessageContentType::DialogShared,
-        67 => MessageContentType::PaidMedia,
-        68 => MessageContentType::PaymentRefunded,
-        69 => MessageContentType::GiftStars,
-        70 => MessageContentType::PrizeStars,
-        71 => MessageContentType::StarGift,
-        72 => MessageContentType::StarGiftUnique,
-        73 => MessageContentType::PaidMessagesRefunded,
-        74 => MessageContentType::PaidMessagesPrice,
-        75 => MessageContentType::ConferenceCall,
-        76 => MessageContentType::ToDoList,
-        77 => MessageContentType::TodoCompletions,
-        78 => MessageContentType::TodoAppendTasks,
-        79 => MessageContentType::GiftTon,
-        80 => MessageContentType::SuggestedPostSuccess,
-        81 => MessageContentType::SuggestedPostRefund,
-        82 => MessageContentType::SuggestedPostApproval,
-        83 => MessageContentType::SuggestBirthday,
-        84 => MessageContentType::StarGiftPurchaseOffer,
-        85 => MessageContentType::StarGiftPurchaseOfferDeclined,
-        86 => MessageContentType::NewCreatorPending,
-        87 => MessageContentType::ChangeCreator,
-        88 => MessageContentType::NoForwardsToggle,
-        89 => MessageContentType::NoForwardsRequest,
-        90 => MessageContentType::ManagedBotCreated,
-        91 => MessageContentType::PollAppendAnswer,
-        92 => MessageContentType::PollDeleteAnswer,
-        93 => MessageContentType::RichText,
-        94 => MessageContentType::ChangeCommunity,
-        95 => MessageContentType::ChatJoinedViaCommunity,
-        _ => return None,
-    };
-    Some(content_type)
-}
-
-/// `store(const MessageContent *content, StorerT &storer)`
-/// (MessageContent.cpp:1830-3035).
-///
-/// The seven deferred payload types (Contact, ChatSetTheme, the StarGift
-/// family, RichText) have no [`MessageContent`] variant on this line
-/// (module-doc deferrals), so they cannot be constructed here; their
-/// parse side degrades to `MessageUnsupported` exactly like the C++
-/// `is_bad` fallback.
+/// `store(const MessageContent *, ...)` (MessageContent.cpp:1831-3021): the
+/// per-type store switch after the `MessageContentType` int.
 pub fn store_message_content(
-    ctx: &mut dyn ContentStoreContext,
     content: &MessageContent,
+    ctx: &dyn MessageContentStorage,
     out: &mut Vec<u8>,
 ) {
-    store_i32(out, content.get_type() as i32);
+    let content_type = content.get_type();
+    store_i32(out, content_type as i32);
     match content {
         MessageContent::Animation(m) => {
             ctx.store_animation(m.file_id, out);
-            store_flags::<1>(out, [m.has_spoiler]);
+            store_flags(out, [m.has_spoiler]);
             m.caption.store(out);
         }
         MessageContent::Audio(m) => {
             ctx.store_audio(m.file_id, out);
             m.caption.store(out);
             store_bool(out, true);
+        }
+        MessageContent::Contact(m) => {
+            m.contact.store(out);
         }
         MessageContent::Document(m) => {
             ctx.store_document(m.file_id, out);
@@ -4011,20 +4452,20 @@ pub fn store_message_content(
         MessageContent::Photo(m) => {
             let has_video_file_id = m.video_file_id.is_valid();
             store_photo(&m.photo, ctx, out);
-            store_flags::<2>(out, [m.has_spoiler, has_video_file_id]);
+            store_flags(out, [m.has_spoiler, has_video_file_id]);
             m.caption.store(out);
             if has_video_file_id {
                 ctx.store_video(m.video_file_id, out);
             }
         }
         MessageContent::Sticker(m) => {
-            ctx.store_sticker(m.file_id, false, out);
-            store_flags::<1>(out, [m.is_premium]);
+            ctx.store_sticker(m.file_id, out);
+            store_flags(out, [m.is_premium]);
         }
         MessageContent::Text(m) => {
             let has_web_page_id = m.web_page_id.is_valid();
             let has_web_page_url = !m.web_page_url.is_empty();
-            store_flags::<5>(
+            store_flags(
                 out,
                 [
                     has_web_page_id,
@@ -4056,7 +4497,7 @@ pub fn store_message_content(
             let has_start_timestamp = m.start_timestamp != 0;
             let has_storyboard_files = !m.storyboard_file_ids.is_empty();
             let has_storyboard_map_files = !m.storyboard_map_file_ids.is_empty();
-            store_flags::<7>(
+            store_flags(
                 out,
                 [
                     m.has_spoiler,
@@ -4113,7 +4554,7 @@ pub fn store_message_content(
             store_string(out, &m.title);
             store_i32(out, m.participant_user_ids.len() as i32);
             for user_id in &m.participant_user_ids {
-                store_i64(out, user_id.get());
+                store_user_id(*user_id, out);
             }
         }
         MessageContent::ChatChangeTitle(m) => {
@@ -4127,47 +4568,45 @@ pub fn store_message_content(
         MessageContent::ChatAddUsers(m) => {
             store_i32(out, m.user_ids.len() as i32);
             for user_id in &m.user_ids {
-                store_i64(out, user_id.get());
+                store_user_id(*user_id, out);
             }
         }
         MessageContent::ChatJoinedByLink(m) => {
-            store_flags::<1>(out, [m.is_approved]);
+            store_flags(out, [m.is_approved]);
         }
         MessageContent::ChatDeleteUser(m) => {
-            store_i64(out, m.user_id.get());
+            store_user_id(m.user_id, out);
         }
         MessageContent::ChatMigrateTo(m) => {
-            // `store(ChannelId)` — the C++ id is an int32.
-            store_i32(out, m.migrated_to_channel_id.get() as i32);
+            store_channel_id(m.migrated_to_channel_id, out);
         }
         MessageContent::ChannelCreate(m) => {
             store_string(out, &m.title);
         }
         MessageContent::ChannelMigrateFrom(m) => {
             store_string(out, &m.title);
-            // `store(ChatId)` — the C++ id is an int32.
-            store_i32(out, m.migrated_from_chat_id.get() as i32);
+            store_chat_id(m.migrated_from_chat_id, out);
         }
         MessageContent::PinMessage(m) => {
-            store_i32(out, m.message_id.get() as i32);
+            store_i64(out, m.message_id.get());
         }
         MessageContent::GameScore(m) => {
-            store_i32(out, m.game_message_id.get() as i32);
+            store_i64(out, m.game_message_id.get());
             store_i64(out, m.game_id);
             store_i32(out, m.score);
         }
         MessageContent::ScreenshotTaken(_) => {}
         MessageContent::ChatSetTtl(m) => {
             let has_from_user_id = m.from_user_id.is_valid();
-            store_flags::<1>(out, [has_from_user_id]);
+            store_flags(out, [has_from_user_id]);
             store_i32(out, m.ttl);
             if has_from_user_id {
-                store_i64(out, m.from_user_id.get());
+                store_user_id(m.from_user_id, out);
             }
         }
         MessageContent::Call(m) => {
             let has_call_access_hash = m.call_access_hash != 0;
-            store_flags::<2>(out, [m.is_video, has_call_access_hash]);
+            store_flags(out, [m.is_video, has_call_access_hash]);
             store_i64(out, m.call_id);
             store_i32(out, m.duration);
             store_i32(out, m.discard_reason.r#type as i32);
@@ -4185,7 +4624,7 @@ pub fn store_message_content(
             let is_correctly_stored = true;
             let has_invoice_dialog_id = m.invoice_dialog_id.is_valid();
             let has_subscription_until_date = m.subscription_until_date != 0;
-            store_flags::<11>(
+            store_flags(
                 out,
                 [
                     has_payload,
@@ -4209,8 +4648,8 @@ pub fn store_message_content(
             if has_shipping_option_id {
                 store_string(out, &m.shipping_option_id);
             }
-            if let Some(order_info) = &m.order_info {
-                store_order_info(order_info, out);
+            if has_order_info {
+                store_order_info(m.order_info.as_ref().unwrap(), out);
             }
             if has_telegram_payment_charge_id {
                 store_string(out, &m.telegram_payment_charge_id);
@@ -4219,7 +4658,7 @@ pub fn store_message_content(
                 store_string(out, &m.provider_payment_charge_id);
             }
             if has_invoice_message_id {
-                store_i32(out, m.invoice_message_id.get() as i32);
+                store_i64(out, m.invoice_message_id.get());
             }
             if has_invoice_dialog_id {
                 store_i64(out, m.invoice_dialog_id.get());
@@ -4253,13 +4692,13 @@ pub fn store_message_content(
         MessageContent::Poll(m) => {
             let has_caption = !m.caption.text.is_empty();
             let has_attached_media = m.attached_media.is_some();
-            store_flags::<2>(out, [has_caption, has_attached_media]);
-            store_i64(out, m.poll_id.get());
+            store_flags(out, [has_caption, has_attached_media]);
+            ctx.store_poll(m.poll_id, out);
             if has_caption {
                 m.caption.store(out);
             }
             if let Some(attached_media) = &m.attached_media {
-                store_message_content(ctx, attached_media, out);
+                store_message_content(attached_media, ctx, out);
             }
         }
         MessageContent::Dice(m) => {
@@ -4267,7 +4706,7 @@ pub fn store_message_content(
             let has_stake_ton_count = m.stake_ton_count != 0;
             let has_prize_ton_count = m.prize_ton_count != 0;
             let has_state_hash = !m.state_hash.is_empty();
-            store_flags::<5>(
+            store_flags(
                 out,
                 [
                     m.is_stake,
@@ -4300,7 +4739,7 @@ pub fn store_message_content(
         MessageContent::GroupCall(m) => {
             let has_duration = m.duration >= 0;
             let has_schedule_date = m.schedule_date > 0;
-            store_flags::<2>(out, [has_duration, has_schedule_date]);
+            store_flags(out, [has_duration, has_schedule_date]);
             store_i64(out, m.input_group_call_id.get_group_call_id());
             store_i64(out, m.input_group_call_id.get_access_hash());
             if has_duration {
@@ -4315,7 +4754,7 @@ pub fn store_message_content(
             store_i64(out, m.input_group_call_id.get_access_hash());
             store_i32(out, m.user_ids.len() as i32);
             for user_id in &m.user_ids {
-                store_i64(out, user_id.get());
+                store_user_id(*user_id, out);
             }
         }
         MessageContent::WebViewDataSent(m) => {
@@ -4329,7 +4768,7 @@ pub fn store_message_content(
             let has_crypto_amount = !m.crypto_currency.is_empty();
             let has_text = !m.text.text.is_empty();
             let has_days = true;
-            store_flags::<3>(out, [has_crypto_amount, has_text, has_days]);
+            store_flags(out, [has_crypto_amount, has_text, has_days]);
             store_string(out, &m.currency);
             store_i64(out, m.amount);
             store_i32(out, m.days);
@@ -4342,7 +4781,7 @@ pub fn store_message_content(
             }
         }
         MessageContent::TopicCreate(m) => {
-            store_flags::<1>(out, [m.title_missing]);
+            store_flags(out, [m.title_missing]);
             store_string(out, &m.title);
             store_forum_topic_icon(&m.icon, out);
         }
@@ -4355,7 +4794,7 @@ pub fn store_message_content(
         MessageContent::WriteAccessAllowed(_) => {}
         MessageContent::RequestedDialog(m) => {
             let has_one_shared_dialog = m.shared_dialog_ids.len() == 1;
-            store_flags::<1>(out, [has_one_shared_dialog]);
+            store_flags(out, [has_one_shared_dialog]);
             if has_one_shared_dialog {
                 store_i64(out, m.shared_dialog_ids[0].get());
             } else {
@@ -4371,15 +4810,14 @@ pub fn store_message_content(
         }
         MessageContent::SetBackground(m) => {
             let has_message_id = m.old_message_id.is_valid();
-            store_flags::<2>(out, [has_message_id, m.for_both]);
+            store_flags(out, [has_message_id, m.for_both]);
             if has_message_id {
-                store_i32(out, m.old_message_id.get() as i32);
+                store_i64(out, m.old_message_id.get());
             }
-            ctx.store_background_id(m.background_info.background_id, out);
-            store_background_type(&m.background_info.background_type, out);
+            store_background_info(&m.background_info, ctx, out);
         }
         MessageContent::Story(m) => {
-            store_flags::<1>(out, [m.via_mention]);
+            store_flags(out, [m.via_mention]);
             m.story_full_id.store(out);
         }
         MessageContent::WriteAccessAllowedByRequest(_) => {}
@@ -4391,7 +4829,7 @@ pub fn store_message_content(
             let has_crypto_amount = m.crypto_amount > 0;
             let has_text = !m.text.text.is_empty();
             let has_days = true;
-            store_flags::<9>(
+            store_flags(
                 out,
                 [
                     m.via_giveaway,
@@ -4428,7 +4866,7 @@ pub fn store_message_content(
         }
         MessageContent::Giveaway(m) => {
             let has_star_count = m.star_count != 0;
-            store_flags::<1>(out, [has_star_count]);
+            store_flags(out, [has_star_count]);
             store_giveaway_parameters(&m.giveaway_parameters, out);
             store_i32(out, m.quantity);
             store_i32(out, m.months);
@@ -4438,7 +4876,7 @@ pub fn store_message_content(
         }
         MessageContent::GiveawayLaunch(m) => {
             let has_star_count = m.star_count != 0;
-            store_flags::<1>(out, [has_star_count]);
+            store_flags(out, [has_star_count]);
             if has_star_count {
                 store_i64(out, m.star_count);
             }
@@ -4447,7 +4885,7 @@ pub fn store_message_content(
             let has_winner_count = m.winner_count != 0;
             let has_unclaimed_count = m.unclaimed_count != 0;
             let has_giveaway_message_id = m.giveaway_message_id.is_valid();
-            store_flags::<4>(
+            store_flags(
                 out,
                 [
                     has_winner_count,
@@ -4463,7 +4901,7 @@ pub fn store_message_content(
                 store_i32(out, m.unclaimed_count);
             }
             if has_giveaway_message_id {
-                store_i32(out, m.giveaway_message_id.get() as i32);
+                store_i64(out, m.giveaway_message_id.get());
             }
         }
         MessageContent::GiveawayWinners(m) => {
@@ -4477,7 +4915,7 @@ pub fn store_message_content(
             let has_unclaimed_count = m.unclaimed_count != 0;
             let has_winner_user_ids = !m.winner_user_ids.is_empty();
             let has_star_count = m.star_count != 0;
-            store_flags::<12>(
+            store_flags(
                 out,
                 [
                     m.only_new_subscribers,
@@ -4495,7 +4933,7 @@ pub fn store_message_content(
                 ],
             );
             if has_giveaway_message_id {
-                store_i32(out, m.giveaway_message_id.get() as i32);
+                store_i64(out, m.giveaway_message_id.get());
             }
             if has_boosted_channel_id {
                 store_i64(out, m.boosted_channel_id.get());
@@ -4521,7 +4959,7 @@ pub fn store_message_content(
             if has_winner_user_ids {
                 store_i32(out, m.winner_user_ids.len() as i32);
                 for user_id in &m.winner_user_ids {
-                    store_i64(out, user_id.get());
+                    store_user_id(*user_id, out);
                 }
             }
             if has_star_count {
@@ -4545,10 +4983,10 @@ pub fn store_message_content(
         MessageContent::PaidMedia(m) => {
             let has_caption = !m.caption.text.is_empty();
             let has_payload = !m.payload.is_empty();
-            store_flags::<2>(out, [has_caption, has_payload]);
+            store_flags(out, [has_caption, has_payload]);
             store_i32(out, m.media.len() as i32);
-            for extended_media in &m.media {
-                store_message_extended_media(extended_media, ctx, out);
+            for media in &m.media {
+                store_message_extended_media(media, ctx, out);
             }
             if has_caption {
                 m.caption.store(out);
@@ -4560,7 +4998,7 @@ pub fn store_message_content(
         }
         MessageContent::PaymentRefunded(m) => {
             let has_invoice_payload = !m.invoice_payload.is_empty();
-            store_flags::<1>(out, [has_invoice_payload]);
+            store_flags(out, [has_invoice_payload]);
             store_i64(out, m.dialog_id.get());
             store_string(out, &m.currency);
             store_i64(out, m.total_amount);
@@ -4573,7 +5011,7 @@ pub fn store_message_content(
         MessageContent::GiftStars(m) => {
             let has_crypto_amount = !m.crypto_currency.is_empty();
             let has_transaction_id = !m.transaction_id.is_empty();
-            store_flags::<2>(out, [has_crypto_amount, has_transaction_id]);
+            store_flags(out, [has_crypto_amount, has_transaction_id]);
             store_string(out, &m.currency);
             store_i64(out, m.amount);
             store_i64(out, m.star_count);
@@ -4586,11 +5024,11 @@ pub fn store_message_content(
             }
         }
         MessageContent::PrizeStars(m) => {
-            store_flags::<1>(out, [m.is_unclaimed]);
+            store_flags(out, [m.is_unclaimed]);
             store_i64(out, m.star_count);
             store_string(out, &m.transaction_id);
             store_i64(out, m.boosted_dialog_id.get());
-            store_i32(out, m.giveaway_message_id.get() as i32);
+            store_i64(out, m.giveaway_message_id.get());
         }
         MessageContent::PaidMessagesRefunded(m) => {
             store_flags::<0>(out, []);
@@ -4598,13 +5036,13 @@ pub fn store_message_content(
             store_i64(out, m.star_count);
         }
         MessageContent::PaidMessagesPrice(m) => {
-            store_flags::<1>(out, [m.broadcast_messages_allowed]);
+            store_flags(out, [m.broadcast_messages_allowed]);
             store_i64(out, m.star_count);
         }
         MessageContent::ConferenceCall(m) => {
             let has_duration = m.duration != 0;
             let has_other_participant_dialog_ids = !m.other_participant_dialog_ids.is_empty();
-            store_flags::<5>(
+            store_flags(
                 out,
                 [
                     m.is_active,
@@ -4637,7 +5075,7 @@ pub fn store_message_content(
             let has_to_do_message_id = m.to_do_message_id.is_valid();
             let has_completed_task_ids = !m.completed_task_ids.is_empty();
             let has_incompleted_task_ids = !m.incompleted_task_ids.is_empty();
-            store_flags::<3>(
+            store_flags(
                 out,
                 [
                     has_to_do_message_id,
@@ -4646,7 +5084,7 @@ pub fn store_message_content(
                 ],
             );
             if has_to_do_message_id {
-                store_i32(out, m.to_do_message_id.get() as i32);
+                store_i64(out, m.to_do_message_id.get());
             }
             if has_completed_task_ids {
                 store_i32_vec(out, &m.completed_task_ids);
@@ -4658,9 +5096,9 @@ pub fn store_message_content(
         MessageContent::TodoAppendTasks(m) => {
             let has_to_do_message_id = m.to_do_message_id.is_valid();
             let has_items = !m.items.is_empty();
-            store_flags::<2>(out, [has_to_do_message_id, has_items]);
+            store_flags(out, [has_to_do_message_id, has_items]);
             if has_to_do_message_id {
-                store_i32(out, m.to_do_message_id.get() as i32);
+                store_i64(out, m.to_do_message_id.get());
             }
             if has_items {
                 store_i32(out, m.items.len() as i32);
@@ -4671,7 +5109,7 @@ pub fn store_message_content(
         }
         MessageContent::GiftTon(m) => {
             let has_transaction_id = !m.transaction_id.is_empty();
-            store_flags::<1>(out, [has_transaction_id]);
+            store_flags(out, [has_transaction_id]);
             store_string(out, &m.currency);
             store_i64(out, m.amount);
             store_string(out, &m.crypto_currency);
@@ -4683,9 +5121,9 @@ pub fn store_message_content(
         MessageContent::SuggestedPostSuccess(m) => {
             let has_suggested_post_message_id = m.suggested_post_message_id.is_valid();
             let has_amount = m.amount != CurrencyAmount::default();
-            store_flags::<2>(out, [has_suggested_post_message_id, has_amount]);
+            store_flags(out, [has_suggested_post_message_id, has_amount]);
             if has_suggested_post_message_id {
-                store_i32(out, m.suggested_post_message_id.get() as i32);
+                store_i64(out, m.suggested_post_message_id.get());
             }
             if has_amount {
                 store_currency_amount(&m.amount, out);
@@ -4693,17 +5131,17 @@ pub fn store_message_content(
         }
         MessageContent::SuggestedPostRefund(m) => {
             let has_suggested_post_message_id = m.suggested_post_message_id.is_valid();
-            store_flags::<2>(out, [has_suggested_post_message_id, m.is_payer_initiated]);
+            store_flags(out, [has_suggested_post_message_id, m.is_payer_initiated]);
             if has_suggested_post_message_id {
-                store_i32(out, m.suggested_post_message_id.get() as i32);
+                store_i64(out, m.suggested_post_message_id.get());
             }
         }
         MessageContent::SuggestedPostApproval(m) => {
             let has_suggested_post_message_id = m.suggested_post_message_id.is_valid();
             let has_comment = !m.comment.is_empty();
-            let has_price = m.price != SuggestedPostPrice::default();
+            let has_price = !m.price.is_empty();
             let has_send_date = m.send_date != 0;
-            store_flags::<6>(
+            store_flags(
                 out,
                 [
                     has_suggested_post_message_id,
@@ -4715,7 +5153,7 @@ pub fn store_message_content(
                 ],
             );
             if has_suggested_post_message_id {
-                store_i32(out, m.suggested_post_message_id.get() as i32);
+                store_i64(out, m.suggested_post_message_id.get());
             }
             if has_price {
                 store_suggested_post_price(&m.price, out);
@@ -4733,50 +5171,50 @@ pub fn store_message_content(
         }
         MessageContent::NewCreatorPending(m) => {
             let has_new_creator_user_id = m.new_creator_user_id.is_valid();
-            store_flags::<1>(out, [has_new_creator_user_id]);
+            store_flags(out, [has_new_creator_user_id]);
             if has_new_creator_user_id {
-                store_i64(out, m.new_creator_user_id.get());
+                store_user_id(m.new_creator_user_id, out);
             }
         }
         MessageContent::ChangeCreator(m) => {
             store_flags::<0>(out, []);
-            store_i64(out, m.new_creator_user_id.get());
+            store_user_id(m.new_creator_user_id, out);
         }
         MessageContent::NoForwardsToggle(m) => {
             let has_request_message_id = m.request_message_id.is_valid();
-            store_flags::<3>(out, [m.prev_value, m.new_value, has_request_message_id]);
+            store_flags(out, [m.prev_value, m.new_value, has_request_message_id]);
             if has_request_message_id {
-                store_i32(out, m.request_message_id.get() as i32);
+                store_i64(out, m.request_message_id.get());
             }
         }
         MessageContent::NoForwardsRequest(m) => {
-            store_flags::<3>(out, [m.is_expired, m.prev_value, m.new_value]);
+            store_flags(out, [m.is_expired, m.prev_value, m.new_value]);
         }
         MessageContent::ManagedBotCreated(m) => {
             store_flags::<0>(out, []);
-            store_i64(out, m.bot_user_id.get());
+            store_user_id(m.bot_user_id, out);
         }
         MessageContent::PollAppendAnswer(m) => {
             let has_poll_message_id = m.poll_message_id.is_valid();
-            store_flags::<1>(out, [has_poll_message_id]);
+            store_flags(out, [has_poll_message_id]);
             if has_poll_message_id {
-                store_i32(out, m.poll_message_id.get() as i32);
+                store_i64(out, m.poll_message_id.get());
             }
             m.text.store(out);
             store_string(out, &m.data);
         }
         MessageContent::PollDeleteAnswer(m) => {
             let has_poll_message_id = m.poll_message_id.is_valid();
-            store_flags::<1>(out, [has_poll_message_id]);
+            store_flags(out, [has_poll_message_id]);
             if has_poll_message_id {
-                store_i32(out, m.poll_message_id.get() as i32);
+                store_i64(out, m.poll_message_id.get());
             }
             m.text.store(out);
             store_string(out, &m.data);
         }
         MessageContent::ChangeCommunity(m) => {
             let has_community_id = m.community_id.is_valid();
-            store_flags::<1>(out, [has_community_id]);
+            store_flags(out, [has_community_id]);
             if has_community_id {
                 m.community_id.store(out);
             }
@@ -4788,2420 +5226,2537 @@ pub fn store_message_content(
     }
 }
 
-/// `SuggestedPostPrice::store` (SuggestedPostPrice.hpp:6-16).
-fn store_suggested_post_price(price: &SuggestedPostPrice, out: &mut Vec<u8>) {
-    let has_amount = price.amount != 0;
-    store_flags::<1>(out, [has_amount]);
-    store_i32(out, price.r#type as i32);
-    if has_amount {
-        store_i64(out, price.amount);
-    }
-}
-
-/// `SuggestedPostPrice::parse` (SuggestedPostPrice.hpp:18-...).
-fn parse_suggested_post_price(input: &mut Parser) -> Result<SuggestedPostPrice, &'static str> {
-    let [has_amount] = input.parse_flags::<1>()?;
-    let type_raw = input.i32_()?;
-    let r#type = match type_raw {
-        0 => SuggestedPostPriceType::None,
-        1 => SuggestedPostPriceType::Star,
-        2 => SuggestedPostPriceType::Ton,
-        _ => SuggestedPostPriceType::default(),
-    };
-    let amount = if has_amount { input.i64_()? } else { 0 };
-    Ok(SuggestedPostPrice { r#type, amount })
-}
-
-/// The `BackgroundFill::get_type` discriminator (BackgroundType.h:48-57).
-fn background_fill_get_type(fill: &BackgroundFill) -> BackgroundFillType {
-    fill.get_type()
-}
-
-/// `BackgroundType::store` (BackgroundType.hpp:6-40).
-fn store_background_type(background_type: &BackgroundType, out: &mut Vec<u8>) {
-    let has_fill = background_type.fill.top_color != 0 || background_type.fill.bottom_color != 0;
-    let has_intensity = background_type.intensity != 0;
-    let fill_type = background_fill_get_type(&background_type.fill);
-    let is_gradient = matches!(fill_type, BackgroundFillType::Gradient);
-    let is_freeform_gradient = matches!(fill_type, BackgroundFillType::FreeformGradient);
-    let has_theme_name = !background_type.theme_name.is_empty();
-    store_flags::<7>(
-        out,
-        [
-            background_type.is_blurred,
-            background_type.is_moving,
-            has_fill,
-            has_intensity,
-            is_gradient,
-            is_freeform_gradient,
-            has_theme_name,
-        ],
-    );
-    store_i32(out, background_type.r#type as i32);
-    if is_freeform_gradient {
-        store_i32(out, background_type.fill.top_color);
-        store_i32(out, background_type.fill.bottom_color);
-        store_i32(out, background_type.fill.third_color);
-        store_i32(out, background_type.fill.fourth_color);
-    } else if has_fill {
-        store_i32(out, background_type.fill.top_color);
-        if is_gradient {
-            store_i32(out, background_type.fill.bottom_color);
-            store_i32(out, background_type.fill.rotation_angle);
-        }
-    }
-    if has_intensity {
-        store_i32(out, background_type.intensity);
-    }
-    if has_theme_name {
-        store_string(out, &background_type.theme_name);
-    }
-}
-
-/// `BackgroundType::parse` (BackgroundType.hpp:42-...).
-fn parse_background_type(input: &mut Parser) -> Result<BackgroundType, &'static str> {
-    let [
-        is_blurred,
-        is_moving,
-        has_fill,
-        has_intensity,
-        is_gradient,
-        is_freeform_gradient,
-        has_theme_name,
-    ] = input.parse_flags::<7>()?;
-    let type_raw = input.i32_()?;
-    let r#type = match type_raw {
-        0 => BackgroundTypeType::Wallpaper,
-        1 => BackgroundTypeType::Pattern,
-        2 => BackgroundTypeType::Fill,
-        3 => BackgroundTypeType::ChatTheme,
-        _ => BackgroundTypeType::default(),
-    };
-    let fill = if is_freeform_gradient {
-        BackgroundFill {
-            top_color: input.i32_()?,
-            bottom_color: input.i32_()?,
-            rotation_angle: 0,
-            third_color: input.i32_()?,
-            fourth_color: input.i32_()?,
-        }
-    } else if has_fill {
-        let top_color = input.i32_()?;
-        if is_gradient {
-            BackgroundFill {
-                top_color,
-                bottom_color: input.i32_()?,
-                rotation_angle: input.i32_()?,
-                third_color: -1,
-                fourth_color: -1,
-            }
-        } else {
-            BackgroundFill {
-                top_color,
-                bottom_color: top_color,
-                rotation_angle: 0,
-                third_color: -1,
-                fourth_color: -1,
-            }
-        }
-    } else {
-        BackgroundFill {
-            top_color: 0,
-            bottom_color: 0,
-            rotation_angle: 0,
-            third_color: -1,
-            fourth_color: -1,
-        }
-    };
-    let intensity = if has_intensity { input.i32_()? } else { 0 };
-    let theme_name = if has_theme_name {
-        input.string()?
-    } else {
-        String::new()
-    };
-    Ok(BackgroundType {
-        r#type,
-        is_blurred,
-        is_moving,
-        intensity,
-        fill,
-        theme_name,
-    })
-}
-
-/// The `MessageId` value reader — the C++ id is an int32 on the wire
-/// (the Rust model widens it to i64).
-fn parse_message_id(input: &mut Parser) -> Result<MessageId, &'static str> {
-    Ok(MessageId::new(i64::from(input.i32_()?)))
-}
-
-/// The C++ `is_bad → MessageUnsupported(0)` fallback record.
-fn unsupported_content() -> MessageContent {
-    MessageContent::Unsupported(MessageUnsupported { version: 0 })
-}
-
-/// `Photo::is_bad` (Photo.h:51-61) — an empty photo or any size without
-/// a valid file id makes the record unusable.
-fn photo_is_bad(photo: &Photo) -> bool {
-    photo.is_empty()
-        || photo
-            .photos
-            .iter()
-            .any(|photo_size| !photo_size.file_id.is_valid())
-}
-
-/// The `MessageExtendedMedia::Type` value reader — the inverse of the
-/// `as i32` the store writes; unknown values keep the enum default,
-/// exactly like the C++ enum assignment.
-fn message_extended_media_type_from_raw(raw: i32) -> MessageExtendedMediaType {
-    match raw {
-        0 => MessageExtendedMediaType::Empty,
-        1 => MessageExtendedMediaType::Unsupported,
-        2 => MessageExtendedMediaType::Preview,
-        3 => MessageExtendedMediaType::Photo,
-        4 => MessageExtendedMediaType::Video,
-        _ => MessageExtendedMediaType::default(),
-    }
-}
-
-/// The `SecureValueType` value reader for [`parse_message_content`] —
-/// the inverse of the `as i32` the store writes; unknown values keep
-/// the enum default, exactly like the C++ enum assignment.
-fn secure_value_type_from_raw(raw: i32) -> SecureValueType {
-    match raw {
-        0 => SecureValueType::None,
-        1 => SecureValueType::PersonalDetails,
-        2 => SecureValueType::Passport,
-        3 => SecureValueType::DriverLicense,
-        4 => SecureValueType::IdentityCard,
-        5 => SecureValueType::InternalPassport,
-        6 => SecureValueType::Address,
-        7 => SecureValueType::UtilityBill,
-        8 => SecureValueType::BankStatement,
-        9 => SecureValueType::RentalAgreement,
-        10 => SecureValueType::PassportRegistration,
-        11 => SecureValueType::TemporaryRegistration,
-        12 => SecureValueType::PhoneNumber,
-        13 => SecureValueType::EmailAddress,
-        _ => SecureValueType::default(),
-    }
-}
-
-/// `parse(unique_ptr<MessageContent> &content, ParserT &parser)`
-/// (MessageContent.cpp:3048-4505).
-///
-/// Parse errors and the C++ `is_bad` validations all degrade to
-/// [`unsupported_content`]. The seven deferred payload types (Contact,
-/// ChatSetTheme, StarGift, StarGiftUnique, StarGiftPurchaseOffer,
-/// StarGiftPurchaseOfferDeclined, RichText) have no model to rebuild on
-/// this line and degrade the same way — the C++ degrades to the same
-/// record for any type it cannot rebuild (`[deferred-variant]`).
+/// `parse(unique_ptr<MessageContent> &, ...)` (MessageContent.cpp:3034-4506):
+/// the per-type parse switch after the `MessageContentType` int. Unknown
+/// types return `MessageUnsupported(0)` with the remainder unconsumed, like
+/// the C++ `default:` arm; a truncated blob is a hard `Err`.
 pub fn parse_message_content(
-    ctx: &mut dyn ContentStoreContext,
-    input: &mut Parser,
-) -> MessageContent {
-    let raw = match input.i32_() {
-        Ok(raw) => raw,
-        Err(_) => return unsupported_content(),
+    parser: &mut Parser,
+    ctx: &mut dyn MessageContentStorage,
+) -> Result<MessageContent, &'static str> {
+    let type_raw = parser.i32_()?;
+    let content_type = MessageContentType::from_raw(type_raw);
+    let Some(content_type) = content_type else {
+        // The C++ `default: is_bad = true` arm (MessageContent.cpp:4499) —
+        // known-to-a-newer-binary and the six unmodeled types land here.
+        tdutils::log_error!("Load a message with an invalid content of type {type_raw}");
+        return Ok(MessageContent::Unsupported(MessageUnsupported {
+            version: 0,
+        }));
     };
-    let content_type = match content_type_from_raw(raw) {
-        Some(content_type) => content_type,
-        None => {
-            tdutils::log_error!("Load a message with an invalid content of type {}", raw);
-            return unsupported_content();
+    let mut is_bad = false;
+    let content = match content_type {
+        MessageContentType::Animation => {
+            let file_id = ctx.parse_animation(parser)?;
+            let mut has_spoiler = false;
+            if parser.version() >= version::ADD_MESSAGE_MEDIA_SPOILER {
+                has_spoiler = parser.parse_flags::<1>()?[0];
+            }
+            let caption = parse_caption(parser)?;
+            is_bad = !file_id.is_valid();
+            MessageContent::Animation(MessageAnimation {
+                file_id,
+                caption,
+                has_spoiler,
+            })
         }
-    };
-    let parsed: Result<MessageContent, &'static str> =
-        (|| -> Result<MessageContent, &'static str> {
-            match content_type {
-                MessageContentType::Animation => {
-                    let file_id = ctx.parse_animation(input)?;
-                    let has_spoiler = if input.version() >= version::ADD_MESSAGE_MEDIA_SPOILER {
-                        input.parse_flags::<1>()?[0]
-                    } else {
-                        false
-                    };
-                    let caption = parse_caption(input)?;
+        MessageContentType::Audio => {
+            let file_id = ctx.parse_audio(parser)?;
+            let caption = parse_caption(parser)?;
+            let _legacy_is_listened = parser.bool()?;
+            is_bad = !file_id.is_valid();
+            MessageContent::Audio(MessageAudio { file_id, caption })
+        }
+        MessageContentType::Contact => {
+            let contact = Contact::parse_from(parser)?;
+            MessageContent::Contact(MessageContact { contact })
+        }
+        MessageContentType::Document => {
+            let file_id = ctx.parse_document(parser)?;
+            let caption = parse_caption(parser)?;
+            is_bad = !file_id.is_valid();
+            MessageContent::Document(MessageDocument { file_id, caption })
+        }
+        MessageContentType::Game => MessageContent::Game(MessageGame {
+            game: parse_game(parser, ctx)?,
+        }),
+        MessageContentType::Invoice => MessageContent::Invoice(MessageInvoice {
+            input_invoice: parse_input_invoice(parser, ctx)?,
+        }),
+        MessageContentType::LiveLocation => {
+            let location = parse_location(parser)?;
+            let period = parser.i32_()?;
+            let heading = if parser.version() >= version::ADD_LIVE_LOCATION_HEADING {
+                parser.i32_()?
+            } else {
+                0
+            };
+            let proximity_alert_radius =
+                if parser.version() >= version::ADD_LIVE_LOCATION_PROXIMITY_ALERT_DISTANCE {
+                    parser.i32_()?
+                } else {
+                    0
+                };
+            if period <= 0 {
+                is_bad = true;
+            }
+            MessageContent::LiveLocation(MessageLiveLocation {
+                location,
+                period,
+                heading,
+                proximity_alert_radius,
+            })
+        }
+        MessageContentType::Location => MessageContent::Location(MessageLocation {
+            location: parse_location(parser)?,
+        }),
+        MessageContentType::Photo => {
+            let photo = parse_photo(parser, ctx)?;
+            is_bad |= photo_is_bad(&photo);
+            let mut has_spoiler = false;
+            let mut has_video_file_id = false;
+            if parser.version() >= version::ADD_MESSAGE_MEDIA_SPOILER {
+                let flags = parser.parse_flags::<2>()?;
+                has_spoiler = flags[0];
+                has_video_file_id = flags[1];
+            }
+            let caption = parse_caption(parser)?;
+            let video_file_id = if has_video_file_id {
+                ctx.parse_video(parser)?
+            } else {
+                FileId::default()
+            };
+            MessageContent::Photo(MessagePhoto {
+                photo,
+                video_file_id,
+                caption,
+                has_spoiler,
+            })
+        }
+        MessageContentType::Sticker => {
+            let file_id = ctx.parse_sticker(parser)?;
+            let mut is_premium = false;
+            if parser.version() >= version::ADD_MESSAGE_STICKER_FLAGS {
+                is_premium = parser.parse_flags::<1>()?[0];
+            }
+            is_bad = !file_id.is_valid();
+            MessageContent::Sticker(MessageSticker {
+                file_id,
+                is_premium,
+            })
+        }
+        MessageContentType::Text => {
+            let mut has_web_page_id = true;
+            let mut force_small_media = false;
+            let mut force_large_media = false;
+            let mut has_web_page_url = false;
+            let mut skip_web_page_confirmation = false;
+            if parser.version() >= version::ADD_MESSAGE_TEXT_FLAGS {
+                let flags = parser.parse_flags::<5>()?;
+                has_web_page_id = flags[0];
+                force_small_media = flags[1];
+                force_large_media = flags[2];
+                has_web_page_url = flags[3];
+                skip_web_page_confirmation = flags[4];
+            }
+            let text = parse_formatted_text(parser)?;
+            let web_page_id = if has_web_page_id {
+                WebPageId::new(parser.i64_()?)
+            } else {
+                WebPageId::default()
+            };
+            let web_page_url = if has_web_page_url {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            if has_web_page_url && has_web_page_id {
+                ctx.on_load_web_page_url_from_database(web_page_id, &web_page_url);
+            }
+            MessageContent::Text(MessageText {
+                text,
+                web_page_id,
+                force_small_media,
+                force_large_media,
+                skip_web_page_confirmation,
+                web_page_url,
+            })
+        }
+        MessageContentType::Unsupported => {
+            let version_ = if parser.version() >= version::ADD_MESSAGE_UNSUPPORTED_VERSION {
+                parser.i32_()?
+            } else {
+                0
+            };
+            MessageContent::Unsupported(MessageUnsupported { version: version_ })
+        }
+        MessageContentType::Venue => MessageContent::Venue(MessageVenue {
+            venue: parse_venue(parser)?,
+        }),
+        MessageContentType::Video => {
+            let file_id = ctx.parse_video(parser)?;
+            let mut has_spoiler = false;
+            let mut has_alternative_videos = false;
+            let mut has_hls_files = false;
+            let mut has_cover = false;
+            let mut has_start_timestamp = false;
+            let mut has_storyboard_files = false;
+            let mut has_storyboard_map_files = false;
+            if parser.version() >= version::ADD_MESSAGE_MEDIA_SPOILER {
+                let flags = parser.parse_flags::<7>()?;
+                has_spoiler = flags[0];
+                has_alternative_videos = flags[1];
+                has_hls_files = flags[2];
+                has_cover = flags[3];
+                has_start_timestamp = flags[4];
+                has_storyboard_files = flags[5];
+                has_storyboard_map_files = flags[6];
+            }
+            let caption = parse_caption(parser)?;
+            let mut alternative_file_ids = Vec::new();
+            if has_alternative_videos {
+                let video_count = parser.i32_()?;
+                if video_count < 0 || parser.left_len() < video_count as usize {
+                    return Err("Wrong vector length");
+                }
+                for _ in 0..video_count {
+                    let file_id = ctx.parse_video(parser)?;
                     if !file_id.is_valid() {
-                        return Ok(unsupported_content());
+                        is_bad = true;
+                    } else {
+                        alternative_file_ids.push(file_id);
                     }
-                    Ok(MessageContent::Animation(MessageAnimation {
-                        file_id,
-                        caption,
-                        has_spoiler,
-                    }))
-                }
-                MessageContentType::Audio => {
-                    let file_id = ctx.parse_audio(input)?;
-                    let caption = parse_caption(input)?;
-                    let _legacy_is_listened = input.bool()?;
-                    if !file_id.is_valid() {
-                        return Ok(unsupported_content());
-                    }
-                    Ok(MessageContent::Audio(MessageAudio { file_id, caption }))
-                }
-                MessageContentType::Contact => Err("[deferred-variant] MessageContact"),
-                MessageContentType::Document => {
-                    let file_id = ctx.parse_document(input)?;
-                    let caption = parse_caption(input)?;
-                    if !file_id.is_valid() {
-                        return Ok(unsupported_content());
-                    }
-                    Ok(MessageContent::Document(MessageDocument {
-                        file_id,
-                        caption,
-                    }))
-                }
-                MessageContentType::Game => Ok(MessageContent::Game(MessageGame {
-                    game: parse_game(ctx, input)?,
-                })),
-                MessageContentType::Invoice => Ok(MessageContent::Invoice(MessageInvoice {
-                    input_invoice: parse_input_invoice(ctx, input)?,
-                })),
-                MessageContentType::LiveLocation => {
-                    let location = parse_location(input)?;
-                    let period = input.i32_()?;
-                    let heading = if input.version() >= version::ADD_LIVE_LOCATION_HEADING {
-                        input.i32_()?
-                    } else {
-                        0
-                    };
-                    let proximity_alert_radius =
-                        if input.version() >= version::ADD_LIVE_LOCATION_PROXIMITY_ALERT_DISTANCE {
-                            input.i32_()?
-                        } else {
-                            0
-                        };
-                    if period <= 0 {
-                        return Ok(unsupported_content());
-                    }
-                    Ok(MessageContent::LiveLocation(MessageLiveLocation {
-                        location,
-                        period,
-                        heading,
-                        proximity_alert_radius,
-                    }))
-                }
-                MessageContentType::Location => Ok(MessageContent::Location(MessageLocation {
-                    location: parse_location(input)?,
-                })),
-                MessageContentType::Photo => {
-                    let photo = parse_photo(ctx, input)?;
-                    if photo_is_bad(&photo) {
-                        return Ok(unsupported_content());
-                    }
-                    let (has_spoiler, has_video_file_id) =
-                        if input.version() >= version::ADD_MESSAGE_MEDIA_SPOILER {
-                            let flags = input.parse_flags::<2>()?;
-                            (flags[0], flags[1])
-                        } else {
-                            (false, false)
-                        };
-                    let caption = parse_caption(input)?;
-                    let video_file_id = if has_video_file_id {
-                        ctx.parse_video(input)?
-                    } else {
-                        FileId::default()
-                    };
-                    Ok(MessageContent::Photo(MessagePhoto {
-                        photo,
-                        video_file_id,
-                        caption,
-                        has_spoiler,
-                    }))
-                }
-                MessageContentType::Sticker => {
-                    let file_id = ctx.parse_sticker(false, input)?;
-                    let is_premium = if input.version() >= version::ADD_MESSAGE_STICKER_FLAGS {
-                        input.parse_flags::<1>()?[0]
-                    } else {
-                        false
-                    };
-                    if !file_id.is_valid() {
-                        return Ok(unsupported_content());
-                    }
-                    Ok(MessageContent::Sticker(MessageSticker {
-                        file_id,
-                        is_premium,
-                    }))
-                }
-                MessageContentType::Text => {
-                    let (
-                        has_web_page_id,
-                        force_small_media,
-                        force_large_media,
-                        has_web_page_url,
-                        skip_web_page_confirmation,
-                    ) = if input.version() >= version::ADD_MESSAGE_TEXT_FLAGS {
-                        let flags = input.parse_flags::<5>()?;
-                        (flags[0], flags[1], flags[2], flags[3], flags[4])
-                    } else {
-                        (true, false, false, false, false)
-                    };
-                    let text = FormattedText::parse(input)?;
-                    let web_page_id = if has_web_page_id {
-                        WebPageId::new(input.i64_()?)
-                    } else {
-                        WebPageId::default()
-                    };
-                    let web_page_url = if has_web_page_url {
-                        input.string()?
-                    } else {
-                        String::new()
-                    };
-                    if has_web_page_url && has_web_page_id {
-                        ctx.on_loaded_web_page_url(web_page_id, &web_page_url);
-                    }
-                    Ok(MessageContent::Text(MessageText {
-                        text,
-                        web_page_id,
-                        force_small_media,
-                        force_large_media,
-                        skip_web_page_confirmation,
-                        web_page_url,
-                    }))
-                }
-                MessageContentType::Unsupported => {
-                    let version_value =
-                        if input.version() >= version::ADD_MESSAGE_UNSUPPORTED_VERSION {
-                            input.i32_()?
-                        } else {
-                            0
-                        };
-                    Ok(MessageContent::Unsupported(MessageUnsupported {
-                        version: version_value,
-                    }))
-                }
-                MessageContentType::Venue => Ok(MessageContent::Venue(MessageVenue {
-                    venue: parse_venue(input)?,
-                })),
-                MessageContentType::Video => {
-                    let file_id = ctx.parse_video(input)?;
-                    let (
-                        has_spoiler,
-                        has_alternative_videos,
-                        has_hls_files,
-                        has_cover,
-                        has_start_timestamp,
-                        has_storyboard_files,
-                        has_storyboard_map_files,
-                    ) = if input.version() >= version::ADD_MESSAGE_MEDIA_SPOILER {
-                        let flags = input.parse_flags::<7>()?;
-                        (
-                            flags[0], flags[1], flags[2], flags[3], flags[4], flags[5], flags[6],
-                        )
-                    } else {
-                        (false, false, false, false, false, false, false)
-                    };
-                    let caption = parse_caption(input)?;
-                    let mut is_bad = !file_id.is_valid();
-                    let mut alternative_file_ids = Vec::new();
-                    if has_alternative_videos {
-                        let count = input.i32_()?;
-                        for _ in 0..count.max(0) {
-                            let alternative = ctx.parse_video(input)?;
-                            if !alternative.is_valid() {
-                                is_bad = true;
-                            } else {
-                                alternative_file_ids.push(alternative);
-                            }
-                        }
-                    }
-                    let mut hls_file_ids = Vec::new();
-                    if has_hls_files {
-                        let count = input.i32_()?;
-                        for _ in 0..count.max(0) {
-                            let hls = ctx.parse_document(input)?;
-                            if !hls.is_valid() {
-                                is_bad = true;
-                            } else {
-                                hls_file_ids.push(hls);
-                            }
-                        }
-                    }
-                    let cover = if has_cover {
-                        parse_photo(ctx, input)?
-                    } else {
-                        Photo::default()
-                    };
-                    let start_timestamp = if has_start_timestamp {
-                        input.i32_()?
-                    } else {
-                        0
-                    };
-                    let mut storyboard_file_ids = Vec::new();
-                    if has_storyboard_files {
-                        let count = input.i32_()?;
-                        for _ in 0..count.max(0) {
-                            let storyboard = ctx.parse_document(input)?;
-                            if !storyboard.is_valid() {
-                                is_bad = true;
-                            } else {
-                                storyboard_file_ids.push(storyboard);
-                            }
-                        }
-                    }
-                    let mut storyboard_map_file_ids = Vec::new();
-                    if has_storyboard_map_files {
-                        let count = input.i32_()?;
-                        for _ in 0..count.max(0) {
-                            let storyboard_map = ctx.parse_document(input)?;
-                            if !storyboard_map.is_valid() {
-                                is_bad = true;
-                            } else {
-                                storyboard_map_file_ids.push(storyboard_map);
-                            }
-                        }
-                    }
-                    if is_bad {
-                        return Ok(unsupported_content());
-                    }
-                    Ok(MessageContent::Video(MessageVideo {
-                        file_id,
-                        alternative_file_ids,
-                        hls_file_ids,
-                        storyboard_file_ids,
-                        storyboard_map_file_ids,
-                        cover,
-                        start_timestamp,
-                        caption,
-                        has_spoiler,
-                    }))
-                }
-                MessageContentType::VideoNote => {
-                    let file_id = ctx.parse_video_note(input)?;
-                    let is_viewed = input.bool()?;
-                    if !file_id.is_valid() {
-                        return Ok(unsupported_content());
-                    }
-                    Ok(MessageContent::VideoNote(MessageVideoNote {
-                        file_id,
-                        is_viewed,
-                    }))
-                }
-                MessageContentType::VoiceNote => {
-                    let file_id = ctx.parse_voice_note(input)?;
-                    let caption = parse_caption(input)?;
-                    let is_listened = input.bool()?;
-                    if !file_id.is_valid() {
-                        return Ok(unsupported_content());
-                    }
-                    Ok(MessageContent::VoiceNote(MessageVoiceNote {
-                        file_id,
-                        caption,
-                        is_listened,
-                    }))
-                }
-                MessageContentType::ChatCreate => {
-                    let title = input.string()?;
-                    let len = input.i32_()?;
-                    if len < 0 {
-                        return Err("Wrong vector length");
-                    }
-                    let mut participant_user_ids = Vec::with_capacity(len as usize);
-                    for _ in 0..len {
-                        participant_user_ids.push(UserId::new(input.i64_()?));
-                    }
-                    Ok(MessageContent::ChatCreate(MessageChatCreate {
-                        title,
-                        participant_user_ids,
-                    }))
-                }
-                MessageContentType::ChatChangeTitle => {
-                    Ok(MessageContent::ChatChangeTitle(MessageChatChangeTitle {
-                        title: input.string()?,
-                    }))
-                }
-                MessageContentType::ChatChangePhoto => {
-                    let photo = parse_photo(ctx, input)?;
-                    if photo.is_empty() {
-                        return Ok(unsupported_content());
-                    }
-                    Ok(MessageContent::ChatChangePhoto(MessageChatChangePhoto {
-                        photo,
-                    }))
-                }
-                MessageContentType::ChatDeletePhoto => {
-                    Ok(MessageContent::ChatDeletePhoto(MessageChatDeletePhoto))
-                }
-                MessageContentType::ChatDeleteHistory => {
-                    Ok(MessageContent::ChatDeleteHistory(MessageChatDeleteHistory))
-                }
-                MessageContentType::ChatAddUsers => {
-                    let len = input.i32_()?;
-                    if len < 0 {
-                        return Err("Wrong vector length");
-                    }
-                    let mut user_ids = Vec::with_capacity(len as usize);
-                    for _ in 0..len {
-                        user_ids.push(UserId::new(input.i64_()?));
-                    }
-                    Ok(MessageContent::ChatAddUsers(MessageChatAddUsers {
-                        user_ids,
-                    }))
-                }
-                MessageContentType::ChatJoinedByLink => {
-                    let is_approved =
-                        if input.version() >= version::ADD_INVITE_LINKS_REQUIRING_APPROVAL {
-                            input.parse_flags::<1>()?[0]
-                        } else {
-                            false
-                        };
-                    Ok(MessageContent::ChatJoinedByLink(MessageChatJoinedByLink {
-                        is_approved,
-                    }))
-                }
-                MessageContentType::ChatDeleteUser => {
-                    Ok(MessageContent::ChatDeleteUser(MessageChatDeleteUser {
-                        user_id: UserId::new(input.i64_()?),
-                    }))
-                }
-                MessageContentType::ChatMigrateTo => {
-                    Ok(MessageContent::ChatMigrateTo(MessageChatMigrateTo {
-                        migrated_to_channel_id: ChannelId::new(input.i32_()? as i64),
-                    }))
-                }
-                MessageContentType::ChannelCreate => {
-                    Ok(MessageContent::ChannelCreate(MessageChannelCreate {
-                        title: input.string()?,
-                    }))
-                }
-                MessageContentType::ChannelMigrateFrom => {
-                    let title = input.string()?;
-                    let migrated_from_chat_id = ChatId::new(input.i32_()? as i64);
-                    Ok(MessageContent::ChannelMigrateFrom(
-                        MessageChannelMigrateFrom {
-                            title,
-                            migrated_from_chat_id,
-                        },
-                    ))
-                }
-                MessageContentType::PinMessage => {
-                    Ok(MessageContent::PinMessage(MessagePinMessage {
-                        message_id: parse_message_id(input)?,
-                    }))
-                }
-                MessageContentType::GameScore => {
-                    let game_message_id = parse_message_id(input)?;
-                    let game_id = input.i64_()?;
-                    let score = input.i32_()?;
-                    Ok(MessageContent::GameScore(MessageGameScore {
-                        game_message_id,
-                        game_id,
-                        score,
-                    }))
-                }
-                MessageContentType::ScreenshotTaken => {
-                    Ok(MessageContent::ScreenshotTaken(MessageScreenshotTaken))
-                }
-                MessageContentType::ChatSetTtl => {
-                    let has_from_user_id =
-                        if input.version() >= version::ADD_MESSAGE_CHAT_SET_TTL_FLAGS {
-                            input.parse_flags::<1>()?[0]
-                        } else {
-                            false
-                        };
-                    let ttl = input.i32_()?;
-                    let from_user_id = if has_from_user_id {
-                        UserId::new(input.i64_()?)
-                    } else {
-                        UserId::default()
-                    };
-                    Ok(MessageContent::ChatSetTtl(MessageChatSetTtl {
-                        ttl,
-                        from_user_id,
-                    }))
-                }
-                MessageContentType::Call => {
-                    let (is_video, has_call_access_hash) =
-                        if input.version() >= version::ADD_VIDEO_CALLS_SUPPORT {
-                            let flags = input.parse_flags::<2>()?;
-                            (flags[0], flags[1])
-                        } else {
-                            (false, false)
-                        };
-                    let call_id = input.i64_()?;
-                    let duration = input.i32_()?;
-                    let discard_reason_type_raw = input.i32_()?;
-                    let call_access_hash = if has_call_access_hash {
-                        input.i64_()?
-                    } else {
-                        0
-                    };
-                    let discard_reason = CallDiscardReason {
-                        r#type: match discard_reason_type_raw {
-                            0 => CallDiscardReasonType::Empty,
-                            1 => CallDiscardReasonType::Missed,
-                            2 => CallDiscardReasonType::Disconnected,
-                            3 => CallDiscardReasonType::HungUp,
-                            4 => CallDiscardReasonType::Declined,
-                            5 => CallDiscardReasonType::UpgradeToGroupCall,
-                            _ => CallDiscardReasonType::default(),
-                        },
-                        slug: String::new(),
-                    };
-                    Ok(MessageContent::Call(MessageCall {
-                        call_id,
-                        call_access_hash,
-                        duration,
-                        discard_reason,
-                        is_video,
-                    }))
-                }
-                MessageContentType::PaymentSuccessful => {
-                    let flags = input.parse_flags::<11>()?;
-                    let (
-                        has_payload,
-                        has_shipping_option_id,
-                        has_order_info,
-                        has_telegram_payment_charge_id,
-                        has_provider_payment_charge_id,
-                        has_invoice_message_id,
-                        is_correctly_stored,
-                        has_invoice_dialog_id,
-                        is_recurring,
-                        is_first_recurring,
-                        has_subscription_until_date,
-                    ) = (
-                        flags[0], flags[1], flags[2], flags[3], flags[4], flags[5], flags[6],
-                        flags[7], flags[8], flags[9], flags[10],
-                    );
-                    let currency = input.string()?;
-                    let total_amount = input.i64_()?;
-                    // The pre-fix records stored payload/shipping swapped with the
-                    // total amount (MessageContent.cpp:3402-3412).
-                    let (invoice_payload, shipping_option_id) = if is_correctly_stored {
-                        (
-                            if has_payload {
-                                input.string()?
-                            } else {
-                                String::new()
-                            },
-                            if has_shipping_option_id {
-                                input.string()?
-                            } else {
-                                String::new()
-                            },
-                        )
-                    } else {
-                        (
-                            if has_payload {
-                                input.i64_()?.to_string()
-                            } else {
-                                String::new()
-                            },
-                            if has_shipping_option_id {
-                                input.string()?
-                            } else {
-                                String::new()
-                            },
-                        )
-                    };
-                    let order_info = if has_order_info {
-                        Some(parse_order_info(input)?)
-                    } else {
-                        None
-                    };
-                    let telegram_payment_charge_id = if has_telegram_payment_charge_id {
-                        input.string()?
-                    } else {
-                        String::new()
-                    };
-                    let provider_payment_charge_id = if has_provider_payment_charge_id {
-                        input.string()?
-                    } else {
-                        String::new()
-                    };
-                    let invoice_message_id = if has_invoice_message_id {
-                        parse_message_id(input)?
-                    } else {
-                        MessageId::default()
-                    };
-                    let invoice_dialog_id = if has_invoice_dialog_id {
-                        DialogId::new(input.i64_()?)
-                    } else {
-                        DialogId::default()
-                    };
-                    let subscription_until_date = if has_subscription_until_date {
-                        input.i32_()?
-                    } else {
-                        0
-                    };
-                    if !is_correctly_stored {
-                        return Ok(unsupported_content());
-                    }
-                    Ok(MessageContent::PaymentSuccessful(
-                        MessagePaymentSuccessful {
-                            invoice_dialog_id,
-                            invoice_message_id,
-                            currency,
-                            total_amount,
-                            invoice_payload,
-                            subscription_until_date,
-                            is_recurring,
-                            is_first_recurring,
-                            shipping_option_id,
-                            order_info,
-                            telegram_payment_charge_id,
-                            provider_payment_charge_id,
-                        },
-                    ))
-                }
-                MessageContentType::ContactRegistered => {
-                    Ok(MessageContent::ContactRegistered(MessageContactRegistered))
-                }
-                MessageContentType::ExpiredPhoto => {
-                    Ok(MessageContent::ExpiredPhoto(MessageExpiredPhoto))
-                }
-                MessageContentType::ExpiredVideo => {
-                    Ok(MessageContent::ExpiredVideo(MessageExpiredVideo))
-                }
-                MessageContentType::CustomServiceAction => Ok(MessageContent::CustomServiceAction(
-                    MessageCustomServiceAction {
-                        message: input.string()?,
-                    },
-                )),
-                MessageContentType::WebsiteConnected => {
-                    Ok(MessageContent::WebsiteConnected(MessageWebsiteConnected {
-                        domain_name: input.string()?,
-                    }))
-                }
-                MessageContentType::PassportDataSent => {
-                    let len = input.i32_()?;
-                    if len < 0 {
-                        return Err("Wrong vector length");
-                    }
-                    let mut types = Vec::with_capacity(len as usize);
-                    for _ in 0..len {
-                        let raw_type = input.i32_()?;
-                        types.push(secure_value_type_from_raw(raw_type));
-                    }
-                    Ok(MessageContent::PassportDataSent(MessagePassportDataSent {
-                        types,
-                    }))
-                }
-                MessageContentType::PassportDataReceived => {
-                    let len = input.i32_()?;
-                    if len < 0 {
-                        return Err("Wrong vector length");
-                    }
-                    let mut values = Vec::with_capacity(len as usize);
-                    for _ in 0..len {
-                        values.push(parse_encrypted_secure_value(ctx, input)?);
-                    }
-                    let credentials = parse_encrypted_secure_credentials(input)?;
-                    Ok(MessageContent::PassportDataReceived(
-                        MessagePassportDataReceived {
-                            values,
-                            credentials,
-                        },
-                    ))
-                }
-                MessageContentType::Poll => {
-                    let (has_caption, has_attached_media) =
-                        if input.version() >= version::ADD_POLL_CAPTION {
-                            let flags = input.parse_flags::<2>()?;
-                            (flags[0], flags[1])
-                        } else {
-                            (false, false)
-                        };
-                    let poll_id = PollId::new(input.i64_()?);
-                    let caption = if has_caption {
-                        parse_caption(input)?
-                    } else {
-                        FormattedText::default()
-                    };
-                    let attached_media = if has_attached_media {
-                        let attached = parse_message_content(ctx, input);
-                        Some(Box::new(attached))
-                    } else {
-                        None
-                    };
-                    if !poll_id.is_valid() {
-                        return Ok(unsupported_content());
-                    }
-                    Ok(MessageContent::Poll(MessagePoll {
-                        poll_id,
-                        caption,
-                        attached_media,
-                    }))
-                }
-                MessageContentType::Dice => {
-                    let (
-                        is_stake,
-                        has_seed,
-                        has_stake_ton_count,
-                        has_prize_ton_count,
-                        has_state_hash,
-                    ) = if input.version() >= version::ADD_DICE_FLAGS {
-                        let flags = input.parse_flags::<5>()?;
-                        (flags[0], flags[1], flags[2], flags[3], flags[4])
-                    } else {
-                        (false, false, false, false, false)
-                    };
-                    let emoji = if input.version() >= version::ADD_DICE_EMOJI {
-                        remove_emoji_modifiers(&input.string()?, true)
-                    } else {
-                        MessageDice::DEFAULT_EMOJI.to_string()
-                    };
-                    let dice_value = input.i32_()?;
-                    let seed = if has_seed {
-                        input.string()?
-                    } else {
-                        String::new()
-                    };
-                    let stake_ton_count = if has_stake_ton_count {
-                        input.i64_()?
-                    } else {
-                        0
-                    };
-                    let prize_ton_count = if has_prize_ton_count {
-                        input.i64_()?
-                    } else {
-                        0
-                    };
-                    let state_hash = if has_state_hash {
-                        input.string()?
-                    } else {
-                        String::new()
-                    };
-                    let dice = MessageDice {
-                        emoji,
-                        dice_value,
-                        is_stake,
-                        seed,
-                        state_hash,
-                        stake_ton_count,
-                        prize_ton_count,
-                    };
-                    if !dice.is_valid() {
-                        return Ok(unsupported_content());
-                    }
-                    Ok(MessageContent::Dice(dice))
-                }
-                MessageContentType::ProximityAlertTriggered => {
-                    let traveler_dialog_id = DialogId::new(input.i64_()?);
-                    let watcher_dialog_id = DialogId::new(input.i64_()?);
-                    let distance = input.i32_()?;
-                    Ok(MessageContent::ProximityAlertTriggered(
-                        MessageProximityAlertTriggered {
-                            traveler_dialog_id,
-                            watcher_dialog_id,
-                            distance,
-                        },
-                    ))
-                }
-                MessageContentType::GroupCall => {
-                    let (has_duration, has_schedule_date) = {
-                        let flags = input.parse_flags::<2>()?;
-                        (flags[0], flags[1])
-                    };
-                    let input_group_call_id = InputGroupCallId::new(input.i64_()?, input.i64_()?);
-                    let duration = if has_duration { input.i32_()? } else { -1 };
-                    let schedule_date = if has_schedule_date { input.i32_()? } else { -1 };
-                    Ok(MessageContent::GroupCall(MessageGroupCall {
-                        input_group_call_id,
-                        duration,
-                        schedule_date,
-                    }))
-                }
-                MessageContentType::InviteToGroupCall => {
-                    let input_group_call_id = InputGroupCallId::new(input.i64_()?, input.i64_()?);
-                    let len = input.i32_()?;
-                    if len < 0 {
-                        return Err("Wrong vector length");
-                    }
-                    let mut user_ids = Vec::with_capacity(len as usize);
-                    for _ in 0..len {
-                        user_ids.push(UserId::new(input.i64_()?));
-                    }
-                    Ok(MessageContent::InviteToGroupCall(
-                        MessageInviteToGroupCall {
-                            input_group_call_id,
-                            user_ids,
-                        },
-                    ))
-                }
-                MessageContentType::ChatSetTheme => Err("[deferred-variant] MessageChatSetTheme"),
-                MessageContentType::WebViewDataSent => {
-                    Ok(MessageContent::WebViewDataSent(MessageWebViewDataSent {
-                        button_text: input.string()?,
-                    }))
-                }
-                MessageContentType::WebViewDataReceived => {
-                    let button_text = input.string()?;
-                    let data = input.string()?;
-                    Ok(MessageContent::WebViewDataReceived(
-                        MessageWebViewDataReceived { button_text, data },
-                    ))
-                }
-                MessageContentType::GiftPremium => {
-                    let (has_crypto_amount, has_text, has_days) = {
-                        let flags = input.parse_flags::<3>()?;
-                        (flags[0], flags[1], flags[2])
-                    };
-                    let currency = input.string()?;
-                    let amount = input.i64_()?;
-                    let mut days = input.i32_()?;
-                    if !has_days {
-                        days = get_premium_duration_day_count(days);
-                    }
-                    let (crypto_currency, crypto_amount) = if has_crypto_amount {
-                        (input.string()?, input.i64_()?)
-                    } else {
-                        (String::new(), 0)
-                    };
-                    let text = if has_text {
-                        FormattedText::parse(input)?
-                    } else {
-                        FormattedText::default()
-                    };
-                    Ok(MessageContent::GiftPremium(MessageGiftPremium {
-                        text,
-                        currency,
-                        amount,
-                        crypto_currency,
-                        crypto_amount,
-                        days,
-                    }))
-                }
-                MessageContentType::TopicCreate => {
-                    let title_missing = if input.version() >= version::SUPPORT_BOT_TOPICS {
-                        input.parse_flags::<1>()?[0]
-                    } else {
-                        false
-                    };
-                    let title = input.string()?;
-                    let icon = parse_forum_topic_icon(input)?;
-                    Ok(MessageContent::TopicCreate(MessageTopicCreate {
-                        title,
-                        icon,
-                        title_missing,
-                    }))
-                }
-                MessageContentType::TopicEdit => Ok(MessageContent::TopicEdit(MessageTopicEdit {
-                    edited_data: parse_forum_topic_edited_data(input)?,
-                })),
-                MessageContentType::SuggestProfilePhoto => {
-                    let photo = parse_photo(ctx, input)?;
-                    if photo.is_empty() {
-                        return Ok(unsupported_content());
-                    }
-                    Ok(MessageContent::SuggestProfilePhoto(
-                        MessageSuggestProfilePhoto { photo },
-                    ))
-                }
-                MessageContentType::WriteAccessAllowed => Ok(MessageContent::WriteAccessAllowed(
-                    MessageWriteAccessAllowed,
-                )),
-                MessageContentType::RequestedDialog => {
-                    let has_one_shared_dialog =
-                        if input.version() >= version::SUPPORT_MULTIPLE_SHARED_USERS {
-                            input.parse_flags::<1>()?[0]
-                        } else {
-                            true
-                        };
-                    let shared_dialog_ids = if has_one_shared_dialog {
-                        vec![DialogId::new(input.i64_()?)]
-                    } else {
-                        let len = input.i32_()?;
-                        if len < 0 {
-                            return Err("Wrong vector length");
-                        }
-                        let mut ids = Vec::with_capacity(len as usize);
-                        for _ in 0..len {
-                            ids.push(DialogId::new(input.i64_()?));
-                        }
-                        if ids.len() > 1
-                            && ids
-                                .iter()
-                                .any(|dialog_id| dialog_id.get_type() != DialogType::User)
-                        {
-                            return Ok(unsupported_content());
-                        }
-                        ids
-                    };
-                    if shared_dialog_ids.is_empty() || !shared_dialog_ids[0].is_valid() {
-                        return Ok(unsupported_content());
-                    }
-                    let button_id = input.i32_()?;
-                    Ok(MessageContent::RequestedDialog(MessageRequestedDialog {
-                        shared_dialog_ids,
-                        button_id,
-                    }))
-                }
-                MessageContentType::WebViewWriteAccessAllowed => Ok(
-                    MessageContent::WebViewWriteAccessAllowed(MessageWebViewWriteAccessAllowed {
-                        web_app: parse_web_app(ctx, input)?,
-                    }),
-                ),
-                MessageContentType::SetBackground => {
-                    let (has_message_id, for_both) = {
-                        let flags = input.parse_flags::<2>()?;
-                        (flags[0], flags[1])
-                    };
-                    let old_message_id = if has_message_id {
-                        parse_message_id(input)?
-                    } else {
-                        MessageId::default()
-                    };
-                    let background_id = ctx.parse_background_id(input)?;
-                    let background_type = parse_background_type(input)?;
-                    Ok(MessageContent::SetBackground(MessageSetBackground {
-                        old_message_id,
-                        background_info: BackgroundInfo {
-                            background_id,
-                            background_type,
-                        },
-                        for_both,
-                    }))
-                }
-                MessageContentType::Story => {
-                    let via_mention = input.parse_flags::<1>()?[0];
-                    let dialog_id = DialogId::new(input.i64_()?);
-                    let story_id = StoryId::new(input.i32_()?);
-                    let story_full_id = StoryFullId::new(dialog_id, story_id);
-                    if !story_full_id.is_server() {
-                        return Ok(unsupported_content());
-                    }
-                    Ok(MessageContent::Story(MessageStory {
-                        story_full_id,
-                        via_mention,
-                    }))
-                }
-                MessageContentType::WriteAccessAllowedByRequest => Ok(
-                    MessageContent::WriteAccessAllowedByRequest(MessageWriteAccessAllowedByRequest),
-                ),
-                MessageContentType::GiftCode => {
-                    let flags = input.parse_flags::<9>()?;
-                    let (
-                        via_giveaway,
-                        has_creator_dialog_id,
-                        is_unclaimed,
-                        has_currency,
-                        has_amount,
-                        has_crypto_currency,
-                        has_crypto_amount,
-                        has_text,
-                        has_days,
-                    ) = (
-                        flags[0], flags[1], flags[2], flags[3], flags[4], flags[5], flags[6],
-                        flags[7], flags[8],
-                    );
-                    let creator_dialog_id = if has_creator_dialog_id {
-                        DialogId::new(input.i64_()?)
-                    } else {
-                        DialogId::default()
-                    };
-                    let mut days = input.i32_()?;
-                    if !has_days {
-                        days = get_premium_duration_day_count(days);
-                    }
-                    let code = input.string()?;
-                    let currency = if has_currency {
-                        input.string()?
-                    } else {
-                        String::new()
-                    };
-                    let amount = if has_amount { input.i64_()? } else { 0 };
-                    let crypto_currency = if has_crypto_currency {
-                        input.string()?
-                    } else {
-                        String::new()
-                    };
-                    let crypto_amount = if has_crypto_amount { input.i64_()? } else { 0 };
-                    let text = if has_text {
-                        FormattedText::parse(input)?
-                    } else {
-                        FormattedText::default()
-                    };
-                    Ok(MessageContent::GiftCode(MessageGiftCode {
-                        creator_dialog_id,
-                        text,
-                        days,
-                        currency,
-                        amount,
-                        crypto_currency,
-                        crypto_amount,
-                        via_giveaway,
-                        is_unclaimed,
-                        code,
-                    }))
-                }
-                MessageContentType::Giveaway => {
-                    let has_star_count = input.parse_flags::<1>()?[0];
-                    let giveaway_parameters = parse_giveaway_parameters(input)?;
-                    let quantity = input.i32_()?;
-                    let months = input.i32_()?;
-                    let star_count = if has_star_count { input.i64_()? } else { 0 };
-                    if !giveaway_parameters.is_valid() {
-                        return Ok(unsupported_content());
-                    }
-                    Ok(MessageContent::Giveaway(MessageGiveaway {
-                        giveaway_parameters,
-                        quantity,
-                        months,
-                        star_count,
-                    }))
-                }
-                MessageContentType::GiveawayLaunch => {
-                    let has_star_count = if input.version() >= version::SUPPORT_STAR_GIVEAWAYS {
-                        input.parse_flags::<1>()?[0]
-                    } else {
-                        false
-                    };
-                    let star_count = if has_star_count { input.i64_()? } else { 0 };
-                    Ok(MessageContent::GiveawayLaunch(MessageGiveawayLaunch {
-                        star_count,
-                    }))
-                }
-                MessageContentType::GiveawayResults => {
-                    let (
-                        has_winner_count,
-                        has_unclaimed_count,
-                        has_giveaway_message_id,
-                        is_star_giveaway,
-                    ) = {
-                        let flags = input.parse_flags::<4>()?;
-                        (flags[0], flags[1], flags[2], flags[3])
-                    };
-                    let winner_count = if has_winner_count { input.i32_()? } else { 0 };
-                    let unclaimed_count = if has_unclaimed_count {
-                        input.i32_()?
-                    } else {
-                        0
-                    };
-                    let giveaway_message_id = if has_giveaway_message_id {
-                        parse_message_id(input)?
-                    } else {
-                        MessageId::default()
-                    };
-                    if winner_count < 0 || unclaimed_count < 0 {
-                        return Ok(unsupported_content());
-                    }
-                    Ok(MessageContent::GiveawayResults(MessageGiveawayResults {
-                        giveaway_message_id,
-                        winner_count,
-                        unclaimed_count,
-                        is_star_giveaway,
-                    }))
-                }
-                MessageContentType::GiveawayWinners => {
-                    let flags = input.parse_flags::<12>()?;
-                    let (
-                        only_new_subscribers,
-                        was_refunded,
-                        has_giveaway_message_id,
-                        has_boosted_channel_id,
-                        has_additional_dialog_count,
-                        has_month_count,
-                        has_prize_description,
-                        has_winners_selection_date,
-                        has_winner_count,
-                        has_unclaimed_count,
-                        has_winner_user_ids,
-                        has_star_count,
-                    ) = (
-                        flags[0], flags[1], flags[2], flags[3], flags[4], flags[5], flags[6],
-                        flags[7], flags[8], flags[9], flags[10], flags[11],
-                    );
-                    let giveaway_message_id = if has_giveaway_message_id {
-                        parse_message_id(input)?
-                    } else {
-                        MessageId::default()
-                    };
-                    let boosted_channel_id = if has_boosted_channel_id {
-                        ChannelId::new(input.i64_()?)
-                    } else {
-                        ChannelId::default()
-                    };
-                    let additional_dialog_count = if has_additional_dialog_count {
-                        input.i32_()?
-                    } else {
-                        0
-                    };
-                    let month_count = if has_month_count { input.i32_()? } else { 0 };
-                    let prize_description = if has_prize_description {
-                        input.string()?
-                    } else {
-                        String::new()
-                    };
-                    let winners_selection_date = if has_winners_selection_date {
-                        input.i32_()?
-                    } else {
-                        0
-                    };
-                    let winner_count = if has_winner_count { input.i32_()? } else { 0 };
-                    let unclaimed_count = if has_unclaimed_count {
-                        input.i32_()?
-                    } else {
-                        0
-                    };
-                    let winner_user_ids = if has_winner_user_ids {
-                        let len = input.i32_()?;
-                        if len < 0 {
-                            return Err("Wrong vector length");
-                        }
-                        let mut ids = Vec::with_capacity(len as usize);
-                        for _ in 0..len {
-                            ids.push(UserId::new(input.i64_()?));
-                        }
-                        ids
-                    } else {
-                        Vec::new()
-                    };
-                    let star_count = if has_star_count { input.i64_()? } else { 0 };
-                    if winner_count < 0 || unclaimed_count < 0 {
-                        return Ok(unsupported_content());
-                    }
-                    Ok(MessageContent::GiveawayWinners(MessageGiveawayWinners {
-                        giveaway_message_id,
-                        boosted_channel_id,
-                        additional_dialog_count,
-                        month_count,
-                        star_count,
-                        prize_description,
-                        winners_selection_date,
-                        only_new_subscribers,
-                        was_refunded,
-                        winner_count,
-                        unclaimed_count,
-                        winner_user_ids,
-                    }))
-                }
-                MessageContentType::ExpiredVideoNote => {
-                    Ok(MessageContent::ExpiredVideoNote(MessageExpiredVideoNote))
-                }
-                MessageContentType::ExpiredVoiceNote => {
-                    Ok(MessageContent::ExpiredVoiceNote(MessageExpiredVoiceNote))
-                }
-                MessageContentType::BoostApply => {
-                    input.parse_flags::<0>()?;
-                    let boost_count = input.i32_()?;
-                    if boost_count < 0 {
-                        return Ok(unsupported_content());
-                    }
-                    Ok(MessageContent::BoostApply(MessageBoostApply {
-                        boost_count,
-                    }))
-                }
-                MessageContentType::DialogShared => {
-                    input.parse_flags::<0>()?;
-                    let len = input.i32_()?;
-                    if len < 0 {
-                        return Err("Wrong vector length");
-                    }
-                    let mut shared_dialogs = Vec::with_capacity(len as usize);
-                    for _ in 0..len {
-                        shared_dialogs.push(parse_shared_dialog(ctx, input)?);
-                    }
-                    if shared_dialogs.is_empty()
-                        || shared_dialogs
-                            .iter()
-                            .any(|shared_dialog| !shared_dialog.is_valid())
-                    {
-                        return Ok(unsupported_content());
-                    }
-                    let button_id = input.i32_()?;
-                    Ok(MessageContent::DialogShared(MessageDialogShared {
-                        shared_dialogs,
-                        button_id,
-                    }))
-                }
-                MessageContentType::PaidMedia => {
-                    let (has_caption, has_payload) = {
-                        let flags = input.parse_flags::<2>()?;
-                        (flags[0], flags[1])
-                    };
-                    let len = input.i32_()?;
-                    if len < 0 {
-                        return Err("Wrong vector length");
-                    }
-                    let mut media = Vec::with_capacity(len as usize);
-                    for _ in 0..len {
-                        media.push(parse_message_extended_media(ctx, input)?);
-                    }
-                    let caption = if has_caption {
-                        parse_caption(input)?
-                    } else {
-                        FormattedText::default()
-                    };
-                    let star_count = input.i64_()?;
-                    let payload = if has_payload {
-                        input.string()?
-                    } else {
-                        String::new()
-                    };
-                    if media.iter().any(|extended_media| extended_media.is_empty()) {
-                        return Ok(unsupported_content());
-                    }
-                    Ok(MessageContent::PaidMedia(MessagePaidMedia {
-                        media,
-                        caption,
-                        star_count,
-                        payload,
-                    }))
-                }
-                MessageContentType::PaymentRefunded => {
-                    let has_invoice_payload = input.parse_flags::<1>()?[0];
-                    let dialog_id = DialogId::new(input.i64_()?);
-                    let currency = input.string()?;
-                    let total_amount = input.i64_()?;
-                    let invoice_payload = if has_invoice_payload {
-                        input.string()?
-                    } else {
-                        String::new()
-                    };
-                    let telegram_payment_charge_id = input.string()?;
-                    let provider_payment_charge_id = input.string()?;
-                    Ok(MessageContent::PaymentRefunded(MessagePaymentRefunded {
-                        dialog_id,
-                        currency,
-                        total_amount,
-                        invoice_payload,
-                        telegram_payment_charge_id,
-                        provider_payment_charge_id,
-                    }))
-                }
-                MessageContentType::GiftStars => {
-                    let (has_crypto_amount, has_transaction_id) = {
-                        let flags = input.parse_flags::<2>()?;
-                        (flags[0], flags[1])
-                    };
-                    let currency = input.string()?;
-                    let amount = input.i64_()?;
-                    let star_count = input.i64_()?;
-                    let (crypto_currency, crypto_amount) = if has_crypto_amount {
-                        (input.string()?, input.i64_()?)
-                    } else {
-                        (String::new(), 0)
-                    };
-                    let transaction_id = if has_transaction_id {
-                        input.string()?
-                    } else {
-                        String::new()
-                    };
-                    Ok(MessageContent::GiftStars(MessageGiftStars {
-                        currency,
-                        amount,
-                        crypto_currency,
-                        crypto_amount,
-                        star_count,
-                        transaction_id,
-                    }))
-                }
-                MessageContentType::PrizeStars => {
-                    let is_unclaimed = input.parse_flags::<1>()?[0];
-                    let star_count = input.i64_()?;
-                    let transaction_id = input.string()?;
-                    let boosted_dialog_id = DialogId::new(input.i64_()?);
-                    let giveaway_message_id = parse_message_id(input)?;
-                    Ok(MessageContent::PrizeStars(MessagePrizeStars {
-                        star_count,
-                        transaction_id,
-                        boosted_dialog_id,
-                        giveaway_message_id,
-                        is_unclaimed,
-                    }))
-                }
-                MessageContentType::StarGift
-                | MessageContentType::StarGiftUnique
-                | MessageContentType::StarGiftPurchaseOffer
-                | MessageContentType::StarGiftPurchaseOfferDeclined => {
-                    Err("[deferred-variant] StarGift family")
-                }
-                MessageContentType::PaidMessagesRefunded => {
-                    input.parse_flags::<0>()?;
-                    let message_count = input.i32_()?;
-                    let star_count = input.i64_()?;
-                    Ok(MessageContent::PaidMessagesRefunded(
-                        MessagePaidMessagesRefunded {
-                            message_count,
-                            star_count,
-                        },
-                    ))
-                }
-                MessageContentType::PaidMessagesPrice => {
-                    let broadcast_messages_allowed = input.parse_flags::<1>()?[0];
-                    let star_count = input.i64_()?;
-                    Ok(MessageContent::PaidMessagesPrice(
-                        MessagePaidMessagesPrice {
-                            star_count,
-                            broadcast_messages_allowed,
-                        },
-                    ))
-                }
-                MessageContentType::ConferenceCall => {
-                    let (
-                        is_active,
-                        is_video,
-                        was_missed,
-                        has_duration,
-                        has_other_participant_dialog_ids,
-                    ) = {
-                        let flags = input.parse_flags::<5>()?;
-                        (flags[0], flags[1], flags[2], flags[3], flags[4])
-                    };
-                    let call_id = input.i64_()?;
-                    let duration = if has_duration { input.i32_()? } else { 0 };
-                    let other_participant_dialog_ids = if has_other_participant_dialog_ids {
-                        let len = input.i32_()?;
-                        if len < 0 {
-                            return Err("Wrong vector length");
-                        }
-                        let mut ids = Vec::with_capacity(len as usize);
-                        for _ in 0..len {
-                            ids.push(DialogId::new(input.i64_()?));
-                        }
-                        ids
-                    } else {
-                        Vec::new()
-                    };
-                    Ok(MessageContent::ConferenceCall(MessageConferenceCall {
-                        call_id,
-                        duration,
-                        other_participant_dialog_ids,
-                        is_active,
-                        is_video,
-                        was_missed,
-                    }))
-                }
-                MessageContentType::ToDoList => {
-                    input.parse_flags::<0>()?;
-                    let list = parse_to_do_list(input)?;
-                    let len = input.i32_()?;
-                    if len < 0 {
-                        return Err("Wrong vector length");
-                    }
-                    let mut completions = Vec::with_capacity(len as usize);
-                    for _ in 0..len {
-                        completions.push(parse_to_do_completion(input)?);
-                    }
-                    Ok(MessageContent::ToDoList(MessageToDoList {
-                        list,
-                        completions,
-                    }))
-                }
-                MessageContentType::TodoCompletions => {
-                    let (has_to_do_message_id, has_completed_task_ids, has_incompleted_task_ids) = {
-                        let flags = input.parse_flags::<3>()?;
-                        (flags[0], flags[1], flags[2])
-                    };
-                    let to_do_message_id = if has_to_do_message_id {
-                        parse_message_id(input)?
-                    } else {
-                        MessageId::default()
-                    };
-                    let completed_task_ids = if has_completed_task_ids {
-                        input.i32_vec()?
-                    } else {
-                        Vec::new()
-                    };
-                    let incompleted_task_ids = if has_incompleted_task_ids {
-                        input.i32_vec()?
-                    } else {
-                        Vec::new()
-                    };
-                    Ok(MessageContent::TodoCompletions(MessageTodoCompletions {
-                        to_do_message_id,
-                        completed_task_ids,
-                        incompleted_task_ids,
-                    }))
-                }
-                MessageContentType::TodoAppendTasks => {
-                    let (has_to_do_message_id, has_items) = {
-                        let flags = input.parse_flags::<2>()?;
-                        (flags[0], flags[1])
-                    };
-                    let to_do_message_id = if has_to_do_message_id {
-                        parse_message_id(input)?
-                    } else {
-                        MessageId::default()
-                    };
-                    let items = if has_items {
-                        let len = input.i32_()?;
-                        if len < 0 {
-                            return Err("Wrong vector length");
-                        }
-                        let mut result = Vec::with_capacity(len as usize);
-                        for _ in 0..len {
-                            result.push(parse_to_do_item(input)?);
-                        }
-                        result
-                    } else {
-                        Vec::new()
-                    };
-                    Ok(MessageContent::TodoAppendTasks(MessageTodoAppendTasks {
-                        to_do_message_id,
-                        items,
-                    }))
-                }
-                MessageContentType::GiftTon => {
-                    let has_transaction_id = input.parse_flags::<1>()?[0];
-                    let currency = input.string()?;
-                    let amount = input.i64_()?;
-                    let crypto_currency = input.string()?;
-                    let crypto_amount = input.i64_()?;
-                    let transaction_id = if has_transaction_id {
-                        input.string()?
-                    } else {
-                        String::new()
-                    };
-                    Ok(MessageContent::GiftTon(MessageGiftTon {
-                        currency,
-                        amount,
-                        crypto_currency,
-                        crypto_amount,
-                        transaction_id,
-                    }))
-                }
-                MessageContentType::SuggestedPostSuccess => {
-                    let (has_suggested_post_message_id, has_amount) = {
-                        let flags = input.parse_flags::<2>()?;
-                        (flags[0], flags[1])
-                    };
-                    let suggested_post_message_id = if has_suggested_post_message_id {
-                        parse_message_id(input)?
-                    } else {
-                        MessageId::default()
-                    };
-                    let amount = if has_amount {
-                        parse_currency_amount(input)?
-                    } else {
-                        CurrencyAmount::default()
-                    };
-                    Ok(MessageContent::SuggestedPostSuccess(
-                        MessageSuggestedPostSuccess {
-                            suggested_post_message_id,
-                            amount,
-                        },
-                    ))
-                }
-                MessageContentType::SuggestedPostRefund => {
-                    let (has_suggested_post_message_id, is_payer_initiated) = {
-                        let flags = input.parse_flags::<2>()?;
-                        (flags[0], flags[1])
-                    };
-                    let suggested_post_message_id = if has_suggested_post_message_id {
-                        parse_message_id(input)?
-                    } else {
-                        MessageId::default()
-                    };
-                    Ok(MessageContent::SuggestedPostRefund(
-                        MessageSuggestedPostRefund {
-                            suggested_post_message_id,
-                            is_payer_initiated,
-                        },
-                    ))
-                }
-                MessageContentType::SuggestedPostApproval => {
-                    let (
-                        has_suggested_post_message_id,
-                        has_price,
-                        has_comment,
-                        has_send_date,
-                        is_rejected,
-                        is_balance_too_low,
-                    ) = {
-                        let flags = input.parse_flags::<6>()?;
-                        (flags[0], flags[1], flags[2], flags[3], flags[4], flags[5])
-                    };
-                    let suggested_post_message_id = if has_suggested_post_message_id {
-                        parse_message_id(input)?
-                    } else {
-                        MessageId::default()
-                    };
-                    let price = if has_price {
-                        parse_suggested_post_price(input)?
-                    } else {
-                        SuggestedPostPrice::default()
-                    };
-                    let comment = if has_comment {
-                        input.string()?
-                    } else {
-                        String::new()
-                    };
-                    let send_date = if has_send_date { input.i32_()? } else { 0 };
-                    Ok(MessageContent::SuggestedPostApproval(
-                        MessageSuggestedPostApproval {
-                            suggested_post_message_id,
-                            price,
-                            comment,
-                            send_date,
-                            is_rejected,
-                            is_balance_too_low,
-                        },
-                    ))
-                }
-                MessageContentType::SuggestBirthday => {
-                    input.parse_flags::<0>()?;
-                    let birthdate = Birthdate::parse_from(input)?;
-                    Ok(MessageContent::SuggestBirthday(MessageSuggestBirthday {
-                        birthdate,
-                    }))
-                }
-                MessageContentType::NewCreatorPending => {
-                    let has_new_creator_user_id = input.parse_flags::<1>()?[0];
-                    let new_creator_user_id = if has_new_creator_user_id {
-                        UserId::new(input.i64_()?)
-                    } else {
-                        UserId::default()
-                    };
-                    Ok(MessageContent::NewCreatorPending(
-                        MessageNewCreatorPending {
-                            new_creator_user_id,
-                        },
-                    ))
-                }
-                MessageContentType::ChangeCreator => {
-                    input.parse_flags::<0>()?;
-                    let new_creator_user_id = UserId::new(input.i64_()?);
-                    if !new_creator_user_id.is_valid() {
-                        return Ok(unsupported_content());
-                    }
-                    Ok(MessageContent::ChangeCreator(MessageChangeCreator {
-                        new_creator_user_id,
-                    }))
-                }
-                MessageContentType::NoForwardsToggle => {
-                    let (prev_value, new_value, has_request_message_id) = {
-                        let flags = input.parse_flags::<3>()?;
-                        (flags[0], flags[1], flags[2])
-                    };
-                    let request_message_id = if has_request_message_id {
-                        parse_message_id(input)?
-                    } else {
-                        MessageId::default()
-                    };
-                    Ok(MessageContent::NoForwardsToggle(MessageNoForwardsToggle {
-                        request_message_id,
-                        prev_value,
-                        new_value,
-                    }))
-                }
-                MessageContentType::NoForwardsRequest => {
-                    let (is_expired, prev_value, new_value) = {
-                        let flags = input.parse_flags::<3>()?;
-                        (flags[0], flags[1], flags[2])
-                    };
-                    Ok(MessageContent::NoForwardsRequest(
-                        MessageNoForwardsRequest {
-                            is_expired,
-                            prev_value,
-                            new_value,
-                        },
-                    ))
-                }
-                MessageContentType::ManagedBotCreated => {
-                    input.parse_flags::<0>()?;
-                    let bot_user_id = UserId::new(input.i64_()?);
-                    if !bot_user_id.is_valid() {
-                        return Ok(unsupported_content());
-                    }
-                    Ok(MessageContent::ManagedBotCreated(
-                        MessageManagedBotCreated { bot_user_id },
-                    ))
-                }
-                MessageContentType::PollAppendAnswer => {
-                    let has_poll_message_id = input.parse_flags::<1>()?[0];
-                    let poll_message_id = if has_poll_message_id {
-                        parse_message_id(input)?
-                    } else {
-                        MessageId::default()
-                    };
-                    let text = FormattedText::parse(input)?;
-                    let data = input.string()?;
-                    Ok(MessageContent::PollAppendAnswer(MessagePollAppendAnswer {
-                        poll_message_id,
-                        text,
-                        data,
-                    }))
-                }
-                MessageContentType::PollDeleteAnswer => {
-                    let has_poll_message_id = input.parse_flags::<1>()?[0];
-                    let poll_message_id = if has_poll_message_id {
-                        parse_message_id(input)?
-                    } else {
-                        MessageId::default()
-                    };
-                    let text = FormattedText::parse(input)?;
-                    let data = input.string()?;
-                    Ok(MessageContent::PollDeleteAnswer(MessagePollDeleteAnswer {
-                        poll_message_id,
-                        text,
-                        data,
-                    }))
-                }
-                MessageContentType::RichText => Err("[deferred-variant] MessageRichText"),
-                MessageContentType::ChangeCommunity => {
-                    let has_community_id = input.parse_flags::<1>()?[0];
-                    let community_id = if has_community_id {
-                        CommunityId::new(input.i64_()?)
-                    } else {
-                        CommunityId::default()
-                    };
-                    Ok(MessageContent::ChangeCommunity(MessageChangeCommunity {
-                        community_id,
-                    }))
-                }
-                MessageContentType::ChatJoinedViaCommunity => {
-                    input.parse_flags::<0>()?;
-                    let community_id = CommunityId::new(input.i64_()?);
-                    Ok(MessageContent::ChatJoinedViaCommunity(
-                        MessageChatJoinedViaCommunity { community_id },
-                    ))
-                }
-                MessageContentType::None => {
-                    tdutils::log_error!("Load a message with an invalid content of type {}", raw);
-                    Ok(unsupported_content())
                 }
             }
-        })();
-    parsed.unwrap_or_else(|_| unsupported_content())
+            let mut hls_file_ids = Vec::new();
+            if has_hls_files {
+                let file_count = parser.i32_()?;
+                if file_count < 0 || parser.left_len() < file_count as usize {
+                    return Err("Wrong vector length");
+                }
+                for _ in 0..file_count {
+                    let file_id = ctx.parse_document(parser)?;
+                    if !file_id.is_valid() {
+                        is_bad = true;
+                    } else {
+                        hls_file_ids.push(file_id);
+                    }
+                }
+            }
+            let cover = if has_cover {
+                parse_photo(parser, ctx)?
+            } else {
+                Photo::default()
+            };
+            let start_timestamp = if has_start_timestamp {
+                parser.i32_()?
+            } else {
+                0
+            };
+            let mut storyboard_file_ids = Vec::new();
+            if has_storyboard_files {
+                let file_count = parser.i32_()?;
+                if file_count < 0 || parser.left_len() < file_count as usize {
+                    return Err("Wrong vector length");
+                }
+                for _ in 0..file_count {
+                    let file_id = ctx.parse_document(parser)?;
+                    if !file_id.is_valid() {
+                        is_bad = true;
+                    } else {
+                        storyboard_file_ids.push(file_id);
+                    }
+                }
+            }
+            let mut storyboard_map_file_ids = Vec::new();
+            if has_storyboard_map_files {
+                let file_count = parser.i32_()?;
+                if file_count < 0 || parser.left_len() < file_count as usize {
+                    return Err("Wrong vector length");
+                }
+                for _ in 0..file_count {
+                    let file_id = ctx.parse_document(parser)?;
+                    if !file_id.is_valid() {
+                        is_bad = true;
+                    } else {
+                        storyboard_map_file_ids.push(file_id);
+                    }
+                }
+            }
+            if !file_id.is_valid() {
+                is_bad = true;
+            }
+            MessageContent::Video(MessageVideo {
+                file_id,
+                alternative_file_ids,
+                hls_file_ids,
+                storyboard_file_ids,
+                storyboard_map_file_ids,
+                cover,
+                start_timestamp,
+                caption,
+                has_spoiler,
+            })
+        }
+        MessageContentType::VideoNote => {
+            let file_id = ctx.parse_video_note(parser)?;
+            let is_viewed = parser.bool()?;
+            is_bad = !file_id.is_valid();
+            MessageContent::VideoNote(MessageVideoNote { file_id, is_viewed })
+        }
+        MessageContentType::VoiceNote => {
+            let file_id = ctx.parse_voice_note(parser)?;
+            let caption = parse_caption(parser)?;
+            let is_listened = parser.bool()?;
+            is_bad = !file_id.is_valid();
+            MessageContent::VoiceNote(MessageVoiceNote {
+                file_id,
+                caption,
+                is_listened,
+            })
+        }
+        MessageContentType::ChatCreate => {
+            let title = parser.string()?;
+            let participant_user_ids = parse_user_id_vec(parser)?;
+            MessageContent::ChatCreate(MessageChatCreate {
+                title,
+                participant_user_ids,
+            })
+        }
+        MessageContentType::ChatChangeTitle => {
+            MessageContent::ChatChangeTitle(MessageChatChangeTitle {
+                title: parser.string()?,
+            })
+        }
+        MessageContentType::ChatChangePhoto => {
+            let photo = parse_photo(parser, ctx)?;
+            if photo.is_empty() {
+                is_bad = true;
+            }
+            MessageContent::ChatChangePhoto(MessageChatChangePhoto { photo })
+        }
+        MessageContentType::ChatDeletePhoto => {
+            MessageContent::ChatDeletePhoto(MessageChatDeletePhoto)
+        }
+        MessageContentType::ChatDeleteHistory => {
+            MessageContent::ChatDeleteHistory(MessageChatDeleteHistory)
+        }
+        MessageContentType::ChatAddUsers => MessageContent::ChatAddUsers(MessageChatAddUsers {
+            user_ids: parse_user_id_vec(parser)?,
+        }),
+        MessageContentType::ChatJoinedByLink => {
+            let is_approved = if parser.version() >= version::ADD_INVITE_LINKS_REQUIRING_APPROVAL {
+                parser.parse_flags::<1>()?[0]
+            } else {
+                false
+            };
+            MessageContent::ChatJoinedByLink(MessageChatJoinedByLink { is_approved })
+        }
+        MessageContentType::ChatDeleteUser => {
+            MessageContent::ChatDeleteUser(MessageChatDeleteUser {
+                user_id: parse_user_id(parser)?,
+            })
+        }
+        MessageContentType::ChatMigrateTo => MessageContent::ChatMigrateTo(MessageChatMigrateTo {
+            migrated_to_channel_id: parse_channel_id(parser)?,
+        }),
+        MessageContentType::ChannelCreate => MessageContent::ChannelCreate(MessageChannelCreate {
+            title: parser.string()?,
+        }),
+        MessageContentType::ChannelMigrateFrom => {
+            let title = parser.string()?;
+            let migrated_from_chat_id = parse_chat_id(parser)?;
+            MessageContent::ChannelMigrateFrom(MessageChannelMigrateFrom {
+                title,
+                migrated_from_chat_id,
+            })
+        }
+        MessageContentType::PinMessage => MessageContent::PinMessage(MessagePinMessage {
+            message_id: parse_message_id(parser)?,
+        }),
+        MessageContentType::GameScore => {
+            let game_message_id = parse_message_id(parser)?;
+            let game_id = parser.i64_()?;
+            let score = parser.i32_()?;
+            MessageContent::GameScore(MessageGameScore {
+                game_message_id,
+                game_id,
+                score,
+            })
+        }
+        MessageContentType::ScreenshotTaken => {
+            MessageContent::ScreenshotTaken(MessageScreenshotTaken)
+        }
+        MessageContentType::ChatSetTtl => {
+            let mut has_from_user_id = false;
+            if parser.version() >= version::ADD_MESSAGE_CHAT_SET_TTL_FLAGS {
+                has_from_user_id = parser.parse_flags::<1>()?[0];
+            }
+            let ttl = parser.i32_()?;
+            let from_user_id = if has_from_user_id {
+                parse_user_id(parser)?
+            } else {
+                UserId::default()
+            };
+            MessageContent::ChatSetTtl(MessageChatSetTtl { ttl, from_user_id })
+        }
+        MessageContentType::Call => {
+            let mut is_video = false;
+            let mut has_call_access_hash = false;
+            if parser.version() >= version::ADD_VIDEO_CALLS_SUPPORT {
+                let flags = parser.parse_flags::<2>()?;
+                is_video = flags[0];
+                has_call_access_hash = flags[1];
+            }
+            let call_id = parser.i64_()?;
+            let duration = parser.i32_()?;
+            let discard_reason_type_raw = parser.i32_()?;
+            let discard_reason = CallDiscardReason {
+                r#type: CallDiscardReasonType::from_raw(discard_reason_type_raw),
+                slug: String::new(),
+            };
+            let call_access_hash = if has_call_access_hash {
+                parser.i64_()?
+            } else {
+                0
+            };
+            MessageContent::Call(MessageCall {
+                call_id,
+                call_access_hash,
+                duration,
+                discard_reason,
+                is_video,
+            })
+        }
+        MessageContentType::PaymentSuccessful => {
+            let flags = parser.parse_flags::<11>()?;
+            let currency = parser.string()?;
+            let mut total_amount = parser.i64_()?;
+            // The legacy `is_correctly_stored = false` layout stored
+            // `total_amount` in the payload slot and `invoice_payload` in
+            // the shipping slot (MessageContent.cpp:3720-3728).
+            let invoice_payload;
+            let shipping_option_id;
+            if flags[6] {
+                invoice_payload = if flags[0] {
+                    parser.string()?
+                } else {
+                    String::new()
+                };
+                shipping_option_id = if flags[1] {
+                    parser.string()?
+                } else {
+                    String::new()
+                };
+            } else {
+                if flags[0] {
+                    total_amount = parser.i64_()?;
+                }
+                invoice_payload = if flags[1] {
+                    parser.string()?
+                } else {
+                    String::new()
+                };
+                shipping_option_id = String::new();
+            }
+            let order_info = if flags[2] {
+                Some(parse_order_info(parser)?)
+            } else {
+                None
+            };
+            let telegram_payment_charge_id = if flags[3] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let provider_payment_charge_id = if flags[4] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let invoice_message_id = if flags[5] {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            let invoice_dialog_id = if flags[7] {
+                parse_dialog_id(parser)?
+            } else {
+                DialogId::default()
+            };
+            let subscription_until_date = if flags[10] { parser.i32_()? } else { 0 };
+            if !flags[6] {
+                return Ok(MessageContent::Unsupported(MessageUnsupported {
+                    version: 0,
+                }));
+            }
+            MessageContent::PaymentSuccessful(MessagePaymentSuccessful {
+                invoice_dialog_id,
+                invoice_message_id,
+                currency,
+                total_amount,
+                invoice_payload,
+                subscription_until_date,
+                is_recurring: flags[8],
+                is_first_recurring: flags[9],
+                shipping_option_id,
+                order_info,
+                telegram_payment_charge_id,
+                provider_payment_charge_id,
+            })
+        }
+        MessageContentType::ContactRegistered => {
+            MessageContent::ContactRegistered(MessageContactRegistered)
+        }
+        MessageContentType::ExpiredPhoto => MessageContent::ExpiredPhoto(MessageExpiredPhoto),
+        MessageContentType::ExpiredVideo => MessageContent::ExpiredVideo(MessageExpiredVideo),
+        MessageContentType::CustomServiceAction => {
+            MessageContent::CustomServiceAction(MessageCustomServiceAction {
+                message: parser.string()?,
+            })
+        }
+        MessageContentType::WebsiteConnected => {
+            MessageContent::WebsiteConnected(MessageWebsiteConnected {
+                domain_name: parser.string()?,
+            })
+        }
+        MessageContentType::PassportDataSent => {
+            let types_len = parser.i32_()?;
+            if types_len < 0 || parser.left_len() < types_len as usize {
+                return Err("Wrong vector length");
+            }
+            let mut types = Vec::with_capacity(types_len as usize);
+            for _ in 0..types_len {
+                let raw = parser.i32_()?;
+                types.push(match SecureValueType::try_from(raw) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        tdutils::log_error!("Wrong secure value type {raw}");
+                        SecureValueType::None
+                    }
+                });
+            }
+            MessageContent::PassportDataSent(MessagePassportDataSent { types })
+        }
+        MessageContentType::PassportDataReceived => {
+            let values_len = parser.i32_()?;
+            if values_len < 0 || parser.left_len() < values_len as usize {
+                return Err("Wrong vector length");
+            }
+            let mut values = Vec::with_capacity(values_len as usize);
+            for _ in 0..values_len {
+                values.push(parse_encrypted_secure_value(parser, ctx)?);
+            }
+            let credentials = parse_encrypted_secure_credentials(parser)?;
+            MessageContent::PassportDataReceived(MessagePassportDataReceived {
+                values,
+                credentials,
+            })
+        }
+        MessageContentType::Poll => {
+            let mut has_caption = false;
+            let mut has_attached_media = false;
+            if parser.version() >= version::ADD_POLL_CAPTION {
+                let flags = parser.parse_flags::<2>()?;
+                has_caption = flags[0];
+                has_attached_media = flags[1];
+            }
+            let poll_id = ctx.parse_poll(parser)?;
+            let caption = if has_caption {
+                parse_caption(parser)?
+            } else {
+                FormattedText::default()
+            };
+            let attached_media = if has_attached_media {
+                Some(Box::new(parse_message_content(parser, ctx)?))
+            } else {
+                None
+            };
+            is_bad = !poll_id.is_valid();
+            MessageContent::Poll(MessagePoll {
+                poll_id,
+                caption,
+                attached_media,
+            })
+        }
+        MessageContentType::Dice => {
+            let mut is_stake = false;
+            let mut has_seed = false;
+            let mut has_stake_ton_count = false;
+            let mut has_prize_ton_count = false;
+            let mut has_state_hash = false;
+            if parser.version() >= version::ADD_DICE_FLAGS {
+                let flags = parser.parse_flags::<5>()?;
+                is_stake = flags[0];
+                has_seed = flags[1];
+                has_stake_ton_count = flags[2];
+                has_prize_ton_count = flags[3];
+                has_state_hash = flags[4];
+            }
+            let emoji = if parser.version() >= version::ADD_DICE_EMOJI {
+                remove_emoji_modifiers(&parser.string()?, true)
+            } else {
+                MessageDice::DEFAULT_EMOJI.to_string()
+            };
+            let dice_value = parser.i32_()?;
+            let seed = if has_seed {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let stake_ton_count = if has_stake_ton_count {
+                parser.i64_()?
+            } else {
+                0
+            };
+            let prize_ton_count = if has_prize_ton_count {
+                parser.i64_()?
+            } else {
+                0
+            };
+            let state_hash = if has_state_hash {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let dice = MessageDice {
+                emoji,
+                dice_value,
+                is_stake,
+                seed,
+                state_hash,
+                stake_ton_count,
+                prize_ton_count,
+            };
+            is_bad = !dice.is_valid();
+            MessageContent::Dice(dice)
+        }
+        MessageContentType::ProximityAlertTriggered => {
+            let traveler_dialog_id = parse_dialog_id(parser)?;
+            let watcher_dialog_id = parse_dialog_id(parser)?;
+            let distance = parser.i32_()?;
+            MessageContent::ProximityAlertTriggered(MessageProximityAlertTriggered {
+                traveler_dialog_id,
+                watcher_dialog_id,
+                distance,
+            })
+        }
+        MessageContentType::GroupCall => {
+            let flags = parser.parse_flags::<2>()?;
+            let group_call_id = parser.i64_()?;
+            let access_hash = parser.i64_()?;
+            let duration = if flags[0] { parser.i32_()? } else { -1 };
+            let schedule_date = if flags[1] { parser.i32_()? } else { -1 };
+            MessageContent::GroupCall(MessageGroupCall {
+                input_group_call_id: InputGroupCallId::new(group_call_id, access_hash),
+                duration,
+                schedule_date,
+            })
+        }
+        MessageContentType::InviteToGroupCall => {
+            let group_call_id = parser.i64_()?;
+            let access_hash = parser.i64_()?;
+            let user_ids = parse_user_id_vec(parser)?;
+            MessageContent::InviteToGroupCall(MessageInviteToGroupCall {
+                input_group_call_id: InputGroupCallId::new(group_call_id, access_hash),
+                user_ids,
+            })
+        }
+        MessageContentType::WebViewDataSent => {
+            MessageContent::WebViewDataSent(MessageWebViewDataSent {
+                button_text: parser.string()?,
+            })
+        }
+        MessageContentType::WebViewDataReceived => {
+            let button_text = parser.string()?;
+            let data = parser.string()?;
+            MessageContent::WebViewDataReceived(MessageWebViewDataReceived { button_text, data })
+        }
+        MessageContentType::GiftPremium => {
+            let flags = parser.parse_flags::<3>()?;
+            let currency = parser.string()?;
+            let amount = parser.i64_()?;
+            let mut days = parser.i32_()?;
+            if !flags[2] {
+                days = get_premium_duration_day_count(days);
+            }
+            let crypto_currency = if flags[0] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let crypto_amount = if flags[0] { parser.i64_()? } else { 0 };
+            let text = if flags[1] {
+                parse_formatted_text(parser)?
+            } else {
+                FormattedText::default()
+            };
+            MessageContent::GiftPremium(MessageGiftPremium {
+                text,
+                currency,
+                amount,
+                crypto_currency,
+                crypto_amount,
+                days,
+            })
+        }
+        MessageContentType::TopicCreate => {
+            let mut title_missing = false;
+            if parser.version() >= version::SUPPORT_BOT_TOPICS {
+                title_missing = parser.parse_flags::<1>()?[0];
+            }
+            let title = parser.string()?;
+            let icon = parse_forum_topic_icon(parser)?;
+            MessageContent::TopicCreate(MessageTopicCreate {
+                title,
+                icon,
+                title_missing,
+            })
+        }
+        MessageContentType::TopicEdit => MessageContent::TopicEdit(MessageTopicEdit {
+            edited_data: parse_forum_topic_edited_data(parser)?,
+        }),
+        MessageContentType::SuggestProfilePhoto => {
+            let photo = parse_photo(parser, ctx)?;
+            if photo.is_empty() {
+                is_bad = true;
+            }
+            MessageContent::SuggestProfilePhoto(MessageSuggestProfilePhoto { photo })
+        }
+        MessageContentType::WriteAccessAllowed => {
+            MessageContent::WriteAccessAllowed(MessageWriteAccessAllowed)
+        }
+        MessageContentType::RequestedDialog => {
+            let mut has_one_shared_dialog = true;
+            if parser.version() >= version::SUPPORT_MULTIPLE_SHARED_USERS {
+                has_one_shared_dialog = parser.parse_flags::<1>()?[0];
+            }
+            let shared_dialog_ids = if has_one_shared_dialog {
+                vec![parse_dialog_id(parser)?]
+            } else {
+                let len = parser.i32_()?;
+                if len < 0 || parser.left_len() < len as usize {
+                    return Err("Wrong vector length");
+                }
+                let mut dialog_ids = Vec::with_capacity(len as usize);
+                for _ in 0..len {
+                    dialog_ids.push(parse_dialog_id(parser)?);
+                }
+                if dialog_ids.len() > 1 {
+                    for dialog_id in &dialog_ids {
+                        if dialog_id.get_type() != crate::messages_manager::DialogType::User {
+                            is_bad = true;
+                        }
+                    }
+                }
+                dialog_ids
+            };
+            if shared_dialog_ids.is_empty() || !shared_dialog_ids[0].is_valid() {
+                is_bad = true;
+            }
+            let button_id = parser.i32_()?;
+            MessageContent::RequestedDialog(MessageRequestedDialog {
+                shared_dialog_ids,
+                button_id,
+            })
+        }
+        MessageContentType::WebViewWriteAccessAllowed => {
+            MessageContent::WebViewWriteAccessAllowed(MessageWebViewWriteAccessAllowed {
+                web_app: parse_web_app(parser, ctx)?,
+            })
+        }
+        MessageContentType::SetBackground => {
+            let flags = parser.parse_flags::<2>()?;
+            let old_message_id = if flags[0] {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            let background_info = parse_background_info(parser, ctx)?;
+            MessageContent::SetBackground(MessageSetBackground {
+                old_message_id,
+                background_info,
+                for_both: flags[1],
+            })
+        }
+        MessageContentType::Story => {
+            let via_mention = parser.parse_flags::<1>()?[0];
+            let dialog_id = parse_dialog_id(parser)?;
+            let story_raw = parser.i32_()?;
+            let story_full_id = StoryFullId::new(dialog_id, StoryId::new(story_raw));
+            if !story_full_id.is_server() {
+                is_bad = true;
+            }
+            MessageContent::Story(MessageStory {
+                story_full_id,
+                via_mention,
+            })
+        }
+        MessageContentType::WriteAccessAllowedByRequest => {
+            MessageContent::WriteAccessAllowedByRequest(MessageWriteAccessAllowedByRequest)
+        }
+        MessageContentType::GiftCode => {
+            let flags = parser.parse_flags::<9>()?;
+            let creator_dialog_id = if flags[1] {
+                parse_dialog_id(parser)?
+            } else {
+                DialogId::default()
+            };
+            let mut days = parser.i32_()?;
+            if !flags[8] {
+                days = get_premium_duration_day_count(days);
+            }
+            let code = parser.string()?;
+            let currency = if flags[3] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let amount = if flags[4] { parser.i64_()? } else { 0 };
+            let crypto_currency = if flags[5] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let crypto_amount = if flags[6] { parser.i64_()? } else { 0 };
+            let text = if flags[7] {
+                parse_formatted_text(parser)?
+            } else {
+                FormattedText::default()
+            };
+            MessageContent::GiftCode(MessageGiftCode {
+                creator_dialog_id,
+                text,
+                days,
+                currency,
+                amount,
+                crypto_currency,
+                crypto_amount,
+                via_giveaway: flags[0],
+                is_unclaimed: flags[2],
+                code,
+            })
+        }
+        MessageContentType::Giveaway => {
+            let has_star_count = parser.parse_flags::<1>()?[0];
+            let giveaway_parameters = parse_giveaway_parameters(parser)?;
+            let quantity = parser.i32_()?;
+            let months = parser.i32_()?;
+            let star_count = if has_star_count { parser.i64_()? } else { 0 };
+            if !giveaway_parameters.is_valid() {
+                is_bad = true;
+            }
+            MessageContent::Giveaway(MessageGiveaway {
+                giveaway_parameters,
+                quantity,
+                months,
+                star_count,
+            })
+        }
+        MessageContentType::GiveawayLaunch => {
+            let mut has_star_count = false;
+            if parser.version() >= version::SUPPORT_STAR_GIVEAWAYS {
+                has_star_count = parser.parse_flags::<1>()?[0];
+            }
+            let star_count = if has_star_count { parser.i64_()? } else { 0 };
+            MessageContent::GiveawayLaunch(MessageGiveawayLaunch { star_count })
+        }
+        MessageContentType::GiveawayResults => {
+            let flags = parser.parse_flags::<4>()?;
+            let winner_count = if flags[0] { parser.i32_()? } else { 0 };
+            let unclaimed_count = if flags[1] { parser.i32_()? } else { 0 };
+            let giveaway_message_id = if flags[2] {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            if winner_count < 0 || unclaimed_count < 0 {
+                is_bad = true;
+            }
+            MessageContent::GiveawayResults(MessageGiveawayResults {
+                giveaway_message_id,
+                winner_count,
+                unclaimed_count,
+                is_star_giveaway: flags[3],
+            })
+        }
+        MessageContentType::GiveawayWinners => {
+            let flags = parser.parse_flags::<12>()?;
+            let giveaway_message_id = if flags[2] {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            let boosted_channel_id = if flags[3] {
+                parse_channel_id(parser)?
+            } else {
+                ChannelId::default()
+            };
+            let additional_dialog_count = if flags[4] { parser.i32_()? } else { 0 };
+            let month_count = if flags[5] { parser.i32_()? } else { 0 };
+            let prize_description = if flags[6] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let winners_selection_date = if flags[7] { parser.i32_()? } else { 0 };
+            let winner_count = if flags[8] { parser.i32_()? } else { 0 };
+            let unclaimed_count = if flags[9] { parser.i32_()? } else { 0 };
+            let winner_user_ids = if flags[10] {
+                parse_user_id_vec(parser)?
+            } else {
+                Vec::new()
+            };
+            let star_count = if flags[11] { parser.i64_()? } else { 0 };
+            if winner_count < 0 || unclaimed_count < 0 {
+                is_bad = true;
+            }
+            MessageContent::GiveawayWinners(MessageGiveawayWinners {
+                giveaway_message_id,
+                boosted_channel_id,
+                additional_dialog_count,
+                month_count,
+                star_count,
+                prize_description,
+                winners_selection_date,
+                only_new_subscribers: flags[0],
+                was_refunded: flags[1],
+                winner_count,
+                unclaimed_count,
+                winner_user_ids,
+            })
+        }
+        MessageContentType::ExpiredVideoNote => {
+            MessageContent::ExpiredVideoNote(MessageExpiredVideoNote)
+        }
+        MessageContentType::ExpiredVoiceNote => {
+            MessageContent::ExpiredVoiceNote(MessageExpiredVoiceNote)
+        }
+        MessageContentType::BoostApply => {
+            parser.parse_flags::<0>()?;
+            let boost_count = parser.i32_()?;
+            if boost_count < 0 {
+                is_bad = true;
+            }
+            MessageContent::BoostApply(MessageBoostApply { boost_count })
+        }
+        MessageContentType::DialogShared => {
+            parser.parse_flags::<0>()?;
+            let len = parser.i32_()?;
+            if len < 0 || parser.left_len() < len as usize {
+                return Err("Wrong vector length");
+            }
+            let mut shared_dialogs = Vec::with_capacity(len as usize);
+            for _ in 0..len {
+                shared_dialogs.push(parse_shared_dialog(parser, ctx)?);
+            }
+            if shared_dialogs.is_empty() || shared_dialogs.iter().any(|d| !d.is_valid()) {
+                is_bad = true;
+            }
+            let button_id = parser.i32_()?;
+            MessageContent::DialogShared(MessageDialogShared {
+                shared_dialogs,
+                button_id,
+            })
+        }
+        MessageContentType::PaidMedia => {
+            let flags = parser.parse_flags::<2>()?;
+            let media_len = parser.i32_()?;
+            if media_len < 0 || parser.left_len() < media_len as usize {
+                return Err("Wrong vector length");
+            }
+            let mut media = Vec::with_capacity(media_len as usize);
+            for _ in 0..media_len {
+                media.push(parse_message_extended_media(parser, ctx)?);
+            }
+            let caption = if flags[0] {
+                parse_caption(parser)?
+            } else {
+                FormattedText::default()
+            };
+            let star_count = parser.i64_()?;
+            let payload = if flags[1] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            for media_item in &media {
+                if media_item.is_empty() {
+                    is_bad = true;
+                }
+            }
+            MessageContent::PaidMedia(MessagePaidMedia {
+                media,
+                caption,
+                star_count,
+                payload,
+            })
+        }
+        MessageContentType::PaymentRefunded => {
+            let has_invoice_payload = parser.parse_flags::<1>()?[0];
+            let dialog_id = parse_dialog_id(parser)?;
+            let currency = parser.string()?;
+            let total_amount = parser.i64_()?;
+            let invoice_payload = if has_invoice_payload {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let telegram_payment_charge_id = parser.string()?;
+            let provider_payment_charge_id = parser.string()?;
+            MessageContent::PaymentRefunded(MessagePaymentRefunded {
+                dialog_id,
+                currency,
+                total_amount,
+                invoice_payload,
+                telegram_payment_charge_id,
+                provider_payment_charge_id,
+            })
+        }
+        MessageContentType::GiftStars => {
+            let flags = parser.parse_flags::<2>()?;
+            let currency = parser.string()?;
+            let amount = parser.i64_()?;
+            let star_count = parser.i64_()?;
+            let crypto_currency = if flags[0] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let crypto_amount = if flags[0] { parser.i64_()? } else { 0 };
+            let transaction_id = if flags[1] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            MessageContent::GiftStars(MessageGiftStars {
+                currency,
+                amount,
+                crypto_currency,
+                crypto_amount,
+                star_count,
+                transaction_id,
+            })
+        }
+        MessageContentType::PrizeStars => {
+            let is_unclaimed = parser.parse_flags::<1>()?[0];
+            let star_count = parser.i64_()?;
+            let transaction_id = parser.string()?;
+            let boosted_dialog_id = parse_dialog_id(parser)?;
+            let giveaway_message_id = parse_message_id(parser)?;
+            MessageContent::PrizeStars(MessagePrizeStars {
+                star_count,
+                transaction_id,
+                boosted_dialog_id,
+                giveaway_message_id,
+                is_unclaimed,
+            })
+        }
+        MessageContentType::PaidMessagesRefunded => {
+            parser.parse_flags::<0>()?;
+            let message_count = parser.i32_()?;
+            let star_count = parser.i64_()?;
+            MessageContent::PaidMessagesRefunded(MessagePaidMessagesRefunded {
+                message_count,
+                star_count,
+            })
+        }
+        MessageContentType::PaidMessagesPrice => {
+            let broadcast_messages_allowed = parser.parse_flags::<1>()?[0];
+            let star_count = parser.i64_()?;
+            MessageContent::PaidMessagesPrice(MessagePaidMessagesPrice {
+                star_count,
+                broadcast_messages_allowed,
+            })
+        }
+        MessageContentType::ConferenceCall => {
+            let flags = parser.parse_flags::<5>()?;
+            let call_id = parser.i64_()?;
+            let duration = if flags[3] { parser.i32_()? } else { 0 };
+            let other_participant_dialog_ids = if flags[4] {
+                let len = parser.i32_()?;
+                if len < 0 || parser.left_len() < len as usize {
+                    return Err("Wrong vector length");
+                }
+                let mut dialog_ids = Vec::with_capacity(len as usize);
+                for _ in 0..len {
+                    dialog_ids.push(parse_dialog_id(parser)?);
+                }
+                dialog_ids
+            } else {
+                Vec::new()
+            };
+            MessageContent::ConferenceCall(MessageConferenceCall {
+                call_id,
+                duration,
+                other_participant_dialog_ids,
+                is_active: flags[0],
+                is_video: flags[1],
+                was_missed: flags[2],
+            })
+        }
+        MessageContentType::ToDoList => {
+            parser.parse_flags::<0>()?;
+            let list = parse_to_do_list(parser)?;
+            let completions_len = parser.i32_()?;
+            if completions_len < 0 || parser.left_len() < completions_len as usize {
+                return Err("Wrong vector length");
+            }
+            let mut completions = Vec::with_capacity(completions_len as usize);
+            for _ in 0..completions_len {
+                completions.push(parse_to_do_completion(parser)?);
+            }
+            MessageContent::ToDoList(MessageToDoList { list, completions })
+        }
+        MessageContentType::TodoCompletions => {
+            let flags = parser.parse_flags::<3>()?;
+            let to_do_message_id = if flags[0] {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            let completed_task_ids = if flags[1] {
+                parser.i32_vec()?
+            } else {
+                Vec::new()
+            };
+            let incompleted_task_ids = if flags[2] {
+                parser.i32_vec()?
+            } else {
+                Vec::new()
+            };
+            MessageContent::TodoCompletions(MessageTodoCompletions {
+                to_do_message_id,
+                completed_task_ids,
+                incompleted_task_ids,
+            })
+        }
+        MessageContentType::TodoAppendTasks => {
+            let flags = parser.parse_flags::<2>()?;
+            let to_do_message_id = if flags[0] {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            let items = if flags[1] {
+                let len = parser.i32_()?;
+                if len < 0 || parser.left_len() < len as usize {
+                    return Err("Wrong vector length");
+                }
+                let mut items = Vec::with_capacity(len as usize);
+                for _ in 0..len {
+                    items.push(parse_to_do_item(parser)?);
+                }
+                items
+            } else {
+                Vec::new()
+            };
+            MessageContent::TodoAppendTasks(MessageTodoAppendTasks {
+                to_do_message_id,
+                items,
+            })
+        }
+        MessageContentType::GiftTon => {
+            let has_transaction_id = parser.parse_flags::<1>()?[0];
+            let currency = parser.string()?;
+            let amount = parser.i64_()?;
+            let crypto_currency = parser.string()?;
+            let crypto_amount = parser.i64_()?;
+            let transaction_id = if has_transaction_id {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            MessageContent::GiftTon(MessageGiftTon {
+                currency,
+                amount,
+                crypto_currency,
+                crypto_amount,
+                transaction_id,
+            })
+        }
+        MessageContentType::SuggestedPostSuccess => {
+            let flags = parser.parse_flags::<2>()?;
+            let suggested_post_message_id = if flags[0] {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            let amount = if flags[1] {
+                parse_currency_amount(parser)?
+            } else {
+                CurrencyAmount::default()
+            };
+            MessageContent::SuggestedPostSuccess(MessageSuggestedPostSuccess {
+                suggested_post_message_id,
+                amount,
+            })
+        }
+        MessageContentType::SuggestedPostRefund => {
+            let flags = parser.parse_flags::<2>()?;
+            let suggested_post_message_id = if flags[0] {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            MessageContent::SuggestedPostRefund(MessageSuggestedPostRefund {
+                suggested_post_message_id,
+                is_payer_initiated: flags[1],
+            })
+        }
+        MessageContentType::SuggestedPostApproval => {
+            let flags = parser.parse_flags::<6>()?;
+            let suggested_post_message_id = if flags[0] {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            let price = if flags[1] {
+                parse_suggested_post_price(parser)?
+            } else {
+                SuggestedPostPrice::default()
+            };
+            let comment = if flags[2] {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            let send_date = if flags[3] { parser.i32_()? } else { 0 };
+            MessageContent::SuggestedPostApproval(MessageSuggestedPostApproval {
+                suggested_post_message_id,
+                price,
+                comment,
+                send_date,
+                is_rejected: flags[4],
+                is_balance_too_low: flags[5],
+            })
+        }
+        MessageContentType::SuggestBirthday => {
+            parser.parse_flags::<0>()?;
+            MessageContent::SuggestBirthday(MessageSuggestBirthday {
+                birthdate: Birthdate::parse_from(parser)?,
+            })
+        }
+        MessageContentType::NewCreatorPending => {
+            let has_new_creator_user_id = parser.parse_flags::<1>()?[0];
+            let new_creator_user_id = if has_new_creator_user_id {
+                parse_user_id(parser)?
+            } else {
+                UserId::default()
+            };
+            MessageContent::NewCreatorPending(MessageNewCreatorPending {
+                new_creator_user_id,
+            })
+        }
+        MessageContentType::ChangeCreator => {
+            parser.parse_flags::<0>()?;
+            let new_creator_user_id = parse_user_id(parser)?;
+            if !new_creator_user_id.is_valid() {
+                is_bad = true;
+            }
+            MessageContent::ChangeCreator(MessageChangeCreator {
+                new_creator_user_id,
+            })
+        }
+        MessageContentType::NoForwardsToggle => {
+            let flags = parser.parse_flags::<3>()?;
+            let request_message_id = if flags[2] {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            MessageContent::NoForwardsToggle(MessageNoForwardsToggle {
+                request_message_id,
+                prev_value: flags[0],
+                new_value: flags[1],
+            })
+        }
+        MessageContentType::NoForwardsRequest => {
+            let flags = parser.parse_flags::<3>()?;
+            MessageContent::NoForwardsRequest(MessageNoForwardsRequest {
+                is_expired: flags[0],
+                prev_value: flags[1],
+                new_value: flags[2],
+            })
+        }
+        MessageContentType::ManagedBotCreated => {
+            parser.parse_flags::<0>()?;
+            let bot_user_id = parse_user_id(parser)?;
+            if !bot_user_id.is_valid() {
+                is_bad = true;
+            }
+            MessageContent::ManagedBotCreated(MessageManagedBotCreated { bot_user_id })
+        }
+        MessageContentType::PollAppendAnswer => {
+            let has_poll_message_id = parser.parse_flags::<1>()?[0];
+            let poll_message_id = if has_poll_message_id {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            let text = parse_formatted_text(parser)?;
+            let data = parser.string()?;
+            MessageContent::PollAppendAnswer(MessagePollAppendAnswer {
+                poll_message_id,
+                text,
+                data,
+            })
+        }
+        MessageContentType::PollDeleteAnswer => {
+            let has_poll_message_id = parser.parse_flags::<1>()?[0];
+            let poll_message_id = if has_poll_message_id {
+                parse_message_id(parser)?
+            } else {
+                MessageId::default()
+            };
+            let text = parse_formatted_text(parser)?;
+            let data = parser.string()?;
+            MessageContent::PollDeleteAnswer(MessagePollDeleteAnswer {
+                poll_message_id,
+                text,
+                data,
+            })
+        }
+        MessageContentType::ChangeCommunity => {
+            let has_community_id = parser.parse_flags::<1>()?[0];
+            let community_id = if has_community_id {
+                CommunityId::new(parser.i64_()?)
+            } else {
+                CommunityId::default()
+            };
+            MessageContent::ChangeCommunity(MessageChangeCommunity { community_id })
+        }
+        MessageContentType::ChatJoinedViaCommunity => {
+            parser.parse_flags::<0>()?;
+            let community_id = CommunityId::new(parser.i64_()?);
+            MessageContent::ChatJoinedViaCommunity(MessageChatJoinedViaCommunity { community_id })
+        }
+        // The unmodeled six: StarGift/StarGiftUnique/StarGiftPurchaseOffer/
+        // StarGiftPurchaseOfferDeclined/ChatSetTheme/RichText.
+        MessageContentType::StarGift
+        | MessageContentType::StarGiftUnique
+        | MessageContentType::StarGiftPurchaseOffer
+        | MessageContentType::StarGiftPurchaseOfferDeclined
+        | MessageContentType::ChatSetTheme
+        | MessageContentType::RichText
+        | MessageContentType::None => {
+            tdutils::log_error!("Load a message with an unmodeled content of type {type_raw}");
+            return Ok(MessageContent::Unsupported(MessageUnsupported {
+                version: 0,
+            }));
+        }
+    };
+    if is_bad {
+        tdutils::log_error!(
+            "Load a message with an invalid content of type {}",
+            content_type as i32
+        );
+        return Ok(MessageContent::Unsupported(MessageUnsupported {
+            version: 0,
+        }));
+    }
+    Ok(content)
+}
+
+fn parse_user_id_vec(parser: &mut Parser) -> Result<Vec<UserId>, &'static str> {
+    let len = parser.i32_()?;
+    if len < 0 || parser.left_len() < len as usize {
+        return Err("Wrong vector length");
+    }
+    let mut user_ids = Vec::with_capacity(len as usize);
+    for _ in 0..len {
+        user_ids.push(parse_user_id(parser)?);
+    }
+    Ok(user_ids)
+}
+
+fn parse_formatted_text(parser: &mut Parser) -> Result<FormattedText, &'static str> {
+    FormattedText::parse(parser)
+}
+
+// ---------------------------------------------------------------------------
+// M.9.7/M.9.8/M.9.9 — the classification, policy and accessor planes
+// (MessageContentType.cpp, MessageContent.cpp:6207-7415). The manager
+// reads go through the [`MessageContentContext`] seam — the Rust shape of
+// the `const Td *td` parameter these C++ functions take.
+// ---------------------------------------------------------------------------
+
+/// `td::StickerType` (StickerType.h:17). Owned by StickersManager (the
+/// Wave-2/3 stickers slice); the value lands here because
+/// [`get_message_content_sticker_type`] is its first consumer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum StickerType {
+    #[default]
+    Regular = 0,
+    Mask,
+    CustomEmoji,
+}
+
+/// The `const Td *td` surface of the M.9.7/M.9.8/M.9.9 planes — the
+/// manager queries the C++ free functions make through `td`. Real
+/// implementations land with each owner (the UserManager reads with the
+/// Td wiring of this line, ChatManager with M.5, PollManager with
+/// Wave 2, StickersManager/WebPagesManager with their slices); tests use
+/// a table stand-in the way the store/parse plane uses `RawIdStorage`.
+pub trait MessageContentContext {
+    // -- UserManager (UserManager.cpp:5387/5610/5620/5720) --
+    fn get_user_default_permissions(&self, user_id: UserId) -> RestrictedRights;
+    fn get_secret_chat_default_permissions(&self, secret_chat_id: SecretChatId)
+    -> RestrictedRights;
+    /// `UserManager::is_user_bot` (UserManager.cpp:5387-5393).
+    fn is_user_bot(&self, user_id: UserId) -> bool;
+    /// `UserManager::get_user_voice_messages_forbidden`
+    /// (UserManager.cpp:5720-5729).
+    fn get_user_voice_messages_forbidden(&self, user_id: UserId) -> bool;
+
+    // -- ChatManager (M.5) --
+    /// `td->chat_manager_->get_chat_permissions(chat_id)
+    /// .get_effective_restricted_rights()` (MessageContent.cpp:6218-6220).
+    fn get_chat_effective_restricted_rights(&self, chat_id: ChatId) -> RestrictedRights;
+    /// The channel twin of the chat read (MessageContent.cpp:6221-6222).
+    fn get_channel_effective_restricted_rights(&self, channel_id: ChannelId) -> RestrictedRights;
+    /// `ChatManager::is_broadcast_channel`.
+    fn is_broadcast_channel(&self, channel_id: ChannelId) -> bool;
+    /// `ChatManager::is_monoforum_channel`.
+    fn is_monoforum_channel(&self, channel_id: ChannelId) -> bool;
+
+    // -- AuthManager / DialogManager --
+    /// `td->auth_manager_->is_bot()`.
+    fn is_bot(&self) -> bool;
+    /// `td->dialog_manager_->get_my_dialog_id()`.
+    fn get_my_dialog_id(&self) -> DialogId;
+
+    // -- PollManager (Wave 2) --
+    fn get_poll_is_anonymous(&self, poll_id: PollId) -> bool;
+    fn get_poll_is_closed(&self, poll_id: PollId) -> bool;
+    fn get_poll_can_add_option(&self, poll_id: PollId) -> bool;
+    fn get_poll_can_view_stats(&self, poll_id: PollId) -> bool;
+    fn get_poll_has_unread_votes(&self, poll_id: PollId) -> bool;
+    fn remove_poll_has_unread_votes(&self, poll_id: PollId);
+    /// `PollManager::has_input_media` (the forward gate,
+    /// MessageContent.cpp:6503-6506).
+    fn has_input_media_poll(&self, poll_id: PollId) -> bool;
+    /// `PollManager::get_individual_message_contents`
+    /// (MessageContent.cpp:6702-6705); `attached_media` is the stored
+    /// `MessagePoll::attached_media` of the message.
+    fn get_poll_individual_message_contents(
+        &self,
+        poll_id: PollId,
+        attached_media: Option<&MessageContent>,
+    ) -> Vec<MessageContent>;
+    /// `PollManager::get_poll_option_properties`
+    /// (PollManager.cpp:1147) — the td_api request arm.
+    #[allow(clippy::too_many_arguments)] // the C++ handler has the same shape
+    fn get_poll_option_properties(
+        &self,
+        poll_id: PollId,
+        option_id: &str,
+        dialog_id: DialogId,
+        message_id: MessageId,
+        can_be_replied: bool,
+        can_be_replied_in_another_chat: bool,
+        can_get_link: bool,
+        is_forward: bool,
+        is_outgoing: bool,
+        promise: Promise<crate::td_api::PollOptionProperties>,
+    );
+
+    // -- StickersManager (Wave 2/3) --
+    /// `StickersManager::get_sticker_type(file_id)`
+    /// (MessageContent.cpp:6714-6717).
+    fn get_sticker_type(&self, file_id: FileId) -> StickerType;
+
+    // -- WebPagesManager (Wave 2) --
+    /// `WebPagesManager::get_web_page_user_ids`
+    /// (MessageContent.cpp:6902-6905).
+    fn get_web_page_user_ids(&self, web_page_id: WebPageId) -> Vec<UserId>;
+    /// `WebPagesManager::get_web_page_channel_ids`
+    /// (MessageContent.cpp:7207-7212).
+    fn get_web_page_channel_ids(&self, web_page_id: WebPageId) -> Vec<ChannelId>;
+
+    // -- OptionManager --
+    /// `td->option_manager_->get_option_integer(name, default)` — the
+    /// `checklist_task_count_max` read of
+    /// `ToDoList::get_can_append_items` (ToDoList.cpp:70).
+    fn get_option_integer(&self, name: &str, default: i64) -> i64;
+}
+
+/// `is_local_poll_id` (PollManager.cpp:449-452) — the local (unsent)
+/// poll-id range; a pure helper, so it ports ahead of its Wave-2 owner.
+fn is_local_poll_id(poll_id: PollId) -> bool {
+    poll_id.get() < 0 && poll_id.get() > i32::MIN as i64
+}
+
+/// The pre-integration line carries the M.5.3 `chat_manager::MessageId`
+/// beside the M.10.1a `messages_manager::MessageId`; the integrator
+/// collapses them, and this bridge keeps the replied-id arms 1-to-1
+/// until then.
+fn to_messages_manager_message_id(message_id: MessageId) -> crate::messages_manager::MessageId {
+    crate::messages_manager::MessageId::new(message_id.get())
+}
+
+/// `can_send_message_content` (MessageContent.cpp:6207-6481). The
+/// `RichText` arm (`RichMessage::can_send`) is deferred with the
+/// unmodeled variant; the `ChatSetTheme` service arm is part of the
+/// `UNREACHABLE()` tail, which aborts exactly like the C++.
+pub fn can_send_message_content(
+    td: &dyn MessageContentContext,
+    dialog_id: DialogId,
+    content: &MessageContent,
+    is_forward: bool,
+    check_permissions: bool,
+) -> Result<(), Status> {
+    let dialog_type = dialog_id.get_type();
+    let permissions = if !check_permissions {
+        RestrictedRights::from_bools(
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            ChannelType::Unknown,
+        )
+    } else {
+        match dialog_type {
+            DialogType::User => td.get_user_default_permissions(dialog_id.get_user_id()),
+            DialogType::Chat => td.get_chat_effective_restricted_rights(dialog_id.get_chat_id()),
+            DialogType::Channel => {
+                td.get_channel_effective_restricted_rights(dialog_id.get_channel_id())
+            }
+            DialogType::SecretChat => {
+                td.get_secret_chat_default_permissions(dialog_id.get_secret_chat_id())
+            }
+            DialogType::None => unreachable!(),
+        }
+    };
+
+    let content_type = content.get_type();
+    if dialog_type == DialogType::SecretChat
+        && !can_send_message_content_to_secret_chat(content_type)
+    {
+        return Err(Status::error(400, "Message can't be sent to a secret chat"));
+    }
+    match content_type {
+        MessageContentType::Animation => {
+            if !permissions.can_send_animations() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send animations to the chat",
+                ));
+            }
+        }
+        MessageContentType::Audio => {
+            if !permissions.can_send_audios() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send music to the chat",
+                ));
+            }
+        }
+        MessageContentType::Contact => {
+            if !permissions.can_send_messages() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send contacts to the chat",
+                ));
+            }
+        }
+        MessageContentType::Dice => {
+            if !permissions.can_send_stickers() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send dice to the chat",
+                ));
+            }
+        }
+        MessageContentType::Document => {
+            if !permissions.can_send_documents() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send documents to the chat",
+                ));
+            }
+        }
+        MessageContentType::Game => {
+            if dialog_type == DialogType::Channel {
+                let channel_id = dialog_id.get_channel_id();
+                if td.is_broadcast_channel(channel_id) {
+                    // return Status::Error(400, "Games can't be sent to channel chats");
+                }
+                if td.is_monoforum_channel(channel_id) {
+                    return Err(Status::error(
+                        400,
+                        "Games can't be sent to channel direct messages chats",
+                    ));
+                }
+            }
+            if !permissions.can_send_games() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send games to the chat",
+                ));
+            }
+        }
+        MessageContentType::Giveaway => {
+            if !permissions.can_send_messages() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send giveaways to the chat",
+                ));
+            }
+        }
+        MessageContentType::GiveawayWinners => {
+            if !permissions.can_send_messages() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send giveaway winners to the chat",
+                ));
+            }
+        }
+        MessageContentType::Invoice => {
+            if !permissions.can_send_messages() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send invoice messages to the chat",
+                ));
+            }
+        }
+        MessageContentType::LiveLocation => {
+            if !permissions.can_send_messages() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send live locations to the chat",
+                ));
+            }
+        }
+        MessageContentType::Location => {
+            if !permissions.can_send_messages() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send locations to the chat",
+                ));
+            }
+        }
+        MessageContentType::PaidMedia => {
+            if is_forward {
+                if !permissions.can_send_photos() || !permissions.can_send_videos() {
+                    return Err(Status::error(
+                        400,
+                        "Not enough rights to send paid media to the chat",
+                    ));
+                }
+            } else if !td.is_bot()
+                && (dialog_type != DialogType::Channel
+                    || !td.is_broadcast_channel(dialog_id.get_channel_id()))
+            {
+                return Err(Status::error(
+                    400,
+                    "Paid media can be sent only in channel chats",
+                ));
+            }
+        }
+        MessageContentType::Photo => {
+            if !permissions.can_send_photos() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send photos to the chat",
+                ));
+            }
+        }
+        MessageContentType::Poll => {
+            if !permissions.can_send_polls() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send polls to the chat",
+                ));
+            }
+            if dialog_type == DialogType::Channel {
+                let channel_id = dialog_id.get_channel_id();
+                let MessageContent::Poll(m) = content else {
+                    unreachable!()
+                };
+                if td.is_broadcast_channel(channel_id) && !td.get_poll_is_anonymous(m.poll_id) {
+                    return Err(Status::error(
+                        400,
+                        "Non-anonymous polls can't be sent to channel chats",
+                    ));
+                }
+                if td.is_monoforum_channel(channel_id) {
+                    return Err(Status::error(
+                        400,
+                        "Polls can't be sent to channel direct messages chats",
+                    ));
+                }
+            }
+            if dialog_type == DialogType::User
+                && !is_forward
+                && !td.is_bot()
+                && !td.is_user_bot(dialog_id.get_user_id())
+                && dialog_id != td.get_my_dialog_id()
+            {
+                return Err(Status::error(
+                    400,
+                    "Polls can't be sent to the private chat",
+                ));
+            }
+        }
+        MessageContentType::Sticker => {
+            if !permissions.can_send_stickers() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send stickers to the chat",
+                ));
+            }
+            if get_message_content_sticker_type(td, content) == StickerType::CustomEmoji {
+                return Err(Status::error(400, "Can't send emoji stickers in messages"));
+            }
+        }
+        MessageContentType::Story => {
+            if !permissions.can_send_photos() || !permissions.can_send_videos() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send stories to the chat",
+                ));
+            }
+        }
+        MessageContentType::Text => {
+            if !permissions.can_send_messages() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send text messages to the chat",
+                ));
+            }
+        }
+        MessageContentType::ToDoList => {
+            if !permissions.can_send_polls() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send checklists to the chat",
+                ));
+            }
+            if dialog_type == DialogType::Channel {
+                let channel_id = dialog_id.get_channel_id();
+                if td.is_broadcast_channel(channel_id) {
+                    return Err(Status::error(
+                        400,
+                        "Checklists can't be sent to channel chats",
+                    ));
+                }
+                if td.is_monoforum_channel(channel_id) {
+                    return Err(Status::error(
+                        400,
+                        "Checklists can't be sent to channel direct messages chats",
+                    ));
+                }
+            }
+        }
+        MessageContentType::Venue => {
+            if !permissions.can_send_messages() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send venues to the chat",
+                ));
+            }
+        }
+        MessageContentType::Video => {
+            if !permissions.can_send_videos() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send videos to the chat",
+                ));
+            }
+        }
+        MessageContentType::VideoNote => {
+            if !permissions.can_send_video_notes() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send video notes to the chat",
+                ));
+            }
+            if dialog_type == DialogType::User
+                && td.get_user_voice_messages_forbidden(dialog_id.get_user_id())
+            {
+                return Err(Status::error(
+                    400,
+                    "User restricted receiving of video note messages",
+                ));
+            }
+        }
+        MessageContentType::VoiceNote => {
+            if !permissions.can_send_voice_notes() {
+                return Err(Status::error(
+                    400,
+                    "Not enough rights to send voice notes to the chat",
+                ));
+            }
+            if dialog_type == DialogType::User
+                && td.get_user_voice_messages_forbidden(dialog_id.get_user_id())
+            {
+                return Err(Status::error(
+                    400,
+                    "User restricted receiving of voice note messages",
+                ));
+            }
+        }
+        MessageContentType::Unsupported => {}
+        // The C++ tail is the enumerated service types plus
+        // `ChatSetTheme`, all `UNREACHABLE()`: sending never offers them.
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+/// `can_forward_message_content` (MessageContent.cpp:6483-6512). The
+/// `RichText` arm is deferred with the unmodeled variant.
+pub fn can_forward_message_content(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+    is_copy: bool,
+) -> bool {
+    let content_type = content.get_type();
+    if content_type == MessageContentType::Text {
+        let MessageContent::Text(text) = content else {
+            unreachable!()
+        };
+        // text must be non-empty if there is no link preview
+        return !is_empty_string(&text.text.text)
+            || text.web_page_id.is_valid()
+            || !text.web_page_url.is_empty();
+    }
+    if content_type == MessageContentType::Poll {
+        let MessageContent::Poll(poll) = content else {
+            unreachable!()
+        };
+        return !is_local_poll_id(poll.poll_id);
+    }
+    if is_copy {
+        if matches!(
+            content_type,
+            MessageContentType::Giveaway
+                | MessageContentType::GiveawayWinners
+                | MessageContentType::PaidMedia
+                | MessageContentType::Invoice
+        ) {
+            return false;
+        }
+        if content_type == MessageContentType::Poll {
+            let MessageContent::Poll(poll) = content else {
+                unreachable!()
+            };
+            if !td.has_input_media_poll(poll.poll_id) {
+                return false;
+            }
+        }
+    }
+
+    !is_service_message_content(content_type)
+        && content_type != MessageContentType::Unsupported
+        && !is_expired_message_content(content_type)
+}
+
+/// `update_opened_message_content` (MessageContent.cpp:6514-6531).
+pub fn update_opened_message_content(content: &mut MessageContent) -> bool {
+    match content {
+        MessageContent::VideoNote(video_note) => {
+            if video_note.is_viewed {
+                return false;
+            }
+            video_note.is_viewed = true;
+            true
+        }
+        MessageContent::VoiceNote(voice_note) => {
+            if voice_note.is_listened {
+                return false;
+            }
+            voice_note.is_listened = true;
+            true
+        }
+        _ => false,
+    }
+}
+
+/// `get_message_content_caption` (MessageContent.cpp) — the private
+/// caption lookup `get_message_content_text` falls back to.
+fn get_message_content_caption(content: &MessageContent) -> Option<&FormattedText> {
+    match content {
+        MessageContent::Animation(m) => Some(&m.caption),
+        MessageContent::Audio(m) => Some(&m.caption),
+        MessageContent::Document(m) => Some(&m.caption),
+        MessageContent::Invoice(m) => Some(m.input_invoice.get_caption()),
+        MessageContent::PaidMedia(m) => Some(&m.caption),
+        MessageContent::Photo(m) => Some(&m.caption),
+        MessageContent::Video(m) => Some(&m.caption),
+        MessageContent::VoiceNote(m) => Some(&m.caption),
+        _ => None,
+    }
+}
+
+/// `get_message_content_text` (MessageContent.cpp) — the text every
+/// search-index and min-id consumer shares; `StarGift` (an unmodeled
+/// text-carrying type) lands with its arm.
+pub fn get_message_content_text(content: &MessageContent) -> Option<&FormattedText> {
+    match content {
+        MessageContent::Text(m) => Some(&m.text),
+        MessageContent::Game(m) => Some(m.game.get_text()),
+        MessageContent::GiftPremium(m) => Some(&m.text),
+        MessageContent::GiftCode(m) => Some(&m.text),
+        MessageContent::Poll(m) => Some(&m.caption),
+        _ => get_message_content_caption(content),
+    }
+}
+
+/// `get_message_content_text_index_mask` (MessageContent.cpp:6537-6559).
+fn get_message_content_text_index_mask(content: &MessageContent) -> i32 {
+    let text = get_message_content_text(content);
+    match text {
+        Some(text) if content.get_type() != MessageContentType::Game => {
+            for entity in &text.entities {
+                if matches!(
+                    entity.r#type,
+                    Some(Type::Url) | Some(Type::EmailAddress) | Some(Type::TextUrl)
+                ) {
+                    return message_search_filter_index_mask(MessageSearchFilter::Url);
+                }
+            }
+            0
+        }
+        _ => 0,
+    }
+}
+
+/// `get_message_content_media_index_mask` (MessageContent.cpp:6561-6685).
+/// The C++ `td` only feeds the `RichText` arm, which lands with the
+/// unmodeled variant.
+fn get_message_content_media_index_mask(
+    _td: &dyn MessageContentContext,
+    content: &MessageContent,
+    is_outgoing: bool,
+) -> i32 {
+    match content {
+        MessageContent::Animation(_) => {
+            message_search_filter_index_mask(MessageSearchFilter::Animation)
+        }
+        MessageContent::Audio(_) => message_search_filter_index_mask(MessageSearchFilter::Audio),
+        MessageContent::Document(_) => {
+            message_search_filter_index_mask(MessageSearchFilter::Document)
+        }
+        MessageContent::Photo(_) => {
+            message_search_filter_index_mask(MessageSearchFilter::Photo)
+                | message_search_filter_index_mask(MessageSearchFilter::PhotoAndVideo)
+        }
+        MessageContent::Video(_) => {
+            message_search_filter_index_mask(MessageSearchFilter::Video)
+                | message_search_filter_index_mask(MessageSearchFilter::PhotoAndVideo)
+        }
+        MessageContent::VideoNote(_) => {
+            message_search_filter_index_mask(MessageSearchFilter::VideoNote)
+                | message_search_filter_index_mask(MessageSearchFilter::VoiceAndVideoNote)
+        }
+        MessageContent::VoiceNote(_) => {
+            message_search_filter_index_mask(MessageSearchFilter::VoiceNote)
+                | message_search_filter_index_mask(MessageSearchFilter::VoiceAndVideoNote)
+        }
+        MessageContent::ChatChangePhoto(_) => {
+            message_search_filter_index_mask(MessageSearchFilter::ChatPhoto)
+        }
+        MessageContent::Call(m) => {
+            let mut index_mask = message_search_filter_index_mask(MessageSearchFilter::Call);
+            if !is_outgoing
+                && (m.discard_reason.r#type == CallDiscardReasonType::Declined
+                    || m.discard_reason.r#type == CallDiscardReasonType::Missed)
+            {
+                index_mask |= message_search_filter_index_mask(MessageSearchFilter::MissedCall);
+            }
+            index_mask
+        }
+        MessageContent::ConferenceCall(m) => {
+            let mut index_mask = message_search_filter_index_mask(MessageSearchFilter::Call);
+            if !is_outgoing && m.was_missed {
+                index_mask |= message_search_filter_index_mask(MessageSearchFilter::MissedCall);
+            }
+            index_mask
+        }
+        MessageContent::Poll(_) => message_search_filter_index_mask(MessageSearchFilter::Poll),
+        // The C++ zero tail enumerates every remaining type explicitly;
+        // the modeled set matches it exactly.
+        _ => 0,
+    }
+}
+
+/// `get_message_content_index_mask` (MessageContent.cpp:6687-6691).
+pub fn get_message_content_index_mask(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+    is_outgoing: bool,
+) -> i32 {
+    get_message_content_text_index_mask(content)
+        | get_message_content_media_index_mask(td, content, is_outgoing)
+}
+
+/// `get_individual_message_contents` (MessageContent.cpp:6693-6712) —
+/// the album splat. The `Poll` arm delegates through the seam; the
+/// `RichText` arm lands with the unmodeled variant.
+pub fn get_individual_message_contents(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> Vec<MessageContent> {
+    match content {
+        MessageContent::PaidMedia(m) => m
+            .media
+            .iter()
+            .map(MessageExtendedMedia::get_message_content)
+            .collect(),
+        MessageContent::Poll(m) => {
+            td.get_poll_individual_message_contents(m.poll_id, m.attached_media.as_deref())
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// `get_message_content_sticker_type` (MessageContent.cpp:6714-6718).
+pub fn get_message_content_sticker_type(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> StickerType {
+    assert!(matches!(content, MessageContent::Sticker(_)));
+    match content {
+        MessageContent::Sticker(m) => td.get_sticker_type(m.file_id),
+        _ => unreachable!(),
+    }
+}
+
+/// `get_message_content_pinned_message_id` (MessageContent.cpp:6720-6728).
+pub fn get_message_content_pinned_message_id(content: &MessageContent) -> MessageId {
+    match content {
+        MessageContent::PinMessage(m) => m.message_id,
+        _ => MessageId::default(),
+    }
+}
+
+/// `get_message_content_my_background_info` (MessageContent.cpp:6730-6754).
+pub fn get_message_content_my_background_info(
+    content: &MessageContent,
+    is_outgoing: bool,
+) -> BackgroundInfo {
+    match content {
+        MessageContent::SetBackground(set_background) => {
+            if is_outgoing || set_background.for_both {
+                return set_background.background_info.clone();
+            }
+            BackgroundInfo::default()
+        }
+        _ => BackgroundInfo::default(),
+    }
+}
+
+// `get_message_content_chat_theme` (MessageContent.cpp:6756-6764) is
+// deferred with the unmodeled `ChatSetTheme` variant.
+
+/// `get_message_content_replied_message_full_id` (MessageContent.cpp:6766-6872).
+/// The `StarGiftUnique` arm lands with the unmodeled variant.
+pub fn get_message_content_replied_message_full_id(
+    dialog_id: DialogId,
+    content: &MessageContent,
+) -> MessageFullId {
+    match content {
+        MessageContent::PinMessage(m) => {
+            MessageFullId::new(dialog_id, to_messages_manager_message_id(m.message_id))
+        }
+        MessageContent::GameScore(m) => {
+            MessageFullId::new(dialog_id, to_messages_manager_message_id(m.game_message_id))
+        }
+        MessageContent::PaymentSuccessful(m) => {
+            if !m.invoice_message_id.is_valid() {
+                return MessageFullId::default();
+            }
+            let reply_in_dialog_id = if m.invoice_dialog_id.is_valid() {
+                m.invoice_dialog_id
+            } else {
+                dialog_id
+            };
+            MessageFullId::new(
+                reply_in_dialog_id,
+                to_messages_manager_message_id(m.invoice_message_id),
+            )
+        }
+        MessageContent::SetBackground(m) => {
+            if !m.old_message_id.is_valid() {
+                return MessageFullId::default();
+            }
+            MessageFullId::new(dialog_id, to_messages_manager_message_id(m.old_message_id))
+        }
+        MessageContent::GiveawayResults(m) => {
+            if !m.giveaway_message_id.is_valid() {
+                return MessageFullId::default();
+            }
+            MessageFullId::new(
+                dialog_id,
+                to_messages_manager_message_id(m.giveaway_message_id),
+            )
+        }
+        MessageContent::TodoCompletions(m) => {
+            if !m.to_do_message_id.is_valid() {
+                return MessageFullId::default();
+            }
+            MessageFullId::new(
+                dialog_id,
+                to_messages_manager_message_id(m.to_do_message_id),
+            )
+        }
+        MessageContent::TodoAppendTasks(m) => {
+            if !m.to_do_message_id.is_valid() {
+                return MessageFullId::default();
+            }
+            MessageFullId::new(
+                dialog_id,
+                to_messages_manager_message_id(m.to_do_message_id),
+            )
+        }
+        MessageContent::SuggestedPostSuccess(m) => {
+            if !m.suggested_post_message_id.is_valid() {
+                return MessageFullId::default();
+            }
+            MessageFullId::new(
+                dialog_id,
+                to_messages_manager_message_id(m.suggested_post_message_id),
+            )
+        }
+        MessageContent::SuggestedPostRefund(m) => {
+            if !m.suggested_post_message_id.is_valid() {
+                return MessageFullId::default();
+            }
+            MessageFullId::new(
+                dialog_id,
+                to_messages_manager_message_id(m.suggested_post_message_id),
+            )
+        }
+        MessageContent::SuggestedPostApproval(m) => {
+            if !m.suggested_post_message_id.is_valid() {
+                return MessageFullId::default();
+            }
+            MessageFullId::new(
+                dialog_id,
+                to_messages_manager_message_id(m.suggested_post_message_id),
+            )
+        }
+        MessageContent::NoForwardsToggle(m) => {
+            if !m.request_message_id.is_valid() {
+                return MessageFullId::default();
+            }
+            MessageFullId::new(
+                dialog_id,
+                to_messages_manager_message_id(m.request_message_id),
+            )
+        }
+        MessageContent::PollAppendAnswer(m) => {
+            if !m.poll_message_id.is_valid() {
+                return MessageFullId::default();
+            }
+            MessageFullId::new(dialog_id, to_messages_manager_message_id(m.poll_message_id))
+        }
+        MessageContent::PollDeleteAnswer(m) => {
+            if !m.poll_message_id.is_valid() {
+                return MessageFullId::default();
+            }
+            MessageFullId::new(dialog_id, to_messages_manager_message_id(m.poll_message_id))
+        }
+        // update getRepliedMessage documentation
+        _ => MessageFullId::default(),
+    }
+}
+
+/// `get_message_content_group_call_info` (MessageContent.cpp:6874-6881).
+pub fn get_message_content_group_call_info(content: &MessageContent) -> (InputGroupCallId, bool) {
+    assert!(matches!(content, MessageContent::GroupCall(_)));
+    match content {
+        MessageContent::GroupCall(m) => (m.input_group_call_id, m.duration >= 0),
+        _ => unreachable!(),
+    }
+}
+
+/// `get_formatted_text_user_ids` (MessageContent.cpp:6883-6895).
+fn get_formatted_text_user_ids(formatted_text: Option<&FormattedText>) -> Vec<UserId> {
+    let mut user_ids = Vec::new();
+    if let Some(formatted_text) = formatted_text {
+        for entity in &formatted_text.entities {
+            if entity.user_id.is_valid() {
+                user_ids.push(entity.user_id);
+            }
+        }
+    }
+    user_ids
+}
+
+/// `td::combine` (td/utils/algorithm.h) — append, sort, unique; both
+/// inputs are sorted-unique vectors at the call sites.
+fn combine_sorted_unique<T: Ord>(mut first: Vec<T>, mut second: Vec<T>) -> Vec<T> {
+    first.append(&mut second);
+    first.sort_unstable();
+    first.dedup();
+    first
+}
+
+/// `get_message_content_min_user_ids` (MessageContent.cpp:6897-7204).
+/// The `Text` web-page arm reads through the seam; the `RichText` arm
+/// lands with the unmodeled variant. Every modeled type is the C++
+/// `break` arm falling through to the formatted-text fallback.
+pub fn get_message_content_min_user_ids(
+    td: &dyn MessageContentContext,
+    message_content: &MessageContent,
+) -> Vec<UserId> {
+    match message_content {
+        MessageContent::Text(content) => {
+            let mut user_ids = get_formatted_text_user_ids(Some(&content.text));
+            if content.web_page_id.is_valid() {
+                user_ids =
+                    combine_sorted_unique(user_ids, td.get_web_page_user_ids(content.web_page_id));
+            }
+            user_ids
+        }
+        MessageContent::Contact(content) => {
+            let user_id = content.contact.get_user_id();
+            if user_id.is_valid() {
+                return vec![user_id];
+            }
+            get_formatted_text_user_ids(get_message_content_text(message_content))
+        }
+        MessageContent::Game(content) => {
+            let user_id = content.game.get_bot_user_id();
+            if user_id.is_valid() {
+                return vec![user_id];
+            }
+            get_formatted_text_user_ids(get_message_content_text(message_content))
+        }
+        MessageContent::ChatCreate(content) => content.participant_user_ids.clone(),
+        MessageContent::ChatAddUsers(content) => content.user_ids.clone(),
+        MessageContent::ChatDeleteUser(content) => vec![content.user_id],
+        MessageContent::ProximityAlertTriggered(content) => {
+            let mut user_ids = Vec::new();
+            if content.traveler_dialog_id.get_type() == DialogType::User {
+                user_ids.push(content.traveler_dialog_id.get_user_id());
+            }
+            if content.watcher_dialog_id.get_type() == DialogType::User {
+                user_ids.push(content.watcher_dialog_id.get_user_id());
+            }
+            user_ids
+        }
+        MessageContent::InviteToGroupCall(content) => content.user_ids.clone(),
+        MessageContent::Story(content) => {
+            let dialog_id = content.story_full_id.get_dialog_id();
+            if dialog_id.get_type() == DialogType::User {
+                return vec![dialog_id.get_user_id()];
+            }
+            get_formatted_text_user_ids(get_message_content_text(message_content))
+        }
+        MessageContent::GiveawayWinners(content) => content.winner_user_ids.clone(),
+        MessageContent::NewCreatorPending(content) => {
+            if content.new_creator_user_id.is_valid() {
+                return vec![content.new_creator_user_id];
+            }
+            get_formatted_text_user_ids(get_message_content_text(message_content))
+        }
+        MessageContent::ChangeCreator(content) => vec![content.new_creator_user_id],
+        MessageContent::ManagedBotCreated(content) => vec![content.bot_user_id],
+        // `ChatSetTtl` keeps its C++ comment: the `from_user_id` user
+        // can't be min. The "private chats only" types (DialogShared,
+        // PaymentRefunded, PrizeStars, the StarGift family,
+        // ConferenceCall) fall through the same way.
+        _ => get_formatted_text_user_ids(get_message_content_text(message_content)),
+    }
+}
+
+/// `get_message_content_min_channel_ids` (MessageContent.cpp:7206-7238).
+pub fn get_message_content_min_channel_ids(
+    td: &dyn MessageContentContext,
+    message_content: &MessageContent,
+) -> Vec<ChannelId> {
+    match message_content {
+        MessageContent::Text(content) => {
+            if content.web_page_id.is_valid() {
+                return td.get_web_page_channel_ids(content.web_page_id);
+            }
+            Vec::new()
+        }
+        MessageContent::ProximityAlertTriggered(content) => {
+            let mut channel_ids = Vec::new();
+            if content.traveler_dialog_id.get_type() == DialogType::Channel {
+                channel_ids.push(content.traveler_dialog_id.get_channel_id());
+            }
+            if content.watcher_dialog_id.get_type() == DialogType::Channel {
+                channel_ids.push(content.watcher_dialog_id.get_channel_id());
+            }
+            channel_ids
+        }
+        MessageContent::Story(content) => {
+            let dialog_id = content.story_full_id.get_dialog_id();
+            if dialog_id.get_type() == DialogType::Channel {
+                return vec![dialog_id.get_channel_id()];
+            }
+            Vec::new()
+        }
+        MessageContent::Giveaway(content) => content.giveaway_parameters.get_channel_ids(),
+        MessageContent::GiveawayWinners(content) => vec![content.boosted_channel_id],
+        _ => Vec::new(),
+    }
+}
+
+/// `get_message_content_added_user_ids` (MessageContent.cpp:7240-7245).
+pub fn get_message_content_added_user_ids(content: &MessageContent) -> Vec<UserId> {
+    assert!(matches!(content, MessageContent::ChatAddUsers(_)));
+    match content {
+        MessageContent::ChatAddUsers(m) => m.user_ids.clone(),
+        _ => unreachable!(),
+    }
+}
+
+/// `get_message_content_deleted_user_id` (MessageContent.cpp:7247-7255).
+pub fn get_message_content_deleted_user_id(content: &MessageContent) -> UserId {
+    match content {
+        MessageContent::ChatDeleteUser(m) => m.user_id,
+        _ => UserId::default(),
+    }
+}
+
+/// `get_message_content_input_phone_call` (MessageContent.cpp:7257-7266).
+pub fn get_message_content_input_phone_call(
+    content: &MessageContent,
+) -> Option<telegram_api::InputPhoneCall> {
+    assert!(matches!(content, MessageContent::Call(_)));
+    match content {
+        MessageContent::Call(call) => {
+            if call.call_access_hash == 0 {
+                return None;
+            }
+            Some(telegram_api::InputPhoneCall {
+                id: call.call_id,
+                access_hash: call.call_access_hash,
+            })
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// `get_message_content_live_location_period` (MessageContent.cpp:7268-7276).
+pub fn get_message_content_live_location_period(content: &MessageContent) -> i32 {
+    match content {
+        MessageContent::LiveLocation(m) => m.period,
+        _ => 0,
+    }
+}
+
+/// `get_message_content_poll_id` (MessageContent.cpp:7278-7286).
+pub fn get_message_content_poll_id(content: &MessageContent) -> PollId {
+    match content {
+        MessageContent::Poll(m) => m.poll_id,
+        _ => PollId::default(),
+    }
+}
+
+/// `get_message_content_poll_is_anonymous` (MessageContent.cpp:7288-7296).
+pub fn get_message_content_poll_is_anonymous(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> bool {
+    match content {
+        MessageContent::Poll(m) => td.get_poll_is_anonymous(m.poll_id),
+        _ => false,
+    }
+}
+
+/// `get_message_content_poll_is_closed` (MessageContent.cpp:7298-7306).
+pub fn get_message_content_poll_is_closed(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> bool {
+    match content {
+        MessageContent::Poll(m) => td.get_poll_is_closed(m.poll_id),
+        _ => true,
+    }
+}
+
+/// `get_message_content_poll_can_add_option` (MessageContent.cpp:7308-7316).
+pub fn get_message_content_poll_can_add_option(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> bool {
+    match content {
+        MessageContent::Poll(m) => td.get_poll_can_add_option(m.poll_id),
+        _ => false,
+    }
+}
+
+/// `get_message_content_poll_can_view_stats` (MessageContent.cpp:7318-7326).
+pub fn get_message_content_poll_can_view_stats(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> bool {
+    match content {
+        MessageContent::Poll(m) => td.get_poll_can_view_stats(m.poll_id),
+        _ => false,
+    }
+}
+
+/// `get_message_content_poll_has_unread_votes` (MessageContent.cpp:7328-7336).
+pub fn get_message_content_poll_has_unread_votes(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> bool {
+    match content {
+        MessageContent::Poll(m) => td.get_poll_has_unread_votes(m.poll_id),
+        _ => false,
+    }
+}
+
+/// `remove_message_content_poll_has_unread_votes` (MessageContent.cpp:7338-7346).
+pub fn remove_message_content_poll_has_unread_votes(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) {
+    if let MessageContent::Poll(m) = content {
+        td.remove_poll_has_unread_votes(m.poll_id);
+    }
+}
+
+/// `get_message_content_poll_option_properties` (MessageContent.cpp:7348-7359).
+#[allow(clippy::too_many_arguments)] // the C++ handler has the same shape
+pub fn get_message_content_poll_option_properties(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+    option_id: &str,
+    dialog_id: DialogId,
+    message_id: MessageId,
+    can_be_replied: bool,
+    can_be_replied_in_another_chat: bool,
+    can_get_link: bool,
+    is_forward: bool,
+    is_outgoing: bool,
+    promise: Promise<crate::td_api::PollOptionProperties>,
+) {
+    assert!(matches!(content, MessageContent::Poll(_)));
+    match content {
+        MessageContent::Poll(m) => td.get_poll_option_properties(
+            m.poll_id,
+            option_id,
+            dialog_id,
+            message_id,
+            can_be_replied,
+            can_be_replied_in_another_chat,
+            can_get_link,
+            is_forward,
+            is_outgoing,
+            promise,
+        ),
+        _ => unreachable!(),
+    }
+}
+
+/// `get_message_content_to_do_list_others_can_append`
+/// (MessageContent.cpp:7361-7369).
+pub fn get_message_content_to_do_list_others_can_append(content: &MessageContent) -> bool {
+    match content {
+        MessageContent::ToDoList(m) => m.list.others_can_append,
+        _ => false,
+    }
+}
+
+/// `get_message_content_to_do_list_can_append_items`
+/// (MessageContent.cpp:7371-7379) — the C++ reads the
+/// `checklist_task_count_max` option through `td`.
+pub fn get_message_content_to_do_list_can_append_items(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+    item_count: i32,
+) -> bool {
+    match content {
+        MessageContent::ToDoList(m) => {
+            let max_task_count = td.get_option_integer("checklist_task_count_max", 0);
+            m.list.get_can_append_items(max_task_count, item_count)
+        }
+        _ => false,
+    }
+}
+
+/// `get_message_content_to_do_list_others_can_complete`
+/// (MessageContent.cpp:7381-7389).
+pub fn get_message_content_to_do_list_others_can_complete(content: &MessageContent) -> bool {
+    match content {
+        MessageContent::ToDoList(m) => m.list.others_can_complete,
+        _ => false,
+    }
+}
+
+/// `get_message_content_photo` (MessageContent.cpp:7391-7399).
+pub fn get_message_content_photo(content: &MessageContent) -> Option<&Photo> {
+    match content {
+        MessageContent::Photo(m) => Some(&m.photo),
+        _ => None,
+    }
+}
+
+/// `get_message_content_venue` (MessageContent.cpp:7401-7409).
+pub fn get_message_content_venue(content: &MessageContent) -> Option<&Venue> {
+    match content {
+        MessageContent::Venue(m) => Some(&m.venue),
+        _ => None,
+    }
+}
+
+/// `get_message_content_web_page_id` (MessageContent.cpp:7411-7415) —
+/// the C++ takes a nullable content.
+pub fn get_message_content_web_page_id(content: Option<&MessageContent>) -> WebPageId {
+    if let Some(MessageContent::Text(m)) = content {
+        return m.web_page_id;
+    }
+    WebPageId::default()
+}
+
+/// `has_message_content_web_page` (MessageContent.cpp:7417-7423).
+pub fn has_message_content_web_page(content: &MessageContent) -> bool {
+    matches!(content, MessageContent::Text(m) if m.web_page_id.is_valid())
+}
+
+/// `remove_message_content_web_page` (MessageContent.cpp:7425-7434).
+pub fn remove_message_content_web_page(content: &mut MessageContent) {
+    assert!(matches!(content, MessageContent::Text(_)));
+    if let MessageContent::Text(message_text) = content {
+        message_text.web_page_id = WebPageId::default();
+        message_text.force_small_media = false;
+        message_text.force_large_media = false;
+        message_text.skip_web_page_confirmation = false;
+        message_text.web_page_url = String::new();
+    }
+}
+
+/// `can_message_content_have_media_timestamp` (MessageContent.cpp:7436-7452).
+pub fn can_message_content_have_media_timestamp(content: &MessageContent) -> bool {
+    match content {
+        MessageContent::Audio(_)
+        | MessageContent::Story(_)
+        | MessageContent::Video(_)
+        | MessageContent::VideoNote(_)
+        | MessageContent::VoiceNote(_) => true,
+        MessageContent::Invoice(m) => m.input_invoice.has_media_timestamp(),
+        _ => has_message_content_web_page(content),
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::store_parse::{Parser, store_i32, store_log_event_version};
-
-    /// The seam stand-in: every manager record becomes a tag word plus
-    /// the plain file-id pair, so the dispatcher plumbing round-trips
-    /// byte-exactly while the manager slices are pending.
-    struct RoundTripContext;
-
-    const TAG_ANIMATION: i32 = 1;
-    const TAG_AUDIO: i32 = 2;
-    const TAG_DOCUMENT: i32 = 3;
-    const TAG_STICKER: i32 = 4;
-    const TAG_VIDEO: i32 = 5;
-    const TAG_VIDEO_NOTE: i32 = 6;
-    const TAG_VOICE_NOTE: i32 = 7;
-    const TAG_FILE: i32 = 8;
-    const TAG_BACKGROUND: i32 = 9;
-
-    impl RoundTripContext {
-        fn write_tagged(tag: i32, file_id: FileId, out: &mut Vec<u8>) {
-            store_i32(out, tag);
-            store_i32(out, file_id.get());
-            store_i32(out, file_id.get_remote());
-        }
-
-        fn read_tagged(expected: i32, input: &mut Parser) -> Result<FileId, &'static str> {
-            let tag = input.i32_()?;
-            if tag != expected {
-                return Err("wrong manager record tag");
-            }
-            let id = input.i32_()?;
-            let remote_id = input.i32_()?;
-            Ok(FileId::new(id, remote_id))
-        }
-    }
-
-    impl ContentStoreContext for RoundTripContext {
-        fn store_animation(&mut self, file_id: FileId, out: &mut Vec<u8>) {
-            Self::write_tagged(TAG_ANIMATION, file_id, out);
-        }
-        fn parse_animation(&mut self, input: &mut Parser) -> Result<FileId, &'static str> {
-            Self::read_tagged(TAG_ANIMATION, input)
-        }
-        fn store_audio(&mut self, file_id: FileId, out: &mut Vec<u8>) {
-            Self::write_tagged(TAG_AUDIO, file_id, out);
-        }
-        fn parse_audio(&mut self, input: &mut Parser) -> Result<FileId, &'static str> {
-            Self::read_tagged(TAG_AUDIO, input)
-        }
-        fn store_document(&mut self, file_id: FileId, out: &mut Vec<u8>) {
-            Self::write_tagged(TAG_DOCUMENT, file_id, out);
-        }
-        fn parse_document(&mut self, input: &mut Parser) -> Result<FileId, &'static str> {
-            Self::read_tagged(TAG_DOCUMENT, input)
-        }
-        fn store_sticker(&mut self, file_id: FileId, _in_sticker_set: bool, out: &mut Vec<u8>) {
-            Self::write_tagged(TAG_STICKER, file_id, out);
-        }
-        fn parse_sticker(
-            &mut self,
-            _in_sticker_set: bool,
-            input: &mut Parser,
-        ) -> Result<FileId, &'static str> {
-            Self::read_tagged(TAG_STICKER, input)
-        }
-        fn store_video(&mut self, file_id: FileId, out: &mut Vec<u8>) {
-            Self::write_tagged(TAG_VIDEO, file_id, out);
-        }
-        fn parse_video(&mut self, input: &mut Parser) -> Result<FileId, &'static str> {
-            Self::read_tagged(TAG_VIDEO, input)
-        }
-        fn store_video_note(&mut self, file_id: FileId, out: &mut Vec<u8>) {
-            Self::write_tagged(TAG_VIDEO_NOTE, file_id, out);
-        }
-        fn parse_video_note(&mut self, input: &mut Parser) -> Result<FileId, &'static str> {
-            Self::read_tagged(TAG_VIDEO_NOTE, input)
-        }
-        fn store_voice_note(&mut self, file_id: FileId, out: &mut Vec<u8>) {
-            Self::write_tagged(TAG_VOICE_NOTE, file_id, out);
-        }
-        fn parse_voice_note(&mut self, input: &mut Parser) -> Result<FileId, &'static str> {
-            Self::read_tagged(TAG_VOICE_NOTE, input)
-        }
-        fn store_file(&mut self, file_id: FileId, out: &mut Vec<u8>) {
-            Self::write_tagged(TAG_FILE, file_id, out);
-        }
-        fn parse_file(&mut self, input: &mut Parser) -> Result<FileId, &'static str> {
-            Self::read_tagged(TAG_FILE, input)
-        }
-        fn store_background_id(&mut self, background_id: BackgroundId, out: &mut Vec<u8>) {
-            store_i32(out, TAG_BACKGROUND);
-            store_i64(out, background_id.get());
-        }
-        fn parse_background_id(
-            &mut self,
-            input: &mut Parser,
-        ) -> Result<BackgroundId, &'static str> {
-            let tag = input.i32_()?;
-            if tag != TAG_BACKGROUND {
-                return Err("wrong manager record tag");
-            }
-            Ok(BackgroundId::new(input.i64_()?))
-        }
-    }
-
-    fn round_trip(content: &MessageContent) -> MessageContent {
-        let mut bytes = Vec::new();
-        store_log_event_version(&mut bytes);
-        let mut ctx = RoundTripContext;
-        store_message_content(&mut ctx, content, &mut bytes);
-        let mut parser = Parser::new_log_event(&bytes).expect("version prefix");
-        let parsed = parse_message_content(&mut ctx, &mut parser);
-        parser.fetch_end().expect("whole record consumed");
-        parsed
-    }
-
-    fn assert_round_trips(content: MessageContent) {
-        let expected_type = content.get_type();
-        let reparsed = round_trip(&content);
-        assert_eq!(
-            reparsed.get_type(),
-            expected_type,
-            "type lost for {content:?}"
-        );
-        assert_eq!(reparsed, content, "payload mismatch for {content:?}");
-    }
-
-    #[test]
-    fn service_contents_round_trip() {
-        assert_round_trips(MessageContent::ChatDeletePhoto(MessageChatDeletePhoto));
-        assert_round_trips(MessageContent::ChatDeleteHistory(MessageChatDeleteHistory));
-        assert_round_trips(MessageContent::ScreenshotTaken(MessageScreenshotTaken));
-        assert_round_trips(MessageContent::ContactRegistered(MessageContactRegistered));
-        assert_round_trips(MessageContent::ExpiredPhoto(MessageExpiredPhoto));
-        assert_round_trips(MessageContent::ExpiredVideo(MessageExpiredVideo));
-        assert_round_trips(MessageContent::ExpiredVideoNote(MessageExpiredVideoNote));
-        assert_round_trips(MessageContent::ExpiredVoiceNote(MessageExpiredVoiceNote));
-        assert_round_trips(MessageContent::WriteAccessAllowed(
-            MessageWriteAccessAllowed,
-        ));
-        assert_round_trips(MessageContent::WriteAccessAllowedByRequest(
-            MessageWriteAccessAllowedByRequest,
-        ));
-        assert_round_trips(MessageContent::ChatJoinedByLink(MessageChatJoinedByLink {
-            is_approved: true,
-        }));
-        assert_round_trips(MessageContent::ChatChangeTitle(MessageChatChangeTitle {
-            title: "title".to_string(),
-        }));
-        assert_round_trips(MessageContent::ChatAddUsers(MessageChatAddUsers {
-            user_ids: vec![UserId::new(1), UserId::new(2)],
-        }));
-        assert_round_trips(MessageContent::ChatDeleteUser(MessageChatDeleteUser {
-            user_id: UserId::new(3),
-        }));
-        assert_round_trips(MessageContent::ChatMigrateTo(MessageChatMigrateTo {
-            migrated_to_channel_id: ChannelId::new(4),
-        }));
-        assert_round_trips(MessageContent::ChannelCreate(MessageChannelCreate {
-            title: "channel".to_string(),
-        }));
-        assert_round_trips(MessageContent::ChannelMigrateFrom(
-            MessageChannelMigrateFrom {
-                title: "chat".to_string(),
-                migrated_from_chat_id: ChatId::new(5),
-            },
-        ));
-        assert_round_trips(MessageContent::PinMessage(MessagePinMessage {
-            message_id: MessageId::new(6),
-        }));
-        assert_round_trips(MessageContent::GameScore(MessageGameScore {
-            game_message_id: MessageId::new(7),
-            game_id: 8,
-            score: 9,
-        }));
-        assert_round_trips(MessageContent::ChatSetTtl(MessageChatSetTtl {
-            ttl: 3600,
-            from_user_id: UserId::new(10),
-        }));
-        assert_round_trips(MessageContent::Call(MessageCall {
-            call_id: 11,
-            call_access_hash: 12,
-            duration: 60,
-            discard_reason: CallDiscardReason {
-                r#type: CallDiscardReasonType::HungUp,
-                slug: String::new(),
-            },
-            is_video: true,
-        }));
-        assert_round_trips(MessageContent::CustomServiceAction(
-            MessageCustomServiceAction {
-                message: "custom".to_string(),
-            },
-        ));
-        assert_round_trips(MessageContent::WebsiteConnected(MessageWebsiteConnected {
-            domain_name: "telegram.org".to_string(),
-        }));
-        assert_round_trips(MessageContent::WebViewDataSent(MessageWebViewDataSent {
-            button_text: "button".to_string(),
-        }));
-        assert_round_trips(MessageContent::WebViewDataReceived(
-            MessageWebViewDataReceived {
-                button_text: "button".to_string(),
-                data: "data".to_string(),
-            },
-        ));
-        assert_round_trips(MessageContent::BoostApply(MessageBoostApply {
-            boost_count: 3,
-        }));
-        assert_round_trips(MessageContent::PaidMessagesRefunded(
-            MessagePaidMessagesRefunded {
-                message_count: 4,
-                star_count: 100,
-            },
-        ));
-        assert_round_trips(MessageContent::PaidMessagesPrice(
-            MessagePaidMessagesPrice {
-                star_count: 25,
-                broadcast_messages_allowed: true,
-            },
-        ));
-        assert_round_trips(MessageContent::ConferenceCall(MessageConferenceCall {
-            call_id: 13,
-            duration: 600,
-            other_participant_dialog_ids: vec![DialogId::new(14), DialogId::new(15)],
-            is_active: true,
-            is_video: true,
-            was_missed: false,
-        }));
-        assert_round_trips(MessageContent::TodoCompletions(MessageTodoCompletions {
-            to_do_message_id: MessageId::new(34),
-            completed_task_ids: vec![1, 2],
-            incompleted_task_ids: vec![3],
-        }));
-        assert_round_trips(MessageContent::TodoAppendTasks(MessageTodoAppendTasks {
-            to_do_message_id: MessageId::new(17),
-            items: vec![ToDoItem {
-                id: 1,
-                title: FormattedText::default(),
-            }],
-        }));
-        assert_round_trips(MessageContent::GiftTon(MessageGiftTon {
-            currency: "USD".to_string(),
-            amount: 5,
-            crypto_currency: "TON".to_string(),
-            crypto_amount: 50_000_000,
-            transaction_id: "tx".to_string(),
-        }));
-        assert_round_trips(MessageContent::GiftStars(MessageGiftStars {
-            currency: "USD".to_string(),
-            amount: 5,
-            crypto_currency: String::new(),
-            crypto_amount: 0,
-            star_count: 250,
-            transaction_id: "tx".to_string(),
-        }));
-        assert_round_trips(MessageContent::PrizeStars(MessagePrizeStars {
-            star_count: 100,
-            transaction_id: "tx".to_string(),
-            boosted_dialog_id: DialogId::new(18),
-            giveaway_message_id: MessageId::new(19),
-            is_unclaimed: true,
-        }));
-        assert_round_trips(MessageContent::PaymentRefunded(MessagePaymentRefunded {
-            dialog_id: DialogId::new(20),
-            currency: "USD".to_string(),
-            total_amount: 10,
-            invoice_payload: "payload".to_string(),
-            telegram_payment_charge_id: "tg".to_string(),
-            provider_payment_charge_id: "provider".to_string(),
-        }));
-        assert_round_trips(MessageContent::NewCreatorPending(
-            MessageNewCreatorPending {
-                new_creator_user_id: UserId::new(21),
-            },
-        ));
-        assert_round_trips(MessageContent::ChangeCreator(MessageChangeCreator {
-            new_creator_user_id: UserId::new(22),
-        }));
-        assert_round_trips(MessageContent::NoForwardsToggle(MessageNoForwardsToggle {
-            request_message_id: MessageId::new(98),
-            prev_value: false,
-            new_value: true,
-        }));
-        assert_round_trips(MessageContent::NoForwardsRequest(
-            MessageNoForwardsRequest {
-                is_expired: true,
-                prev_value: false,
-                new_value: true,
-            },
-        ));
-        assert_round_trips(MessageContent::ManagedBotCreated(
-            MessageManagedBotCreated {
-                bot_user_id: UserId::new(24),
-            },
-        ));
-        assert_round_trips(MessageContent::PollAppendAnswer(MessagePollAppendAnswer {
-            poll_message_id: MessageId::new(25),
-            text: FormattedText::default(),
-            data: "data".to_string(),
-        }));
-        assert_round_trips(MessageContent::PollDeleteAnswer(MessagePollDeleteAnswer {
-            poll_message_id: MessageId::new(26),
-            text: FormattedText::default(),
-            data: "data".to_string(),
-        }));
-        assert_round_trips(MessageContent::ChangeCommunity(MessageChangeCommunity {
-            community_id: CommunityId::new(27),
-        }));
-        assert_round_trips(MessageContent::ChatJoinedViaCommunity(
-            MessageChatJoinedViaCommunity {
-                community_id: CommunityId::new(28),
-            },
-        ));
-        assert_round_trips(MessageContent::Unsupported(MessageUnsupported {
-            version: 5,
-        }));
-    }
-
-    #[test]
-    fn text_and_dice_round_trip() {
-        assert_round_trips(MessageContent::Text(MessageText::new(
-            FormattedText {
-                text: "hello".to_string(),
-                entities: Vec::new(),
-            },
-            WebPageId::new(42),
-            false,
-            false,
-            false,
-            "https://telegram.org".to_string(),
-        )));
-        assert_round_trips(MessageContent::Dice(MessageDice::new(
-            "",
-            3,
-            false,
-            String::new(),
-            String::new(),
-            0,
-            0,
-        )));
-        assert_round_trips(MessageContent::Dice(MessageDice::new(
-            MessageDice::DEFAULT_EMOJI,
-            0,
-            true,
-            "a".repeat(32),
-            "state".to_string(),
-            100,
-            200,
-        )));
-    }
-
-    #[test]
-    fn location_plane_round_trip() {
-        assert_round_trips(MessageContent::Location(MessageLocation {
-            location: Location::default(),
-        }));
-        assert_round_trips(MessageContent::Venue(MessageVenue {
-            venue: Venue {
-                location: Location::default(),
-                title: "title".to_string(),
-                address: "address".to_string(),
-                provider: "provider".to_string(),
-                id: "id".to_string(),
-                r#type: "type".to_string(),
-            },
-        }));
-        assert_round_trips(MessageContent::LiveLocation(MessageLiveLocation::new(
-            Location::default(),
-            900,
-            180,
-            50,
-        )));
-    }
-
-    #[test]
-    fn payment_successful_round_trip() {
-        assert_round_trips(MessageContent::PaymentSuccessful(
-            MessagePaymentSuccessful {
-                invoice_dialog_id: DialogId::new(30),
-                invoice_message_id: MessageId::new(74),
-                currency: "USD".to_string(),
-                total_amount: 100,
-                invoice_payload: "payload".to_string(),
-                subscription_until_date: 0,
-                is_recurring: false,
-                is_first_recurring: false,
-                shipping_option_id: "option".to_string(),
-                order_info: Some(OrderInfo {
-                    name: "name".to_string(),
-                    phone_number: String::new(),
-                    email_address: String::new(),
-                    shipping_address: Some(Box::new(Address {
-                        country_code: "US".to_string(),
-                        state: String::new(),
-                        city: "city".to_string(),
-                        street_line1: String::new(),
-                        street_line2: String::new(),
-                        postal_code: String::new(),
-                    })),
-                }),
-                telegram_payment_charge_id: "tg".to_string(),
-                provider_payment_charge_id: "provider".to_string(),
-            },
-        ));
-    }
-
-    #[test]
-    fn poll_recursion_round_trip() {
-        let attached = MessageContent::Photo(MessagePhoto {
-            photo: photo_with_size(),
-            video_file_id: FileId::new(9, 0),
-            caption: FormattedText::default(),
-            has_spoiler: false,
-        });
-        assert_round_trips(MessageContent::Poll(MessagePoll {
-            poll_id: PollId::new(100),
-            caption: FormattedText {
-                text: "caption".to_string(),
-                entities: Vec::new(),
-            },
-            attached_media: Some(Box::new(attached)),
-        }));
-    }
-
-    fn photo_with_size() -> Photo {
-        Photo {
-            id: 1,
-            date: 2,
-            minithumbnail: String::new(),
-            photos: vec![PhotoSize {
-                size_type: 'x' as i32,
-                size: 100,
-                dimensions: Dimensions {
-                    width: 10,
-                    height: 10,
-                },
-                file_id: FileId::new(7, 8),
-                progressive_sizes: Vec::new(),
-            }],
-            animations: Vec::new(),
-            sticker_photo_size: None,
-            has_stickers: false,
-            sticker_file_ids: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn requested_dialog_shapes_round_trip() {
-        assert_round_trips(MessageContent::RequestedDialog(MessageRequestedDialog {
-            shared_dialog_ids: vec![DialogId::new(1000000001)],
-            button_id: 1,
-        }));
-        assert_round_trips(MessageContent::RequestedDialog(MessageRequestedDialog {
-            shared_dialog_ids: vec![
-                DialogId::new(1000000001),
-                DialogId::new(1000000002),
-                DialogId::new(1000000003),
-            ],
-            button_id: 2,
-        }));
-    }
-
-    #[test]
-    fn giveaway_plane_round_trip() {
-        let valid_parameters = GiveawayParameters {
-            boosted_channel_id: ChannelId::new(40),
-            additional_channel_ids: vec![ChannelId::new(41)],
-            only_new_subscribers: true,
-            winners_are_visible: false,
-            date: 1700000000,
-            country_codes: vec!["US".to_string()],
-            prize_description: "prize".to_string(),
-        };
-        assert!(valid_parameters.is_valid());
-        assert_round_trips(MessageContent::Giveaway(MessageGiveaway {
-            giveaway_parameters: valid_parameters,
-            quantity: 3,
-            months: 5,
-            star_count: 500,
-        }));
-        assert_round_trips(MessageContent::GiveawayLaunch(MessageGiveawayLaunch {
-            star_count: 1000,
-        }));
-        assert_round_trips(MessageContent::GiveawayResults(MessageGiveawayResults {
-            giveaway_message_id: MessageId::new(42),
-            winner_count: 10,
-            unclaimed_count: 2,
-            is_star_giveaway: true,
-        }));
-        assert_round_trips(MessageContent::GiveawayWinners(MessageGiveawayWinners {
-            giveaway_message_id: MessageId::new(50),
-            boosted_channel_id: ChannelId::new(44),
-            additional_dialog_count: 1,
-            month_count: 6,
-            star_count: 0,
-            prize_description: "prize".to_string(),
-            winners_selection_date: 1700000001,
-            only_new_subscribers: true,
-            was_refunded: false,
-            winner_count: 5,
-            unclaimed_count: 0,
-            winner_user_ids: vec![UserId::new(45), UserId::new(46)],
-        }));
-    }
-
-    #[test]
-    fn suggested_post_family_round_trip() {
-        assert_round_trips(MessageContent::SuggestedPostSuccess(
-            MessageSuggestedPostSuccess {
-                suggested_post_message_id: MessageId::new(50),
-                amount: CurrencyAmount {
-                    r#type: CurrencyAmountType::Star,
-                    star_amount: StarAmount {
-                        star_count: 100,
-                        nanostar_count: 0,
-                    },
-                    ton_amount: TonAmount::default(),
-                },
-            },
-        ));
-        assert_round_trips(MessageContent::SuggestedPostRefund(
-            MessageSuggestedPostRefund {
-                suggested_post_message_id: MessageId::new(58),
-                is_payer_initiated: true,
-            },
-        ));
-        assert_round_trips(MessageContent::SuggestedPostApproval(
-            MessageSuggestedPostApproval {
-                suggested_post_message_id: MessageId::new(26),
-                price: SuggestedPostPrice {
-                    r#type: SuggestedPostPriceType::Ton,
-                    amount: 10_000_000,
-                },
-                comment: "comment".to_string(),
-                send_date: 1700000002,
-                is_rejected: false,
-                is_balance_too_low: false,
-            },
-        ));
-    }
-
-    #[test]
-    fn gift_code_and_premium_round_trip() {
-        assert_round_trips(MessageContent::GiftCode(MessageGiftCode {
-            creator_dialog_id: DialogId::new(60),
-            text: FormattedText::default(),
-            days: 12,
-            currency: "USD".to_string(),
-            amount: 5,
-            crypto_currency: String::new(),
-            crypto_amount: 0,
-            via_giveaway: false,
-            is_unclaimed: true,
-            code: "CODE".to_string(),
-        }));
-        assert_round_trips(MessageContent::GiftPremium(MessageGiftPremium {
-            text: FormattedText {
-                text: "gift".to_string(),
-                entities: Vec::new(),
-            },
-            currency: "USD".to_string(),
-            amount: 5,
-            crypto_currency: "TON".to_string(),
-            crypto_amount: 1,
-            days: 3,
-        }));
-    }
-
-    #[test]
-    fn background_round_trip() {
-        assert_round_trips(MessageContent::SetBackground(MessageSetBackground {
-            old_message_id: MessageId::new(66),
-            background_info: BackgroundInfo {
-                background_id: BackgroundId::new(71),
-                background_type: BackgroundType {
-                    r#type: BackgroundTypeType::Pattern,
-                    is_blurred: false,
-                    is_moving: true,
-                    intensity: 50,
-                    fill: BackgroundFill {
-                        top_color: 0x305070,
-                        bottom_color: 0x907050,
-                        rotation_angle: 45,
-                        third_color: -1,
-                        fourth_color: -1,
-                    },
-                    theme_name: String::new(),
-                },
-            },
-            for_both: true,
-        }));
-    }
-
-    #[test]
-    fn to_do_list_round_trip() {
-        assert_round_trips(MessageContent::ToDoList(MessageToDoList {
-            list: ToDoList {
-                title: FormattedText::default(),
-                items: vec![ToDoItem {
-                    id: 1,
-                    title: FormattedText::default(),
-                }],
-                others_can_append: true,
-                others_can_complete: false,
-            },
-            completions: vec![ToDoCompletion {
-                id: 1,
-                completed_by_dialog_id: DialogId::new(1000000009),
-                date: 1700000003,
-            }],
-        }));
-    }
-
-    #[test]
-    fn deferred_types_degrade_to_unsupported() {
-        // raw = 8 (Contact): the deferred payload has no model, so the
-        // parse degrades to the C++ is_bad fallback.
-        let mut bytes = Vec::new();
-        store_log_event_version(&mut bytes);
-        store_i32(&mut bytes, 8);
-        let mut parser = Parser::new_log_event(&bytes).expect("version prefix");
-        let parsed = parse_message_content(&mut RoundTripContext, &mut parser);
-        assert_eq!(parsed.get_type(), MessageContentType::Unsupported);
-    }
-
-    #[test]
-    fn premium_duration_day_count_matches_cpp() {
-        assert_eq!(get_premium_duration_day_count(0), 7);
-        assert_eq!(get_premium_duration_day_count(-5), 7);
-        assert_eq!(
-            get_premium_duration_day_count(12),
-            12 * 30 + 12 / 3 + 12 / 12
-        );
-        assert_eq!(get_premium_duration_day_count(10_000_001), 7);
-    }
-}
-
-#[cfg(test)]
-mod content_store_tests {
     use super::*;
 
     /// The full C++ discriminant order (MessageContentType.h:15-113):
@@ -8336,5 +8891,2185 @@ mod content_store_tests {
         assert!(completion.is_valid());
         completion.date = 0;
         assert!(!completion.is_valid());
+    }
+
+    // ==== M.9.2/M.9.3 tests ====
+
+    /// The raw-id storage stand-in: every mediated call round-trips the
+    /// raw id. Byte-compatible with the C++ only once the real managers
+    /// back the seam (the module doc records the M.12.2 gate).
+    struct RawIdStorage;
+
+    impl MessageContentStorage for RawIdStorage {
+        fn store_file(&self, file_id: FileId, out: &mut Vec<u8>) {
+            store_i32(out, file_id.get());
+        }
+
+        fn parse_file(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+            Ok(FileId::new(parser.i32_()?, 0))
+        }
+
+        fn store_animation(&self, file_id: FileId, out: &mut Vec<u8>) {
+            self.store_file(file_id, out);
+        }
+
+        fn parse_animation(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+            self.parse_file(parser)
+        }
+
+        fn store_audio(&self, file_id: FileId, out: &mut Vec<u8>) {
+            self.store_file(file_id, out);
+        }
+
+        fn parse_audio(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+            self.parse_file(parser)
+        }
+
+        fn store_document(&self, file_id: FileId, out: &mut Vec<u8>) {
+            self.store_file(file_id, out);
+        }
+
+        fn parse_document(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+            self.parse_file(parser)
+        }
+
+        fn store_video(&self, file_id: FileId, out: &mut Vec<u8>) {
+            self.store_file(file_id, out);
+        }
+
+        fn parse_video(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+            self.parse_file(parser)
+        }
+
+        fn store_video_note(&self, file_id: FileId, out: &mut Vec<u8>) {
+            self.store_file(file_id, out);
+        }
+
+        fn parse_video_note(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+            self.parse_file(parser)
+        }
+
+        fn store_voice_note(&self, file_id: FileId, out: &mut Vec<u8>) {
+            self.store_file(file_id, out);
+        }
+
+        fn parse_voice_note(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+            self.parse_file(parser)
+        }
+
+        fn store_sticker(&self, file_id: FileId, out: &mut Vec<u8>) {
+            self.store_file(file_id, out);
+        }
+
+        fn parse_sticker(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+            self.parse_file(parser)
+        }
+
+        fn store_poll(&self, poll_id: PollId, out: &mut Vec<u8>) {
+            store_i64(out, poll_id.get());
+        }
+
+        fn parse_poll(&mut self, parser: &mut Parser) -> Result<PollId, &'static str> {
+            Ok(PollId::new(parser.i64_()?))
+        }
+
+        fn store_background(&self, background_id: BackgroundId, out: &mut Vec<u8>) {
+            store_i64(out, background_id.get());
+        }
+
+        fn parse_background(&mut self, parser: &mut Parser) -> Result<BackgroundId, &'static str> {
+            Ok(BackgroundId::new(parser.i64_()?))
+        }
+
+        fn on_load_web_page_url_from_database(&mut self, _web_page_id: WebPageId, _url: &str) {}
+    }
+
+    /// The representative populated model of every modeled variant —
+    /// non-default field values wherever the type carries any, so the
+    /// round-trip exercises flags and conditionals, not just defaults.
+    fn sample_contents() -> Vec<MessageContent> {
+        let user_id = UserId::new(7);
+        let dialog_id = DialogId::from_user_id(user_id);
+        let message_id = MessageId::new(4242);
+        let file_id = FileId::new(11, 3);
+        let text = |s: &str| FormattedText {
+            text: s.to_string(),
+            entities: vec![MessageEntity::new(
+                crate::message_entity::Type::Italic,
+                0,
+                2,
+            )],
+        };
+        vec![
+            MessageContent::Text(MessageText::new(
+                text("hello"),
+                WebPageId::new(99),
+                true,
+                false,
+                true,
+                "https://example.com".to_string(),
+            )),
+            MessageContent::Animation(MessageAnimation {
+                file_id,
+                caption: text("cap"),
+                has_spoiler: true,
+            }),
+            MessageContent::Audio(MessageAudio {
+                file_id,
+                caption: text("cap"),
+            }),
+            MessageContent::Contact(MessageContact {
+                contact: Contact::new(
+                    "+15551234567".to_string(),
+                    "John".to_string(),
+                    "Doe".to_string(),
+                    String::new(),
+                    user_id,
+                ),
+            }),
+            MessageContent::Document(MessageDocument {
+                file_id,
+                caption: text("cap"),
+            }),
+            MessageContent::Game(MessageGame {
+                game: Game {
+                    id: 5,
+                    access_hash: -6,
+                    bot_user_id: user_id,
+                    short_name: "game".to_string(),
+                    title: "The Game".to_string(),
+                    description: "desc".to_string(),
+                    photo: Photo::default(),
+                    animation_file_id: file_id,
+                    text: text("game text"),
+                },
+            }),
+            MessageContent::Invoice(MessageInvoice {
+                input_invoice: InputInvoice {
+                    title: "t".to_string(),
+                    description: "d".to_string(),
+                    photo: Photo::default(),
+                    start_parameter: "sp".to_string(),
+                    invoice: Invoice {
+                        currency: "USD".to_string(),
+                        price_parts: vec![LabeledPricePart {
+                            label: "part".to_string(),
+                            amount: 250,
+                        }],
+                        subscription_period: 30,
+                        max_tip_amount: 10,
+                        suggested_tip_amounts: vec![5, 20],
+                        recurring_payment_terms_of_service_url: "r".to_string(),
+                        terms_of_service_url: "tos".to_string(),
+                        is_test: true,
+                        need_name: true,
+                        need_phone_number: true,
+                        need_email_address: true,
+                        need_shipping_address: true,
+                        send_phone_number_to_provider: true,
+                        send_email_address_to_provider: true,
+                        is_flexible: true,
+                    },
+                    payload: "payload".to_string(),
+                    provider_token: "tok".to_string(),
+                    provider_data: "pdata".to_string(),
+                    extended_media: MessageExtendedMedia {
+                        r#type: MessageExtendedMediaType::Preview,
+                        unsupported_version: 1,
+                        duration: 3,
+                        dimensions: crate::photo::get_dimensions(10, 20, "test"),
+                        minithumbnail: "mini".to_string(),
+                        photo: Photo::default(),
+                        video_file_id: FileId::default(),
+                        start_timestamp: 9,
+                    },
+                    extended_media_caption: text("caption"),
+                    total_amount: 250,
+                    receipt_message_id: message_id,
+                },
+            }),
+            MessageContent::LiveLocation(MessageLiveLocation::new(
+                Location::new(1.5, -2.5, 30.0, -7),
+                90,
+                180,
+                1500,
+            )),
+            MessageContent::Location(MessageLocation {
+                location: Location::new(10.0, 20.0, 5.0, -8),
+            }),
+            MessageContent::Venue(MessageVenue {
+                venue: Venue {
+                    location: Location::new(30.0, 40.0, 0.0, -9),
+                    title: "Title".to_string(),
+                    address: "Address".to_string(),
+                    provider: "provider".to_string(),
+                    id: "venue-id".to_string(),
+                    r#type: "venue-type".to_string(),
+                },
+            }),
+            MessageContent::Photo(MessagePhoto {
+                photo: Photo {
+                    id: 123,
+                    date: 1000,
+                    minithumbnail: "mini".to_string(),
+                    photos: vec![crate::photo::PhotoSize {
+                        size_type: b'x' as i32,
+                        size: 42,
+                        dimensions: crate::photo::get_dimensions(100, 200, "test"),
+                        file_id,
+                        progressive_sizes: vec![1, 2, 3],
+                    }],
+                    animations: Vec::new(),
+                    sticker_photo_size: None,
+                    sticker_file_ids: Vec::new(),
+                    has_stickers: true,
+                },
+                video_file_id: file_id,
+                caption: text("cap"),
+                has_spoiler: true,
+            }),
+            MessageContent::Sticker(MessageSticker {
+                file_id,
+                is_premium: true,
+            }),
+            MessageContent::Video(MessageVideo {
+                file_id,
+                alternative_file_ids: vec![FileId::new(12, 0)],
+                hls_file_ids: vec![FileId::new(13, 0)],
+                storyboard_file_ids: vec![FileId::new(14, 0)],
+                storyboard_map_file_ids: vec![FileId::new(15, 0)],
+                cover: Photo::default(),
+                start_timestamp: 33,
+                caption: text("cap"),
+                has_spoiler: true,
+            }),
+            MessageContent::VideoNote(MessageVideoNote {
+                file_id,
+                is_viewed: true,
+            }),
+            MessageContent::VoiceNote(MessageVoiceNote {
+                file_id,
+                caption: text("cap"),
+                is_listened: true,
+            }),
+            MessageContent::ChatCreate(MessageChatCreate {
+                title: "chat".to_string(),
+                participant_user_ids: vec![user_id, UserId::new(9)],
+            }),
+            MessageContent::ChatChangeTitle(MessageChatChangeTitle {
+                title: "renamed".to_string(),
+            }),
+            MessageContent::ChatChangePhoto(MessageChatChangePhoto {
+                photo: Photo {
+                    id: 77,
+                    date: 1001,
+                    minithumbnail: String::new(),
+                    photos: vec![],
+                    animations: vec![crate::photo::AnimationSize {
+                        photo_size: crate::photo::PhotoSize {
+                            size_type: b's' as i32,
+                            size: 7,
+                            dimensions: crate::photo::get_dimensions(8, 8, "test"),
+                            file_id,
+                            progressive_sizes: Vec::new(),
+                        },
+                        main_frame_timestamp: 0.5,
+                    }],
+                    sticker_photo_size: None,
+                    sticker_file_ids: Vec::new(),
+                    has_stickers: false,
+                },
+            }),
+            MessageContent::ChatAddUsers(MessageChatAddUsers {
+                user_ids: vec![user_id],
+            }),
+            MessageContent::ChatJoinedByLink(MessageChatJoinedByLink { is_approved: true }),
+            MessageContent::ChatDeleteUser(MessageChatDeleteUser { user_id }),
+            MessageContent::ChatMigrateTo(MessageChatMigrateTo {
+                migrated_to_channel_id: crate::chat_manager::ChannelId::new(1001),
+            }),
+            MessageContent::ChannelCreate(MessageChannelCreate {
+                title: "channel".to_string(),
+            }),
+            MessageContent::ChannelMigrateFrom(MessageChannelMigrateFrom {
+                title: "old".to_string(),
+                migrated_from_chat_id: ChatId::new(42),
+            }),
+            MessageContent::PinMessage(MessagePinMessage { message_id }),
+            MessageContent::GameScore(MessageGameScore {
+                game_message_id: message_id,
+                game_id: 123456789,
+                score: 1000,
+            }),
+            MessageContent::ChatSetTtl(MessageChatSetTtl {
+                ttl: 86400,
+                from_user_id: user_id,
+            }),
+            MessageContent::Unsupported(MessageUnsupported { version: 3 }),
+            MessageContent::Call(MessageCall {
+                call_id: 777,
+                call_access_hash: -12345,
+                duration: 65,
+                discard_reason: CallDiscardReason {
+                    r#type: CallDiscardReasonType::HungUp,
+                    slug: String::new(),
+                },
+                is_video: true,
+            }),
+            MessageContent::PaymentSuccessful(MessagePaymentSuccessful {
+                invoice_dialog_id: dialog_id,
+                invoice_message_id: message_id,
+                currency: "USD".to_string(),
+                total_amount: 999,
+                invoice_payload: "pl".to_string(),
+                subscription_until_date: 2000,
+                is_recurring: true,
+                is_first_recurring: true,
+                shipping_option_id: "opt".to_string(),
+                order_info: Some(OrderInfo {
+                    name: "John Doe".to_string(),
+                    phone_number: "+1555".to_string(),
+                    email_address: "a@b.c".to_string(),
+                    shipping_address: Some(Box::new(Address {
+                        country_code: "US".to_string(),
+                        state: "CA".to_string(),
+                        city: "SF".to_string(),
+                        street_line1: "1 st".to_string(),
+                        street_line2: String::new(),
+                        postal_code: "94100".to_string(),
+                    })),
+                }),
+                telegram_payment_charge_id: "tc".to_string(),
+                provider_payment_charge_id: "pc".to_string(),
+            }),
+            MessageContent::CustomServiceAction(MessageCustomServiceAction {
+                message: "action".to_string(),
+            }),
+            MessageContent::WebsiteConnected(MessageWebsiteConnected {
+                domain_name: "example.com".to_string(),
+            }),
+            MessageContent::PassportDataSent(MessagePassportDataSent {
+                types: vec![SecureValueType::Passport, SecureValueType::EmailAddress],
+            }),
+            MessageContent::PassportDataReceived(MessagePassportDataReceived {
+                values: vec![EncryptedSecureValue {
+                    r#type: SecureValueType::Address,
+                    data: EncryptedSecureData {
+                        data: "d".to_string(),
+                        hash: "h".to_string(),
+                        encrypted_secret: "s".to_string(),
+                    },
+                    files: vec![EncryptedSecureFile {
+                        file: DatedFile {
+                            file_id,
+                            date: 1000,
+                        },
+                        file_hash: "fh".to_string(),
+                        encrypted_secret: "es".to_string(),
+                    }],
+                    front_side: EncryptedSecureFile::default(),
+                    reverse_side: EncryptedSecureFile::default(),
+                    selfie: EncryptedSecureFile::default(),
+                    translations: Vec::new(),
+                    hash: "vh".to_string(),
+                }],
+                credentials: EncryptedSecureCredentials {
+                    data: "d".to_string(),
+                    hash: "h".to_string(),
+                    encrypted_secret: "s".to_string(),
+                },
+            }),
+            MessageContent::Poll(MessagePoll {
+                poll_id: PollId::new(555),
+                caption: text("poll cap"),
+                attached_media: Some(Box::new(MessageContent::Unsupported(MessageUnsupported {
+                    version: 1,
+                }))),
+            }),
+            MessageContent::Dice(MessageDice {
+                emoji: "🎲".to_string(),
+                dice_value: 5,
+                is_stake: false,
+                seed: "seed".to_string(),
+                state_hash: "hash".to_string(),
+                stake_ton_count: 0,
+                prize_ton_count: 0,
+            }),
+            MessageContent::ProximityAlertTriggered(MessageProximityAlertTriggered {
+                traveler_dialog_id: dialog_id,
+                watcher_dialog_id: DialogId::from_user_id(UserId::new(8)),
+                distance: 42,
+            }),
+            MessageContent::GroupCall(MessageGroupCall {
+                input_group_call_id: InputGroupCallId::new(11, -22),
+                duration: 30,
+                schedule_date: 2000,
+            }),
+            MessageContent::InviteToGroupCall(MessageInviteToGroupCall {
+                input_group_call_id: InputGroupCallId::new(12, -23),
+                user_ids: vec![user_id],
+            }),
+            MessageContent::WebViewDataSent(MessageWebViewDataSent {
+                button_text: "btn".to_string(),
+            }),
+            MessageContent::WebViewDataReceived(MessageWebViewDataReceived {
+                button_text: "btn".to_string(),
+                data: "data".to_string(),
+            }),
+            MessageContent::GiftPremium(MessageGiftPremium {
+                text: text("gift"),
+                currency: "USD".to_string(),
+                amount: 5,
+                crypto_currency: "TON".to_string(),
+                crypto_amount: 1,
+                days: 30,
+            }),
+            MessageContent::TopicCreate(MessageTopicCreate {
+                title: "topic".to_string(),
+                icon: ForumTopicIcon::new(0xFF0000, crate::emoji_status::CustomEmojiId::new(9)),
+                title_missing: true,
+            }),
+            MessageContent::TopicEdit(MessageTopicEdit {
+                edited_data: ForumTopicEditedData {
+                    title: "new".to_string(),
+                    icon_custom_emoji_id: crate::emoji_status::CustomEmojiId::new(3),
+                    edit_icon_custom_emoji_id: true,
+                    edit_is_closed: true,
+                    is_closed: true,
+                    edit_is_hidden: true,
+                    is_hidden: true,
+                },
+            }),
+            MessageContent::SuggestProfilePhoto(MessageSuggestProfilePhoto {
+                photo: Photo {
+                    id: 88,
+                    date: 1002,
+                    minithumbnail: String::new(),
+                    photos: vec![crate::photo::PhotoSize {
+                        size_type: b'x' as i32,
+                        size: 9,
+                        dimensions: crate::photo::get_dimensions(50, 50, "test"),
+                        file_id: FileId::new(31, 0),
+                        progressive_sizes: Vec::new(),
+                    }],
+                    animations: Vec::new(),
+                    sticker_photo_size: None,
+                    sticker_file_ids: Vec::new(),
+                    has_stickers: false,
+                },
+            }),
+            MessageContent::RequestedDialog(MessageRequestedDialog {
+                shared_dialog_ids: vec![dialog_id],
+                button_id: 5,
+            }),
+            MessageContent::WebViewWriteAccessAllowed(MessageWebViewWriteAccessAllowed {
+                web_app: WebApp {
+                    id: 1,
+                    access_hash: -2,
+                    short_name: "app".to_string(),
+                    title: "App".to_string(),
+                    description: "d".to_string(),
+                    photo: Photo::default(),
+                    animation_file_id: FileId::default(),
+                    hash: 99,
+                },
+            }),
+            MessageContent::SetBackground(MessageSetBackground {
+                old_message_id: message_id,
+                background_info: BackgroundInfo {
+                    background_id: BackgroundId::new(44),
+                    background_type: BackgroundType::pattern(
+                        true,
+                        BackgroundFill::gradient(1, 2, 135),
+                        50,
+                    ),
+                },
+                for_both: true,
+            }),
+            MessageContent::Story(MessageStory {
+                story_full_id: StoryFullId::new(dialog_id, StoryId::new(10)),
+                via_mention: true,
+            }),
+            MessageContent::GiftCode(MessageGiftCode {
+                creator_dialog_id: dialog_id,
+                text: text("giftcode"),
+                days: 3,
+                currency: "USD".to_string(),
+                amount: 10,
+                crypto_currency: "TON".to_string(),
+                crypto_amount: 2,
+                via_giveaway: true,
+                is_unclaimed: true,
+                code: "CODE".to_string(),
+            }),
+            MessageContent::Giveaway(MessageGiveaway {
+                giveaway_parameters: GiveawayParameters {
+                    boosted_channel_id: crate::chat_manager::ChannelId::new(1002),
+                    additional_channel_ids: vec![crate::chat_manager::ChannelId::new(1003)],
+                    only_new_subscribers: true,
+                    winners_are_visible: true,
+                    date: 2000,
+                    country_codes: vec!["US".to_string()],
+                    prize_description: "prize".to_string(),
+                },
+                quantity: 5,
+                months: 3,
+                star_count: 100,
+            }),
+            MessageContent::GiveawayLaunch(MessageGiveawayLaunch { star_count: 50 }),
+            MessageContent::GiveawayResults(MessageGiveawayResults {
+                giveaway_message_id: message_id,
+                winner_count: 3,
+                unclaimed_count: 1,
+                is_star_giveaway: true,
+            }),
+            MessageContent::GiveawayWinners(MessageGiveawayWinners {
+                giveaway_message_id: message_id,
+                boosted_channel_id: crate::chat_manager::ChannelId::new(1004),
+                additional_dialog_count: 2,
+                month_count: 1,
+                star_count: 10,
+                prize_description: "p".to_string(),
+                winners_selection_date: 2100,
+                only_new_subscribers: true,
+                was_refunded: true,
+                winner_count: 2,
+                unclaimed_count: 1,
+                winner_user_ids: vec![user_id],
+            }),
+            MessageContent::BoostApply(MessageBoostApply { boost_count: 3 }),
+            MessageContent::DialogShared(MessageDialogShared {
+                shared_dialogs: vec![SharedDialog {
+                    dialog_id: DialogId::from_user_id(UserId::new(6)),
+                    first_name: "A".to_string(),
+                    ..SharedDialog::default()
+                }],
+                button_id: 7,
+            }),
+            MessageContent::PaidMedia(MessagePaidMedia {
+                media: vec![MessageExtendedMedia {
+                    r#type: MessageExtendedMediaType::Video,
+                    unsupported_version: 0,
+                    duration: 5,
+                    dimensions: crate::photo::get_dimensions(0, 0, "test"),
+                    minithumbnail: String::new(),
+                    photo: Photo::default(),
+                    video_file_id: FileId::new(21, 0),
+                    start_timestamp: 2,
+                }],
+                caption: text("paid"),
+                star_count: 15,
+                payload: "pay".to_string(),
+            }),
+            MessageContent::PaymentRefunded(MessagePaymentRefunded {
+                dialog_id,
+                currency: "USD".to_string(),
+                total_amount: 50,
+                invoice_payload: "pl".to_string(),
+                telegram_payment_charge_id: "tc".to_string(),
+                provider_payment_charge_id: "pc".to_string(),
+            }),
+            MessageContent::GiftStars(MessageGiftStars {
+                currency: "USD".to_string(),
+                amount: 5,
+                crypto_currency: "TON".to_string(),
+                crypto_amount: 1,
+                star_count: 100,
+                transaction_id: "tx".to_string(),
+            }),
+            MessageContent::PrizeStars(MessagePrizeStars {
+                star_count: 20,
+                transaction_id: "tx".to_string(),
+                boosted_dialog_id: DialogId::from_channel_id(crate::chat_manager::ChannelId::new(
+                    1005,
+                )),
+                giveaway_message_id: message_id,
+                is_unclaimed: true,
+            }),
+            MessageContent::PaidMessagesRefunded(MessagePaidMessagesRefunded {
+                message_count: 4,
+                star_count: 40,
+            }),
+            MessageContent::PaidMessagesPrice(MessagePaidMessagesPrice {
+                star_count: 10,
+                broadcast_messages_allowed: true,
+            }),
+            MessageContent::ConferenceCall(MessageConferenceCall {
+                call_id: 31,
+                duration: 120,
+                other_participant_dialog_ids: vec![dialog_id],
+                is_active: true,
+                is_video: true,
+                was_missed: true,
+            }),
+            MessageContent::ToDoList(MessageToDoList {
+                list: ToDoList {
+                    title: text("todo"),
+                    items: vec![ToDoItem {
+                        id: 1,
+                        title: text("task"),
+                    }],
+                    others_can_append: true,
+                    others_can_complete: true,
+                },
+                completions: vec![ToDoCompletion {
+                    id: 1,
+                    completed_by_dialog_id: DialogId::from_user_id(UserId::new(7)),
+                    date: 1500,
+                }],
+            }),
+            MessageContent::TodoCompletions(MessageTodoCompletions {
+                to_do_message_id: message_id,
+                completed_task_ids: vec![1],
+                incompleted_task_ids: vec![2, 3],
+            }),
+            MessageContent::TodoAppendTasks(MessageTodoAppendTasks {
+                to_do_message_id: message_id,
+                items: vec![ToDoItem {
+                    id: 2,
+                    title: text("task2"),
+                }],
+            }),
+            MessageContent::GiftTon(MessageGiftTon {
+                currency: "USD".to_string(),
+                amount: 5,
+                crypto_currency: "TON".to_string(),
+                crypto_amount: 1,
+                transaction_id: "tx".to_string(),
+            }),
+            MessageContent::SuggestedPostSuccess(MessageSuggestedPostSuccess {
+                suggested_post_message_id: message_id,
+                amount: CurrencyAmount {
+                    r#type: CurrencyAmountType::Star,
+                    star_amount: StarAmount {
+                        star_count: 5,
+                        nanostar_count: 1,
+                    },
+                    ton_amount: TonAmount::default(),
+                },
+            }),
+            MessageContent::SuggestedPostRefund(MessageSuggestedPostRefund {
+                suggested_post_message_id: message_id,
+                is_payer_initiated: true,
+            }),
+            MessageContent::SuggestedPostApproval(MessageSuggestedPostApproval {
+                suggested_post_message_id: message_id,
+                price: SuggestedPostPrice {
+                    r#type: SuggestedPostPriceType::Ton,
+                    amount: 7_000_000,
+                },
+                comment: "ok".to_string(),
+                send_date: 2500,
+                is_rejected: true,
+                is_balance_too_low: true,
+            }),
+            MessageContent::SuggestBirthday(MessageSuggestBirthday {
+                birthdate: crate::birthdate::Birthdate::new(29, 2, 1990),
+            }),
+            MessageContent::NewCreatorPending(MessageNewCreatorPending {
+                new_creator_user_id: user_id,
+            }),
+            MessageContent::ChangeCreator(MessageChangeCreator {
+                new_creator_user_id: user_id,
+            }),
+            MessageContent::NoForwardsToggle(MessageNoForwardsToggle {
+                request_message_id: message_id,
+                prev_value: true,
+                new_value: false,
+            }),
+            MessageContent::NoForwardsRequest(MessageNoForwardsRequest {
+                is_expired: true,
+                prev_value: true,
+                new_value: false,
+            }),
+            MessageContent::ManagedBotCreated(MessageManagedBotCreated {
+                bot_user_id: user_id,
+            }),
+            MessageContent::PollAppendAnswer(MessagePollAppendAnswer {
+                poll_message_id: message_id,
+                text: text("answer"),
+                data: "data".to_string(),
+            }),
+            MessageContent::PollDeleteAnswer(MessagePollDeleteAnswer {
+                poll_message_id: message_id,
+                text: text("answer"),
+                data: "data".to_string(),
+            }),
+            MessageContent::ChangeCommunity(MessageChangeCommunity {
+                community_id: CommunityId::new(77),
+            }),
+            MessageContent::ChatJoinedViaCommunity(MessageChatJoinedViaCommunity {
+                community_id: CommunityId::new(78),
+            }),
+            // The field-less variants.
+            MessageContent::ChatDeletePhoto(MessageChatDeletePhoto),
+            MessageContent::ChatDeleteHistory(MessageChatDeleteHistory),
+            MessageContent::ContactRegistered(MessageContactRegistered),
+            MessageContent::ExpiredPhoto(MessageExpiredPhoto),
+            MessageContent::ExpiredVideo(MessageExpiredVideo),
+            MessageContent::ExpiredVideoNote(MessageExpiredVideoNote),
+            MessageContent::ExpiredVoiceNote(MessageExpiredVoiceNote),
+            MessageContent::ScreenshotTaken(MessageScreenshotTaken),
+            MessageContent::WriteAccessAllowed(MessageWriteAccessAllowed),
+            MessageContent::WriteAccessAllowedByRequest(MessageWriteAccessAllowedByRequest),
+        ]
+    }
+
+    #[test]
+    fn every_modeled_variant_round_trips_through_the_db_format() {
+        let contents = sample_contents();
+        assert_eq!(contents.len(), 90, "one sample per modeled variant");
+        for content in contents {
+            let mut out = Vec::new();
+            store_message_content(&content, &RawIdStorage, &mut out);
+            let mut parser = Parser::new(&out);
+            let parsed = parse_message_content(&mut parser, &mut RawIdStorage).unwrap();
+            parser.fetch_end().unwrap();
+            assert_eq!(
+                parsed.get_type(),
+                content.get_type(),
+                "round trip changed the content type"
+            );
+            assert_eq!(
+                parsed,
+                content,
+                "round trip changed the bytes of {:?}",
+                content.get_type()
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_content_stores_the_type_int_and_version() {
+        let mut out = Vec::new();
+        store_message_content(
+            &MessageContent::Unsupported(MessageUnsupported { version: 5 }),
+            &RawIdStorage,
+            &mut out,
+        );
+        // Type int 27 (`Unsupported`), then the version — the whole blob.
+        assert_eq!(out, [0x1b, 0, 0, 0, 5, 0, 0, 0]);
+
+        // A pre-`AddMessageUnsupportedVersion` (16) blob carries no version.
+        let blob = [0x1bu8, 0, 0, 0];
+        let mut parser = Parser::new_with_version(&blob, 15);
+        match parse_message_content(&mut parser, &mut RawIdStorage).unwrap() {
+            MessageContent::Unsupported(m) => assert_eq!(m.version, 0),
+            _ => panic!("wrong type"),
+        }
+    }
+
+    #[test]
+    fn unknown_and_unmodeled_types_degrade_to_unsupported_without_consuming() {
+        // Type int 93 is `RichText` — known to the C++ binary but unmodeled
+        // here; the C++ `default:`/is_bad arm returns `MessageUnsupported(0)`
+        // and leaves the remainder unconsumed.
+        let blob = [93u8, 0, 0, 0, 1, 2, 3, 4];
+        let mut parser = Parser::new_with_version(&blob, 61);
+        let parsed = parse_message_content(&mut parser, &mut RawIdStorage).unwrap();
+        assert!(matches!(parsed, MessageContent::Unsupported(m) if m.version == 0));
+        assert_eq!(parser.left_len(), 4, "the trailing bytes must stay");
+    }
+
+    #[test]
+    fn legacy_version_branches_match_the_cpp() {
+        // Dice pre-AddDiceEmoji (25)/AddDiceFlags (57): no flags block, no
+        // emoji — the default die emoji is the C++ fallback.
+        let mut blob = Vec::new();
+        store_i32(&mut blob, MessageContentType::Dice as i32);
+        store_i32(&mut blob, 3);
+        let mut parser = Parser::new_with_version(&blob, 24);
+        match parse_message_content(&mut parser, &mut RawIdStorage).unwrap() {
+            MessageContent::Dice(d) => {
+                assert_eq!(d.emoji, MessageDice::DEFAULT_EMOJI);
+                assert_eq!(d.dice_value, 3);
+                assert!(!d.is_stake);
+            }
+            _ => panic!("wrong type"),
+        }
+
+        // GiftPremium with has_days=false runs the month-to-day conversion:
+        // 12 months -> 12*30 + 12/3 + 12/12 = 365.
+        let mut blob = Vec::new();
+        store_i32(&mut blob, MessageContentType::GiftPremium as i32);
+        store_flags(&mut blob, [false, false, false]);
+        store_string(&mut blob, "USD");
+        store_i64(&mut blob, 5);
+        store_i32(&mut blob, 12);
+        let mut parser = Parser::new_with_version(&blob, 61);
+        match parse_message_content(&mut parser, &mut RawIdStorage).unwrap() {
+            MessageContent::GiftPremium(g) => assert_eq!(g.days, 365),
+            _ => panic!("wrong type"),
+        }
+
+        // Call pre-AddVideoCallsSupport (20): no flags, is_video=false.
+        let mut blob = Vec::new();
+        store_i32(&mut blob, MessageContentType::Call as i32);
+        store_i64(&mut blob, 99);
+        store_i32(&mut blob, 30);
+        store_i32(&mut blob, CallDiscardReasonType::Missed as i32);
+        let mut parser = Parser::new_with_version(&blob, 19);
+        match parse_message_content(&mut parser, &mut RawIdStorage).unwrap() {
+            MessageContent::Call(c) => {
+                assert!(!c.is_video);
+                assert_eq!(c.call_access_hash, 0);
+                assert_eq!(c.discard_reason.r#type, CallDiscardReasonType::Missed);
+            }
+            _ => panic!("wrong type"),
+        }
+
+        // LiveLocation pre-heading (29)/proximity (30): both default to 0.
+        let mut blob = Vec::new();
+        store_i32(&mut blob, MessageContentType::LiveLocation as i32);
+        store_flags(&mut blob, [false, false, false]);
+        store_f64(&mut blob, 0.0);
+        store_f64(&mut blob, 0.0);
+        store_i32(&mut blob, 60);
+        let mut parser = Parser::new_with_version(&blob, 28);
+        match parse_message_content(&mut parser, &mut RawIdStorage).unwrap() {
+            MessageContent::LiveLocation(l) => {
+                assert_eq!(l.period, 60);
+                assert_eq!(l.heading, 0);
+                assert_eq!(l.proximity_alert_radius, 0);
+            }
+            _ => panic!("wrong type"),
+        }
+
+        // ChatSetTtl pre-AddMessageChatSetTtlFlags (44): no from_user_id.
+        let mut blob = Vec::new();
+        store_i32(&mut blob, MessageContentType::ChatSetTtl as i32);
+        store_i32(&mut blob, 60);
+        let mut parser = Parser::new_with_version(&blob, 43);
+        match parse_message_content(&mut parser, &mut RawIdStorage).unwrap() {
+            MessageContent::ChatSetTtl(m) => {
+                assert_eq!(m.ttl, 60);
+                assert!(!m.from_user_id.is_valid());
+            }
+            _ => panic!("wrong type"),
+        }
+
+        // GiveawayLaunch pre-SupportStarGiveaways (54): no flags, no stars.
+        let mut blob = Vec::new();
+        store_i32(&mut blob, MessageContentType::GiveawayLaunch as i32);
+        let mut parser = Parser::new_with_version(&blob, 53);
+        match parse_message_content(&mut parser, &mut RawIdStorage).unwrap() {
+            MessageContent::GiveawayLaunch(m) => assert_eq!(m.star_count, 0),
+            _ => panic!("wrong type"),
+        }
+
+        // RequestedDialog pre-SupportMultipleSharedUsers (52): one dialog,
+        // no flags block.
+        let mut blob = Vec::new();
+        store_i32(&mut blob, MessageContentType::RequestedDialog as i32);
+        store_i64(&mut blob, DialogId::from_user_id(UserId::new(7)).get());
+        store_i32(&mut blob, 3);
+        let mut parser = Parser::new_with_version(&blob, 51);
+        match parse_message_content(&mut parser, &mut RawIdStorage).unwrap() {
+            MessageContent::RequestedDialog(m) => {
+                assert_eq!(m.shared_dialog_ids.len(), 1);
+                assert_eq!(m.button_id, 3);
+            }
+            _ => panic!("wrong type"),
+        }
+
+        // Text pre-AddMessageTextFlags (49): has_web_page_id defaults true,
+        // so the web page id still follows the text.
+        let mut blob = Vec::new();
+        store_i32(&mut blob, MessageContentType::Text as i32);
+        store_string(&mut blob, "text");
+        store_i32(&mut blob, 0);
+        store_i64(&mut blob, 7);
+        let mut parser = Parser::new_with_version(&blob, 48);
+        match parse_message_content(&mut parser, &mut RawIdStorage).unwrap() {
+            MessageContent::Text(m) => {
+                assert_eq!(m.web_page_id, WebPageId::new(7));
+                assert!(m.web_page_url.is_empty());
+            }
+            _ => panic!("wrong type"),
+        }
+    }
+
+    #[test]
+    fn caption_parse_re_derives_entities_pre_add_caption_entities() {
+        // An Audio caption blob written before AddCaptionEntities (13)
+        // stores only the text; find_entities re-derives the URL entity.
+        let mut blob = Vec::new();
+        store_i32(&mut blob, MessageContentType::Audio as i32);
+        store_i32(&mut blob, 77); // the raw-id audio file id
+        store_string(&mut blob, "see a.com here");
+        store_i32(&mut blob, 1); // the legacy is_listened dummy
+        let mut parser = Parser::new_with_version(&blob, 12);
+        match parse_message_content(&mut parser, &mut RawIdStorage).unwrap() {
+            MessageContent::Audio(a) => {
+                assert_eq!(a.caption.text, "see a.com here");
+                assert!(!a.caption.entities.is_empty());
+                assert!(a.file_id.is_valid());
+            }
+            _ => panic!("wrong type"),
+        }
+    }
+
+    #[test]
+    fn invalid_content_degrades_to_unsupported() {
+        // A ChatChangePhoto with an empty photo is is_bad.
+        let mut out = Vec::new();
+        store_message_content(
+            &MessageContent::ChatChangePhoto(MessageChatChangePhoto {
+                photo: Photo::default(),
+            }),
+            &RawIdStorage,
+            &mut out,
+        );
+        let parsed = parse_message_content(&mut Parser::new(&out), &mut RawIdStorage).unwrap();
+        assert!(matches!(parsed, MessageContent::Unsupported(m) if m.version == 0));
+
+        // A non-server story id is is_bad.
+        let mut out = Vec::new();
+        store_message_content(
+            &MessageContent::Story(MessageStory {
+                story_full_id: StoryFullId::new(
+                    DialogId::from_user_id(UserId::new(1)),
+                    StoryId::new(2_000_000_000),
+                ),
+                via_mention: false,
+            }),
+            &RawIdStorage,
+            &mut out,
+        );
+        let parsed = parse_message_content(&mut Parser::new(&out), &mut RawIdStorage).unwrap();
+        assert!(matches!(parsed, MessageContent::Unsupported(_)));
+
+        // A live location with period 0 is is_bad.
+        let mut out = Vec::new();
+        store_message_content(
+            &MessageContent::LiveLocation(MessageLiveLocation {
+                location: Location::default(),
+                period: 0,
+                heading: 0,
+                proximity_alert_radius: 0,
+            }),
+            &RawIdStorage,
+            &mut out,
+        );
+        let parsed = parse_message_content(&mut Parser::new(&out), &mut RawIdStorage).unwrap();
+        assert!(matches!(parsed, MessageContent::Unsupported(_)));
+
+        // A negative boost count is is_bad.
+        let mut out = Vec::new();
+        store_message_content(
+            &MessageContent::BoostApply(MessageBoostApply { boost_count: -1 }),
+            &RawIdStorage,
+            &mut out,
+        );
+        let parsed = parse_message_content(&mut Parser::new(&out), &mut RawIdStorage).unwrap();
+        assert!(matches!(parsed, MessageContent::Unsupported(_)));
+    }
+
+    #[test]
+    fn call_bytes_pin_the_flag_layout() {
+        let call = MessageContent::Call(MessageCall {
+            call_id: 1,
+            call_access_hash: -1,
+            duration: 2,
+            discard_reason: CallDiscardReason {
+                r#type: CallDiscardReasonType::Declined,
+                slug: String::new(),
+            },
+            is_video: true,
+        });
+        let mut out = Vec::new();
+        store_message_content(&call, &RawIdStorage, &mut out);
+        let expected: Vec<u8> = (MessageContentType::Call as i32)
+            .to_le_bytes()
+            .into_iter()
+            .chain(0b11u32.to_le_bytes()) // is_video | has_call_access_hash
+            .chain(1i64.to_le_bytes())
+            .chain(2i32.to_le_bytes())
+            .chain((CallDiscardReasonType::Declined as i32).to_le_bytes())
+            .chain((-1i64).to_le_bytes())
+            .collect();
+        assert_eq!(out, expected);
+    }
+
+    // ------------------------------------------------------------------
+    // M.9.7/M.9.8/M.9.9 — the classification, policy and accessor planes.
+    // ------------------------------------------------------------------
+
+    /// The `MessageContentContext` stand-in: a permission table over a
+    /// restricted rights word, plus flags for the manager seams the
+    /// policy plane reads. Manager reads without a test default
+    /// `log_error!` and answer like an empty manager would.
+    struct TestContext {
+        rights: RestrictedRights,
+        is_bot: bool,
+        my_dialog_id: DialogId,
+        broadcast: bool,
+        monoforum: bool,
+        voice_forbidden: bool,
+        poll_anonymous: bool,
+        sticker_type: StickerType,
+        web_page_user_ids: Vec<UserId>,
+        web_page_channel_ids: Vec<ChannelId>,
+        poll_input_media: bool,
+        checklist_max: i64,
+        poll_contents: Vec<MessageContent>,
+    }
+
+    impl Default for TestContext {
+        fn default() -> Self {
+            TestContext {
+                rights: RestrictedRights::from_bools(
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    true,
+                    ChannelType::Unknown,
+                ),
+                is_bot: false,
+                my_dialog_id: DialogId::default(),
+                broadcast: false,
+                monoforum: false,
+                voice_forbidden: false,
+                poll_anonymous: true,
+                sticker_type: StickerType::Regular,
+                web_page_user_ids: Vec::new(),
+                web_page_channel_ids: Vec::new(),
+                poll_input_media: true,
+                checklist_max: 100,
+                poll_contents: Vec::new(),
+            }
+        }
+    }
+
+    impl TestContext {
+        fn restricted(&mut self, flags: u64) -> &mut Self {
+            self.rights = RestrictedRights::from_flags(flags);
+            self
+        }
+    }
+
+    impl MessageContentContext for TestContext {
+        fn get_user_default_permissions(&self, _user_id: UserId) -> RestrictedRights {
+            self.rights
+        }
+
+        fn get_secret_chat_default_permissions(
+            &self,
+            _secret_chat_id: SecretChatId,
+        ) -> RestrictedRights {
+            self.rights
+        }
+
+        fn is_user_bot(&self, _user_id: UserId) -> bool {
+            false
+        }
+
+        fn get_user_voice_messages_forbidden(&self, _user_id: UserId) -> bool {
+            self.voice_forbidden
+        }
+
+        fn get_chat_effective_restricted_rights(&self, _chat_id: ChatId) -> RestrictedRights {
+            self.rights
+        }
+
+        fn get_channel_effective_restricted_rights(
+            &self,
+            _channel_id: ChannelId,
+        ) -> RestrictedRights {
+            self.rights
+        }
+
+        fn is_broadcast_channel(&self, _channel_id: ChannelId) -> bool {
+            self.broadcast
+        }
+
+        fn is_monoforum_channel(&self, _channel_id: ChannelId) -> bool {
+            self.monoforum
+        }
+
+        fn is_bot(&self) -> bool {
+            self.is_bot
+        }
+
+        fn get_my_dialog_id(&self) -> DialogId {
+            self.my_dialog_id
+        }
+
+        fn get_poll_is_anonymous(&self, _poll_id: PollId) -> bool {
+            self.poll_anonymous
+        }
+
+        fn get_poll_is_closed(&self, _poll_id: PollId) -> bool {
+            false
+        }
+
+        fn get_poll_can_add_option(&self, _poll_id: PollId) -> bool {
+            false
+        }
+
+        fn get_poll_can_view_stats(&self, _poll_id: PollId) -> bool {
+            false
+        }
+
+        fn get_poll_has_unread_votes(&self, _poll_id: PollId) -> bool {
+            true
+        }
+
+        fn remove_poll_has_unread_votes(&self, _poll_id: PollId) {}
+
+        fn has_input_media_poll(&self, _poll_id: PollId) -> bool {
+            self.poll_input_media
+        }
+
+        fn get_poll_individual_message_contents(
+            &self,
+            _poll_id: PollId,
+            _attached_media: Option<&MessageContent>,
+        ) -> Vec<MessageContent> {
+            self.poll_contents.clone()
+        }
+
+        fn get_poll_option_properties(
+            &self,
+            _poll_id: PollId,
+            _option_id: &str,
+            _dialog_id: DialogId,
+            _message_id: MessageId,
+            _can_be_replied: bool,
+            _can_be_replied_in_another_chat: bool,
+            _can_get_link: bool,
+            _is_forward: bool,
+            _is_outgoing: bool,
+            _promise: Promise<crate::td_api::PollOptionProperties>,
+        ) {
+        }
+
+        fn get_sticker_type(&self, _file_id: FileId) -> StickerType {
+            self.sticker_type
+        }
+
+        fn get_web_page_user_ids(&self, _web_page_id: WebPageId) -> Vec<UserId> {
+            self.web_page_user_ids.clone()
+        }
+
+        fn get_web_page_channel_ids(&self, _web_page_id: WebPageId) -> Vec<ChannelId> {
+            self.web_page_channel_ids.clone()
+        }
+
+        fn get_option_integer(&self, name: &str, default: i64) -> i64 {
+            if name == "checklist_task_count_max" {
+                self.checklist_max
+            } else {
+                default
+            }
+        }
+    }
+
+    fn simple_text(text: &str) -> MessageContent {
+        MessageContent::Text(MessageText::new(
+            FormattedText {
+                text: text.to_string(),
+                entities: Vec::new(),
+            },
+            WebPageId::default(),
+            false,
+            false,
+            false,
+            String::new(),
+        ))
+    }
+
+    /// The modeled C++ false-set of `is_service_message_content`
+    /// (MessageContentType.cpp:623-731): 27 of the 28 `false` arms
+    /// (`RichText` unmodeled); everything else is service.
+    #[test]
+    fn service_classification_partitions_like_the_cpp() {
+        let non_service = [
+            MessageContentType::Animation,
+            MessageContentType::Audio,
+            MessageContentType::Contact,
+            MessageContentType::Dice,
+            MessageContentType::Document,
+            MessageContentType::ExpiredPhoto,
+            MessageContentType::ExpiredVideo,
+            MessageContentType::ExpiredVideoNote,
+            MessageContentType::ExpiredVoiceNote,
+            MessageContentType::Game,
+            MessageContentType::Giveaway,
+            MessageContentType::GiveawayWinners,
+            MessageContentType::Invoice,
+            MessageContentType::LiveLocation,
+            MessageContentType::Location,
+            MessageContentType::PaidMedia,
+            MessageContentType::Photo,
+            MessageContentType::Poll,
+            MessageContentType::Sticker,
+            MessageContentType::Story,
+            MessageContentType::Text,
+            MessageContentType::ToDoList,
+            MessageContentType::Unsupported,
+            MessageContentType::Venue,
+            MessageContentType::Video,
+            MessageContentType::VideoNote,
+            MessageContentType::VoiceNote,
+        ];
+        assert_eq!(non_service.len(), 27);
+        for content_type in non_service {
+            assert!(!is_service_message_content(content_type));
+        }
+        // the expired four are non-service and expired at the same time;
+        // everything else non-service is not expired
+        for content_type in [
+            MessageContentType::Animation,
+            MessageContentType::Audio,
+            MessageContentType::Contact,
+            MessageContentType::Dice,
+            MessageContentType::Document,
+            MessageContentType::Game,
+            MessageContentType::Giveaway,
+            MessageContentType::GiveawayWinners,
+            MessageContentType::Invoice,
+            MessageContentType::LiveLocation,
+            MessageContentType::Location,
+            MessageContentType::PaidMedia,
+            MessageContentType::Photo,
+            MessageContentType::Poll,
+            MessageContentType::Sticker,
+            MessageContentType::Story,
+            MessageContentType::Text,
+            MessageContentType::ToDoList,
+            MessageContentType::Unsupported,
+            MessageContentType::Venue,
+            MessageContentType::Video,
+            MessageContentType::VideoNote,
+            MessageContentType::VoiceNote,
+        ] {
+            assert!(!is_expired_message_content(content_type));
+        }
+        for content_type in [
+            MessageContentType::ExpiredPhoto,
+            MessageContentType::ExpiredVideo,
+            MessageContentType::ExpiredVideoNote,
+            MessageContentType::ExpiredVoiceNote,
+        ] {
+            assert!(is_expired_message_content(content_type));
+        }
+        assert!(is_service_message_content(MessageContentType::ChatCreate));
+        assert!(is_service_message_content(MessageContentType::Call));
+        assert!(is_service_message_content(
+            MessageContentType::PollAppendAnswer
+        ));
+        // C++ UNREACHABLEs on `None` (it enumerates only real types); the
+        // complement answers "service" — the can_be_secret_message_content
+        // degradation precedent.
+        assert!(is_service_message_content(MessageContentType::None));
+    }
+
+    /// `get_expired_message_content_type` (MessageContentType.cpp:897-909).
+    #[test]
+    fn expired_content_type_mapping_matches_the_cpp() {
+        assert_eq!(
+            get_expired_message_content_type(MessageContentType::Photo),
+            MessageContentType::ExpiredPhoto
+        );
+        assert_eq!(
+            get_expired_message_content_type(MessageContentType::Video),
+            MessageContentType::ExpiredVideo
+        );
+        assert_eq!(
+            get_expired_message_content_type(MessageContentType::VideoNote),
+            MessageContentType::ExpiredVideoNote
+        );
+        assert_eq!(
+            get_expired_message_content_type(MessageContentType::VoiceNote),
+            MessageContentType::ExpiredVoiceNote
+        );
+        for content_type in [
+            MessageContentType::Text,
+            MessageContentType::ExpiredPhoto,
+            MessageContentType::None,
+            MessageContentType::Unsupported,
+        ] {
+            assert_eq!(
+                get_expired_message_content_type(content_type),
+                MessageContentType::None
+            );
+        }
+    }
+
+    /// `can_send_message_content_to_secret_chat`
+    /// (MessageContentType.cpp:1019-1121): the 13 true types, the 9
+    /// modeled false types (`RichText` is the tenth, unmodeled).
+    #[test]
+    fn secret_chat_sendable_types_match_the_cpp() {
+        for content_type in [
+            MessageContentType::Animation,
+            MessageContentType::Audio,
+            MessageContentType::Contact,
+            MessageContentType::Document,
+            MessageContentType::LiveLocation,
+            MessageContentType::Location,
+            MessageContentType::Photo,
+            MessageContentType::Sticker,
+            MessageContentType::Text,
+            MessageContentType::Venue,
+            MessageContentType::Video,
+            MessageContentType::VideoNote,
+            MessageContentType::VoiceNote,
+        ] {
+            assert!(can_send_message_content_to_secret_chat(content_type));
+        }
+        for content_type in [
+            MessageContentType::Dice,
+            MessageContentType::Game,
+            MessageContentType::Giveaway,
+            MessageContentType::GiveawayWinners,
+            MessageContentType::Invoice,
+            MessageContentType::PaidMedia,
+            MessageContentType::Poll,
+            MessageContentType::Story,
+            MessageContentType::ToDoList,
+        ] {
+            assert!(!can_send_message_content_to_secret_chat(content_type));
+        }
+    }
+
+    /// The index-mask families (MessageContent.cpp:6537-6691): the media
+    /// bits, the missed-call extras and the Game text exemption.
+    #[test]
+    fn index_masks_match_the_cpp_tables() {
+        let td = TestContext::default();
+        let photo = MessageContent::Photo(MessagePhoto {
+            photo: Photo::default(),
+            video_file_id: FileId::default(),
+            caption: FormattedText::default(),
+            has_spoiler: false,
+        });
+        let expected_photo = message_search_filter_index_mask(MessageSearchFilter::Photo)
+            | message_search_filter_index_mask(MessageSearchFilter::PhotoAndVideo);
+        assert_eq!(
+            get_message_content_index_mask(&td, &photo, true),
+            expected_photo
+        );
+
+        let video = MessageContent::Video(MessageVideo {
+            file_id: FileId::default(),
+            alternative_file_ids: Vec::new(),
+            hls_file_ids: Vec::new(),
+            storyboard_file_ids: Vec::new(),
+            storyboard_map_file_ids: Vec::new(),
+            cover: Photo::default(),
+            start_timestamp: 0,
+            caption: FormattedText::default(),
+            has_spoiler: false,
+        });
+        let expected_video = message_search_filter_index_mask(MessageSearchFilter::Video)
+            | message_search_filter_index_mask(MessageSearchFilter::PhotoAndVideo);
+        assert_eq!(
+            get_message_content_index_mask(&td, &video, false),
+            expected_video
+        );
+
+        let declined_call = MessageContent::Call(MessageCall {
+            call_id: 1,
+            call_access_hash: -1,
+            duration: -1,
+            discard_reason: CallDiscardReason {
+                r#type: CallDiscardReasonType::Declined,
+                slug: String::new(),
+            },
+            is_video: false,
+        });
+        let call_bit = message_search_filter_index_mask(MessageSearchFilter::Call);
+        let missed_bit = message_search_filter_index_mask(MessageSearchFilter::MissedCall);
+        assert_eq!(
+            get_message_content_index_mask(&td, &declined_call, false),
+            call_bit | missed_bit
+        );
+        assert_eq!(
+            get_message_content_index_mask(&td, &declined_call, true),
+            call_bit
+        );
+
+        let missed_conference = MessageContent::ConferenceCall(MessageConferenceCall {
+            call_id: 1,
+            duration: -1,
+            other_participant_dialog_ids: Vec::new(),
+            is_active: false,
+            is_video: false,
+            was_missed: true,
+        });
+        assert_eq!(
+            get_message_content_index_mask(&td, &missed_conference, false),
+            call_bit | missed_bit
+        );
+
+        let with_url = MessageContent::Text(MessageText::new(
+            FormattedText {
+                text: "a https://example.com b".to_string(),
+                entities: vec![MessageEntity::new(Type::TextUrl, 2, 18)],
+            },
+            WebPageId::default(),
+            false,
+            false,
+            false,
+            String::new(),
+        ));
+        assert_eq!(
+            get_message_content_index_mask(&td, &with_url, true),
+            message_search_filter_index_mask(MessageSearchFilter::Url)
+        );
+
+        let game = MessageContent::Game(MessageGame {
+            game: Game {
+                id: 1,
+                access_hash: 2,
+                bot_user_id: UserId::default(),
+                short_name: "g".to_string(),
+                title: "T".to_string(),
+                description: String::new(),
+                photo: Photo::default(),
+                animation_file_id: FileId::default(),
+                text: with_url_text(),
+            },
+        });
+        assert_eq!(get_message_content_index_mask(&td, &game, true), 0);
+    }
+
+    fn with_url_text() -> FormattedText {
+        FormattedText {
+            text: "https://example.com".to_string(),
+            entities: vec![MessageEntity::new(Type::Url, 0, 19)],
+        }
+    }
+
+    /// `can_forward_message_content` (MessageContent.cpp:6483-6512).
+    #[test]
+    fn forwardability_matches_the_cpp_rules() {
+        let td = TestContext::default();
+        assert!(!can_forward_message_content(&td, &simple_text(""), false));
+        assert!(can_forward_message_content(&td, &simple_text("hi"), false));
+
+        let with_preview = MessageContent::Text(MessageText::new(
+            FormattedText::default(),
+            WebPageId::new(7),
+            false,
+            false,
+            false,
+            "https://example.com".to_string(),
+        ));
+        assert!(can_forward_message_content(&td, &with_preview, false));
+
+        let local_poll = MessageContent::Poll(MessagePoll {
+            poll_id: PollId::new(-3),
+            caption: FormattedText::default(),
+            attached_media: None,
+        });
+        assert!(!can_forward_message_content(&td, &local_poll, false));
+        let server_poll = MessageContent::Poll(MessagePoll {
+            poll_id: PollId::new(3),
+            caption: FormattedText::default(),
+            attached_media: None,
+        });
+        assert!(can_forward_message_content(&td, &server_poll, false));
+        // the C++ early-returns for every poll, so the trailing is_copy
+        // poll arm below it is shadowed — non-local polls are forwardable
+        // even without stored input media
+        assert!(can_forward_message_content(&td, &server_poll, true));
+
+        let invoice = MessageContent::Invoice(MessageInvoice {
+            input_invoice: InputInvoice::default(),
+        });
+        assert!(!can_forward_message_content(&td, &invoice, true));
+        assert!(can_forward_message_content(&td, &invoice, false));
+
+        assert!(!can_forward_message_content(&td, &expired_photo(), false));
+    }
+
+    fn expired_photo() -> MessageContent {
+        MessageContent::ExpiredPhoto(MessageExpiredPhoto {})
+    }
+
+    /// `update_opened_message_content` (MessageContent.cpp:6514-6531).
+    #[test]
+    fn opened_content_flips_once_like_the_cpp() {
+        let mut video_note = MessageContent::VideoNote(MessageVideoNote {
+            file_id: FileId::new(9, 0),
+            is_viewed: false,
+        });
+        assert!(update_opened_message_content(&mut video_note));
+        assert!(!update_opened_message_content(&mut video_note));
+        match &video_note {
+            MessageContent::VideoNote(m) => assert!(m.is_viewed),
+            _ => unreachable!(),
+        }
+
+        let mut voice_note = MessageContent::VoiceNote(MessageVoiceNote {
+            file_id: FileId::new(10, 0),
+            caption: FormattedText::default(),
+            is_listened: false,
+        });
+        assert!(update_opened_message_content(&mut voice_note));
+        assert!(!update_opened_message_content(&mut voice_note));
+
+        let mut text = simple_text("hi");
+        assert!(!update_opened_message_content(&mut text));
+    }
+
+    /// The paid-media album splat (MessageContent.cpp:6693-6700) keeps
+    /// the `MessageExtendedMedia` order and routes the poll arm through
+    /// the seam.
+    #[test]
+    fn individual_contents_splat_paid_media_in_order() {
+        let td = TestContext::default();
+        let paid_media = MessageContent::PaidMedia(MessagePaidMedia {
+            media: vec![
+                MessageExtendedMedia {
+                    r#type: MessageExtendedMediaType::Photo,
+                    photo: Photo::default(),
+                    ..Default::default()
+                },
+                MessageExtendedMedia {
+                    r#type: MessageExtendedMediaType::Video,
+                    video_file_id: FileId::new(4, 1),
+                    start_timestamp: 33,
+                    ..Default::default()
+                },
+            ],
+            caption: FormattedText::default(),
+            star_count: 10,
+            payload: String::new(),
+        });
+        let individual = get_individual_message_contents(&td, &paid_media);
+        assert_eq!(individual.len(), 2);
+        assert!(matches!(individual[0], MessageContent::Photo(_)));
+        match &individual[1] {
+            MessageContent::Video(m) => {
+                assert_eq!(m.file_id, FileId::new(4, 1));
+                assert_eq!(m.start_timestamp, 33);
+                assert!(m.cover.is_empty());
+            }
+            _ => panic!("expected the video splat"),
+        }
+
+        let poll_td = TestContext {
+            poll_contents: vec![simple_text("poll")],
+            ..Default::default()
+        };
+        let poll = MessageContent::Poll(MessagePoll {
+            poll_id: PollId::new(5),
+            caption: FormattedText::default(),
+            attached_media: None,
+        });
+        assert_eq!(get_individual_message_contents(&poll_td, &poll).len(), 1);
+    }
+
+    /// `can_send_message_content` (MessageContent.cpp:6207-6481): the
+    /// rights mapping, the secret-chat gate and the per-type extras.
+    #[test]
+    fn can_send_follows_the_cpp_decision_table() {
+        let user_id = UserId::new(7);
+        let dialog_id = DialogId::from_user_id(user_id);
+        let channel_id = ChannelId::new(77);
+        let channel_dialog = DialogId::from_channel_id(channel_id);
+
+        // check_permissions = false allows everything sendable.
+        let mut td = TestContext::default();
+        td.restricted(0);
+        assert!(can_send_message_content(&td, dialog_id, &simple_text("hi"), false, false).is_ok());
+
+        // Text with no can_send_messages right (an empty rights word).
+        let mut td = TestContext::default();
+        td.restricted(0);
+        let error =
+            can_send_message_content(&td, dialog_id, &simple_text("hi"), false, true).unwrap_err();
+        assert_eq!(error.code(), 400);
+        assert_eq!(
+            error.message(),
+            "Not enough rights to send text messages to the chat"
+        );
+
+        // Dice rides the stickers right; animations denied separately.
+        let stickers_bit = 1u64 << 18;
+        let animations_bit = 1u64 << 19;
+        let mut td = TestContext::default();
+        td.restricted(stickers_bit);
+        let dice = MessageContent::Dice(MessageDice::new(
+            MessageDice::DEFAULT_EMOJI,
+            0,
+            false,
+            String::new(),
+            String::new(),
+            0,
+            0,
+        ));
+        assert!(can_send_message_content(&td, dialog_id, &dice, false, true).is_ok());
+        let animation = MessageContent::Animation(MessageAnimation {
+            file_id: FileId::new(1, 0),
+            caption: FormattedText::default(),
+            has_spoiler: false,
+        });
+        let error = can_send_message_content(&td, dialog_id, &animation, false, true).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "Not enough rights to send animations to the chat"
+        );
+        let mut td = TestContext::default();
+        td.restricted(animations_bit);
+        assert!(can_send_message_content(&td, dialog_id, &animation, false, true).is_ok());
+
+        // Secret-chat gate wins over the rights table.
+        let secret_chat_id = SecretChatId::new(9);
+        let secret_dialog = DialogId::from_secret_chat_id(secret_chat_id);
+        let poll = MessageContent::Poll(MessagePoll {
+            poll_id: PollId::new(5),
+            caption: FormattedText::default(),
+            attached_media: None,
+        });
+        let td = TestContext::default();
+        assert_eq!(
+            can_send_message_content(&td, secret_dialog, &poll, false, true)
+                .unwrap_err()
+                .message(),
+            "Message can't be sent to a secret chat"
+        );
+        // a default context answers like an existing secret chat, whose
+        // default permissions allow text
+        let td = TestContext::default();
+        assert!(
+            can_send_message_content(&td, secret_dialog, &simple_text("hi"), false, true).is_ok()
+        );
+
+        // Paid media: forward needs photo+video; direct send is
+        // broadcast-channels-only for users.
+        let photos_bit = 1u64 << 34;
+        let paid_media = MessageContent::PaidMedia(MessagePaidMedia {
+            media: Vec::new(),
+            caption: FormattedText::default(),
+            star_count: 5,
+            payload: String::new(),
+        });
+        let mut td = TestContext::default();
+        td.restricted(photos_bit);
+        let error = can_send_message_content(&td, dialog_id, &paid_media, true, true).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "Not enough rights to send paid media to the chat"
+        );
+        let td = TestContext::default();
+        let error = can_send_message_content(&td, dialog_id, &paid_media, false, true).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "Paid media can be sent only in channel chats"
+        );
+        let td = TestContext {
+            broadcast: true,
+            ..Default::default()
+        };
+        assert!(can_send_message_content(&td, channel_dialog, &paid_media, false, true).is_ok());
+
+        // Non-anonymous polls can't go to broadcast channels; polls
+        // can't go to private chats from users.
+        let td = TestContext {
+            broadcast: true,
+            poll_anonymous: false,
+            ..Default::default()
+        };
+        let error = can_send_message_content(&td, channel_dialog, &poll, false, true).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "Non-anonymous polls can't be sent to channel chats"
+        );
+        let td = TestContext::default();
+        let error = can_send_message_content(&td, dialog_id, &poll, false, true).unwrap_err();
+        assert_eq!(error.message(), "Polls can't be sent to the private chat");
+        let td = TestContext {
+            is_bot: true,
+            ..Default::default()
+        };
+        assert!(can_send_message_content(&td, dialog_id, &poll, false, true).is_ok());
+
+        // Video notes to a user that restricted voice messages.
+        let video_note = MessageContent::VideoNote(MessageVideoNote {
+            file_id: FileId::new(3, 0),
+            is_viewed: false,
+        });
+        let td = TestContext {
+            voice_forbidden: true,
+            ..Default::default()
+        };
+        let error = can_send_message_content(&td, dialog_id, &video_note, false, true).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "User restricted receiving of video note messages"
+        );
+
+        // Custom-emoji stickers can't be sent as messages.
+        let sticker = MessageContent::Sticker(MessageSticker {
+            file_id: FileId::new(2, 0),
+            is_premium: false,
+        });
+        let td = TestContext {
+            sticker_type: StickerType::CustomEmoji,
+            ..Default::default()
+        };
+        let error = can_send_message_content(&td, dialog_id, &sticker, false, true).unwrap_err();
+        assert_eq!(error.message(), "Can't send emoji stickers in messages");
+
+        // Checklists can't go to broadcast channels and ride the poll
+        // right.
+        let todo = MessageContent::ToDoList(MessageToDoList {
+            list: ToDoList::default(),
+            completions: Vec::new(),
+        });
+        let td = TestContext {
+            broadcast: true,
+            ..Default::default()
+        };
+        let error = can_send_message_content(&td, channel_dialog, &todo, false, true).unwrap_err();
+        assert_eq!(error.message(), "Checklists can't be sent to channel chats");
+        let polls_bit = 1u64 << 23;
+        let mut td = TestContext::default();
+        td.restricted(polls_bit);
+        assert!(can_send_message_content(&td, dialog_id, &todo, false, true).is_ok());
+
+        // Games can't go to monoforum channel direct messages chats.
+        let game = MessageContent::Game(MessageGame {
+            game: Game::default(),
+        });
+        let td = TestContext {
+            monoforum: true,
+            ..Default::default()
+        };
+        let error = can_send_message_content(&td, channel_dialog, &game, false, true).unwrap_err();
+        assert_eq!(
+            error.message(),
+            "Games can't be sent to channel direct messages chats"
+        );
+    }
+
+    /// The replied-message id extraction (MessageContent.cpp:6766-6872).
+    #[test]
+    fn replied_message_full_ids_match_the_cpp_arms() {
+        let user_id = UserId::new(7);
+        let dialog_id = DialogId::from_user_id(user_id);
+        let other_dialog = DialogId::from_channel_id(ChannelId::new(50));
+        let full_id = |dialog_id, message_id: MessageId| {
+            MessageFullId::new(dialog_id, to_messages_manager_message_id(message_id))
+        };
+
+        let pin = MessageContent::PinMessage(MessagePinMessage {
+            message_id: MessageId::new(11),
+        });
+        assert_eq!(
+            get_message_content_replied_message_full_id(dialog_id, &pin),
+            full_id(dialog_id, MessageId::new(11))
+        );
+
+        // the validity-checked arms need full-form ids: a server message
+        // id has empty type bits (`MessageId::is_valid`, MessageId.cpp:104)
+        let payment = MessageContent::PaymentSuccessful(MessagePaymentSuccessful {
+            invoice_dialog_id: other_dialog,
+            invoice_message_id: MessageId::new(12 << 20),
+            ..Default::default()
+        });
+        assert_eq!(
+            get_message_content_replied_message_full_id(dialog_id, &payment),
+            full_id(other_dialog, MessageId::new(12 << 20))
+        );
+        let own_payment = MessageContent::PaymentSuccessful(MessagePaymentSuccessful {
+            invoice_dialog_id: DialogId::default(),
+            invoice_message_id: MessageId::new(13 << 20),
+            ..Default::default()
+        });
+        assert_eq!(
+            get_message_content_replied_message_full_id(dialog_id, &own_payment),
+            full_id(dialog_id, MessageId::new(13 << 20))
+        );
+        let invalid_payment = MessageContent::PaymentSuccessful(MessagePaymentSuccessful {
+            invoice_dialog_id: DialogId::default(),
+            invoice_message_id: MessageId::default(),
+            ..Default::default()
+        });
+        assert_eq!(
+            get_message_content_replied_message_full_id(dialog_id, &invalid_payment),
+            MessageFullId::default()
+        );
+
+        for content in [
+            simple_text("hi"),
+            MessageContent::ScreenshotTaken(MessageScreenshotTaken {}),
+        ] {
+            assert_eq!(
+                get_message_content_replied_message_full_id(dialog_id, &content),
+                MessageFullId::default()
+            );
+        }
+
+        let background = MessageContent::SetBackground(MessageSetBackground {
+            old_message_id: MessageId::new(21 << 20),
+            background_info: BackgroundInfo::default(),
+            for_both: false,
+        });
+        assert_eq!(
+            get_message_content_replied_message_full_id(dialog_id, &background),
+            full_id(dialog_id, MessageId::new(21 << 20))
+        );
+    }
+
+    /// `MessagePaymentSuccessful::Default` — the C++ field-initializer
+    /// defaults the M.10.1b plane pinned.
+    #[test]
+    fn min_user_ids_follow_the_cpp_arms() {
+        let user_id = UserId::new(7);
+        let other_user_id = UserId::new(8);
+        let dialog_id = DialogId::from_user_id(user_id);
+        let td = TestContext::default();
+
+        let chat_create = MessageContent::ChatCreate(MessageChatCreate {
+            title: "t".to_string(),
+            participant_user_ids: vec![other_user_id, user_id],
+        });
+        assert_eq!(
+            get_message_content_min_user_ids(&td, &chat_create),
+            vec![other_user_id, user_id]
+        );
+
+        let proximity = MessageContent::ProximityAlertTriggered(MessageProximityAlertTriggered {
+            traveler_dialog_id: DialogId::from_user_id(user_id),
+            watcher_dialog_id: DialogId::from_channel_id(ChannelId::new(5)),
+            distance: 10,
+        });
+        assert_eq!(
+            get_message_content_min_user_ids(&td, &proximity),
+            vec![user_id]
+        );
+        assert_eq!(
+            get_message_content_min_channel_ids(&td, &proximity),
+            vec![ChannelId::new(5)]
+        );
+
+        let story = MessageContent::Story(MessageStory {
+            story_full_id: StoryFullId::new(dialog_id, StoryId::new(3)),
+            via_mention: false,
+        });
+        assert_eq!(get_message_content_min_user_ids(&td, &story), vec![user_id]);
+        assert_eq!(
+            get_message_content_min_channel_ids(&td, &story),
+            Vec::<ChannelId>::new()
+        );
+        let channel_story = MessageContent::Story(MessageStory {
+            story_full_id: StoryFullId::new(
+                DialogId::from_channel_id(ChannelId::new(6)),
+                StoryId::new(3),
+            ),
+            via_mention: false,
+        });
+        assert_eq!(
+            get_message_content_min_channel_ids(&td, &channel_story),
+            vec![ChannelId::new(6)]
+        );
+
+        let giveaway = MessageContent::Giveaway(MessageGiveaway {
+            giveaway_parameters: GiveawayParameters {
+                boosted_channel_id: ChannelId::new(2),
+                additional_channel_ids: vec![ChannelId::new(4), ChannelId::new(3)],
+                ..Default::default()
+            },
+            quantity: 1,
+            months: 2,
+            star_count: 0,
+        });
+        assert_eq!(
+            get_message_content_min_channel_ids(&td, &giveaway),
+            vec![ChannelId::new(4), ChannelId::new(3), ChannelId::new(2)]
+        );
+
+        let contact = MessageContent::Contact(MessageContact {
+            contact: Contact::new(
+                "+15551234567".to_string(),
+                "J".to_string(),
+                "D".to_string(),
+                String::new(),
+                user_id,
+            ),
+        });
+        assert_eq!(
+            get_message_content_min_user_ids(&td, &contact),
+            vec![user_id]
+        );
+
+        // Text min ids combine the formatted-text entities with the web
+        // page ids, sorted-unique; the entity user_id is invalid here,
+        // so only the web page ids survive the combination.
+        let td = TestContext {
+            web_page_user_ids: vec![user_id, UserId::new(100)],
+            ..Default::default()
+        };
+        let text = MessageContent::Text(MessageText::new(
+            FormattedText {
+                text: "hi @a".to_string(),
+                entities: vec![MessageEntity {
+                    r#type: Some(Type::MentionName),
+                    offset: 3,
+                    length: 2,
+                    ..Default::default()
+                }],
+            },
+            WebPageId::new(9),
+            false,
+            false,
+            false,
+            String::new(),
+        ));
+        assert_eq!(
+            get_message_content_min_user_ids(&td, &text),
+            vec![user_id, UserId::new(100)]
+        );
+    }
+
+    /// The named user-id accessors (MessageContent.cpp:7240-7255).
+    #[test]
+    fn added_and_deleted_user_ids_match_the_cpp() {
+        let user_id = UserId::new(7);
+        let other_user_id = UserId::new(9);
+        let added = MessageContent::ChatAddUsers(MessageChatAddUsers {
+            user_ids: vec![user_id, other_user_id],
+        });
+        assert_eq!(
+            get_message_content_added_user_ids(&added),
+            vec![user_id, other_user_id]
+        );
+        let deleted = MessageContent::ChatDeleteUser(MessageChatDeleteUser {
+            user_id: other_user_id,
+        });
+        assert_eq!(get_message_content_deleted_user_id(&deleted), other_user_id);
+        assert_eq!(
+            get_message_content_deleted_user_id(&simple_text("hi")),
+            UserId::default()
+        );
+    }
+
+    /// The phone-call/live-location/poll/to-do accessor families
+    /// (MessageContent.cpp:7257-7389).
+    #[test]
+    fn small_accessors_match_the_cpp_defaults() {
+        let td = TestContext::default();
+
+        let call = MessageContent::Call(MessageCall {
+            call_id: 42,
+            call_access_hash: -7,
+            duration: 60,
+            discard_reason: CallDiscardReason::default(),
+            is_video: false,
+        });
+        match get_message_content_input_phone_call(&call) {
+            Some(telegram_api::InputPhoneCall { id, access_hash }) => {
+                assert_eq!(id, 42);
+                assert_eq!(access_hash, -7);
+            }
+            _ => panic!("expected inputPhoneCall"),
+        }
+        let no_hash_call = MessageContent::Call(MessageCall {
+            call_id: 42,
+            call_access_hash: 0,
+            ..Default::default()
+        });
+        assert!(get_message_content_input_phone_call(&no_hash_call).is_none());
+
+        let live_location = MessageContent::LiveLocation(MessageLiveLocation {
+            location: Location::default(),
+            period: 900,
+            heading: -1,
+            proximity_alert_radius: 0,
+        });
+        assert_eq!(
+            get_message_content_live_location_period(&live_location),
+            900
+        );
+        assert_eq!(
+            get_message_content_live_location_period(&simple_text("hi")),
+            0
+        );
+
+        let poll = MessageContent::Poll(MessagePoll {
+            poll_id: PollId::new(5),
+            caption: FormattedText::default(),
+            attached_media: None,
+        });
+        assert_eq!(get_message_content_poll_id(&poll), PollId::new(5));
+        assert_eq!(
+            get_message_content_poll_id(&simple_text("hi")),
+            PollId::default()
+        );
+        assert!(get_message_content_poll_is_anonymous(&td, &poll));
+        assert!(get_message_content_poll_is_closed(&td, &simple_text("hi")));
+        assert!(get_message_content_poll_has_unread_votes(&td, &poll));
+
+        let todo = MessageContent::ToDoList(MessageToDoList {
+            list: ToDoList {
+                title: FormattedText::default(),
+                items: vec![ToDoItem::default(); 3],
+                others_can_append: true,
+                others_can_complete: false,
+            },
+            completions: Vec::new(),
+        });
+        assert!(get_message_content_to_do_list_others_can_append(&todo));
+        assert!(!get_message_content_to_do_list_others_can_complete(&todo));
+        assert!(get_message_content_to_do_list_can_append_items(
+            &td, &todo, 97
+        ));
+        assert!(!get_message_content_to_do_list_can_append_items(
+            &td, &todo, 98
+        ));
+        assert!(!get_message_content_to_do_list_can_append_items(
+            &td, &todo, -1
+        ));
+        assert!(!get_message_content_to_do_list_can_append_items(
+            &td,
+            &simple_text("hi"),
+            1
+        ));
+    }
+
+    /// The media accessors (MessageContent.cpp:7391-7452) and the
+    /// background-info gate (MessageContent.cpp:6730-6754).
+    #[test]
+    fn media_accessors_and_background_info_match_the_cpp() {
+        let photo = MessageContent::Photo(MessagePhoto {
+            photo: Photo::default(),
+            video_file_id: FileId::default(),
+            caption: FormattedText::default(),
+            has_spoiler: false,
+        });
+        assert!(get_message_content_photo(&photo).is_some());
+        assert!(get_message_content_photo(&simple_text("hi")).is_none());
+        assert!(get_message_content_venue(&photo).is_none());
+
+        let text_with_preview = MessageContent::Text(MessageText::new(
+            FormattedText::default(),
+            WebPageId::new(12),
+            true,
+            true,
+            true,
+            "https://example.com".to_string(),
+        ));
+        assert!(has_message_content_web_page(&text_with_preview));
+        assert_eq!(
+            get_message_content_web_page_id(Some(&text_with_preview)),
+            WebPageId::new(12)
+        );
+        assert_eq!(get_message_content_web_page_id(None), WebPageId::default());
+        assert!(can_message_content_have_media_timestamp(&text_with_preview));
+
+        let mut text = text_with_preview;
+        remove_message_content_web_page(&mut text);
+        match &text {
+            MessageContent::Text(m) => {
+                assert_eq!(m.web_page_id, WebPageId::default());
+                assert!(!m.force_small_media);
+                assert!(!m.force_large_media);
+                assert!(!m.skip_web_page_confirmation);
+                assert!(m.web_page_url.is_empty());
+            }
+            _ => unreachable!(),
+        }
+
+        let audio = MessageContent::Audio(MessageAudio {
+            file_id: FileId::new(1, 0),
+            caption: FormattedText::default(),
+        });
+        assert!(can_message_content_have_media_timestamp(&audio));
+        assert!(!can_message_content_have_media_timestamp(&simple_text(
+            "hi"
+        )));
+
+        let background_info = BackgroundInfo {
+            background_id: BackgroundId::new(3),
+            background_type: BackgroundType::default(),
+        };
+        let set_background = MessageContent::SetBackground(MessageSetBackground {
+            old_message_id: MessageId::default(),
+            background_info: background_info.clone(),
+            for_both: false,
+        });
+        assert_eq!(
+            get_message_content_my_background_info(&set_background, true),
+            background_info
+        );
+        assert_eq!(
+            get_message_content_my_background_info(&set_background, false),
+            BackgroundInfo::default()
+        );
+        let for_both = MessageContent::SetBackground(MessageSetBackground {
+            old_message_id: MessageId::default(),
+            background_info: background_info.clone(),
+            for_both: true,
+        });
+        assert_eq!(
+            get_message_content_my_background_info(&for_both, false),
+            background_info
+        );
+    }
+
+    /// The value helpers the accessors consume: Game/GiveawayParameters/
+    /// InputInvoice/ToDoList.
+    #[test]
+    fn value_helpers_match_the_cpp() {
+        let user_id = UserId::new(7);
+        let game = Game {
+            bot_user_id: user_id,
+            text: with_url_text(),
+            ..Default::default()
+        };
+        assert_eq!(game.get_bot_user_id(), user_id);
+        assert_eq!(game.get_text().text, "https://example.com");
+
+        let parameters = GiveawayParameters {
+            boosted_channel_id: ChannelId::new(2),
+            additional_channel_ids: vec![ChannelId::new(4), ChannelId::new(3)],
+            ..Default::default()
+        };
+        assert_eq!(
+            parameters.get_channel_ids(),
+            vec![ChannelId::new(4), ChannelId::new(3), ChannelId::new(2)]
+        );
+
+        let mut invoice = InputInvoice::default();
+        invoice.extended_media.r#type = MessageExtendedMediaType::Video;
+        assert!(invoice.has_media_timestamp());
+        invoice.extended_media.r#type = MessageExtendedMediaType::Photo;
+        assert!(!invoice.has_media_timestamp());
+        invoice.extended_media_caption = with_url_text();
+        assert_eq!(invoice.get_caption().text, "https://example.com");
+
+        let list = ToDoList {
+            title: FormattedText::default(),
+            items: vec![ToDoItem::default(); 3],
+            others_can_append: false,
+            others_can_complete: true,
+        };
+        assert!(list.get_can_append_items(100, 97));
+        assert!(!list.get_can_append_items(100, 98));
+        assert!(list.get_can_append_items(3, 0));
+        assert!(!list.get_can_append_items(3, 1));
+        assert!(!list.get_can_append_items(100, -1));
     }
 }

@@ -177,6 +177,47 @@ impl StickerPhotoSize {
         Some(result)
     }
 
+    /// `StickerPhotoSize::store` (StickerPhotoSize.hpp:16-30).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let is_custom_emoji = self.type_ == StickerPhotoSizeType::CustomEmoji;
+        let is_sticker = self.type_ == StickerPhotoSizeType::Sticker;
+        crate::store_parse::store_flags(out, [is_custom_emoji, is_sticker]);
+        if is_custom_emoji {
+            crate::store_parse::store_i64(out, self.custom_emoji_id);
+        } else if is_sticker {
+            crate::store_parse::store_i64(out, self.sticker_set_id);
+            crate::store_parse::store_i64(out, self.sticker_id);
+        }
+        crate::store_parse::store_i32_vec(out, &self.background_colors);
+    }
+
+    /// `StickerPhotoSize::parse` (StickerPhotoSize.hpp:33-51). The C++
+    /// `UNREACHABLE()` on an all-zero flag block becomes an error (the
+    /// parser state is corrupted; the C++ would abort).
+    pub fn parse_from(
+        parser: &mut crate::store_parse::Parser,
+    ) -> Result<StickerPhotoSize, &'static str> {
+        let flags = parser.parse_flags::<2>()?;
+        let (type_, custom_emoji_id, sticker_set_id, sticker_id) = if flags[0] {
+            let id = parser.i64_()?;
+            (StickerPhotoSizeType::CustomEmoji, id, 0, 0)
+        } else if flags[1] {
+            let set_id = parser.i64_()?;
+            let sticker_id = parser.i64_()?;
+            (StickerPhotoSizeType::Sticker, 0, set_id, sticker_id)
+        } else {
+            return Err("StickerPhotoSize: unreachable type");
+        };
+        let background_colors = parser.i32_vec()?;
+        Ok(StickerPhotoSize {
+            type_,
+            custom_emoji_id,
+            sticker_set_id,
+            sticker_id,
+            background_colors,
+        })
+    }
+
     /// `StickerPhotoSize::get_chat_photo_sticker_object`
     /// (StickerPhotoSize.cpp:131-160).
     pub fn get_chat_photo_sticker_object(&self) -> td_api::ChatPhotoSticker {
