@@ -13,6 +13,11 @@
 
 use crate::contact::Contact;
 use crate::notification::{NotificationGroupId, NotificationId, NotificationObjectId};
+use crate::notification_settings::{
+    ReactionNotificationSettings, get_notification_settings_scope,
+    get_scope_notification_settings_object,
+};
+use crate::notification_settings_manager::ScopeSettingsAnswer;
 use crate::td::NotificationEnv;
 use crate::td::Td;
 use crate::td_api::{self, Function, Object};
@@ -153,6 +158,21 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             {
                 let mut env = user_env!(td);
                 td.user_manager.get_current_state(&mut env, &mut updates);
+            }
+
+            // NotificationSettingsManager::get_current_state
+            // (Requests.cpp:2221 — before the notification block; the
+            // manager's own is_bot gate applies)
+            if td.auth_manager.is_authorized() {
+                let env = NotificationEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_authorized: true,
+                    auth_is_bot: td.auth_manager.is_bot(),
+                    updates: &mut td.notification_updates,
+                };
+                td.notification_settings_manager
+                    .get_current_state(&env, &mut updates);
             }
 
             // NotificationManager::get_current_state (Requests.cpp:2229 —
@@ -305,6 +325,139 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             }
             let _ = crate::misc::clean_input_string(&request.payload);
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+        }
+
+        // -- the notification settings set (M.13S.4): Requests.cpp:7824/
+        //    7968/7977/7983 + the DeviceTokenManager arm at 2411 --
+        Function::getScopeNotificationSettings(request) => {
+            // `Requests.cpp:7824-7830`: CHECK_IS_USER + the null-scope gate
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(scope_object) = request.scope else {
+                return td.send_error_impl(id, 400, "Scope must be non-empty");
+            };
+            let scope = get_notification_settings_scope(&scope_object);
+            // `GetScopeNotificationSettingsRequest` (Requests.cpp:1340-1364):
+            // the synchronized settings answer the object, an unsynchronized
+            // scope defers into the (net-blocked) fetch and answers nothing
+            let unix_time = td.get_unix_time();
+            let answer = {
+                let env = NotificationEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_authorized: td.auth_manager.is_authorized(),
+                    auth_is_bot: td.auth_manager.is_bot(),
+                    updates: &mut td.notification_updates,
+                };
+                match td
+                    .notification_settings_manager
+                    .get_scope_notification_settings_for_request(&env, scope)
+                {
+                    ScopeSettingsAnswer::Ready(settings) => {
+                        Some(get_scope_notification_settings_object(settings, unix_time))
+                    }
+                    ScopeSettingsAnswer::Deferred => None,
+                }
+            };
+            if let Some(object) = answer {
+                td.send_result(id, Object::scopeNotificationSettings(object));
+            }
+        }
+        Function::setScopeNotificationSettings(request) => {
+            // `Requests.cpp:7968-7975`: CHECK_IS_USER + the null-scope gate;
+            // the answer is ok even before the server acks (the C++ answers
+            // via answer_ok_query with the Status converted by the macro)
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(scope_object) = request.scope else {
+                return td.send_error_impl(id, 400, "Scope must be non-empty");
+            };
+            let scope = get_notification_settings_scope(&scope_object);
+            let result = {
+                let mut env = NotificationEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_authorized: td.auth_manager.is_authorized(),
+                    auth_is_bot: td.auth_manager.is_bot(),
+                    updates: &mut td.notification_updates,
+                };
+                td.notification_settings_manager
+                    .set_scope_notification_settings(&mut env, scope, request.notification_settings)
+            };
+            match result {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::setReactionNotificationSettings(request) => {
+            // `Requests.cpp:7977-7981`
+            if !check_is_user(td, id) {
+                return;
+            }
+            let settings = ReactionNotificationSettings::from_td_api(request.notification_settings);
+            let result = {
+                let mut env = NotificationEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_authorized: td.auth_manager.is_authorized(),
+                    auth_is_bot: td.auth_manager.is_bot(),
+                    updates: &mut td.notification_updates,
+                };
+                td.notification_settings_manager
+                    .set_reaction_notification_settings(&mut env, settings)
+            };
+            match result {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::resetAllNotificationSettings(_) => {
+            // `Requests.cpp:7983-7987`: the local reset answers ok without
+            // waiting for the (net-blocked) ResetNotifySettingsQuery
+            if !check_is_user(td, id) {
+                return;
+            }
+            {
+                let mut env = NotificationEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_authorized: td.auth_manager.is_authorized(),
+                    auth_is_bot: td.auth_manager.is_bot(),
+                    updates: &mut td.notification_updates,
+                };
+                td.notification_settings_manager
+                    .reset_all_notification_settings(&mut env);
+            }
+            td.send_result(id, ok_object());
+        }
+        Function::registerDevice(request) => {
+            // `Requests.cpp:2411-2416`: CHECK_IS_USER, then the
+            // DeviceTokenManager takes the promise; the register ack is
+            // the [blocked: net] tail and the request stays unanswered
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td
+                .deferred_promise::<td_api::PushReceiverId, _>(id, |push_receiver_id| {
+                    Object::pushReceiverId(push_receiver_id)
+                });
+            {
+                let mut env = NotificationEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_authorized: td.auth_manager.is_authorized(),
+                    auth_is_bot: td.auth_manager.is_bot(),
+                    updates: &mut td.notification_updates,
+                };
+                td.device_token_manager.register_device(
+                    &mut env,
+                    request.device_token,
+                    &request.other_user_ids,
+                    promise,
+                );
+            }
         }
 
         // -- the auth set (S76): the real `AuthManager` handlers over the

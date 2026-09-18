@@ -248,6 +248,11 @@ pub struct Td {
     pub(crate) user_manager: UserManager,
     /// `Td::notification_manager_` (`Td.cpp:1251`).
     pub(crate) notification_manager: NotificationManager,
+    /// `Td::notification_settings_manager_` (`Td.cpp:1254`, M.13S).
+    pub(crate) notification_settings_manager:
+        crate::notification_settings_manager::NotificationSettingsManager,
+    /// `Td::device_token_manager_` (`Td.cpp:1345`, M.13S).
+    pub(crate) device_token_manager: crate::device_token_manager::DeviceTokenManager,
     /// The notification manager's `send_update` outbox — the collapsed
     /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
     /// [`Td::flush_user_updates`].
@@ -336,6 +341,9 @@ impl Td {
             auth_manager: AuthManager::new(),
             user_manager: UserManager::new(),
             notification_manager: NotificationManager::default(),
+            notification_settings_manager:
+                crate::notification_settings_manager::NotificationSettingsManager::new(),
+            device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
             notification_updates: Vec::new(),
             premium_required_contact_merger: None,
             stop_cnt: 2,
@@ -502,6 +510,8 @@ impl Td {
         let since_last_open = opened_database.since_last_open;
         let user_events = std::mem::take(&mut opened_database.user_events);
         let secret_chat_events = std::mem::take(&mut opened_database.secret_chat_events);
+        let notification_settings_events =
+            std::mem::take(&mut opened_database.notification_settings_events);
 
         if self.state == State::Close {
             // Close asynchronously opened database
@@ -510,6 +520,26 @@ impl Td {
         }
 
         self.global.init(opened_database.database);
+
+        // `DeviceTokenManager::start_up` (DeviceTokenManager.cpp:329) —
+        // the pmc token load runs at Td start, auth-independently; the
+        // sync loop is the [blocked: net] seam.
+        self.load_device_token_states();
+
+        // `Td::process_binlog_events` (Td.cpp:1034) — the on-server
+        // notification settings log events replay into the settings
+        // manager; the sends are the [blocked: net] seams.
+        {
+            let mut env = NotificationEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+                auth_is_authorized: self.auth_manager.is_authorized(),
+                auth_is_bot: self.auth_manager.is_bot(),
+                updates: &mut self.notification_updates,
+            };
+            self.notification_settings_manager
+                .on_binlog_events(&mut env, notification_settings_events);
+        }
 
         // The S76 bridge thread (updates flow back through OnNetUpdate).
         // Idle until the first query, so the offline tests stay offline.
@@ -1301,6 +1331,18 @@ impl Td {
         {
             expire_time = notification_deadline;
         }
+        // The notification-settings scope-unmute and the device-token
+        // register-retry deadlines share it too (M.13S).
+        if let Some(settings_deadline) = self.notification_settings_manager.next_deadline()
+            && (expire_time == 0.0 || settings_deadline < expire_time)
+        {
+            expire_time = settings_deadline;
+        }
+        if let Some(token_deadline) = self.device_token_manager.next_deadline()
+            && (expire_time == 0.0 || token_deadline < expire_time)
+        {
+            expire_time = token_deadline;
+        }
         if expire_time == 0.0 {
             self.cancel_timeout();
         } else {
@@ -1669,8 +1711,9 @@ impl Td {
         }
     }
 
-    /// `td_->notification_manager_->init()` (AuthManager.cpp:1545) —
-    /// idempotent; the manager no-ops while disabled.
+    /// `td_->notification_manager_->init()` +
+    /// `td_->notification_settings_manager_->init()` (AuthManager.cpp:1545)
+    /// — idempotent; the managers no-op while disabled.
     fn init_notification_manager(&mut self) {
         let mut env = NotificationEnv {
             global: &mut self.global,
@@ -1680,6 +1723,21 @@ impl Td {
             updates: &mut self.notification_updates,
         };
         self.notification_manager.init(&mut env);
+        self.notification_settings_manager.init(&mut env);
+    }
+
+    /// `DeviceTokenManager::start_up` (DeviceTokenManager.cpp:329) — the
+    /// token pmc load runs at Td start, auth-independently; the sync loop
+    /// is the [blocked: net] seam.
+    fn load_device_token_states(&mut self) {
+        let mut env = NotificationEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            updates: &mut self.notification_updates,
+        };
+        self.device_token_manager.load_states(&mut env);
     }
 
     /// The deferred-response outbox drain — the `send_closure(td_id_,
@@ -2576,6 +2634,8 @@ impl Actor for Td {
                 updates: &mut self.notification_updates,
             };
             self.notification_manager.tick_timeouts(&mut env);
+            self.notification_settings_manager.tick_timeouts(&mut env);
+            self.device_token_manager.tick_timeouts(&mut env);
         }
         let actions = self
             .config_manager
@@ -2692,6 +2752,44 @@ impl crate::notification_manager::NotificationManagerEnv for NotificationEnv<'_>
 
     fn pmc_erase(&mut self, key: &str) {
         self.global.binlog_pmc().erase(key);
+    }
+}
+
+impl crate::notification_settings_manager::NotificationSettingsManagerEnv for NotificationEnv<'_> {
+    fn auth_is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    /// The C++ `was_authorized()` bands collapse into the S76
+    /// `is_authorized` on this line.
+    fn auth_was_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn binlog_add(&mut self, handler_type: i32, data: &[u8]) -> u64 {
+        self.global.td_db().binlog().add(handler_type, data)
+    }
+}
+
+impl crate::device_token_manager::DeviceTokenManagerEnv for NotificationEnv<'_> {
+    fn pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
     }
 }
 
@@ -4299,6 +4397,166 @@ mod tests {
             };
             assert_eq!(user.id, 777000);
             assert!(user.is_support, "the C++ service notifications user");
+        });
+    }
+
+    fn private_chats_scope() -> td_api::NotificationSettingsScope {
+        td_api::NotificationSettingsScope::notificationSettingsScopePrivateChats(
+            td_api::notificationSettingsScopePrivateChats,
+        )
+    }
+
+    fn scope_settings_request(mute_for: i32) -> td_api::ScopeNotificationSettings {
+        td_api::ScopeNotificationSettings {
+            mute_for,
+            sound_id: -1,
+            show_preview: true,
+            use_default_mute_stories: true,
+            mute_stories: false,
+            story_sound_id: -1,
+            show_story_poster: true,
+            disable_pinned_message_notifications: false,
+            disable_mention_notifications: false,
+        }
+    }
+
+    #[test]
+    fn notification_settings_arms_round_trip_through_the_td() {
+        let callback = CollectCallback::default();
+        run_actor_with(&callback, |actor, callback, scheduler| {
+            let dir = temp_db_dir("m13s-settings-arms");
+            send(actor, scheduler, 1, set_tdlib_parameters(dir, false));
+            seed_service_notifications_user(actor, scheduler);
+
+            // an unsynchronized scope defers into the (blocked) fetch and
+            // answers nothing — the C++ deferred-promise behavior
+            send(
+                actor,
+                scheduler,
+                2,
+                Function::getScopeNotificationSettings(td_api::getScopeNotificationSettings {
+                    scope: Some(private_chats_scope()),
+                }),
+            );
+            scheduler.run_main(0.05);
+            assert!(
+                responses_of(callback, 2).is_empty(),
+                "the unsynchronized scope must stay unanswered"
+            );
+
+            send(
+                actor,
+                scheduler,
+                3,
+                Function::setScopeNotificationSettings(td_api::setScopeNotificationSettings {
+                    scope: Some(private_chats_scope()),
+                    notification_settings: Some(scope_settings_request(100)),
+                }),
+            );
+            scheduler.run_main(0.05);
+            let responses = responses_of(callback, 3);
+            assert_eq!(responses.len(), 1);
+            assert!(matches!(responses[0], Object::ok(_)), "set answers ok");
+
+            // the synchronized scope answers the stored settings
+            send(
+                actor,
+                scheduler,
+                4,
+                Function::getScopeNotificationSettings(td_api::getScopeNotificationSettings {
+                    scope: Some(private_chats_scope()),
+                }),
+            );
+            scheduler.run_main(0.05);
+            let responses = responses_of(callback, 4);
+            let Object::scopeNotificationSettings(settings) = &responses[0] else {
+                panic!("expected scopeNotificationSettings, got {:?}", responses[0]);
+            };
+            assert!(
+                (99..=100).contains(&settings.mute_for),
+                "mute_for reflects the store"
+            );
+
+            // the reset answers ok and re-synchronizes the defaults
+            send(
+                actor,
+                scheduler,
+                5,
+                Function::resetAllNotificationSettings(td_api::resetAllNotificationSettings),
+            );
+            scheduler.run_main(0.05);
+            assert!(matches!(responses_of(callback, 5)[0], Object::ok(_)));
+            send(
+                actor,
+                scheduler,
+                6,
+                Function::getScopeNotificationSettings(td_api::getScopeNotificationSettings {
+                    scope: Some(private_chats_scope()),
+                }),
+            );
+            scheduler.run_main(0.05);
+            let responses = responses_of(callback, 6);
+            let Object::scopeNotificationSettings(settings) = &responses[0] else {
+                panic!("expected scopeNotificationSettings, got {:?}", responses[0]);
+            };
+            assert_eq!(settings.mute_for, 0, "the reset cleared the mute");
+        });
+    }
+
+    #[test]
+    fn register_device_arm_parks_until_the_ack() {
+        let callback = CollectCallback::default();
+        run_actor_with(&callback, |actor, callback, scheduler| {
+            let dir = temp_db_dir("m13s-register-device");
+            send(actor, scheduler, 1, set_tdlib_parameters(dir, false));
+            seed_service_notifications_user(actor, scheduler);
+
+            let device_token = |token: &str| {
+                Some(td_api::DeviceToken::deviceTokenApplePush(
+                    td_api::deviceTokenApplePush {
+                        device_token: token.to_owned(),
+                        is_app_sandbox: false,
+                    },
+                ))
+            };
+
+            send(
+                actor,
+                scheduler,
+                2,
+                Function::registerDevice(td_api::registerDevice {
+                    device_token: device_token("tok"),
+                    other_user_ids: Vec::new(),
+                }),
+            );
+            scheduler.run_main(0.05);
+            assert!(
+                responses_of(callback, 2).is_empty(),
+                "the register waits for the (blocked) server ack"
+            );
+
+            // a changed token supersedes: the parked request answers an
+            // empty pushReceiverId like the C++ overwritten promise
+            send(
+                actor,
+                scheduler,
+                3,
+                Function::registerDevice(td_api::registerDevice {
+                    device_token: device_token("tok2"),
+                    other_user_ids: Vec::new(),
+                }),
+            );
+            scheduler.run_main(0.05);
+            let responses = responses_of(callback, 2);
+            assert_eq!(responses.len(), 1, "the superseded register answers empty");
+            let Object::pushReceiverId(push_receiver_id) = &responses[0] else {
+                panic!("expected pushReceiverId, got {:?}", responses[0]);
+            };
+            assert_eq!(push_receiver_id.id, 0);
+            assert!(
+                responses_of(callback, 3).is_empty(),
+                "the new register still waits"
+            );
         });
     }
 
