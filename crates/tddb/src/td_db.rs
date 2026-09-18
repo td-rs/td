@@ -17,6 +17,7 @@ use crate::sqlite_key_value::SqliteKeyValue;
 use tdutils::random;
 use tdutils::status::Result;
 use tdutils::status::Status;
+use tdutils::try_result;
 use tdutils::try_status;
 
 /// `DbVersion` (td/telegram/Version.h)
@@ -41,7 +42,8 @@ pub const CURRENT_DB_VERSION: i32 = db_version::NEXT - 1;
 
 /// `MESSAGE_DB_INDEX_COUNT` (td/telegram/MessageDb.cpp)
 const MESSAGE_DB_INDEX_COUNT: i32 = 30;
-#[allow(dead_code)]
+/// `MESSAGE_DB_INDEX_COUNT_OLD` (td/telegram/MessageDb.cpp:42) — the nine
+/// indices the `AddMessageDbMediaIndex` migration adds.
 const MESSAGE_DB_INDEX_COUNT_OLD: i32 = 9;
 
 /// `MessageSearchFilter::Call` / `MissedCall`
@@ -95,6 +97,22 @@ pub const LOG_EVENT_HANDLER_TYPE_CHATS: i32 = 3;
 /// supergroup log events the `ChatManager` mirror writes while a channel
 /// is unsaved (`ChannelLogEvent`).
 pub const LOG_EVENT_HANDLER_TYPE_CHANNELS: i32 = 4;
+/// `LogEvent::HandlerType::ToggleDialogIsPinnedOnServer` (LogEvent.h:85) —
+/// the DialogManager server-sync mirror events (M.6.18). All seven collect
+/// into one replay vector for `DialogManager::on_binlog_dialog_events`.
+pub const LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_PINNED_ON_SERVER: i32 = 0x10c;
+/// `LogEvent::HandlerType::ReorderPinnedDialogsOnServer` (LogEvent.h:86).
+pub const LOG_EVENT_HANDLER_TYPE_REORDER_PINNED_DIALOGS_ON_SERVER: i32 = 0x10d;
+/// `LogEvent::HandlerType::ToggleDialogReportSpamStateOnServer` (LogEvent.h:91).
+pub const LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_REPORT_SPAM_STATE_ON_SERVER: i32 = 0x112;
+/// `LogEvent::HandlerType::ToggleDialogIsMarkedAsUnreadOnServer` (LogEvent.h:94).
+pub const LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_MARKED_AS_UNREAD_ON_SERVER: i32 = 0x115;
+/// `LogEvent::HandlerType::ToggleDialogIsBlockedOnServer` (LogEvent.h:97).
+pub const LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_BLOCKED_ON_SERVER: i32 = 0x118;
+/// `LogEvent::HandlerType::ToggleDialogIsTranslatableOnServer` (LogEvent.h:105).
+pub const LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_TRANSLATABLE_ON_SERVER: i32 = 0x126;
+/// `LogEvent::HandlerType::ToggleDialogViewAsMessagesOnServer` (LogEvent.h:106).
+pub const LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_VIEW_AS_MESSAGES_ON_SERVER: i32 = 0x127;
 
 /// `TdDb::OpenedDatabase` — the database plus the open metadata the Td actor
 /// consumes (`since_last_open`; the per-manager binlog event vectors arrive
@@ -118,6 +136,11 @@ pub struct OpenedDatabase {
     /// event with the Channels handler type, in binlog order, for
     /// `ChatManager::on_binlog_channel_event`.
     pub channel_events: Vec<BinlogEvent>,
+    /// The `dialog_manager_events` replay vector (TdDb.cpp `dialog_events`
+    /// shape) — every binlog event with one of the seven DialogManager
+    /// server-sync handler types, in binlog order, for
+    /// `DialogManager::on_binlog_dialog_events`.
+    pub dialog_manager_events: Vec<BinlogEvent>,
 }
 
 /// `get_binlog_path` — `{database_directory}td{_test}.binlog`.
@@ -231,6 +254,10 @@ pub struct TdDb {
     binlog_pmc: Option<BinlogKeyValue>,
     config_pmc: Option<BinlogKeyValue>,
     binlog: Option<Arc<ConcurrentBinlog>>,
+    /// `TdDb::was_dialog_db_created_` — set by `init_dialog_db` when the
+    /// `dialogs` table was created from scratch (DialogDb.cpp feeds
+    /// `DialogManager::have_old_message_database` through it).
+    was_dialog_db_created: bool,
 }
 
 fn add_media_indices(db: &SqliteDb, begin: i32, end: i32) -> Status {
@@ -293,47 +320,138 @@ fn add_scheduled_messages_table(db: &SqliteDb) -> Status {
     )
 }
 
-/// `init_dialog_db` (fresh-database path; C++ migrations are version-gated)
-fn init_dialog_db(db: &SqliteDb, version: &mut i32) -> Status {
+fn create_notification_group_table(db: &SqliteDb) -> Status {
+    db.exec(
+        "CREATE TABLE IF NOT EXISTS notification_groups (notification_group_id INT4 PRIMARY KEY, dialog_id \
+         INT8, last_notification_date INT4)",
+    )
+}
+
+fn create_last_notification_date_index(db: &SqliteDb) -> Status {
+    db.exec(
+        "CREATE INDEX IF NOT EXISTS notification_group_by_last_notification_date ON notification_groups \
+         (last_notification_date, dialog_id, notification_group_id) WHERE last_notification_date IS NOT NULL",
+    )
+}
+
+fn add_dialogs_in_folder_index(db: &SqliteDb) -> Status {
+    db.exec(
+        "CREATE INDEX IF NOT EXISTS dialog_in_folder_by_dialog_order ON dialogs (folder_id, dialog_order, dialog_id) \
+         WHERE folder_id IS NOT NULL",
+    )
+}
+
+/// `init_dialog_db` (DialogDb.cpp:28-100) — the fresh-DB path plus the
+/// `DbVersion`-gated migration ladder. The pinned-dialogs migration stores
+/// its results into the binlog pmc; `was_created` tells TdDb to reset the
+/// dialog-counters pmc keys afterwards (DialogDb.cpp feeds
+/// `DialogManager::have_old_message_database` through this flag).
+pub fn init_dialog_db(
+    db: &SqliteDb,
+    version: &mut i32,
+    binlog_pmc: &mut BinlogKeyValue,
+    was_created: &mut bool,
+) -> Status {
+    tracing::info!("Init dialog database version={version}");
+    *was_created = false;
+
+    // Check if database exists
     let has_table = db.has_table("dialogs").unwrap();
     let mut version_local = *version;
-    if !has_table || version_local > CURRENT_DB_VERSION {
-        // drop_dialog_db (td/telegram/DialogDb.cpp) — future migrations
+    if !has_table {
+        version_local = 0;
+    } else if version_local > CURRENT_DB_VERSION {
+        try_status!(drop_dialog_db(db, version_local));
         version_local = 0;
     }
 
     if version_local == 0 {
+        tracing::info!("Create new dialog database");
+        *was_created = true;
         try_status!(
             db.exec("CREATE TABLE IF NOT EXISTS dialogs (dialog_id INT8 PRIMARY KEY, dialog_order INT8, data BLOB, \
                      folder_id INT4)")
         );
-        try_status!(
-            db.exec("CREATE TABLE IF NOT EXISTS notification_groups (notification_group_id INT4 PRIMARY KEY, dialog_id \
-                     INT8, last_notification_date INT4)")
-        );
-        try_status!(
-            db.exec("CREATE INDEX IF NOT EXISTS notification_group_by_last_notification_date ON notification_groups \
-                     (last_notification_date, dialog_id, notification_group_id) WHERE last_notification_date IS NOT NULL")
-        );
-        try_status!(
-            db.exec("CREATE INDEX IF NOT EXISTS dialog_in_folder_by_dialog_order ON dialogs (folder_id, dialog_order, dialog_id) \
-                     WHERE folder_id IS NOT NULL")
-        );
+        try_status!(create_notification_group_table(db));
+        try_status!(create_last_notification_date_index(db));
+        try_status!(add_dialogs_in_folder_index(db));
         version_local = CURRENT_DB_VERSION;
     }
+    if version_local < db_version::ADD_NOTIFICATIONS_SUPPORT {
+        try_status!(create_notification_group_table(db));
+        try_status!(create_last_notification_date_index(db));
+    }
+    if version_local < db_version::ADD_FOLDERS {
+        try_status!(db.exec("DROP INDEX IF EXISTS dialog_by_dialog_order"));
+        try_status!(db.exec("ALTER TABLE dialogs ADD COLUMN folder_id INT4"));
+        try_status!(add_dialogs_in_folder_index(db));
+        try_status!(db.exec(
+            "UPDATE dialogs SET folder_id = 0 WHERE dialog_id < -1500000000000 AND dialog_order > 0"
+        ));
+    }
+    if version_local < db_version::STORE_PINNED_DIALOGS_IN_BINLOG {
+        // 9221294780217032704 == get_dialog_order(Auto(), MIN_PINNED_DIALOG_DATE - 1)
+        try_result!(
+            get_pinned_dialogs_stmt,
+            db.get_statement(
+                "SELECT dialog_id FROM dialogs WHERE folder_id = ?1 AND dialog_order > \
+                 9221294780217032704 ORDER BY dialog_order DESC, dialog_id DESC"
+            )
+        );
+        // the try_result! binding is immutable and the statement is stepped
+        let mut get_pinned_dialogs_stmt = get_pinned_dialogs_stmt;
+        for folder_id in 0..2i32 {
+            let mut pinned_dialog_ids: Vec<String> = Vec::new();
+            get_pinned_dialogs_stmt.bind_int32(1, folder_id).ensure();
+            get_pinned_dialogs_stmt.step().ensure();
+            while get_pinned_dialogs_stmt.has_row() {
+                pinned_dialog_ids.push(get_pinned_dialogs_stmt.view_int64(0).to_string());
+                get_pinned_dialogs_stmt.step().ensure();
+            }
+            get_pinned_dialogs_stmt.reset();
+
+            binlog_pmc.set(
+                &format!("pinned_dialog_ids{folder_id}"),
+                &pinned_dialog_ids.join(","),
+            );
+        }
+    }
+
     *version = version_local;
     Status::ok()
 }
 
-/// `init_message_db`
-fn init_message_db(db: &SqliteDb, version: &mut i32) -> Status {
+/// `drop_dialog_db` (DialogDb.cpp:103-110). The C++ keeps the first exec's
+/// status and still runs the second drop, returning the first error —
+/// ported verbatim.
+pub fn drop_dialog_db(db: &SqliteDb, version: i32) -> Status {
+    if version != 0 {
+        tracing::warn!(
+            "Drop chat database version={version} current_db_version={CURRENT_DB_VERSION}"
+        );
+    }
+    let status = db.exec("DROP TABLE IF EXISTS dialogs");
+    try_status!(db.exec("DROP TABLE IF EXISTS notification_groups"));
+    status
+}
+
+/// `init_message_db` (MessageDb.cpp:45-171) — the fresh-DB path plus the
+/// `DbVersion`-gated ALTER ladder.
+pub fn init_message_db(db: &SqliteDb, version: &mut i32) -> Status {
+    tracing::info!("Init message database version={version}");
+
+    // Check if database exists
     let has_table = db.has_table("messages").unwrap();
     let mut version_local = *version;
-    if !has_table || version_local > CURRENT_DB_VERSION {
+    if !has_table {
+        version_local = 0;
+    } else if version_local > CURRENT_DB_VERSION {
+        try_status!(drop_message_db(db, version_local));
         version_local = 0;
     }
 
     if version_local == 0 {
+        tracing::info!("Create new message database");
         try_status!(
             db.exec("CREATE TABLE IF NOT EXISTS messages (dialog_id INT8, message_id INT8, unique_message_id INT4, \
                      sender_user_id INT8, random_id INT8, data BLOB, ttl_expires_at INT4, index_mask INT4, search_id INT8, \
@@ -358,8 +476,47 @@ fn init_message_db(db: &SqliteDb, version: &mut i32) -> Status {
         try_status!(add_scheduled_messages_table(db));
         version_local = CURRENT_DB_VERSION;
     }
+    if version_local < db_version::ADD_MESSAGE_DB_MEDIA_INDEX {
+        try_status!(db.exec("ALTER TABLE messages ADD COLUMN index_mask INT4"));
+        try_status!(add_media_indices(db, 0, MESSAGE_DB_INDEX_COUNT_OLD));
+    }
+    if version_local < db_version::ADD_MESSAGE_DB30_MEDIA_INDEX {
+        try_status!(add_media_indices(
+            db,
+            MESSAGE_DB_INDEX_COUNT_OLD,
+            MESSAGE_DB_INDEX_COUNT
+        ));
+    }
+    if version_local < db_version::ADD_MESSAGE_DB_FTS {
+        try_status!(db.exec("ALTER TABLE messages ADD COLUMN search_id INT8"));
+        try_status!(db.exec("ALTER TABLE messages ADD COLUMN text STRING"));
+        try_status!(add_fts(db));
+    }
+    if version_local < db_version::ADD_MESSAGES_CALL_INDEX {
+        try_status!(add_call_index(db));
+    }
+    if version_local < db_version::ADD_NOTIFICATIONS_SUPPORT {
+        try_status!(db.exec("ALTER TABLE messages ADD COLUMN notification_id INT4"));
+        try_status!(add_notification_id_index(db));
+    }
+    if version_local < db_version::ADD_SCHEDULED_MESSAGES {
+        try_status!(add_scheduled_messages_table(db));
+    }
+    if version_local < db_version::ADD_MESSAGE_THREAD_SUPPORT {
+        try_status!(db.exec("ALTER TABLE messages ADD COLUMN top_thread_message_id INT8"));
+    }
     *version = version_local;
     Status::ok()
+}
+
+/// `drop_message_db` (MessageDb.cpp:174-178) — drops only the `messages`
+/// table; the FTS and scheduled tables are left to the recreate path,
+/// like the C++.
+pub fn drop_message_db(db: &SqliteDb, version: i32) -> Status {
+    tracing::warn!(
+        "Drop message database version={version} current_db_version={CURRENT_DB_VERSION}"
+    );
+    db.exec("DROP TABLE IF EXISTS messages")
 }
 
 /// `init_story_db`
@@ -428,17 +585,21 @@ impl TdDb {
             binlog_pmc: None,
             config_pmc: None,
             binlog: None,
+            was_dialog_db_created: false,
         }
     }
 
     /// `TdDb::init_sqlite` (skeleton): open, WAL, secure_delete, create the
-    /// schema inside one transaction, set `user_version`.
+    /// schema inside one transaction, set `user_version`. The binlog pmc is
+    /// passed in because the C++ `init_dialog_db` writes the pinned-dialogs
+    /// migration results into it and the pmc-erase tail runs against it.
     pub fn init_sqlite(
         &mut self,
         sql_database_path: &str,
         parameters: &Parameters,
         key: &DbKey,
         old_key: &DbKey,
+        binlog_pmc: &mut BinlogKeyValue,
     ) -> Status {
         let use_sqlite = parameters.use_file_database;
         let use_dialog_db = parameters.use_message_database;
@@ -468,9 +629,17 @@ impl TdDb {
 
         let user_version = db.user_version().unwrap();
 
+        let mut was_dialog_db_created = false;
         if use_dialog_db {
             let mut version = user_version;
-            try_status!(init_dialog_db(&db, &mut version));
+            try_status!(init_dialog_db(
+                &db,
+                &mut version,
+                binlog_pmc,
+                &mut was_dialog_db_created
+            ));
+        } else {
+            try_status!(drop_dialog_db(&db, user_version));
         }
         if use_message_thread_db {
             let mut version = user_version;
@@ -479,6 +648,9 @@ impl TdDb {
         if parameters.use_message_database {
             let mut version = user_version;
             try_status!(init_message_db(&db, &mut version));
+        } else {
+            // the database is being replaced by the binlog-only storage
+            try_status!(drop_message_db(&db, user_version));
         }
         if use_story_database {
             let mut version = user_version;
@@ -494,9 +666,48 @@ impl TdDb {
             try_status!(db.set_user_version(CURRENT_DB_VERSION));
         }
 
+        // TdDb.cpp:441-457 — a freshly created dialog database resets every
+        // dialog-counter key the managers persist (their owners re-fetch
+        // everything from the server).
+        if was_dialog_db_created {
+            binlog_pmc.erase_by_prefix(b"pinned_dialog_ids");
+            binlog_pmc.erase_by_prefix(b"last_server_dialog_date");
+            binlog_pmc.erase_by_prefix(b"unread_message_count");
+            binlog_pmc.erase_by_prefix(b"unread_dialog_count");
+            binlog_pmc.erase("sponsored_dialog_id");
+            binlog_pmc.erase_by_prefix(b"top_dialogs#");
+            binlog_pmc.erase("dlds_counter");
+            binlog_pmc.erase_by_prefix(b"dlds#");
+            binlog_pmc.erase("fetched_marks_as_unread");
+            binlog_pmc.erase_by_prefix(b"public_channels");
+            binlog_pmc.erase("channels_to_send_stories");
+            binlog_pmc.erase_by_prefix(b"saved_messages_tags");
+        }
+        if user_version == 0 {
+            binlog_pmc.erase("next_contacts_sync_date");
+            binlog_pmc.erase("saved_contact_count");
+            binlog_pmc.erase("old_featured_sticker_set_count");
+            binlog_pmc.erase("invalidate_old_featured_sticker_sets");
+            // AttachMenuManager::get_attach_menu_bots_database_key()
+            // (AttachMenuManager.cpp:372).
+            binlog_pmc.erase("attach_bots");
+        }
+        binlog_pmc.force_sync(None);
+
         try_status!(db.exec("COMMIT TRANSACTION"));
 
         self.sql_connection = Some(connection.clone());
+
+        // TdDb.cpp:469-476 — the same fresh-dialog-db reset against the
+        // sqlite pmc (this materializes the "common" table, like the C++
+        // `get_sqlite_sync_pmc()->erase` calls do).
+        if was_dialog_db_created {
+            let common_kv = self.common_kv();
+            common_kv.erase(b"calls_db_state");
+            common_kv.erase(b"di_active_live_location_messages");
+            common_kv.erase_by_prefix(b"channel_recommendations");
+        }
+        self.was_dialog_db_created = was_dialog_db_created;
 
         // files key-value handle (used by the file manager in later steps)
         let mut files_kv = SqliteKeyValue::new();
@@ -540,6 +751,21 @@ impl TdDb {
         self.parameters
             .as_ref()
             .expect("TdDb is not initialized: parameters are missing")
+    }
+
+    /// `TdDb::sql_connection_` — a cloned handle to the shared SQLite
+    /// connection (`create_message_db_sync(sql_connection_)` consumers).
+    pub fn sql_connection(&self) -> Arc<SqliteConnectionSafe> {
+        self.sql_connection
+            .as_ref()
+            .expect("TdDb is not initialized: sql connection is missing")
+            .clone()
+    }
+
+    /// `TdDb::was_dialog_db_created()` (TdDb.h) — whether this open created
+    /// the `dialogs` table from scratch.
+    pub fn was_dialog_db_created(&self) -> bool {
+        self.was_dialog_db_created
     }
 
     /// `TdDb::get_sqlite_sync_pmc` — the synchronous view of the "common"
@@ -624,6 +850,7 @@ impl TdDb {
         let mut secret_chat_events: Vec<BinlogEvent> = Vec::new();
         let mut chat_events: Vec<BinlogEvent> = Vec::new();
         let mut channel_events: Vec<BinlogEvent> = Vec::new();
+        let mut dialog_manager_events: Vec<BinlogEvent> = Vec::new();
         let mut binlog = ConcurrentBinlog::new();
         {
             let binlog_pmc = &mut binlog_pmc;
@@ -632,6 +859,7 @@ impl TdDb {
             let secret_chat_events = &mut secret_chat_events;
             let chat_events = &mut chat_events;
             let channel_events = &mut channel_events;
+            let dialog_manager_events = &mut dialog_manager_events;
             let callback = |event: &BinlogEvent| match event.type_ {
                 BINLOG_PMC_MAGIC => binlog_pmc.external_init_handle(event),
                 CONFIG_PMC_MAGIC => config_pmc.external_init_handle(event),
@@ -639,6 +867,15 @@ impl TdDb {
                 LOG_EVENT_HANDLER_TYPE_SECRET_CHAT_INFOS => secret_chat_events.push(event.clone()),
                 LOG_EVENT_HANDLER_TYPE_CHATS => chat_events.push(event.clone()),
                 LOG_EVENT_HANDLER_TYPE_CHANNELS => channel_events.push(event.clone()),
+                LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_PINNED_ON_SERVER
+                | LOG_EVENT_HANDLER_TYPE_REORDER_PINNED_DIALOGS_ON_SERVER
+                | LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_REPORT_SPAM_STATE_ON_SERVER
+                | LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_MARKED_AS_UNREAD_ON_SERVER
+                | LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_BLOCKED_ON_SERVER
+                | LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_TRANSLATABLE_ON_SERVER
+                | LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_VIEW_AS_MESSAGES_ON_SERVER => {
+                    dialog_manager_events.push(event.clone())
+                }
                 _ => {}
             };
             let init_status = binlog.init(
@@ -688,14 +925,24 @@ impl TdDb {
 
         let mut db = TdDb::new();
         db.parameters = Some(parameters.clone());
-        let mut init_status =
-            db.init_sqlite(&sqlite_path, &parameters, &new_sqlite_key, &old_sqlite_key);
+        let mut init_status = db.init_sqlite(
+            &sqlite_path,
+            &parameters,
+            &new_sqlite_key,
+            &old_sqlite_key,
+            &mut binlog_pmc,
+        );
         if init_status.is_error() {
             // C++ destroys the bad database and retries once.
             tracing::error!("Destroy bad SQLite database because of {init_status}");
             let _ = crate::sqlite_db::destroy(&sqlite_path);
-            init_status =
-                db.init_sqlite(&sqlite_path, &parameters, &new_sqlite_key, &old_sqlite_key);
+            init_status = db.init_sqlite(
+                &sqlite_path,
+                &parameters,
+                &new_sqlite_key,
+                &old_sqlite_key,
+                &mut binlog_pmc,
+            );
             if init_status.is_error() {
                 return Result::from_status(init_status);
             }
@@ -711,6 +958,7 @@ impl TdDb {
             secret_chat_events,
             chat_events,
             channel_events,
+            dialog_manager_events,
         })
     }
 
@@ -779,6 +1027,20 @@ mod tests {
         format!("{}/tests/data", env!("CARGO_MANIFEST_DIR"))
     }
 
+    /// `init_sqlite` writes the pinned-dialogs migration results (and the
+    /// fresh-database pmc resets) into the binlog pmc, so the tests hand it
+    /// a real (throwaway) binlog-backed pmc.
+    fn test_binlog_pmc(name: &str) -> BinlogKeyValue {
+        let path = std::env::temp_dir()
+            .join(name)
+            .to_string_lossy()
+            .into_owned();
+        let _ = BinlogKeyValue::destroy(&path);
+        let mut pmc = BinlogKeyValue::new();
+        pmc.init(&path, DbKey::empty()).ensure();
+        pmc
+    }
+
     /// S44 verify: the schema created by the Rust port is identical to the
     /// schema created by the C++ implementation (conformance/cpp/
     /// td_db_create_sample.cpp, db version 14, message threads disabled).
@@ -820,11 +1082,13 @@ mod tests {
         let rs_path = format!("{}/test_tddb_rs", data_dir());
         let _ = crate::sqlite_db::destroy(&rs_path);
         let mut tddb = TdDb::new();
+        let mut pmc = test_binlog_pmc("m6_tddb_rs_pmc");
         tddb.init_sqlite(
             &rs_path,
             &Parameters::default(),
             &DbKey::empty(),
             &DbKey::empty(),
+            &mut pmc,
         )
         .ensure();
         tddb.close();
@@ -843,35 +1107,121 @@ mod tests {
         let path = format!("{}/test_tddb_enc", data_dir());
         let _ = crate::sqlite_db::destroy(&path);
         let mut tddb = TdDb::new();
+        let mut pmc = test_binlog_pmc("m6_tddb_enc_pmc");
         tddb.init_sqlite(
             &path,
             &Parameters::default(),
             &DbKey::password("cucumber"),
             &DbKey::empty(),
+            &mut pmc,
         )
         .ensure();
         tddb.close();
 
         // reopen with the right key works, wrong key fails
         let mut tddb = TdDb::new();
+        let mut pmc = test_binlog_pmc("m6_tddb_enc_pmc");
         tddb.init_sqlite(
             &path,
             &Parameters::default(),
             &DbKey::password("cucumber"),
             &DbKey::empty(),
+            &mut pmc,
         )
         .ensure();
         tddb.close();
         let mut tddb = TdDb::new();
+        let mut pmc = test_binlog_pmc("m6_tddb_enc_pmc");
         assert!(
             tddb.init_sqlite(
                 &path,
                 &Parameters::default(),
                 &DbKey::password("tomato"),
                 &DbKey::empty(),
+                &mut pmc,
             )
             .is_error()
         );
         let _ = crate::sqlite_db::destroy(&path);
+    }
+
+    /// M.6.13: the fresh path sets `was_created` and creates both tables;
+    /// the pinned-dialogs migration (a database at version 11) collects the
+    /// pinned rows per folder into the pmc, newest order first.
+    #[test]
+    fn dialog_db_ladder_and_pinned_migration() {
+        fn open_sqlite(name: &str) -> SqliteDb {
+            let path = std::env::temp_dir()
+                .join(name)
+                .to_string_lossy()
+                .into_owned();
+            let _ = crate::sqlite_db::destroy(&path);
+            SqliteDb::open_with_key(&path, true, &DbKey::empty(), None).unwrap()
+        }
+
+        // 1. fresh database: was_created, both tables exist
+        let db = open_sqlite("m6_dialogdb_fresh");
+        let mut pmc = test_binlog_pmc("m6_dialogdb_fresh_pmc");
+        let mut was_created = false;
+        let mut version = 0;
+        init_dialog_db(&db, &mut version, &mut pmc, &mut was_created).ensure();
+        assert!(was_created);
+        assert_eq!(version, CURRENT_DB_VERSION);
+        assert!(db.has_table("dialogs").unwrap());
+        assert!(db.has_table("notification_groups").unwrap());
+        // a second run over the same database is not a creation
+        let mut version = CURRENT_DB_VERSION;
+        init_dialog_db(&db, &mut version, &mut pmc, &mut was_created).ensure();
+        assert!(!was_created);
+        drop(db);
+        let _ = crate::sqlite_db::destroy(
+            std::env::temp_dir()
+                .join("m6_dialogdb_fresh")
+                .to_str()
+                .unwrap(),
+        );
+
+        // 2. an old (version 11) database migrates its pinned dialogs into
+        // the pmc, ordered by dialog_order DESC per folder
+        let db = open_sqlite("m6_dialogdb_old");
+        db.exec(
+            "CREATE TABLE dialogs (dialog_id INT8 PRIMARY KEY, dialog_order INT8, data BLOB, folder_id INT4)",
+        )
+        .ensure();
+        db.exec(
+            "CREATE TABLE notification_groups (notification_group_id INT4 PRIMARY KEY, dialog_id INT8, \
+             last_notification_date INT4)",
+        )
+        .ensure();
+        for (dialog_id, order, folder) in [
+            (-1000i64, 9221294780217032705i64, 0i32),
+            (-1001, 9221294780217032706, 0),
+            (-1002, 100, 0),
+            (-1003, 9221294780217032707, 1),
+        ] {
+            let mut stmt = db
+                .get_statement("INSERT INTO dialogs VALUES(?1, ?2, ?3, ?4)")
+                .unwrap();
+            stmt.bind_int64(1, dialog_id).ensure();
+            stmt.bind_int64(2, order).ensure();
+            stmt.bind_blob(3, b"x").ensure();
+            stmt.bind_int32(4, folder).ensure();
+            stmt.step().ensure();
+        }
+        let mut pmc = test_binlog_pmc("m6_dialogdb_old_pmc");
+        let mut was_created = true;
+        let mut version = db_version::ADD_SCHEDULED_MESSAGES;
+        init_dialog_db(&db, &mut version, &mut pmc, &mut was_created).ensure();
+        assert!(!was_created);
+        assert_eq!(pmc.get("pinned_dialog_ids0"), "-1001,-1000");
+        assert_eq!(pmc.get("pinned_dialog_ids1"), "-1003");
+        assert_eq!(pmc.get("last_server_dialog_date"), "");
+        drop(db);
+        let _ = crate::sqlite_db::destroy(
+            std::env::temp_dir()
+                .join("m6_dialogdb_old")
+                .to_str()
+                .unwrap(),
+        );
     }
 }
