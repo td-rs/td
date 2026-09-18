@@ -129,6 +129,24 @@ pub fn append_utf8_character(out: &mut Vec<u8>, code: u32) {
     }
 }
 
+/// The M.6-line helper behind `td::utf8_truncate` (utf8.h:69-82): truncate
+/// `s` to at most `length` Unicode characters, returning the byte offset of
+/// the cut point. (`utf8_truncate` below is the str-slice form.)
+pub fn utf8_truncated_len(s: &[u8], length: usize) -> usize {
+    if s.len() > length {
+        let mut remaining = length;
+        for (i, &byte) in s.iter().enumerate() {
+            if is_utf8_character_first_code_unit(byte) {
+                if remaining == 0 {
+                    return i;
+                }
+                remaining -= 1;
+            }
+        }
+    }
+    s.len()
+}
+
 /// `td::utf8_get_search_words` (utf8.cpp): split into lowercased search words
 /// — punctuation and symbols become word separators (`prepare_search_character`
 /// maps them to `' '` or `0`), diacritics are stripped, and casing is folded.
@@ -199,6 +217,19 @@ mod tests {
         assert!(is_utf8_character_first_code_unit(0xc3));
         assert!(!is_utf8_character_first_code_unit(0x80));
         assert!(!is_utf8_character_first_code_unit(0xbf));
+    }
+
+    #[test]
+    fn truncate_cuts_on_character_boundaries() {
+        let s = "aп🦀b".as_bytes();
+        // 'a' + 2-byte п = 3 bytes; 🦀 adds 4 more
+        assert_eq!(utf8_truncated_len(s, 0), 0);
+        assert_eq!(utf8_truncated_len(s, 1), 1);
+        assert_eq!(utf8_truncated_len(s, 2), 3);
+        assert_eq!(utf8_truncated_len(s, 3), 7);
+        assert_eq!(utf8_truncated_len(s, 4), s.len());
+        // never counts continuation bytes
+        assert_eq!(utf8_truncated_len(&[0xc3, 0xa9, b'z'], 2), 3);
     }
 }
 

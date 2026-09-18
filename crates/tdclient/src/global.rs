@@ -12,9 +12,15 @@
 //! ...) accumulate here as the managers land; the net_query_creator /
 //! dispatcher and the location access hashes are the net step.
 
+use std::sync::Arc;
+
+use tdutils::promise::PromiseCreator;
+
 use tddb::binlog_key_value::BinlogKeyValue;
 use tddb::td_db::TdDb;
 
+use crate::dialog_db::{DialogDbAsync, DialogDbAsyncInterface, DialogDbSyncSafe};
+use crate::message_db::{MessageDbAsync, MessageDbAsyncInterface, MessageDbSyncSafe};
 use crate::option_manager::OptionManager;
 
 /// The `server_time_difference` binlog pmc key (Global.cpp:96).
@@ -63,6 +69,16 @@ impl ServerTimeDiff {
 /// `td::Global` — the M.1 subset with the M.2 server-time machinery.
 pub struct Global {
     db: Option<TdDb>,
+    /// `TdDb::message_db_sync_safe_` — held next to the database because the
+    /// engine types live in this crate (the C++ keeps them as TdDb members;
+    /// tddb cannot depend on tdclient here).
+    message_db_sync_safe: Option<Arc<MessageDbSyncSafe>>,
+    /// `TdDb::message_db_async_`.
+    message_db_async: Option<MessageDbAsync>,
+    /// `TdDb::dialog_db_sync_safe_` — same story as the message engine.
+    dialog_db_sync_safe: Option<Arc<DialogDbSyncSafe>>,
+    /// `TdDb::dialog_db_async_`.
+    dialog_db_async: Option<DialogDbAsync>,
     /// `Global::close_flag_`.
     close_flag: bool,
     /// `Global::is_test_dc()` — read from the database parameters.
@@ -95,6 +111,10 @@ impl Global {
     pub fn new() -> Global {
         Global {
             db: None,
+            message_db_sync_safe: None,
+            message_db_async: None,
+            dialog_db_sync_safe: None,
+            dialog_db_async: None,
             close_flag: false,
             is_test_dc: false,
             server_time_difference: 0.0,
@@ -117,10 +137,73 @@ impl Global {
         self.is_test_dc = db.parameters().is_test_dc;
         self.db = Some(db);
 
+        // `TdDb::init_sqlite` tail (TdDb.cpp:478-490): create the dialog and
+        // message database engines, both gated on `use_message_database`
+        // (the C++ `use_dialog_db`); the dialog engines come first, like the
+        // C++. The C++ runs inside the Td actor; here
+        // `create_actor_on_scheduler` needs a scheduler context, so a bare
+        // (scheduler-less) test that never touches the databases leaves the
+        // engines uncreated.
+        if self.db.as_ref().unwrap().parameters().use_message_database {
+            if tdactor::Scheduler::in_scheduler_context() {
+                let connection = self.db.as_ref().unwrap().sql_connection();
+                let dialog_sync_safe = Arc::new(DialogDbSyncSafe::new(connection.clone()));
+                self.dialog_db_async = Some(DialogDbAsync::new(dialog_sync_safe.clone(), -1));
+                self.dialog_db_sync_safe = Some(dialog_sync_safe);
+                let sync_safe = Arc::new(MessageDbSyncSafe::new(connection));
+                self.message_db_async = Some(MessageDbAsync::new(sync_safe.clone(), -1));
+                self.message_db_sync_safe = Some(sync_safe);
+            } else {
+                tracing::debug!("No scheduler context: database engines not created");
+            }
+        }
+
         let saved_diff_str = self
             .binlog_pmc()
             .get_raw(SERVER_TIME_DIFFERENCE_KEY.as_bytes());
         self.load_server_time_difference(&saved_diff_str);
+    }
+
+    /// `TdDb::get_message_db_sync` (TdDb.cpp:236-238).
+    pub fn message_db_sync(&self) -> &MessageDbSyncSafe {
+        self.message_db_sync_safe
+            .as_ref()
+            .expect("message database is not enabled")
+    }
+
+    /// `TdDb::get_message_db_async` (TdDb.cpp:240-242).
+    pub fn message_db_async(&self) -> &MessageDbAsync {
+        self.message_db_async
+            .as_ref()
+            .expect("message database is not enabled")
+    }
+
+    /// `TdDb::get_dialog_db_sync` (TdDb.cpp:252-254).
+    pub fn dialog_db_sync(&self) -> &DialogDbSyncSafe {
+        self.dialog_db_sync_safe
+            .as_ref()
+            .expect("dialog database is not enabled")
+    }
+
+    /// `TdDb::get_dialog_db_async` (TdDb.cpp:256-258).
+    pub fn dialog_db_async(&self) -> &DialogDbAsync {
+        self.dialog_db_async
+            .as_ref()
+            .expect("dialog database is not enabled")
+    }
+
+    /// `TdDb::flush_all` (TdDb.cpp:269-286) — the message and dialog
+    /// databases are the async engines of this slice (the C++ message-thread
+    /// and story engines are not ported); the binlog flush stays in
+    /// [`TdDb::close_all`].
+    pub fn flush_all(&mut self) {
+        tracing::info!("Flush all databases");
+        if let Some(message_db_async) = &self.message_db_async {
+            message_db_async.force_flush();
+        }
+        if let Some(dialog_db_async) = &self.dialog_db_async {
+            dialog_db_async.force_flush();
+        }
     }
 
     /// The body of `Global::init` from Global.cpp:99-140 — pure against the
@@ -228,25 +311,6 @@ impl Global {
             .as_ref()
             .map(|db| db.parameters().use_message_database)
             .unwrap_or(false)
-    }
-
-    /// `Global::is_expected_error` (Global.h:723-739) — the errors the
-    /// query layer answers without logging a failure.
-    pub fn is_expected_error(&self, error: &tdutils::status::Status) -> bool {
-        debug_assert!(error.is_error());
-        if error.code() == 401 {
-            // authorization is lost
-            return true;
-        }
-        if error.code() == 420 || error.code() == 429 {
-            // flood wait
-            return true;
-        }
-        if error.code() == 406 && error.message() == "FROZEN_METHOD_INVALID" {
-            // the account is frozen
-            return true;
-        }
-        self.close_flag()
     }
 
     /// `Global::use_sqlite_pmc()` — gated on the file database exactly like
@@ -363,9 +427,45 @@ impl Global {
         to_unix_time(self.server_time())
     }
 
-    /// `Global::close_all` — drop the database (the manager-actor resets
-    /// accumulate here as the managers land).
+    /// `TdDb::do_close` (TdDb.cpp:293-366): the message and dialog database
+    /// engines are closed on their scheduler through a
+    /// `MultiPromiseActorSafe`; the whole database close (binlog, pmcs, sql
+    /// connection) becomes the final promise, so the connection outlives the
+    /// engine drain — the C++ moves `sql_connection_` into the same lambda.
+    /// Without a pumping scheduler (bare tests) the engines are dropped
+    /// un-drained — they never buffered anything in that mode — and the
+    /// database closes like before.
     pub fn close_all(&mut self, destroy_flag: bool) {
+        let message_db_async = self.message_db_async.take();
+        let dialog_db_async = self.dialog_db_async.take();
+        if message_db_async.is_some() || dialog_db_async.is_some() {
+            if tdactor::Scheduler::in_scheduler_context() {
+                let mut mpas = tdactor::MultiPromiseActorSafe::new("TdDbCloseMultiPromiseActor");
+                let mut db = self.db.take();
+                mpas.add_promise(PromiseCreator::lambda(move |()| {
+                    if let Some(db) = &mut db {
+                        db.close_all(destroy_flag);
+                    }
+                }));
+                let mut lock = mpas.get_promise();
+                self.message_db_sync_safe = None;
+                if let Some(message_db_async) = message_db_async {
+                    message_db_async.close(mpas.get_promise());
+                    drop(message_db_async);
+                }
+                self.dialog_db_sync_safe = None;
+                if let Some(dialog_db_async) = dialog_db_async {
+                    dialog_db_async.close(mpas.get_promise());
+                    drop(dialog_db_async);
+                }
+                lock.set_value(());
+                return;
+            }
+            self.message_db_sync_safe = None;
+            self.dialog_db_sync_safe = None;
+            drop(message_db_async);
+            drop(dialog_db_async);
+        }
         if let Some(db) = &mut self.db {
             db.close_all(destroy_flag);
         }
@@ -376,6 +476,26 @@ impl Global {
     /// shape every manager's persistence goes through.
     pub fn binlog_pmc(&mut self) -> &mut BinlogKeyValue {
         self.td_db().binlog_pmc()
+    }
+
+    /// `Global::is_expected_error` (Global.h:723-737) — errors that are
+    /// normal during a session: lost authorization, flood waits, a frozen
+    /// account, or anything arriving while the client is closing.
+    pub fn is_expected_error(&self, error: &tdutils::status::Status) -> bool {
+        assert!(error.is_error(), "is_expected_error needs an error status");
+        if error.code() == 401 {
+            // authorization is lost
+            return true;
+        }
+        if error.code() == 420 || error.code() == 429 {
+            // flood wait
+            return true;
+        }
+        if error.code() == 406 && error.message() == "FROZEN_METHOD_INVALID" {
+            // the account is frozen
+            return true;
+        }
+        self.close_flag()
     }
 }
 

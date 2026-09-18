@@ -57,6 +57,7 @@ use crate::config_recoverer::{
 use crate::config_result;
 use crate::connection_creator::ConnectionCreator;
 use crate::convert::{self, MessageSpec};
+use crate::dialog_manager::DialogManager;
 use crate::global::Global;
 use crate::link_manager::LinkManager;
 use crate::manager_option_states::ManagerOptionStates;
@@ -251,6 +252,9 @@ pub struct Td {
     /// Td; its binlog replay rides the same `process_binlog_events` pass as
     /// the users, in the C++ users→chats→channels order).
     pub(crate) chat_manager: crate::chat_manager::ChatManager,
+    /// `Td::dialog_manager_` — the M.6 facade state (recent-dialog lists +
+    /// search hints); the actor-dependent halves land with M.6.18+.
+    pub(crate) dialog_manager: DialogManager,
     /// `Td::updates_manager_` (`create_actor` at `Td.cpp:1319-1321`, after
     /// the config) — the update engine. The binlog-pmc state loads lazily
     /// on the first pts access (`init_state`), and the pmc writes flush
@@ -475,6 +479,7 @@ impl Td {
             user_manager: UserManager::new(),
             premium_required_contact_merger: None,
             chat_manager: crate::chat_manager::ChatManager::new(),
+            dialog_manager: DialogManager::new(),
             updates_manager: UpdatesManager::new(TdUpdatesSink),
             stop_cnt: 2,
             deferred_results: Arc::new(Mutex::new(Vec::new())),
@@ -642,6 +647,7 @@ impl Td {
         let secret_chat_events = std::mem::take(&mut opened_database.secret_chat_events);
         let chat_events = std::mem::take(&mut opened_database.chat_events);
         let channel_events = std::mem::take(&mut opened_database.channel_events);
+        let dialog_manager_events = std::mem::take(&mut opened_database.dialog_manager_events);
 
         if self.state == State::Close {
             // Close asynchronously opened database
@@ -1010,6 +1016,9 @@ impl Td {
                 self.chat_manager
                     .on_binlog_channel_event(&mut self.user_manager, &mut env, event);
             }
+        }
+        for event in &dialog_manager_events {
+            crate::dialog_manager::on_binlog_dialog_events(self, std::slice::from_ref(event));
         }
         self.flush_user_updates();
 
