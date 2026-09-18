@@ -1861,11 +1861,15 @@ impl<'a> UserEnv<'a> {
     }
 }
 
-/// `td::AccessRights` (AccessRights.h) — the subset the user manager uses.
+/// `td::AccessRights` (AccessRights.h) — `enum class AccessRights : int32 {
+/// Know, Read, Edit, Write }`; the variants stay in-memory only here, so the
+/// declaration order keeps the pre-M.6 subset first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AccessRights {
     Know,
     Read,
+    /// `AccessRights::Edit` — arrives with the DialogManager slice.
+    Edit,
     Write,
 }
 
@@ -2422,10 +2426,11 @@ impl UserManager {
         self.get_user(user_id).is_some()
     }
 
-    /// `UserManager::have_accessible_user` (UserManager.cpp:4824-4828);
-    /// the message-registered branch lands with MessagesManager.
+    /// `UserManager::have_accessible_user` (UserManager.cpp:4824-4828):
+    /// `u != nullptr && u->is_received` — a registered but not-yet-received
+    /// user is not accessible.
     pub fn have_accessible_user(&self, user_id: UserId) -> bool {
-        self.have_min_user(user_id)
+        self.get_user(user_id).is_some_and(|u| u.is_received)
     }
 
     /// `UserManager::get_user_database_key` (UserManager.cpp:4870-4872).
@@ -4585,7 +4590,7 @@ impl UserManager {
         }
         match access_rights {
             AccessRights::Know | AccessRights::Read => true,
-            AccessRights::Write => !u.is_deleted,
+            AccessRights::Write | AccessRights::Edit => !u.is_deleted,
         }
     }
 
@@ -6563,7 +6568,9 @@ impl UserManager {
             None => false,
             Some(secret_chat) => match access_rights {
                 AccessRights::Know | AccessRights::Read => true,
-                AccessRights::Write => secret_chat.state == SecretChatState::Active,
+                AccessRights::Write | AccessRights::Edit => {
+                    secret_chat.state == SecretChatState::Active
+                }
             },
         }
     }
