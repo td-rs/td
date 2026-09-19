@@ -8114,6 +8114,126 @@ pub trait MessageContentContext {
         community_id: CommunityId,
         source: &str,
     ) -> td_api::CommunityId;
+
+    // -- Lifecycle family (MessageContent.cpp:12252-13770) — the
+    // per-manager reads `get_uploaded_message_content`, the
+    // duration/cover/file-id/search-text families and the service-message
+    // side effects call; the stand-ins answer the C++ defaults. --
+    /// `AnimationsManager::get_animation_duration`
+    /// (MessageContent.cpp:12423).
+    fn get_animation_duration(&self, file_id: FileId) -> i32;
+    /// `AudiosManager::get_audio_duration` (MessageContent.cpp:12427).
+    fn get_audio_duration(&self, file_id: FileId) -> i32;
+    /// `VideosManager::get_video_duration` (MessageContent.cpp:12465).
+    fn get_video_duration(&self, file_id: FileId) -> i32;
+    /// `VideoNotesManager::get_video_note_duration`
+    /// (MessageContent.cpp:12470).
+    fn get_video_note_duration(&self, file_id: FileId) -> i32;
+    /// `VoiceNotesManager::get_voice_note_duration`
+    /// (MessageContent.cpp:12475).
+    fn get_voice_note_duration(&self, file_id: FileId) -> i32;
+    /// `StoryManager::get_story_duration` (MessageContent.cpp:12499).
+    fn get_story_duration(&self, story_full_id: StoryFullId) -> i32;
+    /// `WebPagesManager::get_web_page_media_duration`
+    /// (MessageContent.cpp:12504).
+    fn get_web_page_media_duration(&self, web_page_id: WebPageId) -> i32;
+    /// `VideosManager::get_video_cover_input_media(...) != nullptr`
+    /// (MessageContent.cpp:12539).
+    fn has_video_cover_input_media(&self, file_id: FileId, is_bot: bool) -> bool;
+    /// `photo_get_cover_input_media(...) != nullptr`
+    /// (MessageContent.cpp:12546).
+    fn has_photo_cover_input_media(&self, photo: &Photo, is_bot: bool) -> bool;
+    /// `MessageExtendedMedia::update_to`
+    /// (MessageContent.cpp:13132/13140).
+    fn update_extended_media_to(
+        &mut self,
+        media: &mut MessageExtendedMedia,
+        extended_media: Option<telegram_api::MessageExtendedMedia>,
+        owner_dialog_id: DialogId,
+    ) -> bool;
+    /// `PollManager::stop_local_poll` (MessageContent.cpp:13344).
+    fn stop_local_poll(&mut self, poll_id: PollId);
+    /// `StickersManager::get_animated_emoji_click_sticker`
+    /// (MessageContent.cpp:13367).
+    fn get_animated_emoji_click_sticker(
+        &self,
+        text: &str,
+        message_full_id: MessageFullId,
+        promise: Promise<td_api::Sticker>,
+    );
+    /// `StickersManager::on_animated_emoji_message_clicked`
+    /// (MessageContent.cpp:13384).
+    fn on_animated_emoji_message_clicked(
+        &mut self,
+        emoji: &str,
+        message_full_id: MessageFullId,
+        data: &str,
+    ) -> Result<(), Status>;
+    /// `VideosManager::get_video_mime_type` (MessageContent.cpp:13421).
+    fn get_video_mime_type(&self, file_id: FileId) -> String;
+    /// `PollManager::get_poll_file_ids` (MessageContent.cpp:12885).
+    fn get_poll_file_ids(&self, poll_id: PollId) -> Vec<FileId>;
+    /// `WebPagesManager::get_web_page_story_full_id`
+    /// (MessageContent.cpp:12914).
+    fn get_web_page_story_full_id(&self, web_page_id: WebPageId) -> StoryFullId;
+    /// `WebPagesManager::get_web_page_search_text`
+    /// (MessageContent.cpp:12921).
+    fn get_web_page_search_text(&self, web_page_id: WebPageId) -> String;
+    /// `AnimationsManager::get_animation_search_text`
+    /// (MessageContent.cpp:12934).
+    fn get_animation_search_text(&self, file_id: FileId) -> String;
+    /// `AudiosManager::get_audio_search_text` (MessageContent.cpp:12939).
+    fn get_audio_search_text(&self, file_id: FileId) -> String;
+    /// `DocumentsManager::get_document_search_text`
+    /// (MessageContent.cpp:12944).
+    fn get_document_search_text(&self, file_id: FileId) -> String;
+    /// `VideosManager::get_video_search_text` (MessageContent.cpp:12968).
+    fn get_video_search_text(&self, file_id: FileId) -> String;
+    /// `PollManager::get_poll_search_text` (MessageContent.cpp:12973).
+    fn get_poll_search_text(&self, poll_id: PollId) -> String;
+    /// `MessagesManager::get_message_from_server` — the
+    /// apply-updates-from-service-message refetch; the stand-in no-ops.
+    fn get_message_from_server(&mut self, message_full_id: MessageFullId, source: &str);
+    /// `ForumTopicManager::on_forum_topic_edited`
+    /// (MessageContent.cpp:13701).
+    fn on_forum_topic_edited(
+        &mut self,
+        dialog_id: DialogId,
+        forum_topic_id: i32,
+        edited_data: &ForumTopicEditedData,
+    );
+    /// `UserManager::on_update_user_noforwards`
+    /// (MessageContent.cpp:13706).
+    fn on_update_user_noforwards(
+        &mut self,
+        user_id: UserId,
+        is_me: bool,
+        new_value: bool,
+        is_contact: bool,
+        has_noforwards: bool,
+    );
+    /// `UserManager::on_update_user_linked_community_id`
+    /// (MessageContent.cpp:13724).
+    fn on_update_user_linked_community_id(&mut self, user_id: UserId, community_id: CommunityId);
+    /// `ChatManager::on_update_channel_linked_community_id`
+    /// (MessageContent.cpp:13728).
+    fn on_update_channel_linked_community_id(
+        &mut self,
+        channel_id: ChannelId,
+        community_id: CommunityId,
+    );
+    /// `AnimationsManager::add_saved_animation_by_id`
+    /// (MessageContent.cpp:13741).
+    fn add_saved_animation_by_id(&mut self, file_id: FileId);
+    /// `StickersManager::add_recent_sticker_by_id`
+    /// (MessageContent.cpp:13744).
+    fn add_recent_sticker_by_id(&mut self, is_attached: bool, file_id: FileId);
+    /// `StickersManager::move_sticker_set_to_top_by_sticker_id`
+    /// (MessageContent.cpp:13751).
+    fn move_sticker_set_to_top_by_sticker_id(&mut self, file_id: FileId);
+    /// `StickersManager::move_sticker_set_to_top_by_custom_emoji_ids`
+    /// (MessageContent.cpp:13770).
+    fn move_sticker_set_to_top_by_custom_emoji_ids(&mut self, custom_emoji_ids: Vec<CustomEmojiId>);
 }
 
 /// `is_local_poll_id` (PollManager.cpp:449-452) — the local (unsent)
@@ -16489,6 +16609,903 @@ pub fn get_message_content_craft_gift_result_object(
 }
 
 // ---------------------------------------------------------------------------
+// M.9.17 — the lifecycle tail (MessageContent.cpp:12252-13770): the
+// bot-command/spoiler accessors, `get_uploaded_message_content`, the
+// duration/cover/file-id/search-text families, the expired/failed update
+// machines, the dependencies walk and the service-message side effects.
+// The `Dependencies` value class lands with the M.5/M.6 machinery; the
+// port threads the collector as closures until then.
+// ---------------------------------------------------------------------------
+
+/// `get_message_content_has_bot_commands` (MessageContent.cpp:12252-12262).
+pub fn get_message_content_has_bot_commands(content: &MessageContent) -> bool {
+    if let Some(text) = get_message_content_text(content) {
+        return crate::message_entity::has_bot_commands(Some(text));
+    }
+    false
+}
+
+/// `get_message_content_text_mutable` (MessageContent.cpp:12264-12266).
+pub fn get_message_content_text_mutable(
+    content: &mut MessageContent,
+) -> Option<&mut FormattedText> {
+    match content {
+        MessageContent::Text(m) => Some(&mut m.text),
+        MessageContent::Game(m) => Some(&mut m.game.text),
+        MessageContent::GiftPremium(m) => Some(&mut m.text),
+        MessageContent::GiftCode(m) => Some(&mut m.text),
+        MessageContent::Poll(m) => Some(&mut m.caption),
+        _ => get_message_content_caption_mut(content),
+    }
+}
+
+/// The mutable twin of `get_message_content_caption`
+/// (MessageContent.cpp:12279-12299).
+fn get_message_content_caption_mut(content: &mut MessageContent) -> Option<&mut FormattedText> {
+    match content {
+        MessageContent::Animation(m) => Some(&mut m.caption),
+        MessageContent::Audio(m) => Some(&mut m.caption),
+        MessageContent::Document(m) => Some(&mut m.caption),
+        MessageContent::Invoice(m) => Some(&mut m.input_invoice.extended_media_caption),
+        MessageContent::PaidMedia(m) => Some(&mut m.caption),
+        MessageContent::Photo(m) => Some(&mut m.caption),
+        MessageContent::Video(m) => Some(&mut m.caption),
+        MessageContent::VoiceNote(m) => Some(&mut m.caption),
+        _ => None,
+    }
+}
+
+/// `get_message_content_has_spoiler` (MessageContent.cpp:12314-12328).
+pub fn get_message_content_has_spoiler(content: &MessageContent) -> bool {
+    match content {
+        MessageContent::Animation(m) => m.has_spoiler,
+        MessageContent::Photo(m) => m.has_spoiler,
+        MessageContent::Video(m) => m.has_spoiler,
+        _ => false,
+    }
+}
+
+/// `set_message_content_has_spoiler` (MessageContent.cpp:12330-12344).
+pub fn set_message_content_has_spoiler(content: &mut MessageContent, has_spoiler: bool) {
+    match content {
+        MessageContent::Animation(m) => m.has_spoiler = has_spoiler,
+        MessageContent::Photo(m) => m.has_spoiler = has_spoiler,
+        MessageContent::Video(m) => m.has_spoiler = has_spoiler,
+        _ => {}
+    }
+}
+
+/// `get_uploaded_message_content` (MessageContent.cpp:12346-12395). The
+/// poll/rich-text media_pos recursion needs the poll content registry; the
+/// seam stand-in answers an empty registry, so those arms no-op until the
+/// Wave-2 PollManager lands.
+#[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+pub fn get_uploaded_message_content(
+    td: &mut dyn MessageContentContext,
+    old_content: &MessageContent,
+    media_pos: i32,
+    media_ptr: Option<telegram_api::MessageMedia>,
+    owner_dialog_id: DialogId,
+    message_date: i32,
+    is_content_changed: &mut bool,
+    need_update: &mut bool,
+    source: &str,
+) -> MessageContent {
+    if media_pos >= 0 {
+        let old_content_type = old_content.get_type();
+        debug_assert!(can_message_content_have_multiple_files(old_content_type));
+        match old_content_type {
+            MessageContentType::PaidMedia => {
+                let MessageContent::PaidMedia(paid_media) = old_content else {
+                    unreachable!()
+                };
+                debug_assert!((media_pos as usize) < paid_media.media.len());
+                let content = paid_media.clone();
+                let mut media =
+                    MessageExtendedMedia::init_from_media(td, media_ptr, owner_dialog_id);
+                if !media.has_input_media() {
+                    if !media.is_unsupported() {
+                        tdutils::log_error!("Receive invalid uploaded paid media");
+                    }
+                } else {
+                    content.media[media_pos as usize].merge_files(
+                        td,
+                        &mut media,
+                        owner_dialog_id,
+                        true,
+                        is_content_changed,
+                        need_update,
+                    );
+                }
+                return MessageContent::PaidMedia(content);
+            }
+            _ => {
+                // the poll/rich-text arms ride the Wave-2 registries; the
+                // C++ `UNREACHABLE()` cannot fire until they land
+                unreachable!("the poll/rich-text upload arms ride the Wave-2 registries")
+            }
+        }
+    }
+    let caption = get_message_content_caption(old_content);
+    let has_spoiler = get_message_content_has_spoiler(old_content);
+    let mut content = get_message_content(
+        td,
+        caption.cloned().unwrap_or_default(),
+        None,
+        media_ptr,
+        owner_dialog_id,
+        message_date,
+        false,
+        UserId::default(),
+        &mut MessageSelfDestructType::default(),
+        &mut false,
+        source,
+    );
+    set_message_content_has_spoiler(&mut content, has_spoiler);
+    content
+}
+
+/// `get_message_content_star_count` (MessageContent.cpp:12397-12407).
+pub fn get_message_content_star_count(content: &MessageContent) -> i64 {
+    match content {
+        MessageContent::PaidMedia(m) => m.star_count,
+        _ => 0,
+    }
+}
+
+/// `get_message_content_duration` (MessageContent.cpp:12409-12486).
+pub fn get_message_content_duration(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> i32 {
+    match content {
+        MessageContent::Animation(m) => td.get_animation_duration(m.file_id),
+        MessageContent::Audio(m) => td.get_audio_duration(m.file_id),
+        MessageContent::Invoice(m) => {
+            if !m.input_invoice.extended_media.has_media_timestamp() {
+                -1
+            } else {
+                td.get_video_duration(m.input_invoice.extended_media.video_file_id)
+            }
+        }
+        MessageContent::PaidMedia(m) => {
+            let mut result = -1;
+            for media in &m.media {
+                let duration = if !media.has_media_timestamp() {
+                    -1
+                } else {
+                    td.get_video_duration(media.video_file_id)
+                };
+                result = result.max(duration);
+            }
+            result
+        }
+        MessageContent::Poll(m) => {
+            let mut result = -1;
+            for poll_content in
+                td.get_poll_individual_message_contents(m.poll_id, m.attached_media.as_deref())
+            {
+                result = result.max(get_message_content_duration(td, &poll_content));
+            }
+            result
+        }
+        MessageContent::Video(m) => td.get_video_duration(m.file_id),
+        MessageContent::VideoNote(m) => td.get_video_note_duration(m.file_id),
+        MessageContent::VoiceNote(m) => td.get_voice_note_duration(m.file_id),
+        _ => -1,
+    }
+}
+
+/// `get_message_content_media_duration` (MessageContent.cpp:12488-12527).
+pub fn get_message_content_media_duration(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> i32 {
+    match content {
+        MessageContent::Audio(m) => td.get_audio_duration(m.file_id),
+        MessageContent::Invoice(m) => {
+            if !m.input_invoice.extended_media.has_media_timestamp() {
+                -1
+            } else {
+                td.get_video_duration(m.input_invoice.extended_media.video_file_id)
+            }
+        }
+        MessageContent::Story(m) => td.get_story_duration(m.story_full_id),
+        MessageContent::Text(m) => td.get_web_page_media_duration(m.web_page_id),
+        MessageContent::Video(m) => td.get_video_duration(m.file_id),
+        MessageContent::VideoNote(m) => td.get_video_note_duration(m.file_id),
+        MessageContent::VoiceNote(m) => td.get_voice_note_duration(m.file_id),
+        _ => -1,
+    }
+}
+
+/// `has_message_content_cover` (MessageContent.cpp:12529-12545).
+pub fn has_message_content_cover(content: &MessageContent) -> bool {
+    match content {
+        MessageContent::Photo(m) => m.video_file_id.is_valid(),
+        MessageContent::Video(m) => !m.cover.is_empty(),
+        _ => false,
+    }
+}
+
+/// `td::MessageCover` (MessageCover.h) — the cover the send path must
+/// upload; the C++ variant pair collapses to this enum.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum MessageCover {
+    #[default]
+    Empty,
+    Photo(Photo),
+    Video(FileId),
+}
+
+impl MessageCover {
+    /// `MessageCover::is_empty` (MessageCover.h).
+    pub fn is_empty(&self) -> bool {
+        matches!(self, MessageCover::Empty)
+    }
+
+    /// `MessageCover::get_any_file_id` (MessageCover.cpp).
+    pub fn get_any_file_id(&self) -> FileId {
+        match self {
+            MessageCover::Photo(photo) => crate::photo::get_photo_any_file_id(photo),
+            MessageCover::Video(file_id) => *file_id,
+            MessageCover::Empty => FileId::default(),
+        }
+    }
+}
+
+/// `get_message_content_need_to_upload_covers` (MessageContent.cpp:12547-12599).
+#[allow(clippy::collapsible_match)] // the C++ shape is early-return arms
+pub fn get_message_content_need_to_upload_covers(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> Vec<MessageCover> {
+    match content {
+        MessageContent::Photo(m) => {
+            if m.video_file_id.is_valid()
+                && !td.has_video_cover_input_media(m.video_file_id, td.is_bot())
+            {
+                return vec![MessageCover::Video(m.video_file_id)];
+            }
+        }
+        MessageContent::Video(m) => {
+            if !m.cover.is_empty() && !td.has_photo_cover_input_media(&m.cover, td.is_bot()) {
+                return vec![MessageCover::Photo(m.cover.clone())];
+            }
+        }
+        MessageContent::PaidMedia(m) => {
+            let mut result = Vec::new();
+            for media in &m.media {
+                if media.has_media_timestamp()
+                    && !td.has_video_cover_input_media(media.video_file_id, td.is_bot())
+                {
+                    result.push(MessageCover::Video(media.video_file_id));
+                }
+            }
+            return result;
+        }
+        MessageContent::Poll(m) => {
+            let mut result = Vec::new();
+            for poll_content in
+                td.get_poll_individual_message_contents(m.poll_id, m.attached_media.as_deref())
+            {
+                result.extend(get_message_content_need_to_upload_covers(td, &poll_content));
+            }
+            return result;
+        }
+        _ => {}
+    }
+    Vec::new()
+}
+
+/// `get_message_content_cover_any_file_id` (MessageContent.cpp:12657-12683).
+pub fn get_message_content_cover_any_file_id(content: &MessageContent) -> FileId {
+    match content {
+        MessageContent::Photo(m) => m.video_file_id,
+        MessageContent::Video(m) => {
+            if !m.cover.is_empty() {
+                return crate::photo::get_photo_any_file_id(&m.cover);
+            }
+            FileId::default()
+        }
+        _ => FileId::default(),
+    }
+}
+
+/// `get_message_content_cover_any_file_ids` (MessageContent.cpp:12685-12723).
+pub fn get_message_content_cover_any_file_ids(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> Vec<FileId> {
+    match content {
+        MessageContent::Photo(m) => {
+            if m.video_file_id.is_valid() {
+                vec![m.video_file_id]
+            } else {
+                Vec::new()
+            }
+        }
+        MessageContent::Video(m) => {
+            if m.cover.is_empty() {
+                Vec::new()
+            } else {
+                vec![crate::photo::get_photo_any_file_id(&m.cover)]
+            }
+        }
+        MessageContent::PaidMedia(m) => m
+            .media
+            .iter()
+            .map(|media| {
+                if media.r#type == MessageExtendedMediaType::Video {
+                    media.video_file_id
+                } else {
+                    crate::photo::get_photo_any_file_id(&media.photo)
+                }
+            })
+            .collect(),
+        MessageContent::Poll(m) => td
+            .get_poll_individual_message_contents(m.poll_id, m.attached_media.as_deref())
+            .iter()
+            .map(get_message_content_cover_any_file_id)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// `get_message_content_story_full_id` (MessageContent.cpp:12911-12923).
+pub fn get_message_content_story_full_id(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> StoryFullId {
+    match content {
+        MessageContent::Text(m) => td.get_web_page_story_full_id(m.web_page_id),
+        MessageContent::Story(m) => m.story_full_id,
+        _ => StoryFullId::default(),
+    }
+}
+
+/// `get_message_content_search_text` (MessageContent.cpp:12925-13086).
+pub fn get_message_content_search_text(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> String {
+    match content {
+        MessageContent::Text(m) => {
+            if !m.web_page_id.is_valid() {
+                return m.text.text.clone();
+            }
+            format!(
+                "{} {}",
+                m.text.text,
+                td.get_web_page_search_text(m.web_page_id)
+            )
+        }
+        MessageContent::Animation(m) => {
+            format!(
+                "{} {}",
+                td.get_animation_search_text(m.file_id),
+                m.caption.text
+            )
+        }
+        MessageContent::Audio(m) => {
+            format!("{} {}", td.get_audio_search_text(m.file_id), m.caption.text)
+        }
+        MessageContent::Document(m) => {
+            format!(
+                "{} {}",
+                td.get_document_search_text(m.file_id),
+                m.caption.text
+            )
+        }
+        MessageContent::Invoice(m) => m.input_invoice.extended_media_caption.text.clone(),
+        MessageContent::PaidMedia(m) => m.caption.text.clone(),
+        MessageContent::Photo(m) => m.caption.text.clone(),
+        MessageContent::Video(m) => {
+            format!("{} {}", td.get_video_search_text(m.file_id), m.caption.text)
+        }
+        MessageContent::Poll(m) => {
+            format!("{} {}", td.get_poll_search_text(m.poll_id), m.caption.text)
+        }
+        MessageContent::TopicCreate(m) => m.title.clone(),
+        MessageContent::TopicEdit(m) => m.edited_data.title.clone(),
+        MessageContent::GiftPremium(m) => m.text.text.clone(),
+        MessageContent::GiftCode(m) => m.text.text.clone(),
+        MessageContent::ToDoList(m) => {
+            let mut result = m.list.title.text.clone();
+            for item in &m.list.items {
+                result += " ";
+                result += &item.title.text;
+            }
+            result
+        }
+        _ => String::new(),
+    }
+}
+
+/// `get_message_content_stake_ton_count` (MessageContent.cpp:13088-13097).
+pub fn get_message_content_stake_ton_count(content: &MessageContent) -> i64 {
+    match content {
+        MessageContent::Dice(m) => m.stake_ton_count,
+        _ => 0,
+    }
+}
+
+/// `get_message_content_prize_ton_count` (MessageContent.cpp:13099-13108).
+pub fn get_message_content_prize_ton_count(content: &MessageContent) -> i64 {
+    match content {
+        MessageContent::Dice(m) => m.prize_ton_count,
+        _ => 0,
+    }
+}
+
+/// `find_authentication_codes` (misc.cpp:434-453).
+fn find_authentication_codes(text: &str, authentication_codes: &mut Vec<String>) {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i].is_ascii_digit() {
+            let mut code = String::new();
+            while i < bytes.len() {
+                if bytes[i].is_ascii_digit() {
+                    code.push(bytes[i] as char);
+                    i += 1;
+                    continue;
+                }
+                if bytes[i] == b'-' {
+                    i += 1;
+                    continue;
+                }
+                break;
+            }
+            if (5..=7).contains(&code.len()) {
+                authentication_codes.push(code);
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
+/// `extract_message_content_authentication_codes`
+/// (MessageContent.cpp:13110-13121).
+pub fn extract_message_content_authentication_codes(
+    content: &MessageContent,
+    authentication_codes: &mut Vec<String>,
+) {
+    if let MessageContent::Text(m) = content {
+        find_authentication_codes(&m.text.text, authentication_codes);
+    }
+}
+
+/// `update_message_content_extended_media`
+/// (MessageContent.cpp:13123-13157).
+pub fn update_message_content_extended_media(
+    td: &mut dyn MessageContentContext,
+    content: &mut MessageContent,
+    extended_media: Vec<Option<telegram_api::MessageExtendedMedia>>,
+    owner_dialog_id: DialogId,
+) -> bool {
+    match content {
+        MessageContent::Invoice(m) => {
+            if extended_media.len() != 1 {
+                tdutils::log_error!(
+                    "Receive {} extended media in {owner_dialog_id}",
+                    extended_media.len()
+                );
+                return false;
+            }
+            td.update_extended_media_to(
+                &mut m.input_invoice.extended_media,
+                extended_media.into_iter().next().unwrap(),
+                owner_dialog_id,
+            )
+        }
+        MessageContent::PaidMedia(m) => {
+            if extended_media.len() != m.media.len() {
+                tdutils::log_error!(
+                    "Receive {} paid media instead of {} in {owner_dialog_id}",
+                    extended_media.len(),
+                    m.media.len()
+                );
+                return false;
+            }
+            let mut result = false;
+            for (i, media) in extended_media.into_iter().enumerate() {
+                if td.update_extended_media_to(&mut m.media[i], media, owner_dialog_id) {
+                    result = true;
+                }
+            }
+            result
+        }
+        MessageContent::Unsupported(_) => false,
+        other => {
+            tdutils::log_error!(
+                "Receive updateMessageExtendedMedia for a message of type {:?} in {owner_dialog_id}",
+                other.get_type()
+            );
+            false
+        }
+    }
+}
+
+/// `need_poll_message_content_extended_media`
+/// (MessageContent.cpp:13159-13177).
+pub fn need_poll_message_content_extended_media(content: &MessageContent) -> bool {
+    match content {
+        MessageContent::Invoice(m) => m.input_invoice.extended_media.need_poll(),
+        MessageContent::PaidMedia(m) => m.media.iter().any(|media| media.need_poll()),
+        _ => false,
+    }
+}
+
+/// `need_poll_conference_call_message_content`
+/// (MessageContent.cpp:13179-13186).
+pub fn need_poll_conference_call_message_content(content: &MessageContent) -> bool {
+    let MessageContent::ConferenceCall(call) = content else {
+        unreachable!()
+    };
+    call.duration == 0 && !call.is_active && !call.was_missed
+}
+
+/// `set_message_content_video_start_timestamp`
+/// (MessageContent.cpp:13188-13197).
+pub fn set_message_content_video_start_timestamp(
+    content: &mut MessageContent,
+    start_timestamp: i32,
+) {
+    if let MessageContent::Video(m) = content {
+        m.start_timestamp = start_timestamp;
+    }
+}
+
+/// `get_message_content_animated_emoji_click_sticker`
+/// (MessageContent.cpp:13199-13211).
+pub fn get_message_content_animated_emoji_click_sticker(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+    message_full_id: MessageFullId,
+    promise: Promise<td_api::Sticker>,
+) -> Result<(), Status> {
+    let MessageContent::Text(m) = content else {
+        return Err(Status::error(
+            400,
+            "Message is not an animated emoji message",
+        ));
+    };
+    if !can_be_animated_emoji(&m.text) {
+        return Err(Status::error(
+            400,
+            "Message is not an animated emoji message",
+        ));
+    }
+    td.get_animated_emoji_click_sticker(&m.text.text, message_full_id, promise);
+    Ok(())
+}
+
+/// `on_message_content_animated_emoji_clicked`
+/// (MessageContent.cpp:13213-13228).
+pub fn on_message_content_animated_emoji_clicked(
+    td: &mut dyn MessageContentContext,
+    content: &MessageContent,
+    message_full_id: MessageFullId,
+    emoji: &str,
+    data: &str,
+) {
+    let MessageContent::Text(m) = content else {
+        return;
+    };
+    let mut emoji = emoji.to_string();
+    tdutils::emoji::remove_emoji_modifiers_in_place(&mut emoji, true);
+    if !m.text.entities.is_empty()
+        || tdutils::emoji::remove_emoji_modifiers(&m.text.text, true) != emoji
+    {
+        return;
+    }
+    let error = td.on_animated_emoji_message_clicked(&emoji, message_full_id, data);
+    if let Err(error) = error {
+        tdutils::log_warning!(
+            "Failed to process animated emoji click with data \"{data}\": {error}"
+        );
+    }
+}
+
+/// `need_reget_message_content` (MessageContent.cpp:13230-13272).
+pub fn need_reget_message_content(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> bool {
+    match content {
+        MessageContent::Unsupported(m) => m.version != MessageUnsupported::CURRENT_VERSION,
+        MessageContent::Invoice(m) => m.input_invoice.extended_media.need_reget(),
+        MessageContent::PaidMedia(m) => m.media.iter().any(|media| media.need_reget()),
+        MessageContent::Poll(m) => td
+            .get_poll_individual_message_contents(m.poll_id, m.attached_media.as_deref())
+            .iter()
+            .any(|poll_content| need_reget_message_content(td, poll_content)),
+        MessageContent::Video(m) => m.alternative_file_ids.iter().any(|file_id| {
+            let mime_type = td.get_video_mime_type(*file_id);
+            mime_type == "application/x-tgstoryboard"
+                || mime_type == "application/x-tgstoryboardmap"
+        }),
+        _ => false,
+    }
+}
+
+/// `need_delay_message_content_notification`
+/// (MessageContent.cpp:13274-13292).
+pub fn need_delay_message_content_notification(
+    content: &MessageContent,
+    my_user_id: UserId,
+) -> bool {
+    match content {
+        MessageContent::ChatChangeTitle(_)
+        | MessageContent::ChatChangePhoto(_)
+        | MessageContent::ChatDeletePhoto(_)
+        | MessageContent::ChatJoinedByLink(_) => true,
+        MessageContent::ChatAddUsers(m) => !m.user_ids.contains(&my_user_id),
+        MessageContent::ChatDeleteUser(m) => m.user_id != my_user_id,
+        _ => false,
+    }
+}
+
+/// `update_expired_message_content` (MessageContent.cpp:13294-13332).
+pub fn update_expired_message_content(content: &mut MessageContent) {
+    match content.get_type() {
+        MessageContentType::Photo => *content = MessageContent::ExpiredPhoto(MessageExpiredPhoto),
+        MessageContentType::Video => *content = MessageContent::ExpiredVideo(MessageExpiredVideo),
+        MessageContentType::VideoNote => {
+            *content = MessageContent::ExpiredVideoNote(MessageExpiredVideoNote)
+        }
+        MessageContentType::VoiceNote => {
+            *content = MessageContent::ExpiredVoiceNote(MessageExpiredVoiceNote)
+        }
+        MessageContentType::Animation
+        | MessageContentType::Audio
+        | MessageContentType::Document
+        | MessageContentType::Sticker => {
+            *content = MessageContent::ExpiredVideo(MessageExpiredVideo)
+        }
+        MessageContentType::ExpiredPhoto
+        | MessageContentType::ExpiredVideo
+        | MessageContentType::ExpiredVideoNote
+        | MessageContentType::ExpiredVoiceNote => {
+            // can happen if message content has been reget from somewhere
+        }
+        _ => unreachable!("unexpected content type to expire"),
+    }
+}
+
+/// `update_failed_to_send_message_content`
+/// (MessageContent.cpp:13334-13349).
+pub fn update_failed_to_send_message_content(
+    td: &mut dyn MessageContentContext,
+    content: &MessageContent,
+) {
+    if let MessageContent::Poll(m) = content
+        && is_local_poll_id(m.poll_id)
+    {
+        td.stop_local_poll(m.poll_id);
+    }
+}
+
+/// `add_message_content_dependencies` (MessageContent.cpp:13351-13687).
+/// The `Dependencies` value class lands with the M.5/M.6 machinery; the
+/// collector closures carry its `add` surfaces until then.
+#[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+pub fn add_sender(
+    dialog_id: DialogId,
+    add_user: &mut dyn FnMut(UserId),
+    add_dialog: &mut dyn FnMut(DialogId),
+) {
+    match dialog_id.get_type() {
+        DialogType::User => add_user(dialog_id.get_user_id()),
+        DialogType::Chat | DialogType::Channel => add_dialog(dialog_id),
+        DialogType::SecretChat | DialogType::None => {}
+    }
+}
+
+fn add_dialog_and_dependencies(dialog_id: DialogId, add_dialog: &mut dyn FnMut(DialogId)) {
+    if dialog_id.is_valid() {
+        add_dialog(dialog_id);
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+pub fn add_message_content_dependencies(
+    _td: &dyn MessageContentContext,
+    content: &MessageContent,
+    _my_user_id: UserId,
+    is_bot: bool,
+    add_user: &mut dyn FnMut(UserId),
+    add_dialog: &mut dyn FnMut(DialogId),
+    add_web_page: &mut dyn FnMut(WebPageId),
+    add_story: &mut dyn FnMut(StoryFullId),
+    add_community: &mut dyn FnMut(CommunityId),
+) {
+    match content {
+        MessageContent::Text(m) => add_web_page(m.web_page_id),
+        MessageContent::Contact(m) => add_user(m.contact.get_user_id()),
+        MessageContent::Game(m) => add_user(m.game.get_bot_user_id()),
+        MessageContent::ChatCreate(m) => {
+            for participant_user_id in &m.participant_user_ids {
+                add_user(*participant_user_id);
+            }
+        }
+        MessageContent::ChatAddUsers(m) => {
+            for user_id in &m.user_ids {
+                add_user(*user_id);
+            }
+        }
+        MessageContent::ChatDeleteUser(m) => add_user(m.user_id),
+        MessageContent::ChatMigrateTo(m) => {
+            add_dialog(DialogId::from_channel_id(m.migrated_to_channel_id))
+        }
+        MessageContent::ChannelMigrateFrom(m) => {
+            add_dialog(DialogId::from_chat_id(m.migrated_from_chat_id))
+        }
+        MessageContent::ChatSetTtl(m) => add_user(m.from_user_id),
+        MessageContent::PaymentSuccessful(m) => {
+            add_dialog_and_dependencies(m.invoice_dialog_id, add_dialog)
+        }
+        MessageContent::Poll(m) => {
+            // no need to add poll dependencies, because they are forcibly
+            // loaded with the poll
+            if let Some(attached_media) = m.attached_media.as_deref() {
+                add_message_content_dependencies(
+                    _td,
+                    attached_media,
+                    _my_user_id,
+                    is_bot,
+                    add_user,
+                    add_dialog,
+                    add_web_page,
+                    add_story,
+                    add_community,
+                );
+            }
+        }
+        MessageContent::ProximityAlertTriggered(m) => {
+            add_sender(m.traveler_dialog_id, add_user, add_dialog);
+            add_sender(m.watcher_dialog_id, add_user, add_dialog);
+        }
+        MessageContent::InviteToGroupCall(m) => {
+            for user_id in &m.user_ids {
+                add_user(*user_id);
+            }
+        }
+        MessageContent::RequestedDialog(m) if !is_bot => {
+            for dialog_id in &m.shared_dialog_ids {
+                if dialog_id.get_type() == DialogType::User {
+                    add_user(dialog_id.get_user_id());
+                } else {
+                    add_dialog_and_dependencies(*dialog_id, add_dialog);
+                }
+            }
+        }
+        MessageContent::Story(m) => add_story(m.story_full_id),
+        MessageContent::GiftCode(m) => add_sender(m.creator_dialog_id, add_user, add_dialog),
+        MessageContent::Giveaway(m) => {
+            let boosted = m.giveaway_parameters.boosted_channel_id;
+            add_dialog(DialogId::from_channel_id(boosted));
+            for channel_id in &m.giveaway_parameters.additional_channel_ids {
+                add_dialog(DialogId::from_channel_id(*channel_id));
+            }
+        }
+        MessageContent::GiveawayWinners(m) => {
+            add_dialog(DialogId::from_channel_id(m.boosted_channel_id));
+            for user_id in &m.winner_user_ids {
+                add_user(*user_id);
+            }
+        }
+        MessageContent::PaymentRefunded(m) => add_sender(m.dialog_id, add_user, add_dialog),
+        MessageContent::PrizeStars(m) => {
+            add_dialog_and_dependencies(m.boosted_dialog_id, add_dialog)
+        }
+        MessageContent::ConferenceCall(m) => {
+            for dialog_id in &m.other_participant_dialog_ids {
+                add_sender(*dialog_id, add_user, add_dialog);
+            }
+        }
+        MessageContent::ToDoList(m) => {
+            for completion in &m.completions {
+                add_sender(completion.completed_by_dialog_id, add_user, add_dialog);
+            }
+        }
+        MessageContent::NewCreatorPending(m) => add_user(m.new_creator_user_id),
+        MessageContent::ChangeCreator(m) => add_user(m.new_creator_user_id),
+        MessageContent::ManagedBotCreated(m) => add_user(m.bot_user_id),
+        MessageContent::ChangeCommunity(m) => add_community(m.community_id),
+        MessageContent::ChatJoinedViaCommunity(m) => add_community(m.community_id),
+        _ => {}
+    }
+    crate::message_entity::add_formatted_text_dependencies(
+        add_user,
+        get_message_content_text(content),
+    );
+}
+
+/// `apply_updates_from_service_message_content`
+/// (MessageContent.cpp:13689-13736). The `forum_topic_id` is the raw id
+/// until the M.6 ForumTopicId lands.
+pub fn apply_updates_from_service_message_content(
+    td: &mut dyn MessageContentContext,
+    content: &MessageContent,
+    dialog_id: DialogId,
+    forum_topic_id: i32,
+    sender_dialog_id: DialogId,
+) {
+    match content {
+        MessageContent::TopicEdit(m) if forum_topic_id != 0 => {
+            td.on_forum_topic_edited(dialog_id, forum_topic_id, &m.edited_data);
+        }
+        MessageContent::NoForwardsToggle(m) if dialog_id.get_type() == DialogType::User => {
+            td.on_update_user_noforwards(
+                dialog_id.get_user_id(),
+                sender_dialog_id == td.get_my_dialog_id(),
+                m.new_value,
+                sender_dialog_id == dialog_id,
+                m.new_value,
+            );
+        }
+        MessageContent::PollAppendAnswer(_) | MessageContent::PollDeleteAnswer(_) => {
+            td.get_message_from_server(
+                get_message_content_replied_message_full_id(dialog_id, content),
+                "apply_updates_from_service_message_content",
+            );
+        }
+        MessageContent::ChangeCommunity(m) => match dialog_id.get_type() {
+            DialogType::User => {
+                if td.is_user_bot(dialog_id.get_user_id()) {
+                    td.on_update_user_linked_community_id(dialog_id.get_user_id(), m.community_id);
+                }
+            }
+            DialogType::Channel => {
+                td.on_update_channel_linked_community_id(
+                    dialog_id.get_channel_id(),
+                    m.community_id,
+                );
+            }
+            _ => {
+                tdutils::log_error!("Receive ChangeCommunity in {dialog_id}");
+            }
+        },
+        _ => {}
+    }
+}
+
+/// `on_sent_message_content` (MessageContent.cpp:13738-13747).
+pub fn on_sent_message_content(td: &mut dyn MessageContentContext, content: &MessageContent) {
+    match content {
+        MessageContent::Animation(m) => td.add_saved_animation_by_id(m.file_id),
+        MessageContent::Sticker(m) => td.add_recent_sticker_by_id(false, m.file_id),
+        _ => {}
+    }
+}
+
+/// `move_message_content_sticker_set_to_top`
+/// (MessageContent.cpp:13749-13773).
+pub fn move_message_content_sticker_set_to_top(
+    td: &mut dyn MessageContentContext,
+    content: &MessageContent,
+) {
+    if let MessageContent::Sticker(m) = content {
+        td.move_sticker_set_to_top_by_sticker_id(m.file_id);
+        return;
+    }
+    let mut custom_emoji_ids = Vec::new();
+    if let Some(text) = get_message_content_text(content) {
+        for entity in &text.entities {
+            if entity.r#type == Some(Type::CustomEmoji) {
+                custom_emoji_ids.push(entity.custom_emoji_id);
+            }
+        }
+    }
+    if !custom_emoji_ids.is_empty() {
+        td.move_sticker_set_to_top_by_custom_emoji_ids(custom_emoji_ids);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // M.9.15 — `get_action_message_content` (MessageContent.cpp:10451-11338)
 // ---------------------------------------------------------------------------
 
@@ -21807,6 +22824,153 @@ mod tests {
         ) -> td_api::CommunityId {
             td_api::CommunityId::default()
         }
+
+        fn get_animation_duration(&self, _file_id: FileId) -> i32 {
+            -1
+        }
+
+        fn get_audio_duration(&self, _file_id: FileId) -> i32 {
+            -1
+        }
+
+        fn get_video_duration(&self, _file_id: FileId) -> i32 {
+            -1
+        }
+
+        fn get_video_note_duration(&self, _file_id: FileId) -> i32 {
+            -1
+        }
+
+        fn get_voice_note_duration(&self, _file_id: FileId) -> i32 {
+            -1
+        }
+
+        fn get_story_duration(&self, _story_full_id: StoryFullId) -> i32 {
+            -1
+        }
+
+        fn get_web_page_media_duration(&self, _web_page_id: WebPageId) -> i32 {
+            -1
+        }
+
+        fn has_video_cover_input_media(&self, _file_id: FileId, _is_bot: bool) -> bool {
+            true
+        }
+
+        fn has_photo_cover_input_media(&self, _photo: &Photo, _is_bot: bool) -> bool {
+            true
+        }
+
+        fn update_extended_media_to(
+            &mut self,
+            _media: &mut MessageExtendedMedia,
+            _extended_media: Option<telegram_api::MessageExtendedMedia>,
+            _owner_dialog_id: DialogId,
+        ) -> bool {
+            false
+        }
+
+        fn stop_local_poll(&mut self, _poll_id: PollId) {}
+
+        fn get_animated_emoji_click_sticker(
+            &self,
+            _text: &str,
+            _message_full_id: MessageFullId,
+            promise: Promise<td_api::Sticker>,
+        ) {
+            let _ = promise;
+        }
+
+        fn on_animated_emoji_message_clicked(
+            &mut self,
+            _emoji: &str,
+            _message_full_id: MessageFullId,
+            _data: &str,
+        ) -> Result<(), Status> {
+            Ok(())
+        }
+
+        fn get_video_mime_type(&self, _file_id: FileId) -> String {
+            String::new()
+        }
+
+        fn get_poll_file_ids(&self, _poll_id: PollId) -> Vec<FileId> {
+            Vec::new()
+        }
+
+        fn get_web_page_story_full_id(&self, _web_page_id: WebPageId) -> StoryFullId {
+            StoryFullId::default()
+        }
+
+        fn get_web_page_search_text(&self, _web_page_id: WebPageId) -> String {
+            String::new()
+        }
+
+        fn get_animation_search_text(&self, _file_id: FileId) -> String {
+            String::new()
+        }
+
+        fn get_audio_search_text(&self, _file_id: FileId) -> String {
+            String::new()
+        }
+
+        fn get_document_search_text(&self, _file_id: FileId) -> String {
+            String::new()
+        }
+
+        fn get_video_search_text(&self, _file_id: FileId) -> String {
+            String::new()
+        }
+
+        fn get_poll_search_text(&self, _poll_id: PollId) -> String {
+            String::new()
+        }
+
+        fn get_message_from_server(&mut self, _message_full_id: MessageFullId, _source: &str) {}
+
+        fn on_forum_topic_edited(
+            &mut self,
+            _dialog_id: DialogId,
+            _forum_topic_id: i32,
+            _edited_data: &ForumTopicEditedData,
+        ) {
+        }
+
+        fn on_update_user_noforwards(
+            &mut self,
+            _user_id: UserId,
+            _is_me: bool,
+            _new_value: bool,
+            _is_contact: bool,
+            _has_noforwards: bool,
+        ) {
+        }
+
+        fn on_update_user_linked_community_id(
+            &mut self,
+            _user_id: UserId,
+            _community_id: CommunityId,
+        ) {
+        }
+
+        fn on_update_channel_linked_community_id(
+            &mut self,
+            _channel_id: ChannelId,
+            _community_id: CommunityId,
+        ) {
+        }
+
+        fn add_saved_animation_by_id(&mut self, _file_id: FileId) {}
+
+        fn add_recent_sticker_by_id(&mut self, _is_attached: bool, _file_id: FileId) {}
+
+        fn move_sticker_set_to_top_by_sticker_id(&mut self, _file_id: FileId) {}
+
+        fn move_sticker_set_to_top_by_custom_emoji_ids(
+            &mut self,
+            _custom_emoji_ids: Vec<CustomEmojiId>,
+        ) {
+        }
     }
 
     fn simple_text(text: &str) -> MessageContent {
@@ -26288,6 +27452,579 @@ mod tests {
             }
             other => panic!("unexpected media: {other:?}"),
         }
+    }
+
+    // -- M.9.17: the lifecycle tail ------------------------------------------
+
+    #[test]
+    fn lifecycle_text_and_spoiler_accessors() {
+        let content = MessageContent::Text(MessageText::new(
+            text("hi"),
+            WebPageId::default(),
+            false,
+            false,
+            false,
+            String::new(),
+        ));
+        assert!(get_message_content_text(&content).is_some());
+        assert!(!get_message_content_has_bot_commands(&content));
+
+        // bot commands are detected through the entity walk
+        let content = MessageContent::Text(MessageText::new(
+            FormattedText {
+                text: "/start".to_string(),
+                entities: vec![MessageEntity::new(Type::BotCommand, 0, 6)],
+            },
+            WebPageId::default(),
+            false,
+            false,
+            false,
+            String::new(),
+        ));
+        assert!(get_message_content_has_bot_commands(&content));
+
+        // mutable text access
+        let mut content = MessageContent::Animation(MessageAnimation {
+            file_id: FileId::new(1, 1),
+            caption: text("cap"),
+            has_spoiler: false,
+        });
+        assert!(get_message_content_text_mutable(&mut content).is_some());
+        assert!(!get_message_content_has_spoiler(&content));
+        set_message_content_has_spoiler(&mut content, true);
+        assert!(get_message_content_has_spoiler(&content));
+
+        // caption access
+        let content = MessageContent::Document(MessageDocument {
+            file_id: FileId::new(1, 1),
+            caption: text("cap"),
+        });
+        assert_eq!(get_message_content_caption(&content).unwrap().text, "cap");
+        assert!(get_message_content_caption(&simple_text("x")).is_none());
+    }
+
+    #[test]
+    fn lifecycle_uploaded_content_preserves_caption_and_spoiler() {
+        let mut td = TestContext::default();
+        let old = MessageContent::Photo(MessagePhoto {
+            photo: Photo::default(),
+            video_file_id: FileId::default(),
+            caption: text("cap"),
+            has_spoiler: true,
+        });
+        let mut is_content_changed = false;
+        let mut need_update = false;
+        // an empty media answers the text fallback with the caption kept
+        let new_content = get_uploaded_message_content(
+            &mut td,
+            &old,
+            -1,
+            Some(telegram_api::MessageMedia::messageMediaEmpty(
+                telegram_api::messageMediaEmpty,
+            )),
+            DialogId::from_user_id(UserId::new(7)),
+            1700000000,
+            &mut is_content_changed,
+            &mut need_update,
+            "test",
+        );
+        match new_content {
+            MessageContent::Text(m) => {
+                assert_eq!(m.text.text, "cap");
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // a location media keeps the spoiler irrelevant and answers the location
+        let new_content = get_uploaded_message_content(
+            &mut td,
+            &old,
+            -1,
+            Some(telegram_api::MessageMedia::messageMediaGeo(
+                telegram_api::messageMediaGeo {
+                    geo: Some(telegram_api::GeoPoint::geoPoint(telegram_api::geoPoint {
+                        flags: 0,
+                        long: 37.62,
+                        lat: 55.75,
+                        access_hash: 0,
+                        accuracy_radius: 0,
+                    })),
+                },
+            )),
+            DialogId::from_user_id(UserId::new(7)),
+            1700000000,
+            &mut is_content_changed,
+            &mut need_update,
+            "test",
+        );
+        assert!(matches!(new_content, MessageContent::Location(_)));
+    }
+
+    #[test]
+    fn lifecycle_duration_and_cover_families() {
+        let td = TestContext::default();
+        let file_id = FileId::new(1, 1);
+
+        assert_eq!(
+            get_message_content_star_count(&MessageContent::PaidMedia(MessagePaidMedia {
+                star_count: 100,
+                ..MessagePaidMedia::default()
+            },)),
+            100
+        );
+        assert_eq!(get_message_content_star_count(&simple_text("x")), 0);
+
+        // the duration seams answer -1
+        assert_eq!(
+            get_message_content_duration(
+                &td,
+                &MessageContent::Video(MessageVideo {
+                    file_id,
+                    ..MessageVideo::default()
+                })
+            ),
+            -1
+        );
+        assert_eq!(get_message_content_duration(&td, &simple_text("x")), -1);
+        assert_eq!(
+            get_message_content_media_duration(
+                &td,
+                &MessageContent::Text(MessageText::new(
+                    text("hi"),
+                    WebPageId::default(),
+                    false,
+                    false,
+                    false,
+                    String::new(),
+                ))
+            ),
+            -1
+        );
+
+        // covers
+        assert!(!has_message_content_cover(&simple_text("x")));
+        assert!(has_message_content_cover(&MessageContent::Photo(
+            MessagePhoto {
+                photo: Photo::default(),
+                video_file_id: FileId::new(1, 1),
+                caption: FormattedText::default(),
+                has_spoiler: false,
+            }
+        )));
+
+        // the need-to-upload covers: seams answer true (input media exists)
+        let photo = MessageContent::Photo(MessagePhoto {
+            photo: Photo::default(),
+            video_file_id: FileId::new(1, 1),
+            caption: FormattedText::default(),
+            has_spoiler: false,
+        });
+        assert!(get_message_content_need_to_upload_covers(&td, &photo).is_empty());
+
+        // cover file ids
+        let video_file_id = FileId::new(1, 1);
+        let photo = MessageContent::Photo(MessagePhoto {
+            photo: Photo::default(),
+            video_file_id,
+            caption: FormattedText::default(),
+            has_spoiler: false,
+        });
+        assert_eq!(get_message_content_cover_any_file_id(&photo), video_file_id);
+        assert_eq!(
+            get_message_content_cover_any_file_ids(&td, &photo),
+            vec![video_file_id]
+        );
+        assert!(get_message_content_cover_any_file_ids(&td, &simple_text("x")).is_empty());
+    }
+
+    #[test]
+    fn lifecycle_search_text_family() {
+        let td = TestContext::default();
+        let content = MessageContent::Text(MessageText::new(
+            text("hello"),
+            WebPageId::default(),
+            false,
+            false,
+            false,
+            String::new(),
+        ));
+        assert_eq!(get_message_content_search_text(&td, &content), "hello");
+        assert_eq!(get_message_content_search_text(&td, &simple_text("x")), "x");
+
+        let content = MessageContent::TopicCreate(MessageTopicCreate {
+            title: "topic".to_string(),
+            icon: ForumTopicIcon::new(0, CustomEmojiId::default()),
+            title_missing: false,
+        });
+        assert_eq!(get_message_content_search_text(&td, &content), "topic");
+
+        let content = MessageContent::ToDoList(MessageToDoList {
+            list: ToDoList {
+                title: text("title"),
+                items: vec![ToDoItem {
+                    id: 1,
+                    title: text("item"),
+                }],
+                others_can_append: false,
+                others_can_complete: false,
+            },
+            completions: Vec::new(),
+        });
+        assert_eq!(get_message_content_search_text(&td, &content), "title item");
+
+        // story full id
+        let content = MessageContent::Story(MessageStory {
+            story_full_id: StoryFullId::new(
+                DialogId::from_user_id(UserId::new(5)),
+                StoryId::new(42),
+            ),
+            via_mention: false,
+        });
+        match content {
+            MessageContent::Story(m) => {
+                assert_eq!(
+                    get_message_content_story_full_id(
+                        &td,
+                        &MessageContent::Story(MessageStory {
+                            story_full_id: m.story_full_id,
+                            via_mention: false
+                        })
+                    ),
+                    m.story_full_id
+                );
+            }
+            _ => unreachable!(),
+        }
+
+        // stake/prize ton counts
+        let dice = MessageContent::Dice(MessageDice::new(
+            "🎲",
+            5,
+            true,
+            Vec::new(),
+            String::new(),
+            10,
+            20,
+        ));
+        assert_eq!(get_message_content_stake_ton_count(&dice), 10);
+        assert_eq!(get_message_content_prize_ton_count(&dice), 20);
+        assert_eq!(get_message_content_stake_ton_count(&simple_text("x")), 0);
+    }
+
+    #[test]
+    fn lifecycle_authentication_codes() {
+        let content = MessageContent::Text(MessageText::new(
+            text("code 12345 and 12-34-56 and 1234567-8"),
+            WebPageId::default(),
+            false,
+            false,
+            false,
+            String::new(),
+        ));
+        let mut codes = Vec::new();
+        extract_message_content_authentication_codes(&content, &mut codes);
+        assert_eq!(codes, vec!["12345", "123456"]);
+
+        // non-text contents extract nothing
+        let mut codes = Vec::new();
+        extract_message_content_authentication_codes(&simple_text("x"), &mut codes);
+        assert!(codes.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_extended_media_updates() {
+        let mut td = TestContext::default();
+        // wrong count rejects
+        let mut content = MessageContent::PaidMedia(MessagePaidMedia {
+            media: vec![MessageExtendedMedia::default()],
+            ..MessagePaidMedia::default()
+        });
+        assert!(!update_message_content_extended_media(
+            &mut td,
+            &mut content,
+            Vec::new(),
+            DialogId::from_user_id(UserId::new(7))
+        ));
+
+        // unsupported rejects
+        let mut content = MessageContent::Unsupported(MessageUnsupported::default());
+        assert!(!update_message_content_extended_media(
+            &mut td,
+            &mut content,
+            Vec::new(),
+            DialogId::from_user_id(UserId::new(7))
+        ));
+
+        // poll needs
+        let content = MessageContent::PaidMedia(MessagePaidMedia {
+            media: vec![MessageExtendedMedia {
+                r#type: MessageExtendedMediaType::Preview,
+                ..MessageExtendedMedia::default()
+            }],
+            ..MessagePaidMedia::default()
+        });
+        assert!(need_poll_message_content_extended_media(&content));
+        assert!(!need_poll_message_content_extended_media(&simple_text("x")));
+
+        // conference call poll need
+        let content = MessageContent::ConferenceCall(MessageConferenceCall {
+            call_id: 1,
+            duration: 0,
+            other_participant_dialog_ids: Vec::new(),
+            is_active: false,
+            is_video: false,
+            was_missed: false,
+        });
+        assert!(need_poll_conference_call_message_content(&content));
+
+        // video start timestamp setter
+        let mut video = MessageContent::Video(MessageVideo::default());
+        set_message_content_video_start_timestamp(&mut video, 30);
+        assert!(matches!(video, MessageContent::Video(m) if m.start_timestamp == 30));
+    }
+
+    #[test]
+    fn lifecycle_reget_and_delay_rules() {
+        let td = TestContext::default();
+        let me = UserId::new(7);
+
+        // unsupported with an old version needs a reget
+        let content = MessageContent::Unsupported(MessageUnsupported { version: 0 });
+        assert!(need_reget_message_content(&td, &content));
+        let content = MessageContent::Unsupported(MessageUnsupported {
+            version: MessageUnsupported::CURRENT_VERSION,
+        });
+        assert!(!need_reget_message_content(&td, &content));
+        assert!(!need_reget_message_content(&td, &simple_text("x")));
+
+        // notification delays
+        assert!(need_delay_message_content_notification(
+            &MessageContent::ChatChangeTitle(MessageChatChangeTitle::default()),
+            me
+        ));
+        assert!(!need_delay_message_content_notification(
+            &simple_text("x"),
+            me
+        ));
+        let added = MessageContent::ChatAddUsers(MessageChatAddUsers { user_ids: vec![me] });
+        assert!(!need_delay_message_content_notification(&added, me));
+        let added = MessageContent::ChatAddUsers(MessageChatAddUsers {
+            user_ids: vec![UserId::new(8)],
+        });
+        assert!(need_delay_message_content_notification(&added, me));
+        let deleted = MessageContent::ChatDeleteUser(MessageChatDeleteUser { user_id: me });
+        assert!(!need_delay_message_content_notification(&deleted, me));
+        let deleted = MessageContent::ChatDeleteUser(MessageChatDeleteUser {
+            user_id: UserId::new(8),
+        });
+        assert!(need_delay_message_content_notification(&deleted, me));
+    }
+
+    #[test]
+    fn lifecycle_expired_content_machine() {
+        let mut content = MessageContent::Photo(MessagePhoto::default());
+        update_expired_message_content(&mut content);
+        assert!(matches!(content, MessageContent::ExpiredPhoto(_)));
+
+        let mut content = MessageContent::VideoNote(MessageVideoNote::default());
+        update_expired_message_content(&mut content);
+        assert!(matches!(content, MessageContent::ExpiredVideoNote(_)));
+
+        let mut content = MessageContent::Animation(MessageAnimation::default());
+        update_expired_message_content(&mut content);
+        assert!(matches!(content, MessageContent::ExpiredVideo(_)));
+
+        // already-expired stays
+        let mut content = MessageContent::ExpiredVideo(MessageExpiredVideo);
+        update_expired_message_content(&mut content);
+        assert!(matches!(content, MessageContent::ExpiredVideo(_)));
+    }
+
+    #[test]
+    fn lifecycle_dependencies_walk() {
+        let td = TestContext::default();
+        let mut users = Vec::new();
+        let mut dialogs = Vec::new();
+        let mut web_pages = Vec::new();
+        let mut stories = Vec::new();
+        let mut communities = Vec::new();
+
+        let content = MessageContent::ChatAddUsers(MessageChatAddUsers {
+            user_ids: vec![UserId::new(5), UserId::new(6)],
+        });
+        add_message_content_dependencies(
+            &td,
+            &content,
+            UserId::new(7),
+            false,
+            &mut |user_id| users.push(user_id),
+            &mut |dialog_id| dialogs.push(dialog_id),
+            &mut |web_page_id| web_pages.push(web_page_id),
+            &mut |story| stories.push(story),
+            &mut |community_id| communities.push(community_id),
+        );
+        assert_eq!(users, vec![UserId::new(5), UserId::new(6)]);
+        assert!(dialogs.is_empty());
+
+        // text adds its web page
+        let content = MessageContent::Text(MessageText::new(
+            text("hi"),
+            WebPageId::new(9),
+            false,
+            false,
+            false,
+            String::new(),
+        ));
+        let mut users = Vec::new();
+        add_message_content_dependencies(
+            &td,
+            &content,
+            UserId::new(7),
+            false,
+            &mut |user_id| users.push(user_id),
+            &mut |_| {},
+            &mut |web_page_id| web_pages.push(web_page_id),
+            &mut |_| {},
+            &mut |_| {},
+        );
+        assert_eq!(web_pages, vec![WebPageId::new(9)]);
+
+        // text with mention entities adds the mentioned user
+        let content = MessageContent::Text(MessageText::new(
+            FormattedText {
+                text: "hi".to_string(),
+                entities: vec![MessageEntity {
+                    r#type: Some(Type::MentionName),
+                    offset: 0,
+                    length: 2,
+                    user_id: UserId::new(11),
+                    ..MessageEntity::default()
+                }],
+            },
+            WebPageId::default(),
+            false,
+            false,
+            false,
+            String::new(),
+        ));
+        let mut users = Vec::new();
+        add_message_content_dependencies(
+            &td,
+            &content,
+            UserId::new(7),
+            false,
+            &mut |user_id| users.push(user_id),
+            &mut |_| {},
+            &mut |_| {},
+            &mut |_| {},
+            &mut |_| {},
+        );
+        assert_eq!(users, vec![UserId::new(11)]);
+
+        // giveaways add their channel dialogs
+        let content = MessageContent::Giveaway(MessageGiveaway {
+            giveaway_parameters: GiveawayParameters {
+                boosted_channel_id: ChannelId::new(5),
+                additional_channel_ids: vec![ChannelId::new(6)],
+                ..GiveawayParameters::default()
+            },
+            ..MessageGiveaway::default()
+        });
+        let mut dialogs = Vec::new();
+        add_message_content_dependencies(
+            &td,
+            &content,
+            UserId::new(7),
+            false,
+            &mut |_| {},
+            &mut |dialog_id| dialogs.push(dialog_id),
+            &mut |_| {},
+            &mut |_| {},
+            &mut |_| {},
+        );
+        assert_eq!(
+            dialogs,
+            vec![
+                DialogId::from_channel_id(ChannelId::new(5)),
+                DialogId::from_channel_id(ChannelId::new(6)),
+            ]
+        );
+
+        // communities
+        let content = MessageContent::ChangeCommunity(MessageChangeCommunity {
+            community_id: CommunityId::new(3),
+        });
+        let mut communities = Vec::new();
+        add_message_content_dependencies(
+            &td,
+            &content,
+            UserId::new(7),
+            false,
+            &mut |_| {},
+            &mut |_| {},
+            &mut |_| {},
+            &mut |_| {},
+            &mut |community_id| communities.push(community_id),
+        );
+        assert_eq!(communities, vec![CommunityId::new(3)]);
+    }
+
+    #[test]
+    fn lifecycle_service_and_sent_side_effects() {
+        let mut td = TestContext::default();
+        let dialog_id = DialogId::from_user_id(UserId::new(5));
+
+        // no-forwards toggle on a user dialog routes to the user manager
+        let content = MessageContent::NoForwardsToggle(MessageNoForwardsToggle {
+            request_message_id: MessageId::new(7),
+            prev_value: false,
+            new_value: true,
+        });
+        apply_updates_from_service_message_content(&mut td, &content, dialog_id, 0, dialog_id);
+
+        // change community on a user bot dialog routes to the user manager
+        let content = MessageContent::ChangeCommunity(MessageChangeCommunity {
+            community_id: CommunityId::new(3),
+        });
+        apply_updates_from_service_message_content(&mut td, &content, dialog_id, 0, dialog_id);
+
+        // topic edits with a topic id route to the forum topic manager
+        let content = MessageContent::TopicEdit(MessageTopicEdit {
+            edited_data: ForumTopicEditedData {
+                title: "new".to_string(),
+                ..ForumTopicEditedData::default()
+            },
+        });
+        apply_updates_from_service_message_content(&mut td, &content, dialog_id, 5, dialog_id);
+
+        // on_sent_message_content routes animations and stickers
+        on_sent_message_content(
+            &mut td,
+            &MessageContent::Animation(MessageAnimation {
+                file_id: FileId::new(1, 1),
+                caption: FormattedText::default(),
+                has_spoiler: false,
+            }),
+        );
+        on_sent_message_content(
+            &mut td,
+            &MessageContent::Sticker(MessageSticker {
+                file_id: FileId::new(1, 1),
+                is_premium: false,
+            }),
+        );
+        // non-media contents no-op
+        on_sent_message_content(&mut td, &simple_text("x"));
+
+        // sticker set moves
+        move_message_content_sticker_set_to_top(
+            &mut td,
+            &MessageContent::Sticker(MessageSticker {
+                file_id: FileId::new(1, 1),
+                is_premium: false,
+            }),
+        );
+        move_message_content_sticker_set_to_top(&mut td, &simple_text("x"));
     }
 
     // -- M.9.16: the td_api object dispatcher ---------------------------------
