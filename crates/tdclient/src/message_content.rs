@@ -86,7 +86,7 @@
 //! ([`secret_to_telegram_photo_size`],
 //! [`secret_to_telegram_document_attribute`],
 //! [`secret_to_telegram_document_attributes`],
-//! [`secret_to_telegram_document`]; MessageContent.cpp:9374-9562) — the
+//! [`secret_to_telegram_document`]; MessageContent.cpp:9374-9515) — the
 //! pure layer-8 object reshaping the secret-chats slice will consume.
 //! The consuming `get_secret_message_content` itself
 //! (MessageContent.cpp:9564-9776) needs the
@@ -17270,6 +17270,9 @@ pub fn update_expired_message_content(content: &mut MessageContent) {
     match content.get_type() {
         MessageContentType::Photo => *content = MessageContent::ExpiredPhoto(MessageExpiredPhoto),
         MessageContentType::Video => *content = MessageContent::ExpiredVideo(MessageExpiredVideo),
+        MessageContentType::Unsupported => {
+            // can happen if message content file identifier is broken
+        }
         MessageContentType::VideoNote => {
             *content = MessageContent::ExpiredVideoNote(MessageExpiredVideoNote)
         }
@@ -17402,14 +17405,20 @@ pub fn add_message_content_dependencies(
         MessageContent::Story(m) => add_story(m.story_full_id),
         MessageContent::GiftCode(m) => add_sender(m.creator_dialog_id, add_user, add_dialog),
         MessageContent::Giveaway(m) => {
+            // `GiveawayParameters::add_dependencies` (GiveawayParameters.cpp:82-88)
+            // routes both channel sets through `Dependencies::add_dialog_and_dependencies`
+            // (Dependencies.cpp:65-67), which drops invalid ids.
             let boosted = m.giveaway_parameters.boosted_channel_id;
-            add_dialog(DialogId::from_channel_id(boosted));
+            add_dialog_and_dependencies(DialogId::from_channel_id(boosted), add_dialog);
             for channel_id in &m.giveaway_parameters.additional_channel_ids {
-                add_dialog(DialogId::from_channel_id(*channel_id));
+                add_dialog_and_dependencies(DialogId::from_channel_id(*channel_id), add_dialog);
             }
         }
         MessageContent::GiveawayWinners(m) => {
-            add_dialog(DialogId::from_channel_id(m.boosted_channel_id));
+            add_dialog_and_dependencies(
+                DialogId::from_channel_id(m.boosted_channel_id),
+                add_dialog,
+            );
             for user_id in &m.winner_user_ids {
                 add_user(*user_id);
             }
@@ -17424,6 +17433,14 @@ pub fn add_message_content_dependencies(
             }
         }
         MessageContent::ToDoList(m) => {
+            // `ToDoList::add_dependencies` (ToDoList.cpp:123-128) + the
+            // per-item `ToDoItem::add_dependencies` (ToDoItem.cpp:84-87):
+            // the checklist title and every item title carry entity-user
+            // dependencies, on top of the completions' senders.
+            crate::message_entity::add_formatted_text_dependencies(add_user, Some(&m.list.title));
+            for item in &m.list.items {
+                crate::message_entity::add_formatted_text_dependencies(add_user, Some(&item.title));
+            }
             for completion in &m.completions {
                 add_sender(completion.completed_by_dialog_id, add_user, add_dialog);
             }
@@ -17442,8 +17459,9 @@ pub fn add_message_content_dependencies(
 }
 
 /// `apply_updates_from_service_message_content`
-/// (MessageContent.cpp:13689-13736). The `forum_topic_id` is the raw id
-/// until the M.6 ForumTopicId lands.
+/// (MessageContent.cpp:13686-13730). The `forum_topic_id` is the raw id
+/// until the M.6 ForumTopicId lands; the guard mirrors
+/// `ForumTopicId::is_valid` (`id_ > 0`, ForumTopicId.h:61-63).
 pub fn apply_updates_from_service_message_content(
     td: &mut dyn MessageContentContext,
     content: &MessageContent,
@@ -17452,7 +17470,7 @@ pub fn apply_updates_from_service_message_content(
     sender_dialog_id: DialogId,
 ) {
     match content {
-        MessageContent::TopicEdit(m) if forum_topic_id != 0 => {
+        MessageContent::TopicEdit(m) if forum_topic_id > 0 => {
             td.on_forum_topic_edited(dialog_id, forum_topic_id, &m.edited_data);
         }
         MessageContent::NoForwardsToggle(m) if dialog_id.get_type() == DialogType::User => {
@@ -19044,7 +19062,7 @@ pub fn check_quiz_correct_option_ids(
 
 // -- M.9.13: the secret -> telegram conversions -------------------------------
 //
-// MessageContent.cpp:9374-9562 — the pure `secret_to_telegram` family that
+// MessageContent.cpp:9374-9515 — the pure `secret_to_telegram` family that
 // turns layer-8 secret-chat objects into their telegram_api shapes. The
 // consuming `get_secret_message_content` (MessageContent.cpp:9564-9776)
 // needs the DocumentsManager/FileManager/WebPagesManager intakes and lands
@@ -19062,7 +19080,7 @@ fn secret_clean_string(bytes: &[u8]) -> String {
 }
 
 /// The C++ `telegram_documentAttributeAudio` helper
-/// (MessageContent.cpp:9443-9452): flags are always passed as 0 — the
+/// (MessageContent.cpp:9457-9467): flags are always passed as 0 — the
 /// optional title/performer/waveform fields ride in memory but are never
 /// serialized (flags.0/.1/.2 unset).
 fn secret_telegram_document_attribute_audio(
@@ -19082,7 +19100,7 @@ fn secret_telegram_document_attribute_audio(
     }
 }
 
-/// The C++ documentAttributeVideo build (MessageContent.cpp:9427/9447):
+/// The C++ documentAttributeVideo build (MessageContent.cpp:9438/9452):
 /// flags are always passed as 0 — `round_message` rides its own field and
 /// the streaming/nosound/preload/start-timestamp/codec plane stays empty.
 fn secret_telegram_document_attribute_video(
@@ -19106,7 +19124,7 @@ fn secret_telegram_document_attribute_video(
 }
 
 /// `secret_to_telegram` over the secret `InputStickerSet`
-/// (MessageContent.cpp:9409-9417).
+/// (MessageContent.cpp:9417-9427).
 fn secret_to_telegram_input_sticker_set(
     from: secret_api::InputStickerSet,
 ) -> telegram_api::InputStickerSet {
@@ -19127,7 +19145,7 @@ fn secret_to_telegram_input_sticker_set(
 }
 
 /// `secret_to_telegram` over the secret `PhotoSize` family
-/// (MessageContent.cpp:9378-9397). The secret `photoSize`/`photoCachedSize`
+/// (MessageContent.cpp:9377-9400). The secret `photoSize`/`photoCachedSize`
 /// location is the locally-decrypted file location and has no telegram
 /// counterpart — the conversion drops it, like the C++.
 pub fn secret_to_telegram_photo_size(from: secret_api::PhotoSize) -> telegram_api::PhotoSize {
@@ -19157,7 +19175,7 @@ pub fn secret_to_telegram_photo_size(from: secret_api::PhotoSize) -> telegram_ap
 }
 
 /// `secret_to_telegram` over the secret `DocumentAttribute` family
-/// (MessageContent.cpp:9399-9441,9454-9470).
+/// (MessageContent.cpp:9402-9483).
 pub fn secret_to_telegram_document_attribute(
     from: secret_api::DocumentAttribute,
 ) -> telegram_api::DocumentAttribute {
@@ -19176,7 +19194,7 @@ pub fn secret_to_telegram_document_attribute(
             )
         }
         // the 23-era sticker attribute builds the modern one with an empty
-        // sticker set (MessageContent.cpp:9404-9407)
+        // sticker set (MessageContent.cpp:9412-9415)
         secret_api::DocumentAttribute::documentAttributeSticker23(_) => {
             telegram_api::DocumentAttribute::documentAttributeSticker(
                 telegram_api::documentAttributeSticker {
@@ -19260,7 +19278,7 @@ pub fn secret_to_telegram_document_attribute(
 }
 
 /// `secret_to_telegram` over the attribute vector
-/// (MessageContent.cpp:9454-9463): the C++ skips the arms its downcast
+/// (MessageContent.cpp:9485-9494): the C++ skips the arms its downcast
 /// cannot handle; the secret scheme carries no such variant, so the arms
 /// above are exhaustive.
 pub fn secret_to_telegram_document_attributes(
@@ -19271,7 +19289,7 @@ pub fn secret_to_telegram_document_attributes(
         .collect()
 }
 
-/// `secret_to_telegram_document` (MessageContent.cpp:9472-9482): the secret
+/// `secret_to_telegram_document` (MessageContent.cpp:9498-9509): the secret
 /// `decryptedMessageMediaExternalDocument` as a plain telegram `document` —
 /// empty file reference, the single converted thumbnail (the C++ derefs
 /// the required `thumb_` unconditionally), the attributes through the
