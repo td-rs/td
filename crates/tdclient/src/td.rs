@@ -43,6 +43,7 @@ use tdutils::promise::Promise;
 use tdutils::status::Status;
 
 use crate::auth_manager::{AuthManager, AuthQuerySender};
+use crate::chat_manager::{ChannelId, ChatId, MessageId, RestrictedRights};
 use crate::config_dispatch::{
     CompletedNetQueries, ConfigQueryCallback, SentNetQueries, TdConfigSink, TdSessionSink,
     build_config_net_query,
@@ -56,19 +57,30 @@ use crate::config_recoverer::{
 };
 use crate::config_result;
 use crate::connection_creator::ConnectionCreator;
+use crate::contact::Contact;
 use crate::convert::{self, MessageSpec};
 use crate::dialog_manager::DialogManager;
+use crate::emoji_status::CustomEmojiId;
 use crate::global::Global;
 use crate::link_manager::LinkManager;
 use crate::manager_option_states::ManagerOptionStates;
+use crate::message_content::*;
+use crate::message_entity::FormattedText;
+use crate::messages_manager::{
+    DialogId, EphemeralMessageFullId, FileUploadId, MessageFullId, QuickReplyMessageFullId,
+    StoryFullId, StoryId,
+};
 use crate::net::{AuthSender, BridgeConfig, NetBridge, QueryAnswer};
 use crate::option_manager::OptionManager;
+use crate::photo::{Dimensions, Photo, PhotoSize};
 use crate::query_merger::QueryMerger;
 use crate::requests;
 use crate::synchronous_requests;
 use crate::td_api::{self, Function, Object};
 use crate::time_zone_manager::TimeZoneManager;
 use crate::updates_manager::{UpdatesManager, UpdatesSink};
+use crate::user_manager::FileId;
+use crate::user_manager::SecretChatId;
 use crate::user_manager::{UserEnv, UserId, UserManager};
 
 #[cfg(target_endian = "big")]
@@ -163,6 +175,1141 @@ impl UpdatesSink for TdSink {
     }
     fn on_gap(&mut self) {
         self.gap = true;
+    }
+}
+
+/// The Td-side [`crate::message_content::MessageContentContext`] adapter —
+/// the M.9.18 receive flip. The real reads are the Td-owned surfaces
+/// (auth, options, ids, unix time); the manager surfaces answer the
+/// documented stand-ins until their owners land.
+impl crate::message_content::MessageContentContext for Td {
+    fn get_user_default_permissions(&self, _user_id: UserId) -> RestrictedRights {
+        RestrictedRights::default()
+    }
+    fn get_secret_chat_default_permissions(
+        &self,
+        _secret_chat_id: SecretChatId,
+    ) -> RestrictedRights {
+        RestrictedRights::default()
+    }
+    fn is_user_bot(&self, user_id: UserId) -> bool {
+        self.users
+            .get(&user_id.get())
+            .is_some_and(|u| matches!(u.r#type, Some(td_api::UserType::userTypeBot(_))))
+    }
+    fn get_user_voice_messages_forbidden(&self, _user_id: UserId) -> bool {
+        false
+    }
+    fn get_chat_effective_restricted_rights(&self, _chat_id: ChatId) -> RestrictedRights {
+        RestrictedRights::default()
+    }
+    fn get_channel_effective_restricted_rights(&self, _channel_id: ChannelId) -> RestrictedRights {
+        RestrictedRights::default()
+    }
+    fn is_broadcast_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+    fn is_monoforum_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+    fn is_bot(&self) -> bool {
+        self.auth_manager.is_bot()
+    }
+    fn get_my_dialog_id(&self) -> DialogId {
+        crate::messages_manager::DialogId::from_user_id(crate::user_manager::UserId::new(
+            self.my_id,
+        ))
+    }
+    fn get_poll_is_anonymous(&self, _poll_id: PollId) -> bool {
+        false
+    }
+    fn get_poll_is_closed(&self, _poll_id: PollId) -> bool {
+        false
+    }
+    fn get_poll_can_add_option(&self, _poll_id: PollId) -> bool {
+        false
+    }
+    fn get_poll_can_view_stats(&self, _poll_id: PollId) -> bool {
+        false
+    }
+    fn get_poll_has_unread_votes(&self, _poll_id: PollId) -> bool {
+        false
+    }
+    fn remove_poll_has_unread_votes(&self, _poll_id: PollId) {
+        {}
+    }
+    fn has_input_media_poll(&self, _poll_id: PollId) -> bool {
+        false
+    }
+    fn get_poll_individual_message_contents(
+        &self,
+        _poll_id: PollId,
+        _attached_media: Option<&MessageContent>,
+    ) -> Vec<MessageContent> {
+        Vec::new()
+    }
+    fn get_poll_option_properties(
+        &self,
+        _poll_id: PollId,
+        _option_id: &str,
+        _dialog_id: DialogId,
+        _message_id: MessageId,
+        _can_be_replied: bool,
+        _can_be_replied_in_another_chat: bool,
+        _can_get_link: bool,
+        _is_forward: bool,
+        _is_outgoing: bool,
+        _promise: Promise<crate::td_api::PollOptionProperties>,
+    ) {
+        {}
+    }
+    fn get_sticker_type(&self, _file_id: FileId) -> StickerType {
+        StickerType::default()
+    }
+    fn get_web_page_user_ids(&self, _web_page_id: WebPageId) -> Vec<UserId> {
+        Vec::new()
+    }
+    fn get_web_page_channel_ids(&self, _web_page_id: WebPageId) -> Vec<ChannelId> {
+        Vec::new()
+    }
+    fn get_option_integer(&self, name: &str, default: i64) -> i64 {
+        self.option_manager
+            .as_ref()
+            .map_or(default, |om| om.get_option_integer(name, default))
+    }
+    fn register_web_page(
+        &mut self,
+        _web_page_id: WebPageId,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_web_page(
+        &mut self,
+        _web_page_id: WebPageId,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_quick_reply_web_page(
+        &mut self,
+        _web_page_id: WebPageId,
+        _message_full_id: QuickReplyMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_quick_reply_web_page(
+        &mut self,
+        _web_page_id: WebPageId,
+        _message_full_id: QuickReplyMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_welcome_message_web_page(
+        &mut self,
+        _web_page_id: WebPageId,
+        _message_full_id: EphemeralMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_welcome_message_web_page(
+        &mut self,
+        _web_page_id: WebPageId,
+        _message_full_id: EphemeralMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_premium_gift(
+        &mut self,
+        _months: i32,
+        _star_count: i64,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_premium_gift(
+        &mut self,
+        _months: i32,
+        _star_count: i64,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_ton_gift(
+        &mut self,
+        _ton_count: i64,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_ton_gift(
+        &mut self,
+        _ton_count: i64,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_dice(
+        &mut self,
+        _emoji: &str,
+        _value: i32,
+        _message_full_id: MessageFullId,
+        _quick_reply_message_full_id: QuickReplyMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_dice(
+        &mut self,
+        _emoji: &str,
+        _value: i32,
+        _message_full_id: MessageFullId,
+        _quick_reply_message_full_id: QuickReplyMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_emoji(
+        &mut self,
+        _emoji: &str,
+        _custom_emoji_id: CustomEmojiId,
+        _message_full_id: MessageFullId,
+        _quick_reply_message_full_id: QuickReplyMessageFullId,
+        _ephemeral_message_full_id: EphemeralMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_emoji(
+        &mut self,
+        _emoji: &str,
+        _custom_emoji_id: CustomEmojiId,
+        _message_full_id: MessageFullId,
+        _quick_reply_message_full_id: QuickReplyMessageFullId,
+        _ephemeral_message_full_id: EphemeralMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_voice(
+        &mut self,
+        _file_id: FileId,
+        _content_type: MessageContentType,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_voice(
+        &mut self,
+        _file_id: FileId,
+        _content_type: MessageContentType,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_poll(&mut self, _poll_id: PollId, _message_full_id: MessageFullId, _source: &str) {
+        {}
+    }
+    fn unregister_poll(
+        &mut self,
+        _poll_id: PollId,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_reply_poll(&mut self, _poll_id: PollId) {
+        {}
+    }
+    fn unregister_reply_poll(&mut self, _poll_id: PollId) {
+        {}
+    }
+    fn register_story(
+        &mut self,
+        _story_full_id: StoryFullId,
+        _message_full_id: MessageFullId,
+        _quick_reply_message_full_id: QuickReplyMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_story(
+        &mut self,
+        _story_full_id: StoryFullId,
+        _message_full_id: MessageFullId,
+        _quick_reply_message_full_id: QuickReplyMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_group_call(&mut self, _message_full_id: MessageFullId, _source: &str) {
+        {}
+    }
+    fn unregister_group_call(&mut self, _message_full_id: MessageFullId, _source: &str) {
+        {}
+    }
+    fn register_suggested_profile_photo(&mut self, _photo: &Photo) {
+        {}
+    }
+    fn register_noforwards_request(&mut self, _message_full_id: MessageFullId, _message_date: i32) {
+        {}
+    }
+    fn unregister_noforwards_request(&mut self, _message_full_id: MessageFullId) {
+        {}
+    }
+    fn merge_animations(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_audios(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_documents(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_stickers(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_videos(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_video_notes(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_voice_notes(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_files(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_photo_files(&mut self, _old_photo: &Photo, _new_photo: &Photo, _dialog_id: DialogId) {
+        {}
+    }
+    fn have_web_page(&self, _web_page_id: WebPageId) -> bool {
+        false
+    }
+    fn try_merge_documents(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn get_option_boolean(&self, name: &str) -> bool {
+        self.option_manager
+            .as_ref()
+            .is_some_and(|om| om.get_option_boolean(name, false))
+    }
+    fn get_secret_chat_layer(&self, _secret_chat_id: SecretChatId) -> i32 {
+        0
+    }
+    fn get_secret_chat_user_id(&self, _secret_chat_id: SecretChatId) -> UserId {
+        UserId::default()
+    }
+    fn can_use_premium_custom_emoji_in_dialog(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+    fn is_premium_custom_emoji(&self, _custom_emoji_id: CustomEmojiId) -> bool {
+        false
+    }
+    fn get_channel_can_add_web_page_previews(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+    fn get_web_page_by_url(&self, _url: &str) -> WebPageId {
+        WebPageId::default()
+    }
+    fn have_user_force(&self, _user_id: UserId, _source: &str) -> bool {
+        false
+    }
+    fn ensure_input_user(&self, _user_id: UserId) -> Result<(), Status> {
+        unreachable!("send-path seam reached on the receive flip")
+    }
+    fn get_my_id(&self) -> UserId {
+        crate::user_manager::UserId::new(self.my_id)
+    }
+    fn get_file_view_details(&self, _file_id: FileId) -> Option<(String, String, String)> {
+        None
+    }
+    fn create_animation(
+        &mut self,
+        _file_id: FileId,
+        _thumbnail: PhotoSize,
+        _has_stickers: bool,
+        _sticker_file_ids: Vec<FileId>,
+        _file_name: String,
+        _mime_type: String,
+        _duration: i32,
+        _dimensions: Dimensions,
+    ) {
+        {}
+    }
+    fn create_audio(
+        &mut self,
+        _file_id: FileId,
+        _thumbnail: PhotoSize,
+        _file_name: String,
+        _mime_type: String,
+        _duration: i32,
+        _title: String,
+        _performer: String,
+    ) {
+        {}
+    }
+    fn create_document(
+        &mut self,
+        _file_id: FileId,
+        _thumbnail: PhotoSize,
+        _file_name: String,
+        _mime_type: String,
+    ) {
+        {}
+    }
+    fn create_sticker(&mut self, _file_id: FileId, _thumbnail: PhotoSize, _dimensions: Dimensions) {
+        {}
+    }
+    fn create_video(
+        &mut self,
+        _file_id: FileId,
+        _thumbnail: PhotoSize,
+        _has_stickers: bool,
+        _sticker_file_ids: Vec<FileId>,
+        _file_name: String,
+        _mime_type: String,
+        _duration: i32,
+        _dimensions: Dimensions,
+        _supports_streaming: bool,
+    ) {
+        {}
+    }
+    fn create_video_note(
+        &mut self,
+        _file_id: FileId,
+        _thumbnail: PhotoSize,
+        _duration: i32,
+        _dimensions: Dimensions,
+    ) {
+        {}
+    }
+    fn create_voice_note(
+        &mut self,
+        _file_id: FileId,
+        _mime_type: String,
+        _duration: i32,
+        _waveform: Vec<u8>,
+    ) {
+        {}
+    }
+    fn create_photo_input(
+        &mut self,
+        _file_id: FileId,
+        _thumbnail: PhotoSize,
+        _width: i32,
+        _height: i32,
+        _sticker_file_ids: Vec<FileId>,
+    ) -> Result<Photo, Status> {
+        unreachable!("send-path seam reached on the receive flip")
+    }
+    fn get_input_file_id(
+        &mut self,
+        _file_type: crate::files::FileType,
+        _input_file: Option<td_api::InputFile>,
+        _dialog_id: DialogId,
+        _allow_get_by_hash: bool,
+        _is_secret: bool,
+    ) -> Result<FileId, Status> {
+        unreachable!("send-path seam reached on the receive flip")
+    }
+    fn get_attached_sticker_file_ids(&self, _sticker_file_ids: Vec<i32>) -> Vec<FileId> {
+        Vec::new()
+    }
+    fn get_input_thumbnail_photo_size(
+        &mut self,
+        _thumbnail: Option<td_api::InputThumbnail>,
+        _dialog_id: DialogId,
+        _is_secret: bool,
+    ) -> Result<PhotoSize, Status> {
+        unreachable!("send-path seam reached on the receive flip")
+    }
+    fn from_persistent_id(
+        &self,
+        _persistent_id: &str,
+        _file_type: crate::files::FileType,
+    ) -> Result<FileId, Status> {
+        unreachable!("send-path seam reached on the receive flip")
+    }
+    fn is_broadcast_channel_dialog(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+    fn create_poll(
+        &mut self,
+        _question: FormattedText,
+        _options: Vec<PollOption>,
+        _is_anonymous: bool,
+        _allows_multiple_answers: bool,
+        _has_open_answers: bool,
+        _fixed_answers: bool,
+        _members_only: bool,
+        _country_codes: Vec<String>,
+        _shuffle_options: bool,
+        _hide_results_until_closes: bool,
+        _is_quiz: bool,
+        _correct_option_ids: Vec<i32>,
+        _explanation: FormattedText,
+        _explanation_media: Option<Box<MessageContent>>,
+        _open_period: i32,
+        _close_date: i32,
+        _is_closed: bool,
+    ) -> PollId {
+        PollId::default()
+    }
+    fn have_story_force(&self, _story_full_id: StoryFullId) -> bool {
+        false
+    }
+    fn has_read_access_input_peer(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+    fn get_input_user_force(&self, _user_id: UserId) -> Option<telegram_api::InputUser> {
+        None
+    }
+    fn get_animation_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputFile>,
+        _input_thumbnail: Option<telegram_api::InputFile>,
+        _has_spoiler: bool,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_audio_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputFile>,
+        _input_thumbnail: Option<telegram_api::InputFile>,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_document_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputFile>,
+        _input_thumbnail: Option<telegram_api::InputFile>,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_sticker_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputFile>,
+        _input_thumbnail: Option<telegram_api::InputFile>,
+        _emoji: &str,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_video_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputFile>,
+        _input_thumbnail: Option<telegram_api::InputFile>,
+        _cover: &Photo,
+        _start_timestamp: i32,
+        _ttl: i32,
+        _has_spoiler: bool,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_video_note_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputFile>,
+        _input_thumbnail: Option<telegram_api::InputFile>,
+        _ttl: i32,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_voice_note_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputFile>,
+        _ttl: i32,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_poll_input_media(
+        &self,
+        _poll_id: PollId,
+        _input_media: Vec<Option<telegram_api::InputMedia>>,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_story_input_media(
+        &self,
+        _story_full_id: StoryFullId,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn photo_get_input_media(
+        &self,
+        _photo: &Photo,
+        _input_file: Option<telegram_api::InputFile>,
+        _ttl: i32,
+        _has_spoiler: bool,
+        _video_file_id: FileId,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_animation_secret_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _caption: &FormattedText,
+        _thumbnail: Vec<u8>,
+        _layer: i32,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn get_audio_secret_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _caption: &FormattedText,
+        _thumbnail: Vec<u8>,
+        _layer: i32,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn get_document_secret_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _caption: &FormattedText,
+        _thumbnail: Vec<u8>,
+        _layer: i32,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn get_sticker_secret_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _thumbnail: Vec<u8>,
+        _layer: i32,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn get_video_secret_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _caption: &FormattedText,
+        _thumbnail: Vec<u8>,
+        _layer: i32,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn get_video_note_secret_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _thumbnail: Vec<u8>,
+        _layer: i32,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn get_voice_note_secret_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _caption: &FormattedText,
+        _layer: i32,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn photo_get_secret_input_media(
+        &self,
+        _photo: &Photo,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _caption: &FormattedText,
+        _thumbnail: Vec<u8>,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn get_input_web_document(&self, _photo: &Photo) -> Option<telegram_api::InputWebDocument> {
+        None
+    }
+    fn delete_animation_thumbnail(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn delete_audio_thumbnail(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn delete_document_thumbnail(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn delete_sticker_thumbnail(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn delete_video_thumbnail(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn delete_video_note_thumbnail(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn cancel_upload(&mut self, _file_upload_id: FileUploadId) {
+        {}
+    }
+    fn was_authorized(&self) -> bool {
+        self.auth_manager.is_authorized()
+    }
+    fn get_live_photo_video_file_id(
+        &mut self,
+        _video: Option<telegram_api::Document>,
+        _owner_dialog_id: DialogId,
+        _is_self_destructing: bool,
+    ) -> FileId {
+        FileId::default()
+    }
+    fn on_get_document(
+        &mut self,
+        _document: telegram_api::Document,
+        _owner_dialog_id: DialogId,
+        _is_self_destructing: bool,
+        _is_send_priority: bool,
+        _doc_type: Option<DocumentType>,
+    ) -> ParsedDocument {
+        ParsedDocument::default()
+    }
+    fn get_web_document_photo(
+        &mut self,
+        _web_document: Option<telegram_api::WebDocument>,
+        _owner_dialog_id: DialogId,
+    ) -> Photo {
+        Photo::default()
+    }
+    fn on_get_web_page(
+        &mut self,
+        _web_page: Option<telegram_api::WebPage>,
+        _owner_dialog_id: DialogId,
+    ) -> WebPageId {
+        WebPageId::default()
+    }
+    fn on_get_poll(
+        &mut self,
+        _poll: Option<telegram_api::Poll>,
+        _results: Option<telegram_api::PollResults>,
+        _source: &str,
+    ) -> PollId {
+        PollId::default()
+    }
+    fn on_get_story(
+        &mut self,
+        _dialog_id: DialogId,
+        _story: Option<telegram_api::StoryItem>,
+    ) -> StoryId {
+        StoryId::default()
+    }
+    fn force_create_dialog(&mut self, _dialog_id: DialogId, _source: &str) {
+        {}
+    }
+    fn is_file_encrypted_secret(&self, _file_id: FileId) -> bool {
+        false
+    }
+    fn copy_file_id_to_secret(&mut self, _file_id: FileId, _dialog_id: DialogId) -> FileId {
+        FileId::default()
+    }
+    fn dup_animation(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
+        FileId::default()
+    }
+    fn dup_audio(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
+        FileId::default()
+    }
+    fn dup_document(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
+        FileId::default()
+    }
+    fn dup_sticker(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
+        FileId::default()
+    }
+    fn dup_video(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
+        FileId::default()
+    }
+    fn dup_video_note(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
+        FileId::default()
+    }
+    fn dup_voice_note(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
+        FileId::default()
+    }
+    fn dup_poll(&mut self, _dialog_id: DialogId, _poll_id: PollId) -> PollId {
+        PollId::default()
+    }
+    fn has_secret_input_media_sticker(&self, _file_id: FileId) -> bool {
+        false
+    }
+    fn is_user_deleted(&self, _user_id: UserId) -> bool {
+        false
+    }
+    fn get_recent_call_access_hash(&self, _call_id: i64) -> i64 {
+        0
+    }
+    fn get_encrypted_secure_values(
+        &mut self,
+        _secure_values: Vec<telegram_api::SecureValue>,
+    ) -> Vec<EncryptedSecureValue> {
+        Vec::new()
+    }
+    fn get_shared_dialog_from_peer(
+        &mut self,
+        _peer: telegram_api::RequestedPeer,
+    ) -> Option<SharedDialog> {
+        None
+    }
+    fn get_background_info(
+        &mut self,
+        _wallpaper: Option<telegram_api::WallPaper>,
+        _is_local: bool,
+        _for_dark_theme: bool,
+    ) -> Option<BackgroundInfo> {
+        None
+    }
+    fn get_web_app_from_bot_app(
+        &mut self,
+        _bot_app: telegram_api::BotApp,
+        _owner_dialog_id: DialogId,
+    ) -> WebApp {
+        WebApp::default()
+    }
+    fn parse_poll_option_answer(
+        &mut self,
+        _answer: Option<telegram_api::PollAnswer>,
+    ) -> Option<(FormattedText, String)> {
+        None
+    }
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+    fn get_user_id_object(&self, user_id: UserId, _source: &str) -> i64 {
+        user_id.get()
+    }
+    fn get_user_ids_object(&self, user_ids: &[UserId], _source: &str) -> Vec<i64> {
+        user_ids.iter().map(|&u| u.get()).collect()
+    }
+    fn is_user_support(&self, _user_id: UserId) -> bool {
+        false
+    }
+    fn get_service_notifications_user_id(&self) -> UserId {
+        crate::user_manager::UserId::new(777000)
+    }
+    fn get_supergroup_id_object(&self, channel_id: ChannelId, _source: &str) -> i64 {
+        channel_id.get()
+    }
+    fn get_basic_group_id_object(&self, chat_id: ChatId, _source: &str) -> i64 {
+        chat_id.get()
+    }
+    fn get_chat_id_object(&self, dialog_id: DialogId, _source: &str) -> i64 {
+        match dialog_id.get_type() {
+            crate::messages_manager::DialogType::User => dialog_id.get_user_id().get(),
+            crate::messages_manager::DialogType::Chat => -dialog_id.get_chat_id().get(),
+            crate::messages_manager::DialogType::Channel => dialog_id.get_channel_id().get(),
+            crate::messages_manager::DialogType::SecretChat => {
+                i64::from(dialog_id.get_secret_chat_id().get())
+            }
+            crate::messages_manager::DialogType::None => 0,
+        }
+    }
+    fn have_input_peer(&self, _dialog_id: DialogId) -> bool {
+        true
+    }
+    fn get_group_call_id(
+        &self,
+        _input_group_call_id: InputGroupCallId,
+        _dialog_id: DialogId,
+    ) -> i64 {
+        0
+    }
+    fn get_message_sender_object(
+        &self,
+        _dialog_id: DialogId,
+        _source: &str,
+    ) -> Option<td_api::MessageSender> {
+        None
+    }
+    fn get_contact_object(&self, _contact: &Contact) -> td_api::Contact {
+        td_api::Contact::default()
+    }
+    fn get_animation_object(&self, _file_id: FileId) -> td_api::Animation {
+        td_api::Animation::default()
+    }
+    fn get_audio_object(&self, _file_id: FileId) -> td_api::Audio {
+        td_api::Audio::default()
+    }
+    fn get_document_object(&self, _file_id: FileId) -> td_api::Document {
+        td_api::Document::default()
+    }
+    fn get_video_object(&self, _file_id: FileId) -> td_api::Video {
+        td_api::Video::default()
+    }
+    fn get_video_note_object(&self, _file_id: FileId) -> td_api::VideoNote {
+        td_api::VideoNote::default()
+    }
+    fn get_voice_note_object(&self, _file_id: FileId) -> td_api::VoiceNote {
+        td_api::VoiceNote::default()
+    }
+    fn get_sticker_object(&self, _file_id: FileId) -> Option<td_api::Sticker> {
+        None
+    }
+    fn get_animated_emoji_object(
+        &self,
+        _text: &str,
+        _custom_emoji_id: CustomEmojiId,
+    ) -> Option<td_api::AnimatedEmoji> {
+        None
+    }
+    fn get_dice_stickers_object(&self, _emoji: &str, _value: i32) -> td_api::DiceStickers {
+        td_api::DiceStickers::default()
+    }
+    fn get_dice_success_animation_frame_number(&self, _emoji: &str, _value: i32) -> i32 {
+        0
+    }
+    fn get_premium_gift_sticker_object(
+        &self,
+        _month_count: i32,
+        _star_count: i64,
+    ) -> Option<td_api::Sticker> {
+        None
+    }
+    fn get_ton_gift_sticker_object(&self, _ton_count: i64) -> Option<td_api::Sticker> {
+        None
+    }
+    fn get_alternative_video_object(
+        &self,
+        _file_id: FileId,
+        _hls_file_ids: &[FileId],
+    ) -> Option<td_api::AlternativeVideo> {
+        None
+    }
+    fn get_video_storyboard_object(
+        &self,
+        _file_id: FileId,
+        _storyboard_map_file_ids: &[FileId],
+    ) -> Option<td_api::VideoStoryboard> {
+        None
+    }
+    fn get_link_preview_object(
+        &self,
+        _web_page_id: WebPageId,
+        _force_small_media: bool,
+        _force_large_media: bool,
+        _skip_confirmation: bool,
+        _invert_media: bool,
+    ) -> Option<td_api::LinkPreview> {
+        None
+    }
+    fn get_photo_object(&self, _photo: &Photo) -> Option<td_api::Photo> {
+        None
+    }
+    fn get_chat_photo_object(&self, _photo: &Photo) -> Option<td_api::ChatPhoto> {
+        None
+    }
+    fn get_poll_object(&self, _poll_id: PollId, _dialog_id: DialogId) -> td_api::Poll {
+        td_api::Poll::default()
+    }
+    fn get_message_invoice_object(
+        &self,
+        _input_invoice: &InputInvoice,
+        _is_server: bool,
+        _skip_bot_commands: bool,
+        _max_media_timestamp: i32,
+    ) -> td_api::MessageContent {
+        td_api::MessageContent::default()
+    }
+    fn get_game_object(
+        &self,
+        _game: &Game,
+        _is_server: bool,
+        _skip_bot_commands: bool,
+    ) -> td_api::Game {
+        td_api::Game::default()
+    }
+    fn get_web_app_object(&self, _web_app: &WebApp) -> td_api::WebApp {
+        td_api::WebApp::default()
+    }
+    fn get_paid_media_object(&self, _extended_media: &MessageExtendedMedia) -> td_api::PaidMedia {
+        td_api::PaidMedia::default()
+    }
+    fn get_shared_user_object(&self, _shared_dialog: &SharedDialog) -> td_api::SharedUser {
+        td_api::SharedUser::default()
+    }
+    fn get_shared_chat_object(&self, _shared_dialog: &SharedDialog) -> td_api::SharedChat {
+        td_api::SharedChat::default()
+    }
+    fn get_giveaway_parameters_object(
+        &self,
+        _parameters: &GiveawayParameters,
+    ) -> td_api::GiveawayParameters {
+        td_api::GiveawayParameters::default()
+    }
+    fn get_chat_background_object(
+        &self,
+        _background_info: &BackgroundInfo,
+    ) -> td_api::ChatBackground {
+        td_api::ChatBackground::default()
+    }
+    fn get_checklist_object(
+        &self,
+        _list: &ToDoList,
+        _completions: &[ToDoCompletion],
+        _dialog_id: DialogId,
+        _message_id: MessageId,
+        _is_outgoing: bool,
+        _is_forward: bool,
+        _is_real_message_content: bool,
+    ) -> td_api::Checklist {
+        td_api::Checklist::default()
+    }
+    fn get_encrypted_passport_element_object(
+        &self,
+        _values: &[EncryptedSecureValue],
+    ) -> Vec<td_api::EncryptedPassportElement> {
+        Vec::new()
+    }
+    fn get_community_id_object(
+        &self,
+        _community_id: CommunityId,
+        _source: &str,
+    ) -> td_api::CommunityId {
+        td_api::CommunityId::default()
+    }
+    fn get_animation_duration(&self, _file_id: FileId) -> i32 {
+        0
+    }
+    fn get_audio_duration(&self, _file_id: FileId) -> i32 {
+        0
+    }
+    fn get_video_duration(&self, _file_id: FileId) -> i32 {
+        0
+    }
+    fn get_video_note_duration(&self, _file_id: FileId) -> i32 {
+        0
+    }
+    fn get_voice_note_duration(&self, _file_id: FileId) -> i32 {
+        0
+    }
+    fn get_story_duration(&self, _story_full_id: StoryFullId) -> i32 {
+        0
+    }
+    fn get_web_page_media_duration(&self, _web_page_id: WebPageId) -> i32 {
+        0
+    }
+    fn has_video_cover_input_media(&self, _file_id: FileId, _is_bot: bool) -> bool {
+        false
+    }
+    fn has_photo_cover_input_media(&self, _photo: &Photo, _is_bot: bool) -> bool {
+        false
+    }
+    fn update_extended_media_to(
+        &mut self,
+        _media: &mut MessageExtendedMedia,
+        _extended_media: Option<telegram_api::MessageExtendedMedia>,
+        _owner_dialog_id: DialogId,
+    ) -> bool {
+        false
+    }
+    fn stop_local_poll(&mut self, _poll_id: PollId) {
+        {}
+    }
+    fn get_animated_emoji_click_sticker(
+        &self,
+        _text: &str,
+        _message_full_id: MessageFullId,
+        _promise: Promise<td_api::Sticker>,
+    ) {
+        {}
+    }
+    fn on_animated_emoji_message_clicked(
+        &mut self,
+        _emoji: &str,
+        _message_full_id: MessageFullId,
+        _data: &str,
+    ) -> Result<(), Status> {
+        unreachable!("send-path seam reached on the receive flip")
+    }
+    fn get_video_mime_type(&self, _file_id: FileId) -> String {
+        String::new()
+    }
+    fn get_poll_file_ids(&self, _poll_id: PollId) -> Vec<FileId> {
+        Vec::new()
+    }
+    fn get_web_page_story_full_id(&self, _web_page_id: WebPageId) -> StoryFullId {
+        StoryFullId::default()
+    }
+    fn get_web_page_search_text(&self, _web_page_id: WebPageId) -> String {
+        String::new()
+    }
+    fn get_animation_search_text(&self, _file_id: FileId) -> String {
+        String::new()
+    }
+    fn get_audio_search_text(&self, _file_id: FileId) -> String {
+        String::new()
+    }
+    fn get_document_search_text(&self, _file_id: FileId) -> String {
+        String::new()
+    }
+    fn get_video_search_text(&self, _file_id: FileId) -> String {
+        String::new()
+    }
+    fn get_poll_search_text(&self, _poll_id: PollId) -> String {
+        String::new()
+    }
+    fn get_message_from_server(&mut self, _message_full_id: MessageFullId, _source: &str) {
+        {}
+    }
+    fn on_forum_topic_edited(
+        &mut self,
+        _dialog_id: DialogId,
+        _forum_topic_id: i32,
+        _edited_data: &ForumTopicEditedData,
+    ) {
+        {}
+    }
+    fn on_update_user_noforwards(
+        &mut self,
+        _user_id: UserId,
+        _is_me: bool,
+        _new_value: bool,
+        _is_contact: bool,
+        _has_noforwards: bool,
+    ) {
+        {}
+    }
+    fn on_update_user_linked_community_id(&mut self, _user_id: UserId, _community_id: CommunityId) {
+        {}
+    }
+    fn on_update_channel_linked_community_id(
+        &mut self,
+        _channel_id: ChannelId,
+        _community_id: CommunityId,
+    ) {
+        {}
+    }
+    fn add_saved_animation_by_id(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn add_recent_sticker_by_id(&mut self, _is_attached: bool, _file_id: FileId) {
+        {}
+    }
+    fn move_sticker_set_to_top_by_sticker_id(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn move_sticker_set_to_top_by_custom_emoji_ids(
+        &mut self,
+        _custom_emoji_ids: Vec<CustomEmojiId>,
+    ) {
+        {}
     }
 }
 
@@ -2187,6 +3334,7 @@ impl Td {
             text: text.clone(),
             pending: true,
             is_outgoing: true,
+            content: None,
         });
         self.send_result(request_id, Object::message(temp));
 
@@ -2283,6 +3431,7 @@ impl Td {
             text: pending.text,
             pending: false,
             is_outgoing: true,
+            content: None,
         });
         let old_message_id = pending.local_id;
         self.send_update(Object::updateMessageSendSucceeded(
@@ -2305,6 +3454,7 @@ impl Td {
             text: pending.text,
             pending: false,
             is_outgoing: true,
+            content: None,
         });
         let old_message_id = pending.local_id;
         self.send_update(Object::updateMessageSendFailed(
@@ -2413,6 +3563,49 @@ impl Td {
         let message_id = m.id as i64;
         let date = m.date;
         let text = wire_message_text(m);
+        // The M.9.18 flip: the wire content runs the M.9.14 intake and the
+        // M.9.16 object conversion instead of the text-only trace shape.
+        // `self` is the Td-side `MessageContentContext` (the M.9.18
+        // adapter); the manager object seams answer the codegen defaults
+        // until their owners land.
+        let dialog_id = DialogId::from_user_id(UserId::new(chat_id));
+        let mut ttl = crate::messages_manager::MessageSelfDestructType::default();
+        let mut disable_web_page_preview = false;
+        let content = crate::message_content::get_message_content(
+            self,
+            FormattedText {
+                text: text.clone(),
+                entities: Vec::new(),
+            },
+            None,
+            m.media.as_deref().cloned(),
+            dialog_id,
+            date,
+            false,
+            UserId::default(),
+            &mut ttl,
+            &mut disable_web_page_preview,
+            "updateNewMessage",
+        );
+        let content_object = crate::message_content::get_message_content_object(
+            self,
+            &content,
+            dialog_id,
+            MessageId::new(message_id),
+            DialogId::default(),
+            true,
+            false,
+            false,
+            DialogId::default(),
+            date,
+            0,
+            false,
+            false,
+            -1,
+            m.invert_media,
+            disable_web_page_preview,
+            "updateNewMessage",
+        );
         let final_message = convert::message_object(&MessageSpec {
             id: message_id,
             chat_id,
@@ -2421,6 +3614,7 @@ impl Td {
             text,
             pending: false,
             is_outgoing: false,
+            content: Some(content_object),
         });
         self.send_update(Object::updateNewMessage(td_api::updateNewMessage {
             message: Some(final_message),

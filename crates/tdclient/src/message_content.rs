@@ -82,6 +82,17 @@
 //! (the in-place write-back of poll-stored option media lands with the
 //! Wave-2 PollManager ref overload — recorded divergence).
 //!
+//! M.9.13 is the secret → telegram conversion family
+//! ([`secret_to_telegram_photo_size`],
+//! [`secret_to_telegram_document_attribute`],
+//! [`secret_to_telegram_document_attributes`],
+//! [`secret_to_telegram_document`]; MessageContent.cpp:9374-9562) — the
+//! pure layer-8 object reshaping the secret-chats slice will consume.
+//! The consuming `get_secret_message_content` itself
+//! (MessageContent.cpp:9564-9776) needs the
+//! DocumentsManager/FileManager/WebPagesManager intakes and lands with
+//! the Wave-3 secret-chats slice, exactly like the plan records.
+//!
 //! The td_api/telegram_api
 //! conversions arrive with their own slices. Value companions living here
 //! that later move to their owners' modules: `Location`/`Venue` (the
@@ -19025,6 +19036,261 @@ pub fn check_quiz_correct_option_ids(
     Ok(())
 }
 
+// -- M.9.13: the secret -> telegram conversions -------------------------------
+//
+// MessageContent.cpp:9374-9562 — the pure `secret_to_telegram` family that
+// turns layer-8 secret-chat objects into their telegram_api shapes. The
+// consuming `get_secret_message_content` (MessageContent.cpp:9564-9776)
+// needs the DocumentsManager/FileManager/WebPagesManager intakes and lands
+// with the Wave-3 secret-chats slice; these helpers are its byte-level
+// building blocks.
+
+/// The C++ `if (!clean_input_string(s)) s.clear();` idiom over the raw
+/// secret-scheme strings (the secret scheme parses `string` fields as raw
+/// bytes): sanitize, and clear on failure.
+fn secret_clean_string(bytes: &[u8]) -> String {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(crate::misc::clean_input_string)
+        .unwrap_or_default()
+}
+
+/// The C++ `telegram_documentAttributeAudio` helper
+/// (MessageContent.cpp:9443-9452): flags are always passed as 0 — the
+/// optional title/performer/waveform fields ride in memory but are never
+/// serialized (flags.0/.1/.2 unset).
+fn secret_telegram_document_attribute_audio(
+    is_voice_note: bool,
+    duration: i32,
+    title: String,
+    performer: String,
+    waveform: Vec<u8>,
+) -> telegram_api::documentAttributeAudio {
+    telegram_api::documentAttributeAudio {
+        flags: 0,
+        voice: is_voice_note,
+        duration,
+        title,
+        performer,
+        waveform,
+    }
+}
+
+/// The C++ documentAttributeVideo build (MessageContent.cpp:9427/9447):
+/// flags are always passed as 0 — `round_message` rides its own field and
+/// the streaming/nosound/preload/start-timestamp/codec plane stays empty.
+fn secret_telegram_document_attribute_video(
+    round_message: bool,
+    duration: i32,
+    w: i32,
+    h: i32,
+) -> telegram_api::documentAttributeVideo {
+    telegram_api::documentAttributeVideo {
+        flags: 0,
+        round_message,
+        supports_streaming: false,
+        nosound: false,
+        duration: f64::from(duration),
+        w,
+        h,
+        preload_prefix_size: 0,
+        video_start_ts: 0.0,
+        video_codec: String::new(),
+    }
+}
+
+/// `secret_to_telegram` over the secret `InputStickerSet`
+/// (MessageContent.cpp:9409-9417).
+fn secret_to_telegram_input_sticker_set(
+    from: secret_api::InputStickerSet,
+) -> telegram_api::InputStickerSet {
+    match from {
+        secret_api::InputStickerSet::inputStickerSetEmpty(_) => {
+            telegram_api::InputStickerSet::inputStickerSetEmpty(
+                telegram_api::inputStickerSetEmpty {},
+            )
+        }
+        secret_api::InputStickerSet::inputStickerSetShortName(sticker_set) => {
+            telegram_api::InputStickerSet::inputStickerSetShortName(
+                telegram_api::inputStickerSetShortName {
+                    short_name: secret_clean_string(&sticker_set.short_name),
+                },
+            )
+        }
+    }
+}
+
+/// `secret_to_telegram` over the secret `PhotoSize` family
+/// (MessageContent.cpp:9378-9397). The secret `photoSize`/`photoCachedSize`
+/// location is the locally-decrypted file location and has no telegram
+/// counterpart — the conversion drops it, like the C++.
+pub fn secret_to_telegram_photo_size(from: secret_api::PhotoSize) -> telegram_api::PhotoSize {
+    match from {
+        secret_api::PhotoSize::photoSizeEmpty(empty) => {
+            telegram_api::PhotoSize::photoSizeEmpty(telegram_api::photoSizeEmpty {
+                r#type: secret_clean_string(&empty.r#type),
+            })
+        }
+        secret_api::PhotoSize::photoSize(photo_size) => {
+            telegram_api::PhotoSize::photoSize(telegram_api::photoSize {
+                r#type: secret_clean_string(&photo_size.r#type),
+                w: photo_size.w,
+                h: photo_size.h,
+                size: photo_size.size,
+            })
+        }
+        secret_api::PhotoSize::photoCachedSize(photo_size) => {
+            telegram_api::PhotoSize::photoCachedSize(telegram_api::photoCachedSize {
+                r#type: secret_clean_string(&photo_size.r#type),
+                w: photo_size.w,
+                h: photo_size.h,
+                bytes: photo_size.bytes,
+            })
+        }
+    }
+}
+
+/// `secret_to_telegram` over the secret `DocumentAttribute` family
+/// (MessageContent.cpp:9399-9441,9454-9470).
+pub fn secret_to_telegram_document_attribute(
+    from: secret_api::DocumentAttribute,
+) -> telegram_api::DocumentAttribute {
+    match from {
+        secret_api::DocumentAttribute::documentAttributeImageSize(image_size) => {
+            telegram_api::DocumentAttribute::documentAttributeImageSize(
+                telegram_api::documentAttributeImageSize {
+                    w: image_size.w,
+                    h: image_size.h,
+                },
+            )
+        }
+        secret_api::DocumentAttribute::documentAttributeAnimated(_) => {
+            telegram_api::DocumentAttribute::documentAttributeAnimated(
+                telegram_api::documentAttributeAnimated {},
+            )
+        }
+        // the 23-era sticker attribute builds the modern one with an empty
+        // sticker set (MessageContent.cpp:9404-9407)
+        secret_api::DocumentAttribute::documentAttributeSticker23(_) => {
+            telegram_api::DocumentAttribute::documentAttributeSticker(
+                telegram_api::documentAttributeSticker {
+                    flags: 0,
+                    mask: false,
+                    alt: String::new(),
+                    stickerset: Some(telegram_api::InputStickerSet::inputStickerSetEmpty(
+                        telegram_api::inputStickerSetEmpty {},
+                    )),
+                    mask_coords: None,
+                },
+            )
+        }
+        secret_api::DocumentAttribute::documentAttributeSticker(sticker) => {
+            telegram_api::DocumentAttribute::documentAttributeSticker(
+                telegram_api::documentAttributeSticker {
+                    flags: 0,
+                    mask: false,
+                    alt: secret_clean_string(&sticker.alt),
+                    stickerset: sticker.stickerset.map(secret_to_telegram_input_sticker_set),
+                    mask_coords: None,
+                },
+            )
+        }
+        secret_api::DocumentAttribute::documentAttributeVideo23(video) => {
+            telegram_api::DocumentAttribute::documentAttributeVideo(
+                secret_telegram_document_attribute_video(false, video.duration, video.w, video.h),
+            )
+        }
+        secret_api::DocumentAttribute::documentAttributeVideo(video) => {
+            telegram_api::DocumentAttribute::documentAttributeVideo(
+                secret_telegram_document_attribute_video(
+                    video.round_message,
+                    video.duration,
+                    video.w,
+                    video.h,
+                ),
+            )
+        }
+        secret_api::DocumentAttribute::documentAttributeFilename(filename) => {
+            telegram_api::DocumentAttribute::documentAttributeFilename(
+                telegram_api::documentAttributeFilename {
+                    file_name: secret_clean_string(&filename.file_name),
+                },
+            )
+        }
+        secret_api::DocumentAttribute::documentAttributeAudio23(audio) => {
+            telegram_api::DocumentAttribute::documentAttributeAudio(
+                secret_telegram_document_attribute_audio(
+                    false,
+                    audio.duration,
+                    String::new(),
+                    String::new(),
+                    Vec::new(),
+                ),
+            )
+        }
+        secret_api::DocumentAttribute::documentAttributeAudio45(audio) => {
+            telegram_api::DocumentAttribute::documentAttributeAudio(
+                secret_telegram_document_attribute_audio(
+                    false,
+                    audio.duration,
+                    secret_clean_string(&audio.title),
+                    secret_clean_string(&audio.performer),
+                    Vec::new(),
+                ),
+            )
+        }
+        secret_api::DocumentAttribute::documentAttributeAudio(audio) => {
+            telegram_api::DocumentAttribute::documentAttributeAudio(
+                secret_telegram_document_attribute_audio(
+                    audio.voice,
+                    audio.duration,
+                    secret_clean_string(&audio.title),
+                    secret_clean_string(&audio.performer),
+                    audio.waveform,
+                ),
+            )
+        }
+    }
+}
+
+/// `secret_to_telegram` over the attribute vector
+/// (MessageContent.cpp:9454-9463): the C++ skips the arms its downcast
+/// cannot handle; the secret scheme carries no such variant, so the arms
+/// above are exhaustive.
+pub fn secret_to_telegram_document_attributes(
+    from: Vec<secret_api::DocumentAttribute>,
+) -> Vec<telegram_api::DocumentAttribute> {
+    from.into_iter()
+        .map(secret_to_telegram_document_attribute)
+        .collect()
+}
+
+/// `secret_to_telegram_document` (MessageContent.cpp:9472-9482): the secret
+/// `decryptedMessageMediaExternalDocument` as a plain telegram `document` —
+/// empty file reference, the single converted thumbnail (the C++ derefs
+/// the required `thumb_` unconditionally), the attributes through the
+/// family above.
+pub fn secret_to_telegram_document(
+    from: secret_api::decryptedMessageMediaExternalDocument,
+) -> telegram_api::document {
+    telegram_api::document {
+        flags: 0,
+        id: from.id,
+        access_hash: from.access_hash,
+        file_reference: Vec::new(),
+        date: from.date,
+        mime_type: secret_clean_string(&from.mime_type),
+        size: i64::from(from.size),
+        thumbs: from
+            .thumb
+            .map(|thumb| vec![secret_to_telegram_photo_size(thumb)])
+            .unwrap_or_default(),
+        video_thumbs: Vec::new(),
+        dc_id: from.dc_id,
+        attributes: secret_to_telegram_document_attributes(from.attributes),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -19987,7 +20253,11 @@ mod tests {
                 MessageContentType::Venue,
             ),
             (
-                MessageContent::LiveLocation(MessageLiveLocation::default()),
+                MessageContent::LiveLocation(MessageLiveLocation {
+                    // the C++ CHECKs `period > 0` in the object dispatcher
+                    period: 60,
+                    ..MessageLiveLocation::default()
+                }),
                 MessageContentType::LiveLocation,
             ),
             (
@@ -20074,7 +20344,13 @@ mod tests {
                 MessageContentType::GiftCode,
             ),
             (
-                MessageContent::DialogShared(MessageDialogShared::default()),
+                MessageContent::DialogShared(MessageDialogShared {
+                    shared_dialogs: vec![SharedDialog {
+                        dialog_id: DialogId::from_user_id(UserId::new(7)),
+                        ..SharedDialog::default()
+                    }],
+                    button_id: 0,
+                }),
                 MessageContentType::DialogShared,
             ),
             (
@@ -27454,6 +27730,207 @@ mod tests {
         }
     }
 
+    // -- M.9.18: the exhaustiveness audit --------------------------------------
+
+    /// One content instance per modeled variant — the M.9.18 audit walks
+    /// the three dispatchers (`get_message_content_object`,
+    /// `get_action_message_content` is arm-per-action, `dup_message_content`)
+    /// over every variant; a missing arm would panic here. The six
+    /// unmodeled variants (StarGift ×4, ChatSetTheme, RichText) are absent
+    /// from the model enum by construction.
+    fn every_modeled_variant() -> Vec<MessageContent> {
+        vec![
+            MessageContent::Text(MessageText::default()),
+            MessageContent::Animation(MessageAnimation::default()),
+            MessageContent::Audio(MessageAudio::default()),
+            MessageContent::Document(MessageDocument::default()),
+            MessageContent::Photo(MessagePhoto {
+                // the C++ CHECKs a non-empty size list in dup paths
+                photo: Photo {
+                    photos: vec![PhotoSize {
+                        size_type: b'i' as i32,
+                        ..PhotoSize::default()
+                    }],
+                    ..Photo::default()
+                },
+                ..MessagePhoto::default()
+            }),
+            MessageContent::Sticker(MessageSticker::default()),
+            MessageContent::Video(MessageVideo::default()),
+            MessageContent::VoiceNote(MessageVoiceNote::default()),
+            MessageContent::VideoNote(MessageVideoNote::default()),
+            MessageContent::Contact(MessageContact::default()),
+            MessageContent::ChatCreate(MessageChatCreate::default()),
+            MessageContent::ChatChangeTitle(MessageChatChangeTitle::default()),
+            MessageContent::ChatChangePhoto(MessageChatChangePhoto::default()),
+            MessageContent::ChatDeletePhoto(MessageChatDeletePhoto),
+            MessageContent::ChatDeleteHistory(MessageChatDeleteHistory),
+            MessageContent::ChatAddUsers(MessageChatAddUsers::default()),
+            MessageContent::ChatJoinedByLink(MessageChatJoinedByLink::default()),
+            MessageContent::ChatDeleteUser(MessageChatDeleteUser::default()),
+            MessageContent::ChatMigrateTo(MessageChatMigrateTo::default()),
+            MessageContent::ChannelCreate(MessageChannelCreate::default()),
+            MessageContent::ChannelMigrateFrom(MessageChannelMigrateFrom::default()),
+            MessageContent::PinMessage(MessagePinMessage::default()),
+            MessageContent::Game(MessageGame::default()),
+            MessageContent::GameScore(MessageGameScore::default()),
+            MessageContent::ScreenshotTaken(MessageScreenshotTaken),
+            MessageContent::ChatSetTtl(MessageChatSetTtl::default()),
+            MessageContent::Unsupported(MessageUnsupported::default()),
+            MessageContent::Call(MessageCall::default()),
+            MessageContent::Invoice(MessageInvoice::default()),
+            MessageContent::PaymentSuccessful(MessagePaymentSuccessful::default()),
+            MessageContent::ContactRegistered(MessageContactRegistered),
+            MessageContent::ExpiredPhoto(MessageExpiredPhoto),
+            MessageContent::ExpiredVideo(MessageExpiredVideo),
+            MessageContent::ExpiredVideoNote(MessageExpiredVideoNote),
+            MessageContent::ExpiredVoiceNote(MessageExpiredVoiceNote),
+            MessageContent::LiveLocation(MessageLiveLocation {
+                // the C++ CHECKs `period > 0` in the object dispatcher
+                period: 60,
+                ..MessageLiveLocation::default()
+            }),
+            MessageContent::CustomServiceAction(MessageCustomServiceAction::default()),
+            MessageContent::WebsiteConnected(MessageWebsiteConnected::default()),
+            MessageContent::PassportDataSent(MessagePassportDataSent::default()),
+            MessageContent::PassportDataReceived(MessagePassportDataReceived::default()),
+            MessageContent::Poll(MessagePoll::default()),
+            MessageContent::Dice(MessageDice::default()),
+            MessageContent::ProximityAlertTriggered(MessageProximityAlertTriggered::default()),
+            MessageContent::GroupCall(MessageGroupCall::default()),
+            MessageContent::InviteToGroupCall(MessageInviteToGroupCall::default()),
+            MessageContent::WebViewDataSent(MessageWebViewDataSent::default()),
+            MessageContent::WebViewDataReceived(MessageWebViewDataReceived::default()),
+            MessageContent::GiftPremium(MessageGiftPremium::default()),
+            MessageContent::GiftStars(MessageGiftStars::default()),
+            MessageContent::TopicCreate(MessageTopicCreate::default()),
+            MessageContent::TopicEdit(MessageTopicEdit::default()),
+            MessageContent::SuggestProfilePhoto(MessageSuggestProfilePhoto::default()),
+            MessageContent::WriteAccessAllowed(MessageWriteAccessAllowed),
+            MessageContent::RequestedDialog(MessageRequestedDialog {
+                // the C++ CHECKs a non-empty dialog list in the object
+                // dispatcher, so the audit instance carries one user
+                shared_dialog_ids: vec![DialogId::from_user_id(UserId::new(7))],
+                button_id: 0,
+            }),
+            MessageContent::WebViewWriteAccessAllowed(MessageWebViewWriteAccessAllowed::default()),
+            MessageContent::SetBackground(MessageSetBackground::default()),
+            MessageContent::Story(MessageStory::default()),
+            MessageContent::WriteAccessAllowedByRequest(MessageWriteAccessAllowedByRequest),
+            MessageContent::GiftCode(MessageGiftCode::default()),
+            MessageContent::Giveaway(MessageGiveaway::default()),
+            MessageContent::GiveawayLaunch(MessageGiveawayLaunch::default()),
+            MessageContent::GiveawayResults(MessageGiveawayResults::default()),
+            MessageContent::GiveawayWinners(MessageGiveawayWinners::default()),
+            MessageContent::BoostApply(MessageBoostApply::default()),
+            MessageContent::DialogShared(MessageDialogShared {
+                // the C++ CHECKs a non-empty dialog list in the object
+                // dispatcher, so the audit instance carries one user
+                shared_dialogs: vec![SharedDialog {
+                    dialog_id: DialogId::from_user_id(UserId::new(7)),
+                    ..SharedDialog::default()
+                }],
+                button_id: 0,
+            }),
+            MessageContent::PaidMedia(MessagePaidMedia::default()),
+            MessageContent::PaymentRefunded(MessagePaymentRefunded::default()),
+            MessageContent::PrizeStars(MessagePrizeStars::default()),
+            MessageContent::PaidMessagesRefunded(MessagePaidMessagesRefunded::default()),
+            MessageContent::PaidMessagesPrice(MessagePaidMessagesPrice::default()),
+            MessageContent::ConferenceCall(MessageConferenceCall::default()),
+            MessageContent::ToDoList(MessageToDoList::default()),
+            MessageContent::TodoCompletions(MessageTodoCompletions::default()),
+            MessageContent::TodoAppendTasks(MessageTodoAppendTasks::default()),
+            MessageContent::GiftTon(MessageGiftTon::default()),
+            MessageContent::SuggestedPostSuccess(MessageSuggestedPostSuccess::default()),
+            MessageContent::SuggestedPostRefund(MessageSuggestedPostRefund::default()),
+            MessageContent::SuggestedPostApproval(MessageSuggestedPostApproval::default()),
+            MessageContent::SuggestBirthday(MessageSuggestBirthday::default()),
+            MessageContent::NewCreatorPending(MessageNewCreatorPending::default()),
+            MessageContent::ChangeCreator(MessageChangeCreator::default()),
+            MessageContent::NoForwardsToggle(MessageNoForwardsToggle::default()),
+            MessageContent::NoForwardsRequest(MessageNoForwardsRequest::default()),
+            MessageContent::ManagedBotCreated(MessageManagedBotCreated::default()),
+            MessageContent::PollAppendAnswer(MessagePollAppendAnswer::default()),
+            MessageContent::PollDeleteAnswer(MessagePollDeleteAnswer::default()),
+            MessageContent::ChangeCommunity(MessageChangeCommunity::default()),
+            MessageContent::ChatJoinedViaCommunity(MessageChatJoinedViaCommunity::default()),
+            MessageContent::Location(MessageLocation::default()),
+            MessageContent::Venue(MessageVenue::default()),
+        ]
+    }
+
+    #[test]
+    fn every_modeled_variant_reaches_the_object_dispatcher() {
+        let td = TestContext::default();
+        let contents = every_modeled_variant();
+        // 90 modeled variants (M.9.1/9.1b/9.2 union)
+        assert_eq!(contents.len(), 90);
+        for content in &contents {
+            let object = get_message_content_object(
+                &td,
+                content,
+                DialogId::from_user_id(UserId::new(7)),
+                MessageId::new(42 << 20),
+                DialogId::default(),
+                true,
+                false,
+                false,
+                DialogId::default(),
+                1700000000,
+                0,
+                false,
+                false,
+                -1,
+                false,
+                false,
+                "audit",
+            );
+            // every arm answers a non-null object (the codegen enum
+            // carries no null variant; the dispatcher's very return is
+            // the exhaustiveness evidence)
+            let _ = object;
+        }
+    }
+
+    #[test]
+    fn every_modeled_variant_reaches_the_dup_dispatcher() {
+        let mut td = TestContext::default();
+        for content in every_modeled_variant() {
+            // service contents answer None; media/service split must not
+            // panic either way
+            let _ = dup_message_content(
+                &mut td,
+                DialogId::from_user_id(UserId::new(7)),
+                &content,
+                MessageContentDupType::Forward,
+                false,
+                MessageCopyOptions::default(),
+            );
+        }
+    }
+
+    #[test]
+    fn every_modeled_variant_reaches_the_lifecycle_walks() {
+        let td = TestContext::default();
+        for content in every_modeled_variant() {
+            // the accessor families must be total over the model
+            let _ = get_message_content_duration(&td, &content);
+            let _ = get_message_content_media_duration(&td, &content);
+            let _ = get_message_content_search_text(&td, &content);
+            let _ = get_message_content_story_full_id(&td, &content);
+            let _ = get_message_content_need_to_upload_covers(&td, &content);
+            let _ = get_message_content_cover_any_file_ids(&td, &content);
+            let _ = has_message_content_cover(&content);
+            let _ = get_message_content_has_bot_commands(&content);
+            let _ = get_message_content_star_count(&content);
+            let _ = get_message_content_stake_ton_count(&content);
+            let _ = get_message_content_prize_ton_count(&content);
+            let _ = need_reget_message_content(&td, &content);
+            let _ = need_delay_message_content_notification(&content, UserId::new(7));
+        }
+    }
+
     // -- M.9.17: the lifecycle tail ------------------------------------------
 
     #[test]
@@ -30649,5 +31126,334 @@ mod tests {
         assert!(!can_message_content_have_multiple_files(
             MessageContentType::Text
         ));
+    }
+
+    // -- M.9.13: the secret -> telegram conversions --------------------------
+
+    #[test]
+    fn secret_photo_sizes_keep_fields_and_drop_location() {
+        use telegram_api::PhotoSize as T;
+        let converted = secret_to_telegram_photo_size(secret_api::PhotoSize::photoSize(
+            secret_api::photoSize {
+                r#type: b"m".to_vec(),
+                location: Some(secret_api::FileLocation::fileLocation(
+                    secret_api::fileLocation {
+                        dc_id: 2,
+                        volume_id: 7,
+                        local_id: 9,
+                        secret: 11,
+                    },
+                )),
+                w: 320,
+                h: 240,
+                size: 12345,
+            },
+        ));
+        match converted {
+            T::photoSize(size) => {
+                assert_eq!(size.r#type, "m");
+                assert_eq!(size.w, 320);
+                assert_eq!(size.h, 240);
+                assert_eq!(size.size, 12345);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let cached = secret_to_telegram_photo_size(secret_api::PhotoSize::photoCachedSize(
+            secret_api::photoCachedSize {
+                r#type: b"i".to_vec(),
+                location: None,
+                w: 90,
+                h: 90,
+                bytes: vec![1, 2, 3],
+            },
+        ));
+        match cached {
+            T::photoCachedSize(size) => {
+                assert_eq!(size.r#type, "i");
+                assert_eq!(size.bytes, vec![1, 2, 3]);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let empty = secret_to_telegram_photo_size(secret_api::PhotoSize::photoSizeEmpty(
+            secret_api::photoSizeEmpty { r#type: Vec::new() },
+        ));
+        match empty {
+            T::photoSizeEmpty(size) => assert_eq!(size.r#type, ""),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secret_strings_are_cleaned_and_cleared() {
+        // a control character becomes a space (the clean_input_string rule)
+        let cleaned = secret_to_telegram_document_attribute(
+            secret_api::DocumentAttribute::documentAttributeFilename(
+                secret_api::documentAttributeFilename {
+                    file_name: b"re\x01port.pdf".to_vec(),
+                },
+            ),
+        );
+        match cleaned {
+            telegram_api::DocumentAttribute::documentAttributeFilename(filename) => {
+                assert_eq!(filename.file_name, "re port.pdf");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // invalid UTF-8 clears the string, like the C++ clear-on-fail
+        let cleared = secret_to_telegram_document_attribute(
+            secret_api::DocumentAttribute::documentAttributeFilename(
+                secret_api::documentAttributeFilename {
+                    file_name: vec![0xff, 0xfe, 0xfd],
+                },
+            ),
+        );
+        match cleared {
+            telegram_api::DocumentAttribute::documentAttributeFilename(filename) => {
+                assert_eq!(filename.file_name, "");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secret_sticker_attributes_normalize() {
+        // the 23-era attribute builds the modern one with an empty set
+        let legacy = secret_to_telegram_document_attribute(
+            secret_api::DocumentAttribute::documentAttributeSticker23(
+                secret_api::documentAttributeSticker23 {},
+            ),
+        );
+        match legacy {
+            telegram_api::DocumentAttribute::documentAttributeSticker(sticker) => {
+                assert_eq!(sticker.alt, "");
+                assert!(!sticker.mask);
+                assert!(matches!(
+                    sticker.stickerset,
+                    Some(telegram_api::InputStickerSet::inputStickerSetEmpty(_))
+                ));
+                assert!(sticker.mask_coords.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // the full attribute keeps alt + the converted set
+        let full = secret_to_telegram_document_attribute(
+            secret_api::DocumentAttribute::documentAttributeSticker(
+                secret_api::documentAttributeSticker {
+                    alt: b"dog".to_vec(),
+                    stickerset: Some(secret_api::InputStickerSet::inputStickerSetShortName(
+                        secret_api::inputStickerSetShortName {
+                            short_name: b"pack\x02name".to_vec(),
+                        },
+                    )),
+                },
+            ),
+        );
+        match full {
+            telegram_api::DocumentAttribute::documentAttributeSticker(sticker) => {
+                assert_eq!(sticker.alt, "dog");
+                match sticker.stickerset {
+                    Some(telegram_api::InputStickerSet::inputStickerSetShortName(set)) => {
+                        assert_eq!(set.short_name, "pack name");
+                    }
+                    other => panic!("unexpected stickerset {other:?}"),
+                }
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secret_video_attributes_carry_the_basics() {
+        // the 23-era video: round_message false, duration widened to f64
+        let legacy = secret_to_telegram_document_attribute(
+            secret_api::DocumentAttribute::documentAttributeVideo23(
+                secret_api::documentAttributeVideo23 {
+                    duration: 33,
+                    w: 640,
+                    h: 480,
+                },
+            ),
+        );
+        match legacy {
+            telegram_api::DocumentAttribute::documentAttributeVideo(video) => {
+                assert!((video.duration - 33.0).abs() < f64::EPSILON);
+                assert_eq!(video.w, 640);
+                assert_eq!(video.h, 480);
+                assert!(!video.round_message);
+                assert!(!video.supports_streaming);
+                assert!(!video.nosound);
+                assert_eq!(video.preload_prefix_size, 0);
+                assert_eq!(video.video_start_ts, 0.0);
+                assert_eq!(video.video_codec, "");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // the modern video keeps round_message only
+        let modern = secret_to_telegram_document_attribute(
+            secret_api::DocumentAttribute::documentAttributeVideo(
+                secret_api::documentAttributeVideo {
+                    flags: 1,
+                    round_message: true,
+                    duration: 12,
+                    w: 240,
+                    h: 240,
+                },
+            ),
+        );
+        match modern {
+            telegram_api::DocumentAttribute::documentAttributeVideo(video) => {
+                assert!(video.round_message);
+                assert!((video.duration - 12.0).abs() < f64::EPSILON);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secret_audio_attributes_wire_drop_optionals() {
+        // the full audio carries voice + cleaned text fields in memory...
+        let converted = secret_to_telegram_document_attribute(
+            secret_api::DocumentAttribute::documentAttributeAudio(
+                secret_api::documentAttributeAudio {
+                    flags: (1 << 0) | (1 << 1) | (1 << 2) | (1 << 10),
+                    voice: true,
+                    duration: 42,
+                    title: b"Song\x03".to_vec(),
+                    performer: b"Artist".to_vec(),
+                    waveform: vec![9, 8, 7],
+                },
+            ),
+        );
+        let audio = match converted {
+            telegram_api::DocumentAttribute::documentAttributeAudio(audio) => audio,
+            other => panic!("unexpected {other:?}"),
+        };
+        assert!(audio.voice);
+        assert_eq!(audio.duration, 42);
+        assert_eq!(audio.title, "Song ");
+        assert_eq!(audio.performer, "Artist");
+        assert_eq!(audio.waveform, vec![9, 8, 7]);
+        // ...but flags are always 0 in the C++ helper, so the wire form
+        // serializes only the voice bit — no title/performer/waveform
+        let mut wire = Vec::new();
+        audio.store_boxed(&mut wire);
+        let text = String::from_utf8_lossy(&wire).to_string();
+        assert!(!text.contains("Song"));
+        assert!(!text.contains("Artist"));
+        assert!(!wire[8..].contains(&9)); // waveform not on the wire
+        // the 45-era audio keeps duration + the text fields, voice false
+        let era45 = secret_to_telegram_document_attribute(
+            secret_api::DocumentAttribute::documentAttributeAudio45(
+                secret_api::documentAttributeAudio45 {
+                    duration: 5,
+                    title: b"T".to_vec(),
+                    performer: b"P".to_vec(),
+                },
+            ),
+        );
+        match era45 {
+            telegram_api::DocumentAttribute::documentAttributeAudio(audio) => {
+                assert!(!audio.voice);
+                assert_eq!(audio.duration, 5);
+                assert_eq!(audio.title, "T");
+                assert_eq!(audio.performer, "P");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secret_image_size_animated_and_audio23_pass_through() {
+        let image_size = secret_to_telegram_document_attribute(
+            secret_api::DocumentAttribute::documentAttributeImageSize(
+                secret_api::documentAttributeImageSize { w: 10, h: 20 },
+            ),
+        );
+        match image_size {
+            telegram_api::DocumentAttribute::documentAttributeImageSize(size) => {
+                assert_eq!((size.w, size.h), (10, 20));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let animated = secret_to_telegram_document_attribute(
+            secret_api::DocumentAttribute::documentAttributeAnimated(
+                secret_api::documentAttributeAnimated {},
+            ),
+        );
+        assert!(matches!(
+            animated,
+            telegram_api::DocumentAttribute::documentAttributeAnimated(_)
+        ));
+        let audio23 = secret_to_telegram_document_attribute(
+            secret_api::DocumentAttribute::documentAttributeAudio23(
+                secret_api::documentAttributeAudio23 { duration: 7 },
+            ),
+        );
+        match audio23 {
+            telegram_api::DocumentAttribute::documentAttributeAudio(audio) => {
+                assert!(!audio.voice);
+                assert_eq!(audio.duration, 7);
+                assert_eq!(audio.title, "");
+                assert_eq!(audio.performer, "");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn secret_external_document_becomes_a_telegram_document() {
+        let converted =
+            secret_to_telegram_document(secret_api::decryptedMessageMediaExternalDocument {
+                id: 1001,
+                access_hash: 2002,
+                date: 1700000000,
+                mime_type: b"application/pdf".to_vec(),
+                size: 4096,
+                thumb: Some(secret_api::PhotoSize::photoSizeEmpty(
+                    secret_api::photoSizeEmpty {
+                        r#type: b"t".to_vec(),
+                    },
+                )),
+                dc_id: 4,
+                attributes: vec![
+                    secret_api::DocumentAttribute::documentAttributeFilename(
+                        secret_api::documentAttributeFilename {
+                            file_name: b"doc.pdf".to_vec(),
+                        },
+                    ),
+                    secret_api::DocumentAttribute::documentAttributeAnimated(
+                        secret_api::documentAttributeAnimated {},
+                    ),
+                ],
+            });
+        assert_eq!(converted.flags, 0);
+        assert_eq!(converted.id, 1001);
+        assert_eq!(converted.access_hash, 2002);
+        assert_eq!(converted.date, 1700000000);
+        assert_eq!(converted.mime_type, "application/pdf");
+        assert_eq!(converted.size, 4096);
+        assert!(converted.file_reference.is_empty());
+        assert_eq!(converted.dc_id, 4);
+        assert!(converted.video_thumbs.is_empty());
+        assert_eq!(converted.thumbs.len(), 1);
+        assert!(matches!(
+            converted.thumbs[0],
+            telegram_api::PhotoSize::photoSizeEmpty(_)
+        ));
+        assert_eq!(converted.attributes.len(), 2);
+        assert!(matches!(
+            converted.attributes[0],
+            telegram_api::DocumentAttribute::documentAttributeFilename(_)
+        ));
+        assert!(matches!(
+            converted.attributes[1],
+            telegram_api::DocumentAttribute::documentAttributeAnimated(_)
+        ));
+        // and the wire form round-trips through the telegram parser
+        let mut wire = Vec::new();
+        converted.store_boxed(&mut wire);
+        let parsed = telegram_api::document::parse(&wire).expect("parse");
+        assert_eq!(parsed.id, 1001);
+        assert_eq!(parsed.attributes.len(), 2);
     }
 }
