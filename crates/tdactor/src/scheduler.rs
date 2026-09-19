@@ -1044,6 +1044,12 @@ impl SchedulerState {
     fn next_timeout(&self) -> Option<Instant> {
         let mut heap = self.timeouts.borrow_mut();
         while let Some(TimeoutEntry(Reverse(at), id, generation)) = heap.peek() {
+            // the entry may outlive the actor (the same protocol as
+            // `run_timeout`): skip dead actors before touching the slot
+            if !id.is_alive() {
+                heap.pop();
+                continue;
+            }
             let info = self.info(id);
             if info.timeout_gen.get() == *generation {
                 return Some(*at);
