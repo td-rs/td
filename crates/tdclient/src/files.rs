@@ -15820,4 +15820,207 @@ mod file_downloader_tests {
         drop(queries);
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// The deterministic generator behind the Track C crypto vectors
+    /// (`DeterministicBytes` in the tdutils crypto tests — the C++
+    /// `TEST(Crypto, AesIgeState)` recipe; the same LCG, mirrored here
+    /// because the tdutils one is `cfg(test)`-private).
+    struct TrackCBytes {
+        seed: u32,
+    }
+
+    impl TrackCBytes {
+        fn new(seed: u32) -> TrackCBytes {
+            TrackCBytes { seed }
+        }
+
+        fn fill(&mut self, out: &mut [u8]) {
+            for byte in out {
+                self.seed = self
+                    .seed
+                    .wrapping_mul(123_457_567)
+                    .wrapping_add(987_651_241);
+                *byte = ((self.seed >> 23) & 255) as u8;
+            }
+        }
+    }
+
+    #[test]
+    fn file_downloader_ige_round_trips_the_track_c_vectors() {
+        // the C++ `TEST(Crypto, AesIgeState)` recipe: each length seeds a
+        // fresh generator that yields the data, then the key, then the
+        // iv. `aes_ige_encrypt` is CRC32-anchored against the C++ by the
+        // tdutils `aes_ige_state_matches_cpp`, so downloading its output
+        // and comparing the decrypted file pins the downloader's IGE half
+        // to the same vectors. 65536 is the big-file arm.
+        for length in [16usize, 32, 256, 1024, 65536] {
+            let mut rnd = TrackCBytes::new(length as u32);
+            let mut data = vec![0u8; length];
+            rnd.fill(&mut data);
+            let mut key = [0u8; 32];
+            rnd.fill(&mut key);
+            let mut iv = [0u8; 32];
+            rnd.fill(&mut iv);
+
+            let mut iv_copy = iv;
+            let mut ciphertext = vec![0u8; length];
+            tdutils::crypto::aes_ige_encrypt(&key, &mut iv_copy, &data, &mut ciphertext);
+
+            let script = vec![(None, Ok(DownloadResult::Bytes(ciphertext)))];
+            let state = SharedNetState::new(script);
+            let callback = Rc::new(RefCell::new(RecordedCallback::default()));
+            let mut downloader = FileDownloader::new(
+                document_location(),
+                LocalFileLocation::Empty,
+                length as i64,
+                format!("track_c_{length}.bin"),
+                FileEncryptionKey::new(&key, &iv),
+                true,
+                false,
+                0,
+                0,
+                Box::new(SharingCallback {
+                    inner: callback.clone(),
+                }),
+                Box::new(FakeDownloadNet::new(state)),
+            );
+            downloader.start();
+            drive_download(&mut downloader, &callback);
+
+            let log = callback.borrow();
+            if let Some(err) = &log.error {
+                panic!(
+                    "length {length} download failed: {} ({})",
+                    err.message(),
+                    err.code()
+                );
+            }
+            let (location, size, _) = log.ok.as_ref().expect("download ok");
+            assert_eq!(size, &(length as i64));
+            assert_eq!(
+                std::fs::read(&location.path).unwrap(),
+                data,
+                "length {length}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_downloader_decrypts_cdn_parts_at_a_nonzero_offset() {
+        // the CDN CTR counter block carries the byte-swapped
+        // part-offset/16 word in iv[12..16] (FileDownloader.cpp:252-262):
+        // part 1 starts at byte 65536, offset/16 = 0x1000, byte-swapped
+        // to 0x00100000
+        let data: Vec<u8> = {
+            let mut rnd = TrackCBytes::new(42);
+            let mut data = vec![0u8; 131072];
+            rnd.fill(&mut data);
+            data
+        };
+        let key: Vec<u8> = (0u8..32).collect();
+        let iv: Vec<u8> = (32u8..48).collect();
+        let cdn_encrypt = |part_iv: &[u8], plain: &[u8]| {
+            let mut ctr = tdutils::crypto::AesCtrState::new();
+            ctr.init(&key, part_iv);
+            let mut ciphertext = plain.to_vec();
+            ctr.encrypt(plain, &mut ciphertext);
+            ciphertext
+        };
+        // the server replaces iv[12..16] with the swapped offset word for
+        // EVERY part — part 0 carries word 0
+        let mut server_iv0 = iv.clone();
+        server_iv0[12..16].copy_from_slice(&0u32.to_le_bytes());
+        let mut server_iv1 = iv.clone();
+        server_iv1[12..16].copy_from_slice(&0x0010_0000u32.to_le_bytes());
+        let ct0 = cdn_encrypt(&server_iv0, &data[..65536]);
+        let ct1 = cdn_encrypt(&server_iv1, &data[65536..]);
+
+        let redirect = Ok(DownloadResult::CdnRedirect {
+            dc_id: 4,
+            file_token: b"token1".to_vec(),
+            encryption_key: key.clone(),
+            encryption_iv: iv.clone(),
+            file_hashes: Vec::new(),
+        });
+        let script = vec![
+            (Some("Default".to_owned()), redirect),
+            (Some("Cdn".to_owned()), Ok(DownloadResult::CdnBytes(ct0))),
+            (Some("Cdn".to_owned()), Ok(DownloadResult::CdnBytes(ct1))),
+            // the redirect set need_check: the whole prefix is verified
+            (
+                Some("Check".to_owned()),
+                Ok(DownloadResult::Hashes(vec![telegram_api::FileHash {
+                    offset: 0,
+                    limit: data.len() as i32,
+                    hash: tdutils::crypto::sha256(&data).to_vec(),
+                }])),
+            ),
+        ];
+        let state = SharedNetState::new(script);
+        let (mut downloader, callback) = build_downloader(
+            state.clone(),
+            LocalFileLocation::Empty,
+            data.len() as i64,
+            "doc.bin",
+            false,
+        );
+        downloader.start();
+        drive_download(&mut downloader, &callback);
+
+        let log = callback.borrow();
+        if let Some(err) = &log.error {
+            panic!("download failed: {} ({})", err.message(), err.code());
+        }
+        let (location, size, _) = log.ok.as_ref().expect("download ok");
+        assert_eq!(size, &(data.len() as i64));
+        assert_eq!(std::fs::read(&location.path).unwrap(), data);
+
+        // both parts rode the CDN: offsets 0 and 65536
+        let queries = state.queries.borrow();
+        assert_eq!(queries.len(), 4);
+        let offsets: Vec<i64> = queries
+            .iter()
+            .filter_map(|(_, q, _)| match q {
+                DownloadQuery::GetCdnFile { offset, .. } => Some(*offset),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(offsets, vec![0, 65536]);
+    }
+
+    #[test]
+    fn file_downloader_rejects_a_web_file_over_cdn() {
+        // use_cdn on a web location fails before any query
+        // (FileDownloader.cpp:172-174)
+        let state = SharedNetState::new(vec![]);
+        let callback = Rc::new(RefCell::new(RecordedCallback::default()));
+        let mut downloader = FileDownloader::new(
+            FullRemoteFileLocation::from_web(
+                FileType::Document,
+                "https://example.com/a.html".to_owned(),
+                42,
+            ),
+            LocalFileLocation::Empty,
+            15,
+            "a.html".to_owned(),
+            FileEncryptionKey::default(),
+            true,
+            false,
+            0,
+            0,
+            Box::new(SharingCallback {
+                inner: callback.clone(),
+            }),
+            Box::new(FakeDownloadNet::new(state.clone())),
+        );
+        downloader.seed_cdn_for_test(b"tok".to_vec(), 4);
+        downloader.start();
+        drive_download(&mut downloader, &callback);
+
+        let log = callback.borrow();
+        let error = log.error.as_ref().expect("cdn-over-web error");
+        assert_eq!(error.message(), "Can't download web file from CDN");
+        assert!(log.ok.is_none());
+        assert!(state.queries.borrow().is_empty());
+    }
 }
