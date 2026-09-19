@@ -49,6 +49,7 @@ use crate::store_parse::{self, Parser};
 use crate::td_api;
 use crate::user_manager::{CommunityId, StoryId, UserId};
 use tddb::sqlite_key_value::SqliteKeyValue;
+use tdmtproto::telegram_api;
 use tdutils::status::{Result as TdResult, Status};
 
 /// `td::FileId` (files/FileId.h) — the file-manager handle. Comparisons
@@ -2184,6 +2185,170 @@ impl FullRemoteFileLocation {
             FullRemoteVariant::Common(common) => common.store_key(out),
         }
     }
+
+    /// `FullRemoteFileLocation::as_input_web_file_location`
+    /// (FileLocation.h:381-384).
+    pub fn as_input_web_file_location(
+        &self,
+    ) -> Result<telegram_api::InputWebFileLocation, &'static str> {
+        if !self.is_web() {
+            return Err("LOG_CHECK(is_web()) failed in as_input_web_file_location");
+        }
+        let FullRemoteVariant::Web(web) = &self.variant else {
+            return Err("not a web location");
+        };
+        Ok(telegram_api::InputWebFileLocation::inputWebFileLocation(
+            telegram_api::inputWebFileLocation {
+                url: web.url.clone(),
+                access_hash: web.access_hash,
+            },
+        ))
+    }
+
+    /// `FullRemoteFileLocation::as_input_file_location`
+    /// (FileLocation.h:386-470). The dialog-photo arms need the peer's
+    /// `InputPeer`, which the C++ fetches through
+    /// `G()->dialog_manager()`; the resolver parameter is that seam (it
+    /// receives the `DialogId` the source carries and answers with the
+    /// peer, or `None` when the peer is not in the cache yet). The
+    /// sticker-set arms are the StickersManager seam (Wave 2).
+    pub fn as_input_file_location(
+        &self,
+        input_peer: &dyn Fn(DialogId) -> Option<telegram_api::InputPeer>,
+    ) -> Result<telegram_api::InputFileLocation, String> {
+        use telegram_api as tl;
+        let file_reference = self.file_reference.as_bytes().to_vec();
+        match &self.variant {
+            FullRemoteVariant::Photo(photo) => {
+                let id = photo.id;
+                let access_hash = photo.access_hash;
+                let thumb_byte = |thumbnail_type: i32| (thumbnail_type as u8 as char).to_string();
+                match &photo.source {
+                    PhotoSizeSource::Legacy { .. } | PhotoSizeSource::StickerSetThumbnail { .. } => {
+                        Err("UNREACHABLE: legacy/sticker-set-thumbnail source in as_input_file_location".to_owned())
+                    }
+                    PhotoSizeSource::Thumbnail {
+                        file_type,
+                        thumbnail_type,
+                    } => match file_type {
+                        FileType::Photo
+                        | FileType::PhotoStory
+                        | FileType::SelfDestructingPhoto => {
+                            Ok(tl::InputFileLocation::inputPhotoFileLocation(tl::inputPhotoFileLocation {
+                                id,
+                                access_hash,
+                                file_reference,
+                                thumb_size: thumb_byte(thumbnail_type.type_),
+                            }))
+                        }
+                        FileType::Thumbnail => {
+                            Ok(tl::InputFileLocation::inputDocumentFileLocation(tl::inputDocumentFileLocation {
+                                id,
+                                access_hash,
+                                file_reference,
+                                thumb_size: thumb_byte(thumbnail_type.type_),
+                            }))
+                        }
+                        _ => Err("UNREACHABLE: thumbnail source file type".to_owned()),
+                    },
+                    PhotoSizeSource::DialogPhotoSmall { dialog_id, .. }
+                    | PhotoSizeSource::DialogPhotoBig { dialog_id, .. } => {
+                        let is_big = matches!(
+                            &photo.source,
+                            PhotoSizeSource::DialogPhotoBig { .. }
+                        );
+                        let peer = input_peer(*dialog_id).ok_or_else(|| {
+                            format!("Have no input peer for dialog photo {dialog_id:?}")
+                        })?;
+                        Ok(tl::InputFileLocation::inputPeerPhotoFileLocation(
+                            tl::inputPeerPhotoFileLocation {
+                                flags: 0,
+                                big: is_big,
+                                peer: Some(Box::new(peer)),
+                                photo_id: id,
+                            },
+                        ))
+                    }
+                    PhotoSizeSource::FullLegacy {
+                        volume_id,
+                        local_id,
+                        secret,
+                    } => Ok(tl::InputFileLocation::inputPhotoLegacyFileLocation(
+                        tl::inputPhotoLegacyFileLocation {
+                            id,
+                            access_hash,
+                            file_reference,
+                            volume_id: *volume_id,
+                            local_id: *local_id,
+                            secret: *secret,
+                        },
+                    )),
+                    PhotoSizeSource::DialogPhotoSmallLegacy {
+                        dialog_id,
+                        volume_id,
+                        local_id,
+                        ..
+                    }
+                    | PhotoSizeSource::DialogPhotoBigLegacy {
+                        dialog_id,
+                        volume_id,
+                        local_id,
+                        ..
+                    } => {
+                        let is_big = matches!(
+                            &photo.source,
+                            PhotoSizeSource::DialogPhotoBigLegacy { .. }
+                        );
+                        let peer = input_peer(*dialog_id).ok_or_else(|| {
+                            format!("Have no input peer for dialog photo {dialog_id:?}")
+                        })?;
+                        Ok(tl::InputFileLocation::inputPeerPhotoFileLocationLegacy(
+                            tl::inputPeerPhotoFileLocationLegacy {
+                                flags: 0,
+                                big: is_big,
+                                peer: Some(Box::new(peer)),
+                                volume_id: *volume_id,
+                                local_id: *local_id,
+                            },
+                        ))
+                    }
+                    PhotoSizeSource::StickerSetThumbnailLegacy { .. }
+                    | PhotoSizeSource::StickerSetThumbnailVersion { .. } => Err(
+                        "StickersManager::get_input_sticker_set is the Wave 2 seam".to_owned(),
+                    ),
+                }
+            }
+            FullRemoteVariant::Common(common) => {
+                if self.is_encrypted_secret() {
+                    Ok(tl::InputFileLocation::inputEncryptedFileLocation(
+                        tl::inputEncryptedFileLocation {
+                            id: common.id,
+                            access_hash: common.access_hash,
+                        },
+                    ))
+                } else if self.is_secure() {
+                    Ok(tl::InputFileLocation::inputSecureFileLocation(
+                        tl::inputSecureFileLocation {
+                            id: common.id,
+                            access_hash: common.access_hash,
+                        },
+                    ))
+                } else {
+                    Ok(tl::InputFileLocation::inputDocumentFileLocation(
+                        tl::inputDocumentFileLocation {
+                            id: common.id,
+                            access_hash: common.access_hash,
+                            file_reference,
+                            thumb_size: String::new(),
+                        },
+                    ))
+                }
+            }
+            FullRemoteVariant::Web(_) => {
+                Err("UNREACHABLE: web location in as_input_file_location".to_owned())
+            }
+        }
+    }
 }
 
 impl PartialEq for FullRemoteFileLocation {
@@ -2808,6 +2973,14 @@ impl FileEncryptionKey {
         &self.key_iv[32..]
     }
 
+    /// `FileEncryptionKey::mutable_iv()` — the in-place iv mutation the
+    /// downloader's resume path performs (FileDownloader.cpp:501).
+    pub fn set_iv(&mut self, iv: [u8; 32]) {
+        assert!(self.is_secret());
+        assert_eq!(self.key_iv.len(), 64);
+        self.key_iv[32..].copy_from_slice(&iv);
+    }
+
     /// `FileEncryptionKey::FileEncryptionKey(const secure_storage::Secret &)`
     /// (FileEncryptionKey.cpp:29-32) — a secure key wrapping the secret.
     pub fn from_secret(secret: &[u8]) -> FileEncryptionKey {
@@ -2817,11 +2990,30 @@ impl FileEncryptionKey {
         }
     }
 
-    /// `FileEncryptionKey::secret` (FileEncryptionKey.h) — the secure-file
-    /// secret payload.
+    /// `FileEncryptionKey::secret` (FileEncryptionKey.cpp:53-56) — the
+    /// first `Secret::size()` (32) bytes; `set_value_hash` appends the
+    /// value hash after them.
     pub fn secret(&self) -> &[u8] {
         assert!(self.is_secure());
-        &self.key_iv
+        &self.key_iv[..self.key_iv.len().min(32)]
+    }
+
+    /// `FileEncryptionKey::has_value_hash` (FileEncryptionKey.cpp:58-61).
+    pub fn has_value_hash(&self) -> bool {
+        assert!(self.is_secure());
+        self.key_iv.len() > 32
+    }
+
+    /// `FileEncryptionKey::set_value_hash` (FileEncryptionKey.cpp:63-65).
+    pub fn set_value_hash(&mut self, value_hash: &[u8]) {
+        self.key_iv.resize(32 + value_hash.len(), 0);
+        self.key_iv[32..].copy_from_slice(value_hash);
+    }
+
+    /// `FileEncryptionKey::value_hash` (FileEncryptionKey.cpp:67-70).
+    pub fn value_hash(&self) -> &[u8] {
+        assert!(self.has_value_hash());
+        &self.key_iv[32..]
     }
 
     /// `FileEncryptionKey::calc_fingerprint` (FileEncryptionKey.cpp:85-90).
@@ -5252,6 +5444,13 @@ pub fn is_remotely_generated_file(conversion: &str) -> bool {
 /// `td::base64url_encode` over the id binaries (ASCII output).
 fn base64url(data: &[u8]) -> String {
     String::from_utf8(tdmtproto::utils::base64url_encode(data)).expect("base64url is ascii")
+}
+
+/// `td::base64_encode` — the standard padded alphabet; the file-reference
+/// error suffix encoding (FileDownloader.cpp:199-201).
+fn base64_encode(data: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(data)
 }
 
 /// `get_file_base_dir`/`get_files_base_dir` (FileLoaderUtils.cpp:238-249)
@@ -9388,6 +9587,1132 @@ impl ResourceManagerWorker for FileHashUploader {
     }
 }
 
+// ==== FileDownloader (M.12.4 + M.12.5) ====
+
+/// `FileDownloader::QueryType` (FileDownloader.h:56).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DownloadQueryType {
+    Default,
+    Cdn,
+    ReuploadCdn,
+    /// The COMMON_QUERY_KEY check queries
+    /// (`upload.getFileHashes`, FileDownloader.h:98).
+    Check,
+}
+
+/// The wire query `FileDownloader::start_part`/`check_loop` build
+/// (FileDownloader.cpp:133-192, 376).
+#[derive(Clone, Debug, PartialEq)]
+pub enum DownloadQuery {
+    /// `upload.getFile`
+    GetFile {
+        location: telegram_api::InputFileLocation,
+        offset: i64,
+        limit: i32,
+        cdn_supported: bool,
+    },
+    /// `upload.getWebFile`
+    GetWebFile {
+        location: telegram_api::InputWebFileLocation,
+        offset: i32,
+        limit: i32,
+    },
+    /// `upload.getCdnFile`
+    GetCdnFile {
+        file_token: Vec<u8>,
+        offset: i64,
+        limit: i32,
+    },
+    /// `upload.reuploadCdnFile`
+    ReuploadCdnFile {
+        file_token: Vec<u8>,
+        request_token: Vec<u8>,
+    },
+    /// `upload.getFileHashes` — the check query
+    GetFileHashes {
+        location: telegram_api::InputFileLocation,
+        offset: i64,
+    },
+}
+
+/// The fetched response of a [`DownloadQuery`] — the C++
+/// `fetch_result<...>` arms of `should_restart_part`/`process_part`/
+/// `process_check_query`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DownloadResult {
+    /// `upload.file` / `upload.webFile` bytes
+    Bytes(Vec<u8>),
+    /// `upload.fileCdnRedirect`
+    CdnRedirect {
+        dc_id: i32,
+        file_token: Vec<u8>,
+        encryption_key: Vec<u8>,
+        encryption_iv: Vec<u8>,
+        file_hashes: Vec<telegram_api::FileHash>,
+    },
+    /// `upload.cdnFile`
+    CdnBytes(Vec<u8>),
+    /// `upload.cdnFileReuploadNeeded`
+    ReuploadNeeded { request_token: Vec<u8> },
+    /// `upload.getFileHashes` — `Vector<fileHash>`
+    Hashes(Vec<telegram_api::FileHash>),
+}
+
+/// The connection-level descriptor the C++ bakes into the NetQuery at
+/// creation (`G()->net_query_creator().create(..., dc_id, net_query_type,
+/// auth_flag)`, FileDownloader.cpp:158-186, 378): which DC serves the
+/// query, whether it carries the auth, and which connection class it
+/// joins (`Download` vs `DownloadSmall`, FileDownloader.cpp:148). The
+/// connection pools, reuse and stealing themselves are Session
+/// properties and stay on the net line (M.12.10); the seam records the
+/// per-query acquisition decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DownloadNetMeta {
+    pub dc_id: DcId,
+    pub auth_flag_on: bool,
+    pub small: bool,
+}
+
+/// The net seam of the collapsed [`FileDownloader`]: the C++
+/// `start_part` + `dispatch_with_callback` + `on_result` trio folded into
+/// one call per query. Downloads are sequential here; the in-flight
+/// pipelining of the C++ actor loop (and the DC-connection reuse/stealing
+/// behind it) is a session property and returns with the live scheduler
+/// (M.12.10). Quick acks: the C++ download queries never set
+/// `quick_ack_promise_` (only the message-send path does,
+/// MessagesManager.cpp:1239-1243; Session.cpp:795 fills it) — the
+/// transport half of that machinery is a net-line property and the
+/// downloader's half is empty, so the seam carries nothing for it.
+pub trait FileDownloaderNet {
+    /// Sends the query and fetches its result. `Err` with the canceled
+    /// code (203, `NetQuery::Error::Canceled`, NetQuery.h:57) restarts
+    /// the part; the CDN control errors (`FILE_TOKEN_INVALID`,
+    /// `REQUEST_TOKEN_INVALID`) are inspected by the downloader itself,
+    /// everything else fails the download.
+    fn download(
+        &mut self,
+        query: DownloadQuery,
+        query_type: DownloadQueryType,
+        meta: DownloadNetMeta,
+    ) -> Result<DownloadResult, Status>;
+
+    /// `open_temp_file(file_type)` (FileLoaderUtils.cpp) — the real
+    /// files-dir layout lands with the orchestration (M.12.7); tests fake
+    /// it with a tempdir.
+    fn open_temp_file(&mut self, file_type: FileType) -> Result<(File, String), Status>;
+
+    /// `FileFd::open(path, Write | Read)` for a known partial path. The
+    /// `write` flag is false on the only_check paths, which must not
+    /// modify the found local copy (FileDownloader.cpp:494, 514, 423).
+    fn open_partial_file(&mut self, path: &str, write: bool) -> Result<File, Status>;
+
+    /// `search_file(file_type, name, size)` (FileLoaderUtils.cpp) — the
+    /// need_search_file seam; the default never finds anything.
+    fn search_file(
+        &mut self,
+        _file_type: FileType,
+        _name: &str,
+        _size: i64,
+    ) -> Result<String, Status> {
+        Err(Status::error_message("File not found"))
+    }
+
+    /// `create_from_temp(file_type, path, name)` (FileLoaderUtils.cpp).
+    fn create_from_temp(
+        &mut self,
+        file_type: FileType,
+        path: &str,
+        name: &str,
+    ) -> Result<String, Status>;
+
+    /// `secure_storage::decrypt_file(secret, value_hash, from, to)` + the
+    /// resulting stat size (FileDownloader.cpp:579-588) — the Wave-3
+    /// secure-storage seam.
+    fn decrypt_secure_file(
+        &mut self,
+        _secret: &[u8],
+        _value_hash: &[u8],
+        _path: &str,
+    ) -> Result<(String, i64), Status> {
+        Err(Status::error_message(
+            "Secure file decryption is not available yet",
+        ))
+    }
+
+    /// `G()->get_webfile_dc_id()` (Global.cpp:254-264) — the
+    /// `webfile_dc_id` config option (ConfigManager.cpp:1218) with the
+    /// test-2/production-4 fallback. The option lands with the config
+    /// seam; the default answers the invalid DcId.
+    fn webfile_dc_id(&mut self) -> DcId {
+        DcId::default()
+    }
+
+    /// The dialog-plane peer resolver behind the dialog-photo download
+    /// arms (`G()->dialog_manager()->get_input_peer`, FileLocation.h:419)
+    /// — `None` when the peer is not in the cache. The real resolver
+    /// lands with the orchestration wiring (M.12.7).
+    fn resolve_input_peer(&mut self, dialog_id: DialogId) -> Option<telegram_api::InputPeer> {
+        let _ = dialog_id;
+        None
+    }
+}
+
+/// `FileDownloader::Callback` (FileDownloader.h:35-45).
+pub trait FileDownloaderCallback {
+    fn on_start_download(&mut self);
+    fn on_partial_download(&mut self, partial_local: PartialLocalFileLocation, size: i64);
+    fn on_ok(&mut self, full_local: FullLocalFileLocation, size: i64, is_new: bool);
+    fn on_error(&mut self, status: Status);
+}
+
+/// `FileDownloader::HashInfo` (FileDownloader.h:87-94); ordering is by
+/// offset alone, like the C++ `operator<`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HashInfo {
+    offset: i64,
+    size: i64,
+    hash: Vec<u8>,
+}
+
+impl PartialOrd for HashInfo {
+    fn partial_cmp(&self, other: &HashInfo) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for HashInfo {
+    fn cmp(&self, other: &HashInfo) -> std::cmp::Ordering {
+        self.offset.cmp(&other.offset)
+    }
+}
+
+/// `td::FileDownloader` (FileDownloader.h) collapsed per the
+/// single-scheduler convention: the actor loop becomes a synchronous
+/// `loop_` over the [`FileDownloaderNet`] seam, the `part_map_` of
+/// in-flight queries disappears with the pipeline (a part is sent and its
+/// result processed inside one `do_loop` pass), and the ResourceManager
+/// link is the [`ResourceManagerWorker`] trait. Secret-key downloads are
+/// inherently ordered (the IGE chain), which the sequential loop provides
+/// by construction — the C++ `ordered_flag_`/`OrderedEventsProcessor`
+/// pair has nothing left to reorder.
+pub struct FileDownloader {
+    remote: FullRemoteFileLocation,
+    local: LocalFileLocation,
+    size: i64,
+    name: String,
+    encryption_key: FileEncryptionKey,
+    callback: Box<dyn FileDownloaderCallback>,
+    net: Box<dyn FileDownloaderNet>,
+
+    only_check: bool,
+
+    path: String,
+    fd: Option<File>,
+
+    next_part: i32,
+    next_part_stop: bool,
+    is_small: bool,
+    need_search_file: bool,
+    keep_fd: bool,
+    offset: i64,
+    limit: i64,
+
+    use_cdn: bool,
+    cdn_dc_id: DcId,
+    cdn_encryption_key: Vec<u8>,
+    cdn_encryption_iv: Vec<u8>,
+    cdn_file_token: Vec<u8>,
+    cdn_file_token_generation: i32,
+    cdn_part_reupload_token: BTreeMap<i32, Vec<u8>>,
+    cdn_part_file_token_generation: BTreeMap<i32, i32>,
+
+    need_check: bool,
+    hash_info: BTreeSet<HashInfo>,
+    has_hash_query: bool,
+
+    stop_flag: bool,
+    resource_manager: Option<ResourceManagerHandle>,
+    resource_state: ResourceState,
+    parts_manager: PartsManager,
+
+    debug_total_parts: u32,
+    debug_bad_part_order: u32,
+    debug_bad_parts: Vec<i32>,
+}
+
+impl FileDownloader {
+    /// The `FileDownloader` constructor (FileDownloader.cpp:35-52).
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        remote: FullRemoteFileLocation,
+        local: LocalFileLocation,
+        size: i64,
+        name: String,
+        encryption_key: FileEncryptionKey,
+        is_small: bool,
+        need_search_file: bool,
+        offset: i64,
+        limit: i64,
+        callback: Box<dyn FileDownloaderCallback>,
+        net: Box<dyn FileDownloaderNet>,
+    ) -> FileDownloader {
+        debug_assert!(
+            encryption_key.empty() || offset == 0,
+            "CHECK(offset_ == 0) for a keyed download"
+        );
+        FileDownloader {
+            remote,
+            local,
+            size,
+            name,
+            encryption_key,
+            callback,
+            net,
+            only_check: false,
+            path: String::new(),
+            fd: None,
+            next_part: 0,
+            next_part_stop: false,
+            is_small,
+            need_search_file,
+            keep_fd: false,
+            offset,
+            limit,
+            use_cdn: false,
+            cdn_dc_id: DcId::default(),
+            cdn_encryption_key: Vec::new(),
+            cdn_encryption_iv: Vec::new(),
+            cdn_file_token: Vec::new(),
+            cdn_file_token_generation: 0,
+            cdn_part_reupload_token: BTreeMap::new(),
+            cdn_part_file_token_generation: BTreeMap::new(),
+            need_check: false,
+            hash_info: BTreeSet::new(),
+            has_hash_query: false,
+            stop_flag: false,
+            resource_manager: None,
+            resource_state: ResourceState::default(),
+            parts_manager: PartsManager::default(),
+            debug_total_parts: 0,
+            debug_bad_part_order: 0,
+            debug_bad_parts: Vec::new(),
+        }
+    }
+
+    /// `FileDownloader::start_up` (FileDownloader.cpp:479-556).
+    pub fn start(&mut self) {
+        if matches!(self.local, LocalFileLocation::Full(_)) {
+            return self.on_error(Status::error_message("File is already downloaded"));
+        }
+        if self.encryption_key.is_secure() && !self.encryption_key.has_value_hash() {
+            tdutils::log_error!("Can't download Secure file with unknown value_hash");
+        }
+        if self.remote.file_type == FileType::SecureEncrypted {
+            self.size = 0;
+        }
+        let mut part_size = 0usize;
+        let mut bitmask = Bitmask::from_ones(0);
+        if let LocalFileLocation::Partial(partial) = &self.local.clone() {
+            self.path = partial.path.clone();
+            let result_fd = self.net.open_partial_file(&partial.path, true);
+            // TODO: check timestamps..
+            if let Ok(fd) = result_fd {
+                if (!self.encryption_key.is_secret() || partial.iv.len() == 32)
+                    && partial.part_size >= 0
+                    && partial.part_size <= (1 << 20)
+                    && (partial.part_size & (partial.part_size - 1)) == 0
+                {
+                    bitmask = Bitmask::from_decode(&partial.ready_bitmask);
+                    if self.encryption_key.is_secret() {
+                        let mut iv = [0u8; 32];
+                        iv.copy_from_slice(partial.iv.as_bytes());
+                        self.encryption_key.set_iv(iv);
+                        self.next_part = bitmask.get_ready_parts(0) as i32;
+                    }
+                    self.fd = Some(fd);
+                    part_size = partial.part_size as usize;
+                } else {
+                    tdutils::log_error!("Have invalid partial local location {partial}");
+                }
+            }
+        }
+        if self.need_search_file
+            && self.fd.is_none()
+            && self.size > 0
+            && self.encryption_key.empty()
+            && !self.remote.is_web()
+            && let Ok(r_path) = self
+                .net
+                .search_file(self.remote.file_type, &self.name, self.size)
+            && let Ok(fd) = self.net.open_partial_file(&r_path, false)
+        {
+            self.path = r_path;
+            self.fd = Some(fd);
+            self.need_check = true;
+            self.only_check = true;
+            part_size = 128 * (1 << 10);
+            bitmask = Bitmask::from_ones((self.size + part_size as i64 - 1) / part_size as i64);
+        }
+        self.try_release_fd();
+
+        let ready_parts = bitmask.as_vector();
+        let init_result = self.parts_manager.init(
+            self.size,
+            self.size,
+            true,
+            part_size,
+            &ready_parts,
+            false,
+            false,
+        );
+        if let tdutils::status::Result::Err(status) = init_result {
+            return self.on_error(status);
+        }
+        if self.only_check {
+            self.parts_manager.set_checked_prefix_size(0);
+        }
+        self.parts_manager
+            .set_streaming_offset(self.offset, self.limit);
+        let file_type = get_main_file_type(self.remote.file_type);
+        if !self.is_small
+            && (matches!(
+                file_type,
+                FileType::VideoNote
+                    | FileType::Document
+                    | FileType::VoiceNote
+                    | FileType::Audio
+                    | FileType::Video
+                    | FileType::Animation
+                    | FileType::VideoStory
+                    | FileType::SelfDestructingVideo
+                    | FileType::SelfDestructingVideoNote
+                    | FileType::SelfDestructingVoiceNote
+            ) || (file_type == FileType::Encrypted && self.size > (1 << 20)))
+        {
+            // the C++ routes these through a DelayDispatcher (3ms inter-part
+            // delay, ramping down to 3ms from 50ms); the sequential loop has
+            // no queue to pace, the delay returns with the live scheduler
+        }
+        self.resource_state
+            .set_unit_size(self.parts_manager.get_part_size());
+        self.update_estimated_limit();
+        self.on_progress();
+        self.loop_();
+    }
+
+    /// `FileDownloader::on_error` (FileDownloader.cpp:54-58).
+    fn on_error(&mut self, status: Status) {
+        self.fd = None;
+        self.stop_flag = true;
+        self.callback.on_error(status);
+    }
+
+    /// `FileDownloader::loop` (FileDownloader.cpp:558-569); the `-1`
+    /// "just stop" code is unreachable in the collapse.
+    pub fn loop_(&mut self) {
+        if self.stop_flag {
+            return;
+        }
+        if let Err(status) = self.do_loop() {
+            self.on_error(status);
+        }
+    }
+
+    /// `FileDownloader::do_loop` (FileDownloader.cpp:571-631).
+    fn do_loop(&mut self) -> Result<(), Status> {
+        let checked_prefix_size = self.parts_manager.get_checked_prefix_size();
+        let ready_prefix_size = self.parts_manager.get_unchecked_ready_prefix_size();
+        let is_ready = self.parts_manager.unchecked_ready();
+        self.check_loop(checked_prefix_size, ready_prefix_size, is_ready)?;
+
+        if self.parts_manager.may_finish() {
+            if let tdutils::status::Result::Err(status) = self.parts_manager.finish() {
+                return Err(status);
+            }
+            self.fd = None;
+            let mut size = self.parts_manager.get_size();
+            if self.encryption_key.is_secure() {
+                let (tmp_path, path_stat_size) = self.net.decrypt_secure_file(
+                    self.encryption_key.secret(),
+                    self.encryption_key.value_hash(),
+                    &self.path,
+                )?;
+                let _ = std::fs::remove_file(&self.path);
+                self.path = tmp_path;
+                size = path_stat_size;
+            }
+            let path = if self.only_check {
+                self.path.clone()
+            } else {
+                self.net
+                    .create_from_temp(self.remote.file_type, &self.path, &self.name)?
+            };
+            self.callback.on_ok(
+                FullLocalFileLocation {
+                    file_type: self.remote.file_type,
+                    path,
+                    mtime_nsec: 0,
+                },
+                size,
+                !self.only_check,
+            );
+
+            self.stop_flag = true;
+            return Ok(());
+        }
+
+        loop {
+            if self.resource_state.unused() < self.parts_manager.get_part_size() as i64 {
+                break;
+            }
+            let part = match self.parts_manager.start_part() {
+                tdutils::status::Result::Ok(part) => part,
+                tdutils::status::Result::Err(status) => return Err(status),
+            };
+            if part.size == 0 {
+                break;
+            }
+            self.resource_state.start_use(part.size as i64);
+
+            let should_restart = self.run_part(part)?;
+            if should_restart {
+                self.resource_state.stop_use(part.size as i64);
+                self.parts_manager.on_part_failed(part.id);
+            }
+            self.update_estimated_limit();
+            if self.stop_flag {
+                return Ok(());
+            }
+            if self.parts_manager.may_finish() {
+                self.loop_();
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// The `start_part` → `on_result` → `should_restart_part` →
+    /// `process_part` → `try_on_part_query` round of one part
+    /// (FileDownloader.cpp:133-192, 60-131, 207-285, 726-740) folded into
+    /// one send-and-wait. Returns whether the part must restart.
+    fn run_part(&mut self, part: Part) -> Result<bool, Status> {
+        let mut part = part;
+        if self.encryption_key.is_secret() {
+            // fix for last part
+            part.size = (part.size + 15) & !15;
+        }
+        let size = self.parts_manager.get_part_size();
+        debug_assert!(part.size <= size, "part bigger than the part size");
+
+        self.callback.on_start_download();
+
+        let query_type = if !self.use_cdn {
+            DownloadQueryType::Default
+        } else if self.cdn_part_reupload_token.contains_key(&part.id) {
+            DownloadQueryType::ReuploadCdn
+        } else {
+            DownloadQueryType::Cdn
+        };
+
+        // `should_restart_part`'s error short-circuits
+        // (FileDownloader.cpp:63-72) plus `on_result`'s Canceled restart
+        // (FileDownloader.cpp:684-687)
+        let send_result = self.send_part_query(part, size, query_type);
+        let net_result = match send_result {
+            Ok(result) => result,
+            Err(status) => {
+                if status.message() == "FILE_TOKEN_INVALID" {
+                    self.use_cdn = false;
+                    return Ok(true);
+                }
+                if status.message() == "REQUEST_TOKEN_INVALID" {
+                    return Ok(true);
+                }
+                if status.code() == NET_QUERY_CANCELED {
+                    return Ok(true);
+                }
+                // the generic error fails the download through
+                // `process_part`'s `check_net_query`
+                // (FileDownloader.cpp:208)
+                return Err(self.check_net_query(status));
+            }
+        };
+
+        match (&query_type, net_result) {
+            // the CdnRedirect arm of should_restart_part
+            // (FileDownloader.cpp:76-100)
+            (
+                DownloadQueryType::Default,
+                DownloadResult::CdnRedirect {
+                    dc_id,
+                    file_token,
+                    encryption_key,
+                    encryption_iv,
+                    file_hashes,
+                },
+            ) => {
+                if self.cdn_file_token == *file_token {
+                    return Ok(true);
+                }
+                self.use_cdn = true;
+                self.need_check = true;
+                self.cdn_file_token_generation += 1;
+                self.cdn_file_token = file_token.clone();
+                self.cdn_dc_id = DcId::external(dc_id);
+                self.cdn_encryption_key = encryption_key.clone();
+                self.cdn_encryption_iv = encryption_iv.clone();
+                self.add_hash_info(&file_hashes);
+                if self.cdn_encryption_iv.len() != 16 || self.cdn_encryption_key.len() != 32 {
+                    return Err(Status::error_message("Wrong ctr key or iv size"));
+                }
+                Ok(true)
+            }
+            // the ReuploadCDN arm (FileDownloader.cpp:103-108)
+            (DownloadQueryType::ReuploadCdn, DownloadResult::Hashes(file_hashes)) => {
+                self.add_hash_info(&file_hashes);
+                Ok(true)
+            }
+            // the CDN arm (FileDownloader.cpp:110-125)
+            (DownloadQueryType::Cdn, DownloadResult::ReuploadNeeded { request_token }) => {
+                self.cdn_part_reupload_token
+                    .insert(part.id, request_token.clone());
+                Ok(true)
+            }
+            (DownloadQueryType::Cdn, DownloadResult::CdnBytes(bytes)) => {
+                let generation = self
+                    .cdn_part_file_token_generation
+                    .get(&part.id)
+                    .copied()
+                    .unwrap_or(0);
+                if generation != self.cdn_file_token_generation {
+                    // "Receive part with an old file_token"
+                    return Ok(true);
+                }
+                let written = self.process_part_bytes(part, bytes, true)?;
+                self.finish_part(part, written)?;
+                Ok(false)
+            }
+            (DownloadQueryType::Default, DownloadResult::Bytes(bytes)) => {
+                let written = self.process_part_bytes(part, bytes, false)?;
+                self.finish_part(part, written)?;
+                Ok(false)
+            }
+            _ => Err(Status::error_message(
+                "Unexpected download result for the query type",
+            )),
+        }
+    }
+
+    /// `FileDownloader::start_part` (FileDownloader.cpp:133-192), with the
+    /// per-query connection descriptor of [`DownloadNetMeta`].
+    fn send_part_query(
+        &mut self,
+        part: Part,
+        size: usize,
+        query_type: DownloadQueryType,
+    ) -> Result<DownloadResult, Status> {
+        let small = self.is_small;
+        if !self.use_cdn {
+            // CDN is supported, unless we use domains instead of IPs from
+            // a browser or stream a middle window
+            // (FileDownloader.cpp:151-157)
+            let cdn_supported = self.parts_manager.get_streaming_offset() == 0;
+            let dc_id = if self.remote.is_web() {
+                self.net.webfile_dc_id()
+            } else {
+                self.remote.get_dc_id()
+            };
+            let meta = DownloadNetMeta {
+                dc_id,
+                auth_flag_on: true,
+                small,
+            };
+            if self.remote.is_web() {
+                let location = self
+                    .remote
+                    .as_input_web_file_location()
+                    .map_err(Status::error_message)?;
+                let query = DownloadQuery::GetWebFile {
+                    location,
+                    offset: part.offset as i32,
+                    limit: size as i32,
+                };
+                return self.net.download(query, query_type, meta);
+            }
+            // the dialog-photo arms resolve the peer through the net
+            // seam before the location is built (a mutable borrow may
+            // not cross the immutable location borrow)
+            let peer = self
+                .dialog_photo_id()
+                .and_then(|id| self.net.resolve_input_peer(id));
+            let location = self
+                .remote
+                .as_input_file_location(&|_| peer.clone())
+                .map_err(|e| Status::error_message(&e))?;
+            let query = DownloadQuery::GetFile {
+                location,
+                offset: part.offset,
+                limit: size as i32,
+                cdn_supported,
+            };
+            return self.net.download(query, query_type, meta);
+        }
+        if self.remote.is_web() {
+            return Err(Status::error_message("Can't download web file from CDN"));
+        }
+        // the C++ find/erase pair (FileDownloader.cpp:175-188): a parked
+        // reupload token is consumed once
+        let reupload_request_token = self.cdn_part_reupload_token.remove(&part.id);
+        let (query, meta) = if let Some(request_token) = reupload_request_token {
+            (
+                DownloadQuery::ReuploadCdnFile {
+                    file_token: self.cdn_file_token.clone(),
+                    request_token,
+                },
+                DownloadNetMeta {
+                    dc_id: self.remote.get_dc_id(),
+                    auth_flag_on: true,
+                    small,
+                },
+            )
+        } else {
+            self.cdn_part_file_token_generation
+                .insert(part.id, self.cdn_file_token_generation);
+            (
+                DownloadQuery::GetCdnFile {
+                    file_token: self.cdn_file_token.clone(),
+                    offset: part.offset,
+                    limit: size as i32,
+                },
+                DownloadNetMeta {
+                    dc_id: self.cdn_dc_id,
+                    // getCdnFile rides the CDN DC without the auth
+                    // (FileDownloader.cpp:180-181)
+                    auth_flag_on: false,
+                    small,
+                },
+            )
+        };
+        self.net.download(query, query_type, meta)
+    }
+
+    /// `FileDownloader::check_net_query` (FileDownloader.cpp:194-205) —
+    /// file-reference errors (`is_file_reference_error`,
+    /// FileReferenceManager.cpp:60-62) get the base64 reference appended
+    /// so the FileLoaderManager repair path can recognize them.
+    fn check_net_query(&self, status: Status) -> Status {
+        if status.code() == 400 && status.message().starts_with("FILE_REFERENCE_") {
+            return Status::error(
+                status.code(),
+                &format!(
+                    "{}#BASE64{}",
+                    status.message(),
+                    base64_encode(self.remote.file_reference.as_bytes())
+                ),
+            );
+        }
+        status
+    }
+
+    /// `FileDownloader::process_part` (FileDownloader.cpp:207-285) — the
+    /// decrypt-and-store half, after the query type decided it is a real
+    /// payload. Returns the number of bytes written.
+    fn process_part_bytes(
+        &mut self,
+        part: Part,
+        mut bytes: Vec<u8>,
+        need_cdn_decrypt: bool,
+    ) -> Result<usize, Status> {
+        let mut padded_size = part.size;
+        if self.encryption_key.is_secret() {
+            padded_size = (part.size + 15) & !15;
+        }
+        if bytes.len() as i64 > padded_size as i64 {
+            return Err(Status::error_message("Part size is more than requested"));
+        }
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+
+        // Encryption
+        if need_cdn_decrypt {
+            debug_assert!(part.offset % 16 == 0, "CDN part offset is not 16-aligned");
+            let offset = (part.offset / 16) as u32;
+            let offset = ((offset & 0xff) << 24)
+                | ((offset & 0xff00) << 8)
+                | ((offset & 0xff0000) >> 8)
+                | ((offset & 0xff000000) >> 24);
+
+            let mut ctr_state = tdutils::crypto::AesCtrState::new();
+            let mut iv = self.cdn_encryption_iv.clone();
+            iv[12..16].copy_from_slice(&offset.to_le_bytes());
+            ctr_state.init(&self.cdn_encryption_key, &iv);
+            let plain = bytes.clone();
+            ctr_state.decrypt(&plain, &mut bytes);
+        }
+        if self.encryption_key.is_secret() {
+            if self.next_part != part.id {
+                return Err(Status::error(
+                    500,
+                    "LOG_CHECK(next_part_ == part.id) failed",
+                ));
+            }
+            debug_assert!(!self.next_part_stop, "CHECK(!next_part_stop_)");
+            self.next_part += 1;
+            if !part.size.is_multiple_of(16) {
+                self.next_part_stop = true;
+            }
+            let mut iv = self.encryption_key.iv_slice().to_vec();
+            tdutils::crypto::aes_ige_decrypt_in_place(
+                self.encryption_key.key_slice(),
+                &mut iv,
+                &mut bytes,
+            );
+            self.encryption_key.set_iv(iv.try_into().expect("iv size"));
+        }
+
+        let written_slice_len = (bytes.len() as i64).min(part.size as i64) as usize;
+        self.acquire_fd()?;
+        let fd = self.fd.as_mut().expect("acquired fd");
+        use std::os::unix::fs::FileExt as _;
+        let written = fd
+            .write_at(&bytes[..written_slice_len], part.offset as u64)
+            .map_err(|e| Status::error_message(format!("Failed to write: {e}").as_str()))?;
+        // may write less than part.size, when size of downloadable file is
+        // unknown
+        if written != written_slice_len {
+            return Err(Status::error_message(
+                "Failed to save file part to the file",
+            ));
+        }
+        Ok(written)
+    }
+
+    /// `FileDownloader::try_on_part_query`'s tail
+    /// (FileDownloader.cpp:729-738).
+    fn finish_part(&mut self, part: Part, size: usize) -> Result<(), Status> {
+        self.resource_state.stop_use(part.size as i64);
+        let old_ready_prefix_count = self.parts_manager.get_unchecked_ready_prefix_count();
+        if let tdutils::status::Result::Err(status) =
+            self.parts_manager.on_part_ok(part.id, part.size, size)
+        {
+            return Err(status);
+        }
+        let new_ready_prefix_count = self.parts_manager.get_unchecked_ready_prefix_count();
+        self.debug_total_parts += 1;
+        if old_ready_prefix_count == new_ready_prefix_count {
+            self.debug_bad_parts.push(part.id);
+            self.debug_bad_part_order += 1;
+        }
+        self.on_progress();
+        Ok(())
+    }
+
+    /// `FileDownloader::on_progress` (FileDownloader.cpp:287-316).
+    fn on_progress(&mut self) {
+        if self.parts_manager.ready() {
+            // do not send partial location. will lead to wrong local_size
+            return;
+        }
+        let ready_size = self.parts_manager.get_ready_size();
+        if ready_size == 0 || self.path.is_empty() {
+            return;
+        }
+        let part_size = self.parts_manager.get_part_size() as i32;
+        let size = self.parts_manager.get_size_or_zero();
+        if self.encryption_key.empty() || self.encryption_key.is_secure() {
+            let partial = PartialLocalFileLocation {
+                file_type: self.remote.file_type,
+                part_size: part_size as i64,
+                path: self.path.clone(),
+                iv: String::new(),
+                ready_bitmask: self.parts_manager.get_bitmask(),
+                ready_size,
+            };
+            self.callback.on_partial_download(partial, size);
+        } else if self.encryption_key.is_secret() {
+            let ready_part_count = self.parts_manager.get_ready_prefix_count();
+            if ready_part_count != self.next_part {
+                tdutils::log_fatal!(
+                    "ready_part_count = {ready_part_count}, next_part = {}",
+                    self.next_part
+                );
+            }
+            let iv = self.encryption_key.iv_slice().to_vec();
+            let partial = PartialLocalFileLocation {
+                file_type: self.remote.file_type,
+                part_size: part_size as i64,
+                path: self.path.clone(),
+                iv: String::from_utf8(iv).unwrap_or_default(),
+                ready_bitmask: self.parts_manager.get_bitmask(),
+                ready_size,
+            };
+            self.callback.on_partial_download(partial, size);
+        }
+    }
+
+    /// `FileDownloader::process_check_query` (FileDownloader.cpp:318-324).
+    fn process_check_query(&mut self, hashes: Vec<telegram_api::FileHash>) {
+        self.has_hash_query = false;
+        self.add_hash_info(&hashes);
+    }
+
+    /// `FileDownloader::check_loop` (FileDownloader.cpp:326-399); the
+    /// C++ SCOPE_EXIT (FileDownloader.cpp:330-332) releases the fd on
+    /// every exit.
+    fn check_loop(
+        &mut self,
+        checked_prefix_size: i64,
+        ready_prefix_size: i64,
+        is_ready: bool,
+    ) -> Result<(), Status> {
+        let result = self.check_loop_impl(checked_prefix_size, ready_prefix_size, is_ready);
+        self.try_release_fd();
+        result
+    }
+
+    /// The `check_loop` body.
+    fn check_loop_impl(
+        &mut self,
+        mut checked_prefix_size: i64,
+        ready_prefix_size: i64,
+        is_ready: bool,
+    ) -> Result<(), Status> {
+        if !self.need_check {
+            return Ok(());
+        }
+        let mut is_changed = false;
+        let mut sent_hashes_query = false;
+        while checked_prefix_size < ready_prefix_size {
+            let mut search_info = HashInfo {
+                offset: checked_prefix_size,
+                size: 0,
+                hash: Vec::new(),
+            };
+            search_info.offset = checked_prefix_size;
+            let covering = self
+                .hash_info
+                .iter()
+                .rev()
+                .find(|info| {
+                    info.offset <= checked_prefix_size
+                        && info.offset + info.size > checked_prefix_size
+                })
+                .cloned();
+            let Some(cover) = covering else {
+                // the C++ upper_bound/begin dance walks back to the last
+                // hash at or before the offset; no coverage → query
+                if !self.has_hash_query && !sent_hashes_query {
+                    sent_hashes_query = true;
+                    self.has_hash_query = true;
+                    let peer = self
+                        .dialog_photo_id()
+                        .and_then(|id| self.net.resolve_input_peer(id));
+                    let location = self
+                        .remote
+                        .as_input_file_location(&|_| peer.clone())
+                        .map_err(|e| Status::error_message(&e))?;
+                    let query = DownloadQuery::GetFileHashes {
+                        location,
+                        offset: checked_prefix_size,
+                    };
+                    // the check query rides the default auth to the
+                    // remote DC (FileDownloader.cpp:378)
+                    let meta = DownloadNetMeta {
+                        dc_id: self.remote.get_dc_id(),
+                        auth_flag_on: true,
+                        small: self.is_small,
+                    };
+                    let hashes = match self.net.download(query, DownloadQueryType::Check, meta) {
+                        Result::Ok(DownloadResult::Hashes(hashes)) => hashes,
+                        Result::Ok(_) => {
+                            return Err(Status::error_message("Unexpected check query result"));
+                        }
+                        Result::Err(status) => return Err(self.check_net_query(status)),
+                    };
+                    self.process_check_query(hashes);
+                    is_changed = true; // the C++ on_progress fires after the
+                    // async result lands; fire it here
+                    continue;
+                }
+                // Should fail?
+                break;
+            };
+            let begin_offset = cover.offset;
+            let mut end_offset = cover.offset + cover.size;
+            if ready_prefix_size < end_offset {
+                if !is_ready {
+                    break;
+                }
+                end_offset = ready_prefix_size;
+            }
+            let slice_size = (end_offset - begin_offset) as usize;
+            let mut slice = vec![0u8; slice_size];
+            self.acquire_fd()?;
+            let read_size = {
+                let fd = self.fd.as_mut().expect("acquired fd");
+                pread_at(fd, &mut slice, begin_offset as u64)?
+            };
+            if slice_size != read_size {
+                return Err(Status::error_message("Failed to read file to check hash"));
+            }
+            let hash = tdutils::crypto::sha256(&slice);
+
+            if hash.as_slice() != cover.hash.as_slice() {
+                if self.only_check {
+                    return Err(Status::error_message("FILE_DOWNLOAD_RESTART"));
+                }
+                return Err(Status::error_message("Hash mismatch"));
+            }
+
+            checked_prefix_size = end_offset;
+            is_changed = true;
+        }
+
+        if is_changed {
+            self.on_progress();
+        }
+        if self.need_check {
+            self.parts_manager.set_need_check();
+            self.parts_manager
+                .set_checked_prefix_size(checked_prefix_size);
+        }
+
+        Ok(())
+    }
+
+    /// `FileDownloader::add_hash_info` (FileDownloader.cpp:401-410).
+    fn add_hash_info(&mut self, hashes: &[telegram_api::FileHash]) {
+        for hash in hashes {
+            self.hash_info.insert(HashInfo {
+                offset: hash.offset,
+                size: hash.limit as i64,
+                hash: hash.hash.clone(),
+            });
+        }
+    }
+
+    /// The `DialogId` a dialog-photo source carries — the resolver input
+    /// of [`FileDownloaderNet::resolve_input_peer`].
+    fn dialog_photo_id(&self) -> Option<DialogId> {
+        let FullRemoteVariant::Photo(photo) = &self.remote.variant else {
+            return None;
+        };
+        match &photo.source {
+            PhotoSizeSource::DialogPhotoSmall { dialog_id, .. }
+            | PhotoSizeSource::DialogPhotoBig { dialog_id, .. }
+            | PhotoSizeSource::DialogPhotoSmallLegacy { dialog_id, .. }
+            | PhotoSizeSource::DialogPhotoBigLegacy { dialog_id, .. } => Some(*dialog_id),
+            _ => None,
+        }
+    }
+
+    /// `FileDownloader::try_release_fd` (FileDownloader.cpp:412-416).
+    fn try_release_fd(&mut self) {
+        if !self.keep_fd && self.fd.is_some() {
+            self.fd = None;
+        }
+    }
+
+    /// `FileDownloader::acquire_fd` (FileDownloader.cpp:418-427).
+    fn acquire_fd(&mut self) -> Result<(), Status> {
+        if self.fd.is_none() {
+            if self.path.is_empty() {
+                let (fd, path) = self.net.open_temp_file(self.remote.file_type)?;
+                self.fd = Some(fd);
+                self.path = path;
+            } else {
+                // the only_check fd must not modify the checked file
+                // (FileDownloader.cpp:423)
+                self.fd = Some(self.net.open_partial_file(&self.path, !self.only_check)?);
+            }
+        }
+        Ok(())
+    }
+
+    /// `FileDownloader::update_downloaded_part`
+    /// (FileDownloader.cpp:458-477) — the streaming-window updates; the
+    /// in-flight cancellation loop of the C++ has nothing to cancel in the
+    /// sequential collapse.
+    pub fn update_downloaded_part(&mut self, offset: i64, limit: i64, max_resource_limit: i64) {
+        if self.parts_manager.get_streaming_offset() != offset {
+            let begin_part_id = self.parts_manager.set_streaming_offset(offset, limit);
+            let new_end_part_id = if limit <= 0 {
+                self.parts_manager.get_part_count()
+            } else {
+                ((offset + limit - 1) / self.parts_manager.get_part_size() as i64) as i32 + 1
+            };
+            let max_parts = (max_resource_limit / self.parts_manager.get_part_size() as i64) as i32;
+            let end_part_id = begin_part_id + max_parts.min(new_end_part_id - begin_part_id);
+            let _ = end_part_id;
+        } else {
+            self.parts_manager.set_streaming_limit(limit);
+        }
+        self.update_estimated_limit();
+        self.loop_();
+    }
+
+    /// `FileDownloader::update_estimated_limit`
+    /// (FileDownloader.cpp:643-655).
+    fn update_estimated_limit(&mut self) {
+        if self.stop_flag {
+            return;
+        }
+        let estimated_extra = self.parts_manager.get_estimated_extra();
+        self.resource_state.update_estimated_limit(estimated_extra);
+        if self.resource_manager.is_some() {
+            self.keep_fd =
+                self.resource_state.active_limit() as usize >= self.parts_manager.get_part_size();
+            self.try_release_fd();
+            if let Some(handle) = self.resource_manager.clone() {
+                handle.update_resources(&self.resource_state);
+            }
+        }
+    }
+
+    /// `FileDownloader::update_priority` (FileDownloader.cpp:434-436).
+    pub fn update_priority(&mut self, priority: i8) {
+        if let Some(handle) = &self.resource_manager {
+            handle.update_priority(priority);
+        }
+    }
+
+    pub fn stop_flag(&self) -> bool {
+        self.stop_flag
+    }
+}
+
+/// The `#[cfg(test)]` seams of [`FileDownloader`] — the pieces the C++
+/// gets from `G()` (the CDN state a redirect would have set) without a
+/// live net.
+#[cfg(test)]
+impl FileDownloader {
+    pub(crate) fn seed_cdn_for_test(&mut self, token: Vec<u8>, dc_id: i32) {
+        self.use_cdn = true;
+        self.need_check = true;
+        self.cdn_file_token = token;
+        self.cdn_dc_id = DcId::external(dc_id);
+        self.cdn_file_token_generation = 1;
+        self.cdn_encryption_key = (0u8..32).collect();
+        self.cdn_encryption_iv = (32u8..48).collect();
+    }
+}
+
+impl ResourceManagerWorker for FileDownloader {
+    /// `FileDownloader::set_resource_manager`
+    /// (FileDownloader.cpp:429-432).
+    fn set_resource_manager(&mut self, handle: ResourceManagerHandle) {
+        handle.update_resources(&self.resource_state);
+        self.resource_manager = Some(handle);
+    }
+
+    /// `FileDownloader::update_resources` (FileDownloader.cpp:438-442).
+    fn update_resources(&mut self, resource_state: ResourceState) {
+        self.resource_state.update_slave(&resource_state);
+        self.loop_();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -12431,6 +13756,18 @@ mod tests {
     }
 
     #[test]
+    fn file_encryption_key_value_hash_round_trips_the_secure_tail() {
+        // FileEncryptionKey.cpp:53-70: secret() stays the first 32 bytes
+        // and the value hash rides after them
+        let mut key = FileEncryptionKey::from_secret(&(0u8..32).collect::<Vec<u8>>());
+        assert!(!key.has_value_hash());
+        key.set_value_hash(&(64u8..96).collect::<Vec<u8>>());
+        assert!(key.has_value_hash());
+        assert_eq!(key.secret(), &(0u8..32).collect::<Vec<u8>>());
+        assert_eq!(key.value_hash(), &(64u8..96).collect::<Vec<u8>>());
+    }
+
+    #[test]
     fn file_uploader_resets_incomplete_secure_partials() {
         // a secure upload whose partial remote is incomplete restarts from
         // scratch (the constructor drops the remote)
@@ -13475,5 +14812,834 @@ mod tests {
             -1,
         );
         assert!(node.can_delete("/files/", "/secure_files/"));
+    }
+}
+
+#[cfg(test)]
+mod file_downloader_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
+    /// One scripted net answer: the expected query-type tag (`None`
+    /// answers any query) and the response to hand back.
+    type ScriptEntry = (Option<String>, Result<DownloadResult, Status>);
+
+    /// The scripted net: pairs of (expected query-type tag, response)
+    /// consumed in order; a `None` tag answers any query. All state is
+    /// shared with the test through `Rc`.
+    struct SharedNetState {
+        script: RefCell<VecDeque<ScriptEntry>>,
+        /// The recorded request sequence: (query type, wire query,
+        /// connection meta).
+        queries: RefCell<Vec<(DownloadQueryType, DownloadQuery, DownloadNetMeta)>>,
+        /// The `search_file` seam answer (the local copy the need_search_file
+        /// path finds).
+        search_hit: RefCell<Option<String>>,
+        /// The `webfile_dc_id` seam answer.
+        webfile_dc: RefCell<DcId>,
+    }
+
+    impl SharedNetState {
+        fn new(script: Vec<ScriptEntry>) -> Rc<SharedNetState> {
+            Rc::new(SharedNetState {
+                script: RefCell::new(VecDeque::from(script)),
+                queries: RefCell::new(Vec::new()),
+                search_hit: RefCell::new(None),
+                webfile_dc: RefCell::new(DcId::default()),
+            })
+        }
+    }
+
+    struct FakeDownloadNet {
+        state: Rc<SharedNetState>,
+        root: std::path::PathBuf,
+    }
+
+    impl FakeDownloadNet {
+        fn new(state: Rc<SharedNetState>) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("m12_dl_{}", tdutils::random::secure_int64()));
+            std::fs::create_dir_all(&root).unwrap();
+            FakeDownloadNet { state, root }
+        }
+
+        fn temp_path(&self, name: &str) -> String {
+            self.root.join(name).to_string_lossy().into_owned()
+        }
+    }
+
+    impl Drop for FakeDownloadNet {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    impl FileDownloaderNet for FakeDownloadNet {
+        fn download(
+            &mut self,
+            query: DownloadQuery,
+            query_type: DownloadQueryType,
+            meta: DownloadNetMeta,
+        ) -> Result<DownloadResult, Status> {
+            self.state
+                .queries
+                .borrow_mut()
+                .push((query_type, query, meta));
+            let entry = {
+                let mut guard = self.state.script.borrow_mut();
+                match guard.pop_front() {
+                    Some(entry) => entry,
+                    None => panic!(
+                        "script exhausted; got queries: {:?}",
+                        self.state
+                            .queries
+                            .borrow()
+                            .iter()
+                            .map(|(t, q, _)| (t, q.clone()))
+                            .collect::<Vec<_>>()
+                    ),
+                }
+            };
+            match entry.0 {
+                Some(tag) if tag != format!("{query_type:?}") => {
+                    panic!("expected query {tag}, got {query_type:?}")
+                }
+                _ => entry.1,
+            }
+        }
+
+        fn open_temp_file(&mut self, _file_type: FileType) -> Result<(File, String), Status> {
+            let path = self.temp_path(&format!("temp_{}.bin", self.state.queries.borrow().len()));
+            let fd = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .map_err(|e| Status::error_message(format!("{e}").as_str()))?;
+            Ok((fd, path))
+        }
+
+        fn open_partial_file(&mut self, path: &str, write: bool) -> Result<File, Status> {
+            // std rejects `create` without write access, so a read-only
+            // open (the only_check paths) never creates
+            File::options()
+                .read(true)
+                .write(write)
+                .create(write)
+                .truncate(false)
+                .open(path)
+                .map_err(|e| Status::error_message(format!("{e}").as_str()))
+        }
+
+        fn webfile_dc_id(&mut self) -> DcId {
+            *self.state.webfile_dc.borrow()
+        }
+
+        fn create_from_temp(
+            &mut self,
+            _file_type: FileType,
+            path: &str,
+            name: &str,
+        ) -> Result<String, Status> {
+            let target = self.root.join(format!("done_{name}"));
+            std::fs::rename(path, &target)
+                .map_err(|e| Status::error_message(format!("{e}").as_str()))?;
+            Ok(target.to_string_lossy().into_owned())
+        }
+
+        fn search_file(
+            &mut self,
+            _file_type: FileType,
+            _name: &str,
+            _size: i64,
+        ) -> Result<String, Status> {
+            match self.state.search_hit.borrow().clone() {
+                Some(path) => Ok(path),
+                None => Err(Status::error_message("File not found")),
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordedCallback {
+        started: usize,
+        partials: usize,
+        ok: Option<(FullLocalFileLocation, i64, bool)>,
+        error: Option<Status>,
+    }
+
+    /// The callback adapter sharing the log with the test (the C++
+    /// `unique_ptr<Callback>` becomes an owned box, so the log lives in an
+    /// `Rc`).
+    struct SharingCallback {
+        inner: Rc<RefCell<RecordedCallback>>,
+    }
+
+    impl FileDownloaderCallback for SharingCallback {
+        fn on_start_download(&mut self) {
+            self.inner.borrow_mut().started += 1;
+        }
+        fn on_partial_download(&mut self, _partial: PartialLocalFileLocation, _size: i64) {
+            self.inner.borrow_mut().partials += 1;
+        }
+        fn on_ok(&mut self, full_local: FullLocalFileLocation, size: i64, is_new: bool) {
+            self.inner.borrow_mut().ok = Some((full_local, size, is_new));
+        }
+        fn on_error(&mut self, status: Status) {
+            self.inner.borrow_mut().error = Some(status);
+        }
+    }
+
+    fn document_location() -> FullRemoteFileLocation {
+        FullRemoteFileLocation::from_document(
+            FileType::Document,
+            10,
+            11,
+            DcId::internal(2),
+            "r".to_owned(),
+        )
+    }
+
+    fn document_bytes() -> Vec<u8> {
+        (0u8..16).collect()
+    }
+
+    /// The C++ ResourceManager ping-pong, collapsed: each grant round
+    /// raises the allowance and re-enters the downloader loop.
+    fn drive_download(downloader: &mut FileDownloader, log: &Rc<RefCell<RecordedCallback>>) {
+        let mut allowance = 1i64 << 20;
+        for _ in 0..64 {
+            if downloader.stop_flag() || log.borrow().error.is_some() || log.borrow().ok.is_some() {
+                return;
+            }
+            allowance += 1 << 20;
+            ResourceManagerWorker::update_resources(downloader, grant(allowance));
+        }
+        panic!("the downloader did not settle in 64 grant rounds");
+    }
+
+    fn grant(limit: i64) -> ResourceState {
+        let mut state = ResourceState::default();
+        state.set_unit_size(1024);
+        state.update_limit(limit);
+        state
+    }
+
+    fn build_downloader(
+        state: Rc<SharedNetState>,
+        local: LocalFileLocation,
+        size: i64,
+        name: &str,
+        need_search_file: bool,
+    ) -> (FileDownloader, Rc<RefCell<RecordedCallback>>) {
+        let callback = Rc::new(RefCell::new(RecordedCallback::default()));
+        let downloader = FileDownloader::new(
+            document_location(),
+            local,
+            size,
+            name.to_owned(),
+            FileEncryptionKey::default(),
+            true,
+            need_search_file,
+            0,
+            0,
+            Box::new(SharingCallback {
+                inner: callback.clone(),
+            }),
+            Box::new(FakeDownloadNet::new(state)),
+        );
+        (downloader, callback)
+    }
+
+    #[test]
+    fn file_downloader_downloads_a_small_document() {
+        let bytes = document_bytes();
+        let script = vec![(None, Ok(DownloadResult::Bytes(bytes.clone())))];
+        let state = SharedNetState::new(script);
+        let (mut downloader, callback) = build_downloader(
+            state.clone(),
+            LocalFileLocation::Empty,
+            bytes.len() as i64,
+            "doc.bin",
+            false,
+        );
+        downloader.start();
+        drive_download(&mut downloader, &callback);
+
+        let log = callback.borrow();
+        if let Some(err) = &log.error {
+            panic!("download failed: {} ({})", err.message(), err.code());
+        }
+        let (location, size, is_new) = log.ok.as_ref().expect("download ok");
+        assert_eq!(size, &(bytes.len() as i64));
+        assert!(is_new);
+        assert_eq!(std::fs::read(&location.path).unwrap(), bytes);
+
+        // the single query was a getFile for the document location over
+        // the authorized remote-DC Download connection
+        let queries = state.queries.borrow();
+        assert_eq!(queries.len(), 1);
+        let (query_type, query, meta) = &queries[0];
+        assert_eq!(*query_type, DownloadQueryType::Default);
+        assert_eq!(
+            *meta,
+            DownloadNetMeta {
+                dc_id: DcId::internal(2),
+                auth_flag_on: true,
+                small: true,
+            }
+        );
+        let DownloadQuery::GetFile {
+            location,
+            offset,
+            limit,
+            cdn_supported,
+        } = query
+        else {
+            panic!("expected a getFile query");
+        };
+        assert!(*cdn_supported);
+        assert_eq!(*offset, 0);
+        assert!(*limit > 0);
+        let telegram_api::InputFileLocation::inputDocumentFileLocation(doc) = location else {
+            panic!("expected an inputDocumentFileLocation");
+        };
+        assert_eq!(doc.id, 10);
+        assert_eq!(doc.access_hash, 11);
+        assert_eq!(doc.file_reference, b"r".to_vec());
+        assert!(log.started >= 1);
+        assert!(log.error.is_none());
+    }
+
+    #[test]
+    fn file_downloader_rejects_an_already_downloaded_file() {
+        let state = SharedNetState::new(vec![]);
+        let (mut downloader, callback) = build_downloader(
+            state,
+            LocalFileLocation::Full(FullLocalFileLocation::new(
+                FileType::Document,
+                "/tmp/already".to_owned(),
+                0,
+            )),
+            16,
+            "doc.bin",
+            false,
+        );
+        downloader.start();
+        drive_download(&mut downloader, &callback);
+        assert_eq!(
+            callback.borrow().error.as_ref().expect("error").message(),
+            "File is already downloaded"
+        );
+    }
+
+    #[test]
+    fn file_downloader_resumes_a_partial_local() {
+        // part 0 of 2 is ready: the first query must be for the second half
+        let bytes = document_bytes();
+        let half = (bytes.len() / 2) as i64;
+        let root = std::env::temp_dir().join(format!("m12_dl_{}", tdutils::random::secure_int64()));
+        std::fs::create_dir_all(&root).unwrap();
+        let partial_path = root.join("partial.bin");
+        std::fs::write(&partial_path, &bytes[..half as usize]).unwrap();
+        let partial = PartialLocalFileLocation {
+            file_type: FileType::Document,
+            part_size: half,
+            path: partial_path.to_string_lossy().into_owned(),
+            iv: String::new(),
+            ready_bitmask: Bitmask::from_ones(1).encode(-1),
+            ready_size: half,
+        };
+        let script = vec![(
+            None,
+            Ok(DownloadResult::Bytes(bytes[half as usize..].to_vec())),
+        )];
+        let state = SharedNetState::new(script);
+        let (mut downloader, callback) = build_downloader(
+            state.clone(),
+            LocalFileLocation::Partial(partial),
+            bytes.len() as i64,
+            "doc.bin",
+            false,
+        );
+        downloader.start();
+        drive_download(&mut downloader, &callback);
+
+        let log = callback.borrow();
+        if let Some(err) = &log.error {
+            panic!("download failed: {} ({})", err.message(), err.code());
+        }
+        let (location, size, _) = log.ok.as_ref().expect("download ok");
+        assert_eq!(size, &(bytes.len() as i64));
+        assert_eq!(std::fs::read(&location.path).unwrap(), bytes);
+
+        // exactly one query, for the second part
+        let queries = state.queries.borrow();
+        assert_eq!(queries.len(), 1);
+        let DownloadQuery::GetFile { offset, .. } = &queries[0].1 else {
+            panic!("expected a getFile query");
+        };
+        assert_eq!(queries[0].0, DownloadQueryType::Default);
+        assert_eq!(*offset, half);
+        drop(queries);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn file_downloader_handles_the_cdn_redirect_and_decrypts() {
+        let bytes = document_bytes();
+        let key: Vec<u8> = (0u8..32).collect();
+        let iv: Vec<u8> = (32u8..48).collect();
+
+        // the CDN ciphertext the fake server serves for offset 0: the
+        // server counter-block carries the byte-swapped part-offset word in
+        // iv[12..16], which is zero at offset 0
+        let mut server_iv = iv.clone();
+        server_iv[12..16].copy_from_slice(&0u32.to_le_bytes());
+        let mut ctr = tdutils::crypto::AesCtrState::new();
+        ctr.init(&key, &server_iv);
+        let mut ciphertext = bytes.clone();
+        let plain = bytes.clone();
+        ctr.encrypt(&plain, &mut ciphertext);
+
+        let redirect = Ok(DownloadResult::CdnRedirect {
+            dc_id: 4,
+            file_token: b"token1".to_vec(),
+            encryption_key: key,
+            encryption_iv: iv,
+            file_hashes: Vec::new(),
+        });
+        let script = vec![
+            (Some("Default".to_owned()), redirect),
+            (
+                Some("Cdn".to_owned()),
+                Ok(DownloadResult::CdnBytes(ciphertext)),
+            ),
+            // the redirect set need_check: the whole prefix is verified
+            (
+                Some("Check".to_owned()),
+                Ok(DownloadResult::Hashes(vec![telegram_api::FileHash {
+                    offset: 0,
+                    limit: bytes.len() as i32,
+                    hash: tdutils::crypto::sha256(&bytes).to_vec(),
+                }])),
+            ),
+        ];
+        let state = SharedNetState::new(script);
+        let (mut downloader, callback) = build_downloader(
+            state.clone(),
+            LocalFileLocation::Empty,
+            bytes.len() as i64,
+            "doc.bin",
+            false,
+        );
+        downloader.start();
+        drive_download(&mut downloader, &callback);
+
+        let log = callback.borrow();
+        if let Some(err) = &log.error {
+            panic!("download failed: {} ({})", err.message(), err.code());
+        }
+        let (location, size, _) = log.ok.as_ref().expect("download ok");
+        assert_eq!(size, &(bytes.len() as i64));
+        assert_eq!(std::fs::read(&location.path).unwrap(), bytes);
+
+        // getFile → cdnRedirect restarts on the CDN with getCdnFile
+        let queries = state.queries.borrow();
+        assert_eq!(queries.len(), 3);
+        assert_eq!(queries[0].0, DownloadQueryType::Default);
+        assert_eq!(queries[1].0, DownloadQueryType::Cdn);
+        // getFile rides the authorized remote DC; getCdnFile goes to the
+        // CDN DC without the auth (FileDownloader.cpp:158-170, 180-181);
+        // the check query returns to the remote DC with the auth
+        // (FileDownloader.cpp:378)
+        assert_eq!(
+            queries[0].2,
+            DownloadNetMeta {
+                dc_id: DcId::internal(2),
+                auth_flag_on: true,
+                small: true,
+            }
+        );
+        assert_eq!(
+            queries[1].2,
+            DownloadNetMeta {
+                dc_id: DcId::external(4),
+                auth_flag_on: false,
+                small: true,
+            }
+        );
+        assert_eq!(
+            queries[2].2,
+            DownloadNetMeta {
+                dc_id: DcId::internal(2),
+                auth_flag_on: true,
+                small: true,
+            }
+        );
+        let DownloadQuery::GetCdnFile {
+            file_token, offset, ..
+        } = &queries[1].1
+        else {
+            panic!("expected a getCdnFile query");
+        };
+        assert_eq!(file_token, b"token1");
+        assert_eq!(*offset, 0);
+    }
+
+    #[test]
+    fn file_downloader_reuploads_a_cdn_part() {
+        let bytes = document_bytes();
+        let script = vec![
+            // the part is served from the CDN but needs a reupload
+            (
+                Some("Cdn".to_owned()),
+                Ok(DownloadResult::ReuploadNeeded {
+                    request_token: b"req1".to_vec(),
+                }),
+            ),
+            // the reupload answer carries fresh hashes
+            (
+                Some("ReuploadCdn".to_owned()),
+                Ok(DownloadResult::Hashes(vec![telegram_api::FileHash {
+                    offset: 0,
+                    limit: bytes.len() as i32,
+                    hash: tdutils::crypto::sha256(&bytes).to_vec(),
+                }])),
+            ),
+            // and then the CDN serves the bytes (CTR-encrypted with the
+            // seeded key/iv)
+            (
+                Some("Cdn".to_owned()),
+                Ok(DownloadResult::CdnBytes({
+                    let mut server_iv: Vec<u8> = (32u8..48).collect();
+                    server_iv[12..16].copy_from_slice(&0u32.to_le_bytes());
+                    let mut ctr = tdutils::crypto::AesCtrState::new();
+                    ctr.init(&(0u8..32).collect::<Vec<u8>>(), &server_iv);
+                    let mut ciphertext = bytes.clone();
+                    let plain = bytes.clone();
+                    ctr.encrypt(&plain, &mut ciphertext);
+                    ciphertext
+                })),
+            ),
+            // the need_check machine then verifies the whole prefix
+            (
+                Some("Check".to_owned()),
+                Ok(DownloadResult::Hashes(vec![telegram_api::FileHash {
+                    offset: 0,
+                    limit: bytes.len() as i32,
+                    hash: tdutils::crypto::sha256(&bytes).to_vec(),
+                }])),
+            ),
+        ];
+        let state = SharedNetState::new(script);
+        let (mut downloader, callback) = build_downloader(
+            state.clone(),
+            LocalFileLocation::Empty,
+            bytes.len() as i64,
+            "doc.bin",
+            false,
+        );
+        // seed the CDN state the redirect arm would have set
+        downloader.seed_cdn_for_test(b"tok".to_vec(), 4);
+        downloader.start();
+        drive_download(&mut downloader, &callback);
+
+        let log = callback.borrow();
+        if let Some(err) = &log.error {
+            panic!("download failed: {} ({})", err.message(), err.code());
+        }
+        let (location, _, _) = log.ok.as_ref().expect("download ok");
+        assert_eq!(std::fs::read(&location.path).unwrap(), bytes);
+
+        let queries = state.queries.borrow();
+        // the reupload hashes already cover the whole prefix, so no
+        // getFileHashes check query is needed
+        assert_eq!(queries.len(), 3);
+        assert_eq!(queries[0].0, DownloadQueryType::Cdn);
+        // reuploadCdnFile carries the auth back to the remote DC
+        // (FileDownloader.cpp:184-186)
+        assert_eq!(
+            queries[1].2,
+            DownloadNetMeta {
+                dc_id: DcId::internal(2),
+                auth_flag_on: true,
+                small: true,
+            }
+        );
+        let DownloadQuery::ReuploadCdnFile {
+            file_token,
+            request_token,
+        } = &queries[1].1
+        else {
+            panic!("expected a reuploadCdnFile query");
+        };
+        assert_eq!(file_token, b"tok");
+        assert_eq!(request_token, b"req1");
+        // the follow-up getCdnFile still goes to the CDN
+        assert_eq!(queries[2].0, DownloadQueryType::Cdn);
+    }
+
+    #[test]
+    fn file_downloader_falls_back_from_cdn_on_file_token_invalid() {
+        let bytes = document_bytes();
+        let script = vec![
+            (
+                Some("Cdn".to_owned()),
+                Err(Status::error_message("FILE_TOKEN_INVALID")),
+            ),
+            (None, Ok(DownloadResult::Bytes(bytes.clone()))),
+            // the CDN round left need_check set; the check runs on the
+            // downloaded data and passes
+            (
+                Some("Check".to_owned()),
+                Ok(DownloadResult::Hashes(vec![telegram_api::FileHash {
+                    offset: 0,
+                    limit: bytes.len() as i32,
+                    hash: tdutils::crypto::sha256(&bytes).to_vec(),
+                }])),
+            ),
+        ];
+        let state = SharedNetState::new(script);
+        let (mut downloader, callback) = build_downloader(
+            state.clone(),
+            LocalFileLocation::Empty,
+            bytes.len() as i64,
+            "doc.bin",
+            false,
+        );
+        downloader.seed_cdn_for_test(b"tok".to_vec(), 4);
+        downloader.start();
+        drive_download(&mut downloader, &callback);
+
+        let log = callback.borrow();
+        if let Some(err) = &log.error {
+            panic!("download failed: {} ({})", err.message(), err.code());
+        }
+        let (location, _, _) = log.ok.as_ref().expect("download ok");
+        assert_eq!(std::fs::read(&location.path).unwrap(), bytes);
+
+        let queries = state.queries.borrow();
+        assert_eq!(queries[0].0, DownloadQueryType::Cdn);
+        assert_eq!(queries[1].0, DownloadQueryType::Default);
+        // the fallback getFile rides the authorized remote DC again
+        assert_eq!(
+            queries[1].2,
+            DownloadNetMeta {
+                dc_id: DcId::internal(2),
+                auth_flag_on: true,
+                small: true,
+            }
+        );
+    }
+
+    #[test]
+    fn file_downloader_detects_a_hash_mismatch_on_check() {
+        let bytes = document_bytes();
+        let wrong_hash = vec![0u8; 32];
+        let script = vec![(
+            Some("Check".to_owned()),
+            Ok(DownloadResult::Hashes(vec![telegram_api::FileHash {
+                offset: 0,
+                limit: bytes.len() as i32,
+                hash: wrong_hash,
+            }])),
+        )];
+        let state = SharedNetState::new(script);
+        let root = std::env::temp_dir().join(format!("m12_dl_{}", tdutils::random::secure_int64()));
+        std::fs::create_dir_all(&root).unwrap();
+        let existing = root.join("existing_doc.bin");
+        std::fs::write(&existing, &bytes).unwrap();
+        let (mut downloader, callback) = build_downloader(
+            state.clone(),
+            LocalFileLocation::Empty,
+            bytes.len() as i64,
+            "existing_doc.bin",
+            true,
+        );
+        // need_search_file finds the local copy, and the downloader then
+        // only checks it against the server hashes
+        *state.search_hit.borrow_mut() = Some(existing.to_string_lossy().into_owned());
+        downloader.start();
+        drive_download(&mut downloader, &callback);
+
+        let log = callback.borrow();
+        let error = log.error.as_ref().expect("hash mismatch error");
+        // only_check (the search-file path) reports a restart request
+        assert_eq!(error.message(), "FILE_DOWNLOAD_RESTART");
+        assert!(log.ok.is_none());
+        drop(log);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn file_downloader_restarts_a_canceled_query() {
+        // a canceled in-flight query (NetQuery::Error::Canceled = 203)
+        // restarts its part instead of failing the download
+        // (FileDownloader.cpp:684-687)
+        let bytes = document_bytes();
+        let script = vec![
+            (None, Err(Status::error(NET_QUERY_CANCELED, "Canceled"))),
+            (None, Ok(DownloadResult::Bytes(bytes.clone()))),
+        ];
+        let state = SharedNetState::new(script);
+        let (mut downloader, callback) = build_downloader(
+            state.clone(),
+            LocalFileLocation::Empty,
+            bytes.len() as i64,
+            "doc.bin",
+            false,
+        );
+        downloader.start();
+        drive_download(&mut downloader, &callback);
+
+        let log = callback.borrow();
+        if let Some(err) = &log.error {
+            panic!("download failed: {} ({})", err.message(), err.code());
+        }
+        let (location, size, _) = log.ok.as_ref().expect("download ok");
+        assert_eq!(size, &(bytes.len() as i64));
+        assert_eq!(std::fs::read(&location.path).unwrap(), bytes);
+
+        assert_eq!(state.queries.borrow().len(), 2);
+    }
+
+    #[test]
+    fn file_downloader_annotates_a_file_reference_error() {
+        // the failing error gets the base64-encoded file reference
+        // appended (FileDownloader.cpp:194-205), so the FileLoaderManager
+        // repair path recognizes it
+        let script = vec![(None, Err(Status::error(400, "FILE_REFERENCE_INVALID")))];
+        let state = SharedNetState::new(script);
+        let (mut downloader, callback) =
+            build_downloader(state, LocalFileLocation::Empty, 16, "doc.bin", false);
+        downloader.start();
+        drive_download(&mut downloader, &callback);
+
+        let log = callback.borrow();
+        let error = log.error.as_ref().expect("file reference error");
+        assert_eq!(error.code(), 400);
+        assert_eq!(error.message(), "FILE_REFERENCE_INVALID#BASE64cg==");
+        assert!(log.ok.is_none());
+    }
+
+    #[test]
+    fn file_downloader_drops_cdn_support_while_streaming() {
+        // a middle-of-file streaming window asks without cdn_supported
+        // (FileDownloader.cpp:151-157); the offset rides start_up's
+        // set_streaming_offset
+        let bytes = document_bytes();
+        let script = vec![(None, Ok(DownloadResult::Bytes(bytes.clone())))];
+        let state = SharedNetState::new(script);
+        let callback = Rc::new(RefCell::new(RecordedCallback::default()));
+        let mut downloader = FileDownloader::new(
+            document_location(),
+            LocalFileLocation::Empty,
+            bytes.len() as i64,
+            "doc.bin".to_owned(),
+            FileEncryptionKey::default(),
+            true,
+            false,
+            8, // the streaming offset
+            0, // no limit
+            Box::new(SharingCallback {
+                inner: callback.clone(),
+            }),
+            Box::new(FakeDownloadNet::new(state.clone())),
+        );
+        downloader.start();
+        drive_download(&mut downloader, &callback);
+
+        let log = callback.borrow();
+        if let Some(err) = &log.error {
+            panic!("download failed: {} ({})", err.message(), err.code());
+        }
+        let (location, _, _) = log.ok.as_ref().expect("download ok");
+        assert_eq!(std::fs::read(&location.path).unwrap(), bytes);
+
+        let queries = state.queries.borrow();
+        assert_eq!(queries.len(), 1);
+        let DownloadQuery::GetFile {
+            offset,
+            cdn_supported,
+            ..
+        } = &queries[0].1
+        else {
+            panic!("expected a getFile query");
+        };
+        // part 0 still starts at byte 0 — the streaming window only gates
+        // which parts are pending
+        assert_eq!(*offset, 0);
+        assert!(!*cdn_supported);
+    }
+
+    #[test]
+    fn file_downloader_downloads_a_web_file() {
+        // upload.getWebFile over the webfile DC (FileDownloader.cpp:158-165)
+        let bytes = b"<html>hi</html>".to_vec();
+        let script = vec![(None, Ok(DownloadResult::Bytes(bytes.clone())))];
+        let state = SharedNetState::new(script);
+        *state.webfile_dc.borrow_mut() = DcId::external(4);
+        let callback = Rc::new(RefCell::new(RecordedCallback::default()));
+        let mut downloader = FileDownloader::new(
+            FullRemoteFileLocation::from_web(
+                FileType::Document,
+                "https://example.com/a.html".to_owned(),
+                42,
+            ),
+            LocalFileLocation::Empty,
+            bytes.len() as i64,
+            "a.html".to_owned(),
+            FileEncryptionKey::default(),
+            true,
+            false,
+            0,
+            0,
+            Box::new(SharingCallback {
+                inner: callback.clone(),
+            }),
+            Box::new(FakeDownloadNet::new(state.clone())),
+        );
+        downloader.start();
+        drive_download(&mut downloader, &callback);
+
+        let log = callback.borrow();
+        if let Some(err) = &log.error {
+            panic!("download failed: {} ({})", err.message(), err.code());
+        }
+        let (location, size, _) = log.ok.as_ref().expect("download ok");
+        assert_eq!(size, &(bytes.len() as i64));
+        assert_eq!(std::fs::read(&location.path).unwrap(), bytes);
+
+        let queries = state.queries.borrow();
+        assert_eq!(queries.len(), 1);
+        let (query_type, query, meta) = &queries[0];
+        assert_eq!(*query_type, DownloadQueryType::Default);
+        assert_eq!(
+            *meta,
+            DownloadNetMeta {
+                dc_id: DcId::external(4),
+                auth_flag_on: true,
+                small: true,
+            }
+        );
+        let DownloadQuery::GetWebFile {
+            location,
+            offset,
+            limit,
+        } = query
+        else {
+            panic!("expected a getWebFile query");
+        };
+        let telegram_api::InputWebFileLocation::inputWebFileLocation(web) = location else {
+            panic!("expected an inputWebFileLocation");
+        };
+        assert_eq!(web.url, "https://example.com/a.html");
+        assert_eq!(web.access_hash, 42);
+        assert_eq!(*offset, 0);
+        assert!(*limit > 0);
     }
 }
