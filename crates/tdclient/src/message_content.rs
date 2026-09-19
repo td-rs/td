@@ -17701,8 +17701,40 @@ fn get_currency_amount_from_stars(amount: Option<telegram_api::StarsAmount>) -> 
     }
 }
 
+/// `is_supported_reply_message_content` (MessageContentType.cpp:848-881).
+pub fn is_supported_reply_message_content(content_type: MessageContentType) -> bool {
+    use MessageContentType::*;
+    matches!(
+        content_type,
+        Animation
+            | Audio
+            | Contact
+            | Dice
+            | Document
+            | Game
+            | Giveaway
+            | GiveawayWinners
+            | Invoice
+            | Location
+            | PaidMedia
+            | Photo
+            | Poll
+            | Sticker
+            | Story
+            | Text
+            | ToDoList
+            | Unsupported
+            | Venue
+            | Video
+            | VideoNote
+            | VoiceNote // update documentation when the list changes
+    )
+}
+
 /// `SuggestedPostPrice(StarsAmount &&)` (SuggestedPostPrice.cpp:18-52).
-fn get_suggested_post_price(amount: Option<telegram_api::StarsAmount>) -> SuggestedPostPrice {
+pub(crate) fn get_suggested_post_price(
+    amount: Option<telegram_api::StarsAmount>,
+) -> SuggestedPostPrice {
     let Some(amount) = amount else {
         return SuggestedPostPrice::default();
     };

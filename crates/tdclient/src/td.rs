@@ -1313,6 +1313,224 @@ impl crate::message_content::MessageContentContext for Td {
     }
 }
 
+/// The M.10.3 receive-flip adapter: `Td` as the intake/builder
+/// [`crate::messages_manager::MessageObjectContext`]. The reads the M.9.18
+/// surface already owns (users, auth, options, clock) answer for real, the
+/// manager-owned reads (`have_dialog`, the ephemeral-id registry) walk the
+/// M.10.2c skeleton, and the ChatManager/ForumTopic/NotificationSettings
+/// surfaces answer the documented stand-ins until their receive slices
+/// land (the same defaults the M.10.4 test context pins).
+impl crate::messages_manager::MessageObjectContext for Td {
+    fn content_context(&self) -> &dyn crate::message_content::MessageContentContext {
+        self
+    }
+
+    fn is_bot(&self) -> bool {
+        crate::message_content::MessageContentContext::is_bot(self)
+    }
+
+    fn now(&self) -> f64 {
+        tdutils::time::now()
+    }
+
+    fn server_time(&self) -> f64 {
+        self.global.unix_time() as f64
+    }
+
+    fn is_test_dc(&self) -> bool {
+        self.global.is_test_dc()
+    }
+
+    fn get_restriction_options(&self) -> crate::restriction_reason::RestrictionOptions {
+        crate::restriction_reason::RestrictionOptions {
+            ignored_restriction_reasons: String::new(),
+            restriction_add_platforms: String::new(),
+            ignore_platform_restrictions: false,
+        }
+    }
+
+    fn get_message_sender_object_const(
+        &self,
+        sender_user_id: UserId,
+        sender_dialog_id: DialogId,
+        _source: &str,
+    ) -> Option<td_api::MessageSender> {
+        if sender_dialog_id.is_valid() {
+            return Some(td_api::MessageSender::messageSenderChat(
+                td_api::messageSenderChat {
+                    chat_id: sender_dialog_id.get(),
+                },
+            ));
+        }
+        if !sender_user_id.is_valid() {
+            return None;
+        }
+        Some(td_api::MessageSender::messageSenderUser(
+            td_api::messageSenderUser {
+                user_id: sender_user_id.get(),
+            },
+        ))
+    }
+
+    fn have_min_user(&self, user_id: UserId) -> bool {
+        self.users.contains_key(&user_id.get())
+    }
+
+    fn have_dialog(&self, dialog_id: DialogId) -> bool {
+        self.messages_manager.get_dialog(dialog_id).is_some()
+    }
+
+    fn have_dialog_info(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn have_min_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn force_create_dialog(&self, _dialog_id: DialogId, _source: &str) {
+        // the C++ force-creates with a `send_closure` — the actor wiring is
+        // the Td receive slice's; the intake registers the dialog itself.
+    }
+
+    fn content_context_mut(&mut self) -> &mut dyn crate::message_content::MessageContentContext {
+        self
+    }
+
+    fn have_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn get_min_channel(
+        &self,
+        _channel_id: ChannelId,
+    ) -> Option<crate::messages_manager::MinChannel> {
+        None
+    }
+
+    fn can_dialog_have_threads(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn get_message_id_of_ephemeral_message_id(
+        &self,
+        dialog_id: DialogId,
+        ephemeral_message_id: crate::messages_manager::EphemeralMessageId,
+    ) -> crate::messages_manager::MessageId {
+        self.messages_manager
+            .update_ephemeral_message_ids
+            .get(&crate::messages_manager::EphemeralMessageFullId::new(
+                dialog_id,
+                ephemeral_message_id,
+            ))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn get_channel_has_linked_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn is_forum_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn is_megagroup_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn get_channel_linked_channel_id(&self, _channel_id: ChannelId, _source: &str) -> ChannelId {
+        ChannelId::default()
+    }
+
+    fn have_channel_force(&self, _channel_id: ChannelId, _source: &str) -> bool {
+        false
+    }
+
+    fn have_input_peer_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn get_user_private_forward_name(&self, _user_id: UserId) -> String {
+        String::new()
+    }
+
+    fn is_admined_monoforum_channel(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn is_monoforum_channel_dialog(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn get_monoforum_channel_id(&self, channel_id: ChannelId) -> ChannelId {
+        channel_id
+    }
+
+    fn channel_can_post_messages(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn get_dialog_has_protected_content_force(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn get_forum_topic_id_object(
+        &self,
+        _dialog_id: DialogId,
+        forum_topic_id: crate::messages_manager::ForumTopicId,
+    ) -> i32 {
+        forum_topic_id.get()
+    }
+
+    fn get_saved_messages_topic_id_object(
+        &self,
+        _dialog_id: DialogId,
+        saved_messages_topic_id: crate::messages_manager::SavedMessagesTopicId,
+    ) -> i64 {
+        saved_messages_topic_id.get_dialog_id().get()
+    }
+
+    fn get_message_content_media_duration(
+        &self,
+        _content: &crate::message_content::MessageContent,
+    ) -> i32 {
+        -1
+    }
+
+    fn get_message_sender_object_force(
+        &self,
+        dialog_id: DialogId,
+        _source: &str,
+    ) -> Option<td_api::MessageSender> {
+        Some(td_api::MessageSender::messageSenderChat(
+            td_api::messageSenderChat {
+                chat_id: dialog_id.get(),
+            },
+        ))
+    }
+
+    fn get_scope_disable_pinned_message_notifications(&self) -> bool {
+        false
+    }
+
+    fn get_scope_disable_mention_notifications(&self) -> bool {
+        false
+    }
+}
+
+/// The reactions half of the receive adapter: the banned-chat read is the
+/// ChatManager status cache, false until that receive slice lands.
+impl crate::messages_manager::DialogReactionsContext for Td {
+    fn is_chat_banned(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn is_bot(&self) -> bool {
+        crate::message_content::MessageContentContext::is_bot(self)
+    }
+}
+
 /// The full Td actor: the request entry point and the manager orchestrator.
 pub struct Td {
     callback: Option<Box<dyn TdCallback>>,
@@ -3550,81 +3768,42 @@ impl Td {
     }
 
     /// The receive path for a wire `updateNewMessage` (the container
-    /// users/chats were collected into the sink first): the fresh dialog
-    /// emits `updateNewChat`, then `updateNewMessage`. The sender's access
-    /// hash is remembered for the reply peer.
+    /// users/chats were collected into the sink first): the full M.10.3
+    /// intake — `parse_telegram_api_message` → `create_message` →
+    /// `fix_new_message` — runs through the M.10.2c manager, and the
+    /// emitted object is the M.10.4 `get_message_object` builder. The
+    /// M.9.18 flip (wire media through `get_message_content`) now lives at
+    /// its C++ call position inside `parse_telegram_api_message`.
     fn apply_new_message(&mut self, message: &telegram_api::Message) {
-        let telegram_api::Message::message(m) = message else {
+        // The manager and the context are both pieces of `Td`; the intake
+        // is driven over a taken manager to split the borrows.
+        let mut manager = std::mem::take(&mut self.messages_manager);
+        let received =
+            manager.on_get_message(self, message.clone(), true, false, "updateNewMessage");
+        self.messages_manager = manager;
+        let Some((dialog_id, mut m)) = received else {
             return;
         };
-        let Some(telegram_api::Peer::peerUser(peer)) = m.peer_id.as_ref() else {
-            return;
-        };
-        // The walking-skeleton receive surface: a private incoming
-        // message. Bot sessions carry no `from_id` — the container users
-        // hold the sender, and the peer IS the sender here (the S76
-        // corpus peer).
-        let chat_id = peer.user_id;
-        self.ensure_chat(chat_id);
-        let message_id = m.id as i64;
-        let date = m.date;
-        let text = wire_message_text(m);
-        // The M.9.18 flip: the wire content runs the M.9.14 intake and the
-        // M.9.16 object conversion instead of the text-only trace shape.
-        // `self` is the Td-side `MessageContentContext` (the M.9.18
-        // adapter); the manager object seams answer the codegen defaults
-        // until their owners land.
-        let dialog_id = DialogId::from_user_id(UserId::new(chat_id));
-        let mut ttl = crate::messages_manager::MessageSelfDestructType::default();
-        let mut disable_web_page_preview = false;
-        let content = crate::message_content::get_message_content(
+        // `add_new_dialog` emits `updateNewChat` for the fresh dialog
+        // (MessagesManager.cpp:33079+); the walking skeleton maps user
+        // dialogs to its chat objects, the other dialog kinds ride the
+        // ChatManager chat-object wiring.
+        if dialog_id.get_type() == crate::messages_manager::DialogType::User {
+            self.ensure_chat(dialog_id.get_user_id().get());
+        }
+        let object = crate::messages_manager::get_message_object(
+            &self.messages_manager,
             self,
-            FormattedText {
-                text: text.clone(),
-                entities: Vec::new(),
-            },
-            None,
-            m.media.as_deref().cloned(),
+            self,
             dialog_id,
-            date,
-            false,
-            UserId::default(),
-            &mut ttl,
-            &mut disable_web_page_preview,
+            &mut m,
             "updateNewMessage",
         );
-        let content_object = crate::message_content::get_message_content_object(
-            self,
-            &content,
-            dialog_id,
-            MessageId::new(message_id),
-            DialogId::default(),
-            true,
-            false,
-            false,
-            DialogId::default(),
-            date,
-            0,
-            false,
-            false,
-            -1,
-            m.invert_media,
-            disable_web_page_preview,
-            "updateNewMessage",
-        );
-        let final_message = convert::message_object(&MessageSpec {
-            id: message_id,
-            chat_id,
-            sender_user_id: chat_id,
-            date,
-            text,
-            pending: false,
-            is_outgoing: false,
-            content: Some(content_object),
-        });
-        self.send_update(Object::updateNewMessage(td_api::updateNewMessage {
-            message: Some(final_message),
-        }));
+        if let Some(object) = object {
+            self.send_update(Object::updateNewMessage(td_api::updateNewMessage {
+                message: Some(object),
+            }));
+        }
     }
 
     /// `Td` close: dropping the callback sends the close notification; the
@@ -3635,12 +3814,6 @@ impl Td {
         }
         drop(self.callback.take());
     }
-}
-
-/// `get_message_text` for the plain-text shape (the walking-skeleton
-/// messages carry no media).
-fn wire_message_text(message: &telegram_api::message) -> String {
-    message.message.clone()
 }
 
 /// Parses a top-level boxed `Vector<user>` (the `users.getUsers` result).

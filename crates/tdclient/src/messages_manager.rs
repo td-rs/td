@@ -2436,6 +2436,97 @@ impl MessageOrigin {
         }
     }
 
+    /// `MessageOrigin::get_message_origin` (MessageOrigin.cpp:23-80) — the
+    /// intake ctor over a wire forward header.
+    pub fn get_message_origin(
+        ctx: &dyn MessageObjectContext,
+        forward_header: telegram_api::MessageFwdHeader,
+    ) -> Result<MessageOrigin, &'static str> {
+        let telegram_api::MessageFwdHeader {
+            from_id,
+            from_name,
+            date: _,
+            channel_post,
+            post_author,
+            saved_from_peer: _,
+            saved_from_msg_id: _,
+            saved_from_id: _,
+            saved_from_name: _,
+            saved_date: _,
+            psa_type: _,
+            imported: _,
+            saved_out: _,
+            flags: _,
+        } = forward_header;
+
+        let mut sender_dialog_id = from_id
+            .as_ref()
+            .map(DialogId::from_peer)
+            .unwrap_or_default();
+        if from_id.is_some() && !sender_dialog_id.is_valid() {
+            log_error!("Receive invalid sender identifier in message forward header");
+            sender_dialog_id = DialogId::default();
+        }
+
+        let mut message_id = MessageId::default();
+        if channel_post != 0 {
+            message_id = MessageId::from_server_message_id(ServerMessageId::new(channel_post));
+            if !message_id.is_valid() {
+                log_error!(
+                    "Receive {} in message forward header",
+                    DisplayMessageId(message_id)
+                );
+                message_id = MessageId::default();
+            }
+        }
+
+        let author_signature = post_author;
+        let sender_name = from_name;
+
+        let mut sender_user_id = UserId::default();
+        if sender_dialog_id.get_type() == DialogType::User {
+            sender_user_id = sender_dialog_id.get_user_id();
+            sender_dialog_id = DialogId::default();
+        }
+        if !sender_dialog_id.is_valid() {
+            if sender_user_id.is_valid() {
+                if message_id.is_valid() {
+                    log_error!("Receive non-empty message identifier in message forward header");
+                    message_id = MessageId::default();
+                }
+            } else if sender_name.is_empty() {
+                log_error!("Receive wrong message forward header");
+                return Result::Err("Receive empty forward header");
+            }
+        } else if sender_dialog_id.get_type() != DialogType::Channel {
+            log_error!("Receive wrong message forward header with non-channel sender");
+            return Result::Err("Forward from a non-channel");
+        } else {
+            let channel_id = sender_dialog_id.get_channel_id();
+            if !ctx.have_channel(channel_id) {
+                log_error!(
+                    "Receive forward from {} channel {:?}",
+                    if ctx.have_min_channel(channel_id) {
+                        "min"
+                    } else {
+                        "unknown"
+                    },
+                    channel_id
+                );
+            }
+            ctx.force_create_dialog(sender_dialog_id, "get_message_origin");
+            assert!(!sender_user_id.is_valid());
+        }
+
+        Result::Ok(MessageOrigin {
+            sender_user_id,
+            sender_dialog_id,
+            message_id,
+            author_signature,
+            sender_name,
+        })
+    }
+
     /// `MessageOrigin::get_message_origin_object` (MessageOrigin.cpp:82-98).
     pub fn get_message_origin_object(
         &self,
@@ -2571,6 +2662,35 @@ pub struct FactCheck {
 }
 
 impl FactCheck {
+    /// `FactCheck::get_fact_check` (FactCheck.cpp:16-28) — the intake ctor.
+    pub fn get_fact_check<U: crate::message_entity::UserManagerLike + ?Sized>(
+        user_manager: Option<&mut U>,
+        fact_check: Option<telegram_api::FactCheck>,
+        is_bot: bool,
+    ) -> Option<FactCheck> {
+        let fact_check = fact_check?;
+        if is_bot || fact_check.hash == 0 {
+            return None;
+        }
+        let text = match fact_check.text {
+            Some(text_with_entities) => crate::message_entity::get_formatted_text(
+                user_manager,
+                text_with_entities.text,
+                text_with_entities.entities,
+                true,
+                false,
+                "factCheck",
+            ),
+            None => FormattedText::default(),
+        };
+        Some(FactCheck {
+            country_code: fact_check.country,
+            text,
+            hash: fact_check.hash,
+            need_check: fact_check.need_check,
+        })
+    }
+
     /// `FactCheck::is_empty` (FactCheck.h:41-43).
     pub fn is_empty(&self) -> bool {
         self.hash == 0
@@ -2692,6 +2812,29 @@ impl ReactionType {
             return 0;
         }
         i64::from_le_bytes(bytes.try_into().unwrap())
+    }
+
+    /// `ReactionType::ReactionType(const telegram_api::object_ptr<Reaction> &)` (ReactionType.cpp:39-62).
+    pub fn from_telegram(reaction: Option<&telegram_api::Reaction>) -> ReactionType {
+        let Some(reaction) = reaction else {
+            return ReactionType::default();
+        };
+        match reaction {
+            telegram_api::Reaction::reactionEmpty(_) => ReactionType::default(),
+            telegram_api::Reaction::reactionEmoji(reaction) => {
+                // the reserved internal prefixes can't arrive from the wire
+                let emoticon = reaction.emoticon.as_str();
+                if emoticon.starts_with('#') || emoticon == "$" {
+                    ReactionType::default()
+                } else {
+                    ReactionType::new(emoticon)
+                }
+            }
+            telegram_api::Reaction::reactionCustomEmoji(reaction) => {
+                ReactionType::new(get_custom_emoji_string(reaction.document_id))
+            }
+            telegram_api::Reaction::reactionPaid(_) => ReactionType::paid(),
+        }
     }
 
     /// `ReactionType::get_reaction_type_object` (ReactionType.cpp:143-154).
@@ -3464,6 +3607,34 @@ impl MessageReaction {
     /// `MessageReaction::MAX_CHOOSE_COUNT` (MessageReaction.h:25).
     pub const MAX_CHOOSE_COUNT: i32 = 2147483640;
 
+    /// `MessageReaction::add_my_recent_chooser_dialog_id`
+    /// (MessageReaction.cpp:358-363).
+    pub fn add_my_recent_chooser_dialog_id(&mut self, dialog_id: DialogId) {
+        assert!(!self.my_recent_chooser_dialog_id.is_valid());
+        self.my_recent_chooser_dialog_id = dialog_id;
+        add_to_top_dialog_id(
+            &mut self.recent_chooser_dialog_ids,
+            MAX_RECENT_CHOOSERS + 1,
+            dialog_id,
+        );
+        self.fix_choose_count();
+    }
+
+    /// `MessageReaction::remove_my_recent_chooser_dialog_id`
+    /// (MessageReaction.cpp:365-373).
+    pub fn remove_my_recent_chooser_dialog_id(&mut self) -> bool {
+        if self.my_recent_chooser_dialog_id.is_valid() {
+            let chooser = self.my_recent_chooser_dialog_id;
+            let before = self.recent_chooser_dialog_ids.len();
+            self.recent_chooser_dialog_ids.retain(|id| *id != chooser);
+            assert!(self.recent_chooser_dialog_ids.len() != before);
+            self.my_recent_chooser_dialog_id = DialogId::default();
+            true
+        } else {
+            false
+        }
+    }
+
     /// `MessageReaction::is_empty` (MessageReaction.h:51-53).
     pub fn is_empty(&self) -> bool {
         self.choose_count <= 0
@@ -3628,6 +3799,55 @@ pub struct MessageReactor {
 }
 
 impl MessageReactor {
+    /// `MessageReactor::is_valid` (MessageReactor.h:52-54).
+    pub fn is_valid(&self) -> bool {
+        self.count > 0
+            && if self.is_me {
+                self.dialog_id.is_valid()
+            } else {
+                (self.dialog_id.is_valid() || self.is_anonymous) && self.is_top
+            }
+    }
+
+    /// `MessageReactor::is_me` (MessageReactor.h:56-58).
+    pub fn is_me(&self) -> bool {
+        self.is_me
+    }
+
+    /// `MessageReactor::store_min_channel` (MessageReactor.cpp:24-34).
+    fn store_min_channel(&mut self, ctx: &dyn MessageObjectContext) {
+        if self.dialog_id.get_type() == DialogType::Channel && !ctx.have_dialog_info(self.dialog_id)
+        {
+            let channel_id = self.dialog_id.get_channel_id();
+            match ctx.get_min_channel(channel_id) {
+                Some(min_channel) => self.min_channel = Some(min_channel),
+                None => log_error!("Receive unknown reacted {channel_id:?}"),
+            }
+        }
+    }
+
+    /// `MessageReactor::MessageReactor(Td *, telegram_api::messageReactor)`
+    /// (MessageReactor.cpp:36-43).
+    pub fn from_telegram(
+        ctx: &dyn MessageObjectContext,
+        reactor: telegram_api::MessageReactor,
+    ) -> MessageReactor {
+        let mut result = MessageReactor {
+            dialog_id: reactor
+                .peer_id
+                .as_ref()
+                .map(DialogId::from_peer)
+                .unwrap_or_default(),
+            count: reactor.count,
+            is_top: reactor.top,
+            is_me: reactor.my,
+            is_anonymous: reactor.anonymous,
+            min_channel: None,
+        };
+        result.store_min_channel(ctx);
+        result
+    }
+
     /// `MessageReactor::store` (MessageReactor.hpp:17-38).
     pub fn store(&self, out: &mut Vec<u8>) {
         let has_dialog_id = self.dialog_id.is_valid();
@@ -3677,6 +3897,74 @@ impl MessageReactor {
     }
 }
 
+/// `operator<` (MessageReactor.cpp:136-141) — count-descending, then id.
+fn message_reactor_less(lhs: &MessageReactor, rhs: &MessageReactor) -> bool {
+    if lhs.count != rhs.count {
+        return lhs.count > rhs.count;
+    }
+    lhs.dialog_id.get() < rhs.dialog_id.get()
+}
+
+fn message_reactor_cmp(lhs: &MessageReactor, rhs: &MessageReactor) -> std::cmp::Ordering {
+    if message_reactor_less(lhs, rhs) {
+        std::cmp::Ordering::Less
+    } else if message_reactor_less(rhs, lhs) {
+        std::cmp::Ordering::Greater
+    } else {
+        std::cmp::Ordering::Equal
+    }
+}
+
+/// `MessageReactor::fix_message_reactors` (MessageReactor.cpp:89-134) — the
+/// `for_group_call` arm (donor lists, TOP_REACTOR_COUNT=100) rides the
+/// Wave-2 group-call slice.
+pub fn fix_message_reactors(reactors: &mut Vec<MessageReactor>, need_warning: bool) {
+    const TOP_REACTOR_COUNT: usize = 3;
+    if reactors.len() > TOP_REACTOR_COUNT + 1 {
+        log_error!("Have too many reactors ({})", reactors.len());
+        reactors.truncate(TOP_REACTOR_COUNT + 1);
+    }
+    if reactors.len() > TOP_REACTOR_COUNT && !reactors[TOP_REACTOR_COUNT].is_me() {
+        log_error!("Receive unexpected reactors ({})", reactors.len());
+        reactors.truncate(TOP_REACTOR_COUNT);
+    }
+    if need_warning {
+        for (i, reactor) in reactors.iter().enumerate() {
+            if reactor.is_top != (i < TOP_REACTOR_COUNT) {
+                log_error!("Receive incorrect top");
+                break;
+            }
+        }
+        for i in 0..reactors.len().saturating_sub(1) {
+            if reactors[i].count < reactors[i + 1].count {
+                log_error!("Receive unordered reactors");
+                break;
+            }
+        }
+    }
+    let mut was_me = false;
+    reactors.retain(|reactor| {
+        if !reactor.is_valid() {
+            return false;
+        }
+        if reactor.is_me() {
+            if was_me {
+                log_error!("Receive self multiple times");
+                return false;
+            }
+            was_me = true;
+        }
+        true
+    });
+    reactors.sort_by(message_reactor_cmp);
+    if reactors.len() > TOP_REACTOR_COUNT && !reactors[TOP_REACTOR_COUNT].is_me() {
+        reactors.truncate(TOP_REACTOR_COUNT);
+    }
+    for (i, reactor) in reactors.iter_mut().enumerate() {
+        reactor.is_top = i < TOP_REACTOR_COUNT;
+    }
+}
+
 /// `td::MessageReactions` (MessageReaction.h:163-257) — the reactions block
 /// of a message. The value plane + store/parse land here (M.10.2 —
 /// `Message::store`/`parse` is byte-parity-bound to it); the manager family
@@ -3697,6 +3985,231 @@ pub struct MessageReactions {
 }
 
 impl MessageReactions {
+    /// `MessageReactions::get_message_reactions` (MessageReaction.cpp:526-631)
+    /// — the intake ctor over a wire reactions block.
+    pub fn get_message_reactions(
+        ctx: &dyn MessageObjectContext,
+        reactions: Option<telegram_api::MessageReactions>,
+        is_bot: bool,
+    ) -> Option<MessageReactions> {
+        let reactions = reactions?;
+        if is_bot {
+            return None;
+        }
+
+        let mut result = MessageReactions {
+            can_get_added_reactions: reactions.can_see_list,
+            is_min: reactions.min,
+            are_tags: reactions.reactions_as_tags,
+            ..MessageReactions::default()
+        };
+
+        let mut my_dialog_id = DialogId::default();
+        for peer_reaction in &reactions.recent_reactions {
+            if peer_reaction.my {
+                let dialog_id = peer_reaction
+                    .peer_id
+                    .as_ref()
+                    .map(DialogId::from_peer)
+                    .unwrap_or_default();
+                if !dialog_id.is_valid() {
+                    continue;
+                }
+                if my_dialog_id.is_valid() && dialog_id != my_dialog_id {
+                    log_error!("Receive my reactions with {dialog_id:?} and {my_dialog_id:?}");
+                }
+                my_dialog_id = dialog_id;
+            }
+        }
+
+        let mut seen_reaction_types = HashSet::new();
+        let mut chosen_reaction_order: Vec<(i32, ReactionType)> = Vec::new();
+        for reaction_count in reactions.results {
+            let reaction_type = ReactionType::from_telegram(reaction_count.reaction.as_ref());
+            if reaction_count.count <= 0
+                || reaction_count.count >= MessageReaction::MAX_CHOOSE_COUNT
+                || reaction_type.is_empty()
+            {
+                log_error!(
+                    "Receive {reaction_type} with invalid count {}",
+                    reaction_count.count
+                );
+                continue;
+            }
+
+            if !seen_reaction_types.insert(reaction_type.clone()) {
+                log_error!("Receive duplicate {reaction_type}");
+                continue;
+            }
+
+            let mut recent_choosers = HashSet::new();
+            let mut my_recent_chooser_dialog_id = DialogId::default();
+            let mut recent_chooser_dialog_ids = Vec::new();
+            let mut recent_chooser_min_channels: Vec<(ChannelId, MinChannel)> = Vec::new();
+            for peer_reaction in &reactions.recent_reactions {
+                let peer_reaction_type =
+                    ReactionType::from_telegram(peer_reaction.reaction.as_ref());
+                if peer_reaction_type != reaction_type {
+                    continue;
+                }
+                let dialog_id = peer_reaction
+                    .peer_id
+                    .as_ref()
+                    .map(DialogId::from_peer)
+                    .unwrap_or_default();
+                if !recent_choosers.insert(dialog_id) {
+                    log_error!(
+                        "Receive duplicate {dialog_id:?} as a recent chooser for {reaction_type}"
+                    );
+                    continue;
+                }
+                if !check_min_message_sender(ctx, dialog_id, &mut recent_chooser_min_channels) {
+                    continue;
+                }
+
+                recent_chooser_dialog_ids.push(dialog_id);
+                if dialog_id == my_dialog_id {
+                    my_recent_chooser_dialog_id = dialog_id;
+                }
+                if peer_reaction.unread {
+                    result.unread_reactions.push(UnreadMessageReaction {
+                        reaction_type: peer_reaction_type,
+                        sender_dialog_id: dialog_id,
+                        is_big: peer_reaction.big,
+                    });
+                }
+                if recent_chooser_dialog_ids.len() == MAX_RECENT_CHOOSERS {
+                    break;
+                }
+            }
+
+            // `telegram_api::reactionCount::CHOSEN_ORDER_MASK` = flag bit 0.
+            let is_chosen = (reaction_count.flags & 1) != 0;
+            if is_chosen {
+                if reaction_type.is_paid_reaction() {
+                    if reaction_count.chosen_order != -1 {
+                        log_error!(
+                            "Receive paid reaction with order {}",
+                            reaction_count.chosen_order
+                        );
+                    }
+                } else {
+                    chosen_reaction_order
+                        .push((reaction_count.chosen_order, reaction_type.clone()));
+                }
+            }
+            result.reactions.push(MessageReaction {
+                reaction_type,
+                choose_count: reaction_count.count,
+                is_chosen,
+                my_recent_chooser_dialog_id,
+                recent_chooser_dialog_ids,
+                recent_chooser_min_channels,
+            });
+        }
+        if chosen_reaction_order.len() > 1 {
+            chosen_reaction_order.sort();
+            result.chosen_reaction_order = chosen_reaction_order
+                .into_iter()
+                .map(|(_, reaction_type)| reaction_type)
+                .collect();
+        }
+        let mut was_me = false;
+        for top_reactor in reactions.top_reactors {
+            let reactor = MessageReactor::from_telegram(ctx, top_reactor);
+            if !reactor.is_valid() || (reactions.min && reactor.is_me()) {
+                log_error!("Receive an invalid reactor");
+                continue;
+            }
+            if reactor.is_me() {
+                if was_me {
+                    log_error!("Receive duplicate self reactor");
+                    continue;
+                }
+                was_me = true;
+            }
+            result.top_reactors.push(reactor);
+        }
+        fix_message_reactors(&mut result.top_reactors, true);
+        Some(result)
+    }
+
+    /// `MessageReactions::get_reaction` (MessageReaction.cpp:633-649).
+    pub fn get_reaction(&self, reaction_type: &ReactionType) -> Option<&MessageReaction> {
+        self.reactions
+            .iter()
+            .find(|added_reaction| &added_reaction.reaction_type == reaction_type)
+    }
+
+    /// `MessageReactions::sort_reactions` (MessageReaction.cpp:841-860).
+    pub fn sort_reactions(&mut self, active_reaction_pos: &HashMap<ReactionType, usize>) {
+        let fallback_pos = active_reaction_pos.len();
+        self.reactions.sort_by(|lhs, rhs| {
+            use std::cmp::Ordering;
+            let lhs_is_paid = lhs.reaction_type.is_paid_reaction();
+            let rhs_is_paid = rhs.reaction_type.is_paid_reaction();
+            if lhs_is_paid != rhs_is_paid {
+                return if lhs_is_paid {
+                    Ordering::Less
+                } else {
+                    Ordering::Greater
+                };
+            }
+            if lhs.choose_count != rhs.choose_count {
+                return rhs.choose_count.cmp(&lhs.choose_count);
+            }
+            let lhs_pos = active_reaction_pos
+                .get(&lhs.reaction_type)
+                .copied()
+                .unwrap_or(fallback_pos);
+            let rhs_pos = active_reaction_pos
+                .get(&rhs.reaction_type)
+                .copied()
+                .unwrap_or(fallback_pos);
+            if lhs_pos != rhs_pos {
+                return lhs_pos.cmp(&rhs_pos);
+            }
+            lhs.reaction_type.cmp(&rhs.reaction_type)
+        });
+    }
+
+    /// `MessageReactions::fix_chosen_reaction` (MessageReaction.cpp:862-880).
+    pub fn fix_chosen_reaction(&mut self) {
+        let mut my_dialog_id = DialogId::default();
+        for reaction in &mut self.reactions {
+            if !reaction.is_chosen() && reaction.my_recent_chooser_dialog_id.is_valid() {
+                my_dialog_id = reaction.my_recent_chooser_dialog_id;
+                tdutils::log_warning!("Fix recent chosen reaction");
+                reaction.remove_my_recent_chooser_dialog_id();
+            }
+        }
+        if !my_dialog_id.is_valid() {
+            return;
+        }
+        for reaction in &mut self.reactions {
+            if !reaction.reaction_type.is_paid_reaction()
+                && reaction.is_chosen()
+                && !reaction.my_recent_chooser_dialog_id.is_valid()
+            {
+                reaction.add_my_recent_chooser_dialog_id(my_dialog_id);
+            }
+        }
+    }
+
+    /// `MessageReactions::fix_my_recent_chooser_dialog_id`
+    /// (MessageReaction.cpp:882-890).
+    pub fn fix_my_recent_chooser_dialog_id(&mut self, my_dialog_id: DialogId) {
+        for reaction in &mut self.reactions {
+            if !reaction.reaction_type.is_paid_reaction()
+                && reaction.is_chosen()
+                && !reaction.my_recent_chooser_dialog_id.is_valid()
+                && reaction.recent_chooser_dialog_ids.contains(&my_dialog_id)
+            {
+                reaction.my_recent_chooser_dialog_id = my_dialog_id;
+            }
+        }
+    }
+
     /// `MessageReactions::are_empty` (MessageReaction.cpp).
     pub fn are_empty(&self) -> bool {
         self.reactions.is_empty()
@@ -5145,6 +5658,32 @@ pub struct MessageQuote {
 }
 
 impl MessageQuote {
+    /// `MessageQuote::MessageQuote(Td *, messageReplyHeader)` (MessageQuote.cpp:40-52).
+    pub fn from_reply_header<U: crate::message_entity::UserManagerLike + ?Sized>(
+        user_manager: Option<&mut U>,
+        reply_header: &telegram_api::messageReplyHeader,
+    ) -> MessageQuote {
+        if reply_header.quote_text.is_empty() {
+            return MessageQuote::default();
+        }
+        let mut text = crate::message_entity::get_formatted_text(
+            user_manager,
+            reply_header.quote_text.clone(),
+            reply_header.quote_entities.clone(),
+            true,
+            false,
+            "messageReplyHeader",
+        );
+        if crate::message_entity::remove_unallowed_quote_entities(&mut text) {
+            log_error!("Receive a quote with unexpected entities");
+        }
+        MessageQuote {
+            text,
+            position: reply_header.quote_offset.max(0),
+            is_manual: reply_header.quote,
+        }
+    }
+
     /// `MessageQuote::is_empty` (MessageQuote.h).
     pub fn is_empty(&self) -> bool {
         self.text.text.is_empty()
@@ -5214,6 +5753,22 @@ pub struct LastForwardedMessageInfo {
 }
 
 impl LastForwardedMessageInfo {
+    /// `LastForwardedMessageInfo::is_empty` (MessageForwardInfo.cpp:21-23).
+    pub fn is_empty(&self) -> bool {
+        *self == LastForwardedMessageInfo::default()
+    }
+
+    /// `LastForwardedMessageInfo::validate` (MessageForwardInfo.cpp:25-31).
+    pub fn validate(&mut self) {
+        if self.dialog_id.is_valid() != self.message_id.is_valid()
+            || (self.sender_dialog_id != DialogId::default() && !self.sender_dialog_id.is_valid())
+            || ((self.sender_dialog_id != DialogId::default() || !self.sender_name.is_empty())
+                && self.date <= 0)
+        {
+            *self = LastForwardedMessageInfo::default();
+        }
+    }
+
     /// `LastForwardedMessageInfo::get_forward_source_object`
     /// (MessageForwardInfo.cpp:68-92).
     pub fn get_forward_source_object(
@@ -5301,22 +5856,6 @@ impl LastForwardedMessageInfo {
         MessageFullId::new(self.dialog_id, self.message_id)
     }
 
-    /// `LastForwardedMessageInfo::is_empty` (MessageForwardInfo.cpp:21-23).
-    pub fn is_empty(&self) -> bool {
-        *self == LastForwardedMessageInfo::default()
-    }
-
-    /// `LastForwardedMessageInfo::validate` (MessageForwardInfo.cpp:25-33).
-    pub fn validate(&mut self) {
-        if self.dialog_id.is_valid() != self.message_id.is_valid()
-            || (self.sender_dialog_id != DialogId::default() && !self.sender_dialog_id.is_valid())
-            || ((self.sender_dialog_id != DialogId::default() || !self.sender_name.is_empty())
-                && self.date <= 0)
-        {
-            *self = LastForwardedMessageInfo::default();
-        }
-    }
-
     /// `LastForwardedMessageInfo::store` (MessageForwardInfo.hpp:16-37).
     pub fn store(&self, out: &mut Vec<u8>) {
         let has_sender_dialog_id = self.sender_dialog_id.is_valid();
@@ -5385,6 +5924,106 @@ pub struct MessageForwardInfo {
 }
 
 impl MessageForwardInfo {
+    /// `MessageForwardInfo::get_message_forward_info` (MessageForwardInfo.cpp:134-180)
+    /// — the intake ctor over a wire forward header.
+    pub fn get_message_forward_info(
+        ctx: &dyn MessageObjectContext,
+        forward_header: Option<telegram_api::MessageFwdHeader>,
+    ) -> Option<MessageForwardInfo> {
+        let telegram_api::MessageFwdHeader {
+            imported,
+            saved_out,
+            from_id,
+            from_name,
+            date,
+            channel_post,
+            post_author,
+            saved_from_peer,
+            saved_from_msg_id,
+            saved_from_id,
+            saved_from_name,
+            saved_date,
+            psa_type,
+            flags: _,
+        } = forward_header?;
+
+        if date <= 0 {
+            log_error!("Wrong date {date} in message forward header");
+            return None;
+        }
+
+        let mut last_message_info = LastForwardedMessageInfo::default();
+        if saved_from_peer.is_some() || saved_from_id.is_some() || !saved_from_name.is_empty() {
+            let sender_dialog_id = saved_from_id
+                .as_ref()
+                .map(DialogId::from_peer)
+                .unwrap_or_default();
+            last_message_info = LastForwardedMessageInfo {
+                dialog_id: saved_from_peer
+                    .as_ref()
+                    .map(DialogId::from_peer)
+                    .unwrap_or_default(),
+                message_id: MessageId::from_server_message_id(ServerMessageId::new(
+                    saved_from_msg_id,
+                )),
+                sender_dialog_id,
+                sender_name: saved_from_name,
+                date: saved_date,
+                is_outgoing: saved_out
+                    || sender_dialog_id == ctx.content_context().get_my_dialog_id(),
+            };
+            last_message_info.validate();
+            if last_message_info.is_empty() {
+                log_error!("Receive wrong last message in message forward header");
+            } else {
+                // `last_message_info.add_dependencies` — the per-kind dialog
+                // fan-out rides the force_create_dialog seam (the
+                // `Dependencies` graph lands with the receive path).
+                if last_message_info.dialog_id.is_valid() {
+                    ctx.force_create_dialog(
+                        last_message_info.dialog_id,
+                        "get_message_forward_info",
+                    );
+                }
+                if last_message_info.sender_dialog_id.is_valid() {
+                    ctx.force_create_dialog(
+                        last_message_info.sender_dialog_id,
+                        "get_message_forward_info",
+                    );
+                }
+            }
+        }
+        let origin = MessageOrigin::get_message_origin(
+            ctx,
+            telegram_api::MessageFwdHeader {
+                flags: 0,
+                imported: false,
+                saved_out: false,
+                from_id,
+                from_name,
+                date,
+                channel_post,
+                post_author,
+                saved_from_peer: None,
+                saved_from_msg_id: 0,
+                saved_from_id: None,
+                saved_from_name: String::new(),
+                saved_date: 0,
+                // moved out before the origin conversion, like the C++
+                psa_type: String::new(),
+            },
+        )
+        .ok()?;
+
+        Some(MessageForwardInfo {
+            origin,
+            date,
+            last_message_info,
+            psa_type,
+            is_imported: imported,
+        })
+    }
+
     /// `MessageForwardInfo::is_imported` (MessageForwardInfo.h).
     pub fn is_imported(&self) -> bool {
         self.is_imported
@@ -5506,6 +6145,169 @@ pub struct RepliedMessageInfo {
 }
 
 impl RepliedMessageInfo {
+    /// `RepliedMessageInfo::RepliedMessageInfo(Td *, messageReplyHeader, ...)`
+    /// (RepliedMessageInfo.cpp:49-140) — the intake ctor.
+    pub fn from_telegram(
+        ctx: &mut dyn MessageObjectContext,
+        reply_header: telegram_api::messageReplyHeader,
+        dialog_id: DialogId,
+        message_id: MessageId,
+        date: i32,
+    ) -> RepliedMessageInfo {
+        let mut result = RepliedMessageInfo::default();
+        let mut reply_header = reply_header;
+        let is_bot = ctx.is_bot();
+        let display_full_id = |dialog_id: DialogId, message_id: MessageId| -> String {
+            format!("{dialog_id:?}:{message_id:?}")
+        };
+        if reply_header.reply_to_scheduled {
+            let mut reply_message_id = MessageId::from_scheduled(
+                ScheduledServerMessageId::new(reply_header.reply_to_msg_id),
+                date,
+                false,
+            );
+            if message_id.is_valid_scheduled() {
+                if let Some(peer) = &reply_header.reply_to_peer_id {
+                    result.dialog_id = DialogId::from_peer(peer);
+                    log_error!(
+                        "Receive reply to {} in {}",
+                        display_full_id(result.dialog_id, reply_message_id),
+                        display_full_id(dialog_id, message_id)
+                    );
+                    reply_message_id = MessageId::default();
+                    result.dialog_id = DialogId::default();
+                }
+                if message_id == reply_message_id {
+                    log_error!(
+                        "Receive reply to {reply_message_id:?} in {}",
+                        display_full_id(dialog_id, message_id)
+                    );
+                    reply_message_id = MessageId::default();
+                }
+            } else {
+                log_error!(
+                    "Receive reply to {reply_message_id:?} in {}",
+                    display_full_id(dialog_id, message_id)
+                );
+                reply_message_id = MessageId::default();
+            }
+            if reply_header.reply_from.is_some() || reply_header.reply_media.is_some() {
+                log_error!(
+                    "Receive reply from other chat in {}",
+                    display_full_id(dialog_id, message_id)
+                );
+            }
+            result.message_id = reply_message_id;
+        } else if reply_header.reply_to_ephemeral {
+            if reply_header.reply_to_msg_id == 0
+                || reply_header.reply_to_peer_id.is_some()
+                || reply_header.reply_from.is_some()
+                || reply_header.reply_media.is_some()
+                || reply_header.todo_item_id != 0
+                || !reply_header.poll_option.is_empty()
+            {
+                log_error!(
+                    "Receive an invalid ephemeral reply header in {}",
+                    display_full_id(dialog_id, message_id)
+                );
+            } else {
+                result.message_id = ctx.get_message_id_of_ephemeral_message_id(
+                    dialog_id,
+                    EphemeralMessageId::new(reply_header.reply_to_msg_id),
+                );
+            }
+        } else {
+            if reply_header.reply_to_msg_id != 0 {
+                result.message_id = MessageId::from_server_message_id(ServerMessageId::new(
+                    reply_header.reply_to_msg_id,
+                ));
+                if let Some(peer) = &reply_header.reply_to_peer_id {
+                    result.dialog_id = DialogId::from_peer(peer);
+                    if !result.dialog_id.is_valid() {
+                        log_error!("Receive reply in an invalid peer");
+                        result.message_id = MessageId::default();
+                        result.dialog_id = DialogId::default();
+                    }
+                }
+                if !result.message_id.is_valid() {
+                    log_error!(
+                        "Receive an invalid reply message id in {}",
+                        display_full_id(dialog_id, message_id)
+                    );
+                    result.message_id = MessageId::default();
+                    result.dialog_id = DialogId::default();
+                } else if !message_id.is_scheduled()
+                    && message_id != MessageId::default()
+                    && !result.dialog_id.is_valid()
+                    && ((result.message_id > message_id && !has_qts_messages(ctx, dialog_id))
+                        || result.message_id == message_id)
+                {
+                    log_error!(
+                        "Receive reply to {:?} in {}",
+                        result.message_id,
+                        display_full_id(dialog_id, message_id)
+                    );
+                    result.message_id = MessageId::default();
+                }
+            } else if reply_header.reply_to_peer_id.is_some()
+                && !(is_bot && dialog_id.get_type() == DialogType::User)
+            {
+                log_error!(
+                    "Receive an invalid reply header in {}",
+                    display_full_id(dialog_id, message_id)
+                );
+            }
+            if let Some(reply_from) = reply_header.reply_from.take() {
+                result.origin_date = reply_from.date;
+                if result.origin_date <= 0 {
+                    log_error!(
+                        "Receive an invalid reply origin date in {}",
+                        display_full_id(dialog_id, message_id)
+                    );
+                    result.origin_date = 0;
+                } else {
+                    match MessageOrigin::get_message_origin(ctx, reply_from) {
+                        Result::Ok(origin) => result.origin = origin,
+                        Result::Err(_) => result.origin_date = 0,
+                    }
+                }
+            }
+            let has_reply_media = reply_header.reply_media.as_deref().is_some_and(|media| {
+                !matches!(media, telegram_api::MessageMedia::messageMediaEmpty(_))
+            });
+            if !result.origin.is_empty() && has_reply_media {
+                let mut ttl = MessageSelfDestructType::default();
+                let mut disable_web_page_preview = false;
+                result.content = Some(crate::message_content::get_message_content(
+                    ctx.content_context_mut(),
+                    FormattedText::default(),
+                    None,
+                    reply_header.reply_media.take().map(|media| *media),
+                    dialog_id,
+                    result.origin_date,
+                    true,
+                    UserId::default(),
+                    &mut ttl,
+                    &mut disable_web_page_preview,
+                    "messageReplyHeader",
+                ));
+                let content_type = result.content.as_ref().unwrap().get_type();
+                if !crate::message_content::is_supported_reply_message_content(content_type) {
+                    log_error!("Receive reply with media of the type {content_type:?}");
+                    result.content = None;
+                }
+            }
+        }
+        if !result.origin.is_empty() || result.message_id != MessageId::default() {
+            let mut user_manager =
+                crate::message_content::ContextUserManager::new(ctx.content_context());
+            result.quote = MessageQuote::from_reply_header(Some(&mut user_manager), &reply_header);
+        }
+        result.todo_item_id = reply_header.todo_item_id.max(0);
+        result.poll_option_id = String::from_utf8(reply_header.poll_option).unwrap_or_default();
+        result
+    }
+
     /// `RepliedMessageInfo::legacy` (RepliedMessageInfo.h:57-62).
     pub fn legacy(
         reply_to_message_id: MessageId,
@@ -6012,6 +6814,22 @@ pub struct SuggestedPost {
 }
 
 impl SuggestedPost {
+    /// `SuggestedPost::get_suggested_post` (SuggestedPost.cpp:13-27) — the
+    /// intake ctor.
+    pub fn get_suggested_post(post: Option<telegram_api::SuggestedPost>) -> Option<SuggestedPost> {
+        let post = post?;
+        let result = SuggestedPost {
+            is_accepted: post.accepted,
+            is_rejected: post.rejected,
+            price: crate::message_content::get_suggested_post_price(post.price),
+            schedule_date: post.schedule_date,
+        };
+        if result.is_accepted && result.is_rejected {
+            log_error!("Receive accepted and rejected suggested post");
+        }
+        Some(result)
+    }
+
     /// `SuggestedPost::is_pending` (SuggestedPost.h).
     pub fn is_pending(&self) -> bool {
         !self.is_accepted && !self.is_rejected
@@ -7872,6 +8690,8 @@ pub struct MessagesManager {
     pub(crate) dialogs: HashMap<DialogId, Box<Dialog>>,
     /// `update_message_ids_` — new_message_id -> temporary_id.
     pub(crate) update_message_ids: HashMap<(DialogId, MessageId), MessageId>,
+    /// `update_ephemeral_message_ids_` (MessagesManager.h:3318).
+    pub(crate) update_ephemeral_message_ids: HashMap<EphemeralMessageFullId, MessageId>,
     // `being_sent_messages_` — message_random_id -> message; the send path
     // (M.10.8+) reads it
     #[allow(dead_code)]
@@ -7909,6 +8729,142 @@ impl MessagesManager {
             return;
         }
         self.calls_db_state.message_count_by_index = [-1, -1];
+    }
+
+    /// `MessagesManager::add_dialog_for_new_message` + `add_dialog`
+    /// (MessagesManager.cpp:33044-33076) — the fresh-dialog core: the map
+    /// insert with the C++ in-class defaults. The message-database
+    /// synchronous load of `add_dialog` and the per-kind init of
+    /// `add_new_dialog` (has_bots/forum flags/`updateNewChat` emission)
+    /// ride the DialogDb/chat-manager receive slices.
+    pub fn add_dialog_for_new_message(&mut self, dialog_id: DialogId) -> &mut Dialog {
+        let dialog = self.dialogs.entry(dialog_id).or_insert_with(|| {
+            let mut dialog = Box::new(Dialog::default());
+            dialog.dialog_id = dialog_id;
+            dialog
+        });
+        dialog.as_mut()
+    }
+
+    /// `MessagesManager::on_get_message(DialogId, telegram_api::Message,
+    /// bool, bool, const char *)` + the `MessageInfo` overload
+    /// (MessagesManager.cpp:11910-12179) — the receive-path head. The
+    /// created `Message` is returned to the caller until the per-dialog
+    /// message containers land (M.10.9): the C++ continues into
+    /// `add_message_to_dialog` → `send_update_new_message`, whose
+    /// ordering/notification/update fan-out is the recorded seam
+    /// (the media-fetch scheduling call of the plan, `load_message_content`,
+    /// is M.10.18's scheduler).
+    pub fn on_get_message(
+        &mut self,
+        ctx: &mut dyn MessageObjectContext,
+        message_ptr: telegram_api::Message,
+        from_update: bool,
+        is_scheduled: bool,
+        source: &str,
+    ) -> Option<(DialogId, Box<Message>)> {
+        let message_info =
+            parse_telegram_api_message(ctx, message_ptr, is_scheduled, false, source);
+        self.on_get_message_info(ctx, message_info, from_update, source)
+    }
+
+    /// `MessagesManager::on_get_message(MessageInfo &&, bool, const char *)`
+    /// (MessagesManager.cpp:11944-12179) — the head through the new-message
+    /// branch; the sent-message re-add branch and the post-add update
+    /// fan-out are the recorded seams of the slice split.
+    pub fn on_get_message_info(
+        &mut self,
+        ctx: &mut dyn MessageObjectContext,
+        message_info: MessageInfo,
+        from_update: bool,
+        source: &str,
+    ) -> Option<(DialogId, Box<Message>)> {
+        let report_delivery_until_date = message_info.report_delivery_until_date;
+        let (dialog_id, new_message) = create_message(ctx, self, message_info, false, source);
+        let mut new_message = new_message?;
+        let message_id = new_message.message_id;
+        if report_delivery_until_date != 0 && message_id.is_server() {
+            // `message_query_manager_->report_message_delivery`
+            // (MessagesManager.cpp:11952-11954) — the delivery-report
+            // query plane is the net slice's owner; the date rides the
+            // message until then.
+        }
+
+        let is_ephemeral = new_message.ephemeral_message_id.is_valid();
+        let old_message_id = if is_ephemeral {
+            *self
+                .update_ephemeral_message_ids
+                .get(&EphemeralMessageFullId::new(
+                    dialog_id,
+                    new_message.ephemeral_message_id,
+                ))
+                .unwrap_or(&MessageId::default())
+        } else {
+            *self
+                .update_message_ids
+                .get(&(dialog_id, message_id))
+                .unwrap_or(&MessageId::default())
+        };
+        if old_message_id.is_valid() || old_message_id.is_valid_scheduled() {
+            // The sent-message re-add branch (MessagesManager.cpp:12008+):
+            // `update_reply_to_message_id` → `delete_message` →
+            // `update_message` → `send_update_message_send_succeeded` all
+            // belong to the delete/edit/send slices that own the containers;
+            // a duplicate intake cannot be re-added here.
+            log_error!(
+                "Receive a duplicate {} in {:?} from {}",
+                DisplayMessageId(message_id),
+                dialog_id,
+                source
+            );
+            return None;
+        }
+        let _ = from_update;
+
+        self.add_dialog_for_new_message(dialog_id);
+
+        // The reactions context views the same object — the banned-chat
+        // read is the ChatManager status cache, answered by the same
+        // surface until the receive slices unify the two traits.
+        let reactions_ctx = MessageObjectReactionsContext { ctx: &*ctx };
+        fix_new_message(
+            self,
+            &reactions_ctx,
+            &*ctx,
+            dialog_id,
+            &mut new_message,
+            false,
+        );
+
+        // The media-fetch scheduling call of the plan:
+        // `load_message_content` (MessagesManager.cpp:12300+) fires inside
+        // `add_message_to_dialog` per received message; the load scheduler
+        // is M.10.18's and the call stays the recorded seam until then.
+        //
+        // `add_message_to_dialog` (MessagesManager.cpp:12263+) continues:
+        // the ordered-messages insert, last-message/counter maintenance,
+        // `send_update_new_message`, the awaited promises, live locations,
+        // reply counts, the inaccessible-chat deletion and the reply-markup
+        // dialog update are the M.10.9+ receive-path fan-out.
+
+        Some((dialog_id, new_message))
+    }
+}
+
+/// The `DialogReactionsContext` view of a `MessageObjectContext` —
+/// `is_chat_banned` is the ChatManager status cache read; the standalone
+/// banned-chat queries land with the ChatManager receive slice.
+pub struct MessageObjectReactionsContext<'a> {
+    ctx: &'a dyn MessageObjectContext,
+}
+
+impl DialogReactionsContext for MessageObjectReactionsContext<'_> {
+    fn is_chat_banned(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn is_bot(&self) -> bool {
+        self.ctx.is_bot()
     }
 }
 
@@ -9258,6 +10214,1709 @@ impl MessageTopic {
     }
 }
 
+// ---------------------------------------------------------------------------
+// M.10.3a — the message intake value plane: the telegram_api → internal
+// converters `create_message` (MessagesManager.cpp:11582) consumes.
+// Mirrors: MessageReplyHeader.cpp, RepliedMessageInfo.cpp:49-140,
+// MessageOrigin.cpp:23-80, MessageForwardInfo.cpp:25-180, FactCheck.cpp:16-28,
+// SuggestedPost.cpp:13-27, MessageReaction.cpp:526-631 + 841-890,
+// MessageReactor.cpp:24-141, MessageSender.cpp:101-131.
+// ---------------------------------------------------------------------------
+
+/// `get_custom_emoji_string` (ReactionType.cpp:23-30).
+fn get_custom_emoji_string(custom_emoji_id: i64) -> String {
+    use base64::Engine as _;
+    let bytes = custom_emoji_id.to_le_bytes();
+    format!(
+        "#{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
+}
+
+/// `add_to_top` (td/utils/algorithm.h:115-136) — moves `value` to the front,
+/// appending it (or dropping the last element) as needed.
+fn add_to_top_dialog_id(v: &mut Vec<DialogId>, max_size: usize, value: DialogId) {
+    let size = v.len();
+    let mut value = value;
+    let mut i = 0;
+    while i < size {
+        if v[i] == value {
+            value = v[i];
+            break;
+        }
+        i += 1;
+    }
+    if i == size {
+        if size < max_size || i == 0 {
+            v.push(value);
+        } else {
+            i -= 1;
+        }
+    }
+    while i > 0 {
+        v[i] = v[i - 1];
+        i -= 1;
+    }
+    if !v.is_empty() {
+        v[0] = value;
+    }
+}
+
+/// `has_qts_messages` (RepliedMessageInfo.cpp:32-45).
+fn has_qts_messages(ctx: &dyn MessageObjectContext, dialog_id: DialogId) -> bool {
+    match dialog_id.get_type() {
+        DialogType::User | DialogType::Chat => {
+            ctx.content_context().get_option_integer("session_count", 0) > 1
+        }
+        DialogType::Channel | DialogType::SecretChat => false,
+        DialogType::None => unreachable!(),
+    }
+}
+
+/// `check_min_message_sender` (MessageSender.cpp:101-133).
+pub fn check_min_message_sender(
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    min_channels: &mut Vec<(ChannelId, MinChannel)>,
+) -> bool {
+    if ctx.have_dialog_info(dialog_id) {
+        return true;
+    }
+    match dialog_id.get_type() {
+        DialogType::User => {
+            let user_id = dialog_id.get_user_id();
+            if !ctx.have_min_user(user_id) {
+                log_error!("Receive unknown {user_id:?}");
+                return false;
+            }
+            true
+        }
+        DialogType::Channel => {
+            let channel_id = dialog_id.get_channel_id();
+            let Some(min_channel) = ctx.get_min_channel(channel_id) else {
+                log_error!("Receive unknown {channel_id:?}");
+                return false;
+            };
+            if min_channels.iter().any(|(id, _)| *id == channel_id) {
+                return true;
+            }
+            min_channels.push((channel_id, min_channel));
+            true
+        }
+        _ => {
+            log_error!("Receive unknown {:?}", dialog_id);
+            false
+        }
+    }
+}
+
+/// `td::MessageReplyHeader` (MessageReplyHeader.h) — the parsed reply header
+/// of an incoming message (the store/parse plane rides `RepliedMessageInfo`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MessageReplyHeader {
+    /// `replied_message_info_` (MessageReplyHeader.h:28).
+    pub replied_message_info: RepliedMessageInfo,
+    /// `top_thread_message_id_` (MessageReplyHeader.h:30).
+    pub top_thread_message_id: MessageId,
+    /// `is_topic_message_` (MessageReplyHeader.h:31).
+    pub is_topic_message: bool,
+    /// `story_full_id_` (MessageReplyHeader.h:32).
+    pub story_full_id: StoryFullId,
+}
+
+impl MessageReplyHeader {
+    /// `MessageReplyHeader::MessageReplyHeader` (MessageReplyHeader.cpp:18-73).
+    pub fn from_telegram(
+        ctx: &mut dyn MessageObjectContext,
+        reply_header: Option<telegram_api::MessageReplyHeader>,
+        dialog_id: DialogId,
+        message_id: MessageId,
+        date: i32,
+    ) -> MessageReplyHeader {
+        let mut result = MessageReplyHeader::default();
+        let Some(reply_header) = reply_header else {
+            return result;
+        };
+        match reply_header {
+            telegram_api::MessageReplyHeader::messageReplyStoryHeader(story_header) => {
+                let story_dialog_id = story_header
+                    .peer
+                    .as_ref()
+                    .map(DialogId::from_peer)
+                    .unwrap_or_default();
+                let story_id = StoryId::new(story_header.story_id);
+                if !story_dialog_id.is_valid()
+                    || !story_id.is_server()
+                    || message_id == MessageId::default()
+                {
+                    log_error!("Receive an invalid reply story header in {dialog_id:?}");
+                } else {
+                    result.story_full_id = StoryFullId::new(story_dialog_id, story_id);
+                }
+            }
+            telegram_api::MessageReplyHeader::messageReplyHeader(mut header) => {
+                let can_have_thread = ctx.can_dialog_have_threads(dialog_id);
+                if !message_id.is_scheduled() && can_have_thread {
+                    result.is_topic_message = header.forum_topic;
+                    if header.reply_to_top_id == 0
+                        && result.is_topic_message
+                        && header.reply_from.is_some()
+                        && header.reply_to_peer_id.is_none()
+                        && header.reply_to_msg_id != 0
+                    {
+                        header.reply_to_top_id = header.reply_to_msg_id;
+                        header.reply_to_msg_id = 0;
+                        header.reply_to_ephemeral = false;
+                    }
+                    if header.reply_to_top_id != 0 {
+                        result.top_thread_message_id = MessageId::from_server_message_id(
+                            ServerMessageId::new(header.reply_to_top_id),
+                        );
+                        if !result.top_thread_message_id.is_valid() {
+                            log_error!("Receive an invalid top thread message id in {dialog_id:?}");
+                            result.top_thread_message_id = MessageId::default();
+                        } else if dialog_id.get_type() == DialogType::User {
+                            result.is_topic_message = true;
+                        }
+                    }
+                }
+
+                result.replied_message_info =
+                    RepliedMessageInfo::from_telegram(ctx, header, dialog_id, message_id, date);
+
+                if !message_id.is_scheduled()
+                    && can_have_thread
+                    && dialog_id.get_type() == DialogType::Channel
+                {
+                    if !result.top_thread_message_id.is_valid() {
+                        let same_chat_reply_to_message_id = result
+                            .replied_message_info
+                            .get_same_chat_reply_to_message_id(false);
+                        if same_chat_reply_to_message_id.is_server() {
+                            result.top_thread_message_id = same_chat_reply_to_message_id;
+                        } else {
+                            result.is_topic_message = false;
+                        }
+                    }
+                    if result.top_thread_message_id >= message_id
+                        && message_id != MessageId::default()
+                    {
+                        log_error!(
+                            "Receive top thread {} in {} in {dialog_id:?}",
+                            DisplayMessageId(result.top_thread_message_id),
+                            DisplayMessageId(message_id)
+                        );
+                        result.top_thread_message_id = MessageId::default();
+                    }
+                }
+            }
+        }
+        result
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M.10.3 — the receive-path intake: `parse_telegram_api_message`,
+// `create_message` (MessagesManager.cpp:11582), `fix_new_message`
+// (MessagesManager.cpp:30810) and the `Dependencies` walk they feed. The
+// M.7 sink arms (`updateNewMessage`/`updateNewChannelMessage`) consume the
+// manager through [`MessagesManager::on_get_message`]; the wire media
+// conversion is the M.9.18 receive flip (`get_message_content`), reused
+// here at its C++ call position — not duplicated.
+// ---------------------------------------------------------------------------
+
+/// `Dependencies` (Dependencies.cpp:14-101) — the dependency collector the
+/// intake fans force-create over. The C++ class also carries chat/channel/
+/// secret/web-page/story/community id sets for the resolve phase; the M.10.3
+/// fan-out only reads the dialog set, so the port carries users + dialogs
+/// (the per-kind sets grow with `Dependencies::resolve_force`'s owner).
+#[derive(Debug, Default)]
+pub struct Dependencies {
+    user_ids: std::collections::BTreeSet<UserId>,
+    dialog_ids: std::collections::BTreeSet<DialogId>,
+}
+
+impl Dependencies {
+    /// `Dependencies::add(UserId)` (Dependencies.cpp:22-26).
+    pub fn add_user(&mut self, user_id: UserId) {
+        if user_id.is_valid() {
+            self.user_ids.insert(user_id);
+        }
+    }
+
+    /// `Dependencies::add_dialog_and_dependencies` (Dependencies.cpp:65-67).
+    pub fn add_dialog_and_dependencies(&mut self, dialog_id: DialogId) {
+        if dialog_id.is_valid() && self.dialog_ids.insert(dialog_id) {
+            self.add_dialog_dependencies(dialog_id);
+        }
+    }
+
+    /// `Dependencies::add_dialog_dependencies` (Dependencies.cpp:71-90) —
+    /// the id is decomposed into the per-kind owner set; the port has the
+    /// user set, the rest are re-added as their dialog.
+    pub fn add_dialog_dependencies(&mut self, dialog_id: DialogId) {
+        match dialog_id.get_type() {
+            DialogType::User => self.add_user(dialog_id.get_user_id()),
+            DialogType::Chat | DialogType::Channel | DialogType::SecretChat | DialogType::None => {}
+        }
+    }
+
+    /// `Dependencies::add_message_sender_dependencies`
+    /// (Dependencies.cpp:92-98).
+    pub fn add_message_sender_dependencies(&mut self, dialog_id: DialogId) {
+        if dialog_id.get_type() == DialogType::User {
+            self.add_user(dialog_id.get_user_id());
+        } else {
+            self.add_dialog_and_dependencies(dialog_id);
+        }
+    }
+
+    /// `Dependencies::add(StoryFullId)` (Dependencies.cpp:58-63).
+    pub fn add_story(&mut self, story_full_id: StoryFullId) {
+        if story_full_id.get_dialog_id().is_valid() {
+            self.add_dialog_and_dependencies(story_full_id.get_dialog_id());
+        }
+    }
+
+    /// `Dependencies::get_dialog_ids` — the force-create fan-out set.
+    pub fn get_dialog_ids(&self) -> impl Iterator<Item = DialogId> + '_ {
+        self.dialog_ids.iter().copied()
+    }
+}
+
+/// `MessageOrigin::add_dependencies` (MessageOrigin.cpp:133-137).
+fn add_message_origin_dependencies(dependencies: &mut Dependencies, origin: &MessageOrigin) {
+    dependencies.add_user(origin.sender_user_id);
+    dependencies.add_dialog_and_dependencies(origin.sender_dialog_id);
+}
+
+/// `LastForwardedMessageInfo::add_dependencies`
+/// (MessageForwardInfo.cpp:45-50).
+fn add_last_forwarded_message_info_dependencies(
+    dependencies: &mut Dependencies,
+    last_message_info: &LastForwardedMessageInfo,
+) {
+    dependencies.add_dialog_and_dependencies(last_message_info.dialog_id);
+    dependencies.add_message_sender_dependencies(last_message_info.sender_dialog_id);
+}
+
+/// `MessageQuote::add_dependencies` (MessageQuote.cpp:104-107).
+fn add_message_quote_dependencies(dependencies: &mut Dependencies, quote: &MessageQuote) {
+    for entity in &quote.text.entities {
+        if entity.user_id.is_valid() {
+            dependencies.add_user(entity.user_id);
+        }
+    }
+}
+
+/// `MessageForwardInfo::add_dependencies` (MessageForwardInfo.cpp:210-215).
+fn add_message_forward_info_dependencies(
+    dependencies: &mut Dependencies,
+    forward_info: &MessageForwardInfo,
+) {
+    add_message_origin_dependencies(dependencies, &forward_info.origin);
+    add_last_forwarded_message_info_dependencies(dependencies, &forward_info.last_message_info);
+}
+
+/// `RepliedMessageInfo::add_dependencies`
+/// (RepliedMessageInfo.cpp:337-348).
+fn add_replied_message_info_dependencies(
+    dependencies: &mut Dependencies,
+    ctx: &dyn MessageObjectContext,
+    replied_message_info: &RepliedMessageInfo,
+    my_user_id: UserId,
+    is_bot: bool,
+) {
+    dependencies.add_dialog_and_dependencies(replied_message_info.dialog_id);
+    add_message_origin_dependencies(dependencies, &replied_message_info.origin);
+    add_message_quote_dependencies(dependencies, &replied_message_info.quote);
+    if let Some(content) = &replied_message_info.content {
+        let dependencies_cell = std::cell::RefCell::new(&mut *dependencies);
+        let mut user_sink = |user_id: UserId| dependencies_cell.borrow_mut().add_user(user_id);
+        let mut dialog_sink = |dialog_id: DialogId| {
+            dependencies_cell
+                .borrow_mut()
+                .add_dialog_and_dependencies(dialog_id)
+        };
+        let mut web_page_sink = |_: crate::message_content::WebPageId| {};
+        let mut story_sink =
+            |story_full_id: StoryFullId| dependencies_cell.borrow_mut().add_story(story_full_id);
+        let mut community_sink = |_: crate::message_content::CommunityId| {};
+        crate::message_content::add_message_content_dependencies(
+            ctx.content_context(),
+            content,
+            my_user_id,
+            is_bot,
+            &mut user_sink,
+            &mut dialog_sink,
+            &mut web_page_sink,
+            &mut story_sink,
+            &mut community_sink,
+        );
+    }
+}
+
+/// `SavedMessagesTopicId::add_dependencies`
+/// (SavedMessagesTopicId.cpp:118-125) — the hidden-author topic only pins
+/// the dialog itself.
+fn add_saved_messages_topic_id_dependencies(
+    dependencies: &mut Dependencies,
+    saved_messages_topic_id: SavedMessagesTopicId,
+) {
+    dependencies.add_dialog_dependencies(saved_messages_topic_id.get_dialog_id());
+}
+
+/// `ForumTopicManager::can_be_forum` (ForumTopicManager.cpp:1253-1266).
+fn can_be_forum(ctx: &dyn MessageObjectContext, dialog_id: DialogId) -> bool {
+    match dialog_id.get_type() {
+        DialogType::User => {
+            ctx.is_bot() || ctx.content_context().is_user_bot(dialog_id.get_user_id())
+        }
+        DialogType::Channel => {
+            let channel_id = dialog_id.get_channel_id();
+            !ctx.content_context().is_broadcast_channel(channel_id)
+                && !ctx.content_context().is_monoforum_channel(channel_id)
+        }
+        DialogType::Chat | DialogType::SecretChat | DialogType::None => false,
+    }
+}
+
+/// The hidden-author Saved Messages topic peer (SavedMessagesTopicId.cpp:21).
+const HIDDEN_AUTHOR_DIALOG_ID: i64 = 2666000;
+
+/// `MTPROTO_LAYER` (Version.h:13) — the layer constant the legacy flag
+/// encodes.
+const MTPROTO_LAYER: i32 = 229;
+
+/// `SavedMessagesTopicId::SavedMessagesTopicId(DialogId, const
+/// MessageForwardInfo *, DialogId)` (SavedMessagesTopicId.cpp:22-58) — the
+/// topic guess for a message received in the Saved Messages dialog.
+fn guess_saved_messages_topic_id(
+    ctx: &dyn MessageObjectContext,
+    my_dialog_id: DialogId,
+    message_forward_info: Option<&MessageForwardInfo>,
+    real_forward_from_dialog_id: DialogId,
+) -> SavedMessagesTopicId {
+    let mut dialog_id = my_dialog_id;
+    if let Some(forward_info) = message_forward_info {
+        let last_dialog_id = forward_info.get_last_dialog_id();
+        if last_dialog_id.is_valid() {
+            return SavedMessagesTopicId::new(last_dialog_id);
+        }
+        if real_forward_from_dialog_id != DialogId::default()
+            && forward_info.last_message_info.has_sender_name()
+        {
+            if real_forward_from_dialog_id.get_type() == DialogType::User {
+                dialog_id = DialogId::new(HIDDEN_AUTHOR_DIALOG_ID);
+            } else {
+                dialog_id = real_forward_from_dialog_id;
+            }
+            return SavedMessagesTopicId::new(dialog_id);
+        }
+        if forward_info.origin.get_sender(ctx).is_valid() {
+            return SavedMessagesTopicId::new(my_dialog_id);
+        }
+        if forward_info.origin.is_sender_hidden(ctx) {
+            return SavedMessagesTopicId::new(DialogId::new(HIDDEN_AUTHOR_DIALOG_ID));
+        }
+    }
+    SavedMessagesTopicId::new(dialog_id)
+}
+
+/// `MessagesManager::is_message_auto_read` (MessagesManager.cpp:21469-21492).
+pub fn is_message_auto_read(
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    is_outgoing: bool,
+) -> bool {
+    match dialog_id.get_type() {
+        DialogType::User => {
+            let user_id = dialog_id.get_user_id();
+            if user_id == ctx.content_context().get_my_id() {
+                return true;
+            }
+            if is_outgoing
+                && ctx.content_context().is_user_bot(user_id)
+                && !ctx.content_context().is_user_support(user_id)
+            {
+                return true;
+            }
+            false
+        }
+        DialogType::Chat => {
+            // TODO auto_read message content and messages sent to group with bots only
+            false
+        }
+        DialogType::Channel => {
+            is_outgoing && ctx.content_context().is_broadcast_channel_dialog(dialog_id)
+        }
+        DialogType::SecretChat | DialogType::None => false,
+    }
+}
+
+/// `MessagesManager::fix_message_topic` (MessagesManager.cpp:4873-4941).
+pub fn fix_message_topic(
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    m: &mut Message,
+    from_database: bool,
+) {
+    let message_id = m.message_id;
+    let dialog_type = dialog_id.get_type();
+    let can_be_forum = can_be_forum(ctx, dialog_id);
+    let content_type = m
+        .content
+        .as_ref()
+        .expect("message without content")
+        .get_type();
+    if content_type == MessageContentType::TopicCreate {
+        if !m.top_thread_message_id.is_valid()
+            && message_id.is_server()
+            && (dialog_type == DialogType::Channel || !ctx.is_bot())
+        {
+            m.top_thread_message_id = message_id;
+        }
+        m.is_topic_message = true;
+    } else if !m.top_thread_message_id.is_valid()
+        && can_be_forum
+        && dialog_type == DialogType::Channel
+        && message_id.is_server()
+        && (!m.reply_info.is_empty() || m.reply_info.was_dropped())
+    {
+        m.top_thread_message_id = message_id;
+    }
+    if m.top_thread_message_id != MessageId::default()
+        && (!can_be_forum || (message_id.is_valid_scheduled() && message_id.is_scheduled_server()))
+    {
+        // just in case
+        m.top_thread_message_id = MessageId::default();
+    }
+    if m.top_thread_message_id == MessageId::default() {
+        // just in case
+        m.is_topic_message = false;
+    }
+
+    if dialog_id == ctx.content_context().get_my_dialog_id() {
+        if !m.saved_messages_topic_id.is_valid() {
+            if !from_database {
+                log_error!(
+                    "Receive no topic for {} in {:?} of type {:?} sent by {:?}",
+                    DisplayMessageId(message_id),
+                    dialog_id,
+                    content_type,
+                    get_message_sender(m)
+                );
+            }
+            m.saved_messages_topic_id = guess_saved_messages_topic_id(
+                ctx,
+                ctx.content_context().get_my_dialog_id(),
+                m.forward_info.as_ref(),
+                m.real_forward_from_dialog_id,
+            );
+        }
+    } else if ctx.is_admined_monoforum_channel(dialog_id) {
+        if !m.saved_messages_topic_id.is_valid()
+            && message_id != MessageId::from_server_message_id(ServerMessageId::new(1))
+        {
+            if !from_database {
+                log_error!(
+                    "Receive no topic for {} in {:?} of type {:?} sent by {:?}",
+                    DisplayMessageId(message_id),
+                    dialog_id,
+                    content_type,
+                    get_message_sender(m)
+                );
+            }
+            if m.sender_user_id.is_valid() {
+                // there is no way to guess the topic for channel messages
+                m.saved_messages_topic_id = SavedMessagesTopicId::new(get_message_sender(m));
+            }
+        }
+    } else if m.saved_messages_topic_id.is_valid() {
+        if !ctx.is_monoforum_channel_dialog(dialog_id) {
+            log_error!(
+                "Receive saved messages topic {:?} for {} in {:?} of type {:?} sent by {:?}",
+                m.saved_messages_topic_id.get_dialog_id(),
+                DisplayMessageId(message_id),
+                dialog_id,
+                content_type,
+                get_message_sender(m)
+            );
+        }
+        m.saved_messages_topic_id = SavedMessagesTopicId::default();
+    }
+}
+
+/// `MessagesManager::has_message_sender_user_id`
+/// (MessagesManager.cpp:2885-2895).
+pub fn has_message_sender_user_id(
+    manager: &MessagesManager,
+    reactions_ctx: &dyn DialogReactionsContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> bool {
+    if !m.sender_user_id.is_valid() {
+        return false;
+    }
+    if reactions_ctx.is_bot() && is_discussion_message(manager, reactions_ctx, dialog_id, m) {
+        return false;
+    }
+    true
+}
+
+/// `MessageReplyInfo::MessageReplyInfo(Td *, telegram_api::messageReplies &&,
+/// bool)` (MessageReplyInfo.cpp:21-100) — the intake ctor.
+impl MessageReplyInfo {
+    pub fn from_telegram(
+        ctx: &dyn MessageObjectContext,
+        reply_info: Option<telegram_api::MessageReplies>,
+        is_bot: bool,
+    ) -> MessageReplyInfo {
+        let Some(reply_info) = reply_info else {
+            return MessageReplyInfo::default();
+        };
+        if reply_info.replies < 0 {
+            log_error!("Receive wrong replies count {}", reply_info.replies);
+            return MessageReplyInfo::default();
+        }
+        if is_bot || reply_info.channel_id == 777 {
+            return MessageReplyInfo {
+                is_dropped: true,
+                ..MessageReplyInfo::default()
+            };
+        }
+        let mut result = MessageReplyInfo {
+            reply_count: reply_info.replies,
+            pts: reply_info.replies_pts,
+            is_comment: reply_info.comments,
+            ..MessageReplyInfo::default()
+        };
+        if result.is_comment {
+            result.channel_id = ChannelId::new(reply_info.channel_id);
+            if !result.channel_id.is_valid() {
+                log_error!("Receive invalid channel {:?}", result.channel_id);
+                result.channel_id = ChannelId::default();
+                result.is_comment = false;
+            }
+        }
+        if result.is_comment {
+            let mut min_channels: Vec<(ChannelId, MinChannel)> = Vec::new();
+            for peer in &reply_info.recent_repliers {
+                let dialog_id = DialogId::from_peer(peer);
+                if result.recent_replier_dialog_ids.contains(&dialog_id) {
+                    log_error!("Receive duplicate {dialog_id:?} as a recent replier");
+                    continue;
+                }
+                if !check_min_message_sender(ctx, dialog_id, &mut min_channels) {
+                    continue;
+                }
+                result.recent_replier_dialog_ids.push(dialog_id);
+                if result.recent_replier_dialog_ids.len() == MessageReplyInfo::MAX_RECENT_REPLIERS {
+                    break;
+                }
+            }
+            result.replier_min_channels = min_channels;
+        }
+        if ServerMessageId::new(reply_info.max_id).is_valid() {
+            result.max_message_id =
+                MessageId::from_server_message_id(ServerMessageId::new(reply_info.max_id));
+        }
+        if ServerMessageId::new(reply_info.read_max_id).is_valid() {
+            result.last_read_inbox_message_id =
+                MessageId::from_server_message_id(ServerMessageId::new(reply_info.read_max_id));
+        }
+        if result.last_read_inbox_message_id > result.max_message_id {
+            // possible if last thread message was deleted after it was read
+            result.max_message_id = result.last_read_inbox_message_id;
+        }
+        result
+    }
+}
+
+/// `MessagesManager::MessageInfo` (MessagesManager.h:1059-1116). The wire
+/// object pointers are the codegen `Option`s; `content` is the C++
+/// `unique_ptr` — the `create_message` CHECK
+/// (`message_info.content != nullptr`) is the intake `expect`.
+#[derive(Debug, Default)]
+pub struct MessageInfo {
+    pub dialog_id: DialogId,
+    pub message_id: MessageId,
+    pub sender_user_id: UserId,
+    pub sender_dialog_id: DialogId,
+    pub receiver_user_id: UserId,
+    pub ephemeral_message_id: EphemeralMessageId,
+    pub saved_messages_topic_id: SavedMessagesTopicId,
+    pub date: i32,
+    pub schedule_repeat_period: i32,
+    pub ttl_period: i32,
+    pub ttl: MessageSelfDestructType,
+    pub disable_web_page_preview: bool,
+    pub random_id: i64,
+    pub forward_header: Option<telegram_api::MessageFwdHeader>,
+    pub reply_header: MessageReplyHeader,
+    pub via_bot_user_id: UserId,
+    pub guest_bot_via_dialog_id: DialogId,
+    pub via_business_bot_user_id: UserId,
+    pub view_count: i32,
+    pub forward_count: i32,
+    pub reply_info: Option<telegram_api::MessageReplies>,
+    pub reactions: Option<telegram_api::MessageReactions>,
+    pub fact_check: Option<telegram_api::FactCheck>,
+    pub suggested_post: Option<telegram_api::SuggestedPost>,
+    pub sender_rank: String,
+    pub sender_boost_count: i32,
+    pub edit_date: i32,
+    pub chat_instance: i64,
+    pub restriction_reasons: Vec<RestrictionReason>,
+    pub author_signature: String,
+    pub summary_from_language: String,
+    pub media_album_id: i64,
+    pub effect_id: MessageEffectId,
+    pub report_delivery_until_date: i32,
+    pub paid_message_star_count: i64,
+    pub is_outgoing: bool,
+    pub is_silent: bool,
+    pub is_channel_post: bool,
+    pub is_legacy: bool,
+    pub hide_edit_date: bool,
+    pub is_from_scheduled: bool,
+    pub is_from_offline: bool,
+    pub is_pinned: bool,
+    pub noforwards: bool,
+    pub has_mention: bool,
+    pub has_unread_content: bool,
+    pub invert_media: bool,
+    pub video_processing_pending: bool,
+    pub reactions_are_possible: bool,
+    pub is_paid_suggested_post_stars: bool,
+    pub is_paid_suggested_post_ton: bool,
+    pub content: Option<MessageContent>,
+    pub reply_markup: Option<telegram_api::ReplyMarkup>,
+    pub anchor_message_id: MessageId,
+}
+
+/// `MessagesManager::parse_telegram_api_message`
+/// (MessagesManager.cpp:11372-11562).
+pub fn parse_telegram_api_message(
+    ctx: &mut dyn MessageObjectContext,
+    message_ptr: telegram_api::Message,
+    is_scheduled: bool,
+    is_business_message: bool,
+    source: &str,
+) -> MessageInfo {
+    let is_bot = ctx.is_bot();
+    let mut message_info = MessageInfo {
+        message_id: MessageId::get_message_id(&message_ptr, is_scheduled),
+        ..MessageInfo::default()
+    };
+    match message_ptr {
+        telegram_api::Message::messageEmpty(_) => {
+            message_info.message_id = MessageId::default();
+        }
+        telegram_api::Message::message(message) => {
+            let telegram_api::message {
+                out,
+                mentioned,
+                media_unread,
+                silent,
+                post,
+                from_scheduled,
+                legacy,
+                edit_hide,
+                pinned,
+                noforwards,
+                invert_media,
+                offline,
+                video_processing_pending,
+                paid_suggested_post_stars,
+                paid_suggested_post_ton,
+                id: _,
+                from_id,
+                from_boosts_applied,
+                from_rank,
+                peer_id,
+                saved_peer_id,
+                fwd_from,
+                via_bot_id,
+                via_business_bot_id,
+                guestchat_via_from,
+                reply_to,
+                date,
+                message: message_text,
+                media,
+                reply_markup,
+                entities,
+                views,
+                forwards,
+                replies,
+                edit_date,
+                post_author,
+                grouped_id,
+                reactions,
+                restriction_reason,
+                ttl_period,
+                quick_reply_shortcut_id,
+                effect,
+                factcheck,
+                report_delivery_until_date,
+                paid_message_stars,
+                suggested_post,
+                schedule_repeat_period,
+                summary_from_language,
+                rich_message,
+                ..
+            } = message;
+            if quick_reply_shortcut_id != 0 {
+                log_error!("Receive shortcut {quick_reply_shortcut_id} from {source}");
+                message_info.message_id = MessageId::default();
+                return finish_message_info(message_info, saved_peer_id);
+            }
+
+            message_info.dialog_id = peer_id
+                .as_ref()
+                .map(DialogId::from_peer)
+                .unwrap_or_default();
+            message_info.sender_dialog_id = from_id
+                .as_ref()
+                .map(DialogId::from_peer)
+                .unwrap_or(message_info.dialog_id);
+            message_info.date = date;
+            message_info.forward_header = fwd_from;
+            message_info.reply_header = MessageReplyHeader::from_telegram(
+                ctx,
+                reply_to,
+                message_info.dialog_id,
+                message_info.message_id,
+                message_info.date,
+            );
+            message_info.via_bot_user_id = UserId::new(via_bot_id);
+            if message_info.via_bot_user_id != UserId::default()
+                && !message_info.via_bot_user_id.is_valid()
+            {
+                log_error!(
+                    "Receive invalid user {:?} from {source}",
+                    message_info.via_bot_user_id
+                );
+                message_info.via_bot_user_id = UserId::default();
+            }
+            if let Some(peer) = guestchat_via_from {
+                message_info.guest_bot_via_dialog_id = DialogId::from_peer(&peer);
+                if !message_info.guest_bot_via_dialog_id.is_valid() {
+                    log_error!(
+                        "Receive invalid dialog {:?} from {source}",
+                        message_info.guest_bot_via_dialog_id
+                    );
+                    message_info.guest_bot_via_dialog_id = DialogId::default();
+                }
+            }
+            message_info.via_business_bot_user_id = UserId::new(via_business_bot_id);
+            if message_info.via_business_bot_user_id != UserId::default()
+                && !message_info.via_business_bot_user_id.is_valid()
+            {
+                log_error!(
+                    "Receive invalid user {:?} from {source}",
+                    message_info.via_business_bot_user_id
+                );
+                message_info.via_business_bot_user_id = UserId::default();
+            }
+            message_info.view_count = views;
+            message_info.forward_count = forwards;
+            message_info.reply_info = replies;
+            message_info.reactions = reactions;
+            message_info.fact_check = factcheck;
+            message_info.suggested_post = suggested_post;
+            message_info.edit_date = edit_date;
+            message_info.media_album_id = grouped_id;
+            message_info.ttl_period = ttl_period;
+            message_info.is_outgoing = out;
+            message_info.is_silent = silent;
+            message_info.is_channel_post = post;
+            message_info.is_legacy = legacy;
+            message_info.hide_edit_date = edit_hide;
+            message_info.is_from_scheduled = from_scheduled;
+            message_info.is_from_offline = offline;
+            message_info.is_pinned = pinned;
+            message_info.noforwards = noforwards;
+            message_info.has_mention = mentioned;
+            message_info.has_unread_content = media_unread;
+            message_info.invert_media = invert_media;
+            message_info.video_processing_pending = video_processing_pending;
+            message_info.is_paid_suggested_post_stars = paid_suggested_post_stars;
+            message_info.is_paid_suggested_post_ton = paid_suggested_post_ton;
+            message_info.effect_id = MessageEffectId::new(effect);
+            message_info.schedule_repeat_period = schedule_repeat_period.max(0);
+            message_info.report_delivery_until_date = report_delivery_until_date;
+
+            let is_content_read = if !is_bot {
+                if is_scheduled {
+                    false
+                } else if is_message_auto_read(
+                    ctx,
+                    message_info.dialog_id,
+                    message_info.is_outgoing,
+                ) {
+                    true
+                } else {
+                    !message_info.has_unread_content
+                }
+            } else {
+                true
+            };
+            let send_date = message_info
+                .forward_header
+                .as_ref()
+                .map(|header| header.date)
+                .unwrap_or(message_info.date);
+            let new_source = format!(
+                "{:?} sent by {:?} from {}",
+                MessageFullId::new(message_info.dialog_id, message_info.message_id),
+                message_info.sender_dialog_id,
+                source
+            );
+            // The M.9.18 receive flip: the wire content runs the M.9.14
+            // intake (`get_message_content`) at its C++ call position.
+            let mut user_manager =
+                crate::message_content::ContextUserManager::new(ctx.content_context());
+            let text = crate::message_entity::get_message_text(
+                Some(&mut user_manager),
+                message_text,
+                entities,
+                true,
+                is_bot,
+                send_date,
+                message_info.media_album_id != 0,
+                &new_source,
+            );
+            message_info.content = Some(crate::message_content::get_message_content(
+                ctx.content_context_mut(),
+                text,
+                rich_message,
+                media.map(|media| *media),
+                message_info.dialog_id,
+                message_info.date,
+                is_content_read,
+                message_info.via_bot_user_id,
+                &mut message_info.ttl,
+                &mut message_info.disable_web_page_preview,
+                &new_source,
+            ));
+            message_info.reply_markup = reply_markup;
+            message_info.restriction_reasons =
+                crate::restriction_reason::get_restriction_reasons(restriction_reason);
+            message_info.author_signature = post_author;
+            message_info.summary_from_language = summary_from_language;
+            message_info.sender_boost_count = from_boosts_applied;
+            message_info.sender_rank = from_rank;
+            message_info.paid_message_star_count = get_star_count(paid_message_stars);
+            return finish_message_info(message_info, saved_peer_id);
+        }
+        telegram_api::Message::messageService(message) => {
+            let telegram_api::messageService {
+                out,
+                mentioned,
+                media_unread,
+                reactions_are_possible,
+                silent,
+                post,
+                legacy,
+                id: _,
+                from_id,
+                peer_id,
+                saved_peer_id,
+                reply_to,
+                date,
+                action,
+                reactions,
+                ttl_period,
+                ..
+            } = message;
+
+            message_info.dialog_id = peer_id
+                .as_ref()
+                .map(DialogId::from_peer)
+                .unwrap_or_default();
+            message_info.sender_dialog_id = from_id
+                .as_ref()
+                .map(DialogId::from_peer)
+                .unwrap_or(message_info.dialog_id);
+            message_info.date = date;
+            message_info.reactions = reactions;
+            message_info.ttl_period = ttl_period;
+            message_info.is_outgoing = out;
+            message_info.is_silent = silent;
+            message_info.is_channel_post = post;
+            message_info.is_legacy = legacy;
+            message_info.has_mention = mentioned;
+            message_info.has_unread_content = media_unread;
+            message_info.reactions_are_possible = reactions_are_possible;
+            message_info.reply_header = MessageReplyHeader::from_telegram(
+                ctx,
+                reply_to,
+                message_info.dialog_id,
+                message_info.message_id,
+                message_info.date,
+            );
+            message_info.content = Some(crate::message_content::get_action_message_content(
+                ctx.content_context_mut(),
+                action,
+                message_info.dialog_id,
+                date,
+                &message_info.reply_header.replied_message_info,
+                is_business_message,
+            ));
+            message_info.reply_header.replied_message_info = RepliedMessageInfo::default();
+            message_info.reply_header.story_full_id = StoryFullId::default();
+            return finish_message_info(message_info, saved_peer_id);
+        }
+    }
+    message_info
+}
+
+/// The tail both non-empty parse arms share: the Saved Messages topic read
+/// and the sender user/dialog split (MessagesManager.cpp:11554-11561).
+fn finish_message_info(
+    mut message_info: MessageInfo,
+    saved_peer_id: Option<telegram_api::Peer>,
+) -> MessageInfo {
+    if let Some(saved_peer_id) = saved_peer_id {
+        message_info.saved_messages_topic_id =
+            SavedMessagesTopicId::new(DialogId::from_peer(&saved_peer_id));
+    }
+    if message_info.sender_dialog_id.get_type() == DialogType::User {
+        message_info.sender_user_id = message_info.sender_dialog_id.get_user_id();
+        message_info.sender_dialog_id = DialogId::default();
+    }
+    message_info
+}
+
+/// `MessagesManager::add_message_dependencies`
+/// (MessagesManager.cpp:21494-21537).
+pub fn add_message_dependencies(
+    dependencies: &mut Dependencies,
+    ctx: &dyn MessageObjectContext,
+    m: &Message,
+) {
+    let my_user_id = ctx.content_context().get_my_id();
+    let is_bot = ctx.is_bot();
+    dependencies.add_user(m.sender_user_id);
+    dependencies.add_user(m.receiver_user_id);
+    dependencies.add_dialog_and_dependencies(m.sender_dialog_id);
+    add_saved_messages_topic_id_dependencies(dependencies, m.saved_messages_topic_id);
+    add_replied_message_info_dependencies(
+        dependencies,
+        ctx,
+        &m.replied_message_info,
+        my_user_id,
+        is_bot,
+    );
+    dependencies.add_dialog_and_dependencies(m.reply_to_story_full_id.get_dialog_id());
+    dependencies.add_dialog_and_dependencies(m.real_forward_from_dialog_id);
+    dependencies.add_user(m.via_bot_user_id);
+    dependencies.add_message_sender_dependencies(m.guest_bot_via_dialog_id);
+    dependencies.add_user(m.via_business_bot_user_id);
+    if let Some(forward_info) = &m.forward_info {
+        add_message_forward_info_dependencies(dependencies, forward_info);
+    }
+    // `add_min_channel` of the reply-info replier min channels is the
+    // ChatManager cache side effect (MessagesManager.cpp:21522-21525); the
+    // channel cache lands with the ChatManager receive slice.
+    for recent_replier_dialog_id in m.reply_info.recent_replier_dialog_ids.clone() {
+        dependencies.add_message_sender_dependencies(recent_replier_dialog_id);
+    }
+    if let Some(reactions) = &m.reactions {
+        // `MessageReactions::add_min_channels` (MessageReaction.cpp:984-990)
+        // is the same ChatManager cache side effect; recorded with the one
+        // above.
+        add_message_reactions_dependencies(dependencies, reactions);
+    }
+    if let Some(fact_check) = &m.fact_check {
+        add_fact_check_dependencies(dependencies, fact_check);
+    }
+    if let Some(content) = &m.content {
+        let dependencies_cell = std::cell::RefCell::new(&mut *dependencies);
+        let mut user_sink = |user_id: UserId| dependencies_cell.borrow_mut().add_user(user_id);
+        let mut dialog_sink = |dialog_id: DialogId| {
+            dependencies_cell
+                .borrow_mut()
+                .add_dialog_and_dependencies(dialog_id)
+        };
+        let mut web_page_sink = |_: crate::message_content::WebPageId| {};
+        let mut story_sink =
+            |story_full_id: StoryFullId| dependencies_cell.borrow_mut().add_story(story_full_id);
+        let mut community_sink = |_: crate::message_content::CommunityId| {};
+        crate::message_content::add_message_content_dependencies(
+            ctx.content_context(),
+            content,
+            my_user_id,
+            is_bot,
+            &mut user_sink,
+            &mut dialog_sink,
+            &mut web_page_sink,
+            &mut story_sink,
+            &mut community_sink,
+        );
+    }
+    add_reply_markup_dependencies(dependencies, m.reply_markup.as_deref());
+    // `m->ephemeral_message` (MessagesManager.cpp:21533-21535) and
+    // `m->thread_draft_message` (21536) are always empty on the intake path
+    // — they are set by the send/database slices that own them.
+}
+
+/// `MessageReactions::add_dependencies` (MessageReaction.cpp:1011-1021).
+fn add_message_reactions_dependencies(
+    dependencies: &mut Dependencies,
+    reactions: &MessageReactions,
+) {
+    for reaction in &reactions.reactions {
+        for dialog_id in &reaction.recent_chooser_dialog_ids {
+            dependencies.add_message_sender_dependencies(*dialog_id);
+        }
+    }
+    for reactor in &reactions.top_reactors {
+        // `MessageReactor::add_dependencies` (MessageReactor.cpp:67-70).
+        dependencies.add_message_sender_dependencies(reactor.dialog_id);
+    }
+}
+
+/// `FactCheck::add_dependencies` (FactCheck.cpp:39-43).
+fn add_fact_check_dependencies(dependencies: &mut Dependencies, fact_check: &FactCheck) {
+    for entity in &fact_check.text.entities {
+        if entity.user_id.is_valid() {
+            dependencies.add_user(entity.user_id);
+        }
+    }
+}
+
+/// `add_reply_markup_dependencies` (ReplyMarkup.cpp:513-523) +
+/// `InlineKeyboardButton::add_dependencies` (InlineKeyboardButton.cpp:38-41).
+fn add_reply_markup_dependencies(
+    dependencies: &mut Dependencies,
+    reply_markup: Option<&ReplyMarkup>,
+) {
+    let Some(reply_markup) = reply_markup else {
+        return;
+    };
+    for row in &reply_markup.inline_keyboard {
+        for button in row {
+            dependencies.add_user(button.user_id);
+        }
+    }
+}
+
+/// `MessagesManager::create_message` (MessagesManager.cpp:11582-11907).
+pub fn create_message(
+    ctx: &mut dyn MessageObjectContext,
+    manager: &MessagesManager,
+    mut message_info: MessageInfo,
+    is_guest_message: bool,
+    source: &str,
+) -> (DialogId, Option<Box<Message>>) {
+    let dialog_id = message_info.dialog_id;
+    let message_id = message_info.message_id;
+    if (!message_id.is_valid() && !message_id.is_valid_scheduled()) || !dialog_id.is_valid() {
+        if message_id != MessageId::default() || dialog_id != DialogId::default() {
+            log_error!(
+                "Receive {} in {:?}",
+                DisplayMessageId(message_id),
+                dialog_id
+            );
+        }
+        return (DialogId::default(), None);
+    }
+    let dialog_type = dialog_id.get_type();
+    if message_id.is_yet_unsent()
+        || (dialog_type != DialogType::SecretChat
+            && message_id.is_local()
+            && message_info.receiver_user_id == UserId::default())
+    {
+        log_error!("Receive {}", DisplayMessageId(message_id));
+        return (DialogId::default(), None);
+    }
+
+    let is_bot = ctx.is_bot();
+    let mut sender_user_id = message_info.sender_user_id;
+    let mut sender_dialog_id = message_info.sender_dialog_id;
+    if !sender_user_id.is_valid() {
+        if sender_user_id != UserId::default() {
+            log_error!("Receive invalid user {:?}", sender_user_id);
+            sender_user_id = UserId::default();
+        }
+        if !ctx.content_context().is_broadcast_channel_dialog(dialog_id) && is_bot {
+            // `add_anonymous_bot_user` / `add_service_notifications_user` +
+            // `add_channel_bot_user` (MessagesManager.cpp:11615-11621) — the
+            // special users arrive through the M.7 container users; the
+            // synthesis side effect is the UserManager receive seam.
+        }
+    }
+    if sender_dialog_id.is_valid() {
+        if dialog_type == DialogType::User || dialog_type == DialogType::SecretChat {
+            log_error!(
+                "Receive {} sent by {:?} in {:?}",
+                DisplayMessageId(message_id),
+                sender_dialog_id,
+                dialog_id
+            );
+            return (DialogId::default(), None);
+        }
+    } else if sender_dialog_id != DialogId::default() {
+        log_error!("Receive invalid dialog {:?}", sender_dialog_id);
+        sender_dialog_id = DialogId::default();
+    }
+    if message_info.receiver_user_id != UserId::default()
+        && !message_info.receiver_user_id.is_valid()
+    {
+        log_error!(
+            "Receive message receiver {:?}",
+            message_info.receiver_user_id
+        );
+        message_info.receiver_user_id = UserId::default();
+    }
+    if message_info.ephemeral_message_id.is_valid()
+        && message_info.receiver_user_id == UserId::default()
+    {
+        log_error!(
+            "Receive ephemeral message {:?} without receiver in {:?}",
+            message_info.ephemeral_message_id,
+            dialog_id
+        );
+        return (DialogId::default(), None);
+    }
+
+    let mut is_channel_post = message_info.is_channel_post;
+    if is_channel_post && !ctx.content_context().is_broadcast_channel_dialog(dialog_id) {
+        log_error!(
+            "Receive is_channel_post for {} in {:?}",
+            DisplayMessageId(message_id),
+            dialog_id
+        );
+        is_channel_post = false;
+    }
+    if !is_channel_post
+        && (message_info.is_paid_suggested_post_stars || message_info.is_paid_suggested_post_ton)
+    {
+        log_error!(
+            "Receive {} {} for {} in {:?}",
+            message_info.is_paid_suggested_post_stars,
+            message_info.is_paid_suggested_post_ton,
+            DisplayMessageId(message_id),
+            dialog_id
+        );
+        message_info.is_paid_suggested_post_stars = false;
+        message_info.is_paid_suggested_post_ton = false;
+    }
+
+    let my_id = ctx.content_context().get_my_id();
+    let my_dialog_id = DialogId::from_user_id(my_id);
+    if !is_guest_message
+        && dialog_id == my_dialog_id
+        && (sender_user_id != my_id || sender_dialog_id.is_valid())
+    {
+        log_error!(
+            "Receive user {:?}/dialog {:?} as a sender of {} instead of self",
+            sender_user_id,
+            sender_dialog_id,
+            DisplayMessageId(message_id)
+        );
+        sender_user_id = my_id;
+        sender_dialog_id = DialogId::default();
+    }
+
+    // CHECK(message_info.content != nullptr) (MessagesManager.cpp:11602).
+    let mut content = message_info
+        .content
+        .take()
+        .expect("Receive a message without content");
+    let mut content_type = content.get_type();
+    let mut is_outgoing = message_info.is_outgoing;
+    #[allow(clippy::nonminimal_bool)]
+    // the C++ expression keeps its shape (MessagesManager.cpp:11661-11663)
+    let supposed_to_be_outgoing = sender_user_id == my_id
+        && !(dialog_id == my_dialog_id && !message_id.is_scheduled())
+        && !(is_bot && message_info.guest_bot_via_dialog_id != DialogId::default());
+    if !is_guest_message
+        && sender_user_id.is_valid()
+        && supposed_to_be_outgoing != is_outgoing
+        && content_type != MessageContentType::ChatDeleteHistory
+    {
+        log_error!(
+            "Receive wrong out flag = {} for {} of type {:?} in {:?}: me is {:?}, but message is from {:?}",
+            is_outgoing,
+            DisplayMessageId(message_id),
+            content_type,
+            dialog_id,
+            my_id,
+            sender_user_id
+        );
+        is_outgoing = supposed_to_be_outgoing;
+    }
+
+    let mut date = message_info.date;
+    if date <= 0 {
+        log_error!(
+            "Wrong date = {} received in {} in {:?}",
+            date,
+            DisplayMessageId(message_id),
+            dialog_id
+        );
+        date = 1;
+    }
+
+    let top_thread_message_id = message_info.reply_header.top_thread_message_id;
+    let is_topic_message = message_info.reply_header.is_topic_message;
+    let mut reply_to_story_full_id = message_info.reply_header.story_full_id;
+    if reply_to_story_full_id != StoryFullId::default() {
+        let story_dialog_id = reply_to_story_full_id.get_dialog_id();
+        if story_dialog_id != my_dialog_id
+            && story_dialog_id != dialog_id
+            && story_dialog_id != DialogId::from_user_id(sender_user_id)
+            && !is_guest_message
+        {
+            log_error!(
+                "Receive reply to story {:?} in {:?}",
+                reply_to_story_full_id.get_dialog_id(),
+                dialog_id
+            );
+            reply_to_story_full_id = StoryFullId::default();
+        }
+    }
+
+    let mut via_bot_user_id = message_info.via_bot_user_id;
+    if !via_bot_user_id.is_valid() {
+        via_bot_user_id = UserId::default();
+    }
+
+    let mut edit_date = message_info.edit_date;
+    if edit_date < 0 {
+        log_error!(
+            "Wrong edit_date = {} received in {} in {:?}",
+            edit_date,
+            DisplayMessageId(message_id),
+            dialog_id
+        );
+        edit_date = 0;
+    }
+
+    if content_type == MessageContentType::Sticker
+        && crate::message_content::get_message_content_sticker_type(ctx.content_context(), &content)
+            == crate::message_content::StickerType::CustomEmoji
+    {
+        tdutils::log_info!("Replace emoji sticker with an empty message");
+        content = crate::message_content::create_text_message_content(
+            "Invalid sticker".to_string(),
+            Vec::new(),
+            crate::message_content::WebPageId::default(),
+            false,
+            false,
+            false,
+            String::new(),
+        );
+        message_info.invert_media = false;
+        content_type = content.get_type();
+    }
+
+    let mut hide_edit_date = message_info.hide_edit_date;
+    if hide_edit_date && (is_bot || content_type == MessageContentType::LiveLocation) {
+        hide_edit_date = false;
+    }
+
+    let mut ttl_period = message_info.ttl_period;
+    if ttl_period < 0 || (message_id.is_scheduled() && ttl_period != 0) {
+        log_error!(
+            "Wrong auto-delete time {} received in {} in {:?}",
+            ttl_period,
+            DisplayMessageId(message_id),
+            dialog_id
+        );
+        ttl_period = 0;
+    }
+
+    let mut ttl = message_info.ttl;
+    let mut is_content_secret = ttl.is_secret_message_content(content_type); // must be calculated before TTL is adjusted
+    if !ttl.is_empty() {
+        if !ttl.is_valid() || message_id.is_scheduled() {
+            log_error!(
+                "Wrong TTL {:?} received in {} in {:?}",
+                ttl,
+                DisplayMessageId(message_id),
+                dialog_id
+            );
+            ttl = MessageSelfDestructType::default();
+        } else {
+            ttl.ensure_at_least(
+                crate::message_content::get_message_content_duration(
+                    ctx.content_context(),
+                    &content,
+                ) + 1,
+            );
+        }
+    }
+
+    if message_id.is_scheduled() {
+        if message_info.reactions.is_some() {
+            log_error!(
+                "Receive {} in {:?} with reactions",
+                DisplayMessageId(message_id),
+                dialog_id
+            );
+            message_info.reactions = None;
+        }
+        if message_info.fact_check.is_some() {
+            log_error!(
+                "Receive {} in {:?} with a fact check",
+                DisplayMessageId(message_id),
+                dialog_id
+            );
+            message_info.fact_check = None;
+        }
+        if message_info.suggested_post.is_some() {
+            log_error!(
+                "Receive {} in {:?} with a suggested post",
+                DisplayMessageId(message_id),
+                dialog_id
+            );
+            message_info.suggested_post = None;
+        }
+        if message_info.is_pinned {
+            log_error!(
+                "Receive pinned {} in {:?}",
+                DisplayMessageId(message_id),
+                dialog_id
+            );
+            message_info.is_pinned = false;
+        }
+    }
+    let mut view_count = message_info.view_count;
+    if view_count < 0 {
+        log_error!(
+            "Wrong view_count = {} received in {} in {:?}",
+            view_count,
+            DisplayMessageId(message_id),
+            dialog_id
+        );
+        view_count = 0;
+    }
+    let mut forward_count = message_info.forward_count;
+    if forward_count < 0 {
+        log_error!(
+            "Wrong forward_count = {} received in {} in {:?}",
+            forward_count,
+            DisplayMessageId(message_id),
+            dialog_id
+        );
+        forward_count = 0;
+    }
+    let reply_info = MessageReplyInfo::from_telegram(ctx, message_info.reply_info.take(), is_bot);
+    let mut reactions =
+        MessageReactions::get_message_reactions(ctx, message_info.reactions.take(), is_bot);
+    if let Some(reactions) = &mut reactions {
+        reactions.sort_reactions(&manager.active_reaction_pos);
+        reactions.fix_chosen_reaction();
+        reactions.fix_my_recent_chooser_dialog_id(my_dialog_id);
+    }
+    let mut user_manager = crate::message_content::ContextUserManager::new(ctx.content_context());
+    let fact_check = FactCheck::get_fact_check(
+        Some(&mut user_manager),
+        message_info.fact_check.take(),
+        is_bot,
+    );
+    let suggested_post = SuggestedPost::get_suggested_post(message_info.suggested_post.take());
+
+    let has_forward_info = message_info.forward_header.is_some();
+    let mut noforwards = message_info.noforwards;
+    let is_expired = crate::message_content::is_expired_message_content(content_type);
+    if is_expired {
+        // self-destruct time is ignored/set to 0 if the message has already been expired
+        message_info.reply_header.replied_message_info = RepliedMessageInfo::default();
+        reply_to_story_full_id = StoryFullId::default();
+        noforwards = false;
+        is_content_secret = false;
+        message_info.invert_media = false;
+    }
+
+    let has_mention = message_info.has_mention
+        || (content_type == MessageContentType::PinMessage
+            && ctx
+                .content_context()
+                .get_option_boolean("process_pinned_messages_as_mentions"));
+
+    let mut message = Box::new(Message::default());
+    message.message_id = message_id;
+    message.sender_user_id = sender_user_id;
+    message.sender_dialog_id = sender_dialog_id;
+    message.receiver_user_id = message_info.receiver_user_id;
+    message.ephemeral_message_id = message_info.ephemeral_message_id;
+    message.date = date;
+    message.schedule_repeat_period = message_info.schedule_repeat_period;
+    message.ttl_period = ttl_period;
+    message.ttl = ttl;
+    message.disable_web_page_preview = message_info.disable_web_page_preview;
+    message.edit_date = edit_date;
+    message.random_id = message_info.random_id;
+    message.forward_info =
+        MessageForwardInfo::get_message_forward_info(ctx, message_info.forward_header.take());
+    message.replied_message_info =
+        std::mem::take(&mut message_info.reply_header.replied_message_info);
+    message.top_thread_message_id = top_thread_message_id;
+    message.is_topic_message = is_topic_message;
+    message.via_bot_user_id = via_bot_user_id;
+    message.guest_bot_via_dialog_id = message_info.guest_bot_via_dialog_id;
+    message.via_business_bot_user_id = message_info.via_business_bot_user_id;
+    message.reply_to_story_full_id = reply_to_story_full_id;
+    message.restriction_reasons = std::mem::take(&mut message_info.restriction_reasons);
+    message.author_signature = std::mem::take(&mut message_info.author_signature);
+    message.summary_from_language = std::mem::take(&mut message_info.summary_from_language);
+    message.sender_boost_count = message_info.sender_boost_count;
+    message.chat_instance = message_info.chat_instance;
+    message.sender_rank = std::mem::take(&mut message_info.sender_rank);
+    message.paid_message_star_count = message_info.paid_message_star_count;
+    message.saved_messages_topic_id = message_info.saved_messages_topic_id;
+    message.is_outgoing = is_outgoing;
+    message.is_channel_post = is_channel_post;
+    message.contains_mention =
+        !is_outgoing && dialog_type != DialogType::User && !is_expired && has_mention && !is_bot;
+    message.contains_unread_mention = !message_id.is_scheduled()
+        && message_id.is_server()
+        && message.contains_mention
+        && message_info.has_unread_content
+        && (dialog_type == DialogType::Chat
+            || (dialog_type == DialogType::Channel
+                && !ctx.content_context().is_broadcast_channel_dialog(dialog_id)));
+    message.disable_notification = message_info.is_silent;
+    message.is_content_secret = is_content_secret;
+    message.hide_edit_date = hide_edit_date;
+    message.is_from_scheduled = message_info.is_from_scheduled;
+    message.is_from_offline = message_info.is_from_offline;
+    message.is_pinned = message_info.is_pinned;
+    message.noforwards = noforwards;
+    message.video_processing_pending = message_info.video_processing_pending;
+    message.is_paid_suggested_post_stars = message_info.is_paid_suggested_post_stars;
+    message.is_paid_suggested_post_ton = message_info.is_paid_suggested_post_ton;
+    message.reactions_are_possible = message_info.reactions_are_possible;
+    message.interaction_info_update_date = ctx.server_time() as i32;
+    message.view_count = view_count;
+    message.forward_count = forward_count;
+    message.reply_info = reply_info;
+    message.reactions = reactions;
+    message.fact_check = fact_check;
+    message.suggested_post = suggested_post;
+    message.effect_id = message_info.effect_id;
+    message.legacy_layer = if message_info.is_legacy {
+        MTPROTO_LAYER
+    } else {
+        0
+    };
+    message.invert_media = message_info.invert_media;
+    message.content = Some(content);
+    let mention_markup = message.contains_mention || dialog_type == DialogType::User;
+    message.reply_markup = message_info
+        .reply_markup
+        .take()
+        .and_then(|reply_markup| {
+            ReplyMarkup::from_telegram(reply_markup, false, is_bot, mention_markup)
+        })
+        .map(Box::new);
+    if message.reply_markup.is_some() && is_expired {
+        // just in case
+        if message.reply_markup.as_ref().unwrap().r#type != ReplyMarkupType::InlineKeyboard {
+            message.had_reply_markup = true;
+        }
+        message.reply_markup = None;
+    }
+
+    if message_info.media_album_id != 0 {
+        if !crate::message_content::is_allowed_media_group_content(content_type) {
+            if content_type != MessageContentType::Unsupported {
+                // the C++ logs the built content object here
+                // (MessagesManager.cpp:11869-11877); the object build rides
+                // the registered-dialog read (`get_message_message_content_object`)
+                // and collapses to the content type for the intake log.
+                log_error!(
+                    "Receive media group identifier {} in {} from {:?} with content of type {:?}",
+                    message_info.media_album_id,
+                    DisplayMessageId(message_id),
+                    dialog_id,
+                    content_type
+                );
+            }
+        } else {
+            message.media_album_id = message_info.media_album_id;
+        }
+    }
+
+    if message.forward_info.is_none() && has_forward_info {
+        message.had_forward_info = true;
+    }
+
+    if !is_guest_message {
+        fix_message_topic(ctx, dialog_id, &mut message, false);
+    }
+
+    let mut dependencies = Dependencies::default();
+    add_message_dependencies(&mut dependencies, ctx, &message);
+    for dependent_dialog_id in dependencies.get_dialog_ids() {
+        if dependent_dialog_id != dialog_id {
+            ctx.force_create_dialog(dependent_dialog_id, source);
+        }
+    }
+
+    (dialog_id, Some(message))
+}
+
+/// `MessagesManager::fix_new_message` (MessagesManager.cpp:30810-30886).
+pub fn fix_new_message(
+    manager: &MessagesManager,
+    reactions_ctx: &dyn DialogReactionsContext,
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    m: &mut Message,
+    from_database: bool,
+) {
+    if !has_message_sender_user_id(manager, reactions_ctx, dialog_id, m)
+        && !m.sender_dialog_id.is_valid()
+    {
+        if ctx.content_context().is_broadcast_channel_dialog(dialog_id) {
+            m.sender_dialog_id = dialog_id;
+        } else if is_discussion_message(manager, reactions_ctx, dialog_id, m) {
+            m.sender_dialog_id = m
+                .forward_info
+                .as_ref()
+                .map_or(DialogId::default(), |forward_info| {
+                    forward_info.get_last_dialog_id()
+                });
+        } else {
+            log_error!(
+                "Failed to repair sender chat in {} in {:?}",
+                DisplayMessageId(m.message_id),
+                dialog_id
+            );
+        }
+    }
+
+    let dialog_type = dialog_id.get_type();
+    let anonymous_bot_user_id =
+        crate::user_manager::UserManager::get_anonymous_bot_user_id(ctx.is_test_dc());
+    if m.sender_user_id == anonymous_bot_user_id
+        && !m.sender_dialog_id.is_valid()
+        && dialog_type == DialogType::Channel
+        && !ctx.content_context().is_broadcast_channel_dialog(dialog_id)
+    {
+        m.sender_user_id = UserId::default();
+        m.sender_dialog_id = dialog_id;
+    }
+
+    if !from_database && m.message_id.is_valid() {
+        match dialog_type {
+            DialogType::Chat | DialogType::Channel => {
+                if let Some(d) = manager.get_dialog(dialog_id) {
+                    m.available_reactions_generation = d.available_reactions_generation;
+                }
+            }
+            DialogType::User | DialogType::SecretChat => {}
+            DialogType::None => unreachable!(),
+        }
+        if let Some(d) = manager.get_dialog(dialog_id) {
+            m.history_generation = d.history_generation;
+        }
+    }
+
+    fix_message_topic(ctx, dialog_id, m, from_database);
+
+    m.last_access_date = ctx.server_time() as i32;
+
+    if !from_database && m.contains_mention {
+        assert!(!ctx.is_bot());
+        let message_content_type = m
+            .content
+            .as_ref()
+            .expect("message without content")
+            .get_type();
+        if message_content_type == MessageContentType::PinMessage {
+            let pinned_message_id = crate::message_content::get_message_content_pinned_message_id(
+                m.content.as_ref().unwrap(),
+            );
+            let pinned_disabled = manager
+                .get_dialog(dialog_id)
+                .is_some_and(|d| is_dialog_pinned_message_notifications_disabled(ctx, d));
+            if pinned_disabled || !pinned_message_id.is_valid() {
+                // treat message pin without pinned message as an ordinary message
+                m.contains_mention = false;
+            }
+        } else if manager
+            .get_dialog(dialog_id)
+            .is_some_and(|d| is_dialog_mention_notifications_disabled(ctx, d))
+        {
+            // disable mention notification
+            m.is_mention_notification_disabled = true;
+        }
+    }
+
+    if m.contains_unread_mention
+        && let Some(d) = manager.get_dialog(dialog_id)
+        && m.message_id <= d.last_read_all_mentions_message_id
+    {
+        m.contains_unread_mention = false;
+    }
+
+    if dialog_type == DialogType::Channel && !m.contains_unread_mention {
+        let channel_read_media_period = ctx.content_context().get_option_integer(
+            "channels_read_media_period",
+            if ctx.is_test_dc() { 300 } else { 7 * 86400 },
+        );
+        if (m.date as f64) < ctx.server_time() - channel_read_media_period as f64 {
+            crate::message_content::update_opened_message_content(
+                m.content.as_mut().expect("message without content"),
+            );
+        }
+    }
+
+    if m.reply_markup.is_some() && !ctx.is_bot() {
+        let drop_markup = {
+            let reply_markup = m.reply_markup.as_ref().unwrap();
+            if !reply_markup.is_personal
+                && (reply_markup.r#type == ReplyMarkupType::ForceReply
+                    || reply_markup.r#type == ReplyMarkupType::RemoveKeyboard)
+            {
+                true
+            } else {
+                reply_markup.r#type != ReplyMarkupType::InlineKeyboard
+                    && ctx.is_admined_monoforum_channel(dialog_id)
+            }
+        };
+        if drop_markup {
+            m.reply_markup = None;
+        }
+    }
+}
+
+/// `MessagesManager::is_dialog_pinned_message_notifications_disabled`
+/// (MessagesManager.cpp:16584-16593) — the scope read is the
+/// NotificationSettingsManager seam.
+fn is_dialog_pinned_message_notifications_disabled(
+    ctx: &dyn MessageObjectContext,
+    d: &Dialog,
+) -> bool {
+    assert!(!ctx.is_bot());
+    if d.notification_settings
+        .use_default_disable_pinned_message_notifications
+    {
+        return ctx.get_scope_disable_pinned_message_notifications();
+    }
+    d.notification_settings.disable_pinned_message_notifications
+}
+
+/// `MessagesManager::is_dialog_mention_notifications_disabled`
+/// (MessagesManager.cpp:16595-16604) — the scope read is the
+/// NotificationSettingsManager seam.
+fn is_dialog_mention_notifications_disabled(ctx: &dyn MessageObjectContext, d: &Dialog) -> bool {
+    assert!(!ctx.is_bot());
+    if d.notification_settings
+        .use_default_disable_mention_notifications
+    {
+        return ctx.get_scope_disable_mention_notifications();
+    }
+    d.notification_settings.disable_mention_notifications
+}
+
 /// The message-plane `const Td *td` surface: the M.9 content context plus
 /// the queries `get_message_object` and its helpers make. The real `Td`
 /// wiring lands with the Td slices; the stand-ins answer the id-object
@@ -9376,6 +12035,41 @@ pub trait MessageObjectContext {
         dialog_id: DialogId,
         source: &str,
     ) -> Option<td_api::MessageSender>;
+
+    /// The `&mut Td *` form for the intake-time content conversion
+    /// (`get_message_content` takes the mutable `Td *`).
+    fn content_context_mut(&mut self) -> &mut dyn crate::message_content::MessageContentContext;
+
+    /// `ChatManager::have_channel` (MessageOrigin.cpp:70).
+    fn have_channel(&self, channel_id: ChannelId) -> bool;
+
+    /// `ChatManager::get_min_channel` (MessageSender.cpp:116) — `None` for
+    /// an unknown channel.
+    fn get_min_channel(&self, channel_id: ChannelId) -> Option<MinChannel>;
+
+    /// `DialogManager::can_dialog_have_threads` (MessageReplyHeader.cpp:37).
+    fn can_dialog_have_threads(&self, dialog_id: DialogId) -> bool;
+
+    /// `MessagesManager::get_message_id_of_ephemeral_message_id`
+    /// (RepliedMessageInfo.cpp:80) — the `update_ephemeral_message_ids_`
+    /// lookup (MessagesManager.h:3318); the empty id when unknown.
+    fn get_message_id_of_ephemeral_message_id(
+        &self,
+        dialog_id: DialogId,
+        ephemeral_message_id: EphemeralMessageId,
+    ) -> MessageId;
+
+    /// `NotificationSettingsManager::get_scope_disable_pinned_message_notifications`
+    /// — the scope half of
+    /// `is_dialog_pinned_message_notifications_disabled`
+    /// (MessagesManager.cpp:16584-16593); the manager lands with the
+    /// notification-settings receive slice and the seam answers false.
+    fn get_scope_disable_pinned_message_notifications(&self) -> bool;
+
+    /// `NotificationSettingsManager::get_scope_disable_mention_notifications`
+    /// — the scope half of `is_dialog_mention_notifications_disabled`
+    /// (MessagesManager.cpp:16595-16604); same seam as above.
+    fn get_scope_disable_mention_notifications(&self) -> bool;
 }
 
 /// `get_min_message_sender_object(Td *, DialogId, source)`
@@ -13023,6 +15717,40 @@ mod tests {
 
         fn force_create_dialog(&self, _dialog_id: DialogId, _source: &str) {}
 
+        fn content_context_mut(
+            &mut self,
+        ) -> &mut dyn crate::message_content::MessageContentContext {
+            &mut self.content
+        }
+
+        fn have_channel(&self, _channel_id: ChannelId) -> bool {
+            false
+        }
+
+        fn get_min_channel(&self, _channel_id: ChannelId) -> Option<MinChannel> {
+            None
+        }
+
+        fn can_dialog_have_threads(&self, _dialog_id: DialogId) -> bool {
+            false
+        }
+
+        fn get_message_id_of_ephemeral_message_id(
+            &self,
+            _dialog_id: DialogId,
+            _ephemeral_message_id: EphemeralMessageId,
+        ) -> MessageId {
+            MessageId::default()
+        }
+
+        fn get_scope_disable_pinned_message_notifications(&self) -> bool {
+            false
+        }
+
+        fn get_scope_disable_mention_notifications(&self) -> bool {
+            false
+        }
+
         fn get_channel_has_linked_channel(&self, _channel_id: ChannelId) -> bool {
             false
         }
@@ -13623,5 +16351,269 @@ mod tests {
         let messages = get_messages_object(5, vec![Some(object), None], true);
         assert_eq!(messages.total_count, 4);
         assert_eq!(messages.messages.len(), 1);
+    }
+
+    /// The M.10.3 Verify pipeline: a recorded `updateNewMessage` wire shape
+    /// through `on_get_message` (parse → create → fix) produces the same
+    /// td_api `message` object through the M.10.4 builder.
+    #[test]
+    fn m10_3_update_new_message_corpus_matches_the_builder() {
+        // The recorded private-text shape: an incoming message with no
+        // `from_id` (the bot-session sender is the peer).
+        let wire = telegram_api::Message::message(telegram_api::message {
+            id: 400,
+            peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                user_id: 2000,
+            })),
+            date: 1700000100,
+            message: "hello".to_string(),
+            ..Default::default()
+        });
+        let mut manager = MessagesManager::default();
+        let mut ctx = TestObjectContext::default();
+        let (dialog_id, mut m) = manager
+            .on_get_message(&mut ctx, wire, true, false, "updateNewMessage")
+            .unwrap();
+        let user_dialog_id = DialogId::from_user_id(UserId::new(2000));
+        assert_eq!(dialog_id, user_dialog_id);
+        assert_eq!(
+            m.message_id,
+            MessageId::from_server_message_id(ServerMessageId::new(400))
+        );
+        assert_eq!(m.date, 1700000100);
+        // the fresh dialog registered into the skeleton
+        assert!(manager.get_dialog(dialog_id).is_some());
+
+        let object = get_message_object(
+            &manager,
+            &NoDialogReactionsContext,
+            &ctx,
+            dialog_id,
+            &mut m,
+            "test",
+        )
+        .unwrap();
+        assert_eq!(object.id, 400 << 20);
+        assert_eq!(object.chat_id, user_dialog_id.get());
+        assert_eq!(object.date, 1700000100);
+        assert!(!object.is_outgoing);
+        match object.content.unwrap() {
+            td_api::MessageContent::messageText(content) => {
+                assert_eq!(content.text.unwrap().text, "hello");
+            }
+            other => panic!("wrong content arm: {other:?}"),
+        }
+    }
+
+    /// The user/channel sender split of `parse_telegram_api_message` and
+    /// the Saved Messages topic read.
+    #[test]
+    fn m10_3_parse_telegram_api_message_splits_the_sender() {
+        let mut ctx = TestObjectContext::default();
+
+        // from_id carries the user; the sender collapses to the user id
+        let wire = telegram_api::Message::message(telegram_api::message {
+            id: 500,
+            peer_id: Some(telegram_api::Peer::peerChat(telegram_api::peerChat {
+                chat_id: 77,
+            })),
+            from_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                user_id: 7,
+            })),
+            date: 1700000100,
+            message: "hi".to_string(),
+            grouped_id: 99,
+            ..Default::default()
+        });
+        let info = parse_telegram_api_message(&mut ctx, wire, false, false, "test");
+        assert_eq!(info.sender_user_id, UserId::new(7));
+        assert_eq!(info.sender_dialog_id, DialogId::default());
+        assert_eq!(info.dialog_id, DialogId::from_chat_id(ChatId::new(77)));
+        assert_eq!(info.media_album_id, 99);
+
+        // channel posts keep the dialog sender
+        let wire = telegram_api::Message::message(telegram_api::message {
+            id: 501,
+            peer_id: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                channel_id: 900,
+            })),
+            from_id: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                channel_id: 900,
+            })),
+            date: 1700000100,
+            post: true,
+            message: "post".to_string(),
+            ..Default::default()
+        });
+        let info = parse_telegram_api_message(&mut ctx, wire, false, false, "test");
+        assert_eq!(
+            info.sender_dialog_id,
+            DialogId::from_channel_id(ChannelId::new(900))
+        );
+        assert!(!info.sender_user_id.is_valid());
+        assert!(info.is_channel_post);
+    }
+
+    /// The service-message arm: the action content is parsed and the reply
+    /// header is reset like the C++ (MessagesManager.cpp:11504-11508).
+    #[test]
+    fn m10_3_service_message_parses_the_action_and_resets_the_reply_header() {
+        let wire = telegram_api::Message::messageService(telegram_api::messageService {
+            id: 401,
+            peer_id: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                channel_id: 900,
+            })),
+            from_id: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                channel_id: 900,
+            })),
+            date: 1700000100,
+            reply_to: Some(telegram_api::MessageReplyHeader::messageReplyHeader(
+                telegram_api::messageReplyHeader {
+                    reply_to_msg_id: 5,
+                    ..Default::default()
+                },
+            )),
+            action: Some(telegram_api::MessageAction::messageActionChatCreate(
+                telegram_api::messageActionChatCreate {
+                    title: "group".to_string(),
+                    users: vec![7],
+                },
+            )),
+            ..Default::default()
+        });
+        let mut ctx = TestObjectContext::default();
+        let info = parse_telegram_api_message(&mut ctx, wire, false, false, "test");
+        match info.content {
+            Some(crate::message_content::MessageContent::ChatCreate(created)) => {
+                assert_eq!(created.title, "group");
+                assert_eq!(created.participant_user_ids, vec![UserId::new(7)]);
+            }
+            other => panic!("wrong content arm: {other:?}"),
+        }
+        // the reply header does not survive the service-message parse
+        assert_eq!(
+            info.reply_header.replied_message_info,
+            RepliedMessageInfo::default()
+        );
+        assert_eq!(info.reply_header.story_full_id, StoryFullId::default());
+    }
+
+    /// The `create_message` fixups: the outgoing-flag repair, the date /
+    /// ttl / counter clamps (MessagesManager.cpp:11645-11690).
+    #[test]
+    fn m10_3_create_message_fixes_the_out_flag_and_clamps() {
+        let message_info = MessageInfo {
+            dialog_id: DialogId::from_user_id(UserId::new(2000)),
+            message_id: MessageId::from_server_message_id(ServerMessageId::new(402)),
+            // my id in the test context is 1000 — the message claims not
+            // outgoing while sent by me from another dialog
+            sender_user_id: UserId::new(1000),
+            date: -5,
+            ttl_period: -1,
+            view_count: -3,
+            forward_count: -1,
+            content: Some(crate::message_content::MessageContent::Text(
+                crate::message_content::MessageText::default(),
+            )),
+            ..Default::default()
+        };
+        let manager = MessagesManager::default();
+        let mut ctx = TestObjectContext::default();
+        let (dialog_id, m) = create_message(&mut ctx, &manager, message_info, false, "test");
+        let m = m.map(|m| *m).unwrap();
+        assert_eq!(dialog_id, DialogId::from_user_id(UserId::new(2000)));
+        assert!(m.is_outgoing, "the out flag is repaired");
+        assert_eq!(m.date, 1, "the non-positive date is clamped");
+        assert_eq!(m.ttl_period, 0, "the negative ttl is clamped");
+        assert_eq!(m.view_count, 0, "the negative view count is clamped");
+        assert_eq!(m.forward_count, 0, "the negative forward count is clamped");
+    }
+
+    /// The duplicate intake reads `update_message_ids_` and bails — the
+    /// re-add branch is the send/delete slices' (MessagesManager.cpp:12008+).
+    #[test]
+    fn m10_3_on_get_message_dedups_through_the_update_registry() {
+        let dialog_id = DialogId::from_user_id(UserId::new(2000));
+        let message_id = MessageId::from_server_message_id(ServerMessageId::new(400));
+        let wire = telegram_api::Message::message(telegram_api::message {
+            id: 400,
+            peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                user_id: 2000,
+            })),
+            date: 1700000100,
+            message: "hello".to_string(),
+            ..Default::default()
+        });
+        let mut manager = MessagesManager::default();
+        let mut ctx = TestObjectContext::default();
+
+        // without the temporary id the message is new
+        assert!(
+            manager
+                .on_get_message(&mut ctx, wire.clone(), true, false, "updateNewMessage")
+                .is_some()
+        );
+        // with one registered the message is a duplicate of a sent message
+        manager.update_message_ids.insert(
+            (dialog_id, message_id),
+            MessageId::new(MessageId::TYPE_LOCAL as i64),
+        );
+        let wire2 = telegram_api::Message::message(telegram_api::message {
+            id: 400,
+            peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                user_id: 2000,
+            })),
+            date: 1700000100,
+            message: "hello again".to_string(),
+            ..Default::default()
+        });
+        assert!(
+            manager
+                .on_get_message(&mut ctx, wire2, true, false, "updateNewMessage")
+                .is_none()
+        );
+    }
+
+    /// The invalid shapes `create_message` drops (MessagesManager.cpp:11587-
+    /// 11600): the empty id, the quick-reply shortcut, the ephemeral message
+    /// without a receiver.
+    #[test]
+    fn m10_3_create_message_drops_the_invalid_shapes() {
+        let manager = MessagesManager::default();
+        let mut ctx = TestObjectContext::default();
+
+        // the quick-reply shortcut zeroes the id at parse time
+        let wire = telegram_api::Message::message(telegram_api::message {
+            id: 400,
+            peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                user_id: 2000,
+            })),
+            date: 1700000100,
+            message: "shortcut".to_string(),
+            quick_reply_shortcut_id: 3,
+            ..Default::default()
+        });
+        let info = parse_telegram_api_message(&mut ctx, wire, false, false, "test");
+        assert_eq!(info.message_id, MessageId::default());
+        assert!(
+            create_message(&mut ctx, &manager, info, false, "test")
+                .1
+                .is_none()
+        );
+
+        // a yet-unsent id has no business on the receive path
+        let info = MessageInfo {
+            dialog_id: DialogId::from_user_id(UserId::new(2000)),
+            message_id: MessageId::new(MessageId::TYPE_YET_UNSENT as i64),
+            content: Some(crate::message_content::MessageContent::Text(
+                crate::message_content::MessageText::default(),
+            )),
+            ..Default::default()
+        };
+        assert!(
+            create_message(&mut ctx, &manager, info, false, "test")
+                .1
+                .is_none()
+        );
     }
 }
