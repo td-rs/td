@@ -23,11 +23,13 @@ pub mod version {
     pub const ADD_ACCESS_HASH_TO_SECRET_CHAT: i32 = 5;
     pub const FIX_MIN_USERS: i32 = 10;
     pub const ADD_PHOTO_SIZE_SOURCE: i32 = 22;
+    pub const SUPPORT_BANNED_CHANNELS: i32 = 31;
     pub const REMOVE_PHOTO_VOLUME_AND_LOCAL_ID: i32 = 32;
     pub const SUPPORT_64_BIT_IDS: i32 = 33;
     pub const MAKE_PARTICIPANT_FLAGS_64_BIT: i32 = 46;
     pub const ADD_USER_FLAGS2: i32 = 48;
     pub const ADD_CONTACT_VCARD: i32 = 16;
+    pub const SUPPORT_EPHEMERAL_MESSAGES: i32 = 61;
     /// `Version::Next` of tdlib 1.8.67 (`SupportEphemeralMessages` + 1).
     pub const NEXT: i32 = 62;
     /// What `LogEventStorerUnsafe` writes (`Version::Next - 1`).

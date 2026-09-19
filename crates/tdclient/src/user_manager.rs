@@ -796,7 +796,7 @@ impl TimeCtx {
         }
     }
 
-    fn store_time(out: &mut Vec<u8>, time_at: f64, ctx: &TimeCtx) {
+    pub(crate) fn store_time(out: &mut Vec<u8>, time_at: f64, ctx: &TimeCtx) {
         if time_at == 0.0 {
             store_parse::store_f64(out, -1.0);
         } else {
@@ -806,7 +806,7 @@ impl TimeCtx {
         }
     }
 
-    fn parse_time(parser: &mut Parser, ctx: &TimeCtx) -> Result<f64, &'static str> {
+    pub(crate) fn parse_time(parser: &mut Parser, ctx: &TimeCtx) -> Result<f64, &'static str> {
         let time_left = parser.f64_()?;
         if time_left < -0.1 {
             return Ok(0.0);
@@ -1831,11 +1831,15 @@ impl<'a> UserEnv<'a> {
     }
 }
 
-/// `td::AccessRights` (AccessRights.h) — the subset the user manager uses.
+/// `td::AccessRights` (AccessRights.h) — `enum class AccessRights : int32 {
+/// Know, Read, Edit, Write }`; the variants stay in-memory only here, so the
+/// declaration order keeps the pre-M.6 subset first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AccessRights {
     Know,
     Read,
+    /// `AccessRights::Edit` — arrives with the DialogManager slice.
+    Edit,
     Write,
 }
 
@@ -2392,10 +2396,11 @@ impl UserManager {
         self.get_user(user_id).is_some()
     }
 
-    /// `UserManager::have_accessible_user` (UserManager.cpp:4824-4828);
-    /// the message-registered branch lands with MessagesManager.
+    /// `UserManager::have_accessible_user` (UserManager.cpp:4824-4828):
+    /// `u != nullptr && u->is_received` — a registered but not-yet-received
+    /// user is not accessible.
     pub fn have_accessible_user(&self, user_id: UserId) -> bool {
-        self.have_min_user(user_id)
+        self.get_user(user_id).is_some_and(|u| u.is_received)
     }
 
     /// `UserManager::get_user_database_key` (UserManager.cpp:4870-4872).
@@ -4468,6 +4473,50 @@ impl UserManager {
         }
     }
 
+    /// `UserManager::get_bot_commands` (UserManager.cpp:5841-5883) — the
+    /// bot-info command extraction behind the chatFull/channelFull
+    /// intakes. `participants` filters channel bots to chat members.
+    pub fn get_bot_commands(
+        &mut self,
+        env: &mut UserEnv,
+        bot_infos: Vec<telegram_api::BotInfo>,
+        participants: Option<&[crate::chat_manager::DialogParticipant]>,
+    ) -> Vec<crate::chat_manager::BotCommands> {
+        let mut result = Vec::new();
+        if env.auth_is_bot {
+            return result;
+        }
+        for bot_info in bot_infos {
+            if bot_info.commands.is_empty() {
+                continue;
+            }
+            let user_id = UserId::new(bot_info.user_id);
+            if !self.get_user_force(env, user_id, "get_bot_commands") {
+                tdutils::log_error!("Receive unknown {user_id:?}");
+                continue;
+            }
+            if !self.is_user_bot_of(user_id) {
+                if !self.is_user_deleted_of(user_id) {
+                    tdutils::log_error!("Receive non-bot {user_id:?}");
+                }
+                continue;
+            }
+            if let Some(participants) = participants
+                && !participants
+                    .iter()
+                    .any(|p| p.dialog_id_ == crate::chat_manager::DialogId::from_user_id(user_id))
+            {
+                tdutils::log_error!("Skip commands of non-member bot {user_id:?}");
+                continue;
+            }
+            result.push(crate::chat_manager::BotCommands::from_telegram(
+                user_id,
+                bot_info.commands,
+            ));
+        }
+        result
+    }
+
     /// `UserManager::have_input_peer_user` (UserManager.cpp:5271-5300);
     /// the `user_messages_` admission landed with M.4.15.
     pub fn have_input_peer_user(
@@ -4511,7 +4560,7 @@ impl UserManager {
         }
         match access_rights {
             AccessRights::Know | AccessRights::Read => true,
-            AccessRights::Write => !u.is_deleted,
+            AccessRights::Write | AccessRights::Edit => !u.is_deleted,
         }
     }
 
@@ -6489,7 +6538,9 @@ impl UserManager {
             None => false,
             Some(secret_chat) => match access_rights {
                 AccessRights::Know | AccessRights::Read => true,
-                AccessRights::Write => secret_chat.state == SecretChatState::Active,
+                AccessRights::Write | AccessRights::Edit => {
+                    secret_chat.state == SecretChatState::Active
+                }
             },
         }
     }

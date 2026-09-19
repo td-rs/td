@@ -181,6 +181,12 @@ impl MessageId {
         id_type == TYPE_YET_UNSENT || id_type == TYPE_LOCAL
     }
 
+    /// `MessageId::max` (MessageId.h) — the m10 branch ports the full
+    /// layout; this is the single value the notification slice needs.
+    pub fn max() -> MessageId {
+        MessageId((i32::MAX as i64) << 20)
+    }
+
     /// `MessageId::store` (MessageId.h:193-195).
     pub fn store(self, out: &mut Vec<u8>) {
         store_parse::store_i64(out, self.0);

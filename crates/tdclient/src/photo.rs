@@ -595,6 +595,91 @@ pub fn get_chat_photo_object(photo: &Photo) -> td_api::ChatPhoto {
     }
 }
 
+/// `td::DialogPhoto` (DialogPhoto.h:23) — the chat-photo handle the basic
+/// group/channel records carry (`ProfilePhoto` is this plus the photo id).
+/// The two `FileId`s stay placeholders until the Files step, with the same
+/// consequences the module docs describe for the photo sizes.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DialogPhoto {
+    pub small_file_id: FileId,
+    pub big_file_id: FileId,
+    pub minithumbnail: String,
+    pub has_animation: bool,
+    pub is_personal: bool,
+}
+
+impl DialogPhoto {
+    /// `get_dialog_photo` (DialogPhoto.cpp:90-130): a null/`chatPhotoEmpty`
+    /// yields the empty photo; a `chatPhoto` contributes the stripped
+    /// minithumbnail, the animation flag and the dc id (kept for the
+    /// invalid-value parity of `DcId::create`). The two
+    /// `register_photo_size` calls are the documented Files-step no-op —
+    /// both file ids stay invalid placeholders.
+    pub fn get_dialog_photo(chat_photo: Option<telegram_api::ChatPhoto>) -> DialogPhoto {
+        let mut result = DialogPhoto::default();
+        match chat_photo {
+            None => {}
+            Some(telegram_api::ChatPhoto::chatPhotoEmpty(_)) => {}
+            Some(telegram_api::ChatPhoto::chatPhoto(chat_photo)) => {
+                let _dc_id = crate::chat_manager::DcId::create(chat_photo.dc_id);
+                result.has_animation = chat_photo.has_video;
+                result.is_personal = false;
+                result.minithumbnail =
+                    String::from_utf8_lossy(&chat_photo.stripped_thumb).into_owned();
+            }
+        }
+        result
+    }
+
+    /// `need_update_dialog_photo` (DialogPhoto.cpp:212) — the minithumbnail
+    /// is deliberately not compared, like the C++.
+    pub fn need_update(&self, to: &DialogPhoto) -> bool {
+        self.small_file_id != to.small_file_id
+            || self.big_file_id != to.big_file_id
+            || self.has_animation != to.has_animation
+            || self.is_personal != to.is_personal
+    }
+
+    /// `as_fake_dialog_photo` (DialogPhoto.cpp:144-160): the 'a'/'c' size
+    /// selection, the minithumbnail and the animation flag. The C++
+    /// "Failed to convert" error fires when either selected size carries no
+    /// valid file id — a condition the placeholders cannot express until the
+    /// Files step, so the selected fields are kept instead (module docs).
+    pub fn as_fake_dialog_photo(
+        photo: &Photo,
+        _dialog_id: crate::chat_manager::DialogId,
+        is_personal: bool,
+    ) -> DialogPhoto {
+        let mut result = DialogPhoto::default();
+        if !photo.is_empty() {
+            for size in &photo.photos {
+                if size.size_type == b'a' as i32 {
+                    result.small_file_id = size.file_id;
+                } else if size.size_type == b'c' as i32 {
+                    result.big_file_id = size.file_id;
+                }
+            }
+            result.minithumbnail = photo.minithumbnail.clone();
+            result.has_animation = !photo.animations.is_empty();
+            result.is_personal = is_personal;
+        }
+        result
+    }
+}
+
+/// `dialog_photo_get_file_ids` (DialogPhoto.cpp:133-139) — the valid file
+/// ids, small then big; placeholders never qualify.
+pub fn dialog_photo_get_file_ids(dialog_photo: &DialogPhoto) -> Vec<FileId> {
+    let mut result = Vec::new();
+    if dialog_photo.small_file_id.is_valid() {
+        result.push(dialog_photo.small_file_id);
+    }
+    if dialog_photo.big_file_id.is_valid() {
+        result.push(dialog_photo.big_file_id);
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -960,5 +1045,97 @@ mod tests {
             }),
             320 * 240
         );
+    }
+
+    #[test]
+    fn get_dialog_photo_matches_the_cpp_mapping() {
+        // null and chatPhotoEmpty yield the empty photo
+        assert_eq!(DialogPhoto::default(), DialogPhoto::get_dialog_photo(None));
+        assert_eq!(
+            DialogPhoto::default(),
+            DialogPhoto::get_dialog_photo(Some(telegram_api::ChatPhoto::chatPhotoEmpty(
+                telegram_api::chatPhotoEmpty {}
+            )))
+        );
+
+        // a chatPhoto keeps the stripped minithumbnail, the animation flag and
+        // the not-personal default; the file ids stay invalid placeholders
+        // and an out-of-range dc id degrades to invalid (DcId::create parity)
+        let photo = DialogPhoto::get_dialog_photo(Some(telegram_api::ChatPhoto::chatPhoto(
+            telegram_api::chatPhoto {
+                flags: 1,
+                has_video: true,
+                photo_id: 1234567890,
+                stripped_thumb: b"abc".to_vec(),
+                dc_id: 99999,
+            },
+        )));
+        assert!(photo.has_animation);
+        assert!(!photo.is_personal);
+        assert_eq!(photo.minithumbnail, "abc");
+        assert!(!photo.small_file_id.is_valid());
+        assert!(!photo.big_file_id.is_valid());
+        assert!(dialog_photo_get_file_ids(&photo).is_empty());
+    }
+
+    #[test]
+    fn need_update_dialog_photo_ignores_the_minithumbnail() {
+        let from = DialogPhoto {
+            small_file_id: FileId::default(),
+            big_file_id: FileId::default(),
+            minithumbnail: "old".to_owned(),
+            has_animation: false,
+            is_personal: false,
+        };
+        let mut to = from.clone();
+        to.minithumbnail = "new".to_owned();
+        assert!(!from.need_update(&to));
+
+        to.has_animation = true;
+        assert!(from.need_update(&to));
+        to.has_animation = false;
+        to.is_personal = true;
+        assert!(from.need_update(&to));
+        to.is_personal = false;
+        to.small_file_id = FileId::default();
+        assert!(!from.need_update(&to));
+    }
+
+    #[test]
+    fn as_fake_dialog_photo_selects_the_a_and_c_sizes() {
+        use crate::chat_manager::DialogId;
+
+        // an empty photo stays empty
+        let empty = DialogPhoto::as_fake_dialog_photo(&Photo::default(), DialogId::new(0), true);
+        assert_eq!(DialogPhoto::default(), empty);
+
+        let photo = Photo {
+            id: 1,
+            date: 100,
+            minithumbnail: "mini".to_owned(),
+            photos: vec![
+                PhotoSize {
+                    size_type: b'x' as i32,
+                    file_id: FileId::default(),
+                    ..Default::default()
+                },
+                PhotoSize {
+                    size_type: b'a' as i32,
+                    file_id: FileId::default(),
+                    ..Default::default()
+                },
+                PhotoSize {
+                    size_type: b'c' as i32,
+                    file_id: FileId::default(),
+                    ..Default::default()
+                },
+            ],
+            animations: vec![AnimationSize::default()],
+            ..Default::default()
+        };
+        let fake = DialogPhoto::as_fake_dialog_photo(&photo, DialogId::new(-1001000000002), true);
+        assert_eq!(fake.minithumbnail, "mini");
+        assert!(fake.has_animation);
+        assert!(fake.is_personal);
     }
 }
