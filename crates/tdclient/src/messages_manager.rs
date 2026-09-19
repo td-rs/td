@@ -12049,8 +12049,9 @@ pub fn update_message_content(
 /// had-forward/saved-topic/notification-id plane (32302-32424), the replied
 /// message/thread/topic plane (32449-32507, with the register/unregister
 /// reply and forum-topic count walks), the non-edit reply-markup
-/// acquire/lose blocks (32713-32769), and the pinned/mention/
-/// interaction-info/reactions moves (32770-32789) — they walk the
+/// acquire/lose blocks (32695-32738; 32713 is only its inner else), and the
+/// pinned/contains-unread-mention/interaction-info/fact-check/
+/// suggested-post moves (32751-32771) — they walk the
 /// dialog/notification/interaction containers those slices own.
 #[allow(clippy::too_many_arguments)] // the C++ carries these through `Td *`
 pub fn update_message(
