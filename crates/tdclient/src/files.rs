@@ -2532,7 +2532,10 @@ pub struct PartialLocalFileLocation {
     pub file_type: FileType,
     pub part_size: i64,
     pub path: String,
-    pub iv: String,
+    /// The C++ `iv_` is a binary `std::string` (the raw 32-byte IGE iv
+    /// of a secret download, FileDownloader.cpp:310); not UTF-8 in
+    /// general.
+    pub iv: Vec<u8>,
     /// The C++ `ready_bitmask_` is a binary `std::string` (a
     /// zero-one-encoded [`Bitmask`]); not UTF-8 in general.
     pub ready_bitmask: Vec<u8>,
@@ -2548,7 +2551,7 @@ impl PartialLocalFileLocation {
         store_parse::store_i32(out, (self.part_size & 0x7FFFFFFF) as i32);
         let deprecated_ready_part_count = if self.part_size > 0x7FFFFFFF { -2 } else { -1 };
         store_parse::store_i32(out, deprecated_ready_part_count);
-        store_parse::store_string(out, &self.iv);
+        store_parse::store_string_bytes(out, &self.iv);
         store_parse::store_string_bytes(out, &self.ready_bitmask);
         if deprecated_ready_part_count == -2 {
             assert!(self.part_size < (1i64 << 62));
@@ -2568,7 +2571,7 @@ impl PartialLocalFileLocation {
         let part_size_low = parser.i32_()?;
         let mut part_size = part_size_low as i64;
         let deprecated_ready_part_count = parser.i32_()?;
-        let iv = parser.string()?;
+        let iv = parser.string_bytes()?;
         let ready_bitmask;
         if deprecated_ready_part_count == -1 || deprecated_ready_part_count == -2 {
             ready_bitmask = parser.string_bytes()?;
@@ -9856,9 +9859,9 @@ impl FileDownloader {
         callback: Box<dyn FileDownloaderCallback>,
         net: Box<dyn FileDownloaderNet>,
     ) -> FileDownloader {
-        debug_assert!(
+        assert!(
             encryption_key.empty() || offset == 0,
-            "CHECK(offset_ == 0) for a keyed download"
+            "CHECK(offset_ == 0) failed for a keyed download"
         );
         FileDownloader {
             remote,
@@ -9925,7 +9928,7 @@ impl FileDownloader {
                     bitmask = Bitmask::from_decode(&partial.ready_bitmask);
                     if self.encryption_key.is_secret() {
                         let mut iv = [0u8; 32];
-                        iv.copy_from_slice(partial.iv.as_bytes());
+                        iv.copy_from_slice(&partial.iv);
                         self.encryption_key.set_iv(iv);
                         self.next_part = bitmask.get_ready_parts(0) as i32;
                     }
@@ -10096,13 +10099,21 @@ impl FileDownloader {
     /// (FileDownloader.cpp:133-192, 60-131, 207-285, 726-740) folded into
     /// one send-and-wait. Returns whether the part must restart.
     fn run_part(&mut self, part: Part) -> Result<bool, Status> {
-        let mut part = part;
-        if self.encryption_key.is_secret() {
-            // fix for last part
-            part.size = (part.size + 15) & !15;
-        }
+        // the C++ pads only its by-value copy inside `start_part`
+        // (FileDownloader.cpp:133-136); the part that flows on through
+        // `process_part`/`try_on_part_query` stays unpadded — the write
+        // is trimmed to the unpadded size (cpp:275), and `stop_use`/
+        // `on_part_ok` account for the unpadded size (cpp:729, 731)
+        let padded_size = if self.encryption_key.is_secret() {
+            (part.size + 15) & !15
+        } else {
+            part.size
+        };
         let size = self.parts_manager.get_part_size();
-        debug_assert!(part.size <= size, "part bigger than the part size");
+        assert!(
+            padded_size <= size,
+            "CHECK(part.size <= part_size()) failed"
+        );
 
         self.callback.on_start_download();
 
@@ -10179,11 +10190,13 @@ impl FileDownloader {
                 Ok(true)
             }
             (DownloadQueryType::Cdn, DownloadResult::CdnBytes(bytes)) => {
+                // CHECK(it != cdn_part_file_token_generation_.end())
+                // (FileDownloader.cpp:118-119)
                 let generation = self
                     .cdn_part_file_token_generation
                     .get(&part.id)
                     .copied()
-                    .unwrap_or(0);
+                    .expect("no file token generation for the cdn part");
                 if generation != self.cdn_file_token_generation {
                     // "Receive part with an old file_token"
                     return Ok(true);
@@ -10336,7 +10349,7 @@ impl FileDownloader {
 
         // Encryption
         if need_cdn_decrypt {
-            debug_assert!(part.offset % 16 == 0, "CDN part offset is not 16-aligned");
+            assert!(part.offset % 16 == 0, "CHECK(part.offset % 16 == 0) failed");
             let offset = (part.offset / 16) as u32;
             let offset = ((offset & 0xff) << 24)
                 | ((offset & 0xff00) << 8)
@@ -10357,7 +10370,9 @@ impl FileDownloader {
                     "LOG_CHECK(next_part_ == part.id) failed",
                 ));
             }
-            debug_assert!(!self.next_part_stop, "CHECK(!next_part_stop_)");
+            // `part.size` is the unpadded tail here, exactly the value the
+            // C++ tests (FileDownloader.cpp:268)
+            assert!(!self.next_part_stop, "CHECK(!next_part_stop_) failed");
             self.next_part += 1;
             if !part.size.is_multiple_of(16) {
                 self.next_part_stop = true;
@@ -10425,7 +10440,7 @@ impl FileDownloader {
                 file_type: self.remote.file_type,
                 part_size: part_size as i64,
                 path: self.path.clone(),
-                iv: String::new(),
+                iv: Vec::new(),
                 ready_bitmask: self.parts_manager.get_bitmask(),
                 ready_size,
             };
@@ -10438,12 +10453,13 @@ impl FileDownloader {
                     self.next_part
                 );
             }
-            let iv = self.encryption_key.iv_slice().to_vec();
             let partial = PartialLocalFileLocation {
                 file_type: self.remote.file_type,
                 part_size: part_size as i64,
                 path: self.path.clone(),
-                iv: String::from_utf8(iv).unwrap_or_default(),
+                // the raw iv bytes, like the C++ `as<UInt256>` copy
+                // (FileDownloader.cpp:306-310)
+                iv: self.encryption_key.iv_slice().to_vec(),
                 ready_bitmask: self.parts_manager.get_bitmask(),
                 ready_size,
             };
@@ -10484,59 +10500,68 @@ impl FileDownloader {
         let mut is_changed = false;
         let mut sent_hashes_query = false;
         while checked_prefix_size < ready_prefix_size {
-            let mut search_info = HashInfo {
-                offset: checked_prefix_size,
-                size: 0,
-                hash: Vec::new(),
-            };
-            search_info.offset = checked_prefix_size;
-            let covering = self
+            // the C++ `upper_bound` then `--it` dance lands on the single
+            // hash entry at or before the offset
+            // (FileDownloader.cpp:337-344); only that entry may verify —
+            // a lower-offset entry that happens to cover is never
+            // consulted
+            let at_or_before = self
                 .hash_info
-                .iter()
-                .rev()
-                .find(|info| {
-                    info.offset <= checked_prefix_size
-                        && info.offset + info.size > checked_prefix_size
-                })
-                .cloned();
-            let Some(cover) = covering else {
-                // the C++ upper_bound/begin dance walks back to the last
-                // hash at or before the offset; no coverage → query
-                if !self.has_hash_query && !sent_hashes_query {
-                    sent_hashes_query = true;
-                    self.has_hash_query = true;
-                    let peer = self
-                        .dialog_photo_id()
-                        .and_then(|id| self.net.resolve_input_peer(id));
-                    let location = self
-                        .remote
-                        .as_input_file_location(&|_| peer.clone())
-                        .map_err(|e| Status::error_message(&e))?;
-                    let query = DownloadQuery::GetFileHashes {
-                        location,
+                .range(
+                    ..=HashInfo {
                         offset: checked_prefix_size,
-                    };
-                    // the check query rides the default auth to the
-                    // remote DC (FileDownloader.cpp:378)
-                    let meta = DownloadNetMeta {
-                        dc_id: self.remote.get_dc_id(),
-                        auth_flag_on: true,
-                        small: self.is_small,
-                    };
-                    let hashes = match self.net.download(query, DownloadQueryType::Check, meta) {
-                        Result::Ok(DownloadResult::Hashes(hashes)) => hashes,
-                        Result::Ok(_) => {
-                            return Err(Status::error_message("Unexpected check query result"));
-                        }
-                        Result::Err(status) => return Err(self.check_net_query(status)),
-                    };
-                    self.process_check_query(hashes);
-                    is_changed = true; // the C++ on_progress fires after the
-                    // async result lands; fire it here
-                    continue;
+                        size: 0,
+                        hash: Vec::new(),
+                    },
+                )
+                .next_back()
+                .cloned();
+            let cover = match at_or_before {
+                Some(cover)
+                    if cover.offset <= checked_prefix_size
+                        && cover.offset + cover.size > checked_prefix_size =>
+                {
+                    cover
                 }
-                // Should fail?
-                break;
+                _ => {
+                    if !self.has_hash_query && !sent_hashes_query {
+                        sent_hashes_query = true;
+                        self.has_hash_query = true;
+                        let peer = self
+                            .dialog_photo_id()
+                            .and_then(|id| self.net.resolve_input_peer(id));
+                        let location = self
+                            .remote
+                            .as_input_file_location(&|_| peer.clone())
+                            .map_err(|e| Status::error_message(&e))?;
+                        let query = DownloadQuery::GetFileHashes {
+                            location,
+                            offset: checked_prefix_size,
+                        };
+                        // the check query rides the default auth to the
+                        // remote DC (FileDownloader.cpp:378)
+                        let meta = DownloadNetMeta {
+                            dc_id: self.remote.get_dc_id(),
+                            auth_flag_on: true,
+                            small: self.is_small,
+                        };
+                        let hashes = match self.net.download(query, DownloadQueryType::Check, meta)
+                        {
+                            Result::Ok(DownloadResult::Hashes(hashes)) => hashes,
+                            Result::Ok(_) => {
+                                return Err(Status::error_message("Unexpected check query result"));
+                            }
+                            Result::Err(status) => return Err(self.check_net_query(status)),
+                        };
+                        self.process_check_query(hashes);
+                        // the query itself changes nothing; on_progress
+                        // fires only after a verified segment
+                        // (FileDownloader.cpp:386-388)
+                        continue;
+                    }
+                    // Should fail?
+                    break;
+                }
             };
             let begin_offset = cover.offset;
             let mut end_offset = cover.offset + cover.size;
@@ -11334,25 +11359,27 @@ mod tests {
 
     #[test]
     fn partial_local_location_legacy_bitmask_and_big_part_sizes() {
-        // a legacy blob with the all-ones deprecated count
+        // a legacy blob with the all-ones deprecated count; the iv is
+        // binary, not UTF-8 (FileDownloader.cpp:310)
         let mut out = Vec::new();
         store_parse::store_i32(&mut out, FileType::Document as i32);
         store_parse::store_string(&mut out, "/tmp/a");
         store_parse::store_i32(&mut out, 524288); // 512 KiB part size
         store_parse::store_i32(&mut out, 3); // 3 ready parts
-        store_parse::store_string(&mut out, "iv");
+        store_parse::store_string_bytes(&mut out, &[0xff, 0x00, 0xfe, 0x80]);
         let mut parser = Parser::new(&out);
         let parsed = PartialLocalFileLocation::parse_from(&mut parser).unwrap();
         parser.fetch_end().unwrap();
         assert_eq!(parsed.part_size, 524288);
         assert_eq!(parsed.ready_bitmask, [0x07]);
+        assert_eq!(parsed.iv, [0xff, 0x00, 0xfe, 0x80]);
 
         // the modern -2 path carries the high 31 bits
         let location = PartialLocalFileLocation {
             file_type: FileType::Document,
             path: "/tmp/a".to_owned(),
             part_size: (1i64 << 40) + 5,
-            iv: "iv".to_owned(),
+            iv: b"iv".to_vec(),
             ready_bitmask: vec![0xff, 1],
             ready_size: 0,
         };
@@ -11427,7 +11454,7 @@ mod tests {
                 file_type: FileType::Document,
                 path: "/tmp/a".to_owned(),
                 part_size: 524288,
-                iv: "iv".to_owned(),
+                iv: b"iv".to_vec(),
                 ready_bitmask: vec![0x07],
                 ready_size: 0,
             }),
@@ -13108,7 +13135,7 @@ mod tests {
             file_type: FileType::Document,
             part_size: 1024,
             path: "/tmp/partial".to_owned(),
-            iv: String::new(),
+            iv: Vec::new(),
             ready_bitmask: Bitmask::from_ones(2).encode(-1),
             ready_size: 0,
         });
@@ -13169,7 +13196,7 @@ mod tests {
             file_type: FileType::SecureEncrypted,
             part_size: 1024,
             path: "/tmp/enc".to_owned(),
-            iv: String::new(),
+            iv: Vec::new(),
             ready_bitmask: Bitmask::from_ones(4).encode(-1),
             ready_size: 0,
         });
@@ -14806,7 +14833,7 @@ mod tests {
                 ready_size: 0,
                 ready_bitmask: Vec::new(),
                 part_size: 1,
-                iv: String::new(),
+                iv: Vec::new(),
             }),
             -1,
             -1,
@@ -15149,7 +15176,7 @@ mod file_downloader_tests {
             file_type: FileType::Document,
             part_size: half,
             path: partial_path.to_string_lossy().into_owned(),
-            iv: String::new(),
+            iv: Vec::new(),
             ready_bitmask: Bitmask::from_ones(1).encode(-1),
             ready_size: half,
         };
@@ -15641,5 +15668,156 @@ mod file_downloader_tests {
         assert_eq!(web.access_hash, 42);
         assert_eq!(*offset, 0);
         assert!(*limit > 0);
+    }
+
+    /// IGE-encrypts `plain` under `key`/`iv` (the server side of a secret
+    /// download).
+    fn secret_encrypt(key: &[u8], iv: &[u8], plain: &[u8]) -> Vec<u8> {
+        let mut iv = iv.to_vec();
+        let mut data = plain.to_vec();
+        tdutils::crypto::aes_ige_encrypt_in_place(key, &mut iv, &mut data);
+        data
+    }
+
+    /// The iv after IGE-decrypting `ct` — the chain the next part rides.
+    fn secret_advance_iv(key: &[u8], iv: &[u8], ct: &[u8]) -> Vec<u8> {
+        let mut iv = iv.to_vec();
+        let mut data = ct.to_vec();
+        tdutils::crypto::aes_ige_decrypt_in_place(key, &mut iv, &mut data);
+        iv
+    }
+
+    #[test]
+    fn file_downloader_downloads_a_secret_document_with_ige() {
+        // a secret download whose size (40) is not 16-aligned: start_part
+        // pads only its local copy (FileDownloader.cpp:133-136), the
+        // server serves the 16-aligned ciphertext (48 bytes), and the
+        // write is trimmed back to the unpadded part size (cpp:275) —
+        // padding bytes must not reach the file
+        let key: Vec<u8> = (0u8..32).collect();
+        let iv: Vec<u8> = (32u8..64).collect();
+        let plain: Vec<u8> = (0u8..40).collect();
+        let mut server_payload = plain.clone();
+        server_payload.extend_from_slice(&[0xab; 8]); // the aligned-up tail
+        let ciphertext = secret_encrypt(&key, &iv, &server_payload);
+        assert_eq!(ciphertext.len(), 48);
+
+        let script = vec![(None, Ok(DownloadResult::Bytes(ciphertext)))];
+        let state = SharedNetState::new(script);
+        let callback = Rc::new(RefCell::new(RecordedCallback::default()));
+        let mut downloader = FileDownloader::new(
+            document_location(),
+            LocalFileLocation::Empty,
+            plain.len() as i64,
+            "sec.bin".to_owned(),
+            FileEncryptionKey::new(&key, &iv),
+            true,
+            false,
+            0,
+            0,
+            Box::new(SharingCallback {
+                inner: callback.clone(),
+            }),
+            Box::new(FakeDownloadNet::new(state)),
+        );
+        downloader.start();
+        drive_download(&mut downloader, &callback);
+
+        let log = callback.borrow();
+        if let Some(err) = &log.error {
+            panic!("download failed: {} ({})", err.message(), err.code());
+        }
+        let (location, size, _) = log.ok.as_ref().expect("download ok");
+        assert_eq!(size, &(plain.len() as i64));
+        let written = std::fs::read(&location.path).unwrap();
+        assert_eq!(written.len(), plain.len());
+        assert_eq!(written, plain);
+    }
+
+    #[test]
+    fn file_downloader_resumes_a_secret_partial_with_the_chained_iv() {
+        // the partial state carries the raw 32-byte iv (the chain after
+        // the ready prefix, FileDownloader.cpp:306-310); the resume gate
+        // needs iv.len() == 32 (cpp:497) and the next part decrypts with
+        // the advanced iv
+        let key: Vec<u8> = (0u8..32).collect();
+        let iv: Vec<u8> = (32u8..64).collect();
+        let plain: Vec<u8> = (0u8..40).collect();
+        let part_size: i64 = 16;
+
+        // part 0 was downloaded before the restart; the partial file
+        // stores the DECRYPTED bytes (process_part writes the decrypted
+        // slice) and the saved iv is the chain after its ciphertext
+        let ct0 = secret_encrypt(&key, &iv, &plain[..16]);
+        let chained_iv = secret_advance_iv(&key, &iv, &ct0);
+
+        let root = std::env::temp_dir().join(format!("m12_dl_{}", tdutils::random::secure_int64()));
+        std::fs::create_dir_all(&root).unwrap();
+        let partial_path = root.join("partial_sec.bin");
+        std::fs::write(&partial_path, &plain[..16]).unwrap();
+        let partial = PartialLocalFileLocation {
+            file_type: FileType::Document,
+            part_size,
+            path: partial_path.to_string_lossy().into_owned(),
+            iv: chained_iv.clone(),
+            ready_bitmask: Bitmask::from_ones(1).encode(-1),
+            ready_size: part_size,
+        };
+
+        // part 1 rides the chained iv; part 2 is the unaligned tail the
+        // server aligns up to 16
+        let ct1 = secret_encrypt(&key, &chained_iv, &plain[16..32]);
+        let iv_after_1 = secret_advance_iv(&key, &chained_iv, &ct1);
+        let mut payload2 = plain[32..40].to_vec();
+        payload2.extend_from_slice(&[0xcd; 8]);
+        let ct2 = secret_encrypt(&key, &iv_after_1, &payload2);
+        assert_eq!(ct2.len(), 16);
+
+        let script = vec![
+            (None, Ok(DownloadResult::Bytes(ct1))),
+            (None, Ok(DownloadResult::Bytes(ct2))),
+        ];
+        let state = SharedNetState::new(script);
+        let callback = Rc::new(RefCell::new(RecordedCallback::default()));
+        let mut downloader = FileDownloader::new(
+            document_location(),
+            LocalFileLocation::Partial(partial),
+            plain.len() as i64,
+            "sec.bin".to_owned(),
+            FileEncryptionKey::new(&key, &iv),
+            true,
+            false,
+            0,
+            0,
+            Box::new(SharingCallback {
+                inner: callback.clone(),
+            }),
+            Box::new(FakeDownloadNet::new(state.clone())),
+        );
+        downloader.start();
+        drive_download(&mut downloader, &callback);
+
+        let log = callback.borrow();
+        if let Some(err) = &log.error {
+            panic!("download failed: {} ({})", err.message(), err.code());
+        }
+        let (location, size, _) = log.ok.as_ref().expect("download ok");
+        assert_eq!(size, &(plain.len() as i64));
+        let written = std::fs::read(&location.path).unwrap();
+        assert_eq!(written.len(), plain.len());
+        assert_eq!(written, plain);
+
+        // the resume asked exactly the two missing parts
+        let queries = state.queries.borrow();
+        let offsets: Vec<i64> = queries
+            .iter()
+            .map(|(_, q, _)| match q {
+                DownloadQuery::GetFile { offset, .. } => *offset,
+                _ => panic!("expected getFile queries"),
+            })
+            .collect();
+        assert_eq!(offsets, vec![16, 32]);
+        drop(queries);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
