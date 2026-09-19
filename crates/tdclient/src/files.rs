@@ -37,7 +37,7 @@
 
 use std::cell::RefCell;
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -4895,6 +4895,106 @@ impl FileNode {
     pub fn get_main_file_id_priority(&self) -> i8 {
         self.main_file_id_priority
     }
+
+    /// `FileNode::get_unique_id(FullGenerateFileLocation)`
+    /// (FileManager.cpp:1213-1215).
+    pub fn get_generate_unique_id(location: &FullGenerateFileLocation) -> String {
+        let mut binary = vec![0xff];
+        location.store(&mut binary);
+        base64url(&tdutils::zero_encode::zero_encode(&binary))
+    }
+
+    /// `FileNode::get_unique_id(FullRemoteFileLocation)`
+    /// (FileManager.cpp:1217-1219).
+    pub fn get_remote_unique_id(location: &FullRemoteFileLocation) -> String {
+        let mut binary = Vec::new();
+        location.store_unique(&mut binary);
+        base64url(&tdutils::zero_encode::zero_encode(&binary))
+    }
+
+    /// `FileNode::get_persistent_id(FullGenerateFileLocation)`
+    /// (FileManager.cpp:1221-1227).
+    pub fn get_generate_persistent_id(location: &FullGenerateFileLocation) -> String {
+        let mut binary = Vec::new();
+        location.store(&mut binary);
+        let mut binary = tdutils::zero_encode::zero_encode(&binary);
+        binary.push(PERSISTENT_ID_VERSION_GENERATED);
+        base64url(&binary)
+    }
+
+    /// `FileNode::get_persistent_id(FullRemoteFileLocation)`
+    /// (FileManager.cpp:1229-1236).
+    pub fn get_remote_persistent_id(location: &FullRemoteFileLocation) -> String {
+        let mut binary = Vec::new();
+        location.store(&mut binary);
+        let mut binary = tdutils::zero_encode::zero_encode(&binary);
+        binary.push(PERSISTENT_ID_VERSION_PREFIX);
+        binary.push(PERSISTENT_ID_VERSION);
+        base64url(&binary)
+    }
+
+    /// `FileNode::get_persistent_file_id` (FileManager.cpp:1238-1247).
+    pub fn get_persistent_file_id(&self) -> String {
+        if self.remote.is_full_alive {
+            if let Some(full) = &self.remote.full {
+                return FileNode::get_remote_persistent_id(full);
+            }
+        } else if !self.url.is_empty() {
+            return self.url.clone();
+        } else if let Some(generate) = &self.generate
+            && is_remotely_generated_file(&generate.conversion)
+        {
+            return FileNode::get_generate_persistent_id(generate);
+        }
+        String::new()
+    }
+
+    /// `FileNode::get_unique_file_id` (FileManager.cpp:1249-1258).
+    pub fn get_unique_file_id(&self) -> String {
+        if self.remote.is_full_alive {
+            if let Some(full) = &self.remote.full
+                && !full.is_web()
+            {
+                return FileNode::get_remote_unique_id(full);
+            }
+        } else if let Some(generate) = &self.generate
+            && is_remotely_generated_file(&generate.conversion)
+        {
+            return FileNode::get_generate_unique_id(generate);
+        }
+        String::new()
+    }
+
+    /// `FileNode::suggested_path` (FileManager.cpp:907-923).
+    pub fn suggested_path(&self) -> String {
+        if !self.remote_name.is_empty() {
+            return self.remote_name.clone();
+        }
+        if !self.url.is_empty() {
+            let file_name = tdutils::http_url::get_url_file_name(&self.url);
+            if !file_name.is_empty() {
+                return file_name;
+            }
+        }
+        if let Some(generate) = &self.generate
+            && !generate.original_path.is_empty()
+        {
+            return generate.original_path.clone();
+        }
+        self.local.file_name().to_string()
+    }
+
+    /// `FileNode::can_delete` (FileManager.cpp:1202-1207) — the
+    /// files-dir seam is caller-supplied ([`get_files_dir`]).
+    pub fn can_delete(&self, files_dir: &str, secure_files_dir: &str) -> bool {
+        if let LocalFileLocation::Full(full) = &self.local {
+            let file_type = self.get_type();
+            return full
+                .path
+                .starts_with(&get_files_dir(file_type, files_dir, secure_files_dir));
+        }
+        matches!(self.local, LocalFileLocation::Partial(_))
+    }
 }
 
 /// `td::FileView` (FileManager.h:288-...) — the read-only projection over a
@@ -5117,6 +5217,287 @@ impl<'a> FileView<'a> {
                 | PhotoSizeSourceType::Thumbnail
         )
     }
+
+    /// `FileView::suggested_path` (FileManager.cpp:1158-1160).
+    pub fn suggested_path(&self) -> String {
+        self.node.suggested_path()
+    }
+
+    /// `FileView::can_delete` (FileManager.cpp:1209-1211).
+    pub fn can_delete(&self, files_dir: &str, secure_files_dir: &str) -> bool {
+        self.node.can_delete(files_dir, secure_files_dir)
+    }
+
+    /// `FileView::get_unique_file_id` (FileManager.h:386-391).
+    pub fn get_unique_file_id(&self) -> String {
+        self.node.get_unique_file_id()
+    }
+}
+
+/// `FileNode::PERSISTENT_ID_VERSION*` (FileManager.h:137-139).
+pub const PERSISTENT_ID_VERSION_OLD: u8 = 2;
+pub const PERSISTENT_ID_VERSION_GENERATED: u8 = 3;
+pub const PERSISTENT_ID_VERSION: u8 = 4;
+/// The `narrow_cast<uint8>(Version::Next) - 1` byte pushed before
+/// [`PERSISTENT_ID_VERSION`] in remote persistent ids. `Version::Next` is 62
+/// in tdlib 1.8.67 (Version.h: `SupportRichMessages` 60,
+/// `SupportEphemeralMessages` 61, `Next` 62), so the byte is 61.
+const PERSISTENT_ID_VERSION_PREFIX: u8 = 61;
+
+/// `FileManager::is_remotely_generated_file` (FileManager.cpp:1431-1433).
+pub fn is_remotely_generated_file(conversion: &str) -> bool {
+    conversion.starts_with("#map#") || conversion.starts_with("#audio_t#")
+}
+
+/// `td::base64url_encode` over the id binaries (ASCII output).
+fn base64url(data: &[u8]) -> String {
+    String::from_utf8(tdmtproto::utils::base64url_encode(data)).expect("base64url is ascii")
+}
+
+/// `get_file_base_dir`/`get_files_base_dir` (FileLoaderUtils.cpp:238-249)
+/// over caller-supplied `Global::get_files_dir()` /
+/// `get_secure_files_dir()` values.
+pub fn get_files_base_dir<'a>(
+    file_type: FileType,
+    files_dir: &'a str,
+    secure_files_dir: &'a str,
+) -> &'a str {
+    match get_file_dir_type(file_type) {
+        FileDirType::Secure => secure_files_dir,
+        FileDirType::Common => files_dir,
+    }
+}
+
+/// `get_files_dir` (FileLoaderUtils.cpp:255-257).
+pub fn get_files_dir(file_type: FileType, files_dir: &str, secure_files_dir: &str) -> String {
+    format!(
+        "{}{}/",
+        get_files_base_dir(file_type, files_dir, secure_files_dir),
+        get_file_type_name(file_type)
+    )
+}
+
+/// `td::Stat` fields `check_full_local_location`/`check_partial_local_location`
+/// read (FileLoaderUtils.cpp:291-360).
+pub struct FileStat {
+    pub is_reg: bool,
+    pub is_dir: bool,
+    pub size: i64,
+    pub mtime_nsec: u64,
+}
+
+/// The environment seam of the collapsed [`FileManager`] — the C++
+/// `FileManager::Context` flags (`keep_exact_remote_location`), the
+/// filesystem access behind `FileLoaderUtils` (`realpath`, `stat`), the
+/// `TdDb::with_db_path` bad paths, the `Global` files directories and the
+/// option reads of `check_full_local_location`. The default methods do the
+/// real `std::fs` work; tests override the pieces they exercise.
+pub trait FileManagerContext {
+    /// `Context::keep_exact_remote_location` (FileManager.h).
+    fn keep_exact_remote_location(&self) -> bool {
+        false
+    }
+
+    /// `realpath(path, /*require_absolute=*/ true)` — `Err` when the path
+    /// cannot be resolved (FileManager.cpp "Can't find real file path").
+    fn real_path(&self, path: &str) -> Result<String, Status> {
+        std::fs::canonicalize(path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .map_err(|_| Status::error(400, "Can't find real file path"))
+    }
+
+    /// `td::stat(path)`.
+    fn stat(&self, path: &str) -> Result<FileStat, Status> {
+        let meta = std::fs::metadata(path)
+            .map_err(|_| Status::error(400, "Can't get stat about the file"))?;
+        let mtime_nsec = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        Ok(FileStat {
+            is_reg: meta.is_file(),
+            is_dir: meta.is_dir(),
+            size: meta.len() as i64,
+            mtime_nsec,
+        })
+    }
+
+    /// `G()->get_files_dir()`.
+    fn files_dir(&self) -> String {
+        String::new()
+    }
+
+    /// `G()->get_secure_files_dir()`.
+    fn secure_files_dir(&self) -> String {
+        String::new()
+    }
+
+    /// `TdDb::with_db_path` — the database paths that must never be sent
+    /// (`bad_paths_`).
+    fn db_paths(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// `G()->get_option_integer(name, default)` — the option cache read of
+    /// `check_full_local_location`'s video-note limit.
+    fn option_integer(&self, _name: &str, default: i64) -> i64 {
+        default
+    }
+
+    /// `LogInterface::get_file_paths` — `register_generate` skips the
+    /// `#mtime#` prefix for logged paths.
+    fn logged_file_paths(&self) -> Vec<String> {
+        Vec::new()
+    }
+}
+
+/// `are_modification_times_equal` (FileLoaderUtils.cpp:259-271).
+pub fn are_modification_times_equal(old_mtime: i64, new_mtime: i64) -> bool {
+    if old_mtime == new_mtime {
+        return true;
+    }
+    if old_mtime < new_mtime {
+        return false;
+    }
+    // FAT32 has 2 seconds mtime resolution, but file system sometimes
+    // reports odd modification time
+    old_mtime - new_mtime == 1_000_000_000
+        && old_mtime % 1_000_000_000 == 0
+        && new_mtime % 2_000_000_000 == 0
+}
+
+/// `FullLocalLocationInfo` (FileLoaderUtils.h:43-49).
+pub struct FullLocalLocationInfo {
+    pub location: FullLocalFileLocation,
+    pub size: i64,
+}
+
+impl fmt::Debug for FullLocalLocationInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FullLocalLocationInfo")
+            .field("location", &self.location)
+            .field("size", &self.size)
+            .finish()
+    }
+}
+
+/// `check_full_local_location` (FileLoaderUtils.cpp:273-345) — the
+/// register-local validation surface. `G()->get_option_integer` goes through
+/// the [`FileManagerContext`].
+pub fn check_full_local_location<C: FileManagerContext + ?Sized>(
+    context: &C,
+    mut local_info: FullLocalLocationInfo,
+    skip_file_size_checks: bool,
+) -> Result<FullLocalLocationInfo, Status> {
+    const MAX_FILE_SIZE: i64 = 4000 << 20; // 4000 MB
+    const MAX_THUMBNAIL_SIZE: i64 = 200 * (1 << 10) - 1; // 200 KB - 1 B
+    const MAX_PHOTO_SIZE: i64 = 10 * (1 << 20); // 10 MB
+    const DEFAULT_VIDEO_NOTE_SIZE_MAX: i64 = 12 * (1 << 20); // 12 MB
+    const MAX_VIDEO_STORY_SIZE: i64 = 30 * (1 << 20); // 30 MB
+
+    let mut size = local_info.size;
+    if local_info.location.path.is_empty() {
+        return Err(Status::error(400, "File must have non-empty path"));
+    }
+    local_info.location.path = context.real_path(&local_info.location.path)?;
+
+    let stat = context.stat(&local_info.location.path)?;
+    if !stat.is_reg {
+        return Err(Status::error(400, "File must be a regular file"));
+    }
+    if stat.size < 0 {
+        // TODO is it possible?
+        return Err(Status::error(400, "File is too big"));
+    }
+    if stat.size == 0 {
+        return Err(Status::error(400, "File must be non-empty"));
+    }
+
+    if size <= 0 {
+        size = stat.size;
+    } else if size != stat.size {
+        return Err(Status::error(400, "File size has changed"));
+    }
+
+    if local_info.location.mtime_nsec == 0 {
+        local_info.location.mtime_nsec = stat.mtime_nsec;
+    } else if !are_modification_times_equal(
+        local_info.location.mtime_nsec as i64,
+        stat.mtime_nsec as i64,
+    ) {
+        return Err(Status::error(400, "File was modified"));
+    }
+    local_info.size = size;
+    if skip_file_size_checks {
+        return Ok(local_info);
+    }
+
+    let file_name = tdutils::path_view::PathView::new(&local_info.location.path)
+        .file_name()
+        .to_string();
+    let get_file_size_error = |reason: &str, max_size: i64| {
+        Status::error(
+            400,
+            format!(
+                "File of size {} bytes is too big{}; the maximum size is {} bytes",
+                size, reason, max_size
+            )
+            .as_str(),
+        )
+    };
+    if (local_info.location.file_type == FileType::Thumbnail
+        || local_info.location.file_type == FileType::EncryptedThumbnail)
+        && size > MAX_THUMBNAIL_SIZE
+        && !file_name.starts_with("map")
+        && !file_name.starts_with("Album cover for ")
+    {
+        return Err(get_file_size_error(" for a thumbnail", MAX_THUMBNAIL_SIZE));
+    }
+    if size > MAX_FILE_SIZE {
+        return Err(get_file_size_error("", MAX_FILE_SIZE));
+    }
+    if get_file_type_class(local_info.location.file_type) == FileTypeClass::Photo
+        && size > MAX_PHOTO_SIZE
+    {
+        return Err(get_file_size_error(" for a photo", MAX_PHOTO_SIZE));
+    }
+    if local_info.location.file_type == FileType::VideoNote
+        || local_info.location.file_type == FileType::SelfDestructingVideoNote
+    {
+        let max_size = context.option_integer("video_note_size_max", DEFAULT_VIDEO_NOTE_SIZE_MAX);
+        if size > max_size {
+            return Err(get_file_size_error(" for a video note", max_size));
+        }
+    }
+    if local_info.location.file_type == FileType::VideoStory && size > MAX_VIDEO_STORY_SIZE {
+        return Err(get_file_size_error(
+            " for a video story",
+            MAX_VIDEO_STORY_SIZE,
+        ));
+    }
+    Ok(local_info)
+}
+
+/// `check_partial_local_location` (FileLoaderUtils.cpp:353-363).
+pub fn check_partial_local_location<C: FileManagerContext + ?Sized>(
+    context: &C,
+    location: &PartialLocalFileLocation,
+) -> Result<(), Status> {
+    let stat = context.stat(&location.path)?;
+    if !stat.is_reg {
+        if stat.is_dir {
+            return Err(Status::error(
+                0,
+                format!("Can't use directory \"{}\" as a file path", location.path).as_str(),
+            ));
+        }
+        return Err(Status::error(0, "File must be a regular file"));
+    }
+    // can't check mtime. Hope nobody will mess with the file in our
+    // temporary directory
+    Ok(())
 }
 
 /// The actor-effect seam of the collapsed [`FileManager`]: the C++
@@ -5175,6 +5556,14 @@ enum MergeEvent {
     },
 }
 
+/// `FileManager::RemoteInfo` (FileManager.h:876-886) — the
+/// `remote_location_info_` Enumerator entry; equality is by remote location.
+struct RemoteInfo {
+    location: FullRemoteFileLocation,
+    source: FileLocationSource,
+    file_id: FileId,
+}
+
 /// `td::FileManager` (FileManager.h:397) collapsed per the single-scheduler
 /// convention: the node registry and the merge machine as plain methods, the
 /// actor effects behind [`FileManagerWorker`]. The database round-trip that
@@ -5187,16 +5576,123 @@ pub struct FileManager {
     /// `file_id_info_` — file id → node id.
     file_id_node: HashMap<FileId, usize>,
     worker: Option<Box<dyn FileManagerWorker>>,
+    context: Option<Box<dyn FileManagerContext>>,
+
+    /// `next_file_id`'s counter — the C++ `file_id_info_.size()`.
+    last_file_id: i32,
+    /// `empty_file_ids_`.
+    empty_file_ids: Vec<i32>,
+    /// `FileIdInfo::pin_flag_` per file id.
+    pinned_file_ids: BTreeSet<FileId>,
+
+    /// `local_location_to_file_id_`.
+    local_location_to_file_id: BTreeMap<FullLocalFileLocation, FileId>,
+    /// `generate_location_to_file_id_`.
+    generate_location_to_file_id: BTreeMap<FullGenerateFileLocation, FileId>,
+    /// `remote_location_to_file_id_` (the `keep_exact_remote_location = false`
+    /// table).
+    remote_location_to_file_id: BTreeMap<FullRemoteFileLocation, FileId>,
+    /// `remote_location_info_` — the Enumerator entries; the index is the
+    /// `remote_key` handed out inside `FileId::remote_id`.
+    remote_location_info: Vec<RemoteInfo>,
+    /// The Enumerator's value→index map.
+    remote_location_index: BTreeMap<FullRemoteFileLocation, usize>,
+
+    /// `bad_paths_` — seeded from `FileManagerContext::db_paths`.
+    bad_paths: BTreeSet<String>,
 }
+
+/// The trait-default [`FileManagerContext`] (no filesystem overrides, no
+/// bad paths, `keep_exact_remote_location = false`).
+struct DefaultFileManagerContext;
+
+impl FileManagerContext for DefaultFileManagerContext {}
+
+/// `FileStoreType` (FileManager.hpp:24).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FileStoreType {
+    Empty,
+    Url,
+    Generate,
+    Local,
+    Remote,
+}
+
+/// The `Version` entries the FileManager-mediated `FileId` serialization
+/// branches on (td/telegram/Version.h).
+const VERSION_STORE_FILE_ID: i32 = 1;
+const VERSION_STORE_FILE_OWNER_ID: i32 = 6;
+const VERSION_STORE_FILE_ENCRYPTION_KEY: i32 = 7;
 
 impl FileManager {
     pub fn new() -> FileManager {
-        FileManager::default()
+        FileManager {
+            // the C++ constructor burns file id 0 (the invalid handle) and
+            // node id 0 (FileManager.cpp:1316-1317), so the first registered
+            // id/node is 1 and `FileId::is_valid` holds
+            last_file_id: 1,
+            file_nodes: vec![None],
+            ..Default::default()
+        }
+    }
+
+    /// Installs the context seam; also seeds `bad_paths_` the way the C++
+    /// constructor does with `TdDb::with_db_path` (FileManager.cpp:1309-1320).
+    pub fn set_context(&mut self, context: Box<dyn FileManagerContext>) {
+        for path in context.db_paths() {
+            self.bad_paths.insert(path);
+        }
+        self.context = Some(context);
+    }
+
+    fn ctx(&mut self) -> &mut dyn FileManagerContext {
+        if self.context.is_none() {
+            self.context = Some(Box::new(DefaultFileManagerContext));
+        }
+        self.context.as_deref_mut().expect("context")
     }
 
     /// Registers the worker; replaces the previous one.
     pub fn set_worker(&mut self, worker: Box<dyn FileManagerWorker>) {
         self.worker = Some(worker);
+    }
+
+    /// `FileManager::next_file_id` (FileManager.cpp:4756-4766).
+    fn next_file_id(&mut self) -> FileId {
+        if let Some(id) = self.empty_file_ids.pop() {
+            return FileId::new(id, 0);
+        }
+        let res = FileId::new(self.last_file_id, 0);
+        self.last_file_id += 1;
+        res
+    }
+
+    /// `FileManager::try_forget_file_id` (FileManager.cpp:1633-1651).
+    fn try_forget_file_id(&mut self, file_id: FileId) -> bool {
+        if self.pinned_file_ids.contains(&file_id) {
+            return false; // "Can't forget file ..., because it is pinned"
+        }
+        let Some(&node_id) = self.file_id_node.get(&file_id) else {
+            return false;
+        };
+        let Some(node) = self.file_nodes[node_id].as_ref() else {
+            return false;
+        };
+        if node.main_file_id == file_id {
+            return false; // "Can't forget main file ..."
+        }
+        let mut file_ids = std::mem::take(&mut self.file_nodes[node_id].as_mut().unwrap().file_ids);
+        if !file_ids.contains(&file_id) {
+            self.file_nodes[node_id].as_mut().unwrap().file_ids = file_ids;
+            debug_assert!(false, "try_forget_file_id of a foreign file id");
+            return false;
+        }
+        file_ids.retain(|id| *id != file_id);
+        self.file_nodes[node_id].as_mut().unwrap().file_ids = file_ids;
+        self.pinned_file_ids.remove(&file_id);
+        self.file_id_node.remove(&file_id);
+        self.empty_file_ids.push(file_id.get());
+        true
     }
 
     /// `create_file_node` — appends a node and re-keys its file ids to it.
@@ -5226,6 +5722,760 @@ impl FileManager {
         self.file_id_node
             .get(&file_id)
             .and_then(|&node_id| self.file_nodes[node_id].as_ref())
+    }
+
+    fn get_file_node_mut(&mut self, file_id: FileId) -> Option<&mut FileNode> {
+        let node_id = *self.file_id_node.get(&file_id)?;
+        self.file_nodes[node_id].as_mut()
+    }
+
+    /// `FileManager::get_file_view` over the registry.
+    pub fn get_file_view(&self, file_id: FileId) -> Option<FileView<'_>> {
+        self.get_file_node(file_id).map(FileView::new)
+    }
+
+    /// `FileManager::pin_file_id` — the C++ pins through
+    /// `get_file_id_info(file_id)->pin_flag_ = true`.
+    fn pin_file_id(&mut self, file_id: FileId) {
+        self.pinned_file_ids.insert(file_id);
+    }
+
+    /// `FileManager::try_flush_node` (FileManager.cpp:2574-2577) — the pmc
+    /// half through the worker's `flush_node_full` hook, the info half
+    /// through [`Self::try_flush_node_info`].
+    fn try_flush_node(&mut self, node_id: usize) {
+        let need_pmc_flush = self.file_nodes[node_id]
+            .as_ref()
+            .is_some_and(|node| node.need_pmc_flush());
+        if need_pmc_flush {
+            let node = self.file_nodes[node_id].as_ref().expect("node");
+            if let Some(worker) = self.worker.as_deref_mut() {
+                worker.flush_node_full(node, false, false, false, FileDbId::default());
+            }
+            if let Some(node) = self.file_nodes[node_id].as_mut() {
+                node.on_pmc_flushed();
+            }
+        }
+        self.try_flush_node_info(node_id);
+    }
+
+    /// `FileManager::register_empty` (FileManager.cpp:1653-1674).
+    pub fn register_empty(&mut self, file_type: FileType) -> FileId {
+        let location = FullLocalFileLocation {
+            file_type,
+            path: String::new(),
+            mtime_nsec: 0,
+        };
+        if let Some(&file_id) = self.local_location_to_file_id.get(&location)
+            && file_id.is_valid()
+        {
+            return file_id;
+        }
+        let file_id = self.next_file_id();
+        self.local_location_to_file_id
+            .insert(location.clone(), file_id);
+
+        let node = FileNode::new(
+            LocalFileLocation::Full(location),
+            NewRemoteFileLocation::default(),
+            None,
+            0,
+            0,
+            String::new(),
+            String::new(),
+            DialogId::default(),
+            FileEncryptionKey::default(),
+            file_id,
+            0,
+        );
+        self.register_file_node(file_id, 0, node);
+        self.pin_file_id(file_id);
+        file_id
+    }
+
+    /// `FileManager::register_local` (FileManager.cpp:1690-1745).
+    pub fn register_local(
+        &mut self,
+        location: FullLocalFileLocation,
+        owner_dialog_id: DialogId,
+        size: i64,
+        get_by_hash: bool,
+        skip_file_size_checks: bool,
+        merge_file_id: FileId,
+    ) -> Result<FileId, Status> {
+        let info = check_full_local_location(
+            self.ctx(),
+            FullLocalLocationInfo { location, size },
+            skip_file_size_checks,
+        )?;
+        let location = info.location;
+        let size = info.size;
+
+        if self.bad_paths.contains(&location.path) {
+            return Err(Status::error(
+                400,
+                "Sending of internal database files is forbidden",
+            ));
+        }
+
+        let mut is_new = false;
+        let file_id = match self.local_location_to_file_id.get(&location) {
+            Some(file_id) if file_id.is_valid() => *file_id,
+            _ => {
+                let file_id = self.next_file_id();
+                let mut node = FileNode::new(
+                    LocalFileLocation::Full(location.clone()),
+                    NewRemoteFileLocation::default(),
+                    None,
+                    size,
+                    0,
+                    String::new(),
+                    String::new(),
+                    owner_dialog_id,
+                    FileEncryptionKey::default(),
+                    file_id,
+                    0,
+                );
+                node.need_load_from_pmc = true;
+                self.register_file_node(file_id, 0, node);
+                self.local_location_to_file_id
+                    .insert(location.clone(), file_id);
+                is_new = true;
+                file_id
+            }
+        };
+        let _ = get_by_hash; // vestigial in the C++ register_local too
+
+        if merge_file_id.is_valid() {
+            let merge_result = self.merge(file_id, merge_file_id);
+            if merge_result.is_ok() {
+                let main_file_id = self
+                    .get_file_node(file_id)
+                    .map(|node| node.main_file_id)
+                    .expect("merged node");
+                let mut node_id = *self
+                    .file_id_node
+                    .get(&main_file_id)
+                    .expect("merged node id");
+                if main_file_id != file_id {
+                    if is_new && !self.pinned_file_ids.contains(&file_id) {
+                        let is_removed = self.try_forget_file_id(file_id);
+                        debug_assert!(is_removed, "try_forget_file_id of a fresh unmerged id");
+                        self.local_location_to_file_id.remove(&location);
+                    }
+                    node_id = *self
+                        .file_id_node
+                        .get(&main_file_id)
+                        .expect("merged node id");
+                }
+                self.try_flush_node(node_id);
+            }
+            if is_new {
+                self.pin_file_id(file_id);
+            }
+            merge_result?;
+        } else if is_new {
+            self.pin_file_id(file_id);
+        }
+        Ok(file_id)
+    }
+
+    /// `FileManager::register_remote` (FileManager.cpp:1747-1819).
+    pub fn register_remote(
+        &mut self,
+        location: FullRemoteFileLocation,
+        file_location_source: FileLocationSource,
+        owner_dialog_id: DialogId,
+        size: i64,
+        expected_size: i64,
+        remote_name: String,
+    ) -> FileId {
+        let mut size = size;
+        let mut expected_size = expected_size;
+        if size < 0 {
+            size = 0;
+        }
+        if expected_size < 0 {
+            expected_size = 0;
+        }
+        let url = location.get_url().to_string();
+
+        let file_id;
+        let mut merge_file_id = FileId::default();
+        let mut remote_key = 0;
+        if self.ctx().keep_exact_remote_location() {
+            file_id = self.next_file_id();
+            match self.remote_location_index.get(&location).copied() {
+                Some(index) => {
+                    remote_key = index;
+                    let stored_file_id = self.remote_location_info[index].file_id;
+                    if stored_file_id != file_id {
+                        merge_file_id = stored_file_id;
+                        let stored_location = self.remote_location_info[index].location.clone();
+                        let stored_source = self.remote_location_info[index].source;
+                        if merge_choose_full_remote_location(
+                            &location,
+                            file_location_source,
+                            &stored_location,
+                            stored_source,
+                        ) == 0
+                        {
+                            let info = &mut self.remote_location_info[index];
+                            info.location = location.clone();
+                            info.source = file_location_source;
+                        }
+                    }
+                }
+                None => {
+                    let index = self.remote_location_info.len();
+                    self.remote_location_info.push(RemoteInfo {
+                        location: location.clone(),
+                        source: file_location_source,
+                        file_id,
+                    });
+                    self.remote_location_index.insert(location.clone(), index);
+                    remote_key = index;
+                }
+            }
+        } else {
+            if let Some(other_id) = self.remote_location_to_file_id.get(&location).copied() {
+                if other_id.is_valid() {
+                    let other_source = self
+                        .get_file_node(other_id)
+                        .map(|node| node.remote.full_source)
+                        .unwrap_or(FileLocationSource::None);
+                    if other_source == FileLocationSource::FromServer {
+                        // if the file has already been received from the
+                        // server, then we don't need merge or create a new
+                        // file: skip merging of dc_id, file_reference and
+                        // access_hash
+                        return other_id;
+                    }
+                }
+                merge_file_id = other_id;
+            }
+            file_id = self.next_file_id();
+            if !merge_file_id.is_valid() {
+                self.remote_location_to_file_id
+                    .insert(location.clone(), file_id);
+            }
+        }
+
+        let node = FileNode::new(
+            LocalFileLocation::Empty,
+            NewRemoteFileLocation::from_remote(
+                RemoteFileLocation::Full(location.clone()),
+                file_location_source,
+            ),
+            None,
+            size,
+            expected_size,
+            remote_name,
+            url,
+            owner_dialog_id,
+            FileEncryptionKey::default(),
+            file_id,
+            1,
+        );
+        self.register_file_node(file_id, 1, node);
+
+        let mut main_file_id = file_id;
+        if !merge_file_id.is_valid() {
+            if let Some(node) = self.get_file_node_mut(main_file_id) {
+                node.need_load_from_pmc = true;
+            }
+            self.pin_file_id(main_file_id);
+        } else {
+            // may invalidate node
+            let _ = self.merge(file_id, merge_file_id);
+            if let Some(node_id) = self.file_id_node.get(&file_id).copied() {
+                self.try_flush_node(node_id);
+            }
+            main_file_id = self
+                .get_file_node(file_id)
+                .map(|node| node.main_file_id)
+                .expect("merged node");
+            if main_file_id != file_id {
+                self.try_forget_file_id(file_id);
+            }
+        }
+        FileId::new(main_file_id.get(), remote_key as i32)
+    }
+
+    /// `FileManager::register_url` (FileManager.cpp:1821-1824).
+    pub fn register_url(
+        &mut self,
+        url: String,
+        file_type: FileType,
+        owner_dialog_id: DialogId,
+    ) -> FileId {
+        self.do_register_generate(
+            FullGenerateFileLocation::new(file_type, url.clone(), "#url#".to_string()),
+            owner_dialog_id,
+            0,
+            url,
+        )
+    }
+
+    /// `FileManager::register_generate` (FileManager.cpp:1826-1840).
+    pub fn register_generate(
+        &mut self,
+        file_type: FileType,
+        original_path: String,
+        conversion: String,
+        owner_dialog_id: DialogId,
+        expected_size: i64,
+    ) -> FileId {
+        // add #mtime# into conversion
+        let mut conversion = conversion;
+        if !original_path.is_empty()
+            && !conversion.starts_with('#')
+            && std::path::Path::new(&original_path).is_absolute()
+            && !self
+                .ctx()
+                .logged_file_paths()
+                .iter()
+                .any(|p| p == &original_path)
+        {
+            let stat = self.ctx().stat(&original_path);
+            let mtime = stat.map(|s| s.mtime_nsec).unwrap_or(0);
+            conversion = format!("#mtime#{:020}#{}", mtime, conversion);
+        }
+        self.do_register_generate(
+            FullGenerateFileLocation::new(file_type, original_path, conversion),
+            owner_dialog_id,
+            expected_size.max(0),
+            String::new(),
+        )
+    }
+
+    /// `FileManager::do_register_generate` (FileManager.cpp:1842-1863).
+    fn do_register_generate(
+        &mut self,
+        generate: FullGenerateFileLocation,
+        owner_dialog_id: DialogId,
+        expected_size: i64,
+        url: String,
+    ) -> FileId {
+        if let Some(&file_id) = self.generate_location_to_file_id.get(&generate)
+            && file_id.is_valid()
+        {
+            return file_id;
+        }
+        let file_id = self.next_file_id();
+
+        let mut node = FileNode::new(
+            LocalFileLocation::Empty,
+            NewRemoteFileLocation::default(),
+            Some(generate.clone()),
+            0,
+            expected_size,
+            String::new(),
+            url,
+            owner_dialog_id,
+            FileEncryptionKey::default(),
+            file_id,
+            0,
+        );
+        node.need_load_from_pmc = true;
+        self.register_file_node(file_id, 0, node);
+        self.generate_location_to_file_id.insert(generate, file_id);
+        self.pin_file_id(file_id);
+        file_id
+    }
+
+    /// `FileManager::copy_file_id` (FileManager.cpp:1625-1631).
+    pub fn copy_file_id(
+        &mut self,
+        file_id: FileId,
+        file_type: FileType,
+        owner_dialog_id: DialogId,
+        source: &str,
+    ) -> FileId {
+        let (suggested_path, size) = match self.get_file_view(file_id) {
+            Some(view) => (view.suggested_path(), view.size()),
+            None => (String::new(), 0),
+        };
+        let result_file_id = self.register_generate(
+            file_type,
+            suggested_path,
+            format!("#file_id#{}", file_id.get()),
+            owner_dialog_id,
+            size,
+        );
+        let _ = source; // the C++ only logs it
+        result_file_id
+    }
+
+    /// `FileManager::get_file_object` (FileManager.cpp:4103-4134).
+    pub fn get_file_object(&self, file_id: FileId) -> td_api::File {
+        let Some(file_node) = self.get_file_node(file_id) else {
+            return td_api::File {
+                id: 0,
+                size: 0,
+                expected_size: 0,
+                local: Some(td_api::LocalFile::default()),
+                remote: Some(td_api::RemoteFile::default()),
+            };
+        };
+
+        let persistent_file_id = file_node.get_persistent_file_id();
+        let unique_file_id = file_node.get_unique_file_id();
+        let is_downloading_completed = matches!(file_node.local, LocalFileLocation::Full(_));
+        let is_uploading_completed = !persistent_file_id.is_empty();
+        let size = file_node.size;
+        let download_offset = file_node.download_offset;
+        let expected_size = file_node.expected_size(false);
+        let local_prefix_size = file_node.local_prefix_size();
+        let local_total_size = file_node.local_total_size();
+        let remote_size = file_node.remote_size();
+        let path = file_node.path().to_string();
+        let files_dir = self
+            .context
+            .as_deref()
+            .map(|c| c.files_dir())
+            .unwrap_or_default();
+        let secure_files_dir = self
+            .context
+            .as_deref()
+            .map(|c| c.secure_files_dir())
+            .unwrap_or_default();
+        let can_be_deleted = file_node.can_delete(&files_dir, &secure_files_dir);
+
+        let file_view = FileView::new(file_node);
+        let can_be_downloaded = file_view.can_download_from_server() || file_view.can_generate();
+
+        td_api::File {
+            id: file_id.get(),
+            size,
+            expected_size,
+            local: Some(td_api::LocalFile {
+                path,
+                can_be_downloaded,
+                can_be_deleted,
+                is_downloading_active: file_node.is_downloading(),
+                is_downloading_completed,
+                download_offset,
+                downloaded_prefix_size: local_prefix_size,
+                downloaded_size: local_total_size,
+            }),
+            remote: Some(td_api::RemoteFile {
+                id: persistent_file_id,
+                unique_id: unique_file_id,
+                is_uploading_active: file_node.is_uploading(),
+                is_uploading_completed,
+                uploaded_size: remote_size,
+            }),
+        }
+    }
+
+    /// `FileManager::store_file` (FileManager.hpp:30-131) — the
+    /// FileManager-mediated `FileId` serialization the photo stores call
+    /// through (`store(dialog_photo.small_file_id, storer)`), ttl 5.
+    pub fn store_file(&self, file_id: FileId, out: &mut Vec<u8>) {
+        self.store_file_ttl(file_id, out, 5)
+    }
+
+    /// The ttl-parametered [`Self::store_file`].
+    pub fn store_file_ttl(&self, file_id: FileId, out: &mut Vec<u8>, ttl: i32) {
+        use store_parse::*;
+
+        let file_view = self.get_file_view(file_id);
+        let file_store_type = if ttl <= 0 {
+            FileStoreType::Empty
+        } else {
+            file_view.as_ref().map_or(FileStoreType::Empty, |view| {
+                if view.has_full_remote_location() {
+                    FileStoreType::Remote
+                } else if view.has_url() {
+                    FileStoreType::Url
+                } else if view.has_generate_location() {
+                    FileStoreType::Generate
+                } else if view.has_full_local_location() {
+                    FileStoreType::Local
+                } else {
+                    FileStoreType::Empty
+                }
+            })
+        };
+
+        store_i32(out, file_store_type as i32);
+
+        let mut has_encryption_key = false;
+        let has_expected_size = file_store_type == FileStoreType::Remote
+            && file_view
+                .as_ref()
+                .is_some_and(|view| view.size() == 0 && view.expected_size(false) != 0);
+        let mut has_secure_key = false;
+        let mut size: i64 = 0;
+        let mut has_64bit_size = false;
+        if file_store_type != FileStoreType::Empty {
+            if let Some(view) = file_view.as_ref() {
+                has_encryption_key = view.is_encrypted_secret();
+                has_secure_key = view.is_encrypted_secure();
+                if file_store_type != FileStoreType::Url {
+                    size = if has_expected_size || file_store_type == FileStoreType::Generate {
+                        view.expected_size(false)
+                    } else {
+                        view.size()
+                    };
+                    has_64bit_size = size > i32::MAX as i64;
+                }
+            }
+            store_flags(
+                out,
+                [
+                    has_encryption_key,
+                    has_expected_size,
+                    has_secure_key,
+                    has_64bit_size,
+                ],
+            );
+        }
+
+        let Some(view) = file_view.as_ref() else {
+            return;
+        };
+        match file_store_type {
+            FileStoreType::Empty => {}
+            FileStoreType::Url => {
+                store_i32(out, view.get_type() as i32);
+                store_string(out, view.get_url().expect("url"));
+                store_i64(out, view.owner_dialog_id().get());
+            }
+            FileStoreType::Remote => {
+                let full_remote_location = view.get_full_remote_location().expect("remote");
+                full_remote_location.store(out);
+                if has_64bit_size {
+                    store_i64(out, size);
+                } else {
+                    store_i32(out, size as i32);
+                }
+                store_string(out, view.remote_name());
+                store_i64(out, view.owner_dialog_id().get());
+            }
+            FileStoreType::Local => {
+                let full_local_location = view.get_full_local_location().expect("local");
+                full_local_location.store(out);
+                if has_64bit_size {
+                    store_i64(out, size);
+                } else {
+                    store_i32(out, size as i32);
+                }
+                store_i32(out, i32::from(view.get_by_hash()));
+                store_i64(out, view.owner_dialog_id().get());
+            }
+            FileStoreType::Generate => {
+                let mut generate_location = view.get_generate_location().expect("generate").clone();
+                let mut from_file_id = FileId::default();
+                let mut have_file_id = false;
+                if generate_location.conversion == "#_file_id#" {
+                    // the nested file id follows the location
+                } else if let Some(raw_id) = generate_location.conversion.strip_prefix("#file_id#")
+                {
+                    // It is not the best possible way to serialize file_id
+                    from_file_id = FileId::new(raw_id.parse().unwrap_or(0), 0);
+                    generate_location.conversion = "#_file_id#".to_string();
+                    have_file_id = true;
+                }
+                generate_location.store(out);
+                if has_64bit_size {
+                    store_i64(out, size);
+                } else {
+                    store_i32(out, size as i32);
+                    store_i32(out, 0); // legacy
+                }
+                store_i64(out, view.owner_dialog_id().get());
+
+                if have_file_id {
+                    self.store_file_ttl(from_file_id, out, ttl - 1);
+                }
+            }
+        }
+        if has_encryption_key || has_secure_key {
+            view.encryption_key().store(out);
+        }
+    }
+
+    /// `FileManager::parse_file` (FileManager.hpp:135-273).
+    pub fn parse_file(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+        if parser.version() < VERSION_STORE_FILE_ID {
+            return Ok(FileId::default());
+        }
+
+        let raw_store_type = parser.i32_()?;
+        let file_store_type = match raw_store_type {
+            0 => FileStoreType::Empty,
+            1 => FileStoreType::Url,
+            2 => FileStoreType::Generate,
+            3 => FileStoreType::Local,
+            4 => FileStoreType::Remote,
+            _ => return Err("Unknown FileStoreType"),
+        };
+
+        let mut has_encryption_key = false;
+        let mut has_expected_size = false;
+        let mut has_secure_key = false;
+        let mut has_64bit_size = false;
+        if file_store_type != FileStoreType::Empty
+            && parser.version() >= VERSION_STORE_FILE_ENCRYPTION_KEY
+        {
+            [
+                has_encryption_key,
+                has_expected_size,
+                has_secure_key,
+                has_64bit_size,
+            ] = parser.parse_flags::<4>()?;
+        }
+
+        let file_id = match file_store_type {
+            FileStoreType::Empty => FileId::default(),
+            FileStoreType::Remote => {
+                let full_remote_location = FullRemoteFileLocation::parse_from(parser)?;
+                let stored_size = if has_64bit_size {
+                    parser.i64_()?
+                } else {
+                    let int_size = parser.i32_()?;
+                    if int_size < 0 {
+                        int_size as i64 + (1i64 << 32)
+                    } else {
+                        int_size as i64
+                    }
+                };
+                let size = if has_expected_size { 0 } else { stored_size };
+                let expected_size = if has_expected_size { stored_size } else { 0 };
+                let name = parser.string()?;
+                let owner_dialog_id = if parser.version() >= VERSION_STORE_FILE_OWNER_ID {
+                    DialogId::new(parser.i64_()?)
+                } else {
+                    DialogId::default()
+                };
+                self.register_remote(
+                    full_remote_location,
+                    FileLocationSource::FromBinlog,
+                    owner_dialog_id,
+                    size,
+                    expected_size,
+                    name,
+                )
+            }
+            FileStoreType::Local => {
+                let full_local_location = FullLocalFileLocation::parse_from(parser)?;
+                let size = if has_64bit_size {
+                    parser.i64_()?
+                } else {
+                    let int_size = parser.i32_()?;
+                    if int_size < 0 {
+                        int_size as i64 + (1i64 << 32)
+                    } else {
+                        int_size as i64
+                    }
+                };
+                let get_by_hash = parser.i32_()?;
+                let owner_dialog_id = if parser.version() >= VERSION_STORE_FILE_OWNER_ID {
+                    DialogId::new(parser.i64_()?)
+                } else {
+                    DialogId::default()
+                };
+                match self.register_local(
+                    full_local_location.clone(),
+                    owner_dialog_id,
+                    size,
+                    get_by_hash != 0,
+                    false,
+                    FileId::default(),
+                ) {
+                    Ok(file_id) => file_id,
+                    Err(_) => {
+                        tdutils::log_error!(
+                            "Can't resend local file {} of size {} owned by {:?}",
+                            full_local_location,
+                            size,
+                            owner_dialog_id
+                        );
+                        self.register_empty(full_local_location.file_type)
+                    }
+                }
+            }
+            FileStoreType::Generate => {
+                let mut full_generated_location = FullGenerateFileLocation::parse_from(parser)?;
+                let expected_size = if has_64bit_size {
+                    parser.i64_()?
+                } else {
+                    let int_size = parser.i32_()?;
+                    let expected_size = if int_size < 0 {
+                        int_size as i64 + (1i64 << 32)
+                    } else {
+                        int_size as i64
+                    };
+                    let zero = parser.i32_()?;
+                    let _ = zero;
+                    expected_size
+                };
+                let owner_dialog_id = if parser.version() >= VERSION_STORE_FILE_OWNER_ID {
+                    DialogId::new(parser.i64_()?)
+                } else {
+                    DialogId::default()
+                };
+                if full_generated_location.conversion.starts_with("#file_id#") {
+                    tdutils::log_error!("Can't resend message with '#file_id#...' location");
+                    self.register_empty(full_generated_location.file_type)
+                } else if full_generated_location.conversion == "#_file_id#" {
+                    let file_id = self.parse_file(parser)?;
+                    if file_id.empty() {
+                        self.register_empty(full_generated_location.file_type)
+                    } else {
+                        full_generated_location.conversion = format!("#file_id#{}", file_id.get());
+                        self.register_generate(
+                            full_generated_location.file_type,
+                            full_generated_location.original_path.clone(),
+                            full_generated_location.conversion.clone(),
+                            owner_dialog_id,
+                            expected_size,
+                        )
+                    }
+                } else {
+                    self.register_generate(
+                        full_generated_location.file_type,
+                        full_generated_location.original_path.clone(),
+                        full_generated_location.conversion.clone(),
+                        owner_dialog_id,
+                        expected_size,
+                    )
+                }
+            }
+            FileStoreType::Url => {
+                let type_ = FileType::from_raw(parser.i32_()?);
+                let url = parser.string()?;
+                let owner_dialog_id = if parser.version() >= VERSION_STORE_FILE_OWNER_ID {
+                    DialogId::new(parser.i64_()?)
+                } else {
+                    DialogId::default()
+                };
+                self.register_url(url, type_, owner_dialog_id)
+            }
+        };
+
+        if has_encryption_key || has_secure_key {
+            let encryption_key_type = if has_encryption_key {
+                FileEncryptionKeyType::Secret
+            } else {
+                FileEncryptionKeyType::Secure
+            };
+            let mut encryption_key = FileEncryptionKey::default();
+            encryption_key.parse_from(encryption_key_type, parser)?;
+            self.set_encryption_key(file_id, encryption_key);
+        }
+
+        Ok(file_id)
+    }
+
+    /// `FileManager::set_encryption_key` (FileManager.cpp) over the node
+    /// registry; a missing node is a no-op (the C++ null check).
+    pub fn set_encryption_key(&mut self, file_id: FileId, key: FileEncryptionKey) {
+        if let Some(node) = self.get_file_node_mut(file_id) {
+            node.set_encryption_key(key);
+        }
     }
 
     /// `FileManager::try_flush_node_info` (FileManager.cpp) — the gated
@@ -5499,20 +6749,25 @@ impl FileManager {
         self.file_nodes[x_node_id] = Some(nodes[0].clone());
         self.file_nodes[y_node_id] = Some(nodes[1].clone());
 
+        // the registry id of the survivor differs from the pair index
+        // whenever the reserved node slot 0 is in play
+        let node_id = if node_i == 0 { x_node_id } else { y_node_id };
+        let other_node_id = if node_i == 0 { y_node_id } else { x_node_id };
+
         let other_pmc_id = nodes[other_node_i].pmc_id;
         let other_file_ids = nodes[other_node_i].file_ids.clone();
-        self.file_nodes[node_i]
+        self.file_nodes[node_id]
             .as_mut()
             .expect("node")
             .file_ids
             .extend(other_file_ids.iter().copied());
         for file_id in &other_file_ids {
-            self.file_id_node.insert(*file_id, node_i);
+            self.file_id_node.insert(*file_id, node_id);
         }
 
         // the C++ "check if some download/upload queries are ready" loop
         {
-            let node = self.file_nodes[node_i].as_ref().expect("node");
+            let node = self.file_nodes[node_id].as_ref().expect("node");
             let view = FileView::new(node);
             let with_downloads = view.has_full_local_location();
             let with_uploads = view.has_active_upload_remote_location();
@@ -5525,21 +6780,20 @@ impl FileManager {
             }
         }
 
-        let other_node_id = if node_i == 0 { y_node_id } else { x_node_id };
         self.file_nodes[other_node_id] = None;
 
         events.push(MergeEvent::RunNode(Box::new(
-            self.file_nodes[node_i].as_ref().expect("node").clone(),
+            self.file_nodes[node_id].as_ref().expect("node").clone(),
         )));
 
         if other_pmc_id.is_valid() {
-            self.file_nodes[node_i]
+            self.file_nodes[node_id]
                 .as_mut()
                 .expect("node")
                 .on_pmc_changed();
         }
         {
-            let node = self.file_nodes[node_i].as_ref().expect("node");
+            let node = self.file_nodes[node_id].as_ref().expect("node");
             events.push(MergeEvent::FlushFull {
                 node: Box::new(node.clone()),
                 new_remote: node_i != remote_i as usize,
@@ -11514,9 +12768,12 @@ mod tests {
         }
     }
 
+    /// A recorded `getDocumentByHash` query: (sha256, size, url).
+    type HashQuery = ([u8; 32], i64, String);
+
     #[derive(Clone, Default)]
     struct HashNetState {
-        queries: Rc<RefCell<Vec<([u8; 32], i64, String)>>>,
+        queries: Rc<RefCell<Vec<HashQuery>>>,
         result: Rc<RefCell<Option<std::result::Result<DocumentByHash, Status>>>>,
     }
 
@@ -11717,5 +12974,506 @@ mod tests {
         uploader2.update_resources(grant(1 << 20));
         assert!(log.ok.borrow().is_some());
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ==== M.12.2c — entry points, id strings and the register family ====
+
+    fn document_location() -> FullRemoteFileLocation {
+        FullRemoteFileLocation::from_document(
+            FileType::Document,
+            10,
+            11,
+            DcId::internal(2),
+            String::new(),
+        )
+    }
+
+    /// The persistent/unique id binaries, computed independently: a
+    /// Document/5 location on dc 2 with id 10, access hash 11 stores as
+    /// `i32 type | i32 dc | i64 id | i64 access_hash`; the unique id drops
+    /// the type word to the FileTypeClass+1 (Document → 2) and the
+    /// file-reference/dc words; zero_encode is the 250-capped zero RLE;
+    /// remote persistent ids append the `Version::Next - 1` (61) and
+    /// `PERSISTENT_ID_VERSION` (4) bytes, generated ones just the version 3.
+    #[test]
+    fn persistent_and_unique_ids_match_the_cpp_bytes() {
+        let location = document_location();
+        // store bytes: 05000000 02000000 0a00000000000000 0b00000000000000
+        // zero RLE:   05 00 02 02 00 02 0a 00 06 0b 00 06
+        assert_eq!(
+            FileNode::get_remote_persistent_id(&location),
+            "BQADAgADCgAHCwAHPQQ"
+        );
+        // unique: i32 class+1 = 2, then the id (the C++ CommonAsKey drops
+        // the access hash)
+        assert_eq!(FileNode::get_remote_unique_id(&location), "AgADCgAH");
+
+        // a generate location with a remotely-generated conversion
+        let generate = FullGenerateFileLocation::new(
+            FileType::Document,
+            String::new(),
+            "#map#0:0:100:100".to_owned(),
+        );
+        assert!(is_remotely_generated_file(&generate.conversion));
+        let node = FileNode::new(
+            LocalFileLocation::Empty,
+            NewRemoteFileLocation::default(),
+            Some(generate.clone()),
+            0,
+            0,
+            String::new(),
+            String::new(),
+            DialogId::default(),
+            FileEncryptionKey::default(),
+            FileId::new(1, 0),
+            0,
+        );
+        // store: i32 5, empty string, "#map#0:0:100:100"
+        assert_eq!(
+            node.get_persistent_file_id(),
+            "BQAHECNtYXAjMDowOjEwMDoxMDAAAwM"
+        );
+        assert_eq!(node.get_unique_file_id(), "_wUABxAjbWFwIzA6MDoxMDA6MTAwAAM");
+
+        // a url-only node: the persistent id is the url itself, the unique
+        // id is empty
+        let url_node = FileNode::new(
+            LocalFileLocation::Empty,
+            NewRemoteFileLocation::default(),
+            None,
+            0,
+            0,
+            String::new(),
+            "https://example.com/a.jpg".to_owned(),
+            DialogId::default(),
+            FileEncryptionKey::default(),
+            FileId::new(2, 0),
+            0,
+        );
+        assert_eq!(
+            url_node.get_persistent_file_id(),
+            "https://example.com/a.jpg"
+        );
+        assert_eq!(url_node.get_unique_file_id(), "");
+    }
+
+    #[test]
+    fn is_remotely_generated_file_matches_the_cpp() {
+        assert!(is_remotely_generated_file("#map#1:2:3:4"));
+        assert!(is_remotely_generated_file("#audio_t#something"));
+        assert!(!is_remotely_generated_file("#url#"));
+        assert!(!is_remotely_generated_file("#file_id#5"));
+        assert!(!is_remotely_generated_file("#mtime#000#map#"));
+        assert!(!is_remotely_generated_file(""));
+    }
+
+    #[test]
+    fn get_files_dir_matches_the_cpp() {
+        // the C++ base directories end with a slash
+        assert_eq!(get_files_dir(FileType::Photo, "/f/", "/s/"), "/f/photos/");
+        assert_eq!(
+            get_files_dir(FileType::Document, "/f/", "/s/"),
+            "/f/documents/"
+        );
+        assert_eq!(
+            get_files_dir(FileType::SecureDecrypted, "/f/", "/s/"),
+            "/s/passport/"
+        );
+        assert_eq!(get_files_base_dir(FileType::Photo, "/f/", "/s/"), "/f/");
+        assert_eq!(
+            get_files_base_dir(FileType::SecureEncrypted, "/f/", "/s/"),
+            "/s/"
+        );
+    }
+
+    /// A context that fakes `realpath` (identity) but keeps the real stat
+    /// and option reads.
+    struct IdentityRealPathContext;
+
+    impl FileManagerContext for IdentityRealPathContext {
+        fn real_path(&self, path: &str) -> Result<String, Status> {
+            Ok(path.to_owned())
+        }
+    }
+
+    #[test]
+    fn check_full_local_location_validates_like_the_cpp() {
+        let context = IdentityRealPathContext;
+        let mk = |path: &str, size: i64| FullLocalLocationInfo {
+            location: FullLocalFileLocation::new(FileType::Document, path.to_owned(), 0),
+            size,
+        };
+
+        // empty path
+        let err = check_full_local_location(&context, mk("", 0), false).unwrap_err();
+        assert_eq!(err.code(), 400);
+        assert_eq!(err.message(), "File must have non-empty path");
+
+        // real_path failure (the default context's canonicalize)
+        let err =
+            check_full_local_location(&DefaultFileManagerContext, mk("/nonexistent/a/b", 0), false)
+                .unwrap_err();
+        assert_eq!(err.message(), "Can't find real file path");
+
+        // real file: the zero size is filled from the stat
+        let dir = std::env::temp_dir();
+        let path = dir.join("m12_check_local_file");
+        std::fs::write(&path, b"12345").unwrap();
+        let location_path = path.to_string_lossy().into_owned();
+        let info = check_full_local_location(&context, mk(&location_path, 0), false).unwrap();
+        assert_eq!(info.size, 5);
+        assert!(info.location.mtime_nsec != 0);
+
+        // size mismatch
+        let err = check_full_local_location(&context, mk(&location_path, 6), false).unwrap_err();
+        assert_eq!(err.message(), "File size has changed");
+
+        // empty file
+        let empty_path = dir.join("m12_check_empty_file");
+        std::fs::write(&empty_path, b"").unwrap();
+        let err = check_full_local_location(&context, mk(&empty_path.to_string_lossy(), 0), false)
+            .unwrap_err();
+        assert_eq!(err.message(), "File must be non-empty");
+
+        // thumbnail limit (200 KB - 1), bypassed for "map*" names
+        let big = dir.join("m12_check_big_thumb");
+        std::fs::write(&big, vec![0u8; 200 * 1024]).unwrap();
+        let thumb = |path: &str| FullLocalLocationInfo {
+            location: FullLocalFileLocation::new(FileType::Thumbnail, path.to_owned(), 0),
+            size: 200 * 1024,
+        };
+        let err =
+            check_full_local_location(&context, thumb(&big.to_string_lossy()), false).unwrap_err();
+        assert!(
+            err.message()
+                .starts_with("File of size 204800 bytes is too big for a thumbnail")
+        );
+        let map_thumb = dir.join("map_m12_check_big_thumb");
+        std::fs::write(&map_thumb, vec![0u8; 200 * 1024]).unwrap();
+        check_full_local_location(&context, thumb(&map_thumb.to_string_lossy()), false).unwrap();
+
+        // the video-note option override through the context
+        let video_note = dir.join("m12_check_video_note");
+        std::fs::write(&video_note, vec![0u8; 100]).unwrap();
+        struct NoteContext;
+        impl FileManagerContext for NoteContext {
+            fn real_path(&self, path: &str) -> Result<String, Status> {
+                Ok(path.to_owned())
+            }
+            fn option_integer(&self, _name: &str, _default: i64) -> i64 {
+                50
+            }
+        }
+        let info = FullLocalLocationInfo {
+            location: FullLocalFileLocation::new(
+                FileType::VideoNote,
+                video_note.to_string_lossy().into_owned(),
+                0,
+            ),
+            size: 100,
+        };
+        let err = check_full_local_location(&NoteContext, info, false).unwrap_err();
+        assert!(
+            err.message()
+                .starts_with("File of size 100 bytes is too big for a video note")
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&empty_path);
+        let _ = std::fs::remove_file(&big);
+        let _ = std::fs::remove_file(&map_thumb);
+        let _ = std::fs::remove_file(&video_note);
+    }
+
+    #[test]
+    fn register_family_and_get_file_object_match_the_cpp() {
+        let mut manager = FileManager::new();
+
+        // register_remote: two registrations of the same FromServer location
+        // collapse to one id
+        let first = manager.register_remote(
+            document_location(),
+            FileLocationSource::FromServer,
+            DialogId::new(-100200300),
+            500,
+            0,
+            "a.pdf".to_owned(),
+        );
+        let second = manager.register_remote(
+            document_location(),
+            FileLocationSource::FromServer,
+            DialogId::default(),
+            0,
+            0,
+            String::new(),
+        );
+        assert_eq!(first.get(), second.get());
+
+        let file = manager.get_file_object(first);
+        assert_eq!(file.id, first.get());
+        assert_eq!(file.size, 500);
+        assert_eq!(file.remote.as_ref().unwrap().id, "BQADAgADCgAHCwAHPQQ");
+        assert_eq!(file.remote.as_ref().unwrap().unique_id, "AgADCgAH");
+        assert!(file.remote.as_ref().unwrap().is_uploading_completed);
+        assert_eq!(file.remote.as_ref().unwrap().uploaded_size, 500);
+        assert!(file.local.as_ref().unwrap().can_be_downloaded);
+        assert_eq!(file.local.as_ref().unwrap().downloaded_size, 0);
+
+        // an unknown id produces the C++ empty-file object
+        let empty = manager.get_file_object(FileId::new(10000, 0));
+        assert_eq!(empty.id, 0);
+        assert_eq!(empty.size, 0);
+
+        // register_url: dedup over the generate table, persistent id = url
+        let url_id = manager.register_url(
+            "https://example.com/b.pdf".to_owned(),
+            FileType::Document,
+            DialogId::new(1),
+        );
+        let url_id_again = manager.register_url(
+            "https://example.com/b.pdf".to_owned(),
+            FileType::Document,
+            DialogId::default(),
+        );
+        assert_eq!(url_id.get(), url_id_again.get());
+        let url_object = manager.get_file_object(url_id);
+        assert_eq!(
+            url_object.remote.as_ref().unwrap().id,
+            "https://example.com/b.pdf"
+        );
+        assert!(url_object.remote.as_ref().unwrap().is_uploading_completed);
+        // not downloadable from the server, but generate-able (the C++
+        // can_download_from_server || can_generate for the #url# location)
+        assert!(!FileView::new(manager.get_file_node(url_id).unwrap()).can_download_from_server());
+        assert!(url_object.local.as_ref().unwrap().can_be_downloaded);
+
+        // register_empty: dedup, and an empty file object
+        let empty_id = manager.register_empty(FileType::Document);
+        let empty_id_again = manager.register_empty(FileType::Document);
+        assert_eq!(empty_id.get(), empty_id_again.get());
+        let empty_object = manager.get_file_object(empty_id);
+        assert_eq!(empty_object.id, empty_id.get());
+        assert!(!empty_object.remote.as_ref().unwrap().is_uploading_completed);
+
+        // copy_file_id registers a #file_id#N generate alias
+        let copied = manager.copy_file_id(first, FileType::Document, DialogId::new(2), "test");
+        let copied_object = manager.get_file_object(copied);
+        // the alias adopts the remote location through the pmc-less node
+        // only after a merge; until then the persistent id stays empty
+        assert_eq!(copied_object.id, copied.get());
+    }
+
+    #[test]
+    fn register_local_rejects_bad_paths_like_the_cpp() {
+        let mut manager = FileManager::new();
+        struct BadPathContext(String);
+        impl FileManagerContext for BadPathContext {
+            fn real_path(&self, path: &str) -> Result<String, Status> {
+                Ok(path.to_owned())
+            }
+            fn stat(&self, _path: &str) -> Result<FileStat, Status> {
+                Ok(FileStat {
+                    is_reg: true,
+                    is_dir: false,
+                    size: 5,
+                    mtime_nsec: 1,
+                })
+            }
+            fn db_paths(&self) -> Vec<String> {
+                vec![self.0.clone()]
+            }
+        }
+        manager.set_context(Box::new(BadPathContext("/td/binlog".to_owned())));
+
+        let err = manager
+            .register_local(
+                FullLocalFileLocation::new(FileType::Document, "/td/binlog".to_owned(), 0),
+                DialogId::default(),
+                5,
+                false,
+                false,
+                FileId::default(),
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), 400);
+        assert_eq!(
+            err.message(),
+            "Sending of internal database files is forbidden"
+        );
+
+        let file_id = manager
+            .register_local(
+                FullLocalFileLocation::new(FileType::Document, "/tmp/ok".to_owned(), 0),
+                DialogId::new(3),
+                5,
+                false,
+                true, // skip the size checks so the fake stat wins
+                FileId::default(),
+            )
+            .unwrap();
+        assert!(file_id.is_valid());
+        // registering the same location again returns the same id
+        let file_id_again = manager
+            .register_local(
+                FullLocalFileLocation::new(FileType::Document, "/tmp/ok".to_owned(), 0),
+                DialogId::default(),
+                5,
+                false,
+                true,
+                FileId::default(),
+            )
+            .unwrap();
+        assert_eq!(file_id.get(), file_id_again.get());
+    }
+
+    /// `FileManager::store_file`/`parse_file` round-trip through the
+    /// FileManager-mediated FileId format the photo stores use.
+    #[test]
+    fn store_parse_file_round_trips_all_arms() {
+        let mut manager = FileManager::new();
+
+        // Remote arm
+        let remote_id = manager.register_remote(
+            document_location(),
+            FileLocationSource::FromServer,
+            DialogId::new(-100200300),
+            500,
+            0,
+            "a.pdf".to_owned(),
+        );
+
+        // Local arm
+        let local_id = manager.register_empty(FileType::Document);
+
+        // Generate arm with the nested #file_id# payload
+        let generate_id = manager.register_generate(
+            FileType::Document,
+            "/tmp/x".to_owned(),
+            format!("#file_id#{}", remote_id.get()),
+            DialogId::new(4),
+            0,
+        );
+
+        // Url arm
+        let url_id = manager.register_url(
+            "https://example.com/c.pdf".to_owned(),
+            FileType::Document,
+            DialogId::new(5),
+        );
+
+        for file_id in [remote_id, local_id, generate_id, url_id] {
+            let mut bytes = Vec::new();
+            manager.store_file(file_id, &mut bytes);
+            let mut parser = Parser::new(&bytes);
+            let parsed = manager.parse_file(&mut parser).unwrap();
+            parser.fetch_end().unwrap();
+            // the parse registers an equal node; compare through the objects
+            let original = manager.get_file_object(file_id);
+            let reparsed = manager.get_file_object(parsed);
+            assert_eq!(
+                original.remote.as_ref().unwrap().id,
+                reparsed.remote.as_ref().unwrap().id,
+                "remote ids must survive the round trip"
+            );
+            assert_eq!(original.size, reparsed.size);
+            assert_eq!(
+                original.local.as_ref().unwrap().path,
+                reparsed.local.as_ref().unwrap().path
+            );
+        }
+    }
+
+    /// The pre-`StoreFileEncryptionKey` layout: no flags word, legacy int32
+    /// sizes with the negative wrap, and the generate arm's legacy zero.
+    #[test]
+    fn parse_file_legacy_layout_matches_the_cpp() {
+        use store_parse::*;
+
+        let mut manager = FileManager::new();
+        let remote_id = manager.register_remote(
+            document_location(),
+            FileLocationSource::FromServer,
+            DialogId::new(7),
+            500,
+            0,
+            "a.pdf".to_owned(),
+        );
+
+        let mut bytes = Vec::new();
+        manager.store_file(remote_id, &mut bytes);
+        // strip the modern flags word (bytes 4..8) to model version < 7
+        let legacy: Vec<u8> = bytes[..4]
+            .iter()
+            .chain(bytes[8..].iter())
+            .copied()
+            .collect();
+
+        let mut other = FileManager::new();
+        let mut parser = Parser::new(&legacy);
+        parser.set_version(VERSION_STORE_FILE_OWNER_ID);
+        let parsed = other.parse_file(&mut parser).unwrap();
+        parser.fetch_end().unwrap();
+
+        let original = manager.get_file_object(remote_id);
+        let reparsed = other.get_file_object(parsed);
+        assert_eq!(
+            original.remote.as_ref().unwrap().id,
+            reparsed.remote.as_ref().unwrap().id
+        );
+        assert_eq!(reparsed.size, 500);
+    }
+
+    #[test]
+    fn suggested_path_and_can_delete_match_the_cpp() {
+        // remote_name wins over the url file name and the generate path
+        let mut node = FileNode::new(
+            LocalFileLocation::Empty,
+            NewRemoteFileLocation::default(),
+            Some(FullGenerateFileLocation::new(
+                FileType::Document,
+                "/gen/orig.bin".to_owned(),
+                String::new(),
+            )),
+            0,
+            0,
+            "remote.bin".to_owned(),
+            "https://example.com/url.bin".to_owned(),
+            DialogId::default(),
+            FileEncryptionKey::default(),
+            FileId::new(1, 0),
+            0,
+        );
+        assert_eq!(node.suggested_path(), "remote.bin");
+        node.set_remote_name(String::new());
+        assert_eq!(node.suggested_path(), "url.bin");
+        node.set_url(String::new());
+        assert_eq!(node.suggested_path(), "/gen/orig.bin");
+
+        // can_delete: full-local inside the files dir, partial always,
+        // full-local outside never
+        node.set_local_location(
+            LocalFileLocation::Full(FullLocalFileLocation::new(
+                FileType::Document,
+                "/files/documents/remote.bin".to_owned(),
+                0,
+            )),
+            -1,
+            -1,
+        );
+        assert!(node.can_delete("/files/", "/secure_files/"));
+        assert!(!node.can_delete("/other/", "/secure_files/"));
+        node.set_local_location(
+            LocalFileLocation::Partial(PartialLocalFileLocation {
+                file_type: FileType::Document,
+                path: "/tmp/x.bin".to_owned(),
+                ready_size: 0,
+                ready_bitmask: Vec::new(),
+                part_size: 1,
+                iv: String::new(),
+            }),
+            -1,
+            -1,
+        );
+        assert!(node.can_delete("/files/", "/secure_files/"));
     }
 }
