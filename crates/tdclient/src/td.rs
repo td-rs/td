@@ -255,6 +255,11 @@ pub struct Td {
     /// `Td::dialog_manager_` — the M.6 facade state (recent-dialog lists +
     /// search hints); the actor-dependent halves land with M.6.18+.
     pub(crate) dialog_manager: DialogManager,
+    /// `Td::messages_manager_` — the M.10 manager state (the dialog/message
+    /// container set + the database family bookkeeping); the receive path
+    /// (M.10.3+) is the first reader.
+    #[allow(dead_code)]
+    pub(crate) messages_manager: crate::messages_manager::MessagesManager,
     /// `Td::stop_cnt_` — the hangup and the close completion each drop one.
     stop_cnt: i32,
     /// The deferred-response outbox. The C++ request promises re-enter the
@@ -334,6 +339,7 @@ impl Td {
             user_manager: UserManager::new(),
             premium_required_contact_merger: None,
             dialog_manager: DialogManager::new(),
+            messages_manager: crate::messages_manager::MessagesManager::new(),
             stop_cnt: 2,
             deferred_results: Arc::new(Mutex::new(Vec::new())),
             bridge: None,

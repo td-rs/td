@@ -18008,6 +18008,11 @@ pub fn check_quiz_correct_option_ids(
     Ok(())
 }
 
+/// Crate-visible alias for the test context (the M.10 slices' mask/index
+/// tests reuse it).
+#[cfg(test)]
+pub(crate) use tests::TestContext as SharedTestContext;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -20209,7 +20214,7 @@ mod tests {
     /// restricted rights word, plus flags for the manager seams the
     /// policy plane reads. Manager reads without a test default
     /// `log_error!` and answer like an empty manager would.
-    struct TestContext {
+    pub(crate) struct TestContext {
         rights: RestrictedRights,
         is_bot: bool,
         my_dialog_id: DialogId,

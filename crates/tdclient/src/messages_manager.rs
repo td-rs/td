@@ -26,6 +26,7 @@ use crate::message_content::{
     BackgroundInfo, InputGroupCallId, MessageContent, MessageContentType, SuggestedPostPrice,
     can_be_secret_message_content,
 };
+use crate::message_db::MessageDbAsyncInterface;
 use crate::message_entity::FormattedText;
 use crate::restriction_reason::RestrictionReason;
 use crate::store_parse::{Parser, store_flags, store_i32, store_i64, store_string};
@@ -4855,6 +4856,20 @@ pub struct MessageForwardInfo {
 }
 
 impl MessageForwardInfo {
+    /// `MessageForwardInfo::get_last_dialog_id` (MessageForwardInfo.h).
+    pub fn get_last_dialog_id(&self) -> DialogId {
+        self.last_message_info.dialog_id
+    }
+
+    /// `MessageForwardInfo::get_last_message_full_id`
+    /// (MessageForwardInfo.h).
+    pub fn get_last_message_full_id(&self) -> MessageFullId {
+        MessageFullId::new(
+            self.last_message_info.dialog_id,
+            self.last_message_info.message_id,
+        )
+    }
+
     /// `MessageForwardInfo::store` (MessageForwardInfo.hpp:64-81).
     pub fn store(&self, out: &mut Vec<u8>) {
         let has_last_message_info = !self.last_message_info.is_empty();
@@ -7074,6 +7089,825 @@ pub fn parse_message_log_event(
 /// (MessagesManager.cpp:3089).
 fn self_destruct_is_secret(ttl: MessageSelfDestructType, content_type: MessageContentType) -> bool {
     ttl.is_secret_message_content(content_type)
+}
+
+// ---------------------------------------------------------------------------
+// M.10.2c — the manager skeleton + the database family
+// (MessagesManager.cpp:31866-32152, 4161-4197, 5005-5023, 8138-8144,
+// 19525-19620, 3749-3808) over the M.6 MessageDb engines. The manager struct
+// carries the core container set; per-slice state grows with its tasks (the
+// plan convention). Seams:
+// - `DialogReactionsContext::is_chat_banned` — the Chat/Channel banned check
+//   needs the chat-status plane; the Td impl lands with its slice.
+// - `get_active_reactions` filters through the manager's
+//   `active_reaction_pos` cache (the Wave-2 reactions state) — empty for
+//   now, recorded.
+// - `get_message_search_text` rides `get_message_content_search_text`
+//   (MessageContent.cpp), which lands with the M.9.17 lifecycle tail on the
+//   sibling line — empty string until that merge.
+// ---------------------------------------------------------------------------
+
+/// The context the reactions-visibility predicates need beyond the pure
+/// values (MessagesManager.cpp:27558-27571 `need_hide_dialog_reactions`).
+pub trait DialogReactionsContext {
+    /// `ChatManager::get_chat_status(chat_id).is_banned()` /
+    /// `get_channel_status(channel_id).is_banned()` — false for the other
+    /// dialog types.
+    fn is_chat_banned(&self, dialog_id: DialogId) -> bool;
+
+    /// `AuthManager::is_bot()`.
+    fn is_bot(&self) -> bool;
+}
+
+/// The no-context stand-in: nothing banned, not a bot (tests).
+pub struct NoDialogReactionsContext;
+
+impl DialogReactionsContext for NoDialogReactionsContext {
+    fn is_chat_banned(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn is_bot(&self) -> bool {
+        false
+    }
+}
+
+/// `MessagesManager::CallsDbState` (MessagesManager.h:1604-1610).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CallsDbState {
+    pub first_calls_database_message_id_by_index: [MessageId; 2],
+    pub message_count_by_index: [i32; 2],
+}
+
+impl CallsDbState {
+    /// `CallsDbState::store` (MessagesManager.cpp:3749-3760).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        store_i32(
+            out,
+            self.first_calls_database_message_id_by_index.len() as i32,
+        );
+        for first_message_id in &self.first_calls_database_message_id_by_index {
+            first_message_id.store(out);
+        }
+        store_i32(out, self.message_count_by_index.len() as i32);
+        for message_count in &self.message_count_by_index {
+            store_i32(out, *message_count);
+        }
+    }
+
+    /// `CallsDbState::parse` (MessagesManager.cpp:3762-3780).
+    pub fn parse_from(parser: &mut Parser) -> Result<CallsDbState, &'static str> {
+        let size = parser.i32_()?;
+        if size < 0 || size as usize > 2 {
+            return Err("Wrong first_calls_database_message_id_by_index table size");
+        }
+        let mut state = CallsDbState::default();
+        for entry in state
+            .first_calls_database_message_id_by_index
+            .iter_mut()
+            .take(size as usize)
+        {
+            *entry = MessageId::parse_from(parser)?;
+        }
+        let size = parser.i32_()?;
+        if size < 0 || size as usize > 2 {
+            return Err("Wrong message_count_by_index table size");
+        }
+        for entry in state.message_count_by_index.iter_mut().take(size as usize) {
+            *entry = parser.i32_()?;
+        }
+        Ok(state)
+    }
+}
+
+/// The `td::MessagesManager` struct skeleton (MessagesManager.h:3300+): the
+/// per-dialog container set the database family and the receive path walk.
+/// The C++ class carries ~200 private fields; the ones the ported slices
+/// touch land here per slice, the rest grow with their owning tasks.
+#[derive(Debug, Default)]
+pub struct MessagesManager {
+    /// `dialogs_` (MessagesManager.h:2948).
+    pub(crate) dialogs: HashMap<DialogId, Box<Dialog>>,
+    /// `update_message_ids_` — new_message_id -> temporary_id.
+    pub(crate) update_message_ids: HashMap<(DialogId, MessageId), MessageId>,
+    // `being_sent_messages_` — message_random_id -> message; the send path
+    // (M.10.8+) reads it
+    #[allow(dead_code)]
+    pub(crate) being_sent_messages: HashMap<i64, MessageFullId>,
+    // `being_readded_message_full_id_` — the delete/files path reads it
+    #[allow(dead_code)]
+    pub(crate) being_readded_message_full_id: MessageFullId,
+    /// `calls_db_state_` (MessagesManager.h:1600).
+    pub(crate) calls_db_state: CallsDbState,
+    /// `active_reaction_pos_` — the Wave-2 reactions-manager cache; empty
+    /// until that slice ([blocked: Wave-2]).
+    pub(crate) active_reaction_pos: HashMap<ReactionType, usize>,
+}
+
+impl MessagesManager {
+    pub fn new() -> MessagesManager {
+        MessagesManager::default()
+    }
+
+    /// `MessagesManager::get_dialog` (the map lookup form).
+    pub fn get_dialog(&self, dialog_id: DialogId) -> Option<&Dialog> {
+        self.dialogs.get(&dialog_id).map(|d| d.as_ref())
+    }
+
+    pub fn get_dialog_mut(&mut self, dialog_id: DialogId) -> Option<&mut Dialog> {
+        self.dialogs.get_mut(&dialog_id).map(|d| d.as_mut())
+    }
+
+    /// `MessagesManager::load_calls_db_state` (MessagesManager.cpp:3782-3796)
+    /// — the `calls_db_state` pmc row, -1 counts until loaded.
+    pub fn load_calls_db_state(&mut self, td_db_is_message_database: bool) {
+        // the sqlite sync pmc read lands with the Td wiring slice; the
+        // in-memory -1 seeding is the loadable part
+        if !td_db_is_message_database {
+            return;
+        }
+        self.calls_db_state.message_count_by_index = [-1, -1];
+    }
+}
+
+/// `MessagesManager::get_message_sender` (MessagesManager.cpp:6200-6204).
+pub fn get_message_sender(m: &Message) -> DialogId {
+    if m.sender_dialog_id.is_valid() {
+        m.sender_dialog_id
+    } else {
+        DialogId::from_user_id(m.sender_user_id)
+    }
+}
+
+/// `MessagesManager::get_message_search_text` (MessagesManager.cpp:8138-8143)
+/// — [blocked: M.9.17] `get_message_content_search_text` lands with the
+/// lifecycle tail; the empty string is the recorded stand-in.
+pub fn get_message_search_text(m: &Message) -> String {
+    if m.is_content_secret {
+        return String::new();
+    }
+    String::new()
+}
+
+/// `MessagesManager::is_discussion_message` (MessagesManager.cpp:23913-23934)
+/// — the linked-dialog lookups ride the manager maps.
+pub fn is_discussion_message(
+    manager: &MessagesManager,
+    ctx: &dyn DialogReactionsContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> bool {
+    let Some(forward_info) = &m.forward_info else {
+        return false;
+    };
+    if m.sender_user_id.is_valid() {
+        // only the service notifications bot posts discussion messages as a
+        // user
+        if !ctx.is_bot()
+            || m.sender_user_id.get()
+                != crate::user_manager::UserManager::get_service_notifications_user_id().get()
+        {
+            return false;
+        }
+    }
+    let linked_dialog_id = forward_info.get_last_dialog_id();
+    if !linked_dialog_id.is_valid() || linked_dialog_id == dialog_id {
+        return false;
+    }
+    match dialog_id.get_type() {
+        DialogType::User => {
+            linked_dialog_id.get_type() == DialogType::Channel
+                && manager
+                    .get_dialog(linked_dialog_id)
+                    .is_some_and(|d| d.is_forum)
+        }
+        DialogType::Channel => {
+            // is_megagroup_channel of the dialog — the channel kind rides
+            // the chat status; false until that slice ([blocked: M.5 seam])
+            false
+        }
+        _ => false,
+    }
+}
+
+/// `MessagesManager::get_active_reactions` (MessagesManager.cpp:6416-6421).
+pub fn get_active_reactions(
+    manager: &MessagesManager,
+    ctx: &dyn DialogReactionsContext,
+    available_reactions: &ChatReactions,
+) -> ChatReactions {
+    if ctx.is_bot() {
+        return available_reactions.clone();
+    }
+    // `ChatReactions::get_active_reactions` (ChatReactions.cpp) — filters
+    // the reaction set to the active ones; with the empty Wave-2 cache the
+    // paid flag survives and the regular set empties
+    let mut result = available_reactions.clone();
+    result
+        .reaction_types
+        .retain(|reaction_type| manager.active_reaction_pos.contains_key(reaction_type));
+    result.allow_all_regular = false;
+    result.allow_all_custom = false;
+    result
+}
+
+/// `MessagesManager::need_hide_dialog_reactions`
+/// (MessagesManager.cpp:27558-27571).
+pub fn need_hide_dialog_reactions(ctx: &dyn DialogReactionsContext, dialog_id: DialogId) -> bool {
+    match dialog_id.get_type() {
+        DialogType::User | DialogType::SecretChat => false,
+        DialogType::Chat | DialogType::Channel => ctx.is_chat_banned(dialog_id),
+        DialogType::None => false,
+    }
+}
+
+/// `MessagesManager::get_dialog_active_reactions`
+/// (MessagesManager.cpp:6423-6440).
+pub fn get_dialog_active_reactions(
+    manager: &MessagesManager,
+    ctx: &dyn DialogReactionsContext,
+    d: &Dialog,
+) -> ChatReactions {
+    if need_hide_dialog_reactions(ctx, d.dialog_id) {
+        return ChatReactions::default();
+    }
+    match d.dialog_id.get_type() {
+        DialogType::User => ChatReactions::from_all_flags(true, true),
+        DialogType::Chat | DialogType::Channel => {
+            get_active_reactions(manager, ctx, &d.available_reactions)
+        }
+        _ => ChatReactions::default(),
+    }
+}
+
+/// `MessagesManager::get_message_active_reactions`
+/// (MessagesManager.cpp:6391-6414).
+pub fn get_message_active_reactions(
+    manager: &MessagesManager,
+    ctx: &dyn DialogReactionsContext,
+    d: &Dialog,
+    m: &Message,
+) -> ChatReactions {
+    if !m.message_id.is_server() {
+        return ChatReactions::default();
+    }
+    if !m.reactions_are_possible
+        && crate::message_content::is_service_message_content(
+            m.content.as_ref().unwrap().get_type(),
+        )
+    {
+        return ChatReactions::default();
+    }
+    if is_discussion_message(manager, ctx, d.dialog_id, m) {
+        let linked_dialog_id = m.forward_info.as_ref().unwrap().last_message_info.dialog_id;
+        return match manager.get_dialog(linked_dialog_id) {
+            Some(linked_d) => get_dialog_active_reactions(manager, ctx, linked_d),
+            None => ChatReactions::default(),
+        };
+    }
+    get_dialog_active_reactions(manager, ctx, d)
+}
+
+/// `MessagesManager::has_unread_message_reactions`
+/// (MessagesManager.cpp:5005-5012).
+pub fn has_unread_message_reactions(
+    manager: &MessagesManager,
+    ctx: &dyn DialogReactionsContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> bool {
+    if ctx.is_bot() {
+        return false;
+    }
+    let Some(reactions) = &m.reactions else {
+        return false;
+    };
+    if reactions.unread_reactions.is_empty() {
+        return false;
+    }
+    // `is_visible_message_reactions` (MessagesManager.cpp:6370-6390)
+    let Some(d) = manager.get_dialog(dialog_id) else {
+        return false;
+    };
+    if get_message_active_reactions(manager, ctx, d, m).empty() {
+        return false;
+    }
+    m.available_reactions_generation == d.available_reactions_generation
+}
+
+/// `MessagesManager::has_unread_poll_votes` (MessagesManager.cpp:5014-5023).
+pub fn has_unread_poll_votes(ctx: &dyn DialogReactionsContext, m: &Message) -> bool {
+    if ctx.is_bot() {
+        return false;
+    }
+    if m.forward_info.is_some()
+        || m.content.as_ref().unwrap().get_type() != MessageContentType::Poll
+    {
+        return false;
+    }
+    false // [blocked: M.9.17] get_message_content_poll_has_unread_votes over the poll manager seam
+}
+
+/// `MessagesManager::get_message_index_mask` (MessagesManager.cpp:4161-4197).
+pub fn get_message_index_mask(
+    manager: &MessagesManager,
+    ctx: &dyn DialogReactionsContext,
+    content_ctx: &dyn crate::message_content::MessageContentContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> i32 {
+    if ctx.is_bot() || m.message_id.is_scheduled() || m.message_id.is_yet_unsent() {
+        return 0;
+    }
+    if m.is_failed_to_send {
+        return message_search_filter_index_mask(MessageSearchFilter::FailedToSend);
+    }
+    let is_secret = dialog_id.get_type() == DialogType::SecretChat;
+    if !m.message_id.is_server() && !is_secret {
+        return 0;
+    }
+
+    let mut index_mask = 0;
+    if m.is_pinned {
+        index_mask |= message_search_filter_index_mask(MessageSearchFilter::Pinned);
+    }
+    // retain second condition just in case
+    if m.is_content_secret || (!m.ttl.is_empty() && !is_secret) {
+        return index_mask;
+    }
+    index_mask |= crate::message_content::get_message_content_index_mask(
+        content_ctx,
+        m.content.as_ref().unwrap(),
+        m.is_outgoing,
+    );
+    if m.contains_mention {
+        index_mask |= message_search_filter_index_mask(MessageSearchFilter::Mention);
+        if m.contains_unread_mention {
+            index_mask |= message_search_filter_index_mask(MessageSearchFilter::UnreadMention);
+        }
+    }
+    if has_unread_message_reactions(manager, ctx, dialog_id, m) {
+        index_mask |= message_search_filter_index_mask(MessageSearchFilter::UnreadReaction);
+    }
+    if has_unread_poll_votes(ctx, m) {
+        index_mask |= message_search_filter_index_mask(MessageSearchFilter::UnreadPollVote);
+    }
+    index_mask
+}
+
+/// `MessagesManager::add_message_to_database` (MessagesManager.cpp:31866-31929)
+/// — over the M.6 async engine. The `time` bundle feeds the
+/// `ttl_expires_at` relative conversion.
+#[allow(clippy::too_many_arguments)]
+pub fn add_message_to_database(
+    global: &crate::global::Global,
+    manager: &mut MessagesManager,
+    reactions_ctx: &dyn DialogReactionsContext,
+    content_ctx: &dyn crate::message_content::MessageContentContext,
+    time: &crate::user_manager::TimeCtx,
+    dialog_id: DialogId,
+    m: &Message,
+    source: &str,
+) {
+    if !global.use_message_database() {
+        return;
+    }
+
+    let message_id = m.message_id;
+
+    if message_id.is_scheduled() {
+        tracing::info!(
+            "Add message {}:{} to database from {}",
+            dialog_id.get(),
+            message_id.get(),
+            source
+        );
+        // `set_dialog_has_scheduled_database_messages` rides the dialog
+        // state slice (M.10.3); the engine write is the loadable half
+        let mut data = Vec::new();
+        store_message_log_event(m, &MessageDbStorageBridge, time, &mut data);
+        global.message_db_async().add_scheduled_message(
+            MessageFullId::new(dialog_id, message_id),
+            data,
+            tdutils::promise::PromiseCreator::lambda(|()| ()),
+        );
+        return;
+    }
+    debug_assert!(message_id.is_server() || message_id.is_local());
+
+    tracing::info!(
+        "Add message {}:{} to database from {}",
+        dialog_id.get(),
+        message_id.get(),
+        source
+    );
+
+    let mut unique_message_id = ServerMessageId::new(0);
+    let mut random_id = 0i64;
+    let mut search_id = 0i64;
+    let mut text = String::new();
+    match dialog_id.get_type() {
+        DialogType::User | DialogType::Chat => {
+            if message_id.is_server() {
+                unique_message_id = message_id.get_server_message_id();
+            }
+        }
+        DialogType::Channel => {}
+        DialogType::SecretChat => {
+            random_id = m.random_id;
+            text = get_message_search_text(m);
+            if !text.is_empty() {
+                search_id = ((m.date as i64) << 32) | (m.random_id as u32 as i64);
+            }
+        }
+        DialogType::None => {
+            unreachable!()
+        }
+    }
+
+    let mut ttl_expires_at = 0i32;
+    if m.ttl_expires_at != 0.0 {
+        ttl_expires_at = (m.ttl_expires_at - time.now + time.server_time) as i32 + 1;
+    }
+    if m.ttl_period != 0 && (ttl_expires_at == 0 || m.date + m.ttl_period < ttl_expires_at) {
+        ttl_expires_at = m.date + m.ttl_period;
+    }
+    let d = manager
+        .dialogs
+        .get(&dialog_id)
+        .expect("dialog must exist when adding a message to the database");
+    let index_mask = get_message_index_mask(manager, reactions_ctx, content_ctx, dialog_id, m);
+    let _ = d;
+    let mut data = Vec::new();
+    store_message_log_event(m, &MessageDbStorageBridge, time, &mut data);
+    global.message_db_async().add_message(
+        MessageFullId::new(dialog_id, message_id),
+        unique_message_id,
+        get_message_sender(m),
+        random_id,
+        ttl_expires_at,
+        index_mask,
+        search_id,
+        text,
+        m.notification_id,
+        m.top_thread_message_id,
+        data,
+        tdutils::promise::PromiseCreator::lambda(|()| ()),
+    );
+}
+
+/// The `MessageContentStorage` bridge the database family stores messages
+/// through — the file/animation/... pair ids round-trip the raw `FileId`
+/// numbers like the M.9 `RawIdStorage` until the M.12.2 manager impls land.
+pub struct MessageDbStorageBridge;
+
+impl crate::message_content::MessageContentStorage for MessageDbStorageBridge {
+    fn store_file(&self, file_id: FileId, out: &mut Vec<u8>) {
+        store_i32(out, file_id.get());
+    }
+
+    fn parse_file(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+        Ok(FileId::new(parser.i32_()?, 0))
+    }
+
+    fn store_animation(&self, file_id: FileId, out: &mut Vec<u8>) {
+        self.store_file(file_id, out);
+    }
+
+    fn parse_animation(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+        self.parse_file(parser)
+    }
+
+    fn store_audio(&self, file_id: FileId, out: &mut Vec<u8>) {
+        self.store_file(file_id, out);
+    }
+
+    fn parse_audio(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+        self.parse_file(parser)
+    }
+
+    fn store_document(&self, file_id: FileId, out: &mut Vec<u8>) {
+        self.store_file(file_id, out);
+    }
+
+    fn parse_document(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+        self.parse_file(parser)
+    }
+
+    fn store_video(&self, file_id: FileId, out: &mut Vec<u8>) {
+        self.store_file(file_id, out);
+    }
+
+    fn parse_video(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+        self.parse_file(parser)
+    }
+
+    fn store_video_note(&self, file_id: FileId, out: &mut Vec<u8>) {
+        self.store_file(file_id, out);
+    }
+
+    fn parse_video_note(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+        self.parse_file(parser)
+    }
+
+    fn store_voice_note(&self, file_id: FileId, out: &mut Vec<u8>) {
+        self.store_file(file_id, out);
+    }
+
+    fn parse_voice_note(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+        self.parse_file(parser)
+    }
+
+    fn store_sticker(&self, file_id: FileId, out: &mut Vec<u8>) {
+        self.store_file(file_id, out);
+    }
+
+    fn parse_sticker(&mut self, parser: &mut Parser) -> Result<FileId, &'static str> {
+        self.parse_file(parser)
+    }
+
+    fn store_poll(&self, poll_id: crate::message_content::PollId, out: &mut Vec<u8>) {
+        store_i64(out, poll_id.get());
+    }
+
+    fn parse_poll(
+        &mut self,
+        parser: &mut Parser,
+    ) -> Result<crate::message_content::PollId, &'static str> {
+        Ok(crate::message_content::PollId::new(parser.i64_()?))
+    }
+
+    fn store_background(
+        &self,
+        background_id: crate::message_content::BackgroundId,
+        out: &mut Vec<u8>,
+    ) {
+        store_i64(out, background_id.get());
+    }
+
+    fn parse_background(
+        &mut self,
+        parser: &mut Parser,
+    ) -> Result<crate::message_content::BackgroundId, &'static str> {
+        Ok(crate::message_content::BackgroundId::new(parser.i64_()?))
+    }
+
+    fn store_reactions(&mut self, reactions: &MessageReactions, out: &mut Vec<u8>) {
+        reactions.store(out);
+    }
+
+    fn parse_reactions(&mut self, input: &mut Parser) -> Result<MessageReactions, &'static str> {
+        MessageReactions::parse_from(input)
+    }
+
+    fn store_reply_markup(
+        &mut self,
+        reply_markup: &tdmtproto::telegram_api::ReplyMarkup,
+        out: &mut Vec<u8>,
+    ) {
+        if let Some(markup) = ReplyMarkup::from_telegram(reply_markup.clone(), false, true, false) {
+            markup.store(out);
+        }
+    }
+
+    fn parse_reply_markup(
+        &mut self,
+        _input: &mut Parser,
+    ) -> Result<tdmtproto::telegram_api::ReplyMarkup, &'static str> {
+        // the input converter direction (internal -> telegram_api) lands
+        // with the send path (M.10.8); the DB rows never need it before
+        Err("ReplyMarkup wire conversion is not implemented yet")
+    }
+
+    fn store_min_channel(&mut self, min_channel: &MinChannel, out: &mut Vec<u8>) {
+        store_min_channel(out, min_channel);
+    }
+
+    fn parse_min_channel(&mut self, input: &mut Parser) -> Result<MinChannel, &'static str> {
+        parse_min_channel(input)
+    }
+
+    fn on_load_web_page_url_from_database(
+        &mut self,
+        _web_page_id: crate::message_content::WebPageId,
+        _url: &str,
+    ) {
+    }
+}
+
+/// `MessagesManager::delete_all_dialog_messages_from_database`
+/// (MessagesManager.cpp:31947-31977).
+pub fn delete_all_dialog_messages_from_database(
+    global: &crate::global::Global,
+    dialog_id: DialogId,
+    max_message_id: MessageId,
+    source: &str,
+) {
+    debug_assert!(max_message_id.is_valid());
+    if !global.use_message_database() {
+        return;
+    }
+
+    tracing::info!(
+        "Delete all messages in dialog {} from database up to message {} from {}",
+        dialog_id.get(),
+        max_message_id.get(),
+        source
+    );
+    global.message_db_async().delete_all_dialog_messages(
+        dialog_id,
+        max_message_id,
+        tdutils::promise::PromiseCreator::lambda(|()| ()),
+    );
+}
+
+/// `MessagesManager::do_delete_message_log_event`
+/// (MessagesManager.cpp:32154-32200) — the binlog-persisted delete + the
+/// async row erase. The file-deletion leg of the C++ (FileManager promise
+/// fan-in) lands with the Files slice; the log event and the row delete
+/// are the durable half.
+pub fn do_delete_message_log_event(
+    global: &mut crate::global::Global,
+    log_event: &DeleteMessageLogEvent,
+) {
+    debug_assert!(global.use_message_database());
+
+    if !log_event.file_ids.is_empty() {
+        // need_delete_file consults the file reference manager
+        // ([blocked: M.12]); the log event is still written so the replay
+        // sees the delete
+        let mut data = Vec::new();
+        log_event.store(&mut data);
+        global
+            .td_db()
+            .binlog()
+            .add(tddb::td_db::LOG_EVENT_HANDLER_TYPE_DELETE_MESSAGE, &data);
+    }
+
+    tracing::info!(
+        "Delete message {}:{} from database",
+        log_event.message_full_id.dialog_id.get(),
+        log_event.message_full_id.message_id.get()
+    );
+    global.message_db_async().delete_message(
+        log_event.message_full_id,
+        tdutils::promise::PromiseCreator::lambda(|()| ()),
+    );
+}
+
+/// `MessagesManager::delete_message_from_database`
+/// (MessagesManager.cpp:32063-32152) — the database-relevant spine; the
+/// notification-group and file-deletion side effects are seams until their
+/// slices (M.13 wiring / M.12).
+pub fn delete_message_from_database(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    message_id: MessageId,
+    m: Option<&Message>,
+    is_permanently_deleted: bool,
+    source: &str,
+) {
+    if !message_id.is_valid() && !message_id.is_valid_scheduled() {
+        return;
+    }
+    if message_id.is_yet_unsent() {
+        return;
+    }
+
+    // the local thread bookkeeping and the notification repairs are the
+    // receive-path/files seams (recorded; M.10.3/M.13)
+
+    if is_permanently_deleted {
+        if message_id.is_scheduled()
+            && message_id.is_valid_scheduled()
+            && message_id.is_scheduled_server()
+        {
+            let scheduled = manager
+                .dialogs
+                .get_mut(&dialog_id)
+                .and_then(|d| d.scheduled_messages.as_mut());
+            if let Some(scheduled) = scheduled {
+                scheduled
+                    .deleted_scheduled_server_message_ids
+                    .insert(message_id.get_scheduled_server_message_id());
+            }
+        } else if let Some(d) = manager.dialogs.get_mut(&dialog_id) {
+            // don't store failed to send message identifiers for bots
+            d.deleted_message_ids.insert(message_id);
+        }
+
+        if message_id.is_any_server()
+            && let Some(old_message_id) = manager
+                .update_message_ids
+                .get(&(dialog_id, message_id))
+                .copied()
+            && old_message_id != MessageId::default()
+        {
+            tracing::warn!(
+                "Sent message {}:{} was deleted before it was received",
+                dialog_id.get(),
+                message_id.get()
+            );
+            manager.update_message_ids.remove(&(dialog_id, message_id));
+            // `delete_messages` fan-out lands with the delete path (M.10.6)
+            let _ = old_message_id;
+        }
+    }
+
+    if global.use_message_database() {
+        let log_event = DeleteMessageLogEvent {
+            id: 0,
+            message_full_id: MessageFullId::new(dialog_id, message_id),
+            file_ids: Vec::new(),
+        };
+        // the file-ids leg needs need_delete_message_files
+        // ([blocked: M.12]); empty for now
+        do_delete_message_log_event(global, &log_event);
+        let _ = m;
+        let _ = source;
+    }
+}
+
+/// `MessagesManager::parse_message` (MessagesManager.cpp:19525-19620) —
+/// the database-load validation entry. The bot/generation repairs ride the
+/// Td context slices; the blob validation and the id matching are the
+/// loadable core.
+pub fn parse_message(
+    time: &crate::user_manager::TimeCtx,
+    expected_message_id: MessageId,
+    value: &[u8],
+    is_scheduled: bool,
+) -> Option<Box<Message>> {
+    let parse_result = parse_message_log_event(value, &mut MessageDbStorageBridge, time);
+    let m = match parse_result {
+        Ok(m) => m,
+        Err(_) => return None,
+    };
+    let is_message_id_valid = if is_scheduled {
+        if !expected_message_id.is_valid_scheduled() {
+            false
+        } else if m.message_id == expected_message_id {
+            true
+        } else {
+            m.message_id.is_valid_scheduled()
+                && expected_message_id.is_scheduled_server()
+                && m.message_id.is_scheduled_server()
+                && m.message_id.get_scheduled_server_message_id()
+                    == expected_message_id.get_scheduled_server_message_id()
+        }
+    } else {
+        expected_message_id.is_valid() && m.message_id == expected_message_id
+    };
+    if !is_message_id_valid {
+        return None;
+    }
+    Some(Box::new(m))
+}
+
+/// `MessagesManager::DeleteMessageLogEvent` (MessagesManager.cpp:31979-32010).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DeleteMessageLogEvent {
+    pub id: u64,
+    pub message_full_id: MessageFullId,
+    pub file_ids: Vec<FileId>,
+}
+
+impl DeleteMessageLogEvent {
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_file_ids = !self.file_ids.is_empty();
+        store_flags(out, [has_file_ids]);
+        self.message_full_id.store(out);
+        if has_file_ids {
+            store_vec_header(out, self.file_ids.len());
+            for file_id in &self.file_ids {
+                store_i32(out, file_id.get());
+            }
+        }
+    }
+
+    pub fn parse_from(parser: &mut Parser) -> Result<DeleteMessageLogEvent, &'static str> {
+        let [has_file_ids] = parser.parse_flags::<1>()?;
+        let message_full_id = MessageFullId::parse_from(parser)?;
+        let file_ids = if has_file_ids {
+            let size = parser.i32_()?;
+            if size < 0 || size as usize > parser.left_len() {
+                return Err("Wrong vector length");
+            }
+            let mut file_ids = Vec::with_capacity(size as usize);
+            for _ in 0..size {
+                file_ids.push(FileId::new(parser.i32_()?, 0));
+            }
+            file_ids
+        } else {
+            Vec::new()
+        };
+        Ok(DeleteMessageLogEvent {
+            id: 0,
+            message_full_id,
+            file_ids,
+        })
+    }
 }
 
 /// `message_search_filter_count()` (MessageSearchFilter.h:43-45) — the
@@ -9554,6 +10388,134 @@ mod tests {
         assert_eq!(button.r#type, InlineKeyboardButtonType::Url);
         assert_eq!(button.text, "open");
         assert_eq!(button.data, "https://telegram.org/"); // check_link adds the trailing slash
+    }
+
+    #[test]
+    fn calls_db_state_roundtrip() {
+        let state = CallsDbState {
+            first_calls_database_message_id_by_index: [
+                MessageId::from_server_message_id(ServerMessageId::new(100)),
+                MessageId::from_server_message_id(ServerMessageId::new(200)),
+            ],
+            message_count_by_index: [5, -1],
+        };
+        let mut bytes = Vec::new();
+        state.store(&mut bytes);
+        let mut parser = Parser::new(&bytes);
+        assert_eq!(CallsDbState::parse_from(&mut parser).unwrap(), state);
+        parser.fetch_end().unwrap();
+
+        // oversized tables are rejected
+        let mut bad = Vec::new();
+        store_i32(&mut bad, 3);
+        let mut parser = Parser::new(&bad);
+        assert!(CallsDbState::parse_from(&mut parser).is_err());
+    }
+
+    #[test]
+    fn delete_message_log_event_roundtrip() {
+        let event = DeleteMessageLogEvent {
+            id: 0,
+            message_full_id: MessageFullId::new(
+                DialogId::from_user_id(UserId::new(9)),
+                MessageId::from_server_message_id(ServerMessageId::new(42)),
+            ),
+            file_ids: vec![FileId::new(7, 0), FileId::new(8, 0)],
+        };
+        let mut bytes = Vec::new();
+        event.store(&mut bytes);
+        let mut parser = Parser::new(&bytes);
+        assert_eq!(
+            DeleteMessageLogEvent::parse_from(&mut parser).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn index_mask_decision_table() {
+        let mut m = Message::default();
+        m.message_id = MessageId::from_server_message_id(ServerMessageId::new(1));
+        m.content = Some(crate::message_content::MessageContent::Text(
+            crate::message_content::MessageText::default(),
+        ));
+
+        let manager = MessagesManager::default();
+
+        // yet-unsent messages are never indexed
+        m.message_id = MessageId::min(); // a yet-unsent id
+        assert_eq!(
+            get_message_index_mask(
+                &manager,
+                &NoDialogReactionsContext,
+                &crate::message_content::SharedTestContext::default(),
+                DialogId::from_user_id(UserId::new(1)),
+                &m
+            ),
+            0
+        );
+        // failed-to-send messages carry only the FailedToSend bit
+        m.message_id = MessageId::from_server_message_id(ServerMessageId::new(2));
+        m.is_failed_to_send = true;
+        assert_eq!(
+            get_message_index_mask(
+                &manager,
+                &NoDialogReactionsContext,
+                &crate::message_content::SharedTestContext::default(),
+                DialogId::from_user_id(UserId::new(1)),
+                &m
+            ),
+            message_search_filter_index_mask(MessageSearchFilter::FailedToSend)
+        );
+        // pinned + secret content collapses to the pinned bit alone
+        m.is_failed_to_send = false;
+        m.is_pinned = true;
+        m.is_content_secret = true;
+        assert_eq!(
+            get_message_index_mask(
+                &manager,
+                &NoDialogReactionsContext,
+                &crate::message_content::SharedTestContext::default(),
+                DialogId::from_user_id(UserId::new(1)),
+                &m
+            ),
+            message_search_filter_index_mask(MessageSearchFilter::Pinned)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn parse_message_validates_the_expected_id() {
+        let time = crate::user_manager::TimeCtx {
+            now: 0.0,
+            server_time: 0.0,
+        };
+        let mut m = Message::default();
+        m.message_id = MessageId::from_server_message_id(ServerMessageId::new(10));
+        m.date = 5;
+        m.content = Some(crate::message_content::MessageContent::Text(
+            crate::message_content::MessageText::default(),
+        ));
+        let mut bytes = Vec::new();
+        store_message_log_event(&m, &MessageDbStorageBridge, &time, &mut bytes);
+
+        // exact match
+        let parsed = parse_message(&time, m.message_id, &bytes, false).unwrap();
+        assert_eq!(parsed.message_id, m.message_id);
+        // mismatched id is dropped
+        assert!(
+            parse_message(
+                &time,
+                MessageId::from_server_message_id(ServerMessageId::new(11)),
+                &bytes,
+                false
+            )
+            .is_none()
+        );
+        // a scheduled expectation over an ordinary id is dropped
+        assert!(parse_message(&time, MessageId::default(), &bytes, true).is_none());
+        // a corrupt blob is dropped
+        assert!(parse_message(&time, m.message_id, &bytes[..bytes.len() - 1], false).is_none());
     }
 
     #[test]

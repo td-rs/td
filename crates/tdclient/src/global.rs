@@ -305,6 +305,14 @@ impl Global {
             .unwrap_or(false)
     }
 
+    /// `Global::use_message_database()`.
+    pub fn use_message_database(&self) -> bool {
+        self.db
+            .as_ref()
+            .map(|db| db.parameters().use_message_database)
+            .unwrap_or(false)
+    }
+
     /// `Global::use_sqlite_pmc()` — gated on the file database exactly like
     /// the C++ (`TdDb::use_sqlite_pmc`).
     pub fn use_sqlite_pmc(&self) -> bool {

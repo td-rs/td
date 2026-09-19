@@ -105,6 +105,8 @@ pub const LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_BLOCKED_ON_SERVER: i32 = 0x118
 pub const LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_TRANSLATABLE_ON_SERVER: i32 = 0x126;
 /// `LogEvent::HandlerType::ToggleDialogViewAsMessagesOnServer` (LogEvent.h:106).
 pub const LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_VIEW_AS_MESSAGES_ON_SERVER: i32 = 0x127;
+/// `LogEvent::HandlerType::DeleteMessage` (logevent/LogEvent.h:74).
+pub const LOG_EVENT_HANDLER_TYPE_DELETE_MESSAGE: i32 = 0x101;
 
 /// `TdDb::OpenedDatabase` — the database plus the open metadata the Td actor
 /// consumes (`since_last_open`; the per-manager binlog event vectors arrive
