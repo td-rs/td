@@ -3015,6 +3015,45 @@ impl RepliedMessageInfo {
     pub fn is_external(&self) -> bool {
         self.origin_date != 0
     }
+
+    /// `RepliedMessageInfo::get_same_chat_reply_to_message_id`
+    /// (RepliedMessageInfo.cpp:400-408).
+    pub fn get_same_chat_reply_to_message_id(&self, ignore_external: bool) -> MessageId {
+        if self.message_id == MessageId::default() {
+            return MessageId::default();
+        }
+        if !ignore_external && !self.origin.is_empty() {
+            return MessageId::default();
+        }
+        if self.dialog_id == DialogId::default() {
+            self.message_id
+        } else {
+            MessageId::default()
+        }
+    }
+
+    /// `RepliedMessageInfo::get_reply_message_full_id`
+    /// (RepliedMessageInfo.cpp:410-418).
+    pub fn get_reply_message_full_id(
+        &self,
+        owner_dialog_id: DialogId,
+        ignore_external: bool,
+    ) -> MessageFullId {
+        if self.message_id == MessageId::default() {
+            return MessageFullId::default();
+        }
+        if ignore_external && !self.origin.is_empty() {
+            return MessageFullId::default();
+        }
+        MessageFullId {
+            dialog_id: if self.dialog_id.is_valid() {
+                self.dialog_id
+            } else {
+                owner_dialog_id
+            },
+            message_id: self.message_id,
+        }
+    }
 }
 
 /// `td::MessageInputReplyTo` (MessageInputReplyTo.h:19-29) — the reply

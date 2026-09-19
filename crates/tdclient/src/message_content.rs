@@ -105,7 +105,7 @@ use crate::message_entity::{
 };
 use crate::messages_manager::{
     DialogId, DialogType, EphemeralMessageFullId, FileUploadId, MessageFullId, MessageSearchFilter,
-    MessageSelfDestructType, QuickReplyMessageFullId, StoryFullId, StoryId,
+    MessageSelfDestructType, QuickReplyMessageFullId, RepliedMessageInfo, StoryFullId, StoryId,
     message_search_filter_index_mask,
 };
 use crate::misc::is_empty_string;
@@ -7842,6 +7842,48 @@ pub trait MessageContentContext {
     /// (MessageContent.cpp:10284) — the stand-in answers `false`, which
     /// exercises the secret-copy path through the file-id seams.
     fn has_secret_input_media_sticker(&self, file_id: FileId) -> bool;
+
+    // -- Action family (MessageContent.cpp:10451-11338) — the manager
+    // intakes `get_action_message_content` calls. --
+    /// `UserManager::is_user_deleted` (MessageContent.cpp:10555).
+    fn is_user_deleted(&self, user_id: UserId) -> bool;
+    /// `CallActor::get_recent_call_access_hash` (CallActor.cpp:226-234).
+    fn get_recent_call_access_hash(&self, call_id: i64) -> i64;
+    /// `get_encrypted_secure_values` (SecureValue.cpp:571-582) — the
+    /// FileManager-mediated file parse; the stand-in answers an empty
+    /// vector.
+    fn get_encrypted_secure_values(
+        &mut self,
+        secure_values: Vec<telegram_api::SecureValue>,
+    ) -> Vec<EncryptedSecureValue>;
+    /// `SharedDialog(Td *, RequestedPeer &&)` (SharedDialog.cpp) — the
+    /// manager intake; the stand-in answers `None`.
+    fn get_shared_dialog_from_peer(
+        &mut self,
+        peer: telegram_api::RequestedPeer,
+    ) -> Option<SharedDialog>;
+    /// `BackgroundInfo(Td *, WallPaper &&, bool, bool)` (BackgroundInfo.cpp)
+    /// — the manager intake; the stand-in answers `None` (invalid).
+    fn get_background_info(
+        &mut self,
+        wallpaper: Option<telegram_api::WallPaper>,
+        is_local: bool,
+        for_dark_theme: bool,
+    ) -> Option<BackgroundInfo>;
+    /// `WebApp(Td *, botApp &&, DialogId)` (WebApp.cpp) — the manager
+    /// intake; the stand-in answers the empty app.
+    fn get_web_app_from_bot_app(
+        &mut self,
+        bot_app: telegram_api::BotApp,
+        owner_dialog_id: DialogId,
+    ) -> WebApp;
+    /// `PollOption(Td *, pollAnswer &&, vector &)`
+    /// (MessageContent.cpp:11303/11318) — the answer intake collapses to
+    /// the (text, data) pair; the stand-in answers `None`.
+    fn parse_poll_option_answer(
+        &mut self,
+        answer: Option<telegram_api::PollAnswer>,
+    ) -> Option<(FormattedText, String)>;
 }
 
 /// `is_local_poll_id` (PollManager.cpp:449-452) — the local (unsent)
@@ -7856,6 +7898,13 @@ fn is_local_poll_id(poll_id: PollId) -> bool {
 /// until then.
 fn to_messages_manager_message_id(message_id: MessageId) -> crate::messages_manager::MessageId {
     crate::messages_manager::MessageId::new(message_id.get())
+}
+
+/// The reverse bridge: the action plane reads `RepliedMessageInfo` ids in
+/// the `messages_manager` space, but the message structs still carry the
+/// pre-integration `chat_manager::MessageId`.
+fn to_chat_manager_message_id(message_id: crate::messages_manager::MessageId) -> MessageId {
+    MessageId::new(message_id.get())
 }
 
 /// `can_send_message_content` (MessageContent.cpp:6207-6481). The
@@ -14824,6 +14873,1305 @@ fn fix_dup_file_id(
 }
 
 // ---------------------------------------------------------------------------
+// M.9.15 — `get_action_message_content` (MessageContent.cpp:10451-11338)
+// ---------------------------------------------------------------------------
+
+/// `get_call_discard_reason` (CallDiscardReason.cpp:15-64).
+pub fn get_call_discard_reason(
+    reason: &Option<telegram_api::PhoneCallDiscardReason>,
+) -> CallDiscardReason {
+    let mut result = CallDiscardReason::default();
+    match reason {
+        Some(telegram_api::PhoneCallDiscardReason::phoneCallDiscardReasonMissed(_)) => {
+            result.r#type = CallDiscardReasonType::Missed
+        }
+        Some(telegram_api::PhoneCallDiscardReason::phoneCallDiscardReasonDisconnect(_)) => {
+            result.r#type = CallDiscardReasonType::Disconnected
+        }
+        Some(telegram_api::PhoneCallDiscardReason::phoneCallDiscardReasonHangup(_)) => {
+            result.r#type = CallDiscardReasonType::HungUp
+        }
+        Some(telegram_api::PhoneCallDiscardReason::phoneCallDiscardReasonBusy(_)) => {
+            result.r#type = CallDiscardReasonType::Declined
+        }
+        Some(
+            telegram_api::PhoneCallDiscardReason::phoneCallDiscardReasonMigrateConferenceCall(m),
+        ) => {
+            result.r#type = CallDiscardReasonType::UpgradeToGroupCall;
+            result.slug = m.slug.clone();
+        }
+        _ => {}
+    }
+    result
+}
+
+/// `get_secure_value_type` (SecureValue.cpp:70-103) + the dedup helper
+/// `unique_secure_value_types` (SecureValue.cpp:151-153) + the vector
+/// overload `get_secure_value_types` (SecureValue.cpp:155-158).
+fn get_secure_value_type(secure_value_type: telegram_api::SecureValueType) -> SecureValueType {
+    match secure_value_type {
+        telegram_api::SecureValueType::secureValueTypePersonalDetails(_) => {
+            SecureValueType::PersonalDetails
+        }
+        telegram_api::SecureValueType::secureValueTypePassport(_) => SecureValueType::Passport,
+        telegram_api::SecureValueType::secureValueTypeDriverLicense(_) => {
+            SecureValueType::DriverLicense
+        }
+        telegram_api::SecureValueType::secureValueTypeIdentityCard(_) => {
+            SecureValueType::IdentityCard
+        }
+        telegram_api::SecureValueType::secureValueTypeInternalPassport(_) => {
+            SecureValueType::InternalPassport
+        }
+        telegram_api::SecureValueType::secureValueTypeAddress(_) => SecureValueType::Address,
+        telegram_api::SecureValueType::secureValueTypeUtilityBill(_) => {
+            SecureValueType::UtilityBill
+        }
+        telegram_api::SecureValueType::secureValueTypeBankStatement(_) => {
+            SecureValueType::BankStatement
+        }
+        telegram_api::SecureValueType::secureValueTypeRentalAgreement(_) => {
+            SecureValueType::RentalAgreement
+        }
+        telegram_api::SecureValueType::secureValueTypePassportRegistration(_) => {
+            SecureValueType::PassportRegistration
+        }
+        telegram_api::SecureValueType::secureValueTypeTemporaryRegistration(_) => {
+            SecureValueType::TemporaryRegistration
+        }
+        telegram_api::SecureValueType::secureValueTypePhone(_) => SecureValueType::PhoneNumber,
+        telegram_api::SecureValueType::secureValueTypeEmail(_) => SecureValueType::EmailAddress,
+    }
+}
+
+fn get_secure_value_types(
+    secure_value_types: Vec<telegram_api::SecureValueType>,
+) -> Vec<SecureValueType> {
+    let mut result = Vec::new();
+    for secure_value_type in secure_value_types {
+        let r#type = get_secure_value_type(secure_value_type);
+        if r#type != SecureValueType::None && !result.contains(&r#type) {
+            result.push(r#type);
+        }
+    }
+    result
+}
+
+/// `get_encrypted_secure_credentials` (SecureValue.cpp:664-673) — the
+/// pure byte copies; no manager read.
+pub fn get_encrypted_secure_credentials(
+    credentials: telegram_api::SecureCredentialsEncrypted,
+) -> EncryptedSecureCredentials {
+    EncryptedSecureCredentials {
+        data: String::from_utf8_lossy(&credentials.data).into_owned(),
+        hash: String::from_utf8_lossy(&credentials.hash).into_owned(),
+        encrypted_secret: String::from_utf8_lossy(&credentials.secret).into_owned(),
+    }
+}
+
+/// `get_address` (OrderInfo.cpp:145-152 area) — the pure
+/// `postAddress` → `Address` conversion.
+fn get_address(address: telegram_api::PostAddress) -> Address {
+    Address {
+        country_code: address.country_iso2,
+        state: address.state,
+        city: address.city,
+        street_line1: address.street_line1,
+        street_line2: address.street_line2,
+        postal_code: address.post_code,
+    }
+}
+
+/// `get_order_info` (OrderInfo.cpp:173-180).
+pub fn get_order_info(order_info: Option<telegram_api::PaymentRequestedInfo>) -> Option<OrderInfo> {
+    let order_info = order_info?;
+    if order_info.flags == 0 {
+        return None;
+    }
+    Some(OrderInfo {
+        name: order_info.name,
+        phone_number: order_info.phone,
+        email_address: order_info.email,
+        shipping_address: order_info
+            .shipping_address
+            .map(|address| Box::new(get_address(address))),
+    })
+}
+
+/// `CurrencyAmount(StarsAmount &&, bool)` (CurrencyAmount.cpp:11-46) with
+/// `allow_negative = false`.
+fn get_currency_amount_from_stars(amount: Option<telegram_api::StarsAmount>) -> CurrencyAmount {
+    let Some(amount) = amount else {
+        return CurrencyAmount::default();
+    };
+    match amount {
+        telegram_api::StarsAmount::starsAmount(amount) => {
+            if amount.amount == 0 {
+                return CurrencyAmount::default();
+            }
+            CurrencyAmount {
+                r#type: CurrencyAmountType::Star,
+                star_amount: StarAmount {
+                    star_count: amount.amount,
+                    nanostar_count: 0,
+                },
+                ton_amount: TonAmount::default(),
+            }
+        }
+        telegram_api::StarsAmount::starsTonAmount(amount) => {
+            if amount.amount == 0 {
+                return CurrencyAmount::default();
+            }
+            CurrencyAmount {
+                r#type: CurrencyAmountType::Ton,
+                star_amount: StarAmount::default(),
+                ton_amount: TonAmount {
+                    ton_amount: amount.amount,
+                },
+            }
+        }
+    }
+}
+
+/// `SuggestedPostPrice(StarsAmount &&)` (SuggestedPostPrice.cpp:18-52).
+fn get_suggested_post_price(amount: Option<telegram_api::StarsAmount>) -> SuggestedPostPrice {
+    let Some(amount) = amount else {
+        return SuggestedPostPrice::default();
+    };
+    match amount {
+        telegram_api::StarsAmount::starsAmount(amount) => {
+            if amount.amount == 0 {
+                return SuggestedPostPrice::default();
+            }
+            SuggestedPostPrice {
+                r#type: SuggestedPostPriceType::Star,
+                amount: amount.amount,
+            }
+        }
+        telegram_api::StarsAmount::starsTonAmount(amount) => {
+            let ton_amount = get_ton_count(amount.amount);
+            if ton_amount % SuggestedPostPrice::TON_MULTIPLIER != 0 {
+                tdutils::log_error!("Receive price of {ton_amount} Grams");
+            }
+            if ton_amount == 0 {
+                return SuggestedPostPrice::default();
+            }
+            SuggestedPostPrice {
+                r#type: SuggestedPostPriceType::Ton,
+                amount: ton_amount / SuggestedPostPrice::TON_MULTIPLIER,
+            }
+        }
+    }
+}
+
+/// The business-message gate of `get_action_message_content`
+/// (MessageContent.cpp:10455-10561) — pure validation logs.
+fn check_business_message_action(
+    td: &dyn MessageContentContext,
+    action: &telegram_api::MessageAction,
+    owner_dialog_id: DialogId,
+) {
+    let disallowed = matches!(
+        action,
+        telegram_api::MessageAction::messageActionEmpty(_)
+            | telegram_api::MessageAction::messageActionChatCreate(_)
+            | telegram_api::MessageAction::messageActionChatEditTitle(_)
+            | telegram_api::MessageAction::messageActionChatEditPhoto(_)
+            | telegram_api::MessageAction::messageActionChatDeletePhoto(_)
+            | telegram_api::MessageAction::messageActionChatAddUser(_)
+            | telegram_api::MessageAction::messageActionChatJoinedByLink(_)
+            | telegram_api::MessageAction::messageActionChatDeleteUser(_)
+            | telegram_api::MessageAction::messageActionChatMigrateTo(_)
+            | telegram_api::MessageAction::messageActionChannelCreate(_)
+            | telegram_api::MessageAction::messageActionChannelMigrateFrom(_)
+            | telegram_api::MessageAction::messageActionSecureValuesSentMe(_)
+            | telegram_api::MessageAction::messageActionGroupCall(_)
+            | telegram_api::MessageAction::messageActionInviteToGroupCall(_)
+            | telegram_api::MessageAction::messageActionGroupCallScheduled(_)
+            | telegram_api::MessageAction::messageActionChatJoinedByRequest(_)
+            | telegram_api::MessageAction::messageActionWebViewDataSentMe(_)
+            | telegram_api::MessageAction::messageActionGiveawayLaunch(_)
+            | telegram_api::MessageAction::messageActionGiveawayResults(_)
+            | telegram_api::MessageAction::messageActionBoostApply(_)
+            | telegram_api::MessageAction::messageActionPaidMessagesPrice(_)
+            | telegram_api::MessageAction::messageActionSuggestedPostApproval(_)
+            | telegram_api::MessageAction::messageActionSuggestedPostSuccess(_)
+            | telegram_api::MessageAction::messageActionSuggestedPostRefund(_)
+            | telegram_api::MessageAction::messageActionNewCreatorPending(_)
+            | telegram_api::MessageAction::messageActionChangeCreator(_)
+            | telegram_api::MessageAction::messageActionChatJoinedViaCommunity(_)
+    );
+    if disallowed {
+        tdutils::log_error!("Receive business {action:?}");
+        return;
+    }
+    if matches!(
+        action,
+        telegram_api::MessageAction::messageActionBotAllowed(_)
+            | telegram_api::MessageAction::messageActionSecureValuesSent(_)
+            | telegram_api::MessageAction::messageActionWebViewDataSent(_)
+            | telegram_api::MessageAction::messageActionTopicCreate(_)
+            | telegram_api::MessageAction::messageActionTopicEdit(_)
+            | telegram_api::MessageAction::messageActionRequestedPeer(_)
+            | telegram_api::MessageAction::messageActionManagedBotCreated(_)
+            | telegram_api::MessageAction::messageActionChangeCommunity(_)
+    ) {
+        // ok in chats with bots
+        if owner_dialog_id.get_type() == DialogType::User {
+            let user_id = owner_dialog_id.get_user_id();
+            if !td.is_user_bot(user_id) && !td.is_user_deleted(user_id) {
+                tdutils::log_error!("Receive in {owner_dialog_id} business {action:?}");
+            }
+        } else {
+            tdutils::log_error!("Receive in {owner_dialog_id} business {action:?}");
+        }
+    }
+}
+
+/// The replied-message gate of `get_action_message_content`
+/// (MessageContent.cpp:10562-10591) — pure validation logs.
+fn check_action_replied_message_info(
+    action: &telegram_api::MessageAction,
+    replied_message_info: &RepliedMessageInfo,
+) {
+    let ok = matches!(
+        action,
+        telegram_api::MessageAction::messageActionHistoryClear(_)
+            | telegram_api::MessageAction::messageActionPinMessage(_)
+            | telegram_api::MessageAction::messageActionGameScore(_)
+            | telegram_api::MessageAction::messageActionPaymentSent(_)
+            | telegram_api::MessageAction::messageActionPaymentSentMe(_)
+            | telegram_api::MessageAction::messageActionGeoProximityReached(_)
+            | telegram_api::MessageAction::messageActionTopicEdit(_)
+            | telegram_api::MessageAction::messageActionSetChatWallPaper(_)
+            | telegram_api::MessageAction::messageActionGiveawayResults(_)
+            | telegram_api::MessageAction::messageActionRequestedPeerSentMe(_)
+            | telegram_api::MessageAction::messageActionRequestedPeer(_)
+            | telegram_api::MessageAction::messageActionStarGiftUnique(_)
+            | telegram_api::MessageAction::messageActionTodoCompletions(_)
+            | telegram_api::MessageAction::messageActionTodoAppendTasks(_)
+            | telegram_api::MessageAction::messageActionSuggestedPostApproval(_)
+            | telegram_api::MessageAction::messageActionSuggestedPostSuccess(_)
+            | telegram_api::MessageAction::messageActionSuggestedPostRefund(_)
+            | telegram_api::MessageAction::messageActionStarGiftPurchaseOfferDeclined(_)
+            | telegram_api::MessageAction::messageActionNoForwardsToggle(_)
+            | telegram_api::MessageAction::messageActionPollAppendAnswer(_)
+            | telegram_api::MessageAction::messageActionPollDeleteAnswer(_)
+    );
+    if !ok && !replied_message_info.is_empty() {
+        tdutils::log_error!("Receive {action:?} with a replied message");
+    }
+}
+
+/// The `get_action_message_content` break tail (MessageContent.cpp:11334-11336).
+fn fallback_action_message_content() -> MessageContent {
+    MessageContent::Text(MessageText::new(
+        FormattedText::default(),
+        WebPageId::default(),
+        false,
+        false,
+        false,
+        String::new(),
+    ))
+}
+
+/// `get_action_message_content` (MessageContent.cpp:10451-11338) — the
+/// telegram_api `MessageAction` dispatcher. The StarGift-family and
+/// `ChatSetTheme` arms are deferred with their unmodeled variants and
+/// answer the C++ `break` tail (the empty-text fallback).
+#[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+pub fn get_action_message_content(
+    td: &mut dyn MessageContentContext,
+    action_ptr: Option<telegram_api::MessageAction>,
+    owner_dialog_id: DialogId,
+    _message_date: i32,
+    replied_message_info: &RepliedMessageInfo,
+    is_business_message: bool,
+) -> MessageContent {
+    let Some(action_ptr) = action_ptr else {
+        tdutils::log_error!("Receive empty message action in {owner_dialog_id}");
+        return fallback_action_message_content();
+    };
+    if is_business_message {
+        check_business_message_action(td, &action_ptr, owner_dialog_id);
+    }
+    check_action_replied_message_info(&action_ptr, replied_message_info);
+    match action_ptr {
+        telegram_api::MessageAction::messageActionEmpty(_) => {
+            tdutils::log_error!("Receive empty message action in {owner_dialog_id}");
+            fallback_action_message_content()
+        }
+        telegram_api::MessageAction::messageActionChatCreate(action) => {
+            let mut participant_user_ids = Vec::with_capacity(action.users.len());
+            for user in action.users {
+                let user_id = UserId::new(user);
+                if user_id.is_valid() {
+                    participant_user_ids.push(user_id);
+                } else {
+                    tdutils::log_error!(
+                        "Receive messageActionChatCreate with invalid {user_id:?} in {owner_dialog_id}"
+                    );
+                }
+            }
+            MessageContent::ChatCreate(MessageChatCreate {
+                title: action.title,
+                participant_user_ids,
+            })
+        }
+        telegram_api::MessageAction::messageActionChatEditTitle(action) => {
+            MessageContent::ChatChangeTitle(MessageChatChangeTitle {
+                title: action.title,
+            })
+        }
+        telegram_api::MessageAction::messageActionChatEditPhoto(action) => {
+            let photo = action
+                .photo
+                .map(crate::photo::get_photo)
+                .unwrap_or_default();
+            if photo.is_empty() {
+                return fallback_action_message_content();
+            }
+            MessageContent::ChatChangePhoto(MessageChatChangePhoto { photo })
+        }
+        telegram_api::MessageAction::messageActionChatDeletePhoto(_) => {
+            MessageContent::ChatDeletePhoto(MessageChatDeletePhoto)
+        }
+        telegram_api::MessageAction::messageActionHistoryClear(_) => {
+            MessageContent::ChatDeleteHistory(MessageChatDeleteHistory)
+        }
+        telegram_api::MessageAction::messageActionChatAddUser(action) => {
+            let mut user_ids = Vec::with_capacity(action.users.len());
+            for user in action.users {
+                let user_id = UserId::new(user);
+                if user_id.is_valid() {
+                    user_ids.push(user_id);
+                } else {
+                    tdutils::log_error!(
+                        "Receive messageActionChatAddUser with invalid {user_id:?} in {owner_dialog_id}"
+                    );
+                }
+            }
+            MessageContent::ChatAddUsers(MessageChatAddUsers { user_ids })
+        }
+        telegram_api::MessageAction::messageActionChatJoinedByLink(_) => {
+            MessageContent::ChatJoinedByLink(MessageChatJoinedByLink { is_approved: false })
+        }
+        telegram_api::MessageAction::messageActionChatDeleteUser(action) => {
+            let user_id = UserId::new(action.user_id);
+            if !user_id.is_valid() {
+                tdutils::log_error!(
+                    "Receive messageActionChatDeleteUser with invalid {user_id:?} in {owner_dialog_id}"
+                );
+                return fallback_action_message_content();
+            }
+            MessageContent::ChatDeleteUser(MessageChatDeleteUser { user_id })
+        }
+        telegram_api::MessageAction::messageActionChatMigrateTo(action) => {
+            let migrated_to_channel_id = ChannelId::new(action.channel_id);
+            if !migrated_to_channel_id.is_valid() {
+                tdutils::log_error!(
+                    "Receive messageActionChatMigrateTo with invalid {migrated_to_channel_id:?} in {owner_dialog_id}"
+                );
+                return fallback_action_message_content();
+            }
+            MessageContent::ChatMigrateTo(MessageChatMigrateTo {
+                migrated_to_channel_id,
+            })
+        }
+        telegram_api::MessageAction::messageActionChannelCreate(action) => {
+            MessageContent::ChannelCreate(MessageChannelCreate {
+                title: action.title,
+            })
+        }
+        telegram_api::MessageAction::messageActionChannelMigrateFrom(action) => {
+            let chat_id = ChatId::new(action.chat_id);
+            if !chat_id.is_valid() {
+                tdutils::log_error!(
+                    "Receive messageActionChannelMigrateFrom with invalid {chat_id:?} in {owner_dialog_id}"
+                );
+            }
+            MessageContent::ChannelMigrateFrom(MessageChannelMigrateFrom {
+                title: action.title,
+                migrated_from_chat_id: chat_id,
+            })
+        }
+        telegram_api::MessageAction::messageActionPinMessage(_) => {
+            let mut reply_to_message_id =
+                replied_message_info.get_same_chat_reply_to_message_id(true);
+            if !reply_to_message_id.is_valid() {
+                // possible in basic groups
+                tdutils::log_info!(
+                    "Receive pinned message with {} in {owner_dialog_id}",
+                    reply_to_message_id.get()
+                );
+                reply_to_message_id = crate::messages_manager::MessageId::default();
+            }
+            MessageContent::PinMessage(MessagePinMessage {
+                message_id: to_chat_manager_message_id(reply_to_message_id),
+            })
+        }
+        telegram_api::MessageAction::messageActionGameScore(action) => {
+            let mut reply_to_message_id =
+                replied_message_info.get_same_chat_reply_to_message_id(true);
+            if !reply_to_message_id.is_valid() {
+                // possible in basic groups
+                tdutils::log_info!(
+                    "Receive game score with {} in {owner_dialog_id}",
+                    reply_to_message_id.get()
+                );
+                reply_to_message_id = crate::messages_manager::MessageId::default();
+            }
+            MessageContent::GameScore(MessageGameScore {
+                game_message_id: to_chat_manager_message_id(reply_to_message_id),
+                game_id: action.game_id,
+                score: action.score,
+            })
+        }
+        telegram_api::MessageAction::messageActionPhoneCall(action) => {
+            if action.duration < 0 {
+                tdutils::log_error!("Receive invalid {action:?}");
+                return fallback_action_message_content();
+            }
+            let call_access_hash = td.get_recent_call_access_hash(action.call_id);
+            MessageContent::Call(MessageCall {
+                call_id: action.call_id,
+                call_access_hash,
+                duration: action.duration,
+                discard_reason: get_call_discard_reason(&action.reason),
+                is_video: action.video,
+            })
+        }
+        telegram_api::MessageAction::messageActionPaymentSent(action) => {
+            if !is_business_message && td.is_bot() {
+                tdutils::log_error!("Receive MessageActionPaymentSent in {owner_dialog_id}");
+                return fallback_action_message_content();
+            }
+            let mut message_full_id =
+                replied_message_info.get_reply_message_full_id(DialogId::default(), true);
+            if !message_full_id.get_message_id().is_valid() {
+                if message_full_id.get_message_id() != crate::messages_manager::MessageId::default()
+                {
+                    tdutils::log_error!(
+                        "Receive successful payment message with {message_full_id:?} in {owner_dialog_id}"
+                    );
+                }
+                message_full_id = MessageFullId::default();
+            }
+            let total_amount = action.total_amount;
+            let total_amount = if total_amount <= 0 || !check_currency_amount(total_amount) {
+                tdutils::log_error!("Receive invalid total amount {total_amount}");
+                0
+            } else {
+                total_amount
+            };
+            MessageContent::PaymentSuccessful(MessagePaymentSuccessful {
+                invoice_dialog_id: message_full_id.get_dialog_id(),
+                invoice_message_id: to_chat_manager_message_id(message_full_id.get_message_id()),
+                currency: action.currency,
+                total_amount,
+                invoice_payload: action.invoice_slug,
+                subscription_until_date: action.subscription_until_date,
+                is_recurring: action.recurring_used,
+                is_first_recurring: action.recurring_init,
+                ..MessagePaymentSuccessful::default()
+            })
+        }
+        telegram_api::MessageAction::messageActionPaymentSentMe(action) => {
+            // ignore replied_message_info
+            let total_amount = action.total_amount;
+            let total_amount = if total_amount <= 0 || !check_currency_amount(total_amount) {
+                tdutils::log_error!("Receive invalid total amount {total_amount}");
+                0
+            } else {
+                total_amount
+            };
+            let mut result = MessagePaymentSuccessful {
+                invoice_dialog_id: DialogId::default(),
+                invoice_message_id: MessageId::default(),
+                currency: action.currency,
+                total_amount,
+                invoice_payload: String::from_utf8_lossy(&action.payload).into_owned(),
+                subscription_until_date: action.subscription_until_date,
+                is_recurring: action.recurring_used,
+                is_first_recurring: action.recurring_init,
+                ..MessagePaymentSuccessful::default()
+            };
+            result.shipping_option_id = action.shipping_option_id;
+            result.order_info = get_order_info(action.info);
+            let charge = action.charge.unwrap_or_default();
+            result.telegram_payment_charge_id = charge.id;
+            result.provider_payment_charge_id = charge.provider_charge_id;
+            MessageContent::PaymentSuccessful(result)
+        }
+        telegram_api::MessageAction::messageActionScreenshotTaken(_) => {
+            MessageContent::ScreenshotTaken(MessageScreenshotTaken)
+        }
+        telegram_api::MessageAction::messageActionCustomAction(action) => {
+            MessageContent::CustomServiceAction(MessageCustomServiceAction {
+                message: action.message,
+            })
+        }
+        telegram_api::MessageAction::messageActionBotAllowed(action) => {
+            if action.attach_menu {
+                return MessageContent::WriteAccessAllowed(MessageWriteAccessAllowed);
+            }
+            if !action.domain.is_empty() {
+                return MessageContent::WebsiteConnected(MessageWebsiteConnected {
+                    domain_name: action.domain,
+                });
+            }
+            if let Some(app) = action.app {
+                return MessageContent::WebViewWriteAccessAllowed(
+                    MessageWebViewWriteAccessAllowed {
+                        web_app: td.get_web_app_from_bot_app(app, owner_dialog_id),
+                    },
+                );
+            }
+            if action.from_request {
+                return MessageContent::WriteAccessAllowedByRequest(
+                    MessageWriteAccessAllowedByRequest,
+                );
+            }
+            MessageContent::Unsupported(MessageUnsupported::default())
+        }
+        telegram_api::MessageAction::messageActionSecureValuesSent(action) => {
+            if td.is_bot() {
+                tdutils::log_error!("Receive MessageActionSecureValuesSent in {owner_dialog_id}");
+            }
+            MessageContent::PassportDataSent(MessagePassportDataSent {
+                types: get_secure_value_types(action.types),
+            })
+        }
+        telegram_api::MessageAction::messageActionSecureValuesSentMe(action) => {
+            if !td.is_bot() {
+                tdutils::log_error!("Receive MessageActionSecureValuesSentMe in {owner_dialog_id}");
+            }
+            MessageContent::PassportDataReceived(MessagePassportDataReceived {
+                values: td.get_encrypted_secure_values(action.values),
+                credentials: get_encrypted_secure_credentials(
+                    action.credentials.unwrap_or_default(),
+                ),
+            })
+        }
+        telegram_api::MessageAction::messageActionContactSignUp(_) => {
+            if !is_business_message && td.is_bot() {
+                tdutils::log_error!("Receive ContactRegistered in {owner_dialog_id}");
+            }
+            MessageContent::ContactRegistered(MessageContactRegistered)
+        }
+        telegram_api::MessageAction::messageActionGeoProximityReached(action) => {
+            let traveler_dialog_id = DialogId::from_peer(
+                action
+                    .from_id
+                    .as_ref()
+                    .unwrap_or(&telegram_api::Peer::default()),
+            );
+            let watcher_dialog_id = DialogId::from_peer(
+                action
+                    .to_id
+                    .as_ref()
+                    .unwrap_or(&telegram_api::Peer::default()),
+            );
+            if !traveler_dialog_id.is_valid()
+                || !watcher_dialog_id.is_valid()
+                || action.distance < 0
+            {
+                tdutils::log_error!("Receive invalid {action:?}");
+                return fallback_action_message_content();
+            }
+            // ignore replied_message_info
+            MessageContent::ProximityAlertTriggered(MessageProximityAlertTriggered {
+                traveler_dialog_id,
+                watcher_dialog_id,
+                distance: action.distance,
+            })
+        }
+        telegram_api::MessageAction::messageActionGroupCall(action) => {
+            let mut duration = -1;
+            if action.flags & (1 << 0) != 0 {
+                // DURATION_MASK
+                duration = action.duration;
+                if duration < 0 {
+                    tdutils::log_error!("Receive invalid {action:?}");
+                    return fallback_action_message_content();
+                }
+            }
+            MessageContent::GroupCall(MessageGroupCall {
+                input_group_call_id: {
+                    // `InputGroupCallId(const InputGroupCall &)`
+                    // (InputGroupCallId.cpp:13-22): the slug/invite forms
+                    // log and answer the default id
+                    match action.call {
+                        Some(telegram_api::InputGroupCall::inputGroupCall(call)) => {
+                            InputGroupCallId::new(call.id, call.access_hash)
+                        }
+                        other => {
+                            tdutils::log_error!("Receive {other:?}");
+                            InputGroupCallId::default()
+                        }
+                    }
+                },
+                duration,
+                schedule_date: -1,
+            })
+        }
+        telegram_api::MessageAction::messageActionInviteToGroupCall(action) => {
+            let mut user_ids = Vec::with_capacity(action.users.len());
+            for user in action.users {
+                let user_id = UserId::new(user);
+                if user_id.is_valid() {
+                    user_ids.push(user_id);
+                } else {
+                    tdutils::log_error!(
+                        "Receive messageActionInviteToGroupCall with invalid {user_id:?} in {owner_dialog_id}"
+                    );
+                }
+            }
+            MessageContent::InviteToGroupCall(MessageInviteToGroupCall {
+                input_group_call_id: {
+                    // `InputGroupCallId(const InputGroupCall &)`
+                    // (InputGroupCallId.cpp:13-22): the slug/invite forms
+                    // log and answer the default id
+                    match action.call {
+                        Some(telegram_api::InputGroupCall::inputGroupCall(call)) => {
+                            InputGroupCallId::new(call.id, call.access_hash)
+                        }
+                        other => {
+                            tdutils::log_error!("Receive {other:?}");
+                            InputGroupCallId::default()
+                        }
+                    }
+                },
+                user_ids,
+            })
+        }
+        telegram_api::MessageAction::messageActionSetMessagesTTL(action) => {
+            let from_user_id = UserId::new(action.auto_setting_from);
+            if action.period < 0 || !(from_user_id == UserId::default() || from_user_id.is_valid())
+            {
+                tdutils::log_error!("Receive invalid {action:?}");
+                return fallback_action_message_content();
+            }
+            MessageContent::ChatSetTtl(MessageChatSetTtl {
+                ttl: action.period,
+                from_user_id,
+            })
+        }
+        telegram_api::MessageAction::messageActionGroupCallScheduled(action) => {
+            if action.schedule_date <= 0 {
+                tdutils::log_error!("Receive wrong schedule_date = {}", action.schedule_date);
+                return fallback_action_message_content();
+            }
+            MessageContent::GroupCall(MessageGroupCall {
+                input_group_call_id: {
+                    // `InputGroupCallId(const InputGroupCall &)`
+                    // (InputGroupCallId.cpp:13-22): the slug/invite forms
+                    // log and answer the default id
+                    match action.call {
+                        Some(telegram_api::InputGroupCall::inputGroupCall(call)) => {
+                            InputGroupCallId::new(call.id, call.access_hash)
+                        }
+                        other => {
+                            tdutils::log_error!("Receive {other:?}");
+                            InputGroupCallId::default()
+                        }
+                    }
+                },
+                duration: -1,
+                schedule_date: action.schedule_date,
+            })
+        }
+        telegram_api::MessageAction::messageActionSetChatTheme(_) => {
+            // deferred with the unmodeled ChatSetTheme variant — the C++
+            // constructs MessageChatSetTheme(ChatTheme(td, ...)) here
+            fallback_action_message_content()
+        }
+        telegram_api::MessageAction::messageActionChatJoinedByRequest(_) => {
+            MessageContent::ChatJoinedByLink(MessageChatJoinedByLink { is_approved: true })
+        }
+        telegram_api::MessageAction::messageActionWebViewDataSent(action) => {
+            if td.is_bot() {
+                tdutils::log_error!("Receive messageActionWebViewDataSent in {owner_dialog_id}");
+                return fallback_action_message_content();
+            }
+            MessageContent::WebViewDataSent(MessageWebViewDataSent {
+                button_text: action.text,
+            })
+        }
+        telegram_api::MessageAction::messageActionWebViewDataSentMe(action) => {
+            if !td.is_bot() {
+                tdutils::log_error!("Receive messageActionWebViewDataSentMe in {owner_dialog_id}");
+                return fallback_action_message_content();
+            }
+            MessageContent::WebViewDataReceived(MessageWebViewDataReceived {
+                button_text: action.text,
+                data: action.data,
+            })
+        }
+        telegram_api::MessageAction::messageActionGiftPremium(action) => {
+            let mut amount = action.amount;
+            if amount <= 0 || !check_currency_amount(amount) {
+                tdutils::log_error!("Receive invalid premium gift price {amount}");
+                amount = 0;
+            }
+            let mut crypto_amount = action.crypto_amount;
+            if action.crypto_currency.is_empty() {
+                if crypto_amount != 0 {
+                    tdutils::log_error!(
+                        "Receive premium gift crypto price {crypto_amount} without currency"
+                    );
+                    crypto_amount = 0;
+                }
+            } else if crypto_amount <= 0 {
+                tdutils::log_error!("Receive invalid premium gift crypto amount {crypto_amount}");
+                crypto_amount = 0;
+            }
+            let text = crate::message_entity::get_formatted_text_of_text_with_entities(
+                Some(&mut ContextUserManager { td }),
+                action.message,
+                true,
+                false,
+                "messageActionGiftPremium",
+            );
+            MessageContent::GiftPremium(MessageGiftPremium {
+                text,
+                currency: action.currency,
+                amount,
+                crypto_currency: action.crypto_currency,
+                crypto_amount,
+                days: action.days,
+            })
+        }
+        telegram_api::MessageAction::messageActionTopicCreate(action) => {
+            MessageContent::TopicCreate(MessageTopicCreate {
+                title: action.title,
+                icon: ForumTopicIcon::new(
+                    action.icon_color,
+                    CustomEmojiId::new(action.icon_emoji_id),
+                ),
+                title_missing: action.title_missing,
+            })
+        }
+        telegram_api::MessageAction::messageActionTopicEdit(action) => {
+            let edit_icon_custom_emoji_id = action.flags & (1 << 0) != 0; // ICON_EMOJI_ID_MASK
+            let edit_is_closed = action.flags & (1 << 1) != 0; // CLOSED_MASK
+            let edit_is_hidden = action.flags & (1 << 2) != 0; // HIDDEN_MASK
+            // ignore replied_message_info
+            MessageContent::TopicEdit(MessageTopicEdit {
+                edited_data: ForumTopicEditedData {
+                    title: action.title,
+                    icon_custom_emoji_id: CustomEmojiId::new(action.icon_emoji_id),
+                    edit_icon_custom_emoji_id,
+                    edit_is_closed,
+                    is_closed: action.closed,
+                    edit_is_hidden,
+                    is_hidden: action.hidden,
+                },
+            })
+        }
+        telegram_api::MessageAction::messageActionSuggestProfilePhoto(action) => {
+            let photo = action
+                .photo
+                .map(crate::photo::get_photo)
+                .unwrap_or_default();
+            if photo.is_empty() {
+                return fallback_action_message_content();
+            }
+            MessageContent::SuggestProfilePhoto(MessageSuggestProfilePhoto { photo })
+        }
+        telegram_api::MessageAction::messageActionRequestedPeer(action) => {
+            // ignore replied_message_info
+            let mut shared_dialog_ids = Vec::new();
+            for peer in &action.peers {
+                let dialog_id = DialogId::from_peer(peer);
+                if dialog_id.is_valid() {
+                    shared_dialog_ids.push(dialog_id);
+                }
+            }
+            if shared_dialog_ids.len() > 1
+                && shared_dialog_ids
+                    .iter()
+                    .any(|dialog_id| dialog_id.get_type() != DialogType::User)
+            {
+                shared_dialog_ids.clear();
+            }
+            if shared_dialog_ids.is_empty() || shared_dialog_ids.len() != action.peers.len() {
+                tdutils::log_error!("Receive invalid {action:?}");
+                return fallback_action_message_content();
+            }
+            MessageContent::RequestedDialog(MessageRequestedDialog {
+                shared_dialog_ids,
+                button_id: action.button_id,
+            })
+        }
+        telegram_api::MessageAction::messageActionSetChatWallPaper(action) => {
+            let Some(background_info) = td.get_background_info(action.wallpaper, true, false)
+            else {
+                return fallback_action_message_content();
+            };
+            let mut reply_to_message_id =
+                replied_message_info.get_same_chat_reply_to_message_id(true);
+            if !reply_to_message_id.is_valid() || !action.same {
+                reply_to_message_id = crate::messages_manager::MessageId::default();
+            }
+            MessageContent::SetBackground(MessageSetBackground {
+                old_message_id: to_chat_manager_message_id(reply_to_message_id),
+                background_info,
+                for_both: action.for_both,
+            })
+        }
+        telegram_api::MessageAction::messageActionGiveawayLaunch(action) => {
+            MessageContent::GiveawayLaunch(MessageGiveawayLaunch {
+                star_count: get_star_count(action.stars),
+            })
+        }
+        telegram_api::MessageAction::messageActionGiftCode(action) => {
+            let mut dialog_id = DialogId::default();
+            if let Some(boost_peer) = &action.boost_peer {
+                dialog_id = DialogId::from_peer(boost_peer);
+                if !dialog_id.is_valid() {
+                    tdutils::log_error!("Receive invalid {action:?}");
+                    return fallback_action_message_content();
+                }
+                if dialog_id.get_type() != DialogType::User {
+                    td.force_create_dialog(dialog_id, "messageActionGiftCode");
+                }
+            }
+            let text = crate::message_entity::get_formatted_text_of_text_with_entities(
+                Some(&mut ContextUserManager { td }),
+                action.message,
+                true,
+                false,
+                "messageActionGiftCode",
+            );
+            MessageContent::GiftCode(MessageGiftCode {
+                creator_dialog_id: dialog_id,
+                text,
+                days: action.days,
+                currency: action.currency,
+                amount: action.amount,
+                crypto_currency: action.crypto_currency,
+                crypto_amount: action.crypto_amount,
+                via_giveaway: action.via_giveaway,
+                is_unclaimed: action.unclaimed,
+                code: action.slug,
+            })
+        }
+        telegram_api::MessageAction::messageActionGiveawayResults(action) => {
+            let mut reply_to_message_id =
+                replied_message_info.get_same_chat_reply_to_message_id(true);
+            if !reply_to_message_id.is_valid()
+                && reply_to_message_id != crate::messages_manager::MessageId::default()
+            {
+                tdutils::log_error!(
+                    "Receive giveaway results message with {} in {owner_dialog_id}",
+                    reply_to_message_id.get()
+                );
+                reply_to_message_id = crate::messages_manager::MessageId::default();
+            }
+            MessageContent::GiveawayResults(MessageGiveawayResults {
+                giveaway_message_id: to_chat_manager_message_id(reply_to_message_id),
+                winner_count: action.winners_count,
+                unclaimed_count: action.unclaimed_count,
+                is_star_giveaway: action.stars,
+            })
+        }
+        telegram_api::MessageAction::messageActionBoostApply(action) => {
+            MessageContent::BoostApply(MessageBoostApply {
+                boost_count: action.boosts.max(0),
+            })
+        }
+        telegram_api::MessageAction::messageActionRequestedPeerSentMe(action) => {
+            // ignore replied_message_info
+            let mut shared_dialogs = Vec::new();
+            for peer in &action.peers {
+                if let Some(shared_dialog) = td.get_shared_dialog_from_peer(peer.clone()) {
+                    shared_dialogs.push(shared_dialog);
+                }
+            }
+            if shared_dialogs.len() > 1 && shared_dialogs.iter().any(|dialog| !dialog.is_user()) {
+                shared_dialogs.clear();
+            }
+            if shared_dialogs.is_empty() || shared_dialogs.len() != action.peers.len() {
+                tdutils::log_error!("Receive invalid {action:?}");
+                return fallback_action_message_content();
+            }
+            MessageContent::DialogShared(MessageDialogShared {
+                shared_dialogs,
+                button_id: action.button_id,
+            })
+        }
+        telegram_api::MessageAction::messageActionPaymentRefunded(action) => {
+            let total_amount = action.total_amount;
+            let total_amount = if total_amount <= 0 || !check_currency_amount(total_amount) {
+                tdutils::log_error!("Receive invalid refunded payment amount {total_amount}");
+                0
+            } else {
+                total_amount
+            };
+            let charge = action.charge.unwrap_or_default();
+            MessageContent::PaymentRefunded(MessagePaymentRefunded {
+                dialog_id: DialogId::from_peer(
+                    action
+                        .peer
+                        .as_ref()
+                        .unwrap_or(&telegram_api::Peer::default()),
+                ),
+                currency: action.currency,
+                total_amount,
+                invoice_payload: String::from_utf8_lossy(&action.payload).into_owned(),
+                telegram_payment_charge_id: charge.id,
+                provider_payment_charge_id: charge.provider_charge_id,
+            })
+        }
+        telegram_api::MessageAction::messageActionGiftStars(action) => {
+            let mut amount = action.amount;
+            if amount <= 0 || !check_currency_amount(amount) {
+                tdutils::log_error!("Receive invalid gifted star price {amount}");
+                amount = 0;
+            }
+            let mut crypto_amount = action.crypto_amount;
+            if action.crypto_currency.is_empty() {
+                if crypto_amount != 0 {
+                    tdutils::log_error!(
+                        "Receive gifted star crypto price {crypto_amount} without currency"
+                    );
+                    crypto_amount = 0;
+                }
+            } else if crypto_amount <= 0 {
+                tdutils::log_error!("Receive invalid gifted star crypto amount {crypto_amount}");
+                crypto_amount = 0;
+            }
+            MessageContent::GiftStars(MessageGiftStars {
+                currency: action.currency,
+                amount,
+                crypto_currency: action.crypto_currency,
+                crypto_amount,
+                star_count: get_star_count(action.stars),
+                transaction_id: action.transaction_id,
+            })
+        }
+        telegram_api::MessageAction::messageActionPrizeStars(action) => {
+            let boosted_dialog_id = DialogId::from_peer(
+                action
+                    .boost_peer
+                    .as_ref()
+                    .unwrap_or(&telegram_api::Peer::default()),
+            );
+            if !boosted_dialog_id.is_valid() {
+                tdutils::log_error!("Receive invalid {action:?}");
+                return fallback_action_message_content();
+            }
+            td.force_create_dialog(boosted_dialog_id, "messageActionPrizeStars");
+            MessageContent::PrizeStars(MessagePrizeStars {
+                star_count: get_star_count(action.stars),
+                transaction_id: action.transaction_id,
+                boosted_dialog_id,
+                giveaway_message_id: MessageId::new(i64::from(action.giveaway_msg_id)),
+                is_unclaimed: action.unclaimed,
+            })
+        }
+        telegram_api::MessageAction::messageActionStarGift(_) => {
+            // deferred with the unmodeled StarGift value class — the C++
+            // validates and constructs MessageStarGift here
+            fallback_action_message_content()
+        }
+        telegram_api::MessageAction::messageActionStarGiftUnique(_) => {
+            // deferred with the unmodeled StarGift value class — the C++
+            // validates and constructs MessageStarGiftUnique here
+            fallback_action_message_content()
+        }
+        telegram_api::MessageAction::messageActionPaidMessagesRefunded(action) => {
+            MessageContent::PaidMessagesRefunded(MessagePaidMessagesRefunded {
+                message_count: action.count.max(0),
+                star_count: get_star_count(action.stars),
+            })
+        }
+        telegram_api::MessageAction::messageActionPaidMessagesPrice(action) => {
+            MessageContent::PaidMessagesPrice(MessagePaidMessagesPrice {
+                star_count: get_star_count(action.stars),
+                broadcast_messages_allowed: action.broadcast_messages_allowed,
+            })
+        }
+        telegram_api::MessageAction::messageActionConferenceCall(action) => {
+            let other_participant_dialog_ids = Vec::new();
+            for peer in &action.other_participants {
+                let dialog_id = DialogId::from_peer(peer);
+                if !dialog_id.is_valid() {
+                    tdutils::log_error!("Receive invalid {dialog_id}");
+                    continue;
+                }
+                if dialog_id.get_type() != DialogType::User {
+                    td.force_create_dialog(dialog_id, "messageActionConferenceCall");
+                }
+                // NOTE: the C++ never pushes valid dialogs into
+                // `other_participant_dialog_ids` (only the
+                // `force_create_dialog` side effect) — ported faithfully.
+            }
+            MessageContent::ConferenceCall(MessageConferenceCall {
+                call_id: action.call_id,
+                duration: action.duration.max(0),
+                other_participant_dialog_ids,
+                is_active: action.active,
+                is_video: action.video,
+                was_missed: action.missed,
+            })
+        }
+        telegram_api::MessageAction::messageActionTodoCompletions(action) => {
+            let mut reply_to_message_id =
+                replied_message_info.get_same_chat_reply_to_message_id(true);
+            if !reply_to_message_id.is_valid()
+                && reply_to_message_id != crate::messages_manager::MessageId::default()
+            {
+                tdutils::log_error!(
+                    "Receive checklist task marks change message with {} in {owner_dialog_id}",
+                    reply_to_message_id.get()
+                );
+                reply_to_message_id = crate::messages_manager::MessageId::default();
+            }
+            MessageContent::TodoCompletions(MessageTodoCompletions {
+                to_do_message_id: to_chat_manager_message_id(reply_to_message_id),
+                completed_task_ids: action.completed,
+                incompleted_task_ids: action.incompleted,
+            })
+        }
+        telegram_api::MessageAction::messageActionTodoAppendTasks(action) => {
+            let mut reply_to_message_id =
+                replied_message_info.get_same_chat_reply_to_message_id(true);
+            if !reply_to_message_id.is_valid()
+                && reply_to_message_id != crate::messages_manager::MessageId::default()
+            {
+                tdutils::log_error!(
+                    "Receive checklist task addition message with {} in {owner_dialog_id}",
+                    reply_to_message_id.get()
+                );
+                reply_to_message_id = crate::messages_manager::MessageId::default();
+            }
+            let mut items = Vec::with_capacity(action.list.len());
+            for item in action.list {
+                items.push(ToDoItem {
+                    id: item.id,
+                    title: crate::message_entity::get_formatted_text_of_text_with_entities(
+                        Some(&mut ContextUserManager { td }),
+                        item.title,
+                        true,
+                        true,
+                        "ToDoItem",
+                    ),
+                });
+            }
+            MessageContent::TodoAppendTasks(MessageTodoAppendTasks {
+                to_do_message_id: to_chat_manager_message_id(reply_to_message_id),
+                items,
+            })
+        }
+        telegram_api::MessageAction::messageActionSuggestedPostApproval(action) => {
+            let mut reply_to_message_id =
+                replied_message_info.get_same_chat_reply_to_message_id(true);
+            if !reply_to_message_id.is_valid()
+                && reply_to_message_id != crate::messages_manager::MessageId::default()
+            {
+                tdutils::log_error!(
+                    "Receive suggested post refund message with {} in {owner_dialog_id}",
+                    reply_to_message_id.get()
+                );
+                reply_to_message_id = crate::messages_manager::MessageId::default();
+            }
+            MessageContent::SuggestedPostApproval(MessageSuggestedPostApproval {
+                suggested_post_message_id: to_chat_manager_message_id(reply_to_message_id),
+                price: get_suggested_post_price(action.price),
+                comment: action.reject_comment,
+                send_date: action.schedule_date,
+                is_rejected: action.rejected,
+                is_balance_too_low: action.balance_too_low,
+            })
+        }
+        telegram_api::MessageAction::messageActionSuggestedPostSuccess(action) => {
+            let mut reply_to_message_id =
+                replied_message_info.get_same_chat_reply_to_message_id(true);
+            if !reply_to_message_id.is_valid()
+                && reply_to_message_id != crate::messages_manager::MessageId::default()
+            {
+                tdutils::log_error!(
+                    "Receive suggested post success message with {} in {owner_dialog_id}",
+                    reply_to_message_id.get()
+                );
+                reply_to_message_id = crate::messages_manager::MessageId::default();
+            }
+            MessageContent::SuggestedPostSuccess(MessageSuggestedPostSuccess {
+                suggested_post_message_id: to_chat_manager_message_id(reply_to_message_id),
+                amount: get_currency_amount_from_stars(action.price),
+            })
+        }
+        telegram_api::MessageAction::messageActionSuggestedPostRefund(action) => {
+            let mut reply_to_message_id =
+                replied_message_info.get_same_chat_reply_to_message_id(true);
+            if !reply_to_message_id.is_valid()
+                && reply_to_message_id != crate::messages_manager::MessageId::default()
+            {
+                tdutils::log_error!(
+                    "Receive suggested post refund message with {} in {owner_dialog_id}",
+                    reply_to_message_id.get()
+                );
+                reply_to_message_id = crate::messages_manager::MessageId::default();
+            }
+            MessageContent::SuggestedPostRefund(MessageSuggestedPostRefund {
+                suggested_post_message_id: to_chat_manager_message_id(reply_to_message_id),
+                is_payer_initiated: action.payer_initiated,
+            })
+        }
+        telegram_api::MessageAction::messageActionGiftTon(action) => {
+            let mut amount = action.amount;
+            if amount <= 0 || !check_currency_amount(amount) {
+                tdutils::log_error!("Receive invalid gifted TON price {amount}");
+                amount = 0;
+            }
+            let mut crypto_amount = action.crypto_amount;
+            if action.crypto_currency.is_empty() {
+                if crypto_amount != 0 {
+                    tdutils::log_error!(
+                        "Receive gifted TON crypto price {crypto_amount} without currency"
+                    );
+                    crypto_amount = 0;
+                }
+            } else if crypto_amount <= 0 {
+                tdutils::log_error!("Receive invalid gifted TON crypto amount {crypto_amount}");
+                crypto_amount = 0;
+            }
+            MessageContent::GiftTon(MessageGiftTon {
+                currency: action.currency,
+                amount,
+                crypto_currency: action.crypto_currency,
+                crypto_amount,
+                transaction_id: action.transaction_id,
+            })
+        }
+        telegram_api::MessageAction::messageActionSuggestBirthday(action) => {
+            let birthday = action.birthday.unwrap_or_default();
+            MessageContent::SuggestBirthday(MessageSuggestBirthday {
+                birthdate: Birthdate::new(birthday.day, birthday.month, birthday.year),
+            })
+        }
+        telegram_api::MessageAction::messageActionStarGiftPurchaseOffer(_) => {
+            // deferred with the unmodeled StarGift value class
+            fallback_action_message_content()
+        }
+        telegram_api::MessageAction::messageActionStarGiftPurchaseOfferDeclined(_) => {
+            // deferred with the unmodeled StarGift value class
+            fallback_action_message_content()
+        }
+        telegram_api::MessageAction::messageActionNewCreatorPending(action) => {
+            let mut new_creator_user_id = UserId::new(action.new_creator_id);
+            if !new_creator_user_id.is_valid() && new_creator_user_id != UserId::default() {
+                tdutils::log_error!("Receive {new_creator_user_id:?}");
+                new_creator_user_id = UserId::default();
+            }
+            MessageContent::NewCreatorPending(MessageNewCreatorPending {
+                new_creator_user_id,
+            })
+        }
+        telegram_api::MessageAction::messageActionChangeCreator(action) => {
+            let new_creator_user_id = UserId::new(action.new_creator_id);
+            if !new_creator_user_id.is_valid() {
+                tdutils::log_error!("Receive {new_creator_user_id:?}");
+                return fallback_action_message_content();
+            }
+            MessageContent::ChangeCreator(MessageChangeCreator {
+                new_creator_user_id,
+            })
+        }
+        telegram_api::MessageAction::messageActionNoForwardsToggle(action) => {
+            let mut reply_to_message_id =
+                replied_message_info.get_same_chat_reply_to_message_id(true);
+            if !reply_to_message_id.is_valid()
+                && reply_to_message_id != crate::messages_manager::MessageId::default()
+            {
+                tdutils::log_error!(
+                    "Receive protected content toggle with {} in {owner_dialog_id}",
+                    reply_to_message_id.get()
+                );
+                reply_to_message_id = crate::messages_manager::MessageId::default();
+            }
+            MessageContent::NoForwardsToggle(MessageNoForwardsToggle {
+                request_message_id: to_chat_manager_message_id(reply_to_message_id),
+                prev_value: action.prev_value,
+                new_value: action.new_value,
+            })
+        }
+        telegram_api::MessageAction::messageActionNoForwardsRequest(action) => {
+            if !action.prev_value || action.new_value {
+                tdutils::log_error!("Receive {action:?}");
+                return MessageContent::Unsupported(MessageUnsupported::default());
+            }
+            MessageContent::NoForwardsRequest(MessageNoForwardsRequest {
+                is_expired: action.expired,
+                prev_value: action.prev_value,
+                new_value: action.new_value,
+            })
+        }
+        telegram_api::MessageAction::messageActionPollAppendAnswer(action) => {
+            let reply_to_message_id = replied_message_info.get_same_chat_reply_to_message_id(true);
+            if !reply_to_message_id.is_valid() {
+                tdutils::log_error!(
+                    "Receive poll option addition with {} in {owner_dialog_id}",
+                    reply_to_message_id.get()
+                );
+                return MessageContent::Unsupported(MessageUnsupported::default());
+            }
+            let Some((text, data)) = td.parse_poll_option_answer(action.answer.map(|a| *a)) else {
+                return MessageContent::Unsupported(MessageUnsupported::default());
+            };
+            MessageContent::PollAppendAnswer(MessagePollAppendAnswer {
+                poll_message_id: to_chat_manager_message_id(reply_to_message_id),
+                text,
+                data,
+            })
+        }
+        telegram_api::MessageAction::messageActionPollDeleteAnswer(action) => {
+            let reply_to_message_id = replied_message_info.get_same_chat_reply_to_message_id(true);
+            if !reply_to_message_id.is_valid() {
+                tdutils::log_error!(
+                    "Receive poll option deletion with {} in {owner_dialog_id}",
+                    reply_to_message_id.get()
+                );
+                return MessageContent::Unsupported(MessageUnsupported::default());
+            }
+            let Some((text, data)) = td.parse_poll_option_answer(action.answer.map(|a| *a)) else {
+                return MessageContent::Unsupported(MessageUnsupported::default());
+            };
+            MessageContent::PollDeleteAnswer(MessagePollDeleteAnswer {
+                poll_message_id: to_chat_manager_message_id(reply_to_message_id),
+                text,
+                data,
+            })
+        }
+        telegram_api::MessageAction::messageActionManagedBotCreated(action) => {
+            let bot_user_id = UserId::new(action.bot_id);
+            if !bot_user_id.is_valid() {
+                tdutils::log_error!("Receive {bot_user_id:?}");
+                return fallback_action_message_content();
+            }
+            MessageContent::ManagedBotCreated(MessageManagedBotCreated { bot_user_id })
+        }
+        telegram_api::MessageAction::messageActionChangeCommunity(action) => {
+            let mut community_id = CommunityId::new(action.community_id);
+            if !community_id.is_valid() {
+                community_id = CommunityId::default();
+            }
+            MessageContent::ChangeCommunity(MessageChangeCommunity { community_id })
+        }
+        telegram_api::MessageAction::messageActionChatJoinedViaCommunity(action) => {
+            let mut community_id = CommunityId::new(action.community_id);
+            if !community_id.is_valid() {
+                tdutils::log_error!("Receive {action:?}");
+                community_id = CommunityId::default();
+            }
+            MessageContent::ChatJoinedViaCommunity(MessageChatJoinedViaCommunity { community_id })
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // M.9.4d — the poll arm (MessageContent.cpp:5060-5132, 5302-5378) with the
 // PollOption input plane (PollOption.h, PollOption.cpp:53-97) and the quiz
 // validator (PollManager.cpp:453-468). The Poll VALUE class stays with the
@@ -18521,6 +19869,52 @@ mod tests {
 
         fn has_secret_input_media_sticker(&self, _file_id: FileId) -> bool {
             false
+        }
+
+        fn is_user_deleted(&self, _user_id: UserId) -> bool {
+            false
+        }
+
+        fn get_recent_call_access_hash(&self, _call_id: i64) -> i64 {
+            0
+        }
+
+        fn get_encrypted_secure_values(
+            &mut self,
+            _secure_values: Vec<telegram_api::SecureValue>,
+        ) -> Vec<EncryptedSecureValue> {
+            Vec::new()
+        }
+
+        fn get_shared_dialog_from_peer(
+            &mut self,
+            _peer: telegram_api::RequestedPeer,
+        ) -> Option<SharedDialog> {
+            None
+        }
+
+        fn get_background_info(
+            &mut self,
+            _wallpaper: Option<telegram_api::WallPaper>,
+            _is_local: bool,
+            _for_dark_theme: bool,
+        ) -> Option<BackgroundInfo> {
+            None
+        }
+
+        fn get_web_app_from_bot_app(
+            &mut self,
+            _bot_app: telegram_api::BotApp,
+            _owner_dialog_id: DialogId,
+        ) -> WebApp {
+            WebApp::default()
+        }
+
+        fn parse_poll_option_answer(
+            &mut self,
+            _answer: Option<telegram_api::PollAnswer>,
+        ) -> Option<(FormattedText, String)> {
+            None
         }
     }
 
@@ -23003,6 +24397,710 @@ mod tests {
             }
             other => panic!("unexpected media: {other:?}"),
         }
+    }
+
+    // -- M.9.15: the action dispatcher --------------------------------------
+
+    fn action_content(
+        td: &mut TestContext,
+        action: Option<telegram_api::MessageAction>,
+        replied_message_info: &RepliedMessageInfo,
+    ) -> MessageContent {
+        get_action_message_content(
+            td,
+            action,
+            DialogId::from_user_id(UserId::new(7)),
+            1700000001,
+            replied_message_info,
+            false,
+        )
+    }
+
+    #[test]
+    fn action_chat_edit_arms() {
+        let mut td = TestContext::default();
+        let no_reply = RepliedMessageInfo::default();
+
+        // chat create filters invalid user ids
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionChatCreate(
+                telegram_api::messageActionChatCreate {
+                    title: "T".to_string(),
+                    users: vec![5, 0, 6],
+                },
+            )),
+            &no_reply,
+        );
+        match content {
+            MessageContent::ChatCreate(m) => {
+                assert_eq!(m.title, "T");
+                assert_eq!(m.participant_user_ids, vec![UserId::new(5), UserId::new(6)]);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // edit title
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionChatEditTitle(
+                telegram_api::messageActionChatEditTitle {
+                    title: "N".to_string(),
+                },
+            )),
+            &no_reply,
+        );
+        match content {
+            MessageContent::ChatChangeTitle(m) => assert_eq!(m.title, "N"),
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // delete photo / history clear are unit structs
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionChatDeletePhoto(
+                telegram_api::messageActionChatDeletePhoto,
+            )),
+            &no_reply,
+        );
+        assert!(matches!(content, MessageContent::ChatDeletePhoto(_)));
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionHistoryClear(
+                telegram_api::messageActionHistoryClear,
+            )),
+            &no_reply,
+        );
+        assert!(matches!(content, MessageContent::ChatDeleteHistory(_)));
+
+        // empty action falls back to text
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionEmpty(
+                telegram_api::messageActionEmpty,
+            )),
+            &no_reply,
+        );
+        assert!(matches!(content, MessageContent::Text(_)));
+    }
+
+    #[test]
+    fn action_pin_and_game_score_use_the_replied_id() {
+        let mut td = TestContext::default();
+        let replied = RepliedMessageInfo::legacy(
+            crate::messages_manager::MessageId::from_server_message_id(
+                crate::messages_manager::ServerMessageId::new(42),
+            ),
+            DialogId::default(),
+        );
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionPinMessage(
+                telegram_api::messageActionPinMessage,
+            )),
+            &replied,
+        );
+        match content {
+            MessageContent::PinMessage(m) => {
+                assert_eq!(m.message_id.get(), 42 << 20);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionGameScore(
+                telegram_api::messageActionGameScore {
+                    game_id: 100,
+                    score: 50,
+                },
+            )),
+            &replied,
+        );
+        match content {
+            MessageContent::GameScore(m) => {
+                assert_eq!(m.game_message_id.get(), 42 << 20);
+                assert_eq!(m.game_id, 100);
+                assert_eq!(m.score, 50);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // no reply -> invalid id resets
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionPinMessage(
+                telegram_api::messageActionPinMessage,
+            )),
+            &RepliedMessageInfo::default(),
+        );
+        match content {
+            MessageContent::PinMessage(m) => assert!(!m.message_id.is_valid()),
+            other => panic!("unexpected content: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn action_phone_call_discard_reasons() {
+        let mut td = TestContext::default();
+        let action = telegram_api::messageActionPhoneCall {
+            flags: 0,
+            video: true,
+            call_id: 55,
+            reason: Some(
+                telegram_api::PhoneCallDiscardReason::phoneCallDiscardReasonBusy(
+                    telegram_api::phoneCallDiscardReasonBusy,
+                ),
+            ),
+            duration: 10,
+        };
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionPhoneCall(action)),
+            &RepliedMessageInfo::default(),
+        );
+        match content {
+            MessageContent::Call(m) => {
+                assert_eq!(m.call_id, 55);
+                assert_eq!(m.duration, 10);
+                assert!(m.is_video);
+                assert_eq!(m.discard_reason.r#type, CallDiscardReasonType::Declined);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // a negative duration falls back
+        let action = telegram_api::messageActionPhoneCall {
+            flags: 0,
+            video: false,
+            call_id: 55,
+            reason: None,
+            duration: -1,
+        };
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionPhoneCall(action)),
+            &RepliedMessageInfo::default(),
+        );
+        assert!(matches!(content, MessageContent::Text(_)));
+    }
+
+    #[test]
+    fn action_payment_sent_arms() {
+        let mut td = TestContext::default();
+        let replied = RepliedMessageInfo::legacy(
+            crate::messages_manager::MessageId::from_server_message_id(
+                crate::messages_manager::ServerMessageId::new(7),
+            ),
+            DialogId::default(),
+        );
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionPaymentSent(
+                telegram_api::messageActionPaymentSent {
+                    flags: 0,
+                    recurring_init: true,
+                    recurring_used: false,
+                    currency: "USD".to_string(),
+                    total_amount: 100,
+                    invoice_slug: "slug".to_string(),
+                    subscription_until_date: 500,
+                },
+            )),
+            &replied,
+        );
+        match content {
+            MessageContent::PaymentSuccessful(m) => {
+                assert_eq!(m.currency, "USD");
+                assert_eq!(m.total_amount, 100);
+                assert_eq!(m.invoice_payload, "slug");
+                assert_eq!(m.invoice_message_id.get(), 7 << 20);
+                assert!(m.is_first_recurring);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // invalid amount collapses to 0
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionPaymentSent(
+                telegram_api::messageActionPaymentSent {
+                    flags: 0,
+                    recurring_init: false,
+                    recurring_used: false,
+                    currency: "USD".to_string(),
+                    total_amount: -5,
+                    invoice_slug: String::new(),
+                    subscription_until_date: 0,
+                },
+            )),
+            &RepliedMessageInfo::default(),
+        );
+        match content {
+            MessageContent::PaymentSuccessful(m) => assert_eq!(m.total_amount, 0),
+            other => panic!("unexpected content: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn action_bot_allowed_variants() {
+        let mut td = TestContext::default();
+        let no_reply = RepliedMessageInfo::default();
+        let mut action = |attach_menu, domain, from_request, app| {
+            action_content(
+                &mut td,
+                Some(telegram_api::MessageAction::messageActionBotAllowed(
+                    telegram_api::messageActionBotAllowed {
+                        flags: 0,
+                        attach_menu,
+                        from_request,
+                        domain,
+                        app,
+                    },
+                )),
+                &no_reply,
+            )
+        };
+        assert!(matches!(
+            action(true, String::new(), false, None),
+            MessageContent::WriteAccessAllowed(_)
+        ));
+        assert!(matches!(
+            action(false, "example.com".to_string(), false, None),
+            MessageContent::WebsiteConnected(m) if m.domain_name == "example.com"
+        ));
+        assert!(matches!(
+            action(false, String::new(), true, None),
+            MessageContent::WriteAccessAllowedByRequest(_)
+        ));
+        assert!(matches!(
+            action(false, String::new(), false, None),
+            MessageContent::Unsupported(_)
+        ));
+    }
+
+    #[test]
+    fn action_secure_values_dedup() {
+        let mut td = TestContext::default();
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionSecureValuesSent(
+                telegram_api::messageActionSecureValuesSent {
+                    types: vec![
+                        telegram_api::SecureValueType::secureValueTypePassport(
+                            telegram_api::secureValueTypePassport,
+                        ),
+                        telegram_api::SecureValueType::secureValueTypePhone(
+                            telegram_api::secureValueTypePhone,
+                        ),
+                        telegram_api::SecureValueType::secureValueTypePassport(
+                            telegram_api::secureValueTypePassport,
+                        ),
+                    ],
+                },
+            )),
+            &RepliedMessageInfo::default(),
+        );
+        match content {
+            MessageContent::PassportDataSent(m) => {
+                assert_eq!(m.types.len(), 2);
+                assert_eq!(m.types[0], SecureValueType::Passport);
+                assert_eq!(m.types[1], SecureValueType::PhoneNumber);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn action_group_call_and_ttl_arms() {
+        let mut td = TestContext::default();
+        let no_reply = RepliedMessageInfo::default();
+        // with duration flag
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionGroupCall(
+                telegram_api::messageActionGroupCall {
+                    flags: 1,
+                    call: Some(telegram_api::InputGroupCall::inputGroupCall(
+                        telegram_api::inputGroupCall {
+                            id: 9,
+                            access_hash: 8,
+                        },
+                    )),
+                    duration: 60,
+                },
+            )),
+            &no_reply,
+        );
+        match content {
+            MessageContent::GroupCall(m) => {
+                assert_eq!(m.duration, 60);
+                assert_eq!(m.schedule_date, -1);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // set messages ttl with an auto setting user
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionSetMessagesTTL(
+                telegram_api::messageActionSetMessagesTTL {
+                    flags: 0,
+                    period: 30,
+                    auto_setting_from: 5,
+                },
+            )),
+            &no_reply,
+        );
+        match content {
+            MessageContent::ChatSetTtl(m) => {
+                assert_eq!(m.ttl, 30);
+                assert_eq!(m.from_user_id, UserId::new(5));
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // a negative period falls back
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionSetMessagesTTL(
+                telegram_api::messageActionSetMessagesTTL {
+                    flags: 0,
+                    period: -1,
+                    auto_setting_from: 0,
+                },
+            )),
+            &no_reply,
+        );
+        assert!(matches!(content, MessageContent::Text(_)));
+    }
+
+    #[test]
+    fn action_gift_premium_validation() {
+        let mut td = TestContext::default();
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionGiftPremium(
+                telegram_api::messageActionGiftPremium {
+                    flags: 0,
+                    currency: "USD".to_string(),
+                    amount: 500,
+                    days: 3,
+                    crypto_currency: String::new(),
+                    crypto_amount: 0,
+                    message: None,
+                },
+            )),
+            &RepliedMessageInfo::default(),
+        );
+        match content {
+            MessageContent::GiftPremium(m) => {
+                assert_eq!(m.currency, "USD");
+                assert_eq!(m.amount, 500);
+                assert_eq!(m.days, 3);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // a crypto amount without a currency resets
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionGiftPremium(
+                telegram_api::messageActionGiftPremium {
+                    flags: 0,
+                    currency: "USD".to_string(),
+                    amount: 500,
+                    days: 3,
+                    crypto_currency: String::new(),
+                    crypto_amount: 7,
+                    message: None,
+                },
+            )),
+            &RepliedMessageInfo::default(),
+        );
+        match content {
+            MessageContent::GiftPremium(m) => assert_eq!(m.crypto_amount, 0),
+            other => panic!("unexpected content: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn action_topic_edit_flags() {
+        let mut td = TestContext::default();
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionTopicEdit(
+                telegram_api::messageActionTopicEdit {
+                    flags: (1 << 0) | (1 << 1),
+                    title: "title".to_string(),
+                    icon_emoji_id: 3,
+                    closed: true,
+                    hidden: false,
+                },
+            )),
+            &RepliedMessageInfo::default(),
+        );
+        match content {
+            MessageContent::TopicEdit(m) => {
+                assert_eq!(m.edited_data.title, "title");
+                assert!(m.edited_data.edit_icon_custom_emoji_id);
+                assert!(m.edited_data.edit_is_closed);
+                assert!(!m.edited_data.edit_is_hidden);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn action_requested_peer_validation() {
+        let mut td = TestContext::default();
+        let peers = vec![
+            telegram_api::Peer::peerUser(telegram_api::peerUser { user_id: 5 }),
+            telegram_api::Peer::peerUser(telegram_api::peerUser { user_id: 6 }),
+        ];
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionRequestedPeer(
+                telegram_api::messageActionRequestedPeer {
+                    button_id: 2,
+                    peers: peers.clone(),
+                },
+            )),
+            &RepliedMessageInfo::default(),
+        );
+        match content {
+            MessageContent::RequestedDialog(m) => {
+                assert_eq!(m.button_id, 2);
+                assert_eq!(
+                    m.shared_dialog_ids,
+                    vec![
+                        DialogId::from_user_id(UserId::new(5)),
+                        DialogId::from_user_id(UserId::new(6))
+                    ]
+                );
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // mixing a channel clears the list and falls back
+        let mixed = vec![
+            telegram_api::Peer::peerUser(telegram_api::peerUser { user_id: 5 }),
+            telegram_api::Peer::peerChannel(telegram_api::peerChannel { channel_id: 8 }),
+        ];
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionRequestedPeer(
+                telegram_api::messageActionRequestedPeer {
+                    button_id: 2,
+                    peers: mixed,
+                },
+            )),
+            &RepliedMessageInfo::default(),
+        );
+        assert!(matches!(content, MessageContent::Text(_)));
+    }
+
+    #[test]
+    fn action_deferred_star_gift_and_chat_theme_arms_fall_back() {
+        let mut td = TestContext::default();
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionStarGift(
+                telegram_api::messageActionStarGift::default(),
+            )),
+            &RepliedMessageInfo::default(),
+        );
+        assert!(matches!(content, MessageContent::Text(_)));
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionSetChatTheme(
+                telegram_api::messageActionSetChatTheme::default(),
+            )),
+            &RepliedMessageInfo::default(),
+        );
+        assert!(matches!(content, MessageContent::Text(_)));
+    }
+
+    #[test]
+    fn action_misc_arms() {
+        let mut td = TestContext::default();
+        let no_reply = RepliedMessageInfo::default();
+
+        // boost apply clamps at zero
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionBoostApply(
+                telegram_api::messageActionBoostApply { boosts: -3 },
+            )),
+            &no_reply,
+        );
+        match content {
+            MessageContent::BoostApply(m) => assert_eq!(m.boost_count, 0),
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // giveaway launch
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionGiveawayLaunch(
+                telegram_api::messageActionGiveawayLaunch {
+                    flags: 0,
+                    stars: 100,
+                },
+            )),
+            &no_reply,
+        );
+        match content {
+            MessageContent::GiveawayLaunch(m) => assert_eq!(m.star_count, 100),
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // todo append tasks
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionTodoAppendTasks(
+                telegram_api::messageActionTodoAppendTasks {
+                    list: vec![telegram_api::TodoItem {
+                        id: 3,
+                        title: Some(telegram_api::TextWithEntities {
+                            text: "task".to_string(),
+                            entities: Vec::new(),
+                        }),
+                    }],
+                },
+            )),
+            &no_reply,
+        );
+        match content {
+            MessageContent::TodoAppendTasks(m) => {
+                assert_eq!(m.items.len(), 1);
+                assert_eq!(m.items[0].id, 3);
+                assert_eq!(m.items[0].title.text, "task");
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // suggest birthday
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionSuggestBirthday(
+                telegram_api::messageActionSuggestBirthday {
+                    birthday: Some(telegram_api::Birthday {
+                        flags: 0,
+                        day: 31,
+                        month: 12,
+                        year: 2000,
+                    }),
+                },
+            )),
+            &no_reply,
+        );
+        match content {
+            MessageContent::SuggestBirthday(m) => {
+                assert_eq!(m.birthdate.get_day(), 31);
+                assert_eq!(m.birthdate.get_month(), 12);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // managed bot created
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionManagedBotCreated(
+                telegram_api::messageActionManagedBotCreated { bot_id: 5 },
+            )),
+            &no_reply,
+        );
+        match content {
+            MessageContent::ManagedBotCreated(m) => {
+                assert_eq!(m.bot_user_id, UserId::new(5))
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // no-forwards request with the wrong flags is unsupported
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionNoForwardsRequest(
+                telegram_api::messageActionNoForwardsRequest {
+                    flags: 0,
+                    prev_value: false,
+                    new_value: true,
+                    expired: false,
+                },
+            )),
+            &no_reply,
+        );
+        assert!(matches!(content, MessageContent::Unsupported(_)));
+
+        // poll append answer without a reply is unsupported
+        let content = action_content(
+            &mut td,
+            Some(telegram_api::MessageAction::messageActionPollAppendAnswer(
+                telegram_api::messageActionPollAppendAnswer { answer: None },
+            )),
+            &no_reply,
+        );
+        assert!(matches!(content, MessageContent::Unsupported(_)));
+    }
+
+    #[test]
+    fn action_helpers() {
+        // call discard reasons
+        assert_eq!(
+            get_call_discard_reason(&Some(
+                telegram_api::PhoneCallDiscardReason::phoneCallDiscardReasonMissed(
+                    telegram_api::phoneCallDiscardReasonMissed,
+                ),
+            ))
+            .r#type,
+            CallDiscardReasonType::Missed
+        );
+        assert_eq!(
+            get_call_discard_reason(&None).r#type,
+            CallDiscardReasonType::Empty
+        );
+
+        // order info: zero flags means none
+        assert!(get_order_info(None).is_none());
+        assert!(
+            get_order_info(Some(telegram_api::PaymentRequestedInfo {
+                flags: 0,
+                name: String::new(),
+                phone: String::new(),
+                email: String::new(),
+                shipping_address: None,
+            }))
+            .is_none()
+        );
+        let order_info = get_order_info(Some(telegram_api::PaymentRequestedInfo {
+            flags: 1,
+            name: "N".to_string(),
+            phone: "P".to_string(),
+            email: "E".to_string(),
+            shipping_address: Some(telegram_api::PostAddress {
+                street_line1: "S1".to_string(),
+                street_line2: "S2".to_string(),
+                city: "C".to_string(),
+                state: "ST".to_string(),
+                country_iso2: "US".to_string(),
+                post_code: "PC".to_string(),
+            }),
+        }))
+        .unwrap();
+        assert_eq!(order_info.name, "N");
+        assert_eq!(order_info.shipping_address.as_ref().unwrap().city, "C");
+
+        // encrypted credentials byte copies
+        let credentials =
+            get_encrypted_secure_credentials(telegram_api::SecureCredentialsEncrypted {
+                data: b"data".to_vec(),
+                hash: b"hash".to_vec(),
+                secret: b"secret".to_vec(),
+            });
+        assert_eq!(credentials.data, "data");
+        assert_eq!(credentials.hash, "hash");
+        assert_eq!(credentials.encrypted_secret, "secret");
     }
 
     // -- M.9.14: the intake dispatcher + dup_message_content ---------------
