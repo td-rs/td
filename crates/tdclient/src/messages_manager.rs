@@ -11940,6 +11940,354 @@ fn is_dialog_mention_notifications_disabled(ctx: &dyn MessageObjectContext, d: &
     d.notification_settings.disable_mention_notifications
 }
 
+// ---------------------------------------------------------------------------
+// M.10.5 — the edit path: `on_message_edited`
+// (MessagesManager.cpp:5985-6014), the update_message edit core
+// (MessagesManager.cpp:32217-32831) and the M.9.10/M.9.11 content-merge
+// machinery consumer `update_message_content`
+// (MessagesManager.cpp:32838-32876). The C++ driver is
+// `process_pts_update`'s `updateEditMessage` arm
+// (MessagesManager.cpp:5847-5860): `have_message_force` → the on_get_message
+// replace → `on_message_edited`; the replace/lookup halves need the
+// per-dialog message containers (M.10.9) and ride the recorded seam, while
+// the core below is driven with explicit messages.
+// ---------------------------------------------------------------------------
+
+/// `MessagesManager::need_message_changed_warning`
+/// (MessagesManager.cpp:32847-32863).
+pub fn need_message_changed_warning(old_message: &Message) -> bool {
+    if old_message.edit_date > 0 {
+        // message was edited
+        return false;
+    }
+    if is_ephemeral_message(old_message) {
+        // message has no edit_date, but could have been edited
+        return false;
+    }
+    if old_message.message_id.is_yet_unsent()
+        && (is_message_forward(old_message) || old_message.real_forward_from_dialog_id.is_valid())
+    {
+        // original message may be edited
+        return false;
+    }
+    if old_message.ttl.is_valid() {
+        // message can expire
+        return false;
+    }
+    if !old_message.restriction_reasons.is_empty() {
+        return false;
+    }
+    true
+}
+
+/// `MessagesManager::update_message_content`
+/// (MessagesManager.cpp:32838-32876) — the M.9.10 consumer driving
+/// [`crate::message_content::merge_and_compare_message_contents`] (M.9.11).
+/// The `update_edited_content`/`edited_messages_` plane
+/// (MessagesManager.cpp:32842-32846) is the edited-content store and lands
+/// with its owner slice; the port supports the on-dialog form only. The
+/// `DownloadManager::change_search_text` tail (32865-32874) is the
+/// file-source/search seam.
+#[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+pub fn update_message_content(
+    ctx: &mut dyn MessageObjectContext,
+    dialog_id: DialogId,
+    old_message: &mut Message,
+    mut new_content: MessageContent,
+    need_message_changed_warning: bool,
+    need_merge_files: bool,
+    is_message_in_dialog: bool,
+    is_content_changed: &mut bool,
+) -> bool {
+    let mut old_content = old_message.content.take().expect("message without content");
+    let mut need_update = false;
+    crate::message_content::merge_and_compare_message_contents(
+        ctx.content_context_mut(),
+        &mut old_content,
+        &mut new_content,
+        need_message_changed_warning,
+        dialog_id,
+        need_merge_files,
+        &old_message.file_upload_ids,
+        old_message.ttl,
+        old_message.ttl_expires_at,
+        Some(&mut old_message.is_content_secret),
+        is_content_changed,
+        &mut need_update,
+    );
+
+    if *is_content_changed || need_update {
+        if is_message_in_dialog {
+            crate::message_content::reregister_message_content(
+                ctx.content_context_mut(),
+                &old_content,
+                &new_content,
+                MessageFullId::new(dialog_id, old_message.message_id),
+                old_message.date,
+                "update_message_content",
+            );
+        }
+        old_message.content = Some(new_content);
+        old_message.last_edit_pts = 0;
+    } else {
+        // the same-type merge may have mutated the old content in place
+        // without flagging a change
+        old_message.content = Some(old_content);
+    }
+    need_update
+}
+
+/// `MessagesManager::update_message` (MessagesManager.cpp:32217-32831) — the
+/// M.10.5 edit core: the date gate, the edit-date/`hide_edit_date` flags,
+/// the edited reply-markup rules and the content replace through
+/// [`update_message_content`]. Returns `need_send_update`; `is_edited` rides
+/// [`UpdateMessageEditOutcome`]. The remaining update_message families are
+/// their own slices' (senders/receiver/ephemeral/boost/rank/chat-instance/
+/// paid-star/summary/forward-info/saved-topic/notification ids at
+/// 32308-32630, the offline/paid/video-processing/reactions-possible/
+/// media-album/effect-id plane at 32655-32691, the non-edit reply-markup
+/// acquire/lose blocks at 32704-32769, and the pinned/mention/
+/// interaction-info/reactions moves at 32770-32789) — they walk the
+/// dialog/notification/interaction containers those slices own.
+pub fn update_message(
+    ctx: &mut dyn MessageObjectContext,
+    manager: &MessagesManager,
+    dialog_id: DialogId,
+    old_message: &mut Message,
+    new_message: &mut Message,
+    is_message_in_dialog: bool,
+    source: &str,
+) -> UpdateMessageEditOutcome {
+    assert_eq!(
+        old_message.message_id, new_message.message_id,
+        "{} {source}",
+        dialog_id
+    );
+    let message_id = old_message.message_id;
+    let old_content_type = old_message
+        .content
+        .as_ref()
+        .expect("message without content")
+        .get_type();
+    let new_content_type = new_message
+        .content
+        .as_ref()
+        .expect("message without content")
+        .get_type();
+    let is_scheduled = message_id.is_scheduled();
+    let mut need_send_update = false;
+
+    let mut outcome = UpdateMessageEditOutcome::default();
+
+    if old_message.date != new_message.date {
+        if new_message.date > 0 && (is_scheduled || !is_message_in_dialog) {
+            if !(is_scheduled
+                || message_id.is_yet_unsent()
+                || (message_id.is_server() && message_id.get_server_message_id().get() == 1)
+                || old_content_type == MessageContentType::ChannelMigrateFrom
+                || old_content_type == MessageContentType::ChannelCreate)
+            {
+                log_error!(
+                    "Date has changed for {} in {:?} from {} to {}, message content type is {:?}/{:?} from {}",
+                    DisplayMessageId(message_id),
+                    dialog_id,
+                    old_message.date,
+                    new_message.date,
+                    old_content_type,
+                    new_content_type,
+                    source
+                );
+            }
+            assert!(old_message.date > 0);
+            old_message.date = new_message.date;
+            need_send_update = true;
+        } else {
+            log_error!(
+                "Receive {} in {:?} with date changed from {} to {}, message content type is {:?}/{:?} from {}",
+                DisplayMessageId(message_id),
+                dialog_id,
+                old_message.date,
+                new_message.date,
+                old_content_type,
+                new_content_type,
+                source
+            );
+        }
+    }
+    if old_message.schedule_repeat_period != new_message.schedule_repeat_period {
+        old_message.schedule_repeat_period = new_message.schedule_repeat_period;
+        need_send_update = true;
+    }
+    if old_message.date == old_message.edited_schedule_date
+        && old_message.edited_schedule_repeat_period == old_message.schedule_repeat_period
+    {
+        old_message.edited_schedule_date = 0;
+        old_message.edited_schedule_repeat_period = 0;
+    }
+
+    let mut is_edited = false;
+    let old_shown_edit_date = get_message_shown_edit_date(old_message);
+    if old_message.edit_date != new_message.edit_date {
+        if new_message.edit_date > 0 {
+            if new_message.edit_date > old_message.edit_date {
+                old_message.edit_date = new_message.edit_date;
+            }
+        } else {
+            log_error!(
+                "Receive {} in {:?} of type {:?}/{:?} with wrong edit date {}, old edit date = {} from {}",
+                DisplayMessageId(message_id),
+                dialog_id,
+                old_content_type,
+                new_content_type,
+                new_message.edit_date,
+                old_message.edit_date,
+                source
+            );
+        }
+    }
+
+    if old_message.author_signature != new_message.author_signature {
+        old_message.author_signature = std::mem::take(&mut new_message.author_signature);
+        need_send_update = true;
+    }
+
+    if old_message.hide_edit_date != new_message.hide_edit_date {
+        old_message.hide_edit_date = new_message.hide_edit_date;
+    }
+    let new_shown_edit_date = get_message_shown_edit_date(old_message);
+    if new_shown_edit_date != old_shown_edit_date {
+        is_edited = true;
+        need_send_update = true;
+    }
+
+    if old_message.edit_date > 0 {
+        // inline keyboard can be edited
+        let reply_markup_changed = (old_message.reply_markup.is_none())
+            != (new_message.reply_markup.is_none())
+            || (old_message.reply_markup.is_some()
+                && old_message.reply_markup != new_message.reply_markup);
+        if reply_markup_changed {
+            if let Some(d) = manager.get_dialog(dialog_id)
+                && d.reply_markup_message_id == message_id
+                && !ctx.is_bot()
+                && new_message.reply_markup.is_none()
+            {
+                // `set_dialog_reply_markup(d, MessageId(), nullptr)`
+                // (MessagesManager.cpp:32701) — the updateChatReplyMarkup
+                // emission is the dialog-plane seam.
+            }
+            old_message.reply_markup = new_message.reply_markup.take();
+            is_edited = true;
+            need_send_update = true;
+        }
+        old_message.had_reply_markup = false;
+    }
+
+    if old_message.last_access_date < new_message.last_access_date {
+        old_message.last_access_date = new_message.last_access_date;
+    }
+    if old_message.history_generation < new_message.history_generation {
+        old_message.history_generation = new_message.history_generation;
+    }
+    if new_message.is_update_sent || is_edited {
+        old_message.is_update_sent = true;
+    }
+
+    let mut is_preview_changed = false;
+    if old_message.invert_media != new_message.invert_media {
+        old_message.invert_media = new_message.invert_media;
+        is_preview_changed = true;
+    }
+    if old_message.disable_web_page_preview != new_message.disable_web_page_preview {
+        if old_message.disable_web_page_preview {
+            is_preview_changed = new_message
+                .content
+                .as_ref()
+                .is_some_and(crate::message_content::has_message_content_web_page);
+        } else {
+            assert!(new_message.disable_web_page_preview);
+            is_preview_changed = old_message
+                .content
+                .as_ref()
+                .is_some_and(crate::message_content::has_message_content_web_page);
+        }
+        old_message.disable_web_page_preview = new_message.disable_web_page_preview;
+    }
+
+    let mut is_content_changed = false;
+    let need_update = update_message_content(
+        ctx,
+        dialog_id,
+        old_message,
+        new_message.content.take().expect("message without content"),
+        need_message_changed_warning(old_message),
+        message_id.is_yet_unsent() && new_message.edit_date == 0,
+        is_message_in_dialog,
+        &mut is_content_changed,
+    );
+    if need_update || is_preview_changed {
+        // `send_update_message_content` (MessagesManager.cpp:32793) — the
+        // updateMessageContent emission is the Td update-plane seam.
+        need_send_update = true;
+    }
+    if is_content_changed {
+        outcome.is_content_changed = true;
+    }
+
+    // the visible-reply-info transitions and
+    // `send_update_message_interaction_info` (32798-32808) ride the
+    // interaction-info slice (`was_visible_message_reply_info` is captured
+    // before the content replace at MessagesManager.cpp:32253)
+
+    outcome.is_edited = is_edited;
+    outcome.need_send_update = need_send_update;
+    outcome
+}
+
+/// The `update_message` edit outcome — the emission decisions the update
+/// plane (the Td wiring) consumes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UpdateMessageEditOutcome {
+    /// `is_edited` — `updateMessageEdited` must be sent for a non-bot.
+    pub is_edited: bool,
+    /// `need_send_update` — the message object changed for the app.
+    pub need_send_update: bool,
+    /// `is_content_changed` — the content object itself was replaced.
+    pub is_content_changed: bool,
+}
+
+/// `MessagesManager::on_message_edited`
+/// (MessagesManager.cpp:5985-6014) over the explicit message — the
+/// per-dialog lookup is the M.10.9 container seam. Returns whether the bot
+/// `updateMessageEdited` must be emitted.
+pub fn on_message_edited(
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    m: &mut Message,
+    pts: i32,
+    had_message: bool,
+    is_bot: bool,
+) -> bool {
+    m.last_edit_pts = pts;
+    if let Some(d) = manager.get_dialog_mut(dialog_id) {
+        d.last_edited_message_id = m.message_id;
+    }
+    let send_edited = is_bot;
+    if send_edited {
+        // `send_update_message_edited` (MessagesManager.cpp:5995) — the
+        // updateMessageEdited emission is the Td update-plane seam.
+    }
+    // `update_used_hashtags` (MessagesManager.cpp:5997) — the hashtag
+    // cache is its own slice.
+    if !had_message && !is_bot {
+        // the unread reaction / poll-vote count repairs
+        // (MessagesManager.cpp:5999-6012) ride the unread-counter slice
+        // (`has_unread_message_reactions`/`repair_dialog_unread_reaction_count`
+        // and the poll-vote pair).
+    }
+    send_edited
+}
+
 /// The message-plane `const Td *td` surface: the M.9 content context plus
 /// the queries `get_message_object` and its helpers make. The real `Td`
 /// wiring lands with the Td slices; the stand-ins answer the id-object
@@ -16638,5 +16986,218 @@ mod tests {
                 .1
                 .is_none()
         );
+    }
+
+    /// The M.10.5 Verify pipeline, offline part: a recorded
+    /// `updateEditMessage` shape — the re-intake of the full edited message
+    /// (MessagesManager.cpp:5853-5858) — followed by the update_message
+    /// edit core replaces the content and applies the edit flags.
+    #[test]
+    fn m10_5_update_edit_message_corpus_edits_the_message() {
+        let dialog_id = DialogId::from_user_id(UserId::new(2000));
+        let wire = |text: &str, edit_date: i32| {
+            telegram_api::Message::message(telegram_api::message {
+                id: 400,
+                peer_id: Some(telegram_api::Peer::peerUser(telegram_api::peerUser {
+                    user_id: 2000,
+                })),
+                date: 1700000100,
+                edit_date,
+                message: text.to_string(),
+                ..Default::default()
+            })
+        };
+        let mut manager = MessagesManager::default();
+        let mut ctx = TestObjectContext::default();
+        let (_, mut old_message) = manager
+            .on_get_message(&mut ctx, wire("v1", 0), true, false, "updateNewMessage")
+            .unwrap();
+        // the edited shape re-enters through the same intake
+        let (_, mut new_message) = manager
+            .on_get_message(
+                &mut ctx,
+                wire("v2", 1700000200),
+                true,
+                false,
+                "updateEditMessage",
+            )
+            .unwrap();
+
+        let outcome = update_message(
+            &mut ctx,
+            &manager,
+            dialog_id,
+            &mut old_message,
+            &mut new_message,
+            false,
+            "updateEditMessage",
+        );
+        assert!(outcome.is_edited, "the shown edit date has changed");
+        assert!(outcome.need_send_update);
+        assert_eq!(old_message.edit_date, 1700000200);
+        match old_message.content {
+            Some(crate::message_content::MessageContent::Text(text)) => {
+                assert_eq!(text.text.text, "v2");
+            }
+            other => panic!("wrong content arm: {other:?}"),
+        }
+    }
+
+    /// The edit_date rules (MessagesManager.cpp:32287-32301): the date only
+    /// moves forward, a zero edit date is dropped, and `is_edited` fires
+    /// only on a shown-edit-date change.
+    #[test]
+    fn m10_5_edit_date_never_moves_backwards() {
+        let dialog_id = DialogId::from_user_id(UserId::new(2000));
+        let build = |edit_date: i32| {
+            let mut new_message = Box::new(Message::default());
+            new_message.message_id = MessageId::from_server_message_id(ServerMessageId::new(400));
+            new_message.date = 1700000100;
+            new_message.edit_date = edit_date;
+            new_message.content = Some(crate::message_content::MessageContent::Text(
+                crate::message_content::MessageText::default(),
+            ));
+            new_message
+        };
+        let mut ctx = TestObjectContext::default();
+        let manager = MessagesManager::default();
+
+        let mut old_message = build(1700000300);
+        let mut new_message = build(1700000200);
+        let outcome = update_message(
+            &mut ctx,
+            &manager,
+            dialog_id,
+            &mut old_message,
+            &mut new_message,
+            false,
+            "test",
+        );
+        assert!(!outcome.is_edited);
+        assert!(!outcome.need_send_update);
+        assert_eq!(old_message.edit_date, 1700000300, "the date stays");
+
+        // a zero edit date is logged and ignored
+        let mut new_message = build(0);
+        let outcome = update_message(
+            &mut ctx,
+            &manager,
+            dialog_id,
+            &mut old_message,
+            &mut new_message,
+            false,
+            "test",
+        );
+        assert!(!outcome.is_edited);
+        assert_eq!(old_message.edit_date, 1700000300);
+    }
+
+    /// The content replace through the M.9.10/M.9.11 machinery: a type
+    /// change flags `need_update`, replaces the content and resets
+    /// `last_edit_pts` (MessagesManager.cpp:32854-32861).
+    #[test]
+    fn m10_5_content_type_change_resets_last_edit_pts() {
+        let dialog_id = DialogId::from_user_id(UserId::new(2000));
+        let mut old_message = Box::new(Message::default());
+        old_message.message_id = MessageId::from_server_message_id(ServerMessageId::new(400));
+        old_message.date = 1700000100;
+        old_message.last_edit_pts = 7;
+        old_message.content = Some(crate::message_content::MessageContent::Text(
+            crate::message_content::MessageText::default(),
+        ));
+        let mut new_message = Box::new(Message::default());
+        new_message.message_id = old_message.message_id;
+        new_message.date = 1700000100;
+        new_message.content = Some(crate::message_content::MessageContent::Photo(
+            crate::message_content::MessagePhoto::default(),
+        ));
+
+        let mut ctx = TestObjectContext::default();
+        let manager = MessagesManager::default();
+        let outcome = update_message(
+            &mut ctx,
+            &manager,
+            dialog_id,
+            &mut old_message,
+            &mut new_message,
+            false,
+            "test",
+        );
+        assert!(outcome.need_send_update, "the content update is flagged");
+        assert!(
+            !outcome.is_content_changed,
+            "the type change rides need_update"
+        );
+        assert!(matches!(
+            old_message.content,
+            Some(crate::message_content::MessageContent::Photo(_))
+        ));
+        assert_eq!(old_message.last_edit_pts, 0, "the edit pts are reset");
+    }
+
+    /// `need_message_changed_warning` (MessagesManager.cpp:32847-32863).
+    #[test]
+    fn m10_5_need_message_changed_warning_table() {
+        let base = || Message {
+            message_id: MessageId::from_server_message_id(ServerMessageId::new(400)),
+            content: Some(crate::message_content::MessageContent::Text(
+                crate::message_content::MessageText::default(),
+            )),
+            ..Default::default()
+        };
+        assert!(need_message_changed_warning(&base()));
+
+        let mut edited = base();
+        edited.edit_date = 1700000200;
+        assert!(!need_message_changed_warning(&edited), "already edited");
+
+        let mut yet_unsent_forward = base();
+        yet_unsent_forward.message_id = MessageId::new(MessageId::TYPE_YET_UNSENT as i64);
+        yet_unsent_forward.real_forward_from_dialog_id = DialogId::from_user_id(UserId::new(5));
+        assert!(
+            !need_message_changed_warning(&yet_unsent_forward),
+            "the original may be edited"
+        );
+
+        let mut expiring = base();
+        expiring.ttl = MessageSelfDestructType::with_ttl(60, false);
+        assert!(!need_message_changed_warning(&expiring), "can expire");
+
+        let mut restricted = base();
+        restricted.restriction_reasons = vec![crate::restriction_reason::RestrictionReason::new(
+            "ios".to_string(),
+            " pornography".to_string(),
+            "restricted".to_string(),
+        )];
+        assert!(!need_message_changed_warning(&restricted));
+    }
+
+    /// `on_message_edited` (MessagesManager.cpp:5985-6014): the pts and the
+    /// dialog marker land, and the bot branch asks for
+    /// `updateMessageEdited`.
+    #[test]
+    fn m10_5_on_message_edited_sets_pts_and_dialog_marker() {
+        let dialog_id = DialogId::from_user_id(UserId::new(2000));
+        let mut manager = MessagesManager::default();
+        manager.add_dialog_for_new_message(dialog_id);
+        let mut m = Message {
+            message_id: MessageId::from_server_message_id(ServerMessageId::new(400)),
+            ..Default::default()
+        };
+
+        let send_edited = on_message_edited(&mut manager, dialog_id, &mut m, 77, false, true);
+        assert!(send_edited, "the bot branch emits updateMessageEdited");
+        assert_eq!(m.last_edit_pts, 77);
+        assert_eq!(
+            manager
+                .get_dialog(dialog_id)
+                .unwrap()
+                .last_edited_message_id,
+            m.message_id
+        );
+
+        let send_edited = on_message_edited(&mut manager, dialog_id, &mut m, 78, false, false);
+        assert!(!send_edited, "non-bot edits emit via the is_edited flow");
+        assert_eq!(m.last_edit_pts, 78);
     }
 }
