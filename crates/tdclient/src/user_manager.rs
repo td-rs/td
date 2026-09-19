@@ -290,6 +290,21 @@ impl UserId {
     pub fn get(self) -> i64 {
         self.0
     }
+
+    /// `UserId::store` (UserId.h:53-55) — the raw id as int64.
+    pub fn store(self, out: &mut Vec<u8>) {
+        store_parse::store_i64(out, self.0);
+    }
+
+    /// `UserId::parse` (UserId.h:57-64) — int64 from
+    /// `Version::Support64BitIds` (33) on, int32 before.
+    pub fn parse_from(parser: &mut store_parse::Parser) -> Result<UserId, &'static str> {
+        if parser.version() >= store_parse::version::SUPPORT_64_BIT_IDS {
+            Ok(UserId(parser.i64_()?))
+        } else {
+            Ok(UserId(parser.i32_()? as i64))
+        }
+    }
 }
 
 /// `td::SecretChatId` (SecretChatId.h): 0 < id.
@@ -797,7 +812,7 @@ impl TimeCtx {
         }
     }
 
-    fn store_time(out: &mut Vec<u8>, time_at: f64, ctx: &TimeCtx) {
+    pub(crate) fn store_time(out: &mut Vec<u8>, time_at: f64, ctx: &TimeCtx) {
         if time_at == 0.0 {
             store_parse::store_f64(out, -1.0);
         } else {
@@ -807,7 +822,7 @@ impl TimeCtx {
         }
     }
 
-    fn parse_time(parser: &mut Parser, ctx: &TimeCtx) -> Result<f64, &'static str> {
+    pub(crate) fn parse_time(parser: &mut Parser, ctx: &TimeCtx) -> Result<f64, &'static str> {
         let time_left = parser.f64_()?;
         if time_left < -0.1 {
             return Ok(0.0);

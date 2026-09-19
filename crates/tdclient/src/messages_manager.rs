@@ -132,6 +132,12 @@ impl EphemeralMessageId {
         parser.fetch_end()?;
         Ok(EphemeralMessageId(id))
     }
+
+    /// The `ParserT` overload of `EphemeralMessageId::parse`
+    /// (EphemeralMessageId.hpp).
+    pub fn parse_from(parser: &mut Parser) -> Result<EphemeralMessageId, &'static str> {
+        Ok(EphemeralMessageId(parser.i32_()?))
+    }
 }
 
 /// `td::MessageId` (MessageId.h) — the full three-id-space identifier.
@@ -1866,6 +1872,12 @@ impl MessageEffectId {
         parser.fetch_end()?;
         Ok(MessageEffectId(id))
     }
+
+    /// The `ParserT` overload (MessageEffectId.hpp) for the nested
+    /// store/parse planes.
+    pub fn parse_from(parser: &mut Parser) -> Result<MessageEffectId, &'static str> {
+        Ok(MessageEffectId(parser.i64_()?))
+    }
 }
 
 impl std::fmt::Display for MessageEffectId {
@@ -2063,6 +2075,18 @@ impl StoryFullId {
         let story_id = parser.i32_()?;
         parser.fetch_end()?;
         Ok(StoryFullId::new(DialogId(dialog_id), StoryId(story_id)))
+    }
+
+    /// The `ParserT` overload of `StoryFullId::parse` (StoryFullId.hpp) —
+    /// used from the nested store/parse planes (the ids are stored through
+    /// `DialogId::store`/`StoryId::store`, so parse through those too).
+    pub fn parse_from(parser: &mut Parser) -> Result<StoryFullId, &'static str> {
+        let dialog_id = DialogId::parse_from(parser)?;
+        let story_id = StoryId(parser.i32_()?);
+        Ok(StoryFullId {
+            dialog_id,
+            story_id,
+        })
     }
 }
 
@@ -2365,6 +2389,86 @@ impl MessageOrigin {
     pub fn get_sender_name(&self) -> &str {
         &self.sender_name
     }
+
+    /// `MessageOrigin::store` (MessageOrigin.hpp:17-42).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_sender_user_id = self.sender_user_id.is_valid();
+        let has_sender_dialog_id = self.sender_dialog_id.is_valid();
+        let has_message_id = self.message_id.is_valid();
+        let has_author_signature = !self.author_signature.is_empty();
+        let has_sender_name = !self.sender_name.is_empty();
+        store_flags(
+            out,
+            [
+                has_sender_user_id,
+                has_sender_dialog_id,
+                has_message_id,
+                has_author_signature,
+                has_sender_name,
+            ],
+        );
+        if has_sender_user_id {
+            self.sender_user_id.store(out);
+        }
+        if has_sender_dialog_id {
+            self.sender_dialog_id.store(out);
+        }
+        if has_message_id {
+            self.message_id.store(out);
+        }
+        if has_author_signature {
+            store_string(out, &self.author_signature);
+        }
+        if has_sender_name {
+            store_string(out, &self.sender_name);
+        }
+    }
+
+    /// `MessageOrigin::parse` (MessageOrigin.hpp:44-71). The C++ `CHECK`
+    /// that a stored sender dialog is a channel stays an assert.
+    pub fn parse_from(parser: &mut Parser) -> Result<MessageOrigin, &'static str> {
+        let [
+            has_sender_user_id,
+            has_sender_dialog_id,
+            has_message_id,
+            has_author_signature,
+            has_sender_name,
+        ] = parser.parse_flags::<5>()?;
+        let sender_user_id = if has_sender_user_id {
+            UserId::parse_from(parser)?
+        } else {
+            UserId::default()
+        };
+        let sender_dialog_id = if has_sender_dialog_id {
+            let dialog_id = DialogId::parse_from(parser)?;
+            assert!(dialog_id.get_type() == DialogType::Channel);
+            dialog_id
+        } else {
+            DialogId::default()
+        };
+        let message_id = if has_message_id {
+            MessageId::parse_from(parser)?
+        } else {
+            MessageId::default()
+        };
+        let author_signature = if has_author_signature {
+            parser.string()?
+        } else {
+            String::new()
+        };
+        let sender_name = if has_sender_name {
+            parser.string()?
+        } else {
+            String::new()
+        };
+        Ok(MessageOrigin {
+            sender_user_id,
+            sender_dialog_id,
+            message_id,
+            author_signature,
+            sender_name,
+        })
+    }
 }
 
 /// `td::FactCheck` (FactCheck.h) — the fact-check block attached to a message.
@@ -2385,6 +2489,47 @@ impl FactCheck {
     /// `FactCheck::need_check` (FactCheck.h:45-47).
     pub fn need_check(&self) -> bool {
         self.need_check
+    }
+
+    /// `FactCheck::store` (FactCheck.hpp:16-36). The C++ `CHECK(!is_empty())`
+    /// is the caller's contract.
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_country_code = !self.country_code.is_empty();
+        let has_text = !self.text.text.is_empty();
+        store_flags(out, [self.need_check, has_country_code, has_text]);
+        store_i64(out, self.hash);
+        if has_country_code {
+            store_string(out, &self.country_code);
+        }
+        if has_text {
+            self.text.store(out);
+        }
+    }
+
+    /// `FactCheck::parse` (FactCheck.hpp:38-60).
+    pub fn parse_from(parser: &mut Parser) -> Result<FactCheck, &'static str> {
+        let [need_check, has_country_code, has_text] = parser.parse_flags::<3>()?;
+        let hash = parser.i64_()?;
+        let country_code = if has_country_code {
+            parser.string()?
+        } else {
+            String::new()
+        };
+        let text = if has_text {
+            FormattedText::parse(parser)?
+        } else {
+            FormattedText::default()
+        };
+        let result = FactCheck {
+            country_code,
+            text,
+            hash,
+            need_check,
+        };
+        if result.is_empty() {
+            return Err("Load an empty fact check");
+        }
+        Ok(result)
     }
 }
 
@@ -2525,6 +2670,117 @@ impl MessageReplyInfo {
     /// `MessageReplyInfo::was_dropped` (MessageReplyInfo.h:47-49).
     pub fn was_dropped(&self) -> bool {
         self.is_dropped
+    }
+
+    /// `MessageReplyInfo::store` (MessageReplyInfo.hpp:16-51). The C++
+    /// `CHECK(!is_empty())` is the caller's contract.
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_recent_replier_dialog_ids = !self.recent_replier_dialog_ids.is_empty();
+        let has_channel_id = self.channel_id.is_valid();
+        let has_max_message_id = self.max_message_id.is_valid();
+        let has_last_read_inbox_message_id = self.last_read_inbox_message_id.is_valid();
+        let has_last_read_outbox_message_id = self.last_read_outbox_message_id.is_valid();
+        let has_replier_min_channels = !self.replier_min_channels.is_empty();
+        store_flags(
+            out,
+            [
+                self.is_comment,
+                has_recent_replier_dialog_ids,
+                has_channel_id,
+                has_max_message_id,
+                has_last_read_inbox_message_id,
+                has_last_read_outbox_message_id,
+                has_replier_min_channels,
+            ],
+        );
+        store_i32(out, self.reply_count);
+        store_i32(out, self.pts);
+        if has_recent_replier_dialog_ids {
+            store_dialog_id_vec(out, &self.recent_replier_dialog_ids);
+        }
+        if has_channel_id {
+            self.channel_id.store(out);
+        }
+        if has_max_message_id {
+            self.max_message_id.store(out);
+        }
+        if has_last_read_inbox_message_id {
+            self.last_read_inbox_message_id.store(out);
+        }
+        if has_last_read_outbox_message_id {
+            self.last_read_outbox_message_id.store(out);
+        }
+        if has_replier_min_channels {
+            store_min_channel_vec(out, &self.replier_min_channels);
+        }
+    }
+
+    /// `MessageReplyInfo::parse` (MessageReplyInfo.hpp:53-94) — including
+    /// the channel id 777 "dropped legacy" special case and the recent
+    /// repliers clamp.
+    pub fn parse_from(parser: &mut Parser) -> Result<MessageReplyInfo, &'static str> {
+        let [
+            is_comment,
+            has_recent_replier_dialog_ids,
+            has_channel_id,
+            has_max_message_id,
+            has_last_read_inbox_message_id,
+            has_last_read_outbox_message_id,
+            has_replier_min_channels,
+        ] = parser.parse_flags::<7>()?;
+        let reply_count = parser.i32_()?;
+        let pts = parser.i32_()?;
+        let recent_replier_dialog_ids = if has_recent_replier_dialog_ids {
+            parse_dialog_id_vec(parser)?
+        } else {
+            Vec::new()
+        };
+        let channel_id = if has_channel_id {
+            ChannelId::parse_from(parser)?
+        } else {
+            ChannelId::default()
+        };
+        let max_message_id = if has_max_message_id {
+            MessageId::parse_from(parser)?
+        } else {
+            MessageId::default()
+        };
+        let last_read_inbox_message_id = if has_last_read_inbox_message_id {
+            MessageId::parse_from(parser)?
+        } else {
+            MessageId::default()
+        };
+        let last_read_outbox_message_id = if has_last_read_outbox_message_id {
+            MessageId::parse_from(parser)?
+        } else {
+            MessageId::default()
+        };
+        let replier_min_channels = if has_replier_min_channels {
+            parse_min_channel_vec(parser)?
+        } else {
+            Vec::new()
+        };
+
+        let mut result = MessageReplyInfo {
+            reply_count,
+            pts,
+            recent_replier_dialog_ids,
+            replier_min_channels,
+            channel_id,
+            max_message_id,
+            last_read_inbox_message_id,
+            last_read_outbox_message_id,
+            is_comment,
+            is_dropped: false,
+        };
+        if result.channel_id.get() == 777 {
+            result = MessageReplyInfo::default();
+            result.is_dropped = true;
+        }
+        result
+            .recent_replier_dialog_ids
+            .truncate(Self::MAX_RECENT_REPLIERS);
+        Ok(result)
     }
 }
 
@@ -2829,12 +3085,502 @@ impl BusinessBotManageBar {
     }
 }
 
-/// `td::MessageReactions` — STAND-IN: the full struct is owned by the Wave-2
-/// ReactionManager slice; until then the `Message`/`Dialog` fields only need
-/// an opaque owned value (MessagesManager.h:127 forward-declares it).
-#[derive(Clone, Debug, Default)]
+/// `store(const ReactionType &, ...)` (ReactionType.hpp:17-21) — the raw
+/// string; the C++ `CHECK(!is_empty())` is the caller's contract.
+pub fn store_reaction_type(out: &mut Vec<u8>, reaction_type: &ReactionType) {
+    store_string(out, reaction_type.get_string());
+}
+
+/// `parse(ReactionType &, ...)` (ReactionType.hpp:23-27).
+pub fn parse_reaction_type(parser: &mut Parser) -> Result<ReactionType, &'static str> {
+    Ok(ReactionType::new(parser.string()?))
+}
+
+/// `store(const MinChannel &, ...)` (MinChannel.hpp:17-41). RECORDED GAP:
+/// the `MinChannel` stand-in has no `photo`/`accent_color_id` yet (the
+/// chat-photo plane owns them), so `has_photo`/`has_accent_color_id` are
+/// always stored false — correct for everything the Rust client writes —
+/// and a parse of foreign data that sets either flag is an error rather
+/// than a silent misread.
+pub fn store_min_channel(out: &mut Vec<u8>, min_channel: &MinChannel) {
+    let has_title = !min_channel.title.is_empty();
+    store_flags(out, [has_title, false, min_channel.is_megagroup, false]);
+    if has_title {
+        store_string(out, &min_channel.title);
+    }
+}
+
+/// `parse(MinChannel &, ...)` (MinChannel.hpp:43-67).
+pub fn parse_min_channel(parser: &mut Parser) -> Result<MinChannel, &'static str> {
+    let [has_title, has_photo, is_megagroup, has_accent_color_id] = parser.parse_flags::<4>()?;
+    if has_photo || has_accent_color_id {
+        // the MinChannel stand-in cannot consume the photo/accent payloads
+        return Err("MinChannel photo/accent color is not supported yet");
+    }
+    let title = if has_title {
+        parser.string()?
+    } else {
+        String::new()
+    };
+    Ok(MinChannel {
+        title,
+        is_megagroup,
+    })
+}
+
+/// The C++ `td::store(const vector<T> &, ...)` framing — int32 length then
+/// the elements (tl_helpers.h).
+fn store_vec_header(out: &mut Vec<u8>, len: usize) {
+    store_i32(out, len as i32);
+}
+
+pub(crate) fn store_dialog_id_vec(out: &mut Vec<u8>, values: &[DialogId]) {
+    store_vec_header(out, values.len());
+    for value in values {
+        value.store(out);
+    }
+}
+
+pub(crate) fn parse_dialog_id_vec(parser: &mut Parser) -> Result<Vec<DialogId>, &'static str> {
+    let size = parser.i32_()?;
+    if size < 0 || size as usize > parser.left_len() / 4 {
+        return Err("Wrong vector length");
+    }
+    let mut values = Vec::with_capacity(size as usize);
+    for _ in 0..size {
+        values.push(DialogId::parse_from(parser)?);
+    }
+    Ok(values)
+}
+
+pub(crate) fn store_reaction_type_vec(out: &mut Vec<u8>, values: &[ReactionType]) {
+    store_vec_header(out, values.len());
+    for value in values {
+        store_reaction_type(out, value);
+    }
+}
+
+pub(crate) fn parse_reaction_type_vec(
+    parser: &mut Parser,
+) -> Result<Vec<ReactionType>, &'static str> {
+    let size = parser.i32_()?;
+    if size < 0 || size as usize > parser.left_len() {
+        return Err("Wrong vector length");
+    }
+    let mut values = Vec::with_capacity(size as usize);
+    for _ in 0..size {
+        values.push(parse_reaction_type(parser)?);
+    }
+    Ok(values)
+}
+
+pub(crate) fn store_min_channel_vec(out: &mut Vec<u8>, values: &[(ChannelId, MinChannel)]) {
+    store_vec_header(out, values.len());
+    for (channel_id, min_channel) in values {
+        channel_id.store(out);
+        store_min_channel(out, min_channel);
+    }
+}
+
+pub(crate) fn parse_min_channel_vec(
+    parser: &mut Parser,
+) -> Result<Vec<(ChannelId, MinChannel)>, &'static str> {
+    let size = parser.i32_()?;
+    if size < 0 || size as usize > parser.left_len() {
+        return Err("Wrong vector length");
+    }
+    let mut values = Vec::with_capacity(size as usize);
+    for _ in 0..size {
+        let channel_id = ChannelId::parse_from(parser)?;
+        let min_channel = parse_min_channel(parser)?;
+        values.push((channel_id, min_channel));
+    }
+    Ok(values)
+}
+
+pub(crate) fn store_message_reaction_vec(out: &mut Vec<u8>, values: &[MessageReaction]) {
+    store_vec_header(out, values.len());
+    for value in values {
+        value.store(out);
+    }
+}
+
+pub(crate) fn parse_message_reaction_vec(
+    parser: &mut Parser,
+) -> Result<Vec<MessageReaction>, &'static str> {
+    let size = parser.i32_()?;
+    if size < 0 || size as usize > parser.left_len() {
+        return Err("Wrong vector length");
+    }
+    let mut values = Vec::with_capacity(size as usize);
+    for _ in 0..size {
+        values.push(MessageReaction::parse_from(parser)?);
+    }
+    Ok(values)
+}
+
+pub(crate) fn store_unread_message_reaction_vec(
+    out: &mut Vec<u8>,
+    values: &[UnreadMessageReaction],
+) {
+    store_vec_header(out, values.len());
+    for value in values {
+        value.store(out);
+    }
+}
+
+pub(crate) fn parse_unread_message_reaction_vec(
+    parser: &mut Parser,
+) -> Result<Vec<UnreadMessageReaction>, &'static str> {
+    let size = parser.i32_()?;
+    if size < 0 || size as usize > parser.left_len() {
+        return Err("Wrong vector length");
+    }
+    let mut values = Vec::with_capacity(size as usize);
+    for _ in 0..size {
+        values.push(UnreadMessageReaction::parse_from(parser)?);
+    }
+    Ok(values)
+}
+
+pub(crate) fn store_message_reactor_vec(out: &mut Vec<u8>, values: &[MessageReactor]) {
+    store_vec_header(out, values.len());
+    for value in values {
+        value.store(out);
+    }
+}
+
+pub(crate) fn parse_message_reactor_vec(
+    parser: &mut Parser,
+) -> Result<Vec<MessageReactor>, &'static str> {
+    let size = parser.i32_()?;
+    if size < 0 || size as usize > parser.left_len() {
+        return Err("Wrong vector length");
+    }
+    let mut values = Vec::with_capacity(size as usize);
+    for _ in 0..size {
+        values.push(MessageReactor::parse_from(parser)?);
+    }
+    Ok(values)
+}
+
+/// `td::MessageReaction` (MessageReaction.h:23-118) — one reaction type on a
+/// message with its counter and recent choosers. Only the value plane +
+/// store/parse land here (M.10.2); the mutation family (`set_as_chosen`,
+/// `update_from`, ...) is owned by the Wave-2 ReactionManager slice.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MessageReaction {
+    pub reaction_type: ReactionType,
+    pub choose_count: i32,
+    pub is_chosen: bool,
+    pub my_recent_chooser_dialog_id: DialogId,
+    pub recent_chooser_dialog_ids: Vec<DialogId>,
+    pub recent_chooser_min_channels: Vec<(ChannelId, MinChannel)>,
+}
+
+impl MessageReaction {
+    /// `MessageReaction::MAX_CHOOSE_COUNT` (MessageReaction.h:25).
+    pub const MAX_CHOOSE_COUNT: i32 = 2147483640;
+
+    /// `MessageReaction::is_empty` (MessageReaction.h:51-53).
+    pub fn is_empty(&self) -> bool {
+        self.choose_count <= 0
+    }
+
+    /// `MessageReaction::is_chosen` (MessageReaction.h:55-57).
+    pub fn is_chosen(&self) -> bool {
+        self.is_chosen
+    }
+
+    /// `MessageReaction::get_choose_count` (MessageReaction.h:89-91).
+    pub fn get_choose_count(&self) -> i32 {
+        self.choose_count
+    }
+
+    /// `MessageReaction::get_reaction_type` (MessageReaction.h:104-106).
+    pub fn get_reaction_type(&self) -> &ReactionType {
+        &self.reaction_type
+    }
+
+    /// `MessageReaction::fix_choose_count` (MessageReaction.cpp) — the
+    /// counter is at least the number of recent choosers.
+    pub fn fix_choose_count(&mut self) {
+        self.choose_count = self
+            .choose_count
+            .max(self.recent_chooser_dialog_ids.len() as i32);
+    }
+
+    /// `MessageReaction::store` (MessageReaction.hpp:20-42).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_recent_chooser_dialog_ids = !self.recent_chooser_dialog_ids.is_empty();
+        let has_recent_chooser_min_channels = !self.recent_chooser_min_channels.is_empty();
+        let has_my_recent_chooser_dialog_id = self.my_recent_chooser_dialog_id.is_valid();
+        store_flags(
+            out,
+            [
+                self.is_chosen,
+                has_recent_chooser_dialog_ids,
+                has_recent_chooser_min_channels,
+                has_my_recent_chooser_dialog_id,
+            ],
+        );
+        store_reaction_type(out, &self.reaction_type);
+        store_i32(out, self.choose_count);
+        if has_recent_chooser_dialog_ids {
+            store_dialog_id_vec(out, &self.recent_chooser_dialog_ids);
+        }
+        if has_recent_chooser_min_channels {
+            store_min_channel_vec(out, &self.recent_chooser_min_channels);
+        }
+        if has_my_recent_chooser_dialog_id {
+            self.my_recent_chooser_dialog_id.store(out);
+        }
+    }
+
+    /// `MessageReaction::parse` (MessageReaction.hpp:44-79).
+    pub fn parse_from(parser: &mut Parser) -> Result<MessageReaction, &'static str> {
+        let [
+            is_chosen,
+            has_recent_chooser_dialog_ids,
+            has_recent_chooser_min_channels,
+            has_my_recent_chooser_dialog_id,
+        ] = parser.parse_flags::<4>()?;
+        let reaction_type = parse_reaction_type(parser)?;
+        let choose_count = parser.i32_()?;
+        let recent_chooser_dialog_ids = if has_recent_chooser_dialog_ids {
+            parse_dialog_id_vec(parser)?
+        } else {
+            Vec::new()
+        };
+        let recent_chooser_min_channels = if has_recent_chooser_min_channels {
+            parse_min_channel_vec(parser)?
+        } else {
+            Vec::new()
+        };
+        let my_recent_chooser_dialog_id = if has_my_recent_chooser_dialog_id {
+            let dialog_id = DialogId::parse_from(parser)?;
+            if !dialog_id.is_valid() || !recent_chooser_dialog_ids.contains(&dialog_id) {
+                return Err("Invalid recent reaction chooser");
+            }
+            dialog_id
+        } else {
+            DialogId::default()
+        };
+        let mut result = MessageReaction {
+            reaction_type,
+            choose_count,
+            is_chosen,
+            my_recent_chooser_dialog_id,
+            recent_chooser_dialog_ids,
+            recent_chooser_min_channels,
+        };
+        result.fix_choose_count();
+        if result.is_empty() || result.reaction_type.is_empty() {
+            return Err("Invalid message reaction");
+        }
+        Ok(result)
+    }
+}
+
+/// `td::UnreadMessageReaction` (MessageReaction.h:122-150).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct UnreadMessageReaction {
+    pub reaction_type: ReactionType,
+    pub sender_dialog_id: DialogId,
+    pub is_big: bool,
+}
+
+impl UnreadMessageReaction {
+    /// `UnreadMessageReaction::store` (MessageReaction.hpp:81-87).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        store_flags(out, [self.is_big]);
+        store_reaction_type(out, &self.reaction_type);
+        self.sender_dialog_id.store(out);
+    }
+
+    /// `UnreadMessageReaction::parse` (MessageReaction.hpp:89-99).
+    pub fn parse_from(parser: &mut Parser) -> Result<UnreadMessageReaction, &'static str> {
+        let [is_big] = parser.parse_flags::<1>()?;
+        let reaction_type = parse_reaction_type(parser)?;
+        let sender_dialog_id = DialogId::parse_from(parser)?;
+        if reaction_type.is_empty() {
+            return Err("Invalid unread message reaction");
+        }
+        Ok(UnreadMessageReaction {
+            reaction_type,
+            sender_dialog_id,
+            is_big,
+        })
+    }
+}
+
+/// `td::MessageReactor` (MessageReactor.h) — a top reactor of a message.
+/// The `min_channel` photo/accent-color fields ride the `MinChannel`
+/// stand-in's recorded gap.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MessageReactor {
+    pub dialog_id: DialogId,
+    pub min_channel: Option<MinChannel>,
+    pub count: i32,
+    pub is_top: bool,
+    pub is_me: bool,
+    pub is_anonymous: bool,
+}
+
+impl MessageReactor {
+    /// `MessageReactor::store` (MessageReactor.hpp:17-38).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_dialog_id = self.dialog_id.is_valid();
+        let has_min_channel = self.min_channel.is_some();
+        store_flags(
+            out,
+            [
+                self.is_top,
+                self.is_me,
+                self.is_anonymous,
+                has_dialog_id,
+                has_min_channel,
+            ],
+        );
+        if has_dialog_id {
+            self.dialog_id.store(out);
+        }
+        store_i32(out, self.count);
+        if has_min_channel {
+            store_min_channel(out, self.min_channel.as_ref().unwrap());
+        }
+    }
+
+    /// `MessageReactor::parse` (MessageReactor.hpp:40-61).
+    pub fn parse_from(parser: &mut Parser) -> Result<MessageReactor, &'static str> {
+        let [is_top, is_me, is_anonymous, has_dialog_id, has_min_channel] =
+            parser.parse_flags::<5>()?;
+        let dialog_id = if has_dialog_id {
+            DialogId::parse_from(parser)?
+        } else {
+            DialogId::default()
+        };
+        let count = parser.i32_()?;
+        let min_channel = if has_min_channel {
+            Some(parse_min_channel(parser)?)
+        } else {
+            None
+        };
+        Ok(MessageReactor {
+            dialog_id,
+            min_channel,
+            count,
+            is_top,
+            is_me,
+            is_anonymous,
+        })
+    }
+}
+
+/// `td::MessageReactions` (MessageReaction.h:163-257) — the reactions block
+/// of a message. The value plane + store/parse land here (M.10.2 —
+/// `Message::store`/`parse` is byte-parity-bound to it); the manager family
+/// (`get_message_reactions`, `update_from`, polling, the td_api object)
+/// stays with the Wave-2 ReactionManager slice. The pending-paid-reaction
+/// fields are memory-only in C++ and are not stored.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct MessageReactions {
-    // ported with the Wave-2 reactions slice
+    pub reactions: Vec<MessageReaction>,
+    pub unread_reactions: Vec<UnreadMessageReaction>,
+    pub chosen_reaction_order: Vec<ReactionType>,
+    pub top_reactors: Vec<MessageReactor>,
+    pub pending_paid_reactions: i32,
+    pub is_min: bool,
+    pub need_polling: bool,
+    pub can_get_added_reactions: bool,
+    pub are_tags: bool,
+}
+
+impl MessageReactions {
+    /// `MessageReactions::are_empty` (MessageReaction.cpp).
+    pub fn are_empty(&self) -> bool {
+        self.reactions.is_empty()
+            && self.unread_reactions.is_empty()
+            && self.top_reactors.is_empty()
+    }
+
+    /// `MessageReactions::store` (MessageReaction.hpp:114-137).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_reactions = !self.reactions.is_empty();
+        let has_unread_reactions = !self.unread_reactions.is_empty();
+        let has_chosen_reaction_order = !self.chosen_reaction_order.is_empty();
+        let has_top_reactors = !self.top_reactors.is_empty();
+        store_flags(
+            out,
+            [
+                self.is_min,
+                self.need_polling,
+                self.can_get_added_reactions,
+                has_unread_reactions,
+                has_reactions,
+                has_chosen_reaction_order,
+                self.are_tags,
+                has_top_reactors,
+            ],
+        );
+        if has_reactions {
+            store_message_reaction_vec(out, &self.reactions);
+        }
+        if has_unread_reactions {
+            store_unread_message_reaction_vec(out, &self.unread_reactions);
+        }
+        if has_chosen_reaction_order {
+            store_reaction_type_vec(out, &self.chosen_reaction_order);
+        }
+        if has_top_reactors {
+            store_message_reactor_vec(out, &self.top_reactors);
+        }
+    }
+
+    /// `MessageReactions::parse` (MessageReaction.hpp:139-160).
+    pub fn parse_from(parser: &mut Parser) -> Result<MessageReactions, &'static str> {
+        let [
+            is_min,
+            need_polling,
+            can_get_added_reactions,
+            has_unread_reactions,
+            has_reactions,
+            has_chosen_reaction_order,
+            are_tags,
+            has_top_reactors,
+        ] = parser.parse_flags::<8>()?;
+        let reactions = if has_reactions {
+            parse_message_reaction_vec(parser)?
+        } else {
+            Vec::new()
+        };
+        let unread_reactions = if has_unread_reactions {
+            parse_unread_message_reaction_vec(parser)?
+        } else {
+            Vec::new()
+        };
+        let chosen_reaction_order = if has_chosen_reaction_order {
+            parse_reaction_type_vec(parser)?
+        } else {
+            Vec::new()
+        };
+        let top_reactors = if has_top_reactors {
+            parse_message_reactor_vec(parser)?
+        } else {
+            Vec::new()
+        };
+        Ok(MessageReactions {
+            reactions,
+            unread_reactions,
+            chosen_reaction_order,
+            top_reactors,
+            pending_paid_reactions: 0,
+            is_min,
+            need_polling,
+            can_get_added_reactions,
+            are_tags,
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2916,6 +3662,36 @@ impl MessageQuote {
     pub fn is_empty(&self) -> bool {
         self.text.text.is_empty()
     }
+
+    /// `MessageQuote::store` (MessageQuote.hpp:16-33).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_text = !self.text.text.is_empty();
+        let has_position = self.position != 0;
+        store_flags(out, [has_text, has_position, self.is_manual]);
+        if has_text {
+            self.text.store(out);
+        }
+        if has_position {
+            store_i32(out, self.position);
+        }
+    }
+
+    /// `MessageQuote::parse` (MessageQuote.hpp:35-56) — the text is passed
+    /// through `remove_unallowed_quote_entities` like the C++.
+    pub fn parse_from(parser: &mut Parser) -> Result<MessageQuote, &'static str> {
+        let [has_text, has_position, is_manual] = parser.parse_flags::<3>()?;
+        let mut text = FormattedText::default();
+        if has_text {
+            text = FormattedText::parse(parser)?;
+            crate::message_entity::remove_unallowed_quote_entities(&mut text);
+        }
+        let position = if has_position { parser.i32_()? } else { 0 };
+        Ok(MessageQuote {
+            text,
+            position,
+            is_manual,
+        })
+    }
 }
 
 /// `td::LastForwardedMessageInfo` (MessageForwardInfo.h:26-73) — where the
@@ -2963,8 +3739,77 @@ impl LastForwardedMessageInfo {
         MessageFullId::new(self.dialog_id, self.message_id)
     }
 
-    // `is_empty`/`validate` live in MessageForwardInfo.cpp — they land with
-    // the forward-info consuming slices.
+    /// `LastForwardedMessageInfo::is_empty` (MessageForwardInfo.cpp:21-23).
+    pub fn is_empty(&self) -> bool {
+        *self == LastForwardedMessageInfo::default()
+    }
+
+    /// `LastForwardedMessageInfo::validate` (MessageForwardInfo.cpp:25-33).
+    pub fn validate(&mut self) {
+        if self.dialog_id.is_valid() != self.message_id.is_valid()
+            || (self.sender_dialog_id != DialogId::default() && !self.sender_dialog_id.is_valid())
+            || ((self.sender_dialog_id != DialogId::default() || !self.sender_name.is_empty())
+                && self.date <= 0)
+        {
+            *self = LastForwardedMessageInfo::default();
+        }
+    }
+
+    /// `LastForwardedMessageInfo::store` (MessageForwardInfo.hpp:16-37).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_sender_dialog_id = self.sender_dialog_id.is_valid();
+        let has_sender_name = !self.sender_name.is_empty();
+        let has_date = self.date > 0;
+        store_flags(
+            out,
+            [
+                has_sender_dialog_id,
+                has_sender_name,
+                has_date,
+                self.is_outgoing,
+            ],
+        );
+        self.dialog_id.store(out);
+        self.message_id.store(out);
+        if has_sender_dialog_id {
+            self.sender_dialog_id.store(out);
+        }
+        if has_sender_name {
+            store_string(out, &self.sender_name);
+        }
+        if has_date {
+            store_i32(out, self.date);
+        }
+    }
+
+    /// `LastForwardedMessageInfo::parse` (MessageForwardInfo.hpp:39-62).
+    pub fn parse_from(parser: &mut Parser) -> Result<LastForwardedMessageInfo, &'static str> {
+        let [has_sender_dialog_id, has_sender_name, has_date, is_outgoing] =
+            parser.parse_flags::<4>()?;
+        let dialog_id = DialogId::parse_from(parser)?;
+        let message_id = MessageId::parse_from(parser)?;
+        let sender_dialog_id = if has_sender_dialog_id {
+            DialogId::parse_from(parser)?
+        } else {
+            DialogId::default()
+        };
+        let sender_name = if has_sender_name {
+            parser.string()?
+        } else {
+            String::new()
+        };
+        let date = if has_date { parser.i32_()? } else { 0 };
+        let mut result = LastForwardedMessageInfo {
+            dialog_id,
+            message_id,
+            sender_dialog_id,
+            sender_name,
+            date,
+            is_outgoing,
+        };
+        result.validate();
+        Ok(result)
+    }
 }
 
 /// `td::MessageForwardInfo` (MessageForwardInfo.h:76-117).
@@ -2975,6 +3820,47 @@ pub struct MessageForwardInfo {
     pub last_message_info: LastForwardedMessageInfo,
     pub psa_type: String,
     pub is_imported: bool,
+}
+
+impl MessageForwardInfo {
+    /// `MessageForwardInfo::store` (MessageForwardInfo.hpp:64-81).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_last_message_info = !self.last_message_info.is_empty();
+        let has_psa_type = !self.psa_type.is_empty();
+        store_flags(out, [self.is_imported, has_last_message_info, has_psa_type]);
+        self.origin.store(out);
+        store_i32(out, self.date);
+        if has_last_message_info {
+            self.last_message_info.store(out);
+        }
+        if has_psa_type {
+            store_string(out, &self.psa_type);
+        }
+    }
+
+    /// `MessageForwardInfo::parse` (MessageForwardInfo.hpp:83-99).
+    pub fn parse_from(parser: &mut Parser) -> Result<MessageForwardInfo, &'static str> {
+        let [is_imported, has_last_message_info, has_psa_type] = parser.parse_flags::<3>()?;
+        let origin = MessageOrigin::parse_from(parser)?;
+        let date = parser.i32_()?;
+        let last_message_info = if has_last_message_info {
+            LastForwardedMessageInfo::parse_from(parser)?
+        } else {
+            LastForwardedMessageInfo::default()
+        };
+        let psa_type = if has_psa_type {
+            parser.string()?
+        } else {
+            String::new()
+        };
+        Ok(MessageForwardInfo {
+            origin,
+            date,
+            last_message_info,
+            psa_type,
+            is_imported,
+        })
+    }
 }
 
 /// `td::RepliedMessageInfo` (RepliedMessageInfo.h:23-50) — the reply header
@@ -3054,6 +3940,126 @@ impl RepliedMessageInfo {
             message_id: self.message_id,
         }
     }
+
+    /// `RepliedMessageInfo::store` (RepliedMessageInfo.hpp:16-59) — the
+    /// embedded replied-to content rides the M.9 store seam.
+    pub fn store(
+        &self,
+        ctx: &dyn crate::message_content::MessageContentStorage,
+        out: &mut Vec<u8>,
+    ) {
+        let has_message_id = self.message_id.is_valid() || self.message_id.is_valid_scheduled();
+        let has_dialog_id = self.dialog_id.is_valid();
+        let has_origin_date = self.origin_date != 0;
+        let has_origin = !self.origin.is_empty();
+        let has_content = self.content.is_some();
+        let has_quote = !self.quote.is_empty();
+        let has_todo_item_id = self.todo_item_id != 0;
+        let has_poll_option_id = !self.poll_option_id.is_empty();
+        store_flags(
+            out,
+            [
+                has_message_id,
+                has_dialog_id,
+                has_origin_date,
+                has_origin,
+                false,
+                false,
+                has_content,
+                false,
+                has_quote,
+                has_todo_item_id,
+                has_poll_option_id,
+            ],
+        );
+        if has_message_id {
+            self.message_id.store(out);
+        }
+        if has_dialog_id {
+            self.dialog_id.store(out);
+        }
+        if has_origin_date {
+            store_i32(out, self.origin_date);
+        }
+        if has_origin {
+            self.origin.store(out);
+        }
+        if has_content {
+            crate::message_content::store_message_content(self.content.as_ref().unwrap(), ctx, out);
+        }
+        if has_quote {
+            self.quote.store(out);
+        }
+        if has_todo_item_id {
+            store_i32(out, self.todo_item_id);
+        }
+        if has_poll_option_id {
+            store_string(out, &self.poll_option_id);
+        }
+    }
+
+    /// `RepliedMessageInfo::parse` (RepliedMessageInfo.hpp:61-127) — the
+    /// legacy quote/position fields collapse into a `MessageQuote`.
+    pub fn parse_from(
+        parser: &mut Parser,
+        ctx: &mut dyn crate::message_content::MessageContentStorage,
+    ) -> Result<RepliedMessageInfo, &'static str> {
+        let [
+            has_message_id,
+            has_dialog_id,
+            has_origin_date,
+            has_origin,
+            has_quote_legacy,
+            is_quote_manual_legacy,
+            has_content,
+            has_quote_position_legacy,
+            has_quote,
+            has_todo_item_id,
+            has_poll_option_id,
+        ] = parser.parse_flags::<11>()?;
+        let mut result = RepliedMessageInfo::default();
+        if has_message_id {
+            result.message_id = MessageId::parse_from(parser)?;
+        }
+        if has_dialog_id {
+            result.dialog_id = DialogId::parse_from(parser)?;
+        }
+        if has_origin_date {
+            result.origin_date = parser.i32_()?;
+        }
+        if has_origin {
+            result.origin = MessageOrigin::parse_from(parser)?;
+        }
+        let quote_legacy = if has_quote_legacy {
+            Some(FormattedText::parse(parser)?)
+        } else {
+            None
+        };
+        if has_content {
+            result.content = Some(crate::message_content::parse_message_content(parser, ctx)?);
+        }
+        let quote_position_legacy = if has_quote_position_legacy {
+            parser.i32_()?
+        } else {
+            0
+        };
+        if has_quote {
+            result.quote = MessageQuote::parse_from(parser)?;
+        } else if let Some(text) = quote_legacy {
+            result.quote = MessageQuote {
+                text,
+                position: quote_position_legacy,
+                is_manual: is_quote_manual_legacy,
+            };
+        }
+        if has_todo_item_id {
+            result.todo_item_id = parser.i32_()?;
+        }
+        if has_poll_option_id {
+            result.poll_option_id = parser.string()?;
+        }
+        Ok(result)
+    }
 }
 
 /// `td::MessageInputReplyTo` (MessageInputReplyTo.h:19-29) — the reply
@@ -3086,6 +4092,143 @@ impl Default for MessageInputReplyTo {
     }
 }
 
+impl MessageInputReplyTo {
+    /// `MessageInputReplyTo::regular` (MessageInputReplyTo.cpp:14-20).
+    pub fn regular(message_id: MessageId) -> MessageInputReplyTo {
+        MessageInputReplyTo {
+            message_id,
+            ..MessageInputReplyTo::default()
+        }
+    }
+
+    /// `MessageInputReplyTo::is_empty` (MessageInputReplyTo.h:72-75).
+    pub fn is_empty(&self) -> bool {
+        !self.message_id.is_valid()
+            && !self.message_id.is_valid_scheduled()
+            && !self.ephemeral_message_id.is_valid()
+            && !self.story_full_id.is_valid()
+    }
+
+    /// `MessageInputReplyTo::is_valid` (MessageInputReplyTo.h:77-79).
+    pub fn is_valid(&self) -> bool {
+        !self.is_empty()
+    }
+
+    /// `MessageInputReplyTo::get_same_chat_reply_to_message_id`
+    /// (MessageInputReplyTo.cpp:12-15).
+    pub fn get_same_chat_reply_to_message_id(&self) -> MessageId {
+        if self.dialog_id == DialogId::default()
+            && (self.message_id.is_valid() || self.message_id.is_valid_scheduled())
+        {
+            self.message_id
+        } else {
+            MessageId::default()
+        }
+    }
+
+    /// `MessageInputReplyTo::store` (MessageInputReplyTo.hpp:16-62).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_message_id = self.message_id.is_valid();
+        let has_story_full_id = self.story_full_id.is_valid();
+        let has_dialog_id = self.dialog_id.is_valid();
+        let has_quote = !self.quote.is_empty();
+        let has_todo_item_id = self.todo_item_id != 0;
+        let has_poll_option_id = !self.poll_option_id.is_empty();
+        let has_ephemeral_message_id = self.ephemeral_message_id.is_valid();
+        store_flags(
+            out,
+            [
+                has_message_id,
+                has_story_full_id,
+                false,
+                has_dialog_id,
+                false,
+                has_quote,
+                has_todo_item_id,
+                has_poll_option_id,
+                has_ephemeral_message_id,
+            ],
+        );
+        if has_message_id {
+            self.message_id.store(out);
+        }
+        if has_story_full_id {
+            self.story_full_id.store(out);
+        }
+        if has_dialog_id {
+            self.dialog_id.store(out);
+        }
+        if has_quote {
+            self.quote.store(out);
+        }
+        if has_todo_item_id {
+            store_i32(out, self.todo_item_id);
+        }
+        if has_poll_option_id {
+            store_string(out, &self.poll_option_id);
+        }
+        if has_ephemeral_message_id {
+            self.ephemeral_message_id.store(out);
+        }
+    }
+
+    /// `MessageInputReplyTo::parse` (MessageInputReplyTo.hpp:64-122) — the
+    /// legacy quote fields collapse into a `MessageQuote` like the C++.
+    pub fn parse_from(parser: &mut Parser) -> Result<MessageInputReplyTo, &'static str> {
+        let [
+            has_message_id,
+            has_story_full_id,
+            has_quote_legacy,
+            has_dialog_id,
+            has_quote_position_legacy,
+            has_quote,
+            has_todo_item_id,
+            has_poll_option_id,
+            has_ephemeral_message_id,
+        ] = parser.parse_flags::<9>()?;
+        let mut result = MessageInputReplyTo::default();
+        if has_message_id {
+            result.message_id = MessageId::parse_from(parser)?;
+            result.debug_source = "binlog";
+        }
+        if has_story_full_id {
+            result.story_full_id = StoryFullId::parse_from(parser)?;
+        }
+        let quote_legacy = if has_quote_legacy {
+            Some(FormattedText::parse(parser)?)
+        } else {
+            None
+        };
+        if has_dialog_id {
+            result.dialog_id = DialogId::parse_from(parser)?;
+        }
+        let quote_position_legacy = if has_quote_position_legacy {
+            parser.i32_()?
+        } else {
+            0
+        };
+        if has_quote {
+            result.quote = MessageQuote::parse_from(parser)?;
+        } else if let Some(text) = quote_legacy {
+            result.quote = MessageQuote {
+                text,
+                position: quote_position_legacy,
+                is_manual: false,
+            };
+        }
+        if has_todo_item_id {
+            result.todo_item_id = parser.i32_()?;
+        }
+        if has_poll_option_id {
+            result.poll_option_id = parser.string()?;
+        }
+        if has_ephemeral_message_id {
+            result.ephemeral_message_id = EphemeralMessageId::parse_from(parser)?;
+        }
+        Ok(result)
+    }
+}
+
 /// `td::InputMessageText` (InputMessageText.h:24-33).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct InputMessageText {
@@ -3102,6 +4245,60 @@ impl InputMessageText {
     /// `InputMessageText::is_empty` (InputMessageText.h:47-50).
     pub fn is_empty(&self) -> bool {
         self.text.text.is_empty() && self.web_page_url.is_empty()
+    }
+
+    /// `store(const InputMessageText &, ...)` (InputMessageText.hpp:16-37).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_web_page_url = !self.web_page_url.is_empty();
+        let has_empty_text = self.text.text.is_empty();
+        store_flags(
+            out,
+            [
+                self.disable_web_page_preview,
+                self.clear_draft,
+                self.force_small_media,
+                self.force_large_media,
+                has_web_page_url,
+                has_empty_text,
+            ],
+        );
+        if !has_empty_text {
+            self.text.store(out);
+        }
+        if has_web_page_url {
+            store_string(out, &self.web_page_url);
+        }
+    }
+
+    /// `parse(InputMessageText &, ...)` (InputMessageText.hpp:39-59).
+    pub fn parse_from(parser: &mut Parser) -> Result<InputMessageText, &'static str> {
+        let [
+            disable_web_page_preview,
+            clear_draft,
+            force_small_media,
+            force_large_media,
+            has_web_page_url,
+            has_empty_text,
+        ] = parser.parse_flags::<6>()?;
+        let text = if !has_empty_text {
+            FormattedText::parse(parser)?
+        } else {
+            FormattedText::default()
+        };
+        let web_page_url = if has_web_page_url {
+            parser.string()?
+        } else {
+            String::new()
+        };
+        Ok(InputMessageText {
+            text,
+            web_page_url,
+            disable_web_page_preview,
+            force_small_media,
+            force_large_media,
+            show_above_text: false,
+            clear_draft,
+        })
     }
 }
 
@@ -3127,6 +4324,78 @@ impl SuggestedPost {
     pub fn get_schedule_date(&self) -> i32 {
         self.schedule_date
     }
+
+    /// `SuggestedPost::store` (SuggestedPost.hpp:14-31).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_price = !self.price.is_empty();
+        let has_schedule_date = self.schedule_date != 0;
+        store_flags(
+            out,
+            [
+                self.is_accepted,
+                self.is_rejected,
+                has_price,
+                has_schedule_date,
+            ],
+        );
+        if has_price {
+            store_suggested_post_price(out, &self.price);
+        }
+        if has_schedule_date {
+            store_i32(out, self.schedule_date);
+        }
+    }
+
+    /// `SuggestedPost::parse` (SuggestedPost.hpp:33-48).
+    pub fn parse_from(parser: &mut Parser) -> Result<SuggestedPost, &'static str> {
+        let [is_accepted, is_rejected, has_price, has_schedule_date] = parser.parse_flags::<4>()?;
+        let price = if has_price {
+            parse_suggested_post_price(parser)?
+        } else {
+            SuggestedPostPrice::default()
+        };
+        let schedule_date = if has_schedule_date { parser.i32_()? } else { 0 };
+        Ok(SuggestedPost {
+            price,
+            schedule_date,
+            is_accepted,
+            is_rejected,
+        })
+    }
+}
+
+/// `SuggestedPostPrice::store` (SuggestedPostPrice.hpp:14-26) — lives here
+/// (not in `message_content`) because the M.9 line owns the type but the
+/// store/parse plane arrived with M.10.2; move at the next M.9 touch if
+/// the split bothers you.
+pub fn store_suggested_post_price(out: &mut Vec<u8>, price: &SuggestedPostPrice) {
+    let has_amount = price.amount != 0;
+    store_flags(out, [has_amount]);
+    store_i32(
+        out,
+        match price.r#type {
+            crate::message_content::SuggestedPostPriceType::None => 0,
+            crate::message_content::SuggestedPostPriceType::Star => 1,
+            crate::message_content::SuggestedPostPriceType::Ton => 2,
+        },
+    );
+    if has_amount {
+        store_i64(out, price.amount);
+    }
+}
+
+/// `SuggestedPostPrice::parse` (SuggestedPostPrice.hpp:28-38).
+pub fn parse_suggested_post_price(parser: &mut Parser) -> Result<SuggestedPostPrice, &'static str> {
+    let [has_amount] = parser.parse_flags::<1>()?;
+    let price_type = parser.i32_()?;
+    let amount = if has_amount { parser.i64_()? } else { 0 };
+    let r#type = match price_type {
+        0 => crate::message_content::SuggestedPostPriceType::None,
+        1 => crate::message_content::SuggestedPostPriceType::Star,
+        2 => crate::message_content::SuggestedPostPriceType::Ton,
+        _ => return Err("Wrong suggested post price type"),
+    };
+    Ok(SuggestedPostPrice { r#type, amount })
 }
 
 /// `td::DraftMessageContentType` (DraftMessage.h:33).
@@ -3172,6 +4441,115 @@ impl DraftMessageContent {
             DraftMessageContent::VoiceNote(_) => DraftMessageContentType::VoiceNote,
         }
     }
+
+    /// The per-class `store` overrides (DraftMessage.cpp:40-48/115-123 and
+    /// the `store(const DraftMessageContent *, ...)` switch at 172-193) —
+    /// the discriminant then the flags/payload, i.e. exactly
+    /// `store_draft_message_content` after the type word.
+    pub fn store(&self, out: &mut Vec<u8>) {
+        store_i32(out, self.get_type() as i32);
+        match self {
+            DraftMessageContent::VideoNote(video_note) => {
+                let has_path = !video_note.path.is_empty();
+                let has_duration = video_note.duration != 0;
+                let has_length = video_note.length != 0;
+                let has_ttl = video_note.ttl.is_valid();
+                store_flags(out, [has_path, has_duration, has_length, has_ttl]);
+                if has_path {
+                    store_string(out, &video_note.path);
+                }
+                if has_duration {
+                    store_i32(out, video_note.duration);
+                }
+                if has_length {
+                    store_i32(out, video_note.length);
+                }
+                if has_ttl {
+                    video_note.ttl.store(out);
+                }
+            }
+            DraftMessageContent::VoiceNote(voice_note) => {
+                let has_path = !voice_note.path.is_empty();
+                let has_duration = voice_note.duration != 0;
+                let has_waveform = !voice_note.waveform.is_empty();
+                let has_ttl = voice_note.ttl.is_valid();
+                store_flags(out, [has_path, has_duration, has_waveform, has_ttl]);
+                if has_path {
+                    store_string(out, &voice_note.path);
+                }
+                if has_duration {
+                    store_i32(out, voice_note.duration);
+                }
+                if has_waveform {
+                    store_string(out, &voice_note.waveform);
+                }
+                if has_ttl {
+                    voice_note.ttl.store(out);
+                }
+            }
+        }
+    }
+
+    /// `parse_draft_message_content` (DraftMessage.cpp:208-228).
+    pub fn parse_from(parser: &mut Parser) -> Result<DraftMessageContent, &'static str> {
+        let content_type = parser.i32_()?;
+        match content_type {
+            0 => {
+                let [has_path, has_duration, has_length, has_ttl] = parser.parse_flags::<4>()?;
+                Ok(DraftMessageContent::VideoNote(
+                    DraftMessageContentVideoNote {
+                        path: if has_path {
+                            parser.string()?
+                        } else {
+                            String::new()
+                        },
+                        duration: if has_duration { parser.i32_()? } else { 0 },
+                        length: if has_length { parser.i32_()? } else { 0 },
+                        ttl: if has_ttl {
+                            MessageSelfDestructType::parse_from(parser)?
+                        } else {
+                            MessageSelfDestructType::default()
+                        },
+                    },
+                ))
+            }
+            1 => {
+                let [has_path, has_duration, has_waveform, has_ttl] = parser.parse_flags::<4>()?;
+                Ok(DraftMessageContent::VoiceNote(
+                    DraftMessageContentVoiceNote {
+                        path: if has_path {
+                            parser.string()?
+                        } else {
+                            String::new()
+                        },
+                        duration: if has_duration { parser.i32_()? } else { 0 },
+                        waveform: if has_waveform {
+                            parser.string()?
+                        } else {
+                            String::new()
+                        },
+                        ttl: if has_ttl {
+                            MessageSelfDestructType::parse_from(parser)?
+                        } else {
+                            MessageSelfDestructType::default()
+                        },
+                    },
+                ))
+            }
+            _ => Err("Wrong draft content type"),
+        }
+    }
+}
+
+impl MessageSelfDestructType {
+    /// The `ParserT` overload of `MessageSelfDestructType::parse`
+    /// (MessageSelfDestructType.hpp) — the nested store/parse planes read
+    /// it inline.
+    pub fn parse_from(parser: &mut Parser) -> Result<MessageSelfDestructType, &'static str> {
+        Ok(MessageSelfDestructType {
+            ttl: parser.i32_()?,
+        })
+    }
 }
 
 /// `td::DraftMessage` (DraftMessage.h:50-60) — `rich_message_content` must
@@ -3197,6 +4575,134 @@ impl DraftMessage {
     /// `DraftMessage::is_local` (DraftMessage.h:71-73).
     pub fn is_local(&self) -> bool {
         self.local_content.is_some()
+    }
+
+    /// `DraftMessage::store` (DraftMessage.hpp:24-60). The rich-message
+    /// arm stores through the M.9 content seam; the RichMessage legacy
+    /// payload is a Wave-2 WebPageBlock block and stores as absent.
+    pub fn store(
+        &self,
+        ctx: &dyn crate::message_content::MessageContentStorage,
+        out: &mut Vec<u8>,
+    ) {
+        let has_input_message_text = !self.input_message_text.is_empty();
+        let has_message_input_reply_to = !self.message_input_reply_to.is_empty();
+        let has_local_content = self.local_content.is_some();
+        let has_message_effect_id = self.message_effect_id.is_valid();
+        let has_suggested_post = self.suggested_post.is_some();
+        let is_rich = self.rich_message_content.is_some();
+        store_flags(
+            out,
+            [
+                has_input_message_text,
+                has_message_input_reply_to,
+                has_local_content,
+                has_message_effect_id,
+                has_suggested_post,
+                false,
+                is_rich,
+            ],
+        );
+        store_i32(out, self.date);
+        if has_input_message_text {
+            self.input_message_text.store(out);
+        }
+        if has_message_input_reply_to {
+            self.message_input_reply_to.store(out);
+        }
+        if has_local_content {
+            self.local_content.as_ref().unwrap().store(out);
+        }
+        if has_message_effect_id {
+            self.message_effect_id.store(out);
+        }
+        if has_suggested_post {
+            self.suggested_post.as_ref().unwrap().store(out);
+        }
+        if is_rich {
+            crate::message_content::store_message_content(
+                self.rich_message_content.as_ref().unwrap(),
+                ctx,
+                out,
+            );
+        }
+    }
+
+    /// `DraftMessage::parse` (DraftMessage.hpp:62-121) — the pre-
+    /// `SupportRepliesInOtherChats` (51) legacy layout stores the reply
+    /// message id inline; the legacy RichMessage payload arm is a Wave-2
+    /// block and errors like a truncated blob.
+    pub fn parse_from(
+        parser: &mut Parser,
+        ctx: &mut dyn crate::message_content::MessageContentStorage,
+    ) -> Result<DraftMessage, &'static str> {
+        let mut result = DraftMessage::default();
+        let has_input_message_text;
+        let mut has_message_input_reply_to = false;
+        let mut has_local_content = false;
+        let mut has_message_effect_id = false;
+        let mut has_suggested_post = false;
+        let mut is_rich_legacy = false;
+        let mut is_rich = false;
+        let has_legacy_reply_to_message_id;
+        if parser.version() >= crate::store_parse::version::SUPPORT_REPLIES_IN_OTHER_CHATS {
+            has_legacy_reply_to_message_id = false;
+            let [
+                has_input_message_text_,
+                has_message_input_reply_to_,
+                has_local_content_,
+                has_message_effect_id_,
+                has_suggested_post_,
+                is_rich_legacy_,
+                is_rich_,
+            ] = parser.parse_flags::<7>()?;
+            has_input_message_text = has_input_message_text_;
+            has_message_input_reply_to = has_message_input_reply_to_;
+            has_local_content = has_local_content_;
+            has_message_effect_id = has_message_effect_id_;
+            has_suggested_post = has_suggested_post_;
+            is_rich_legacy = is_rich_legacy_;
+            is_rich = is_rich_;
+        } else {
+            has_legacy_reply_to_message_id = true;
+            has_input_message_text = true;
+        }
+        result.date = parser.i32_()?;
+        if has_legacy_reply_to_message_id {
+            let legacy_reply_to_message_id = MessageId::parse_from(parser)?;
+            result.message_input_reply_to =
+                MessageInputReplyTo::regular(legacy_reply_to_message_id);
+        }
+        if has_input_message_text {
+            result.input_message_text = InputMessageText::parse_from(parser)?;
+        }
+        if has_message_input_reply_to {
+            result.message_input_reply_to = MessageInputReplyTo::parse_from(parser)?;
+
+            let message_id = result
+                .message_input_reply_to
+                .get_same_chat_reply_to_message_id();
+            if message_id.is_valid() && (message_id.is_yet_unsent() || message_id.is_local()) {
+                result.message_input_reply_to = MessageInputReplyTo::default();
+            }
+        }
+        if has_local_content {
+            result.local_content = Some(DraftMessageContent::parse_from(parser)?);
+        }
+        if has_message_effect_id {
+            result.message_effect_id = MessageEffectId::parse_from(parser)?;
+        }
+        if has_suggested_post {
+            result.suggested_post = Some(SuggestedPost::parse_from(parser)?);
+        }
+        if is_rich_legacy {
+            return Err("Legacy RichMessage draft payload is not supported yet");
+        }
+        if is_rich {
+            result.rich_message_content =
+                Some(crate::message_content::parse_message_content(parser, ctx)?);
+        }
+        Ok(result)
     }
 }
 
@@ -5294,5 +6800,482 @@ mod tests {
         scheduled.deleted_scheduled_server_message_ids.insert(id);
         assert_eq!(scheduled.scheduled_message_date.get(&id), Some(&1700000003));
         assert!(scheduled.deleted_scheduled_server_message_ids.contains(&id));
+    }
+
+    // ==== M.10.2a tests — the companion store/parse plane ====
+
+    /// A `MessageContentStorage` that panics on any call: the companion
+    /// tests store payloads without content, so the seam must never fire.
+    struct NoStorage;
+
+    impl crate::message_content::MessageContentStorage for NoStorage {
+        fn store_file(&self, _file_id: FileId, _out: &mut Vec<u8>) {
+            unreachable!()
+        }
+        fn parse_file(&mut self, _parser: &mut Parser) -> Result<FileId, &'static str> {
+            unreachable!()
+        }
+        fn store_animation(&self, _file_id: FileId, _out: &mut Vec<u8>) {
+            unreachable!()
+        }
+        fn parse_animation(&mut self, _parser: &mut Parser) -> Result<FileId, &'static str> {
+            unreachable!()
+        }
+        fn store_audio(&self, _file_id: FileId, _out: &mut Vec<u8>) {
+            unreachable!()
+        }
+        fn parse_audio(&mut self, _parser: &mut Parser) -> Result<FileId, &'static str> {
+            unreachable!()
+        }
+        fn store_document(&self, _file_id: FileId, _out: &mut Vec<u8>) {
+            unreachable!()
+        }
+        fn parse_document(&mut self, _parser: &mut Parser) -> Result<FileId, &'static str> {
+            unreachable!()
+        }
+        fn store_video(&self, _file_id: FileId, _out: &mut Vec<u8>) {
+            unreachable!()
+        }
+        fn parse_video(&mut self, _parser: &mut Parser) -> Result<FileId, &'static str> {
+            unreachable!()
+        }
+        fn store_video_note(&self, _file_id: FileId, _out: &mut Vec<u8>) {
+            unreachable!()
+        }
+        fn parse_video_note(&mut self, _parser: &mut Parser) -> Result<FileId, &'static str> {
+            unreachable!()
+        }
+        fn store_voice_note(&self, _file_id: FileId, _out: &mut Vec<u8>) {
+            unreachable!()
+        }
+        fn parse_voice_note(&mut self, _parser: &mut Parser) -> Result<FileId, &'static str> {
+            unreachable!()
+        }
+        fn store_sticker(&self, _file_id: FileId, _out: &mut Vec<u8>) {
+            unreachable!()
+        }
+        fn parse_sticker(&mut self, _parser: &mut Parser) -> Result<FileId, &'static str> {
+            unreachable!()
+        }
+        fn store_poll(&self, _poll_id: crate::message_content::PollId, _out: &mut Vec<u8>) {
+            unreachable!()
+        }
+        fn parse_poll(
+            &mut self,
+            _parser: &mut Parser,
+        ) -> Result<crate::message_content::PollId, &'static str> {
+            unreachable!()
+        }
+        fn store_background(
+            &self,
+            _background_id: crate::message_content::BackgroundId,
+            _out: &mut Vec<u8>,
+        ) {
+            unreachable!()
+        }
+        fn parse_background(
+            &mut self,
+            _parser: &mut Parser,
+        ) -> Result<crate::message_content::BackgroundId, &'static str> {
+            unreachable!()
+        }
+        fn store_reactions(&mut self, _reactions: &MessageReactions, _out: &mut Vec<u8>) {
+            unreachable!()
+        }
+        fn parse_reactions(
+            &mut self,
+            _input: &mut Parser,
+        ) -> Result<MessageReactions, &'static str> {
+            unreachable!()
+        }
+        fn store_reply_markup(
+            &mut self,
+            _reply_markup: &tdmtproto::telegram_api::ReplyMarkup,
+            _out: &mut Vec<u8>,
+        ) {
+            unreachable!()
+        }
+        fn parse_reply_markup(
+            &mut self,
+            _input: &mut Parser,
+        ) -> Result<tdmtproto::telegram_api::ReplyMarkup, &'static str> {
+            unreachable!()
+        }
+        fn store_min_channel(&mut self, _min_channel: &MinChannel, _out: &mut Vec<u8>) {
+            unreachable!()
+        }
+        fn parse_min_channel(&mut self, _input: &mut Parser) -> Result<MinChannel, &'static str> {
+            unreachable!()
+        }
+        fn on_load_web_page_url_from_database(
+            &mut self,
+            _web_page_id: crate::message_content::WebPageId,
+            _url: &str,
+        ) {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    fn message_origin_store_parse_roundtrip() {
+        let empty = MessageOrigin::default();
+        let mut bytes = Vec::new();
+        empty.store(&mut bytes);
+        // the empty origin is exactly the clear flag word
+        assert_eq!(bytes, vec![0, 0, 0, 0]);
+        let mut parser = Parser::new(&bytes);
+        assert_eq!(MessageOrigin::parse_from(&mut parser).unwrap(), empty);
+
+        let full = MessageOrigin::new(
+            UserId::new(7),
+            DialogId::from_channel_id(ChannelId::new(10)),
+            MessageId::from_server_message_id(ServerMessageId::new(100)),
+            "sig".to_string(),
+            "name".to_string(),
+        );
+        let mut bytes = Vec::new();
+        full.store(&mut bytes);
+        let mut parser = Parser::new(&bytes);
+        assert_eq!(MessageOrigin::parse_from(&mut parser).unwrap(), full);
+    }
+
+    #[test]
+    fn forward_info_store_parse_roundtrip() {
+        let mut info = MessageForwardInfo {
+            origin: MessageOrigin::new(
+                UserId::default(),
+                DialogId::from_channel_id(ChannelId::new(42)),
+                MessageId::from_server_message_id(ServerMessageId::new(500)),
+                String::new(),
+                String::new(),
+            ),
+            date: 1700000000,
+            last_message_info: LastForwardedMessageInfo {
+                dialog_id: DialogId::from_user_id(UserId::new(9)),
+                message_id: MessageId::from_server_message_id(ServerMessageId::new(501)),
+                sender_dialog_id: DialogId::from_user_id(UserId::new(9)),
+                sender_name: "sender".to_string(),
+                date: 1700000100,
+                is_outgoing: true,
+            },
+            psa_type: "PSA".to_string(),
+            is_imported: true,
+        };
+        let mut bytes = Vec::new();
+        info.store(&mut bytes);
+        let mut parser = Parser::new(&bytes);
+        assert_eq!(MessageForwardInfo::parse_from(&mut parser).unwrap(), info);
+
+        // validate() collapses an inconsistent last_message_info (sender
+        // name without a date)
+        info.last_message_info.date = 0;
+        let mut bytes = Vec::new();
+        info.store(&mut bytes);
+        let mut parser = Parser::new(&bytes);
+        let parsed = MessageForwardInfo::parse_from(&mut parser).unwrap();
+        assert!(parsed.last_message_info.is_empty());
+    }
+
+    #[test]
+    fn message_reply_info_store_parse_roundtrip() {
+        let mut info = MessageReplyInfo {
+            reply_count: 3,
+            pts: 100,
+            recent_replier_dialog_ids: vec![
+                DialogId::from_user_id(UserId::new(1)),
+                DialogId::from_user_id(UserId::new(2)),
+            ],
+            replier_min_channels: vec![(
+                ChannelId::new(77),
+                MinChannel {
+                    title: "channel".to_string(),
+                    is_megagroup: true,
+                },
+            )],
+            channel_id: ChannelId::new(5),
+            max_message_id: MessageId::from_server_message_id(ServerMessageId::new(600)),
+            last_read_inbox_message_id: MessageId::from_server_message_id(ServerMessageId::new(
+                599,
+            )),
+            last_read_outbox_message_id: MessageId::from_server_message_id(ServerMessageId::new(
+                598,
+            )),
+            is_comment: true,
+            is_dropped: false,
+        };
+        let mut bytes = Vec::new();
+        info.store(&mut bytes);
+        let mut parser = Parser::new(&bytes);
+        assert_eq!(MessageReplyInfo::parse_from(&mut parser).unwrap(), info);
+
+        // channel id 777 collapses to the dropped default
+        info.channel_id = ChannelId::new(777);
+        let mut bytes = Vec::new();
+        info.store(&mut bytes);
+        let mut parser = Parser::new(&bytes);
+        let parsed = MessageReplyInfo::parse_from(&mut parser).unwrap();
+        assert!(parsed.is_dropped);
+        assert!(parsed.is_empty());
+    }
+
+    #[test]
+    fn replied_message_info_store_parse_roundtrip() {
+        let info = RepliedMessageInfo {
+            message_id: MessageId::from_server_message_id(ServerMessageId::new(700)),
+            dialog_id: DialogId::from_user_id(UserId::new(3)),
+            origin_date: 1700000200,
+            origin: MessageOrigin::new(
+                UserId::new(4),
+                DialogId::default(),
+                MessageId::default(),
+                String::new(),
+                "op".to_string(),
+            ),
+            content: None,
+            quote: MessageQuote {
+                text: FormattedText {
+                    text: "quote".to_string(),
+                    entities: Vec::new(),
+                },
+                position: 3,
+                is_manual: true,
+            },
+            todo_item_id: 0,
+            poll_option_id: String::new(),
+        };
+        let mut bytes = Vec::new();
+        info.store(&NoStorage, &mut bytes);
+        let mut parser = Parser::new(&bytes);
+        assert_eq!(
+            RepliedMessageInfo::parse_from(&mut parser, &mut NoStorage).unwrap(),
+            info
+        );
+    }
+
+    #[test]
+    fn fact_check_store_parse_roundtrip() {
+        let check = FactCheck {
+            country_code: "US".to_string(),
+            text: FormattedText {
+                text: "text".to_string(),
+                entities: Vec::new(),
+            },
+            hash: 123456789,
+            need_check: false,
+        };
+        let mut bytes = Vec::new();
+        check.store(&mut bytes);
+        let mut parser = Parser::new(&bytes);
+        assert_eq!(FactCheck::parse_from(&mut parser).unwrap(), check);
+
+        // an empty fact check (hash 0) is rejected by parse
+        let mut bytes = Vec::new();
+        FactCheck::default().store(&mut bytes);
+        let mut parser = Parser::new(&bytes);
+        assert!(FactCheck::parse_from(&mut parser).is_err());
+    }
+
+    #[test]
+    fn suggested_post_store_parse_roundtrip() {
+        let post = SuggestedPost {
+            price: SuggestedPostPrice {
+                r#type: crate::message_content::SuggestedPostPriceType::Star,
+                amount: 42,
+            },
+            schedule_date: 1700000300,
+            is_accepted: false,
+            is_rejected: false,
+        };
+        let mut bytes = Vec::new();
+        post.store(&mut bytes);
+        let mut parser = Parser::new(&bytes);
+        assert_eq!(SuggestedPost::parse_from(&mut parser).unwrap(), post);
+    }
+
+    #[test]
+    fn input_message_text_store_parse_roundtrip() {
+        let text = InputMessageText {
+            text: FormattedText {
+                text: "hello".to_string(),
+                entities: Vec::new(),
+            },
+            web_page_url: "https://example.com".to_string(),
+            disable_web_page_preview: true,
+            force_small_media: false,
+            force_large_media: true,
+            show_above_text: false,
+            clear_draft: false,
+        };
+        let mut bytes = Vec::new();
+        text.store(&mut bytes);
+        let mut parser = Parser::new(&bytes);
+        assert_eq!(InputMessageText::parse_from(&mut parser).unwrap(), text);
+
+        // the empty text arm stores no FormattedText and no url at all
+        let mut bytes = Vec::new();
+        InputMessageText::default().store(&mut bytes);
+        assert_eq!(bytes.len(), 4); // the flag word alone
+    }
+
+    #[test]
+    fn draft_message_store_parse_roundtrip() {
+        let draft = DraftMessage {
+            date: 1700000400,
+            message_input_reply_to: MessageInputReplyTo::regular(
+                MessageId::from_server_message_id(ServerMessageId::new(800)),
+            ),
+            input_message_text: InputMessageText {
+                text: FormattedText {
+                    text: "draft".to_string(),
+                    entities: Vec::new(),
+                },
+                web_page_url: String::new(),
+                disable_web_page_preview: false,
+                force_small_media: false,
+                force_large_media: false,
+                show_above_text: false,
+                clear_draft: false,
+            },
+            rich_message_content: None,
+            local_content: Some(DraftMessageContent::VoiceNote(
+                DraftMessageContentVoiceNote {
+                    path: "/tmp/voice.ogg".to_string(),
+                    duration: 12,
+                    waveform: "wave".to_string(),
+                    ttl: MessageSelfDestructType::default(),
+                },
+            )),
+            message_effect_id: MessageEffectId::new(50),
+            suggested_post: None,
+        };
+        let mut bytes = Vec::new();
+        draft.store(&NoStorage, &mut bytes);
+        let mut parser = Parser::new(&bytes);
+        let parsed = DraftMessage::parse_from(&mut parser, &mut NoStorage).unwrap();
+        // parsing marks the reply source like the C++ `debug_source_ =
+        // "binlog"`; everything else round-trips
+        assert_eq!(parsed.message_input_reply_to.debug_source, "binlog");
+        let mut parsed = parsed;
+        parsed.message_input_reply_to.debug_source = draft.message_input_reply_to.debug_source;
+        assert_eq!(parsed, draft);
+    }
+
+    #[test]
+    fn draft_message_legacy_layout_reads_the_inline_reply_id() {
+        // pre-SupportRepliesInOtherChats (51): flags absent, the reply
+        // message id follows the date directly
+        let mut bytes = Vec::new();
+        store_i32(&mut bytes, 1700000500); // date
+        MessageId::from_server_message_id(ServerMessageId::new(801)).store(&mut bytes);
+        InputMessageText::default().store(&mut bytes);
+        let mut parser = Parser::new_with_version(&bytes, 50);
+        let parsed = DraftMessage::parse_from(&mut parser, &mut NoStorage).unwrap();
+        assert_eq!(
+            parsed.message_input_reply_to.message_id,
+            MessageId::from_server_message_id(ServerMessageId::new(801))
+        );
+        assert_eq!(parsed.date, 1700000500);
+    }
+
+    #[test]
+    fn message_input_reply_to_store_parse_roundtrip() {
+        let full = MessageInputReplyTo {
+            message_id: MessageId::from_server_message_id(ServerMessageId::new(900)),
+            ephemeral_message_id: EphemeralMessageId::default(),
+            dialog_id: DialogId::from_user_id(UserId::new(11)),
+            quote: MessageQuote {
+                text: FormattedText {
+                    text: "q".to_string(),
+                    entities: Vec::new(),
+                },
+                position: 0,
+                is_manual: false,
+            },
+            todo_item_id: 2,
+            poll_option_id: "1".to_string(),
+            debug_source: "test",
+            story_full_id: StoryFullId::new(
+                DialogId::from_user_id(UserId::new(12)),
+                StoryId::new(13),
+            ),
+        };
+        let mut bytes = Vec::new();
+        full.store(&mut bytes);
+        let mut parser = Parser::new(&bytes);
+        let parsed = MessageInputReplyTo::parse_from(&mut parser).unwrap();
+        assert_eq!(parsed.message_id, full.message_id);
+        assert_eq!(parsed.dialog_id, full.dialog_id);
+        assert_eq!(parsed.quote, full.quote);
+        assert_eq!(parsed.todo_item_id, full.todo_item_id);
+        assert_eq!(parsed.story_full_id, full.story_full_id);
+        assert_eq!(parsed.debug_source, "binlog");
+
+        assert!(MessageInputReplyTo::regular(MessageId::default()).is_empty());
+        assert!(
+            !MessageInputReplyTo::regular(MessageId::from_server_message_id(ServerMessageId::new(
+                1
+            )))
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn message_reactions_store_parse_roundtrip() {
+        let reactions = MessageReactions {
+            reactions: vec![MessageReaction {
+                reaction_type: ReactionType::new("👍"),
+                choose_count: 5,
+                is_chosen: true,
+                my_recent_chooser_dialog_id: DialogId::from_user_id(UserId::new(1)),
+                recent_chooser_dialog_ids: vec![DialogId::from_user_id(UserId::new(1))],
+                recent_chooser_min_channels: Vec::new(),
+            }],
+            unread_reactions: vec![UnreadMessageReaction {
+                reaction_type: ReactionType::new("🔥"),
+                sender_dialog_id: DialogId::from_user_id(UserId::new(2)),
+                is_big: true,
+            }],
+            chosen_reaction_order: vec![ReactionType::new("👍")],
+            top_reactors: vec![MessageReactor {
+                dialog_id: DialogId::from_user_id(UserId::new(3)),
+                min_channel: Some(MinChannel {
+                    title: "top".to_string(),
+                    is_megagroup: false,
+                }),
+                count: 7,
+                is_top: true,
+                is_me: false,
+                is_anonymous: false,
+            }],
+            pending_paid_reactions: 0,
+            is_min: false,
+            need_polling: true,
+            can_get_added_reactions: false,
+            are_tags: false,
+        };
+        let mut bytes = Vec::new();
+        reactions.store(&mut bytes);
+        let mut parser = Parser::new(&bytes);
+        assert_eq!(
+            MessageReactions::parse_from(&mut parser).unwrap(),
+            reactions
+        );
+        assert!(!reactions.are_empty());
+        assert!(MessageReactions::default().are_empty());
+
+        // the my-recent-chooser validity rule: a chooser not in the recent
+        // list is an error
+        let bad = MessageReaction {
+            reaction_type: ReactionType::new("👍"),
+            choose_count: 2,
+            is_chosen: false,
+            my_recent_chooser_dialog_id: DialogId::from_user_id(UserId::new(9)),
+            recent_chooser_dialog_ids: vec![DialogId::from_user_id(UserId::new(1))],
+            recent_chooser_min_channels: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        bad.store(&mut bytes);
+        let mut parser = Parser::new(&bytes);
+        assert!(MessageReaction::parse_from(&mut parser).is_err());
     }
 }

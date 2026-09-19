@@ -33,6 +33,7 @@ pub mod version {
     pub const ADD_PHOTO_SIZE_SOURCE: i32 = 22;
     pub const ADD_DICE_EMOJI: i32 = 25;
     pub const ADD_DIALOG_PHOTO_HAS_ANIMATION: i32 = 27;
+    pub const ADD_KEYBOARD_BUTTON_FLAGS: i32 = 35;
     pub const ADD_PHOTO_PROGRESSIVE_SIZES: i32 = 28;
     pub const ADD_LIVE_LOCATION_HEADING: i32 = 29;
     pub const ADD_LIVE_LOCATION_PROXIMITY_ALERT_DISTANCE: i32 = 30;
@@ -49,6 +50,7 @@ pub mod version {
     pub const MAKE_PARTICIPANT_FLAGS_64_BIT: i32 = 46;
     pub const ADD_USER_FLAGS2: i32 = 48;
     pub const ADD_MESSAGE_TEXT_FLAGS: i32 = 49;
+    pub const SUPPORT_REPLIES_IN_OTHER_CHATS: i32 = 51;
     pub const SUPPORT_MULTIPLE_SHARED_USERS: i32 = 52;
     pub const SUPPORT_STAR_GIVEAWAYS: i32 = 54;
     pub const SUPPORT_BOT_TOPICS: i32 = 56;
