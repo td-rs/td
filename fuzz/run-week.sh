@@ -16,7 +16,7 @@ CORPUS="$ROOT/fuzz/corpus"
 ARTIFACTS="$ROOT/fuzz/artifacts"
 LOG="$ROOT/fuzz/fuzz-week.log"
 BIN="$ROOT/fuzz/target/x86_64-unknown-linux-gnu/release"
-TARGETS=(td_api_json json_value binlog_event mtproto_packet tl_scheme_text transport_frame app_config simple_config user_log_event user_full secret_chat emoji_status)
+TARGETS=(td_api_json json_value binlog_event mtproto_packet tl_scheme_text transport_frame app_config simple_config user_log_event user_full secret_chat emoji_status message_content)
 CHUNK=${FUZZ_CHUNK:-1800} # seconds per target per cycle (30 min)
 
 mkdir -p "$CORPUS" "$ARTIFACTS"

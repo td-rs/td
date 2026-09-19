@@ -19,6 +19,7 @@ JSON, URL, HTML, entities, binlog reader, secret-chat crypto.
 | `user_full`       | the `UserFull` database blob — `usf<id>` rows                            |
 | `secret_chat`     | the `SecretChat` database blob — SecretChats binlog events + `sc<id>` rows |
 | `emoji_status`    | the `EmojiStatus` value parser — the payload inside `User` blobs         |
+| `message_content` | the `MessageContent` database blob — every message row + `StoreMessage` binlog event body (M.9.2/M.9.3) |
 
 The M.4.17 database-blob targets (`user_log_event`, `user_full`,
 `secret_chat`, `emoji_status`) cover what is attacker-reachable from the
