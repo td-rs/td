@@ -11087,8 +11087,14 @@ pub fn merge_and_compare_message_contents(
 /// The `UserManagerLike` adapter over the [`MessageContentContext`] seam —
 /// only the entity-rule reads are reachable (is_user_bot, the secret-chat
 /// reads); the rest are the C++ nullptr-shape stubs.
-struct ContextUserManager<'a> {
+pub(crate) struct ContextUserManager<'a> {
     td: &'a dyn MessageContentContext,
+}
+
+impl<'a> ContextUserManager<'a> {
+    pub(crate) fn new(td: &'a dyn MessageContentContext) -> ContextUserManager<'a> {
+        ContextUserManager { td }
+    }
 }
 
 impl UserManagerLike for ContextUserManager<'_> {

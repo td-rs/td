@@ -2395,6 +2395,91 @@ impl MessageOrigin {
         &self.sender_name
     }
 
+    /// `MessageOrigin::is_sender_hidden` (MessageOrigin.cpp:100-107).
+    pub fn is_sender_hidden(&self, ctx: &dyn MessageObjectContext) -> bool {
+        if !self.sender_name.is_empty() {
+            return true;
+        }
+        let hidden_sender_channel_id = if ctx.is_test_dc() {
+            10460537
+        } else {
+            1228946795
+        };
+        self.sender_dialog_id == DialogId::from_channel_id(ChannelId::new(hidden_sender_channel_id))
+            && !self.author_signature.is_empty()
+            && !self.message_id.is_valid()
+    }
+
+    /// `MessageOrigin::get_sender` (MessageOrigin.cpp:115-122).
+    pub fn get_sender(&self, ctx: &dyn MessageObjectContext) -> DialogId {
+        if self.is_sender_hidden(ctx) {
+            return DialogId::default();
+        }
+        if self.message_id.is_valid() || self.sender_dialog_id.is_valid() {
+            self.sender_dialog_id
+        } else {
+            DialogId::from_user_id(self.sender_user_id)
+        }
+    }
+
+    /// `MessageOrigin::hide_sender_if_needed` (MessageOrigin.cpp:124-135).
+    pub fn hide_sender_if_needed(&mut self, ctx: &dyn MessageObjectContext) {
+        if !self.is_sender_hidden(ctx)
+            && !self.message_id.is_valid()
+            && !self.sender_dialog_id.is_valid()
+        {
+            let private_forward_name = ctx.get_user_private_forward_name(self.sender_user_id);
+            if !private_forward_name.is_empty() {
+                self.sender_user_id = UserId::default();
+                self.sender_name = private_forward_name;
+            }
+        }
+    }
+
+    /// `MessageOrigin::get_message_origin_object` (MessageOrigin.cpp:82-98).
+    pub fn get_message_origin_object(
+        &self,
+        ctx: &dyn MessageObjectContext,
+    ) -> td_api::MessageOrigin {
+        if self.is_sender_hidden(ctx) {
+            return td_api::MessageOrigin::messageOriginHiddenUser(
+                td_api::messageOriginHiddenUser {
+                    sender_name: if self.sender_name.is_empty() {
+                        self.author_signature.clone()
+                    } else {
+                        self.sender_name.clone()
+                    },
+                },
+            );
+        }
+        if self.message_id.is_valid() {
+            return td_api::MessageOrigin::messageOriginChannel(td_api::messageOriginChannel {
+                chat_id: ctx
+                    .content_context()
+                    .get_chat_id_object(self.sender_dialog_id, "messageOriginChannel"),
+                message_id: self.message_id.get(),
+                author_signature: self.author_signature.clone(),
+            });
+        }
+        if self.sender_dialog_id.is_valid() {
+            return td_api::MessageOrigin::messageOriginChat(td_api::messageOriginChat {
+                sender_chat_id: ctx
+                    .content_context()
+                    .get_chat_id_object(self.sender_dialog_id, "messageOriginChat"),
+                author_signature: if self.sender_name.is_empty() {
+                    self.author_signature.clone()
+                } else {
+                    self.sender_name.clone()
+                },
+            });
+        }
+        td_api::MessageOrigin::messageOriginUser(td_api::messageOriginUser {
+            sender_user_id: ctx
+                .content_context()
+                .get_user_id_object(self.sender_user_id, "messageOriginUser"),
+        })
+    }
+
     /// `MessageOrigin::store` (MessageOrigin.hpp:17-42).
     pub fn store(&self, out: &mut Vec<u8>) {
         let has_sender_user_id = self.sender_user_id.is_valid();
@@ -2496,6 +2581,25 @@ impl FactCheck {
         self.need_check
     }
 
+    /// `FactCheck::get_fact_check_object` (FactCheck.cpp:43-48).
+    pub fn get_fact_check_object<U: crate::message_entity::UserManagerLike + ?Sized>(
+        &self,
+        user_manager: Option<&mut U>,
+    ) -> Option<td_api::FactCheck> {
+        if self.is_empty() || self.need_check {
+            return None;
+        }
+        Some(td_api::FactCheck {
+            text: Some(crate::message_entity::get_formatted_text_object(
+                user_manager,
+                &self.text,
+                true,
+                -1,
+            )),
+            country_code: self.country_code.clone(),
+        })
+    }
+
     /// `FactCheck::store` (FactCheck.hpp:16-36). The C++ `CHECK(!is_empty())`
     /// is the caller's contract.
     pub fn store(&self, out: &mut Vec<u8>) {
@@ -2569,6 +2673,49 @@ impl ReactionType {
     /// `ReactionType::is_paid_reaction` (ReactionType.cpp:175-177).
     pub fn is_paid_reaction(&self) -> bool {
         self.0 == "$"
+    }
+
+    /// `ReactionType::paid` (ReactionType.h).
+    pub fn paid() -> ReactionType {
+        ReactionType("$".to_owned())
+    }
+
+    /// `get_custom_emoji_id(reaction)` (ReactionType.cpp:23-30) — the
+    /// base64-encoded 8-byte big payload after the `'#'` prefix. The C++
+    /// CHECKs the shape; malformed input decodes to 0 here (the callers
+    /// only feed stored custom reactions).
+    pub fn get_custom_emoji_id(&self) -> i64 {
+        debug_assert!(self.is_custom_reaction());
+        let bytes =
+            tdmtproto::utils::base64_decode(&self.0.as_bytes()[1..]).unwrap_or_else(|_| Vec::new());
+        if bytes.len() != 8 {
+            return 0;
+        }
+        i64::from_le_bytes(bytes.try_into().unwrap())
+    }
+
+    /// `ReactionType::get_reaction_type_object` (ReactionType.cpp:143-154).
+    pub fn get_reaction_type_object(&self) -> Option<td_api::ReactionType> {
+        if self.is_empty() {
+            return None;
+        }
+        if self.is_custom_reaction() {
+            return Some(td_api::ReactionType::reactionTypeCustomEmoji(
+                td_api::reactionTypeCustomEmoji {
+                    custom_emoji_id: self.get_custom_emoji_id(),
+                },
+            ));
+        }
+        if self.is_paid_reaction() {
+            return Some(td_api::ReactionType::reactionTypePaid(
+                td_api::reactionTypePaid,
+            ));
+        }
+        Some(td_api::ReactionType::reactionTypeEmoji(
+            td_api::reactionTypeEmoji {
+                emoji: self.0.clone(),
+            },
+        ))
     }
 }
 
@@ -2786,6 +2933,36 @@ impl MessageReplyInfo {
             .recent_replier_dialog_ids
             .truncate(Self::MAX_RECENT_REPLIERS);
         Ok(result)
+    }
+
+    /// `MessageReplyInfo::get_message_reply_info_object`
+    /// (MessageReplyInfo.cpp:177-191).
+    pub fn get_message_reply_info_object(
+        &self,
+        ctx: &dyn MessageObjectContext,
+        dialog_last_read_inbox_message_id: MessageId,
+    ) -> Option<td_api::MessageReplyInfo> {
+        if self.is_empty() {
+            return None;
+        }
+        let recent_repliers = get_min_message_senders_object(
+            ctx,
+            &self.recent_replier_dialog_ids,
+            "get_message_reply_info_object",
+        );
+        let mut last_read_inbox_message_id = self.last_read_inbox_message_id;
+        if last_read_inbox_message_id.is_valid()
+            && last_read_inbox_message_id < dialog_last_read_inbox_message_id
+        {
+            last_read_inbox_message_id = dialog_last_read_inbox_message_id.min(self.max_message_id);
+        }
+        Some(td_api::MessageReplyInfo {
+            reply_count: self.reply_count,
+            recent_replier_ids: recent_repliers,
+            last_read_inbox_message_id: last_read_inbox_message_id.get(),
+            last_read_outbox_message_id: self.last_read_outbox_message_id.get(),
+            last_message_id: self.max_message_id.get(),
+        })
     }
 }
 
@@ -3403,6 +3580,24 @@ impl UnreadMessageReaction {
         self.sender_dialog_id.store(out);
     }
 
+    /// `UnreadMessageReaction::get_unread_reaction_object`
+    /// (MessageReaction.cpp:503-510).
+    pub fn get_unread_reaction_object(
+        &self,
+        ctx: &dyn MessageObjectContext,
+    ) -> Option<td_api::UnreadReaction> {
+        let sender_id = get_min_message_sender_object(
+            ctx,
+            self.sender_dialog_id,
+            "get_unread_reaction_object",
+        )?;
+        Some(td_api::UnreadReaction {
+            r#type: self.reaction_type.get_reaction_type_object(),
+            sender_id: Some(sender_id),
+            is_big: self.is_big,
+        })
+    }
+
     /// `UnreadMessageReaction::parse` (MessageReaction.hpp:89-99).
     pub fn parse_from(parser: &mut Parser) -> Result<UnreadMessageReaction, &'static str> {
         let [is_big] = parser.parse_flags::<1>()?;
@@ -3642,6 +3837,30 @@ impl KeyboardButtonStyle {
     /// `KeyboardButtonStyle::is_default` (KeyboardButtonStyle.h).
     pub fn is_default(&self) -> bool {
         self.r#type == KeyboardButtonStyleType::Default && !self.icon_custom_emoji_id.is_valid()
+    }
+
+    /// `KeyboardButtonStyle::get_icon_custom_emoji_id` (KeyboardButtonStyle.h).
+    pub fn get_icon_custom_emoji_id(&self) -> crate::emoji_status::CustomEmojiId {
+        self.icon_custom_emoji_id
+    }
+
+    /// `KeyboardButtonStyle::get_button_style_object`
+    /// (KeyboardButtonStyle.cpp:51-65).
+    pub fn get_button_style_object(&self) -> Option<td_api::ButtonStyle> {
+        match self.r#type {
+            KeyboardButtonStyleType::Default => Some(td_api::ButtonStyle::buttonStyleDefault(
+                td_api::buttonStyleDefault,
+            )),
+            KeyboardButtonStyleType::Primary => Some(td_api::ButtonStyle::buttonStylePrimary(
+                td_api::buttonStylePrimary,
+            )),
+            KeyboardButtonStyleType::Danger => Some(td_api::ButtonStyle::buttonStyleDanger(
+                td_api::buttonStyleDanger,
+            )),
+            KeyboardButtonStyleType::Success => Some(td_api::ButtonStyle::buttonStyleSuccess(
+                td_api::buttonStyleSuccess,
+            )),
+        }
     }
 
     /// `KeyboardButtonStyle::store` (KeyboardButtonStyle.hpp:14-31).
@@ -3948,6 +4167,119 @@ impl RequestedDialogType {
             suggested_username,
         })
     }
+
+    /// `RequestedDialogType::get_keyboard_button_type_object`
+    /// (RequestedDialogType.cpp:128-147).
+    pub fn get_keyboard_button_type_object(&self) -> td_api::KeyboardButtonType {
+        match self.r#type {
+            RequestedDialogTypeType::User => {
+                td_api::KeyboardButtonType::keyboardButtonTypeRequestUsers(
+                    td_api::keyboardButtonTypeRequestUsers {
+                        id: self.button_id,
+                        restrict_user_is_bot: self.restrict_is_bot,
+                        user_is_bot: self.is_bot,
+                        restrict_user_is_premium: self.restrict_is_premium,
+                        user_is_premium: self.is_premium,
+                        max_quantity: self.max_quantity,
+                        request_name: self.request_name,
+                        request_username: self.request_username,
+                        request_photo: self.request_photo,
+                    },
+                )
+            }
+            RequestedDialogTypeType::CreateBot => {
+                td_api::KeyboardButtonType::keyboardButtonTypeRequestManagedBot(
+                    td_api::keyboardButtonTypeRequestManagedBot {
+                        id: self.button_id,
+                        suggested_name: self.suggested_name.clone(),
+                        suggested_username: self.suggested_username.clone(),
+                    },
+                )
+            }
+            RequestedDialogTypeType::Group | RequestedDialogTypeType::Channel => {
+                let user_administrator_rights = if self.restrict_user_administrator_rights {
+                    Some(
+                        self.user_administrator_rights
+                            .get_chat_administrator_rights_object(),
+                    )
+                } else {
+                    None
+                };
+                let bot_administrator_rights = if self.restrict_bot_administrator_rights {
+                    Some(
+                        self.bot_administrator_rights
+                            .get_chat_administrator_rights_object(),
+                    )
+                } else {
+                    None
+                };
+                td_api::KeyboardButtonType::keyboardButtonTypeRequestChat(
+                    td_api::keyboardButtonTypeRequestChat {
+                        id: self.button_id,
+                        chat_is_channel: self.r#type == RequestedDialogTypeType::Channel,
+                        restrict_chat_is_forum: self.restrict_is_forum,
+                        chat_is_forum: self.is_forum,
+                        restrict_chat_has_username: self.restrict_has_username,
+                        chat_has_username: self.has_username,
+                        chat_is_created: self.is_created,
+                        user_administrator_rights,
+                        bot_administrator_rights,
+                        bot_is_member: self.bot_is_participant,
+                        request_title: self.request_name,
+                        request_username: self.request_username,
+                        request_photo: self.request_photo,
+                    },
+                )
+            }
+        }
+    }
+
+    /// `RequestedDialogType::get_button_id` (RequestedDialogType.h).
+    pub fn get_button_id(&self) -> i32 {
+        self.button_id
+    }
+}
+
+/// `td::TargetDialogTypes` (TargetDialogTypes.h) — the SwitchInline button
+/// target mask; `InlineKeyboardButton::id` carries it in the SwitchInline
+/// arm.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TargetDialogTypes(i64);
+
+impl TargetDialogTypes {
+    const USERS_MASK: i64 = 1;
+    const BOTS_MASK: i64 = 2;
+    const CHATS_MASK: i64 = 4;
+    const BROADCASTS_MASK: i64 = 8;
+    const FULL_MASK: i64 =
+        Self::USERS_MASK | Self::BOTS_MASK | Self::CHATS_MASK | Self::BROADCASTS_MASK;
+
+    /// `TargetDialogTypes::TargetDialogTypes(int64 mask)`.
+    pub fn from_mask(mask: i64) -> TargetDialogTypes {
+        TargetDialogTypes(mask)
+    }
+
+    /// `TargetDialogTypes::get_mask`.
+    pub fn get_mask(self) -> i64 {
+        self.0
+    }
+
+    /// `TargetDialogTypes::get_full_mask`.
+    pub fn get_full_mask(self) -> i64 {
+        if self.0 == 0 { Self::FULL_MASK } else { self.0 }
+    }
+
+    /// `TargetDialogTypes::get_target_chat_types_object`
+    /// (TargetDialogTypes.cpp:81-85).
+    pub fn get_target_chat_types_object(self) -> td_api::TargetChatTypes {
+        let mask = self.get_full_mask();
+        td_api::TargetChatTypes {
+            allow_user_chats: (mask & Self::USERS_MASK) != 0,
+            allow_bot_chats: (mask & Self::BOTS_MASK) != 0,
+            allow_group_chats: (mask & Self::CHATS_MASK) != 0,
+            allow_channel_chats: (mask & Self::BROADCASTS_MASK) != 0,
+        }
+    }
 }
 
 /// `KeyboardButton::Type` (KeyboardButton.h:25-35) — append only.
@@ -4105,6 +4437,66 @@ impl KeyboardButton {
             result.style = KeyboardButtonStyle::parse_from(parser)?;
         }
         Ok(result)
+    }
+
+    /// `KeyboardButton::get_keyboard_button_object`
+    /// (KeyboardButton.cpp:216-249).
+    pub fn get_keyboard_button_object(&self) -> td_api::KeyboardButton {
+        let type_object = match self.r#type {
+            KeyboardButtonType::Text => {
+                td_api::KeyboardButtonType::keyboardButtonTypeText(td_api::keyboardButtonTypeText)
+            }
+            KeyboardButtonType::RequestPhoneNumber => {
+                td_api::KeyboardButtonType::keyboardButtonTypeRequestPhoneNumber(
+                    td_api::keyboardButtonTypeRequestPhoneNumber,
+                )
+            }
+            KeyboardButtonType::RequestLocation => {
+                td_api::KeyboardButtonType::keyboardButtonTypeRequestLocation(
+                    td_api::keyboardButtonTypeRequestLocation,
+                )
+            }
+            KeyboardButtonType::RequestPoll => {
+                td_api::KeyboardButtonType::keyboardButtonTypeRequestPoll(
+                    td_api::keyboardButtonTypeRequestPoll {
+                        force_regular: false,
+                        force_quiz: false,
+                    },
+                )
+            }
+            KeyboardButtonType::RequestPollQuiz => {
+                td_api::KeyboardButtonType::keyboardButtonTypeRequestPoll(
+                    td_api::keyboardButtonTypeRequestPoll {
+                        force_regular: false,
+                        force_quiz: true,
+                    },
+                )
+            }
+            KeyboardButtonType::RequestPollRegular => {
+                td_api::KeyboardButtonType::keyboardButtonTypeRequestPoll(
+                    td_api::keyboardButtonTypeRequestPoll {
+                        force_regular: true,
+                        force_quiz: false,
+                    },
+                )
+            }
+            KeyboardButtonType::WebView => td_api::KeyboardButtonType::keyboardButtonTypeWebApp(
+                td_api::keyboardButtonTypeWebApp {
+                    url: format!("{}#kb", self.url),
+                },
+            ),
+            KeyboardButtonType::RequestDialog => self
+                .requested_dialog_type
+                .as_ref()
+                .expect("RequestDialog button without a type")
+                .get_keyboard_button_type_object(),
+        };
+        td_api::KeyboardButton {
+            text: self.text.clone(),
+            icon_custom_emoji_id: self.style.get_icon_custom_emoji_id().get(),
+            style: self.style.get_button_style_object(),
+            r#type: Some(type_object),
+        }
     }
 }
 
@@ -4552,6 +4944,68 @@ impl ReplyMarkup {
             inline_keyboard,
         })
     }
+
+    /// `ReplyMarkup::get_reply_markup_object`
+    /// (ReplyMarkup.cpp:425-470). The `UserManager *` of the C++ is the
+    /// context; the nullptr-user_manager call sites of the C++ (none in
+    /// the object plane) pass a context answering the id-object defaults.
+    pub fn get_reply_markup_object(
+        &self,
+        ctx: &dyn MessageObjectContext,
+    ) -> Option<td_api::ReplyMarkup> {
+        match self.r#type {
+            ReplyMarkupType::InlineKeyboard => {
+                let rows = self
+                    .inline_keyboard
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|button| get_inline_keyboard_button_object(ctx, button))
+                            .collect()
+                    })
+                    .collect();
+                Some(td_api::ReplyMarkup::replyMarkupInlineKeyboard(
+                    td_api::replyMarkupInlineKeyboard {
+                        rows,
+                        force_reply: self.force_reply,
+                    },
+                ))
+            }
+            ReplyMarkupType::ShowKeyboard => {
+                let rows = self
+                    .keyboard
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|button| button.get_keyboard_button_object())
+                            .collect()
+                    })
+                    .collect();
+                Some(td_api::ReplyMarkup::replyMarkupShowKeyboard(
+                    td_api::replyMarkupShowKeyboard {
+                        rows,
+                        is_persistent: self.is_persistent,
+                        resize_keyboard: self.need_resize_keyboard,
+                        one_time: self.is_one_time_keyboard,
+                        is_personal: self.is_personal,
+                        force_reply: self.force_reply,
+                        input_field_placeholder: self.placeholder.clone(),
+                    },
+                ))
+            }
+            ReplyMarkupType::RemoveKeyboard => Some(
+                td_api::ReplyMarkup::replyMarkupRemoveKeyboard(td_api::replyMarkupRemoveKeyboard {
+                    is_personal: self.is_personal,
+                }),
+            ),
+            ReplyMarkupType::ForceReply => Some(td_api::ReplyMarkup::replyMarkupForceReply(
+                td_api::replyMarkupForceReply {
+                    is_personal: self.is_personal,
+                    input_field_placeholder: self.placeholder.clone(),
+                },
+            )),
+        }
+    }
 }
 
 fn store_button_rows(out: &mut Vec<u8>, rows: &[Vec<KeyboardButton>]) {
@@ -4696,6 +5150,26 @@ impl MessageQuote {
         self.text.text.is_empty()
     }
 
+    /// `MessageQuote::get_text_quote_object` (MessageQuote.cpp:139-145).
+    pub fn get_text_quote_object<U: crate::message_entity::UserManagerLike + ?Sized>(
+        &self,
+        user_manager: Option<&mut U>,
+    ) -> Option<td_api::TextQuote> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(td_api::TextQuote {
+            text: Some(crate::message_entity::get_formatted_text_object(
+                user_manager,
+                &self.text,
+                true,
+                -1,
+            )),
+            position: self.position,
+            is_manual: self.is_manual,
+        })
+    }
+
     /// `MessageQuote::store` (MessageQuote.hpp:16-33).
     pub fn store(&self, out: &mut Vec<u8>) {
         let has_text = !self.text.text.is_empty();
@@ -4740,6 +5214,61 @@ pub struct LastForwardedMessageInfo {
 }
 
 impl LastForwardedMessageInfo {
+    /// `LastForwardedMessageInfo::get_forward_source_object`
+    /// (MessageForwardInfo.cpp:68-92).
+    pub fn get_forward_source_object(
+        &self,
+        ctx: &dyn MessageObjectContext,
+        for_saved_messages: bool,
+        origin: &MessageOrigin,
+        origin_date: i32,
+    ) -> Option<td_api::ForwardSource> {
+        if self.is_empty() && (origin.is_empty() || !for_saved_messages) {
+            return None;
+        }
+        let mut sender_id = None;
+        if self.date == 0 && for_saved_messages {
+            let origin_sender_dialog_id = origin.get_sender(ctx);
+            if origin_sender_dialog_id.is_valid() {
+                sender_id = ctx.get_message_sender_object_const(
+                    UserId::default(),
+                    origin_sender_dialog_id,
+                    "origin.forwardSource.sender_id",
+                );
+            }
+            return Some(td_api::ForwardSource {
+                chat_id: ctx
+                    .content_context()
+                    .get_chat_id_object(self.dialog_id, "forwardSource.chat_id"),
+                message_id: self.message_id.get(),
+                sender_id,
+                sender_name: origin.get_sender_name().to_owned(),
+                date: origin_date,
+                is_outgoing: self.is_outgoing
+                    || origin_sender_dialog_id == ctx.content_context().get_my_dialog_id(),
+            });
+        }
+
+        if self.sender_dialog_id != DialogId::default() {
+            sender_id = ctx.get_message_sender_object_const(
+                UserId::default(),
+                self.sender_dialog_id,
+                "forwardSource.sender_id",
+            );
+        }
+        Some(td_api::ForwardSource {
+            chat_id: ctx
+                .content_context()
+                .get_chat_id_object(self.dialog_id, "forwardSource.chat_id"),
+            message_id: self.message_id.get(),
+            sender_id,
+            sender_name: self.sender_name.clone(),
+            date: self.date,
+            is_outgoing: self.is_outgoing
+                || self.sender_dialog_id == ctx.content_context().get_my_dialog_id(),
+        })
+    }
+
     pub fn new(
         dialog_id: DialogId,
         message_id: MessageId,
@@ -4856,6 +5385,56 @@ pub struct MessageForwardInfo {
 }
 
 impl MessageForwardInfo {
+    /// `MessageForwardInfo::is_imported` (MessageForwardInfo.h).
+    pub fn is_imported(&self) -> bool {
+        self.is_imported
+    }
+
+    /// `MessageForwardInfo::get_origin` (MessageForwardInfo.h).
+    pub fn get_origin(&self) -> &MessageOrigin {
+        &self.origin
+    }
+
+    /// `MessageForwardInfo::get_origin_date` (MessageForwardInfo.h).
+    pub fn get_origin_date(&self) -> i32 {
+        self.date
+    }
+
+    /// `MessageForwardInfo::get_message_forward_info_object`
+    /// (MessageForwardInfo.cpp:193-201).
+    pub fn get_message_forward_info_object(
+        &self,
+        ctx: &dyn MessageObjectContext,
+        for_saved_messages: bool,
+    ) -> Option<td_api::MessageForwardInfo> {
+        if self.is_imported {
+            return None;
+        }
+        Some(td_api::MessageForwardInfo {
+            origin: Some(self.origin.get_message_origin_object(ctx)),
+            date: self.date,
+            source: self.last_message_info.get_forward_source_object(
+                ctx,
+                for_saved_messages,
+                &self.origin,
+                self.date,
+            ),
+            public_service_announcement_type: self.psa_type.clone(),
+        })
+    }
+
+    /// `MessageForwardInfo::get_message_import_info_object`
+    /// (MessageForwardInfo.cpp:203-208).
+    pub fn get_message_import_info_object(&self) -> Option<td_api::MessageImportInfo> {
+        if !self.is_imported {
+            return None;
+        }
+        Some(td_api::MessageImportInfo {
+            sender_name: self.origin.get_sender_name().to_owned(),
+            date: self.date,
+        })
+    }
+
     /// `MessageForwardInfo::get_last_dialog_id` (MessageForwardInfo.h).
     pub fn get_last_dialog_id(&self) -> DialogId {
         self.last_message_info.dialog_id
@@ -4942,6 +5521,77 @@ impl RepliedMessageInfo {
     /// `RepliedMessageInfo::is_empty` (RepliedMessageInfo.h:67-69).
     pub fn is_empty(&self) -> bool {
         self.message_id == MessageId::default() && self.origin.is_empty()
+    }
+
+    /// `RepliedMessageInfo::get_message_reply_to_message_object`
+    /// (RepliedMessageInfo.cpp:346-385).
+    pub fn get_message_reply_to_message_object(
+        &self,
+        ctx: &dyn MessageObjectContext,
+        dialog_id: DialogId,
+        message_id: MessageId,
+    ) -> Option<td_api::MessageReplyTo> {
+        let dialog_id = if self.dialog_id.is_valid() {
+            self.dialog_id
+        } else {
+            dialog_id
+        };
+        let mut chat_id = ctx
+            .content_context()
+            .get_chat_id_object(dialog_id, "messageReplyToMessage");
+        if self.message_id == MessageId::default() {
+            chat_id = 0;
+        }
+
+        let mut origin = None;
+        if !self.origin.is_empty() {
+            origin = Some(self.origin.get_message_origin_object(ctx));
+        }
+
+        let mut content = None;
+        if let Some(reply_content) = &self.content {
+            let content_object = crate::message_content::get_message_content_object(
+                ctx.content_context(),
+                reply_content,
+                DialogId::default(),
+                crate::chat_manager::MessageId::new(message_id.get()),
+                DialogId::default(),
+                false,
+                false,
+                true,
+                DialogId::default(),
+                0,
+                0,
+                false,
+                true,
+                -1,
+                false,
+                false,
+                "get_message_reply_to_message_object",
+            );
+            match content_object {
+                td_api::MessageContent::messageUnsupported(_) => {}
+                td_api::MessageContent::messageText(message_text)
+                    if message_text.link_preview.is_none()
+                        && message_text.link_preview_options.is_none() => {}
+                content_object => content = Some(content_object),
+            }
+        }
+
+        let mut user_manager =
+            crate::message_content::ContextUserManager::new(ctx.content_context());
+        Some(td_api::MessageReplyTo::messageReplyToMessage(
+            td_api::messageReplyToMessage {
+                chat_id,
+                message_id: self.message_id.get(),
+                quote: self.quote.get_text_quote_object(Some(&mut user_manager)),
+                checklist_task_id: self.todo_item_id,
+                poll_option_id: self.poll_option_id.clone(),
+                origin,
+                origin_send_date: self.origin_date,
+                content,
+            },
+        ))
     }
 
     /// `RepliedMessageInfo::is_external` (RepliedMessageInfo.h:71-73).
@@ -5370,6 +6020,38 @@ impl SuggestedPost {
     /// `SuggestedPost::get_schedule_date` (SuggestedPost.h).
     pub fn get_schedule_date(&self) -> i32 {
         self.schedule_date
+    }
+
+    /// `SuggestedPost::get_suggested_post_state_object`
+    /// (SuggestedPost.cpp:68-77).
+    pub fn get_suggested_post_state_object(&self) -> td_api::SuggestedPostState {
+        if self.is_accepted {
+            return td_api::SuggestedPostState::suggestedPostStateApproved(
+                td_api::suggestedPostStateApproved,
+            );
+        }
+        if self.is_rejected {
+            return td_api::SuggestedPostState::suggestedPostStateDeclined(
+                td_api::suggestedPostStateDeclined,
+            );
+        }
+        td_api::SuggestedPostState::suggestedPostStatePending(td_api::suggestedPostStatePending)
+    }
+
+    /// `SuggestedPost::get_suggested_post_info_object`
+    /// (SuggestedPost.cpp:79-86).
+    pub fn get_suggested_post_info_object(
+        &self,
+        can_be_accepted: bool,
+        can_be_rejected: bool,
+    ) -> td_api::SuggestedPostInfo {
+        td_api::SuggestedPostInfo {
+            price: self.price.get_suggested_post_price_object(),
+            send_date: self.schedule_date,
+            state: Some(self.get_suggested_post_state_object()),
+            can_be_approved: can_be_accepted,
+            can_be_declined: can_be_rejected,
+        }
     }
 
     /// `SuggestedPost::store` (SuggestedPost.hpp:14-31).
@@ -8226,6 +8908,1657 @@ impl Default for Dialog {
     }
 }
 
+// ---------------------------------------------------------------------------
+// M.10.4 — the Message → td_api builder family (MessagesManager.cpp
+// 20526-20865 + 4929-5105, 8145-8150, 8228-8342, 20518-20524, 23339-23477,
+// 23950-23958; MessageSender.cpp 22-100; MessageOrigin.cpp 82-135;
+// MessageForwardInfo.cpp 68-208; MessageReplyInfo.cpp 177-191;
+// MessageReaction.cpp 455-510, 963-990; ReplyMarkup.cpp 425-511;
+// InlineKeyboardButton.cpp 470-526; KeyboardButton.cpp 216-249;
+// MessageSendOptions.cpp 84-93; MessageTopic.{h,cpp};
+// ForumTopicId.h). `get_message_object` consumes everything the receive
+// path (M.10.3) and the dispatcher flips (M.10.20) produce.
+//
+// The C++ `Td *td` surface becomes [`MessageObjectContext`]: the M.9
+// content-object context plus the message-plane queries. The
+// Dialog-reads ride the `&MessagesManager` argument like M.10.2c.
+//
+// Seams (each pinned at its use):
+// - `force_create_dialog` calls inside the C++ `get_min_message_sender_object`
+//   are net/manager actions — the trait exposes the hook; stand-ins no-op.
+// - the paid-top-reactor recompute in `get_message_reactions_object` needs
+//   `MessageReactions::pending_paid_reaction_type_` (PaidReactionType), not
+//   yet in the M.10.2a store plane — the visible reactions merge is exact,
+//   the recompute is deferred to the Wave-2 paid-reactions slice.
+// - `MessageTopic::get_message_topic(Td*, ...)` / `get_send_message_topic`
+//   td_api parsers are send-path (M.10.8).
+// ---------------------------------------------------------------------------
+
+/// `td::ForumTopicId` (ForumTopicId.h) — the forum topic identifier, stored
+/// as the server message id of the topic creation message.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ForumTopicId(i32);
+
+impl ForumTopicId {
+    /// `ForumTopicId::from_top_thread_message_id`.
+    pub fn from_top_thread_message_id(top_thread_message_id: MessageId) -> ForumTopicId {
+        ForumTopicId(top_thread_message_id.get_server_message_id().get())
+    }
+
+    /// `ForumTopicId::to_top_thread_message_id`.
+    pub fn to_top_thread_message_id(self) -> MessageId {
+        MessageId::from_server_message_id(ServerMessageId::new(self.0))
+    }
+
+    /// `ForumTopicId::general`.
+    pub fn general() -> ForumTopicId {
+        ForumTopicId(1)
+    }
+
+    /// `ForumTopicId::is_valid`.
+    pub fn is_valid(self) -> bool {
+        self.0 > 0
+    }
+
+    /// `ForumTopicId::get`.
+    pub fn get(self) -> i32 {
+        self.0
+    }
+}
+
+/// `td::MessageTopic` (MessageTopic.h:20-56) — the topic a message belongs
+/// to: a discussion thread, a forum topic, a direct-messages topic or a
+/// Saved Messages topic.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct MessageTopic {
+    r#type: MessageTopicType,
+    dialog_id: DialogId,
+    top_thread_message_id: MessageId,
+    forum_topic_id: ForumTopicId,
+    saved_messages_topic_id: SavedMessagesTopicId,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[repr(i32)]
+enum MessageTopicType {
+    #[default]
+    None = 0,
+    Thread = 1,
+    Forum = 2,
+    Monoforum = 3,
+    SavedMessages = 4,
+}
+
+impl MessageTopic {
+    /// `MessageTopic::MessageTopic(Td *, DialogId, bool, MessageId,
+    /// SavedMessagesTopicId)` (MessageTopic.cpp:22-64).
+    pub fn new_from_message(
+        ctx: &dyn MessageObjectContext,
+        dialog_id: DialogId,
+        is_topic_message: bool,
+        top_thread_message_id: MessageId,
+        saved_messages_topic_id: SavedMessagesTopicId,
+    ) -> MessageTopic {
+        let mut result = MessageTopic::default();
+        let dialog_type = dialog_id.get_type();
+        if dialog_type == DialogType::User {
+            let user_id = dialog_id.get_user_id();
+            if user_id == ctx.content_context().get_my_id() {
+                if saved_messages_topic_id.is_valid() {
+                    result.r#type = MessageTopicType::SavedMessages;
+                    result.dialog_id = dialog_id;
+                    result.saved_messages_topic_id = saved_messages_topic_id;
+                }
+                return result;
+            }
+            if (ctx.content_context().is_user_bot(user_id) || ctx.is_bot()) && is_topic_message {
+                result.r#type = MessageTopicType::Forum;
+                result.dialog_id = dialog_id;
+                result.forum_topic_id =
+                    ForumTopicId::from_top_thread_message_id(top_thread_message_id);
+                return result;
+            }
+            return result;
+        }
+        if dialog_type != DialogType::Channel {
+            return result;
+        }
+        let channel_id = dialog_id.get_channel_id();
+        if ctx.content_context().is_monoforum_channel(channel_id) {
+            if saved_messages_topic_id.is_valid() {
+                result.r#type = MessageTopicType::Monoforum;
+                result.dialog_id = dialog_id;
+                result.saved_messages_topic_id = saved_messages_topic_id;
+            }
+            return result;
+        }
+        if ctx.is_forum_channel(channel_id) && !is_topic_message {
+            result.r#type = MessageTopicType::Forum;
+            result.dialog_id = dialog_id;
+            result.forum_topic_id = ForumTopicId::general();
+            return result;
+        }
+        if !top_thread_message_id.is_server() {
+            if top_thread_message_id != MessageId::default() {
+                log_error!(
+                    "Have top thread {:?} in {:?}",
+                    top_thread_message_id,
+                    dialog_id
+                );
+            }
+            return result;
+        }
+        if is_topic_message && ctx.is_megagroup_channel(channel_id) {
+            result.r#type = MessageTopicType::Forum;
+            result.dialog_id = dialog_id;
+            result.forum_topic_id = ForumTopicId::from_top_thread_message_id(top_thread_message_id);
+            return result;
+        }
+        if ctx.is_megagroup_channel(channel_id) {
+            result.r#type = MessageTopicType::Thread;
+            result.dialog_id = dialog_id;
+            result.top_thread_message_id = top_thread_message_id;
+        }
+        result
+    }
+
+    /// `MessageTopic::autodetect` (MessageTopic.cpp:66-81).
+    pub fn autodetect(
+        ctx: &dyn MessageObjectContext,
+        dialog_id: DialogId,
+        top_thread_message_id: MessageId,
+    ) -> MessageTopic {
+        if !top_thread_message_id.is_server() {
+            return MessageTopic::default();
+        }
+        let dialog_type = dialog_id.get_type();
+        if dialog_type == DialogType::User {
+            let user_id = dialog_id.get_user_id();
+            if user_id != ctx.content_context().get_my_id()
+                && (ctx.content_context().is_user_bot(user_id) || ctx.is_bot())
+            {
+                return MessageTopic::forum(
+                    dialog_id,
+                    ForumTopicId::from_top_thread_message_id(top_thread_message_id),
+                );
+            }
+        }
+        if dialog_type == DialogType::Channel {
+            let channel_id = dialog_id.get_channel_id();
+            if ctx.is_forum_channel(channel_id) {
+                return MessageTopic::forum(
+                    dialog_id,
+                    ForumTopicId::from_top_thread_message_id(top_thread_message_id),
+                );
+            }
+            if ctx.is_megagroup_channel(channel_id) {
+                return MessageTopic::thread(dialog_id, top_thread_message_id);
+            }
+        }
+        MessageTopic::default()
+    }
+
+    /// `MessageTopic::thread`.
+    pub fn thread(dialog_id: DialogId, top_thread_message_id: MessageId) -> MessageTopic {
+        // dialog_id can be a broadcast channel
+        MessageTopic {
+            r#type: MessageTopicType::Thread,
+            dialog_id,
+            top_thread_message_id,
+            ..MessageTopic::default()
+        }
+    }
+
+    /// `MessageTopic::forum`.
+    pub fn forum(dialog_id: DialogId, forum_topic_id: ForumTopicId) -> MessageTopic {
+        MessageTopic {
+            r#type: MessageTopicType::Forum,
+            dialog_id,
+            forum_topic_id,
+            ..MessageTopic::default()
+        }
+    }
+
+    /// `MessageTopic::monoforum`.
+    pub fn monoforum(
+        dialog_id: DialogId,
+        saved_messages_topic_id: SavedMessagesTopicId,
+    ) -> MessageTopic {
+        MessageTopic {
+            r#type: MessageTopicType::Monoforum,
+            dialog_id,
+            saved_messages_topic_id,
+            ..MessageTopic::default()
+        }
+    }
+
+    /// `MessageTopic::saved_messages`.
+    pub fn saved_messages(
+        dialog_id: DialogId,
+        saved_messages_topic_id: SavedMessagesTopicId,
+    ) -> MessageTopic {
+        MessageTopic {
+            r#type: MessageTopicType::SavedMessages,
+            dialog_id,
+            saved_messages_topic_id,
+            ..MessageTopic::default()
+        }
+    }
+
+    /// `MessageTopic::is_empty`.
+    pub fn is_empty(&self) -> bool {
+        self.r#type == MessageTopicType::None
+    }
+
+    /// `MessageTopic::is_valid`.
+    pub fn is_valid(&self) -> bool {
+        match self.r#type {
+            MessageTopicType::None => false,
+            MessageTopicType::Thread => {
+                self.dialog_id.is_valid() && self.top_thread_message_id.is_valid()
+            }
+            MessageTopicType::Forum => self.dialog_id.is_valid() && self.forum_topic_id.is_valid(),
+            MessageTopicType::Monoforum | MessageTopicType::SavedMessages => {
+                self.dialog_id.is_valid() && self.saved_messages_topic_id.is_valid()
+            }
+        }
+    }
+
+    /// `MessageTopic::is_thread`.
+    pub fn is_thread(&self) -> bool {
+        self.r#type == MessageTopicType::Thread
+    }
+
+    /// `MessageTopic::is_forum`.
+    pub fn is_forum(&self) -> bool {
+        self.r#type == MessageTopicType::Forum
+    }
+
+    /// `MessageTopic::is_forum_general`.
+    pub fn is_forum_general(&self) -> bool {
+        self.r#type == MessageTopicType::Forum && self.forum_topic_id == ForumTopicId::general()
+    }
+
+    /// `MessageTopic::is_monoforum`.
+    pub fn is_monoforum(&self) -> bool {
+        self.r#type == MessageTopicType::Monoforum
+    }
+
+    /// `MessageTopic::is_saved_messages`.
+    pub fn is_saved_messages(&self) -> bool {
+        self.r#type == MessageTopicType::SavedMessages
+    }
+
+    /// `MessageTopic::get_forum_topic_id`.
+    pub fn get_forum_topic_id(&self) -> ForumTopicId {
+        assert!(self.r#type == MessageTopicType::Forum);
+        self.forum_topic_id
+    }
+
+    /// `MessageTopic::get_message_topic_object` (MessageTopic.cpp:250-267).
+    pub fn get_message_topic_object(
+        &self,
+        ctx: &dyn MessageObjectContext,
+    ) -> Option<td_api::MessageTopic> {
+        match self.r#type {
+            MessageTopicType::None => None,
+            MessageTopicType::Thread => Some(td_api::MessageTopic::messageTopicThread(
+                td_api::messageTopicThread {
+                    message_thread_id: self.top_thread_message_id.get(),
+                },
+            )),
+            MessageTopicType::Forum => Some(td_api::MessageTopic::messageTopicForum(
+                td_api::messageTopicForum {
+                    forum_topic_id: ctx
+                        .get_forum_topic_id_object(self.dialog_id, self.forum_topic_id),
+                },
+            )),
+            MessageTopicType::Monoforum => Some(td_api::MessageTopic::messageTopicDirectMessages(
+                td_api::messageTopicDirectMessages {
+                    direct_messages_chat_topic_id: ctx.get_saved_messages_topic_id_object(
+                        self.dialog_id,
+                        self.saved_messages_topic_id,
+                    ),
+                },
+            )),
+            MessageTopicType::SavedMessages => {
+                Some(td_api::MessageTopic::messageTopicSavedMessages(
+                    td_api::messageTopicSavedMessages {
+                        saved_messages_topic_id: ctx.get_saved_messages_topic_id_object(
+                            self.dialog_id,
+                            self.saved_messages_topic_id,
+                        ),
+                    },
+                ))
+            }
+        }
+    }
+
+    /// `MessageTopic::get_implicit_reply_to_message_id`
+    /// (MessageTopic.cpp:269-291).
+    pub fn get_implicit_reply_to_message_id(&self, ctx: &dyn MessageObjectContext) -> MessageId {
+        match self.r#type {
+            MessageTopicType::Thread => self.top_thread_message_id,
+            MessageTopicType::Forum => {
+                let dialog_type = self.dialog_id.get_type();
+                if ctx.is_bot() && dialog_type == DialogType::User {
+                    return MessageId::default();
+                }
+                if dialog_type == DialogType::Channel
+                    && self.forum_topic_id == ForumTopicId::general()
+                {
+                    return MessageId::default();
+                }
+                self.forum_topic_id.to_top_thread_message_id()
+            }
+            MessageTopicType::Monoforum
+            | MessageTopicType::SavedMessages
+            | MessageTopicType::None => MessageId::default(),
+        }
+    }
+}
+
+/// The message-plane `const Td *td` surface: the M.9 content context plus
+/// the queries `get_message_object` and its helpers make. The real `Td`
+/// wiring lands with the Td slices; the stand-ins answer the id-object
+/// defaults like [`crate::message_content::MessageContentContext`].
+pub trait MessageObjectContext {
+    /// Upcast to the M.9 content-object surface
+    /// (`get_message_content_object`'s `Td *`).
+    fn content_context(&self) -> &dyn crate::message_content::MessageContentContext;
+
+    /// `td->auth_manager_->is_bot()`.
+    fn is_bot(&self) -> bool;
+
+    /// `td::Time::now()` — drives `ttl_expires_in`/`retry_after`.
+    fn now(&self) -> f64;
+
+    /// `G()->server_time()`.
+    fn server_time(&self) -> f64;
+
+    /// `G()->is_test_dc()`.
+    fn is_test_dc(&self) -> bool;
+
+    /// `G()->get_restriction_options()` (RestrictionReason.cpp).
+    fn get_restriction_options(&self) -> crate::restriction_reason::RestrictionOptions;
+
+    /// `get_message_sender_object_const(Td *, UserId, DialogId, source)`
+    /// (MessageSender.cpp:22-33) — the dialog-known sender form wins.
+    fn get_message_sender_object_const(
+        &self,
+        sender_user_id: UserId,
+        sender_dialog_id: DialogId,
+        source: &str,
+    ) -> Option<td_api::MessageSender>;
+
+    /// `UserManager::have_min_user` (MessageSender.cpp:69).
+    fn have_min_user(&self, user_id: UserId) -> bool;
+
+    /// `MessagesManager::have_dialog` (MessageSender.cpp:75).
+    fn have_dialog(&self, dialog_id: DialogId) -> bool;
+
+    /// `DialogManager::have_dialog_info` (MessageSender.cpp:76).
+    fn have_dialog_info(&self, dialog_id: DialogId) -> bool;
+
+    /// `ChatManager::have_min_channel` (MessageSender.cpp:77).
+    fn have_min_channel(&self, channel_id: ChannelId) -> bool;
+
+    /// `DialogManager::force_create_dialog(dialog_id, source, true)` — the
+    /// min-sender creation side effect; a no-op until the Td wiring.
+    fn force_create_dialog(&self, dialog_id: DialogId, source: &str);
+
+    /// `ChatManager::get_channel_has_linked_channel`
+    /// (MessagesManager.cpp:4943).
+    fn get_channel_has_linked_channel(&self, channel_id: ChannelId) -> bool;
+
+    /// `ChatManager::is_forum_channel` (MessageTopic.cpp:48).
+    fn is_forum_channel(&self, channel_id: ChannelId) -> bool;
+
+    /// `ChatManager::is_megagroup_channel` (MessageTopic.cpp:57).
+    fn is_megagroup_channel(&self, channel_id: ChannelId) -> bool;
+
+    /// `ChatManager::get_channel_linked_channel_id`
+    /// (MessagesManager.cpp:4947).
+    fn get_channel_linked_channel_id(&self, channel_id: ChannelId, source: &str) -> ChannelId;
+
+    /// `ChatManager::have_channel_force` (MessagesManager.cpp:4979).
+    fn have_channel_force(&self, channel_id: ChannelId, source: &str) -> bool;
+
+    /// `DialogManager::have_input_peer_channel(channel_id, Read)`
+    /// (MessagesManager.cpp:4980).
+    fn have_input_peer_channel(&self, channel_id: ChannelId) -> bool;
+
+    /// `UserManager::get_user_private_forward_name`
+    /// (MessageOrigin.cpp:128).
+    fn get_user_private_forward_name(&self, user_id: UserId) -> String;
+
+    /// `DialogManager::is_admined_monoforum_channel`
+    /// (MessagesManager.cpp:8234+).
+    fn is_admined_monoforum_channel(&self, dialog_id: DialogId) -> bool;
+
+    /// `DialogManager::is_monoforum_channel(DialogId)`.
+    fn is_monoforum_channel_dialog(&self, dialog_id: DialogId) -> bool;
+
+    /// `ChatManager::get_monoforum_channel_id(ChannelId)`
+    /// (MessagesManager.cpp:8247).
+    fn get_monoforum_channel_id(&self, channel_id: ChannelId) -> ChannelId;
+
+    /// `ChatManager::get_channel_status(channel_id).can_post_messages()`
+    /// (MessagesManager.cpp:8250).
+    fn channel_can_post_messages(&self, channel_id: ChannelId) -> bool;
+
+    /// `DialogManager::get_dialog_has_protected_content_force`
+    /// (MessagesManager.cpp:8146).
+    fn get_dialog_has_protected_content_force(&self, dialog_id: DialogId) -> bool;
+
+    /// `ForumTopicManager::get_forum_topic_id_object`
+    /// (MessageTopic.cpp:256) — the raw id until the manager lands.
+    fn get_forum_topic_id_object(&self, dialog_id: DialogId, forum_topic_id: ForumTopicId) -> i32;
+
+    /// `SavedMessagesManager::get_saved_messages_topic_id_object`
+    /// (MessageTopic.cpp:259+) — the raw id until the manager lands.
+    fn get_saved_messages_topic_id_object(
+        &self,
+        dialog_id: DialogId,
+        saved_messages_topic_id: SavedMessagesTopicId,
+    ) -> i64;
+
+    /// `get_message_content_media_duration(content, td)`
+    /// (MessageContent.cpp:12491) — the per-manager duration reads
+    /// collapse to the seam default (-1, "no duration").
+    fn get_message_content_media_duration(&self, content: &MessageContent) -> i32;
+
+    /// `get_message_sender_object(Td *, DialogId, source)`
+    /// (MessageSender.cpp:56-62) — the force-creating form the paid
+    /// reactor uses.
+    fn get_message_sender_object_force(
+        &self,
+        dialog_id: DialogId,
+        source: &str,
+    ) -> Option<td_api::MessageSender>;
+}
+
+/// `get_min_message_sender_object(Td *, DialogId, source)`
+/// (MessageSender.cpp:64-85).
+pub fn get_min_message_sender_object(
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    source: &str,
+) -> Option<td_api::MessageSender> {
+    let dialog_type = dialog_id.get_type();
+    if dialog_type == DialogType::User {
+        let user_id = dialog_id.get_user_id();
+        if ctx.have_min_user(user_id) {
+            return Some(td_api::MessageSender::messageSenderUser(
+                td_api::messageSenderUser {
+                    user_id: ctx.content_context().get_user_id_object(user_id, source),
+                },
+            ));
+        }
+    } else {
+        if !ctx.have_dialog(dialog_id)
+            && (ctx.have_dialog_info(dialog_id)
+                || (dialog_type == DialogType::Channel
+                    && ctx.have_min_channel(dialog_id.get_channel_id())))
+        {
+            log_error!("Force creation of {:?}", dialog_id); // the C++ LOG(INFO)
+            ctx.force_create_dialog(dialog_id, source);
+        }
+        if ctx.have_dialog(dialog_id) {
+            return Some(td_api::MessageSender::messageSenderChat(
+                td_api::messageSenderChat {
+                    chat_id: ctx.content_context().get_chat_id_object(dialog_id, source),
+                },
+            ));
+        }
+    }
+    log_error!("Can't return unknown {:?} from {}", dialog_id, source);
+    None
+}
+
+/// `get_min_message_senders_object(Td *, vector<DialogId>, source)`
+/// (MessageSender.cpp:88-100).
+pub fn get_min_message_senders_object(
+    ctx: &dyn MessageObjectContext,
+    dialog_ids: &[DialogId],
+    source: &str,
+) -> Vec<td_api::MessageSender> {
+    let mut message_senders = Vec::new();
+    for dialog_id in dialog_ids {
+        if let Some(message_sender) = get_min_message_sender_object(ctx, *dialog_id, source) {
+            message_senders.push(message_sender);
+        }
+    }
+    message_senders
+}
+
+/// `get_inline_keyboard_button_object(UserManager *, const
+/// InlineKeyboardButton &)` (InlineKeyboardButton.cpp:470-526).
+fn get_inline_keyboard_button_object(
+    ctx: &dyn MessageObjectContext,
+    keyboard_button: &InlineKeyboardButton,
+) -> td_api::InlineKeyboardButton {
+    let type_object = match keyboard_button.r#type {
+        InlineKeyboardButtonType::Url => {
+            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeUrl(
+                td_api::inlineKeyboardButtonTypeUrl {
+                    url: keyboard_button.data.clone(),
+                },
+            )
+        }
+        InlineKeyboardButtonType::Callback => {
+            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeCallback(
+                td_api::inlineKeyboardButtonTypeCallback {
+                    data: keyboard_button.data.clone().into_bytes(),
+                },
+            )
+        }
+        InlineKeyboardButtonType::CallbackGame => {
+            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeCallbackGame(
+                td_api::inlineKeyboardButtonTypeCallbackGame,
+            )
+        }
+        InlineKeyboardButtonType::SwitchInline => {
+            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeSwitchInline(
+                td_api::inlineKeyboardButtonTypeSwitchInline {
+                    query: keyboard_button.data.clone(),
+                    target_chat: Some(Box::new(td_api::TargetChat::targetChatChosen(
+                        td_api::targetChatChosen {
+                            types: Some(
+                                TargetDialogTypes::from_mask(keyboard_button.id)
+                                    .get_target_chat_types_object(),
+                            ),
+                        },
+                    ))),
+                },
+            )
+        }
+        InlineKeyboardButtonType::SwitchInlineCurrentDialog => {
+            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeSwitchInline(
+                td_api::inlineKeyboardButtonTypeSwitchInline {
+                    query: keyboard_button.data.clone(),
+                    target_chat: Some(Box::new(td_api::TargetChat::targetChatCurrent(
+                        td_api::targetChatCurrent,
+                    ))),
+                },
+            )
+        }
+        InlineKeyboardButtonType::Buy => {
+            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeBuy(
+                td_api::inlineKeyboardButtonTypeBuy,
+            )
+        }
+        InlineKeyboardButtonType::UrlAuth => {
+            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeLoginUrl(
+                td_api::inlineKeyboardButtonTypeLoginUrl {
+                    url: keyboard_button.data.clone(),
+                    id: keyboard_button.id,
+                    forward_text: keyboard_button.forward_text.clone(),
+                },
+            )
+        }
+        InlineKeyboardButtonType::CallbackWithPassword => {
+            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeCallbackWithPassword(
+                td_api::inlineKeyboardButtonTypeCallbackWithPassword {
+                    data: keyboard_button.data.clone().into_bytes(),
+                },
+            )
+        }
+        InlineKeyboardButtonType::User => {
+            let need_user = !ctx
+                .content_context()
+                .is_user_bot(ctx.content_context().get_my_id());
+            let user_id = if need_user {
+                ctx.content_context().get_user_id_object(
+                    keyboard_button.user_id,
+                    "get_inline_keyboard_button_object",
+                )
+            } else {
+                keyboard_button.user_id.get()
+            };
+            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeUser(
+                td_api::inlineKeyboardButtonTypeUser { user_id },
+            )
+        }
+        InlineKeyboardButtonType::WebView => {
+            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeWebApp(
+                td_api::inlineKeyboardButtonTypeWebApp {
+                    url: keyboard_button.data.clone(),
+                },
+            )
+        }
+        InlineKeyboardButtonType::Copy => {
+            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeCopyText(
+                td_api::inlineKeyboardButtonTypeCopyText {
+                    text: keyboard_button.data.clone(),
+                },
+            )
+        }
+        InlineKeyboardButtonType::Disabled => {
+            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeDisabled(
+                td_api::inlineKeyboardButtonTypeDisabled,
+            )
+        }
+    };
+    td_api::InlineKeyboardButton {
+        text: keyboard_button.text.clone(),
+        icon_custom_emoji_id: keyboard_button.style.get_icon_custom_emoji_id().get(),
+        style: keyboard_button.style.get_button_style_object(),
+        r#type: Some(type_object),
+    }
+}
+
+/// `MessageSendOptions::get_message_scheduling_state_object`
+/// (MessageSendOptions.cpp:84-93).
+pub fn get_message_scheduling_state_object(
+    send_date: i32,
+    repeat_period: i32,
+    video_processing_pending: bool,
+) -> Option<td_api::MessageSchedulingState> {
+    const SCHEDULE_WHEN_ONLINE_DATE: i32 = 2147483646;
+    if video_processing_pending {
+        return Some(
+            td_api::MessageSchedulingState::messageSchedulingStateSendWhenVideoProcessed(
+                td_api::messageSchedulingStateSendWhenVideoProcessed { send_date },
+            ),
+        );
+    }
+    if send_date == SCHEDULE_WHEN_ONLINE_DATE {
+        return Some(
+            td_api::MessageSchedulingState::messageSchedulingStateSendWhenOnline(
+                td_api::messageSchedulingStateSendWhenOnline,
+            ),
+        );
+    }
+    Some(
+        td_api::MessageSchedulingState::messageSchedulingStateSendAtDate(
+            td_api::messageSchedulingStateSendAtDate {
+                send_date,
+                repeat_period,
+            },
+        ),
+    )
+}
+
+/// `StarManager::get_star_count` (StarManager.cpp:1799-1815), the
+/// `allow_negative = false` form.
+fn get_star_count(amount: i64) -> i64 {
+    let max_amount = 1i64 << 51;
+    if amount < 0 {
+        log_error!("Receive Telegram Star amount = {}", amount);
+        return 0;
+    }
+    if amount > max_amount {
+        log_error!("Receive Telegram Star amount = {}", amount);
+        return max_amount;
+    }
+    amount
+}
+
+/// `MessagesManager::get_required_paid_message_star_count`
+/// (MessagesManager.cpp:20518-20524).
+pub fn get_required_paid_message_star_count(error_code: i32, error_message: &str) -> i64 {
+    let allow_payment_required_prefix = "ALLOW_PAYMENT_REQUIRED_";
+    if (error_code == 400 || error_code == 403)
+        && let Some(star_count) = error_message.strip_prefix(allow_payment_required_prefix)
+        && let Ok(amount) = star_count.parse::<i64>()
+    {
+        return get_star_count(amount);
+    }
+    0
+}
+
+/// `MessagesManager::is_ephemeral_message` (MessagesManager.cpp:23395-23397).
+pub fn is_ephemeral_message(m: &Message) -> bool {
+    m.receiver_user_id.is_valid()
+}
+
+/// `MessagesManager::is_message_forward` (MessagesManager.cpp:23411-23413).
+pub fn is_message_forward(m: &Message) -> bool {
+    m.forward_info.is_some() || m.had_forward_info
+}
+
+/// `MessagesManager::get_message_shown_edit_date`
+/// (MessagesManager.cpp:23461-23463).
+pub fn get_message_shown_edit_date(m: &Message) -> i32 {
+    if m.hide_edit_date || m.message_id.is_scheduled() {
+        0
+    } else {
+        m.edit_date
+    }
+}
+
+/// `MessagesManager::get_message_topic` (MessagesManager.cpp:23474-23476).
+pub fn get_message_topic(
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> MessageTopic {
+    MessageTopic::new_from_message(
+        ctx,
+        dialog_id,
+        m.is_topic_message,
+        m.top_thread_message_id,
+        m.saved_messages_topic_id,
+    )
+}
+
+/// `MessagesManager::get_message_own_max_media_timestamp`
+/// (MessagesManager.cpp:23950-23953).
+pub fn get_message_own_max_media_timestamp(ctx: &dyn MessageObjectContext, m: &Message) -> i32 {
+    let duration = ctx
+        .get_message_content_media_duration(m.content.as_ref().expect("message without content"));
+    if duration == 0 { i32::MAX } else { duration }
+}
+
+/// `MessagesManager::get_message_max_media_timestamp`
+/// (MessagesManager.cpp:23955-23957).
+pub fn get_message_max_media_timestamp(m: &Message) -> i32 {
+    if m.max_own_media_timestamp >= 0 {
+        m.max_own_media_timestamp
+    } else {
+        m.max_reply_media_timestamp
+    }
+}
+
+/// `MessagesManager::can_resend_message` (MessagesManager.cpp:23339-23365).
+pub fn can_resend_message(ctx: &dyn MessageObjectContext, m: &Message) -> bool {
+    if m.send_error_code != 429
+        && m.send_error_message != "Message is too old to be re-sent automatically"
+        && m.send_error_message != "SCHEDULE_TOO_MUCH"
+        && m.send_error_message != "SEND_AS_PEER_INVALID"
+        && m.send_error_message != "QUOTE_TEXT_INVALID"
+        && m.send_error_message != "REPLY_MESSAGE_ID_INVALID"
+        && !m.send_error_message.starts_with("ALLOW_PAYMENT_REQUIRED_")
+    {
+        return false;
+    }
+    if m.is_bot_start_message || m.is_quick_reply_message {
+        return false;
+    }
+    if m.forward_info.is_some() || m.real_forward_from_dialog_id.is_valid() {
+        // TODO implement resending of forwarded messages
+        return false;
+    }
+    let content = m.content.as_ref().expect("message without content");
+    let content_type = content.get_type();
+    if m.via_bot_user_id.is_valid() || m.hide_via_bot {
+        // via bot message
+        if !crate::message_content::can_message_content_have_input_media(
+            ctx.content_context(),
+            content,
+            false,
+        ) {
+            return false;
+        }
+
+        // resend via_bot message as an ordinary message if error code is 429
+        // TODO support other error codes
+    }
+
+    if content_type == MessageContentType::ChatSetTtl
+        || content_type == MessageContentType::ScreenshotTaken
+    {
+        // TODO implement resending of ChatSetTtl and ScreenshotTaken messages
+        return false;
+    }
+    true
+}
+
+/// `MessagesManager::need_skip_bot_commands`
+/// (MessagesManager.cpp:5346-5355).
+pub fn need_skip_bot_commands(
+    manager: &MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    m: Option<&Message>,
+) -> bool {
+    if ctx.content_context().is_bot() {
+        return false;
+    }
+
+    if let Some(m) = m
+        && m.message_id.is_scheduled()
+    {
+        return true;
+    }
+
+    let has_bots_info = manager
+        .get_dialog(dialog_id)
+        .is_some_and(|d| d.is_has_bots_inited && !d.has_bots);
+    has_bots_info || ctx.content_context().is_broadcast_channel_dialog(dialog_id)
+}
+
+/// `MessagesManager::get_message_has_protected_content`
+/// (MessagesManager.cpp:8145-8147).
+pub fn get_message_has_protected_content(
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> bool {
+    let noforwards = match &m.ephemeral_message {
+        None => m.noforwards,
+        Some(ephemeral_message) => ephemeral_message.noforwards,
+    };
+    noforwards || ctx.get_dialog_has_protected_content_force(dialog_id)
+}
+
+/// `MessagesManager::can_save_message` (MessagesManager.cpp:8336-8342).
+pub fn can_save_message(
+    dialog_id: DialogId,
+    m: Option<&Message>,
+    ctx: &dyn MessageObjectContext,
+) -> bool {
+    let Some(m) = m else {
+        return false;
+    };
+    if m.is_content_secret {
+        return false;
+    }
+    if get_message_has_protected_content(ctx, dialog_id, m) {
+        return false;
+    }
+    true
+}
+
+/// `MessagesManager::is_active_message_reply_info`
+/// (MessagesManager.cpp:4929-4963).
+pub fn is_active_message_reply_info(
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    reply_info: &MessageReplyInfo,
+) -> bool {
+    if reply_info.is_empty() {
+        return false;
+    }
+    if dialog_id.get_type() != DialogType::Channel {
+        return false;
+    }
+
+    if !reply_info.is_comment {
+        return true;
+    }
+    if !ctx.content_context().is_broadcast_channel_dialog(dialog_id) {
+        return true;
+    }
+
+    let channel_id = dialog_id.get_channel_id();
+    if !ctx.get_channel_has_linked_channel(channel_id) {
+        return false;
+    }
+
+    let linked_channel_id =
+        ctx.get_channel_linked_channel_id(channel_id, "is_active_message_reply_info");
+    if !linked_channel_id.is_valid() {
+        // keep the comment button while linked channel is unknown
+        return true;
+    }
+
+    if linked_channel_id != reply_info.channel_id {
+        return false;
+    }
+
+    true
+}
+
+/// `MessagesManager::is_visible_message_reply_info`
+/// (MessagesManager.cpp:4965-4987).
+pub fn is_visible_message_reply_info(
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> bool {
+    if !m.message_id.is_valid() {
+        return false;
+    }
+    let is_broadcast = ctx.content_context().is_broadcast_channel_dialog(dialog_id);
+    if !m.message_id.is_server() && !(is_broadcast && m.message_id.is_yet_unsent()) {
+        return false;
+    }
+    if is_broadcast && (m.had_reply_markup || m.reply_markup.is_some()) {
+        return false;
+    }
+    if !is_active_message_reply_info(ctx, dialog_id, &m.reply_info) {
+        return false;
+    }
+    if m.reply_info.is_comment
+        && is_broadcast
+        && ctx.have_channel_force(m.reply_info.channel_id, "is_visible_message_reply_info")
+        && !ctx.have_input_peer_channel(m.reply_info.channel_id)
+    {
+        // keep the comment button while have no information about the linked channel
+        return false;
+    }
+    true
+}
+
+/// `MessagesManager::is_visible_message_reactions`
+/// (MessagesManager.cpp:4989-5003).
+pub fn is_visible_message_reactions(
+    manager: &MessagesManager,
+    reactions_ctx: &dyn DialogReactionsContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> bool {
+    let Some(d) = manager.get_dialog(dialog_id) else {
+        return false;
+    };
+    if get_message_active_reactions(manager, reactions_ctx, d, m).empty() {
+        return false;
+    }
+    if m.available_reactions_generation != d.available_reactions_generation {
+        return false;
+    }
+    true
+}
+
+/// The value half of `MessageReactions::get_message_reactions_object` —
+/// the same conversion without the visibility gate.
+fn get_message_reactions_value_object(
+    ctx: &dyn MessageObjectContext,
+    reactions: &MessageReactions,
+    my_user_id: UserId,
+    peer_user_id: UserId,
+) -> td_api::MessageReactions {
+    let mut reaction_objects: Vec<td_api::MessageReaction> = reactions
+        .reactions
+        .iter()
+        .map(|reaction| get_message_reaction_object(ctx, reaction, my_user_id, peer_user_id))
+        .collect();
+    let reactors: Vec<td_api::PaidReactor> = reactions
+        .top_reactors
+        .iter()
+        .map(|reactor| get_paid_reactor_object(ctx, reactor))
+        .collect();
+    if reactions.pending_paid_reactions > 0 {
+        if reactions.reactions.is_empty()
+            || !reactions.reactions[0].reaction_type.is_paid_reaction()
+        {
+            let pending_reaction = MessageReaction {
+                reaction_type: ReactionType::paid(),
+                choose_count: reactions.pending_paid_reactions,
+                is_chosen: true,
+                ..MessageReaction::default()
+            };
+            reaction_objects.insert(
+                0,
+                get_message_reaction_object(ctx, &pending_reaction, my_user_id, peer_user_id),
+            );
+        } else {
+            reaction_objects[0].total_count += reactions.pending_paid_reactions;
+            reaction_objects[0].is_chosen = true;
+        }
+
+        // the top-reactor recompute needs `pending_paid_reaction_type_`
+        // [blocked: Wave-2 paid reactions]
+    }
+    td_api::MessageReactions {
+        reactions: reaction_objects,
+        are_tags: reactions.are_tags,
+        paid_reactors: reactors,
+        can_get_added_reactions: reactions.can_get_added_reactions,
+    }
+}
+
+/// `MessageReaction::MAX_RECENT_CHOOSERS` (MessageReaction.h:36).
+const MAX_RECENT_CHOOSERS: usize = 3;
+
+/// `MessageReaction::get_message_reaction_object`
+/// (MessageReaction.cpp:455-484).
+fn get_message_reaction_object(
+    ctx: &dyn MessageObjectContext,
+    reaction: &MessageReaction,
+    my_user_id: UserId,
+    peer_user_id: UserId,
+) -> td_api::MessageReaction {
+    assert!(!reaction.is_empty());
+
+    let mut used_sender = None;
+    let mut recent_choosers: Vec<td_api::MessageSender> = Vec::new();
+    if my_user_id.is_valid() {
+        assert!(peer_user_id.is_valid());
+        if reaction.is_chosen {
+            let recent_chooser = get_min_message_sender_object(
+                ctx,
+                DialogId::from_user_id(my_user_id),
+                "get_message_reaction_object",
+            );
+            if let Some(recent_chooser) = recent_chooser {
+                used_sender = get_min_message_sender_object(
+                    ctx,
+                    DialogId::from_user_id(my_user_id),
+                    "get_message_reaction_object",
+                );
+                recent_choosers.push(recent_chooser);
+            }
+        }
+        if reaction.choose_count >= if reaction.is_chosen { 2 } else { 1 } {
+            let recent_chooser = get_min_message_sender_object(
+                ctx,
+                DialogId::from_user_id(peer_user_id),
+                "get_message_reaction_object",
+            );
+            if let Some(recent_chooser) = recent_chooser {
+                recent_choosers.push(recent_chooser);
+            }
+        }
+    } else {
+        for dialog_id in &reaction.recent_chooser_dialog_ids {
+            let recent_chooser =
+                get_min_message_sender_object(ctx, *dialog_id, "get_message_reaction_object");
+            if let Some(recent_chooser) = recent_chooser {
+                if reaction.is_chosen && *dialog_id == reaction.my_recent_chooser_dialog_id {
+                    used_sender = get_min_message_sender_object(
+                        ctx,
+                        *dialog_id,
+                        "get_message_reaction_object",
+                    );
+                }
+                recent_choosers.push(recent_chooser);
+                if recent_choosers.len() == MAX_RECENT_CHOOSERS {
+                    break;
+                }
+            }
+        }
+    }
+    td_api::MessageReaction {
+        r#type: reaction.reaction_type.get_reaction_type_object(),
+        total_count: reaction.choose_count,
+        is_chosen: reaction.is_chosen,
+        used_sender_id: used_sender,
+        recent_sender_ids: recent_choosers,
+    }
+}
+
+/// `MessageReactor::get_paid_reactor_object` (MessageReactor.cpp:55-59).
+fn get_paid_reactor_object(
+    ctx: &dyn MessageObjectContext,
+    reactor: &MessageReactor,
+) -> td_api::PaidReactor {
+    td_api::PaidReactor {
+        sender_id: if reactor.dialog_id == DialogId::default() {
+            None
+        } else {
+            ctx.get_message_sender_object_force(reactor.dialog_id, "paidReactor")
+        },
+        star_count: i64::from(reactor.count),
+        is_top: reactor.is_top,
+        is_me: reactor.is_me,
+        is_anonymous: reactor.is_anonymous,
+    }
+}
+
+/// `MessagesManager::get_message_interaction_info_object`
+/// (MessagesManager.cpp:5035-5073).
+pub fn get_message_interaction_info_object(
+    manager: &MessagesManager,
+    reactions_ctx: &dyn DialogReactionsContext,
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> Option<td_api::MessageInteractionInfo> {
+    let is_visible_reply_info = is_visible_message_reply_info(ctx, dialog_id, m);
+    let has_reactions = m.reactions.is_some()
+        && !m.reactions.as_ref().unwrap().are_empty()
+        && is_visible_message_reactions(manager, reactions_ctx, dialog_id, m);
+    if m.view_count == 0 && m.forward_count == 0 && !is_visible_reply_info && !has_reactions {
+        return None;
+    }
+    if m.message_id.is_scheduled()
+        && (m.forward_info.is_none()
+            || ctx.content_context().is_broadcast_channel_dialog(dialog_id))
+    {
+        return None;
+    }
+    if m.message_id.is_local() && m.forward_info.is_none() {
+        return None;
+    }
+
+    let mut reply_info = None;
+    if is_visible_reply_info {
+        let expected_dialog_id = if m.reply_info.is_comment {
+            DialogId::from_channel_id(m.reply_info.channel_id)
+        } else {
+            dialog_id
+        };
+        let last_read_inbox_message_id = manager
+            .get_dialog(expected_dialog_id)
+            .map(|d| d.last_read_inbox_message_id)
+            .unwrap_or_default();
+        reply_info = Some(
+            m.reply_info
+                .get_message_reply_info_object(ctx, last_read_inbox_message_id)
+                .expect("non-empty reply info"),
+        );
+    }
+
+    let mut reactions = None;
+    if has_reactions {
+        let mut my_user_id = UserId::default();
+        let mut peer_user_id = UserId::default();
+        if dialog_id.get_type() == DialogType::User {
+            my_user_id = ctx.content_context().get_my_id();
+            peer_user_id = dialog_id.get_user_id();
+        }
+        reactions = Some(get_message_reactions_value_object(
+            ctx,
+            m.reactions.as_ref().unwrap(),
+            my_user_id,
+            peer_user_id,
+        ));
+    }
+
+    Some(td_api::MessageInteractionInfo {
+        view_count: m.view_count,
+        forward_count: m.forward_count,
+        reply_info,
+        reactions,
+    })
+}
+
+/// `MessagesManager::get_message_fact_check_object`
+/// (MessagesManager.cpp:5075-5080).
+pub fn get_message_fact_check_object(
+    ctx: &dyn MessageObjectContext,
+    m: &Message,
+) -> Option<td_api::FactCheck> {
+    let fact_check = m.fact_check.as_ref()?;
+    let mut user_manager = crate::message_content::ContextUserManager::new(ctx.content_context());
+    fact_check.get_fact_check_object(Some(&mut user_manager))
+}
+
+/// `MessagesManager::can_approve_or_decline_message`
+/// (MessagesManager.cpp:8228-8239).
+pub fn can_approve_or_decline_message(
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> bool {
+    let Some(suggested_post) = &m.suggested_post else {
+        return false;
+    };
+    if !suggested_post.is_pending()
+        || !m.message_id.is_server()
+        || m.is_outgoing
+        || !ctx.is_monoforum_channel_dialog(dialog_id)
+        || m.ephemeral_message.is_some()
+    {
+        return false;
+    }
+    let is_from_user = m.sender_user_id.is_valid();
+    if !is_from_user && ctx.is_admined_monoforum_channel(dialog_id) {
+        // only the user can approve or decline post suggested by a direct messages administrator
+        return false;
+    }
+    true
+}
+
+/// `MessagesManager::can_approve_message` (MessagesManager.cpp:8241-8261).
+pub fn can_approve_message(
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> bool {
+    if !can_approve_or_decline_message(ctx, dialog_id, m) {
+        return false;
+    }
+    let is_from_user = m.sender_user_id.is_valid();
+    if is_from_user {
+        let channel_id = ctx.get_monoforum_channel_id(dialog_id.get_channel_id());
+        if !ctx.channel_can_post_messages(channel_id) {
+            // there are not enough rights
+            return false;
+        }
+    } else {
+        // can't check that the administrator suggested the post still has the post_messages administrator right
+    }
+    let schedule_date = m.suggested_post.as_ref().unwrap().get_schedule_date();
+    if schedule_date != 0 && schedule_date < ctx.content_context().unix_time() - 86400 {
+        // the post is too old
+        return false;
+    }
+    true
+}
+
+/// `MessagesManager::can_decline_message` (MessagesManager.cpp:8263-8271).
+pub fn can_decline_message(
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> bool {
+    if !can_approve_or_decline_message(ctx, dialog_id, m) {
+        return false;
+    }
+    let is_from_user = m.sender_user_id.is_valid();
+    if is_from_user && !ctx.is_admined_monoforum_channel(dialog_id) {
+        // only an administrator can decline post suggested by the regular user
+        return false;
+    }
+    true
+}
+
+/// `MessagesManager::get_message_suggested_post_info_object`
+/// (MessagesManager.cpp:5082-5089).
+pub fn get_message_suggested_post_info_object(
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> Option<td_api::SuggestedPostInfo> {
+    let suggested_post = m.suggested_post.as_ref()?;
+    Some(suggested_post.get_suggested_post_info_object(
+        can_approve_message(ctx, dialog_id, m),
+        can_decline_message(ctx, dialog_id, m),
+    ))
+}
+
+/// `MessagesManager::get_unread_reactions_object`
+/// (MessagesManager.cpp:5091-5105).
+pub fn get_unread_reactions_object(
+    manager: &MessagesManager,
+    reactions_ctx: &dyn DialogReactionsContext,
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> Vec<td_api::UnreadReaction> {
+    if !has_unread_message_reactions(manager, reactions_ctx, dialog_id, m) {
+        return Vec::new();
+    }
+
+    let mut unread_reactions = Vec::new();
+    for unread_reaction in &m.reactions.as_ref().unwrap().unread_reactions {
+        if let Some(unread_reaction_object) = unread_reaction.get_unread_reaction_object(ctx) {
+            unread_reactions.push(unread_reaction_object);
+        }
+    }
+    unread_reactions
+}
+
+/// `MessagesManager::get_message_sending_state_object`
+/// (MessagesManager.cpp:20526-20547).
+pub fn get_message_sending_state_object(
+    ctx: &dyn MessageObjectContext,
+    m: &Message,
+) -> Option<td_api::MessageSendingState> {
+    if m.message_id.is_yet_unsent() {
+        return Some(td_api::MessageSendingState::messageSendingStatePending(
+            td_api::messageSendingStatePending {
+                sending_id: m.sending_id,
+            },
+        ));
+    }
+    if m.is_failed_to_send {
+        let can_retry = can_resend_message(ctx, m);
+        let error_code = if m.send_error_code > 0 {
+            m.send_error_code
+        } else {
+            400
+        };
+        let need_another_sender =
+            can_retry && error_code == 400 && m.send_error_message == "SEND_AS_PEER_INVALID";
+        let need_another_reply_quote =
+            can_retry && error_code == 400 && m.send_error_message == "QUOTE_TEXT_INVALID";
+        let need_drop_reply =
+            can_retry && error_code == 400 && m.send_error_message == "REPLY_MESSAGE_ID_INVALID";
+        return Some(td_api::MessageSendingState::messageSendingStateFailed(
+            td_api::messageSendingStateFailed {
+                error: Some(td_api::Error {
+                    code: error_code,
+                    message: m.send_error_message.clone(),
+                }),
+                can_retry,
+                need_another_sender,
+                need_another_reply_quote,
+                need_drop_reply,
+                required_paid_message_star_count: get_required_paid_message_star_count(
+                    error_code,
+                    &m.send_error_message,
+                ),
+                retry_after: (m.try_resend_at - ctx.now()).max(0.0),
+            },
+        ));
+    }
+    None
+}
+
+/// `MessagesManager::get_message_guest_sender_object`
+/// (MessagesManager.cpp:20549-20554).
+fn get_message_guest_sender_object(
+    ctx: &dyn MessageObjectContext,
+    m: &Message,
+) -> Option<td_api::MessageSender> {
+    if m.guest_bot_via_dialog_id == DialogId::default() {
+        return None;
+    }
+    ctx.get_message_sender_object_const(
+        UserId::default(),
+        m.guest_bot_via_dialog_id,
+        "get_message_guest_sender_object",
+    )
+}
+
+/// `td::clamp` — min-if-below/max-if-above; `f64::clamp` panics on an
+/// inverted range, the C++ helper does not (MessagesManager.cpp:20762).
+fn td_clamp(value: f64, min_value: f64, max_value: f64) -> f64 {
+    if value < min_value {
+        return min_value;
+    }
+    if value > max_value {
+        return max_value;
+    }
+    value
+}
+
+/// `MessagesManager::get_message_message_content_object`
+/// (MessagesManager.cpp:20556-20575).
+fn get_message_message_content_object(
+    manager: &MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> td_api::MessageContent {
+    let live_location_date = if m.is_failed_to_send { 0 } else { m.date };
+    let mut original_dialog_id = dialog_id;
+    let mut original_date = m.date;
+    if let Some(forward_info) = &m.forward_info
+        && !forward_info.is_imported()
+    {
+        let origin = forward_info.get_origin();
+        if origin.is_channel_post() {
+            original_dialog_id = origin.get_sender(ctx);
+        } else {
+            original_dialog_id = DialogId::default(); // unknown
+        }
+        original_date = forward_info.get_origin_date();
+    }
+    crate::message_content::get_message_content_object(
+        ctx.content_context(),
+        m.content.as_ref().expect("message without content"),
+        dialog_id,
+        crate::chat_manager::MessageId::new(m.message_id.get()),
+        original_dialog_id,
+        true,
+        m.is_outgoing,
+        is_message_forward(m),
+        get_message_sender(m),
+        live_location_date,
+        original_date,
+        m.is_content_secret,
+        need_skip_bot_commands(manager, ctx, dialog_id, Some(m)),
+        get_message_max_media_timestamp(m),
+        m.invert_media,
+        m.disable_web_page_preview,
+        "get_message_message_content_object",
+    )
+}
+
+/// `MessagesManager::get_ephemeral_message_content_object`
+/// (MessagesManager.cpp:20577-20587).
+fn get_ephemeral_message_content_object(
+    manager: &MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    m: Option<&Message>,
+) -> Option<td_api::EphemeralMessageContent> {
+    let m = m?;
+    let can_be_saved = can_save_message(dialog_id, Some(m), ctx);
+    let has_timestamped_media = false; // reply_to == nullptr || m->max_own_media_timestamp >= 0;
+    Some(td_api::EphemeralMessageContent {
+        can_be_saved,
+        has_timestamped_media,
+        content: Some(get_message_message_content_object(
+            manager, ctx, dialog_id, m,
+        )),
+        reply_markup: m
+            .reply_markup
+            .as_deref()
+            .and_then(|reply_markup| reply_markup.get_reply_markup_object(ctx)),
+    })
+}
+
+/// `MessagesManager::get_message_object(DialogId, const Message *, source)`
+/// (MessagesManager.cpp:20732-20827). `is_update_sent` mutates like the
+/// C++.
+#[allow(clippy::too_many_arguments)] // the C++ builder has the same shape
+pub fn get_message_object(
+    manager: &MessagesManager,
+    reactions_ctx: &dyn DialogReactionsContext,
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    m: &mut Message,
+    source: &str,
+) -> Option<td_api::Message> {
+    assert!(manager.get_dialog(dialog_id).is_some(), "{}", source);
+
+    let is_bot = ctx.content_context().is_bot();
+    let sending_state = get_message_sending_state_object(ctx, m);
+    if sending_state.is_none() || !is_bot {
+        m.is_update_sent = true;
+    }
+    let is_ephemeral = is_ephemeral_message(m);
+    let is_scheduled = m.message_id.is_scheduled();
+    let is_from_saved_messages = dialog_id == ctx.content_context().get_my_dialog_id();
+    let mut is_outgoing = m.is_outgoing;
+    if is_from_saved_messages {
+        // in Saved Messages all non-forwarded messages must be outgoing
+        // a forwarded message is outgoing, only if it doesn't have from_dialog_id and its sender isn't hidden
+        // i.e. a message is incoming only if it's a forwarded message with known from_dialog_id or with a hidden sender
+        is_outgoing = is_scheduled
+            || m.forward_info.is_none()
+            || (!m
+                .forward_info
+                .as_ref()
+                .unwrap()
+                .get_last_dialog_id()
+                .is_valid()
+                && !m
+                    .forward_info
+                    .as_ref()
+                    .unwrap()
+                    .get_origin()
+                    .is_sender_hidden(ctx));
+    }
+    if m.is_from_scheduled && is_outgoing && is_bot {
+        is_outgoing = false;
+    }
+
+    let ttl_period = if is_ephemeral { 0 } else { m.ttl_period };
+    let ttl_expires_in = if m.ttl_expires_at != 0.0 {
+        td_clamp(
+            m.ttl_expires_at - ctx.now(),
+            1e-3,
+            f64::from(m.ttl.get_input_ttl()) - 1e-3,
+        )
+    } else {
+        0.0
+    };
+    let auto_delete_in = if ttl_period == 0 {
+        0.0
+    } else {
+        td_clamp(
+            f64::from(m.date) + f64::from(ttl_period) - ctx.server_time(),
+            1e-3,
+            f64::from(ttl_period) - 1e-3,
+        )
+    };
+    let sender = ctx.get_message_sender_object_const(m.sender_user_id, m.sender_dialog_id, source);
+    let scheduling_state = if is_scheduled {
+        get_message_scheduling_state_object(
+            m.date,
+            m.schedule_repeat_period,
+            m.video_processing_pending,
+        )
+    } else {
+        None
+    };
+    let forward_info = m.forward_info.as_ref().and_then(|forward_info| {
+        forward_info.get_message_forward_info_object(ctx, is_from_saved_messages)
+    });
+    let import_info = m
+        .forward_info
+        .as_ref()
+        .and_then(|forward_info| forward_info.get_message_import_info_object());
+    let interaction_info = if is_bot {
+        None
+    } else {
+        get_message_interaction_info_object(manager, reactions_ctx, ctx, dialog_id, m)
+    };
+    let unread_reactions = get_unread_reactions_object(manager, reactions_ctx, ctx, dialog_id, m);
+    let fact_check = get_message_fact_check_object(ctx, m);
+    let suggested_post = get_message_suggested_post_info_object(ctx, dialog_id, m);
+    let can_be_saved = can_save_message(dialog_id, Some(m), ctx);
+    let via_bot_user_id = ctx
+        .content_context()
+        .get_user_id_object(m.via_bot_user_id, "get_message_object via_bot_user_id");
+    let via_business_bot_user_id = ctx.content_context().get_user_id_object(
+        m.via_business_bot_user_id,
+        "get_message_object via_business_bot_user_id",
+    );
+    let reply_to = {
+        if !m.replied_message_info.is_empty() {
+            let same_chat_reply_to_message_id = m
+                .replied_message_info
+                .get_same_chat_reply_to_message_id(false);
+            let need_skip_reply = (is_bot
+                && !m.replied_message_info.is_external()
+                && same_chat_reply_to_message_id == MessageId::default())
+                || (!is_bot
+                    && m.is_topic_message
+                    && same_chat_reply_to_message_id == m.top_thread_message_id);
+            if need_skip_reply {
+                None
+            } else {
+                m.replied_message_info.get_message_reply_to_message_object(
+                    ctx,
+                    dialog_id,
+                    m.message_id,
+                )
+            }
+        } else if m.reply_to_story_full_id.is_valid() {
+            Some(td_api::MessageReplyTo::messageReplyToStory(
+                td_api::messageReplyToStory {
+                    story_poster_chat_id: ctx.content_context().get_chat_id_object(
+                        m.reply_to_story_full_id.get_dialog_id(),
+                        "get_message_object messageReplyToStory",
+                    ),
+                    story_id: m.reply_to_story_full_id.get_story_id().get(),
+                },
+            ))
+        } else {
+            None
+        }
+    };
+    let topic = get_message_topic(ctx, dialog_id, m);
+    let date = if is_scheduled { 0 } else { m.date };
+    let edit_date = get_message_shown_edit_date(m);
+    let has_timestamped_media = reply_to.is_none() || m.max_own_media_timestamp >= 0;
+    let reply_markup = m
+        .reply_markup
+        .as_deref()
+        .and_then(|reply_markup| reply_markup.get_reply_markup_object(ctx));
+    let content = get_message_message_content_object(manager, ctx, dialog_id, m);
+    let self_destruct_type = m.ttl.get_message_self_destruct_type_object();
+    let contains_unread_poll_votes = has_unread_poll_votes(reactions_ctx, m);
+    let receiver_id = if m.receiver_user_id.is_valid() {
+        ctx.get_message_sender_object_const(m.receiver_user_id, DialogId::default(), source)
+    } else {
+        None
+    };
+    let ephemeral_message_id = if is_bot {
+        m.ephemeral_message_id.get()
+    } else {
+        0
+    };
+
+    let restriction_info = crate::restriction_reason::get_restriction_info_object(
+        &m.restriction_reasons,
+        &ctx.get_restriction_options(),
+    );
+
+    Some(td_api::Message {
+        id: m.message_id.get(),
+        sender_id: sender,
+        receiver_id,
+        chat_id: ctx
+            .content_context()
+            .get_chat_id_object(dialog_id, "get_message_object"),
+        sending_state,
+        scheduling_state,
+        is_outgoing,
+        is_pinned: m.is_pinned,
+        is_from_offline: m.is_from_offline,
+        can_be_saved,
+        has_timestamped_media,
+        is_channel_post: m.is_channel_post,
+        is_paid_star_suggested_post: m.is_paid_suggested_post_stars,
+        is_paid_gram_suggested_post: m.is_paid_suggested_post_ton,
+        contains_unread_mention: m.contains_unread_mention,
+        contains_unread_poll_votes,
+        date,
+        edit_date,
+        forward_info,
+        import_info,
+        interaction_info,
+        unread_reactions,
+        fact_check,
+        suggested_post_info: suggested_post,
+        reply_to,
+        topic_id: topic.get_message_topic_object(ctx),
+        self_destruct_type,
+        self_destruct_in: ttl_expires_in,
+        auto_delete_in,
+        via_bot_user_id,
+        guest_bot_caller_id: get_message_guest_sender_object(ctx, m),
+        sender_business_bot_user_id: via_business_bot_user_id,
+        sender_boost_count: m.sender_boost_count,
+        sender_tag: m.sender_rank.clone(),
+        paid_message_star_count: m.paid_message_star_count,
+        author_signature: m.author_signature.clone(),
+        media_album_id: m.media_album_id,
+        effect_id: m.effect_id.get(),
+        restriction_info,
+        summary_language_code: m.summary_from_language.clone(),
+        content: Some(content),
+        ephemeral_content: get_ephemeral_message_content_object(
+            manager,
+            ctx,
+            dialog_id,
+            m.ephemeral_message.as_deref(),
+        ),
+        reply_markup,
+        ephemeral_message_id,
+        chat_instance: m.chat_instance,
+    })
+}
+
+/// `MessagesManager::get_messages_object(total_count, vector<Message *>,
+/// skip_not_found)` (MessagesManager.cpp:20852-20865).
+pub fn get_messages_object(
+    mut total_count: i32,
+    mut messages: Vec<Option<td_api::Message>>,
+    skip_not_found: bool,
+) -> td_api::Messages {
+    let message_count = i32::try_from(messages.len()).unwrap_or(i32::MAX);
+    if total_count < message_count {
+        if total_count != -1 {
+            log_error!(
+                "Have wrong total_count = {}, while having {} messages",
+                total_count,
+                message_count
+            );
+        }
+        total_count = message_count;
+    }
+    if skip_not_found {
+        let before = messages.len();
+        messages.retain(|message| message.is_some());
+        total_count -= i32::try_from(before - messages.len()).unwrap_or(0);
+    }
+    td_api::Messages {
+        total_count,
+        messages: messages.into_iter().flatten().collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -10576,5 +12909,718 @@ mod tests {
         bad.store(&mut bytes);
         let mut parser = Parser::new(&bytes);
         assert!(MessageReaction::parse_from(&mut parser).is_err());
+    }
+
+    // ==== M.10.4 tests — the Message → td_api builder family ====
+
+    /// The [`MessageObjectContext`] stand-in: a [`TestContext`] for the
+    /// content plane plus the id-object/clock knobs the builder reads.
+    struct TestObjectContext {
+        content: crate::message_content::SharedTestContext,
+        is_bot: bool,
+        now: f64,
+        server_time: f64,
+        is_test_dc: bool,
+        known_dialogs: HashSet<DialogId>,
+        known_users: HashSet<UserId>,
+    }
+
+    impl Default for TestObjectContext {
+        fn default() -> TestObjectContext {
+            TestObjectContext {
+                content: crate::message_content::SharedTestContext::default(),
+                is_bot: false,
+                now: 1000.0,
+                server_time: 1000.0,
+                is_test_dc: false,
+                known_dialogs: HashSet::new(),
+                known_users: HashSet::new(),
+            }
+        }
+    }
+
+    impl TestObjectContext {
+        fn with_dialog(mut self, dialog_id: DialogId) -> TestObjectContext {
+            self.known_dialogs.insert(dialog_id);
+            self
+        }
+
+        fn with_user(mut self, user_id: UserId) -> TestObjectContext {
+            self.known_users.insert(user_id);
+            self
+        }
+    }
+
+    impl MessageObjectContext for TestObjectContext {
+        fn content_context(&self) -> &dyn crate::message_content::MessageContentContext {
+            &self.content
+        }
+
+        fn is_bot(&self) -> bool {
+            self.is_bot
+        }
+
+        fn now(&self) -> f64 {
+            self.now
+        }
+
+        fn server_time(&self) -> f64 {
+            self.server_time
+        }
+
+        fn is_test_dc(&self) -> bool {
+            self.is_test_dc
+        }
+
+        fn get_restriction_options(&self) -> crate::restriction_reason::RestrictionOptions {
+            crate::restriction_reason::RestrictionOptions {
+                ignored_restriction_reasons: String::new(),
+                restriction_add_platforms: String::new(),
+                ignore_platform_restrictions: false,
+            }
+        }
+
+        fn get_message_sender_object_const(
+            &self,
+            sender_user_id: UserId,
+            sender_dialog_id: DialogId,
+            _source: &str,
+        ) -> Option<td_api::MessageSender> {
+            if self.known_dialogs.contains(&sender_dialog_id) {
+                return Some(td_api::MessageSender::messageSenderChat(
+                    td_api::messageSenderChat {
+                        chat_id: sender_dialog_id.get(),
+                    },
+                ));
+            }
+            if !sender_user_id.is_valid() {
+                return None;
+            }
+            Some(td_api::MessageSender::messageSenderUser(
+                td_api::messageSenderUser {
+                    user_id: sender_user_id.get(),
+                },
+            ))
+        }
+
+        fn have_min_user(&self, user_id: UserId) -> bool {
+            self.known_users.contains(&user_id)
+        }
+
+        fn have_dialog(&self, dialog_id: DialogId) -> bool {
+            self.known_dialogs.contains(&dialog_id)
+        }
+
+        fn have_dialog_info(&self, dialog_id: DialogId) -> bool {
+            self.known_dialogs.contains(&dialog_id)
+        }
+
+        fn have_min_channel(&self, channel_id: ChannelId) -> bool {
+            self.known_dialogs
+                .contains(&DialogId::from_channel_id(channel_id))
+        }
+
+        fn force_create_dialog(&self, _dialog_id: DialogId, _source: &str) {}
+
+        fn get_channel_has_linked_channel(&self, _channel_id: ChannelId) -> bool {
+            false
+        }
+
+        fn is_forum_channel(&self, _channel_id: ChannelId) -> bool {
+            false
+        }
+
+        fn is_megagroup_channel(&self, _channel_id: ChannelId) -> bool {
+            false
+        }
+
+        fn get_channel_linked_channel_id(
+            &self,
+            _channel_id: ChannelId,
+            _source: &str,
+        ) -> ChannelId {
+            ChannelId::default()
+        }
+
+        fn have_channel_force(&self, _channel_id: ChannelId, _source: &str) -> bool {
+            false
+        }
+
+        fn have_input_peer_channel(&self, _channel_id: ChannelId) -> bool {
+            false
+        }
+
+        fn get_user_private_forward_name(&self, _user_id: UserId) -> String {
+            String::new()
+        }
+
+        fn is_admined_monoforum_channel(&self, _dialog_id: DialogId) -> bool {
+            false
+        }
+
+        fn is_monoforum_channel_dialog(&self, _dialog_id: DialogId) -> bool {
+            false
+        }
+
+        fn get_monoforum_channel_id(&self, channel_id: ChannelId) -> ChannelId {
+            channel_id
+        }
+
+        fn channel_can_post_messages(&self, _channel_id: ChannelId) -> bool {
+            false
+        }
+
+        fn get_dialog_has_protected_content_force(&self, _dialog_id: DialogId) -> bool {
+            false
+        }
+
+        fn get_forum_topic_id_object(
+            &self,
+            _dialog_id: DialogId,
+            forum_topic_id: ForumTopicId,
+        ) -> i32 {
+            forum_topic_id.get()
+        }
+
+        fn get_saved_messages_topic_id_object(
+            &self,
+            _dialog_id: DialogId,
+            saved_messages_topic_id: SavedMessagesTopicId,
+        ) -> i64 {
+            saved_messages_topic_id.get_dialog_id().get()
+        }
+
+        fn get_message_content_media_duration(&self, _content: &MessageContent) -> i32 {
+            -1
+        }
+
+        fn get_message_sender_object_force(
+            &self,
+            dialog_id: DialogId,
+            _source: &str,
+        ) -> Option<td_api::MessageSender> {
+            Some(td_api::MessageSender::messageSenderChat(
+                td_api::messageSenderChat {
+                    chat_id: dialog_id.get(),
+                },
+            ))
+        }
+    }
+
+    fn test_dialog() -> Box<Dialog> {
+        Box::new(Dialog::default())
+    }
+
+    #[test]
+    fn m10_4_scheduling_state_table() {
+        // video-processing-pending wins
+        match get_message_scheduling_state_object(1700000000, 0, true).unwrap() {
+            td_api::MessageSchedulingState::messageSchedulingStateSendWhenVideoProcessed(state) => {
+                assert_eq!(state.send_date, 1700000000);
+            }
+            _ => panic!("wrong arm"),
+        }
+        // the when-online sentinel
+        match get_message_scheduling_state_object(2147483646, 0, false).unwrap() {
+            td_api::MessageSchedulingState::messageSchedulingStateSendWhenOnline(_) => {}
+            _ => panic!("wrong arm"),
+        }
+        // an ordinary at-date state carries the repeat period
+        match get_message_scheduling_state_object(1700000000, 604800, false).unwrap() {
+            td_api::MessageSchedulingState::messageSchedulingStateSendAtDate(state) => {
+                assert_eq!(state.send_date, 1700000000);
+                assert_eq!(state.repeat_period, 604800);
+            }
+            _ => panic!("wrong arm"),
+        }
+    }
+
+    #[test]
+    fn m10_4_required_paid_message_star_count() {
+        assert_eq!(
+            get_required_paid_message_star_count(400, "ALLOW_PAYMENT_REQUIRED_50"),
+            50
+        );
+        assert_eq!(
+            get_required_paid_message_star_count(403, "ALLOW_PAYMENT_REQUIRED_1"),
+            1
+        );
+        assert_eq!(
+            get_required_paid_message_star_count(500, "ALLOW_PAYMENT_REQUIRED_50"),
+            0
+        );
+        assert_eq!(get_required_paid_message_star_count(400, "OTHER"), 0);
+        // the StarManager clamp
+        assert_eq!(
+            get_required_paid_message_star_count(400, "ALLOW_PAYMENT_REQUIRED_9999999999999999"),
+            1i64 << 51
+        );
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn m10_4_sending_state_table() {
+        let ctx = TestObjectContext::default();
+
+        // a yet-unsent message is pending with its sending id
+        let mut m = Message::default();
+        m.message_id = MessageId::min(); // yet unsent
+        m.sending_id = 7;
+        match get_message_sending_state_object(&ctx, &m).unwrap() {
+            td_api::MessageSendingState::messageSendingStatePending(state) => {
+                assert_eq!(state.sending_id, 7);
+            }
+            _ => panic!("wrong arm"),
+        }
+
+        // a failed message with a retryable quote error
+        let mut m = Message::default();
+        m.message_id = MessageId::from_server_message_id(ServerMessageId::new(5));
+        m.content = Some(crate::message_content::MessageContent::Text(
+            crate::message_content::MessageText::default(),
+        ));
+        m.is_failed_to_send = true;
+        m.send_error_code = 400;
+        m.send_error_message = "QUOTE_TEXT_INVALID".to_owned();
+        m.try_resend_at = 1005.0;
+        match get_message_sending_state_object(&ctx, &m).unwrap() {
+            td_api::MessageSendingState::messageSendingStateFailed(state) => {
+                assert!(state.can_retry);
+                assert!(state.need_another_reply_quote);
+                assert!(!state.need_another_sender);
+                assert!(!state.need_drop_reply);
+                assert_eq!(state.required_paid_message_star_count, 0);
+                assert!((state.retry_after - 5.0).abs() < 1e-9);
+                assert_eq!(state.error.unwrap().code, 400);
+            }
+            _ => panic!("wrong arm"),
+        }
+
+        // a non-retryable error normalizes the code to 400 and pays stars
+        let mut m = Message::default();
+        m.message_id = MessageId::from_server_message_id(ServerMessageId::new(5));
+        m.content = Some(crate::message_content::MessageContent::Text(
+            crate::message_content::MessageText::default(),
+        ));
+        m.is_failed_to_send = true;
+        m.send_error_code = 0;
+        m.send_error_message = "ALLOW_PAYMENT_REQUIRED_25".to_owned();
+        match get_message_sending_state_object(&ctx, &m).unwrap() {
+            td_api::MessageSendingState::messageSendingStateFailed(state) => {
+                // the C++ lets ALLOW_PAYMENT_REQUIRED_* retry
+                assert!(state.can_retry);
+                assert_eq!(state.error.unwrap().code, 400);
+                assert_eq!(state.required_paid_message_star_count, 25);
+                assert!((state.retry_after).abs() < 1e-9); // max(0 - 1000, 0)
+            }
+            _ => panic!("wrong arm"),
+        }
+
+        // an ordinary sent message has no sending state
+        let mut m = Message::default();
+        m.message_id = MessageId::from_server_message_id(ServerMessageId::new(5));
+        assert!(get_message_sending_state_object(&ctx, &m).is_none());
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn m10_4_can_resend_message_table() {
+        let ctx = TestObjectContext::default();
+        let mut m = Message::default();
+        m.message_id = MessageId::from_server_message_id(ServerMessageId::new(5));
+        m.content = Some(crate::message_content::MessageContent::Text(
+            crate::message_content::MessageText::default(),
+        ));
+
+        // a 429 error is retryable
+        m.send_error_code = 429;
+        assert!(can_resend_message(&ctx, &m));
+        // an unknown error is not
+        m.send_error_code = 400;
+        m.send_error_message = "CHAT_SEND_MEDIA_FORBIDDEN".to_owned();
+        assert!(!can_resend_message(&ctx, &m));
+        // forwarded messages are not resendable
+        m.send_error_code = 429;
+        m.forward_info = Some(MessageForwardInfo::default());
+        assert!(!can_resend_message(&ctx, &m));
+        m.forward_info = None;
+        // ChatSetTtl content is not resendable
+        m.content = Some(crate::message_content::MessageContent::ChatSetTtl(
+            crate::message_content::MessageChatSetTtl::default(),
+        ));
+        assert!(!can_resend_message(&ctx, &m));
+    }
+
+    #[test]
+    fn m10_4_message_origin_object_arms() {
+        let ctx = TestObjectContext::default();
+
+        // a user origin carries the raw user id
+        let origin = MessageOrigin {
+            sender_user_id: UserId::new(42),
+            ..MessageOrigin::default()
+        };
+        match origin.get_message_origin_object(&ctx) {
+            td_api::MessageOrigin::messageOriginUser(o) => assert_eq!(o.sender_user_id, 42),
+            _ => panic!("wrong arm"),
+        }
+
+        // a chat origin maps the signature fallback
+        let origin = MessageOrigin {
+            sender_dialog_id: DialogId::from_chat_id(ChatId::new(500)),
+            author_signature: "sig".to_owned(),
+            ..MessageOrigin::default()
+        };
+        match origin.get_message_origin_object(&ctx) {
+            td_api::MessageOrigin::messageOriginChat(o) => {
+                assert_eq!(o.sender_chat_id, -500);
+                assert_eq!(o.author_signature, "sig");
+            }
+            _ => panic!("wrong arm"),
+        }
+
+        // a channel origin carries the message id
+        let origin = MessageOrigin {
+            sender_dialog_id: DialogId::from_channel_id(ChannelId::new(7)),
+            message_id: MessageId::from_server_message_id(ServerMessageId::new(9)),
+            ..MessageOrigin::default()
+        };
+        match origin.get_message_origin_object(&ctx) {
+            td_api::MessageOrigin::messageOriginChannel(o) => {
+                // the stand-in chat-id object returns the raw channel id
+                assert_eq!(o.chat_id, 7);
+                assert_eq!(o.message_id, 9 << 20);
+            }
+            _ => panic!("wrong arm"),
+        }
+
+        // a hidden sender wins over everything
+        let origin = MessageOrigin {
+            sender_dialog_id: DialogId::from_channel_id(ChannelId::new(7)),
+            message_id: MessageId::from_server_message_id(ServerMessageId::new(9)),
+            sender_name: "Hidden".to_owned(),
+            ..MessageOrigin::default()
+        };
+        match origin.get_message_origin_object(&ctx) {
+            td_api::MessageOrigin::messageOriginHiddenUser(o) => {
+                assert_eq!(o.sender_name, "Hidden")
+            }
+            _ => panic!("wrong arm"),
+        }
+
+        // the production hidden-sender channel on a main-network dc
+        let origin = MessageOrigin {
+            sender_dialog_id: DialogId::from_channel_id(ChannelId::new(1228946795)),
+            author_signature: "sig".to_owned(),
+            ..MessageOrigin::default()
+        };
+        assert!(origin.is_sender_hidden(&ctx));
+        match origin.get_message_origin_object(&ctx) {
+            td_api::MessageOrigin::messageOriginHiddenUser(o) => assert_eq!(o.sender_name, "sig"),
+            _ => panic!("wrong arm"),
+        }
+        // the test-dc twin
+        let test_ctx = TestObjectContext {
+            is_test_dc: true,
+            ..TestObjectContext::default()
+        };
+        let origin = MessageOrigin {
+            sender_dialog_id: DialogId::from_channel_id(ChannelId::new(10460537)),
+            author_signature: "sig".to_owned(),
+            ..MessageOrigin::default()
+        };
+        assert!(origin.is_sender_hidden(&test_ctx));
+    }
+
+    #[test]
+    fn m10_4_forward_info_arms() {
+        let ctx = TestObjectContext::default();
+        let mut forward = MessageForwardInfo {
+            origin: MessageOrigin {
+                sender_user_id: UserId::new(42),
+                ..MessageOrigin::default()
+            },
+            date: 1700000000,
+            ..MessageForwardInfo::default()
+        };
+        let object = forward
+            .get_message_forward_info_object(&ctx, false)
+            .unwrap();
+        assert_eq!(object.date, 1700000000);
+        assert!(object.source.is_none());
+
+        // an imported forward becomes an import info instead
+        forward.is_imported = true;
+        assert!(
+            forward
+                .get_message_forward_info_object(&ctx, false)
+                .is_none()
+        );
+        let import_info = forward.get_message_import_info_object().unwrap();
+        assert_eq!(import_info.date, 1700000000);
+
+        // a plain forward has no import info
+        forward.is_imported = false;
+        assert!(forward.get_message_import_info_object().is_none());
+    }
+
+    #[test]
+    fn m10_4_unread_reaction_object_needs_a_known_sender() {
+        let user_dialog_id = DialogId::from_user_id(UserId::new(77));
+        let ctx = TestObjectContext::default().with_user(UserId::new(77));
+        let reaction = UnreadMessageReaction {
+            reaction_type: ReactionType::new("\u{1F44D}"),
+            sender_dialog_id: user_dialog_id,
+            is_big: true,
+        };
+        let object = reaction.get_unread_reaction_object(&ctx).unwrap();
+        assert!(object.is_big);
+        match object.r#type.unwrap() {
+            td_api::ReactionType::reactionTypeEmoji(o) => assert_eq!(o.emoji, "\u{1F44D}"),
+            _ => panic!("wrong arm"),
+        }
+
+        // an unknown sender drops the reaction like the C++ nullptr
+        let anonymous_ctx = TestObjectContext::default();
+        assert!(
+            reaction
+                .get_unread_reaction_object(&anonymous_ctx)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn m10_4_reaction_type_objects() {
+        match ReactionType::new("👍").get_reaction_type_object().unwrap() {
+            td_api::ReactionType::reactionTypeEmoji(o) => assert_eq!(o.emoji, "👍"),
+            _ => panic!("wrong arm"),
+        }
+        assert!(ReactionType::default().get_reaction_type_object().is_none());
+        match ReactionType::paid().get_reaction_type_object().unwrap() {
+            td_api::ReactionType::reactionTypePaid(_) => {}
+            _ => panic!("wrong arm"),
+        }
+        // the custom emoji payload is the base64 of the little-endian id
+        let custom = ReactionType::new(format!("#{}", "AQAAAAAAAAA=")); // 1i64.to_le_bytes()
+        match custom.get_reaction_type_object().unwrap() {
+            td_api::ReactionType::reactionTypeCustomEmoji(o) => assert_eq!(o.custom_emoji_id, 1),
+            _ => panic!("wrong arm"),
+        }
+    }
+
+    #[test]
+    fn m10_4_reply_info_object_clamps_last_read_inbox() {
+        let ctx = TestObjectContext::default();
+        let mut reply_info = MessageReplyInfo {
+            reply_count: 3,
+            max_message_id: MessageId::from_server_message_id(ServerMessageId::new(50)),
+            last_read_inbox_message_id: MessageId::from_server_message_id(ServerMessageId::new(10)),
+            ..MessageReplyInfo::default()
+        };
+        reply_info.reply_count = 3;
+        let dialog_last_read = MessageId::from_server_message_id(ServerMessageId::new(30));
+        let object = reply_info
+            .get_message_reply_info_object(&ctx, dialog_last_read)
+            .unwrap();
+        // the stored 10 lags the dialog 30, so it is lifted to min(30, max=50)
+        assert_eq!(object.last_read_inbox_message_id, 30 << 20);
+        assert_eq!(object.last_message_id, 50 << 20);
+        assert_eq!(object.reply_count, 3);
+
+        // an empty reply info collapses to None
+        assert!(
+            MessageReplyInfo::default()
+                .get_message_reply_info_object(&ctx, dialog_last_read)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn m10_4_reply_markup_object_arms() {
+        let ctx = TestObjectContext::default();
+
+        // a show-keyboard markup with a quiz request button
+        let markup = ReplyMarkup {
+            r#type: ReplyMarkupType::ShowKeyboard,
+            is_personal: true,
+            placeholder: "poll?".to_owned(),
+            keyboard: vec![vec![KeyboardButton {
+                r#type: KeyboardButtonType::RequestPollQuiz,
+                style: KeyboardButtonStyle::default(),
+                text: "ask".to_owned(),
+                url: String::new(),
+                requested_dialog_type: None,
+            }]],
+            ..ReplyMarkup::default()
+        };
+        match markup.get_reply_markup_object(&ctx).unwrap() {
+            td_api::ReplyMarkup::replyMarkupShowKeyboard(o) => {
+                assert!(o.is_personal);
+                assert_eq!(o.input_field_placeholder, "poll?");
+                assert_eq!(o.rows.len(), 1);
+                match o.rows[0][0].r#type.as_ref().unwrap() {
+                    td_api::KeyboardButtonType::keyboardButtonTypeRequestPoll(t) => {
+                        assert!(t.force_quiz)
+                    }
+                    _ => panic!("wrong arm"),
+                }
+            }
+            _ => panic!("wrong arm"),
+        }
+
+        // a switch-inline button with the empty mask broadcasts all targets
+        let markup = ReplyMarkup {
+            r#type: ReplyMarkupType::InlineKeyboard,
+            inline_keyboard: vec![vec![InlineKeyboardButton {
+                r#type: InlineKeyboardButtonType::SwitchInline,
+                id: 0,
+                text: "start".to_owned(),
+                data: "query".to_owned(),
+                ..InlineKeyboardButton::default()
+            }]],
+            ..ReplyMarkup::default()
+        };
+        match markup.get_reply_markup_object(&ctx).unwrap() {
+            td_api::ReplyMarkup::replyMarkupInlineKeyboard(o) => {
+                match o.rows[0][0].r#type.as_ref().unwrap() {
+                    td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeSwitchInline(t) => {
+                        match t.target_chat.as_deref().unwrap() {
+                            td_api::TargetChat::targetChatChosen(chosen) => {
+                                let types = chosen.types.as_ref().unwrap();
+                                assert!(types.allow_user_chats);
+                                assert!(types.allow_bot_chats);
+                                assert!(types.allow_group_chats);
+                                assert!(types.allow_channel_chats);
+                            }
+                            _ => panic!("wrong arm"),
+                        }
+                    }
+                    _ => panic!("wrong arm"),
+                }
+            }
+            _ => panic!("wrong arm"),
+        }
+
+        // the null markup stays null
+        let empty: Option<ReplyMarkup> = None;
+        assert!(empty.is_none());
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn m10_4_interaction_info_gates() {
+        let manager = MessagesManager::default();
+        let reactions_ctx = NoDialogReactionsContext;
+        let ctx = TestObjectContext::default();
+        let dialog_id = DialogId::from_user_id(UserId::new(1));
+
+        // nothing to show
+        let mut m = Message::default();
+        m.message_id = MessageId::from_server_message_id(ServerMessageId::new(5));
+        m.content = Some(crate::message_content::MessageContent::Text(
+            crate::message_content::MessageText::default(),
+        ));
+        assert!(
+            get_message_interaction_info_object(&manager, &reactions_ctx, &ctx, dialog_id, &m)
+                .is_none()
+        );
+
+        // view counts surface
+        m.view_count = 10;
+        let object =
+            get_message_interaction_info_object(&manager, &reactions_ctx, &ctx, dialog_id, &m)
+                .unwrap();
+        assert_eq!(object.view_count, 10);
+        assert!(object.reply_info.is_none());
+
+        // a scheduled non-forward has no interaction info
+        m.view_count = 0;
+        m.message_id = MessageId::from_scheduled(
+            crate::messages_manager::ScheduledServerMessageId::new(6),
+            1700000000,
+            false,
+        );
+        assert!(
+            get_message_interaction_info_object(&manager, &reactions_ctx, &ctx, dialog_id, &m)
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn m10_4_message_object_full_mapping() {
+        let user_id = UserId::new(42);
+        let dialog_id = DialogId::from_user_id(user_id);
+        let mut manager = MessagesManager::default();
+        manager.dialogs.insert(dialog_id, test_dialog());
+        let reactions_ctx = NoDialogReactionsContext;
+        let ctx = TestObjectContext::default()
+            .with_dialog(dialog_id)
+            .with_user(user_id);
+
+        let mut m = Message::default();
+        m.message_id = MessageId::from_server_message_id(ServerMessageId::new(123));
+        m.sender_user_id = user_id;
+        m.date = 1700000100;
+        m.is_outgoing = true;
+        m.content = Some(crate::message_content::MessageContent::Text(
+            crate::message_content::MessageText::default(),
+        ));
+
+        let object =
+            get_message_object(&manager, &reactions_ctx, &ctx, dialog_id, &mut m, "test").unwrap();
+        assert_eq!(object.id, 123 << 20);
+        assert_eq!(object.date, 1700000100);
+        assert!(object.is_outgoing);
+        assert!(object.can_be_saved);
+        assert!(object.has_timestamped_media);
+        assert_eq!(object.chat_id, dialog_id.get());
+        match object.sender_id.unwrap() {
+            td_api::MessageSender::messageSenderUser(o) => assert_eq!(o.user_id, 42),
+            _ => panic!("wrong arm"),
+        }
+        match object.content.unwrap() {
+            td_api::MessageContent::messageText(_) => {}
+            _ => panic!("wrong arm"),
+        }
+        // the mutation side effect: the object is now known to the app
+        assert!(m.is_update_sent);
+
+        // a scheduled message hides its date and reports the scheduling state
+        let mut m = Message::default();
+        m.message_id = MessageId::from_scheduled(
+            crate::messages_manager::ScheduledServerMessageId::new(9),
+            1700000000,
+            false,
+        );
+        m.sender_user_id = user_id;
+        m.date = 1700000000;
+        m.content = Some(crate::message_content::MessageContent::Text(
+            crate::message_content::MessageText::default(),
+        ));
+        let object =
+            get_message_object(&manager, &reactions_ctx, &ctx, dialog_id, &mut m, "test").unwrap();
+        assert_eq!(object.date, 0);
+        match object.scheduling_state.unwrap() {
+            td_api::MessageSchedulingState::messageSchedulingStateSendAtDate(state) => {
+                assert_eq!(state.send_date, 1700000000);
+            }
+            _ => panic!("wrong arm"),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn m10_4_get_messages_object_total_count() {
+        let object = td_api::Message::default();
+        // unknown total falls back to the count
+        let messages = get_messages_object(-1, vec![Some(object.clone()), None], true);
+        assert_eq!(messages.total_count, 1);
+        assert_eq!(messages.messages.len(), 1);
+
+        // skip_not_found keeps the total in sync
+        let messages = get_messages_object(5, vec![Some(object), None], true);
+        assert_eq!(messages.total_count, 4);
+        assert_eq!(messages.messages.len(), 1);
     }
 }
