@@ -723,6 +723,15 @@ impl Location {
         ))
     }
 
+    /// `Location::get_location_object` (Location.cpp:83-88).
+    pub fn get_location_object(&self) -> td_api::Location {
+        td_api::Location {
+            latitude: self.latitude,
+            longitude: self.longitude,
+            horizontal_accuracy: self.horizontal_accuracy,
+        }
+    }
+
     /// `Location::get_secret_input_media_geo_point` (Location.cpp:121-123).
     pub fn get_secret_input_media_geo_point(&self) -> SecretInputMedia {
         SecretInputMedia::new(
@@ -809,6 +818,18 @@ impl Venue {
         ))
     }
 
+    /// `Venue::get_venue_object` (Venue.cpp:47-52).
+    pub fn get_venue_object(&self) -> td_api::Venue {
+        td_api::Venue {
+            location: Some(self.location.get_location_object()),
+            title: self.title.clone(),
+            address: self.address.clone(),
+            provider: self.provider.clone(),
+            id: self.id.clone(),
+            r#type: self.r#type.clone(),
+        }
+    }
+
     /// `Venue::get_secret_input_media_venue` (Venue.cpp:63-67).
     pub fn get_secret_input_media_venue(&self) -> SecretInputMedia {
         SecretInputMedia::new(
@@ -841,6 +862,15 @@ impl StarAmount {
     /// `StarAmount::is_positive` (StarAmount.h:28-31).
     pub fn is_positive(&self) -> bool {
         self.star_count > 0 || self.nanostar_count > 0
+    }
+
+    /// `StarAmount::get_star_amount_object` (StarAmount.cpp) — the
+    /// codegen `StarAmount` mirrors the packed pair.
+    pub fn get_star_amount_object(&self) -> td_api::StarAmount {
+        td_api::StarAmount {
+            star_count: self.star_count,
+            nanostar_count: self.nanostar_count,
+        }
     }
 }
 
@@ -875,6 +905,18 @@ pub struct CurrencyAmount {
     pub ton_amount: TonAmount,
 }
 
+impl CurrencyAmount {
+    /// `CurrencyAmount::get_star_amount` (CurrencyAmount.h).
+    pub fn get_star_amount(&self) -> StarAmount {
+        self.star_amount
+    }
+
+    /// `CurrencyAmount::get_ton_amount` (CurrencyAmount.h).
+    pub fn get_ton_amount(&self) -> TonAmount {
+        self.ton_amount
+    }
+}
+
 /// The nested `SuggestedPostPrice::Type` (SuggestedPostPrice.h:16).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum SuggestedPostPriceType {
@@ -898,6 +940,28 @@ impl SuggestedPostPrice {
     /// `SuggestedPostPrice::is_empty` (SuggestedPostPrice.h:34-36).
     pub fn is_empty(&self) -> bool {
         self.r#type == SuggestedPostPriceType::None
+    }
+
+    /// `SuggestedPostPrice::get_suggested_post_price_object`
+    /// (SuggestedPostPrice.cpp:53-64).
+    pub fn get_suggested_post_price_object(&self) -> Option<td_api::SuggestedPostPrice> {
+        match self.r#type {
+            SuggestedPostPriceType::Star => {
+                Some(td_api::SuggestedPostPrice::suggestedPostPriceStar(
+                    td_api::suggestedPostPriceStar {
+                        star_count: self.amount,
+                    },
+                ))
+            }
+            SuggestedPostPriceType::Ton => {
+                Some(td_api::SuggestedPostPrice::suggestedPostPriceGram(
+                    td_api::suggestedPostPriceGram {
+                        gram_cent_count: self.amount,
+                    },
+                ))
+            }
+            SuggestedPostPriceType::None => None,
+        }
     }
 }
 
@@ -7760,9 +7824,6 @@ pub trait MessageContentContext {
     // FileManager answer the stand-in shapes until they land. --
     /// `AuthManager::was_authorized` (MessageContent.cpp:9780).
     fn was_authorized(&self) -> bool;
-    /// `UserManager::get_user_id_object` (MessageContent.cpp:9904-9905) —
-    /// the ensure-updateUser side effect; the stand-in no-ops.
-    fn get_user_id_object(&self, user_id: UserId, source: &str);
     /// `VideosManager::get_live_photo_video_file_id`
     /// (MessageContent.cpp:9833-9834); the stand-in answers an invalid id.
     fn get_live_photo_video_file_id(
@@ -7884,6 +7945,175 @@ pub trait MessageContentContext {
         &mut self,
         answer: Option<telegram_api::PollAnswer>,
     ) -> Option<(FormattedText, String)>;
+
+    // -- Object family (MessageContent.cpp:11338-12252) — the manager
+    // td_api object getters `get_message_content_object` calls; the
+    // Wave-2/3 managers and the M.12.2 FileManager answer the codegen
+    // defaults until they land. --
+    /// `Global::unix_time()` (MessageContent.cpp:11387).
+    fn unix_time(&self) -> i32;
+    /// `UserManager::get_user_id_object` (MessageContent.cpp:11515) —
+    /// returns the raw id (the port keeps the object id equal to the raw
+    /// id until the id-object plane lands).
+    fn get_user_id_object(&self, user_id: UserId, source: &str) -> i64;
+    /// `UserManager::get_user_ids_object` (MessageContent.cpp:11495).
+    fn get_user_ids_object(&self, user_ids: &[UserId], source: &str) -> Vec<i64>;
+    /// `UserManager::is_user_support` (MessageContent.cpp:11683).
+    fn is_user_support(&self, user_id: UserId) -> bool;
+    /// `UserManager::get_service_notifications_user_id`.
+    fn get_service_notifications_user_id(&self) -> UserId;
+    /// `ChatManager::get_supergroup_id_object`
+    /// (MessageContent.cpp:11538).
+    fn get_supergroup_id_object(&self, channel_id: ChannelId, source: &str) -> i64;
+    /// `ChatManager::get_basic_group_id_object` (MessageContent.cpp:11546).
+    fn get_basic_group_id_object(&self, chat_id: ChatId, source: &str) -> i64;
+    /// `DialogManager::get_chat_id_object` (MessageContent.cpp:11576).
+    fn get_chat_id_object(&self, dialog_id: DialogId, source: &str) -> i64;
+    /// `DialogManager::have_input_peer(dialog_id, false, Read)`
+    /// (MessageContent.cpp:11600).
+    fn have_input_peer(&self, dialog_id: DialogId) -> bool;
+    /// `GroupCallManager::get_group_call_id` (MessageContent.cpp:11640).
+    fn get_group_call_id(&self, input_group_call_id: InputGroupCallId, dialog_id: DialogId) -> i64;
+    /// `get_message_sender_object` (MessageContent.cpp:11668).
+    fn get_message_sender_object(
+        &self,
+        dialog_id: DialogId,
+        source: &str,
+    ) -> Option<td_api::MessageSender>;
+    /// `Contact::get_contact_object` (Contact.cpp:134-160).
+    fn get_contact_object(&self, contact: &Contact) -> td_api::Contact;
+    /// `AnimationsManager::get_animation_object` (MessageContent.cpp:11344).
+    fn get_animation_object(&self, file_id: FileId) -> td_api::Animation;
+    /// `AudiosManager::get_audio_object` (MessageContent.cpp:11350).
+    fn get_audio_object(&self, file_id: FileId) -> td_api::Audio;
+    /// `DocumentsManager::get_document_object` (MessageContent.cpp:11356).
+    fn get_document_object(&self, file_id: FileId) -> td_api::Document;
+    /// `VideosManager::get_video_object` (MessageContent.cpp:11407).
+    fn get_video_object(&self, file_id: FileId) -> td_api::Video;
+    /// `VideoNotesManager::get_video_note_object`
+    /// (MessageContent.cpp:11442).
+    fn get_video_note_object(&self, file_id: FileId) -> td_api::VideoNote;
+    /// `VoiceNotesManager::get_voice_note_object` (MessageContent.cpp:11448).
+    fn get_voice_note_object(&self, file_id: FileId) -> td_api::VoiceNote;
+    /// `StickersManager::get_sticker_object` (MessageContent.cpp:11412) —
+    /// the C++ CHECKs non-null; the stand-in answers `None`.
+    fn get_sticker_object(&self, file_id: FileId) -> Option<td_api::Sticker>;
+    /// `StickersManager::get_animated_emoji_object`
+    /// (MessageContent.cpp:11421).
+    fn get_animated_emoji_object(
+        &self,
+        text: &str,
+        custom_emoji_id: CustomEmojiId,
+    ) -> Option<td_api::AnimatedEmoji>;
+    /// `StickersManager::get_dice_stickers_object`
+    /// (MessageContent.cpp:11612).
+    fn get_dice_stickers_object(&self, emoji: &str, value: i32) -> td_api::DiceStickers;
+    /// `StickersManager::get_dice_success_animation_frame_number`
+    /// (MessageContent.cpp:11614).
+    fn get_dice_success_animation_frame_number(&self, emoji: &str, value: i32) -> i32;
+    /// `StickersManager::get_premium_gift_sticker_object`
+    /// (MessageContent.cpp:11686).
+    fn get_premium_gift_sticker_object(
+        &self,
+        month_count: i32,
+        star_count: i64,
+    ) -> Option<td_api::Sticker>;
+    /// `StickersManager::get_ton_gift_sticker_object`
+    /// (MessageContent.cpp:11988).
+    fn get_ton_gift_sticker_object(&self, ton_count: i64) -> Option<td_api::Sticker>;
+    /// `VideosManager::get_alternative_video_object`
+    /// (MessageContent.cpp:11431).
+    fn get_alternative_video_object(
+        &self,
+        file_id: FileId,
+        hls_file_ids: &[FileId],
+    ) -> Option<td_api::AlternativeVideo>;
+    /// `DocumentsManager::get_video_storyboard_object`
+    /// (MessageContent.cpp:11436).
+    fn get_video_storyboard_object(
+        &self,
+        file_id: FileId,
+        storyboard_map_file_ids: &[FileId],
+    ) -> Option<td_api::VideoStoryboard>;
+    /// `WebPagesManager::get_link_preview_object`
+    /// (MessageContent.cpp:11425).
+    fn get_link_preview_object(
+        &self,
+        web_page_id: WebPageId,
+        force_small_media: bool,
+        force_large_media: bool,
+        skip_confirmation: bool,
+        invert_media: bool,
+    ) -> Option<td_api::LinkPreview>;
+    /// `get_photo_object` (MessageContent.cpp:11396).
+    fn get_photo_object(&self, photo: &Photo) -> Option<td_api::Photo>;
+    /// `get_chat_photo_object` null form (MessageContent.cpp:11501).
+    fn get_chat_photo_object(&self, photo: &Photo) -> Option<td_api::ChatPhoto>;
+    /// `PollManager::get_poll_object` (MessageContent.cpp:11599).
+    fn get_poll_object(&self, poll_id: PollId, dialog_id: DialogId) -> td_api::Poll;
+    /// `InputInvoice::get_message_invoice_object`
+    /// (MessageContent.cpp:11363).
+    fn get_message_invoice_object(
+        &self,
+        input_invoice: &InputInvoice,
+        is_server: bool,
+        skip_bot_commands: bool,
+        max_media_timestamp: i32,
+    ) -> td_api::MessageContent;
+    /// `Game::get_game_object` (MessageContent.cpp:11359).
+    fn get_game_object(
+        &self,
+        game: &Game,
+        is_server: bool,
+        skip_bot_commands: bool,
+    ) -> td_api::Game;
+    /// `WebApp::get_web_app_object` (MessageContent.cpp:11727).
+    fn get_web_app_object(&self, web_app: &WebApp) -> td_api::WebApp;
+    /// `MessageExtendedMedia::get_paid_media_object`
+    /// (MessageContent.cpp:11810).
+    fn get_paid_media_object(&self, extended_media: &MessageExtendedMedia) -> td_api::PaidMedia;
+    /// `SharedDialog::get_shared_user_object`
+    /// (MessageContent.cpp:11795).
+    fn get_shared_user_object(&self, shared_dialog: &SharedDialog) -> td_api::SharedUser;
+    /// `SharedDialog::get_shared_chat_object` (MessageContent.cpp:11805).
+    fn get_shared_chat_object(&self, shared_dialog: &SharedDialog) -> td_api::SharedChat;
+    /// `GiveawayParameters::get_giveaway_parameters_object`
+    /// (MessageContent.cpp:11767).
+    fn get_giveaway_parameters_object(
+        &self,
+        parameters: &GiveawayParameters,
+    ) -> td_api::GiveawayParameters;
+    /// `BackgroundInfo::get_chat_background_object`
+    /// (MessageContent.cpp:11737).
+    fn get_chat_background_object(
+        &self,
+        background_info: &BackgroundInfo,
+    ) -> td_api::ChatBackground;
+    /// `ToDoList::get_checklist_object` (MessageContent.cpp:11885).
+    #[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+    fn get_checklist_object(
+        &self,
+        list: &ToDoList,
+        completions: &[ToDoCompletion],
+        dialog_id: DialogId,
+        message_id: MessageId,
+        is_outgoing: bool,
+        is_forward: bool,
+        is_real_message_content: bool,
+    ) -> td_api::Checklist;
+    /// `get_encrypted_passport_element_object`
+    /// (MessageContent.cpp:11591) — the FileManager-mediated half.
+    fn get_encrypted_passport_element_object(
+        &self,
+        values: &[EncryptedSecureValue],
+    ) -> Vec<td_api::EncryptedPassportElement>;
+    /// `CommunityManager::get_community_id_object`
+    /// (MessageContent.cpp:12090).
+    fn get_community_id_object(
+        &self,
+        community_id: CommunityId,
+        source: &str,
+    ) -> td_api::CommunityId;
 }
 
 /// `is_local_poll_id` (PollManager.cpp:449-452) — the local (unsent)
@@ -14873,6 +15103,1392 @@ fn fix_dup_file_id(
 }
 
 // ---------------------------------------------------------------------------
+// M.9.16 — `get_message_content_object` (MessageContent.cpp:11338-12252) —
+// the td_api output surface. The manager object getters ride the seam and
+// answer the codegen defaults until their owners land; the pure helpers
+// (discard reasons, passport types, order info, locations) are exact.
+// ---------------------------------------------------------------------------
+
+/// `get_call_discard_reason_object` (CallDiscardReason.cpp:66-83). The
+/// `UpgradeToGroupCall` arm's invite-link read is LinkManager (Wave 3) —
+/// the slug link answers empty until then.
+pub fn get_call_discard_reason_object(reason: &CallDiscardReason) -> td_api::CallDiscardReason {
+    match reason.r#type {
+        CallDiscardReasonType::Empty => {
+            td_api::CallDiscardReason::callDiscardReasonEmpty(td_api::callDiscardReasonEmpty)
+        }
+        CallDiscardReasonType::Missed => {
+            td_api::CallDiscardReason::callDiscardReasonMissed(td_api::callDiscardReasonMissed)
+        }
+        CallDiscardReasonType::Disconnected => {
+            td_api::CallDiscardReason::callDiscardReasonDisconnected(
+                td_api::callDiscardReasonDisconnected,
+            )
+        }
+        CallDiscardReasonType::HungUp => {
+            td_api::CallDiscardReason::callDiscardReasonHungUp(td_api::callDiscardReasonHungUp)
+        }
+        CallDiscardReasonType::Declined => {
+            td_api::CallDiscardReason::callDiscardReasonDeclined(td_api::callDiscardReasonDeclined)
+        }
+        CallDiscardReasonType::UpgradeToGroupCall => {
+            td_api::CallDiscardReason::callDiscardReasonUpgradeToGroupCall(
+                td_api::callDiscardReasonUpgradeToGroupCall {
+                    invite_link: String::new(),
+                },
+            )
+        }
+    }
+}
+
+/// `get_passport_element_type_object` (SecureValue.cpp:165-195).
+fn get_passport_element_type_object(r#type: SecureValueType) -> td_api::PassportElementType {
+    match r#type {
+        SecureValueType::PersonalDetails => {
+            td_api::PassportElementType::passportElementTypePersonalDetails(
+                td_api::passportElementTypePersonalDetails,
+            )
+        }
+        SecureValueType::Passport => td_api::PassportElementType::passportElementTypePassport(
+            td_api::passportElementTypePassport,
+        ),
+        SecureValueType::DriverLicense => {
+            td_api::PassportElementType::passportElementTypeDriverLicense(
+                td_api::passportElementTypeDriverLicense,
+            )
+        }
+        SecureValueType::IdentityCard => {
+            td_api::PassportElementType::passportElementTypeIdentityCard(
+                td_api::passportElementTypeIdentityCard,
+            )
+        }
+        SecureValueType::InternalPassport => {
+            td_api::PassportElementType::passportElementTypeInternalPassport(
+                td_api::passportElementTypeInternalPassport,
+            )
+        }
+        SecureValueType::Address => td_api::PassportElementType::passportElementTypeAddress(
+            td_api::passportElementTypeAddress,
+        ),
+        SecureValueType::UtilityBill => {
+            td_api::PassportElementType::passportElementTypeUtilityBill(
+                td_api::passportElementTypeUtilityBill,
+            )
+        }
+        SecureValueType::BankStatement => {
+            td_api::PassportElementType::passportElementTypeBankStatement(
+                td_api::passportElementTypeBankStatement,
+            )
+        }
+        SecureValueType::RentalAgreement => {
+            td_api::PassportElementType::passportElementTypeRentalAgreement(
+                td_api::passportElementTypeRentalAgreement,
+            )
+        }
+        SecureValueType::PassportRegistration => {
+            td_api::PassportElementType::passportElementTypePassportRegistration(
+                td_api::passportElementTypePassportRegistration,
+            )
+        }
+        SecureValueType::TemporaryRegistration => {
+            td_api::PassportElementType::passportElementTypeTemporaryRegistration(
+                td_api::passportElementTypeTemporaryRegistration,
+            )
+        }
+        SecureValueType::PhoneNumber => {
+            td_api::PassportElementType::passportElementTypePhoneNumber(
+                td_api::passportElementTypePhoneNumber,
+            )
+        }
+        SecureValueType::EmailAddress => {
+            td_api::PassportElementType::passportElementTypeEmailAddress(
+                td_api::passportElementTypeEmailAddress,
+            )
+        }
+        SecureValueType::None => unreachable!(),
+    }
+}
+
+/// `get_passport_element_types_object` (SecureValue.cpp:235-238).
+fn get_passport_element_types_object(
+    types: &[SecureValueType],
+) -> Vec<td_api::PassportElementType> {
+    types
+        .iter()
+        .map(|&r#type| get_passport_element_type_object(r#type))
+        .collect()
+}
+
+/// `get_encrypted_credentials_object` (SecureValue.cpp:674-678).
+pub fn get_encrypted_credentials_object(
+    credentials: &EncryptedSecureCredentials,
+) -> td_api::EncryptedCredentials {
+    td_api::EncryptedCredentials {
+        data: credentials.data.as_bytes().to_vec(),
+        hash: credentials.hash.as_bytes().to_vec(),
+        secret: credentials.encrypted_secret.as_bytes().to_vec(),
+    }
+}
+
+/// `get_order_info_object` (OrderInfo.cpp:182-188).
+pub fn get_order_info_object(order_info: &Option<OrderInfo>) -> Option<td_api::OrderInfo> {
+    let order_info = order_info.as_ref()?;
+    Some(td_api::OrderInfo {
+        name: order_info.name.clone(),
+        phone_number: order_info.phone_number.clone(),
+        email_address: order_info.email_address.clone(),
+        shipping_address: order_info
+            .shipping_address
+            .as_ref()
+            .map(|address| td_api::Address {
+                country_code: address.country_code.clone(),
+                state: address.state.clone(),
+                city: address.city.clone(),
+                street_line1: address.street_line1.clone(),
+                street_line2: address.street_line2.clone(),
+                postal_code: address.postal_code.clone(),
+            }),
+    })
+}
+
+/// `base64_encode` (misc) — the `messagePollOptionAdded` data arm.
+fn base64_encode(data: &str) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(data.as_bytes())
+}
+
+/// `get_message_content_object` (MessageContent.cpp:11338-12246). The
+/// StarGift-family / ChatSetTheme / RichText arms vanish with their
+/// unmodeled variants; the manager object getters ride the seam.
+#[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+pub fn get_message_content_object(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+    dialog_id: DialogId,
+    message_id: MessageId,
+    _initial_dialog_id: DialogId,
+    is_real_message_content: bool,
+    is_outgoing: bool,
+    is_forward: bool,
+    _sender_dialog_id: DialogId,
+    message_date: i32,
+    _initial_date: i32,
+    is_content_secret: bool,
+    skip_bot_commands: bool,
+    max_media_timestamp: i32,
+    invert_media: bool,
+    mut disable_web_page_preview: bool,
+    source: &str,
+) -> td_api::MessageContent {
+    let is_server = message_id.is_valid()
+        && message_id.is_any_server()
+        && dialog_id.get_type() != DialogType::SecretChat;
+    let mut user_manager = ContextUserManager { td };
+    let mut get_text_object = |text: &FormattedText| {
+        crate::message_entity::get_formatted_text_object(
+            if is_server {
+                Some(&mut user_manager)
+            } else {
+                None::<&mut ContextUserManager<'_>>
+            },
+            text,
+            skip_bot_commands,
+            max_media_timestamp,
+        )
+    };
+    match content {
+        MessageContent::Animation(m) => td_api::MessageContent::messageAnimation(
+            td_api::messageAnimation {
+                animation: Some(td.get_animation_object(m.file_id)),
+                caption: Some(get_text_object(&m.caption)),
+                show_caption_above_media: invert_media,
+                has_spoiler: m.has_spoiler,
+                is_secret: is_content_secret,
+            },
+        ),
+        MessageContent::Audio(m) => td_api::MessageContent::messageAudio(
+            td_api::messageAudio {
+                audio: Some(td.get_audio_object(m.file_id)),
+                caption: Some(get_text_object(&m.caption)),
+            },
+        ),
+        MessageContent::Contact(m) => td_api::MessageContent::messageContact(
+            td_api::messageContact {
+                contact: Some(td.get_contact_object(&m.contact)),
+            },
+        ),
+        MessageContent::Document(m) => td_api::MessageContent::messageDocument(
+            td_api::messageDocument {
+                document: Some(td.get_document_object(m.file_id)),
+                caption: Some(get_text_object(&m.caption)),
+            },
+        ),
+        MessageContent::Game(m) => td_api::MessageContent::messageGame(td_api::messageGame {
+            game: Some(td.get_game_object(&m.game, is_server, skip_bot_commands)),
+        }),
+        MessageContent::Invoice(m) => td.get_message_invoice_object(
+            &m.input_invoice,
+            is_server,
+            skip_bot_commands,
+            max_media_timestamp,
+        ),
+        MessageContent::LiveLocation(m) => {
+            debug_assert!(m.period > 0);
+            let passed = (td.unix_time() - message_date).max(0);
+            let expires_in = if m.period == i32::MAX {
+                m.period
+            } else {
+                (m.period - passed).max(0)
+            };
+            let heading = if expires_in == 0 { 0 } else { m.heading };
+            let proximity_alert_radius = if expires_in == 0 {
+                0
+            } else {
+                m.proximity_alert_radius
+            };
+            td_api::MessageContent::messageLiveLocation(td_api::messageLiveLocation {
+                location: Some(td_api::LiveLocation {
+                    location: Some(m.location.get_location_object()),
+                    live_period: m.period,
+                    heading,
+                    proximity_alert_radius,
+                }),
+                expires_in,
+            })
+        }
+        MessageContent::Location(m) => td_api::MessageContent::messageLocation(
+            td_api::messageLocation {
+                location: Some(m.location.get_location_object()),
+            },
+        ),
+        MessageContent::Photo(m) => {
+            let Some(photo) = td.get_photo_object(&m.photo) else {
+                tdutils::log_error!(
+                    "Have empty photo in {} in {} from {source}",
+                    message_id.get(),
+                    dialog_id
+                );
+                return td_api::MessageContent::messageExpiredPhoto(
+                    td_api::messageExpiredPhoto,
+                );
+            };
+            td_api::MessageContent::messagePhoto(td_api::messagePhoto {
+                photo: Some(photo),
+                video: Some(td.get_video_object(m.video_file_id)),
+                caption: Some(get_text_object(&m.caption)),
+                show_caption_above_media: invert_media,
+                has_spoiler: m.has_spoiler,
+                is_secret: is_content_secret,
+            })
+        }
+        MessageContent::Sticker(m) => {
+            let Some(sticker) = td.get_sticker_object(m.file_id) else {
+                // the C++ CHECKs non-null; the stand-in answers the
+                // codegen default instead of aborting
+                return td_api::MessageContent::messageSticker(td_api::messageSticker {
+                    sticker: Some(td_api::Sticker::default()),
+                    is_premium: false,
+                });
+            };
+            td_api::MessageContent::messageSticker(td_api::messageSticker {
+                sticker: Some(sticker),
+                is_premium: m.is_premium,
+            })
+        }
+        MessageContent::Text(m) => {
+            if can_be_animated_emoji(&m.text)
+                && !m.web_page_id.is_valid()
+                && let Some(animated_emoji) =
+                    td.get_animated_emoji_object(&m.text.text, get_custom_emoji_id(&m.text))
+            {
+                return td_api::MessageContent::messageAnimatedEmoji(
+                    td_api::messageAnimatedEmoji {
+                        animated_emoji: Some(animated_emoji),
+                        emoji: m.text.text.clone(),
+                    },
+                );
+            }
+            let mut web_page = td.get_link_preview_object(
+                m.web_page_id,
+                m.force_small_media,
+                m.force_large_media,
+                m.skip_web_page_confirmation,
+                invert_media,
+            );
+            if let Some(web_page) = web_page.as_mut()
+                && !web_page.skip_confirmation
+                && crate::message_entity::is_visible_url(&m.text, &web_page.url)
+            {
+                web_page.skip_confirmation = true;
+            }
+            if web_page.is_none()
+                && crate::message_entity::get_first_url(&m.text).is_empty()
+            {
+                disable_web_page_preview = false;
+            } else if disable_web_page_preview && web_page.is_some() {
+                tdutils::log_error!(
+                    "Have {} in {} in {} with link preview disabled from {source}",
+                    m.web_page_id.get(),
+                    message_id.get(),
+                    dialog_id
+                );
+                web_page = None;
+            }
+            let link_preview_options =
+                if disable_web_page_preview
+                    || !m.web_page_url.is_empty()
+                    || m.force_small_media
+                    || m.force_large_media
+                    || invert_media
+                {
+                    Some(td_api::LinkPreviewOptions {
+                        is_disabled: disable_web_page_preview,
+                        url: m.web_page_url.clone(),
+                        force_small_media: m.force_small_media,
+                        force_large_media: m.force_large_media,
+                        show_above_text: invert_media,
+                    })
+                } else {
+                    None
+                };
+            td_api::MessageContent::messageText(td_api::messageText {
+                text: Some(get_text_object(&m.text)),
+                link_preview: web_page,
+                link_preview_options,
+            })
+        }
+        MessageContent::Unsupported(_) => td_api::MessageContent::messageUnsupported(
+            td_api::messageUnsupported,
+        ),
+        MessageContent::Venue(m) => td_api::MessageContent::messageVenue(
+            td_api::messageVenue {
+                venue: Some(m.venue.get_venue_object()),
+            },
+        ),
+        MessageContent::Video(m) => {
+            let mut alternative_videos = Vec::new();
+            let mut storyboards = Vec::new();
+            if !td.get_option_boolean("video_ignore_alt_documents") {
+                for file_id in &m.alternative_file_ids {
+                    if let Some(video) =
+                        td.get_alternative_video_object(*file_id, &m.hls_file_ids)
+                    {
+                        alternative_videos.push(video);
+                    }
+                }
+                for file_id in &m.storyboard_file_ids {
+                    if let Some(storyboard) =
+                        td.get_video_storyboard_object(*file_id, &m.storyboard_map_file_ids)
+                    {
+                        storyboards.push(storyboard);
+                    }
+                }
+            }
+            td_api::MessageContent::messageVideo(td_api::messageVideo {
+                video: Some(td.get_video_object(m.file_id)),
+                alternative_videos,
+                storyboards,
+                cover: td.get_photo_object(&m.cover),
+                start_timestamp: m.start_timestamp,
+                caption: Some(get_text_object(&m.caption)),
+                show_caption_above_media: invert_media,
+                has_spoiler: m.has_spoiler,
+                is_secret: is_content_secret,
+            })
+        }
+        MessageContent::VideoNote(m) => td_api::MessageContent::messageVideoNote(
+            td_api::messageVideoNote {
+                video_note: Some(td.get_video_note_object(m.file_id)),
+                is_viewed: m.is_viewed,
+                is_secret: is_content_secret,
+            },
+        ),
+        MessageContent::VoiceNote(m) => td_api::MessageContent::messageVoiceNote(
+            td_api::messageVoiceNote {
+                voice_note: Some(td.get_voice_note_object(m.file_id)),
+                caption: Some(get_text_object(&m.caption)),
+                is_listened: m.is_listened,
+            },
+        ),
+        MessageContent::ChatCreate(m) => td_api::MessageContent::messageBasicGroupChatCreate(
+            td_api::messageBasicGroupChatCreate {
+                title: m.title.clone(),
+                member_user_ids: td.get_user_ids_object(&m.participant_user_ids, "MessageChatCreate"),
+            },
+        ),
+        MessageContent::ChatChangeTitle(m) => td_api::MessageContent::messageChatChangeTitle(
+            td_api::messageChatChangeTitle {
+                title: m.title.clone(),
+            },
+        ),
+        MessageContent::ChatChangePhoto(m) => {
+            let Some(photo) = td.get_chat_photo_object(&m.photo) else {
+                tdutils::log_error!(
+                    "Have empty chat photo in {} in {} from {source}",
+                    message_id.get(),
+                    dialog_id
+                );
+                return td_api::MessageContent::messageChatDeletePhoto(
+                    td_api::messageChatDeletePhoto,
+                );
+            };
+            td_api::MessageContent::messageChatChangePhoto(td_api::messageChatChangePhoto {
+                photo: Some(photo),
+            })
+        }
+        MessageContent::ChatDeletePhoto(_) => td_api::MessageContent::messageChatDeletePhoto(
+            td_api::messageChatDeletePhoto,
+        ),
+        MessageContent::ChatDeleteHistory(_) => td_api::MessageContent::messageUnsupported(
+            td_api::messageUnsupported,
+        ),
+        MessageContent::ChatAddUsers(m) => td_api::MessageContent::messageChatAddMembers(
+            td_api::messageChatAddMembers {
+                member_user_ids: td.get_user_ids_object(&m.user_ids, "MessageChatAddUsers"),
+            },
+        ),
+        MessageContent::ChatJoinedByLink(m) => {
+            if m.is_approved {
+                td_api::MessageContent::messageChatJoinByRequest(
+                    td_api::messageChatJoinByRequest,
+                )
+            } else {
+                td_api::MessageContent::messageChatJoinByLink(td_api::messageChatJoinByLink)
+            }
+        }
+        MessageContent::ChatDeleteUser(m) => td_api::MessageContent::messageChatDeleteMember(
+            td_api::messageChatDeleteMember {
+                user_id: td.get_user_id_object(m.user_id, "MessageChatDeleteMember"),
+            },
+        ),
+        MessageContent::ChatMigrateTo(m) => td_api::MessageContent::messageChatUpgradeTo(
+            td_api::messageChatUpgradeTo {
+                supergroup_id: td.get_supergroup_id_object(m.migrated_to_channel_id, "MessageChatUpgradeTo"),
+            },
+        ),
+        MessageContent::ChannelCreate(m) => td_api::MessageContent::messageSupergroupChatCreate(
+            td_api::messageSupergroupChatCreate {
+                title: m.title.clone(),
+            },
+        ),
+        MessageContent::ChannelMigrateFrom(m) => td_api::MessageContent::messageChatUpgradeFrom(
+            td_api::messageChatUpgradeFrom {
+                title: m.title.clone(),
+                basic_group_id: td.get_basic_group_id_object(m.migrated_from_chat_id, "MessageChatUpgradeFrom"),
+            },
+        ),
+        MessageContent::PinMessage(m) => td_api::MessageContent::messagePinMessage(
+            td_api::messagePinMessage {
+                message_id: m.message_id.get(),
+            },
+        ),
+        MessageContent::GameScore(m) => td_api::MessageContent::messageGameScore(
+            td_api::messageGameScore {
+                game_message_id: m.game_message_id.get(),
+                game_id: m.game_id,
+                score: m.score,
+            },
+        ),
+        MessageContent::ScreenshotTaken(_) => td_api::MessageContent::messageScreenshotTaken(
+            td_api::messageScreenshotTaken,
+        ),
+        MessageContent::ChatSetTtl(m) => td_api::MessageContent::messageChatSetMessageAutoDeleteTime(
+            td_api::messageChatSetMessageAutoDeleteTime {
+                message_auto_delete_time: m.ttl,
+                from_user_id: td.get_user_id_object(m.from_user_id, "MessageChatSetTtl"),
+            },
+        ),
+        MessageContent::Call(m) => td_api::MessageContent::messageCall(td_api::messageCall {
+            unique_id: if m.call_access_hash == 0 { 0 } else { m.call_id },
+            is_video: m.is_video,
+            discard_reason: Some(get_call_discard_reason_object(&m.discard_reason)),
+            duration: m.duration,
+        }),
+        MessageContent::PaymentSuccessful(m) => {
+            if !m.telegram_payment_charge_id.is_empty()
+                || !m.provider_payment_charge_id.is_empty()
+            {
+                return td_api::MessageContent::messagePaymentSuccessfulBot(
+                    td_api::messagePaymentSuccessfulBot {
+                        currency: m.currency.clone(),
+                        total_amount: m.total_amount,
+                        subscription_until_date: m.subscription_until_date,
+                        is_recurring: m.is_recurring,
+                        is_first_recurring: m.is_first_recurring,
+                        invoice_payload: m.invoice_payload.as_bytes().to_vec(),
+                        shipping_option_id: m.shipping_option_id.clone(),
+                        order_info: get_order_info_object(&m.order_info),
+                        telegram_payment_charge_id: m.telegram_payment_charge_id.clone(),
+                        provider_payment_charge_id: m.provider_payment_charge_id.clone(),
+                    },
+                );
+            }
+            let invoice_dialog_id = if m.invoice_dialog_id.is_valid() {
+                m.invoice_dialog_id
+            } else {
+                dialog_id
+            };
+            td_api::MessageContent::messagePaymentSuccessful(td_api::messagePaymentSuccessful {
+                invoice_chat_id: td.get_chat_id_object(invoice_dialog_id, "messagePaymentSuccessful"),
+                invoice_message_id: m.invoice_message_id.get(),
+                currency: m.currency.clone(),
+                total_amount: m.total_amount,
+                subscription_until_date: m.subscription_until_date,
+                is_recurring: m.is_recurring,
+                is_first_recurring: m.is_first_recurring,
+                invoice_name: m.invoice_payload.clone(),
+            })
+        }
+        MessageContent::ContactRegistered(_) => {
+            td_api::MessageContent::messageContactRegistered(td_api::messageContactRegistered)
+        }
+        MessageContent::ExpiredPhoto(_) => td_api::MessageContent::messageExpiredPhoto(
+            td_api::messageExpiredPhoto,
+        ),
+        MessageContent::ExpiredVideo(_) => td_api::MessageContent::messageExpiredVideo(
+            td_api::messageExpiredVideo,
+        ),
+        MessageContent::CustomServiceAction(m) => td_api::MessageContent::messageCustomServiceAction(
+            td_api::messageCustomServiceAction {
+                text: m.message.clone(),
+            },
+        ),
+        MessageContent::WebsiteConnected(m) => td_api::MessageContent::messageBotWriteAccessAllowed(
+            td_api::messageBotWriteAccessAllowed {
+                reason: Some(
+                    td_api::BotWriteAccessAllowReason::botWriteAccessAllowReasonConnectedWebsite(
+                        td_api::botWriteAccessAllowReasonConnectedWebsite {
+                            domain_name: m.domain_name.clone(),
+                        },
+                    ),
+                ),
+            },
+        ),
+        MessageContent::PassportDataSent(m) => td_api::MessageContent::messagePassportDataSent(
+            td_api::messagePassportDataSent {
+                types: get_passport_element_types_object(&m.types),
+            },
+        ),
+        MessageContent::PassportDataReceived(m) => td_api::MessageContent::messagePassportDataReceived(
+            td_api::messagePassportDataReceived {
+                elements: td.get_encrypted_passport_element_object(&m.values),
+                credentials: Some(get_encrypted_credentials_object(&m.credentials)),
+            },
+        ),
+        MessageContent::Poll(m) => {
+            let can_add_option = !td.is_bot()
+                && !is_forward
+                && message_id.is_server()
+                && td.have_input_peer(dialog_id)
+                && td.get_poll_can_add_option(m.poll_id)
+                && is_real_message_content;
+            td_api::MessageContent::messagePoll(td_api::messagePoll {
+                poll: Some(td.get_poll_object(m.poll_id, dialog_id)),
+                description: Some(get_text_object(&m.caption)),
+                media: m
+                    .attached_media
+                    .as_deref()
+                    .and_then(|attached_media| get_poll_media_object(td, attached_media)),
+                can_add_option,
+            })
+        }
+        MessageContent::Dice(m) => {
+            let initial_state = td.get_dice_stickers_object(&m.emoji, 0);
+            let final_state = if m.dice_value == 0 {
+                None
+            } else {
+                Some(td.get_dice_stickers_object(&m.emoji, m.dice_value))
+            };
+            let success_animation_frame_number =
+                td.get_dice_success_animation_frame_number(&m.emoji, m.dice_value);
+            if m.is_stake {
+                return td_api::MessageContent::messageStakeDice(td_api::messageStakeDice {
+                    initial_state: Some(initial_state),
+                    final_state,
+                    value: m.dice_value,
+                    stake_gram_amount: m.stake_ton_count,
+                    prize_gram_amount: m.prize_ton_count,
+                });
+            }
+            td_api::MessageContent::messageDice(td_api::messageDice {
+                initial_state: Some(initial_state),
+                final_state,
+                emoji: m.emoji.clone(),
+                value: m.dice_value,
+                success_animation_frame_number,
+            })
+        }
+        MessageContent::ProximityAlertTriggered(m) => {
+            td_api::MessageContent::messageProximityAlertTriggered(
+                td_api::messageProximityAlertTriggered {
+                    traveler_id: td
+                        .get_message_sender_object(m.traveler_dialog_id, "messageProximityAlertTriggered 1"),
+                    watcher_id: td
+                        .get_message_sender_object(m.watcher_dialog_id, "messageProximityAlertTriggered 2"),
+                    distance: m.distance,
+                },
+            )
+        }
+        MessageContent::GroupCall(m) => {
+            if m.duration >= 0 {
+                td_api::MessageContent::messageVideoChatEnded(td_api::messageVideoChatEnded {
+                    duration: m.duration,
+                })
+            } else {
+                let group_call_id = td.get_group_call_id(m.input_group_call_id, DialogId::default()) as i32;
+                if m.schedule_date > 0 {
+                    td_api::MessageContent::messageVideoChatScheduled(
+                        td_api::messageVideoChatScheduled {
+                            group_call_id,
+                            start_date: m.schedule_date,
+                        },
+                    )
+                } else {
+                    td_api::MessageContent::messageVideoChatStarted(
+                        td_api::messageVideoChatStarted { group_call_id },
+                    )
+                }
+            }
+        }
+        MessageContent::InviteToGroupCall(m) => {
+            td_api::MessageContent::messageInviteVideoChatParticipants(
+                td_api::messageInviteVideoChatParticipants {
+                    group_call_id: td.get_group_call_id(m.input_group_call_id, DialogId::default()) as i32,
+                    user_ids: td.get_user_ids_object(&m.user_ids, "MessageInviteToGroupCall"),
+                },
+            )
+        }
+        MessageContent::WebViewDataSent(m) => td_api::MessageContent::messageWebAppDataSent(
+            td_api::messageWebAppDataSent {
+                button_text: m.button_text.clone(),
+            },
+        ),
+        MessageContent::WebViewDataReceived(m) => td_api::MessageContent::messageWebAppDataReceived(
+            td_api::messageWebAppDataReceived {
+                button_text: m.button_text.clone(),
+                data: m.data.clone(),
+            },
+        ),
+        MessageContent::GiftPremium(m) => {
+            let mut gifter_user_id = 0;
+            let mut receiver_user_id = 0;
+            if dialog_id.get_type() == DialogType::User {
+                let user_id = dialog_id.get_user_id();
+                if is_outgoing {
+                    receiver_user_id = td.get_user_id_object(user_id, "MessageGiftPremium 2");
+                } else if user_id != td.get_service_notifications_user_id()
+                    && !td.is_user_bot(user_id)
+                    && !td.is_user_support(user_id)
+                {
+                    gifter_user_id = td.get_user_id_object(user_id, "MessageGiftPremium 3");
+                }
+            } else {
+                tdutils::log_error!("Receive gifted premium in {} in {dialog_id} from {source}",
+                    message_id.get());
+            }
+            let month_count = get_premium_duration_month_count(m.days);
+            td_api::MessageContent::messageGiftedPremium(td_api::messageGiftedPremium {
+                gifter_user_id,
+                receiver_user_id,
+                text: Some(get_text_object(&m.text)),
+                currency: m.currency.clone(),
+                amount: m.amount,
+                cryptocurrency: m.crypto_currency.clone(),
+                cryptocurrency_amount: m.crypto_amount,
+                month_count: if get_premium_duration_day_count(month_count) == m.days {
+                    month_count
+                } else {
+                    0
+                },
+                day_count: m.days,
+                sticker: td.get_premium_gift_sticker_object(month_count, 0),
+            })
+        }
+        MessageContent::TopicCreate(m) => td_api::MessageContent::messageForumTopicCreated(
+            td_api::messageForumTopicCreated {
+                name: m.title.clone(),
+                is_name_implicit: m.title_missing,
+                icon: Some(td_api::ForumTopicIcon {
+                    color: m.icon.get_color(),
+                    custom_emoji_id: m.icon.get_custom_emoji_id().get(),
+                }),
+            },
+        ),
+        MessageContent::TopicEdit(m) => get_edited_data_message_content_object(&m.edited_data),
+        MessageContent::SuggestProfilePhoto(m) => {
+            let Some(photo) = td.get_chat_photo_object(&m.photo) else {
+                tdutils::log_error!(
+                    "Have empty suggested profile photo in {} in {} from {source}",
+                    message_id.get(),
+                    dialog_id
+                );
+                return td_api::MessageContent::messageUnsupported(td_api::messageUnsupported);
+            };
+            td_api::MessageContent::messageSuggestProfilePhoto(
+                td_api::messageSuggestProfilePhoto {
+                    photo: Some(photo),
+                },
+            )
+        }
+        MessageContent::WriteAccessAllowed(_) => td_api::MessageContent::messageBotWriteAccessAllowed(
+            td_api::messageBotWriteAccessAllowed {
+                reason: Some(
+                    td_api::BotWriteAccessAllowReason::botWriteAccessAllowReasonAddedToAttachmentMenu(
+                        td_api::botWriteAccessAllowReasonAddedToAttachmentMenu,
+                    ),
+                ),
+            },
+        ),
+        MessageContent::RequestedDialog(m) => {
+            debug_assert!(!m.shared_dialog_ids.is_empty());
+            if m.shared_dialog_ids[0].get_type() == DialogType::User {
+                let mut users = Vec::with_capacity(m.shared_dialog_ids.len());
+                for shared_dialog_id in &m.shared_dialog_ids {
+                    users.push(td.get_shared_user_object(&SharedDialog {
+                        dialog_id: *shared_dialog_id,
+                        ..SharedDialog::default()
+                    }));
+                }
+                td_api::MessageContent::messageUsersShared(td_api::messageUsersShared {
+                    users,
+                    button_id: m.button_id,
+                })
+            } else {
+                debug_assert_eq!(m.shared_dialog_ids.len(), 1);
+                td_api::MessageContent::messageChatShared(td_api::messageChatShared {
+                    chat: Some(td.get_shared_chat_object(&SharedDialog {
+                        dialog_id: m.shared_dialog_ids[0],
+                        ..SharedDialog::default()
+                    })),
+                    button_id: m.button_id,
+                })
+            }
+        }
+        MessageContent::WebViewWriteAccessAllowed(m) => {
+            td_api::MessageContent::messageBotWriteAccessAllowed(
+                td_api::messageBotWriteAccessAllowed {
+                    reason: Some(
+                        td_api::BotWriteAccessAllowReason::botWriteAccessAllowReasonLaunchedWebApp(
+                            td_api::botWriteAccessAllowReasonLaunchedWebApp {
+                                web_app: Some(td.get_web_app_object(&m.web_app)),
+                            },
+                        ),
+                    ),
+                },
+            )
+        }
+        MessageContent::SetBackground(m) => td_api::MessageContent::messageChatSetBackground(
+            td_api::messageChatSetBackground {
+                old_background_message_id: m.old_message_id.get(),
+                background: Some(td.get_chat_background_object(&m.background_info)),
+                only_for_self: !m.for_both,
+            },
+        ),
+        MessageContent::Story(m) => td_api::MessageContent::messageStory(td_api::messageStory {
+            story_poster_chat_id: td.get_chat_id_object(m.story_full_id.get_dialog_id(), "messageStory"),
+            story_id: m.story_full_id.get_story_id().get(),
+            via_mention: m.via_mention,
+        }),
+        MessageContent::WriteAccessAllowedByRequest(_) => {
+            td_api::MessageContent::messageBotWriteAccessAllowed(
+                td_api::messageBotWriteAccessAllowed {
+                    reason: Some(
+                        td_api::BotWriteAccessAllowReason::botWriteAccessAllowReasonAcceptedRequest(
+                            td_api::botWriteAccessAllowReasonAcceptedRequest,
+                        ),
+                    ),
+                },
+            )
+        }
+        MessageContent::GiftCode(m) => {
+            let month_count = get_premium_duration_month_count(m.days);
+            td_api::MessageContent::messagePremiumGiftCode(td_api::messagePremiumGiftCode {
+                creator_id: m
+                    .creator_dialog_id
+                    .is_valid()
+                    .then(|| {
+                        td.get_message_sender_object(m.creator_dialog_id, "messagePremiumGiftCode")
+                    })
+                    .flatten(),
+                text: Some(get_text_object(&m.text)),
+                is_from_giveaway: m.via_giveaway,
+                is_unclaimed: m.is_unclaimed,
+                currency: m.currency.clone(),
+                amount: m.amount,
+                cryptocurrency: m.crypto_currency.clone(),
+                cryptocurrency_amount: m.crypto_amount,
+                month_count: if get_premium_duration_day_count(month_count) == m.days {
+                    month_count
+                } else {
+                    0
+                },
+                day_count: m.days,
+                sticker: td.get_premium_gift_sticker_object(month_count, 0),
+                code: m.code.clone(),
+            })
+        }
+        MessageContent::Giveaway(m) => {
+            let prize = if m.months != 0 {
+                td_api::GiveawayPrize::giveawayPrizePremium(td_api::giveawayPrizePremium {
+                    month_count: m.months,
+                })
+            } else {
+                td_api::GiveawayPrize::giveawayPrizeStars(td_api::giveawayPrizeStars {
+                    star_count: m.star_count,
+                })
+            };
+            td_api::MessageContent::messageGiveaway(td_api::messageGiveaway {
+                parameters: Some(td.get_giveaway_parameters_object(&m.giveaway_parameters)),
+                winner_count: m.quantity,
+                prize: Some(prize),
+                sticker: td.get_premium_gift_sticker_object(m.months, m.star_count),
+            })
+        }
+        MessageContent::GiveawayLaunch(m) => td_api::MessageContent::messageGiveawayCreated(
+            td_api::messageGiveawayCreated {
+                star_count: m.star_count,
+            },
+        ),
+        MessageContent::GiveawayResults(m) => td_api::MessageContent::messageGiveawayCompleted(
+            td_api::messageGiveawayCompleted {
+                giveaway_message_id: m.giveaway_message_id.get(),
+                winner_count: m.winner_count,
+                is_star_giveaway: m.is_star_giveaway,
+                unclaimed_prize_count: m.unclaimed_count,
+            },
+        ),
+        MessageContent::GiveawayWinners(m) => {
+            let prize = if m.month_count != 0 {
+                td_api::GiveawayPrize::giveawayPrizePremium(td_api::giveawayPrizePremium {
+                    month_count: m.month_count,
+                })
+            } else {
+                td_api::GiveawayPrize::giveawayPrizeStars(td_api::giveawayPrizeStars {
+                    star_count: m.star_count,
+                })
+            };
+            td_api::MessageContent::messageGiveawayWinners(td_api::messageGiveawayWinners {
+                boosted_chat_id: td.get_chat_id_object(
+                    DialogId::from_channel_id(m.boosted_channel_id),
+                    "messageGiveawayWinners",
+                ),
+                giveaway_message_id: m.giveaway_message_id.get(),
+                additional_chat_count: m.additional_dialog_count,
+                actual_winners_selection_date: m.winners_selection_date,
+                only_new_members: m.only_new_subscribers,
+                was_refunded: m.was_refunded,
+                prize: Some(prize),
+                prize_description: m.prize_description.clone(),
+                winner_count: m.winner_count,
+                winner_user_ids: td.get_user_ids_object(&m.winner_user_ids, "messageGiveawayWinners"),
+                unclaimed_prize_count: m.unclaimed_count,
+            })
+        }
+        MessageContent::ExpiredVideoNote(_) => td_api::MessageContent::messageExpiredVideoNote(
+            td_api::messageExpiredVideoNote,
+        ),
+        MessageContent::ExpiredVoiceNote(_) => td_api::MessageContent::messageExpiredVoiceNote(
+            td_api::messageExpiredVoiceNote,
+        ),
+        MessageContent::BoostApply(m) => td_api::MessageContent::messageChatBoost(
+            td_api::messageChatBoost {
+                boost_count: m.boost_count,
+            },
+        ),
+        MessageContent::DialogShared(m) => {
+            debug_assert!(!m.shared_dialogs.is_empty());
+            if m.shared_dialogs[0].is_user() {
+                let mut users = Vec::with_capacity(m.shared_dialogs.len());
+                for shared_dialog in &m.shared_dialogs {
+                    users.push(td.get_shared_user_object(shared_dialog));
+                }
+                td_api::MessageContent::messageUsersShared(td_api::messageUsersShared {
+                    users,
+                    button_id: m.button_id,
+                })
+            } else {
+                debug_assert_eq!(m.shared_dialogs.len(), 1);
+                td_api::MessageContent::messageChatShared(td_api::messageChatShared {
+                    chat: Some(td.get_shared_chat_object(&m.shared_dialogs[0])),
+                    button_id: m.button_id,
+                })
+            }
+        }
+        MessageContent::PaidMedia(m) => td_api::MessageContent::messagePaidMedia(
+            td_api::messagePaidMedia {
+                star_count: m.star_count,
+                media: m
+                    .media
+                    .iter()
+                    .map(|media| td.get_paid_media_object(media))
+                    .collect(),
+                caption: Some(get_text_object(&m.caption)),
+                show_caption_above_media: invert_media,
+            },
+        ),
+        MessageContent::PaymentRefunded(m) => td_api::MessageContent::messagePaymentRefunded(
+            td_api::messagePaymentRefunded {
+                owner_id: td.get_message_sender_object(m.dialog_id, "messagePaymentRefunded"),
+                currency: m.currency.clone(),
+                total_amount: m.total_amount,
+                invoice_payload: m.invoice_payload.as_bytes().to_vec(),
+                telegram_payment_charge_id: m.telegram_payment_charge_id.clone(),
+                provider_payment_charge_id: m.provider_payment_charge_id.clone(),
+            },
+        ),
+        MessageContent::GiftStars(m) => {
+            let mut gifter_user_id = 0;
+            let mut receiver_user_id = 0;
+            if dialog_id.get_type() == DialogType::User {
+                let user_id = dialog_id.get_user_id();
+                if is_outgoing {
+                    receiver_user_id = td.get_user_id_object(user_id, "MessageGiftStars 2");
+                } else if user_id != td.get_service_notifications_user_id()
+                    && !td.is_user_bot(user_id)
+                    && !td.is_user_support(user_id)
+                {
+                    gifter_user_id = td.get_user_id_object(user_id, "MessageGiftStars 3");
+                }
+            } else {
+                tdutils::log_error!("Receive gifted stars in {} in {dialog_id} from {source}",
+                    message_id.get());
+            }
+            td_api::MessageContent::messageGiftedStars(td_api::messageGiftedStars {
+                gifter_user_id,
+                receiver_user_id,
+                currency: m.currency.clone(),
+                amount: m.amount,
+                cryptocurrency: m.crypto_currency.clone(),
+                cryptocurrency_amount: m.crypto_amount,
+                star_count: m.star_count,
+                transaction_id: m.transaction_id.clone(),
+                sticker: td.get_premium_gift_sticker_object(0, m.star_count),
+            })
+        }
+        MessageContent::PrizeStars(m) => td_api::MessageContent::messageGiveawayPrizeStars(
+            td_api::messageGiveawayPrizeStars {
+                star_count: m.star_count,
+                transaction_id: m.transaction_id.clone(),
+                boosted_chat_id: td.get_chat_id_object(m.boosted_dialog_id, "messageGiveawayPrizeStars"),
+                giveaway_message_id: m.giveaway_message_id.get(),
+                is_unclaimed: m.is_unclaimed,
+                sticker: td.get_premium_gift_sticker_object(0, m.star_count),
+            },
+        ),
+        MessageContent::PaidMessagesRefunded(m) => {
+            td_api::MessageContent::messagePaidMessagesRefunded(td_api::messagePaidMessagesRefunded {
+                message_count: m.message_count,
+                star_count: m.star_count,
+            })
+        }
+        MessageContent::PaidMessagesPrice(m) => {
+            if td.is_broadcast_channel_dialog(dialog_id) {
+                return td_api::MessageContent::messageDirectMessagePriceChanged(
+                    td_api::messageDirectMessagePriceChanged {
+                        is_enabled: m.broadcast_messages_allowed,
+                        paid_message_star_count: if m.broadcast_messages_allowed {
+                            0
+                        } else {
+                            m.star_count
+                        },
+                    },
+                );
+            }
+            td_api::MessageContent::messagePaidMessagePriceChanged(
+                td_api::messagePaidMessagePriceChanged {
+                    paid_message_star_count: m.star_count,
+                },
+            )
+        }
+        MessageContent::ConferenceCall(m) => {
+            let mut other_participant_ids = Vec::with_capacity(
+                m.other_participant_dialog_ids.len(),
+            );
+            for participant_dialog_id in &m.other_participant_dialog_ids {
+                if let Some(sender) =
+                    td.get_message_sender_object(*participant_dialog_id, "messageGroupCall")
+                {
+                    other_participant_ids.push(sender);
+                }
+            }
+            td_api::MessageContent::messageGroupCall(td_api::messageGroupCall {
+                unique_id: m.call_id,
+                is_active: m.is_active,
+                was_missed: m.was_missed,
+                is_video: m.is_video,
+                duration: m.duration,
+                other_participant_ids,
+            })
+        }
+        MessageContent::ToDoList(m) => td_api::MessageContent::messageChecklist(
+            td_api::messageChecklist {
+                list: Some(td.get_checklist_object(
+                &m.list,
+                &m.completions,
+                dialog_id,
+                message_id,
+                is_outgoing,
+                is_forward,
+                is_real_message_content,
+            )),
+            },
+        ),
+        MessageContent::TodoCompletions(m) => {
+            td_api::MessageContent::messageChecklistTasksDone(td_api::messageChecklistTasksDone {
+                checklist_message_id: m.to_do_message_id.get(),
+                marked_as_done_task_ids: m.completed_task_ids.clone(),
+                marked_as_not_done_task_ids: m.incompleted_task_ids.clone(),
+            })
+        }
+        MessageContent::TodoAppendTasks(m) => {
+            let tasks = m
+                .items
+                .iter()
+                .map(|item| td_api::ChecklistTask {
+                    id: item.id,
+                    text: Some(crate::message_entity::get_formatted_text_object(
+                        None::<&mut ContextUserManager<'_>>,
+                        &item.title,
+                        true,
+                        -1,
+                    )),
+                    completed_by: None,
+                    completion_date: 0,
+                })
+                .collect();
+            td_api::MessageContent::messageChecklistTasksAdded(
+                td_api::messageChecklistTasksAdded {
+                    checklist_message_id: m.to_do_message_id.get(),
+                    tasks,
+                },
+            )
+        }
+        MessageContent::GiftTon(m) => {
+            let mut gifter_user_id = 0;
+            let mut receiver_user_id = 0;
+            if dialog_id.get_type() == DialogType::User {
+                let user_id = dialog_id.get_user_id();
+                if is_outgoing {
+                    receiver_user_id = td.get_user_id_object(user_id, "MessageGiftTon 2");
+                } else if user_id != td.get_service_notifications_user_id()
+                    && !td.is_user_bot(user_id)
+                    && !td.is_user_support(user_id)
+                {
+                    gifter_user_id = td.get_user_id_object(user_id, "MessageGiftTon 3");
+                }
+            } else {
+                tdutils::log_error!("Receive gifted TON in {} in {dialog_id} from {source}",
+                    message_id.get());
+            }
+            td_api::MessageContent::messageGiftedGrams(td_api::messageGiftedGrams {
+                gifter_user_id,
+                receiver_user_id,
+                gram_amount: m.crypto_amount,
+                transaction_id: m.transaction_id.clone(),
+                sticker: td.get_ton_gift_sticker_object(m.crypto_amount),
+            })
+        }
+        MessageContent::SuggestedPostSuccess(m) => {
+            td_api::MessageContent::messageSuggestedPostPaid(td_api::messageSuggestedPostPaid {
+                suggested_post_message_id: m.suggested_post_message_id.get(),
+                star_amount: Some(m.amount.get_star_amount().get_star_amount_object()),
+                gram_amount: m.amount.get_ton_amount().ton_amount,
+            })
+        }
+        MessageContent::SuggestedPostRefund(m) => {
+            let reason = if m.is_payer_initiated {
+                td_api::SuggestedPostRefundReason::suggestedPostRefundReasonPaymentRefunded(
+                    td_api::suggestedPostRefundReasonPaymentRefunded,
+                )
+            } else {
+                td_api::SuggestedPostRefundReason::suggestedPostRefundReasonPostDeleted(
+                    td_api::suggestedPostRefundReasonPostDeleted,
+                )
+            };
+            td_api::MessageContent::messageSuggestedPostRefunded(
+                td_api::messageSuggestedPostRefunded {
+                    suggested_post_message_id: m.suggested_post_message_id.get(),
+                    reason: Some(reason),
+                },
+            )
+        }
+        MessageContent::SuggestedPostApproval(m) => {
+            if m.is_balance_too_low {
+                let mut price = m.price.get_suggested_post_price_object();
+                if price.is_none() {
+                    tdutils::log_error!(
+                        "Have no price for messageSuggestedPostApprovalFailed in {} in {} from {source}",
+                    message_id.get(),
+                    dialog_id
+                    );
+                    price = Some(td_api::SuggestedPostPrice::suggestedPostPriceStar(
+                        td_api::suggestedPostPriceStar { star_count: 1 },
+                    ));
+                }
+                return td_api::MessageContent::messageSuggestedPostApprovalFailed(
+                    td_api::messageSuggestedPostApprovalFailed {
+                        suggested_post_message_id: m.suggested_post_message_id.get(),
+                        price,
+                    },
+                );
+            }
+            if m.is_rejected {
+                return td_api::MessageContent::messageSuggestedPostDeclined(
+                    td_api::messageSuggestedPostDeclined {
+                        suggested_post_message_id: m.suggested_post_message_id.get(),
+                        comment: m.comment.clone(),
+                    },
+                );
+            }
+            td_api::MessageContent::messageSuggestedPostApproved(
+                td_api::messageSuggestedPostApproved {
+                    suggested_post_message_id: m.suggested_post_message_id.get(),
+                    price: m.price.get_suggested_post_price_object(),
+                    send_date: m.send_date,
+                },
+            )
+        }
+        MessageContent::SuggestBirthday(m) => td_api::MessageContent::messageSuggestBirthdate(
+            td_api::messageSuggestBirthdate {
+                birthdate: m.birthdate.get_birthdate_object(),
+            },
+        ),
+        MessageContent::NewCreatorPending(m) => td_api::MessageContent::messageChatOwnerLeft(
+            td_api::messageChatOwnerLeft {
+                new_owner_user_id: td.get_user_id_object(m.new_creator_user_id, "messageChatOwnerLeft"),
+            },
+        ),
+        MessageContent::ChangeCreator(m) => td_api::MessageContent::messageChatOwnerChanged(
+            td_api::messageChatOwnerChanged {
+                new_owner_user_id: td.get_user_id_object(m.new_creator_user_id, "messageChatOwnerChanged"),
+            },
+        ),
+        MessageContent::NoForwardsToggle(m) => {
+            td_api::MessageContent::messageChatHasProtectedContentToggled(
+                td_api::messageChatHasProtectedContentToggled {
+                    request_message_id: m.request_message_id.get(),
+                    old_has_protected_content: m.prev_value,
+                    new_has_protected_content: m.new_value,
+                },
+            )
+        }
+        MessageContent::NoForwardsRequest(m) => {
+            let duration =
+                td.get_option_integer("has_protected_content_disable_request_duration", 0);
+            let is_expired = m.is_expired || td.unix_time() >= message_date + duration as i32;
+            td_api::MessageContent::messageChatHasProtectedContentDisableRequested(
+                td_api::messageChatHasProtectedContentDisableRequested {
+                    is_expired,
+                },
+            )
+        }
+        MessageContent::ManagedBotCreated(m) => {
+            let manager_bot_user_id = if dialog_id.get_type() == DialogType::User {
+                if is_outgoing {
+                    dialog_id.get_user_id()
+                } else {
+                    td.get_my_id()
+                }
+            } else {
+                tdutils::log_error!("Have messageManagedBotCreated in {dialog_id}");
+                td.get_my_id()
+            };
+            td_api::MessageContent::messageManagedBotCreated(td_api::messageManagedBotCreated {
+                bot_user_id: td.get_user_id_object(m.bot_user_id, "messageManagedBotCreated"),
+                manager_bot_user_id: td.get_user_id_object(manager_bot_user_id, "messageManagedBotCreated 2"),
+            })
+        }
+        MessageContent::PollAppendAnswer(m) => td_api::MessageContent::messagePollOptionAdded(
+            td_api::messagePollOptionAdded {
+                poll_message_id: m.poll_message_id.get(),
+                option_id: if tdutils::utf8::check_utf8(m.data.as_bytes()) {
+                    m.data.clone()
+                } else {
+                    base64_encode(&m.data)
+                },
+                text: Some(crate::message_entity::get_formatted_text_object(
+                    None::<&mut ContextUserManager<'_>>,
+                    &m.text,
+                    true,
+                    -1,
+                )),
+            },
+        ),
+        MessageContent::PollDeleteAnswer(m) => td_api::MessageContent::messagePollOptionDeleted(
+            td_api::messagePollOptionDeleted {
+                poll_message_id: m.poll_message_id.get(),
+                option_id: if tdutils::utf8::check_utf8(m.data.as_bytes()) {
+                    m.data.clone()
+                } else {
+                    base64_encode(&m.data)
+                },
+                text: Some(crate::message_entity::get_formatted_text_object(
+                    None::<&mut ContextUserManager<'_>>,
+                    &m.text,
+                    true,
+                    -1,
+                )),
+            },
+        ),
+        MessageContent::ChangeCommunity(m) => {
+            if m.community_id.is_valid() {
+                td_api::MessageContent::messageChatAddedToCommunity(
+                    td_api::messageChatAddedToCommunity {
+                        community_id: td.get_community_id_object(
+                            m.community_id,
+                            "messageChatAddedToCommunity",
+                        )
+                        .id,
+                    },
+                )
+            } else {
+                td_api::MessageContent::messageChatRemovedFromCommunity(
+                    td_api::messageChatRemovedFromCommunity,
+                )
+            }
+        }
+        MessageContent::ChatJoinedViaCommunity(m) => {
+            td_api::MessageContent::messageChatJoinFromCommunity(
+                td_api::messageChatJoinFromCommunity {
+                    community_id: td
+                        .get_community_id_object(m.community_id, "messageChatJoinFromCommunity")
+                        .id,
+                },
+            )
+        }
+    }
+}
+
+/// `get_poll_media_object` (MessageContent.cpp:12248-12330).
+pub fn get_poll_media_object(
+    td: &dyn MessageContentContext,
+    content: &MessageContent,
+) -> Option<td_api::PollMedia> {
+    match content {
+        MessageContent::Animation(m) => Some(td_api::PollMedia::pollMediaAnimation(
+            td_api::pollMediaAnimation {
+                animation: Some(td.get_animation_object(m.file_id)),
+            },
+        )),
+        MessageContent::Audio(m) => {
+            Some(td_api::PollMedia::pollMediaAudio(td_api::pollMediaAudio {
+                audio: Some(td.get_audio_object(m.file_id)),
+            }))
+        }
+        MessageContent::Document(m) => Some(td_api::PollMedia::pollMediaDocument(
+            td_api::pollMediaDocument {
+                document: Some(td.get_document_object(m.file_id)),
+            },
+        )),
+        MessageContent::Location(m) => Some(td_api::PollMedia::pollMediaLocation(
+            td_api::pollMediaLocation {
+                location: Some(m.location.get_location_object()),
+            },
+        )),
+        MessageContent::Photo(m) => {
+            let Some(photo) = td.get_photo_object(&m.photo) else {
+                tdutils::log_error!("Have empty photo");
+                return None;
+            };
+            Some(td_api::PollMedia::pollMediaPhoto(td_api::pollMediaPhoto {
+                photo: Some(photo),
+                video: Some(td.get_video_object(m.video_file_id)),
+            }))
+        }
+        MessageContent::Sticker(m) => {
+            let sticker = td.get_sticker_object(m.file_id);
+            Some(td_api::PollMedia::pollMediaSticker(
+                td_api::pollMediaSticker { sticker },
+            ))
+        }
+        MessageContent::Text(m) => {
+            let web_page = td.get_link_preview_object(
+                m.web_page_id,
+                m.force_small_media,
+                m.force_large_media,
+                m.skip_web_page_confirmation,
+                false,
+            );
+            Some(td_api::PollMedia::pollMediaLink(td_api::pollMediaLink {
+                url: m.web_page_url.clone(),
+                link_preview: web_page,
+            }))
+        }
+        MessageContent::Venue(m) => {
+            Some(td_api::PollMedia::pollMediaVenue(td_api::pollMediaVenue {
+                venue: Some(m.venue.get_venue_object()),
+            }))
+        }
+        MessageContent::Video(m) => {
+            let mut alternative_videos = Vec::new();
+            let mut storyboards = Vec::new();
+            if !td.get_option_boolean("video_ignore_alt_documents") {
+                for file_id in &m.alternative_file_ids {
+                    if let Some(video) = td.get_alternative_video_object(*file_id, &m.hls_file_ids)
+                    {
+                        alternative_videos.push(video);
+                    }
+                }
+                for file_id in &m.storyboard_file_ids {
+                    if let Some(storyboard) =
+                        td.get_video_storyboard_object(*file_id, &m.storyboard_map_file_ids)
+                    {
+                        storyboards.push(storyboard);
+                    }
+                }
+            }
+            Some(td_api::PollMedia::pollMediaVideo(td_api::pollMediaVideo {
+                video: Some(td.get_video_object(m.file_id)),
+                alternative_videos,
+                storyboards,
+                cover: td.get_photo_object(&m.cover),
+                start_timestamp: m.start_timestamp,
+            }))
+        }
+        _ => None,
+    }
+}
+
+/// `get_edited_data_message_content_object` (ForumTopicEditedData.cpp) —
+/// the TopicEdit arm helper.
+fn get_edited_data_message_content_object(
+    edited_data: &ForumTopicEditedData,
+) -> td_api::MessageContent {
+    if edited_data.is_empty() {
+        return td_api::MessageContent::messageForumTopicEdited(
+            td_api::messageForumTopicEdited::default(),
+        );
+    }
+    td_api::MessageContent::messageForumTopicEdited(td_api::messageForumTopicEdited {
+        name: edited_data.title.clone(),
+        edit_icon_custom_emoji_id: edited_data.edit_icon_custom_emoji_id,
+        icon_custom_emoji_id: edited_data.icon_custom_emoji_id.get(),
+    })
+}
+
+/// `get_message_content_upgrade_gift_result_object`
+/// (MessageContent.cpp:12272-12294) — the StarGiftUnique-only switch; the
+/// variant is unmodeled, so the C++ `UNREACHABLE()` cannot be reached.
+pub fn get_message_content_upgrade_gift_result_object(
+    _td: &dyn MessageContentContext,
+    _content: &MessageContent,
+    _dialog_id: DialogId,
+    _message_id: MessageId,
+) -> td_api::UpgradeGiftResult {
+    unreachable!("the unmodeled StarGiftUnique variant cannot reach the upgrade result")
+}
+
+/// `get_message_content_craft_gift_result_object`
+/// (MessageContent.cpp:12296-12309) — same shape as the upgrade result.
+pub fn get_message_content_craft_gift_result_object(
+    _td: &dyn MessageContentContext,
+    _content: &MessageContent,
+    _message_id: MessageId,
+) -> td_api::CraftGiftResult {
+    unreachable!("the unmodeled StarGiftUnique variant cannot reach the craft result")
+}
+
+// ---------------------------------------------------------------------------
 // M.9.15 — `get_action_message_content` (MessageContent.cpp:10451-11338)
 // ---------------------------------------------------------------------------
 
@@ -18605,6 +20221,7 @@ mod tests {
         web_page_user_ids: Vec<UserId>,
         web_page_channel_ids: Vec<ChannelId>,
         poll_input_media: bool,
+        poll_can_add_option: bool,
         checklist_max: i64,
         poll_contents: Vec<MessageContent>,
         poll_contents_2: Vec<MessageContent>,
@@ -18669,6 +20286,7 @@ mod tests {
                 web_page_user_ids: Vec::new(),
                 web_page_channel_ids: Vec::new(),
                 poll_input_media: true,
+                poll_can_add_option: true,
                 checklist_max: 100,
                 poll_contents: Vec::new(),
                 poll_contents_2: Vec::new(),
@@ -18762,7 +20380,7 @@ mod tests {
         }
 
         fn get_poll_can_add_option(&self, _poll_id: PollId) -> bool {
-            false
+            self.poll_can_add_option
         }
 
         fn get_poll_can_view_stats(&self, _poll_id: PollId) -> bool {
@@ -19758,8 +21376,6 @@ mod tests {
             self.authorized
         }
 
-        fn get_user_id_object(&self, _user_id: UserId, _source: &str) {}
-
         fn get_live_photo_video_file_id(
             &mut self,
             _video: Option<telegram_api::Document>,
@@ -19915,6 +21531,281 @@ mod tests {
             _answer: Option<telegram_api::PollAnswer>,
         ) -> Option<(FormattedText, String)> {
             None
+        }
+
+        fn unix_time(&self) -> i32 {
+            1700000100
+        }
+
+        fn get_user_id_object(&self, user_id: UserId, _source: &str) -> i64 {
+            user_id.get()
+        }
+
+        fn get_user_ids_object(&self, user_ids: &[UserId], source: &str) -> Vec<i64> {
+            user_ids
+                .iter()
+                .map(|&user_id| self.get_user_id_object(user_id, source))
+                .collect()
+        }
+
+        fn is_user_support(&self, _user_id: UserId) -> bool {
+            false
+        }
+
+        fn get_service_notifications_user_id(&self) -> UserId {
+            UserId::new(777000)
+        }
+
+        fn get_supergroup_id_object(&self, channel_id: ChannelId, _source: &str) -> i64 {
+            channel_id.get()
+        }
+
+        fn get_basic_group_id_object(&self, chat_id: ChatId, _source: &str) -> i64 {
+            chat_id.get()
+        }
+
+        fn get_chat_id_object(&self, dialog_id: DialogId, _source: &str) -> i64 {
+            match dialog_id.get_type() {
+                DialogType::User => dialog_id.get_user_id().get(),
+                DialogType::Chat => -dialog_id.get_chat_id().get(),
+                DialogType::Channel => dialog_id.get_channel_id().get(),
+                DialogType::SecretChat => i64::from(dialog_id.get_secret_chat_id().get()),
+                DialogType::None => 0,
+            }
+        }
+
+        fn have_input_peer(&self, _dialog_id: DialogId) -> bool {
+            true
+        }
+
+        fn get_group_call_id(
+            &self,
+            _input_group_call_id: InputGroupCallId,
+            _dialog_id: DialogId,
+        ) -> i64 {
+            0
+        }
+
+        fn get_message_sender_object(
+            &self,
+            dialog_id: DialogId,
+            _source: &str,
+        ) -> Option<td_api::MessageSender> {
+            match dialog_id.get_type() {
+                DialogType::User => Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser {
+                        user_id: dialog_id.get_user_id().get(),
+                    },
+                )),
+                DialogType::Chat => Some(td_api::MessageSender::messageSenderChat(
+                    td_api::messageSenderChat {
+                        chat_id: dialog_id.get_chat_id().get(),
+                    },
+                )),
+                _ => None,
+            }
+        }
+
+        fn get_contact_object(&self, contact: &Contact) -> td_api::Contact {
+            td_api::Contact {
+                phone_number: contact.get_phone_number().to_string(),
+                first_name: contact.get_first_name().to_string(),
+                last_name: contact.get_last_name().to_string(),
+                vcard: String::new(),
+                user_id: contact.get_user_id().get(),
+            }
+        }
+
+        fn get_animation_object(&self, _file_id: FileId) -> td_api::Animation {
+            td_api::Animation {
+                ..Default::default()
+            }
+        }
+
+        fn get_audio_object(&self, _file_id: FileId) -> td_api::Audio {
+            td_api::Audio::default()
+        }
+
+        fn get_document_object(&self, _file_id: FileId) -> td_api::Document {
+            td_api::Document::default()
+        }
+
+        fn get_video_object(&self, _file_id: FileId) -> td_api::Video {
+            td_api::Video::default()
+        }
+
+        fn get_video_note_object(&self, _file_id: FileId) -> td_api::VideoNote {
+            td_api::VideoNote::default()
+        }
+
+        fn get_voice_note_object(&self, _file_id: FileId) -> td_api::VoiceNote {
+            td_api::VoiceNote::default()
+        }
+
+        fn get_sticker_object(&self, _file_id: FileId) -> Option<td_api::Sticker> {
+            None
+        }
+
+        fn get_animated_emoji_object(
+            &self,
+            _text: &str,
+            _custom_emoji_id: CustomEmojiId,
+        ) -> Option<td_api::AnimatedEmoji> {
+            None
+        }
+
+        fn get_dice_stickers_object(&self, _emoji: &str, _value: i32) -> td_api::DiceStickers {
+            td_api::DiceStickers::default()
+        }
+
+        fn get_dice_success_animation_frame_number(&self, _emoji: &str, _value: i32) -> i32 {
+            0
+        }
+
+        fn get_premium_gift_sticker_object(
+            &self,
+            _month_count: i32,
+            _star_count: i64,
+        ) -> Option<td_api::Sticker> {
+            None
+        }
+
+        fn get_ton_gift_sticker_object(&self, _ton_count: i64) -> Option<td_api::Sticker> {
+            None
+        }
+
+        fn get_alternative_video_object(
+            &self,
+            _file_id: FileId,
+            _hls_file_ids: &[FileId],
+        ) -> Option<td_api::AlternativeVideo> {
+            None
+        }
+
+        fn get_video_storyboard_object(
+            &self,
+            _file_id: FileId,
+            _storyboard_map_file_ids: &[FileId],
+        ) -> Option<td_api::VideoStoryboard> {
+            None
+        }
+
+        fn get_link_preview_object(
+            &self,
+            _web_page_id: WebPageId,
+            _force_small_media: bool,
+            _force_large_media: bool,
+            _skip_confirmation: bool,
+            _invert_media: bool,
+        ) -> Option<td_api::LinkPreview> {
+            None
+        }
+
+        fn get_photo_object(&self, _photo: &Photo) -> Option<td_api::Photo> {
+            None
+        }
+
+        fn get_chat_photo_object(&self, _photo: &Photo) -> Option<td_api::ChatPhoto> {
+            None
+        }
+
+        fn get_poll_object(&self, _poll_id: PollId, _dialog_id: DialogId) -> td_api::Poll {
+            td_api::Poll::default()
+        }
+
+        fn get_message_invoice_object(
+            &self,
+            _input_invoice: &InputInvoice,
+            _is_server: bool,
+            _skip_bot_commands: bool,
+            _max_media_timestamp: i32,
+        ) -> td_api::MessageContent {
+            td_api::MessageContent::messageInvoice(td_api::messageInvoice::default())
+        }
+
+        fn get_game_object(
+            &self,
+            _game: &Game,
+            _is_server: bool,
+            _skip_bot_commands: bool,
+        ) -> td_api::Game {
+            td_api::Game::default()
+        }
+
+        fn get_web_app_object(&self, _web_app: &WebApp) -> td_api::WebApp {
+            td_api::WebApp::default()
+        }
+
+        fn get_paid_media_object(
+            &self,
+            _extended_media: &MessageExtendedMedia,
+        ) -> td_api::PaidMedia {
+            td_api::PaidMedia::default()
+        }
+
+        fn get_shared_user_object(&self, shared_dialog: &SharedDialog) -> td_api::SharedUser {
+            td_api::SharedUser {
+                user_id: shared_dialog.dialog_id.get_user_id().get(),
+                ..Default::default()
+            }
+        }
+
+        fn get_shared_chat_object(&self, _shared_dialog: &SharedDialog) -> td_api::SharedChat {
+            td_api::SharedChat {
+                ..Default::default()
+            }
+        }
+
+        fn get_giveaway_parameters_object(
+            &self,
+            _parameters: &GiveawayParameters,
+        ) -> td_api::GiveawayParameters {
+            td_api::GiveawayParameters {
+                ..Default::default()
+            }
+        }
+
+        fn get_chat_background_object(
+            &self,
+            _background_info: &BackgroundInfo,
+        ) -> td_api::ChatBackground {
+            td_api::ChatBackground::default()
+        }
+
+        fn get_checklist_object(
+            &self,
+            list: &ToDoList,
+            _completions: &[ToDoCompletion],
+            _dialog_id: DialogId,
+            _message_id: MessageId,
+            _is_outgoing: bool,
+            _is_forward: bool,
+            _is_real_message_content: bool,
+        ) -> td_api::Checklist {
+            td_api::Checklist {
+                title: Some(crate::message_entity::get_formatted_text_object(
+                    None::<&mut ()>,
+                    &list.title,
+                    true,
+                    -1,
+                )),
+                ..Default::default()
+            }
+        }
+
+        fn get_encrypted_passport_element_object(
+            &self,
+            _values: &[EncryptedSecureValue],
+        ) -> Vec<td_api::EncryptedPassportElement> {
+            Vec::new()
+        }
+
+        fn get_community_id_object(
+            &self,
+            _community_id: CommunityId,
+            _source: &str,
+        ) -> td_api::CommunityId {
+            td_api::CommunityId::default()
         }
     }
 
@@ -24397,6 +26288,722 @@ mod tests {
             }
             other => panic!("unexpected media: {other:?}"),
         }
+    }
+
+    // -- M.9.16: the td_api object dispatcher ---------------------------------
+
+    fn content_object(td: &TestContext, content: &MessageContent) -> td_api::MessageContent {
+        content_object_in(
+            td,
+            content,
+            DialogId::from_user_id(UserId::new(7)),
+            MessageId::new(42 << 20),
+            false,
+        )
+    }
+
+    fn content_object_in(
+        td: &TestContext,
+        content: &MessageContent,
+        dialog_id: DialogId,
+        message_id: MessageId,
+        is_outgoing: bool,
+    ) -> td_api::MessageContent {
+        get_message_content_object(
+            td,
+            content,
+            dialog_id,
+            message_id,
+            DialogId::default(),
+            true,
+            is_outgoing,
+            false,
+            DialogId::default(),
+            1700000000,
+            0,
+            false,
+            false,
+            -1,
+            false,
+            false,
+            "test",
+        )
+    }
+
+    #[test]
+    fn object_basic_media_arms() {
+        let td = TestContext::default();
+        let file_id = FileId::new(1, 1);
+
+        let content = MessageContent::Animation(MessageAnimation {
+            file_id,
+            caption: text("cap"),
+            has_spoiler: true,
+        });
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageAnimation(m) => {
+                assert!(m.animation.is_some());
+                assert_eq!(m.caption.as_ref().unwrap().text, "cap");
+                assert!(m.has_spoiler);
+                assert!(!m.is_secret);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        let content = MessageContent::Audio(MessageAudio {
+            file_id,
+            caption: text("cap"),
+        });
+        assert!(matches!(
+            content_object(&td, &content),
+            td_api::MessageContent::messageAudio(_)
+        ));
+
+        let content = MessageContent::Contact(MessageContact {
+            contact: Contact::new(
+                "+123".to_string(),
+                "A".to_string(),
+                "B".to_string(),
+                String::new(),
+                UserId::new(5),
+            ),
+        });
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageContact(m) => {
+                let contact = m.contact.unwrap();
+                assert_eq!(contact.phone_number, "+123");
+                assert_eq!(contact.user_id, 5);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        let content = MessageContent::Document(MessageDocument {
+            file_id,
+            caption: FormattedText::default(),
+        });
+        assert!(matches!(
+            content_object(&td, &content),
+            td_api::MessageContent::messageDocument(_)
+        ));
+
+        let content = MessageContent::VideoNote(MessageVideoNote {
+            file_id,
+            is_viewed: true,
+        });
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageVideoNote(m) => assert!(m.is_viewed),
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        let content = MessageContent::VoiceNote(MessageVoiceNote {
+            file_id,
+            caption: FormattedText::default(),
+            is_listened: true,
+        });
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageVoiceNote(m) => assert!(m.is_listened),
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // the sticker seam answers None -> the codegen default sticker
+        let content = MessageContent::Sticker(MessageSticker {
+            file_id,
+            is_premium: true,
+        });
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageSticker(m) => assert!(m.sticker.is_some()),
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // photo with an empty photo object answers expired photo
+        let content = MessageContent::Photo(MessagePhoto {
+            photo: Photo::default(),
+            video_file_id: FileId::default(),
+            caption: FormattedText::default(),
+            has_spoiler: false,
+        });
+        assert!(matches!(
+            content_object(&td, &content),
+            td_api::MessageContent::messageExpiredPhoto(_)
+        ));
+    }
+
+    #[test]
+    fn object_text_arm() {
+        let td = TestContext::default();
+        // a text with a url and preview disabled answers link_preview_options
+        let content = MessageContent::Text(MessageText::new(
+            FormattedText {
+                text: "hello https://example.com".to_string(),
+                entities: vec![MessageEntity::new(Type::Url, 6, 19)],
+            },
+            WebPageId::default(),
+            false,
+            false,
+            false,
+            "https://example.com".to_string(),
+        ));
+        let td_params = TestContext::default();
+        let object = get_message_content_object(
+            &td_params,
+            &content,
+            DialogId::from_user_id(UserId::new(7)),
+            MessageId::new(42 << 20),
+            DialogId::default(),
+            true,
+            false,
+            false,
+            DialogId::default(),
+            1700000000,
+            0,
+            false,
+            false,
+            -1,
+            false,
+            true,
+            "test",
+        );
+        match object {
+            td_api::MessageContent::messageText(m) => {
+                assert!(m.link_preview_options.is_some());
+                assert!(m.link_preview_options.as_ref().unwrap().is_disabled);
+                assert_eq!(
+                    m.link_preview_options.as_ref().unwrap().url,
+                    "https://example.com"
+                );
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // plain text with no url has no options
+        let content = simple_text("hi");
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageText(m) => {
+                assert!(m.link_preview_options.is_none());
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_live_location_expiry() {
+        let td = TestContext::default();
+        let content = MessageContent::LiveLocation(MessageLiveLocation::new(
+            Location::new(55.75, 37.62, 0.0, 0),
+            3600,
+            90,
+            500,
+        ));
+        // unix_time (1700000100) - message_date (1700000000) = 100 passed
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageLiveLocation(m) => {
+                assert_eq!(m.expires_in, 3500);
+                let location = m.location.unwrap();
+                assert_eq!(location.live_period, 3600);
+                assert_eq!(location.heading, 90);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // an expired live location zeroes heading and radius
+        let content = MessageContent::LiveLocation(MessageLiveLocation::new(
+            Location::new(55.75, 37.62, 0.0, 0),
+            50,
+            90,
+            500,
+        ));
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageLiveLocation(m) => {
+                assert_eq!(m.expires_in, 0);
+                assert_eq!(m.location.unwrap().heading, 0);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_call_and_payment_arms() {
+        let td = TestContext::default();
+        // a call without an access hash zeroes the unique id
+        let content = MessageContent::Call(MessageCall {
+            call_id: 99,
+            call_access_hash: 0,
+            duration: 10,
+            discard_reason: CallDiscardReason {
+                r#type: CallDiscardReasonType::HungUp,
+                slug: String::new(),
+            },
+            is_video: true,
+        });
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageCall(m) => {
+                assert_eq!(m.unique_id, 0);
+                assert!(m.is_video);
+                assert_eq!(m.duration, 10);
+                assert!(matches!(
+                    m.discard_reason,
+                    Some(td_api::CallDiscardReason::callDiscardReasonHungUp(_))
+                ));
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // payment with charge ids answers the bot flavor
+        let content = MessageContent::PaymentSuccessful(MessagePaymentSuccessful {
+            telegram_payment_charge_id: "tg".to_string(),
+            provider_payment_charge_id: "pv".to_string(),
+            currency: "USD".to_string(),
+            total_amount: 100,
+            invoice_payload: "payload".to_string(),
+            shipping_option_id: "opt".to_string(),
+            ..MessagePaymentSuccessful::default()
+        });
+        match content_object(&td, &content) {
+            td_api::MessageContent::messagePaymentSuccessfulBot(m) => {
+                assert_eq!(m.currency, "USD");
+                assert_eq!(m.telegram_payment_charge_id, "tg");
+                assert_eq!(m.invoice_payload, b"payload");
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // payment without charge ids answers the plain flavor
+        let content = MessageContent::PaymentSuccessful(MessagePaymentSuccessful {
+            invoice_dialog_id: DialogId::from_user_id(UserId::new(5)),
+            invoice_message_id: MessageId::new(7),
+            currency: "USD".to_string(),
+            total_amount: 100,
+            invoice_payload: "payload".to_string(),
+            ..MessagePaymentSuccessful::default()
+        });
+        match content_object(&td, &content) {
+            td_api::MessageContent::messagePaymentSuccessful(m) => {
+                assert_eq!(m.invoice_chat_id, 5);
+                assert_eq!(m.invoice_message_id, 7);
+                assert_eq!(m.invoice_name, "payload");
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_service_arms() {
+        let td = TestContext::default();
+
+        let content = MessageContent::ChatCreate(MessageChatCreate {
+            title: "T".to_string(),
+            participant_user_ids: vec![UserId::new(5)],
+        });
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageBasicGroupChatCreate(m) => {
+                assert_eq!(m.title, "T");
+                assert_eq!(m.member_user_ids, vec![5]);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        let content = MessageContent::ChatDeleteUser(MessageChatDeleteUser {
+            user_id: UserId::new(5),
+        });
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageChatDeleteMember(m) => {
+                assert_eq!(m.user_id, 5);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        let content = MessageContent::ChatMigrateTo(MessageChatMigrateTo {
+            migrated_to_channel_id: ChannelId::new(8),
+        });
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageChatUpgradeTo(m) => {
+                assert_eq!(m.supergroup_id, 8);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // chat joined by link approved -> join by request
+        let content =
+            MessageContent::ChatJoinedByLink(MessageChatJoinedByLink { is_approved: true });
+        assert!(matches!(
+            content_object(&td, &content),
+            td_api::MessageContent::messageChatJoinByRequest(_)
+        ));
+        let content =
+            MessageContent::ChatJoinedByLink(MessageChatJoinedByLink { is_approved: false });
+        assert!(matches!(
+            content_object(&td, &content),
+            td_api::MessageContent::messageChatJoinByLink(_)
+        ));
+
+        // chat delete history answers unsupported
+        let content = MessageContent::ChatDeleteHistory(MessageChatDeleteHistory);
+        assert!(matches!(
+            content_object(&td, &content),
+            td_api::MessageContent::messageUnsupported(_)
+        ));
+
+        // pin message and game score ids
+        let content = MessageContent::PinMessage(MessagePinMessage {
+            message_id: MessageId::new(7),
+        });
+        match content_object(&td, &content) {
+            td_api::MessageContent::messagePinMessage(m) => assert_eq!(m.message_id, 7),
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // chat set ttl
+        let content = MessageContent::ChatSetTtl(MessageChatSetTtl {
+            ttl: 30,
+            from_user_id: UserId::new(5),
+        });
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageChatSetMessageAutoDeleteTime(m) => {
+                assert_eq!(m.message_auto_delete_time, 30);
+                assert_eq!(m.from_user_id, 5);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_poll_and_dice_arms() {
+        let td = TestContext {
+            is_bot: false,
+            ..TestContext::default()
+        };
+
+        let poll_id = PollId::new(1);
+        let content = MessageContent::Poll(MessagePoll {
+            poll_id,
+            caption: text("poll"),
+            attached_media: None,
+        });
+        match content_object(&td, &content) {
+            td_api::MessageContent::messagePoll(m) => {
+                assert!(m.poll.is_some());
+                assert_eq!(m.description.as_ref().unwrap().text, "poll");
+                assert!(m.can_add_option);
+                assert!(m.media.is_none());
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // a bot can't add options
+        let bot_td = TestContext {
+            is_bot: true,
+            ..TestContext::default()
+        };
+        match content_object(&bot_td, &content) {
+            td_api::MessageContent::messagePoll(m) => assert!(!m.can_add_option),
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // regular dice
+        let content = MessageContent::Dice(MessageDice::new(
+            "🎲",
+            5,
+            false,
+            Vec::new(),
+            String::new(),
+            0,
+            0,
+        ));
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageDice(m) => {
+                assert_eq!(m.emoji, "🎲");
+                assert_eq!(m.value, 5);
+                assert!(m.final_state.is_some());
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // stake dice
+        let content = MessageContent::Dice(MessageDice::new(
+            "🎲",
+            6,
+            true,
+            vec![1; 32],
+            String::new(),
+            10,
+            20,
+        ));
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageStakeDice(m) => {
+                assert_eq!(m.value, 6);
+                assert_eq!(m.stake_gram_amount, 10);
+                assert_eq!(m.prize_gram_amount, 20);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_group_call_arms() {
+        let td = TestContext::default();
+        let call_id = InputGroupCallId::new(9, 8);
+
+        let content = MessageContent::GroupCall(MessageGroupCall {
+            input_group_call_id: call_id,
+            duration: 60,
+            schedule_date: -1,
+        });
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageVideoChatEnded(m) => {
+                assert_eq!(m.duration, 60);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        let content = MessageContent::GroupCall(MessageGroupCall {
+            input_group_call_id: call_id,
+            duration: -1,
+            schedule_date: 500,
+        });
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageVideoChatScheduled(m) => {
+                assert_eq!(m.start_date, 500);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        let content = MessageContent::GroupCall(MessageGroupCall {
+            input_group_call_id: call_id,
+            duration: -1,
+            schedule_date: -1,
+        });
+        assert!(matches!(
+            content_object(&td, &content),
+            td_api::MessageContent::messageVideoChatStarted(_)
+        ));
+    }
+
+    #[test]
+    fn object_gift_and_giveaway_arms() {
+        let td = TestContext::default();
+        let user_dialog = DialogId::from_user_id(UserId::new(7));
+
+        // outgoing gift premium -> receiver is the dialog user
+        let content = MessageContent::GiftPremium(MessageGiftPremium {
+            text: text("gift"),
+            currency: "USD".to_string(),
+            amount: 500,
+            days: 31,
+            ..MessageGiftPremium::default()
+        });
+        let object = content_object_in(&td, &content, user_dialog, MessageId::new(42 << 20), true);
+        match object {
+            td_api::MessageContent::messageGiftedPremium(m) => {
+                assert_eq!(m.gifter_user_id, 0);
+                assert_eq!(m.receiver_user_id, 7);
+                assert_eq!(m.amount, 500);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // incoming gift premium -> the gifter is the dialog user
+        let object = content_object_in(&td, &content, user_dialog, MessageId::new(42 << 20), false);
+        match object {
+            td_api::MessageContent::messageGiftedPremium(m) => {
+                assert_eq!(m.gifter_user_id, 7);
+                assert_eq!(m.receiver_user_id, 0);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // giveaway with months -> premium prize
+        let content = MessageContent::Giveaway(MessageGiveaway {
+            giveaway_parameters: GiveawayParameters::default(),
+            quantity: 10,
+            months: 3,
+            star_count: 0,
+        });
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageGiveaway(m) => {
+                assert_eq!(m.winner_count, 10);
+                assert!(matches!(
+                    m.prize,
+                    Some(td_api::GiveawayPrize::giveawayPrizePremium(_))
+                ));
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // giveaway with stars only -> stars prize
+        let content = MessageContent::Giveaway(MessageGiveaway {
+            giveaway_parameters: GiveawayParameters::default(),
+            quantity: 10,
+            months: 0,
+            star_count: 100,
+        });
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageGiveaway(m) => {
+                assert!(matches!(
+                    m.prize,
+                    Some(td_api::GiveawayPrize::giveawayPrizeStars(_))
+                ));
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_checklist_and_suggested_post_arms() {
+        let td = TestContext::default();
+
+        let content = MessageContent::TodoCompletions(MessageTodoCompletions {
+            to_do_message_id: MessageId::new(7),
+            completed_task_ids: vec![1, 2],
+            incompleted_task_ids: vec![3],
+        });
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageChecklistTasksDone(m) => {
+                assert_eq!(m.checklist_message_id, 7);
+                assert_eq!(m.marked_as_done_task_ids, vec![1, 2]);
+                assert_eq!(m.marked_as_not_done_task_ids, vec![3]);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        let content = MessageContent::TodoAppendTasks(MessageTodoAppendTasks {
+            to_do_message_id: MessageId::new(7),
+            items: vec![ToDoItem {
+                id: 3,
+                title: text("task"),
+            }],
+        });
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageChecklistTasksAdded(m) => {
+                assert_eq!(m.checklist_message_id, 7);
+                assert_eq!(m.tasks.len(), 1);
+                assert_eq!(m.tasks[0].id, 3);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // suggested post approval with a too-low balance answers a star-1 price
+        let content = MessageContent::SuggestedPostApproval(MessageSuggestedPostApproval {
+            suggested_post_message_id: MessageId::new(7),
+            price: SuggestedPostPrice::default(),
+            comment: String::new(),
+            send_date: 0,
+            is_rejected: false,
+            is_balance_too_low: true,
+        });
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageSuggestedPostApprovalFailed(m) => {
+                assert!(matches!(
+                    m.price,
+                    Some(td_api::SuggestedPostPrice::suggestedPostPriceStar(ref p)) if p.star_count == 1
+                ));
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_poll_option_and_community_arms() {
+        let td = TestContext::default();
+
+        // the C++ base64-encodes non-UTF-8 data; a Rust `String` is
+        // always valid UTF-8, so the branch is unreachable on this line
+        // and the data passes through (recorded divergence)
+        let content = MessageContent::PollAppendAnswer(MessagePollAppendAnswer {
+            poll_message_id: MessageId::new(7),
+            text: text("option"),
+            data: "option-data".to_string(),
+        });
+        match content_object(&td, &content) {
+            td_api::MessageContent::messagePollOptionAdded(m) => {
+                assert_eq!(m.option_id, "option-data");
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // valid community -> added
+        let content = MessageContent::ChangeCommunity(MessageChangeCommunity {
+            community_id: CommunityId::new(5),
+        });
+        assert!(matches!(
+            content_object(&td, &content),
+            td_api::MessageContent::messageChatAddedToCommunity(_)
+        ));
+
+        // invalid community -> removed
+        let content = MessageContent::ChangeCommunity(MessageChangeCommunity {
+            community_id: CommunityId::default(),
+        });
+        assert!(matches!(
+            content_object(&td, &content),
+            td_api::MessageContent::messageChatRemovedFromCommunity(_)
+        ));
+    }
+
+    #[test]
+    fn object_no_forwards_request_expiry() {
+        let td = TestContext::default();
+        let content = MessageContent::NoForwardsRequest(MessageNoForwardsRequest {
+            is_expired: false,
+            prev_value: true,
+            new_value: false,
+        });
+        // unix_time 1700000100 - message_date 1700000000 = 100 < the
+        // default duration 0 -> expired
+        match content_object(&td, &content) {
+            td_api::MessageContent::messageChatHasProtectedContentDisableRequested(m) => {
+                assert!(m.is_expired);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn object_helper_functions() {
+        // call discard reason objects
+        assert!(matches!(
+            get_call_discard_reason_object(&CallDiscardReason {
+                r#type: CallDiscardReasonType::Empty,
+                slug: String::new(),
+            }),
+            td_api::CallDiscardReason::callDiscardReasonEmpty(_)
+        ));
+
+        // encrypted credentials byte copies
+        let credentials = EncryptedSecureCredentials {
+            data: "data".to_string(),
+            hash: "hash".to_string(),
+            encrypted_secret: "secret".to_string(),
+        };
+        let object = get_encrypted_credentials_object(&credentials);
+        assert_eq!(object.data, b"data");
+        assert_eq!(object.hash, b"hash");
+        assert_eq!(object.secret, b"secret");
+
+        // order info object
+        let order_info = Some(OrderInfo {
+            name: "N".to_string(),
+            phone_number: "P".to_string(),
+            email_address: "E".to_string(),
+            shipping_address: None,
+        });
+        let object = get_order_info_object(&order_info).unwrap();
+        assert_eq!(object.name, "N");
+        assert_eq!(object.shipping_address, None);
+
+        // suggested post price objects
+        assert!(matches!(
+            SuggestedPostPrice {
+                r#type: SuggestedPostPriceType::Star,
+                amount: 100,
+            }
+            .get_suggested_post_price_object(),
+            Some(td_api::SuggestedPostPrice::suggestedPostPriceStar(ref p)) if p.star_count == 100
+        ));
+        assert!(
+            SuggestedPostPrice::default()
+                .get_suggested_post_price_object()
+                .is_none()
+        );
     }
 
     // -- M.9.15: the action dispatcher --------------------------------------
