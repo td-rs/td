@@ -90,6 +90,11 @@ name = "emoji_status"
 path = "fuzz_targets/emoji_status.rs"
 doc = false
 
+[[bin]]
+name = "message_content"
+path = "fuzz_targets/message_content.rs"
+doc = false
+
 # Panic = bug: the parsers must report errors, never crash (the tdlib
 # parsers guarantee no-throw on any input).
 [profile.release]

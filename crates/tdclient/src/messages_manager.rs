@@ -9803,6 +9803,7 @@ pub fn is_active_message_reply_info(
 
 /// `MessagesManager::is_visible_message_reply_info`
 /// (MessagesManager.cpp:4965-4987).
+#[allow(clippy::nonminimal_bool)] // the C++ guard keeps its shape (MessagesManager.cpp:4972)
 pub fn is_visible_message_reply_info(
     ctx: &dyn MessageObjectContext,
     dialog_id: DialogId,
