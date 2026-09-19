@@ -137,12 +137,15 @@ struct PendingSend {
 }
 
 /// The collecting sink under the S72 UpdatesManager — Td drains it and
-/// converts/emits (the pts machine semantics stay in the manager).
+/// converts/emits (the pts machine semantics stay in the manager). The
+/// new-message arm carries its update source: `updateNewMessage` and
+/// `updateNewChannelMessage` both feed the same MessagesManager intake
+/// (the C++ pts path treats the pair uniformly, UpdatesManager.cpp:1153-1160).
 #[derive(Default)]
 struct TdSink {
     users: Vec<tdmtproto::telegram_api::User>,
     chats: Vec<tdmtproto::telegram_api::Chat>,
-    new_messages: Vec<tdmtproto::telegram_api::Message>,
+    new_messages: Vec<(tdmtproto::telegram_api::Message, &'static str)>,
     message_ids: Vec<(i32, i64)>,
     gap: bool,
 }
@@ -160,14 +163,15 @@ impl UpdatesSink for TdSink {
         _pts: i32,
         _pts_count: i32,
     ) {
-        self.new_messages.push(message);
+        self.new_messages.push((message, "updateNewMessage"));
     }
     fn on_new_channel_message(
         &mut self,
-        _message: tdmtproto::telegram_api::Message,
+        message: tdmtproto::telegram_api::Message,
         _pts: i32,
         _pts_count: i32,
     ) {
+        self.new_messages.push((message, "updateNewChannelMessage"));
     }
     fn on_delete_messages(&mut self, _messages: Vec<i32>, _pts: i32, _pts_count: i32) {}
     fn on_message_id(&mut self, id: i32, random_id: i64) {
@@ -3762,24 +3766,23 @@ impl Td {
                 }
             }
         }
-        for message in &sink.new_messages {
-            self.apply_new_message(message);
+        for (message, source) in &sink.new_messages {
+            self.apply_new_message(message, source);
         }
     }
 
-    /// The receive path for a wire `updateNewMessage` (the container
-    /// users/chats were collected into the sink first): the full M.10.3
-    /// intake — `parse_telegram_api_message` → `create_message` →
+    /// The receive path for a wire `updateNewMessage`/`updateNewChannelMessage`
+    /// (the container users/chats were collected into the sink first): the
+    /// full M.10.3 intake — `parse_telegram_api_message` → `create_message` →
     /// `fix_new_message` — runs through the M.10.2c manager, and the
     /// emitted object is the M.10.4 `get_message_object` builder. The
     /// M.9.18 flip (wire media through `get_message_content`) now lives at
     /// its C++ call position inside `parse_telegram_api_message`.
-    fn apply_new_message(&mut self, message: &telegram_api::Message) {
+    fn apply_new_message(&mut self, message: &telegram_api::Message, source: &str) {
         // The manager and the context are both pieces of `Td`; the intake
         // is driven over a taken manager to split the borrows.
         let mut manager = std::mem::take(&mut self.messages_manager);
-        let received =
-            manager.on_get_message(self, message.clone(), true, false, "updateNewMessage");
+        let received = manager.on_get_message(self, message.clone(), true, false, source);
         self.messages_manager = manager;
         let Some((dialog_id, mut m)) = received else {
             return;

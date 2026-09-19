@@ -5976,16 +5976,20 @@ impl MessageForwardInfo {
             if last_message_info.is_empty() {
                 log_error!("Receive wrong last message in message forward header");
             } else {
-                // `last_message_info.add_dependencies` — the per-kind dialog
-                // fan-out rides the force_create_dialog seam (the
-                // `Dependencies` graph lands with the receive path).
+                // `last_message_info.add_dependencies` +
+                // `dependencies.get_dialog_ids()` (MessageForwardInfo.cpp:164-169):
+                // the fan-out walks the dialog set only — a user sender lands
+                // in the user set (Dependencies.cpp:92-98) and is never
+                // force-created here.
                 if last_message_info.dialog_id.is_valid() {
                     ctx.force_create_dialog(
                         last_message_info.dialog_id,
                         "get_message_forward_info",
                     );
                 }
-                if last_message_info.sender_dialog_id.is_valid() {
+                if last_message_info.sender_dialog_id.is_valid()
+                    && last_message_info.sender_dialog_id.get_type() != DialogType::User
+                {
                     ctx.force_create_dialog(
                         last_message_info.sender_dialog_id,
                         "get_message_forward_info",
@@ -10473,7 +10477,7 @@ impl Dependencies {
 
     /// `Dependencies::add(StoryFullId)` (Dependencies.cpp:58-63).
     pub fn add_story(&mut self, story_full_id: StoryFullId) {
-        if story_full_id.get_dialog_id().is_valid() {
+        if story_full_id.is_valid() {
             self.add_dialog_and_dependencies(story_full_id.get_dialog_id());
         }
     }
@@ -10958,7 +10962,7 @@ pub fn parse_telegram_api_message(
                 quick_reply_shortcut_id,
                 effect,
                 factcheck,
-                report_delivery_until_date,
+                report_delivery_until_date: _,
                 paid_message_stars,
                 suggested_post,
                 schedule_repeat_period,
@@ -10969,7 +10973,9 @@ pub fn parse_telegram_api_message(
             if quick_reply_shortcut_id != 0 {
                 log_error!("Receive shortcut {quick_reply_shortcut_id} from {source}");
                 message_info.message_id = MessageId::default();
-                return finish_message_info(message_info, saved_peer_id);
+                // the C++ `break` leaves before the arm's saved_peer_id read
+                // (MessagesManager.cpp:11387-11391 vs 11549)
+                return finish_message_info(message_info, None);
             }
 
             message_info.dialog_id = peer_id
@@ -11045,7 +11051,9 @@ pub fn parse_telegram_api_message(
             message_info.is_paid_suggested_post_ton = paid_suggested_post_ton;
             message_info.effect_id = MessageEffectId::new(effect);
             message_info.schedule_repeat_period = schedule_repeat_period.max(0);
-            message_info.report_delivery_until_date = report_delivery_until_date;
+            // the C++ parse never reads the wire `report_delivery_until_date_`
+            // (MessagesManager.h:1093 stays zero; only the on_get_message read
+            // at MessagesManager.cpp:11924 exists), so neither does the port
 
             let is_content_read = if !is_bot {
                 if is_scheduled {
@@ -11333,6 +11341,13 @@ pub fn create_message(
         return (DialogId::default(), None);
     }
 
+    // CHECK(message_info.content != nullptr) (MessagesManager.cpp:11601) —
+    // positioned before the sender/receiver gates like the C++.
+    let mut content = message_info
+        .content
+        .take()
+        .expect("Receive a message without content");
+
     let is_bot = ctx.is_bot();
     let mut sender_user_id = message_info.sender_user_id;
     let mut sender_dialog_id = message_info.sender_dialog_id;
@@ -11421,11 +11436,8 @@ pub fn create_message(
         sender_dialog_id = DialogId::default();
     }
 
-    // CHECK(message_info.content != nullptr) (MessagesManager.cpp:11602).
-    let mut content = message_info
-        .content
-        .take()
-        .expect("Receive a message without content");
+    // CHECK(message_info.content != nullptr) (MessagesManager.cpp:11601),
+    // taken above at its C++ position.
     let mut content_type = content.get_type();
     let mut is_outgoing = message_info.is_outgoing;
     #[allow(clippy::nonminimal_bool)]
@@ -11552,6 +11564,14 @@ pub fn create_message(
     }
 
     if message_id.is_scheduled() {
+        if message_info.reply_info.is_some() {
+            log_error!(
+                "Receive {} in {:?} with reply info",
+                DisplayMessageId(message_id),
+                dialog_id
+            );
+            message_info.reply_info = None;
+        }
         if message_info.reactions.is_some() {
             log_error!(
                 "Receive {} in {:?} with reactions",
@@ -11625,7 +11645,10 @@ pub fn create_message(
     let mut noforwards = message_info.noforwards;
     let is_expired = crate::message_content::is_expired_message_content(content_type);
     if is_expired {
-        // self-destruct time is ignored/set to 0 if the message has already been expired
+        assert!(
+            ttl.is_empty(),
+            "self-destruct time is ignored/set to 0 if the message has already been expired"
+        );
         message_info.reply_header.replied_message_info = RepliedMessageInfo::default();
         reply_to_story_full_id = StoryFullId::default();
         noforwards = false;
