@@ -21,7 +21,7 @@
 //! - `VLOG(notifications)` traces are dropped; `LOG(ERROR)` warnings are kept
 //!   via `log_error!`.
 
-use crate::chat_manager::{ChannelId, ChatId};
+use crate::chat_manager::{ChannelId, ChannelType, ChatId};
 use crate::message_content::{
     BackgroundInfo, InputGroupCallId, MessageContent, MessageContentType, SuggestedPostPrice,
     can_be_secret_message_content,
@@ -1919,6 +1919,10 @@ impl SavedMessagesTopicId {
     }
 
     /// `SavedMessagesTopicId::parse` (SavedMessagesTopicId.h:80-82).
+    pub fn parse_from(parser: &mut Parser) -> Result<SavedMessagesTopicId, &'static str> {
+        Ok(SavedMessagesTopicId::new(DialogId::parse_from(parser)?))
+    }
+
     pub fn parse_value(input: &[u8]) -> Result<SavedMessagesTopicId, &'static str> {
         let dialog_id = DialogId::parse_value(input)?;
         Ok(SavedMessagesTopicId { dialog_id })
@@ -3584,6 +3588,1034 @@ impl MessageReactions {
 }
 
 // ---------------------------------------------------------------------------
+// M.10.2b — the internal ReplyMarkup plane (ReplyMarkup.h, KeyboardButton.h,
+// InlineKeyboardButton.h, KeyboardButtonStyle.h, RequestedDialogType.h) with
+// the store/parse formats (the matching .hpp files) and the
+// telegram_api→internal converters (`get_reply_markup(telegram_api...)`,
+// ReplyMarkup.cpp:37-135). The internal model is what `Message::reply_markup`
+// holds (the M.10.1b stand-in re-points here); the td_api input/object
+// converters land with the send path (M.10.8) and `get_message_object`
+// (M.10.4).
+// ---------------------------------------------------------------------------
+
+/// `KeyboardButtonStyle::Type` (KeyboardButtonStyle.h:19).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(i32)]
+pub enum KeyboardButtonStyleType {
+    #[default]
+    Default = 0,
+    Primary = 1,
+    Danger = 2,
+    Success = 3,
+}
+
+/// `td::KeyboardButtonStyle` (KeyboardButtonStyle.h).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct KeyboardButtonStyle {
+    pub r#type: KeyboardButtonStyleType,
+    pub icon_custom_emoji_id: crate::emoji_status::CustomEmojiId,
+}
+
+impl KeyboardButtonStyle {
+    /// `KeyboardButtonStyle::KeyboardButtonStyle(telegram_api::keyboardButtonStyle &&)`
+    /// (KeyboardButtonStyle.cpp:37-45).
+    pub fn from_telegram(style: Option<&telegram_api::KeyboardButtonStyle>) -> KeyboardButtonStyle {
+        let Some(style) = style else {
+            return KeyboardButtonStyle::default();
+        };
+        let r#type = if style.bg_primary {
+            KeyboardButtonStyleType::Primary
+        } else if style.bg_danger {
+            KeyboardButtonStyleType::Danger
+        } else if style.bg_success {
+            KeyboardButtonStyleType::Success
+        } else {
+            KeyboardButtonStyleType::Default
+        };
+        KeyboardButtonStyle {
+            r#type,
+            icon_custom_emoji_id: crate::emoji_status::CustomEmojiId::new(style.icon),
+        }
+    }
+
+    /// `KeyboardButtonStyle::is_default` (KeyboardButtonStyle.h).
+    pub fn is_default(&self) -> bool {
+        self.r#type == KeyboardButtonStyleType::Default && !self.icon_custom_emoji_id.is_valid()
+    }
+
+    /// `KeyboardButtonStyle::store` (KeyboardButtonStyle.hpp:14-31).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_type = self.r#type != KeyboardButtonStyleType::Default;
+        let has_icon_custom_emoji_id = self.icon_custom_emoji_id.is_valid();
+        store_flags(out, [has_type, has_icon_custom_emoji_id]);
+        if has_type {
+            store_i32(out, self.r#type as i32);
+        }
+        if has_icon_custom_emoji_id {
+            store_i64(out, self.icon_custom_emoji_id.get());
+        }
+    }
+
+    /// `KeyboardButtonStyle::parse` (KeyboardButtonStyle.hpp:33-49).
+    pub fn parse_from(parser: &mut Parser) -> Result<KeyboardButtonStyle, &'static str> {
+        let [has_type, has_icon_custom_emoji_id] = parser.parse_flags::<2>()?;
+        let r#type = if has_type {
+            match parser.i32_()? {
+                0 => KeyboardButtonStyleType::Default,
+                1 => KeyboardButtonStyleType::Primary,
+                2 => KeyboardButtonStyleType::Danger,
+                3 => KeyboardButtonStyleType::Success,
+                _ => return Err("Wrong keyboard button style type"),
+            }
+        } else {
+            KeyboardButtonStyleType::Default
+        };
+        let icon_custom_emoji_id = if has_icon_custom_emoji_id {
+            crate::emoji_status::CustomEmojiId::new(parser.i64_()?)
+        } else {
+            crate::emoji_status::CustomEmojiId::default()
+        };
+        Ok(KeyboardButtonStyle {
+            r#type,
+            icon_custom_emoji_id,
+        })
+    }
+}
+
+/// `RequestedDialogType::Type` (RequestedDialogType.h:22).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(i32)]
+pub enum RequestedDialogTypeType {
+    #[default]
+    User = 0,
+    Group = 1,
+    Channel = 2,
+    CreateBot = 3,
+}
+
+/// `td::RequestedDialogType` (RequestedDialogType.h:19-100).
+#[derive(Clone, Debug, PartialEq)]
+pub struct RequestedDialogType {
+    pub r#type: RequestedDialogTypeType,
+    pub button_id: i32,
+    pub max_quantity: i32,
+    pub restrict_is_bot: bool,
+    pub is_bot: bool,
+    pub restrict_is_premium: bool,
+    pub is_premium: bool,
+    pub request_name: bool,
+    pub request_username: bool,
+    pub request_photo: bool,
+    pub restrict_is_forum: bool,
+    pub is_forum: bool,
+    pub bot_is_participant: bool,
+    pub restrict_has_username: bool,
+    pub has_username: bool,
+    pub is_created: bool,
+    pub restrict_user_administrator_rights: bool,
+    pub restrict_bot_administrator_rights: bool,
+    pub user_administrator_rights: crate::chat_manager::AdministratorRights,
+    pub bot_administrator_rights: crate::chat_manager::AdministratorRights,
+    pub suggested_name: String,
+    pub suggested_username: String,
+}
+
+impl Default for RequestedDialogType {
+    /// The C++ field initializers (RequestedDialogType.h:23-45); the
+    /// AdministratorRights store/parse lands beside this type in
+    /// chat_manager.
+    fn default() -> RequestedDialogType {
+        RequestedDialogType {
+            r#type: RequestedDialogTypeType::User,
+            button_id: 0,
+            max_quantity: 1,
+            restrict_is_bot: false,
+            is_bot: false,
+            restrict_is_premium: false,
+            is_premium: false,
+            request_name: false,
+            request_username: false,
+            request_photo: false,
+            restrict_is_forum: false,
+            is_forum: false,
+            bot_is_participant: false,
+            restrict_has_username: false,
+            has_username: false,
+            is_created: false,
+            restrict_user_administrator_rights: false,
+            restrict_bot_administrator_rights: false,
+            user_administrator_rights: crate::chat_manager::AdministratorRights::default(),
+            bot_administrator_rights: crate::chat_manager::AdministratorRights::default(),
+            suggested_name: String::new(),
+            suggested_username: String::new(),
+        }
+    }
+}
+
+impl RequestedDialogType {
+    /// `RequestedDialogType::RequestedDialogType(telegram_api::RequestPeerType &&, ...)`
+    /// (RequestedDialogType.cpp:26-84).
+    pub fn from_telegram(
+        peer_type: telegram_api::RequestPeerType,
+        button_id: i32,
+        max_quantity: i32,
+    ) -> RequestedDialogType {
+        let mut result = RequestedDialogType {
+            button_id,
+            max_quantity: max_quantity.max(1),
+            ..RequestedDialogType::default()
+        };
+        match peer_type {
+            telegram_api::RequestPeerType::requestPeerTypeUser(t) => {
+                result.r#type = RequestedDialogTypeType::User;
+                result.restrict_is_bot = t.flags & 1 != 0;
+                result.is_bot = t.bot;
+                result.restrict_is_premium = t.flags & 2 != 0;
+                result.is_premium = t.premium;
+            }
+            telegram_api::RequestPeerType::requestPeerTypeChat(t) => {
+                result.r#type = RequestedDialogTypeType::Group;
+                result.restrict_is_forum = t.flags & 16 != 0;
+                result.is_forum = t.forum;
+                result.bot_is_participant = t.bot_participant;
+                result.restrict_has_username = t.flags & 8 != 0;
+                result.has_username = t.has_username;
+                result.is_created = t.creator;
+                result.restrict_user_administrator_rights =
+                    !result.is_created && t.user_admin_rights.is_some();
+                result.restrict_bot_administrator_rights = t.bot_admin_rights.is_some();
+                result.user_administrator_rights =
+                    crate::chat_manager::AdministratorRights::from_chat_admin_rights(
+                        t.user_admin_rights.as_ref(),
+                        ChannelType::Megagroup,
+                    );
+                result.bot_administrator_rights =
+                    crate::chat_manager::AdministratorRights::from_chat_admin_rights(
+                        t.bot_admin_rights.as_ref(),
+                        ChannelType::Megagroup,
+                    );
+            }
+            telegram_api::RequestPeerType::requestPeerTypeBroadcast(t) => {
+                result.r#type = RequestedDialogTypeType::Channel;
+                result.restrict_has_username = t.flags & 8 != 0;
+                result.has_username = t.has_username;
+                result.is_created = t.creator;
+                result.restrict_user_administrator_rights =
+                    !result.is_created && t.user_admin_rights.is_some();
+                result.restrict_bot_administrator_rights = t.bot_admin_rights.is_some();
+                result.user_administrator_rights =
+                    crate::chat_manager::AdministratorRights::from_chat_admin_rights(
+                        t.user_admin_rights.as_ref(),
+                        ChannelType::Broadcast,
+                    );
+                result.bot_administrator_rights =
+                    crate::chat_manager::AdministratorRights::from_chat_admin_rights(
+                        t.bot_admin_rights.as_ref(),
+                        ChannelType::Broadcast,
+                    );
+            }
+            telegram_api::RequestPeerType::requestPeerTypeCreateBot(t) => {
+                if t.bot_managed {
+                    result.r#type = RequestedDialogTypeType::CreateBot;
+                    result.suggested_name = t.suggested_name;
+                    result.suggested_username = t.suggested_username;
+                } else {
+                    log_error!("Receive request to create an unmanaged bot");
+                    result.r#type = RequestedDialogTypeType::User;
+                    result.restrict_is_bot = true;
+                    result.is_bot = true;
+                }
+            }
+        }
+        result
+    }
+
+    /// `RequestedDialogType::store` (RequestedDialogType.hpp:17-57).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_max_quantity = self.max_quantity != 1;
+        let has_suggested_name = !self.suggested_name.is_empty();
+        let has_suggested_username = !self.suggested_username.is_empty();
+        store_flags(
+            out,
+            [
+                self.restrict_is_bot,
+                self.is_bot,
+                self.restrict_is_premium,
+                self.is_premium,
+                self.restrict_is_forum,
+                self.is_forum,
+                self.bot_is_participant,
+                self.restrict_has_username,
+                self.has_username,
+                self.is_created,
+                self.restrict_user_administrator_rights,
+                self.restrict_bot_administrator_rights,
+                has_max_quantity,
+                has_suggested_name,
+                has_suggested_username,
+            ],
+        );
+        store_i32(out, self.r#type as i32);
+        store_i32(out, self.button_id);
+        if self.restrict_user_administrator_rights {
+            self.user_administrator_rights.store(out);
+        }
+        if self.restrict_bot_administrator_rights {
+            self.bot_administrator_rights.store(out);
+        }
+        if has_max_quantity {
+            store_i32(out, self.max_quantity);
+        }
+        if has_suggested_name {
+            store_string(out, &self.suggested_name);
+        }
+        if has_suggested_username {
+            store_string(out, &self.suggested_username);
+        }
+    }
+
+    /// `RequestedDialogType::parse` (RequestedDialogType.hpp:59-113).
+    pub fn parse_from(parser: &mut Parser) -> Result<RequestedDialogType, &'static str> {
+        let [
+            restrict_is_bot,
+            is_bot,
+            restrict_is_premium,
+            is_premium,
+            restrict_is_forum,
+            is_forum,
+            bot_is_participant,
+            restrict_has_username,
+            has_username,
+            is_created,
+            restrict_user_administrator_rights,
+            restrict_bot_administrator_rights,
+            has_max_quantity,
+            has_suggested_name,
+            has_suggested_username,
+        ] = parser.parse_flags::<15>()?;
+        let r#type = match parser.i32_()? {
+            0 => RequestedDialogTypeType::User,
+            1 => RequestedDialogTypeType::Group,
+            2 => RequestedDialogTypeType::Channel,
+            3 => RequestedDialogTypeType::CreateBot,
+            _ => return Err("Wrong requested dialog type"),
+        };
+        let button_id = parser.i32_()?;
+        let user_administrator_rights = if restrict_user_administrator_rights {
+            crate::chat_manager::AdministratorRights::parse_impl(parser)?
+        } else {
+            crate::chat_manager::AdministratorRights::default()
+        };
+        let bot_administrator_rights = if restrict_bot_administrator_rights {
+            crate::chat_manager::AdministratorRights::parse_impl(parser)?
+        } else {
+            crate::chat_manager::AdministratorRights::default()
+        };
+        let max_quantity = if has_max_quantity { parser.i32_()? } else { 1 };
+        let suggested_name = if has_suggested_name {
+            parser.string()?
+        } else {
+            String::new()
+        };
+        let suggested_username = if has_suggested_username {
+            parser.string()?
+        } else {
+            String::new()
+        };
+        Ok(RequestedDialogType {
+            r#type,
+            button_id,
+            max_quantity,
+            restrict_is_bot,
+            is_bot,
+            restrict_is_premium,
+            is_premium,
+            request_name: false,
+            request_username: false,
+            request_photo: false,
+            restrict_is_forum,
+            is_forum,
+            bot_is_participant,
+            restrict_has_username,
+            has_username,
+            is_created,
+            restrict_user_administrator_rights,
+            restrict_bot_administrator_rights,
+            user_administrator_rights,
+            bot_administrator_rights,
+            suggested_name,
+            suggested_username,
+        })
+    }
+}
+
+/// `KeyboardButton::Type` (KeyboardButton.h:25-35) — append only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(i32)]
+pub enum KeyboardButtonType {
+    #[default]
+    Text = 0,
+    RequestPhoneNumber = 1,
+    RequestLocation = 2,
+    RequestPoll = 3,
+    RequestPollQuiz = 4,
+    RequestPollRegular = 5,
+    WebView = 6,
+    RequestDialog = 7,
+}
+
+/// `td::KeyboardButton` (KeyboardButton.h:23-52).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct KeyboardButton {
+    pub r#type: KeyboardButtonType,
+    pub style: KeyboardButtonStyle,
+    pub text: String,
+    /// WebView only
+    pub url: String,
+    /// RequestDialog only
+    pub requested_dialog_type: Option<RequestedDialogType>,
+}
+
+impl KeyboardButton {
+    /// `KeyboardButton::KeyboardButton(telegram_api::keyboardButton &&)`
+    /// (KeyboardButton.cpp:22-79).
+    pub fn from_telegram(keyboard_button: telegram_api::KeyboardButton) -> KeyboardButton {
+        let mut result = KeyboardButton::default();
+        let Some(button_type) = keyboard_button.r#type else {
+            log_error!("Unsupported keyboard button");
+            result.style = KeyboardButtonStyle::from_telegram(keyboard_button.style.as_ref());
+            result.text = keyboard_button.text;
+            return result;
+        };
+        match button_type {
+            telegram_api::ButtonType::buttonTypeDefault(_) => {
+                result.r#type = KeyboardButtonType::Text;
+            }
+            telegram_api::ButtonType::buttonTypeRequestPhone(_) => {
+                result.r#type = KeyboardButtonType::RequestPhoneNumber;
+            }
+            telegram_api::ButtonType::buttonTypeRequestGeoLocation(_) => {
+                result.r#type = KeyboardButtonType::RequestLocation;
+            }
+            telegram_api::ButtonType::buttonTypeRequestPoll(t) => {
+                if t.flags & 1 != 0 {
+                    result.r#type = if t.quiz {
+                        KeyboardButtonType::RequestPollQuiz
+                    } else {
+                        KeyboardButtonType::RequestPollRegular
+                    };
+                } else {
+                    result.r#type = KeyboardButtonType::RequestPoll;
+                }
+            }
+            telegram_api::ButtonType::buttonTypeSimpleWebView(t) => {
+                match crate::link_manager::check_link(&t.url, false, false) {
+                    Ok(url) => {
+                        result.r#type = KeyboardButtonType::WebView;
+                        result.url = url;
+                    }
+                    Err(error) => {
+                        log_error!("Keyboard Web App {}", error.message());
+                    }
+                }
+            }
+            telegram_api::ButtonType::buttonTypeRequestPeer(t) => {
+                result.r#type = KeyboardButtonType::RequestDialog;
+                if let Some(peer_type) = t.peer_type {
+                    result.requested_dialog_type = Some(RequestedDialogType::from_telegram(
+                        peer_type,
+                        t.button_id,
+                        t.max_quantity,
+                    ));
+                }
+            }
+            telegram_api::ButtonType::inputButtonTypeRequestPeer(_) => {
+                log_error!("Unsupported keyboard button");
+            }
+        }
+        result.style = KeyboardButtonStyle::from_telegram(keyboard_button.style.as_ref());
+        result.text = keyboard_button.text;
+        result
+    }
+
+    /// `KeyboardButton::is_empty` (KeyboardButton.h:45-47).
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+            && (self.r#type == KeyboardButtonType::Text
+                || !self.style.icon_custom_emoji_id.is_valid())
+    }
+
+    /// `KeyboardButton::store` (KeyboardButton.hpp:17-40).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_url = !self.url.is_empty();
+        let has_requested_dialog_type = self.requested_dialog_type.is_some();
+        let has_style = !self.style.is_default();
+        store_flags(out, [has_url, has_requested_dialog_type, has_style]);
+        store_i32(out, self.r#type as i32);
+        store_string(out, &self.text);
+        if has_url {
+            store_string(out, &self.url);
+        }
+        if has_requested_dialog_type {
+            self.requested_dialog_type.as_ref().unwrap().store(out);
+        }
+        if has_style {
+            self.style.store(out);
+        }
+    }
+
+    /// `KeyboardButton::parse` (KeyboardButton.hpp:42-80) — the
+    /// pre-`AddKeyboardButtonFlags` (35) legacy layout stores type/text/url
+    /// unconditionally.
+    pub fn parse_from(parser: &mut Parser) -> Result<KeyboardButton, &'static str> {
+        let mut result = KeyboardButton::default();
+        let has_url;
+        let has_requested_dialog_type;
+        let has_style;
+        if parser.version() >= crate::store_parse::version::ADD_KEYBOARD_BUTTON_FLAGS {
+            let [has_url_, has_requested_dialog_type_, has_style_] = parser.parse_flags::<3>()?;
+            has_url = has_url_;
+            has_requested_dialog_type = has_requested_dialog_type_;
+            has_style = has_style_;
+        } else {
+            has_url = false;
+            has_requested_dialog_type = false;
+            has_style = false;
+        }
+        result.r#type = match parser.i32_()? {
+            0 => KeyboardButtonType::Text,
+            1 => KeyboardButtonType::RequestPhoneNumber,
+            2 => KeyboardButtonType::RequestLocation,
+            3 => KeyboardButtonType::RequestPoll,
+            4 => KeyboardButtonType::RequestPollQuiz,
+            5 => KeyboardButtonType::RequestPollRegular,
+            6 => KeyboardButtonType::WebView,
+            7 => KeyboardButtonType::RequestDialog,
+            _ => return Err("Wrong keyboard button type"),
+        };
+        result.text = parser.string()?;
+        if has_url {
+            result.url = parser.string()?;
+        }
+        if has_requested_dialog_type {
+            result.requested_dialog_type = Some(RequestedDialogType::parse_from(parser)?);
+        }
+        if has_style {
+            result.style = KeyboardButtonStyle::parse_from(parser)?;
+        }
+        Ok(result)
+    }
+}
+
+/// `InlineKeyboardButton::Type` (InlineKeyboardButton.h:23-38) — append only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(i32)]
+pub enum InlineKeyboardButtonType {
+    Url = 0,
+    Callback = 1,
+    CallbackGame = 2,
+    SwitchInline = 3,
+    SwitchInlineCurrentDialog = 4,
+    Buy = 5,
+    UrlAuth = 6,
+    CallbackWithPassword = 7,
+    User = 8,
+    WebView = 9,
+    Copy = 10,
+    #[default]
+    Disabled = 11,
+}
+
+/// `td::InlineKeyboardButton` (InlineKeyboardButton.h:21-58).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct InlineKeyboardButton {
+    pub r#type: InlineKeyboardButtonType,
+    /// UrlAuth: button id; SwitchInline: target dialog types mask
+    pub id: i64,
+    /// User only
+    pub user_id: UserId,
+    pub style: KeyboardButtonStyle,
+    pub text: String,
+    /// UrlAuth only
+    pub forward_text: String,
+    pub data: String,
+}
+
+impl InlineKeyboardButton {
+    /// `get_inline_keyboard_button(telegram_api::keyboardInlineButton &&)`
+    /// (InlineKeyboardButton.cpp:126-204). Invalid links/users leave the
+    /// button Disabled like the C++ `break`-out-of-switch.
+    pub fn from_telegram(
+        keyboard_button: telegram_api::KeyboardInlineButton,
+    ) -> InlineKeyboardButton {
+        let mut button = InlineKeyboardButton::default();
+        let Some(button_type) = keyboard_button.r#type else {
+            log_error!("Unsupported inline keyboard button");
+            button.style = KeyboardButtonStyle::from_telegram(keyboard_button.style.as_ref());
+            button.text = keyboard_button.text;
+            return button;
+        };
+        match button_type {
+            telegram_api::InlineButtonType::inlineButtonTypeUrl(t) => {
+                match crate::link_manager::check_link(&t.url, false, false) {
+                    Ok(url) => {
+                        button.r#type = InlineKeyboardButtonType::Url;
+                        button.data = url;
+                    }
+                    Err(error) => log_error!("Inline keyboard {}", error.message()),
+                }
+            }
+            telegram_api::InlineButtonType::inlineButtonTypeCallback(t) => {
+                button.r#type = if t.requires_password {
+                    InlineKeyboardButtonType::CallbackWithPassword
+                } else {
+                    InlineKeyboardButtonType::Callback
+                };
+                button.data = String::from_utf8_lossy(&t.data).into_owned();
+            }
+            telegram_api::InlineButtonType::inlineButtonTypeGame(_) => {
+                button.r#type = InlineKeyboardButtonType::CallbackGame;
+            }
+            telegram_api::InlineButtonType::inlineButtonTypeSwitchInline(t) => {
+                if t.same_peer {
+                    button.r#type = InlineKeyboardButtonType::SwitchInlineCurrentDialog;
+                } else {
+                    button.r#type = InlineKeyboardButtonType::SwitchInline;
+                    button.id = get_inline_query_peer_types_mask(&t.peer_types);
+                }
+                button.data = t.query;
+            }
+            telegram_api::InlineButtonType::inlineButtonTypeBuy(_) => {
+                button.r#type = InlineKeyboardButtonType::Buy;
+            }
+            telegram_api::InlineButtonType::inlineButtonTypeUrlAuth(t) => {
+                match crate::link_manager::check_link(&t.url, false, false) {
+                    Ok(url) => {
+                        button.r#type = InlineKeyboardButtonType::UrlAuth;
+                        button.id = t.button_id as i64;
+                        button.forward_text = t.fwd_text;
+                        button.data = url;
+                    }
+                    Err(error) => log_error!("Inline keyboard Login {}", error.message()),
+                }
+            }
+            telegram_api::InlineButtonType::inlineButtonTypeUserProfile(t) => {
+                let user_id = UserId::new(t.user_id);
+                if !user_id.is_valid() {
+                    log_error!("Receive {} in inline keyboard", user_id.get());
+                } else {
+                    button.r#type = InlineKeyboardButtonType::User;
+                    button.user_id = user_id;
+                }
+            }
+            telegram_api::InlineButtonType::inlineButtonTypeWebView(t) => {
+                match crate::link_manager::check_link(&t.url, false, false) {
+                    Ok(url) => {
+                        button.r#type = InlineKeyboardButtonType::WebView;
+                        button.data = url;
+                    }
+                    Err(error) => log_error!("Inline keyboard Web App {}", error.message()),
+                }
+            }
+            telegram_api::InlineButtonType::inlineButtonTypeCopy(t) => {
+                button.r#type = InlineKeyboardButtonType::Copy;
+                button.data = t.copy_text;
+            }
+            telegram_api::InlineButtonType::inlineButtonTypeDisabled(_) => {
+                button.r#type = InlineKeyboardButtonType::Disabled;
+            }
+            telegram_api::InlineButtonType::inputInlineButtonTypeUrlAuth(_)
+            | telegram_api::InlineButtonType::inputInlineButtonTypeUserProfile(_) => {
+                log_error!("Unsupported inline keyboard button");
+            }
+        }
+        button.style = KeyboardButtonStyle::from_telegram(keyboard_button.style.as_ref());
+        button.text = keyboard_button.text;
+        button
+    }
+
+    /// `InlineKeyboardButton::store` (InlineKeyboardButton.hpp:17-51).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_id = self.id != 0;
+        let has_user_id = self.user_id.is_valid();
+        let has_forward_text = !self.forward_text.is_empty();
+        let has_data = !self.data.is_empty();
+        let has_style = !self.style.is_default();
+        store_flags(
+            out,
+            [has_id, has_user_id, has_forward_text, has_data, has_style],
+        );
+        store_i32(out, self.r#type as i32);
+        if has_id {
+            store_i64(out, self.id);
+        }
+        if has_user_id {
+            self.user_id.store(out);
+        }
+        store_string(out, &self.text);
+        if has_forward_text {
+            store_string(out, &self.forward_text);
+        }
+        if has_data {
+            store_string(out, &self.data);
+        }
+        if has_style {
+            self.style.store(out);
+        }
+    }
+
+    /// `InlineKeyboardButton::parse` (InlineKeyboardButton.hpp:53-98) — with
+    /// the pre-`AddKeyboardButtonFlags` legacy layout.
+    pub fn parse_from(parser: &mut Parser) -> Result<InlineKeyboardButton, &'static str> {
+        let mut button = InlineKeyboardButton::default();
+        if parser.version() >= crate::store_parse::version::ADD_KEYBOARD_BUTTON_FLAGS {
+            let [has_id, has_user_id, has_forward_text, has_data, has_style] =
+                parser.parse_flags::<5>()?;
+            button.r#type = parse_inline_keyboard_button_type(parser)?;
+            if has_id {
+                button.id = parser.i64_()?;
+            }
+            if has_user_id {
+                button.user_id = UserId::parse_from(parser)?;
+            }
+            button.text = parser.string()?;
+            if has_forward_text {
+                button.forward_text = parser.string()?;
+            }
+            if has_data {
+                button.data = parser.string()?;
+            }
+            if has_style {
+                button.style = KeyboardButtonStyle::parse_from(parser)?;
+            }
+        } else {
+            button.r#type = parse_inline_keyboard_button_type(parser)?;
+            if button.r#type == InlineKeyboardButtonType::UrlAuth {
+                if parser.version() >= crate::store_parse::version::SUPPORT_64_BIT_IDS {
+                    button.id = parser.i64_()?;
+                } else {
+                    button.id = parser.i32_()? as i64;
+                }
+            }
+            button.text = parser.string()?;
+            button.data = parser.string()?;
+        }
+        Ok(button)
+    }
+}
+
+fn parse_inline_keyboard_button_type(
+    parser: &mut Parser,
+) -> Result<InlineKeyboardButtonType, &'static str> {
+    Ok(match parser.i32_()? {
+        0 => InlineKeyboardButtonType::Url,
+        1 => InlineKeyboardButtonType::Callback,
+        2 => InlineKeyboardButtonType::CallbackGame,
+        3 => InlineKeyboardButtonType::SwitchInline,
+        4 => InlineKeyboardButtonType::SwitchInlineCurrentDialog,
+        5 => InlineKeyboardButtonType::Buy,
+        6 => InlineKeyboardButtonType::UrlAuth,
+        7 => InlineKeyboardButtonType::CallbackWithPassword,
+        8 => InlineKeyboardButtonType::User,
+        9 => InlineKeyboardButtonType::WebView,
+        10 => InlineKeyboardButtonType::Copy,
+        11 => InlineKeyboardButtonType::Disabled,
+        _ => return Err("Wrong inline keyboard button type"),
+    })
+}
+
+/// `TargetDialogTypes(vector<InlineQueryPeerType> &&)` (TargetDialogTypes.cpp:14-35)
+/// — the USERS/BOTS/CHATS/BROADCASTS bit mask.
+pub fn get_inline_query_peer_types_mask(peer_types: &[telegram_api::InlineQueryPeerType]) -> i64 {
+    const USERS_MASK: i64 = 1;
+    const BOTS_MASK: i64 = 2;
+    const CHATS_MASK: i64 = 4;
+    const BROADCASTS_MASK: i64 = 8;
+    let mut mask = 0i64;
+    for peer_type in peer_types {
+        mask |= match peer_type {
+            telegram_api::InlineQueryPeerType::inlineQueryPeerTypePM(_) => USERS_MASK,
+            telegram_api::InlineQueryPeerType::inlineQueryPeerTypeBotPM(_) => BOTS_MASK,
+            telegram_api::InlineQueryPeerType::inlineQueryPeerTypeChat(_)
+            | telegram_api::InlineQueryPeerType::inlineQueryPeerTypeMegagroup(_) => CHATS_MASK,
+            telegram_api::InlineQueryPeerType::inlineQueryPeerTypeBroadcast(_) => BROADCASTS_MASK,
+            telegram_api::InlineQueryPeerType::inlineQueryPeerTypeSameBotPM(_) => {
+                log_error!("Receive inlineQueryPeerTypeSameBotPM");
+                0
+            }
+        };
+    }
+    mask
+}
+
+/// `ReplyMarkup::Type` (ReplyMarkup.h:27) — append only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(i32)]
+pub enum ReplyMarkupType {
+    InlineKeyboard = 0,
+    ShowKeyboard = 1,
+    RemoveKeyboard = 2,
+    #[default]
+    ForceReply = 3,
+}
+
+/// `td::ReplyMarkup` (ReplyMarkup.h:25-49) — the internal reply markup a
+/// `Message` holds. The M.10.1b stand-in typed this as the generated
+/// `telegram_api::ReplyMarkup`; M.10.2b re-points `Message::reply_markup`
+/// here and keeps the wire conversion in [`ReplyMarkup::from_telegram`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ReplyMarkup {
+    pub r#type: ReplyMarkupType,
+    /// for ShowKeyboard, RemoveKeyboard, ForceReply
+    pub is_personal: bool,
+    /// for ShowKeyboard, InlineKeyboard
+    pub force_reply: bool,
+    /// for ShowKeyboard
+    pub is_persistent: bool,
+    /// for ShowKeyboard
+    pub need_resize_keyboard: bool,
+    /// for ShowKeyboard
+    pub is_one_time_keyboard: bool,
+    /// for ShowKeyboard
+    pub keyboard: Vec<Vec<KeyboardButton>>,
+    /// for ShowKeyboard, ForceReply
+    pub placeholder: String,
+    /// for InlineKeyboard
+    pub inline_keyboard: Vec<Vec<InlineKeyboardButton>>,
+}
+
+impl ReplyMarkup {
+    /// `get_reply_markup(telegram_api::ReplyMarkup &&, ...)` (ReplyMarkup.cpp:37-135).
+    pub fn from_telegram(
+        reply_markup: telegram_api::ReplyMarkup,
+        only_inline_keyboard: bool,
+        is_bot: bool,
+        message_contains_mention: bool,
+    ) -> Option<ReplyMarkup> {
+        let mut result = ReplyMarkup::default();
+        match reply_markup {
+            telegram_api::ReplyMarkup::replyInlineMarkup(inline_markup) => {
+                result.r#type = ReplyMarkupType::InlineKeyboard;
+                for row in &inline_markup.rows {
+                    let mut buttons = Vec::new();
+                    for button in &row.buttons {
+                        let button = InlineKeyboardButton::from_telegram(button.clone());
+                        if !button.text.is_empty() || button.style.icon_custom_emoji_id.is_valid() {
+                            buttons.push(button);
+                        }
+                    }
+                    if !buttons.is_empty() {
+                        result.inline_keyboard.push(buttons);
+                    }
+                }
+                if result.inline_keyboard.is_empty() {
+                    return None;
+                }
+                result.force_reply = inline_markup.force_reply;
+            }
+            telegram_api::ReplyMarkup::replyKeyboardMarkup(keyboard_markup) => {
+                if only_inline_keyboard {
+                    log_error!("Inline keyboard expected");
+                    return None;
+                }
+                result.r#type = ReplyMarkupType::ShowKeyboard;
+                result.is_persistent = keyboard_markup.persistent;
+                result.need_resize_keyboard = keyboard_markup.resize;
+                result.is_one_time_keyboard = keyboard_markup.single_use;
+                result.is_personal = keyboard_markup.selective;
+                result.force_reply = keyboard_markup.force_reply;
+                result.placeholder = keyboard_markup.placeholder;
+                for row in &keyboard_markup.rows {
+                    let mut buttons = Vec::new();
+                    for button in &row.buttons {
+                        let button = KeyboardButton::from_telegram(button.clone());
+                        if !button.is_empty() {
+                            buttons.push(button);
+                        }
+                    }
+                    if !buttons.is_empty() {
+                        result.keyboard.push(buttons);
+                    }
+                }
+                if result.keyboard.is_empty() {
+                    return None;
+                }
+            }
+            telegram_api::ReplyMarkup::replyKeyboardHide(hide_keyboard_markup) => {
+                if only_inline_keyboard {
+                    log_error!("Inline keyboard expected");
+                    return None;
+                }
+                result.r#type = ReplyMarkupType::RemoveKeyboard;
+                result.is_personal = hide_keyboard_markup.selective;
+            }
+            telegram_api::ReplyMarkup::replyKeyboardForceReply(force_reply_markup) => {
+                if only_inline_keyboard {
+                    log_error!("Inline keyboard expected");
+                    return None;
+                }
+                result.r#type = ReplyMarkupType::ForceReply;
+                result.is_personal = force_reply_markup.selective;
+                result.placeholder = force_reply_markup.placeholder;
+            }
+        }
+
+        if !is_bot && result.r#type != ReplyMarkupType::InlineKeyboard {
+            // incoming keyboard
+            if result.is_personal {
+                if !message_contains_mention {
+                    result.is_personal = false;
+                    result.force_reply = false;
+                }
+            } else {
+                result.is_personal = true;
+            }
+        }
+
+        Some(result)
+    }
+
+    /// `store(const ReplyMarkup &, ...)` (ReplyMarkup.hpp:17-42).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let has_keyboard = !self.keyboard.is_empty();
+        let has_inline_keyboard = !self.inline_keyboard.is_empty();
+        let has_placeholder = !self.placeholder.is_empty();
+        store_flags(
+            out,
+            [
+                self.is_personal,
+                self.need_resize_keyboard,
+                self.is_one_time_keyboard,
+                has_keyboard,
+                has_inline_keyboard,
+                has_placeholder,
+                self.is_persistent,
+                self.force_reply,
+            ],
+        );
+        store_i32(out, self.r#type as i32);
+        if has_keyboard {
+            store_button_rows(out, &self.keyboard);
+        }
+        if has_inline_keyboard {
+            store_inline_button_rows(out, &self.inline_keyboard);
+        }
+        if has_placeholder {
+            store_string(out, &self.placeholder);
+        }
+    }
+
+    /// `parse(ReplyMarkup &, ...)` (ReplyMarkup.hpp:44-69).
+    pub fn parse_from(parser: &mut Parser) -> Result<ReplyMarkup, &'static str> {
+        let [
+            is_personal,
+            need_resize_keyboard,
+            is_one_time_keyboard,
+            has_keyboard,
+            has_inline_keyboard,
+            has_placeholder,
+            is_persistent,
+            force_reply,
+        ] = parser.parse_flags::<8>()?;
+        let r#type = match parser.i32_()? {
+            0 => ReplyMarkupType::InlineKeyboard,
+            1 => ReplyMarkupType::ShowKeyboard,
+            2 => ReplyMarkupType::RemoveKeyboard,
+            3 => ReplyMarkupType::ForceReply,
+            _ => return Err("Wrong reply markup type"),
+        };
+        let keyboard = if has_keyboard {
+            parse_button_rows(parser)?
+        } else {
+            Vec::new()
+        };
+        let inline_keyboard = if has_inline_keyboard {
+            parse_inline_button_rows(parser)?
+        } else {
+            Vec::new()
+        };
+        let placeholder = if has_placeholder {
+            parser.string()?
+        } else {
+            String::new()
+        };
+        Ok(ReplyMarkup {
+            r#type,
+            is_personal,
+            force_reply,
+            is_persistent,
+            need_resize_keyboard,
+            is_one_time_keyboard,
+            keyboard,
+            placeholder,
+            inline_keyboard,
+        })
+    }
+}
+
+fn store_button_rows(out: &mut Vec<u8>, rows: &[Vec<KeyboardButton>]) {
+    store_vec_header(out, rows.len());
+    for row in rows {
+        store_vec_header(out, row.len());
+        for button in row {
+            button.store(out);
+        }
+    }
+}
+
+fn parse_button_rows(parser: &mut Parser) -> Result<Vec<Vec<KeyboardButton>>, &'static str> {
+    let rows_count = parser.i32_()?;
+    if rows_count < 0 || rows_count as usize > parser.left_len() {
+        return Err("Wrong vector length");
+    }
+    let mut rows = Vec::with_capacity(rows_count as usize);
+    for _ in 0..rows_count {
+        let buttons_count = parser.i32_()?;
+        if buttons_count < 0 || buttons_count as usize > parser.left_len() {
+            return Err("Wrong vector length");
+        }
+        let mut buttons = Vec::with_capacity(buttons_count as usize);
+        for _ in 0..buttons_count {
+            buttons.push(KeyboardButton::parse_from(parser)?);
+        }
+        rows.push(buttons);
+    }
+    Ok(rows)
+}
+
+fn store_inline_button_rows(out: &mut Vec<u8>, rows: &[Vec<InlineKeyboardButton>]) {
+    store_vec_header(out, rows.len());
+    for row in rows {
+        store_vec_header(out, row.len());
+        for button in row {
+            button.store(out);
+        }
+    }
+}
+
+fn parse_inline_button_rows(
+    parser: &mut Parser,
+) -> Result<Vec<Vec<InlineKeyboardButton>>, &'static str> {
+    let rows_count = parser.i32_()?;
+    if rows_count < 0 || rows_count as usize > parser.left_len() {
+        return Err("Wrong vector length");
+    }
+    let mut rows = Vec::with_capacity(rows_count as usize);
+    for _ in 0..rows_count {
+        let buttons_count = parser.i32_()?;
+        if buttons_count < 0 || buttons_count as usize > parser.left_len() {
+            return Err("Wrong vector length");
+        }
+        let mut buttons = Vec::with_capacity(buttons_count as usize);
+        for _ in 0..buttons_count {
+            buttons.push(InlineKeyboardButton::parse_from(parser)?);
+        }
+        rows.push(buttons);
+    }
+    Ok(rows)
+}
+
+// ---------------------------------------------------------------------------
 // M.10.1b batch 2 — the Message/Dialog struct plane (MessagesManager.h
 // 1118-1269 and 1308-1492), with the companions those structs pull in:
 // SuggestedPost.h, MessageForwardInfo.h (LastForwardedMessageInfo),
@@ -4885,7 +5917,7 @@ pub struct Message {
     pub media_album_id: i64,
     pub effect_id: MessageEffectId,
     pub content: Option<MessageContent>,
-    pub reply_markup: Option<Box<telegram_api::ReplyMarkup>>,
+    pub reply_markup: Option<Box<ReplyMarkup>>,
     pub ephemeral_message: Option<Box<Message>>,
     pub schedule_repeat_period: i32,
     pub edited_schedule_date: i32,
@@ -5015,6 +6047,1033 @@ impl Default for Message {
             send_query_ref: SendQueryRef::default(),
         }
     }
+}
+
+/// `get_default_service_message_content_reactions_are_possible`
+/// (MessageContentType.cpp:1144-1176) — the static default for
+/// `Message::reactions_are_possible`; the classification family lives in
+/// M.9's `message_content`, this entry arrives with the M.10 store plane
+/// (move at the next M.9 touch).
+pub fn get_default_service_message_content_reactions_are_possible(
+    content_type: MessageContentType,
+) -> bool {
+    matches!(
+        content_type,
+        MessageContentType::BoostApply
+            | MessageContentType::Call
+            | MessageContentType::ChangeCommunity
+            | MessageContentType::ChangeCreator
+            | MessageContentType::ChatAddUsers
+            | MessageContentType::ChatChangePhoto
+            | MessageContentType::ChatChangeTitle
+            | MessageContentType::ChatDeletePhoto
+            | MessageContentType::ChatDeleteUser
+            | MessageContentType::ChatJoinedByLink
+            | MessageContentType::ChatJoinedViaCommunity
+            | MessageContentType::ChatSetTheme
+            | MessageContentType::ChatSetTtl
+            | MessageContentType::ConferenceCall
+            | MessageContentType::ContactRegistered
+            | MessageContentType::GameScore
+            | MessageContentType::GiftCode
+            | MessageContentType::GiftPremium
+            | MessageContentType::GiftStars
+            | MessageContentType::GiveawayResults
+            | MessageContentType::GroupCall
+            | MessageContentType::InviteToGroupCall
+            | MessageContentType::ManagedBotCreated
+            | MessageContentType::NewCreatorPending
+            | MessageContentType::NoForwardsRequest
+            | MessageContentType::NoForwardsToggle
+            | MessageContentType::PaidMessagesPrice
+            | MessageContentType::PaidMessagesRefunded
+            | MessageContentType::PaymentRefunded
+            | MessageContentType::PaymentSuccessful
+            | MessageContentType::PinMessage
+            | MessageContentType::PollAppendAnswer
+            | MessageContentType::PollDeleteAnswer
+            | MessageContentType::PrizeStars
+            | MessageContentType::ProximityAlertTriggered
+            | MessageContentType::ScreenshotTaken
+            | MessageContentType::SetBackground
+            | MessageContentType::StarGift
+            | MessageContentType::StarGiftPurchaseOffer
+            | MessageContentType::StarGiftPurchaseOfferDeclined
+            | MessageContentType::StarGiftUnique
+            | MessageContentType::SuggestBirthday
+            | MessageContentType::SuggestedPostApproval
+            | MessageContentType::SuggestedPostRefund
+            | MessageContentType::SuggestedPostSuccess
+            | MessageContentType::SuggestProfilePhoto
+            | MessageContentType::TodoAppendTasks
+            | MessageContentType::TodoCompletions
+            | MessageContentType::TopicCreate
+            | MessageContentType::TopicEdit
+            | MessageContentType::WebsiteConnected
+            | MessageContentType::WebViewWriteAccessAllowed
+            | MessageContentType::WriteAccessAllowed
+            | MessageContentType::WriteAccessAllowedByRequest
+    )
+}
+
+impl Message {
+    /// `MessagesManager::Message::store` (MessagesManager.cpp:2308-2655).
+    /// The `TimeCtx` carries the `store_time` clocks (LogEventHelper.h).
+    pub fn store(
+        &self,
+        storage: &dyn crate::message_content::MessageContentStorage,
+        time: &crate::user_manager::TimeCtx,
+        out: &mut Vec<u8>,
+    ) {
+        let has_sender_user_id = self.sender_user_id.is_valid();
+        let has_edit_date = self.edit_date > 0;
+        let has_random_id = self.random_id != 0;
+        let is_reply_to_random_id = self.reply_to_random_id != 0;
+        let is_via_bot = self.via_bot_user_id.is_valid();
+        let has_view_count = self.view_count > 0;
+        let has_reply_markup = self.reply_markup.is_some();
+        let has_ttl = self.ttl.is_valid();
+        let has_author_signature = !self.author_signature.is_empty();
+        let has_media_album_id = self.media_album_id != 0;
+        let has_send_date = self.message_id.is_yet_unsent() && self.send_date != 0;
+        let has_flags2 = true;
+        let has_notification_id = self.notification_id.is_valid();
+        let has_send_error_code = self.send_error_code != 0;
+        let has_real_forward_from = self.real_forward_from_dialog_id.is_valid()
+            && self.real_forward_from_message_id.is_valid();
+        let has_legacy_layer = self.legacy_layer != 0;
+        let has_restriction_reasons = !self.restriction_reasons.is_empty();
+        let has_forward_count = self.forward_count > 0;
+        let has_reply_info = !self.reply_info.is_empty();
+        let has_sender_dialog_id = self.sender_dialog_id.is_valid();
+        let has_top_thread_message_id = self.top_thread_message_id.is_valid();
+        let has_thread_draft_message = self.thread_draft_message.is_some();
+        let has_local_thread_message_ids = !self.local_thread_message_ids.is_empty();
+        let has_linked_top_thread_message_id = self.linked_top_thread_message_id.is_valid();
+        let has_interaction_info_update_date = self.interaction_info_update_date != 0;
+        let has_send_emoji = !self.send_emoji.is_empty();
+        let has_ttl_period = self.ttl_period != 0;
+        let has_max_reply_media_timestamp = self.max_reply_media_timestamp >= 0;
+        let are_message_media_timestamp_entities_found = true;
+        let has_flags3 = true;
+        let has_reactions = self.reactions.is_some();
+        let has_available_reactions_generation = self.available_reactions_generation != 0;
+        let has_history_generation = self.history_generation != 0;
+        let is_reply_to_story = self.reply_to_story_full_id != StoryFullId::default();
+        let has_input_reply_to = !self.message_id.is_any_server() && self.input_reply_to.is_valid();
+        let has_replied_message_info = !self.replied_message_info.is_empty();
+        let has_forward_info = self.forward_info.is_some();
+        let has_saved_messages_topic_id = self.saved_messages_topic_id.is_valid();
+        let has_initial_top_thread_message_id =
+            !self.message_id.is_any_server() && self.initial_top_thread_message_id.is_valid();
+        let has_sender_boost_count = self.sender_boost_count != 0;
+        let has_via_business_bot_user_id = self.via_business_bot_user_id.is_valid();
+        let has_effect_id = self.effect_id.is_valid();
+        let has_fact_check = self.fact_check.is_some();
+        let has_initial_sender_dialog_id =
+            !self.message_id.is_any_server() && self.initial_sender_dialog_id.is_valid();
+        let has_reactions_are_possible = true;
+        let has_new_video_start_timestamp = self.new_video_start_timestamp >= 0;
+        let has_paid_message_star_count = self.paid_message_star_count > 0;
+        let has_suggested_post = self.suggested_post.is_some();
+        let has_flags4 = true;
+        let has_schedule_repeat_period = self.schedule_repeat_period != 0;
+        let has_summary_from_language = !self.summary_from_language.is_empty();
+        let has_sender_rank = !self.sender_rank.is_empty();
+        let has_guest_bot_via_dialog_id = self.guest_bot_via_dialog_id.is_valid();
+        let has_receiver_user_id = self.receiver_user_id.is_valid();
+        let has_ephemeral_message_id = self.ephemeral_message_id.is_valid();
+        let has_send_callback_query_id = self.send_callback_query_id != 0;
+        let has_chat_instance = self.chat_instance != 0;
+        let has_ephemeral_message = self.ephemeral_message.is_some();
+        store_flags(
+            out,
+            [
+                self.is_channel_post,
+                self.is_outgoing,
+                self.is_failed_to_send,
+                self.disable_notification,
+                self.contains_mention,
+                self.from_background,
+                self.disable_web_page_preview,
+                self.clear_draft,
+                false,
+                false,
+                has_sender_user_id,
+                has_edit_date,
+                has_random_id,
+                false,
+                false,
+                is_reply_to_random_id,
+                is_via_bot,
+                has_view_count,
+                has_reply_markup,
+                has_ttl,
+                has_author_signature,
+                false,
+                self.had_reply_markup,
+                self.contains_unread_mention,
+                has_media_album_id,
+                false,
+                self.in_game_share,
+                self.is_content_secret,
+                has_send_date,
+                has_flags2,
+            ],
+        );
+        if has_flags2 {
+            store_flags(
+                out,
+                [
+                    has_notification_id,
+                    self.is_mention_notification_disabled,
+                    self.had_forward_info,
+                    false,
+                    has_send_error_code,
+                    self.hide_via_bot,
+                    self.is_bot_start_message,
+                    has_real_forward_from,
+                    has_legacy_layer,
+                    self.hide_edit_date,
+                    has_restriction_reasons,
+                    self.is_from_scheduled,
+                    self.is_copy,
+                    false,
+                    has_forward_count,
+                    has_reply_info,
+                    has_sender_dialog_id,
+                    false,
+                    has_top_thread_message_id,
+                    has_thread_draft_message,
+                    has_local_thread_message_ids,
+                    has_linked_top_thread_message_id,
+                    self.is_pinned,
+                    has_interaction_info_update_date,
+                    has_send_emoji,
+                    false,
+                    has_ttl_period,
+                    has_max_reply_media_timestamp,
+                    are_message_media_timestamp_entities_found,
+                    has_flags3,
+                ],
+            );
+        }
+        if has_flags3 {
+            store_flags(
+                out,
+                [
+                    self.noforwards,
+                    self.has_explicit_sender,
+                    has_reactions,
+                    has_available_reactions_generation,
+                    self.update_stickersets_order,
+                    self.is_topic_message, // 5
+                    has_history_generation,
+                    is_reply_to_story,
+                    false,
+                    self.invert_media,
+                    has_input_reply_to, // 10
+                    has_replied_message_info,
+                    has_forward_info,
+                    has_saved_messages_topic_id,
+                    has_initial_top_thread_message_id,
+                    has_sender_boost_count, // 15
+                    has_via_business_bot_user_id,
+                    self.is_from_offline,
+                    has_effect_id,
+                    has_fact_check,
+                    has_initial_sender_dialog_id, // 20
+                    self.allow_paid,
+                    self.video_processing_pending,
+                    has_reactions_are_possible,
+                    self.reactions_are_possible,
+                    has_new_video_start_timestamp, // 25
+                    has_paid_message_star_count,
+                    has_suggested_post,
+                    self.is_paid_suggested_post_stars,
+                    has_flags4,
+                ],
+            );
+        }
+        if has_flags4 {
+            store_flags(
+                out,
+                [
+                    self.is_paid_suggested_post_ton,
+                    self.initial_is_topic_message,
+                    has_schedule_repeat_period,
+                    has_summary_from_language,
+                    self.is_quick_reply_message,
+                    has_sender_rank,
+                    has_guest_bot_via_dialog_id,
+                    has_receiver_user_id,
+                    has_ephemeral_message_id,
+                    has_send_callback_query_id,
+                    has_chat_instance,
+                    self.send_anchor,
+                    has_ephemeral_message,
+                ],
+            );
+        }
+        // update MessageDb::get_message_info when flags5 is added
+
+        self.message_id.store(out);
+        if has_sender_user_id {
+            self.sender_user_id.store(out);
+        }
+        store_i32(out, self.date);
+        if has_edit_date {
+            store_i32(out, self.edit_date);
+        }
+        if has_send_date {
+            store_i32(out, self.send_date);
+        }
+        if has_random_id {
+            store_i64(out, self.random_id);
+        }
+        if has_forward_info {
+            self.forward_info.as_ref().unwrap().store(out);
+        }
+        if has_real_forward_from {
+            self.real_forward_from_dialog_id.store(out);
+            self.real_forward_from_message_id.store(out);
+        }
+        if is_reply_to_random_id {
+            store_i64(out, self.reply_to_random_id);
+        }
+        if is_via_bot {
+            self.via_bot_user_id.store(out);
+        }
+        if has_view_count {
+            store_i32(out, self.view_count);
+        }
+        if has_forward_count {
+            store_i32(out, self.forward_count);
+        }
+        if has_reply_info {
+            self.reply_info.store(out);
+        }
+        if has_ttl {
+            self.ttl.store(out);
+            crate::user_manager::TimeCtx::store_time(out, self.ttl_expires_at, time);
+        }
+        if has_send_error_code {
+            store_i32(out, self.send_error_code);
+            store_string(out, &self.send_error_message);
+            if self.send_error_code == 429 {
+                crate::user_manager::TimeCtx::store_time(out, self.try_resend_at, time);
+            }
+        }
+        if has_author_signature {
+            store_string(out, &self.author_signature);
+        }
+        if has_media_album_id {
+            store_i64(out, self.media_album_id);
+        }
+        if has_notification_id {
+            self.notification_id.store(out);
+        }
+        if has_legacy_layer {
+            store_i32(out, self.legacy_layer);
+        }
+        if has_restriction_reasons {
+            crate::restriction_reason::store_restriction_reasons(out, &self.restriction_reasons);
+        }
+        if has_sender_dialog_id {
+            self.sender_dialog_id.store(out);
+        }
+        if has_top_thread_message_id {
+            self.top_thread_message_id.store(out);
+        }
+        if has_thread_draft_message {
+            self.thread_draft_message
+                .as_ref()
+                .unwrap()
+                .store(storage, out);
+        }
+        if has_local_thread_message_ids {
+            store_vec_header(out, self.local_thread_message_ids.len());
+            for message_id in &self.local_thread_message_ids {
+                message_id.store(out);
+            }
+        }
+        if has_linked_top_thread_message_id {
+            self.linked_top_thread_message_id.store(out);
+        }
+        if has_interaction_info_update_date {
+            store_i32(out, self.interaction_info_update_date);
+        }
+        if has_send_emoji {
+            store_string(out, &self.send_emoji);
+        }
+        crate::message_content::store_message_content(
+            self.content.as_ref().expect("message content must be set"),
+            storage,
+            out,
+        );
+        if has_reply_markup {
+            self.reply_markup.as_ref().unwrap().store(out);
+        }
+        if has_ttl_period {
+            store_i32(out, self.ttl_period);
+        }
+        if has_max_reply_media_timestamp {
+            store_i32(out, self.max_reply_media_timestamp);
+        }
+        if has_reactions {
+            self.reactions.as_ref().unwrap().store(out);
+        }
+        if has_available_reactions_generation {
+            store_i32(out, self.available_reactions_generation as i32);
+        }
+        if has_history_generation {
+            store_i32(out, self.history_generation as i32);
+        }
+        if is_reply_to_story {
+            self.reply_to_story_full_id.store(out);
+        }
+        if has_input_reply_to {
+            self.input_reply_to.store(out);
+        }
+        if has_replied_message_info {
+            self.replied_message_info.store(storage, out);
+        }
+        if has_saved_messages_topic_id {
+            self.saved_messages_topic_id.store(out);
+        }
+        if has_initial_top_thread_message_id {
+            self.initial_top_thread_message_id.store(out);
+        }
+        if has_sender_boost_count {
+            store_i32(out, self.sender_boost_count);
+        }
+        if has_via_business_bot_user_id {
+            self.via_business_bot_user_id.store(out);
+        }
+        if has_effect_id {
+            self.effect_id.store(out);
+        }
+        if has_fact_check {
+            self.fact_check.as_ref().unwrap().store(out);
+        }
+        if has_initial_sender_dialog_id {
+            self.initial_sender_dialog_id.store(out);
+        }
+        if has_new_video_start_timestamp {
+            store_i32(out, self.new_video_start_timestamp);
+        }
+        if has_paid_message_star_count {
+            store_i64(out, self.paid_message_star_count);
+        }
+        if has_suggested_post {
+            self.suggested_post.as_ref().unwrap().store(out);
+        }
+        if has_schedule_repeat_period {
+            store_i32(out, self.schedule_repeat_period);
+        }
+        if has_summary_from_language {
+            store_string(out, &self.summary_from_language);
+        }
+        if has_sender_rank {
+            store_string(out, &self.sender_rank);
+        }
+        if has_guest_bot_via_dialog_id {
+            self.guest_bot_via_dialog_id.store(out);
+        }
+        if has_receiver_user_id {
+            self.receiver_user_id.store(out);
+        }
+        if has_ephemeral_message_id {
+            self.ephemeral_message_id.store(out);
+        }
+        if has_send_callback_query_id {
+            store_i64(out, self.send_callback_query_id);
+        }
+        if has_chat_instance {
+            store_i64(out, self.chat_instance);
+        }
+        if has_ephemeral_message {
+            self.ephemeral_message
+                .as_ref()
+                .unwrap()
+                .store(storage, time, out);
+        }
+    }
+
+    /// `MessagesManager::Message::parse` (MessagesManager.cpp:2658-3096)
+    /// — the whole legacy ladder (forwarded/reply flags of every era) plus
+    /// the closing repairs. "do not forget to resolve message dependencies".
+    pub fn parse_from(
+        parser: &mut Parser,
+        storage: &mut dyn crate::message_content::MessageContentStorage,
+        time: &crate::user_manager::TimeCtx,
+    ) -> Result<Message, &'static str> {
+        let mut m = Message::default();
+        let mut has_notification_id = false;
+        let [
+            is_channel_post,
+            is_outgoing,
+            is_failed_to_send,
+            disable_notification,
+            contains_mention,
+            from_background,
+            disable_web_page_preview,
+            clear_draft,
+            _legacy_have_previous,
+            _legacy_have_next,
+            has_sender_user_id,
+            has_edit_date,
+            has_random_id,
+            legacy_is_forwarded,
+            legacy_is_reply,
+            is_reply_to_random_id,
+            is_via_bot,
+            has_view_count,
+            has_reply_markup,
+            has_ttl,
+            has_author_signature,
+            legacy_has_forward_author_signature,
+            had_reply_markup,
+            contains_unread_mention,
+            has_media_album_id,
+            legacy_has_forward_from,
+            in_game_share,
+            is_content_secret,
+            has_send_date,
+            has_flags2,
+        ] = parser.parse_flags::<30>()?;
+        let mut legacy_has_forward_sender_name = false;
+        let mut has_send_error_code = false;
+        let mut has_real_forward_from = false;
+        let mut has_legacy_layer = false;
+        let mut has_restriction_reasons = false;
+        let mut legacy_has_forward_psa_type = false;
+        let mut has_forward_count = false;
+        let mut has_reply_info = false;
+        let mut has_sender_dialog_id = false;
+        let mut legacy_has_reply_in_dialog_id = false;
+        let mut has_top_thread_message_id = false;
+        let mut has_thread_draft_message = false;
+        let mut has_local_thread_message_ids = false;
+        let mut has_linked_top_thread_message_id = false;
+        let mut has_interaction_info_update_date = false;
+        let mut has_send_emoji = false;
+        let mut legacy_is_imported = false;
+        let mut has_ttl_period = false;
+        let mut has_max_reply_media_timestamp = false;
+        let mut has_flags3 = false;
+        if has_flags2 {
+            let [
+                has_notification_id_,
+                is_mention_notification_disabled,
+                had_forward_info,
+                legacy_has_forward_sender_name_,
+                has_send_error_code_,
+                hide_via_bot,
+                is_bot_start_message,
+                has_real_forward_from_,
+                has_legacy_layer_,
+                hide_edit_date,
+                has_restriction_reasons_,
+                is_from_scheduled,
+                is_copy,
+                legacy_has_forward_psa_type_,
+                has_forward_count_,
+                has_reply_info_,
+                has_sender_dialog_id_,
+                legacy_has_reply_in_dialog_id_,
+                has_top_thread_message_id_,
+                has_thread_draft_message_,
+                has_local_thread_message_ids_,
+                has_linked_top_thread_message_id_,
+                is_pinned,
+                has_interaction_info_update_date_,
+                has_send_emoji_,
+                legacy_is_imported_,
+                has_ttl_period_,
+                has_max_reply_media_timestamp_,
+                are_media_timestamp_entities_found,
+                has_flags3_,
+            ] = parser.parse_flags::<30>()?;
+            has_notification_id = has_notification_id_;
+            m.is_mention_notification_disabled = is_mention_notification_disabled;
+            m.had_forward_info = had_forward_info;
+            legacy_has_forward_sender_name = legacy_has_forward_sender_name_;
+            has_send_error_code = has_send_error_code_;
+            m.hide_via_bot = hide_via_bot;
+            m.is_bot_start_message = is_bot_start_message;
+            has_real_forward_from = has_real_forward_from_;
+            has_legacy_layer = has_legacy_layer_;
+            m.hide_edit_date = hide_edit_date;
+            has_restriction_reasons = has_restriction_reasons_;
+            m.is_from_scheduled = is_from_scheduled;
+            m.is_copy = is_copy;
+            legacy_has_forward_psa_type = legacy_has_forward_psa_type_;
+            has_forward_count = has_forward_count_;
+            has_reply_info = has_reply_info_;
+            has_sender_dialog_id = has_sender_dialog_id_;
+            legacy_has_reply_in_dialog_id = legacy_has_reply_in_dialog_id_;
+            has_top_thread_message_id = has_top_thread_message_id_;
+            has_thread_draft_message = has_thread_draft_message_;
+            has_local_thread_message_ids = has_local_thread_message_ids_;
+            has_linked_top_thread_message_id = has_linked_top_thread_message_id_;
+            m.is_pinned = is_pinned;
+            has_interaction_info_update_date = has_interaction_info_update_date_;
+            has_send_emoji = has_send_emoji_;
+            legacy_is_imported = legacy_is_imported_;
+            has_ttl_period = has_ttl_period_;
+            has_max_reply_media_timestamp = has_max_reply_media_timestamp_;
+            m.are_media_timestamp_entities_found = are_media_timestamp_entities_found;
+            has_flags3 = has_flags3_;
+        }
+        let mut has_reactions = false;
+        let mut has_available_reactions_generation = false;
+        let mut has_history_generation = false;
+        let mut is_reply_to_story = false;
+        let mut legacy_has_forward_origin = false;
+        let mut has_input_reply_to = false;
+        let mut has_replied_message_info = false;
+        let mut has_forward_info = false;
+        let mut has_saved_messages_topic_id = false;
+        let mut has_initial_top_thread_message_id = false;
+        let mut has_sender_boost_count = false;
+        let mut has_via_business_bot_user_id = false;
+        let mut has_effect_id = false;
+        let mut has_fact_check = false;
+        let mut has_initial_sender_dialog_id = false;
+        let mut has_reactions_are_possible = false;
+        let mut has_new_video_start_timestamp = false;
+        let mut has_paid_message_star_count = false;
+        let mut has_suggested_post = false;
+        let mut has_flags4 = false;
+        let mut has_schedule_repeat_period = false;
+        let mut has_summary_from_language = false;
+        let mut has_sender_rank = false;
+        let mut has_guest_bot_via_dialog_id = false;
+        let mut has_receiver_user_id = false;
+        let mut has_ephemeral_message_id = false;
+        let mut has_send_callback_query_id = false;
+        let mut has_chat_instance = false;
+        let mut has_ephemeral_message = false;
+        if has_flags3 {
+            let [
+                noforwards,
+                has_explicit_sender,
+                has_reactions_,
+                has_available_reactions_generation_,
+                update_stickersets_order,
+                is_topic_message,
+                has_history_generation_,
+                is_reply_to_story_,
+                legacy_has_forward_origin_,
+                invert_media,
+                has_input_reply_to_,
+                has_replied_message_info_,
+                has_forward_info_,
+                has_saved_messages_topic_id_,
+                has_initial_top_thread_message_id_,
+                has_sender_boost_count_,
+                has_via_business_bot_user_id_,
+                is_from_offline,
+                has_effect_id_,
+                has_fact_check_,
+                has_initial_sender_dialog_id_,
+                allow_paid,
+                video_processing_pending,
+                has_reactions_are_possible_,
+                reactions_are_possible,
+                has_new_video_start_timestamp_,
+                has_paid_message_star_count_,
+                has_suggested_post_,
+                is_paid_suggested_post_stars,
+                has_flags4_,
+            ] = parser.parse_flags::<30>()?;
+            m.noforwards = noforwards;
+            m.has_explicit_sender = has_explicit_sender;
+            has_reactions = has_reactions_;
+            has_available_reactions_generation = has_available_reactions_generation_;
+            m.update_stickersets_order = update_stickersets_order;
+            m.is_topic_message = is_topic_message;
+            has_history_generation = has_history_generation_;
+            is_reply_to_story = is_reply_to_story_;
+            legacy_has_forward_origin = legacy_has_forward_origin_;
+            m.invert_media = invert_media;
+            has_input_reply_to = has_input_reply_to_;
+            has_replied_message_info = has_replied_message_info_;
+            has_forward_info = has_forward_info_;
+            has_saved_messages_topic_id = has_saved_messages_topic_id_;
+            has_initial_top_thread_message_id = has_initial_top_thread_message_id_;
+            has_sender_boost_count = has_sender_boost_count_;
+            has_via_business_bot_user_id = has_via_business_bot_user_id_;
+            m.is_from_offline = is_from_offline;
+            has_effect_id = has_effect_id_;
+            has_fact_check = has_fact_check_;
+            has_initial_sender_dialog_id = has_initial_sender_dialog_id_;
+            m.allow_paid = allow_paid;
+            m.video_processing_pending = video_processing_pending;
+            has_reactions_are_possible = has_reactions_are_possible_;
+            m.reactions_are_possible = reactions_are_possible;
+            has_new_video_start_timestamp = has_new_video_start_timestamp_;
+            has_paid_message_star_count = has_paid_message_star_count_;
+            has_suggested_post = has_suggested_post_;
+            m.is_paid_suggested_post_stars = is_paid_suggested_post_stars;
+            has_flags4 = has_flags4_;
+        }
+        if has_flags4 {
+            let [
+                is_paid_suggested_post_ton,
+                initial_is_topic_message,
+                has_schedule_repeat_period_,
+                has_summary_from_language_,
+                is_quick_reply_message,
+                has_sender_rank_,
+                has_guest_bot_via_dialog_id_,
+                has_receiver_user_id_,
+                has_ephemeral_message_id_,
+                has_send_callback_query_id_,
+                has_chat_instance_,
+                send_anchor,
+                has_ephemeral_message_,
+            ] = parser.parse_flags::<13>()?;
+            has_schedule_repeat_period = has_schedule_repeat_period_;
+            has_summary_from_language = has_summary_from_language_;
+            has_sender_rank = has_sender_rank_;
+            has_guest_bot_via_dialog_id = has_guest_bot_via_dialog_id_;
+            has_receiver_user_id = has_receiver_user_id_;
+            has_ephemeral_message_id = has_ephemeral_message_id_;
+            has_send_callback_query_id = has_send_callback_query_id_;
+            has_chat_instance = has_chat_instance_;
+            has_ephemeral_message = has_ephemeral_message_;
+            m.is_paid_suggested_post_ton = is_paid_suggested_post_ton;
+            m.initial_is_topic_message = initial_is_topic_message;
+            m.is_quick_reply_message = is_quick_reply_message;
+            m.send_anchor = send_anchor;
+        }
+
+        m.is_channel_post = is_channel_post;
+        m.is_outgoing = is_outgoing;
+        m.is_failed_to_send = is_failed_to_send;
+        m.disable_notification = disable_notification;
+        m.contains_mention = contains_mention;
+        m.from_background = from_background;
+        m.disable_web_page_preview = disable_web_page_preview;
+        m.clear_draft = clear_draft;
+        m.had_reply_markup = had_reply_markup;
+        m.contains_unread_mention = contains_unread_mention;
+        m.in_game_share = in_game_share;
+        m.is_content_secret = is_content_secret;
+
+        m.message_id = MessageId::parse_from(parser)?;
+        if !m.message_id.is_valid() && !m.message_id.is_valid_scheduled() {
+            return Err("Invalid message identifier");
+        }
+        if has_sender_user_id {
+            m.sender_user_id = UserId::parse_from(parser)?;
+        }
+        m.date = parser.i32_()?;
+        if has_edit_date {
+            m.edit_date = parser.i32_()?;
+        }
+        if has_send_date {
+            if !m.message_id.is_yet_unsent() {
+                return Err("Unexpected send date");
+            }
+            m.send_date = parser.i32_()?;
+        } else if m.message_id.is_valid() && m.message_id.is_yet_unsent() {
+            m.send_date = m.date; // for backward compatibility
+        }
+        if has_random_id {
+            m.random_id = parser.i64_()?;
+        }
+        if has_forward_info {
+            m.forward_info = Some(MessageForwardInfo::parse_from(parser)?);
+        } else if legacy_is_forwarded {
+            let (forward_origin, forward_date) = if legacy_has_forward_origin {
+                (MessageOrigin::parse_from(parser)?, parser.i32_()?)
+            } else {
+                let forward_sender_user_id = UserId::parse_from(parser)?;
+                let forward_date = parser.i32_()?;
+                let forward_sender_dialog_id = DialogId::parse_from(parser)?;
+                let forward_message_id = MessageId::parse_from(parser)?;
+                let forward_author_signature = if legacy_has_forward_author_signature {
+                    parser.string()?
+                } else {
+                    String::new()
+                };
+                let forward_sender_name = if legacy_has_forward_sender_name {
+                    parser.string()?
+                } else {
+                    String::new()
+                };
+                (
+                    MessageOrigin::new(
+                        forward_sender_user_id,
+                        forward_sender_dialog_id,
+                        forward_message_id,
+                        forward_author_signature,
+                        forward_sender_name,
+                    ),
+                    forward_date,
+                )
+            };
+            let mut last_message_info = LastForwardedMessageInfo::default();
+            if legacy_has_forward_from {
+                let forward_from_dialog_id = DialogId::parse_from(parser)?;
+                let forward_from_message_id = MessageId::parse_from(parser)?;
+                last_message_info = LastForwardedMessageInfo {
+                    dialog_id: forward_from_dialog_id,
+                    message_id: forward_from_message_id,
+                    sender_dialog_id: DialogId::default(),
+                    sender_name: String::new(),
+                    date: 0,
+                    is_outgoing: false,
+                };
+            }
+            let psa_type = if legacy_has_forward_psa_type {
+                parser.string()?
+            } else {
+                String::new()
+            };
+            m.forward_info = Some(MessageForwardInfo {
+                origin: forward_origin,
+                date: forward_date,
+                last_message_info,
+                psa_type,
+                is_imported: legacy_is_imported,
+            });
+        }
+        if has_real_forward_from {
+            m.real_forward_from_dialog_id = DialogId::parse_from(parser)?;
+            m.real_forward_from_message_id = MessageId::parse_from(parser)?;
+        }
+        let mut legacy_reply_to_message_id = MessageId::default();
+        if legacy_is_reply {
+            legacy_reply_to_message_id = MessageId::parse_from(parser)?;
+        }
+        if is_reply_to_random_id {
+            m.reply_to_random_id = parser.i64_()?;
+        }
+        if is_via_bot {
+            m.via_bot_user_id = UserId::parse_from(parser)?;
+        }
+        if has_view_count {
+            m.view_count = parser.i32_()?;
+        }
+        if has_forward_count {
+            m.forward_count = parser.i32_()?;
+        }
+        if has_reply_info {
+            m.reply_info = MessageReplyInfo::parse_from(parser)?;
+        }
+        if has_ttl {
+            m.ttl = MessageSelfDestructType::parse_from(parser)?;
+            m.ttl_expires_at = crate::user_manager::TimeCtx::parse_time(parser, time)?;
+        }
+        if has_send_error_code {
+            m.send_error_code = parser.i32_()?;
+            m.send_error_message = parser.string()?;
+            if m.send_error_code == 429 {
+                m.try_resend_at = crate::user_manager::TimeCtx::parse_time(parser, time)?;
+            }
+        }
+        if has_author_signature {
+            m.author_signature = parser.string()?;
+        }
+        if has_media_album_id {
+            m.media_album_id = parser.i64_()?;
+        }
+        if has_notification_id {
+            m.notification_id = NotificationId::parse_from(parser)?;
+        }
+        if has_legacy_layer {
+            m.legacy_layer = parser.i32_()?;
+        }
+        if has_restriction_reasons {
+            m.restriction_reasons = crate::restriction_reason::parse_restriction_reasons(parser)?;
+        }
+        if has_sender_dialog_id {
+            m.sender_dialog_id = DialogId::parse_from(parser)?;
+        }
+        let mut legacy_reply_in_dialog_id = DialogId::default();
+        if legacy_has_reply_in_dialog_id {
+            legacy_reply_in_dialog_id = DialogId::parse_from(parser)?;
+        }
+        if has_top_thread_message_id {
+            m.top_thread_message_id = MessageId::parse_from(parser)?;
+        }
+        if has_thread_draft_message {
+            m.thread_draft_message = Some(DraftMessage::parse_from(parser, storage)?);
+        }
+        if has_local_thread_message_ids {
+            let size = parser.i32_()?;
+            if size < 0 || size as usize > parser.left_len() / 4 {
+                return Err("Wrong vector length");
+            }
+            for _ in 0..size {
+                m.local_thread_message_ids
+                    .push(MessageId::parse_from(parser)?);
+            }
+        }
+        if has_linked_top_thread_message_id {
+            m.linked_top_thread_message_id = MessageId::parse_from(parser)?;
+        }
+        if has_interaction_info_update_date {
+            m.interaction_info_update_date = parser.i32_()?;
+        }
+        if has_send_emoji {
+            m.send_emoji = parser.string()?;
+        }
+        m.content = Some(crate::message_content::parse_message_content(
+            parser, storage,
+        )?);
+        if has_reply_markup {
+            m.reply_markup = Some(Box::new(ReplyMarkup::parse_from(parser)?));
+        }
+        if has_ttl_period {
+            m.ttl_period = parser.i32_()?;
+        }
+        if has_max_reply_media_timestamp {
+            m.max_reply_media_timestamp = parser.i32_()?;
+        }
+        if has_reactions {
+            m.reactions = Some(MessageReactions::parse_from(parser)?);
+        }
+        if has_available_reactions_generation {
+            m.available_reactions_generation = parser.i32_()? as u32;
+        }
+        if has_history_generation {
+            m.history_generation = parser.i32_()? as u32;
+        }
+        if is_reply_to_story {
+            m.reply_to_story_full_id = StoryFullId::parse_from(parser)?;
+        }
+        if has_input_reply_to {
+            m.input_reply_to = MessageInputReplyTo::parse_from(parser)?;
+        } else if !m.message_id.is_any_server() {
+            if m.reply_to_story_full_id.is_valid() {
+                m.input_reply_to = MessageInputReplyTo {
+                    story_full_id: m.reply_to_story_full_id,
+                    ..MessageInputReplyTo::default()
+                };
+            } else if legacy_reply_to_message_id.is_valid() {
+                m.input_reply_to = MessageInputReplyTo::regular(legacy_reply_to_message_id);
+            }
+        }
+        if has_replied_message_info {
+            m.replied_message_info = RepliedMessageInfo::parse_from(parser, storage)?;
+        } else {
+            m.replied_message_info =
+                RepliedMessageInfo::legacy(legacy_reply_to_message_id, legacy_reply_in_dialog_id);
+        }
+        if has_saved_messages_topic_id {
+            m.saved_messages_topic_id = SavedMessagesTopicId::parse_from(parser)?;
+        }
+        if has_initial_top_thread_message_id {
+            m.initial_top_thread_message_id = MessageId::parse_from(parser)?;
+        }
+        if has_sender_boost_count {
+            m.sender_boost_count = parser.i32_()?;
+        }
+        if has_via_business_bot_user_id {
+            m.via_business_bot_user_id = UserId::parse_from(parser)?;
+        }
+        if has_effect_id {
+            m.effect_id = MessageEffectId::parse_from(parser)?;
+        }
+        if has_fact_check {
+            m.fact_check = Some(FactCheck::parse_from(parser)?);
+        }
+        if has_initial_sender_dialog_id {
+            m.initial_sender_dialog_id = DialogId::parse_from(parser)?;
+        }
+        if has_new_video_start_timestamp {
+            m.new_video_start_timestamp = parser.i32_()?;
+        } else {
+            m.new_video_start_timestamp = -1;
+        }
+        if has_paid_message_star_count {
+            m.paid_message_star_count = parser.i64_()?;
+        }
+        if has_suggested_post {
+            m.suggested_post = Some(SuggestedPost::parse_from(parser)?);
+        }
+        if has_schedule_repeat_period {
+            m.schedule_repeat_period = parser.i32_()?;
+        }
+        if has_summary_from_language {
+            m.summary_from_language = parser.string()?;
+        }
+        if has_sender_rank {
+            m.sender_rank = parser.string()?;
+        }
+        if has_guest_bot_via_dialog_id {
+            m.guest_bot_via_dialog_id = DialogId::parse_from(parser)?;
+        }
+        if has_receiver_user_id {
+            m.receiver_user_id = UserId::parse_from(parser)?;
+            if !m.receiver_user_id.is_valid() {
+                return Err("Invalid ephemeral message receiver identifier");
+            }
+        }
+        if has_ephemeral_message_id {
+            m.ephemeral_message_id = EphemeralMessageId::parse_from(parser)?;
+            if !m.ephemeral_message_id.is_valid() {
+                return Err("Invalid ephemeral message identifier");
+            }
+        }
+        if has_send_callback_query_id {
+            m.send_callback_query_id = parser.i64_()?;
+        }
+        if has_chat_instance {
+            m.chat_instance = parser.i64_()?;
+        }
+        if has_ephemeral_message {
+            m.ephemeral_message = Some(Box::new(Message::parse_from(parser, storage, time)?));
+        }
+
+        let content = m.content.as_ref().unwrap();
+        m.is_content_secret |= self_destruct_is_secret(m.ttl, content.get_type()); // repair is_content_secret for old messages
+        if m.hide_edit_date && content.get_type() == MessageContentType::LiveLocation {
+            m.hide_edit_date = false;
+        }
+        if !has_reactions_are_possible {
+            m.reactions_are_possible =
+                get_default_service_message_content_reactions_are_possible(content.get_type());
+        }
+        Ok(m)
+    }
+}
+
+/// `log_event_store(Message)` — the version-prefixed database value
+/// (MessagesManager.cpp:31879/31924 `log_event_store(*m)`).
+pub fn store_message_log_event(
+    message: &Message,
+    storage: &dyn crate::message_content::MessageContentStorage,
+    time: &crate::user_manager::TimeCtx,
+    out: &mut Vec<u8>,
+) {
+    crate::store_parse::store_log_event_version(out);
+    message.store(storage, time, out);
+}
+
+/// `log_event_parse(Message, value)` — the load side of the message
+/// database row / binlog event.
+pub fn parse_message_log_event(
+    input: &[u8],
+    storage: &mut dyn crate::message_content::MessageContentStorage,
+    time: &crate::user_manager::TimeCtx,
+) -> Result<Message, &'static str> {
+    let mut parser = Parser::new_log_event(input)?;
+    let message = Message::parse_from(&mut parser, storage, time)?;
+    parser.fetch_end()?;
+    Ok(message)
+}
+
+/// The `Message::parse` closing-repair helper: the C++ inline
+/// `ttl.is_secret_message_content(content->get_type())` call
+/// (MessagesManager.cpp:3089).
+fn self_destruct_is_secret(ttl: MessageSelfDestructType, content_type: MessageContentType) -> bool {
+    ttl.is_secret_message_content(content_type)
 }
 
 /// `message_search_filter_count()` (MessageSearchFilter.h:43-45) — the
@@ -7217,6 +9276,284 @@ mod tests {
             )))
             .is_empty()
         );
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn message_store_parse_roundtrip_full() {
+        let time = crate::user_manager::TimeCtx {
+            now: 1000.0,
+            server_time: 1700000000.5,
+        };
+        let mut m = Message::default();
+        m.message_id = MessageId::from_server_message_id(ServerMessageId::new(1234));
+        m.sender_user_id = UserId::new(10);
+        m.date = 1700000100;
+        m.edit_date = 1700000200;
+        m.random_id = 777;
+        m.forward_info = Some(MessageForwardInfo {
+            origin: MessageOrigin::new(
+                UserId::default(),
+                DialogId::from_channel_id(ChannelId::new(30)),
+                MessageId::from_server_message_id(ServerMessageId::new(4321)),
+                String::new(),
+                String::new(),
+            ),
+            date: 1699990000,
+            ..MessageForwardInfo::default()
+        });
+        m.via_bot_user_id = UserId::new(11);
+        m.view_count = 100;
+        m.reply_info = MessageReplyInfo {
+            reply_count: 5,
+            ..MessageReplyInfo::default()
+        };
+        m.ttl = MessageSelfDestructType::with_ttl(60, false);
+        m.ttl_expires_at = 2000.0;
+        m.author_signature = "sig".to_string();
+        m.media_album_id = 42;
+        m.notification_id = NotificationId::new(55);
+        m.legacy_layer = 62;
+        m.restriction_reasons = vec![RestrictionReason::new(
+            "platform".to_string(),
+            "spam".to_string(),
+            "text".to_string(),
+        )];
+        m.sender_dialog_id = DialogId::from_channel_id(ChannelId::new(31));
+        m.top_thread_message_id = MessageId::from_server_message_id(ServerMessageId::new(1233));
+        m.linked_top_thread_message_id =
+            MessageId::from_server_message_id(ServerMessageId::new(900));
+        m.interaction_info_update_date = 1700000300;
+        m.send_emoji = "🎲".to_string();
+        m.content = Some(crate::message_content::MessageContent::Text(
+            crate::message_content::MessageText {
+                text: FormattedText {
+                    text: "hello world".to_string(),
+                    entities: Vec::new(),
+                },
+                ..crate::message_content::MessageText::default()
+            },
+        ));
+        m.reply_markup = Some(Box::new(ReplyMarkup {
+            r#type: ReplyMarkupType::InlineKeyboard,
+            force_reply: true,
+            inline_keyboard: vec![vec![InlineKeyboardButton {
+                r#type: InlineKeyboardButtonType::Callback,
+                data: "payload".to_string(),
+                text: "click".to_string(),
+                ..InlineKeyboardButton::default()
+            }]],
+            ..ReplyMarkup::default()
+        }));
+        m.ttl_period = 86400;
+        m.max_reply_media_timestamp = 5;
+        m.reactions = Some(MessageReactions {
+            reactions: vec![MessageReaction {
+                reaction_type: ReactionType::new("👍"),
+                choose_count: 3,
+                ..MessageReaction::default()
+            }],
+            ..MessageReactions::default()
+        });
+        m.available_reactions_generation = 7;
+        m.history_generation = 2;
+        m.reply_to_story_full_id =
+            StoryFullId::new(DialogId::from_user_id(UserId::new(12)), StoryId::new(13));
+        m.replied_message_info = RepliedMessageInfo {
+            message_id: MessageId::from_server_message_id(ServerMessageId::new(1230)),
+            ..RepliedMessageInfo::default()
+        };
+        m.saved_messages_topic_id =
+            SavedMessagesTopicId::new(DialogId::from_user_id(UserId::new(14)));
+        m.sender_boost_count = 2;
+        m.via_business_bot_user_id = UserId::new(15);
+        m.effect_id = MessageEffectId::new(64);
+        m.fact_check = Some(FactCheck {
+            country_code: "US".to_string(),
+            hash: 999,
+            ..FactCheck::default()
+        });
+        m.is_pinned = true;
+        m.noforwards = true;
+        m.contains_mention = true;
+
+        let mut bytes = Vec::new();
+        store_message_log_event(&m, &NoStorage, &time, &mut bytes);
+        let parsed = parse_message_log_event(&bytes, &mut NoStorage, &time).unwrap();
+
+        // identity-lite assertions over the parsed copy
+        assert_eq!(parsed.message_id, m.message_id);
+        assert_eq!(parsed.sender_user_id, m.sender_user_id);
+        assert_eq!(parsed.date, m.date);
+        assert_eq!(parsed.edit_date, m.edit_date);
+        assert_eq!(parsed.random_id, m.random_id);
+        assert_eq!(parsed.forward_info, m.forward_info);
+        assert_eq!(parsed.via_bot_user_id, m.via_bot_user_id);
+        assert_eq!(parsed.view_count, m.view_count);
+        assert_eq!(parsed.reply_info, m.reply_info);
+        assert_eq!(parsed.ttl, m.ttl);
+        // store_time round-trips relative to the SAME clocks
+        assert_eq!(parsed.ttl_expires_at, m.ttl_expires_at);
+        assert_eq!(parsed.author_signature, m.author_signature);
+        assert_eq!(parsed.media_album_id, m.media_album_id);
+        assert_eq!(parsed.notification_id, m.notification_id);
+        assert_eq!(parsed.legacy_layer, m.legacy_layer);
+        assert_eq!(parsed.restriction_reasons, m.restriction_reasons);
+        assert_eq!(parsed.sender_dialog_id, m.sender_dialog_id);
+        assert_eq!(parsed.top_thread_message_id, m.top_thread_message_id);
+        assert_eq!(
+            parsed.linked_top_thread_message_id,
+            m.linked_top_thread_message_id
+        );
+        assert_eq!(
+            parsed.interaction_info_update_date,
+            m.interaction_info_update_date
+        );
+        assert_eq!(parsed.send_emoji, m.send_emoji);
+        assert_eq!(parsed.reply_markup, m.reply_markup);
+        assert_eq!(parsed.ttl_period, m.ttl_period);
+        assert_eq!(
+            parsed.max_reply_media_timestamp,
+            m.max_reply_media_timestamp
+        );
+        assert_eq!(parsed.reactions, m.reactions);
+        assert_eq!(
+            parsed.available_reactions_generation,
+            m.available_reactions_generation
+        );
+        assert_eq!(parsed.history_generation, m.history_generation);
+        assert_eq!(parsed.reply_to_story_full_id, m.reply_to_story_full_id);
+        assert_eq!(parsed.replied_message_info, m.replied_message_info);
+        assert_eq!(parsed.saved_messages_topic_id, m.saved_messages_topic_id);
+        assert_eq!(parsed.sender_boost_count, m.sender_boost_count);
+        assert_eq!(parsed.via_business_bot_user_id, m.via_business_bot_user_id);
+        assert_eq!(parsed.effect_id, m.effect_id);
+        assert_eq!(parsed.fact_check, m.fact_check);
+        assert!(parsed.is_pinned);
+        assert!(parsed.noforwards);
+        assert!(parsed.contains_mention);
+        match parsed.content.as_ref().unwrap() {
+            crate::message_content::MessageContent::Text(text) => {
+                assert_eq!(text.text.text, "hello world");
+            }
+            _ => panic!("wrong content"),
+        }
+        // and the re-store is byte-identical
+        let mut bytes2 = Vec::new();
+        store_message_log_event(&parsed, &NoStorage, &time, &mut bytes2);
+        assert_eq!(bytes, bytes2);
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn message_store_minimal_blob_prefix_is_hand_computed() {
+        // the emptiest message stores: the log-event version word, then the
+        // four flag words — all clear except has_flags2/3/4 in the last bit
+        // of their words (bit 29 / bit 29 / all-clear 13-bit word) — then
+        // message_id, date and the content payload. The flag prefix is
+        // pinned by hand; the tail rides the verified primitive stores.
+        let time = crate::user_manager::TimeCtx {
+            now: 0.0,
+            server_time: 0.0,
+        };
+        let mut m = Message::default();
+        m.message_id = MessageId::from_server_message_id(ServerMessageId::new(1));
+        m.date = 100;
+        m.content = Some(crate::message_content::MessageContent::Text(
+            crate::message_content::MessageText::default(),
+        ));
+
+        let mut bytes = Vec::new();
+        store_message_log_event(&m, &NoStorage, &time, &mut bytes);
+        assert!(bytes.len() > 4 + 4 * 3);
+        assert_eq!(&bytes[0..4], &61i32.to_le_bytes()); // version
+        assert_eq!(&bytes[4..8], &(1i32 << 29).to_le_bytes()); // flags1: has_flags2 alone
+        // flags2: are_media_timestamp_entities_found (28, always true) + has_flags3 (29)
+        assert_eq!(&bytes[8..12], &((1i32 << 28) | (1i32 << 29)).to_le_bytes());
+        // flags3: has_reactions_are_possible (23, always true) +
+        // has_new_video_start_timestamp (25, 0 >= 0) + has_flags4 (29)
+        assert_eq!(
+            &bytes[12..16],
+            &((1i32 << 23) | (1i32 << 25) | (1i32 << 29)).to_le_bytes()
+        );
+        assert_eq!(&bytes[16..20], &0i32.to_le_bytes()); // flags4: all clear
+
+        // message_id + date ride their verified stores right after the flags
+        let mut expected = Vec::new();
+        m.message_id.store(&mut expected);
+        crate::store_parse::store_i32(&mut expected, 100);
+        assert_eq!(&bytes[20..20 + expected.len()], &expected[..]);
+    }
+
+    #[test]
+    fn reply_markup_store_parse_roundtrip() {
+        let markup = ReplyMarkup {
+            r#type: ReplyMarkupType::ShowKeyboard,
+            is_personal: true,
+            force_reply: true,
+            is_persistent: true,
+            need_resize_keyboard: true,
+            is_one_time_keyboard: true,
+            keyboard: vec![vec![
+                KeyboardButton {
+                    r#type: KeyboardButtonType::RequestDialog,
+                    style: KeyboardButtonStyle {
+                        r#type: crate::messages_manager::KeyboardButtonStyleType::Primary,
+                        icon_custom_emoji_id: crate::emoji_status::CustomEmojiId::new(7),
+                    },
+                    text: "pick".to_string(),
+                    url: String::new(),
+                    requested_dialog_type: Some(RequestedDialogType {
+                        r#type: RequestedDialogTypeType::Group,
+                        button_id: 3,
+                        max_quantity: 1,
+                        restrict_has_username: true,
+                        has_username: true,
+                        is_created: true,
+                        restrict_user_administrator_rights: true,
+                        ..RequestedDialogType::default()
+                    }),
+                },
+                KeyboardButton {
+                    r#type: KeyboardButtonType::Text,
+                    text: "plain".to_string(),
+                    ..KeyboardButton::default()
+                },
+            ]],
+            placeholder: "type...".to_string(),
+            inline_keyboard: Vec::new(),
+        };
+        let mut bytes = Vec::new();
+        markup.store(&mut bytes);
+        let mut parser = Parser::new(&bytes);
+        assert_eq!(ReplyMarkup::parse_from(&mut parser).unwrap(), markup);
+    }
+
+    #[test]
+    fn reply_markup_from_telegram_inline_keyboard() {
+        let wire = telegram_api::ReplyMarkup::replyInlineMarkup(telegram_api::replyInlineMarkup {
+            flags: 0,
+            force_reply: false,
+            rows: vec![telegram_api::KeyboardInlineButtonRow {
+                buttons: vec![telegram_api::KeyboardInlineButton {
+                    flags: 0,
+                    style: None,
+                    text: "open".to_string(),
+                    r#type: Some(telegram_api::InlineButtonType::inlineButtonTypeUrl(
+                        telegram_api::inlineButtonTypeUrl {
+                            url: "https://telegram.org".to_string(),
+                        },
+                    )),
+                }],
+            }],
+        });
+        let markup = ReplyMarkup::from_telegram(wire, false, true, false).expect("inline keyboard");
+        assert_eq!(markup.r#type, ReplyMarkupType::InlineKeyboard);
+        assert_eq!(markup.inline_keyboard.len(), 1);
+        let button = &markup.inline_keyboard[0][0];
+        assert_eq!(button.r#type, InlineKeyboardButtonType::Url);
+        assert_eq!(button.text, "open");
+        assert_eq!(button.data, "https://telegram.org/"); // check_link adds the trailing slash
     }
 
     #[test]
