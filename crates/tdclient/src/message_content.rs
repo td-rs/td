@@ -7753,6 +7753,95 @@ pub trait MessageContentContext {
     /// `FileManager::cancel_upload` (MessageContent.cpp:5980/5983) —
     /// M.12.2; the stand-in no-ops.
     fn cancel_upload(&mut self, file_upload_id: FileUploadId);
+
+    // -- Intake family (MessageContent.cpp:9778-10451) — the manager
+    // intakes the wire constructors and `get_message_content`/
+    // `dup_message_content` call; the Wave-2/3 managers and the M.12.2
+    // FileManager answer the stand-in shapes until they land. --
+    /// `AuthManager::was_authorized` (MessageContent.cpp:9780).
+    fn was_authorized(&self) -> bool;
+    /// `UserManager::get_user_id_object` (MessageContent.cpp:9904-9905) —
+    /// the ensure-updateUser side effect; the stand-in no-ops.
+    fn get_user_id_object(&self, user_id: UserId, source: &str);
+    /// `VideosManager::get_live_photo_video_file_id`
+    /// (MessageContent.cpp:9833-9834); the stand-in answers an invalid id.
+    fn get_live_photo_video_file_id(
+        &mut self,
+        video: Option<telegram_api::Document>,
+        owner_dialog_id: DialogId,
+        is_self_destructing: bool,
+    ) -> FileId;
+    /// `DocumentsManager::on_get_document`
+    /// (MessageContent.cpp:9864-9900, 10021, Game.cpp:47) — the parsed
+    /// `Document` collapses to the `(file_id, type)` pair; the stand-in
+    /// answers an empty document.
+    #[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+    fn on_get_document(
+        &mut self,
+        document: telegram_api::Document,
+        owner_dialog_id: DialogId,
+        is_self_destructing: bool,
+        is_send_priority: bool,
+        doc_type: Option<DocumentType>,
+    ) -> ParsedDocument;
+    /// `get_web_document_photo` (InputInvoice.cpp:276-301's tail,
+    /// WebDocument → Photo) — the M.12.2 FileManager conversion.
+    fn get_web_document_photo(
+        &mut self,
+        web_document: Option<telegram_api::WebDocument>,
+        owner_dialog_id: DialogId,
+    ) -> Photo;
+    /// `WebPagesManager::on_get_web_page` (MessageContent.cpp:9980).
+    fn on_get_web_page(
+        &mut self,
+        web_page: Option<telegram_api::WebPage>,
+        owner_dialog_id: DialogId,
+    ) -> WebPageId;
+    /// `PollManager::on_get_poll` (MessageContent.cpp:9985-9987).
+    fn on_get_poll(
+        &mut self,
+        poll: Option<telegram_api::Poll>,
+        results: Option<telegram_api::PollResults>,
+        source: &str,
+    ) -> PollId;
+    /// `StoryManager::on_get_story` (MessageContent.cpp:10056) — returns
+    /// the actual story id the manager resolved.
+    fn on_get_story(
+        &mut self,
+        dialog_id: DialogId,
+        story: Option<telegram_api::StoryItem>,
+    ) -> StoryId;
+    /// `DialogManager::force_create_dialog`
+    /// (MessageContent.cpp:10059/10083/10100) — the M.6 no-op.
+    fn force_create_dialog(&mut self, dialog_id: DialogId, source: &str);
+    /// `FileManager::get_file_view(...).is_encrypted_secret()`
+    /// (MessageContent.cpp:10161) — the M.12.2 file-view read; the
+    /// stand-in answers `false` (no secret file views yet), which routes
+    /// every secret-copy through the `copy_file_id_to_secret` seam.
+    fn is_file_encrypted_secret(&self, file_id: FileId) -> bool;
+    /// `FileManager::copy_file_id` (MessageContent.cpp:10162) — M.12.2;
+    /// the stand-in answers the same id.
+    fn copy_file_id_to_secret(&mut self, file_id: FileId, dialog_id: DialogId) -> FileId;
+    /// `AnimationsManager::dup_animation` (MessageContent.cpp:10183).
+    fn dup_animation(&mut self, new_file_id: FileId, old_file_id: FileId) -> FileId;
+    /// `AudiosManager::dup_audio` (MessageContent.cpp:10192).
+    fn dup_audio(&mut self, new_file_id: FileId, old_file_id: FileId) -> FileId;
+    /// `DocumentsManager::dup_document` (MessageContent.cpp:10207).
+    fn dup_document(&mut self, new_file_id: FileId, old_file_id: FileId) -> FileId;
+    /// `StickersManager::dup_sticker` (MessageContent.cpp:10289).
+    fn dup_sticker(&mut self, new_file_id: FileId, old_file_id: FileId) -> FileId;
+    /// `VideosManager::dup_video` (MessageContent.cpp:10314).
+    fn dup_video(&mut self, new_file_id: FileId, old_file_id: FileId) -> FileId;
+    /// `VideoNotesManager::dup_video_note` (MessageContent.cpp:10324).
+    fn dup_video_note(&mut self, new_file_id: FileId, old_file_id: FileId) -> FileId;
+    /// `VoiceNotesManager::dup_voice_note` (MessageContent.cpp:10333).
+    fn dup_voice_note(&mut self, new_file_id: FileId, old_file_id: FileId) -> FileId;
+    /// `PollManager::dup_poll` (MessageContent.cpp:10255).
+    fn dup_poll(&mut self, dialog_id: DialogId, poll_id: PollId) -> PollId;
+    /// `StickersManager::has_secret_input_media`
+    /// (MessageContent.cpp:10284) — the stand-in answers `false`, which
+    /// exercises the secret-copy path through the file-id seams.
+    fn has_secret_input_media_sticker(&self, file_id: FileId) -> bool;
 }
 
 /// `is_local_poll_id` (PollManager.cpp:449-452) — the local (unsent)
@@ -13349,6 +13438,1392 @@ pub fn delete_message_content_thumbnail(
 }
 
 // ---------------------------------------------------------------------------
+// M.9.14 — the telegram_api intake dispatcher (`get_message_content`,
+// MessageContent.cpp:9778-10145) + `dup_message_content` (10146-10451) with
+// the wire constructors they need.
+// ---------------------------------------------------------------------------
+
+/// `td::MessageContentDupType` (MessageContentDupType.h:18-26).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessageContentDupType {
+    /// normal message sending
+    Send,
+    /// message sending via bot
+    SendViaBot,
+    /// quick reply sending
+    SendQuickReply,
+    /// server-side message forward
+    Forward,
+    /// local message copy
+    Copy,
+    /// server-side message copy
+    ServerCopy,
+}
+
+/// `td::MessageCopyOptions` (MessageCopyOptions.h:26-34) — the
+/// `dup_message_content` subset. The send-path fields (`input_reply_to`,
+/// `reply_markup`, `new_invert_media`) land with the send slice.
+#[derive(Clone, Debug, Default)]
+pub struct MessageCopyOptions {
+    pub send_copy: bool,
+    pub replace_caption: bool,
+    pub new_caption: FormattedText,
+}
+
+/// The C++ `Document::Type` (Document.h:30-41) — the receive-path subset
+/// `get_document_message_content` and the game-animation arm need; the
+/// full value class lands with the M.12 DocumentsManager.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DocumentType {
+    #[default]
+    Unknown,
+    Animation,
+    Audio,
+    General,
+    Sticker,
+    Video,
+    VideoNote,
+    VoiceNote,
+}
+
+/// The seam-shaped `DocumentsManager::on_get_document` result — the C++
+/// `Document` value class collapses to its `(file_id, type)` pair until
+/// the M.12 DocumentsManager lands the full struct.
+#[derive(Clone, Debug, Default)]
+pub struct ParsedDocument {
+    pub file_id: FileId,
+    pub r#type: DocumentType,
+}
+
+impl ParsedDocument {
+    /// `Document::is_empty` (Document.h) — an invalid file id means the
+    /// document was dropped by the parser.
+    pub fn is_empty(&self) -> bool {
+        !self.file_id.is_valid()
+    }
+}
+
+/// `TonAmount::get_ton_count` (TonAmount.cpp:23-40) with
+/// `allow_negative = false`.
+pub fn get_ton_count(amount: i64) -> i64 {
+    let max_amount = 1i64 << 51;
+    if amount < 0 {
+        tdutils::log_error!("Receive TON amount = {amount}");
+        return 0;
+    }
+    if amount > max_amount {
+        tdutils::log_error!("Receive TON amount = {amount}");
+        return max_amount;
+    }
+    amount
+}
+
+/// `StarManager::get_star_count(amount, false)` (StarManager.cpp:1799-1818)
+/// — the ±2^51 clamp with the error log; the local twin of the
+/// user_manager/manager_option_states private copies until the
+/// StarManager slice lands one shared version.
+fn get_star_count(amount: i64) -> i64 {
+    let max_amount = 1i64 << 51;
+    if amount < 0 {
+        tdutils::log_error!("Receive Telegram Star amount = {amount}");
+        return 0;
+    }
+    if amount > max_amount {
+        tdutils::log_error!("Receive Telegram Star amount = {amount}");
+        return max_amount;
+    }
+    amount
+}
+
+/// `Location(const tl_object_ptr<telegram_api::GeoPoint> &)`
+/// (Location.cpp:48-64). The `G()->add_location_access_hash` side effect
+/// of `init` (Location.cpp:34-36) is a Global access-hash cache — recorded
+/// divergence until the Files step wires `Global` into the intake.
+pub fn get_location_from_telegram_geo_point(
+    geo_point: &Option<telegram_api::GeoPoint>,
+) -> Location {
+    match geo_point {
+        Some(telegram_api::GeoPoint::geoPoint(geo_point)) => Location::new(
+            geo_point.lat,
+            geo_point.long,
+            geo_point.accuracy_radius as f64,
+            geo_point.access_hash,
+        ),
+        _ => Location::default(),
+    }
+}
+
+/// `get_document_message_content` (MessageContent.cpp:9516-9540) — the
+/// pure per-type switch over the parsed document.
+#[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+pub fn get_document_message_content(
+    parsed_document: ParsedDocument,
+    caption: FormattedText,
+    is_opened: bool,
+    is_premium: bool,
+    has_spoiler: bool,
+    alternative_file_ids: Vec<FileId>,
+    hls_file_ids: Vec<FileId>,
+    storyboard_file_ids: Vec<FileId>,
+    storyboard_map_file_ids: Vec<FileId>,
+    video_cover: Photo,
+    video_timestamp: i32,
+) -> MessageContent {
+    let file_id = parsed_document.file_id;
+    if !parsed_document.is_empty() {
+        debug_assert!(file_id.is_valid());
+    }
+    if !alternative_file_ids.is_empty() && parsed_document.r#type != DocumentType::Video {
+        tdutils::log_error!("Receive alternative videos for {file_id}");
+    }
+    match parsed_document.r#type {
+        DocumentType::Animation => MessageContent::Animation(MessageAnimation {
+            file_id,
+            caption,
+            has_spoiler,
+        }),
+        DocumentType::Audio => MessageContent::Audio(MessageAudio { file_id, caption }),
+        DocumentType::General => MessageContent::Document(MessageDocument { file_id, caption }),
+        DocumentType::Sticker => MessageContent::Sticker(MessageSticker {
+            file_id,
+            is_premium,
+        }),
+        DocumentType::Unknown => MessageContent::Unsupported(MessageUnsupported::default()),
+        DocumentType::Video => MessageContent::Video(MessageVideo {
+            file_id,
+            alternative_file_ids,
+            hls_file_ids,
+            storyboard_file_ids,
+            storyboard_map_file_ids,
+            cover: video_cover,
+            start_timestamp: video_timestamp,
+            caption,
+            has_spoiler,
+        }),
+        DocumentType::VideoNote => MessageContent::VideoNote(MessageVideoNote {
+            file_id,
+            is_viewed: is_opened,
+        }),
+        DocumentType::VoiceNote => MessageContent::VoiceNote(MessageVoiceNote {
+            file_id,
+            caption,
+            is_listened: is_opened,
+        }),
+    }
+}
+
+/// `WebPagesManager::get_web_page_url` (WebPagesManager.cpp:559-574).
+pub fn get_web_page_url(web_page: Option<&telegram_api::WebPage>) -> String {
+    match web_page {
+        Some(telegram_api::WebPage::webPageEmpty(m)) => m.url.clone(),
+        Some(telegram_api::WebPage::webPagePending(m)) => m.url.clone(),
+        Some(telegram_api::WebPage::webPage(m)) => m.url.clone(),
+        Some(telegram_api::WebPage::webPageNotModified(_)) => {
+            tdutils::log_error!("Receive webPageNotModified");
+            String::new()
+        }
+        None => String::new(),
+    }
+}
+
+/// `dup_photo` (Photo.cpp:151-198) — the send-copy photo subset: the `i`
+/// (or largest) size becomes the input size, the `t` (or smallest) size
+/// the thumbnail; `'i'`/`'t'` are 105/116 in the `PhotoSizeType` layout.
+pub fn dup_photo(photo: Photo) -> Photo {
+    assert!(!photo.photos.is_empty());
+
+    // the C++ `operator<` (PhotoSize.cpp:544-562): size, then pixel
+    // count, then the thumbnail-first type order, then file id, then
+    // width
+    let size_key = |size: &PhotoSize| {
+        (
+            size.size,
+            crate::photo::get_dimensions_pixel_count(size.dimensions),
+            if size.size_type == 116 {
+                -1
+            } else {
+                size.size_type
+            },
+            size.file_id,
+            size.dimensions.width as i32,
+        )
+    };
+
+    let mut input_size: Option<&PhotoSize> = None;
+    for size in &photo.photos {
+        if size.size_type == 105 {
+            input_size = Some(size);
+        }
+    }
+    let mut input_size = match input_size {
+        Some(size) => size.clone(),
+        None => photo
+            .photos
+            .iter()
+            .max_by_key(|size| size_key(size))
+            .unwrap()
+            .clone(),
+    };
+
+    let mut thumbnail: Option<PhotoSize> = None;
+    for size in &photo.photos {
+        if size.size_type == 116 {
+            thumbnail = Some(size.clone());
+        }
+    }
+    if thumbnail.is_none() {
+        let mut best: Option<&PhotoSize> = None;
+        for size in &photo.photos {
+            if size.size_type != 105 && best.is_none_or(|b| size_key(size) < size_key(b)) {
+                best = Some(size);
+            }
+        }
+        thumbnail = best.cloned();
+    }
+
+    let mut result = Photo {
+        id: photo.id,
+        date: photo.date,
+        minithumbnail: photo.minithumbnail,
+        has_stickers: photo.has_stickers,
+        sticker_file_ids: photo.sticker_file_ids,
+        ..Photo::default()
+    };
+    if let Some(mut thumbnail) = thumbnail {
+        thumbnail.size_type = 116;
+        result.photos.push(thumbnail);
+    }
+    input_size.size_type = 105;
+    result.photos.push(input_size);
+    result
+}
+
+/// `Game::Game(Td *, UserId, telegram_api::game &&, FormattedText,
+/// DialogId)` (Game.cpp:23-56). The `on_get_document` animation parse
+/// rides the seam; the C++ requires a non-empty photo object, which the
+/// Rust `Photo::default()` cannot express — the empty-photo repair
+/// (`photo.id = 0`) collapses to the id-0 photo the `Game::new` path
+/// already produces.
+pub fn get_game_from_telegram(
+    td: &mut dyn MessageContentContext,
+    via_bot_user_id: UserId,
+    game: telegram_api::Game,
+    text: FormattedText,
+    owner_dialog_id: DialogId,
+) -> Game {
+    let mut result = Game::new(via_bot_user_id, game.short_name);
+    result.id = game.id;
+    result.access_hash = game.access_hash;
+    result.title = game.title;
+    result.description = game.description;
+    result.photo = crate::photo::get_photo(game.photo.unwrap_or_default());
+    if result.photo.is_empty() {
+        tdutils::log_error!("Receive empty photo for game {}", result.title);
+        result.photo.id = 0; // to prevent null photo in td_api
+    }
+    if let Some(telegram_api::Document::document(document)) = game.document {
+        let parsed_document = td.on_get_document(
+            telegram_api::Document::document(document),
+            owner_dialog_id,
+            false,
+            false,
+            None,
+        );
+        if parsed_document.r#type == DocumentType::Animation {
+            result.animation_file_id = parsed_document.file_id;
+        } else {
+            tdutils::log_error!("Receive non-animation document in the game");
+        }
+    }
+    result.text = text;
+    result
+}
+
+/// `InputInvoice::InputInvoice(messageMediaInvoice &&, Td *, DialogId,
+/// FormattedText &&)` (InputInvoice.cpp:55-83). The web-document photo
+/// parse rides the seam.
+pub fn get_input_invoice_from_telegram(
+    td: &mut dyn MessageContentContext,
+    message_invoice: telegram_api::messageMediaInvoice,
+    owner_dialog_id: DialogId,
+    message: FormattedText,
+) -> InputInvoice {
+    let mut result = InputInvoice {
+        title: message_invoice.title,
+        description: message_invoice.description,
+        start_parameter: message_invoice.start_param,
+        invoice: Invoice {
+            currency: message_invoice.currency,
+            is_test: message_invoice.test,
+            need_shipping_address: message_invoice.shipping_address_requested,
+            ..Invoice::default()
+        },
+        ..InputInvoice::default()
+    };
+    result.photo = td.get_web_document_photo(message_invoice.photo, owner_dialog_id);
+    result.extended_media = MessageExtendedMedia::from_telegram(
+        td,
+        message_invoice.extended_media.map(|m| *m),
+        owner_dialog_id,
+    );
+    if !result.extended_media.is_empty() {
+        result.extended_media_caption = message;
+    }
+    let total_amount = message_invoice.total_amount;
+    if total_amount <= 0 || !check_currency_amount(total_amount) {
+        tdutils::log_error!("Receive invalid total amount {total_amount}");
+        result.total_amount = 0;
+    } else {
+        result.total_amount = total_amount;
+    }
+    if message_invoice.receipt_msg_id != 0 {
+        let receipt_message_id = MessageId::new(i64::from(message_invoice.receipt_msg_id));
+        if !receipt_message_id.is_valid() {
+            tdutils::log_error!(
+                "Receive as receipt message {} in {owner_dialog_id}",
+                receipt_message_id.get()
+            );
+            result.receipt_message_id = MessageId::default();
+        } else {
+            result.receipt_message_id = receipt_message_id;
+        }
+    }
+    result
+}
+
+/// `MessageExtendedMedia(Td *, MessageExtendedMedia &&, DialogId)`
+/// (MessageExtendedMedia.cpp:29-59) + `init_from_media`
+/// (MessageExtendedMedia.cpp:66-127).
+pub fn get_message_extended_media_from_telegram(
+    td: &mut dyn MessageContentContext,
+    extended_media: Option<telegram_api::MessageExtendedMedia>,
+    owner_dialog_id: DialogId,
+) -> MessageExtendedMedia {
+    let Some(extended_media) = extended_media else {
+        return MessageExtendedMedia::default();
+    };
+    match extended_media {
+        telegram_api::MessageExtendedMedia::messageExtendedMediaPreview(m) => {
+            let mut result = MessageExtendedMedia {
+                r#type: MessageExtendedMediaType::Preview,
+                duration: m.video_duration,
+                dimensions: crate::photo::get_dimensions(m.w, m.h, "MessageExtendedMedia"),
+                ..MessageExtendedMedia::default()
+            };
+            match m.thumb {
+                Some(telegram_api::PhotoSize::photoStrippedSize(thumb)) => {
+                    result.minithumbnail = String::from_utf8_lossy(&thumb.bytes).into_owned();
+                }
+                Some(other) => {
+                    tdutils::log_error!("Receive {other:?}");
+                }
+                None => {}
+            }
+            result
+        }
+        telegram_api::MessageExtendedMedia::messageExtendedMedia(m) => {
+            MessageExtendedMedia::init_from_media(td, m.media.map(|m| *m), owner_dialog_id)
+        }
+    }
+}
+
+impl MessageExtendedMedia {
+    /// `MessageExtendedMedia::init_from_media`
+    /// (MessageExtendedMedia.cpp:66-127) — the photo and video arms; the
+    /// `get_live_photo_video_file_id` and `on_get_document` reads ride
+    /// the seam.
+    fn init_from_media(
+        td: &mut dyn MessageContentContext,
+        media: Option<telegram_api::MessageMedia>,
+        owner_dialog_id: DialogId,
+    ) -> MessageExtendedMedia {
+        let mut result = MessageExtendedMedia {
+            r#type: MessageExtendedMediaType::Unsupported,
+            unsupported_version: Self::CURRENT_VERSION,
+            ..MessageExtendedMedia::default()
+        };
+        match media {
+            Some(telegram_api::MessageMedia::messageMediaPhoto(photo)) => {
+                let Some(photo_object) = photo.photo else {
+                    tdutils::log_error!("Receive invalid paid media {photo:?}");
+                    return result;
+                };
+                result.photo = crate::photo::get_photo(photo_object);
+                if result.photo.is_empty() {
+                    tdutils::log_error!("Receive invalid paid media photo");
+                    return result;
+                }
+                if photo.live_photo {
+                    result.video_file_id =
+                        td.get_live_photo_video_file_id(photo.video, owner_dialog_id, false);
+                }
+                result.r#type = MessageExtendedMediaType::Photo;
+            }
+            Some(telegram_api::MessageMedia::messageMediaDocument(document)) => {
+                let video_timestamp = document.video_timestamp;
+                let video_cover = document.video_cover;
+                let Some(telegram_api::Document::document(document)) = document.document else {
+                    tdutils::log_error!("Receive invalid paid media document");
+                    return result;
+                };
+                let parsed_document = td.on_get_document(
+                    telegram_api::Document::document(document),
+                    owner_dialog_id,
+                    false,
+                    false,
+                    Some(DocumentType::Video),
+                );
+                if parsed_document.is_empty() || parsed_document.r#type != DocumentType::Video {
+                    tdutils::log_error!("Receive invalid paid media document");
+                    return result;
+                }
+                debug_assert!(parsed_document.file_id.is_valid());
+                result.video_file_id = parsed_document.file_id;
+                result.start_timestamp = video_timestamp;
+                result.r#type = MessageExtendedMediaType::Video;
+                if let Some(video_cover) = video_cover {
+                    result.photo = crate::photo::get_photo(video_cover);
+                }
+            }
+            Some(other) => {
+                tdutils::log_error!("Receive invalid paid media {other:?}");
+            }
+            None => {}
+        }
+        result
+    }
+
+    /// `MessageExtendedMedia(Td *, MessageExtendedMedia &&, DialogId)`.
+    pub fn from_telegram(
+        td: &mut dyn MessageContentContext,
+        extended_media: Option<telegram_api::MessageExtendedMedia>,
+        owner_dialog_id: DialogId,
+    ) -> MessageExtendedMedia {
+        get_message_extended_media_from_telegram(td, extended_media, owner_dialog_id)
+    }
+}
+
+/// `ToDoCompletion(todoCompletion &&)` (ToDoCompletion.cpp:13-18).
+pub fn get_to_do_completion_from_telegram(
+    completion: telegram_api::TodoCompletion,
+) -> ToDoCompletion {
+    ToDoCompletion {
+        id: completion.id,
+        completed_by_dialog_id: DialogId::from_peer(
+            completion
+                .completed_by
+                .as_ref()
+                .unwrap_or(&telegram_api::Peer::default()),
+        ),
+        date: completion.date,
+    }
+}
+
+/// `ToDoList(user_manager, todoList &&, int32)` (ToDoList.cpp:25-31) with
+/// the `ToDoItem(user_manager, todoItem &&, int32)` conversion
+/// (ToDoItem.cpp:22-28) inlined; the entity reads ride the
+/// `UserManagerLike` plane.
+pub fn get_to_do_list_from_telegram<U: UserManagerLike + ?Sized>(
+    mut user_manager: Option<&mut U>,
+    list: telegram_api::TodoList,
+    message_date: i32,
+) -> ToDoList {
+    let mut result = ToDoList {
+        title: crate::message_entity::get_formatted_text_of_text_with_entities(
+            user_manager.as_deref_mut(),
+            list.title,
+            true,
+            true,
+            "ToDoList",
+        ),
+        others_can_append: list.others_can_append,
+        others_can_complete: list.others_can_complete,
+        ..ToDoList::default()
+    };
+    for item in list.list {
+        let title = crate::message_entity::get_formatted_text_of_text_with_entities(
+            user_manager.as_deref_mut(),
+            item.title,
+            true,
+            true,
+            "ToDoItem",
+        );
+        result.items.push(ToDoItem { id: item.id, title });
+    }
+    let _ = message_date;
+    result
+}
+
+/// `get_message_content` (MessageContent.cpp:9778-10145) — the
+/// telegram_api `MessageMedia` dispatcher. The `rich_message` arm is
+/// deferred with the unmodeled `RichMessage` (Wave-2 WebPages) and
+/// answers `MessageUnsupported` like the other unmodeled-variant arms;
+/// the manager intakes ride the [`MessageContentContext`] seam.
+#[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+pub fn get_message_content(
+    td: &mut dyn MessageContentContext,
+    message: FormattedText,
+    rich_message: Option<telegram_api::RichMessage>,
+    media_ptr: Option<telegram_api::MessageMedia>,
+    owner_dialog_id: DialogId,
+    message_date: i32,
+    is_content_read: bool,
+    via_bot_user_id: UserId,
+    ttl: &mut MessageSelfDestructType,
+    disable_web_page_preview: &mut bool,
+    source: &str,
+) -> MessageContent {
+    let mut media_ptr = media_ptr;
+    let empty_media = matches!(
+        media_ptr,
+        Some(telegram_api::MessageMedia::messageMediaEmpty(_))
+    );
+    if !td.was_authorized() && media_ptr.is_some() && !empty_media {
+        tdutils::log_error!("Receive without authorization from {source}: {media_ptr:?}");
+        media_ptr = None;
+    }
+    *disable_web_page_preview = false;
+
+    match media_ptr {
+        None | Some(telegram_api::MessageMedia::messageMediaEmpty(_)) => {
+            if rich_message.is_some() {
+                if !message.text.is_empty() {
+                    tdutils::log_error!(
+                        "Receive both text and rich text in a message from {owner_dialog_id}"
+                    );
+                }
+                // deferred with the unmodeled RichMessage variant
+                // (Wave-2 WebPages): the C++ constructs MessageRichText here
+                return MessageContent::Unsupported(MessageUnsupported::default());
+            }
+            if message.text.is_empty() {
+                tdutils::log_error!("Receive empty message text and media from {source}");
+            }
+            if !crate::message_entity::get_first_url(&message).is_empty() {
+                *disable_web_page_preview = true;
+            }
+            MessageContent::Text(MessageText::new(
+                message,
+                WebPageId::default(),
+                false,
+                false,
+                false,
+                String::new(),
+            ))
+        }
+        Some(telegram_api::MessageMedia::messageMediaPhoto(media)) => {
+            let Some(photo_object) = media.photo else {
+                if media.ttl_seconds == 0 {
+                    tdutils::log_error!(
+                        "Receive messageMediaPhoto without photo and self-destruct timer from {source}: {media:?}"
+                    );
+                    return fallback_message_content(message, disable_web_page_preview);
+                }
+                return MessageContent::ExpiredPhoto(MessageExpiredPhoto);
+            };
+            let is_self_destructing = media.ttl_seconds != 0;
+            let photo = crate::photo::get_photo(photo_object);
+            if photo.is_empty() {
+                return MessageContent::ExpiredPhoto(MessageExpiredPhoto);
+            }
+            if is_self_destructing {
+                *ttl = MessageSelfDestructType::with_ttl(media.ttl_seconds, true);
+            }
+            let video_file_id = if media.live_photo {
+                td.get_live_photo_video_file_id(media.video, owner_dialog_id, is_self_destructing)
+            } else {
+                FileId::default()
+            };
+            MessageContent::Photo(MessagePhoto {
+                photo,
+                video_file_id,
+                caption: message,
+                has_spoiler: media.spoiler,
+            })
+        }
+        Some(telegram_api::MessageMedia::messageMediaDice(media)) => {
+            let is_stake = media.game_outcome.is_some();
+            if is_stake && media.emoticon != MessageDice::DEFAULT_EMOJI {
+                return MessageContent::Unsupported(MessageUnsupported::default());
+            }
+            let m = MessageDice::new(
+                &media.emoticon,
+                media.value,
+                is_stake,
+                media
+                    .game_outcome
+                    .as_ref()
+                    .map(|outcome| outcome.seed.clone())
+                    .unwrap_or_default(),
+                String::new(),
+                media
+                    .game_outcome
+                    .as_ref()
+                    .map(|outcome| get_ton_count(outcome.stake_ton_amount))
+                    .unwrap_or(0),
+                media
+                    .game_outcome
+                    .as_ref()
+                    .map(|outcome| get_ton_count(outcome.ton_amount))
+                    .unwrap_or(0),
+            );
+            if !m.is_valid() {
+                return fallback_message_content(message, disable_web_page_preview);
+            }
+            MessageContent::Dice(m)
+        }
+        Some(telegram_api::MessageMedia::messageMediaGeo(media)) => {
+            let location = get_location_from_telegram_geo_point(&media.geo);
+            if location.is_empty() {
+                return fallback_message_content(message, disable_web_page_preview);
+            }
+            MessageContent::Location(MessageLocation { location })
+        }
+        Some(telegram_api::MessageMedia::messageMediaGeoLive(media)) => {
+            let location = get_location_from_telegram_geo_point(&media.geo);
+            if location.is_empty() {
+                return fallback_message_content(message, disable_web_page_preview);
+            }
+            if media.period <= 0 {
+                tdutils::log_error!(
+                    "Receive wrong live location period = {} from {source}",
+                    media.period
+                );
+                return MessageContent::Location(MessageLocation { location });
+            }
+            MessageContent::LiveLocation(MessageLiveLocation::new(
+                location,
+                media.period,
+                media.heading,
+                media.proximity_notification_radius,
+            ))
+        }
+        Some(telegram_api::MessageMedia::messageMediaVenue(media)) => {
+            let venue = Venue {
+                location: get_location_from_telegram_geo_point(&media.geo),
+                title: media.title,
+                address: media.address,
+                provider: media.provider,
+                id: media.venue_id,
+                r#type: media.venue_type,
+            };
+            if venue.location.is_empty() {
+                return fallback_message_content(message, disable_web_page_preview);
+            }
+            MessageContent::Venue(MessageVenue { venue })
+        }
+        Some(telegram_api::MessageMedia::messageMediaContact(media)) => {
+            if media.user_id != 0 {
+                td.get_user_id_object(UserId::new(media.user_id), "MessageMediaContact");
+                // to ensure updateUser
+            }
+            MessageContent::Contact(MessageContact {
+                contact: Contact::new(
+                    media.phone_number,
+                    media.first_name,
+                    media.last_name,
+                    media.vcard,
+                    UserId::new(media.user_id),
+                ),
+            })
+        }
+        Some(telegram_api::MessageMedia::messageMediaDocument(media)) => {
+            let Some(document) = media.document else {
+                if media.ttl_seconds == 0 {
+                    tdutils::log_error!(
+                        "Receive messageMediaDocument without document and self-destruct timer from {source}: {media:?}"
+                    );
+                    return fallback_message_content(message, disable_web_page_preview);
+                }
+                if media.voice {
+                    return MessageContent::ExpiredVoiceNote(MessageExpiredVoiceNote);
+                }
+                if media.round {
+                    return MessageContent::ExpiredVideoNote(MessageExpiredVideoNote);
+                }
+                if media.video {
+                    return MessageContent::ExpiredVideo(MessageExpiredVideo);
+                }
+                tdutils::log_error!(
+                    "Receive messageMediaDocument without document and media type from {source}: {media:?}"
+                );
+                return MessageContent::ExpiredVideo(MessageExpiredVideo);
+            };
+            let telegram_api::Document::document(document) = document else {
+                return fallback_message_content(message, disable_web_page_preview);
+            };
+            let is_self_destructing = media.ttl_seconds != 0;
+            if is_self_destructing {
+                *ttl = MessageSelfDestructType::with_ttl(media.ttl_seconds, true);
+            }
+            let mut alternative_file_ids = Vec::new();
+            let mut hls_file_ids = Vec::new();
+            let mut storyboard_file_ids = Vec::new();
+            let mut storyboard_map_file_ids = Vec::new();
+            for alt_document in media.alt_documents {
+                let telegram_api::Document::document(alt_document) = alt_document else {
+                    tdutils::log_error!("Receive alternative documentEmpty");
+                    continue;
+                };
+                match alt_document.mime_type.as_str() {
+                    "application/x-mpegurl" => {
+                        let parsed_document = td.on_get_document(
+                            telegram_api::Document::document(alt_document),
+                            owner_dialog_id,
+                            is_self_destructing,
+                            false,
+                            None,
+                        );
+                        if parsed_document.is_empty()
+                            || parsed_document.r#type != DocumentType::General
+                        {
+                            tdutils::log_error!("Receive invalid HLS file");
+                        } else {
+                            hls_file_ids.push(parsed_document.file_id);
+                        }
+                    }
+                    "application/x-tgstoryboard" => {
+                        let parsed_document = td.on_get_document(
+                            telegram_api::Document::document(alt_document),
+                            owner_dialog_id,
+                            is_self_destructing,
+                            false,
+                            None,
+                        );
+                        if parsed_document.is_empty()
+                            || parsed_document.r#type != DocumentType::General
+                        {
+                            tdutils::log_error!("Receive invalid storyboard file");
+                        } else {
+                            storyboard_file_ids.push(parsed_document.file_id);
+                        }
+                    }
+                    "application/x-tgstoryboardmap" => {
+                        let parsed_document = td.on_get_document(
+                            telegram_api::Document::document(alt_document),
+                            owner_dialog_id,
+                            is_self_destructing,
+                            false,
+                            None,
+                        );
+                        if parsed_document.is_empty()
+                            || parsed_document.r#type != DocumentType::General
+                        {
+                            tdutils::log_error!("Receive invalid storyboard map file");
+                        } else {
+                            storyboard_map_file_ids.push(parsed_document.file_id);
+                        }
+                    }
+                    _ => {
+                        let parsed_alt_document = td.on_get_document(
+                            telegram_api::Document::document(alt_document),
+                            owner_dialog_id,
+                            is_self_destructing,
+                            false,
+                            Some(DocumentType::Video),
+                        );
+                        if parsed_alt_document.is_empty()
+                            || parsed_alt_document.r#type != DocumentType::Video
+                        {
+                            tdutils::log_error!("Receive invalid alternative video");
+                        } else {
+                            alternative_file_ids.push(parsed_alt_document.file_id);
+                        }
+                    }
+                }
+            }
+            let video_cover = media
+                .video_cover
+                .map(crate::photo::get_photo)
+                .unwrap_or_default();
+            let parsed_document = td.on_get_document(
+                telegram_api::Document::document(document),
+                owner_dialog_id,
+                is_self_destructing,
+                false,
+                None,
+            );
+            get_document_message_content(
+                parsed_document,
+                message,
+                is_content_read,
+                !media.nopremium,
+                media.spoiler,
+                alternative_file_ids,
+                hls_file_ids,
+                storyboard_file_ids,
+                storyboard_map_file_ids,
+                video_cover,
+                media.video_timestamp,
+            )
+        }
+        Some(telegram_api::MessageMedia::messageMediaGame(media)) => {
+            let m = MessageGame {
+                game: get_game_from_telegram(
+                    td,
+                    via_bot_user_id,
+                    media.game.unwrap_or_default(),
+                    message.clone(),
+                    owner_dialog_id,
+                ),
+            };
+            if m.game.is_empty() {
+                return fallback_message_content(m.game.text, disable_web_page_preview);
+            }
+            MessageContent::Game(m)
+        }
+        Some(telegram_api::MessageMedia::messageMediaInvoice(media)) => {
+            MessageContent::Invoice(MessageInvoice {
+                input_invoice: get_input_invoice_from_telegram(td, media, owner_dialog_id, message),
+            })
+        }
+        Some(telegram_api::MessageMedia::messageMediaWebPage(media)) => {
+            let web_page_url = if media.manual || media.force_small_media || media.force_large_media
+            {
+                let url = get_web_page_url(media.webpage.as_deref());
+                if url.is_empty() {
+                    tdutils::log_error!("Have no URL in {media:?}");
+                }
+                url
+            } else if td.is_bot() {
+                get_web_page_url(media.webpage.as_deref())
+            } else {
+                String::new()
+            };
+            let web_page_id = td.on_get_web_page(media.webpage.map(|w| *w), owner_dialog_id);
+            MessageContent::Text(MessageText::new(
+                message,
+                web_page_id,
+                media.force_small_media,
+                media.force_large_media,
+                media.safe,
+                web_page_url,
+            ))
+        }
+        Some(telegram_api::MessageMedia::messageMediaPoll(media)) => {
+            let poll_id = td.on_get_poll(media.poll.map(|p| *p), media.results.map(|r| *r), source);
+            if !poll_id.is_valid() {
+                return fallback_message_content(message, disable_web_page_preview);
+            }
+            let attached_media = media.attached_media.and_then(|attached_media| {
+                let content = get_message_content(
+                    td,
+                    FormattedText::default(),
+                    None,
+                    Some(*attached_media),
+                    owner_dialog_id,
+                    message_date,
+                    is_content_read,
+                    via_bot_user_id,
+                    &mut MessageSelfDestructType::default(),
+                    &mut false,
+                    "messageMediaPoll",
+                );
+                if !is_allowed_poll_content(content.get_type()) {
+                    tdutils::log_error!("Receive {:?} in a poll", content.get_type());
+                    None
+                } else {
+                    Some(Box::new(content))
+                }
+            });
+            MessageContent::Poll(MessagePoll {
+                poll_id,
+                caption: message,
+                attached_media,
+            })
+        }
+        Some(telegram_api::MessageMedia::messageMediaStory(media)) => {
+            let dialog_id = DialogId::from_peer(
+                media
+                    .peer
+                    .as_ref()
+                    .unwrap_or(&telegram_api::Peer::default()),
+            );
+            let story_id = StoryId::new(media.id);
+            let story_full_id = StoryFullId::new(dialog_id, story_id);
+            if !story_full_id.is_server() {
+                tdutils::log_error!("Receive {media:?}");
+                return fallback_message_content(message, disable_web_page_preview);
+            }
+            if media.story.is_some() && !td.is_bot() {
+                let actual_story_id = td.on_get_story(dialog_id, media.story.map(|s| *s));
+                if story_id != actual_story_id {
+                    tdutils::log_error!("Receive {actual_story_id} instead of {story_id}");
+                }
+            }
+            td.force_create_dialog(dialog_id, "messageMediaStory");
+            MessageContent::Story(MessageStory {
+                story_full_id,
+                via_mention: media.via_mention,
+            })
+        }
+        Some(telegram_api::MessageMedia::messageMediaGiveaway(media)) => {
+            let mut channel_ids = Vec::new();
+            for channel in &media.channels {
+                let channel_id = ChannelId::new(*channel);
+                if channel_id.is_valid() {
+                    channel_ids.push(channel_id);
+                    td.force_create_dialog(
+                        DialogId::from_channel_id(channel_id),
+                        "messageMediaGiveaway",
+                    );
+                }
+            }
+            if channel_ids.is_empty()
+                || media.quantity <= 0
+                || (media.months <= 0 && media.stars <= 0)
+                || media.until_date < 0
+            {
+                if message_date >= 1700000000 {
+                    // approximate release date
+                    tdutils::log_error!("Receive {media:?}");
+                }
+                return fallback_message_content(message, disable_web_page_preview);
+            }
+            let boosted_channel_id = channel_ids.remove(0);
+            MessageContent::Giveaway(MessageGiveaway {
+                giveaway_parameters: GiveawayParameters {
+                    boosted_channel_id,
+                    additional_channel_ids: channel_ids,
+                    only_new_subscribers: media.only_new_subscribers,
+                    winners_are_visible: media.winners_are_visible,
+                    date: media.until_date,
+                    country_codes: media.countries_iso2,
+                    prize_description: media.prize_description,
+                },
+                quantity: media.quantity,
+                months: media.months,
+                star_count: get_star_count(media.stars),
+            })
+        }
+        Some(telegram_api::MessageMedia::messageMediaGiveawayResults(media)) => {
+            let giveaway_message_id = MessageId::new(i64::from(media.launch_msg_id));
+            let boosted_channel_id = ChannelId::new(media.channel_id);
+            if !giveaway_message_id.is_valid()
+                || !boosted_channel_id.is_valid()
+                || media.additional_peers_count < 0
+                || (media.months <= 0 && media.stars <= 0)
+                || media.until_date <= 0
+                || media.winners_count < 0
+                || media.unclaimed_count < 0
+            {
+                tdutils::log_error!("Receive {media:?}");
+                return fallback_message_content(message, disable_web_page_preview);
+            }
+            td.force_create_dialog(
+                DialogId::from_channel_id(boosted_channel_id),
+                "messageMediaGiveawayResults",
+            );
+            let mut winner_user_ids = Vec::new();
+            for winner in &media.winners {
+                let winner_user_id = UserId::new(*winner);
+                if winner_user_id.is_valid() {
+                    winner_user_ids.push(winner_user_id);
+                } else {
+                    tdutils::log_error!("Receive {media:?}");
+                    break;
+                }
+            }
+            MessageContent::GiveawayWinners(MessageGiveawayWinners {
+                giveaway_message_id,
+                boosted_channel_id,
+                additional_dialog_count: media.additional_peers_count,
+                month_count: media.months,
+                star_count: get_star_count(media.stars),
+                prize_description: media.prize_description,
+                winners_selection_date: media.until_date,
+                only_new_subscribers: media.only_new_subscribers,
+                was_refunded: media.refunded,
+                winner_count: media.winners_count,
+                unclaimed_count: media.unclaimed_count,
+                winner_user_ids,
+            })
+        }
+        Some(telegram_api::MessageMedia::messageMediaPaidMedia(media)) => {
+            let extended_media = media
+                .extended_media
+                .into_iter()
+                .map(|extended_media| {
+                    MessageExtendedMedia::from_telegram(td, Some(*extended_media), owner_dialog_id)
+                })
+                .collect();
+            MessageContent::PaidMedia(MessagePaidMedia {
+                media: extended_media,
+                caption: message,
+                star_count: get_star_count(media.stars_amount),
+                payload: String::new(),
+            })
+        }
+        Some(telegram_api::MessageMedia::messageMediaToDo(media)) => {
+            let mut completions = media
+                .completions
+                .into_iter()
+                .map(get_to_do_completion_from_telegram)
+                .collect::<Vec<_>>();
+            completions.retain(ToDoCompletion::is_valid);
+            MessageContent::ToDoList(MessageToDoList {
+                list: get_to_do_list_from_telegram(
+                    Some(&mut ContextUserManager { td }),
+                    media.todo.unwrap_or_default(),
+                    message_date,
+                ),
+                completions,
+            })
+        }
+        Some(telegram_api::MessageMedia::messageMediaUnsupported(_)) => {
+            MessageContent::Unsupported(MessageUnsupported::default())
+        }
+        Some(other) => {
+            tdutils::log_error!("Receive {other:?}");
+            MessageContent::Unsupported(MessageUnsupported::default())
+        }
+    }
+}
+
+/// The `get_message_content` break tail (MessageContent.cpp:10136-10145):
+/// an explicit empty media message answers the text-only content.
+fn fallback_message_content(
+    message: FormattedText,
+    disable_web_page_preview: &mut bool,
+) -> MessageContent {
+    if !crate::message_entity::get_first_url(&message).is_empty() {
+        *disable_web_page_preview = true;
+    }
+    MessageContent::Text(MessageText::new(
+        message,
+        WebPageId::default(),
+        false,
+        false,
+        false,
+        String::new(),
+    ))
+}
+
+/// `dup_message_content` (MessageContent.cpp:10146-10451). The manager
+/// dup/parse calls ride the seam; the `RichText` arm is deferred with
+/// the unmodeled variant and answers `None` like the C++ null returns.
+#[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+pub fn dup_message_content(
+    td: &mut dyn MessageContentContext,
+    dialog_id: DialogId,
+    content: &MessageContent,
+    dup_type: MessageContentDupType,
+    _is_via_bot: bool,
+    copy_options: MessageCopyOptions,
+) -> Option<MessageContent> {
+    if copy_options.send_copy {
+        debug_assert!(
+            dup_type == MessageContentDupType::Copy
+                || dup_type == MessageContentDupType::ServerCopy
+        );
+    }
+    if dup_type != MessageContentDupType::Forward
+        && dup_type != MessageContentDupType::SendViaBot
+        && dup_type != MessageContentDupType::SendQuickReply
+        && !can_message_content_have_input_media(
+            td,
+            content,
+            dup_type == MessageContentDupType::ServerCopy,
+        )
+    {
+        return None;
+    }
+
+    let to_secret = dialog_id.get_type() == DialogType::SecretChat;
+    let replace_caption = (dup_type == MessageContentDupType::Copy
+        || dup_type == MessageContentDupType::ServerCopy)
+        && copy_options.replace_caption;
+
+    match content {
+        MessageContent::Animation(m) => {
+            let mut result = m.clone();
+            if replace_caption {
+                result.caption = copy_options.new_caption.clone();
+            }
+            let file_id = fix_dup_file_id(td, result.file_id, dialog_id, to_secret);
+            if file_id != result.file_id {
+                result.file_id = td.dup_animation(file_id, result.file_id);
+            }
+            Some(MessageContent::Animation(result))
+        }
+        MessageContent::Audio(m) => {
+            let mut result = m.clone();
+            if replace_caption {
+                result.caption = copy_options.new_caption.clone();
+            }
+            let file_id = fix_dup_file_id(td, result.file_id, dialog_id, to_secret);
+            if file_id != result.file_id {
+                result.file_id = td.dup_audio(file_id, result.file_id);
+            }
+            Some(MessageContent::Audio(result))
+        }
+        MessageContent::Contact(m) => Some(MessageContent::Contact(m.clone())),
+        MessageContent::Dice(m) => {
+            if m.is_stake {
+                return match dup_type {
+                    MessageContentDupType::Send => Some(MessageContent::Dice(MessageDice::new(
+                        &m.emoji,
+                        0,
+                        true,
+                        m.seed.clone(),
+                        m.state_hash.clone(),
+                        m.stake_ton_count,
+                        0,
+                    ))),
+                    MessageContentDupType::SendViaBot => {
+                        unreachable!("stake dice can't be sent via bot")
+                    }
+                    MessageContentDupType::SendQuickReply
+                    | MessageContentDupType::Forward
+                    | MessageContentDupType::ServerCopy => {
+                        Some(MessageContent::Dice(MessageDice::new(
+                            &m.emoji,
+                            m.dice_value,
+                            true,
+                            m.seed.clone(),
+                            m.state_hash.clone(),
+                            m.stake_ton_count,
+                            m.prize_ton_count,
+                        )))
+                    }
+                    MessageContentDupType::Copy => {
+                        // copy as a regular dice
+                        Some(MessageContent::Dice(MessageDice::new(
+                            &m.emoji,
+                            0,
+                            false,
+                            Vec::new(),
+                            String::new(),
+                            0,
+                            0,
+                        )))
+                    }
+                };
+            }
+            Some(MessageContent::Dice(MessageDice::new(
+                &m.emoji,
+                if dup_type != MessageContentDupType::Forward {
+                    0
+                } else {
+                    m.dice_value
+                },
+                false,
+                Vec::new(),
+                String::new(),
+                0,
+                0,
+            )))
+        }
+        MessageContent::Document(m) => {
+            let mut result = m.clone();
+            if replace_caption {
+                result.caption = copy_options.new_caption.clone();
+            }
+            let file_id = fix_dup_file_id(td, result.file_id, dialog_id, to_secret);
+            if file_id != result.file_id {
+                result.file_id = td.dup_document(file_id, result.file_id);
+            }
+            Some(MessageContent::Document(result))
+        }
+        MessageContent::Game(m) => Some(MessageContent::Game(m.clone())),
+        MessageContent::Giveaway(m) => {
+            if dup_type != MessageContentDupType::Forward {
+                return None;
+            }
+            Some(MessageContent::Giveaway(m.clone()))
+        }
+        MessageContent::GiveawayWinners(m) => {
+            if dup_type != MessageContentDupType::Forward {
+                return None;
+            }
+            Some(MessageContent::GiveawayWinners(m.clone()))
+        }
+        MessageContent::Invoice(m) => {
+            if dup_type == MessageContentDupType::Copy {
+                return None;
+            }
+            Some(MessageContent::Invoice(m.clone()))
+        }
+        MessageContent::LiveLocation(m) => {
+            if !to_secret
+                && (dup_type == MessageContentDupType::Send
+                    || dup_type == MessageContentDupType::SendViaBot
+                    || dup_type == MessageContentDupType::SendQuickReply)
+            {
+                Some(MessageContent::LiveLocation(m.clone()))
+            } else {
+                Some(MessageContent::Location(MessageLocation {
+                    location: m.location.clone(),
+                }))
+            }
+        }
+        MessageContent::Location(m) => Some(MessageContent::Location(m.clone())),
+        MessageContent::PaidMedia(m) => {
+            if dup_type == MessageContentDupType::Copy
+                || dup_type == MessageContentDupType::ServerCopy
+            {
+                return None;
+            }
+            debug_assert!(!to_secret);
+            let mut result = m.clone();
+            if replace_caption {
+                result.caption = copy_options.new_caption.clone();
+            }
+            Some(MessageContent::PaidMedia(result))
+        }
+        MessageContent::Photo(m) => {
+            let mut result = m.clone();
+            if replace_caption {
+                result.caption = copy_options.new_caption.clone();
+            }
+            debug_assert!(!result.photo.photos.is_empty());
+            if !to_secret {
+                return Some(MessageContent::Photo(result));
+            }
+            result.photo = dup_photo(result.photo);
+            let file_id = fix_dup_file_id(
+                td,
+                result.photo.photos.last().unwrap().file_id,
+                dialog_id,
+                to_secret,
+            );
+            result.photo.photos.last_mut().unwrap().file_id = file_id;
+            result.video_file_id = FileId::default();
+            Some(MessageContent::Photo(result))
+        }
+        MessageContent::Poll(m) => {
+            let mut poll_id = m.poll_id;
+            if dup_type == MessageContentDupType::Copy
+                || dup_type == MessageContentDupType::ServerCopy
+            {
+                poll_id = td.dup_poll(dialog_id, poll_id);
+            }
+            let attached_media = m.attached_media.as_deref().and_then(|attached_media| {
+                dup_message_content(
+                    td,
+                    dialog_id,
+                    attached_media,
+                    dup_type,
+                    _is_via_bot,
+                    MessageCopyOptions {
+                        send_copy: copy_options.send_copy,
+                        replace_caption: false,
+                        new_caption: FormattedText::default(),
+                    },
+                )
+                .map(Box::new)
+            });
+            Some(MessageContent::Poll(MessagePoll {
+                poll_id,
+                caption: m.caption.clone(),
+                attached_media,
+            }))
+        }
+        MessageContent::Sticker(m) => {
+            let mut result = m.clone();
+            result.is_premium = td.get_option_boolean("is_premium");
+            if to_secret && !td.has_secret_input_media_sticker(result.file_id) {
+                let file_id = fix_dup_file_id(td, result.file_id, dialog_id, to_secret);
+                if file_id != result.file_id {
+                    result.file_id = td.dup_sticker(file_id, result.file_id);
+                }
+            }
+            Some(MessageContent::Sticker(result))
+        }
+        MessageContent::Story(m) => Some(MessageContent::Story(MessageStory {
+            story_full_id: m.story_full_id,
+            via_mention: false,
+        })),
+        MessageContent::Text(m) => {
+            let mut result = m.clone();
+            if dup_type == MessageContentDupType::Copy
+                || dup_type == MessageContentDupType::ServerCopy
+            {
+                crate::message_entity::remove_unallowed_entities(
+                    &mut result.text,
+                    to_message_entity_dialog_id(dialog_id),
+                    Some(&ContextUserManager { td }),
+                    Some(&mut |custom_emoji_id, is_premium| {
+                        is_premium || td.is_premium_custom_emoji(custom_emoji_id)
+                    }),
+                    td.can_use_premium_custom_emoji_in_dialog(dialog_id),
+                );
+            }
+            Some(MessageContent::Text(result))
+        }
+        MessageContent::ToDoList(m) => {
+            let mut result = m.clone();
+            if dup_type == MessageContentDupType::Copy
+                || dup_type == MessageContentDupType::ServerCopy
+                || dup_type == MessageContentDupType::SendQuickReply
+            {
+                result.completions.clear();
+            }
+            Some(MessageContent::ToDoList(result))
+        }
+        MessageContent::Venue(m) => Some(MessageContent::Venue(m.clone())),
+        MessageContent::Video(m) => {
+            let mut result = m.clone();
+            if replace_caption {
+                result.caption = copy_options.new_caption.clone();
+            }
+            let file_id = fix_dup_file_id(td, result.file_id, dialog_id, to_secret);
+            if file_id != result.file_id {
+                result.file_id = td.dup_video(file_id, result.file_id);
+            }
+            Some(MessageContent::Video(result))
+        }
+        MessageContent::VideoNote(m) => {
+            let mut result = m.clone();
+            result.is_viewed = false;
+            let file_id = fix_dup_file_id(td, result.file_id, dialog_id, to_secret);
+            if file_id != result.file_id {
+                result.file_id = td.dup_video_note(file_id, result.file_id);
+            }
+            Some(MessageContent::VideoNote(result))
+        }
+        MessageContent::VoiceNote(m) => {
+            let mut result = m.clone();
+            if replace_caption {
+                result.caption = copy_options.new_caption.clone();
+            }
+            result.is_listened = false;
+            let file_id = fix_dup_file_id(td, result.file_id, dialog_id, to_secret);
+            if file_id != result.file_id {
+                result.file_id = td.dup_voice_note(file_id, result.file_id);
+            }
+            Some(MessageContent::VoiceNote(result))
+        }
+        MessageContent::Unsupported(_) => {
+            if dup_type == MessageContentDupType::SendViaBot
+                || dup_type == MessageContentDupType::SendQuickReply
+            {
+                Some(MessageContent::Unsupported(MessageUnsupported::default()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The `fix_file_id` closure of `dup_message_content`
+/// (MessageContent.cpp:10158-10165): secret copies of non-secret files
+/// go through `FileManager::copy_file_id`, both reads behind the seam
+/// (M.12.2).
+fn fix_dup_file_id(
+    td: &mut dyn MessageContentContext,
+    file_id: FileId,
+    dialog_id: DialogId,
+    to_secret: bool,
+) -> FileId {
+    if to_secret && !td.is_file_encrypted_secret(file_id) {
+        return td.copy_file_id_to_secret(file_id, dialog_id);
+    }
+    file_id
+}
+
+// ---------------------------------------------------------------------------
 // M.9.4d — the poll arm (MessageContent.cpp:5060-5132, 5302-5378) with the
 // PollOption input plane (PollOption.h, PollOption.cpp:53-97) and the quiz
 // validator (PollManager.cpp:453-468). The Poll VALUE class stays with the
@@ -15806,6 +17281,8 @@ mod tests {
         known_stories: Vec<StoryFullId>,
         read_access_dialogs: Vec<DialogId>,
         register_log: Vec<String>,
+        authorized: bool,
+        on_get_poll_id: PollId,
     }
 
     impl Default for TestContext {
@@ -15868,6 +17345,8 @@ mod tests {
                 known_stories: Vec::new(),
                 read_access_dialogs: Vec::new(),
                 register_log: Vec::new(),
+                authorized: true,
+                on_get_poll_id: PollId::new(1),
             }
         }
     }
@@ -16926,6 +18405,123 @@ mod tests {
         fn delete_video_note_thumbnail(&mut self, _file_id: FileId) {}
 
         fn cancel_upload(&mut self, _file_upload_id: FileUploadId) {}
+
+        fn was_authorized(&self) -> bool {
+            self.authorized
+        }
+
+        fn get_user_id_object(&self, _user_id: UserId, _source: &str) {}
+
+        fn get_live_photo_video_file_id(
+            &mut self,
+            _video: Option<telegram_api::Document>,
+            _owner_dialog_id: DialogId,
+            _is_self_destructing: bool,
+        ) -> FileId {
+            FileId::default()
+        }
+
+        fn on_get_document(
+            &mut self,
+            document: telegram_api::Document,
+            _owner_dialog_id: DialogId,
+            _is_self_destructing: bool,
+            _is_send_priority: bool,
+            _doc_type: Option<DocumentType>,
+        ) -> ParsedDocument {
+            // the test stand-in: every document parses as a General file
+            // with a file id derived from the document id
+            let id = match document {
+                telegram_api::Document::document(d) => d.id,
+                telegram_api::Document::documentEmpty(_) => 0,
+            };
+            if id == 0 {
+                return ParsedDocument::default();
+            }
+            ParsedDocument {
+                file_id: FileId::new(id as i32, 1),
+                r#type: DocumentType::General,
+            }
+        }
+
+        fn get_web_document_photo(
+            &mut self,
+            _web_document: Option<telegram_api::WebDocument>,
+            _owner_dialog_id: DialogId,
+        ) -> Photo {
+            Photo::default()
+        }
+
+        fn on_get_web_page(
+            &mut self,
+            _web_page: Option<telegram_api::WebPage>,
+            _owner_dialog_id: DialogId,
+        ) -> WebPageId {
+            self.web_page_by_url
+        }
+
+        fn on_get_poll(
+            &mut self,
+            _poll: Option<telegram_api::Poll>,
+            _results: Option<telegram_api::PollResults>,
+            _source: &str,
+        ) -> PollId {
+            self.on_get_poll_id
+        }
+
+        fn on_get_story(
+            &mut self,
+            _dialog_id: DialogId,
+            _story: Option<telegram_api::StoryItem>,
+        ) -> StoryId {
+            StoryId::new(0)
+        }
+
+        fn force_create_dialog(&mut self, _dialog_id: DialogId, _source: &str) {}
+
+        fn is_file_encrypted_secret(&self, _file_id: FileId) -> bool {
+            false
+        }
+
+        fn copy_file_id_to_secret(&mut self, file_id: FileId, _dialog_id: DialogId) -> FileId {
+            file_id
+        }
+
+        fn dup_animation(&mut self, new_file_id: FileId, _old_file_id: FileId) -> FileId {
+            new_file_id
+        }
+
+        fn dup_audio(&mut self, new_file_id: FileId, _old_file_id: FileId) -> FileId {
+            new_file_id
+        }
+
+        fn dup_document(&mut self, new_file_id: FileId, _old_file_id: FileId) -> FileId {
+            new_file_id
+        }
+
+        fn dup_sticker(&mut self, new_file_id: FileId, _old_file_id: FileId) -> FileId {
+            new_file_id
+        }
+
+        fn dup_video(&mut self, new_file_id: FileId, _old_file_id: FileId) -> FileId {
+            new_file_id
+        }
+
+        fn dup_video_note(&mut self, new_file_id: FileId, _old_file_id: FileId) -> FileId {
+            new_file_id
+        }
+
+        fn dup_voice_note(&mut self, new_file_id: FileId, _old_file_id: FileId) -> FileId {
+            new_file_id
+        }
+
+        fn dup_poll(&mut self, _dialog_id: DialogId, poll_id: PollId) -> PollId {
+            poll_id
+        }
+
+        fn has_secret_input_media_sticker(&self, _file_id: FileId) -> bool {
+            false
+        }
     }
 
     fn simple_text(text: &str) -> MessageContent {
@@ -21407,6 +23003,1191 @@ mod tests {
             }
             other => panic!("unexpected media: {other:?}"),
         }
+    }
+
+    // -- M.9.14: the intake dispatcher + dup_message_content ---------------
+
+    fn intake(
+        td: &mut TestContext,
+        media: Option<telegram_api::MessageMedia>,
+    ) -> (MessageContent, MessageSelfDestructType, bool) {
+        let mut ttl = MessageSelfDestructType::default();
+        let mut disable_web_page_preview = false;
+        let content = get_message_content(
+            td,
+            FormattedText::default(),
+            None,
+            media,
+            DialogId::from_user_id(UserId::new(7)),
+            1700000001,
+            false,
+            UserId::default(),
+            &mut ttl,
+            &mut disable_web_page_preview,
+            "test",
+        );
+        (content, ttl, disable_web_page_preview)
+    }
+
+    #[test]
+    fn intake_empty_media_answers_text_and_flips_the_url_flag() {
+        let mut td = TestContext::default();
+        let (content, _, disable_web_page_preview) = intake(&mut td, None);
+        assert!(matches!(content, MessageContent::Text(_)));
+        assert!(!disable_web_page_preview);
+
+        let with_url = MessageText::new(
+            FormattedText {
+                text: "https://example.com".to_string(),
+                entities: vec![MessageEntity::new(Type::Url, 0, 19)],
+            },
+            WebPageId::default(),
+            false,
+            false,
+            false,
+            String::new(),
+        );
+        let mut ttl = MessageSelfDestructType::default();
+        let mut disable_web_page_preview = false;
+        let content = get_message_content(
+            &mut td,
+            with_url.text,
+            None,
+            None,
+            DialogId::from_user_id(UserId::new(7)),
+            1700000001,
+            false,
+            UserId::default(),
+            &mut ttl,
+            &mut disable_web_page_preview,
+            "test",
+        );
+        assert!(matches!(content, MessageContent::Text(_)));
+        assert!(disable_web_page_preview);
+    }
+
+    #[test]
+    fn intake_drops_media_without_authorization() {
+        let mut td = TestContext {
+            authorized: false,
+            ..TestContext::default()
+        };
+        let (content, _, _) = intake(
+            &mut td,
+            Some(telegram_api::MessageMedia::messageMediaGeo(
+                telegram_api::messageMediaGeo {
+                    geo: Some(telegram_api::GeoPoint::geoPoint(telegram_api::geoPoint {
+                        flags: 0,
+                        long: 1.0,
+                        lat: 2.0,
+                        access_hash: 0,
+                        accuracy_radius: 0,
+                    })),
+                },
+            )),
+        );
+        assert!(matches!(content, MessageContent::Text(_)));
+    }
+
+    #[test]
+    fn intake_photo_arm() {
+        let mut td = TestContext::default();
+        let photo = telegram_api::Photo::photo(telegram_api::photo {
+            flags: 0,
+            has_stickers: false,
+            id: 1,
+            access_hash: 2,
+            file_reference: Vec::new(),
+            date: 100,
+            sizes: Vec::new(),
+            video_sizes: Vec::new(),
+            dc_id: 2,
+        });
+        // self-destructing photo with spoiler
+        let (content, ttl, _) = intake(
+            &mut td,
+            Some(telegram_api::MessageMedia::messageMediaPhoto(
+                telegram_api::messageMediaPhoto {
+                    flags: 0,
+                    spoiler: true,
+                    live_photo: false,
+                    photo: Some(photo.clone()),
+                    ttl_seconds: 10,
+                    video: None,
+                },
+            )),
+        );
+        match content {
+            MessageContent::Photo(m) => {
+                assert!(m.has_spoiler);
+                assert_eq!(m.photo.id, 1);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+        assert_eq!(ttl.get_input_ttl(), 10);
+
+        // no photo and no ttl -> text fallback
+        let (content, _, _) = intake(
+            &mut td,
+            Some(telegram_api::MessageMedia::messageMediaPhoto(
+                telegram_api::messageMediaPhoto {
+                    flags: 0,
+                    spoiler: false,
+                    live_photo: false,
+                    photo: None,
+                    ttl_seconds: 0,
+                    video: None,
+                },
+            )),
+        );
+        assert!(matches!(content, MessageContent::Text(_)));
+
+        // no photo with ttl -> expired
+        let (content, _, _) = intake(
+            &mut td,
+            Some(telegram_api::MessageMedia::messageMediaPhoto(
+                telegram_api::messageMediaPhoto {
+                    flags: 0,
+                    spoiler: false,
+                    live_photo: false,
+                    photo: None,
+                    ttl_seconds: 30,
+                    video: None,
+                },
+            )),
+        );
+        assert!(matches!(content, MessageContent::ExpiredPhoto(_)));
+    }
+
+    #[test]
+    fn intake_dice_arm() {
+        let mut td = TestContext::default();
+        // regular dice
+        let (content, _, _) = intake(
+            &mut td,
+            Some(telegram_api::MessageMedia::messageMediaDice(
+                telegram_api::messageMediaDice {
+                    flags: 0,
+                    value: 5,
+                    emoticon: "🎲".to_string(),
+                    game_outcome: None,
+                },
+            )),
+        );
+        match content {
+            MessageContent::Dice(m) => {
+                assert_eq!(m.dice_value, 5);
+                assert!(!m.is_stake);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // stake dice with a game outcome
+        let (content, _, _) = intake(
+            &mut td,
+            Some(telegram_api::MessageMedia::messageMediaDice(
+                telegram_api::messageMediaDice {
+                    flags: 1,
+                    value: 6,
+                    emoticon: "🎲".to_string(),
+                    game_outcome: Some(telegram_api::messages_EmojiGameOutcome {
+                        seed: vec![1; 32],
+                        stake_ton_amount: 10,
+                        ton_amount: 20,
+                    }),
+                },
+            )),
+        );
+        match content {
+            MessageContent::Dice(m) => {
+                assert!(m.is_stake);
+                assert_eq!(m.dice_value, 6);
+                assert_eq!(m.stake_ton_count, 10);
+                assert_eq!(m.prize_ton_count, 20);
+                assert_eq!(m.seed, vec![1; 32]);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // stake dice with a wrong emoji is unsupported
+        let (content, _, _) = intake(
+            &mut td,
+            Some(telegram_api::MessageMedia::messageMediaDice(
+                telegram_api::messageMediaDice {
+                    flags: 1,
+                    value: 6,
+                    emoticon: "🎯".to_string(),
+                    game_outcome: Some(telegram_api::messages_EmojiGameOutcome {
+                        seed: vec![1; 32],
+                        stake_ton_amount: 10,
+                        ton_amount: 20,
+                    }),
+                },
+            )),
+        );
+        assert!(matches!(content, MessageContent::Unsupported(_)));
+    }
+
+    #[test]
+    fn intake_geo_venue_contact_arms() {
+        let mut td = TestContext::default();
+        let geo_point = telegram_api::GeoPoint::geoPoint(telegram_api::geoPoint {
+            flags: 0,
+            long: 37.62,
+            lat: 55.75,
+            access_hash: 0,
+            accuracy_radius: 100,
+        });
+        let (content, _, _) = intake(
+            &mut td,
+            Some(telegram_api::MessageMedia::messageMediaGeo(
+                telegram_api::messageMediaGeo {
+                    geo: Some(geo_point.clone()),
+                },
+            )),
+        );
+        match content {
+            MessageContent::Location(m) => {
+                assert!((m.location.get_latitude() - 55.75).abs() < 1e-9);
+                assert_eq!(m.location.get_horizontal_accuracy(), 100.0);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // live location with a bad period collapses to Location
+        let (content, _, _) = intake(
+            &mut td,
+            Some(telegram_api::MessageMedia::messageMediaGeoLive(
+                telegram_api::messageMediaGeoLive {
+                    flags: 0,
+                    geo: Some(geo_point.clone()),
+                    heading: 90,
+                    period: 0,
+                    proximity_notification_radius: 100,
+                },
+            )),
+        );
+        assert!(matches!(content, MessageContent::Location(_)));
+
+        // valid live location
+        let (content, _, _) = intake(
+            &mut td,
+            Some(telegram_api::MessageMedia::messageMediaGeoLive(
+                telegram_api::messageMediaGeoLive {
+                    flags: 0,
+                    geo: Some(geo_point.clone()),
+                    heading: 90,
+                    period: 60,
+                    proximity_notification_radius: 100,
+                },
+            )),
+        );
+        match content {
+            MessageContent::LiveLocation(m) => {
+                assert_eq!(m.period, 60);
+                assert_eq!(m.heading, 90);
+                assert_eq!(m.proximity_alert_radius, 100);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // venue
+        let (content, _, _) = intake(
+            &mut td,
+            Some(telegram_api::MessageMedia::messageMediaVenue(
+                telegram_api::messageMediaVenue {
+                    geo: Some(geo_point.clone()),
+                    title: "T".to_string(),
+                    address: "A".to_string(),
+                    provider: "P".to_string(),
+                    venue_id: "I".to_string(),
+                    venue_type: "X".to_string(),
+                },
+            )),
+        );
+        match content {
+            MessageContent::Venue(m) => {
+                assert_eq!(m.venue.title, "T");
+                assert_eq!(m.venue.id, "I");
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // contact
+        let (content, _, _) = intake(
+            &mut td,
+            Some(telegram_api::MessageMedia::messageMediaContact(
+                telegram_api::messageMediaContact {
+                    phone_number: "+123".to_string(),
+                    first_name: "A".to_string(),
+                    last_name: "B".to_string(),
+                    vcard: "vc".to_string(),
+                    user_id: 5,
+                },
+            )),
+        );
+        match content {
+            MessageContent::Contact(m) => {
+                assert_eq!(m.contact.get_phone_number(), "+123");
+                assert_eq!(m.contact.get_user_id(), UserId::new(5));
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn intake_document_arm() {
+        let mut td = TestContext::default();
+        // a documentEmpty media falls back to text
+        let (content, _, _) = intake(
+            &mut td,
+            Some(telegram_api::MessageMedia::messageMediaDocument(
+                telegram_api::messageMediaDocument {
+                    flags: 0,
+                    nopremium: false,
+                    spoiler: false,
+                    video: false,
+                    round: false,
+                    voice: false,
+                    document: Some(telegram_api::Document::documentEmpty(
+                        telegram_api::documentEmpty { id: 0 },
+                    )),
+                    alt_documents: Vec::new(),
+                    video_cover: None,
+                    video_timestamp: 0,
+                    ttl_seconds: 0,
+                },
+            )),
+        );
+        assert!(matches!(content, MessageContent::Text(_)));
+
+        // a real document parses through the seam (General in the stand-in)
+        let (content, _, _) = intake(
+            &mut td,
+            Some(telegram_api::MessageMedia::messageMediaDocument(
+                telegram_api::messageMediaDocument {
+                    flags: 0,
+                    nopremium: true,
+                    spoiler: false,
+                    video: false,
+                    round: false,
+                    voice: false,
+                    document: Some(telegram_api::Document::document(telegram_api::document {
+                        flags: 0,
+                        id: 42,
+                        access_hash: 0,
+                        file_reference: Vec::new(),
+                        date: 0,
+                        mime_type: String::new(),
+                        size: 0,
+                        dc_id: 0,
+                        attributes: Vec::new(),
+                        thumbs: Vec::new(),
+                        video_thumbs: Vec::new(),
+                    })),
+                    alt_documents: Vec::new(),
+                    video_cover: None,
+                    video_timestamp: 0,
+                    ttl_seconds: 0,
+                },
+            )),
+        );
+        match content {
+            MessageContent::Document(m) => {
+                assert_eq!(m.file_id, FileId::new(42, 1));
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // a missing document with the voice flag answers an expired voice note
+        let (content, _, _) = intake(
+            &mut td,
+            Some(telegram_api::MessageMedia::messageMediaDocument(
+                telegram_api::messageMediaDocument {
+                    flags: 0,
+                    nopremium: false,
+                    spoiler: false,
+                    video: false,
+                    round: false,
+                    voice: true,
+                    document: None,
+                    alt_documents: Vec::new(),
+                    video_cover: None,
+                    video_timestamp: 0,
+                    ttl_seconds: 30,
+                },
+            )),
+        );
+        assert!(matches!(content, MessageContent::ExpiredVoiceNote(_)));
+    }
+
+    #[test]
+    fn intake_web_page_poll_story_arms() {
+        let mut td = TestContext::default();
+        // web page with manual flag answers the url
+        let (content, _, _) = intake(
+            &mut td,
+            Some(telegram_api::MessageMedia::messageMediaWebPage(
+                telegram_api::messageMediaWebPage {
+                    flags: 0,
+                    force_large_media: false,
+                    force_small_media: false,
+                    manual: true,
+                    safe: false,
+                    webpage: Some(Box::new(telegram_api::WebPage::webPageEmpty(
+                        telegram_api::webPageEmpty {
+                            flags: 0,
+                            id: 0,
+                            url: "https://example.com".to_string(),
+                        },
+                    ))),
+                },
+            )),
+        );
+        match content {
+            MessageContent::Text(m) => {
+                assert_eq!(m.web_page_url, "https://example.com");
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // poll with an invalid poll id falls back
+        let mut bad_poll_td = TestContext {
+            on_get_poll_id: PollId::default(),
+            ..TestContext::default()
+        };
+        let (content, _, _) = intake(
+            &mut bad_poll_td,
+            Some(telegram_api::MessageMedia::messageMediaPoll(
+                telegram_api::messageMediaPoll {
+                    flags: 0,
+                    poll: None,
+                    results: None,
+                    attached_media: None,
+                },
+            )),
+        );
+        assert!(matches!(content, MessageContent::Text(_)));
+
+        // poll with a valid id
+        let (content, _, _) = intake(
+            &mut td,
+            Some(telegram_api::MessageMedia::messageMediaPoll(
+                telegram_api::messageMediaPoll {
+                    flags: 0,
+                    poll: None,
+                    results: None,
+                    attached_media: None,
+                },
+            )),
+        );
+        match content {
+            MessageContent::Poll(m) => {
+                assert_eq!(m.poll_id, PollId::new(1));
+                assert!(m.attached_media.is_none());
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // story
+        let (content, _, _) = intake(
+            &mut td,
+            Some(telegram_api::MessageMedia::messageMediaStory(
+                telegram_api::messageMediaStory {
+                    flags: 0,
+                    via_mention: true,
+                    peer: Some(telegram_api::Peer::peerChannel(telegram_api::peerChannel {
+                        channel_id: 8,
+                    })),
+                    id: 42,
+                    story: None,
+                },
+            )),
+        );
+        match content {
+            MessageContent::Story(m) => {
+                assert!(m.via_mention);
+                assert_eq!(m.story_full_id.get_story_id(), StoryId::new(42));
+                assert_eq!(
+                    m.story_full_id.get_dialog_id(),
+                    DialogId::from_channel_id(ChannelId::new(8))
+                );
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn intake_giveaway_paid_media_todo_arms() {
+        let mut td = TestContext::default();
+        // valid giveaway
+        let (content, _, _) = intake(
+            &mut td,
+            Some(telegram_api::MessageMedia::messageMediaGiveaway(
+                telegram_api::messageMediaGiveaway {
+                    flags: 0,
+                    only_new_subscribers: true,
+                    winners_are_visible: false,
+                    channels: vec![5, 6],
+                    countries_iso2: vec!["US".to_string()],
+                    prize_description: "prize".to_string(),
+                    quantity: 10,
+                    months: 3,
+                    stars: 100,
+                    until_date: 1700000001,
+                },
+            )),
+        );
+        match content {
+            MessageContent::Giveaway(m) => {
+                assert_eq!(m.quantity, 10);
+                assert_eq!(m.months, 3);
+                assert_eq!(m.star_count, 100);
+                assert_eq!(m.giveaway_parameters.boosted_channel_id, ChannelId::new(5));
+                assert_eq!(
+                    m.giveaway_parameters.additional_channel_ids,
+                    vec![ChannelId::new(6)]
+                );
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // paid media with a preview
+        let (content, _, _) = intake(
+            &mut td,
+            Some(telegram_api::MessageMedia::messageMediaPaidMedia(
+                telegram_api::messageMediaPaidMedia {
+                    stars_amount: 250,
+                    extended_media: vec![Box::new(
+                        telegram_api::MessageExtendedMedia::messageExtendedMediaPreview(
+                            telegram_api::messageExtendedMediaPreview {
+                                flags: 0,
+                                w: 640,
+                                h: 480,
+                                thumb: None,
+                                video_duration: 30,
+                            },
+                        ),
+                    )],
+                },
+            )),
+        );
+        match content {
+            MessageContent::PaidMedia(m) => {
+                assert_eq!(m.star_count, 250);
+                assert_eq!(m.media.len(), 1);
+                assert_eq!(m.media[0].r#type, MessageExtendedMediaType::Preview);
+                assert_eq!(m.media[0].duration, 30);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // todo
+        let (content, _, _) = intake(
+            &mut td,
+            Some(telegram_api::MessageMedia::messageMediaToDo(
+                telegram_api::messageMediaToDo {
+                    flags: 0,
+                    todo: Some(telegram_api::TodoList {
+                        flags: 0,
+                        others_can_append: true,
+                        others_can_complete: false,
+                        title: Some(telegram_api::TextWithEntities {
+                            text: "title".to_string(),
+                            entities: Vec::new(),
+                        }),
+                        list: vec![telegram_api::TodoItem {
+                            id: 1,
+                            title: Some(telegram_api::TextWithEntities {
+                                text: "item".to_string(),
+                                entities: Vec::new(),
+                            }),
+                        }],
+                    }),
+                    completions: Vec::new(),
+                },
+            )),
+        );
+        match content {
+            MessageContent::ToDoList(m) => {
+                assert_eq!(m.list.title.text, "title");
+                assert_eq!(m.list.items.len(), 1);
+                assert_eq!(m.list.items[0].id, 1);
+                assert!(m.list.others_can_append);
+                assert!(m.completions.is_empty());
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn intake_rich_message_and_unsupported_arms() {
+        let mut td = TestContext::default();
+        // richMessage is deferred with the unmodeled variant
+        let mut ttl = MessageSelfDestructType::default();
+        let mut disable_web_page_preview = false;
+        let content = get_message_content(
+            &mut td,
+            FormattedText::default(),
+            Some(telegram_api::RichMessage::default()),
+            Some(telegram_api::MessageMedia::messageMediaEmpty(
+                telegram_api::messageMediaEmpty,
+            )),
+            DialogId::from_user_id(UserId::new(7)),
+            1700000001,
+            false,
+            UserId::default(),
+            &mut ttl,
+            &mut disable_web_page_preview,
+            "test",
+        );
+        assert!(matches!(content, MessageContent::Unsupported(_)));
+
+        // messageMediaUnsupported
+        let (content, _, _) = intake(
+            &mut td,
+            Some(telegram_api::MessageMedia::messageMediaUnsupported(
+                telegram_api::messageMediaUnsupported,
+            )),
+        );
+        assert!(matches!(content, MessageContent::Unsupported(_)));
+    }
+
+    #[test]
+    fn dup_message_content_decision_table() {
+        let mut td = TestContext::default();
+        let dialog_id = DialogId::from_user_id(UserId::new(7));
+
+        // service content can't be duplicated
+        let service = MessageContent::Call(MessageCall::default());
+        assert!(
+            dup_message_content(
+                &mut td,
+                dialog_id,
+                &service,
+                MessageContentDupType::Forward,
+                false,
+                MessageCopyOptions::default(),
+            )
+            .is_none()
+        );
+
+        // live location: Send keeps it live, Forward collapses to Location
+        let live = MessageContent::LiveLocation(MessageLiveLocation::new(
+            Location::new(1.0, 2.0, 0.0, 0),
+            60,
+            0,
+            0,
+        ));
+        let duped = dup_message_content(
+            &mut td,
+            dialog_id,
+            &live,
+            MessageContentDupType::Send,
+            false,
+            MessageCopyOptions::default(),
+        )
+        .unwrap();
+        assert!(matches!(duped, MessageContent::LiveLocation(_)));
+        let duped = dup_message_content(
+            &mut td,
+            dialog_id,
+            &live,
+            MessageContentDupType::Forward,
+            false,
+            MessageCopyOptions::default(),
+        )
+        .unwrap();
+        assert!(matches!(duped, MessageContent::Location(_)));
+
+        // dice: Send resets the value, Forward keeps it
+        let dice = MessageContent::Dice(MessageDice::new(
+            "🎲",
+            5,
+            false,
+            Vec::new(),
+            String::new(),
+            0,
+            0,
+        ));
+        let duped = dup_message_content(
+            &mut td,
+            dialog_id,
+            &dice,
+            MessageContentDupType::Send,
+            false,
+            MessageCopyOptions::default(),
+        )
+        .unwrap();
+        match duped {
+            MessageContent::Dice(m) => assert_eq!(m.dice_value, 0),
+            other => panic!("unexpected content: {other:?}"),
+        }
+        let duped = dup_message_content(
+            &mut td,
+            dialog_id,
+            &dice,
+            MessageContentDupType::Forward,
+            false,
+            MessageCopyOptions::default(),
+        )
+        .unwrap();
+        match duped {
+            MessageContent::Dice(m) => assert_eq!(m.dice_value, 5),
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // stake dice: Copy collapses to a regular dice, Forward keeps the stake
+        let stake = MessageContent::Dice(MessageDice::new(
+            "🎲",
+            6,
+            true,
+            vec![1; 32],
+            "hash".to_string(),
+            10,
+            20,
+        ));
+        let duped = dup_message_content(
+            &mut td,
+            dialog_id,
+            &stake,
+            MessageContentDupType::Copy,
+            false,
+            MessageCopyOptions::default(),
+        )
+        .unwrap();
+        match duped {
+            MessageContent::Dice(m) => assert!(!m.is_stake),
+            other => panic!("unexpected content: {other:?}"),
+        }
+        let duped = dup_message_content(
+            &mut td,
+            dialog_id,
+            &stake,
+            MessageContentDupType::Forward,
+            false,
+            MessageCopyOptions::default(),
+        )
+        .unwrap();
+        match duped {
+            MessageContent::Dice(m) => {
+                assert!(m.is_stake);
+                assert_eq!(m.prize_ton_count, 20);
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // giveaway forwards only
+        let giveaway = MessageContent::Giveaway(MessageGiveaway::default());
+        assert!(
+            dup_message_content(
+                &mut td,
+                dialog_id,
+                &giveaway,
+                MessageContentDupType::Forward,
+                false,
+                MessageCopyOptions::default(),
+            )
+            .is_some()
+        );
+        assert!(
+            dup_message_content(
+                &mut td,
+                dialog_id,
+                &giveaway,
+                MessageContentDupType::Copy,
+                false,
+                MessageCopyOptions::default(),
+            )
+            .is_none()
+        );
+
+        // invoice: Copy is rejected
+        let invoice = MessageContent::Invoice(MessageInvoice::default());
+        assert!(
+            dup_message_content(
+                &mut td,
+                dialog_id,
+                &invoice,
+                MessageContentDupType::Copy,
+                false,
+                MessageCopyOptions::default(),
+            )
+            .is_none()
+        );
+        assert!(
+            dup_message_content(
+                &mut td,
+                dialog_id,
+                &invoice,
+                MessageContentDupType::Forward,
+                false,
+                MessageCopyOptions::default(),
+            )
+            .is_some()
+        );
+
+        // unsupported: SendViaBot keeps it, Forward drops it
+        let unsupported = MessageContent::Unsupported(MessageUnsupported::default());
+        assert!(
+            dup_message_content(
+                &mut td,
+                dialog_id,
+                &unsupported,
+                MessageContentDupType::SendViaBot,
+                false,
+                MessageCopyOptions::default(),
+            )
+            .is_some()
+        );
+        assert!(
+            dup_message_content(
+                &mut td,
+                dialog_id,
+                &unsupported,
+                MessageContentDupType::Forward,
+                false,
+                MessageCopyOptions::default(),
+            )
+            .is_none()
+        );
+
+        // to-do list: Copy clears the completions
+        let todo = MessageContent::ToDoList(MessageToDoList {
+            list: ToDoList::default(),
+            completions: vec![ToDoCompletion {
+                id: 1,
+                completed_by_dialog_id: dialog_id,
+                date: 100,
+            }],
+        });
+        let duped = dup_message_content(
+            &mut td,
+            dialog_id,
+            &todo,
+            MessageContentDupType::Copy,
+            false,
+            MessageCopyOptions::default(),
+        )
+        .unwrap();
+        match duped {
+            MessageContent::ToDoList(m) => assert!(m.completions.is_empty()),
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // video note: duplicated with is_viewed reset
+        let video_note = MessageContent::VideoNote(MessageVideoNote {
+            file_id: FileId::new(1, 1),
+            is_viewed: true,
+        });
+        let duped = dup_message_content(
+            &mut td,
+            dialog_id,
+            &video_note,
+            MessageContentDupType::Forward,
+            false,
+            MessageCopyOptions::default(),
+        )
+        .unwrap();
+        match duped {
+            MessageContent::VideoNote(m) => assert!(!m.is_viewed),
+            other => panic!("unexpected content: {other:?}"),
+        }
+
+        // replace caption on copy
+        let animation = MessageContent::Animation(MessageAnimation {
+            file_id: FileId::new(1, 1),
+            caption: text("old"),
+            has_spoiler: false,
+        });
+        let duped = dup_message_content(
+            &mut td,
+            dialog_id,
+            &animation,
+            MessageContentDupType::Copy,
+            false,
+            MessageCopyOptions {
+                send_copy: false,
+                replace_caption: true,
+                new_caption: text("new"),
+            },
+        )
+        .unwrap();
+        match duped {
+            MessageContent::Animation(m) => assert_eq!(m.caption.text, "new"),
+            other => panic!("unexpected content: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_document_message_content_switch() {
+        let file_id = FileId::new(1, 1);
+        let parsed = ParsedDocument {
+            file_id,
+            r#type: DocumentType::Animation,
+        };
+        let content = get_document_message_content(
+            parsed,
+            FormattedText::default(),
+            false,
+            false,
+            true,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Photo::default(),
+            0,
+        );
+        assert!(matches!(
+            content,
+            MessageContent::Animation(m) if m.file_id == file_id && m.has_spoiler
+        ));
+
+        let parsed = ParsedDocument {
+            file_id,
+            r#type: DocumentType::Unknown,
+        };
+        let content = get_document_message_content(
+            parsed,
+            FormattedText::default(),
+            false,
+            false,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Photo::default(),
+            0,
+        );
+        assert!(matches!(content, MessageContent::Unsupported(_)));
+
+        let parsed = ParsedDocument {
+            file_id,
+            r#type: DocumentType::Video,
+        };
+        let content = get_document_message_content(
+            parsed,
+            FormattedText::default(),
+            false,
+            true,
+            false,
+            vec![FileId::new(2, 1)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Photo::default(),
+            30,
+        );
+        match content {
+            MessageContent::Video(m) => {
+                assert_eq!(m.alternative_file_ids, vec![FileId::new(2, 1)]);
+                assert_eq!(m.start_timestamp, 30);
+                assert_eq!(m.cover, Photo::default());
+            }
+            other => panic!("unexpected content: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dup_photo_selects_input_and_thumbnail_sizes() {
+        let file_id = FileId::new(1, 1);
+        let photo = Photo {
+            id: 1,
+            date: 0,
+            minithumbnail: "mini".to_string(),
+            photos: vec![
+                PhotoSize {
+                    size_type: b'x' as i32,
+                    size: 100,
+                    dimensions: crate::photo::get_dimensions(100, 100, "test"),
+                    file_id,
+                    progressive_sizes: Vec::new(),
+                },
+                PhotoSize {
+                    size_type: b'i' as i32,
+                    size: 200,
+                    dimensions: crate::photo::get_dimensions(200, 200, "test"),
+                    file_id,
+                    progressive_sizes: Vec::new(),
+                },
+                PhotoSize {
+                    size_type: b't' as i32,
+                    size: 50,
+                    dimensions: crate::photo::get_dimensions(50, 50, "test"),
+                    file_id,
+                    progressive_sizes: Vec::new(),
+                },
+            ],
+            animations: Vec::new(),
+            sticker_photo_size: None,
+            has_stickers: true,
+            sticker_file_ids: vec![FileId::new(2, 1)],
+        };
+        let duped = dup_photo(photo);
+        assert_eq!(duped.photos.len(), 2);
+        assert_eq!(duped.photos[0].size_type, b't' as i32);
+        assert_eq!(duped.photos[1].size_type, b'i' as i32);
+        assert_eq!(duped.photos[1].size, 200);
+        assert!(duped.has_stickers);
+        assert_eq!(duped.minithumbnail, "mini");
+
+        // without 'i'/'t' sizes the largest/smallest win
+        let photo = Photo {
+            id: 1,
+            date: 0,
+            minithumbnail: String::new(),
+            photos: vec![
+                PhotoSize {
+                    size_type: b'x' as i32,
+                    size: 100,
+                    dimensions: crate::photo::get_dimensions(100, 100, "test"),
+                    file_id,
+                    progressive_sizes: Vec::new(),
+                },
+                PhotoSize {
+                    size_type: b'y' as i32,
+                    size: 300,
+                    dimensions: crate::photo::get_dimensions(300, 300, "test"),
+                    file_id,
+                    progressive_sizes: Vec::new(),
+                },
+            ],
+            animations: Vec::new(),
+            sticker_photo_size: None,
+            has_stickers: false,
+            sticker_file_ids: Vec::new(),
+        };
+        let duped = dup_photo(photo);
+        assert_eq!(duped.photos.len(), 2);
+        assert_eq!(duped.photos[0].size_type, b't' as i32);
+        assert_eq!(duped.photos[0].size, 100);
+        assert_eq!(duped.photos[1].size_type, b'i' as i32);
+        assert_eq!(duped.photos[1].size, 300);
+    }
+
+    #[test]
+    fn star_and_ton_count_clamps() {
+        assert_eq!(get_star_count(100), 100);
+        assert_eq!(get_star_count(-1), 0);
+        assert_eq!(get_star_count(1i64 << 52), 1i64 << 51);
+        assert_eq!(get_ton_count(100), 100);
+        assert_eq!(get_ton_count(-1), 0);
+        assert_eq!(get_ton_count(1i64 << 52), 1i64 << 51);
+    }
+
+    #[test]
+    fn web_page_url_extraction() {
+        assert_eq!(
+            get_web_page_url(Some(&telegram_api::WebPage::webPageEmpty(
+                telegram_api::webPageEmpty {
+                    flags: 0,
+                    id: 0,
+                    url: "https://example.com".to_string(),
+                }
+            ))),
+            "https://example.com"
+        );
+        assert_eq!(
+            get_web_page_url(Some(&telegram_api::WebPage::webPagePending(
+                telegram_api::webPagePending {
+                    flags: 0,
+                    id: 1,
+                    url: "https://example.org".to_string(),
+                    date: 0,
+                }
+            ))),
+            "https://example.org"
+        );
+        assert_eq!(get_web_page_url(None), "");
+    }
+
+    #[test]
+    fn location_from_telegram_geo_point() {
+        let empty = get_location_from_telegram_geo_point(&None);
+        assert!(empty.is_empty());
+        let empty = get_location_from_telegram_geo_point(&Some(
+            telegram_api::GeoPoint::geoPointEmpty(telegram_api::geoPointEmpty),
+        ));
+        assert!(empty.is_empty());
+        let location = get_location_from_telegram_geo_point(&Some(
+            telegram_api::GeoPoint::geoPoint(telegram_api::geoPoint {
+                flags: 0,
+                long: 37.62,
+                lat: 55.75,
+                access_hash: 7,
+                accuracy_radius: 100,
+            }),
+        ));
+        assert!(!location.is_empty());
+        assert_eq!(location.get_access_hash(), 7);
+        assert_eq!(location.get_horizontal_accuracy(), 100.0);
+    }
+
+    #[test]
+    fn extended_media_preview_and_photo_arms() {
+        let mut td = TestContext::default();
+        // preview with a stripped thumbnail
+        let preview = get_message_extended_media_from_telegram(
+            &mut td,
+            Some(
+                telegram_api::MessageExtendedMedia::messageExtendedMediaPreview(
+                    telegram_api::messageExtendedMediaPreview {
+                        flags: 0,
+                        w: 640,
+                        h: 480,
+                        thumb: Some(telegram_api::PhotoSize::photoStrippedSize(
+                            telegram_api::photoStrippedSize {
+                                r#type: "s".to_string(),
+                                bytes: vec![1, 2, 3],
+                            },
+                        )),
+                        video_duration: 30,
+                    },
+                ),
+            ),
+            DialogId::from_user_id(UserId::new(7)),
+        );
+        assert_eq!(preview.r#type, MessageExtendedMediaType::Preview);
+        assert_eq!(preview.duration, 30);
+        assert_eq!(preview.minithumbnail.as_bytes(), &[1, 2, 3]);
+        assert_eq!(
+            preview.dimensions,
+            crate::photo::get_dimensions(640, 480, "test")
+        );
+
+        // photo arm
+        let photo = get_message_extended_media_from_telegram(
+            &mut td,
+            Some(telegram_api::MessageExtendedMedia::messageExtendedMedia(
+                telegram_api::messageExtendedMedia {
+                    media: Some(Box::new(telegram_api::MessageMedia::messageMediaPhoto(
+                        telegram_api::messageMediaPhoto {
+                            flags: 0,
+                            spoiler: false,
+                            live_photo: false,
+                            photo: Some(telegram_api::Photo::photo(telegram_api::photo {
+                                flags: 0,
+                                has_stickers: false,
+                                id: 3,
+                                access_hash: 0,
+                                file_reference: Vec::new(),
+                                date: 0,
+                                sizes: Vec::new(),
+                                video_sizes: Vec::new(),
+                                dc_id: 2,
+                            })),
+                            ttl_seconds: 0,
+                            video: None,
+                        },
+                    ))),
+                },
+            )),
+            DialogId::from_user_id(UserId::new(7)),
+        );
+        assert_eq!(photo.r#type, MessageExtendedMediaType::Photo);
+        assert_eq!(photo.photo.id, 3);
     }
 
     #[test]
