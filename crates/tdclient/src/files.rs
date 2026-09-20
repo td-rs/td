@@ -35,13 +35,13 @@
 //!   `PhotoSizeSource::DialogPhoto::get_input_peer` are M.12.4 (they are
 //!   the download-RPC query builders).
 
-use std::cell::RefCell;
+use parking_lot::Mutex;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::chat_manager::{ChannelId, ChatId, DcId};
 use crate::message_id::{DialogId, DialogType, MessageFullId, MessageId};
@@ -458,6 +458,11 @@ pub fn get_file_type_class(file_type: FileType) -> FileTypeClass {
 /// `is_document_file_type` (FileType.cpp:254-256).
 pub fn is_document_file_type(file_type: FileType) -> bool {
     get_file_type_class(file_type) == FileTypeClass::Document
+}
+
+/// `is_background_type` (FileManager.cpp:3990-3992).
+fn is_background_type(file_type: FileType) -> bool {
+    file_type == FileType::Wallpaper || file_type == FileType::Background
 }
 
 /// `get_file_dir_type` (FileType.cpp:323-347).
@@ -3074,7 +3079,7 @@ impl fmt::Display for FileEncryptionKey {
 /// that `FileData` serialization calls through. Implemented by
 /// [`FileReferenceManager`] (M.12.2a); the byte-level tests keep the
 /// [`TestFileSources`] stand-in.
-pub trait FileSourceStorage {
+pub trait FileSourceStorage: Send {
     fn store_file_source(&mut self, file_source_id: FileSourceId, out: &mut Vec<u8>);
     fn parse_file_source(&mut self, parser: &mut Parser) -> Result<FileSourceId, &'static str>;
 }
@@ -5491,13 +5496,45 @@ pub struct FileStat {
     pub real_size: i64,
 }
 
+impl FileNode {
+    /// The `FileData` construction of `try_flush_node_info`
+    /// (FileManager.cpp) — the file sources arrive from the caller (the
+    /// FileReferenceManager owns them).
+    pub(crate) fn to_file_data(&self, sources: Vec<FileSourceId>) -> FileData {
+        FileData {
+            owner_dialog_id: self.owner_dialog_id,
+            pmc_id: self.pmc_id.get(),
+            remote: self.remote.partial_or_empty(),
+            local: self.local.clone(),
+            generate: self.generate.clone(),
+            size: self.size,
+            expected_size: self.expected_size,
+            remote_name: self.remote_name.clone(),
+            url: self.url.clone(),
+            encryption_key: self.encryption_key.clone(),
+            file_source_ids: sources,
+        }
+    }
+
+    /// The node's main file id (the C++ `node.main_file_id_` read the
+    /// flush/merge replays need from the Td side).
+    pub fn main_file_id(&self) -> FileId {
+        self.main_file_id
+    }
+
+    /// The pmc record id (`try_flush_node`'s file-db key).
+    pub(crate) fn pmc_id(&self) -> FileDbId {
+        self.pmc_id
+    }
+}
+
 /// The environment seam of the collapsed [`FileManager`] — the C++
 /// `FileManager::Context` flags (`keep_exact_remote_location`), the
 /// filesystem access behind `FileLoaderUtils` (`realpath`, `stat`), the
 /// `TdDb::with_db_path` bad paths, the `Global` files directories and the
 /// option reads of `check_full_local_location`. The default methods do the
 /// real `std::fs` work; tests override the pieces they exercise.
-pub trait FileManagerContext {
+pub trait FileManagerContext: Send {
     /// `Context::keep_exact_remote_location` (FileManager.h).
     fn keep_exact_remote_location(&self) -> bool {
         false
@@ -5774,7 +5811,7 @@ pub fn check_partial_local_location<C: FileManagerContext + ?Sized>(
 /// `Context::on_merge_files`. Every method is a no-op by default; the real
 /// implementations land with the download/upload/generate managers and the
 /// database flush loop (M.12.4-8).
-pub trait FileManagerWorker {
+pub trait FileManagerWorker: Send {
     /// `FileManager::do_cancel_download`.
     fn cancel_download(&mut self, _node: &FileNode) {}
     /// `FileManager::do_cancel_upload`.
@@ -5881,7 +5918,10 @@ pub struct FileManager {
     /// `file_upload_requests_` (FileManager.h:866).
     file_upload_requests: BTreeMap<FileId, UploadRequests>,
     /// `user_download_file_callback_` (FileManager.h:841).
-    user_download_file_callback: Option<Rc<RefCell<dyn DownloadCallback>>>,
+    user_download_file_callback: Option<Arc<parking_lot::Mutex<dyn DownloadCallback>>>,
+    /// `pending_user_file_downloads_` (FileManager.h:837-839) — the parked
+    /// `downloadFile(synchronous)` promises.
+    pending_user_file_downloads: BTreeMap<FileId, UserFileDownloadInfo>,
     /// The `download_queries_` container.
     download_queries: BTreeMap<u64, FileDownloadQuery>,
     /// The `upload_queries_` container.
@@ -5919,11 +5959,11 @@ struct NodeGeneratePlan {
 /// The Download-worker seam `run_generate` re-enters
 /// `FileManager::download` with: the referenced file id, the reserved
 /// internal download id and the event-queue bridge.
-type GenerateDownloadStart = (FileId, i64, Rc<RefCell<dyn DownloadCallback>>);
+type GenerateDownloadStart = (FileId, i64, Arc<parking_lot::Mutex<dyn DownloadCallback>>);
 
 /// One entry of `finish_uploads`' drained callbacks: the manager query
 /// id, the callback and its `was_active` flag.
-type PendingUploadFinish = (i64, Rc<RefCell<dyn UploadCallback>>, bool);
+type PendingUploadFinish = (i64, Arc<parking_lot::Mutex<dyn UploadCallback>>, bool);
 
 /// The `external_path` answer: the worker state plus the pending
 /// download seam of a Download worker.
@@ -5982,6 +6022,15 @@ impl FileManager {
     /// Registers the worker; replaces the previous one.
     pub fn set_worker(&mut self, worker: Box<dyn FileManagerWorker>) {
         self.worker = Some(worker);
+    }
+
+    /// The `FileManager::hangup` half the Td close runs (the C++ resets
+    /// the manager actors, Td.cpp:712): dropping the stored planes breaks
+    /// the shared-cell reference cycle
+    /// (`file_manager → context/worker → cell → file_manager`).
+    pub fn teardown(&mut self) {
+        self.context = None;
+        self.worker = None;
     }
 
     /// `FileManager::next_file_id` (FileManager.cpp:4756-4766).
@@ -6795,6 +6844,398 @@ impl FileManager {
         }
 
         Ok(file_id)
+    }
+
+    /// `FileManager::from_persistent_id` (FileManager.cpp:3994-4025) — the
+    /// `getRemoteFile`/`inputFileRemote` entry over the persistent-id
+    /// string form.
+    pub fn from_persistent_id(
+        &mut self,
+        persistent_id: &str,
+        file_type: FileType,
+    ) -> Result<FileId, Status> {
+        if persistent_id.contains('.') {
+            let url = match tdutils::http_url::parse_url(persistent_id) {
+                tdutils::status::Result::Ok(url) => url.get_url(),
+                tdutils::status::Result::Err(status) => {
+                    return Err(Status::error(
+                        400,
+                        &format!("Invalid file HTTP URL specified: {}", status.message()),
+                    ));
+                }
+            };
+            let Some(url) = crate::misc::clean_input_string(&url) else {
+                return Err(Status::error(400, "URL must be in UTF-8"));
+            };
+            return Ok(self.register_url(url, file_type, DialogId::default()));
+        }
+
+        let tdutils::status::Result::Ok(binary) =
+            tdmtproto::utils::base64url_decode(persistent_id.as_bytes())
+        else {
+            return Err(Status::error(
+                400,
+                "Wrong remote file identifier specified: invalid base64url",
+            ));
+        };
+        if binary.is_empty() {
+            return Err(Status::error(
+                400,
+                "Remote file identifier must be non-empty",
+            ));
+        }
+        match *binary.last().expect("non-empty") {
+            PERSISTENT_ID_VERSION_OLD => self.from_persistent_id_v2(&binary, file_type),
+            PERSISTENT_ID_VERSION => self.from_persistent_id_v3(&binary, file_type),
+            PERSISTENT_ID_VERSION_GENERATED => {
+                self.from_persistent_id_generated(&binary, file_type)
+            }
+            _ => Err(Status::error(
+                400,
+                "Wrong remote file identifier specified: can't unserialize it. Wrong last symbol",
+            )),
+        }
+    }
+
+    /// `FileManager::from_persistent_id_v2` (FileManager.cpp:4072-4075).
+    #[allow(clippy::wrong_self_convention)]
+    fn from_persistent_id_v2(
+        &mut self,
+        binary: &[u8],
+        file_type: FileType,
+    ) -> Result<FileId, Status> {
+        self.from_persistent_id_v23(&binary[..binary.len() - 1], file_type, 0)
+    }
+
+    /// `FileManager::from_persistent_id_v3` (FileManager.cpp:4077-4086).
+    #[allow(clippy::wrong_self_convention)]
+    fn from_persistent_id_v3(
+        &mut self,
+        binary: &[u8],
+        file_type: FileType,
+    ) -> Result<FileId, Status> {
+        let binary = &binary[..binary.len() - 1];
+        if binary.is_empty() {
+            return Err(Status::error(400, "Invalid remote file identifier"));
+        }
+        let version = *binary.last().expect("non-empty") as i32;
+        self.from_persistent_id_v23(&binary[..binary.len() - 1], file_type, version)
+    }
+
+    /// `FileManager::from_persistent_id_v23` (FileManager.cpp:4047-4070).
+    #[allow(clippy::wrong_self_convention)]
+    fn from_persistent_id_v23(
+        &mut self,
+        binary: &[u8],
+        file_type: FileType,
+        version: i32,
+    ) -> Result<FileId, Status> {
+        if !(0..store_parse::version::NEXT).contains(&version) {
+            return Err(Status::error(400, "Invalid remote file identifier"));
+        }
+        let decoded = tdutils::zero_encode::zero_decode(binary);
+        let mut parser = Parser::new(&decoded);
+        parser.set_version(version);
+        let parse_result = FullRemoteFileLocation::parse_from(&mut parser);
+        let remote_location = match parse_result.and_then(|location| {
+            parser.fetch_end()?;
+            Ok(location)
+        }) {
+            Ok(location) => location,
+            Err(_) => {
+                return Err(Status::error(
+                    400,
+                    "Wrong remote file identifier specified: can't unserialize it",
+                ));
+            }
+        };
+        let mut real_file_type = remote_location.file_type;
+        if is_document_file_type(real_file_type) && is_document_file_type(file_type) {
+            real_file_type = file_type;
+        } else if is_background_type(real_file_type) && is_background_type(file_type) {
+            // type of file matches, but real type is in the stored remote
+            // location
+        } else if real_file_type != file_type && file_type != FileType::Temp {
+            return Err(Status::error(
+                400,
+                &format!("Can't use file of type {real_file_type:?} as {file_type:?}"),
+            ));
+        }
+        let mut remote_location = remote_location;
+        remote_location.file_type = real_file_type;
+        Ok(self.register_remote(
+            remote_location,
+            FileLocationSource::FromUser,
+            DialogId::default(),
+            0,
+            0,
+            String::new(),
+        ))
+    }
+
+    /// `FileManager::from_persistent_id_generated`
+    /// (FileManager.cpp:4027-4045).
+    #[allow(clippy::wrong_self_convention)]
+    fn from_persistent_id_generated(
+        &mut self,
+        binary: &[u8],
+        file_type: FileType,
+    ) -> Result<FileId, Status> {
+        let decoded = tdutils::zero_encode::zero_decode(&binary[..binary.len() - 1]);
+        let mut parser = Parser::new(&decoded);
+        let generate_location =
+            match FullGenerateFileLocation::parse_from(&mut parser).and_then(|location| {
+                parser.fetch_end()?;
+                Ok(location)
+            }) {
+                Ok(location) => location,
+                Err(_) => {
+                    return Err(Status::error(
+                        400,
+                        "Wrong remote file identifier specified: can't unserialize it",
+                    ));
+                }
+            };
+        let real_file_type = generate_location.file_type;
+        if (real_file_type != file_type && file_type != FileType::Temp)
+            || (real_file_type != FileType::Thumbnail
+                && real_file_type != FileType::EncryptedThumbnail)
+        {
+            return Err(Status::error(
+                400,
+                &format!("Can't use file of type {real_file_type:?} as {file_type:?}"),
+            ));
+        }
+        if !is_remotely_generated_file(&generate_location.conversion) {
+            return Err(Status::error(400, "Unexpected conversion type"));
+        }
+        Ok(self.do_register_generate(generate_location, DialogId::default(), 0, String::new()))
+    }
+
+    /// `FileManager::check_input_file_id` (FileManager.cpp:4140-4180) —
+    /// the type re-check over the full node data, plus the exact-remote
+    /// `RemoteInfo` registration the reused ids carry.
+    fn check_input_file_id(
+        &mut self,
+        type_: FileType,
+        result: Result<FileId, Status>,
+        is_encrypted: bool,
+        allow_zero: bool,
+        is_secure: bool,
+    ) -> Result<FileId, Status> {
+        let file_id = result?;
+        if allow_zero && !file_id.is_valid() {
+            return Ok(FileId::default());
+        }
+
+        // the node snapshot: the reads end before the RemoteInfo
+        // mutations borrow the manager again (the shadowed `is_encrypted`
+        // is the view's flag, the param keeps the request's)
+        let (main_file_id, real_type, has_url, view_is_encrypted, full_remote_location) = {
+            let Some(node) = self.get_file_node(file_id) else {
+                return Err(Status::error(400, "File not found"));
+            };
+            let view = FileView::new(node);
+            (
+                node.main_file_id,
+                view.get_type(),
+                view.has_url(),
+                view.is_encrypted(),
+                view.get_full_remote_location().cloned(),
+            )
+        };
+        if !is_encrypted
+            && !is_secure
+            && real_type != type_
+            && !(real_type == FileType::Temp && has_url)
+            && !(is_document_file_type(real_type) && is_document_file_type(type_))
+            && !(is_background_type(real_type) && is_background_type(type_))
+            && !(view_is_encrypted && type_ == FileType::Ringtone)
+            && !(real_type == FileType::PhotoStory && type_ == FileType::Photo)
+            && !(real_type == FileType::Photo && type_ == FileType::PhotoStory)
+        {
+            return Err(Status::error(
+                400,
+                &format!("Can't use file of type {real_type:?} as {type_:?}"),
+            ));
+        }
+
+        let Some(full_remote_location) = full_remote_location else {
+            return Ok(main_file_id);
+        };
+
+        let mut remote_id = file_id.get_remote();
+        if remote_id == 0 && self.ctx().keep_exact_remote_location() {
+            match self
+                .remote_location_index
+                .get(&full_remote_location)
+                .copied()
+            {
+                Some(index) => remote_id = index as i32,
+                None => {
+                    let index = self.remote_location_info.len();
+                    self.remote_location_info.push(RemoteInfo {
+                        location: full_remote_location.clone(),
+                        source: FileLocationSource::FromUser,
+                        file_id,
+                    });
+                    self.remote_location_index
+                        .insert(full_remote_location, index);
+                    remote_id = index as i32;
+                }
+            }
+            if self
+                .remote_location_info
+                .get(remote_id as usize)
+                .is_some_and(|info| info.file_id == file_id)
+            {
+                self.pin_file_id(file_id);
+            }
+        }
+        Ok(FileId::new(main_file_id.get(), remote_id))
+    }
+
+    /// `FileManager::get_input_file_id` (FileManager.cpp:4211-4283) — the
+    /// `InputFile` builder. The `reuse_uploaded_photos_by_hash` arm of
+    /// `inputFileLocal` is option-gated off by default and rides the
+    /// `file_hash_to_file_id_` map of the C++ manager; the collapse
+    /// registers locally like the option-off path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_input_file_id(
+        &mut self,
+        type_: FileType,
+        file: Option<&td_api::InputFile>,
+        owner_dialog_id: DialogId,
+        allow_zero: bool,
+        is_encrypted: bool,
+        mut get_by_hash: bool,
+        is_secure: bool,
+        force_reuse: bool,
+        never_reuse: bool,
+    ) -> Result<FileId, Status> {
+        let _ = force_reuse;
+        let Some(file) = file else {
+            if allow_zero {
+                return Ok(FileId::default());
+            }
+            return Err(Status::error(400, "InputFile is not specified"));
+        };
+
+        if is_encrypted || is_secure {
+            get_by_hash = false;
+        }
+
+        let new_type = if is_encrypted {
+            FileType::Encrypted
+        } else if is_secure {
+            FileType::SecureEncrypted
+        } else {
+            type_
+        };
+
+        let r_file_id = match file {
+            td_api::InputFile::inputFileLocal(local) => {
+                let path = local.path.clone();
+                if allow_zero && path.is_empty() {
+                    Ok(FileId::default())
+                } else {
+                    self.register_local(
+                        FullLocalFileLocation::new(new_type, path, 0),
+                        owner_dialog_id,
+                        0,
+                        get_by_hash,
+                        false,
+                        FileId::default(),
+                    )
+                }
+            }
+            td_api::InputFile::inputFileId(input_id) => {
+                if never_reuse {
+                    Err(Status::error(400, "Can't use inputFileId"))
+                } else {
+                    let file_id = FileId::new(input_id.id, 0);
+                    if !file_id.is_valid() {
+                        if !allow_zero {
+                            return Err(Status::error(400, "InputFile is not specified"));
+                        }
+                        Ok(FileId::default())
+                    } else {
+                        Ok(file_id)
+                    }
+                }
+            }
+            td_api::InputFile::inputFileRemote(remote) => {
+                if never_reuse {
+                    Err(Status::error(400, "Can't use inputFileRemote"))
+                } else if allow_zero && remote.id.is_empty() {
+                    Ok(FileId::default())
+                } else {
+                    self.from_persistent_id(&remote.id.clone(), type_)
+                }
+            }
+            td_api::InputFile::inputFileGenerated(generated) => Ok(self.register_generate(
+                new_type,
+                generated.original_path.clone(),
+                generated.conversion.clone(),
+                owner_dialog_id,
+                generated.expected_size,
+            )),
+        };
+
+        self.check_input_file_id(type_, r_file_id, is_encrypted, allow_zero, is_secure)
+    }
+
+    /// `FileManager::preliminary_upload_file` (FileManager.cpp:5356-5370)
+    /// — the `preliminaryUploadFile` arm. The C++
+    /// `PreliminaryUploadFileCallback` only ever observes the synchronous
+    /// `resume_upload` outcomes (the user-arm callback is not parked in
+    /// `file_upload_requests_`), and its `on_upload_ok` cancels the upload
+    /// so a second upload of the same file succeeds — replayed here as the
+    /// post-`upload` completed check.
+    pub fn preliminary_upload_file(
+        &mut self,
+        input_file: Option<&td_api::InputFile>,
+        file_type: FileType,
+        priority: i32,
+        fllm: &mut FileLoadManager,
+    ) -> Result<td_api::File, Status> {
+        check_download_priority(priority)?;
+
+        let is_secret =
+            file_type == FileType::Encrypted || file_type == FileType::EncryptedThumbnail;
+        let is_secure = file_type == FileType::SecureEncrypted;
+        let file_id = self.get_input_file_id(
+            file_type,
+            input_file,
+            DialogId::default(),
+            false,
+            is_secret,
+            !is_secure && !is_secret,
+            is_secure,
+            false,
+            false,
+        )?;
+
+        self.upload(
+            FileUploadId::new(file_id, 0),
+            Arc::new(parking_lot::Mutex::new(NoopUploadCallback)),
+            priority,
+            0,
+            fllm,
+        );
+        // the PreliminaryUploadFileCallback::on_upload_ok cancel hop
+        // (FileManager.cpp:1289-1306)
+        let upload_completed = self
+            .get_file_view(file_id)
+            .map(|view| {
+                view.has_active_upload_remote_location() && can_reuse_remote_file(view.get_type())
+            })
+            .unwrap_or(false);
+        if upload_completed {
+            self.cancel_upload(FileUploadId::new(file_id, 0), fllm);
+        }
+
+        Ok(self.get_file_object(file_id))
     }
 
     /// `FileManager::set_encryption_key` (FileManager.cpp) over the node
@@ -8484,7 +8925,7 @@ pub enum ResourceManagerMode {
 /// `ActorShared<FileLoaderActor>`): the two closures the
 /// [`ResourceManager`] sends. M.12.4's real loader implements this; the
 /// unit tests fake it.
-pub trait ResourceManagerWorker {
+pub trait ResourceManagerWorker: Send {
     /// `send_closure(callback, &FileLoaderActor::set_resource_manager, ...)`
     /// fired at the end of [`ResourceManager::register_worker`].
     fn set_resource_manager(&mut self, handle: ResourceManagerHandle);
@@ -8499,29 +8940,27 @@ pub trait ResourceManagerWorker {
 /// C++ resolves through its message queue cannot occur in the collapse.
 #[derive(Clone)]
 pub struct ResourceManagerHandle {
-    manager: Rc<RefCell<ResourceManager>>,
+    manager: Arc<parking_lot::Mutex<ResourceManager>>,
     node_id: u64,
 }
 
 impl ResourceManagerHandle {
     /// `ResourceManager::update_priority` (ResourceManager.cpp:34-43).
     pub fn update_priority(&self, priority: i8) {
-        self.manager
-            .borrow_mut()
-            .update_priority(self.node_id, priority);
+        self.manager.lock().update_priority(self.node_id, priority);
     }
 
     /// `ResourceManager::update_resources` (ResourceManager.cpp:45-66).
     pub fn update_resources(&self, resource_state: &ResourceState) {
         self.manager
-            .borrow_mut()
+            .lock()
             .update_resources(self.node_id, resource_state);
     }
 
     /// `ResourceManager::hangup_shared` (ResourceManager.cpp:73-88) — the
     /// worker dropped its end of the link.
     pub fn hangup_shared(&self) {
-        self.manager.borrow_mut().disconnect_worker(self.node_id);
+        self.manager.lock().disconnect_worker(self.node_id);
     }
 }
 
@@ -8576,22 +9015,22 @@ impl ResourceManager {
     /// Takes the shared handle so the `set_resource_manager` closure can
     /// carry it back to the worker.
     pub fn register_worker(
-        this: &Rc<RefCell<ResourceManager>>,
+        this: &Arc<parking_lot::Mutex<ResourceManager>>,
         callback: Box<dyn ResourceManagerWorker>,
         priority: i8,
     ) {
-        let node_id = this.borrow_mut().create_node(callback);
-        this.borrow_mut().add_node(node_id, priority);
+        let node_id = this.lock().create_node(callback);
+        this.lock().add_node(node_id, priority);
         // send_closure(node->callback_, &FileLoaderActor::set_resource_manager,
         //               actor_shared(this, node_id)) — sent with the manager
         // borrow released, so the worker may call straight back
         let handle = ResourceManagerHandle {
-            manager: Rc::clone(this),
+            manager: Arc::clone(this),
             node_id,
         };
-        let mut node = this.borrow_mut().take_node(node_id);
+        let mut node = this.lock().take_node(node_id);
         node.callback.set_resource_manager(handle);
-        this.borrow_mut().put_node(node);
+        this.lock().put_node(node);
     }
 
     fn create_node(&mut self, callback: Box<dyn ResourceManagerWorker>) -> u64 {
@@ -8850,7 +9289,7 @@ pub enum UploadPartQuery {
 /// quartet folded into one call that sends the query and fetches its `Bool`
 /// result. Uploads are sequential here; the in-flight pipelining of the C++
 /// actor loop is a scheduler property and returns with it (M.12.7).
-pub trait FileUploaderNet {
+pub trait FileUploaderNet: Send {
     /// `Ok(false)` is the C++ `!result.ok()` 500 path. `Err` with
     /// [`NET_QUERY_CANCELED`] restarts the part; any other `Err` fails the
     /// upload.
@@ -8872,7 +9311,7 @@ pub trait FileUploaderNet {
 }
 
 /// `FileUploader::Callback` (FileUploader.h:32-42).
-pub trait FileUploaderCallback {
+pub trait FileUploaderCallback: Send {
     /// The hash of a just-encrypted secure file.
     fn on_hash(&mut self, hash: Vec<u8>);
     fn on_partial_upload(&mut self, partial_remote: PartialRemoteFileLocation);
@@ -9506,7 +9945,7 @@ pub enum DocumentByHash {
 /// The net seam of the collapsed [`FileHashUploader`]: the C++
 /// `dispatch_with_callback` + `on_result` + `fetch_result` folded into one
 /// call.
-pub trait FileHashUploaderNet {
+pub trait FileHashUploaderNet: Send {
     /// Sends `messages_getDocumentByHash` and fetches the result.
     fn get_document_by_hash(
         &mut self,
@@ -9517,7 +9956,7 @@ pub trait FileHashUploaderNet {
 }
 
 /// `FileHashUploader::Callback` (FileHashUploader.h:25-34).
-pub trait FileHashUploaderCallback {
+pub trait FileHashUploaderCallback: Send {
     fn on_ok(&mut self, location: FullRemoteFileLocation);
     fn on_error(&mut self, status: Status);
 }
@@ -9815,7 +10254,7 @@ pub struct DownloadNetMeta {
 /// MessagesManager.cpp:1239-1243; Session.cpp:795 fills it) — the
 /// transport half of that machinery is a net-line property and the
 /// downloader's half is empty, so the seam carries nothing for it.
-pub trait FileDownloaderNet {
+pub trait FileDownloaderNet: Send {
     /// Sends the query and fetches its result. `Err` with the canceled
     /// code (203, `NetQuery::Error::Canceled`, NetQuery.h:57) restarts
     /// the part; the CDN control errors (`FILE_TOKEN_INVALID`,
@@ -9900,7 +10339,7 @@ pub trait FileDownloaderNet {
 }
 
 /// `FileDownloader::Callback` (FileDownloader.h:35-45).
-pub trait FileDownloaderCallback {
+pub trait FileDownloaderCallback: Send {
     fn on_start_download(&mut self);
     fn on_partial_download(&mut self, partial_local: PartialLocalFileLocation, size: i64);
     fn on_ok(&mut self, full_local: FullLocalFileLocation, size: i64, is_new: bool);
@@ -12451,26 +12890,23 @@ mod tests {
     /// manager; the driver half stays with the test and shares the
     /// received grants and the link handle through `Rc`s.
     struct FakeWorker {
-        grants: Rc<RefCell<Vec<ResourceState>>>,
-        handle: Rc<RefCell<Option<ResourceManagerHandle>>>,
+        grants: Arc<parking_lot::Mutex<Vec<ResourceState>>>,
+        handle: Arc<parking_lot::Mutex<Option<ResourceManagerHandle>>>,
     }
 
     #[derive(Clone)]
     struct FakeWorkerDriver {
-        grants: Rc<RefCell<Vec<ResourceState>>>,
-        handle: Rc<RefCell<Option<ResourceManagerHandle>>>,
+        grants: Arc<parking_lot::Mutex<Vec<ResourceState>>>,
+        handle: Arc<parking_lot::Mutex<Option<ResourceManagerHandle>>>,
     }
 
     impl FakeWorker {
         fn new() -> (FakeWorker, FakeWorkerDriver) {
-            let part = (
-                Rc::new(RefCell::new(Vec::new())),
-                Rc::new(RefCell::new(None)),
-            );
+            let part = (Arc::new(Mutex::new(Vec::new())), Arc::new(Mutex::new(None)));
             (
                 FakeWorker {
-                    grants: Rc::clone(&part.0),
-                    handle: Rc::clone(&part.1),
+                    grants: Arc::clone(&part.0),
+                    handle: Arc::clone(&part.1),
                 },
                 FakeWorkerDriver {
                     grants: part.0,
@@ -12482,22 +12918,22 @@ mod tests {
 
     impl ResourceManagerWorker for FakeWorker {
         fn set_resource_manager(&mut self, handle: ResourceManagerHandle) {
-            *self.handle.borrow_mut() = Some(handle);
+            *self.handle.lock() = Some(handle);
         }
 
         fn update_resources(&mut self, resource_state: ResourceState) {
-            self.grants.borrow_mut().push(resource_state);
+            self.grants.lock().push(resource_state);
         }
     }
 
     impl FakeWorkerDriver {
         fn grant_count(&self) -> usize {
-            self.grants.borrow().len()
+            self.grants.lock().len()
         }
 
         fn last_grant_active_limit(&self) -> i64 {
             self.grants
-                .borrow()
+                .lock()
                 .last()
                 .expect("no grant recorded")
                 .active_limit()
@@ -12518,7 +12954,7 @@ mod tests {
         fn complete_part_and_report(&self, x: i64) {
             let mut state = self
                 .grants
-                .borrow()
+                .lock()
                 .last()
                 .expect("no grant recorded")
                 .clone();
@@ -12529,7 +12965,7 @@ mod tests {
 
         fn hangup(&self) {
             self.handle
-                .borrow()
+                .lock()
                 .as_ref()
                 .expect("no link handle")
                 .hangup_shared();
@@ -12537,7 +12973,7 @@ mod tests {
 
         fn update(&self, state: &ResourceState) {
             self.handle
-                .borrow()
+                .lock()
                 .as_ref()
                 .expect("no link handle")
                 .update_resources(state);
@@ -12546,7 +12982,7 @@ mod tests {
 
     #[test]
     fn resource_manager_greedy_satisfies_smallest_first() {
-        let manager = Rc::new(RefCell::new(ResourceManager::new(
+        let manager = Arc::new(Mutex::new(ResourceManager::new(
             1000,
             ResourceManagerMode::Greedy,
         )));
@@ -12582,7 +13018,7 @@ mod tests {
 
     #[test]
     fn resource_manager_baseline_serves_priority_order() {
-        let manager = Rc::new(RefCell::new(ResourceManager::new(
+        let manager = Arc::new(Mutex::new(ResourceManager::new(
             350,
             ResourceManagerMode::Baseline,
         )));
@@ -13570,7 +14006,7 @@ mod tests {
 
     /// Records the merge hook calls; the C++ ordering is the test payload.
     #[derive(Clone, Default)]
-    struct EventLog(std::rc::Rc<std::cell::RefCell<Vec<String>>>);
+    struct EventLog(Arc<parking_lot::Mutex<Vec<String>>>);
 
     struct RecordingWorker {
         log: EventLog,
@@ -13578,10 +14014,7 @@ mod tests {
 
     impl RecordingWorker {
         fn record(&self, event: &str, main_file_id: FileId) {
-            self.log
-                .0
-                .borrow_mut()
-                .push(format!("{event} {main_file_id}"));
+            self.log.0.lock().push(format!("{event} {main_file_id}"));
         }
     }
 
@@ -13610,7 +14043,7 @@ mod tests {
         fn on_merge_files(&mut self, from_file_id: FileId, to_file_id: FileId) {
             self.log
                 .0
-                .borrow_mut()
+                .lock()
                 .push(format!("on_merge_files {from_file_id} -> {to_file_id}"));
         }
     }
@@ -13682,7 +14115,7 @@ mod tests {
         // about the re-key, the finished uploads drain, then the survivor
         // restarts and flushes
         assert_eq!(
-            log.0.borrow().clone(),
+            log.0.lock().clone(),
             [
                 "cancel_download 2(0)".to_owned(),
                 "cancel_upload 2(0)".to_owned(),
@@ -13698,7 +14131,7 @@ mod tests {
         file_manager
             .merge(FileId::new(1, 0), FileId::new(2, 0))
             .unwrap();
-        assert_eq!(log.0.borrow().len(), 7);
+        assert_eq!(log.0.lock().len(), 7);
     }
 
     #[test]
@@ -13732,7 +14165,7 @@ mod tests {
             200
         );
         // only the two gated info-flush probes ran; no merge effects fired
-        assert!(log.0.borrow().is_empty());
+        assert!(log.0.lock().is_empty());
 
         // different keys without a full remote location to consult
         let keyed = |key: [u8; 32], main_file_id: FileId| {
@@ -13790,7 +14223,7 @@ mod tests {
         );
         // ...but main_file_id_i chose x's lower id, so the survivor adopts it
         assert_eq!(survivor.get_main_file_id(), FileId::new(1, 0));
-        assert_eq!(log.0.borrow().last().unwrap(), "run_node 1(0)");
+        assert_eq!(log.0.lock().last().unwrap(), "run_node 1(0)");
     }
 
     // ==== M.12.6: FileUploader / FileHashUploader ====
@@ -13815,10 +14248,10 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct UploadLog {
-        events: Rc<RefCell<Vec<String>>>,
-        partials: Rc<RefCell<Vec<PartialRemoteFileLocation>>>,
-        oks: Rc<RefCell<Vec<PartialRemoteFileLocation>>>,
-        error: Rc<RefCell<Option<(i32, String)>>>,
+        events: Arc<parking_lot::Mutex<Vec<String>>>,
+        partials: Arc<parking_lot::Mutex<Vec<PartialRemoteFileLocation>>>,
+        oks: Arc<parking_lot::Mutex<Vec<PartialRemoteFileLocation>>>,
+        error: Arc<parking_lot::Mutex<Option<(i32, String)>>>,
     }
 
     struct RecordingUploadCallback {
@@ -13829,31 +14262,31 @@ mod tests {
         fn on_hash(&mut self, hash: Vec<u8>) {
             self.log
                 .events
-                .borrow_mut()
+                .lock()
                 .push(format!("hash {} bytes", hash.len()));
         }
         fn on_partial_upload(&mut self, partial: PartialRemoteFileLocation) {
-            self.log.partials.borrow_mut().push(partial);
+            self.log.partials.lock().push(partial);
         }
         fn on_ok(&mut self, _file_type: FileType, partial: PartialRemoteFileLocation) {
-            self.log.oks.borrow_mut().push(partial);
+            self.log.oks.lock().push(partial);
         }
         fn on_error(&mut self, status: Status) {
-            *self.log.error.borrow_mut() = Some((status.code(), status.message().to_owned()));
+            *self.log.error.lock() = Some((status.code(), status.message().to_owned()));
         }
     }
 
     #[derive(Clone)]
     struct FakeUploadNet {
-        queries: Rc<RefCell<Vec<UploadPartQuery>>>,
-        results: Rc<RefCell<VecDeque<std::result::Result<bool, Status>>>>,
+        queries: Arc<parking_lot::Mutex<Vec<UploadPartQuery>>>,
+        results: Arc<parking_lot::Mutex<VecDeque<std::result::Result<bool, Status>>>>,
     }
 
     impl Default for FakeUploadNet {
         fn default() -> FakeUploadNet {
             FakeUploadNet {
-                queries: Rc::new(RefCell::new(Vec::new())),
-                results: Rc::new(RefCell::new(VecDeque::new())),
+                queries: Arc::new(Mutex::new(Vec::new())),
+                results: Arc::new(Mutex::new(VecDeque::new())),
             }
         }
     }
@@ -13861,15 +14294,15 @@ mod tests {
     impl FakeUploadNet {
         fn with_results(results: Vec<std::result::Result<bool, Status>>) -> FakeUploadNet {
             let net = FakeUploadNet::default();
-            *net.results.borrow_mut() = results.into_iter().collect();
+            *net.results.lock() = results.into_iter().collect();
             net
         }
     }
 
     impl FileUploaderNet for FakeUploadNet {
         fn upload_part(&mut self, query: UploadPartQuery) -> std::result::Result<bool, Status> {
-            self.queries.borrow_mut().push(query);
-            self.results.borrow_mut().pop_front().unwrap_or(Ok(true))
+            self.queries.lock().push(query);
+            self.results.lock().pop_front().unwrap_or(Ok(true))
         }
     }
 
@@ -13887,7 +14320,7 @@ mod tests {
     fn drive_upload(uploader: &mut FileUploader, log: &UploadLog) {
         let mut allowance = 1i64 << 20;
         for _ in 0..64 {
-            if uploader.stop_flag() || log.error.borrow().is_some() {
+            if uploader.stop_flag() || log.error.lock().is_some() {
                 return;
             }
             allowance += 1 << 20;
@@ -13916,7 +14349,7 @@ mod tests {
             Box::new(FakeUploadNet::default()),
         );
         uploader.start();
-        let (code, message) = log.error.borrow().clone().expect("error");
+        let (code, message) = log.error.lock().clone().expect("error");
         assert_eq!((code, message.as_str()), (0, "File is already uploaded"));
         assert!(uploader.stop_flag());
     }
@@ -14000,14 +14433,14 @@ mod tests {
 
         // start reports the empty progress; nothing is sent without resources
         uploader.start();
-        assert_eq!(net.queries.borrow().len(), 0);
-        assert_eq!(log.partials.borrow().len(), 1);
+        assert_eq!(net.queries.lock().len(), 0);
+        assert_eq!(log.partials.lock().len(), 1);
 
         // the manager grant drives the upload
         drive_upload(&mut uploader, &log);
 
         // a single small part carrying the whole file
-        let queries = net.queries.borrow();
+        let queries = net.queries.lock();
         assert_eq!(queries.len(), 1);
         match &queries[0] {
             UploadPartQuery::SaveFilePart {
@@ -14024,9 +14457,9 @@ mod tests {
         }
 
         // the final ok carries the full size
-        assert_eq!(log.partials.borrow().len(), 2);
-        assert_eq!(log.oks.borrow().len(), 1);
-        let ok = &log.oks.borrow()[0];
+        assert_eq!(log.partials.lock().len(), 2);
+        assert_eq!(log.oks.lock().len(), 1);
+        let ok = &log.oks.lock()[0];
         assert_eq!(ok.file_id, uploader.file_id());
         assert_eq!(ok.ready_size, 600);
         assert_eq!(ok.ready_part_count, 1);
@@ -14062,7 +14495,7 @@ mod tests {
         drive_upload(&mut uploader, &log);
 
         // only parts 1 and 2 are sent, under the kept file id
-        let queries = net.queries.borrow();
+        let queries = net.queries.lock();
         assert_eq!(queries.len(), 2);
         for (i, query) in queries.iter().enumerate() {
             match query {
@@ -14079,8 +14512,8 @@ mod tests {
                 _ => panic!("expected a small-file part query"),
             }
         }
-        assert_eq!(log.oks.borrow().len(), 1);
-        assert_eq!(log.oks.borrow()[0].file_id, 4242);
+        assert_eq!(log.oks.lock().len(), 1);
+        assert_eq!(log.oks.lock()[0].file_id, 4242);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -14112,7 +14545,7 @@ mod tests {
         assert!(matches!(uploader.remote(), RemoteFileLocation::Empty));
         drive_upload(&mut uploader, &log);
 
-        let queries = net.queries.borrow();
+        let queries = net.queries.lock();
         assert_eq!(queries.len(), 1);
         match &queries[0] {
             UploadPartQuery::SaveFilePart {
@@ -14126,7 +14559,7 @@ mod tests {
             }
             _ => panic!("expected a small-file part query"),
         }
-        assert_eq!(log.oks.borrow()[0].file_id, uploader.file_id());
+        assert_eq!(log.oks.lock()[0].file_id, uploader.file_id());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -14150,7 +14583,7 @@ mod tests {
         drive_upload(&mut uploader, &log);
 
         // one part, padded to the 16-byte boundary
-        let recorded = net.queries.borrow();
+        let recorded = net.queries.lock();
         assert_eq!(recorded.len(), 1);
         let cipher = match &recorded[0] {
             UploadPartQuery::SaveFilePart { bytes, .. } => bytes.clone(),
@@ -14190,7 +14623,7 @@ mod tests {
         uploader.start();
         drive_upload(&mut uploader, &log);
         {
-            let queries = net.queries.borrow();
+            let queries = net.queries.lock();
             assert_eq!(queries.len(), 2);
             let part_id = |query: &UploadPartQuery| match query {
                 UploadPartQuery::SaveFilePart { part_id, .. } => *part_id,
@@ -14199,8 +14632,8 @@ mod tests {
             assert_eq!(part_id(&queries[0]), 0);
             assert_eq!(part_id(&queries[1]), 0);
         }
-        assert_eq!(log.oks.borrow().len(), 1);
-        assert!(log.error.borrow().is_none());
+        assert_eq!(log.oks.lock().len(), 1);
+        assert!(log.error.lock().is_none());
 
         // a server Bool(false) is the 500 error
         let log = UploadLog::default();
@@ -14216,7 +14649,7 @@ mod tests {
         );
         uploader.start();
         drive_upload(&mut uploader, &log);
-        let (code, message) = log.error.borrow().clone().expect("error");
+        let (code, message) = log.error.lock().clone().expect("error");
         assert_eq!(
             (code, message.as_str()),
             (500, "Internal Server Error during file upload")
@@ -14236,7 +14669,7 @@ mod tests {
         );
         uploader.start();
         drive_upload(&mut uploader, &log);
-        let (code, message) = log.error.borrow().clone().expect("error");
+        let (code, message) = log.error.lock().clone().expect("error");
         assert_eq!((code, message.as_str()), (400, "FILE_PART_INVALID"));
         let _ = std::fs::remove_file(&path);
     }
@@ -14276,8 +14709,8 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct HashNetState {
-        queries: Rc<RefCell<Vec<HashQuery>>>,
-        result: Rc<RefCell<Option<std::result::Result<DocumentByHash, Status>>>>,
+        queries: Arc<parking_lot::Mutex<Vec<HashQuery>>>,
+        result: Arc<parking_lot::Mutex<Option<std::result::Result<DocumentByHash, Status>>>>,
     }
 
     struct FakeHashNet {
@@ -14291,13 +14724,10 @@ mod tests {
             size: i64,
             mime_type: String,
         ) -> std::result::Result<DocumentByHash, Status> {
-            self.state
-                .queries
-                .borrow_mut()
-                .push((sha256, size, mime_type));
+            self.state.queries.lock().push((sha256, size, mime_type));
             self.state
                 .result
-                .borrow_mut()
+                .lock()
                 .take()
                 .unwrap_or(Ok(DocumentByHash::Empty))
         }
@@ -14305,8 +14735,8 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct HashLog {
-        ok: Rc<RefCell<Option<FullRemoteFileLocation>>>,
-        error: Rc<RefCell<Option<String>>>,
+        ok: Arc<parking_lot::Mutex<Option<FullRemoteFileLocation>>>,
+        error: Arc<parking_lot::Mutex<Option<String>>>,
     }
 
     struct RecordingHashCallback {
@@ -14315,10 +14745,10 @@ mod tests {
 
     impl FileHashUploaderCallback for RecordingHashCallback {
         fn on_ok(&mut self, location: FullRemoteFileLocation) {
-            *self.log.ok.borrow_mut() = Some(location);
+            *self.log.ok.lock() = Some(location);
         }
         fn on_error(&mut self, status: Status) {
-            *self.log.error.borrow_mut() = Some(status.message().to_owned());
+            *self.log.error.lock() = Some(status.message().to_owned());
         }
     }
 
@@ -14340,10 +14770,10 @@ mod tests {
 
         // no hashing without a resource grant
         uploader.loop_();
-        assert_eq!(state.queries.borrow().len(), 0);
+        assert_eq!(state.queries.lock().len(), 0);
 
         // the server answer waiting on the seam
-        *state.result.borrow_mut() = Some(Ok(DocumentByHash::Document {
+        *state.result.lock() = Some(Ok(DocumentByHash::Document {
             id: 77,
             access_hash: 88,
             dc_id: 2,
@@ -14352,7 +14782,7 @@ mod tests {
 
         // the grant drives the sha pass and then the query
         uploader.update_resources(grant(1 << 20));
-        let queries = state.queries.borrow();
+        let queries = state.queries.lock();
         assert_eq!(queries.len(), 1);
         let (hash, size, mime_type) = &queries[0];
         assert_eq!(*hash, tdutils::crypto::sha256(&contents));
@@ -14367,9 +14797,9 @@ mod tests {
             DcId::internal(2),
             "ref".to_owned(),
         );
-        assert_eq!(log.ok.borrow().as_ref(), Some(&expected));
+        assert_eq!(log.ok.lock().as_ref(), Some(&expected));
         assert!(uploader.stop_flag());
-        assert!(log.error.borrow().is_none());
+        assert!(log.error.lock().is_none());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -14392,14 +14822,14 @@ mod tests {
         uploader.start();
         uploader.update_resources(grant(1 << 20));
         assert_eq!(
-            log.error.borrow().as_deref(),
+            log.error.lock().as_deref(),
             Some("Document is not found by hash")
         );
         assert!(uploader.stop_flag());
 
         // a document on an invalid dc
         let state = HashNetState::default();
-        *state.result.borrow_mut() = Some(Ok(DocumentByHash::Document {
+        *state.result.lock() = Some(Ok(DocumentByHash::Document {
             id: 1,
             access_hash: 2,
             dc_id: 0,
@@ -14415,7 +14845,7 @@ mod tests {
         uploader.start();
         uploader.update_resources(grant(1 << 20));
         assert_eq!(
-            log.error.borrow().as_deref(),
+            log.error.lock().as_deref(),
             Some("Found document has invalid DcId")
         );
 
@@ -14430,7 +14860,7 @@ mod tests {
             }),
         );
         uploader.start();
-        assert_eq!(log.error.borrow().as_deref(), Some("Size mismatch"));
+        assert_eq!(log.error.lock().as_deref(), Some("Size mismatch"));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -14452,16 +14882,16 @@ mod tests {
 
         // two half-size grants: the hash streams across both, one query
         uploader.update_resources(grant(500));
-        assert_eq!(state.queries.borrow().len(), 0);
+        assert_eq!(state.queries.lock().len(), 0);
         uploader.update_resources(grant(1000));
-        assert_eq!(state.queries.borrow().len(), 1);
+        assert_eq!(state.queries.lock().len(), 1);
         assert_eq!(
-            state.queries.borrow()[0].0,
+            state.queries.lock()[0].0,
             tdutils::crypto::sha256(&contents)
         );
 
         // the document answer completes the upload
-        *state.result.borrow_mut() = Some(Ok(DocumentByHash::Document {
+        *state.result.lock() = Some(Ok(DocumentByHash::Document {
             id: 5,
             access_hash: 6,
             dc_id: 2,
@@ -14475,7 +14905,7 @@ mod tests {
         );
         uploader2.start();
         uploader2.update_resources(grant(1 << 20));
-        assert!(log.ok.borrow().is_some());
+        assert!(log.ok.lock().is_some());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -15003,10 +15433,30 @@ impl FileUploadId {
 
 /// `FileManager::DownloadCallback` (FileManager.h:399-410); the
 /// `on_progress` default is the trait default method.
-pub trait DownloadCallback {
+pub trait DownloadCallback: Send {
     fn on_progress(&mut self, _file_id: FileId) {}
     fn on_download_ok(&mut self, file_id: FileId);
     fn on_download_error(&mut self, file_id: FileId, status: Status);
+}
+
+/// The null `user_download_file_callback_` stand-in for the managers
+/// driven without one (the C++ CHECK(callback != nullptr) cannot hold for
+/// the user arm before Td installs its callback).
+struct NoopDownloadCallback;
+
+impl DownloadCallback for NoopDownloadCallback {
+    fn on_download_ok(&mut self, _file_id: FileId) {}
+    fn on_download_error(&mut self, _file_id: FileId, _status: Status) {}
+}
+
+/// The null upload callback of [`FileManager::preliminary_upload_file`]
+/// (the C++ `PreliminaryUploadFileCallback` observes only the synchronous
+/// outcomes; its effects replay in the manager call itself).
+struct NoopUploadCallback;
+
+impl UploadCallback for NoopUploadCallback {
+    fn on_upload_ok(&mut self, _file_upload_id: FileUploadId) {}
+    fn on_upload_error(&mut self, _file_upload_id: FileUploadId, _status: Status) {}
 }
 
 /// `FileManager::UploadCallback` (FileManager.h:412-436). The C++
@@ -15014,7 +15464,7 @@ pub trait DownloadCallback {
 /// the wire conversion belongs to the caller, so the collapsed callback
 /// receives only the id (the `on_upload_encrypted_ok` default arm folds
 /// into the same method).
-pub trait UploadCallback {
+pub trait UploadCallback: Send {
     fn on_upload_ok(&mut self, file_upload_id: FileUploadId);
     fn on_upload_error(&mut self, file_upload_id: FileUploadId, status: Status);
 }
@@ -15023,7 +15473,16 @@ pub trait UploadCallback {
 #[derive(Default)]
 struct DownloadInfo {
     download_priority: i8,
-    download_callback: Option<Rc<RefCell<dyn DownloadCallback>>>,
+    download_callback: Option<Arc<parking_lot::Mutex<dyn DownloadCallback>>>,
+}
+
+/// `FileManager::UserFileDownloadInfo` (FileManager.h:834-836) — a
+/// synchronous `downloadFile` park: the promise resolves when the user
+/// download finishes ([`FileManager::on_user_file_download_finished`]).
+struct UserFileDownloadInfo {
+    offset: i64,
+    limit: i64,
+    promises: Vec<tdutils::promise::Promise<td_api::File>>,
 }
 
 /// `FileManager::FileDownloadRequests` (FileManager.h:849-854).
@@ -15040,7 +15499,7 @@ struct DownloadRequests {
 struct UploadInfo {
     upload_priority: i8,
     upload_order: u64,
-    upload_callback: Option<Rc<RefCell<dyn UploadCallback>>>,
+    upload_callback: Option<Arc<parking_lot::Mutex<dyn UploadCallback>>>,
 }
 
 /// `FileManager::FileUploadRequests` (FileManager.h:862-865).
@@ -15172,7 +15631,7 @@ pub fn save_file_bytes(
 
 /// The per-query net-seam factory — the C++ loaders reach the net through
 /// `G()`; the collapsed managers build each loader's seam explicitly.
-pub trait FileLoadNetFactory {
+pub trait FileLoadNetFactory: Send {
     /// A fresh net seam for a new [`FileDownloader`] query.
     fn download_net(&mut self) -> Box<dyn FileDownloaderNet>;
     /// A fresh net seam for a new [`FileUploader`] query.
@@ -15258,33 +15717,31 @@ pub struct FileLoadManager {
     next_query_id: u64,
 
     factory: Box<dyn FileLoadNetFactory>,
-    events: Rc<RefCell<Vec<FileLoadEvent>>>,
+    events: Arc<parking_lot::Mutex<Vec<FileLoadEvent>>>,
 }
 
 /// The loader-side callback adapter: queues the manager-plane events
 /// (the C++ `FileDownloaderCallback` → `send_closure(manager, ...)`).
 struct ManagedDownloadCallback {
     query_id: u64,
-    events: Rc<RefCell<Vec<FileLoadEvent>>>,
+    events: Arc<parking_lot::Mutex<Vec<FileLoadEvent>>>,
 }
 
 impl FileDownloaderCallback for ManagedDownloadCallback {
     fn on_start_download(&mut self) {
-        self.events.borrow_mut().push(FileLoadEvent::StartDownload {
+        self.events.lock().push(FileLoadEvent::StartDownload {
             query_id: self.query_id,
         });
     }
     fn on_partial_download(&mut self, partial_local: PartialLocalFileLocation, size: i64) {
-        self.events
-            .borrow_mut()
-            .push(FileLoadEvent::PartialDownload {
-                query_id: self.query_id,
-                partial: partial_local,
-                size,
-            });
+        self.events.lock().push(FileLoadEvent::PartialDownload {
+            query_id: self.query_id,
+            partial: partial_local,
+            size,
+        });
     }
     fn on_ok(&mut self, full_local: FullLocalFileLocation, size: i64, is_new: bool) {
-        self.events.borrow_mut().push(FileLoadEvent::DownloadOk {
+        self.events.lock().push(FileLoadEvent::DownloadOk {
             query_id: self.query_id,
             local: full_local,
             size,
@@ -15292,7 +15749,7 @@ impl FileDownloaderCallback for ManagedDownloadCallback {
         });
     }
     fn on_error(&mut self, status: Status) {
-        self.events.borrow_mut().push(FileLoadEvent::Error {
+        self.events.lock().push(FileLoadEvent::Error {
             query_id: self.query_id,
             status,
         });
@@ -15301,31 +15758,31 @@ impl FileDownloaderCallback for ManagedDownloadCallback {
 
 struct ManagedUploadCallback {
     query_id: u64,
-    events: Rc<RefCell<Vec<FileLoadEvent>>>,
+    events: Arc<parking_lot::Mutex<Vec<FileLoadEvent>>>,
 }
 
 impl FileUploaderCallback for ManagedUploadCallback {
     fn on_hash(&mut self, hash: Vec<u8>) {
-        self.events.borrow_mut().push(FileLoadEvent::Hash {
+        self.events.lock().push(FileLoadEvent::Hash {
             query_id: self.query_id,
             hash,
         });
     }
     fn on_partial_upload(&mut self, partial_remote: PartialRemoteFileLocation) {
-        self.events.borrow_mut().push(FileLoadEvent::PartialUpload {
+        self.events.lock().push(FileLoadEvent::PartialUpload {
             query_id: self.query_id,
             partial: partial_remote,
         });
     }
     fn on_ok(&mut self, file_type: FileType, partial_remote: PartialRemoteFileLocation) {
-        self.events.borrow_mut().push(FileLoadEvent::UploadOk {
+        self.events.lock().push(FileLoadEvent::UploadOk {
             query_id: self.query_id,
             file_type,
             partial: partial_remote,
         });
     }
     fn on_error(&mut self, status: Status) {
-        self.events.borrow_mut().push(FileLoadEvent::Error {
+        self.events.lock().push(FileLoadEvent::Error {
             query_id: self.query_id,
             status,
         });
@@ -15334,18 +15791,18 @@ impl FileUploaderCallback for ManagedUploadCallback {
 
 struct ManagedHashUploadCallback {
     query_id: u64,
-    events: Rc<RefCell<Vec<FileLoadEvent>>>,
+    events: Arc<parking_lot::Mutex<Vec<FileLoadEvent>>>,
 }
 
 impl FileHashUploaderCallback for ManagedHashUploadCallback {
     fn on_ok(&mut self, location: FullRemoteFileLocation) {
-        self.events.borrow_mut().push(FileLoadEvent::UploadFullOk {
+        self.events.lock().push(FileLoadEvent::UploadFullOk {
             query_id: self.query_id,
             remote: location,
         });
     }
     fn on_error(&mut self, status: Status) {
-        self.events.borrow_mut().push(FileLoadEvent::Error {
+        self.events.lock().push(FileLoadEvent::Error {
             query_id: self.query_id,
             status,
         });
@@ -15381,7 +15838,7 @@ impl FileLoadManager {
             upload_nodes: BTreeMap::new(),
             next_query_id: 1,
             factory,
-            events: Rc::new(RefCell::new(Vec::new())),
+            events: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -15443,7 +15900,7 @@ impl FileLoadManager {
             limit,
             Box::new(ManagedDownloadCallback {
                 query_id,
-                events: Rc::clone(&self.events),
+                events: Arc::clone(&self.events),
             }),
             self.factory.download_net(),
         ));
@@ -15504,7 +15961,7 @@ impl FileLoadManager {
     ) {
         let size = bytes.len() as i64;
         match save_file_bytes(self.factory.utils_net().as_mut(), file_type, &bytes, &name) {
-            Ok(local) => self.events.borrow_mut().push(FileLoadEvent::DownloadOk {
+            Ok(local) => self.events.lock().push(FileLoadEvent::DownloadOk {
                 query_id,
                 local,
                 size,
@@ -15512,7 +15969,7 @@ impl FileLoadManager {
             }),
             Err(status) => self
                 .events
-                .borrow_mut()
+                .lock()
                 .push(FileLoadEvent::Error { query_id, status }),
         }
     }
@@ -15528,7 +15985,7 @@ impl FileLoadManager {
             return;
         }
         node.canceled = true;
-        self.events.borrow_mut().push(FileLoadEvent::Error {
+        self.events.lock().push(FileLoadEvent::Error {
             query_id,
             status: Status::error(-1, "Canceled"),
         });
@@ -15555,7 +16012,7 @@ impl FileLoadManager {
             bad_parts,
             Box::new(ManagedUploadCallback {
                 query_id,
-                events: Rc::clone(&self.events),
+                events: Arc::clone(&self.events),
             }),
             self.factory.upload_net(),
         ));
@@ -15590,7 +16047,7 @@ impl FileLoadManager {
             size,
             Box::new(ManagedHashUploadCallback {
                 query_id,
-                events: Rc::clone(&self.events),
+                events: Arc::clone(&self.events),
             }),
             self.factory.hash_net(),
         ));
@@ -15656,7 +16113,7 @@ impl FileLoadManager {
             return;
         }
         node.canceled = true;
-        self.events.borrow_mut().push(FileLoadEvent::Error {
+        self.events.lock().push(FileLoadEvent::Error {
             query_id,
             status: Status::error(-1, "Canceled"),
         });
@@ -15820,7 +16277,12 @@ impl FileLoadManager {
     /// Takes the queued events (the C++ actor-queue drain into
     /// `FileManager`).
     pub fn take_events(&mut self) -> Vec<FileLoadEvent> {
-        std::mem::take(&mut *self.events.borrow_mut())
+        std::mem::take(&mut *self.events.lock())
+    }
+
+    /// The drive quiescence probe — whether any loader events are queued.
+    pub fn has_queued_events(&self) -> bool {
+        !self.events.lock().is_empty()
     }
 }
 
@@ -15866,11 +16328,11 @@ pub enum FileGenerateEvent {
 /// The shared event queue — the manager hands [`Rc`] clones to its
 /// per-query bridges.
 #[derive(Clone)]
-struct GenerateEventQueue(Rc<RefCell<Vec<FileGenerateEvent>>>);
+struct GenerateEventQueue(Arc<parking_lot::Mutex<Vec<FileGenerateEvent>>>);
 
 impl GenerateEventQueue {
     fn push(&self, event: FileGenerateEvent) {
-        self.0.borrow_mut().push(event);
+        self.0.lock().push(event);
     }
 }
 
@@ -15954,12 +16416,12 @@ impl FileGenerateManager {
     pub fn new() -> FileGenerateManager {
         FileGenerateManager {
             queries: BTreeMap::new(),
-            events: GenerateEventQueue(Rc::new(RefCell::new(Vec::new()))),
+            events: GenerateEventQueue(Arc::new(Mutex::new(Vec::new()))),
         }
     }
 
     fn take_event(&mut self) -> Option<FileGenerateEvent> {
-        let mut events = self.events.0.borrow_mut();
+        let mut events = self.events.0.lock();
         if events.is_empty() {
             None
         } else {
@@ -16013,8 +16475,8 @@ impl FileGenerateManager {
                     canceled: false,
                 },
             );
-            let callback: Rc<RefCell<dyn DownloadCallback>> =
-                Rc::new(RefCell::new(DownloadGenerateBridge {
+            let callback: Arc<parking_lot::Mutex<dyn DownloadCallback>> =
+                Arc::new(Mutex::new(DownloadGenerateBridge {
                     query_id,
                     file_type: generate_location.file_type,
                     events: self.events.clone(),
@@ -16532,6 +16994,19 @@ impl FileStatsFast {
     }
 }
 
+/// `td::DatabaseStats` (StorageManager.h:40-45) — the `TdDb::get_stats`
+/// debug string behind `getDatabaseStatistics`.
+pub struct DatabaseStats(pub String);
+
+impl DatabaseStats {
+    /// `get_database_statistics_object` (StorageManager.cpp:30-32).
+    pub fn get_database_statistics_object(&self) -> td_api::DatabaseStatistics {
+        td_api::DatabaseStatistics {
+            statistics: self.0.clone(),
+        }
+    }
+}
+
 /// The per-type stat array (`FileStats::StatByType`).
 pub type StatByType = Vec<FileTypeStat>;
 
@@ -16855,7 +17330,7 @@ pub struct FileGcResult {
 /// switch, the `FileManager::on_file_unlink` update plane and the
 /// cancellation probe. The C++ `CancellationToken` collapses to the
 /// `is_canceled()` probe.
-pub trait FileGcSink {
+pub trait FileGcSink: Send {
     fn use_file_database(&self) -> bool {
         false
     }
@@ -17022,7 +17497,7 @@ struct FsFileInfo {
 /// The stats-worker environment: the files dirs, the db scan and the
 /// stat source — the `FileStatsWorker`'s `G()` plane over the
 /// [`FileManagerContext`] and [`FileGcSink`].
-pub trait FileStatsSink: FileManagerContext + FileGcSink {
+pub trait FileStatsSink: FileManagerContext + FileGcSink + Send {
     /// `log_interface->get_file_paths()` — the fast-stat log size.
     fn log_file_paths(&self) -> Vec<String> {
         Vec::new()
@@ -17173,7 +17648,7 @@ pub struct StorageManager {
 
 /// The StorageManager environment: the binlog pmc persistence, the
 /// option reads and the database/log size sources.
-pub trait StorageContext: FileStatsSink {
+pub trait StorageContext: FileStatsSink + Send {
     /// `get_binlog_pmc()->get/set` (StorageManager.cpp:240-252).
     fn pmc_get(&mut self, _key: &str) -> Vec<u8> {
         Vec::new()
@@ -17276,6 +17751,50 @@ impl StorageManager {
             language_pack_database_size,
             log_size,
         }
+    }
+
+    /// `StorageManager::get_storage_stats` → `on_file_stats` →
+    /// `send_stats` (StorageManager.cpp:63-87, 131-142, 253-280) — the
+    /// full scan behind the `getStorageStatistics` request: the stats
+    /// worker pass, the fast-stat refresh and the dialog-limit slice.
+    pub fn get_storage_stats(
+        &mut self,
+        ctx: &mut dyn StorageContext,
+        need_all_files: bool,
+        dialog_limit: i32,
+    ) -> FileStats {
+        let mut file_stats = get_file_stats(ctx, need_all_files, dialog_limit != 0);
+        self.update_fast_stats(&file_stats);
+        file_stats.apply_dialog_limit(dialog_limit);
+        let dialog_ids = file_stats.get_dialog_ids();
+        ctx.preload_dialogs(&dialog_ids);
+        file_stats
+    }
+
+    /// `get_database_stats` (StorageManager.cpp:95-103) — the TdDb stats
+    /// string behind the `getDatabaseStatistics` request.
+    pub fn get_database_stats(
+        &mut self,
+        ctx: &mut dyn StorageContext,
+    ) -> Result<DatabaseStats, Status> {
+        ctx.database_stats().map(DatabaseStats)
+    }
+
+    /// The `schedule_next_gc` deadline (StorageManager.cpp:323-345) — the
+    /// upper bound the shared Td timeout slot arms at between auto-gc
+    /// passes ([`Self::auto_gc_due`] re-checks the window at fire time).
+    /// `None` mirrors the C++ optimizer-off cancel. The deadline rides the
+    /// alarm clock (`now`) with the system-clock offset the C++
+    /// `next_gc_at - sys_time` computes.
+    pub fn next_gc_at(&self, use_storage_optimizer: bool, sys_time: u32, now: f64) -> Option<f64> {
+        if !use_storage_optimizer {
+            return None;
+        }
+        let mut next_gc_at = self.last_gc_timestamp + GC_EACH;
+        next_gc_at = next_gc_at.clamp(sys_time, sys_time + GC_EACH);
+        next_gc_at += GC_DELAY + GC_RAND_DELAY;
+        let next_gc_in = i64::from(next_gc_at) - i64::from(sys_time);
+        Some(now + next_gc_in as f64)
     }
 
     /// `load_last_gc_timestamp`/`save_last_gc_timestamp`
@@ -17480,7 +17999,7 @@ impl FileDownloadInDatabase {
 /// The `DownloadManager::Callback` (DownloadManager.h:60-86) — the Td
 /// plane. The promise-based `get_file_search_text` answers
 /// synchronously in the collapse.
-pub trait DownloadManagerCallback {
+pub trait DownloadManagerCallback: Send {
     fn update_counters(&mut self, _counters: DownloadCounters) {}
     fn update_file_added(
         &mut self,
@@ -17542,7 +18061,7 @@ pub trait DownloadManagerCallback {
 /// The DownloadManager pmc plane (`G()->td_db()->get_binlog_pmc()` +
 /// `use_message_database` + `unix_time`) plus the FileManager-mediated
 /// file-id serialization the `dlds#` record carries.
-pub trait DownloadManagerContext {
+pub trait DownloadManagerContext: Send {
     fn use_message_database(&self) -> bool {
         false
     }
@@ -17702,6 +18221,13 @@ impl DownloadManager {
         self.context = Some(context);
     }
 
+    /// The close half (the C++ actor reset): drops the stored callback and
+    /// context boxes with the manager.
+    pub fn teardown(&mut self) {
+        self.callback = None;
+        self.context = None;
+    }
+
     /// `init` (DownloadManager.cpp:205-227).
     pub fn init(&mut self) {
         if self.is_inited {
@@ -17776,7 +18302,18 @@ impl DownloadManager {
         debug_assert!(self.is_inited, "LOG_CHECK(is_inited_)");
         let downloads_in_kv = self.ctx().pmc_prefix_get("dlds#");
         for (key, value) in downloads_in_kv {
-            let record = FileDownloadInDatabase::parse(self.ctx(), &mut Parser::new(&value));
+            // the log_event_parse framing: the version prefix feeds the
+            // parser's version (the nested store_file branches on it)
+            let Ok(mut parser) = Parser::new_log_event(&value) else {
+                continue;
+            };
+            let record =
+                FileDownloadInDatabase::parse(self.ctx(), &mut parser).and_then(|record| {
+                    match parser.fetch_end() {
+                        Ok(()) => Ok(record),
+                        Err(error) => Err(Status::error_message(error)),
+                    }
+                });
             let Ok(record) = record else {
                 continue;
             };
@@ -18406,6 +18943,9 @@ impl DownloadManager {
             }
         };
         let mut out = Vec::new();
+        // the log_event_store framing: the writer's version first
+        // (LogEvent.h:166-174), then the record fields
+        store_parse::store_log_event_version(&mut out);
         store_parse::store_flags(&mut out, [record.is_paused]);
         store_parse::store_i64(&mut out, record.download_id);
         self.ctx().store_file_id(record.file_id, &mut out);
@@ -18609,7 +19149,10 @@ impl DownloadManager {
 impl FileManager {
     /// Sets `user_download_file_callback_` (FileManager.h:841) — the
     /// callback the user download requests finish through.
-    pub fn set_user_download_callback(&mut self, callback: Rc<RefCell<dyn DownloadCallback>>) {
+    pub fn set_user_download_callback(
+        &mut self,
+        callback: Arc<parking_lot::Mutex<dyn DownloadCallback>>,
+    ) {
         self.user_download_file_callback = Some(callback);
     }
 
@@ -18639,7 +19182,7 @@ impl FileManager {
         &mut self,
         file_id: FileId,
         internal_download_id: i64,
-        callback: Rc<RefCell<dyn DownloadCallback>>,
+        callback: Arc<parking_lot::Mutex<dyn DownloadCallback>>,
         new_priority: i32,
         offset: i64,
         limit: i64,
@@ -18648,9 +19191,7 @@ impl FileManager {
         debug_assert!(new_priority > 0, "CHECK(new_priority > 0)");
         let Some(node_id) = self.node_id_of(file_id) else {
             let error = Status::error(400, "File not found");
-            callback
-                .borrow_mut()
-                .on_download_error(file_id, error.clone());
+            callback.lock().on_download_error(file_id, error.clone());
             return;
         };
         let local_is_empty = self.file_nodes[node_id]
@@ -18707,7 +19248,7 @@ impl FileManager {
         &mut self,
         file_id: FileId,
         internal_download_id: i64,
-        callback: Rc<RefCell<dyn DownloadCallback>>,
+        callback: Arc<parking_lot::Mutex<dyn DownloadCallback>>,
         new_priority: i32,
         offset: i64,
         limit: i64,
@@ -18720,7 +19261,7 @@ impl FileManager {
             .as_ref()
             .is_some_and(|node| matches!(node.local, LocalFileLocation::Full(_)));
         if already_downloaded {
-            callback.borrow_mut().on_download_ok(file_id);
+            callback.lock().on_download_ok(file_id);
             return;
         }
 
@@ -18733,9 +19274,7 @@ impl FileManager {
             .unwrap_or(false);
         if !can_download {
             let error = Status::error(400, "Can't download or generate the file");
-            callback
-                .borrow_mut()
-                .on_download_error(file_id, error.clone());
+            callback.lock().on_download_error(file_id, error.clone());
             return;
         }
 
@@ -18753,7 +19292,7 @@ impl FileManager {
             );
             info.download_priority = new_priority as i8;
             info.download_callback = Some(callback.clone());
-            callback.borrow_mut().on_progress(file_id);
+            callback.lock().on_progress(file_id);
         } else {
             let node = self.file_nodes[node_id].as_mut().expect("node");
             node.set_download_offset(offset);
@@ -18778,7 +19317,7 @@ impl FileManager {
         &mut self,
         file_id: FileId,
         internal_download_id: i64,
-    ) -> Option<Rc<RefCell<dyn DownloadCallback>>> {
+    ) -> Option<Arc<parking_lot::Mutex<dyn DownloadCallback>>> {
         let requests = self.file_download_requests.get_mut(&file_id)?;
         let callback = if internal_download_id != 0 {
             let info = requests.internal_downloads.remove(&internal_download_id)?;
@@ -18807,7 +19346,7 @@ impl FileManager {
         let Some(mut requests) = self.file_download_requests.remove(&file_id) else {
             return;
         };
-        let mut callbacks: Vec<Rc<RefCell<dyn DownloadCallback>>> = requests
+        let mut callbacks: Vec<Arc<parking_lot::Mutex<dyn DownloadCallback>>> = requests
             .internal_downloads
             .values_mut()
             .filter_map(|info| info.download_callback.take())
@@ -18819,12 +19358,146 @@ impl FileManager {
         }
         for callback in callbacks {
             match &status {
-                None => callback.borrow_mut().on_download_ok(file_id),
+                None => callback.lock().on_download_ok(file_id),
                 Some(status) => {
-                    callback
-                        .borrow_mut()
-                        .on_download_error(file_id, status.clone());
+                    callback.lock().on_download_error(file_id, status.clone());
                 }
+            }
+        }
+    }
+
+    /// `FileManager::download_file` (FileManager.cpp:2961-3000) — the
+    /// `downloadFile` request entry. The parked synchronous promises live
+    /// in `pending_user_file_downloads_`; the non-synchronous promise
+    /// resolves inline with the `download_impl` outcome order (the C++
+    /// promise rides `download`/`download_impl`, whose error paths are
+    /// the same node reads done here).
+    #[allow(clippy::too_many_arguments)]
+    pub fn download_file(
+        &mut self,
+        file_id: FileId,
+        priority: i32,
+        offset: i64,
+        limit: i64,
+        synchronous: bool,
+        mut promise: tdutils::promise::Promise<td_api::File>,
+        fllm: &mut FileLoadManager,
+    ) {
+        if let Err(status) = check_download_priority(priority) {
+            promise.set_error(status);
+            return;
+        }
+        if offset < 0 {
+            promise.set_error(Status::error(400, "Download offset must be non-negative"));
+            return;
+        }
+        if limit < 0 {
+            promise.set_error(Status::error(400, "Download limit must be non-negative"));
+            return;
+        }
+        let node_snapshot = self.get_file_view(file_id).map(|view| {
+            (
+                matches!(view.node.local, LocalFileLocation::Full(_)),
+                view.can_download_from_server() || view.can_generate(),
+            )
+        });
+        let Some((already_downloaded, can_download)) = node_snapshot else {
+            promise.set_error(Status::error(400, "File not found"));
+            return;
+        };
+
+        // we can't have two pending user requests with different offset
+        // and limit, so cancel all previous requests
+        let same_request = self
+            .pending_user_file_downloads
+            .get(&file_id)
+            .is_some_and(|info| info.offset == offset && info.limit == limit);
+        if !same_request && let Some(mut info) = self.pending_user_file_downloads.remove(&file_id) {
+            let canceled = Status::error(200, "Canceled by another downloadFile request");
+            if synchronous {
+                info.promises.clear();
+                self.pending_user_file_downloads.insert(
+                    file_id,
+                    UserFileDownloadInfo {
+                        offset,
+                        limit,
+                        promises: Vec::new(),
+                    },
+                );
+            }
+            for mut parked in info.promises {
+                parked.set_error(canceled.clone());
+            }
+        }
+
+        let callback = self
+            .user_download_file_callback
+            .clone()
+            .unwrap_or_else(|| Arc::new(parking_lot::Mutex::new(NoopDownloadCallback)));
+        if synchronous {
+            let info = self
+                .pending_user_file_downloads
+                .entry(file_id)
+                .or_insert_with(|| UserFileDownloadInfo {
+                    offset,
+                    limit,
+                    promises: Vec::new(),
+                });
+            info.promises.push(promise);
+            self.download(file_id, 0, callback, priority, offset, limit, fllm);
+            return;
+        }
+        self.download(file_id, 0, callback, priority, offset, limit, fllm);
+        // the `download_impl` promise outcomes in order: the
+        // already-downloaded and cannot-download early returns answer
+        // before the request registration
+        if !already_downloaded && !can_download {
+            promise.set_error(Status::error(400, "Can't download or generate the file"));
+            return;
+        }
+        promise.set_value(self.get_file_object(file_id));
+    }
+
+    /// `FileManager::on_user_file_download_finished`
+    /// (FileManager.cpp:3002-3029) — the `UserDownloadFileCallback` hop:
+    /// resolve the parked synchronous promises against the final file
+    /// object.
+    pub fn on_user_file_download_finished(&mut self, file_id: FileId) {
+        let Some(info) = self.pending_user_file_downloads.remove(&file_id) else {
+            return;
+        };
+        let UserFileDownloadInfo {
+            offset,
+            mut limit,
+            promises,
+        } = info;
+        if limit == 0 {
+            limit = i64::MAX;
+        }
+        for mut promise in promises {
+            let file_object = self.get_file_object(file_id);
+            let Some(local) = &file_object.local else {
+                promise.set_error(Status::error(
+                    400,
+                    "File download has failed or was canceled",
+                ));
+                continue;
+            };
+            let download_offset = local.download_offset;
+            let downloaded_size = local.downloaded_prefix_size;
+            let file_size = file_object.size;
+            if local.is_downloading_completed
+                || (download_offset <= offset
+                    && download_offset + downloaded_size >= offset
+                    && ((file_size != 0 && download_offset + downloaded_size == file_size)
+                        || download_offset + downloaded_size - offset >= limit))
+            {
+                promise.set_value(file_object);
+            } else {
+                promise.set_error(Status::error(
+                    400,
+                    "File download has failed or was canceled",
+                ));
             }
         }
     }
@@ -18851,7 +19524,7 @@ impl FileManager {
             return;
         };
         callback
-            .borrow_mut()
+            .lock()
             .on_download_error(file_id, Status::error(200, "Canceled"));
         self.run_generate(node_id, fllm);
         self.run_download(node_id, true, fllm);
@@ -19419,7 +20092,7 @@ impl FileManager {
     fn extract_upload_callback(
         &mut self,
         file_upload_id: FileUploadId,
-    ) -> Option<Rc<RefCell<dyn UploadCallback>>> {
+    ) -> Option<Arc<parking_lot::Mutex<dyn UploadCallback>>> {
         let requests = self.file_upload_requests.get_mut(&file_upload_id.file_id)?;
         let callback = if file_upload_id.internal_upload_id != 0 {
             let info = requests
@@ -19433,7 +20106,8 @@ impl FileManager {
             requests.user_upload_priority = 0;
             // the C++ hands back a fresh PreliminaryUploadFileCallback
             // (FileManager.cpp:3925)
-            Some(Rc::new(RefCell::new(PreliminaryUploadCallback)) as Rc<RefCell<dyn UploadCallback>>)
+            Some(Arc::new(Mutex::new(PreliminaryUploadCallback))
+                as Arc<parking_lot::Mutex<dyn UploadCallback>>)
         };
         if requests.user_upload_priority == 0 && requests.internal_uploads.is_empty() {
             self.file_upload_requests.remove(&file_upload_id.file_id);
@@ -19469,7 +20143,8 @@ impl FileManager {
         if requests.user_upload_priority != 0 {
             callbacks.push((
                 0,
-                Rc::new(RefCell::new(PreliminaryUploadCallback)) as Rc<RefCell<dyn UploadCallback>>,
+                Arc::new(Mutex::new(PreliminaryUploadCallback))
+                    as Arc<parking_lot::Mutex<dyn UploadCallback>>,
                 true,
             ));
         }
@@ -19477,7 +20152,7 @@ impl FileManager {
             let file_upload_id = FileUploadId::new(file_id, internal_upload_id);
             match &status {
                 None => {
-                    callback.borrow_mut().on_upload_ok(file_upload_id);
+                    callback.lock().on_upload_ok(file_upload_id);
                     if is_preliminary {
                         // PreliminaryUploadFileCallback::on_upload_ok ->
                         // FileManager::cancel_upload
@@ -19500,7 +20175,7 @@ impl FileManager {
                     }
                 }
                 Some(status) => callback
-                    .borrow_mut()
+                    .lock()
                     .on_upload_error(file_upload_id, status.clone()),
             }
         }
@@ -19510,7 +20185,7 @@ impl FileManager {
     pub fn upload(
         &mut self,
         file_upload_id: FileUploadId,
-        callback: Rc<RefCell<dyn UploadCallback>>,
+        callback: Arc<parking_lot::Mutex<dyn UploadCallback>>,
         new_priority: i32,
         upload_order: u64,
         fllm: &mut FileLoadManager,
@@ -19537,7 +20212,7 @@ impl FileManager {
         &mut self,
         file_upload_id: FileUploadId,
         bad_parts: Vec<i32>,
-        callback: Rc<RefCell<dyn UploadCallback>>,
+        callback: Arc<parking_lot::Mutex<dyn UploadCallback>>,
         new_priority: i32,
         upload_order: u64,
         force: bool,
@@ -19566,7 +20241,7 @@ impl FileManager {
         &mut self,
         file_upload_id: FileUploadId,
         bad_parts: Vec<i32>,
-        callback: Rc<RefCell<dyn UploadCallback>>,
+        callback: Arc<parking_lot::Mutex<dyn UploadCallback>>,
         new_priority: i32,
         upload_order: u64,
         force: bool,
@@ -19576,7 +20251,7 @@ impl FileManager {
         debug_assert!(new_priority > 0, "CHECK(new_priority > 0)");
         let Some(node_id) = self.node_id_of(file_upload_id.file_id) else {
             callback
-                .borrow_mut()
+                .lock()
                 .on_upload_error(file_upload_id, Status::error(400, "File not found"));
             return;
         };
@@ -19587,7 +20262,7 @@ impl FileManager {
                 .map(|node| node.last_successful_force_reupload_time >= 0.0)
                 .unwrap_or(false);
             if recently_reuploaded {
-                callback.borrow_mut().on_upload_error(
+                callback.lock().on_upload_error(
                     file_upload_id,
                     Status::error(400, "Failed to reupload file"),
                 );
@@ -19639,7 +20314,7 @@ impl FileManager {
             )
         };
         if already_uploaded {
-            callback.borrow_mut().on_upload_ok(file_upload_id);
+            callback.lock().on_upload_ok(file_upload_id);
             return;
         }
 
@@ -19650,7 +20325,7 @@ impl FileManager {
         }
 
         if !has_full_local && !has_generate && !has_alive_remote {
-            callback.borrow_mut().on_upload_error(
+            callback.lock().on_upload_error(
                 file_upload_id,
                 Status::error(
                     400,
@@ -19660,7 +20335,7 @@ impl FileManager {
             return;
         }
         if file_type == FileType::Thumbnail && !has_full_local && can_download {
-            callback.borrow_mut().on_upload_error(
+            callback.lock().on_upload_error(
                 file_upload_id,
                 Status::error(400, "Failed to upload thumbnail without local location"),
             );
@@ -19991,7 +20666,7 @@ impl FileManager {
             return;
         };
         callback
-            .borrow_mut()
+            .lock()
             .on_upload_error(file_upload_id, Status::error(200, "Canceled"));
         self.run_upload(node_id, Vec::new(), fllm);
         self.try_flush_node(node_id);
@@ -20158,7 +20833,7 @@ impl FileManager {
             .as_mut()
             .expect("node")
             .set_upload_pause(file_upload_id);
-        callback.borrow_mut().on_upload_ok(file_upload_id);
+        callback.lock().on_upload_ok(file_upload_id);
         let _ = file_type;
         // don't flush node info, because nothing actually changed
         // (FileManager.cpp:4953)
@@ -20326,6 +21001,48 @@ impl FileManager {
             }
         }
         self.apply_generate_events(fllm);
+    }
+
+    /// The [`FileManagerWorker`] replay targets. The merge/flush hooks fire
+    /// while `&mut self` is held, so the Td-side worker records the
+    /// effects and the Td replays them through its `Arc<parking_lot::Mutex<FileManager>>`
+    /// handle after the driving call returns (the C++ runs the same calls
+    /// on itself inside the single actor).
+    pub fn replay_cancel_download(&mut self, node: &FileNode, fllm: &mut FileLoadManager) {
+        if let Some(node_id) = self.node_id_of(node.main_file_id) {
+            self.do_cancel_download(node_id, fllm);
+        }
+    }
+
+    pub fn replay_cancel_upload(&mut self, node: &FileNode, fllm: &mut FileLoadManager) {
+        if let Some(node_id) = self.node_id_of(node.main_file_id) {
+            self.do_cancel_upload(node_id, fllm);
+        }
+    }
+
+    pub fn replay_cancel_generate(&mut self, node: &FileNode, fllm: &mut FileLoadManager) {
+        if let Some(node_id) = self.node_id_of(node.main_file_id) {
+            self.do_cancel_generate(node_id, fllm);
+        }
+    }
+
+    pub fn replay_finish_downloads(&mut self, file_id: FileId) {
+        self.finish_downloads(file_id, None);
+    }
+
+    pub fn replay_finish_uploads(&mut self, file_id: FileId, fllm: &mut FileLoadManager) {
+        self.finish_uploads(file_id, None, fllm);
+    }
+
+    /// The `run_node` replay — re-evaluates the node's three queues in the
+    /// `on_download_ok` tail order.
+    pub fn replay_run_node(&mut self, node: &FileNode, fllm: &mut FileLoadManager) {
+        let Some(node_id) = self.node_id_of(node.main_file_id) else {
+            return;
+        };
+        self.run_generate(node_id, fllm);
+        self.run_download(node_id, false, fllm);
+        self.run_upload(node_id, Vec::new(), fllm);
     }
 
     /// The drained generate-event dispatch — the `FileManager` handler
@@ -20787,7 +21504,7 @@ impl FileManager {
             .entry(internal_download_id)
             .or_default();
         info.download_priority = 10;
-        info.download_callback = Some(Rc::new(RefCell::new(LoggingDownloadCallback)));
+        info.download_callback = Some(Arc::new(Mutex::new(LoggingDownloadCallback)));
 
         let Some(file_type) = remote_full_file_type else {
             return false;
@@ -20832,9 +21549,7 @@ impl UploadCallback for PreliminaryUploadCallback {
 #[cfg(test)]
 mod file_downloader_tests {
     use super::*;
-    use std::cell::RefCell;
     use std::collections::VecDeque;
-    use std::rc::Rc;
 
     /// One scripted net answer: the expected query-type tag (`None`
     /// answers any query) and the response to hand back.
@@ -20844,35 +21559,35 @@ mod file_downloader_tests {
     /// consumed in order; a `None` tag answers any query. All state is
     /// shared with the test through `Rc`.
     struct SharedNetState {
-        script: RefCell<VecDeque<ScriptEntry>>,
+        script: parking_lot::Mutex<VecDeque<ScriptEntry>>,
         /// The recorded request sequence: (query type, wire query,
         /// connection meta).
-        queries: RefCell<Vec<(DownloadQueryType, DownloadQuery, DownloadNetMeta)>>,
+        queries: parking_lot::Mutex<Vec<(DownloadQueryType, DownloadQuery, DownloadNetMeta)>>,
         /// The `search_file` seam answer (the local copy the need_search_file
         /// path finds).
-        search_hit: RefCell<Option<String>>,
+        search_hit: parking_lot::Mutex<Option<String>>,
         /// The `webfile_dc_id` seam answer.
-        webfile_dc: RefCell<DcId>,
+        webfile_dc: parking_lot::Mutex<DcId>,
     }
 
     impl SharedNetState {
-        fn new(script: Vec<ScriptEntry>) -> Rc<SharedNetState> {
-            Rc::new(SharedNetState {
-                script: RefCell::new(VecDeque::from(script)),
-                queries: RefCell::new(Vec::new()),
-                search_hit: RefCell::new(None),
-                webfile_dc: RefCell::new(DcId::default()),
+        fn new(script: Vec<ScriptEntry>) -> Arc<SharedNetState> {
+            Arc::new(SharedNetState {
+                script: Mutex::new(VecDeque::from(script)),
+                queries: Mutex::new(Vec::new()),
+                search_hit: Mutex::new(None),
+                webfile_dc: Mutex::new(DcId::default()),
             })
         }
     }
 
     struct FakeDownloadNet {
-        state: Rc<SharedNetState>,
+        state: Arc<SharedNetState>,
         root: std::path::PathBuf,
     }
 
     impl FakeDownloadNet {
-        fn new(state: Rc<SharedNetState>) -> Self {
+        fn new(state: Arc<SharedNetState>) -> Self {
             let root =
                 std::env::temp_dir().join(format!("m12_dl_{}", tdutils::random::secure_int64()));
             std::fs::create_dir_all(&root).unwrap();
@@ -20897,19 +21612,16 @@ mod file_downloader_tests {
             query_type: DownloadQueryType,
             meta: DownloadNetMeta,
         ) -> Result<DownloadResult, Status> {
-            self.state
-                .queries
-                .borrow_mut()
-                .push((query_type, query, meta));
+            self.state.queries.lock().push((query_type, query, meta));
             let entry = {
-                let mut guard = self.state.script.borrow_mut();
+                let mut guard = self.state.script.lock();
                 match guard.pop_front() {
                     Some(entry) => entry,
                     None => panic!(
                         "script exhausted; got queries: {:?}",
                         self.state
                             .queries
-                            .borrow()
+                            .lock()
                             .iter()
                             .map(|(t, q, _)| (t, q.clone()))
                             .collect::<Vec<_>>()
@@ -20925,7 +21637,7 @@ mod file_downloader_tests {
         }
 
         fn open_temp_file(&mut self, _file_type: FileType) -> Result<(File, String), Status> {
-            let path = self.temp_path(&format!("temp_{}.bin", self.state.queries.borrow().len()));
+            let path = self.temp_path(&format!("temp_{}.bin", self.state.queries.lock().len()));
             let fd = File::options()
                 .read(true)
                 .write(true)
@@ -20949,7 +21661,7 @@ mod file_downloader_tests {
         }
 
         fn webfile_dc_id(&mut self) -> DcId {
-            *self.state.webfile_dc.borrow()
+            *self.state.webfile_dc.lock()
         }
 
         fn create_from_temp(
@@ -20970,7 +21682,7 @@ mod file_downloader_tests {
             _name: &str,
             _size: i64,
         ) -> Result<String, Status> {
-            match self.state.search_hit.borrow().clone() {
+            match self.state.search_hit.lock().clone() {
                 Some(path) => Ok(path),
                 None => Err(Status::error_message("File not found")),
             }
@@ -20989,21 +21701,21 @@ mod file_downloader_tests {
     /// `unique_ptr<Callback>` becomes an owned box, so the log lives in an
     /// `Rc`).
     struct SharingCallback {
-        inner: Rc<RefCell<RecordedCallback>>,
+        inner: Arc<parking_lot::Mutex<RecordedCallback>>,
     }
 
     impl FileDownloaderCallback for SharingCallback {
         fn on_start_download(&mut self) {
-            self.inner.borrow_mut().started += 1;
+            self.inner.lock().started += 1;
         }
         fn on_partial_download(&mut self, _partial: PartialLocalFileLocation, _size: i64) {
-            self.inner.borrow_mut().partials += 1;
+            self.inner.lock().partials += 1;
         }
         fn on_ok(&mut self, full_local: FullLocalFileLocation, size: i64, is_new: bool) {
-            self.inner.borrow_mut().ok = Some((full_local, size, is_new));
+            self.inner.lock().ok = Some((full_local, size, is_new));
         }
         fn on_error(&mut self, status: Status) {
-            self.inner.borrow_mut().error = Some(status);
+            self.inner.lock().error = Some(status);
         }
     }
 
@@ -21023,10 +21735,13 @@ mod file_downloader_tests {
 
     /// The C++ ResourceManager ping-pong, collapsed: each grant round
     /// raises the allowance and re-enters the downloader loop.
-    fn drive_download(downloader: &mut FileDownloader, log: &Rc<RefCell<RecordedCallback>>) {
+    fn drive_download(
+        downloader: &mut FileDownloader,
+        log: &Arc<parking_lot::Mutex<RecordedCallback>>,
+    ) {
         let mut allowance = 1i64 << 20;
         for _ in 0..64 {
-            if downloader.stop_flag() || log.borrow().error.is_some() || log.borrow().ok.is_some() {
+            if downloader.stop_flag() || log.lock().error.is_some() || log.lock().ok.is_some() {
                 return;
             }
             allowance += 1 << 20;
@@ -21043,13 +21758,13 @@ mod file_downloader_tests {
     }
 
     fn build_downloader(
-        state: Rc<SharedNetState>,
+        state: Arc<SharedNetState>,
         local: LocalFileLocation,
         size: i64,
         name: &str,
         need_search_file: bool,
-    ) -> (FileDownloader, Rc<RefCell<RecordedCallback>>) {
-        let callback = Rc::new(RefCell::new(RecordedCallback::default()));
+    ) -> (FileDownloader, Arc<parking_lot::Mutex<RecordedCallback>>) {
+        let callback = Arc::new(Mutex::new(RecordedCallback::default()));
         let downloader = FileDownloader::new(
             document_location(),
             local,
@@ -21083,7 +21798,7 @@ mod file_downloader_tests {
         downloader.start();
         drive_download(&mut downloader, &callback);
 
-        let log = callback.borrow();
+        let log = callback.lock();
         if let Some(err) = &log.error {
             panic!("download failed: {} ({})", err.message(), err.code());
         }
@@ -21094,7 +21809,7 @@ mod file_downloader_tests {
 
         // the single query was a getFile for the document location over
         // the authorized remote-DC Download connection
-        let queries = state.queries.borrow();
+        let queries = state.queries.lock();
         assert_eq!(queries.len(), 1);
         let (query_type, query, meta) = &queries[0];
         assert_eq!(*query_type, DownloadQueryType::Default);
@@ -21145,7 +21860,7 @@ mod file_downloader_tests {
         downloader.start();
         drive_download(&mut downloader, &callback);
         assert_eq!(
-            callback.borrow().error.as_ref().expect("error").message(),
+            callback.lock().error.as_ref().expect("error").message(),
             "File is already downloaded"
         );
     }
@@ -21182,7 +21897,7 @@ mod file_downloader_tests {
         downloader.start();
         drive_download(&mut downloader, &callback);
 
-        let log = callback.borrow();
+        let log = callback.lock();
         if let Some(err) = &log.error {
             panic!("download failed: {} ({})", err.message(), err.code());
         }
@@ -21191,7 +21906,7 @@ mod file_downloader_tests {
         assert_eq!(std::fs::read(&location.path).unwrap(), bytes);
 
         // exactly one query, for the second part
-        let queries = state.queries.borrow();
+        let queries = state.queries.lock();
         assert_eq!(queries.len(), 1);
         let DownloadQuery::GetFile { offset, .. } = &queries[0].1 else {
             panic!("expected a getFile query");
@@ -21253,7 +21968,7 @@ mod file_downloader_tests {
         downloader.start();
         drive_download(&mut downloader, &callback);
 
-        let log = callback.borrow();
+        let log = callback.lock();
         if let Some(err) = &log.error {
             panic!("download failed: {} ({})", err.message(), err.code());
         }
@@ -21262,7 +21977,7 @@ mod file_downloader_tests {
         assert_eq!(std::fs::read(&location.path).unwrap(), bytes);
 
         // getFile → cdnRedirect restarts on the CDN with getCdnFile
-        let queries = state.queries.borrow();
+        let queries = state.queries.lock();
         assert_eq!(queries.len(), 3);
         assert_eq!(queries[0].0, DownloadQueryType::Default);
         assert_eq!(queries[1].0, DownloadQueryType::Cdn);
@@ -21362,14 +22077,14 @@ mod file_downloader_tests {
         downloader.start();
         drive_download(&mut downloader, &callback);
 
-        let log = callback.borrow();
+        let log = callback.lock();
         if let Some(err) = &log.error {
             panic!("download failed: {} ({})", err.message(), err.code());
         }
         let (location, _, _) = log.ok.as_ref().expect("download ok");
         assert_eq!(std::fs::read(&location.path).unwrap(), bytes);
 
-        let queries = state.queries.borrow();
+        let queries = state.queries.lock();
         // the reupload hashes already cover the whole prefix, so no
         // getFileHashes check query is needed
         assert_eq!(queries.len(), 3);
@@ -21429,14 +22144,14 @@ mod file_downloader_tests {
         downloader.start();
         drive_download(&mut downloader, &callback);
 
-        let log = callback.borrow();
+        let log = callback.lock();
         if let Some(err) = &log.error {
             panic!("download failed: {} ({})", err.message(), err.code());
         }
         let (location, _, _) = log.ok.as_ref().expect("download ok");
         assert_eq!(std::fs::read(&location.path).unwrap(), bytes);
 
-        let queries = state.queries.borrow();
+        let queries = state.queries.lock();
         assert_eq!(queries[0].0, DownloadQueryType::Cdn);
         assert_eq!(queries[1].0, DownloadQueryType::Default);
         // the fallback getFile rides the authorized remote DC again
@@ -21476,11 +22191,11 @@ mod file_downloader_tests {
         );
         // need_search_file finds the local copy, and the downloader then
         // only checks it against the server hashes
-        *state.search_hit.borrow_mut() = Some(existing.to_string_lossy().into_owned());
+        *state.search_hit.lock() = Some(existing.to_string_lossy().into_owned());
         downloader.start();
         drive_download(&mut downloader, &callback);
 
-        let log = callback.borrow();
+        let log = callback.lock();
         let error = log.error.as_ref().expect("hash mismatch error");
         // only_check (the search-file path) reports a restart request
         assert_eq!(error.message(), "FILE_DOWNLOAD_RESTART");
@@ -21510,7 +22225,7 @@ mod file_downloader_tests {
         downloader.start();
         drive_download(&mut downloader, &callback);
 
-        let log = callback.borrow();
+        let log = callback.lock();
         if let Some(err) = &log.error {
             panic!("download failed: {} ({})", err.message(), err.code());
         }
@@ -21518,7 +22233,7 @@ mod file_downloader_tests {
         assert_eq!(size, &(bytes.len() as i64));
         assert_eq!(std::fs::read(&location.path).unwrap(), bytes);
 
-        assert_eq!(state.queries.borrow().len(), 2);
+        assert_eq!(state.queries.lock().len(), 2);
     }
 
     #[test]
@@ -21533,7 +22248,7 @@ mod file_downloader_tests {
         downloader.start();
         drive_download(&mut downloader, &callback);
 
-        let log = callback.borrow();
+        let log = callback.lock();
         let error = log.error.as_ref().expect("file reference error");
         assert_eq!(error.code(), 400);
         assert_eq!(error.message(), "FILE_REFERENCE_INVALID#BASE64cg==");
@@ -21548,7 +22263,7 @@ mod file_downloader_tests {
         let bytes = document_bytes();
         let script = vec![(None, Ok(DownloadResult::Bytes(bytes.clone())))];
         let state = SharedNetState::new(script);
-        let callback = Rc::new(RefCell::new(RecordedCallback::default()));
+        let callback = Arc::new(Mutex::new(RecordedCallback::default()));
         let mut downloader = FileDownloader::new(
             document_location(),
             LocalFileLocation::Empty,
@@ -21567,14 +22282,14 @@ mod file_downloader_tests {
         downloader.start();
         drive_download(&mut downloader, &callback);
 
-        let log = callback.borrow();
+        let log = callback.lock();
         if let Some(err) = &log.error {
             panic!("download failed: {} ({})", err.message(), err.code());
         }
         let (location, _, _) = log.ok.as_ref().expect("download ok");
         assert_eq!(std::fs::read(&location.path).unwrap(), bytes);
 
-        let queries = state.queries.borrow();
+        let queries = state.queries.lock();
         assert_eq!(queries.len(), 1);
         let DownloadQuery::GetFile {
             offset,
@@ -21596,8 +22311,8 @@ mod file_downloader_tests {
         let bytes = b"<html>hi</html>".to_vec();
         let script = vec![(None, Ok(DownloadResult::Bytes(bytes.clone())))];
         let state = SharedNetState::new(script);
-        *state.webfile_dc.borrow_mut() = DcId::external(4);
-        let callback = Rc::new(RefCell::new(RecordedCallback::default()));
+        *state.webfile_dc.lock() = DcId::external(4);
+        let callback = Arc::new(Mutex::new(RecordedCallback::default()));
         let mut downloader = FileDownloader::new(
             FullRemoteFileLocation::from_web(
                 FileType::Document,
@@ -21620,7 +22335,7 @@ mod file_downloader_tests {
         downloader.start();
         drive_download(&mut downloader, &callback);
 
-        let log = callback.borrow();
+        let log = callback.lock();
         if let Some(err) = &log.error {
             panic!("download failed: {} ({})", err.message(), err.code());
         }
@@ -21628,7 +22343,7 @@ mod file_downloader_tests {
         assert_eq!(size, &(bytes.len() as i64));
         assert_eq!(std::fs::read(&location.path).unwrap(), bytes);
 
-        let queries = state.queries.borrow();
+        let queries = state.queries.lock();
         assert_eq!(queries.len(), 1);
         let (query_type, query, meta) = &queries[0];
         assert_eq!(*query_type, DownloadQueryType::Default);
@@ -21691,7 +22406,7 @@ mod file_downloader_tests {
 
         let script = vec![(None, Ok(DownloadResult::Bytes(ciphertext)))];
         let state = SharedNetState::new(script);
-        let callback = Rc::new(RefCell::new(RecordedCallback::default()));
+        let callback = Arc::new(Mutex::new(RecordedCallback::default()));
         let mut downloader = FileDownloader::new(
             document_location(),
             LocalFileLocation::Empty,
@@ -21710,7 +22425,7 @@ mod file_downloader_tests {
         downloader.start();
         drive_download(&mut downloader, &callback);
 
-        let log = callback.borrow();
+        let log = callback.lock();
         if let Some(err) = &log.error {
             panic!("download failed: {} ({})", err.message(), err.code());
         }
@@ -21765,7 +22480,7 @@ mod file_downloader_tests {
             (None, Ok(DownloadResult::Bytes(ct2))),
         ];
         let state = SharedNetState::new(script);
-        let callback = Rc::new(RefCell::new(RecordedCallback::default()));
+        let callback = Arc::new(Mutex::new(RecordedCallback::default()));
         let mut downloader = FileDownloader::new(
             document_location(),
             LocalFileLocation::Partial(partial),
@@ -21784,7 +22499,7 @@ mod file_downloader_tests {
         downloader.start();
         drive_download(&mut downloader, &callback);
 
-        let log = callback.borrow();
+        let log = callback.lock();
         if let Some(err) = &log.error {
             panic!("download failed: {} ({})", err.message(), err.code());
         }
@@ -21795,7 +22510,7 @@ mod file_downloader_tests {
         assert_eq!(written, plain);
 
         // the resume asked exactly the two missing parts
-        let queries = state.queries.borrow();
+        let queries = state.queries.lock();
         let offsets: Vec<i64> = queries
             .iter()
             .map(|(_, q, _)| match q {
@@ -21855,7 +22570,7 @@ mod file_downloader_tests {
 
             let script = vec![(None, Ok(DownloadResult::Bytes(ciphertext)))];
             let state = SharedNetState::new(script);
-            let callback = Rc::new(RefCell::new(RecordedCallback::default()));
+            let callback = Arc::new(Mutex::new(RecordedCallback::default()));
             let mut downloader = FileDownloader::new(
                 document_location(),
                 LocalFileLocation::Empty,
@@ -21874,7 +22589,7 @@ mod file_downloader_tests {
             downloader.start();
             drive_download(&mut downloader, &callback);
 
-            let log = callback.borrow();
+            let log = callback.lock();
             if let Some(err) = &log.error {
                 panic!(
                     "length {length} download failed: {} ({})",
@@ -21954,7 +22669,7 @@ mod file_downloader_tests {
         downloader.start();
         drive_download(&mut downloader, &callback);
 
-        let log = callback.borrow();
+        let log = callback.lock();
         if let Some(err) = &log.error {
             panic!("download failed: {} ({})", err.message(), err.code());
         }
@@ -21963,7 +22678,7 @@ mod file_downloader_tests {
         assert_eq!(std::fs::read(&location.path).unwrap(), data);
 
         // both parts rode the CDN: offsets 0 and 65536
-        let queries = state.queries.borrow();
+        let queries = state.queries.lock();
         assert_eq!(queries.len(), 4);
         let offsets: Vec<i64> = queries
             .iter()
@@ -21980,7 +22695,7 @@ mod file_downloader_tests {
         // use_cdn on a web location fails before any query
         // (FileDownloader.cpp:172-174)
         let state = SharedNetState::new(vec![]);
-        let callback = Rc::new(RefCell::new(RecordedCallback::default()));
+        let callback = Arc::new(Mutex::new(RecordedCallback::default()));
         let mut downloader = FileDownloader::new(
             FullRemoteFileLocation::from_web(
                 FileType::Document,
@@ -22004,11 +22719,11 @@ mod file_downloader_tests {
         downloader.start();
         drive_download(&mut downloader, &callback);
 
-        let log = callback.borrow();
+        let log = callback.lock();
         let error = log.error.as_ref().expect("cdn-over-web error");
         assert_eq!(error.message(), "Can't download web file from CDN");
         assert!(log.ok.is_none());
-        assert!(state.queries.borrow().is_empty());
+        assert!(state.queries.lock().is_empty());
     }
 }
 
@@ -22016,14 +22731,12 @@ mod file_downloader_tests {
 mod file_load_manager_tests {
     use super::*;
     use crate::files::tests::TestFileSources;
-    use std::cell::RefCell;
-    use std::rc::Rc;
 
     /// Serves a fixed payload slice per `getFile` and records the
     /// (offset, limit) request sequence.
     struct SliceNet {
         payload: Vec<u8>,
-        queries: Rc<RefCell<Vec<(i64, i32)>>>,
+        queries: Arc<parking_lot::Mutex<Vec<(i64, i32)>>>,
         root: std::path::PathBuf,
     }
 
@@ -22045,7 +22758,7 @@ mod file_load_manager_tests {
             let DownloadQuery::GetFile { offset, limit, .. } = query else {
                 panic!("expected a getFile query");
             };
-            self.queries.borrow_mut().push((offset, limit));
+            self.queries.lock().push((offset, limit));
             Ok(DownloadResult::Bytes(self.serve(offset, limit)))
         }
 
@@ -22091,7 +22804,7 @@ mod file_load_manager_tests {
     struct TestFactory {
         payload: Vec<u8>,
         root: std::path::PathBuf,
-        download_queries: Rc<RefCell<Vec<(i64, i32)>>>,
+        download_queries: Arc<parking_lot::Mutex<Vec<(i64, i32)>>>,
     }
 
     impl FileLoadNetFactory for TestFactory {
@@ -22132,21 +22845,18 @@ mod file_load_manager_tests {
         }
     }
 
-    struct DownloadCallbackHandle(Rc<RefCell<DownloadLog>>);
+    struct DownloadCallbackHandle(Arc<parking_lot::Mutex<DownloadLog>>);
 
     impl DownloadCallback for DownloadCallbackHandle {
         fn on_progress(&mut self, file_id: FileId) {
-            self.0
-                .borrow_mut()
-                .events
-                .push((file_id, "progress".to_owned()));
+            self.0.lock().events.push((file_id, "progress".to_owned()));
         }
         fn on_download_ok(&mut self, file_id: FileId) {
-            self.0.borrow_mut().events.push((file_id, "ok".to_owned()));
+            self.0.lock().events.push((file_id, "ok".to_owned()));
         }
         fn on_download_error(&mut self, file_id: FileId, status: Status) {
             self.0
-                .borrow_mut()
+                .lock()
                 .events
                 .push((file_id, format!("error:{}", status.message())));
         }
@@ -22208,26 +22918,26 @@ mod file_load_manager_tests {
     fn file_load_manager_downloads_a_file_end_to_end() {
         let root = test_root();
         let payload: Vec<u8> = (0..=255).cycle().take(4096).collect();
-        let query_log: Rc<RefCell<Vec<(i64, i32)>>> = Rc::new(RefCell::new(Vec::new()));
+        let query_log: Arc<parking_lot::Mutex<Vec<(i64, i32)>>> = Arc::new(Mutex::new(Vec::new()));
         let mut file_manager = FileManager::new();
         let file_id = register_downloadable(&mut file_manager, 2, payload.len() as i64, 1);
         let fllm = &mut FileLoadManager::new(
             Box::new(TestFactory {
                 payload: payload.clone(),
                 root: root.clone(),
-                download_queries: Rc::clone(&query_log),
+                download_queries: Arc::clone(&query_log),
             }),
             FileLoadManagerOptions::default(),
         );
 
-        let log = Rc::new(RefCell::new(DownloadLog::default()));
+        let log = Arc::new(Mutex::new(DownloadLog::default()));
         file_manager
-            .set_user_download_callback(Rc::new(RefCell::new(DownloadCallbackHandle(log.clone()))));
+            .set_user_download_callback(Arc::new(Mutex::new(DownloadCallbackHandle(log.clone()))));
         file_manager.download(
             file_id,
             0,
-            Rc::new(RefCell::new(DownloadCallbackHandle(log.clone())))
-                as Rc<RefCell<dyn DownloadCallback>>,
+            Arc::new(Mutex::new(DownloadCallbackHandle(log.clone())))
+                as Arc<parking_lot::Mutex<dyn DownloadCallback>>,
             10,
             -1,
             -1,
@@ -22237,12 +22947,12 @@ mod file_load_manager_tests {
 
         // the request sequence covers the whole payload in part-size
         // steps starting at 0
-        let queries = query_log.borrow();
+        let queries = query_log.lock();
         assert!(
             !queries.is_empty(),
             "no queries; active={} log={:?}",
             fllm.active_downloads(),
-            log.borrow()
+            log.lock()
         );
         // the file is one part: a single getFile at offset 0 (the limit
         // is the manager part size, the served bytes the file tail)
@@ -22251,7 +22961,7 @@ mod file_load_manager_tests {
         drop(queries);
 
         // the single user request finished with ok
-        assert_eq!(log.borrow().messages(file_id), vec!["ok".to_owned()]);
+        assert_eq!(log.lock().messages(file_id), vec!["ok".to_owned()]);
 
         // the node picked up the full local location (the partial events
         // ran through on_partial_download)
@@ -22266,16 +22976,16 @@ mod file_load_manager_tests {
     /// queries and the generation updates.
     #[derive(Default)]
     struct GenerateLog {
-        queries: RefCell<Vec<String>>,
-        web_script: RefCell<std::collections::VecDeque<Result<Vec<u8>, Status>>>,
-        updates: RefCell<Vec<String>>,
+        queries: parking_lot::Mutex<Vec<String>>,
+        web_script: parking_lot::Mutex<std::collections::VecDeque<Result<Vec<u8>, Status>>>,
+        updates: parking_lot::Mutex<Vec<String>>,
     }
 
     /// The generate io/net seam: real temp-dir files plus the scripted
     /// `upload.getWebFile` answers.
     struct GenerateNet {
         root: std::path::PathBuf,
-        log: Rc<GenerateLog>,
+        log: Arc<GenerateLog>,
     }
 
     impl FileDownloaderNet for GenerateNet {
@@ -22287,10 +22997,10 @@ mod file_load_manager_tests {
         ) -> Result<DownloadResult, Status> {
             match query {
                 DownloadQuery::GetWebFile { .. } => {
-                    self.log.queries.borrow_mut().push("GetWebFile".to_owned());
+                    self.log.queries.lock().push("GetWebFile".to_owned());
                     self.log
                         .web_script
-                        .borrow_mut()
+                        .lock()
                         .pop_front()
                         .unwrap_or_else(|| panic!("web script exhausted"))
                         .map(DownloadResult::Bytes)
@@ -22355,7 +23065,7 @@ mod file_load_manager_tests {
     /// The factory: the same seam everywhere (`utils`/`generate`).
     struct GenerateFactory {
         root: std::path::PathBuf,
-        log: Rc<GenerateLog>,
+        log: Arc<GenerateLog>,
     }
 
     impl FileLoadNetFactory for GenerateFactory {
@@ -22381,7 +23091,7 @@ mod file_load_manager_tests {
 
     /// The context mock: records the generation updates.
     struct GenerateContext {
-        log: Rc<GenerateLog>,
+        log: Arc<GenerateLog>,
         access_hash: i64,
     }
 
@@ -22393,7 +23103,7 @@ mod file_load_manager_tests {
             path: &str,
             conversion: &str,
         ) {
-            self.log.updates.borrow_mut().push(format!(
+            self.log.updates.lock().push(format!(
                 "start:{generation_id}:{original_path}:{path}:{conversion}"
             ));
         }
@@ -22401,7 +23111,7 @@ mod file_load_manager_tests {
         fn on_file_generation_stop(&mut self, generation_id: i64) {
             self.log
                 .updates
-                .borrow_mut()
+                .lock()
                 .push(format!("stop:{generation_id}"));
         }
 
@@ -22415,7 +23125,7 @@ mod file_load_manager_tests {
         // the register-generate -> download -> write/progress/finish flow
         // (FileManager.cpp:3673-3786 + FileGenerateManager.cpp:299-391)
         let root = test_root();
-        let log = Rc::new(GenerateLog::default());
+        let log = Arc::new(GenerateLog::default());
         let mut file_manager = FileManager::new();
         file_manager.set_context(Box::new(GenerateContext {
             log: log.clone(),
@@ -22442,15 +23152,15 @@ mod file_load_manager_tests {
         if let Some(node) = file_manager.get_file_node_mut(generate_id) {
             node.need_load_from_pmc = false;
         }
-        let log_dl = Rc::new(RefCell::new(DownloadLog::default()));
-        file_manager.set_user_download_callback(Rc::new(RefCell::new(DownloadCallbackHandle(
+        let log_dl = Arc::new(Mutex::new(DownloadLog::default()));
+        file_manager.set_user_download_callback(Arc::new(Mutex::new(DownloadCallbackHandle(
             log_dl.clone(),
         ))));
         file_manager.download(
             generate_id,
             0,
-            Rc::new(RefCell::new(DownloadCallbackHandle(log_dl.clone())))
-                as Rc<RefCell<dyn DownloadCallback>>,
+            Arc::new(Mutex::new(DownloadCallbackHandle(log_dl.clone())))
+                as Arc<parking_lot::Mutex<dyn DownloadCallback>>,
             10,
             -1,
             -1,
@@ -22460,7 +23170,7 @@ mod file_load_manager_tests {
 
         // the generation started: the update carries the query id, the
         // original path, the allocated temp path and the conversion
-        let updates = log.updates.borrow();
+        let updates = log.updates.lock();
         assert_eq!(updates.len(), 1, "updates={updates:?}");
         assert!(
             updates[0].starts_with("start:1:source.jpg:"),
@@ -22498,7 +23208,7 @@ mod file_load_manager_tests {
 
         // the finished generation merged into the generate file id and
         // finished the user download; the stop update follows the ok
-        assert_eq!(log_dl.borrow().messages(generate_id), vec!["ok".to_owned()]);
+        assert_eq!(log_dl.lock().messages(generate_id), vec!["ok".to_owned()]);
         let node = file_manager.get_file_node(generate_id).expect("node");
         match &node.local {
             LocalFileLocation::Full(full) => {
@@ -22509,7 +23219,7 @@ mod file_load_manager_tests {
             }
             other => panic!("expected a full local location, got {other:?}"),
         }
-        let updates = log.updates.borrow();
+        let updates = log.updates.lock();
         assert_eq!(updates.len(), 2);
         assert_eq!(updates[1], "stop:1");
         drop(updates);
@@ -22521,10 +23231,8 @@ mod file_load_manager_tests {
         // the `#map#` conversion rides upload.getWebFile and
         // save_file_bytes (FileGenerateManager.cpp:212-253)
         let root = test_root();
-        let log = Rc::new(GenerateLog::default());
-        log.web_script
-            .borrow_mut()
-            .push_back(Ok(b"png-bytes".to_vec()));
+        let log = Arc::new(GenerateLog::default());
+        log.web_script.lock().push_back(Ok(b"png-bytes".to_vec()));
         let mut file_manager = FileManager::new();
         file_manager.set_context(Box::new(GenerateContext {
             log: log.clone(),
@@ -22551,15 +23259,15 @@ mod file_load_manager_tests {
         if let Some(node) = file_manager.get_file_node_mut(generate_id) {
             node.need_load_from_pmc = false;
         }
-        let log_dl = Rc::new(RefCell::new(DownloadLog::default()));
-        file_manager.set_user_download_callback(Rc::new(RefCell::new(DownloadCallbackHandle(
+        let log_dl = Arc::new(Mutex::new(DownloadLog::default()));
+        file_manager.set_user_download_callback(Arc::new(Mutex::new(DownloadCallbackHandle(
             log_dl.clone(),
         ))));
         file_manager.download(
             generate_id,
             0,
-            Rc::new(RefCell::new(DownloadCallbackHandle(log_dl.clone())))
-                as Rc<RefCell<dyn DownloadCallback>>,
+            Arc::new(Mutex::new(DownloadCallbackHandle(log_dl.clone())))
+                as Arc<parking_lot::Mutex<dyn DownloadCallback>>,
             10,
             -1,
             -1,
@@ -22567,10 +23275,10 @@ mod file_load_manager_tests {
         );
         file_manager.apply_load_events(fllm);
 
-        assert_eq!(*log.queries.borrow(), vec!["GetWebFile".to_owned()]);
-        assert_eq!(log_dl.borrow().messages(generate_id), vec!["ok".to_owned()]);
+        assert_eq!(*log.queries.lock(), vec!["GetWebFile".to_owned()]);
+        assert_eq!(log_dl.lock().messages(generate_id), vec!["ok".to_owned()]);
         // the web worker emits no generation updates
-        assert!(log.updates.borrow().is_empty());
+        assert!(log.updates.lock().is_empty());
         // the saved copy landed under the computed map name
         let node = file_manager.get_file_node(generate_id).expect("node");
         match &node.local {
@@ -22594,8 +23302,8 @@ mod file_load_manager_tests {
         // (FileGenerateManager.cpp:41-121)
         let root = test_root();
         let payload: Vec<u8> = (0..=255).cycle().take(1024).collect();
-        let query_log: Rc<RefCell<Vec<(i64, i32)>>> = Rc::new(RefCell::new(Vec::new()));
-        let log = Rc::new(GenerateLog::default());
+        let query_log: Arc<parking_lot::Mutex<Vec<(i64, i32)>>> = Arc::new(Mutex::new(Vec::new()));
+        let log = Arc::new(GenerateLog::default());
         let mut file_manager = FileManager::new();
         file_manager.set_context(Box::new(GenerateContext {
             log: log.clone(),
@@ -22606,7 +23314,7 @@ mod file_load_manager_tests {
             Box::new(TestFactory {
                 payload: payload.clone(),
                 root: root.clone(),
-                download_queries: Rc::clone(&query_log),
+                download_queries: Arc::clone(&query_log),
             }),
             FileLoadManagerOptions::default(),
         );
@@ -22624,15 +23332,15 @@ mod file_load_manager_tests {
         if let Some(node) = file_manager.get_file_node_mut(generate_id) {
             node.need_load_from_pmc = false;
         }
-        let log_dl = Rc::new(RefCell::new(DownloadLog::default()));
-        file_manager.set_user_download_callback(Rc::new(RefCell::new(DownloadCallbackHandle(
+        let log_dl = Arc::new(Mutex::new(DownloadLog::default()));
+        file_manager.set_user_download_callback(Arc::new(Mutex::new(DownloadCallbackHandle(
             log_dl.clone(),
         ))));
         file_manager.download(
             generate_id,
             0,
-            Rc::new(RefCell::new(DownloadCallbackHandle(log_dl.clone())))
-                as Rc<RefCell<dyn DownloadCallback>>,
+            Arc::new(Mutex::new(DownloadCallbackHandle(log_dl.clone())))
+                as Arc<parking_lot::Mutex<dyn DownloadCallback>>,
             10,
             -1,
             -1,
@@ -22641,10 +23349,10 @@ mod file_load_manager_tests {
         pump(&mut file_manager, fllm);
 
         // the referenced file was downloaded once
-        assert_eq!(query_log.borrow().len(), 1);
+        assert_eq!(query_log.lock().len(), 1);
         // the generate file id finished with the downloaded bytes under
         // the overridden file type
-        assert_eq!(log_dl.borrow().messages(generate_id), vec!["ok".to_owned()]);
+        assert_eq!(log_dl.lock().messages(generate_id), vec!["ok".to_owned()]);
         let node = file_manager.get_file_node(generate_id).expect("node");
         match &node.local {
             LocalFileLocation::Full(full) => {
@@ -22660,7 +23368,7 @@ mod file_load_manager_tests {
     #[test]
     fn cancel_drops_the_generation_and_rejects_the_arms() {
         let root = test_root();
-        let log = Rc::new(GenerateLog::default());
+        let log = Arc::new(GenerateLog::default());
         let mut file_manager = FileManager::new();
         file_manager.set_context(Box::new(GenerateContext {
             log: log.clone(),
@@ -22687,15 +23395,15 @@ mod file_load_manager_tests {
         if let Some(node) = file_manager.get_file_node_mut(generate_id) {
             node.need_load_from_pmc = false;
         }
-        let log_dl = Rc::new(RefCell::new(DownloadLog::default()));
-        file_manager.set_user_download_callback(Rc::new(RefCell::new(DownloadCallbackHandle(
+        let log_dl = Arc::new(Mutex::new(DownloadLog::default()));
+        file_manager.set_user_download_callback(Arc::new(Mutex::new(DownloadCallbackHandle(
             log_dl.clone(),
         ))));
         file_manager.download(
             generate_id,
             0,
-            Rc::new(RefCell::new(DownloadCallbackHandle(log_dl.clone())))
-                as Rc<RefCell<dyn DownloadCallback>>,
+            Arc::new(Mutex::new(DownloadCallbackHandle(log_dl.clone())))
+                as Arc<parking_lot::Mutex<dyn DownloadCallback>>,
             10,
             -1,
             -1,
@@ -22703,7 +23411,7 @@ mod file_load_manager_tests {
         );
         file_manager.apply_load_events(fllm);
         let temp_path = {
-            let updates = log.updates.borrow();
+            let updates = log.updates.lock();
             updates[0].split(':').nth(3).expect("path").to_owned()
         };
         file_manager
@@ -22717,11 +23425,11 @@ mod file_load_manager_tests {
         file_manager.apply_load_events(fllm);
 
         assert_eq!(
-            log_dl.borrow().messages(generate_id),
+            log_dl.lock().messages(generate_id),
             vec!["error:Canceled".to_owned()]
         );
         assert!(!std::path::Path::new(&temp_path).exists(), "{temp_path}");
-        let updates = log.updates.borrow();
+        let updates = log.updates.lock();
         assert_eq!(updates.len(), 2);
         assert_eq!(updates[1], "stop:1");
         drop(updates);
@@ -22742,7 +23450,7 @@ mod file_load_manager_tests {
         std::fs::write(&path, b"data").unwrap();
         let path = path.to_string_lossy().into_owned();
         let mut ctx = GenerateContext {
-            log: Rc::new(GenerateLog::default()),
+            log: Arc::new(GenerateLog::default()),
             access_hash: 0,
         };
         let actual_mtime = ctx.stat(&path).unwrap().mtime_nsec;
@@ -22799,9 +23507,9 @@ mod file_load_manager_tests {
     /// optional db-record feed.
     struct GcContext {
         root: std::path::PathBuf,
-        unlinked: Rc<RefCell<Vec<String>>>,
+        unlinked: Arc<parking_lot::Mutex<Vec<String>>>,
         use_file_database: bool,
-        db_records: RefCell<Vec<(FileType, String, DialogId, i64)>>,
+        db_records: parking_lot::Mutex<Vec<(FileType, String, DialogId, i64)>>,
     }
 
     impl FileManagerContext for GcContext {
@@ -22816,13 +23524,13 @@ mod file_load_manager_tests {
         }
 
         fn on_file_unlink(&mut self, location: FullLocalFileLocation) {
-            self.unlinked.borrow_mut().push(location.path);
+            self.unlinked.lock().push(location.path);
         }
     }
 
     impl FileStatsSink for GcContext {
         fn scan_file_db(&mut self, callback: &mut dyn FnMut(FileType, String, DialogId, i64)) {
-            for (file_type, path, owner_dialog_id, size) in self.db_records.borrow().iter() {
+            for (file_type, path, owner_dialog_id, size) in self.db_records.lock().iter() {
                 callback(*file_type, path.clone(), *owner_dialog_id, *size);
             }
         }
@@ -22869,17 +23577,17 @@ mod file_load_manager_tests {
             // kept: the type is not selected
             make("old.jpg", FileType::Photo, dialog, 100_000, 50),
         ];
-        let unlinked = Rc::new(RefCell::new(Vec::new()));
+        let unlinked = Arc::new(Mutex::new(Vec::new()));
         let mut sink = GcContext {
             root: test_root(),
             unlinked: unlinked.clone(),
             use_file_database: true,
-            db_records: RefCell::new(Vec::new()),
+            db_records: Mutex::new(Vec::new()),
         };
         let result = run_file_gc(&mut sink, &parameters, files, true).expect("gc");
 
-        assert_eq!(unlinked.borrow().len(), 1);
-        assert_eq!(unlinked.borrow()[0], "old.bin");
+        assert_eq!(unlinked.lock().len(), 1);
+        assert_eq!(unlinked.lock()[0], "old.bin");
         assert_eq!(result.removed_file_stats.get_total_nontemp_stat().size, 10);
         assert_eq!(
             result.kept_file_stats.get_total_nontemp_stat().size,
@@ -22902,17 +23610,17 @@ mod file_load_manager_tests {
             exclude_owner_dialog_ids: Vec::new(),
             dialog_limit: 0,
         };
-        let unlinked2 = Rc::new(RefCell::new(Vec::new()));
+        let unlinked2 = Arc::new(Mutex::new(Vec::new()));
         let mut sink2 = GcContext {
             root: sink.root.clone(),
             unlinked: unlinked2.clone(),
             use_file_database: false,
-            db_records: RefCell::new(Vec::new()),
+            db_records: Mutex::new(Vec::new()),
         };
         let result = run_file_gc(&mut sink2, &parameters, files, true).expect("gc");
         // the two oldest go by count, in the atime order
         assert_eq!(
-            *unlinked2.borrow(),
+            *unlinked2.lock(),
             vec!["a.bin".to_owned(), "b.bin".to_owned()]
         );
         assert_eq!(result.kept_file_stats.get_total_nontemp_stat().size, 4);
@@ -22974,23 +23682,21 @@ mod file_load_manager_tests {
     #[test]
     fn fast_stat_round_trips_through_pmc() {
         struct PmcContext {
-            store: RefCell<BTreeMap<String, Vec<u8>>>,
+            store: parking_lot::Mutex<BTreeMap<String, Vec<u8>>>,
         }
         impl FileManagerContext for PmcContext {}
         impl FileGcSink for PmcContext {}
         impl FileStatsSink for PmcContext {}
         impl StorageContext for PmcContext {
             fn pmc_get(&mut self, key: &str) -> Vec<u8> {
-                self.store.borrow().get(key).cloned().unwrap_or_default()
+                self.store.lock().get(key).cloned().unwrap_or_default()
             }
             fn pmc_set(&mut self, key: &str, value: &[u8]) {
-                self.store
-                    .borrow_mut()
-                    .insert(key.to_owned(), value.to_vec());
+                self.store.lock().insert(key.to_owned(), value.to_vec());
             }
         }
 
-        let ctx = RefCell::new(BTreeMap::new());
+        let ctx = Mutex::new(BTreeMap::new());
         let mut pmc = PmcContext { store: ctx };
         let mut manager = StorageManager::new();
         manager.on_new_file(100, 128, 1);
@@ -23021,9 +23727,9 @@ mod file_load_manager_tests {
 
         let mut sink2 = GcContext {
             root: root.clone(),
-            unlinked: Rc::new(RefCell::new(Vec::new())),
+            unlinked: Arc::new(Mutex::new(Vec::new())),
             use_file_database: true,
-            db_records: RefCell::new(vec![(
+            db_records: Mutex::new(vec![(
                 FileType::Video,
                 doc_path.clone(),
                 DialogId::new(9),
@@ -23064,13 +23770,13 @@ mod file_load_manager_tests {
     /// The `DownloadManager::Callback` double: records every event and
     /// answers the file sizes from a table.
     struct DownloadTestCallback {
-        log: Rc<RefCell<DownloadManagerLog>>,
-        sizes: RefCell<HashMap<FileId, (i64, i64, i64)>>,
+        log: Arc<parking_lot::Mutex<DownloadManagerLog>>,
+        sizes: parking_lot::Mutex<HashMap<FileId, (i64, i64, i64)>>,
     }
 
     impl DownloadManagerCallback for DownloadTestCallback {
         fn update_counters(&mut self, counters: DownloadCounters) {
-            self.log.borrow_mut().events.push(format!(
+            self.log.lock().events.push(format!(
                 "counters:{}/{}",
                 counters.total_size, counters.total_count
             ));
@@ -23086,7 +23792,7 @@ mod file_load_manager_tests {
             _counters: DownloadFileCounters,
         ) {
             self.log
-                .borrow_mut()
+                .lock()
                 .events
                 .push(format!("added:{:?}", file_id.get()));
         }
@@ -23099,26 +23805,26 @@ mod file_load_manager_tests {
             _counters: DownloadFileCounters,
         ) {
             self.log
-                .borrow_mut()
+                .lock()
                 .events
                 .push(format!("changed:{:?}:{is_paused}", file_id.get()));
         }
 
         fn update_file_removed(&mut self, file_id: FileId, _counters: DownloadFileCounters) {
             self.log
-                .borrow_mut()
+                .lock()
                 .events
                 .push(format!("removed:{:?}", file_id.get()));
         }
 
         fn get_internal_download_id(&mut self) -> i64 {
-            let mut log = self.log.borrow_mut();
+            let mut log = self.log.lock();
             log.next_internal_download_id += 1;
             log.next_internal_download_id
         }
 
         fn start_file(&mut self, file_id: FileId, internal_download_id: i64, priority: i8) {
-            self.log.borrow_mut().events.push(format!(
+            self.log.lock().events.push(format!(
                 "start:{:?}:{internal_download_id}:{priority}",
                 file_id.get()
             ));
@@ -23126,14 +23832,14 @@ mod file_load_manager_tests {
 
         fn pause_file(&mut self, file_id: FileId, internal_download_id: i64) {
             self.log
-                .borrow_mut()
+                .lock()
                 .events
                 .push(format!("pause:{:?}:{internal_download_id}", file_id.get()));
         }
 
         fn delete_file(&mut self, file_id: FileId) {
             self.log
-                .borrow_mut()
+                .lock()
                 .events
                 .push(format!("delete:{:?}", file_id.get()));
         }
@@ -23147,7 +23853,7 @@ mod file_load_manager_tests {
         }
 
         fn sync_file_sizes(&mut self, file_id: FileId) -> (i64, i64, i64) {
-            *self.sizes.borrow().get(&file_id).unwrap_or(&(0, 0, 0))
+            *self.sizes.lock().get(&file_id).unwrap_or(&(0, 0, 0))
         }
 
         fn get_file_download_object(
@@ -23175,7 +23881,7 @@ mod file_load_manager_tests {
     /// record field (the FileManager-mediated serialization is the
     /// M.12.10 wiring).
     struct DownloadTestContext {
-        store: Rc<RefCell<BTreeMap<String, Vec<u8>>>>,
+        store: Arc<parking_lot::Mutex<BTreeMap<String, Vec<u8>>>>,
     }
 
     impl DownloadManagerContext for DownloadTestContext {
@@ -23183,24 +23889,20 @@ mod file_load_manager_tests {
             true
         }
         fn pmc_get(&mut self, key: &str) -> Vec<u8> {
-            self.store.borrow().get(key).cloned().unwrap_or_default()
+            self.store.lock().get(key).cloned().unwrap_or_default()
         }
         fn pmc_set(&mut self, key: &str, value: &[u8]) {
-            self.store
-                .borrow_mut()
-                .insert(key.to_owned(), value.to_vec());
+            self.store.lock().insert(key.to_owned(), value.to_vec());
         }
         fn pmc_erase(&mut self, key: &str) {
-            self.store.borrow_mut().remove(key);
+            self.store.lock().remove(key);
         }
         fn pmc_erase_by_prefix(&mut self, prefix: &str) {
-            self.store
-                .borrow_mut()
-                .retain(|key, _| !key.starts_with(prefix));
+            self.store.lock().retain(|key, _| !key.starts_with(prefix));
         }
         fn pmc_prefix_get(&mut self, prefix: &str) -> Vec<(String, Vec<u8>)> {
             self.store
-                .borrow()
+                .lock()
                 .iter()
                 .filter(|(key, _)| key.starts_with(prefix))
                 .map(|(key, value)| (key.clone(), value.clone()))
@@ -23219,17 +23921,17 @@ mod file_load_manager_tests {
     }
 
     fn download_manager_under_test(
-        log: &Rc<RefCell<DownloadManagerLog>>,
-        sizes: &RefCell<HashMap<FileId, (i64, i64, i64)>>,
-        store: &Rc<RefCell<BTreeMap<String, Vec<u8>>>>,
+        log: &Arc<parking_lot::Mutex<DownloadManagerLog>>,
+        sizes: &parking_lot::Mutex<HashMap<FileId, (i64, i64, i64)>>,
+        store: &Arc<parking_lot::Mutex<BTreeMap<String, Vec<u8>>>>,
     ) -> DownloadManager {
         let mut manager = DownloadManager::new();
         manager.set_callback(Box::new(DownloadTestCallback {
-            log: Rc::clone(log),
-            sizes: RefCell::new(sizes.borrow().clone()),
+            log: Arc::clone(log),
+            sizes: Mutex::new(sizes.lock().clone()),
         }));
         manager.set_context(Box::new(DownloadTestContext {
-            store: Rc::clone(store),
+            store: Arc::clone(store),
         }));
         manager.init();
         manager
@@ -23237,20 +23939,20 @@ mod file_load_manager_tests {
 
     #[test]
     fn download_manager_add_file_starts_and_completes() {
-        let log = Rc::new(RefCell::new(DownloadManagerLog::default()));
-        let sizes = RefCell::new(HashMap::new());
-        let store = Rc::new(RefCell::new(BTreeMap::new()));
+        let log = Arc::new(Mutex::new(DownloadManagerLog::default()));
+        let sizes = Mutex::new(HashMap::new());
+        let store = Arc::new(Mutex::new(BTreeMap::new()));
         let mut manager = download_manager_under_test(&log, &sizes, &store);
 
         let file_id = FileId::new(11, 0);
-        sizes.borrow_mut().insert(file_id, (100, 100, 0));
+        sizes.lock().insert(file_id, (100, 100, 0));
         let added = manager
             .add_file(file_id, FileSourceId::default(), "document.pdf", 16)
             .expect("add_file");
         assert!(added.is_none());
 
         // the download started immediately (not paused)
-        let events = log.borrow().events.clone();
+        let events = log.lock().events.clone();
         assert!(
             events
                 .iter()
@@ -23272,7 +23974,7 @@ mod file_load_manager_tests {
         // the progress report completes the file (downloaded == size),
         // so register_file_info flips completed_at and fires changed
         manager.update_file_download_state(file_id, 100, 100, 100, false, 1);
-        let events = log.borrow().events.clone();
+        let events = log.lock().events.clone();
         assert!(
             events
                 .iter()
@@ -23290,20 +23992,20 @@ mod file_load_manager_tests {
 
     #[test]
     fn download_manager_pauses_and_resumes() {
-        let log = Rc::new(RefCell::new(DownloadManagerLog::default()));
-        let sizes = RefCell::new(HashMap::new());
-        let store = Rc::new(RefCell::new(BTreeMap::new()));
+        let log = Arc::new(Mutex::new(DownloadManagerLog::default()));
+        let sizes = Mutex::new(HashMap::new());
+        let store = Arc::new(Mutex::new(BTreeMap::new()));
         let mut manager = download_manager_under_test(&log, &sizes, &store);
 
         let file_id = FileId::new(21, 0);
-        sizes.borrow_mut().insert(file_id, (100, 100, 0));
+        sizes.lock().insert(file_id, (100, 100, 0));
         manager
             .add_file(file_id, FileSourceId::default(), "movie.mp4", 8)
             .expect("add_file");
 
         manager.toggle_is_paused(file_id, true).expect("pause");
         assert!(
-            log.borrow()
+            log.lock()
                 .events
                 .iter()
                 .any(|event| event.starts_with(&format!("pause:{:?}:1", file_id.get())))
@@ -23312,7 +24014,7 @@ mod file_load_manager_tests {
         manager.toggle_is_paused(file_id, false).expect("resume");
         // the internal download id persists across the pause
         assert!(
-            log.borrow()
+            log.lock()
                 .events
                 .iter()
                 .any(|event| event.starts_with(&format!("start:{:?}:1", file_id.get())))
@@ -23321,18 +24023,18 @@ mod file_load_manager_tests {
 
     #[test]
     fn download_manager_remove_updates_counters_and_persists() {
-        let log = Rc::new(RefCell::new(DownloadManagerLog::default()));
-        let sizes = RefCell::new(HashMap::new());
-        let store = Rc::new(RefCell::new(BTreeMap::new()));
+        let log = Arc::new(Mutex::new(DownloadManagerLog::default()));
+        let sizes = Mutex::new(HashMap::new());
+        let store = Arc::new(Mutex::new(BTreeMap::new()));
         let mut manager = download_manager_under_test(&log, &sizes, &store);
 
         let file_id = FileId::new(31, 0);
-        sizes.borrow_mut().insert(file_id, (100, 100, 0));
+        sizes.lock().insert(file_id, (100, 100, 0));
         manager
             .add_file(file_id, FileSourceId::default(), "doc.bin", 16)
             .expect("add_file");
         // the add persisted the download record
-        assert!(store.borrow().contains_key("dlds#1"), "dlds record missing");
+        assert!(store.lock().contains_key("dlds#1"), "dlds record missing");
 
         // the update plane arms after the hints load (is_search_inited)
         let _ = manager.search("", false, false, "", 50).expect("search");
@@ -23341,12 +24043,12 @@ mod file_load_manager_tests {
             .remove_file(file_id, FileSourceId::default(), false)
             .expect("remove");
         assert!(
-            log.borrow()
+            log.lock()
                 .events
                 .iter()
                 .any(|event| event.starts_with(&format!("removed:{:?}", file_id.get())))
         );
-        assert!(store.borrow().get("dlds#1").is_none());
+        assert!(store.lock().get("dlds#1").is_none());
 
         // removing an unknown file fails with the C++ error
         let err = manager
@@ -23356,7 +24058,7 @@ mod file_load_manager_tests {
 
         // remove_file_if_finished on an active file reports the state
         let file_id2 = FileId::new(32, 0);
-        sizes.borrow_mut().insert(file_id2, (100, 100, 0));
+        sizes.lock().insert(file_id2, (100, 100, 0));
         manager
             .add_file(file_id2, FileSourceId::default(), "doc2.bin", 16)
             .expect("add_file");
@@ -23368,13 +24070,15 @@ mod file_load_manager_tests {
 
     #[test]
     fn download_manager_reloads_records_from_pmc() {
-        let log = Rc::new(RefCell::new(DownloadManagerLog::default()));
-        let sizes = RefCell::new(HashMap::new());
-        let store = Rc::new(RefCell::new(BTreeMap::new()));
-        sizes.borrow_mut().insert(FileId::new(41, 0), (100, 100, 0));
-        // seed the record the C++ `sync_with_database` writes: the flags
-        // word + the plain fields with the paused flag set
+        let log = Arc::new(Mutex::new(DownloadManagerLog::default()));
+        let sizes = Mutex::new(HashMap::new());
+        let store = Arc::new(Mutex::new(BTreeMap::new()));
+        sizes.lock().insert(FileId::new(41, 0), (100, 100, 0));
+        // seed the record the C++ `sync_with_database` writes: the
+        // log-event version prefix, the flags word and the plain fields
+        // with the paused flag set
         let mut record = Vec::new();
+        store_parse::store_log_event_version(&mut record);
         store_parse::store_flags(&mut record, [true]);
         store_parse::store_i64(&mut record, 7);
         store_parse::store_i32(&mut record, 41);
@@ -23382,7 +24086,7 @@ mod file_load_manager_tests {
         store_parse::store_i32(&mut record, 16);
         store_parse::store_i32(&mut record, 1_800_000_000);
         store_parse::store_i32(&mut record, 0);
-        store.borrow_mut().insert("dlds#7".to_owned(), record);
+        store.lock().insert("dlds#7".to_owned(), record);
 
         let mut manager = download_manager_under_test(&log, &sizes, &store);
         // the load rides the first active check (search in the C++ acts
@@ -23393,7 +24097,7 @@ mod file_load_manager_tests {
         assert_eq!(counts.active_count, 1);
         assert_eq!(counts.paused_count, 1);
         assert!(
-            !log.borrow()
+            !log.lock()
                 .events
                 .iter()
                 .any(|event| event.starts_with("start:"))
@@ -23405,7 +24109,7 @@ mod file_load_manager_tests {
             .toggle_is_paused(FileId::new(41, 0), false)
             .expect("resume");
         assert!(
-            log.borrow()
+            log.lock()
                 .events
                 .iter()
                 .any(|event| event.starts_with("start:"))
@@ -23413,7 +24117,244 @@ mod file_load_manager_tests {
         manager
             .add_file(FileId::new(41, 0), FileSourceId::default(), "x", 8)
             .expect("add_file");
-        assert!(store.borrow().contains_key("dlds#8"));
+        assert!(store.lock().contains_key("dlds#8"));
+    }
+
+    /// The captured `Result<td_api::File>` of a `downloadFile` promise.
+    type FileSlot = Arc<parking_lot::Mutex<Option<tdutils::status::Result<td_api::File>>>>;
+
+    /// The `downloadFile` promise slot: captures the settled
+    /// `Result<td_api::File>` for the assertions.
+    fn unit_file_promise() -> (tdutils::promise::Promise<td_api::File>, FileSlot) {
+        let slot: FileSlot = Arc::new(parking_lot::Mutex::new(None));
+        let capture = Arc::clone(&slot);
+        let promise = tdutils::promise::PromiseCreator::lambda_result(
+            move |result: tdutils::status::Result<td_api::File>| {
+                *capture.lock() = Some(result);
+            },
+        );
+        (promise, slot)
+    }
+
+    /// M.12.10 — `from_persistent_id` round-trips the persistent-id string
+    /// of a registered remote location back to the same node (the v3
+    /// decoder over the zero-encoded base64url form), and the unknown-tail
+    /// byte answers the C++ "Wrong last symbol" error.
+    #[test]
+    fn from_persistent_id_round_trips_remote_locations() {
+        let mut manager = FileManager::new();
+        let location = FullRemoteFileLocation::from_document(
+            FileType::Document,
+            123,
+            456,
+            crate::chat_manager::DcId::internal(1),
+            "ref".to_owned(),
+        );
+        let file_id = manager.register_remote(
+            location,
+            FileLocationSource::FromUser,
+            DialogId::default(),
+            7,
+            0,
+            "doc.bin".to_owned(),
+        );
+        let persistent_id = manager
+            .get_file_node(file_id)
+            .expect("node")
+            .get_persistent_file_id();
+        assert!(!persistent_id.is_empty());
+
+        let parsed = manager
+            .from_persistent_id(&persistent_id, FileType::Document)
+            .expect("from_persistent_id");
+        assert_eq!(parsed.get(), file_id.get());
+
+        // a v4-prefixed id with a bogus trailing version byte is rejected
+        let mut bogus = tdutils::zero_encode::zero_encode(&[0, 0]);
+        bogus.push(PERSISTENT_ID_VERSION_PREFIX);
+        bogus.push(0x7f);
+        let bogus = base64url(&bogus);
+        let error = manager
+            .from_persistent_id(&bogus, FileType::Document)
+            .expect_err("bad version byte");
+        assert_eq!(
+            error.message(),
+            "Wrong remote file identifier specified: can't unserialize it. Wrong last symbol"
+        );
+    }
+
+    /// M.12.10 — the `downloadFile` entry: the unknown file answers the
+    /// C++ 400 "File not found"; a full-local file resolves the promise
+    /// with its object immediately (the `download_impl` early return).
+    #[test]
+    fn download_file_answers_the_cpp_error_surfaces() {
+        struct LocalContext;
+        impl FileManagerContext for LocalContext {
+            fn real_path(&self, path: &str) -> Result<String, Status> {
+                Ok(path.to_owned())
+            }
+            fn stat(&self, _path: &str) -> Result<FileStat, Status> {
+                Ok(FileStat {
+                    is_reg: true,
+                    is_dir: false,
+                    size: 5,
+                    mtime_nsec: 1,
+                    real_size: 5,
+                })
+            }
+        }
+        let mut manager = FileManager::new();
+        manager.set_context(Box::new(LocalContext));
+        struct NoopNetFactory;
+        impl FileDownloaderNet for NoopNetFactory {
+            fn download(
+                &mut self,
+                _query: DownloadQuery,
+                _query_type: DownloadQueryType,
+                _meta: DownloadNetMeta,
+            ) -> Result<DownloadResult, Status> {
+                Err(Status::error(400, "Not connected"))
+            }
+            fn open_temp_file(
+                &mut self,
+                _file_type: FileType,
+            ) -> Result<(std::fs::File, String), Status> {
+                Err(Status::error_message("no temp files in this test"))
+            }
+            fn open_partial_file(
+                &mut self,
+                _path: &str,
+                _write: bool,
+            ) -> Result<std::fs::File, Status> {
+                Err(Status::error_message("no partial files in this test"))
+            }
+            fn create_from_temp(
+                &mut self,
+                _file_type: FileType,
+                _path: &str,
+                _name: &str,
+            ) -> Result<String, Status> {
+                Err(Status::error_message("no temp files in this test"))
+            }
+        }
+        impl FileLoadNetFactory for NoopNetFactory {
+            fn download_net(&mut self) -> Box<dyn FileDownloaderNet> {
+                Box::new(NoopNetFactory)
+            }
+            fn upload_net(&mut self) -> Box<dyn FileUploaderNet> {
+                unreachable!("no uploads in this test")
+            }
+            fn hash_net(&mut self) -> Box<dyn FileHashUploaderNet> {
+                unreachable!("no hash uploads in this test")
+            }
+            fn utils_net(&mut self) -> Box<dyn FileDownloaderNet> {
+                self.download_net()
+            }
+        }
+        let mut fllm =
+            FileLoadManager::new(Box::new(NoopNetFactory), FileLoadManagerOptions::default());
+
+        // unknown file
+        let (promise, slot) = unit_file_promise();
+        manager.download_file(FileId::new(9, 0), 16, 0, 0, false, promise, &mut fllm);
+        match slot.lock().take().expect("settled") {
+            tdutils::status::Result::Err(status) => {
+                assert_eq!(status.code(), 400);
+                assert_eq!(status.message(), "File not found");
+            }
+            tdutils::status::Result::Ok(_) => panic!("unknown file must error"),
+        }
+
+        // a full-local file resolves with its object
+        let file_id = manager
+            .register_local(
+                FullLocalFileLocation::new(FileType::Document, "/tmp/doc.bin".to_owned(), 0),
+                DialogId::default(),
+                5,
+                false,
+                false,
+                FileId::default(),
+            )
+            .expect("register_local");
+        let (promise, slot) = unit_file_promise();
+        manager.download_file(file_id, 16, 0, 0, false, promise, &mut fllm);
+        match slot.lock().take().expect("settled") {
+            tdutils::status::Result::Ok(file) => {
+                assert_eq!(file.id, file_id.get());
+                assert!(file.local.expect("local").is_downloading_completed);
+            }
+            tdutils::status::Result::Err(status) => {
+                panic!("full-local download must resolve: {status}")
+            }
+        }
+    }
+
+    /// M.12.10 T.7 — the dlds record rides the versioned
+    /// `FileManager::store_file` serialization: a store → parse round-trip
+    /// through the real plane recovers the same node id.
+    #[test]
+    fn dlds_records_round_trip_through_store_file() {
+        let mut manager = FileManager::new();
+        let location = FullRemoteFileLocation::from_document(
+            FileType::Video,
+            77,
+            88,
+            crate::chat_manager::DcId::internal(1),
+            "ref".to_owned(),
+        );
+        let file_id = manager.register_remote(
+            location,
+            FileLocationSource::FromUser,
+            DialogId::default(),
+            42,
+            0,
+            "clip.mp4".to_owned(),
+        );
+
+        // the record body the Td context writes (T.7: the FileManager
+        // serialization, not the raw i32)
+        let mut out = Vec::new();
+        store_parse::store_log_event_version(&mut out);
+        store_parse::store_flags(&mut out, [false]);
+        store_parse::store_i64(&mut out, 3);
+        manager.store_file(file_id, &mut out);
+        store_parse::store_i32(&mut out, 5);
+        store_parse::store_i32(&mut out, 16);
+        store_parse::store_i32(&mut out, 1_700_000_000);
+        store_parse::store_i32(&mut out, 0);
+
+        // parse through the manager-backed context (the Td plane's
+        // store_file/parse_file delegation)
+        struct ManagerContext {
+            manager: Arc<parking_lot::Mutex<FileManager>>,
+        }
+        impl DownloadManagerContext for ManagerContext {
+            fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>) {
+                self.manager.lock().store_file(file_id, out);
+            }
+            fn parse_file_id(
+                &mut self,
+                parser: &mut store_parse::Parser,
+            ) -> Result<FileId, Status> {
+                self.manager
+                    .lock()
+                    .parse_file(parser)
+                    .map_err(Status::error_message)
+            }
+        }
+        let shared_manager = Arc::new(parking_lot::Mutex::new(manager));
+        let mut parser = Parser::new_log_event(&out).expect("versioned record");
+        let record = FileDownloadInDatabase::parse(
+            &mut ManagerContext {
+                manager: Arc::clone(&shared_manager),
+            },
+            &mut parser,
+        )
+        .expect("parse");
+        assert_eq!(record.download_id, 3);
+        assert_eq!(record.file_id.get(), file_id.get());
+        assert_eq!(record.priority, 16);
+        assert!(parser.fetch_end().is_ok());
     }
 
     /// M.12.1h — the C++ FileDb oracle (`conformance/file_db_oracle`):
@@ -23554,7 +24495,7 @@ mod file_load_manager_tests {
         // finishes first in the grant order (the C++ `to_xload` order)
         let root = test_root();
         let payload: Vec<u8> = (0..=255).cycle().take(4096).collect();
-        let query_log: Rc<RefCell<Vec<(i64, i32)>>> = Rc::new(RefCell::new(Vec::new()));
+        let query_log: Arc<parking_lot::Mutex<Vec<(i64, i32)>>> = Arc::new(Mutex::new(Vec::new()));
         let mut file_manager = FileManager::new();
         let low = register_downloadable(&mut file_manager, 2, payload.len() as i64, 1);
         let high = register_downloadable(&mut file_manager, 2, payload.len() as i64, 2);
@@ -23562,21 +24503,21 @@ mod file_load_manager_tests {
             Box::new(TestFactory {
                 payload: payload.clone(),
                 root: root.clone(),
-                download_queries: Rc::clone(&query_log),
+                download_queries: Arc::clone(&query_log),
             }),
             FileLoadManagerOptions::default(),
         );
 
-        let log = Rc::new(RefCell::new(DownloadLog::default()));
+        let log = Arc::new(Mutex::new(DownloadLog::default()));
         file_manager
-            .set_user_download_callback(Rc::new(RefCell::new(DownloadCallbackHandle(log.clone()))));
+            .set_user_download_callback(Arc::new(Mutex::new(DownloadCallbackHandle(log.clone()))));
         // the low-priority file is requested FIRST (a naive FIFO would
         // finish it first)
         file_manager.download(
             low,
             0,
-            Rc::new(RefCell::new(DownloadCallbackHandle(log.clone())))
-                as Rc<RefCell<dyn DownloadCallback>>,
+            Arc::new(Mutex::new(DownloadCallbackHandle(log.clone())))
+                as Arc<parking_lot::Mutex<dyn DownloadCallback>>,
             1,
             -1,
             -1,
@@ -23585,8 +24526,8 @@ mod file_load_manager_tests {
         file_manager.download(
             high,
             0,
-            Rc::new(RefCell::new(DownloadCallbackHandle(log.clone())))
-                as Rc<RefCell<dyn DownloadCallback>>,
+            Arc::new(Mutex::new(DownloadCallbackHandle(log.clone())))
+                as Arc<parking_lot::Mutex<dyn DownloadCallback>>,
             10,
             -1,
             -1,
@@ -23596,7 +24537,7 @@ mod file_load_manager_tests {
 
         // the decision order: the high-priority file's ok precedes the
         // low-priority one
-        let events = &log.borrow().events;
+        let events = &log.lock().events;
         let high_ok = events.iter().position(|(id, e)| *id == high && e == "ok");
         let low_ok = events.iter().position(|(id, e)| *id == low && e == "ok");
         let (Some(high_ok), Some(low_ok)) = (high_ok, low_ok) else {
@@ -23613,7 +24554,7 @@ mod file_load_manager_tests {
         // so both loaders are genuinely mid-way; round 2 (2 MB, the pool
         // cap) completes them
         let payload: Vec<u8> = vec![7u8; 1536 * 1024];
-        let query_log: Rc<RefCell<Vec<(i64, i32)>>> = Rc::new(RefCell::new(Vec::new()));
+        let query_log: Arc<parking_lot::Mutex<Vec<(i64, i32)>>> = Arc::new(Mutex::new(Vec::new()));
         let mut file_manager = FileManager::new();
         let canceled_id = register_downloadable(&mut file_manager, 2, payload.len() as i64, 1);
         let survivor_id = register_downloadable(&mut file_manager, 2, payload.len() as i64, 2);
@@ -23621,19 +24562,19 @@ mod file_load_manager_tests {
             Box::new(TestFactory {
                 payload: payload.clone(),
                 root: root.clone(),
-                download_queries: Rc::clone(&query_log),
+                download_queries: Arc::clone(&query_log),
             }),
             FileLoadManagerOptions::default(),
         );
 
-        let log = Rc::new(RefCell::new(DownloadLog::default()));
+        let log = Arc::new(Mutex::new(DownloadLog::default()));
         file_manager
-            .set_user_download_callback(Rc::new(RefCell::new(DownloadCallbackHandle(log.clone()))));
+            .set_user_download_callback(Arc::new(Mutex::new(DownloadCallbackHandle(log.clone()))));
         file_manager.download(
             canceled_id,
             0,
-            Rc::new(RefCell::new(DownloadCallbackHandle(log.clone())))
-                as Rc<RefCell<dyn DownloadCallback>>,
+            Arc::new(Mutex::new(DownloadCallbackHandle(log.clone())))
+                as Arc<parking_lot::Mutex<dyn DownloadCallback>>,
             5,
             -1,
             -1,
@@ -23642,8 +24583,8 @@ mod file_load_manager_tests {
         file_manager.download(
             survivor_id,
             0,
-            Rc::new(RefCell::new(DownloadCallbackHandle(log.clone())))
-                as Rc<RefCell<dyn DownloadCallback>>,
+            Arc::new(Mutex::new(DownloadCallbackHandle(log.clone())))
+                as Arc<parking_lot::Mutex<dyn DownloadCallback>>,
             5,
             -1,
             -1,
@@ -23662,16 +24603,16 @@ mod file_load_manager_tests {
         // callback only
         file_manager.cancel_download(canceled_id, 0, false, fllm);
         assert_eq!(
-            log.borrow().messages(canceled_id),
+            log.lock().messages(canceled_id),
             vec!["error:Canceled".to_owned()]
         );
 
         // the survivor still completes
         pump(&mut file_manager, fllm);
-        assert_eq!(log.borrow().messages(survivor_id), vec!["ok".to_owned()]);
+        assert_eq!(log.lock().messages(survivor_id), vec!["ok".to_owned()]);
         // ...and the canceled one is never ok
         assert!(
-            !log.borrow()
+            !log.lock()
                 .messages(canceled_id)
                 .iter()
                 .any(|event| event == "ok")
@@ -23683,26 +24624,26 @@ mod file_load_manager_tests {
     fn file_load_manager_cancel_only_if_pending_respects_the_started_flag() {
         let root = test_root();
         let payload: Vec<u8> = vec![7u8; 4096];
-        let query_log: Rc<RefCell<Vec<(i64, i32)>>> = Rc::new(RefCell::new(Vec::new()));
+        let query_log: Arc<parking_lot::Mutex<Vec<(i64, i32)>>> = Arc::new(Mutex::new(Vec::new()));
         let mut file_manager = FileManager::new();
         let file_id = register_downloadable(&mut file_manager, 2, payload.len() as i64, 1);
         let fllm = &mut FileLoadManager::new(
             Box::new(TestFactory {
                 payload: payload.clone(),
                 root: root.clone(),
-                download_queries: Rc::clone(&query_log),
+                download_queries: Arc::clone(&query_log),
             }),
             FileLoadManagerOptions::default(),
         );
 
-        let log = Rc::new(RefCell::new(DownloadLog::default()));
+        let log = Arc::new(Mutex::new(DownloadLog::default()));
         file_manager
-            .set_user_download_callback(Rc::new(RefCell::new(DownloadCallbackHandle(log.clone()))));
+            .set_user_download_callback(Arc::new(Mutex::new(DownloadCallbackHandle(log.clone()))));
         file_manager.download(
             file_id,
             0,
-            Rc::new(RefCell::new(DownloadCallbackHandle(log.clone())))
-                as Rc<RefCell<dyn DownloadCallback>>,
+            Arc::new(Mutex::new(DownloadCallbackHandle(log.clone())))
+                as Arc<parking_lot::Mutex<dyn DownloadCallback>>,
             10,
             -1,
             -1,
@@ -23715,14 +24656,14 @@ mod file_load_manager_tests {
         // only_if_pending must refuse to cancel a started download
         file_manager.cancel_download(file_id, 0, true, fllm);
         assert!(
-            !log.borrow()
+            !log.lock()
                 .messages(file_id)
                 .iter()
                 .any(|event| event.starts_with("error:"))
         );
 
         pump(&mut file_manager, fllm);
-        assert_eq!(log.borrow().messages(file_id), vec!["ok".to_owned()]);
+        assert_eq!(log.lock().messages(file_id), vec!["ok".to_owned()]);
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -23778,14 +24719,14 @@ mod file_load_manager_tests {
         let fllm =
             &mut FileLoadManager::new(Box::new(FailFactory), FileLoadManagerOptions::default());
 
-        let log = Rc::new(RefCell::new(DownloadLog::default()));
+        let log = Arc::new(Mutex::new(DownloadLog::default()));
         file_manager
-            .set_user_download_callback(Rc::new(RefCell::new(DownloadCallbackHandle(log.clone()))));
+            .set_user_download_callback(Arc::new(Mutex::new(DownloadCallbackHandle(log.clone()))));
         file_manager.download(
             file_id,
             0,
-            Rc::new(RefCell::new(DownloadCallbackHandle(log.clone())))
-                as Rc<RefCell<dyn DownloadCallback>>,
+            Arc::new(Mutex::new(DownloadCallbackHandle(log.clone())))
+                as Arc<parking_lot::Mutex<dyn DownloadCallback>>,
             10,
             -1,
             -1,
@@ -23800,7 +24741,7 @@ mod file_load_manager_tests {
         // leaving the request pending with no terminal callback - the
         // C++ flow for a node whose reference never recovers
         // (FileManager.cpp:3294-3316, 3235-3238)
-        assert!(log.borrow().messages(file_id).is_empty());
+        assert!(log.lock().messages(file_id).is_empty());
         assert!(file_manager.file_download_requests.contains_key(&file_id));
         assert!(
             file_manager
@@ -23817,11 +24758,11 @@ mod file_load_manager_tests {
         // same-bytes file is reused; otherwise the bytes land in a new
         // file
         let root = test_root();
-        let query_log: Rc<RefCell<Vec<(i64, i32)>>> = Rc::new(RefCell::new(Vec::new()));
+        let query_log: Arc<parking_lot::Mutex<Vec<(i64, i32)>>> = Arc::new(Mutex::new(Vec::new()));
         let mut factory = TestFactory {
             payload: Vec::new(),
             root: root.clone(),
-            download_queries: Rc::clone(&query_log),
+            download_queries: Arc::clone(&query_log),
         };
         let mut io = factory.utils_net();
         let bytes = b"from bytes".to_vec();
@@ -23850,7 +24791,7 @@ mod file_load_manager_tests {
         // from_bytes: the bytes land as a FullLocalFileLocation and the
         // DownloadOk event flows to the file node
         let root = test_root();
-        let query_log: Rc<RefCell<Vec<(i64, i32)>>> = Rc::new(RefCell::new(Vec::new()));
+        let query_log: Arc<parking_lot::Mutex<Vec<(i64, i32)>>> = Arc::new(Mutex::new(Vec::new()));
         let mut file_manager = FileManager::new();
         // the remote size must match the content bytes, or the
         // register_local merge refuses the adoption like the C++
@@ -23859,7 +24800,7 @@ mod file_load_manager_tests {
             Box::new(TestFactory {
                 payload: Vec::new(),
                 root: root.clone(),
-                download_queries: Rc::clone(&query_log),
+                download_queries: Arc::clone(&query_log),
             }),
             FileLoadManagerOptions::default(),
         );
@@ -23910,18 +24851,15 @@ mod file_load_manager_tests {
         events: Vec<(FileUploadId, String)>,
     }
 
-    struct UploadCallbackHandle(Rc<RefCell<UploadLog>>);
+    struct UploadCallbackHandle(Arc<parking_lot::Mutex<UploadLog>>);
 
     impl UploadCallback for UploadCallbackHandle {
         fn on_upload_ok(&mut self, file_upload_id: FileUploadId) {
-            self.0
-                .borrow_mut()
-                .events
-                .push((file_upload_id, "ok".to_owned()));
+            self.0.lock().events.push((file_upload_id, "ok".to_owned()));
         }
         fn on_upload_error(&mut self, file_upload_id: FileUploadId, status: Status) {
             self.0
-                .borrow_mut()
+                .lock()
                 .events
                 .push((file_upload_id, format!("error:{}", status.message())));
         }
@@ -23967,13 +24905,13 @@ mod file_load_manager_tests {
         let fllm =
             &mut FileLoadManager::new(Box::new(UploadFactory), FileLoadManagerOptions::default());
 
-        let log = Rc::new(RefCell::new(UploadLog::default()));
+        let log = Arc::new(Mutex::new(UploadLog::default()));
         let file_upload_id = FileUploadId::new(file_id, 0);
         file_manager.resume_upload(
             file_upload_id,
             Vec::new(),
-            Rc::new(RefCell::new(UploadCallbackHandle(log.clone())))
-                as Rc<RefCell<dyn UploadCallback>>,
+            Arc::new(Mutex::new(UploadCallbackHandle(log.clone())))
+                as Arc<parking_lot::Mutex<dyn UploadCallback>>,
             10,
             0,
             false,
@@ -24001,7 +24939,7 @@ mod file_load_manager_tests {
         assert!(node.remote.partial.is_some());
         // the extracted callback was the fresh Preliminary one, so the
         // user's own callback did not fire (C++ parity)
-        assert!(log.borrow().events.is_empty());
+        assert!(log.lock().events.is_empty());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -24012,13 +24950,13 @@ mod file_load_manager_tests {
         let fllm =
             &mut FileLoadManager::new(Box::new(UploadFactory), FileLoadManagerOptions::default());
 
-        let log = Rc::new(RefCell::new(UploadLog::default()));
+        let log = Arc::new(Mutex::new(UploadLog::default()));
         let file_upload_id = FileUploadId::new(file_id, 0);
         file_manager.resume_upload(
             file_upload_id,
             Vec::new(),
-            Rc::new(RefCell::new(UploadCallbackHandle(log.clone())))
-                as Rc<RefCell<dyn UploadCallback>>,
+            Arc::new(Mutex::new(UploadCallbackHandle(log.clone())))
+                as Arc<parking_lot::Mutex<dyn UploadCallback>>,
             10,
             0,
             false,
@@ -24029,7 +24967,7 @@ mod file_load_manager_tests {
 
         // the extracted user-arm callback is the no-op Preliminary one;
         // the 200 Canceled the C++ logs is not observable here
-        assert!(log.borrow().events.is_empty());
+        assert!(log.lock().events.is_empty());
         // the extraction cleared the request and re-prioritized the node
         assert!(file_manager.file_upload_requests.is_empty());
         let node = file_manager.get_file_node(file_id).expect("node");

@@ -1624,6 +1624,262 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
         }
 
         // Everything else waits for its manager step.
+        function => run_file_requests(td, id, function),
+    }
+}
+
+/// The M.12.10 Files arm group of the request dispatcher — the
+/// td_api file/download/upload/storage plane over the FileManager,
+/// DownloadManager and StorageManager (Requests.cpp:2947-3080, 6451-6572).
+#[inline(never)]
+fn run_file_requests(td: &mut Td, id: u64, function: Function) {
+    match function {
+        // ------------------------------------------------------------------
+        // getFile (Requests.cpp:2947-2955)
+        Function::getFile(request) => {
+            let mut file = td
+                .file_manager
+                .lock()
+                .get_file_object(crate::files::FileId::new(request.file_id, 0));
+            if file.id == 0 {
+                // `send_result(id, nullptr)` — the null result is the 404
+                // of `Td::send_result`
+                td.send_result(
+                    id,
+                    Object::error(td_api::Error {
+                        code: 404,
+                        message: "Not Found".to_string(),
+                    }),
+                );
+            } else {
+                file.id = request.file_id;
+                td.send_result(id, Object::file(file));
+            }
+        }
+
+        // getRemoteFile (Requests.cpp:2957-2966)
+        Function::getRemoteFile(request) => {
+            let Some(remote_file_id) = clean_or_utf8_error(td, id, &request.remote_file_id) else {
+                return;
+            };
+            let file_type = match request.file_type.as_ref() {
+                Some(file_type) => crate::files::get_file_type(file_type),
+                None => crate::files::FileType::Temp,
+            };
+            let outcome = {
+                let mut file_manager = td.file_manager.lock();
+                match file_manager.from_persistent_id(&remote_file_id, file_type) {
+                    Ok(file_id) => Ok(file_manager.get_file_object(file_id)),
+                    Err(status) => Err(status),
+                }
+            };
+            match outcome {
+                Ok(file) => td.send_result(id, Object::file(file)),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+
+        // getStorageStatistics (Requests.cpp:2968-2979)
+        Function::getStorageStatistics(request) => {
+            let stats = td.get_storage_stats_object(false, request.chat_limit);
+            td.send_result(id, Object::storageStatistics(stats));
+        }
+
+        // getStorageStatisticsFast (Requests.cpp:2981-2992)
+        Function::getStorageStatisticsFast(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let stats = td.get_storage_stats_fast_object();
+            td.send_result(id, Object::storageStatisticsFast(stats));
+        }
+
+        // getDatabaseStatistics (Requests.cpp:2994-3004)
+        Function::getDatabaseStatistics(_) => match td.get_database_statistics_object() {
+            Ok(stats) => td.send_result(id, Object::databaseStatistics(stats)),
+            Err(status) => send_error_status(td, id, status),
+        },
+
+        // optimizeStorage (Requests.cpp:3006-3033)
+        Function::optimizeStorage(request) => match td.optimize_storage(request) {
+            Ok(stats) => td.send_result(id, Object::storageStatistics(stats)),
+            Err(status) => send_error_status(td, id, status),
+        },
+
+        // downloadFile (Requests.cpp:6451-6456)
+        Function::downloadFile(request) => {
+            let promise = td.deferred_promise(id, Object::file);
+            let mut file_manager = td.file_manager.lock();
+            let mut file_load_manager = td.file_load_manager.lock();
+            file_manager.download_file(
+                crate::files::FileId::new(request.file_id, 0),
+                request.priority,
+                request.offset,
+                request.limit,
+                request.synchronous,
+                promise,
+                &mut file_load_manager,
+            );
+        }
+
+        // cancelDownloadFile (Requests.cpp:6469-6481)
+        Function::cancelDownloadFile(request) => {
+            {
+                let mut file_manager = td.file_manager.lock();
+                let mut file_load_manager = td.file_load_manager.lock();
+                file_manager.cancel_download(
+                    crate::files::FileId::new(request.file_id, 0),
+                    0,
+                    request.only_if_pending,
+                    &mut file_load_manager,
+                );
+            }
+            td.send_result(id, ok_object());
+        }
+
+        // preliminaryUploadFile (Requests.cpp:6483-6487)
+        Function::preliminaryUploadFile(request) => {
+            let file_type = match request.file_type.as_ref() {
+                Some(file_type) => crate::files::get_file_type(file_type),
+                None => crate::files::FileType::Temp,
+            };
+            let outcome = {
+                let mut file_manager = td.file_manager.lock();
+                let mut file_load_manager = td.file_load_manager.lock();
+                file_manager.preliminary_upload_file(
+                    request.file.as_ref(),
+                    file_type,
+                    request.priority,
+                    &mut file_load_manager,
+                )
+            };
+            match outcome {
+                Ok(file) => td.send_result(id, Object::file(file)),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+
+        // cancelPreliminaryUploadFile (Requests.cpp:6489-6493)
+        Function::cancelPreliminaryUploadFile(request) => {
+            {
+                let mut file_manager = td.file_manager.lock();
+                let mut file_load_manager = td.file_load_manager.lock();
+                file_manager.cancel_upload(
+                    crate::files::FileUploadId::new(
+                        crate::files::FileId::new(request.file_id, 0),
+                        0,
+                    ),
+                    &mut file_load_manager,
+                );
+            }
+            td.send_result(id, ok_object());
+        }
+
+        // writeGeneratedFilePart (Requests.cpp:6495-6499)
+        Function::writeGeneratedFilePart(request) => {
+            let result = {
+                let mut file_manager = td.file_manager.lock();
+                let mut file_load_manager = td.file_load_manager.lock();
+                file_manager.external_file_generate_write_part(
+                    request.generation_id,
+                    request.offset,
+                    request.data,
+                    &mut file_load_manager,
+                )
+            };
+            finish_unit_result(td, id, result);
+        }
+
+        // setFileGenerationProgress (Requests.cpp:6501-6505)
+        Function::setFileGenerationProgress(request) => {
+            let result = td.file_manager.lock().external_file_generate_progress(
+                request.generation_id,
+                request.expected_size,
+                request.local_prefix_size,
+            );
+            finish_unit_result(td, id, result);
+        }
+
+        // finishFileGeneration (Requests.cpp:6507-6516)
+        Function::finishFileGeneration(request) => {
+            let error = request.error.as_ref().map(|error| {
+                // CLEAN_INPUT_STRING(request.error_->message_)
+                let message = crate::misc::clean_input_string(&error.message)
+                    .unwrap_or_else(|| error.message.clone());
+                Status::error(error.code, &message)
+            });
+            let result = {
+                let mut file_manager = td.file_manager.lock();
+                let mut file_load_manager = td.file_load_manager.lock();
+                file_manager.external_file_generate_finish(
+                    request.generation_id,
+                    error,
+                    &mut file_load_manager,
+                )
+            };
+            finish_unit_result(td, id, result);
+        }
+
+        // toggleDownloadIsPaused (Requests.cpp:6531-6534)
+        Function::toggleDownloadIsPaused(request) => {
+            let result = td.download_manager.lock().toggle_is_paused(
+                crate::files::FileId::new(request.file_id, 0),
+                request.is_paused,
+            );
+            finish_unit_result(td, id, result);
+        }
+
+        // toggleAllDownloadsArePaused (Requests.cpp:6536-6539)
+        Function::toggleAllDownloadsArePaused(request) => {
+            let result = td
+                .download_manager
+                .lock()
+                .toggle_all_is_paused(request.are_paused);
+            finish_unit_result(td, id, result);
+        }
+
+        // removeFileFromDownloads (Requests.cpp:6549-6553)
+        Function::removeFileFromDownloads(request) => {
+            let result = td.download_manager.lock().remove_file(
+                crate::files::FileId::new(request.file_id, 0),
+                crate::files::FileSourceId::default(),
+                request.delete_from_cache,
+            );
+            finish_unit_result(td, id, result);
+        }
+
+        // removeAllFilesFromDownloads (Requests.cpp:6555-6559)
+        Function::removeAllFilesFromDownloads(request) => {
+            let result = td.download_manager.lock().remove_all_files(
+                request.only_active,
+                request.only_completed,
+                request.delete_from_cache,
+            );
+            finish_unit_result(td, id, result);
+        }
+
+        // searchFileDownloads (Requests.cpp:6561-6569)
+        Function::searchFileDownloads(request) => {
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let outcome = td.download_manager.lock().search(
+                &query,
+                request.only_active,
+                request.only_completed,
+                &offset,
+                request.limit,
+            );
+            match outcome {
+                Ok(found) => td.send_result(id, Object::foundFileDownloads(found)),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+
+        // Everything else waits for its manager step.
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
@@ -1719,6 +1975,15 @@ fn finish_unit_request(
             td.send_error_impl(id, status.code(), status.message());
         }
         other => panic!("request {id} never settled: {other:?}"),
+    }
+}
+
+/// The synchronous `CREATE_OK_REQUEST_PROMISE` collapse for the manager
+/// calls that answer `Result<(), Status>` inline.
+fn finish_unit_result(td: &mut Td, id: u64, result: std::result::Result<(), Status>) {
+    match result {
+        Ok(()) => td.send_result(id, ok_object()),
+        Err(status) => td.send_error_impl(id, status.code(), status.message()),
     }
 }
 
@@ -1911,13 +2176,16 @@ mod request_census_tests {
         // merge: the m11 pins + M.13/M.13S's seven real dispatches
         // (removeNotification, removeNotificationGroup, registerDevice and
         // the four notification-settings arms; processPushNotification
-        // stays the 500 placeholder). Fix per flip.
+        // stays the 500 placeholder) + M.12.10's eighteen file-plane
+        // dispatches (getFile/getRemoteFile, the download/upload/
+        // generation arms, the DownloadManager list plane and the four
+        // storage-statistics arms). Fix per flip.
         assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            92,
+            110,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 912, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 894, "interim count");
     }
 }

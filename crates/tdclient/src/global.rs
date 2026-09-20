@@ -279,6 +279,12 @@ impl Global {
         self.dns_time_difference_was_updated = false;
     }
 
+    /// Whether the database was initialized (`Global::td_db()` would
+    /// answer).
+    pub fn has_db(&self) -> bool {
+        self.db.is_some()
+    }
+
     /// `Global::td_db()`.
     pub fn td_db(&mut self) -> &mut TdDb {
         self.db
