@@ -4518,7 +4518,7 @@ pub struct FileNode {
 
     last_successful_force_reupload_time: f64,
 
-    upload_pause: FileId,
+    upload_pause: FileUploadId,
 
     upload_priority: i8,
     download_priority: i8,
@@ -4591,7 +4591,7 @@ impl FileNode {
             file_ids: Vec::new(),
             main_file_id,
             last_successful_force_reupload_time: -1e10,
-            upload_pause: FileId::default(),
+            upload_pause: FileUploadId::default(),
             upload_priority: 0,
             download_priority: 0,
             generate_priority: 0,
@@ -4858,9 +4858,9 @@ impl FileNode {
     }
 
     /// `FileNode::set_upload_pause` (FileManager.cpp:809-817).
-    pub fn set_upload_pause(&mut self, upload_pause: FileId) {
+    pub fn set_upload_pause(&mut self, upload_pause: FileUploadId) {
         if self.upload_pause != upload_pause {
-            if self.upload_pause.is_valid() != upload_pause.is_valid() {
+            if self.upload_pause.file_id.is_valid() != upload_pause.file_id.is_valid() {
                 self.on_info_changed();
             }
             self.upload_pause = upload_pause;
@@ -5055,7 +5055,7 @@ impl FileNode {
     pub fn is_uploading(&self) -> bool {
         self.upload_priority != 0
             || self.generate_upload_priority != 0
-            || self.upload_pause.is_valid()
+            || self.upload_pause.file_id.is_valid()
     }
 
     /// `FileNode::remote_size` (FileManager.cpp:1114-1122).
@@ -5574,6 +5574,12 @@ pub trait FileManagerContext {
     /// `ConfigManager::request_config` on `MTPROTO_CLUSTER_INVALID`
     /// (FileManager.cpp:5168-5171).
     fn request_config(&mut self) {}
+
+    /// `G()->get_option_boolean("ignore_inline_thumbnails")`
+    /// (FileManager.cpp:2783-2785).
+    fn ignore_inline_thumbnails(&self) -> bool {
+        false
+    }
 
     /// `LogInterface::get_file_paths` — `register_generate` skips the
     /// `#mtime#` prefix for logged paths.
@@ -6916,7 +6922,7 @@ impl FileManager {
                 other.upload_id = 0;
                 other.upload_was_update_file_reference = false;
                 other.upload_priority = 0;
-                other.upload_pause = FileId::default();
+                other.upload_pause = FileUploadId::default();
             } else {
                 events.push(MergeEvent::CancelUpload(Box::new(other.clone())));
             }
@@ -8736,6 +8742,10 @@ impl ResourceManager {
 /// `NetQuery::Error::Canceled` (net/NetQuery.h:57) — a canceled upload-part
 /// query restarts its part instead of failing the upload.
 pub const NET_QUERY_CANCELED: i32 = 203;
+
+/// `MAX_FILE_SIZE` (FileManager.cpp:52) — the download offset/limit
+/// bound the encrypted folds CHECK.
+const MAX_DOWNLOAD_FILE_SIZE: i64 = 4000 << 20; // 4000MB
 
 /// The wire query `FileUploader::start_part` would send
 /// (FileUploader.cpp:278-286); the TL codegen surface lands with the net
@@ -14887,8 +14897,8 @@ mod tests {
 // ==== FileLoadManager + load orchestration (M.12.7) ====
 
 /// `FileUploadId` (FileId.hpp) — a `FileId` plus the internal upload id
-/// (`0` for the user request).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// (`0` for the user request; the default is the invalid id).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct FileUploadId {
     pub file_id: FileId,
     pub internal_upload_id: i64,
@@ -15109,6 +15119,7 @@ struct ResourcePool {
 struct DownloadQueryNode {
     file_id: FileId,
     priority: i8,
+    pool_key: (bool, DcId),
     pool: ResourcePool,
     loader: Box<FileDownloader>,
     canceled: bool,
@@ -15349,6 +15360,7 @@ impl FileLoadManager {
             DownloadQueryNode {
                 file_id,
                 priority,
+                pool_key: (is_small, dc_id),
                 pool,
                 loader,
                 canceled: false,
@@ -15383,7 +15395,10 @@ impl FileLoadManager {
 
     /// `FileDownloadManager::from_bytes` (FileDownloadManager.cpp:79-92)
     /// — the `FileFromBytes` actor's `save_file_bytes` runs immediately
-    /// in the collapse.
+    /// in the collapse, so the query cannot be canceled afterwards: the
+    /// C++ window between registration and the actor wakeup does not
+    /// exist here, and a later `cancel` finds no node exactly like the
+    /// C++ after `close_node` ran on ok.
     pub fn from_bytes(
         &mut self,
         query_id: u64,
@@ -15547,16 +15562,28 @@ impl FileLoadManager {
     }
 
     /// The active (not stopped, not canceled) download query ids in the
-    /// grant order: priority descending, then registration order — the
-    /// C++ `ResourceManager::add_node`/`to_xload` order.
+    /// grant order — the C++ `ResourceManager::add_node`/`to_xload`
+    /// order: descending by key (a negative priority stores
+    /// `-priority`), and within equal keys the newest query first
+    /// (insert-before-the-first-entry-with-key-≤-priority,
+    /// ResourceManager.cpp:168-176).
     fn active_download_order(&self) -> Vec<u64> {
         let mut order: Vec<(i8, u64)> = self
             .download_nodes
             .iter()
             .filter(|(_, node)| !node.canceled && !node.loader.stop_flag())
-            .map(|(qid, node)| (-node.priority, *qid))
+            .map(|(qid, node)| {
+                (
+                    if node.priority >= 0 {
+                        node.priority
+                    } else {
+                        -node.priority
+                    },
+                    *qid,
+                )
+            })
             .collect();
-        order.sort();
+        order.sort_by(|a, b| b.cmp(a));
         order.into_iter().map(|(_, qid)| qid).collect()
     }
 
@@ -15572,41 +15599,77 @@ impl FileLoadManager {
                         UploadLoader::HashUploader(hash_uploader) => !hash_uploader.stop_flag(),
                     }
             })
-            .map(|(qid, node)| (-node.priority, *qid))
+            .map(|(qid, node)| {
+                (
+                    if node.priority >= 0 {
+                        node.priority
+                    } else {
+                        -node.priority
+                    },
+                    *qid,
+                )
+            })
             .collect();
-        order.sort();
+        order.sort_by(|a, b| b.cmp(a));
         order.into_iter().map(|(_, qid)| qid).collect()
     }
 
     /// One grant round: every active loader's allowance rises to the
-    /// round budget, in the C++ `to_xload` order (priority desc, then
-    /// registration order). Returns whether any loader was granted.
+    /// round budget in the C++ `to_xload` order (priority desc, newest
+    /// first within equal priority), with each pool's capacity
+    /// depleting across the pass the way `ResourceManager::satisfy_node`
+    /// fair-shares it (ResourceManager.cpp:106-130). Returns whether any
+    /// loader was granted.
     pub fn drive_round(&mut self, round: usize) -> bool {
-        let budget = (round as i64) * (1 << 20);
+        let allowance = (round as i64) * (1 << 20);
         let mut progressed = false;
-        for query_id in self.active_download_order() {
-            let node = self.download_nodes.get_mut(&query_id).expect("active node");
-            let mut grant = ResourceState::default();
-            grant.set_unit_size(1024);
-            grant.update_limit(budget.min(node.pool.max_resource_limit));
-            ResourceManagerWorker::update_resources(node.loader.as_mut(), grant);
-            progressed = true;
+
+        // the download pools, one per (is_small, dc_id)
+        let pool_keys: Vec<(bool, DcId)> =
+            self.download_resource_managers.keys().copied().collect();
+        for pool_key in pool_keys {
+            let pool_max = self.download_resource_managers[&pool_key].max_resource_limit;
+            let mut unused = pool_max;
+            for query_id in self.active_download_order() {
+                let node = self.download_nodes.get_mut(&query_id).expect("active node");
+                if node.pool_key != pool_key {
+                    continue;
+                }
+                let give = allowance.min(unused);
+                if give == 0 {
+                    // the pool is exhausted; the C++ `break`s the pass
+                    break;
+                }
+                unused -= give;
+                let mut grant = ResourceState::default();
+                grant.set_unit_size(1024);
+                grant.update_limit(give);
+                ResourceManagerWorker::update_resources(node.loader.as_mut(), grant);
+                progressed = true;
+            }
         }
+
+        // the single upload pool
+        let mut unused = self.upload_resource_manager.max_resource_limit;
         for query_id in self.active_upload_order() {
             let node = self.upload_nodes.get_mut(&query_id).expect("active node");
+            let give = allowance.min(unused).min(node.pool.max_resource_limit);
+            if give == 0 {
+                break;
+            }
+            unused -= give;
             let mut grant = ResourceState::default();
             grant.set_unit_size(1024);
-            grant.update_limit(budget.min(node.pool.max_resource_limit));
+            grant.update_limit(give);
             match &mut node.loader {
                 UploadLoader::Uploader(uploader) => {
                     ResourceManagerWorker::update_resources(uploader.as_mut(), grant);
-                    progressed = true;
                 }
                 UploadLoader::HashUploader(hash_uploader) => {
                     ResourceManagerWorker::update_resources(hash_uploader.as_mut(), grant);
-                    progressed = true;
                 }
             }
+            progressed = true;
         }
         progressed
     }
@@ -15660,12 +15723,12 @@ impl FileLoadManager {
     }
 }
 
-/// `get_files_temp_dir` (FileLoaderUtils.cpp:251-253).
+/// `get_files_temp_dir` (FileLoaderUtils.cpp:251-253) — one shared
+/// per-base "temp" directory, not per-type.
 fn get_files_temp_dir(file_type: FileType, files_dir: &str, secure_files_dir: &str) -> String {
     format!(
-        "{}.temp{}/",
-        get_files_base_dir(file_type, files_dir, secure_files_dir),
-        file_type
+        "{}temp/",
+        get_files_base_dir(file_type, files_dir, secure_files_dir)
     )
 }
 
@@ -15709,13 +15772,50 @@ impl FileManager {
         fllm: &mut FileLoadManager,
     ) {
         debug_assert!(new_priority > 0, "CHECK(new_priority > 0)");
-        let Some(_) = self.node_id_of(file_id) else {
+        let Some(node_id) = self.node_id_of(file_id) else {
             let error = Status::error(400, "File not found");
             callback
                 .borrow_mut()
                 .on_download_error(file_id, error.clone());
             return;
         };
+        let local_is_empty = self.file_nodes[node_id]
+            .as_ref()
+            .is_some_and(|node| matches!(node.local, LocalFileLocation::Empty));
+        if !local_is_empty {
+            // the C++ pre-download check_local_location (skip=true): a
+            // failed check drops the local location
+            // (on_failed_check_local_location, FileManager.cpp:1483-1489)
+            // so a node whose file vanished from disk re-downloads
+            let (full, size) = self.file_nodes[node_id]
+                .as_ref()
+                .map(|node| match &node.local {
+                    LocalFileLocation::Full(full) => (Some(full.clone()), node.size),
+                    _ => (None, node.size),
+                })
+                .unwrap_or((None, 0));
+            if let Some(full) = full {
+                let check = check_full_local_location(
+                    self.ctx(),
+                    FullLocalLocationInfo {
+                        location: full,
+                        size,
+                    },
+                    true,
+                );
+                let bad_path = check
+                    .as_ref()
+                    .ok()
+                    .is_some_and(|info| self.bad_paths.contains(&info.location.path));
+                if check.is_err() || bad_path {
+                    self.file_nodes[node_id]
+                        .as_mut()
+                        .expect("node")
+                        .drop_local_location();
+                    self.try_flush_node(node_id);
+                }
+            }
+        }
         self.download_impl(
             file_id,
             internal_download_id,
@@ -15964,6 +16064,7 @@ impl FileManager {
         let need_update_limit = download_limit;
 
         if old_priority != 0 {
+            debug_assert!(download_id != 0, "CHECK(download_id_ != 0)");
             let node = self.file_nodes[node_id].as_ref().expect("node");
             if force_update_priority || priority != old_priority {
                 fllm.update_download_priority(node.download_id, priority);
@@ -15972,6 +16073,14 @@ impl FileManager {
                 let mut download_offset = node.download_offset;
                 let mut download_limit = node.get_download_limit();
                 if is_encrypted_any {
+                    assert!(
+                        download_offset <= MAX_DOWNLOAD_FILE_SIZE,
+                        "CHECK(download_offset <= MAX_FILE_SIZE)"
+                    );
+                    assert!(
+                        download_limit <= MAX_DOWNLOAD_FILE_SIZE,
+                        "CHECK(download_limit <= MAX_FILE_SIZE)"
+                    );
                     download_limit += download_offset;
                     download_offset = 0;
                 }
@@ -16061,6 +16170,14 @@ impl FileManager {
             let mut download_offset = node.download_offset;
             let mut download_limit = node.get_download_limit();
             if FileView::new(node).is_encrypted_any() {
+                assert!(
+                    download_offset <= MAX_DOWNLOAD_FILE_SIZE,
+                    "CHECK(download_offset <= MAX_FILE_SIZE)"
+                );
+                assert!(
+                    download_limit <= MAX_DOWNLOAD_FILE_SIZE,
+                    "CHECK(download_limit <= MAX_FILE_SIZE)"
+                );
                 download_limit += download_offset;
                 download_offset = 0;
             }
@@ -16195,12 +16312,31 @@ impl FileManager {
                         .unwrap_or(0);
                     self.ctx().on_new_file(size, real_size, 1);
                 }
-                let has_full_local = self
+                // the register_local-triggered merge tail
+                // (FileManager.cpp:2432-2451): finish the settled queries
+                // of every merged file id and re-evaluate the queues
+                let (node_file_ids, has_full_local, has_active_upload_remote) = self
                     .get_file_node(file_id)
-                    .map(|node| FileView::new(node).has_full_local_location())
-                    .unwrap_or(false);
-                if has_full_local {
-                    self.finish_downloads(file_id, None);
+                    .map(|node| {
+                        let view = FileView::new(node);
+                        (
+                            node.file_ids.clone(),
+                            view.has_full_local_location(),
+                            view.has_active_upload_remote_location(),
+                        )
+                    })
+                    .unwrap_or_default();
+                for merged_file_id in node_file_ids {
+                    if has_full_local {
+                        self.finish_downloads(merged_file_id, None);
+                    }
+                    if has_active_upload_remote {
+                        self.finish_uploads(merged_file_id, None, fllm);
+                    }
+                }
+                if let Some(node_id) = self.node_id_of(file_id) {
+                    self.run_download(node_id, false, fllm);
+                    self.run_upload(node_id, Vec::new(), fllm);
                 }
             }
         }
@@ -16220,6 +16356,21 @@ impl FileManager {
     /// `FileManager::on_download_error_impl`
     /// (FileManager.cpp:5123-5203) — the restart decision order.
     fn on_download_error_impl(
+        &mut self,
+        node_id: usize,
+        kind: DownloadQueryKind,
+        was_active: bool,
+        status: Status,
+        fllm: &mut FileLoadManager,
+    ) {
+        // the C++ SCOPE_EXIT try_flush_node (FileManager.cpp:5125-5127)
+        let result = self.on_download_error_impl_inner(node_id, kind, was_active, status, fllm);
+        self.try_flush_node(node_id);
+        result
+    }
+
+    /// The `on_download_error_impl` body.
+    fn on_download_error_impl_inner(
         &mut self,
         node_id: usize,
         kind: DownloadQueryKind,
@@ -16375,7 +16526,7 @@ impl FileManager {
             .unwrap_or_default();
         for file_id in file_ids {
             self.finish_downloads(file_id, Some(status.clone()));
-            self.finish_uploads(file_id, Some(status.clone()));
+            self.finish_uploads(file_id, Some(status.clone()), fllm);
         }
     }
 
@@ -16396,10 +16547,9 @@ impl FileManager {
                 return None;
             }
             requests.user_upload_priority = 0;
-            requests
-                .internal_uploads
-                .remove(&0)
-                .and_then(|info| info.upload_callback)
+            // the C++ hands back a fresh PreliminaryUploadFileCallback
+            // (FileManager.cpp:3925)
+            Some(Rc::new(RefCell::new(PreliminaryUploadCallback)) as Rc<RefCell<dyn UploadCallback>>)
         };
         if requests.user_upload_priority == 0 && requests.internal_uploads.is_empty() {
             self.file_upload_requests.remove(&file_upload_id.file_id);
@@ -16408,26 +16558,63 @@ impl FileManager {
     }
 
     /// `FileManager::finish_uploads` (FileManager.cpp:3934-3956). The
-    /// C++ user arm constructs a log-only `PreliminaryUploadFileCallback`
-    /// and is skipped in the collapse.
-    fn finish_uploads(&mut self, file_id: FileId, status: Option<Status>) {
+    /// C++ user arm constructs a fresh `PreliminaryUploadFileCallback`
+    /// whose `on_upload_ok` cancels the upload to release the pause for
+    /// the next upload (FileManager.cpp:1288-1291) - the collapse runs
+    /// that effect inline.
+    fn finish_uploads(
+        &mut self,
+        file_id: FileId,
+        status: Option<Status>,
+        fllm: &mut FileLoadManager,
+    ) {
         let Some(mut requests) = self.file_upload_requests.remove(&file_id) else {
             return;
         };
-        let callbacks: Vec<(i64, Rc<RefCell<dyn UploadCallback>>)> = requests
+        let mut callbacks: Vec<(i64, Rc<RefCell<dyn UploadCallback>>, bool)> = requests
             .internal_uploads
             .iter_mut()
             .map(|(internal_upload_id, info)| {
                 (
                     *internal_upload_id,
                     info.upload_callback.take().expect("upload callback"),
+                    false,
                 )
             })
             .collect();
-        for (internal_upload_id, callback) in callbacks {
+        if requests.user_upload_priority != 0 {
+            callbacks.push((
+                0,
+                Rc::new(RefCell::new(PreliminaryUploadCallback)) as Rc<RefCell<dyn UploadCallback>>,
+                true,
+            ));
+        }
+        for (internal_upload_id, callback, is_preliminary) in callbacks {
             let file_upload_id = FileUploadId::new(file_id, internal_upload_id);
             match &status {
-                None => callback.borrow_mut().on_upload_ok(file_upload_id),
+                None => {
+                    callback.borrow_mut().on_upload_ok(file_upload_id);
+                    if is_preliminary {
+                        // PreliminaryUploadFileCallback::on_upload_ok ->
+                        // FileManager::cancel_upload
+                        // (FileManager.cpp:1288-1291)
+                        if let Some(node_id) = self.node_id_of(file_id) {
+                            if self.file_nodes[node_id]
+                                .as_ref()
+                                .expect("node")
+                                .upload_pause
+                                == file_upload_id
+                            {
+                                self.file_nodes[node_id]
+                                    .as_mut()
+                                    .expect("node")
+                                    .set_upload_pause(FileUploadId::default());
+                            }
+                            self.run_upload(node_id, Vec::new(), fllm);
+                            self.try_flush_node(node_id);
+                        }
+                    }
+                }
                 Some(status) => callback
                     .borrow_mut()
                     .on_upload_error(file_upload_id, status.clone()),
@@ -16463,6 +16650,36 @@ impl FileManager {
     /// result exactly like the C++ handing it to the actor.
     #[allow(clippy::too_many_arguments)]
     pub fn resume_upload(
+        &mut self,
+        file_upload_id: FileUploadId,
+        bad_parts: Vec<i32>,
+        callback: Rc<RefCell<dyn UploadCallback>>,
+        new_priority: i32,
+        upload_order: u64,
+        force: bool,
+        prefer_small: bool,
+        fllm: &mut FileLoadManager,
+    ) {
+        let result = self.resume_upload_inner(
+            file_upload_id,
+            bad_parts,
+            callback,
+            new_priority,
+            upload_order,
+            force,
+            prefer_small,
+            fllm,
+        );
+        // the C++ SCOPE_EXIT try_flush_node (FileManager.cpp:3514-3516)
+        if let Some(node_id) = self.node_id_of(file_upload_id.file_id) {
+            self.try_flush_node(node_id);
+        }
+        result
+    }
+
+    /// The `resume_upload` body.
+    #[allow(clippy::too_many_arguments)]
+    fn resume_upload_inner(
         &mut self,
         file_upload_id: FileUploadId,
         bad_parts: Vec<i32>,
@@ -16511,12 +16728,12 @@ impl FileManager {
             .as_ref()
             .expect("node")
             .upload_pause
-            == file_upload_id.file_id
+            == file_upload_id
         {
             self.file_nodes[node_id]
                 .as_mut()
                 .expect("node")
-                .set_upload_pause(FileId::default());
+                .set_upload_pause(FileUploadId::default());
         }
 
         let (
@@ -16645,6 +16862,7 @@ impl FileManager {
             .as_ref()
             .expect("node")
             .upload_priority;
+        let upload_id = self.file_nodes[node_id].as_ref().expect("node").upload_id;
 
         if priority == 0 {
             self.file_nodes[node_id]
@@ -16667,6 +16885,7 @@ impl FileManager {
             .as_ref()
             .expect("node")
             .upload_pause
+            .file_id
             .is_valid()
         {
             return;
@@ -16734,11 +16953,8 @@ impl FileManager {
         };
         if needs_key.0 {
             let node = self.file_nodes[node_id].as_mut().expect("node");
-            let file_id = node.file_ids.first().copied();
-            if let Some(file_id) = file_id {
-                node.encryption_key = FileEncryptionKey::create();
-                let _ = file_id;
-            }
+            assert!(!node.file_ids.is_empty(), "CHECK(!file_ids_.empty())");
+            node.encryption_key = FileEncryptionKey::create();
         }
         if needs_key.1 {
             let node = self.file_nodes[node_id].as_mut().expect("node");
@@ -16750,7 +16966,7 @@ impl FileManager {
         }
 
         if old_priority != 0 {
-            let upload_id = self.file_nodes[node_id].as_ref().expect("node").upload_id;
+            debug_assert!(upload_id != 0, "CHECK(upload_id_ != 0)");
             fllm.update_upload_priority(upload_id, priority);
             return;
         }
@@ -16824,6 +17040,7 @@ impl FileManager {
                 };
                 (full_local, node.size)
             };
+            self.file_nodes[node_id].as_mut().expect("node").upload_id = query_id;
             fllm.upload_by_hash(query_id, file_id, &local, size, -priority);
             return;
         }
@@ -16858,6 +17075,10 @@ impl FileManager {
                 kind: UploadQueryKind::Upload,
             },
         );
+        self.file_nodes[node_id]
+            .as_mut()
+            .expect("node")
+            .upload_id = query_id;
         fllm.upload(
             query_id,
             file_id,
@@ -16879,12 +17100,12 @@ impl FileManager {
             .as_ref()
             .expect("node")
             .upload_pause
-            == file_upload_id.file_id
+            == file_upload_id
         {
             self.file_nodes[node_id]
                 .as_mut()
                 .expect("node")
-                .set_upload_pause(FileId::default());
+                .set_upload_pause(FileUploadId::default());
         }
         let Some(callback) = self.extract_upload_callback(file_upload_id) else {
             return;
@@ -16977,8 +17198,10 @@ impl FileManager {
             return;
         };
 
-        // pick the request with the lowest upload order (user requests
-        // win); FileManager.cpp:4914-4933
+        // pick the request to report: a user-priority id sets the
+        // selection WITHOUT updating the order watermark, so a later
+        // internal entry with any finite order still overrides it -
+        // exactly the C++ walk (FileManager.cpp:4917-4931)
         let mut selected: Option<(FileId, i64, u64)> = None;
         {
             let node = self.file_nodes[node_id].as_ref().expect("node");
@@ -16987,16 +17210,16 @@ impl FileManager {
                     continue;
                 };
                 if requests.user_upload_priority != 0 {
-                    selected = Some((*id, 0, 0));
-                    break;
-                }
-                for (internal_upload_id, info) in &requests.internal_uploads {
-                    let better = match selected {
-                        Some((_, _, best_order)) => info.upload_order < best_order,
-                        None => true,
-                    };
-                    if better {
-                        selected = Some((*id, *internal_upload_id, info.upload_order));
+                    selected = Some((*id, 0, u64::MAX));
+                } else {
+                    for (internal_upload_id, info) in &requests.internal_uploads {
+                        let better = match selected {
+                            Some((_, _, best_order)) => info.upload_order < best_order,
+                            None => true,
+                        };
+                        if better {
+                            selected = Some((*id, *internal_upload_id, info.upload_order));
+                        }
                     }
                 }
             }
@@ -17012,7 +17235,7 @@ impl FileManager {
         self.file_nodes[node_id]
             .as_mut()
             .expect("node")
-            .set_upload_pause(file_upload_id.file_id);
+            .set_upload_pause(file_upload_id);
         callback.borrow_mut().on_upload_ok(file_upload_id);
         let _ = file_type;
         // don't flush node info, because nothing actually changed
@@ -17023,7 +17246,12 @@ impl FileManager {
     /// `register_remote` + merge of the by-hash result is the remote
     /// registration plane; the collapse records the location on the node
     /// directly.
-    fn on_upload_full_ok(&mut self, query_id: u64, remote: FullRemoteFileLocation) {
+    fn on_upload_full_ok(
+        &mut self,
+        query_id: u64,
+        remote: FullRemoteFileLocation,
+        fllm: &mut FileLoadManager,
+    ) {
         let Some((query, _was_active)) = self.finish_upload_query(query_id) else {
             return;
         };
@@ -17039,7 +17267,7 @@ impl FileManager {
                 full_source: FileLocationSource::FromServer,
             });
         }
-        self.finish_uploads(file_id, None);
+        self.finish_uploads(file_id, None, fllm);
     }
 
     /// `FileManager::on_upload_error` (FileManager.cpp:5101-5121).
@@ -17060,6 +17288,21 @@ impl FileManager {
     /// `FileManager::on_upload_error_impl`
     /// (FileManager.cpp:5229-5287).
     fn on_upload_error_impl(
+        &mut self,
+        node_id: usize,
+        kind: UploadQueryKind,
+        was_active: bool,
+        status: Status,
+        fllm: &mut FileLoadManager,
+    ) {
+        // the C++ SCOPE_EXIT try_flush_node (FileManager.cpp:5230-5232)
+        let result = self.on_upload_error_impl_inner(node_id, kind, was_active, status, fllm);
+        self.try_flush_node(node_id);
+        result
+    }
+
+    /// The `on_upload_error_impl` body.
+    fn on_upload_error_impl_inner(
         &mut self,
         node_id: usize,
         kind: UploadQueryKind,
@@ -17149,7 +17392,7 @@ impl FileManager {
                     partial,
                 } => self.on_upload_ok(query_id, file_type, partial),
                 FileLoadEvent::UploadFullOk { query_id, remote } => {
-                    self.on_upload_full_ok(query_id, remote)
+                    self.on_upload_full_ok(query_id, remote, fllm)
                 }
                 FileLoadEvent::Error { query_id, status } => {
                     // route by which query table holds the id
@@ -17172,6 +17415,12 @@ impl FileManager {
         bytes: Vec<u8>,
         fllm: &mut FileLoadManager,
     ) -> bool {
+        // G()->get_option_boolean("ignore_inline_thumbnails")
+        // (FileManager.cpp:2783-2785)
+        if self.ctx().ignore_inline_thumbnails() {
+            return false;
+        }
+
         let Some(node_id) = self.node_id_of(file_id) else {
             return false;
         };
@@ -17226,6 +17475,17 @@ struct LoggingDownloadCallback;
 impl DownloadCallback for LoggingDownloadCallback {
     fn on_download_ok(&mut self, _file_id: FileId) {}
     fn on_download_error(&mut self, _file_id: FileId, _status: Status) {}
+}
+
+/// `FileManager::PreliminaryUploadFileCallback`
+/// (FileManager.cpp:1286-1307): a successful upload reports back through
+/// `cancel_upload` (run by [`FileManager::finish_uploads`] inline) and
+/// errors are no-ops.
+struct PreliminaryUploadCallback;
+
+impl UploadCallback for PreliminaryUploadCallback {
+    fn on_upload_ok(&mut self, _file_upload_id: FileUploadId) {}
+    fn on_upload_error(&mut self, _file_upload_id: FileUploadId, _status: Status) {}
 }
 
 #[cfg(test)]
@@ -18703,7 +18963,6 @@ mod file_load_manager_tests {
             fllm,
         );
         pump(&mut file_manager, fllm);
-        eprintln!("probe4: log={:?}", log.borrow());
 
         // the decision order: the high-priority file's ok precedes the
         // low-priority one
@@ -18903,11 +19162,6 @@ mod file_load_manager_tests {
             fllm,
         );
         pump(&mut file_manager, fllm);
-        eprintln!(
-            "probe3: log={:?} requests_empty={}",
-            log.borrow(),
-            file_manager.file_download_requests.is_empty()
-        );
 
         // the decision order: the FILE_REFERENCE_ error deletes the
         // reference and restarts; the wait-file-reference round reports
@@ -18990,6 +19244,166 @@ mod file_load_manager_tests {
         let view = FileView::new(node);
         let local = view.get_full_local_location().expect("full local").clone();
         assert_eq!(std::fs::read(&local.path).unwrap(), bytes);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Answers every `upload.uploadPart` with Ok(true) - the parts are
+    /// accepted and the uploader finishes on its own counters.
+    struct OkUploadNet;
+
+    impl FileUploaderNet for OkUploadNet {
+        fn upload_part(&mut self, _query: UploadPartQuery) -> Result<bool, Status> {
+            Ok(true)
+        }
+    }
+
+    struct UploadFactory;
+
+    impl FileLoadNetFactory for UploadFactory {
+        fn download_net(&mut self) -> Box<dyn FileDownloaderNet> {
+            unimplemented!("downloads ride dedicated fakes")
+        }
+        fn upload_net(&mut self) -> Box<dyn FileUploaderNet> {
+            Box::new(OkUploadNet)
+        }
+        fn hash_net(&mut self) -> Box<dyn FileHashUploaderNet> {
+            unimplemented!("by-hash rides dedicated fakes")
+        }
+        fn utils_net(&mut self) -> Box<dyn FileDownloaderNet> {
+            unimplemented!("save_file_bytes rides dedicated fakes")
+        }
+    }
+
+    /// The recorded `UploadCallback` log.
+    #[derive(Default, Debug)]
+    struct UploadLog {
+        events: Vec<(FileUploadId, String)>,
+    }
+
+    struct UploadCallbackHandle(Rc<RefCell<UploadLog>>);
+
+    impl UploadCallback for UploadCallbackHandle {
+        fn on_upload_ok(&mut self, file_upload_id: FileUploadId) {
+            self.0
+                .borrow_mut()
+                .events
+                .push((file_upload_id, "ok".to_owned()));
+        }
+        fn on_upload_error(&mut self, file_upload_id: FileUploadId, status: Status) {
+            self.0
+                .borrow_mut()
+                .events
+                .push((file_upload_id, format!("error:{}", status.message())));
+        }
+    }
+
+    /// Registers a real local file for upload tests.
+    fn register_uploadable(
+        file_manager: &mut FileManager,
+        size: usize,
+    ) -> (FileId, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("m12_up_{}", tdutils::random::secure_int64()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("upload_me.bin");
+        std::fs::write(&path, vec![3u8; size]).unwrap();
+        let location =
+            FullLocalFileLocation::new(FileType::Document, path.to_string_lossy().into_owned(), 0);
+        let file_id = file_manager
+            .register_local(
+                location,
+                DialogId::default(),
+                size as i64,
+                false,
+                false,
+                FileId::default(),
+            )
+            .unwrap();
+        // the C++ callers reach the node through `get_sync_file_node`,
+        // whose database load clears `need_load_from_pmc`; there is no db
+        // in the test
+        if let Some(node) = file_manager.get_file_node_mut(file_id) {
+            node.need_load_from_pmc = false;
+        }
+        (file_id, root)
+    }
+
+    #[test]
+    fn file_load_manager_upload_completes_and_pauses_for_the_next_round() {
+        // the user-request upload flow: resume_upload -> run_upload ->
+        // on_upload_ok selects the user request and pauses the node
+        // (FileManager.cpp:4946-4953)
+        let mut file_manager = FileManager::new();
+        let (file_id, root) = register_uploadable(&mut file_manager, 4096);
+        let fllm =
+            &mut FileLoadManager::new(Box::new(UploadFactory), FileLoadManagerOptions::default());
+
+        let log = Rc::new(RefCell::new(UploadLog::default()));
+        let file_upload_id = FileUploadId::new(file_id, 0);
+        file_manager.resume_upload(
+            file_upload_id,
+            Vec::new(),
+            Rc::new(RefCell::new(UploadCallbackHandle(log.clone())))
+                as Rc<RefCell<dyn UploadCallback>>,
+            10,
+            0,
+            false,
+            false,
+            fllm,
+        );
+        for round in 1..=5 {
+            fllm.drive_round(round);
+            file_manager.apply_load_events(fllm);
+            if fllm.active_uploads() == 0 {
+                break;
+            }
+        }
+
+        // the node is upload-paused for the next round
+        let node = file_manager.get_file_node(file_id).expect("node");
+        assert!(
+            node.upload_pause.file_id.is_valid(),
+            "pause={:?} partial={:?} requests={:?} queries={:?}",
+            node.upload_pause,
+            node.remote.partial,
+            file_manager.file_upload_requests.is_empty(),
+            file_manager.upload_queries.len()
+        );
+        assert!(node.remote.partial.is_some());
+        // the extracted callback was the fresh Preliminary one, so the
+        // user's own callback did not fire (C++ parity)
+        assert!(log.borrow().events.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn file_load_manager_cancel_upload_reports_canceled_and_clears_the_queue() {
+        let mut file_manager = FileManager::new();
+        let (file_id, root) = register_uploadable(&mut file_manager, 4096);
+        let fllm =
+            &mut FileLoadManager::new(Box::new(UploadFactory), FileLoadManagerOptions::default());
+
+        let log = Rc::new(RefCell::new(UploadLog::default()));
+        let file_upload_id = FileUploadId::new(file_id, 0);
+        file_manager.resume_upload(
+            file_upload_id,
+            Vec::new(),
+            Rc::new(RefCell::new(UploadCallbackHandle(log.clone())))
+                as Rc<RefCell<dyn UploadCallback>>,
+            10,
+            0,
+            false,
+            false,
+            fllm,
+        );
+        file_manager.cancel_upload(file_upload_id, fllm);
+
+        // the extracted user-arm callback is the no-op Preliminary one;
+        // the 200 Canceled the C++ logs is not observable here
+        assert!(log.borrow().events.is_empty());
+        // the extraction cleared the request and re-prioritized the node
+        assert!(file_manager.file_upload_requests.is_empty());
+        let node = file_manager.get_file_node(file_id).expect("node");
+        assert_eq!(node.upload_priority, 0);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
