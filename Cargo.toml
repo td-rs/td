@@ -11,6 +11,7 @@ members = [
     "crates/tdmtproto",
     "crates/tde2e",
     "crates/tdclient",
+    "crates/tdcli",
     "crates/tdjson",
     "crates/tl-codegen",
     "crates/tdtl",

@@ -178,6 +178,14 @@ impl FileLog {
         self.rotate_threshold.load(Ordering::Relaxed)
     }
 
+    /// `td::FileLog::lazy_rotate`: rotate only when the threshold has been
+    /// exceeded (called once after `init` by the CLI, `cli.cpp`).
+    pub fn lazy_rotate(&self) {
+        if self.size.load(Ordering::Relaxed) > self.rotate_threshold.load(Ordering::Relaxed) {
+            self.do_after_rotation();
+        }
+    }
+
     /// `td::FileLog::do_after_rotation`: close and reopen the file, then
     /// recover the size of what already existed on disk.
     fn do_after_rotation(&self) {

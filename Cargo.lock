@@ -1779,6 +1779,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tdcli"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tdutils",
+]
+
+[[package]]
 name = "tdclient"
 version = "0.1.0"
 dependencies = [
