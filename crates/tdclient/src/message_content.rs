@@ -11262,7 +11262,7 @@ impl UserManagerLike for ContextUserManager<'_> {
 
 /// The pre-integration DialogId bridge (the M.8 module carries its own
 /// minimal enum until the integrator collapses them).
-fn to_message_entity_dialog_id(dialog_id: DialogId) -> crate::message_entity::DialogId {
+pub(crate) fn to_message_entity_dialog_id(dialog_id: DialogId) -> crate::message_entity::DialogId {
     match dialog_id.get_type() {
         DialogType::User => crate::message_entity::DialogId::User(dialog_id.get_user_id()),
         DialogType::SecretChat => {

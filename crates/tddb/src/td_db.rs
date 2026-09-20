@@ -107,6 +107,10 @@ pub const LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_TRANSLATABLE_ON_SERVER: i32 = 
 pub const LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_VIEW_AS_MESSAGES_ON_SERVER: i32 = 0x127;
 /// `LogEvent::HandlerType::DeleteMessage` (logevent/LogEvent.h:74).
 pub const LOG_EVENT_HANDLER_TYPE_DELETE_MESSAGE: i32 = 0x101;
+/// `LogEvent::HandlerType::SendMessage` (logevent/LogEvent.h:73) — the
+/// half-sent outgoing message events (`SendMessageLogEvent`, M.10.8); the
+/// messages-manager owner erases or replays them on open.
+pub const LOG_EVENT_HANDLER_TYPE_SEND_MESSAGE: i32 = 0x100;
 
 /// `TdDb::OpenedDatabase` — the database plus the open metadata the Td actor
 /// consumes (`since_last_open`; the per-manager binlog event vectors arrive
@@ -129,8 +133,9 @@ pub struct OpenedDatabase {
     pub dialog_manager_events: Vec<BinlogEvent>,
     /// The `to_messages_manager` replay vector (TdDb.cpp:122-136) — the
     /// messages-manager handler types collected at open; of the C++ vector's
-    /// members only `DeleteMessage` is ported so far (MessagesManager.cpp
-    /// 36248-36264), the rest arrive with their slices.
+    /// members `DeleteMessage` (MessagesManager.cpp 36248-36264) and
+    /// `SendMessage` (35951-35991) are ported so far, the rest arrive with
+    /// their slices.
     pub messages_manager_events: Vec<BinlogEvent>,
 }
 
@@ -878,7 +883,7 @@ impl TdDb {
                 | LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_VIEW_AS_MESSAGES_ON_SERVER => {
                     dialog_manager_events.push(event.clone())
                 }
-                LOG_EVENT_HANDLER_TYPE_DELETE_MESSAGE => {
+                LOG_EVENT_HANDLER_TYPE_DELETE_MESSAGE | LOG_EVENT_HANDLER_TYPE_SEND_MESSAGE => {
                     messages_manager_events.push(event.clone())
                 }
                 _ => {}

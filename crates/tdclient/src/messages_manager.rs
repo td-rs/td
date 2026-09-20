@@ -1914,6 +1914,40 @@ impl SavedMessagesTopicId {
         self.dialog_id.get()
     }
 
+    /// `SavedMessagesTopicId::SavedMessagesTopicId(DialogId,
+    /// const MessageForwardInfo *, DialogId)` (SavedMessagesTopicId.cpp:23-48)
+    /// — the send-path ctor for the Saved Messages chat.
+    pub fn from_forward(
+        ctx: &dyn MessageObjectContext,
+        my_dialog_id: DialogId,
+        message_forward_info: Option<&MessageForwardInfo>,
+        real_forward_from_dialog_id: DialogId,
+    ) -> SavedMessagesTopicId {
+        const HIDDEN_AUTHOR_DIALOG_ID: i64 = 2666000;
+        if let Some(forward_info) = message_forward_info {
+            let last_dialog_id = forward_info.get_last_dialog_id();
+            if last_dialog_id.is_valid() {
+                return SavedMessagesTopicId::new(last_dialog_id);
+            }
+            let has_last_sender_name = forward_info.last_message_info.sender_dialog_id.is_valid()
+                || !forward_info.last_message_info.sender_name.is_empty();
+            if real_forward_from_dialog_id != DialogId::default() && has_last_sender_name {
+                if real_forward_from_dialog_id.get_type() == DialogType::User {
+                    return SavedMessagesTopicId::new(DialogId::new(HIDDEN_AUTHOR_DIALOG_ID));
+                }
+                return SavedMessagesTopicId::new(real_forward_from_dialog_id);
+            }
+            let from_dialog_id = forward_info.origin.get_sender(ctx);
+            if from_dialog_id.is_valid() {
+                return SavedMessagesTopicId::new(my_dialog_id);
+            }
+            if forward_info.origin.is_sender_hidden(ctx) {
+                return SavedMessagesTopicId::new(DialogId::new(HIDDEN_AUTHOR_DIALOG_ID));
+            }
+        }
+        SavedMessagesTopicId::new(my_dialog_id)
+    }
+
     /// `SavedMessagesTopicId::store` (SavedMessagesTopicId.h:76-78).
     pub fn store(self, out: &mut Vec<u8>) {
         self.dialog_id.store(out);
@@ -6444,6 +6478,12 @@ impl RepliedMessageInfo {
         }
     }
 
+    /// `RepliedMessageInfo::set_message_id` (RepliedMessageInfo.h:97-101).
+    pub fn set_message_id(&mut self, new_message_id: MessageId) {
+        assert!(self.message_id.is_valid() || self.message_id.is_valid_scheduled());
+        self.message_id = new_message_id;
+    }
+
     /// `RepliedMessageInfo::store` (RepliedMessageInfo.hpp:16-59) — the
     /// embedded replied-to content rides the M.9 store seam.
     pub fn store(
@@ -6627,6 +6667,29 @@ impl MessageInputReplyTo {
         } else {
             MessageId::default()
         }
+    }
+
+    /// `MessageInputReplyTo::get_reply_message_full_id`
+    /// (MessageInputReplyTo.cpp:17-22).
+    pub fn get_reply_message_full_id(&self, owner_dialog_id: DialogId) -> MessageFullId {
+        if !self.message_id.is_valid() && !self.message_id.is_valid_scheduled() {
+            return MessageFullId::default();
+        }
+        MessageFullId::new(
+            if self.dialog_id != DialogId::default() {
+                self.dialog_id
+            } else {
+                owner_dialog_id
+            },
+            self.message_id,
+        )
+    }
+
+    /// `MessageInputReplyTo::set_message_id` (MessageInputReplyTo.h:119-123).
+    pub fn set_message_id(&mut self, new_message_id: MessageId, source: &'static str) {
+        assert!(self.message_id.is_valid() || self.message_id.is_valid_scheduled());
+        self.message_id = new_message_id;
+        self.debug_source = source;
     }
 
     /// `MessageInputReplyTo::store` (MessageInputReplyTo.hpp:16-62).
@@ -8697,9 +8760,17 @@ pub struct MessagesManager {
     /// `update_ephemeral_message_ids_` (MessagesManager.h:3318).
     pub(crate) update_ephemeral_message_ids: HashMap<EphemeralMessageFullId, MessageId>,
     // `being_sent_messages_` — message_random_id -> message; the send path
-    // (M.10.8+) reads it
-    #[allow(dead_code)]
+    // (M.10.8) fills it through `begin_send_message` and reads it from
+    // `generate_new_random_id`
     pub(crate) being_sent_messages: HashMap<i64, MessageFullId>,
+    /// `yet_unsent_message_full_id_to_persistent_message_id_`
+    /// (MessagesManager.h:3324) — the yet-unsent → server-id rewrite
+    /// registry. M.10.8 lands the read side (`get_persistent_message_id`);
+    /// the writes ride `on_message_sent`/`updateMessageID` (M.10.9), so the
+    /// map stays empty until that slice.
+    #[allow(dead_code)]
+    pub(crate) yet_unsent_message_full_id_to_persistent_message_id:
+        HashMap<MessageFullId, MessageId>,
     // `being_readded_message_full_id_` — the delete/files path reads it
     #[allow(dead_code)]
     pub(crate) being_readded_message_full_id: MessageFullId,
@@ -10241,6 +10312,24 @@ impl MessageTopic {
                 ))
             }
         }
+    }
+
+    /// `MessageTopic::get_input_top_msg_id` (MessageTopic.h:112-121).
+    pub fn get_input_top_msg_id(&self) -> i32 {
+        match self.r#type {
+            MessageTopicType::Thread => self.top_thread_message_id.get_server_message_id().get(),
+            MessageTopicType::Forum => self.forum_topic_id.get(),
+            MessageTopicType::Monoforum
+            | MessageTopicType::SavedMessages
+            | MessageTopicType::None => 0,
+        }
+    }
+
+    /// `MessageTopic::get_monoforum_saved_messages_topic_id`
+    /// (MessageTopic.h:107-110).
+    pub fn get_monoforum_saved_messages_topic_id(&self) -> SavedMessagesTopicId {
+        assert!(self.r#type == MessageTopicType::Monoforum);
+        self.saved_messages_topic_id
     }
 
     /// `MessageTopic::get_implicit_reply_to_message_id`
@@ -16110,6 +16199,2203 @@ fn set_dialog_unread_mention_count(
         unread_mention_count;
 }
 
+// ---------------------------------------------------------------------------
+// M.10.8 — the outgoing send skeleton (MessagesManager.cpp:20892-21351,
+// 28289-28307, 31092-31700, 35822-35941, 35951-35991): the client-side id
+// allocation, `create_message_to_send`/`get_message_to_send`, the reply
+// plumbing (`create_message_input_reply_to`, `get_message_input_reply_to`),
+// and the durable send plane (`SendMessageLogEvent` + the
+// `HandlerType::SendMessage` crash-recovery replay arm through
+// `continue_send_message`).
+//
+// Seams (each pinned at its use):
+// - the td_api entry ladder (`send_message` 21721: can_send_message,
+//   `MessageSendOptions::get_message_send_options`,
+//   `process_input_message_content`, the error-string parity) is M.10.10 —
+//   this slice takes the pre-validated `MessageContent` form.
+// - the wire query (`do_send_message` → messages.sendMessage, the
+//   upload/secret-media scheduling) and `on_message_sent`/
+//   `updateMessageID`/the `yet_unsent_message_full_id_to_persistent_message_id`
+//   writes are M.10.9's net flip; `do_send_message` trace-logs here.
+// - `add_message_to_dialog`'s ordering/pos/notification fan-out stays the
+//   M.10.3/M.10.9 container seam (`need_update_dialog_pos` is carried as an
+//   out-param); the ported spine covers the send configuration
+//   (`from_database = false, from_update = false, need_update = false`)
+//   exactly, including the yet-unsent random-id correspondence.
+// - the cross-chat reply's forwarded-content embedding
+//   (`get_forwarded_message_info` 21316 + `create_automatic_quote`) is the
+//   M.10.11 forward path; the seam's None answer routes to the C++'s own
+//   reset-to-default branch (RepliedMessageInfo.cpp:152-156).
+// - the Dependencies resolve + get_dialog_force db-load legs of the replay
+//   ride the dialog-db receive seam, like M.10.6's replay arm.
+// - `fail_send_message`/`send_update_new_message`/
+//   `send_update_chat_has_scheduled_messages` emissions are the M.10.9/M.13
+//   update plane; the decisions are computed, the sends trace-log.
+// - `get_topic_id`'s `is_valid_in` chat check rides the SavedMessagesManager
+//   slice; the raw conversion is exact.
+//
+// 'PendingMessageOperation' is the plan doc's name for this plane; the C++
+// truth is `SendMessageLogEvent`/`being_sent_messages_`/
+// `send_message_log_event_id` (zero C++ hits for the plan name).
+//
+// Framing note for the D1 cross-read: the C++ `log_event_store` writes a
+// version word in front of EVERY binlog event body
+// (logevent/LogEvent.h:167-186). The M.10.8 `SendMessageLogEvent` pins that
+// framing exactly (`store_log_event_version` + `Parser::new_log_event`);
+// the landed M.10.6 `DeleteMessageLogEvent` omits the word (its store/parse
+// use the bare `Parser`) — pre-existing, recorded here, to be reconciled at
+// the D1 fixture cross-read, not silently changed.
+// ---------------------------------------------------------------------------
+
+/// `td::MessageSendOptions` (MessageSendOptions.h:21-35) — the send
+/// parameters behind `messageSendOptions`. The td_api parser
+/// (`get_message_send_options`) and the `can_use_for` content gates are the
+/// M.10.10 entry ladder; the engine takes the parsed form.
+#[derive(Clone, Debug, Default)]
+pub struct MessageSendOptions {
+    pub disable_notification: bool,
+    pub from_background: bool,
+    pub update_stickersets_order: bool,
+    pub protect_content: bool,
+    pub allow_paid: bool,
+    pub only_preview: bool,
+    pub schedule_date: i32,
+    pub schedule_repeat_period: i32,
+    pub sending_id: i32,
+    pub effect_id: MessageEffectId,
+    pub paid_message_star_count: i64,
+    pub suggested_post: Option<SuggestedPost>,
+}
+
+/// `MessagesManager::ForwardedMessageInfo` (MessagesManager.h:1160-1165) —
+/// the origin/content triple the cross-chat reply embeds.
+#[derive(Clone, Debug, Default)]
+pub struct ForwardedMessageInfo {
+    pub origin_date: i32,
+    pub origin: MessageOrigin,
+    pub content: Option<MessageContent>,
+}
+
+/// The send-path `Td *td` surface: the message-object queries plus the
+/// chat/dialog/user reads `create_message_to_send`, the reply plumbing and
+/// the replay arm make. The real `Td` wiring lands with the Td slices; the
+/// stand-ins answer the defaults like [`MessageObjectContext`].
+pub trait SendMessageContext: MessageObjectContext {
+    /// `G()->unix_time()`.
+    fn unix_time(&self) -> i32;
+
+    /// `DialogManager::is_broadcast_channel` (MessagesManager.cpp:20957).
+    fn is_broadcast_channel_dialog(&self, dialog_id: DialogId) -> bool;
+
+    /// `td_->option_manager_->get_option_boolean("ignore_default_disable_notification")`
+    /// (MessagesManager.cpp:21070).
+    fn ignore_default_disable_notification(&self) -> bool;
+
+    /// `ChatManager::get_channel_sign_messages` (MessagesManager.cpp:20959).
+    fn get_channel_sign_messages(&self, channel_id: ChannelId) -> bool;
+
+    /// `ChatManager::get_channel_show_message_sender`
+    /// (MessagesManager.cpp:20993).
+    fn get_channel_show_message_sender(&self, channel_id: ChannelId) -> bool;
+
+    /// `DialogManager::is_anonymous_administrator(dialog_id, &signature)`
+    /// (MessagesManager.cpp:20983) — the filled author signature when
+    /// anonymous, `None` otherwise.
+    fn is_anonymous_administrator(&self, dialog_id: DialogId) -> Option<String>;
+
+    /// `DialogManager::get_dialog_title` (MessagesManager.cpp:20997).
+    fn get_dialog_title(&self, dialog_id: DialogId) -> String;
+
+    /// `UserManager::get_user_title` (MessagesManager.cpp:20996).
+    fn get_user_title(&self, user_id: UserId) -> String;
+
+    /// `UserManager::get_secret_chat_ttl` (MessagesManager.cpp:21081).
+    fn get_secret_chat_ttl(&self, secret_chat_id: SecretChatId) -> i32;
+
+    /// `ChatManager::get_channel_my_boost_count`
+    /// (MessagesManager.cpp:21057).
+    fn get_channel_my_boost_count(&self, channel_id: ChannelId) -> i32;
+
+    /// `DialogManager::can_send_message_to_dialog` (MessagesManager.cpp:21130
+    /// via `continue_send_message` 35923) — the (code, message) pair behind
+    /// the C++ `Status`.
+    fn can_send_message_to_dialog(&self, dialog_id: DialogId) -> Result<(), (i32, String)>;
+
+    /// `DialogManager::have_input_peer(dialog_id, allow_secret_chats,
+    /// AccessRights::Read)` (MessagesManager.cpp:21110/35894).
+    fn have_input_peer_read(&self, dialog_id: DialogId, allow_secret_chats: bool) -> bool;
+
+    /// `ForumTopicManager::can_send_message_to_forum_topic`
+    /// (MessagesManager.cpp:8320).
+    fn can_send_message_to_forum_topic(
+        &self,
+        dialog_id: DialogId,
+        forum_topic_id: ForumTopicId,
+    ) -> bool;
+
+    /// `ForumTopicManager::can_be_forum` (MessageTopic.cpp:155).
+    fn can_be_forum(&self, dialog_id: DialogId) -> bool;
+
+    /// `DialogManager::have_dialog_force` (MessageTopic.cpp:122) — the
+    /// in-memory half; the db-load leg is the dialog-db receive seam.
+    fn have_dialog_force(&self, dialog_id: DialogId, source: &str) -> bool;
+
+    /// `DialogManager::get_my_dialog_id` (MessageQuote.cpp:60).
+    fn get_my_dialog_id(&self) -> DialogId;
+
+    /// `SavedMessagesManager::get_topic_id` (SavedMessagesManager.cpp:561) —
+    /// the raw conversion; the `is_valid_in` chat validation rides the
+    /// SavedMessagesManager slice.
+    fn get_saved_messages_topic_id_from_raw(&self, topic_id: i64) -> SavedMessagesTopicId;
+
+    /// `MessagesManager::get_forwarded_message_info(MessageFullId)`
+    /// (MessagesManager.cpp:21316-21329) — the origin/content fetch the
+    /// cross-chat reply embeds. The fetch machinery
+    /// (`get_forwarded_message_origin` + the Forward content dup) is the
+    /// M.10.11 forward path; `None` routes to the C++'s own
+    /// reset-to-default branch (RepliedMessageInfo.cpp:152-156).
+    fn get_forwarded_message_info(
+        &self,
+        dialog_id: DialogId,
+        message_id: MessageId,
+    ) -> Option<ForwardedMessageInfo> {
+        let _ = (dialog_id, message_id);
+        None
+    }
+
+    /// `MessageDbSync::get_message_by_random_id` (MessagesManager.cpp:32924)
+    /// — the secret-chat db leg of `get_message_id_by_random_id`; lands with
+    /// the db wiring. The memory map covers the engine.
+    fn get_message_by_random_id_from_database(
+        &self,
+        dialog_id: DialogId,
+        random_id: i64,
+    ) -> Option<Box<Message>> {
+        let _ = (dialog_id, random_id);
+        None
+    }
+}
+
+/// `MessagesManager::get_next_yet_unsent_message_id`
+/// (MessagesManager.cpp:28277-28279).
+fn get_next_yet_unsent_message_id(d: &mut Dialog, is_bot: bool) -> MessageId {
+    get_next_message_id(d, is_bot, MessageType::YetUnsent)
+}
+
+/// `MessagesManager::get_next_yet_unsent_scheduled_message_id`
+/// (MessagesManager.cpp:28289-28307) — the per-date ladder over the
+/// scheduled container and the last-assigned marker.
+fn get_next_yet_unsent_scheduled_message_id(d: &mut Dialog, date: i32) -> MessageId {
+    assert!(date > 0);
+
+    // `add_dialog_scheduled_messages` (MessagesManager.cpp:29877-29882)
+    if d.scheduled_messages.is_none() {
+        d.scheduled_messages = Some(DialogScheduledMessages::default());
+    }
+    let scheduled_messages = d.scheduled_messages.as_mut().unwrap();
+    let mut message_id = MessageId::from_scheduled(ScheduledServerMessageId::new(1), date, false);
+    for it in scheduled_messages.scheduled_messages.keys() {
+        if it.get_scheduled_message_date() == date && *it > message_id {
+            message_id = *it;
+        }
+    }
+
+    let last_assigned_message_id = scheduled_messages
+        .last_assigned_scheduled_message_id
+        .entry(date)
+        .or_default();
+    if *last_assigned_message_id != MessageId::default() && *last_assigned_message_id > message_id {
+        message_id = *last_assigned_message_id;
+    }
+
+    *last_assigned_message_id = message_id.get_next_message_id(MessageType::YetUnsent);
+    *last_assigned_message_id
+}
+
+/// `MessagesManager::generate_new_random_id` (MessagesManager.cpp:20898-20905)
+/// — a secure random id, nonzero and fresh against both the being-sent
+/// registry and the dialog's yet-unsent correspondence.
+fn generate_new_random_id(d: &Dialog, being_sent_messages: &HashMap<i64, MessageFullId>) -> i64 {
+    loop {
+        let random_id = tdutils::random::secure_int64();
+        if random_id != 0
+            && !being_sent_messages.contains_key(&random_id)
+            && !d.random_id_to_message_id.contains_key(&random_id)
+        {
+            return random_id;
+        }
+    }
+}
+
+/// `MessagesManager::begin_send_message` (MessagesManager.cpp:21120-21127) —
+/// the random-id registration that makes the in-flight message crash-visible.
+pub fn begin_send_message(manager: &mut MessagesManager, dialog_id: DialogId, m: &Message) -> i64 {
+    tracing::info!(
+        "Begin to send {}:{} with random_id = {}",
+        dialog_id.get(),
+        DisplayMessageId(m.message_id),
+        m.random_id
+    );
+    assert!(m.random_id != 0);
+    assert!(m.message_id.is_yet_unsent());
+    let is_inserted = manager
+        .being_sent_messages
+        .insert(m.random_id, MessageFullId::new(dialog_id, m.message_id))
+        .is_none();
+    assert!(is_inserted);
+    m.random_id
+}
+
+/// `MessagesManager::get_persistent_message_id`
+/// (MessagesManager.cpp:21133-21147) — the yet-unsent → server-id rewrite
+/// read; the registry writes are M.10.9, so an empty registry falls through
+/// exactly like the C++ miss.
+pub fn get_persistent_message_id(
+    manager: &MessagesManager,
+    d: &Dialog,
+    message_id: MessageId,
+) -> MessageId {
+    if !message_id.is_valid() && !message_id.is_valid_scheduled() {
+        return MessageId::default();
+    }
+    if message_id.is_yet_unsent() {
+        // it is possible that user tries to do something with an already sent
+        // message by its temporary identifier; use the real message then
+        if let Some(persistent) = manager
+            .yet_unsent_message_full_id_to_persistent_message_id
+            .get(&MessageFullId::new(d.dialog_id, message_id))
+        {
+            return *persistent;
+        }
+    }
+    message_id
+}
+
+/// `MessagesManager::add_random_id_to_message_id_correspondence`
+/// (MessagesManager.cpp:13284-13293).
+fn add_random_id_to_message_id_correspondence(
+    d: &mut Dialog,
+    random_id: i64,
+    message_id: MessageId,
+) {
+    if random_id == 0 {
+        return;
+    }
+    let replace = match d.random_id_to_message_id.get(&random_id) {
+        Some(old) => old.get() < message_id.get(),
+        None => true,
+    };
+    if replace {
+        d.random_id_to_message_id.insert(random_id, message_id);
+    }
+}
+
+/// `MessagesManager::delete_random_id_to_message_id_correspondence`
+/// (MessagesManager.cpp:13295-13302) — the call sites are the
+/// send-completion/delete walks (MessagesManager.cpp:27992/13857/13781); the
+/// M.10.9 `on_message_sent` flip owns the first.
+#[allow(dead_code)]
+fn delete_random_id_to_message_id_correspondence(
+    d: &mut Dialog,
+    random_id: i64,
+    message_id: MessageId,
+) {
+    if let Some(old) = d.random_id_to_message_id.get(&random_id)
+        && *old == message_id
+    {
+        d.random_id_to_message_id.remove(&random_id);
+    }
+}
+
+/// `MessagesManager::get_message_id_by_random_id`
+/// (MessagesManager.cpp:32917-32959) — the memory-map read; the secret-chat
+/// message-db leg is the [`SendMessageContext::get_message_by_random_id_from_database`]
+/// seam.
+pub fn get_message_id_by_random_id(
+    ctx: &dyn SendMessageContext,
+    d: &mut Dialog,
+    random_id: i64,
+    source: &str,
+) -> MessageId {
+    if random_id == 0 {
+        return MessageId::default();
+    }
+    if let Some(message_id) = d.random_id_to_message_id.get(&random_id) {
+        tracing::info!(
+            "Found {}:{} by random_id {} from {}",
+            d.dialog_id.get(),
+            DisplayMessageId(*message_id),
+            random_id,
+            source
+        );
+        return *message_id;
+    }
+    if d.dialog_id.get_type() == DialogType::SecretChat
+        && let Some(m) = ctx.get_message_by_random_id_from_database(d.dialog_id, random_id)
+    {
+        assert!(
+            m.random_id == random_id,
+            "get_message_id_by_random_id random-id mismatch in {:?}",
+            d.dialog_id
+        );
+        assert!(
+            d.random_id_to_message_id.contains_key(&random_id),
+            "get_message_id_by_random_id did not populate the correspondence from {}",
+            source
+        );
+        let message_id = d.random_id_to_message_id[&random_id];
+        assert!(
+            message_id == m.message_id,
+            "get_message_id_by_random_id correspondence mismatch from {}",
+            source
+        );
+        tracing::info!(
+            "Found {}:{} by random_id {} from {}",
+            d.dialog_id.get(),
+            DisplayMessageId(message_id),
+            random_id,
+            source
+        );
+        return message_id;
+    }
+    tracing::info!(
+        "Found no message by random_id {} from {}",
+        random_id,
+        source
+    );
+    MessageId::default()
+}
+
+/// `MessagesManager::is_deleted_message` (MessagesManager.cpp:13791-13798).
+fn is_deleted_message(d: &Dialog, message_id: MessageId) -> bool {
+    if message_id.is_scheduled()
+        && message_id.is_valid_scheduled()
+        && message_id.is_scheduled_server()
+    {
+        d.scheduled_messages.as_ref().is_some_and(|scheduled| {
+            scheduled
+                .deleted_scheduled_server_message_ids
+                .contains(&message_id.get_scheduled_server_message_id())
+        })
+    } else {
+        d.deleted_message_ids.contains(&message_id)
+    }
+}
+
+/// `MessagesManager::get_message(Dialog *, MessageId)` (MessagesManager.cpp
+/// 13720-13740) — the in-memory half; the db-load leg is the dialog-db
+/// receive seam.
+fn get_message_in_dialog(d: &Dialog, message_id: MessageId) -> Option<&Message> {
+    if message_id.is_scheduled() {
+        d.scheduled_messages
+            .as_ref()
+            .and_then(|scheduled| scheduled.scheduled_messages.get(&message_id))
+            .map(|m| m.as_ref())
+    } else {
+        d.messages.get(&message_id).map(|m| m.as_ref())
+    }
+}
+
+/// `MessagesManager::have_message_force(Dialog *, MessageId, source)`
+/// (MessagesManager.cpp:13829-13840) — the in-memory probe; the db-load leg
+/// is the dialog-db receive seam.
+fn have_message_force(d: &Dialog, message_id: MessageId, source: &str) -> bool {
+    let have = get_message_in_dialog(d, message_id).is_some();
+    if have {
+        tracing::info!(
+            "Have message {} in {:?} from {}",
+            DisplayMessageId(message_id),
+            d.dialog_id,
+            source
+        );
+    }
+    have
+}
+
+/// `MessagesManager::register_dialog_ephemeral_message` /
+/// `unregister_dialog_ephemeral_message` (MessagesManager.cpp:13806-13820).
+fn register_dialog_ephemeral_message(d: &mut Dialog, ephemeral_message_id: EphemeralMessageId) {
+    if ephemeral_message_id.is_valid() {
+        d.ephemeral_message_ids
+            .entry(ephemeral_message_id)
+            .or_default();
+    }
+}
+
+fn unregister_dialog_ephemeral_message(d: &mut Dialog, ephemeral_message_id: EphemeralMessageId) {
+    if ephemeral_message_id.is_valid() {
+        d.ephemeral_message_ids.remove(&ephemeral_message_id);
+    }
+}
+
+/// `MessagesManager::add_message_to_dialog` (MessagesManager.cpp:31092-31661)
+/// in the send configuration (`from_database = false, from_update = false,
+/// need_update = false`) — the gates, the yet-unsent random-id
+/// correspondence and the container insert are exact; the C++ lines that
+/// only fire in the receive/database configurations are marked as the
+/// M.10.9 container seam. `Err` carries the C++
+/// `debug_add_message_to_dialog_fail_reason_`.
+#[allow(clippy::too_many_arguments)]
+fn add_message_to_dialog(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    reactions_ctx: &dyn DialogReactionsContext,
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    mut message: Box<Message>,
+    need_update_dialog_pos: &mut bool,
+    source: &'static str,
+) -> Result<MessageFullId, String> {
+    let message_id = message.message_id;
+    if !message_id.is_valid() {
+        // `add_scheduled_message_to_dialog` dispatch (MessagesManager.cpp:31096)
+        return add_scheduled_message_to_dialog(
+            global,
+            manager,
+            reactions_ctx,
+            ctx,
+            dialog_id,
+            message,
+            source,
+        );
+    }
+
+    // `fix_new_message(d, message, false)` (31104) — reads the dialog only
+    if manager.get_dialog(dialog_id).is_some() {
+        fix_new_message(manager, reactions_ctx, ctx, dialog_id, &mut message, false);
+    }
+
+    // the ttl decisions need the message and the clocks only
+    let ttl_expired = message.ttl.is_valid()
+        && message.ttl_expires_at != 0.0
+        && message.ttl_expires_at <= ctx.now();
+    let ttl_period_expired =
+        message.ttl_period > 0 && (message.date + message.ttl_period) as f64 <= ctx.server_time();
+    if ttl_period_expired {
+        assert!(dialog_id.get_type() != DialogType::SecretChat);
+    }
+    let ephemeral_expired = message
+        .ephemeral_message
+        .as_ref()
+        .is_some_and(|ephemeral_message| {
+            (ephemeral_message.date + ephemeral_message.ttl_period) as f64 <= ctx.server_time()
+        });
+
+    // phase 1 — the dialog-scoped gates and mutations
+    let registered_ephemeral_message_id;
+    {
+        let Some(d) = manager.get_dialog_mut(dialog_id) else {
+            // `get_dialog_force` (35888) — the db-load leg is the dialog-db
+            // receive seam
+            return Err("no dialog".to_string());
+        };
+
+        // `*need_update` CHECK (31100-31102) — need_update is the constant
+        // false in the send configuration
+
+        if message_id <= d.last_clear_history_message_id {
+            tracing::info!(
+                "Skip adding cleared {} to {}",
+                DisplayMessageId(message_id),
+                dialog_id.get()
+            );
+            // `delete_message_from_database` from_database leg (31122) —
+            // skipped in this configuration
+            return Err("cleared full history".to_string());
+        }
+
+        if is_deleted_message(d, message_id) {
+            tracing::info!(
+                "Skip adding deleted {} to {}",
+                DisplayMessageId(message_id),
+                dialog_id.get()
+            );
+            return Err("adding deleted message".to_string());
+        }
+
+        // the from_update last_new_message_id LOG(ERROR) (31136-31142) —
+        // from_update = false in this configuration
+
+        // the too-new not-from-update gate (31145-31181): server/local ids
+        // only, so a yet-unsent id keeps `max_message_id` empty and never
+        // fires
+        if !message.is_failed_to_send && !is_ephemeral_message(&message) {
+            let max_message_id = if message_id.is_server() {
+                if d.being_added_message_id.is_valid() {
+                    d.being_updated_last_new_message_id
+                } else {
+                    d.last_new_message_id
+                }
+            } else if message_id.is_local() {
+                if d.being_added_message_id.is_valid() {
+                    d.being_updated_last_database_message_id
+                } else {
+                    d.last_database_message_id
+                }
+            } else {
+                MessageId::default()
+            };
+            if max_message_id != MessageId::default() && message_id > max_message_id {
+                // the need_channel_difference leg (31163-31174) is the
+                // net/channel-difference seam
+                return Err("too new message not from update".to_string());
+            }
+        }
+        if (message_id.is_server()
+            || (message_id.is_local() && dialog_id.get_type() == DialogType::SecretChat))
+            && message_id <= d.max_unavailable_message_id
+            && !is_ephemeral_message(&message)
+        {
+            tracing::info!(
+                "Can't add an unavailable {} to {}",
+                DisplayMessageId(message_id),
+                dialog_id.get()
+            );
+            return Err("ignore unavailable message".to_string());
+        }
+
+        let message_content_type = message
+            .content
+            .as_ref()
+            .expect("message without content")
+            .get_type();
+        if message_content_type == MessageContentType::ChatDeleteHistory {
+            // the delete_message + last-clear-history walk (31192-31220)
+            // rides the M.10.9 delete/container plane; unreachable from the
+            // send path because content validation (M.10.10) rejects service
+            // contents
+            unimplemented!("ChatDeleteHistory content in the send path is the M.10.9 seam");
+        }
+
+        // the need_update reply-markup/last-new blocks (31222-31253) —
+        // need_update = false in this configuration
+
+        // the re-add branch (31246-31296): the memory probe; the
+        // get_message_force db load is the dialog-db receive seam
+        if get_message_in_dialog(d, message_id).is_some() {
+            return Err("adding already existing message".to_string());
+        }
+
+        // the notification preload block (31298-31332) — need_update = false
+        // and from_update = false in this configuration
+
+        assert!(
+            !d.being_added_message_id.is_valid(),
+            "recursive add_message_to_dialog in {:?} from {}",
+            dialog_id,
+            source
+        );
+        assert!(
+            !d.being_deleted_message_id.is_valid(),
+            "recursive delete in {:?} from {}",
+            dialog_id,
+            source
+        );
+
+        d.being_added_message_id = message_id;
+        d.being_updated_last_new_message_id = d.last_new_message_id;
+        d.being_updated_last_database_message_id = d.last_database_message_id;
+
+        // the new-secret-chat notification removal (31345-31347) is the M.13
+        // notification seam
+
+        if message.message_id > d.max_added_message_id {
+            d.max_added_message_id = message.message_id;
+        }
+
+        // the unload-schedule timeout (31353-31358) is the actor-timer seam
+
+        if ephemeral_expired {
+            let ephemeral_message_id = message
+                .ephemeral_message
+                .as_ref()
+                .unwrap()
+                .ephemeral_message_id;
+            unregister_dialog_ephemeral_message(d, ephemeral_message_id);
+            message.ephemeral_message = None;
+        }
+
+        registered_ephemeral_message_id = message.ephemeral_message_id;
+    }
+
+    // phase 2 — the ttl-expired legs (MessagesManager.cpp:31360-31395); they
+    // delete through the message database and unwind the add
+    if ttl_expired && dialog_id.get_type() == DialogType::SecretChat {
+        tracing::info!(
+            "Can't add {} with expired self-destruct timer to {} from {}",
+            DisplayMessageId(message_id),
+            dialog_id.get(),
+            source
+        );
+        delete_message_from_database(
+            global,
+            manager,
+            dialog_id,
+            message_id,
+            Some(&message),
+            true,
+            "delete self-destructed message",
+        );
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        d.being_added_message_id = MessageId::default();
+        return Err("delete self-destructed message".to_string());
+    }
+    if ttl_expired {
+        // `on_message_ttl_expired_impl` (31371) — the expired-content swap is
+        // the receive-plane seam (M.9/M.10.9); unreachable from the send
+        // path, whose ttl_expires_at is 0 until the secret media leg sets it
+        log_error!(
+            "on_message_ttl_expired seam: expired non-secret {} in {:?}",
+            DisplayMessageId(message_id),
+            dialog_id
+        );
+    }
+    if ttl_period_expired {
+        tracing::info!(
+            "Can't add auto-deleted {} sent at {} with auto-delete time {} to {} from {}",
+            DisplayMessageId(message_id),
+            message.date,
+            message.ttl_period,
+            dialog_id.get(),
+            source
+        );
+        delete_message_from_database(
+            global,
+            manager,
+            dialog_id,
+            message_id,
+            Some(&message),
+            true,
+            "delete auto-deleted message",
+        );
+        // the C++ `unregister_dialog_ephemeral_message` (31387) ran inside
+        // phase 1 through the decision above
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        unregister_dialog_ephemeral_message(d, registered_ephemeral_message_id);
+        d.being_added_message_id = MessageId::default();
+        return Err("delete auto-deleted message".to_string());
+    }
+    // `ttl_register_message`/`ttl_period_register_message` (31378/31393) —
+    // the ttl scheduler is the actor-timer seam
+
+    if !message.are_media_timestamp_entities_found {
+        message.are_media_timestamp_entities_found = true;
+        // the from_database entity-fix leg (31404-31411) — from_database =
+        // false in this configuration
+    }
+
+    // the keep_media_order yet-unsent media queue (31415-31427) is the
+    // files/net send-ordering seam (M.10.18/M.10.9)
+
+    // the notification blocks (31429-31454) — need_update = false and
+    // from_database = false in this configuration
+
+    let Some(d) = manager.get_dialog_mut(dialog_id) else {
+        return Err("no dialog".to_string());
+    };
+
+    // `add_message_to_dialog_message_list` (30948-31089) in this
+    // configuration: the is_empty flip and the gap/ordering walk — the
+    // ordered-messages container and the last-message/pos emissions are the
+    // M.10.9 container seam
+    if d.is_empty {
+        d.is_empty = false;
+        *need_update_dialog_pos = true;
+    }
+
+    // update_replied_by_message_count (+1) (31462) — the reply registry is
+    // the M.10.9 container seam
+
+    // `add_message_to_database` (31464-31466) — skipped for yet-unsent ids,
+    // which is the only case this configuration adds
+
+    // the Channel slow-mode/repair walk (31468-31485) — from_update = false
+
+    let message_content_type = message
+        .content
+        .as_ref()
+        .expect("message without content")
+        .get_type();
+    if message_content_type == MessageContentType::ContactRegistered
+        && !d.has_contact_registered_message
+    {
+        d.has_contact_registered_message = true;
+        // `on_dialog_updated` — the binlog-pmc dirty marker is the dialog-db
+        // receive seam
+    }
+
+    // the story-reply fan-out (31492-31500) is the StoryManager seam;
+    // `reget_message_from_server_if_needed` (31502) is [blocked: net];
+    // `add_message_file_sources` (31504) is M.10.18; the content/reply
+    // registrations (31506/31508) are the M.10.9 container seam
+
+    // the from_update speculation blocks (31510-31576) and the forum-topic
+    // count (31578-31580) — from_update = false / the ForumTopicManager seam
+
+    let result_message_id = message.message_id;
+    let random_id = message.random_id;
+    let is_yet_unsent = message.message_id.is_yet_unsent();
+    let is_scheduled_message = message.message_id.is_scheduled();
+    message.debug_source = source;
+    d.messages.insert(message_id, message);
+    // `message_lru_list.put_back` (31585) — the unload container is the
+    // recorded stand-in
+
+    match dialog_id.get_type() {
+        DialogType::User => {
+            // `register_message_users` (31587-31591) — the UserManager
+            // receive seam; skipped for bots like the C++
+        }
+        DialogType::Channel => {
+            // `register_message_users`/`register_message_channels`
+            // (31594-31598) — the same seam
+        }
+        DialogType::Chat | DialogType::SecretChat => {}
+        DialogType::None => unreachable!(),
+    }
+
+    register_dialog_ephemeral_message(d, registered_ephemeral_message_id);
+
+    if is_yet_unsent || dialog_id.get_type() == DialogType::SecretChat {
+        add_random_id_to_message_id_correspondence(d, random_id, result_message_id);
+    }
+
+    // the saved-messages topic/yet-unsent thread/user/notification/bot
+    // command/media-timestamp fan-out (31612-31639) is the manager receive
+    // seam
+
+    if is_yet_unsent && is_scheduled_message {
+        // `send_update_chat_has_scheduled_messages` (31643) — the update
+        // plane is the M.10.9 seam
+        tracing::info!(
+            "send_update_chat_has_scheduled_messages seam: {:?} after sending {}",
+            dialog_id,
+            DisplayMessageId(message_id)
+        );
+    }
+
+    // the paid-star pending walk (31645-31652) is the StarManager seam
+
+    d.being_added_message_id = MessageId::default();
+    // `added_message_count_++` (31658)
+
+    Ok(MessageFullId::new(dialog_id, result_message_id))
+}
+
+/// `MessagesManager::add_scheduled_message_to_dialog`
+/// (MessagesManager.cpp:31663-31830) in the send configuration — same spine
+/// over the scheduled container.
+#[allow(clippy::too_many_arguments)]
+fn add_scheduled_message_to_dialog(
+    _global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    reactions_ctx: &dyn DialogReactionsContext,
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    mut message: Box<Message>,
+    source: &'static str,
+) -> Result<MessageFullId, String> {
+    let message_id = message.message_id;
+    assert!(message_id.is_valid_scheduled());
+    assert!(!message.notification_id.is_valid());
+    assert!(!message.removed_notification_id.is_valid());
+
+    // `fix_new_message(d, message, false)` (31675) — reads the dialog only
+    if manager.get_dialog(dialog_id).is_some() {
+        fix_new_message(manager, reactions_ctx, ctx, dialog_id, &mut message, false);
+    }
+
+    let d = manager
+        .get_dialog_mut(dialog_id)
+        .expect("add_scheduled_message_to_dialog without the dialog");
+
+    if is_deleted_message(d, message_id) {
+        tracing::info!(
+            "Skip adding deleted {} to {} from {}",
+            DisplayMessageId(message_id),
+            dialog_id.get(),
+            source
+        );
+        return Err("adding deleted scheduled message".to_string());
+    }
+
+    if dialog_id.get_type() == DialogType::SecretChat {
+        log_error!(
+            "Tried to add {} to {:?} from {}",
+            DisplayMessageId(message_id),
+            dialog_id,
+            source
+        );
+        return Err("skip adding scheduled message to secret chat".to_string());
+    }
+    if message.ttl != MessageSelfDestructType::default() || message.ttl_expires_at != 0.0 {
+        log_error!(
+            "Tried to add {} with self-destruct timer to {:?} from {}",
+            DisplayMessageId(message_id),
+            dialog_id,
+            source
+        );
+        return Err("skip adding secret scheduled message".to_string());
+    }
+    if message.ttl_period != 0 {
+        log_error!(
+            "Tried to add {} with auto-delete timer to {:?} from {}",
+            DisplayMessageId(message_id),
+            dialog_id,
+            source
+        );
+        return Err("skip adding auto-deleting scheduled message".to_string());
+    }
+
+    let message_content_type = message
+        .content
+        .as_ref()
+        .expect("message without content")
+        .get_type();
+    if crate::message_content::is_service_message_content(message_content_type)
+        || message_content_type == MessageContentType::LiveLocation
+        || crate::message_content::is_expired_message_content(message_content_type)
+    {
+        log_error!(
+            "Tried to add {} of type {message_content_type:?} to {:?} from {}",
+            DisplayMessageId(message_id),
+            dialog_id,
+            source
+        );
+        return Err("skip adding message of unexpected type".to_string());
+    }
+
+    // the re-add branch (31722-31748) — the memory probe; the update/delete
+    // walk rides the M.10.9 container seam
+    if get_message_in_dialog(d, message_id).is_some() {
+        return Err("adding already existing scheduled message".to_string());
+    }
+
+    // `add_message_to_database` (31759) — skipped for yet-unsent ids; the
+    // file-source/content registrations (31764-31769) are the manager seams
+
+    if message_id.is_yet_unsent() {
+        let random_id = message.random_id;
+        add_random_id_to_message_id_correspondence(d, random_id, message_id);
+    }
+
+    // the media-timestamp/reply registrations and the from_update
+    // speculation (31776-31800) — the M.10.9 container/manager seams
+
+    message.debug_source = source;
+    let scheduled = d.scheduled_messages.as_mut().unwrap();
+    if message_id.is_scheduled_server() {
+        let is_inserted = scheduled
+            .scheduled_message_date
+            .insert(message_id.get_scheduled_server_message_id(), message.date)
+            .is_none();
+        assert!(is_inserted);
+    }
+    let is_inserted = scheduled
+        .scheduled_messages
+        .insert(message_id, message)
+        .is_none();
+    assert!(is_inserted);
+
+    Ok(MessageFullId::new(dialog_id, message_id))
+}
+
+/// `MessagesManager::create_message_to_send` (MessagesManager.cpp:20907-21094)
+/// — the outgoing message construction: the topic/reply resolution, the
+/// sender ladder, the id allocation and the field set. The td_api entry
+/// ladder (`send_message`, 21721) is M.10.10; the wire query is M.10.9.
+#[allow(clippy::too_many_arguments)]
+pub fn create_message_to_send(
+    ctx: &dyn SendMessageContext,
+    d: &mut Dialog,
+    message_topic: &MessageTopic,
+    mut input_reply_to: MessageInputReplyTo,
+    options: &MessageSendOptions,
+    content: MessageContent,
+    invert_media: bool,
+    suppress_reply_info: bool,
+    forward_info: Option<MessageForwardInfo>,
+    real_forward_from_dialog_id: DialogId,
+    is_copy: bool,
+    send_as_dialog_id: DialogId,
+    is_quick_reply_message: bool,
+) -> Box<Message> {
+    let is_scheduled = options.schedule_date != 0;
+    let dialog_id = d.dialog_id;
+
+    let dialog_type = dialog_id.get_type();
+    let my_id = ctx.content_context().get_my_id();
+
+    let mut reply_to_random_id = 0i64;
+    let is_general = message_topic.is_forum_general();
+    let initial_is_topic_message = message_topic.is_forum() && !is_general;
+    let initial_top_thread_message_id = MessageId::from_server_message_id(ServerMessageId::new(
+        message_topic.get_input_top_msg_id(),
+    ));
+    let mut is_topic_message = initial_is_topic_message;
+    let mut top_thread_message_id = if is_general {
+        MessageId::default()
+    } else {
+        initial_top_thread_message_id
+    };
+    let same_chat_reply_to_message_id = input_reply_to.get_same_chat_reply_to_message_id();
+    if same_chat_reply_to_message_id.is_valid()
+        || same_chat_reply_to_message_id.is_valid_scheduled()
+    {
+        // the message was forcibly preloaded in create_message_input_reply_to
+        // it can be missing, only if it is unknown message from a push
+        // notification, or an unknown top thread message
+        let reply_m = get_message_in_dialog(d, same_chat_reply_to_message_id);
+        if let Some(reply_m) = reply_m
+            && !same_chat_reply_to_message_id.is_scheduled()
+        {
+            if reply_m.top_thread_message_id.is_valid() {
+                top_thread_message_id = reply_m.top_thread_message_id;
+            }
+            is_topic_message = reply_m.is_topic_message;
+        }
+        if dialog_type == DialogType::SecretChat || same_chat_reply_to_message_id.is_yet_unsent() {
+            if let Some(reply_m) = reply_m {
+                reply_to_random_id = reply_m.random_id;
+            } else {
+                assert!(dialog_type == DialogType::SecretChat);
+                assert!(message_topic.is_empty());
+                input_reply_to = MessageInputReplyTo::default();
+            }
+        }
+    } else if top_thread_message_id.is_valid()
+        && dialog_type == DialogType::Channel
+        && let Some(top_m) = get_message_in_dialog(d, top_thread_message_id)
+    {
+        is_topic_message = top_m.is_topic_message;
+    }
+    tracing::debug!(
+        "Create {}topic message in thread of {}",
+        if is_topic_message { "" } else { "non-" },
+        DisplayMessageId(top_thread_message_id)
+    );
+
+    let mut message = Box::new(Message {
+        content: Some(content),
+        ..Message::default()
+    });
+    let is_channel_post = ctx.is_broadcast_channel_dialog(dialog_id);
+    if !is_channel_post
+        || (!is_scheduled && ctx.get_channel_sign_messages(dialog_id.get_channel_id()))
+    {
+        if message_topic.is_monoforum() {
+            assert!(dialog_id.get_type() == DialogType::Channel);
+            let channel_id = ctx.get_monoforum_channel_id(dialog_id.get_channel_id());
+            assert!(channel_id.is_valid());
+            message.sender_dialog_id = DialogId::from_channel_id(channel_id);
+        } else if send_as_dialog_id.is_valid() {
+            // for resend_messages
+            if send_as_dialog_id.get_type() == DialogType::User {
+                message.sender_user_id = send_as_dialog_id.get_user_id();
+            } else {
+                message.sender_dialog_id = send_as_dialog_id;
+            }
+            if dialog_type == DialogType::Channel {
+                message.has_explicit_sender = true;
+            }
+        } else if d.default_send_message_as_dialog_id.is_valid() {
+            if d.default_send_message_as_dialog_id.get_type() == DialogType::User {
+                // 1:1 with the C++ (20975-20981): the User-typed default
+                // send-as resolves to the own sender
+                message.sender_user_id = my_id;
+            } else {
+                message.sender_dialog_id = d.default_send_message_as_dialog_id;
+            }
+            message.has_explicit_sender = true;
+        } else {
+            if !is_channel_post
+                && let Some(author_signature) = ctx.is_anonymous_administrator(dialog_id)
+            {
+                message.author_signature = author_signature;
+                message.sender_dialog_id = dialog_id;
+            } else {
+                message.sender_user_id = my_id;
+            }
+        }
+    } else {
+        message.sender_dialog_id = dialog_id;
+    }
+    if is_channel_post && !is_scheduled && ctx.get_channel_sign_messages(dialog_id.get_channel_id())
+    {
+        let show_message_sender = ctx.get_channel_show_message_sender(dialog_id.get_channel_id());
+        if message.sender_dialog_id != dialog_id || !message.has_explicit_sender {
+            message.author_signature = if message.sender_dialog_id == dialog_id
+                || message.sender_dialog_id == DialogId::default()
+            {
+                ctx.get_user_title(my_id)
+            } else {
+                ctx.get_dialog_title(message.sender_dialog_id)
+            };
+        }
+        if !show_message_sender {
+            message.initial_sender_dialog_id = get_message_sender(&message);
+            message.sender_user_id = UserId::default();
+            message.sender_dialog_id = dialog_id;
+        }
+    }
+    message.message_id = if is_scheduled {
+        get_next_yet_unsent_scheduled_message_id(d, options.schedule_date)
+    } else {
+        get_next_yet_unsent_message_id(d, ctx.is_bot())
+    };
+    message.send_date = ctx.unix_time();
+    message.date = if is_scheduled {
+        options.schedule_date
+    } else {
+        message.send_date
+    };
+    message.schedule_repeat_period = options.schedule_repeat_period;
+    message.replied_message_info =
+        replied_message_info_from_input_reply_to(ctx, dialog_id, &input_reply_to, message_topic);
+    message.reply_to_story_full_id = input_reply_to.story_full_id;
+    message.input_reply_to = input_reply_to.clone();
+    message.reply_to_random_id = reply_to_random_id;
+    message.top_thread_message_id = top_thread_message_id;
+    message.initial_top_thread_message_id = initial_top_thread_message_id;
+    message.is_topic_message = is_topic_message;
+    message.initial_is_topic_message = initial_is_topic_message;
+    message.is_channel_post = is_channel_post;
+    message.is_outgoing = is_scheduled || dialog_id != DialogId::from_user_id(my_id);
+    message.from_background = options.from_background;
+    message.is_quick_reply_message = is_quick_reply_message;
+    message.update_stickersets_order = options.update_stickersets_order;
+    message.noforwards = options.protect_content;
+    message.allow_paid = options.allow_paid;
+    message.paid_message_star_count = options.paid_message_star_count;
+    message.view_count = if is_channel_post && !is_scheduled {
+        1
+    } else {
+        0
+    };
+    message.forward_count = 0;
+    if !suppress_reply_info
+        && !is_scheduled
+        && dialog_type == DialogType::Channel
+        && !ctx.is_bot()
+        && if is_channel_post {
+            ctx.get_channel_has_linked_channel(dialog_id.get_channel_id())
+        } else {
+            !message.input_reply_to.is_valid()
+        }
+    {
+        message.reply_info.reply_count = 0;
+        if is_channel_post {
+            let linked_channel_id = ctx.get_channel_linked_channel_id(
+                dialog_id.get_channel_id(),
+                "create_message_to_send",
+            );
+            if linked_channel_id.is_valid() {
+                message.reply_info.is_comment = true;
+                message.reply_info.channel_id = linked_channel_id;
+            }
+        }
+    }
+    if message.sender_user_id == my_id && dialog_type == DialogType::Channel && !is_channel_post {
+        message.sender_boost_count = ctx.get_channel_my_boost_count(dialog_id.get_channel_id());
+        // m->sender_rank = get_my_rank — the DialogManager seam (21058)
+    }
+    message.effect_id = MessageEffectId::new(options.effect_id.get());
+    message.invert_media = invert_media;
+    message.forward_info = forward_info;
+    message.real_forward_from_dialog_id = real_forward_from_dialog_id;
+    message.is_copy = is_copy || message.forward_info.is_some();
+    message.sending_id = options.sending_id;
+    message.suggested_post = options.suggested_post.clone();
+
+    message.disable_notification = if ctx.is_bot()
+        || options.disable_notification
+        || ctx.ignore_default_disable_notification()
+    {
+        options.disable_notification
+    } else {
+        d.notification_settings.silent_send_message
+    };
+
+    if dialog_type == DialogType::SecretChat {
+        assert!(!is_scheduled);
+        let content_type = message
+            .content
+            .as_ref()
+            .expect("message without content")
+            .get_type();
+        if crate::message_content::is_service_message_content(content_type) {
+            message.ttl = MessageSelfDestructType::default();
+        } else {
+            message.ttl = MessageSelfDestructType::with_ttl(
+                ctx.get_secret_chat_ttl(dialog_id.get_secret_chat_id()),
+                false,
+            );
+        }
+        message.is_content_secret = message.ttl.is_secret_message_content(content_type);
+    }
+    if dialog_id == DialogId::from_user_id(my_id) {
+        message.saved_messages_topic_id = SavedMessagesTopicId::from_forward(
+            ctx,
+            dialog_id,
+            message.forward_info.as_ref(),
+            message.real_forward_from_dialog_id,
+        );
+    } else if message_topic.is_monoforum() {
+        message.saved_messages_topic_id = message_topic.get_monoforum_saved_messages_topic_id();
+    }
+    if message.sender_dialog_id.is_valid() && message.sender_dialog_id != dialog_id {
+        ctx.force_create_dialog(message.sender_dialog_id, "create_message_to_send");
+    }
+    message
+}
+
+/// `MessagesManager::get_message_actual_content` (MessagesManager.h:3229,
+/// MessagesManager.cpp:23448-23452) — the ephemeral unwrap.
+pub(crate) fn get_message_actual_content(m: &Message) -> &MessageContent {
+    match &m.ephemeral_message {
+        None => m.content.as_ref().expect("message without content"),
+        Some(ephemeral_message) => ephemeral_message
+            .content
+            .as_ref()
+            .expect("message without content"),
+    }
+}
+
+/// `MessagesManager::can_forward_message` (MessagesManager.cpp:8275-8310) —
+/// the `can_be_forwarded` input of the cross-chat reply gate.
+pub fn can_forward_message(
+    ctx: &dyn SendMessageContext,
+    from_dialog_id: DialogId,
+    m: Option<&Message>,
+    is_copy: bool,
+) -> bool {
+    let Some(m) = m else {
+        return false;
+    };
+    if !m.ttl.is_empty() {
+        return false;
+    }
+    assert!(!m.is_content_secret);
+    if m.message_id.is_scheduled() {
+        return false;
+    }
+    if !is_copy && !m.message_id.is_server() && !is_ephemeral_message(m) {
+        return false;
+    }
+    match from_dialog_id.get_type() {
+        DialogType::User | DialogType::Chat | DialogType::Channel => {}
+        DialogType::SecretChat => return false,
+        DialogType::None => unreachable!(),
+    }
+    let content = get_message_actual_content(m);
+    if !crate::message_content::can_forward_message_content(ctx.content_context(), content, is_copy)
+    {
+        return false;
+    }
+    if !(is_copy && ctx.is_bot()) && get_message_has_protected_content(ctx, from_dialog_id, m) {
+        return false;
+    }
+    true
+}
+
+/// `MessagesManager::can_reply_to_message` (MessagesManager.cpp:8311-8328).
+pub fn can_reply_to_message(
+    ctx: &dyn SendMessageContext,
+    d: &Dialog,
+    message_id: MessageId,
+    m: Option<&Message>,
+) -> bool {
+    let dialog_id = d.dialog_id;
+    if m.is_some_and(is_ephemeral_message) {
+        let m = m.unwrap();
+        return m.ephemeral_message_id.is_valid() && !m.is_outgoing;
+    }
+    if !ctx.is_bot()
+        && let Some(m) = m
+        && m.is_topic_message
+        && d.is_forum
+    {
+        let forum_topic_id = ForumTopicId::from_top_thread_message_id(m.top_thread_message_id);
+        if !ctx.can_send_message_to_forum_topic(dialog_id, forum_topic_id) {
+            return false;
+        }
+    }
+    message_id.is_valid()
+        && !(message_id == MessageId::from_server_message_id(ServerMessageId::new(1))
+            && dialog_id.get_type() == DialogType::Channel)
+        && !message_id.is_yet_unsent()
+        && (!message_id.is_local() || dialog_id.get_type() == DialogType::SecretChat)
+        && ctx.can_send_message_to_dialog(dialog_id).is_ok()
+}
+
+/// `MessagesManager::can_reply_to_message_in_another_dialog`
+/// (MessagesManager.cpp:8329-8334).
+pub fn can_reply_to_message_in_another_dialog(
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    m: Option<&Message>,
+    can_be_forwarded: bool,
+) -> bool {
+    can_be_forwarded
+        && m.is_some_and(|m| m.message_id.is_server())
+        && m.is_none_or(|m| m.ephemeral_message.is_none())
+        && !ctx.content_context().is_broadcast_channel_dialog(dialog_id)
+        && !(m.is_some_and(|m| {
+            m.message_id == MessageId::from_server_message_id(ServerMessageId::new(1))
+        }) && dialog_id.get_type() == DialogType::Channel)
+}
+
+/// `MessageQuote::MessageQuote(Td *, td_api::InputTextQuote)`
+/// (MessageQuote.cpp:54-70) — the input quote parse behind the
+/// `inputMessageReplyToMessage`/`...ExternalMessage` arms.
+fn get_message_quote_from_input(
+    ctx: &mut dyn SendMessageContext,
+    quote: Option<td_api::InputTextQuote>,
+) -> MessageQuote {
+    let Some(quote) = quote else {
+        return MessageQuote::default();
+    };
+    let mut ltrim_count = 0i32;
+    let my_dialog_id = ctx.get_my_dialog_id();
+    let always_parse_markdown = ctx
+        .content_context()
+        .get_option_boolean("always_parse_markdown", false);
+    let session_count = ctx.content_context().get_option_integer("session_count", 0) as i32;
+    let can_use_premium_custom_emoji_in_dialog = ctx
+        .content_context()
+        .can_use_premium_custom_emoji_in_dialog(my_dialog_id);
+    let mut user_manager = crate::message_content::ContextUserManager::new(ctx.content_context());
+    let r_text = crate::message_entity::get_formatted_text_of_input(
+        Some(&mut user_manager),
+        crate::message_content::to_message_entity_dialog_id(my_dialog_id),
+        quote.text,
+        ctx.is_bot(),
+        true,
+        true,
+        false,
+        Some(&mut ltrim_count),
+        always_parse_markdown,
+        session_count,
+        Some(&mut |custom_emoji_id, is_premium| {
+            is_premium
+                || ctx
+                    .content_context()
+                    .is_premium_custom_emoji(custom_emoji_id)
+        }),
+        can_use_premium_custom_emoji_in_dialog,
+    );
+    let text = match r_text {
+        Result::Ok(text) if !text.text.is_empty() => text,
+        _ => return MessageQuote::default(),
+    };
+    let mut position = quote.position;
+    if (0..=1_000_000).contains(&position) {
+        // some unreasonably big bound
+        position += ltrim_count;
+    } else {
+        position = 0;
+    }
+    MessageQuote {
+        text,
+        position,
+        is_manual: false,
+    }
+}
+
+/// `RepliedMessageInfo::RepliedMessageInfo(Td *, const MessageInputReplyTo &,
+/// DialogId, const MessageTopic &)` (RepliedMessageInfo.cpp:142-199) — the
+/// send-path ctor. The same-chat/ephemeral legs are exact; the cross-chat
+/// content embedding rides the [`SendMessageContext::get_forwarded_message_info`]
+/// seam (M.10.11's forward path).
+pub fn replied_message_info_from_input_reply_to(
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    input_reply_to: &MessageInputReplyTo,
+    // the C++ reads the topic only inside the cross-chat origin rewrite
+    // (RepliedMessageInfo.cpp:193-198), which rides the
+    // get_forwarded_message_info seam (M.10.11)
+    _message_topic: &MessageTopic,
+) -> RepliedMessageInfo {
+    let mut result = RepliedMessageInfo::default();
+    if !input_reply_to.message_id.is_valid() && !input_reply_to.message_id.is_valid_scheduled() {
+        if input_reply_to.ephemeral_message_id.is_valid() {
+            result.message_id = ctx.get_message_id_of_ephemeral_message_id(
+                dialog_id,
+                input_reply_to.ephemeral_message_id,
+            );
+        }
+        return result;
+    }
+    result.message_id = input_reply_to.message_id;
+    result.quote = input_reply_to.quote.clone();
+    result.todo_item_id = input_reply_to.todo_item_id;
+    result.poll_option_id = input_reply_to.poll_option_id.clone();
+    if input_reply_to.dialog_id != DialogId::default() && input_reply_to.message_id.is_valid() {
+        let Some(info) =
+            ctx.get_forwarded_message_info(input_reply_to.dialog_id, input_reply_to.message_id)
+        else {
+            // the C++ `*this = {}` reset when the replied message cannot be
+            // loaded (RepliedMessageInfo.cpp:152-156)
+            return RepliedMessageInfo::default();
+        };
+        result.origin_date = info.origin_date;
+        result.origin = info.origin;
+        result.content = info.content;
+        // the automatic-quote embedding, the Text-content strip and the
+        // origin-id rewrite (RepliedMessageInfo.cpp:158-198) ride the same
+        // M.10.11 forward seam with the info fetch
+    }
+    result
+}
+
+/// `MessagesManager::can_send_message` (MessagesManager.cpp:21129-21131) —
+/// the direct pass-through kept for the call-shape parity.
+pub fn can_send_message(
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+) -> Result<(), (i32, String)> {
+    ctx.can_send_message_to_dialog(dialog_id)
+}
+
+/// `MessagesManager::get_message_to_send` (MessagesManager.cpp:21096-21118)
+/// — creates the outgoing message, assigns its random id and inserts it
+/// through `add_message_to_dialog`. The wire query stays the M.10.9 seam.
+#[allow(clippy::too_many_arguments)]
+pub fn get_message_to_send(
+    ctx: &mut dyn SendMessageContext,
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    reactions_ctx: &dyn DialogReactionsContext,
+    dialog_id: DialogId,
+    message_topic: &MessageTopic,
+    input_reply_to: MessageInputReplyTo,
+    options: &MessageSendOptions,
+    content: MessageContent,
+    invert_media: bool,
+    need_update_dialog_pos: &mut bool,
+    suppress_reply_info: bool,
+    forward_info: Option<MessageForwardInfo>,
+    real_forward_from_dialog_id: DialogId,
+    is_copy: bool,
+    send_as_dialog_id: DialogId,
+    is_quick_reply_message: bool,
+) -> MessageFullId {
+    let message = {
+        let d = manager
+            .get_dialog_mut(dialog_id)
+            .expect("get_message_to_send without the dialog");
+        d.was_opened = true;
+        create_message_to_send(
+            ctx,
+            d,
+            message_topic,
+            input_reply_to,
+            options,
+            content,
+            invert_media,
+            suppress_reply_info,
+            forward_info,
+            real_forward_from_dialog_id,
+            is_copy,
+            send_as_dialog_id,
+            is_quick_reply_message,
+        )
+    };
+    let message_id = message.message_id;
+    let random_id = {
+        let d = manager
+            .get_dialog(dialog_id)
+            .expect("get_message_to_send without the dialog");
+        generate_new_random_id(d, &manager.being_sent_messages)
+    };
+    let mut message = message;
+    message.random_id = random_id;
+
+    assert!(
+        ctx.have_input_peer_read(dialog_id, true),
+        "have_input_peer(Read) failed for {dialog_id:?} in get_message_to_send"
+    );
+    let result = add_message_to_dialog(
+        global,
+        manager,
+        reactions_ctx,
+        ctx,
+        dialog_id,
+        message,
+        need_update_dialog_pos,
+        "send message",
+    );
+    let result_full_id = match result {
+        Result::Ok(full_id) => full_id,
+        Result::Err(fail_reason) => {
+            panic!("LOG_CHECK failed in get_message_to_send: {message_id:?} {fail_reason}")
+        }
+    };
+    if options.update_stickersets_order && !ctx.is_bot() {
+        let d = manager
+            .get_dialog(dialog_id)
+            .expect("get_message_to_send without the dialog");
+        if let Some(result_message) = get_message_in_dialog(d, result_full_id.get_message_id())
+            && let Some(content) = result_message.content.as_ref()
+        {
+            crate::message_content::move_message_content_sticker_set_to_top(
+                ctx.content_context_mut(),
+                content,
+            );
+        }
+    }
+    result_full_id
+}
+
+/// `MessagesManager::get_message_input_reply_to` (MessagesManager.cpp:21331-21335).
+pub fn get_message_input_reply_to(m: &Message) -> &MessageInputReplyTo {
+    assert!(!m.message_id.is_any_server());
+    &m.input_reply_to
+}
+
+/// `MessagesManager::get_message_random_id(MessageFullId)`
+/// (MessagesManager.cpp:21337-21343) — the db-load leg of
+/// `get_dialog_force` is the dialog-db receive seam.
+pub fn get_message_random_id(manager: &MessagesManager, message_full_id: MessageFullId) -> i64 {
+    let Some(d) = manager.get_dialog(message_full_id.get_dialog_id()) else {
+        return 0;
+    };
+    get_message_random_id_in_dialog(d, message_full_id.get_message_id())
+}
+
+/// `MessagesManager::get_message_random_id(Dialog *, MessageId)`
+/// (MessagesManager.cpp:21345-21351).
+pub fn get_message_random_id_in_dialog(d: &Dialog, message_id: MessageId) -> i64 {
+    get_message_in_dialog(d, message_id).map_or(0, |m| m.random_id)
+}
+
+/// `MessagesManager::create_message_input_reply_to(DialogId, ...)`
+/// (MessagesManager.cpp:20892-20896) — the wrapper over the loaded dialog.
+pub fn create_message_input_reply_to(
+    ctx: &mut dyn SendMessageContext,
+    manager: &MessagesManager,
+    dialog_id: DialogId,
+    message_topic: &MessageTopic,
+    reply_to: Option<td_api::InputMessageReplyTo>,
+    for_draft: bool,
+) -> MessageInputReplyTo {
+    let d = manager
+        .get_dialog(dialog_id)
+        .expect("create_message_input_reply_to without the dialog");
+    create_message_input_reply_to_full(ctx, manager, d, message_topic, reply_to, for_draft, false)
+}
+
+/// `MessagesManager::create_message_input_reply_to(Dialog *, ...)`
+/// (MessagesManager.cpp:21149-21314) — the four td_api arms. Every guard
+/// SILENTLY DROPS (`return {}`) like the C++; the user-visible errors live
+/// in the M.10.10 send entry ladder.
+#[allow(clippy::too_many_arguments)]
+pub fn create_message_input_reply_to_full(
+    ctx: &mut dyn SendMessageContext,
+    manager: &MessagesManager,
+    d: &Dialog,
+    message_topic: &MessageTopic,
+    reply_to: Option<td_api::InputMessageReplyTo>,
+    for_draft: bool,
+    for_ephemeral_message: bool,
+) -> MessageInputReplyTo {
+    let implicit_reply_to_message_id = message_topic.get_implicit_reply_to_message_id(ctx);
+    if implicit_reply_to_message_id.is_valid()
+        && !have_message_force(
+            d,
+            implicit_reply_to_message_id,
+            "create_message_input_reply_to 1",
+        )
+    {
+        tracing::info!(
+            "Have implicit reply to unknown {}",
+            DisplayMessageId(implicit_reply_to_message_id)
+        );
+    }
+    assert!(
+        implicit_reply_to_message_id == MessageId::default()
+            || implicit_reply_to_message_id.is_server()
+    );
+    let Some(reply_to) = reply_to else {
+        if !for_draft && implicit_reply_to_message_id.is_valid() {
+            return MessageInputReplyTo::regular(implicit_reply_to_message_id);
+        }
+        return MessageInputReplyTo::default();
+    };
+    match reply_to {
+        td_api::InputMessageReplyTo::inputMessageReplyToStory(reply_to_story) => {
+            if for_draft || for_ephemeral_message {
+                return MessageInputReplyTo::default();
+            }
+            let story_id = StoryId::new(reply_to_story.story_id);
+            let sender_dialog_id = DialogId::new(reply_to_story.story_poster_chat_id);
+            if d.dialog_id != sender_dialog_id
+                || ctx
+                    .content_context()
+                    .is_broadcast_channel_dialog(sender_dialog_id)
+            {
+                tracing::info!(
+                    "Ignore reply to story from {:?} in a wrong {:?}",
+                    sender_dialog_id,
+                    d.dialog_id
+                );
+                return MessageInputReplyTo::default();
+            }
+            if !story_id.is_server() {
+                tracing::info!("Ignore reply to invalid story {:?}", story_id);
+                return MessageInputReplyTo::default();
+            }
+            if !message_topic.is_empty() {
+                tracing::info!("Story replies can't be sent to a specific topic");
+                return MessageInputReplyTo::default();
+            }
+            MessageInputReplyTo {
+                story_full_id: StoryFullId::new(sender_dialog_id, story_id),
+                ..MessageInputReplyTo::default()
+            }
+        }
+        td_api::InputMessageReplyTo::inputMessageReplyToMessage(reply_to_message) => {
+            let mut message_id = MessageId::new(reply_to_message.message_id);
+            if !message_id.is_valid() {
+                if message_id == MessageId::default()
+                    && !for_draft
+                    && implicit_reply_to_message_id.is_valid()
+                {
+                    return MessageInputReplyTo::regular(implicit_reply_to_message_id);
+                }
+                return MessageInputReplyTo::default();
+            }
+            message_id = get_persistent_message_id(manager, d, message_id);
+            let checklist_task_id = reply_to_message.checklist_task_id.max(0);
+            let mut poll_option_id = reply_to_message.poll_option_id;
+            if crate::misc::clean_input_string(&poll_option_id).is_none() {
+                poll_option_id.clear();
+            }
+            // `get_message_force(d, message_id, "create_message_input_reply_to 2")`
+            // — the memory probe; the db load is the dialog-db receive seam
+            let mut m = get_message_in_dialog(d, message_id);
+            if !can_reply_to_message(ctx, d, message_id, m)
+                || (!for_ephemeral_message && m.is_some_and(is_ephemeral_message))
+            {
+                message_id = MessageId::default();
+                m = None;
+            }
+            let Some(m) = m else {
+                if message_id.is_server()
+                    && d.dialog_id.get_type() != DialogType::SecretChat
+                    && d.last_new_message_id.is_valid()
+                    && message_id > d.last_new_message_id
+                    && d.notification_info
+                        .as_ref()
+                        .is_some_and(|notification_info| {
+                            message_id <= notification_info.max_push_notification_message_id
+                        })
+                {
+                    // allow to reply to yet unreceived server message in the
+                    // same chat
+                    return MessageInputReplyTo {
+                        message_id,
+                        ephemeral_message_id: EphemeralMessageId::default(),
+                        dialog_id: DialogId::default(),
+                        quote: get_message_quote_from_input(ctx, reply_to_message.quote),
+                        todo_item_id: checklist_task_id,
+                        poll_option_id,
+                        debug_source: "create_message_input_reply_to 4",
+                        story_full_id: StoryFullId::default(),
+                    };
+                }
+                if !for_draft && implicit_reply_to_message_id.is_valid() {
+                    return MessageInputReplyTo::regular(implicit_reply_to_message_id);
+                }
+                tracing::info!(
+                    "Can't find {} in {:?}",
+                    DisplayMessageId(message_id),
+                    d.dialog_id
+                );
+
+                // TODO local replies to local messages can be allowed
+                // TODO replies to yet unsent messages can be allowed with
+                // special handling of them on application restart
+                return MessageInputReplyTo::default();
+            };
+
+            // the replied message must be in the same topic; check this if
+            // possible
+            if !message_topic.is_empty() {
+                let reply_message_topic = get_message_topic(ctx, d.dialog_id, m);
+                if *message_topic != reply_message_topic {
+                    if !message_topic.is_thread()
+                        || !reply_message_topic.is_empty()
+                        || m.media_album_id == 0
+                    {
+                        tracing::info!("Ignore reply to message from a different topic");
+                        return MessageInputReplyTo::default();
+                    }
+                    assert!(d.dialog_id.get_type() == DialogType::Channel);
+
+                    // if the message is in an album and not in the thread,
+                    // it can be in the album of the top thread message
+                    // `get_message_force(..., "create_message_input_reply_to 3")`
+                    // — the memory probe; the db load is the dialog-db seam
+                    let top_m = get_message_in_dialog(d, implicit_reply_to_message_id);
+                    if top_m.is_some_and(|top_m| {
+                        top_m.media_album_id != m.media_album_id
+                            || top_m.top_thread_message_id != top_m.message_id
+                    }) {
+                        tracing::info!("Ignore reply to an album message from a different topic");
+                        return MessageInputReplyTo::default();
+                    }
+                }
+            }
+
+            let mut checklist_task_id = checklist_task_id;
+            let content_type = m
+                .content
+                .as_ref()
+                .expect("message without content")
+                .get_type();
+            if checklist_task_id != 0 && content_type != MessageContentType::ToDoList {
+                checklist_task_id = 0;
+            }
+            if !poll_option_id.is_empty() && content_type != MessageContentType::Poll {
+                poll_option_id.clear();
+            }
+            MessageInputReplyTo {
+                message_id: m.message_id,
+                ephemeral_message_id: m.ephemeral_message_id,
+                dialog_id: DialogId::default(),
+                quote: get_message_quote_from_input(ctx, reply_to_message.quote),
+                todo_item_id: checklist_task_id,
+                poll_option_id,
+                debug_source: "create_message_input_reply_to 5",
+                story_full_id: StoryFullId::default(),
+            }
+        }
+        td_api::InputMessageReplyTo::inputMessageReplyToExternalMessage(reply_to_message) => {
+            if d.dialog_id.get_type() == DialogType::SecretChat || for_ephemeral_message {
+                return MessageInputReplyTo::default();
+            }
+            let reply_dialog_id = DialogId::new(reply_to_message.chat_id);
+            // `get_dialog_force(reply_dialog_id, "create_message_input_reply_to")`
+            // — the memory probe; the db-load/create leg is the dialog-db
+            // receive seam
+            let Some(reply_d) = manager.get_dialog(reply_dialog_id) else {
+                return MessageInputReplyTo::default();
+            };
+            let message_id = get_persistent_message_id(
+                manager,
+                reply_d,
+                MessageId::new(reply_to_message.message_id),
+            );
+            // `get_message_force(reply_d, message_id, "create_message_input_reply_to 2")`
+            // — the memory probe; the db load is the dialog-db receive seam
+            let m = get_message_in_dialog(reply_d, message_id);
+            if !can_reply_to_message_in_another_dialog(
+                ctx,
+                reply_dialog_id,
+                m,
+                can_forward_message(ctx, reply_dialog_id, m, false),
+            ) {
+                tracing::info!(
+                    "Can't reply in another chat {} in {:?}",
+                    DisplayMessageId(message_id),
+                    reply_d.dialog_id
+                );
+                return MessageInputReplyTo::default();
+            }
+            let mut checklist_task_id = reply_to_message.checklist_task_id.max(0);
+            if let Some(m) = m
+                && checklist_task_id != 0
+                && m.content
+                    .as_ref()
+                    .expect("message without content")
+                    .get_type()
+                    != MessageContentType::ToDoList
+            {
+                checklist_task_id = 0;
+            }
+            let mut poll_option_id = reply_to_message.poll_option_id;
+            if crate::misc::clean_input_string(&poll_option_id).is_none()
+                || m.is_some_and(|m| {
+                    m.content
+                        .as_ref()
+                        .expect("message without content")
+                        .get_type()
+                        != MessageContentType::Poll
+                })
+            {
+                poll_option_id.clear();
+            }
+            MessageInputReplyTo {
+                message_id: m.map_or(MessageId::default(), |m| m.message_id),
+                ephemeral_message_id: EphemeralMessageId::default(),
+                dialog_id: reply_dialog_id,
+                quote: get_message_quote_from_input(ctx, reply_to_message.quote),
+                todo_item_id: checklist_task_id,
+                poll_option_id,
+                debug_source: "create_message_input_reply_to 6",
+                story_full_id: StoryFullId::default(),
+            }
+        }
+        td_api::InputMessageReplyTo::inputMessageReplyToEphemeralMessage(reply_to_message) => {
+            let ephemeral_message_id =
+                EphemeralMessageId::new(reply_to_message.ephemeral_message_id);
+            if !for_ephemeral_message || !ctx.is_bot() || !ephemeral_message_id.is_valid() {
+                return MessageInputReplyTo::default();
+            }
+            MessageInputReplyTo {
+                message_id: MessageId::default(),
+                ephemeral_message_id,
+                dialog_id: DialogId::default(),
+                quote: MessageQuote::default(),
+                todo_item_id: 0,
+                poll_option_id: String::new(),
+                debug_source: "create_message_input_reply_to 7",
+                story_full_id: StoryFullId::default(),
+            }
+        }
+    }
+}
+
+/// `MessagesManager::SendMessageLogEvent` (MessagesManager.cpp:21696-21719)
+/// — the durable half-sent message: `dialog_id` + the full `Message` store.
+/// The framing matches the C++ `get_log_event_storer` exactly (the log-event
+/// version word, then `td::store(dialog_id)` + `td::store(*m)`); the store
+/// side borrows the live message like the C++ `m_in`.
+pub struct SendMessageLogEvent {
+    pub dialog_id: DialogId,
+    pub message: Box<Message>,
+}
+
+impl SendMessageLogEvent {
+    /// `SendMessageLogEvent::store` (MessagesManager.cpp:21708-21712).
+    pub fn store(
+        dialog_id: DialogId,
+        m: &Message,
+        storage: &dyn crate::message_content::MessageContentStorage,
+        time: &crate::user_manager::TimeCtx,
+        out: &mut Vec<u8>,
+    ) {
+        crate::store_parse::store_log_event_version(out);
+        dialog_id.store(out);
+        m.store(storage, time, out);
+    }
+
+    /// The binlog `add` payload for the live message.
+    pub fn store_to_bytes(
+        dialog_id: DialogId,
+        m: &Message,
+        storage: &dyn crate::message_content::MessageContentStorage,
+        time: &crate::user_manager::TimeCtx,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        Self::store(dialog_id, m, storage, time, &mut bytes);
+        bytes
+    }
+
+    /// `SendMessageLogEvent::parse` (MessagesManager.cpp:21714-21718).
+    pub fn parse_from(
+        parser: &mut Parser,
+        storage: &mut dyn crate::message_content::MessageContentStorage,
+        time: &crate::user_manager::TimeCtx,
+    ) -> Result<SendMessageLogEvent, &'static str> {
+        let dialog_id = DialogId::parse_from(parser)?;
+        let message = Message::parse_from(parser, storage, time)?;
+        Ok(SendMessageLogEvent {
+            dialog_id,
+            message: Box::new(message),
+        })
+    }
+
+    /// `log_event_parse(SendMessageLogEvent, event.get_data())` — the binlog
+    /// event body with the version word.
+    pub fn parse_from_bytes(
+        input: &[u8],
+        storage: &mut dyn crate::message_content::MessageContentStorage,
+        time: &crate::user_manager::TimeCtx,
+    ) -> Result<SendMessageLogEvent, &'static str> {
+        let mut parser = Parser::new_log_event(input)?;
+        let log_event = Self::parse_from(&mut parser, storage, time)?;
+        parser.fetch_end()?;
+        Ok(log_event)
+    }
+}
+
+/// `MessagesManager::save_send_message_log_event`
+/// (MessagesManager.cpp:21980-21991) — the event FIRST half of the
+/// save-then-send crash-consistency contract (21800-21801).
+pub fn save_send_message_log_event(
+    global: &mut crate::global::Global,
+    dialog_id: DialogId,
+    m: &mut Message,
+) {
+    if !global.use_message_database() {
+        return;
+    }
+
+    tracing::info!(
+        "Save {}:{} to binlog",
+        dialog_id.get(),
+        DisplayMessageId(m.message_id)
+    );
+    let time = crate::user_manager::TimeCtx::from_global(global);
+    let data = SendMessageLogEvent::store_to_bytes(dialog_id, m, &MessageDbStorageBridge, &time);
+    assert!(m.send_message_log_event_id == 0);
+    m.send_message_log_event_id = global
+        .td_db()
+        .binlog()
+        .add(tddb::td_db::LOG_EVENT_HANDLER_TYPE_SEND_MESSAGE, &data);
+}
+
+/// `MessagesManager::get_message_reply_to_random_id`
+/// (MessagesManager.cpp:32205-32215).
+pub fn get_message_reply_to_random_id(d: &Dialog, m: &Message) -> i64 {
+    let same_chat_reply_to_message_id = m
+        .replied_message_info
+        .get_same_chat_reply_to_message_id(true);
+    if same_chat_reply_to_message_id != MessageId::default()
+        && m.message_id.is_yet_unsent()
+        && (d.dialog_id.get_type() == DialogType::SecretChat
+            || same_chat_reply_to_message_id.is_yet_unsent())
+        && let Some(replied_m) = get_message_in_dialog(d, same_chat_reply_to_message_id)
+    {
+        return replied_m.random_id;
+    }
+    0
+}
+
+/// `MessagesManager::update_message_reply_to_message_id`
+/// (MessagesManager.cpp:35823-35840) — the replied-id rewrite; the reply
+/// registry walks (`unregister/register_message_reply`) are the M.10.9
+/// container seam.
+pub fn update_message_reply_to_message_id(
+    d: &mut Dialog,
+    m: &mut Message,
+    reply_to_message_id: MessageId,
+    _source: &'static str,
+) {
+    tracing::info!(
+        "Update identifier of replied message of {}:{} to {}",
+        d.dialog_id.get(),
+        DisplayMessageId(m.message_id),
+        DisplayMessageId(reply_to_message_id)
+    );
+    // `unregister_message_reply` (35827) — the M.10.9 container seam
+    m.replied_message_info.set_message_id(reply_to_message_id);
+    if !m.message_id.is_any_server() {
+        m.input_reply_to
+            .set_message_id(reply_to_message_id, "restore_message_reply_to_message_id");
+    }
+    // `register_message_reply` (35835) — the same seam
+}
+
+/// `MessagesManager::set_message_reply` (MessagesManager.cpp:35822-35838) —
+/// the implicit-reply reset leg of the restore.
+fn set_message_reply(
+    ctx: &dyn SendMessageContext,
+    d: &mut Dialog,
+    m: &mut Message,
+    input_reply_to: MessageInputReplyTo,
+) {
+    tracing::info!(
+        "Update replied message of {}:{}",
+        d.dialog_id.get(),
+        DisplayMessageId(m.message_id)
+    );
+    m.replied_message_info = replied_message_info_from_input_reply_to(
+        ctx,
+        d.dialog_id,
+        &input_reply_to,
+        &get_message_topic(ctx, d.dialog_id, m),
+    );
+    m.reply_to_story_full_id = StoryFullId::default();
+    m.reply_to_random_id = get_message_reply_to_random_id(d, m);
+    if !m.message_id.is_any_server() {
+        m.input_reply_to = input_reply_to;
+    }
+}
+
+/// `MessagesManager::restore_message_reply_to_message_id`
+/// (MessagesManager.cpp:35857-35880) — the crash-replay reply repair: a
+/// replied-to yet-unsent id is rewritten to its persisted form, or the reply
+/// resets to the implicit topic reply.
+pub fn restore_message_reply_to_message_id(
+    ctx: &dyn SendMessageContext,
+    d: &mut Dialog,
+    m: &mut Message,
+) {
+    let input_reply_to_is_empty = get_message_input_reply_to(m).is_empty();
+    if input_reply_to_is_empty {
+        return;
+    }
+    let replied_message_full_id =
+        get_message_input_reply_to(m).get_reply_message_full_id(d.dialog_id);
+    let replied_message_id = replied_message_full_id.get_message_id();
+    if replied_message_id == MessageId::default() || !replied_message_id.is_yet_unsent() {
+        return;
+    }
+    assert!(replied_message_full_id.get_dialog_id() == d.dialog_id);
+    let log_check_reply_full_id = m
+        .replied_message_info
+        .get_reply_message_full_id(d.dialog_id, true);
+    assert!(
+        log_check_reply_full_id == replied_message_full_id,
+        "restore_message_reply_to_message_id reply mismatch: {replied_message_full_id:?} vs {log_check_reply_full_id:?}"
+    );
+    let message_id = get_message_id_by_random_id(
+        ctx,
+        d,
+        m.reply_to_random_id,
+        "restore_message_reply_to_message_id",
+    );
+    if (message_id.is_valid() || message_id.is_valid_scheduled())
+        && !message_id.is_local()
+        && (is_message_forward(m) || !message_id.is_yet_unsent())
+    {
+        update_message_reply_to_message_id(d, m, message_id, "restore_message_reply_to_message_id");
+    } else {
+        let implicit_reply_to_message_id =
+            get_message_topic(ctx, d.dialog_id, m).get_implicit_reply_to_message_id(ctx);
+        assert!(
+            implicit_reply_to_message_id == MessageId::default()
+                || implicit_reply_to_message_id.is_server()
+        );
+        set_message_reply(
+            ctx,
+            d,
+            m,
+            MessageInputReplyTo::regular(implicit_reply_to_message_id),
+        );
+    }
+}
+
+/// `MessagesManager::do_send_message` (MessagesManager.cpp:22023-22191) —
+/// the wire/files plane: the messages.sendMessage query, the upload
+/// scheduling, the secret-media encryption. It is M.10.9's
+/// `on_message_sent` flip (net + Files owners); M.10.8 trace-logs the call.
+pub fn do_send_message(dialog_id: DialogId, m: &Message) {
+    tracing::info!(
+        "do_send_message seam: {}:{} (random_id {}) — the wire query is [blocked: M.10.9 net/files]",
+        dialog_id.get(),
+        DisplayMessageId(m.message_id),
+        m.random_id
+    );
+}
+
+/// `MessagesManager::continue_send_message` (MessagesManager.cpp:35882-35941)
+/// — the durable-event continuation: re-allocate the id, repair the reply,
+/// re-add the message and re-gate the send.
+#[allow(clippy::too_many_arguments)]
+pub fn continue_send_message(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    reactions_ctx: &dyn DialogReactionsContext,
+    ctx: &mut dyn SendMessageContext,
+    dialog_id: DialogId,
+    mut message: Box<Message>,
+    need_update_dialog_pos: &mut bool,
+    log_event_id: u64,
+) -> Option<MessageFullId> {
+    assert!(log_event_id != 0);
+    assert!(message.content.is_some());
+
+    // `get_dialog_force(dialog_id, "continue_send_message")` — the db-load
+    // leg is the dialog-db receive seam
+    if manager.get_dialog(dialog_id).is_none() {
+        log_error!("Can't find {dialog_id:?} to continue send a message");
+        global.td_db().binlog().erase(log_event_id);
+        return None;
+    }
+    if !ctx.have_input_peer_read(dialog_id, true) {
+        global.td_db().binlog().erase(log_event_id);
+        return None;
+    }
+
+    tracing::info!(
+        "Continue to send {} to {:?} initially sent at {} from binlog",
+        DisplayMessageId(message.message_id),
+        dialog_id,
+        message.send_date
+    );
+
+    {
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        d.was_opened = true;
+    }
+
+    let now = ctx.unix_time();
+    {
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        if message.message_id.is_scheduled() {
+            message.message_id = get_next_yet_unsent_scheduled_message_id(d, message.date);
+        } else {
+            message.message_id = get_next_yet_unsent_message_id(d, ctx.is_bot());
+            message.date = now;
+        }
+    }
+
+    {
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        restore_message_reply_to_message_id(ctx, d, &mut message);
+    }
+
+    let result_full_id = add_message_to_dialog(
+        global,
+        manager,
+        reactions_ctx,
+        ctx,
+        dialog_id,
+        message,
+        need_update_dialog_pos,
+        "continue_send_message",
+    );
+    let result_full_id = match result_full_id {
+        Result::Ok(full_id) => full_id,
+        Result::Err(fail_reason) => {
+            panic!("CHECK failed in continue_send_message: {fail_reason}")
+        }
+    };
+
+    let result_message = manager
+        .get_dialog(dialog_id)
+        .and_then(|d| get_message_in_dialog(d, result_full_id.get_message_id()))
+        .map(|m| {
+            (
+                m.message_id.is_scheduled(),
+                m.send_date,
+                is_ephemeral_message(m),
+            )
+        });
+    let (is_scheduled_result, send_date, result_is_ephemeral) =
+        result_message.expect("continue_send_message lost the added message");
+    if is_scheduled_result {
+        // `send_update_chat_has_scheduled_messages` (35920) — the update
+        // plane is the M.10.9 seam
+        tracing::info!(
+            "send_update_chat_has_scheduled_messages seam: {dialog_id:?} after continue_send_message"
+        );
+    }
+
+    let mut can_send_status = if result_is_ephemeral {
+        Result::Ok(())
+    } else {
+        ctx.can_send_message_to_dialog(dialog_id)
+    };
+    if can_send_status.is_ok()
+        && send_date < now - MAX_RESEND_DELAY
+        && dialog_id != DialogId::from_user_id(ctx.content_context().get_my_id())
+    {
+        can_send_status = Result::Err((
+            400,
+            "Message is too old to be re-sent automatically".to_string(),
+        ));
+    }
+    if let Result::Err((error_code, error_message)) = &can_send_status {
+        tracing::info!(
+            "Can't continue to send a message to {dialog_id:?}: ({error_code}, {error_message})"
+        );
+
+        // `send_update_new_message` (35931) — the update plane is the M.10.9
+        // seam; `fail_send_message` (35936) — the error/resend state machine
+        // is M.10.9
+        tracing::info!(
+            "fail_send_message seam: {}:{} failed with ({error_code}, {error_message})",
+            dialog_id.get(),
+            DisplayMessageId(result_full_id.get_message_id())
+        );
+        return None;
+    }
+
+    Some(result_full_id)
+}
+
+/// `MAX_RESEND_DELAY` (MessagesManager.h:1702).
+const MAX_RESEND_DELAY: i32 = 86400;
+
+/// The `LogEvent::HandlerType::SendMessage` binlog replay arm
+/// (MessagesManager.cpp:35951-35991) — `on_binlog_events`'s half-sent
+/// recovery: erase when the binlog predates the dialog db, erase
+/// Unsupported-content events with an error log, otherwise dup the content
+/// for the Send direction and continue the send.
+pub fn replay_send_message_log_event(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    reactions_ctx: &dyn DialogReactionsContext,
+    ctx: &mut dyn SendMessageContext,
+    event: &tddb::binlog::BinlogEvent,
+) {
+    // `have_old_message_database` (35947) — the binlog is older than the
+    // dialog db only when the dialog db was never created
+    let have_old_message_database =
+        global.use_message_database() && !global.td_db().was_dialog_db_created();
+    assert!(event.id != 0);
+    if !have_old_message_database {
+        global.td_db().binlog().erase(event.id);
+        return;
+    }
+
+    let time = crate::user_manager::TimeCtx::from_global(global);
+    let log_event =
+        SendMessageLogEvent::parse_from_bytes(event.get_data(), &mut MessageDbStorageBridge, &time)
+            .expect("corrupt SendMessageLogEvent in the binlog");
+
+    let dialog_id = log_event.dialog_id;
+    let mut message = log_event.message;
+    message.send_message_log_event_id = event.id;
+
+    if message
+        .content
+        .as_ref()
+        .expect("message without content")
+        .get_type()
+        == MessageContentType::Unsupported
+    {
+        log_error!("Message content is invalid: {:?}", event.get_data());
+        global.td_db().binlog().erase(event.id);
+        return;
+    }
+
+    // `dependencies.add_dialog_dependencies/add_message_dependencies +
+    // resolve_force` (35970-35973) — the dialog-db receive seam; the
+    // in-memory skeleton stands in, like M.10.6's replay arm
+
+    let content = message.content.as_ref().expect("message without content");
+    message.content = crate::message_content::dup_message_content(
+        ctx.content_context_mut(),
+        dialog_id,
+        content,
+        crate::message_content::MessageContentDupType::Send,
+        false,
+        crate::message_content::MessageCopyOptions::default(),
+    );
+
+    let mut need_update_dialog_pos = false;
+    let result_full_id = continue_send_message(
+        global,
+        manager,
+        reactions_ctx,
+        ctx,
+        dialog_id,
+        message,
+        &mut need_update_dialog_pos,
+        event.id,
+    );
+    if let Some(result_full_id) = result_full_id {
+        // uses send_closure_later internally
+        let result_message = manager
+            .get_dialog(dialog_id)
+            .and_then(|d| get_message_in_dialog(d, result_full_id.get_message_id()))
+            .expect("replayed message vanished");
+        do_send_message(dialog_id, result_message);
+        // `send_update_new_message` (35984) — the update plane is the M.10.9
+        // seam; the pos update (35985-35987) is the M.10.12 seam
+        tracing::info!(
+            "send_update_new_message seam: {dialog_id:?} replayed {}",
+            DisplayMessageId(result_full_id.get_message_id())
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -21202,5 +23488,1699 @@ mod tests {
             DialogId::default(),
             "the mention pending list is untouched here — the flush's list selection is the M.13 seam"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // M.10.8 — the outgoing send skeleton
+    // -------------------------------------------------------------------
+
+    /// The send-path knobs over the M.10.4 [`TestObjectContext`]: the chat
+    /// manager reads, the send rights and the fake clocks
+    /// `create_message_to_send`/`continue_send_message` consume.
+    struct SendTestContext {
+        inner: TestObjectContext,
+        broadcast_dialogs: HashSet<DialogId>,
+        sign_messages: bool,
+        show_message_sender: bool,
+        anonymous_admin_signature: Option<String>,
+        dialog_titles: HashMap<DialogId, String>,
+        user_titles: HashMap<UserId, String>,
+        secret_chat_ttl: i32,
+        channel_boost_count: i32,
+        monoforum_channel: Option<ChannelId>,
+        linked_channel: Option<ChannelId>,
+        can_send_answer: Result<(), (i32, String)>,
+        have_input_peer_answer: bool,
+        ignore_default_disable_notification: bool,
+        unix_time: i32,
+    }
+
+    impl Default for SendTestContext {
+        fn default() -> SendTestContext {
+            SendTestContext {
+                inner: TestObjectContext::default(),
+                broadcast_dialogs: HashSet::new(),
+                sign_messages: false,
+                show_message_sender: false,
+                anonymous_admin_signature: None,
+                dialog_titles: HashMap::new(),
+                user_titles: HashMap::new(),
+                secret_chat_ttl: 0,
+                channel_boost_count: 0,
+                monoforum_channel: None,
+                linked_channel: None,
+                can_send_answer: Result::Ok(()),
+                have_input_peer_answer: true,
+                ignore_default_disable_notification: false,
+                unix_time: 1_700_000_000,
+            }
+        }
+    }
+
+    impl std::ops::Deref for SendTestContext {
+        type Target = TestObjectContext;
+        fn deref(&self) -> &TestObjectContext {
+            &self.inner
+        }
+    }
+
+    impl std::ops::DerefMut for SendTestContext {
+        fn deref_mut(&mut self) -> &mut TestObjectContext {
+            &mut self.inner
+        }
+    }
+
+    impl MessageObjectContext for SendTestContext {
+        fn content_context(&self) -> &dyn crate::message_content::MessageContentContext {
+            self.inner.content_context()
+        }
+        fn content_context_mut(
+            &mut self,
+        ) -> &mut dyn crate::message_content::MessageContentContext {
+            self.inner.content_context_mut()
+        }
+        fn is_bot(&self) -> bool {
+            self.inner.is_bot
+        }
+        fn now(&self) -> f64 {
+            self.inner.now
+        }
+        fn server_time(&self) -> f64 {
+            self.inner.server_time
+        }
+        fn is_test_dc(&self) -> bool {
+            self.inner.is_test_dc
+        }
+        fn get_restriction_options(&self) -> crate::restriction_reason::RestrictionOptions {
+            self.inner.get_restriction_options()
+        }
+        fn get_message_sender_object_const(
+            &self,
+            sender_user_id: UserId,
+            sender_dialog_id: DialogId,
+            source: &str,
+        ) -> Option<td_api::MessageSender> {
+            self.inner
+                .get_message_sender_object_const(sender_user_id, sender_dialog_id, source)
+        }
+        fn have_min_user(&self, user_id: UserId) -> bool {
+            self.inner.have_min_user(user_id)
+        }
+        fn have_dialog(&self, dialog_id: DialogId) -> bool {
+            self.inner.have_dialog(dialog_id)
+        }
+        fn have_dialog_info(&self, dialog_id: DialogId) -> bool {
+            self.inner.have_dialog_info(dialog_id)
+        }
+        fn have_min_channel(&self, channel_id: ChannelId) -> bool {
+            self.inner.have_min_channel(channel_id)
+        }
+        fn force_create_dialog(&self, dialog_id: DialogId, source: &str) {
+            self.inner.force_create_dialog(dialog_id, source)
+        }
+        fn get_channel_has_linked_channel(&self, _channel_id: ChannelId) -> bool {
+            self.linked_channel.is_some()
+        }
+        fn is_forum_channel(&self, _channel_id: ChannelId) -> bool {
+            false
+        }
+        fn is_megagroup_channel(&self, _channel_id: ChannelId) -> bool {
+            false
+        }
+        fn get_channel_linked_channel_id(
+            &self,
+            _channel_id: ChannelId,
+            _source: &str,
+        ) -> ChannelId {
+            self.linked_channel.unwrap_or_default()
+        }
+        fn have_channel_force(&self, _channel_id: ChannelId, _source: &str) -> bool {
+            false
+        }
+        fn have_input_peer_channel(&self, _channel_id: ChannelId) -> bool {
+            false
+        }
+        fn get_user_private_forward_name(&self, _user_id: UserId) -> String {
+            String::new()
+        }
+        fn is_admined_monoforum_channel(&self, _dialog_id: DialogId) -> bool {
+            false
+        }
+        fn is_monoforum_channel_dialog(&self, _dialog_id: DialogId) -> bool {
+            self.monoforum_channel.is_some()
+        }
+        fn get_monoforum_channel_id(&self, _channel_id: ChannelId) -> ChannelId {
+            self.monoforum_channel.unwrap_or_default()
+        }
+        fn channel_can_post_messages(&self, _channel_id: ChannelId) -> bool {
+            true
+        }
+        fn get_dialog_has_protected_content_force(&self, _dialog_id: DialogId) -> bool {
+            false
+        }
+        fn get_forum_topic_id_object(
+            &self,
+            _dialog_id: DialogId,
+            forum_topic_id: ForumTopicId,
+        ) -> i32 {
+            forum_topic_id.get()
+        }
+        fn get_saved_messages_topic_id_object(
+            &self,
+            _dialog_id: DialogId,
+            saved_messages_topic_id: SavedMessagesTopicId,
+        ) -> i64 {
+            saved_messages_topic_id.get_dialog_id().get()
+        }
+        fn get_message_content_media_duration(&self, _content: &MessageContent) -> i32 {
+            -1
+        }
+        fn get_message_sender_object_force(
+            &self,
+            dialog_id: DialogId,
+            _source: &str,
+        ) -> Option<td_api::MessageSender> {
+            self.inner
+                .get_message_sender_object_force(dialog_id, _source)
+        }
+        fn have_channel(&self, _channel_id: ChannelId) -> bool {
+            false
+        }
+        fn get_min_channel(&self, _channel_id: ChannelId) -> Option<MinChannel> {
+            None
+        }
+        fn can_dialog_have_threads(&self, _dialog_id: DialogId) -> bool {
+            false
+        }
+        fn get_message_id_of_ephemeral_message_id(
+            &self,
+            _dialog_id: DialogId,
+            _ephemeral_message_id: EphemeralMessageId,
+        ) -> MessageId {
+            MessageId::default()
+        }
+        fn get_scope_disable_pinned_message_notifications(&self) -> bool {
+            false
+        }
+        fn get_scope_disable_mention_notifications(&self) -> bool {
+            false
+        }
+    }
+
+    impl SendMessageContext for SendTestContext {
+        fn unix_time(&self) -> i32 {
+            self.unix_time
+        }
+        fn is_broadcast_channel_dialog(&self, dialog_id: DialogId) -> bool {
+            self.broadcast_dialogs.contains(&dialog_id)
+        }
+        fn ignore_default_disable_notification(&self) -> bool {
+            self.ignore_default_disable_notification
+        }
+        fn get_channel_sign_messages(&self, _channel_id: ChannelId) -> bool {
+            self.sign_messages
+        }
+        fn get_channel_show_message_sender(&self, _channel_id: ChannelId) -> bool {
+            self.show_message_sender
+        }
+        fn is_anonymous_administrator(&self, _dialog_id: DialogId) -> Option<String> {
+            self.anonymous_admin_signature.clone()
+        }
+        fn get_dialog_title(&self, dialog_id: DialogId) -> String {
+            self.dialog_titles
+                .get(&dialog_id)
+                .cloned()
+                .unwrap_or_default()
+        }
+        fn get_user_title(&self, user_id: UserId) -> String {
+            self.user_titles
+                .get(&user_id)
+                .cloned()
+                .unwrap_or_else(|| format!("user{}", user_id.get()))
+        }
+        fn get_secret_chat_ttl(&self, _secret_chat_id: SecretChatId) -> i32 {
+            self.secret_chat_ttl
+        }
+        fn get_channel_my_boost_count(&self, _channel_id: ChannelId) -> i32 {
+            self.channel_boost_count
+        }
+        fn can_send_message_to_dialog(&self, _dialog_id: DialogId) -> Result<(), (i32, String)> {
+            self.can_send_answer.clone()
+        }
+        fn have_input_peer_read(&self, _dialog_id: DialogId, _allow_secret_chats: bool) -> bool {
+            self.have_input_peer_answer
+        }
+        fn can_send_message_to_forum_topic(
+            &self,
+            _dialog_id: DialogId,
+            _forum_topic_id: ForumTopicId,
+        ) -> bool {
+            true
+        }
+        fn can_be_forum(&self, _dialog_id: DialogId) -> bool {
+            false
+        }
+        fn have_dialog_force(&self, dialog_id: DialogId, _source: &str) -> bool {
+            self.inner.have_dialog(dialog_id)
+        }
+        fn get_my_dialog_id(&self) -> DialogId {
+            DialogId::from_user_id(crate::message_content::MessageContentContext::get_my_id(
+                &self.inner.content,
+            ))
+        }
+        fn get_saved_messages_topic_id_from_raw(&self, topic_id: i64) -> SavedMessagesTopicId {
+            SavedMessagesTopicId::new(DialogId::new(topic_id))
+        }
+    }
+
+    /// A plain non-bot outgoing text send into a user dialog.
+    fn m10_8_send_options() -> MessageSendOptions {
+        MessageSendOptions {
+            ..MessageSendOptions::default()
+        }
+    }
+
+    fn m10_8_text_content(text: &str) -> MessageContent {
+        crate::message_content::MessageContent::Text(crate::message_content::MessageText {
+            text: FormattedText {
+                text: text.to_string(),
+                entities: Vec::new(),
+            },
+            ..crate::message_content::MessageText::default()
+        })
+    }
+
+    fn m10_8_yet_unsent(server_slot: i64) -> MessageId {
+        MessageId::new((server_slot << MessageId::SERVER_ID_SHIFT) + 1)
+    }
+
+    /// The `get_next_message_id` decision table (MessagesManager.cpp:28247-28307):
+    /// the bot and non-bot max ladders, the two last-read guards, the
+    /// overflow flip and the per-date scheduled ladder.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)] // the decision-table row style
+    fn m10_8_next_message_id_decision_table() {
+        // non-bot: the 8-field max ladder
+        let mut d = Dialog::default();
+        d.last_message_id = MessageId::from_server_message_id(ServerMessageId::new(9));
+        d.last_new_message_id = MessageId::from_server_message_id(ServerMessageId::new(7));
+        d.max_unavailable_message_id = MessageId::from_server_message_id(ServerMessageId::new(12));
+        let id = get_next_yet_unsent_message_id(&mut d, false);
+        assert_eq!(id, m10_8_yet_unsent(12), "max of the ladder wins");
+        assert_eq!(d.last_assigned_message_id, id);
+        assert!(!d.had_yet_unsent_message_id_overflow);
+
+        // guard 1: last_read_inbox pulls the base up while it stays below
+        // next_server(last_new). `get_next_server_message_id` of a
+        // server-typed id is the id itself, so the window
+        // (candidate, next_server(last_new)) only opens when last_new is a
+        // non-server id in the dialog (secret chats can set a local
+        // last_new): the marker must sit in the same server-id slot
+        let mut d = Dialog::default();
+        // a Local-shaped last_new in slot 20 (the secret-chat shape)
+        d.last_new_message_id = MessageId::new((20 << MessageId::SERVER_ID_SHIFT) + 2);
+        d.last_read_inbox_message_id = MessageId::new((20 << MessageId::SERVER_ID_SHIFT) + 9);
+        let id = get_next_yet_unsent_message_id(&mut d, false);
+        assert_eq!(
+            id,
+            MessageId::new((20 << MessageId::SERVER_ID_SHIFT) + 17),
+            "last_read_inbox becomes the base inside the window"
+        );
+
+        // guard 1 boundary: a last_read_inbox at/after
+        // last_new.get_next_server_message_id() is ignored — with a
+        // server-typed last_new the window is empty (next_server is the id
+        // itself), so a bigger read marker cannot lift the base
+        let mut d = Dialog::default();
+        d.last_new_message_id = MessageId::from_server_message_id(ServerMessageId::new(20));
+        d.last_read_inbox_message_id = MessageId::from_server_message_id(ServerMessageId::new(21));
+        let id = get_next_yet_unsent_message_id(&mut d, false);
+        assert_eq!(
+            id,
+            m10_8_yet_unsent(20),
+            "the read marker outside the window does not lift the base"
+        );
+
+        // guard 2: the outbox form of the same shape
+        let mut d = Dialog::default();
+        d.last_new_message_id = MessageId::new((30 << MessageId::SERVER_ID_SHIFT) + 2);
+        d.last_read_outbox_message_id = MessageId::new((30 << MessageId::SERVER_ID_SHIFT) + 9);
+        let id = get_next_yet_unsent_message_id(&mut d, false);
+        assert_eq!(
+            id,
+            MessageId::new((30 << MessageId::SERVER_ID_SHIFT) + 17),
+            "last_read_outbox lifts the base"
+        );
+
+        // bot: max(last_assigned, max_unavailable) only
+        let mut d = Dialog::default();
+        d.last_assigned_message_id = MessageId::from_server_message_id(ServerMessageId::new(3));
+        d.max_unavailable_message_id = MessageId::from_server_message_id(ServerMessageId::new(7));
+        let id = get_next_yet_unsent_message_id(&mut d, true);
+        assert_eq!(id, m10_8_yet_unsent(7), "the bot ladder ignores the rest");
+
+        // the overflow flip: allocating past the end of the yet-unsent space
+        // inside one server-id slot moves the prev-server base
+        let mut d = Dialog::default();
+        let last_in_slot = MessageId::new(
+            (5 << MessageId::SERVER_ID_SHIFT) + (1 << MessageId::SERVER_ID_SHIFT) - 7,
+        );
+        d.last_assigned_message_id = last_in_slot;
+        assert!(!d.had_yet_unsent_message_id_overflow);
+        let id = get_next_yet_unsent_message_id(&mut d, false);
+        assert_eq!(id, m10_8_yet_unsent(6), "the next slot's first yet-unsent");
+        assert!(
+            d.had_yet_unsent_message_id_overflow,
+            "the slot crossing flips the flag"
+        );
+
+        // the per-date scheduled ladder
+        let mut d = Dialog::default();
+        let date = 1_800_000_000i32;
+        let first = get_next_yet_unsent_scheduled_message_id(&mut d, date);
+        // the base id carries the SCHEDULED type bits; the ladder bumps the
+        // type to YetUnsent (MessageId.cpp:181-184)
+        let expected_first =
+            MessageId::from_scheduled(ScheduledServerMessageId::new(1), date, false)
+                .get_next_message_id(MessageType::YetUnsent);
+        assert_eq!(first, expected_first, "the first id of a fresh date");
+        let second = get_next_yet_unsent_scheduled_message_id(&mut d, date);
+        assert_eq!(
+            second.get_scheduled_message_date(),
+            date,
+            "the second id stays on the date"
+        );
+        assert!(second > first, "the ladder climbs");
+        let other = get_next_yet_unsent_scheduled_message_id(&mut d, date + 1);
+        assert_ne!(
+            other.get_scheduled_message_date(),
+            second.get_scheduled_message_date(),
+            "dates ladder independently"
+        );
+        assert!(get_next_yet_unsent_scheduled_message_id(&mut d, date) > second);
+    }
+
+    /// `generate_new_random_id` + `begin_send_message` (MessagesManager.cpp
+    /// 20898-20905/21120-21127): nonzero, fresh against both registries, and
+    /// the begin-insert is single-shot.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)] // the decision-table row style
+    fn m10_8_random_id_collision_and_begin_send_table() {
+        let mut manager = MessagesManager::default();
+        let dialog_id = DialogId::from_user_id(UserId::new(77));
+        let d = manager.add_dialog_for_new_message(dialog_id);
+        d.random_id_to_message_id.insert(5, m10_8_yet_unsent(2));
+
+        manager.being_sent_messages.insert(
+            9,
+            MessageFullId::new(
+                dialog_id,
+                MessageId::from_server_message_id(ServerMessageId::new(1)),
+            ),
+        );
+
+        for _ in 0..64 {
+            let random_id = generate_new_random_id(
+                manager.get_dialog(dialog_id).unwrap(),
+                &manager.being_sent_messages,
+            );
+            assert_ne!(random_id, 0);
+            assert_ne!(random_id, 5, "must avoid the random_id_to_message_id ids");
+            assert_ne!(random_id, 9, "must avoid the being-sent ids");
+        }
+
+        // begin_send_message: the CHECKs and the single insert
+        let mut m = Message::default();
+        m.message_id = m10_8_yet_unsent(3);
+        m.random_id = generate_new_random_id(
+            manager.get_dialog(dialog_id).unwrap(),
+            &manager.being_sent_messages,
+        );
+        let random_id = begin_send_message(&mut manager, dialog_id, &m);
+        assert_eq!(random_id, m.random_id);
+        assert_eq!(
+            manager.being_sent_messages.get(&random_id),
+            Some(&MessageFullId::new(dialog_id, m10_8_yet_unsent(3)))
+        );
+
+        // get_persistent_message_id reads the (M.10.9-written) registry: a
+        // hit rewrites, a miss falls through, an invalid id is its own answer
+        manager
+            .yet_unsent_message_full_id_to_persistent_message_id
+            .insert(
+                MessageFullId::new(dialog_id, m10_8_yet_unsent(3)),
+                MessageId::from_server_message_id(ServerMessageId::new(500)),
+            );
+        let d = manager.get_dialog(dialog_id).unwrap();
+        assert_eq!(
+            get_persistent_message_id(&manager, d, m10_8_yet_unsent(3)),
+            MessageId::from_server_message_id(ServerMessageId::new(500))
+        );
+        assert_eq!(
+            get_persistent_message_id(&manager, d, m10_8_yet_unsent(4)),
+            m10_8_yet_unsent(4),
+            "the registry miss falls through"
+        );
+        assert_eq!(
+            get_persistent_message_id(&manager, d, MessageId::default()),
+            MessageId::default()
+        );
+    }
+
+    /// The `create_message_to_send` sender-ladder and field tables
+    /// (MessagesManager.cpp:20907-21094): the ladder rows, the
+    /// scheduled-vs-not fields, the disable_notification three-way, the
+    /// secret-chat TTL branch and the five-gate reply_info lambda.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)] // the decision-table row style
+    fn m10_8_create_message_to_send_sender_and_field_tables() {
+        let dialog_id = DialogId::from_user_id(UserId::new(2));
+        let mut ctx = SendTestContext::default();
+        ctx.inner.is_bot = false;
+        ctx.inner.now = 5_000.0;
+        ctx.inner.server_time = 5_000.0;
+        // the own id is the shared test context's default
+        let my_id = ctx.content_context().get_my_id();
+        ctx.user_titles.insert(my_id, "me".to_string());
+
+        // plain user chat: sender is the own user, no flags
+        let mut d = Dialog::default();
+        d.dialog_id = dialog_id;
+        let m = create_message_to_send(
+            &ctx,
+            &mut d,
+            &MessageTopic::default(),
+            MessageInputReplyTo::default(),
+            &m10_8_send_options(),
+            m10_8_text_content("hi"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+        );
+        assert_eq!(m.sender_user_id, my_id);
+        assert_eq!(m.sender_dialog_id, DialogId::default());
+        assert!(!m.has_explicit_sender);
+        assert_eq!(
+            m.message_id,
+            m10_8_yet_unsent(0),
+            "the first yet-unsent id of a fresh dialog"
+        );
+        assert_eq!(m.date, 1_700_000_000, "date is the fake send_date");
+        assert_eq!(m.send_date, 1_700_000_000);
+        assert!(m.is_outgoing, "another user's chat is outgoing");
+        assert_eq!(m.view_count, 0);
+        assert!(!m.disable_notification);
+        assert!(m.input_reply_to.is_empty());
+        assert_eq!(m.debug_source, "null");
+
+        // self-chat: is_outgoing=false, the saved-messages topic is set
+        let mut d = Dialog::default();
+        d.dialog_id = DialogId::from_user_id(my_id);
+        let m = create_message_to_send(
+            &ctx,
+            &mut d,
+            &MessageTopic::default(),
+            MessageInputReplyTo::default(),
+            &m10_8_send_options(),
+            m10_8_text_content("note"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+        );
+        assert!(!m.is_outgoing, "the Saved Messages chat is not outgoing");
+        assert!(
+            m.saved_messages_topic_id.is_valid(),
+            "the self-chat sets the topic from the (absent) forward info"
+        );
+        assert_eq!(
+            m.saved_messages_topic_id.get_dialog_id(),
+            DialogId::from_user_id(my_id)
+        );
+
+        // scheduled: is_outgoing=true, date is the schedule date, view_count
+        // stays 0 even for a channel post
+        let channel_id = ChannelId::new(10);
+        let channel_dialog_id = DialogId::from_channel_id(channel_id);
+        let mut ctx_channel = SendTestContext::default();
+        ctx_channel.broadcast_dialogs.insert(channel_dialog_id);
+        let mut d = Dialog::default();
+        d.dialog_id = channel_dialog_id;
+        let options = MessageSendOptions {
+            schedule_date: 1_800_000_000,
+            ..m10_8_send_options()
+        };
+        let m = create_message_to_send(
+            &ctx_channel,
+            &mut d,
+            &MessageTopic::default(),
+            MessageInputReplyTo::default(),
+            &options,
+            m10_8_text_content("later"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+        );
+        assert!(m.is_outgoing, "scheduled messages are outgoing");
+        assert_eq!(m.date, 1_800_000_000);
+        assert_eq!(m.view_count, 0, "scheduled channel posts carry no views");
+        assert!(
+            m.message_id.is_scheduled(),
+            "the scheduled ladder allocated the id"
+        );
+        assert!(
+            m.is_channel_post,
+            "the flag is scheduling-blind (21018 sets it unconditioned)"
+        );
+        assert_eq!(
+            m.sender_dialog_id, channel_dialog_id,
+            "the scheduled post skips the signed-sender ladder (20958's else)"
+        );
+
+        // the signed-channel-post block runs only when !is_scheduled and
+        // sign_messages: an unscheduled signed post gets view_count=1, the
+        // signature, and (with show_message_sender=false) the sender stash
+        let mut ctx_signed = SendTestContext::default();
+        ctx_signed.broadcast_dialogs.insert(channel_dialog_id);
+        ctx_signed.sign_messages = true;
+        ctx_signed.show_message_sender = false;
+        ctx_signed.user_titles.insert(my_id, "owner".to_string());
+        let mut d = Dialog::default();
+        d.dialog_id = channel_dialog_id;
+        let m = create_message_to_send(
+            &ctx_signed,
+            &mut d,
+            &MessageTopic::default(),
+            MessageInputReplyTo::default(),
+            &m10_8_send_options(),
+            m10_8_text_content("post"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+        );
+        assert!(m.is_channel_post);
+        assert_eq!(
+            m.view_count, 1,
+            "unscheduled channel posts start with 1 view"
+        );
+        assert_eq!(
+            m.author_signature, "owner",
+            "the plain-sender signature is the own user title"
+        );
+        assert_eq!(
+            m.initial_sender_dialog_id,
+            DialogId::from_user_id(my_id),
+            "the real sender is stashed when the sender is hidden"
+        );
+        assert_eq!(
+            m.sender_user_id,
+            UserId::default(),
+            "the sender user is cleared"
+        );
+        assert_eq!(m.sender_dialog_id, channel_dialog_id);
+
+        // the anonymous-administrator row: sender is the dialog with the
+        // fetched signature
+        let mut ctx_anon = SendTestContext::default();
+        ctx_anon.anonymous_admin_signature = Some("anon".to_string());
+        let mut d = Dialog::default();
+        d.dialog_id = dialog_id;
+        let m = create_message_to_send(
+            &ctx_anon,
+            &mut d,
+            &MessageTopic::default(),
+            MessageInputReplyTo::default(),
+            &m10_8_send_options(),
+            m10_8_text_content("anon"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+        );
+        assert_eq!(m.sender_dialog_id, dialog_id);
+        assert_eq!(m.author_signature, "anon");
+
+        // the send_as row: a User-typed send-as sets the sender user and the
+        // channel flag. The dialog stays non-broadcast and unsigned — an
+        // unsigned broadcast channel skips the whole ladder (20958's else)
+        let send_as_user = DialogId::from_user_id(UserId::new(3));
+        let channel_dialog_id2 = DialogId::from_channel_id(ChannelId::new(11));
+        let ctx_send_as = SendTestContext::default();
+        let mut d = Dialog::default();
+        d.dialog_id = channel_dialog_id2;
+        let m = create_message_to_send(
+            &ctx_send_as,
+            &mut d,
+            &MessageTopic::default(),
+            MessageInputReplyTo::default(),
+            &m10_8_send_options(),
+            m10_8_text_content("as"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            send_as_user,
+            false,
+        );
+        assert_eq!(m.sender_user_id, send_as_user.get_user_id());
+        assert!(
+            m.has_explicit_sender,
+            "the channel target marks the sender explicit"
+        );
+
+        // the default-send-as row (a channel-typed default keeps the dialog)
+        let default_send_as = DialogId::from_channel_id(ChannelId::new(99));
+        let mut d = Dialog::default();
+        d.dialog_id = channel_dialog_id2;
+        d.default_send_message_as_dialog_id = default_send_as;
+        let m = create_message_to_send(
+            &ctx_send_as,
+            &mut d,
+            &MessageTopic::default(),
+            MessageInputReplyTo::default(),
+            &m10_8_send_options(),
+            m10_8_text_content("def"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+        );
+        assert_eq!(m.sender_dialog_id, default_send_as);
+        assert!(m.has_explicit_sender);
+
+        // the monoforum row: sender is the monoforum channel
+        let monoforum_dialog = DialogId::from_channel_id(ChannelId::new(20));
+        let monoforum_channel = ChannelId::new(21);
+        let mut ctx_mono = SendTestContext::default();
+        ctx_mono.monoforum_channel = Some(monoforum_channel);
+        let mut d = Dialog::default();
+        d.dialog_id = monoforum_dialog;
+        let topic = MessageTopic::monoforum(
+            monoforum_dialog,
+            SavedMessagesTopicId::new(monoforum_dialog),
+        );
+        let m = create_message_to_send(
+            &ctx_mono,
+            &mut d,
+            &topic,
+            MessageInputReplyTo::default(),
+            &m10_8_send_options(),
+            m10_8_text_content("dm"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+        );
+        assert_eq!(
+            m.sender_dialog_id,
+            DialogId::from_channel_id(monoforum_channel)
+        );
+        assert_eq!(
+            m.saved_messages_topic_id.get_dialog_id(),
+            monoforum_dialog,
+            "the monoforum topic rides the message"
+        );
+
+        // disable_notification three-way (21069-21074)
+        let explicit = MessageSendOptions {
+            disable_notification: true,
+            ..m10_8_send_options()
+        };
+        let mut d = Dialog::default();
+        d.dialog_id = dialog_id;
+        let m = create_message_to_send(
+            &ctx,
+            &mut d,
+            &MessageTopic::default(),
+            MessageInputReplyTo::default(),
+            &explicit,
+            m10_8_text_content("silent"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+        );
+        assert!(m.disable_notification, "the explicit flag passes through");
+
+        // the dialog's silent_send_message wins when no option forces it
+        let mut d = Dialog::default();
+        d.dialog_id = dialog_id;
+        d.notification_settings.silent_send_message = true;
+        let m = create_message_to_send(
+            &ctx,
+            &mut d,
+            &MessageTopic::default(),
+            MessageInputReplyTo::default(),
+            &m10_8_send_options(),
+            m10_8_text_content("shh"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+        );
+        assert!(
+            m.disable_notification,
+            "the dialog silent flag is inherited"
+        );
+
+        // ...and the ignore_default option overrides the dialog back to the
+        // explicit (false) value
+        let mut ctx_ignore = SendTestContext::default();
+        ctx_ignore.ignore_default_disable_notification = true;
+        let mut d = Dialog::default();
+        d.dialog_id = dialog_id;
+        d.notification_settings.silent_send_message = true;
+        let m = create_message_to_send(
+            &ctx_ignore,
+            &mut d,
+            &MessageTopic::default(),
+            MessageInputReplyTo::default(),
+            &m10_8_send_options(),
+            m10_8_text_content("loud"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+        );
+        assert!(
+            !m.disable_notification,
+            "ignore_default flips back to explicit"
+        );
+
+        // the secret-chat TTL branch: service contents reset the ttl, plain
+        // contents take the chat ttl and mark is_content_secret
+        let secret_dialog = DialogId::from_secret_chat_id(SecretChatId::new(5));
+        let mut ctx_secret = SendTestContext::default();
+        ctx_secret.secret_chat_ttl = 60;
+        let mut d = Dialog::default();
+        d.dialog_id = secret_dialog;
+        let m = create_message_to_send(
+            &ctx_secret,
+            &mut d,
+            &MessageTopic::default(),
+            MessageInputReplyTo::default(),
+            &m10_8_send_options(),
+            m10_8_text_content("burn"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+        );
+        assert_eq!(m.ttl, MessageSelfDestructType::with_ttl(60, false));
+
+        // the five-gate reply_info lambda (21028-21055): on a broadcast
+        // channel with a linked channel and no reply, the gate zeroes the
+        // reply_info and marks the linked-channel comment shape
+        let discussion = DialogId::from_channel_id(ChannelId::new(32));
+        let linked = ChannelId::new(31);
+        let mut ctx_comments = SendTestContext::default();
+        ctx_comments.broadcast_dialogs.insert(discussion);
+        ctx_comments.linked_channel = Some(linked);
+        let mut d = Dialog::default();
+        d.dialog_id = discussion;
+        let m = create_message_to_send(
+            &ctx_comments,
+            &mut d,
+            &MessageTopic::default(),
+            MessageInputReplyTo::default(),
+            &m10_8_send_options(),
+            m10_8_text_content("standalone"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+        );
+        assert_eq!(
+            m.reply_info.reply_count, 0,
+            "gate 5 (no reply) zeroes the reply count"
+        );
+        assert!(
+            m.reply_info.is_comment,
+            "the linked-channel comment arm marks it"
+        );
+        assert_eq!(m.reply_info.channel_id, linked);
+
+        // ...the channel-post fifth gate keys on the LINKED channel, not on
+        // the reply (21041-21043): replying into a linked broadcast channel
+        // still produces the comment reply_info
+        let mut d = Dialog::default();
+        d.dialog_id = discussion;
+        let reply = MessageInputReplyTo::regular(MessageId::from_server_message_id(
+            ServerMessageId::new(100),
+        ));
+        let m = create_message_to_send(
+            &ctx_comments,
+            &mut d,
+            &MessageTopic::default(),
+            reply,
+            &m10_8_send_options(),
+            m10_8_text_content("in thread"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+        );
+        assert!(
+            m.reply_info.is_comment,
+            "the channel-post gate is the linked check, not the reply"
+        );
+        assert_eq!(m.reply_info.channel_id, linked);
+        assert_eq!(
+            m.reply_to_random_id, 0,
+            "reply_to_random_id is only for secret/yet-unsent replied ids"
+        );
+
+        // on a non-broadcast channel the fifth gate is !reply.is_valid();
+        // either way is_comment stays false (it is channel-post-only)
+        let megagroup = DialogId::from_channel_id(ChannelId::new(33));
+        let mut d = Dialog::default();
+        d.dialog_id = megagroup;
+        let m = create_message_to_send(
+            &ctx_comments,
+            &mut d,
+            &MessageTopic::default(),
+            MessageInputReplyTo::default(),
+            &m10_8_send_options(),
+            m10_8_text_content("group"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+        );
+        assert!(!m.reply_info.is_comment);
+        assert_eq!(m.reply_info.channel_id, ChannelId::default());
+
+        // the yet-unsent same-chat reply resolves the random id of the
+        // replied message and inherits its topic shape
+        let mut d = Dialog::default();
+        d.dialog_id = dialog_id;
+        let mut replied_message = Box::new(Message::default());
+        replied_message.message_id = m10_8_yet_unsent(2);
+        replied_message.random_id = 4242;
+        replied_message.is_topic_message = true;
+        replied_message.top_thread_message_id =
+            MessageId::from_server_message_id(ServerMessageId::new(100));
+        d.messages.insert(m10_8_yet_unsent(2), replied_message);
+        let reply = MessageInputReplyTo::regular(m10_8_yet_unsent(2));
+        let m = create_message_to_send(
+            &ctx,
+            &mut d,
+            &MessageTopic::default(),
+            reply,
+            &m10_8_send_options(),
+            m10_8_text_content("reply"),
+            false,
+            false,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+        );
+        assert_eq!(
+            m.reply_to_random_id, 4242,
+            "the yet-unsent reply takes the replied message's random id"
+        );
+        assert_eq!(
+            m.top_thread_message_id,
+            MessageId::from_server_message_id(ServerMessageId::new(100)),
+            "the replied message's thread is inherited"
+        );
+        assert!(m.is_topic_message);
+    }
+
+    /// The reply-plumbing table (MessagesManager.cpp:21149-21314 + 21133): the
+    /// four td_api arms, the silent-drop guards, the push-window reply, the
+    /// album-topic escape and the pinned debug sources.
+    #[test]
+    fn m10_8_reply_plumbing_tables() {
+        let dialog_id = DialogId::from_user_id(UserId::new(2));
+        let mut manager = MessagesManager::default();
+        let mut ctx = SendTestContext::default();
+        ctx.inner.is_bot = false;
+
+        // seed a server message to reply to
+        let target_id = MessageId::from_server_message_id(ServerMessageId::new(100));
+        let mut target = Box::new(Message::default());
+        target.message_id = target_id;
+        target.sender_user_id = dialog_id.get_user_id();
+        target.content = Some(m10_8_text_content("target"));
+        let poll_target_id = MessageId::from_server_message_id(ServerMessageId::new(101));
+        let mut poll_target = Box::new(Message::default());
+        poll_target.message_id = poll_target_id;
+        poll_target.content = Some(m10_8_text_content("not a poll"));
+        {
+            let d = manager.add_dialog_for_new_message(dialog_id);
+            d.last_new_message_id = target_id;
+            d.messages.insert(target_id, target);
+            d.messages.insert(poll_target_id, poll_target);
+        }
+
+        // arm 2 (message): a same-chat server reply resolves through the
+        // memory probe and pins debug source 5
+        let reply_to = td_api::InputMessageReplyTo::inputMessageReplyToMessage(
+            td_api::inputMessageReplyToMessage {
+                message_id: target_id.get(),
+                quote: None,
+                checklist_task_id: 0,
+                poll_option_id: String::new(),
+            },
+        );
+        let input_reply_to = create_message_input_reply_to(
+            &mut ctx,
+            &manager,
+            dialog_id,
+            &MessageTopic::default(),
+            Some(reply_to),
+            false,
+        );
+        assert_eq!(input_reply_to.message_id, target_id);
+        assert_eq!(
+            input_reply_to.debug_source,
+            "create_message_input_reply_to 5"
+        );
+
+        // arm 2: message_id 0 falls back to the (absent) implicit reply and
+        // drops for a topic-less chat
+        let zero_reply = td_api::InputMessageReplyTo::inputMessageReplyToMessage(
+            td_api::inputMessageReplyToMessage {
+                message_id: 0,
+                quote: None,
+                checklist_task_id: 0,
+                poll_option_id: String::new(),
+            },
+        );
+        let input_reply_to = create_message_input_reply_to(
+            &mut ctx,
+            &manager,
+            dialog_id,
+            &MessageTopic::default(),
+            Some(zero_reply),
+            false,
+        );
+        assert!(
+            input_reply_to.is_empty(),
+            "the implicit fallback drops silently"
+        );
+
+        // arm 2 guard: the checklist task id only survives a ToDoList target
+        let checklist_reply = td_api::InputMessageReplyTo::inputMessageReplyToMessage(
+            td_api::inputMessageReplyToMessage {
+                message_id: target_id.get(),
+                quote: None,
+                checklist_task_id: 7,
+                poll_option_id: "opt".to_string(),
+            },
+        );
+        let input_reply_to = create_message_input_reply_to(
+            &mut ctx,
+            &manager,
+            dialog_id,
+            &MessageTopic::default(),
+            Some(checklist_reply),
+            false,
+        );
+        assert_eq!(
+            input_reply_to.todo_item_id, 0,
+            "the non-ToDoList target strips it"
+        );
+        assert_eq!(
+            input_reply_to.poll_option_id, "",
+            "the non-Poll target strips the poll option"
+        );
+
+        // the push-window reply (debug source 4): a server id past
+        // last_new_message_id but within the push-notification window is
+        // allowed without the message being present
+        let push_id = MessageId::from_server_message_id(ServerMessageId::new(150));
+        {
+            let d = manager.get_dialog_mut(dialog_id).unwrap();
+            d.notification_info = Some(NotificationInfo::default());
+            d.notification_info
+                .as_mut()
+                .unwrap()
+                .max_push_notification_message_id =
+                MessageId::from_server_message_id(ServerMessageId::new(200));
+        }
+        let push_reply = td_api::InputMessageReplyTo::inputMessageReplyToMessage(
+            td_api::inputMessageReplyToMessage {
+                message_id: push_id.get(),
+                quote: None,
+                checklist_task_id: 0,
+                poll_option_id: String::new(),
+            },
+        );
+        let input_reply_to = create_message_input_reply_to(
+            &mut ctx,
+            &manager,
+            dialog_id,
+            &MessageTopic::default(),
+            Some(push_reply),
+            false,
+        );
+        assert_eq!(input_reply_to.message_id, push_id);
+        assert_eq!(
+            input_reply_to.debug_source,
+            "create_message_input_reply_to 4"
+        );
+
+        // past the push window it drops back to the implicit reply (also
+        // absent) and drops
+        let beyond_id = MessageId::from_server_message_id(ServerMessageId::new(300));
+        let beyond_reply = td_api::InputMessageReplyTo::inputMessageReplyToMessage(
+            td_api::inputMessageReplyToMessage {
+                message_id: beyond_id.get(),
+                quote: None,
+                checklist_task_id: 0,
+                poll_option_id: String::new(),
+            },
+        );
+        let input_reply_to = create_message_input_reply_to(
+            &mut ctx,
+            &manager,
+            dialog_id,
+            &MessageTopic::default(),
+            Some(beyond_reply),
+            false,
+        );
+        assert!(input_reply_to.is_empty(), "past the window the reply drops");
+
+        // arm 1 (story): a story reply into another chat drops; a story
+        // reply with a topic drops; a valid one pins StoryFullId
+        let story_reply = td_api::InputMessageReplyTo::inputMessageReplyToStory(
+            td_api::inputMessageReplyToStory {
+                story_poster_chat_id: DialogId::from_user_id(UserId::new(9)).get(),
+                story_id: 3,
+            },
+        );
+        let input_reply_to = create_message_input_reply_to(
+            &mut ctx,
+            &manager,
+            dialog_id,
+            &MessageTopic::default(),
+            Some(story_reply),
+            false,
+        );
+        assert!(
+            input_reply_to.is_empty(),
+            "a story reply from another chat drops"
+        );
+
+        let own_story_reply = td_api::InputMessageReplyTo::inputMessageReplyToStory(
+            td_api::inputMessageReplyToStory {
+                story_poster_chat_id: dialog_id.get(),
+                story_id: 3,
+            },
+        );
+        let topic = MessageTopic::thread(dialog_id, target_id);
+        let input_reply_to = create_message_input_reply_to(
+            &mut ctx,
+            &manager,
+            dialog_id,
+            &topic,
+            Some(own_story_reply),
+            false,
+        );
+        assert!(
+            input_reply_to.is_empty(),
+            "a story reply into a specific topic drops"
+        );
+
+        let own_story_reply = td_api::InputMessageReplyTo::inputMessageReplyToStory(
+            td_api::inputMessageReplyToStory {
+                story_poster_chat_id: dialog_id.get(),
+                story_id: 3,
+            },
+        );
+        let input_reply_to = create_message_input_reply_to(
+            &mut ctx,
+            &manager,
+            dialog_id,
+            &MessageTopic::default(),
+            Some(own_story_reply),
+            false,
+        );
+        assert_eq!(
+            input_reply_to.story_full_id,
+            StoryFullId::new(dialog_id, StoryId::new(3)),
+            "the story full id rides through"
+        );
+
+        // arm 3 (external): the reply dialog must be known (the db-load leg
+        // of get_dialog_force is the seam), then the cross-chat reply pins
+        // debug source 6 with the other-chat dialog id
+        let other_dialog = DialogId::from_user_id(UserId::new(8));
+        let other_message_id = MessageId::from_server_message_id(ServerMessageId::new(70));
+        let mut other_message = Box::new(Message::default());
+        other_message.message_id = other_message_id;
+        other_message.content = Some(m10_8_text_content("elsewhere"));
+        {
+            let d = manager.add_dialog_for_new_message(other_dialog);
+            d.last_new_message_id = other_message_id;
+            d.messages.insert(other_message_id, other_message);
+        }
+        let external_reply = td_api::InputMessageReplyTo::inputMessageReplyToExternalMessage(
+            td_api::inputMessageReplyToExternalMessage {
+                chat_id: other_dialog.get(),
+                message_id: other_message_id.get(),
+                quote: None,
+                checklist_task_id: 0,
+                poll_option_id: String::new(),
+            },
+        );
+        let input_reply_to = create_message_input_reply_to(
+            &mut ctx,
+            &manager,
+            dialog_id,
+            &MessageTopic::default(),
+            Some(external_reply),
+            false,
+        );
+        assert_eq!(input_reply_to.message_id, other_message_id);
+        assert_eq!(input_reply_to.dialog_id, other_dialog);
+        assert_eq!(
+            input_reply_to.debug_source,
+            "create_message_input_reply_to 6"
+        );
+
+        // arm 3 guard: an unknown reply chat drops silently (the in-memory
+        // get_dialog_force seam answers None)
+        let unknown_dialog = DialogId::from_user_id(UserId::new(12345));
+        let external_reply = td_api::InputMessageReplyTo::inputMessageReplyToExternalMessage(
+            td_api::inputMessageReplyToExternalMessage {
+                chat_id: unknown_dialog.get(),
+                message_id: 1,
+                quote: None,
+                checklist_task_id: 0,
+                poll_option_id: String::new(),
+            },
+        );
+        let input_reply_to = create_message_input_reply_to(
+            &mut ctx,
+            &manager,
+            dialog_id,
+            &MessageTopic::default(),
+            Some(external_reply),
+            false,
+        );
+        assert!(input_reply_to.is_empty(), "the unknown chat drops silently");
+
+        // arm 4 (ephemeral): only a bot explicitly building an ephemeral
+        // reply passes; everything else drops
+        let ephemeral_reply = td_api::InputMessageReplyTo::inputMessageReplyToEphemeralMessage(
+            td_api::inputMessageReplyToEphemeralMessage {
+                ephemeral_message_id: 9,
+            },
+        );
+        let input_reply_to = create_message_input_reply_to_full(
+            &mut ctx,
+            &manager,
+            manager.get_dialog(dialog_id).unwrap(),
+            &MessageTopic::default(),
+            Some(ephemeral_reply),
+            false,
+            false,
+        );
+        assert!(
+            input_reply_to.is_empty(),
+            "for_ephemeral_message=false drops"
+        );
+
+        // a non-bot ephemeral reply drops too
+        let input_reply_to = create_message_input_reply_to_full(
+            &mut ctx,
+            &manager,
+            manager.get_dialog(dialog_id).unwrap(),
+            &MessageTopic::default(),
+            Some(
+                td_api::InputMessageReplyTo::inputMessageReplyToEphemeralMessage(
+                    td_api::inputMessageReplyToEphemeralMessage {
+                        ephemeral_message_id: 9,
+                    },
+                ),
+            ),
+            false,
+            true,
+        );
+        assert!(input_reply_to.is_empty(), "a non-bot ephemeral reply drops");
+
+        // the bot arm pins debug source 7
+        ctx.inner.is_bot = true;
+        let input_reply_to = create_message_input_reply_to_full(
+            &mut ctx,
+            &manager,
+            manager.get_dialog(dialog_id).unwrap(),
+            &MessageTopic::default(),
+            Some(
+                td_api::InputMessageReplyTo::inputMessageReplyToEphemeralMessage(
+                    td_api::inputMessageReplyToEphemeralMessage {
+                        ephemeral_message_id: 9,
+                    },
+                ),
+            ),
+            false,
+            true,
+        );
+        assert_eq!(
+            input_reply_to.ephemeral_message_id,
+            EphemeralMessageId::new(9)
+        );
+        assert_eq!(
+            input_reply_to.debug_source,
+            "create_message_input_reply_to 7"
+        );
+
+        // get_persistent_message_id rewrite: a yet-unsent id in the registry
+        // resolves to the target server message
+        manager
+            .yet_unsent_message_full_id_to_persistent_message_id
+            .insert(
+                MessageFullId::new(dialog_id, m10_8_yet_unsent(3)),
+                target_id,
+            );
+        let d = manager.get_dialog(dialog_id).unwrap();
+        assert_eq!(
+            get_persistent_message_id(&manager, d, m10_8_yet_unsent(3)),
+            target_id,
+            "the yet-unsent id rewrites to the persisted message"
+        );
+    }
+
+    /// The `SendMessageLogEvent` store→parse byte round-trip under a
+    /// fake-clock `TimeCtx` (MessagesManager.cpp:21696-21719 + the M.10.2
+    /// `Message::store` byte contract).
+    #[test]
+    #[allow(clippy::field_reassign_with_default)] // the decision-table row style
+    fn m10_8_send_message_log_event_roundtrip() {
+        let time = crate::user_manager::TimeCtx {
+            now: 1000.0,
+            server_time: 1_700_000_000.5,
+        };
+        let mut m = Message::default();
+        m.message_id = m10_8_yet_unsent(4);
+        m.sender_user_id = UserId::new(10);
+        m.date = 1_700_000_000;
+        m.send_date = 1_700_000_000;
+        m.random_id = 4242;
+        m.reply_to_random_id = 17;
+        m.input_reply_to = MessageInputReplyTo::regular(MessageId::from_server_message_id(
+            ServerMessageId::new(99),
+        ));
+        m.sending_id = 5;
+        m.is_outgoing = true;
+        m.disable_notification = true;
+        m.noforwards = true;
+        m.from_background = true;
+        m.author_signature = "sig".to_string();
+        m.effect_id = MessageEffectId::new(64);
+        m.content = Some(m10_8_text_content("half-sent"));
+
+        let dialog_id = DialogId::from_user_id(UserId::new(3));
+        let bytes = SendMessageLogEvent::store_to_bytes(dialog_id, &m, &NoStorage, &time);
+        let parsed = SendMessageLogEvent::parse_from_bytes(&bytes, &mut NoStorage, &time).unwrap();
+        assert_eq!(parsed.dialog_id, dialog_id);
+        let p = &parsed.message;
+        assert_eq!(p.message_id, m.message_id);
+        assert_eq!(p.random_id, m.random_id);
+        assert_eq!(p.reply_to_random_id, m.reply_to_random_id);
+        assert_eq!(p.input_reply_to.message_id, m.input_reply_to.message_id);
+        // sending_id is runtime-only: the C++ Message::store has no flag for it
+        assert_eq!(p.is_outgoing, m.is_outgoing);
+        assert_eq!(p.disable_notification, m.disable_notification);
+        assert_eq!(p.noforwards, m.noforwards);
+        assert_eq!(p.from_background, m.from_background);
+        assert_eq!(p.author_signature, m.author_signature);
+        assert_eq!(p.effect_id, m.effect_id);
+        assert_eq!(p.send_date, m.send_date, "the yet-unsent send_date stores");
+        match p.content.as_ref().unwrap() {
+            crate::message_content::MessageContent::Text(text) => {
+                assert_eq!(text.text.text, "half-sent");
+            }
+            _ => panic!("wrong content"),
+        }
+
+        // the C++ `log_event_parse(...).ensure()` rejects trailing garbage
+        let mut broken = bytes.clone();
+        broken.push(0);
+        assert!(SendMessageLogEvent::parse_from_bytes(&broken, &mut NoStorage, &time).is_err());
+    }
+
+    /// The half-sent-message crash test (cloned from the M.10.6 kill-replay):
+    /// the durable `SendMessageLogEvent` is written and the process "dies"
+    /// before the wire query — the reopened engine replays the event,
+    /// restores `send_message_log_event_id`, re-allocates the yet-unsent id,
+    /// re-enters the send skeleton and re-registers the random-id
+    /// correspondence.
+    #[test]
+    fn m10_8_send_survives_a_mid_send_kill_via_binlog_replay() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let base = std::env::temp_dir().join("m10_8_send_run");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = base.canonicalize().unwrap().to_string_lossy().into_owned();
+        let event_written = StdArc::new(AtomicUsize::new(0));
+        let replayed = StdArc::new(AtomicUsize::new(0));
+        let dialog_id = DialogId::from_user_id(UserId::new(3000));
+
+        // phase A: the send skeleton runs up to and including the durable
+        // event; the "wire query" (the M.10.9 seam) never happens
+        let event_written2 = event_written.clone();
+        let dir2 = dir.clone();
+        let mut sched = ConcurrentScheduler::new(0);
+        sched.create_actor_unsafe(
+            0,
+            "KillMidSend",
+            Job(Some(move || {
+                let (mut global, _) = open_delete_run(&dir2);
+                let mut manager = MessagesManager::default();
+                let mut ctx = SendTestContext::default();
+                let reactions_ctx = NoDialogReactionsContext;
+                {
+                    let d = manager.add_dialog_for_new_message(dialog_id);
+                    d.last_new_message_id =
+                        MessageId::from_server_message_id(ServerMessageId::new(50));
+                }
+                let mut need_update_dialog_pos = false;
+                let full_id = get_message_to_send(
+                    &mut ctx,
+                    &mut global,
+                    &mut manager,
+                    &reactions_ctx,
+                    dialog_id,
+                    &MessageTopic::default(),
+                    MessageInputReplyTo::default(),
+                    &m10_8_send_options(),
+                    m10_8_text_content("half-sent"),
+                    false,
+                    &mut need_update_dialog_pos,
+                    false,
+                    None,
+                    DialogId::default(),
+                    false,
+                    DialogId::default(),
+                    false,
+                );
+                // begin_send_message reads the message through the manager;
+                // pull the two CHECKed fields out first to satisfy the
+                // borrow (the C++ pointer aliasing collapses here)
+                let (message_id, random_id) = {
+                    let d = manager.get_dialog(dialog_id).unwrap();
+                    let m = d.messages.get(&full_id.get_message_id()).unwrap();
+                    (m.message_id, m.random_id)
+                };
+                let message_view = Message {
+                    message_id,
+                    random_id,
+                    ..Message::default()
+                };
+                let random_id = begin_send_message(&mut manager, dialog_id, &message_view);
+                assert_ne!(random_id, 0);
+
+                // the ordered pair: the event FIRST, then the send query —
+                // the crash window is between them
+                {
+                    let d = manager.get_dialog_mut(dialog_id).unwrap();
+                    let m = d.messages.get_mut(&full_id.get_message_id()).unwrap();
+                    save_send_message_log_event(&mut global, dialog_id, m);
+                    assert_ne!(
+                        m.send_message_log_event_id, 0,
+                        "the durable event carries the id back"
+                    );
+                }
+                global.td_db().binlog().force_flush();
+                do_send_message(
+                    dialog_id,
+                    manager
+                        .get_dialog(dialog_id)
+                        .unwrap()
+                        .messages
+                        .get(&full_id.get_message_id())
+                        .unwrap(),
+                );
+
+                // the durable in-memory state before the crash window
+                assert!(
+                    !manager
+                        .get_dialog(dialog_id)
+                        .unwrap()
+                        .random_id_to_message_id
+                        .is_empty(),
+                    "the correspondence registered before the crash window"
+                );
+                event_written2.store(1, AtomicOrdering::SeqCst);
+                Scheduler::instance().finish();
+            })),
+        );
+        sched.start();
+        while sched.run_main(30.0) && event_written.load(AtomicOrdering::SeqCst) == 0 {}
+        sched.finish();
+        assert_eq!(event_written.load(AtomicOrdering::SeqCst), 1);
+
+        // phase B: reopen — the replay arm reconstructs the yet-unsent
+        // message with its event id restored and re-enters the send skeleton
+        let replayed2 = replayed.clone();
+        let dir3 = dir.clone();
+        let mut sched = ConcurrentScheduler::new(0);
+        sched.create_actor_unsafe(
+            0,
+            "ReplaySends",
+            Job(Some(move || {
+                let (mut global, message_events) = open_delete_run(&dir3);
+                let mut manager = MessagesManager::default();
+                let mut ctx = SendTestContext::default();
+                let reactions_ctx = NoDialogReactionsContext;
+                manager.add_dialog_for_new_message(dialog_id);
+                let mut replay_count = 0;
+                for event in &message_events {
+                    if event.type_ == tddb::td_db::LOG_EVENT_HANDLER_TYPE_SEND_MESSAGE {
+                        replay_count += 1;
+                        let event_id = event.id;
+                        replay_send_message_log_event(
+                            &mut global,
+                            &mut manager,
+                            &reactions_ctx,
+                            &mut ctx,
+                            event,
+                        );
+                        // the reconstructed message keeps its event id and
+                        // sits in the dialog container
+                        let d = manager.get_dialog(dialog_id).unwrap();
+                        let found = d.messages.values().any(|m| {
+                            m.send_message_log_event_id == event_id
+                                && m.content.as_ref().is_some_and(|content| {
+                                    content.get_type() == MessageContentType::Text
+                                })
+                        });
+                        assert!(found, "the replayed message re-entered the send skeleton");
+                        assert!(
+                            d.random_id_to_message_id
+                                .values()
+                                .any(|message_id| { d.messages.contains_key(message_id) }),
+                            "the random-id correspondence is re-registered"
+                        );
+                        assert!(
+                            d.messages
+                                .keys()
+                                .any(|message_id| message_id.is_yet_unsent()),
+                            "the replay allocated a fresh yet-unsent id"
+                        );
+                    }
+                }
+                assert_eq!(replay_count, 1, "the durable send event replays");
+                replayed2.store(1, AtomicOrdering::SeqCst);
+                Scheduler::instance().finish();
+            })),
+        );
+        sched.start();
+        while sched.run_main(30.0) && replayed.load(AtomicOrdering::SeqCst) == 0 {}
+        sched.finish();
+        assert_eq!(replayed.load(AtomicOrdering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The erase branches of the SendMessage replay arm: pre-dialog-db
+    /// events (have_old_message_database == false) and Unsupported-content
+    /// events are erased, not replayed.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)] // the decision-table row style
+    fn m10_8_send_replay_erase_branches() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let base = std::env::temp_dir().join("m10_8_send_erase_run");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = base.canonicalize().unwrap().to_string_lossy().into_owned();
+        let prepared = StdArc::new(AtomicUsize::new(0));
+        let done = StdArc::new(AtomicUsize::new(0));
+        let dialog_id = DialogId::from_user_id(UserId::new(4000));
+
+        // phase A: an Unsupported-content half-sent event lands in the
+        // binlog; the sqlite file is then dropped so the next open re-creates
+        // the dialog db (the pre-dialog-db state)
+        let prepared2 = prepared.clone();
+        let dir2 = dir.clone();
+        let mut sched = ConcurrentScheduler::new(0);
+        sched.create_actor_unsafe(
+            0,
+            "WriteUnsupportedSend",
+            Job(Some(move || {
+                let (mut global, _) = open_delete_run(&dir2);
+                let time = crate::user_manager::TimeCtx::from_global(&global);
+                let mut m = Message::default();
+                m.message_id = m10_8_yet_unsent(2);
+                m.random_id = 7;
+                m.content = Some(crate::message_content::MessageContent::Unsupported(
+                    crate::message_content::MessageUnsupported::default(),
+                ));
+                let bytes = SendMessageLogEvent::store_to_bytes(
+                    dialog_id,
+                    &m,
+                    &MessageDbStorageBridge,
+                    &time,
+                );
+                global
+                    .td_db()
+                    .binlog()
+                    .add(tddb::td_db::LOG_EVENT_HANDLER_TYPE_SEND_MESSAGE, &bytes);
+                global.td_db().binlog().force_flush();
+                prepared2.store(1, AtomicOrdering::SeqCst);
+                Scheduler::instance().finish();
+            })),
+        );
+        sched.start();
+        while sched.run_main(30.0) && prepared.load(AtomicOrdering::SeqCst) == 0 {}
+        sched.finish();
+        assert_eq!(prepared.load(AtomicOrdering::SeqCst), 1);
+        // drop the dialog database so the next open re-creates it (the
+        // C++ `was_dialog_db_created()` precondition of the erase branch)
+        for suffix in ["db.sqlite", "db.sqlite-wal", "db.sqlite-shm"] {
+            let path = format!("{}{}{}", dir, std::path::MAIN_SEPARATOR, suffix);
+            let _ = std::fs::remove_file(&path);
+        }
+        let dir_with_sep = format!("{}{}", dir, std::path::MAIN_SEPARATOR);
+        assert!(
+            !std::path::Path::new(&format!("{dir_with_sep}db.sqlite")).exists(),
+            "the dialog database file must be gone before the reopen"
+        );
+
+        // phase B: the reopen re-creates the dialog db, so
+        // have_old_message_database is false — the replay erases the event
+        // pre-parse, exactly like the C++ arm
+        let done2 = done.clone();
+        let dir3 = dir.clone();
+        let mut sched = ConcurrentScheduler::new(0);
+        sched.create_actor_unsafe(
+            0,
+            "ReplayErases",
+            Job(Some(move || {
+                let (mut global, message_events) = open_delete_run(&dir3);
+                assert!(
+                    global.td_db().was_dialog_db_created(),
+                    "the dialog db was re-created — the pre-dialog-db branch precondition"
+                );
+                let mut manager = MessagesManager::default();
+                let mut ctx = SendTestContext::default();
+                let reactions_ctx = NoDialogReactionsContext;
+                manager.add_dialog_for_new_message(dialog_id);
+                let send_events = message_events
+                    .iter()
+                    .filter(|event| event.type_ == tddb::td_db::LOG_EVENT_HANDLER_TYPE_SEND_MESSAGE)
+                    .count();
+                assert_eq!(send_events, 1, "the unsupported send event was collected");
+                for event in &message_events {
+                    replay_send_message_log_event(
+                        &mut global,
+                        &mut manager,
+                        &reactions_ctx,
+                        &mut ctx,
+                        event,
+                    );
+                }
+                assert!(
+                    manager.get_dialog(dialog_id).unwrap().messages.is_empty(),
+                    "the erased event never reconstructs a message"
+                );
+                done2.store(1, AtomicOrdering::SeqCst);
+                Scheduler::instance().finish();
+            })),
+        );
+        sched.start();
+        while sched.run_main(30.0) && done.load(AtomicOrdering::SeqCst) == 0 {}
+        sched.finish();
+        assert_eq!(done.load(AtomicOrdering::SeqCst), 1);
+
+        // phase C: the erasure persisted — the third open collects nothing
+        let cleaned = StdArc::new(AtomicUsize::new(0));
+        let cleaned2 = cleaned.clone();
+        let dir4 = dir.clone();
+        let mut sched = ConcurrentScheduler::new(0);
+        sched.create_actor_unsafe(
+            0,
+            "VerifyErased",
+            Job(Some(move || {
+                let (_, message_events) = open_delete_run(&dir4);
+                let send_events = message_events
+                    .iter()
+                    .filter(|event| event.type_ == tddb::td_db::LOG_EVENT_HANDLER_TYPE_SEND_MESSAGE)
+                    .count();
+                assert_eq!(send_events, 0, "the erase branch wiped the event");
+                cleaned2.store(1, AtomicOrdering::SeqCst);
+                Scheduler::instance().finish();
+            })),
+        );
+        sched.start();
+        while sched.run_main(30.0) && cleaned.load(AtomicOrdering::SeqCst) == 0 {}
+        sched.finish();
+        assert_eq!(cleaned.load(AtomicOrdering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
