@@ -15274,7 +15274,7 @@ pub fn set_dialog_last_read_inbox_message_id(
                 notification_block;
             if message_group_valid {
                 let total_count =
-                    get_dialog_pending_notification_count(manager, state, dialog_id, false);
+                    get_dialog_pending_notification_count(ctx, manager, state, dialog_id, false);
                 if total_count == 0 {
                     // `set_dialog_last_notification(dialog_id, group_info, 0,
                     // NotificationId(), source)` (MessagesManager.cpp:12627-12633)
@@ -15555,10 +15555,21 @@ pub fn set_dialog_is_marked_as_unread(
         .is_marked_as_unread = is_marked_as_unread;
     on_dialog_updated(manager, dialog_id, "set_dialog_is_marked_as_unread");
 
-    let (unread_sum, order) = {
+    let (unread_sum, order, is_update_new_chat_sent) = {
         let d = manager.get_dialog(dialog_id).unwrap();
-        (d.server_unread_count + d.local_unread_count, d.order)
+        (
+            d.server_unread_count + d.local_unread_count,
+            d.order,
+            d.is_update_new_chat_sent,
+        )
     };
+    if !is_update_new_chat_sent {
+        // `LOG_CHECK(d->is_update_new_chat_sent)` (MessagesManager.cpp:28749)
+        // — FATAL in a debug C++ build, a silent no-op in release
+        tracing::warn!(
+            "Wrong {dialog_id:?} in set_dialog_is_marked_as_unread (updateNewChat not sent yet)"
+        );
+    }
     state.send_update(td_api::Object::updateChatIsMarkedAsUnread(
         td_api::updateChatIsMarkedAsUnread {
             chat_id: ctx
@@ -15840,9 +15851,23 @@ fn remove_message_notification_id(
 
     let group_id = group_info.get_group_id();
     // `delete_notification_id_to_message_id_correspondence`
-    notification_info
+    // (MessagesManager.cpp:13322-13334) — the erase happens only while the
+    // mapping still points at this message; a stale entry is kept and logged
+    let mapped_message_id = notification_info
         .notification_id_to_message_id
-        .remove(&notification_id);
+        .get(&notification_id)
+        .copied();
+    if mapped_message_id == Some(m.message_id) {
+        notification_info
+            .notification_id_to_message_id
+            .remove(&notification_id);
+    } else {
+        log_error!(
+            "Can't find {:?} from {}",
+            notification_id,
+            DisplayMessageId(m.message_id)
+        );
+    }
     m.removed_notification_id = m.notification_id;
     m.notification_id = NotificationId::default();
     let pinned_matches = notification_info.pinned_message_notification_message_id == m.message_id;
@@ -15860,22 +15885,34 @@ fn remove_message_notification_id(
         );
     }
 
-    if is_permanent && had_active_notification {
-        state.remove_notification(group_id, notification_id, is_permanent, force_update);
+    if is_permanent {
+        if had_active_notification {
+            state.remove_notification(group_id, notification_id, is_permanent, force_update);
+        }
+        // on_message_changed will be called by the caller
+        // don't need to call there to not save twice/or to save just deleted message
+    } else {
+        // the C++ non-permanent arm is `on_message_changed(d, m, false,
+        // source)` (MessagesManager.cpp:13399); its callers
+        // (do_remove_message_notification, MessagesManager.cpp:26478/26544)
+        // are the M.13 notification slice — the persistence tail rides
+        // on_message_changed there ([blocked: M.13])
     }
-
-    // on_message_changed will be called by the caller
-    // don't need to call there to not save twice/or to save just deleted message
 }
 
 /// `MessagesManager::get_dialog_pending_notification_count`
 /// (MessagesManager.cpp:26574-26594).
 fn get_dialog_pending_notification_count(
+    ctx: &dyn MessageObjectContext,
     manager: &MessagesManager,
     state: &dyn ReadStateContext,
     dialog_id: DialogId,
     from_mentions: bool,
 ) -> i32 {
+    assert!(
+        !ctx.is_bot(),
+        "get_dialog_pending_notification_count for a bot"
+    );
     let d = manager.get_dialog(dialog_id).unwrap_or_else(|| {
         panic!("get_dialog_pending_notification_count without the dialog {dialog_id:?}")
     });
@@ -15899,9 +15936,12 @@ fn get_dialog_pending_notification_count(
 }
 
 /// `MessagesManager::remove_message_dialog_notifications`
-/// (MessagesManager.cpp:26937-26988) — the pending-notification zeroing
-/// and the `set_dialog_last_notification` halves are local; the flush and
-/// the group removal sends ride the [`ReadStateContext`] seams.
+/// (MessagesManager.cpp:26937-26988) — the pending-new-message zeroing and
+/// the `set_dialog_last_notification` halves are local: the gate and the
+/// zeroing always use the message pending list regardless of
+/// `from_mentions` (MessagesManager.cpp:26952-26962), `from_mentions` only
+/// selects the flushed list inside the flush; the flush and the group
+/// removal sends ride the [`ReadStateContext`] seams.
 fn remove_message_dialog_notifications(
     manager: &mut MessagesManager,
     ctx: &dyn MessageObjectContext,
@@ -15912,73 +15952,83 @@ fn remove_message_dialog_notifications(
     source: &str,
 ) {
     // removes up to max_message_id
+    assert!(
+        !ctx.is_bot(),
+        "remove_message_dialog_notifications for a bot"
+    );
     assert!(!max_message_id.is_scheduled());
 
-    // `get_next_local_message_id` — computed before the mutable borrow
-    let next_local_message_id = manager
-        .get_dialog_mut(dialog_id)
-        .map(|d| get_next_local_message_id(d, ctx.is_bot()))
-        .unwrap_or_default();
     let last_message_id = manager
         .get_dialog(dialog_id)
         .map(|d| d.last_message_id)
         .unwrap_or_default();
 
-    let Some(d) = manager.get_dialog_mut(dialog_id) else {
-        return;
-    };
-    let Some(notification_info) = d.notification_info.as_mut() else {
-        return;
-    };
-    let NotificationInfo {
-        message_notification_group,
-        mention_notification_group,
-        pending_new_message_notifications,
-        pending_new_mention_notifications,
-        ..
-    } = notification_info;
-    let (group_info, pending) = if from_mentions {
-        (
-            mention_notification_group,
-            pending_new_mention_notifications,
-        )
-    } else {
-        (
+    let (group_id, mut max_notification_message_id, needs_next_local_id) = {
+        let Some(d) = manager.get_dialog_mut(dialog_id) else {
+            return;
+        };
+        let Some(notification_info) = d.notification_info.as_mut() else {
+            return;
+        };
+        let NotificationInfo {
             message_notification_group,
+            mention_notification_group,
             pending_new_message_notifications,
-        )
-    };
-    if !group_info.is_valid() {
-        return;
-    }
-    let group_id = group_info.get_group_id();
-
-    if !pending.is_empty() {
-        for it in pending.iter_mut() {
-            if it.1 <= max_message_id {
-                it.0 = DialogId::default();
-            }
+            ..
+        } = notification_info;
+        let group_info = if from_mentions {
+            mention_notification_group
+        } else {
+            message_notification_group
+        };
+        if !group_info.is_valid() {
+            return;
         }
-        state.flush_pending_new_message_notifications(
-            dialog_id,
-            from_mentions,
-            DialogId::from_user_id(UserId::new(3)),
-        );
-    }
+        let group_id = group_info.get_group_id();
 
-    let mut max_notification_message_id = max_message_id;
-    if last_message_id.is_valid() && max_notification_message_id >= last_message_id {
-        max_notification_message_id = last_message_id;
-        group_info.set_last_notification(0, NotificationId::default()); // "remove_message_dialog_notifications 1"
-    } else if max_notification_message_id == MessageId::max() {
-        max_notification_message_id = next_local_message_id;
-        group_info.set_last_notification(0, NotificationId::default()); // "remove_message_dialog_notifications 2"
-    } else {
-        panic!(
-            "TODO support notification deletion up to {} if it would be ever needed from {}",
-            DisplayMessageId(max_message_id),
-            source
-        );
+        // the message pending list gate + zeroing run for both planes
+        // (MessagesManager.cpp:26952-26962)
+        if !pending_new_message_notifications.is_empty() {
+            for it in pending_new_message_notifications.iter_mut() {
+                if it.1 <= max_message_id {
+                    it.0 = DialogId::default();
+                }
+            }
+            state.flush_pending_new_message_notifications(
+                dialog_id,
+                from_mentions,
+                DialogId::from_user_id(UserId::new(3)),
+            );
+        }
+
+        let mut max_notification_message_id = max_message_id;
+        let needs_next_local_id;
+        if last_message_id.is_valid() && max_notification_message_id >= last_message_id {
+            max_notification_message_id = last_message_id;
+            group_info.set_last_notification(0, NotificationId::default()); // "remove_message_dialog_notifications 1"
+            needs_next_local_id = false;
+        } else if max_notification_message_id == MessageId::max() {
+            group_info.set_last_notification(0, NotificationId::default()); // "remove_message_dialog_notifications 2"
+            needs_next_local_id = true;
+        } else {
+            panic!(
+                "TODO support notification deletion up to {} if it would be ever needed from {}",
+                DisplayMessageId(max_message_id),
+                source
+            );
+        }
+        (group_id, max_notification_message_id, needs_next_local_id)
+    };
+
+    if needs_next_local_id {
+        // the `get_next_local_message_id(d)` allocation of the max() arm
+        // (MessagesManager.cpp:26971) — it fires only on this arm like the
+        // C++; the arm's `set_dialog_last_notification` half runs above it
+        // here, and the two touches are independent in the C++ too
+        max_notification_message_id = manager
+            .get_dialog_mut(dialog_id)
+            .map(|d| get_next_local_message_id(d, ctx.is_bot()))
+            .unwrap_or_default();
     }
 
     state.remove_notification_group(group_id, max_notification_message_id, 0, true, source);
@@ -21069,11 +21119,16 @@ mod tests {
             m.contains_mention = true;
             m.contains_unread_mention = true;
             m.notification_id = NotificationId::new(9);
+            let other_dialog_id = DialogId::from_user_id(UserId::new(42));
             let mut info = NotificationInfo {
                 // `is_from_mention_notification_group(m)` is true (contains_mention),
                 // so `get_notification_group_info(d, m)` reads the mention group
                 mention_notification_group: NotificationGroupInfo::with_group_id(group_id),
-                pending_new_mention_notifications: vec![(DialogId::default(), m.message_id)],
+                // the C++ gate + zeroing always use the message pending list
+                // (MessagesManager.cpp:26952-26962), even for from_mentions =
+                // true; the mention list is only touched inside the flush
+                pending_new_message_notifications: vec![(other_dialog_id, m.message_id)],
+                pending_new_mention_notifications: vec![(other_dialog_id, m.message_id)],
                 ..NotificationInfo::default()
             };
             info.notification_id_to_message_id
@@ -21121,15 +21176,31 @@ mod tests {
         assert_eq!(max_id, m10_7_server_id(31).get());
         assert_eq!(total_count, 0);
         assert!(force);
+        // the allocator fires only on the max() arm — arm 1 must not advance
+        // `last_assigned_message_id`
+        assert_eq!(d.last_assigned_message_id, MessageId::default());
         // the active notification removal for the mention message itself
         assert_eq!(state.removed_notifications.len(), 1);
         assert_eq!(state.removed_notifications[0].0, group_id.get());
         assert_eq!(state.removed_notifications[0].1, 9);
+        // the flush fires because the MESSAGE pending list is non-empty (the
+        // from_mentions=true flag selects the flushed list inside the flush)
         assert_eq!(state.flushed.len(), 1);
-        assert!(state.flushed[0].0, "the mention plane flush");
+        assert!(state.flushed[0].0, "the from_mentions flag passes through");
         assert_eq!(
             state.flushed[0].1,
             DialogId::from_user_id(UserId::new(3)).get()
+        );
+        let info = d.notification_info.as_ref().unwrap();
+        assert_eq!(
+            info.pending_new_message_notifications[0].0,
+            DialogId::default(),
+            "the message pending list is zeroed up to the max"
+        );
+        assert_ne!(
+            info.pending_new_mention_notifications[0].0,
+            DialogId::default(),
+            "the mention pending list is untouched here — the flush's list selection is the M.13 seam"
         );
     }
 }
