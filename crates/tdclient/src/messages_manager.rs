@@ -9397,6 +9397,45 @@ pub fn do_delete_message_log_event(
     );
 }
 
+/// The `LogEvent::HandlerType::DeleteMessage` binlog replay arm
+/// (MessagesManager.cpp:36248-36264): the reopened engine re-parses the
+/// durable event, re-records the deleted id on the dialog skeleton and
+/// re-runs `do_delete_message_log_event` (the row erase). The
+/// `have_old_message_database`/`binlog_erase` leg (36250-36253) answers on
+/// the open parameters, like the C++. The C++ `get_dialog_force` db load of
+/// the dialog is the dialog-db receive seam; the in-memory skeleton is used
+/// as-is.
+pub fn replay_delete_message_log_event(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    event: &tddb::binlog::BinlogEvent,
+) {
+    if !global.use_message_database() {
+        global.td_db().binlog().erase(event.id);
+        return;
+    }
+    let mut parser = Parser::new(event.get_data());
+    let mut log_event = DeleteMessageLogEvent::parse_from(&mut parser)
+        .expect("corrupt DeleteMessageLogEvent in the binlog");
+    log_event.id = event.id;
+
+    let dialog_id = log_event.message_full_id.get_dialog_id();
+    if let Some(d) = manager.get_dialog_mut(dialog_id) {
+        let message_id = log_event.message_full_id.get_message_id();
+        if message_id.is_valid_scheduled() && message_id.is_scheduled_server() {
+            if let Some(scheduled) = d.scheduled_messages.as_mut() {
+                scheduled
+                    .deleted_scheduled_server_message_ids
+                    .insert(message_id.get_scheduled_server_message_id());
+            }
+        } else if message_id != MessageId::default() {
+            d.deleted_message_ids.insert(message_id);
+        }
+    }
+
+    do_delete_message_log_event(global, &log_event);
+}
+
 /// `MessagesManager::delete_message_from_database`
 /// (MessagesManager.cpp:32063-32152) — the database-relevant spine; the
 /// notification-group and file-deletion side effects are seams until their
@@ -9446,14 +9485,24 @@ pub fn delete_message_from_database(
                 .copied()
             && old_message_id != MessageId::default()
         {
+            // `get_message(d, old_message_id)` — with the message containers
+            // absent the lookup resolves to nullptr, so `have_old_message`
+            // answers false (log-only in the C++, behaviorally exact until
+            // M.10.9)
+            let have_old_message = false;
             tracing::warn!(
-                "Sent message {}:{} was deleted before it was received",
+                "Sent message {}:{} was deleted before it was received. Have old {} = {}",
                 dialog_id.get(),
-                message_id.get()
+                message_id.get(),
+                old_message_id.get(),
+                have_old_message
             );
-            manager.update_message_ids.remove(&(dialog_id, message_id));
-            // `delete_messages` fan-out lands with the delete path (M.10.6)
-            let _ = old_message_id;
+            // `delete_messages` (the M.10.6 delete path); the C++ fans out
+            // through `send_closure_later` with an empty promise, so the
+            // error lands nowhere (MessagesManager.cpp:32113-32114)
+            let _ = delete_messages(global, manager, dialog_id, &[old_message_id]);
+            let erased = manager.update_message_ids.remove(&(dialog_id, message_id));
+            assert!(erased.is_some(), "update_message_ids entry vanished");
         }
     }
 
@@ -11660,7 +11709,7 @@ pub fn create_message(
         || (content_type == MessageContentType::PinMessage
             && ctx
                 .content_context()
-                .get_option_boolean("process_pinned_messages_as_mentions"));
+                .get_option_boolean("process_pinned_messages_as_mentions", false));
 
     let mut message = Box::new(Message::default());
     message.message_id = message_id;
@@ -12511,16 +12560,34 @@ pub fn on_message_edited(
 // ---------------------------------------------------------------------------
 
 /// `MessagesManager::get_dialog_by_message_id`
-/// (MessagesManager.cpp:8609-8635) — the message_id_to_dialog_id_ container
-/// is M.10.9's; the message-db unique-id load is the landed leg.
+/// (MessagesManager.cpp:32888-32912) — the message_id_to_dialog_id_
+/// container is M.10.9's; the message-db unique-id load is the landed leg.
+/// The C++ requires the loaded message non-null and CHECKs
+/// `m->message_id == message_id` — the row's id column is that field, so a
+/// stale/corrupt row CHECK-fails here too; the full
+/// `on_get_message_from_database` parse rides the M.10.9 receive slice.
 fn resolve_dialog_by_message_id(
     global: &crate::global::Global,
     message_id: MessageId,
+    source: &str,
 ) -> Option<DialogId> {
     assert!(message_id.is_server());
+    // the `message_id_to_dialog_id_` in-memory container is M.10.9's — an
+    // unresolved id falls to the db leg, which the C++ wraps entirely in
+    // `if (G()->use_message_database())` (MessagesManager.cpp:32892-32905)
+    // and answers nullptr outside it
+    if !global.use_message_database() {
+        return None;
+    }
     global.message_db_sync().with_db(|db| {
         match db.get_message_by_unique_message_id(message_id.get_server_message_id()) {
-            tdutils::status::Result::Ok(row) => Some(row.dialog_id),
+            tdutils::status::Result::Ok(row) => {
+                assert_eq!(
+                    row.message_id, message_id,
+                    "{source}: corrupt unique-id row"
+                );
+                Some(row.dialog_id)
+            }
             tdutils::status::Result::Err(_) => None,
         }
     })
@@ -12549,12 +12616,18 @@ pub fn delete_messages_from_updates(
         }
         // `get_dialog_by_message_id`: an unresolved id is skipped — the C++
         // relies on the difference flow to deliver the delete.
-        let Some(dialog_id) = resolve_dialog_by_message_id(global, *message_id) else {
+        let Some(dialog_id) =
+            resolve_dialog_by_message_id(global, *message_id, "delete_messages_from_updates")
+        else {
             continue;
         };
         // `delete_message` (the in-memory removal, the read-state/counter
         // walk and the notification repairs) is the M.10.9 container seam;
-        // the durable spine runs here.
+        // the durable spine runs here. The C++ second arm — the
+        // `last_clear_history_message_id_to_dialog_id_` re-delete with its
+        // CHECK(message == nullptr) and the last-clear reset
+        // (MessagesManager.cpp:8006-8013) — walks the clear-history
+        // container and rides the same M.10.9 seam.
         delete_message_from_database(
             global,
             manager,
@@ -12576,21 +12649,36 @@ pub fn delete_messages_from_updates(
 
 /// `MessagesManager::delete_messages` (MessagesManager.cpp:8533-8606) — the
 /// user-requested delete: the validation ladder, the id normalization and
-/// the durable spine per id. `check_dialog_access` (8,536) is the rights
-/// seam; `get_persistent_message_id` (21,133) walks the yet-unsent rewrite
-/// container — the recorded seam leaves the id as-is; the
-/// `can_delete_message`/`can_revoke_message` gates (8451-8532) inspect the
-/// stored message — with the containers absent the lookups resolve to
-/// `nullptr` and both gates answer true, behaviorally exact until M.10.9;
-/// `delete_messages_on_server`/`delete_scheduled_messages_on_server`
-/// (8,580-8,587) and the MultiPromiseActor completion are the net-plane
-/// seam.
+/// the durable spine per id. The C++ opens with
+/// `TRY_STATUS_PROMISE(promise, G()->close_status())` (8,535) — the close
+/// gate is owned by the Td dispatch in the port. `check_dialog_access`
+/// (8,536; 34438-34446): the in-memory registration is checked here and the
+/// `get_dialog_force` db load + `check_dialog_access_in_memory` rights are
+/// the dialog-db receive seams; `get_persistent_message_id` (21,133) walks
+/// the yet-unsent rewrite container — the recorded seam leaves the id
+/// as-is; the `can_delete_message`/`can_revoke_message` gates (8451-8532)
+/// inspect the stored message — with the containers absent the lookups
+/// resolve to `nullptr` and both gates answer true, behaviorally exact
+/// until M.10.9; `delete_messages_on_server`/
+/// `delete_scheduled_messages_on_server` (8,580-8,587) and the
+/// MultiPromiseActor completion are the net-plane seam.
 pub fn delete_messages(
     global: &mut crate::global::Global,
     manager: &mut MessagesManager,
     dialog_id: DialogId,
     input_message_ids: &[MessageId],
 ) -> Result<(), Status> {
+    // `check_dialog_access` (MessagesManager.cpp:8536; 34438-34446): the
+    // invalid-id and not-found errors precede everything, and the
+    // `check_dialog_access_in_memory` rights half is the dialog-manager
+    // rights seam.
+    if !dialog_id.is_valid() {
+        return Result::Err(Status::error(400, "Invalid chat identifier specified"));
+    }
+    if manager.get_dialog(dialog_id).is_none() {
+        // the `get_dialog_force` db load leg is the dialog-db receive seam
+        return Result::Err(Status::error(400, "Chat not found"));
+    }
     if input_message_ids.is_empty() {
         return Result::Ok(());
     }
@@ -12619,41 +12707,150 @@ pub fn delete_messages(
 /// `DELETE_MESSAGE_USER_REQUEST_SOURCE` (MessagesManager.h).
 pub const DELETE_MESSAGE_USER_REQUEST_SOURCE: &str = "user request";
 
+/// `MessagesManager::CanDeleteDialog` (MessagesManager.h).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CanDeleteDialog {
+    pub for_self: bool,
+    pub for_all_users: bool,
+}
+
+/// `MessagesManager::can_delete_dialog`
+/// (MessagesManager.cpp:8703-8751). The sponsored-chat head (8704-8714)
+/// is the PromoDataManager seam (an empty sponsored source falls through
+/// like the C++ `chat_source == nullptr`); the channel reads
+/// `is_channel_public`/`status.is_member`/`channel_can_be_deleted` and the
+/// secret-chat `get_secret_chat_state` are the ChatManager stand-ins
+/// answering like an empty manager (public=false, member=false,
+/// undeletable=false, closed secret chat).
+pub fn can_delete_dialog(
+    ctx: &dyn MessageObjectContext,
+    manager: &MessagesManager,
+    dialog_id: DialogId,
+) -> CanDeleteDialog {
+    if ctx.is_bot() || !ctx.content_context().have_input_peer(dialog_id) {
+        return CanDeleteDialog::default();
+    }
+    match dialog_id.get_type() {
+        DialogType::User => {
+            let user_id = dialog_id.get_user_id();
+            if dialog_id == ctx.content_context().get_my_dialog_id()
+                || ctx.content_context().is_user_deleted(user_id)
+                || ctx.content_context().is_user_bot(user_id)
+            {
+                return CanDeleteDialog {
+                    for_self: true,
+                    for_all_users: false,
+                };
+            }
+            // the C++ reads the option with default = true
+            // (MessagesManager.cpp:8726 `get_option_boolean("revoke_pm_inbox", true)`)
+            CanDeleteDialog {
+                for_self: true,
+                for_all_users: ctx
+                    .content_context()
+                    .get_option_boolean("revoke_pm_inbox", true),
+            }
+        }
+        DialogType::Chat => {
+            // chats can be deleted only for self and can be deleted for
+            // everyone by their creator — `status.is_creator()` is the
+            // ChatManager status seam
+            CanDeleteDialog {
+                for_self: true,
+                for_all_users: false,
+            }
+        }
+        DialogType::Channel => {
+            // private non-forum joined supergroups can be deleted for self;
+            // `is_channel_public` and `status.is_member()` are the
+            // ChatManager seam stand-ins and answer false, so `for_self` is
+            // `!is_broadcast_channel && !is_forum` here
+            let channel_id = dialog_id.get_channel_id();
+            let is_forum = manager.get_dialog(dialog_id).is_some_and(|d| d.is_forum);
+            let for_self = !ctx.content_context().is_broadcast_channel(channel_id) && !is_forum;
+            CanDeleteDialog {
+                for_self,
+                for_all_users: false, // `channel_can_be_deleted` — the same seam
+            }
+        }
+        DialogType::SecretChat => {
+            // a closed secret chat deletes for self only; an active one only
+            // for both users — `get_secret_chat_state` is the Wave-3 seam
+            // answering the closed state
+            CanDeleteDialog {
+                for_self: true,
+                for_all_users: false,
+            }
+        }
+        DialogType::None => CanDeleteDialog::default(),
+    }
+}
+
 /// `MessagesManager::delete_dialog_history`
 /// (MessagesManager.cpp:8753-8820) — the gates and the dialog markers: the
-/// sponsored-chat gate (8,766-8,782) is the PromoDataManager seam, the
-/// `can_delete_dialog` rights gate (8,783-8,793) is the ChatManager
-/// rights seam (the revoke downgrade follows the C++ for_self shape), the
+/// C++ opens with `check_dialog_access` (8,758; 34438-34446), inlined below;
+/// the sponsored-chat gate (8,766-8,782) is the PromoDataManager seam, the
+/// `can_delete_dialog` rights gate (8,783-8,793) runs over the context
+/// reads with the ChatManager stand-ins recorded on it, the
 /// `delete_all_dialog_messages` container sweep (8,805) is M.10.9's, and
 /// `delete_dialog_history_on_server` (8,817-8,819) is the net-plane seam.
 /// Returns the effective `revoke` after the C++ downgrade.
 pub fn delete_dialog_history(
+    ctx: &dyn MessageObjectContext,
     manager: &mut MessagesManager,
     dialog_id: DialogId,
     remove_from_dialog_list: bool,
     mut revoke: bool,
 ) -> Result<bool, Status> {
-    let Some(d) = manager.get_dialog(dialog_id) else {
-        return Result::Err(Status::error(
-            400,
-            &format!("Can't delete history of unknown dialog {dialog_id:?}"),
-        ));
-    };
+    // `check_dialog_access` (8,758; 34438-34446): `get_dialog_force` first —
+    // the in-memory lookup, then the dialog-db row existence check (the full
+    // `parse_dialog` load is the dialog-db receive seam); a null answer
+    // errors "Invalid chat identifier specified" for an invalid id and
+    // "Chat not found" otherwise. The `check_dialog_access_in_memory` rights
+    // half is the dialog-manager rights seam.
+    if manager.get_dialog(dialog_id).is_none() {
+        if !dialog_id.is_valid() {
+            return Result::Err(Status::error(400, "Invalid chat identifier specified"));
+        }
+        let row_exists = global_dialog_row_exists(manager, dialog_id);
+        if !row_exists {
+            return Result::Err(Status::error(400, "Chat not found"));
+        }
+        manager.add_dialog_for_new_message(dialog_id);
+    }
 
     // the sponsored-chat gate (MessagesManager.cpp:8766-8782) — the
     // sponsored-dialog plane is its own slice.
-    let can_delete_for_self = true; // `can_delete_dialog.for_self_` — the ChatManager rights seam
-    let can_delete_for_all_users = true; // `can_delete_dialog.for_all_users_` — the same seam
-    if revoke && !can_delete_for_all_users {
-        if !can_delete_for_self {
-            return Result::Err(Status::error(400, "Chat history can't be deleted"));
+    let can_delete = can_delete_dialog(ctx, manager, dialog_id);
+    if revoke {
+        if !can_delete.for_all_users {
+            if !can_delete.for_self {
+                return Result::Err(Status::error(400, "Chat history can't be deleted"));
+            }
+            // Can't delete history of the dialog for everyone; delete it only for self
+            revoke = false;
         }
-        // Can't delete history of the dialog for everyone; delete it only for self
-        revoke = false;
+    } else if !can_delete.for_self {
+        return Result::Err(Status::error(
+            400,
+            &format!("Can't delete history of {dialog_id} only for self"),
+        ));
     }
-    let last_new_message_id = d.last_new_message_id;
-    let old_order = d.order;
-    let max_unavailable_message_id = d.max_unavailable_message_id;
+    let last_new_message_id = manager
+        .get_dialog(dialog_id)
+        .map(|d| d.last_new_message_id)
+        .unwrap_or_default();
+    let old_order = manager
+        .get_dialog(dialog_id)
+        .map(|d| d.order)
+        .unwrap_or(DEFAULT_ORDER);
+    let max_unavailable_message_id = manager
+        .get_dialog(dialog_id)
+        .map(|d| d.max_unavailable_message_id)
+        .unwrap_or_default();
+
+    // `delete_all_dialog_messages` (8,805) — the per-message sweep is the
+    // M.10.9 container seam; it precedes the cleared-history check.
 
     if last_new_message_id.is_valid()
         && last_new_message_id == max_unavailable_message_id
@@ -12664,43 +12861,83 @@ pub fn delete_dialog_history(
         return Result::Ok(revoke);
     }
 
-    // `delete_all_dialog_messages` (8,805) — the per-message sweep is the
-    // M.10.9 container seam.
-
-    // `set_dialog_max_unavailable_message_id` (MessagesManager.cpp:10028+);
-    // the ordered-messages walk of its tail is the M.10.9 container seam.
-    let max_unavailable = if let Some(d) = manager.get_dialog(dialog_id) {
-        let mut target = last_new_message_id;
-        if d.last_new_message_id.is_valid() && target > d.last_new_message_id {
-            // possible if the last unavailable message has already been deleted
-            target = d.last_new_message_id;
-        }
-        let unchanged = d.max_unavailable_message_id == target;
-        let backwards = d.max_unavailable_message_id > target;
-        if unchanged {
-            return Result::Ok(revoke);
-        }
-        if target.is_valid() && target.is_yet_unsent() {
-            return Result::Ok(revoke);
-        }
-        Some((target, backwards))
-    } else {
-        None
-    };
-    if let Some((target, backwards)) = max_unavailable {
-        // the C++ `if (> ) { assign; return; }` early-returns before the
-        // ordered-messages sweep; the sweep itself (3,10064-3,10080) is the
-        // M.10.9 container seam.
-        let _ = backwards;
-        if let Some(d) = manager.get_dialog_mut(dialog_id) {
-            d.max_unavailable_message_id = target;
-        }
-        // `on_dialog_updated` (the binlog-pmc dirty marker) rides the
-        // dialog-db receive slice.
-    }
+    // `set_dialog_max_unavailable_message_id(dialog_id, last_new_message_id,
+    // false, ...)` (8,812; 10028-10064); the ordered-messages walk of its
+    // tail is the M.10.9 container seam.
+    set_dialog_max_unavailable_message_id(
+        manager,
+        dialog_id,
+        last_new_message_id,
+        false,
+        "delete_dialog_history",
+    );
 
     // `delete_dialog_history_on_server` (8,817-8,819) — the net-plane seam.
     Result::Ok(revoke)
+}
+
+/// Whether the dialog has a persisted row — the `get_dialog_force` db leg.
+fn global_dialog_row_exists(manager: &MessagesManager, dialog_id: DialogId) -> bool {
+    let _ = (manager, dialog_id);
+    // the DialogDbSyncSafe row read + `parse_dialog` ride the dialog-db
+    // receive slice; the stand-in answers "no persisted row".
+    false
+}
+
+/// `MessagesManager::set_dialog_max_unavailable_message_id`
+/// (MessagesManager.cpp:10028-10064) — the marker core; the
+/// ordered-messages sweep of the tail is the M.10.9 container seam.
+pub fn set_dialog_max_unavailable_message_id(
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    mut max_unavailable_message_id: MessageId,
+    from_update: bool,
+    source: &str,
+) {
+    assert!(!max_unavailable_message_id.is_scheduled());
+    // `get_dialog_force` — the db load leg is the dialog-db receive seam
+    if manager.get_dialog(dialog_id).is_none() {
+        return;
+    }
+    let backwards = {
+        let d = manager.get_dialog(dialog_id).unwrap();
+        if d.last_new_message_id.is_valid()
+            && max_unavailable_message_id > d.last_new_message_id
+            && from_update
+        {
+            // possible if the last unavailable message has already been deleted
+            max_unavailable_message_id = d.last_new_message_id;
+        }
+        if d.max_unavailable_message_id == max_unavailable_message_id {
+            return;
+        }
+        if max_unavailable_message_id.is_valid() && max_unavailable_message_id.is_yet_unsent() {
+            log_error!(
+                "Tried to update {:?} max unavailable message with {} from {}",
+                dialog_id,
+                DisplayMessageId(max_unavailable_message_id),
+                source
+            );
+            return;
+        }
+        d.max_unavailable_message_id > max_unavailable_message_id
+    };
+    if backwards {
+        // the C++ early-returns before the ordered-messages sweep when the
+        // marker moves backwards (MessagesManager.cpp:10054-10058)
+        manager
+            .get_dialog_mut(dialog_id)
+            .unwrap()
+            .max_unavailable_message_id = max_unavailable_message_id;
+        return;
+    }
+    manager
+        .get_dialog_mut(dialog_id)
+        .unwrap()
+        .max_unavailable_message_id = max_unavailable_message_id;
+    // the ordered-messages sweep of the tail (MessagesManager.cpp:10060-10080)
+    // is the M.10.9 container seam; `on_dialog_updated` (the binlog-pmc dirty
+    // marker) rides the dialog-db receive slice.
 }
 
 /// The message-plane `const Td *td` surface: the M.9 content context plus
@@ -14332,9 +14569,8 @@ mod tests {
     }
 
     use super::*;
-    use crate::message_db::MessageDbImpl;
-    use tddb::db_key::DbKey;
-    use tddb::td_db::{LOG_EVENT_HANDLER_TYPE_DELETE_MESSAGE, init_message_db};
+    use tdactor::{ConcurrentScheduler, Scheduler};
+    use tddb::td_db::LOG_EVENT_HANDLER_TYPE_DELETE_MESSAGE;
 
     // ---- ServerMessageId / ScheduledServerMessageId / EphemeralMessageId ----
 
@@ -17634,116 +17870,376 @@ mod tests {
         assert_eq!(m.last_edit_pts, 78);
     }
 
-    /// The M.10.6 crash-recovery replay: `do_delete_message_log_event`
-    /// writes the binlog event before the row erase can complete, so a kill
-    /// mid-delete leaves the durable event with the row still present; the
-    /// reopened engine replays the binlog and re-applies the erase.
+    /// A one-shot actor that runs a job inside a scheduler context — the
+    /// database engines exist only there (the message_db.rs choreography
+    /// pattern).
+    struct Job<F>(Option<F>);
+    impl<F: FnOnce() + Send + 'static> tdactor::Actor for Job<F> {
+        fn start_up(&mut self) {
+            if let Some(job) = self.0.take() {
+                job();
+            }
+        }
+    }
+
+    fn open_delete_run(dir: &str) -> (crate::global::Global, Vec<tddb::binlog::BinlogEvent>) {
+        let opened = tddb::td_db::TdDb::open(tddb::td_db::Parameters {
+            database_directory: format!("{}{}", dir, std::path::MAIN_SEPARATOR),
+            use_message_database: true,
+            use_file_database: true,
+            ..Default::default()
+        })
+        .unwrap();
+        let messages_manager_events = opened.messages_manager_events;
+        let mut global = crate::global::Global::new();
+        global.init(opened.database);
+        // mark the database authorized: TdDb::open destroys the sqlite file
+        // of a never-authorized run
+        global.binlog_pmc().set("auth", "ok");
+        (global, messages_manager_events)
+    }
+
+    fn store_corpus_row(
+        global: &mut crate::global::Global,
+        manager: &mut MessagesManager,
+        dialog_id: DialogId,
+        message_full_id: MessageFullId,
+    ) {
+        let reactions_ctx = NoDialogReactionsContext;
+        let time = crate::user_manager::TimeCtx::from_global(global);
+        let m = Message {
+            message_id: message_full_id.get_message_id(),
+            date: 1700000100,
+            sender_user_id: dialog_id.get_user_id(),
+            content: Some(crate::message_content::MessageContent::Text(
+                crate::message_content::MessageText::default(),
+            )),
+            ..Default::default()
+        };
+        add_message_to_database(
+            global,
+            manager,
+            &reactions_ctx,
+            &crate::message_content::SharedTestContext::default(),
+            &time,
+            dialog_id,
+            &m,
+            "updateNewMessage",
+        );
+    }
+
+    /// The M.10.6 corpus: a recorded `updateDeleteMessages` shape (two
+    /// server ids in one dialog) through `delete_messages_from_updates` —
+    /// the ids resolve through the unique-id load, the durable deletes land
+    /// through the M.10.2 binlog spine, and the async read confirms the rows
+    /// are erased.
+    #[test]
+    fn m10_6_update_delete_messages_corpus_resolves_and_persists() {
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let base = std::env::temp_dir().join("m10_6_corpus_run");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = base.canonicalize().unwrap().to_string_lossy().into_owned();
+        let done = StdArc::new(AtomicUsize::new(0));
+        let rows_gone = StdArc::new(AtomicUsize::new(0));
+        let dialog_id = DialogId::from_user_id(UserId::new(2000));
+        let id400 = MessageFullId::new(
+            dialog_id,
+            MessageId::from_server_message_id(ServerMessageId::new(400)),
+        );
+        let id401 = MessageFullId::new(
+            dialog_id,
+            MessageId::from_server_message_id(ServerMessageId::new(401)),
+        );
+
+        let mut sched = ConcurrentScheduler::new(0);
+
+        // job 1: the rows land durably (the close drains the writes)
+        sched.create_actor_unsafe(
+            0,
+            "StoreRows",
+            Job(Some({
+                let done = done.clone();
+                let dir = dir.clone();
+                move || {
+                    let (mut global, _) = open_delete_run(&dir);
+                    let mut manager = MessagesManager::default();
+                    manager.add_dialog_for_new_message(dialog_id);
+                    store_corpus_row(&mut global, &mut manager, dialog_id, id400);
+                    store_corpus_row(&mut global, &mut manager, dialog_id, id401);
+                    let stored = done.clone();
+                    global
+                        .message_db_async()
+                        .close(tdutils::promise::PromiseCreator::lambda(move |()| {
+                            stored.store(1, AtomicOrdering::SeqCst);
+                        }));
+                }
+            })),
+        );
+        sched.start();
+        while sched.run_main(30.0) && done.load(AtomicOrdering::SeqCst) == 0 {}
+        sched.finish();
+        assert_eq!(done.load(AtomicOrdering::SeqCst), 1);
+
+        // job 2: the recorded updateDeleteMessages shape, applied — the ids
+        // resolve through the unique-id load, the durable deletes land, and
+        // the async reads apply the buffered deletes before reading back
+        let mut sched = ConcurrentScheduler::new(0);
+        sched.create_actor_unsafe(
+            0,
+            "ApplyDeletes",
+            Job(Some({
+                let rows_gone = rows_gone.clone();
+                let dir = dir.clone();
+                move || {
+                    let (mut global, _) = open_delete_run(&dir);
+                    let mut manager = MessagesManager::default();
+                    manager.add_dialog_for_new_message(dialog_id);
+
+                    let deleted = delete_messages_from_updates(
+                        &mut global,
+                        &mut manager,
+                        &[
+                            MessageId::from_server_message_id(ServerMessageId::new(400)),
+                            MessageId::from_server_message_id(ServerMessageId::new(401)),
+                        ],
+                        true,
+                    );
+                    assert_eq!(
+                        deleted,
+                        vec![(dialog_id, vec![400 << 20, 401 << 20])],
+                        "the per-dialog deleted ids carry the raw message ids"
+                    );
+                    let recorded400 = manager
+                        .get_dialog(dialog_id)
+                        .unwrap()
+                        .deleted_message_ids
+                        .contains(&MessageId::from_server_message_id(ServerMessageId::new(
+                            400,
+                        )));
+                    let recorded401 = manager
+                        .get_dialog(dialog_id)
+                        .unwrap()
+                        .deleted_message_ids
+                        .contains(&MessageId::from_server_message_id(ServerMessageId::new(
+                            401,
+                        )));
+                    assert!(
+                        recorded400 && recorded401,
+                        "the durable deletes re-record the ids on the skeleton"
+                    );
+                    let gone400 = rows_gone.clone();
+                    let gone401 = rows_gone.clone();
+                    // the async read applies the buffered deletes first, so
+                    // both rows must read back as erased (a missing row
+                    // settles the promise with the default, id-invalid)
+                    global.message_db_async().get_message(
+                        id400,
+                        tdutils::promise::PromiseCreator::lambda(
+                            move |result: crate::message_db::MessageDbDialogMessage| {
+                                assert!(
+                                    result.message_id == MessageId::default(),
+                                    "the resolved row 400 is erased"
+                                );
+                                let _ = gone400.fetch_or(1, AtomicOrdering::SeqCst);
+                            },
+                        ),
+                    );
+                    global.message_db_async().get_message(
+                        id401,
+                        tdutils::promise::PromiseCreator::lambda(
+                            move |result: crate::message_db::MessageDbDialogMessage| {
+                                assert!(
+                                    result.message_id == MessageId::default(),
+                                    "the resolved row 401 is erased"
+                                );
+                                let _ = gone401.fetch_or(2, AtomicOrdering::SeqCst);
+                                Scheduler::instance().finish();
+                            },
+                        ),
+                    );
+                }
+            })),
+        );
+        sched.start();
+        while sched.run_main(30.0) && rows_gone.load(AtomicOrdering::SeqCst) != 3 {}
+        sched.finish();
+        assert_eq!(rows_gone.load(AtomicOrdering::SeqCst), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `update_message_ids_` old-id fan-out
+    /// (MessagesManager.cpp:32099-32118): deleting a sent-but-unreceived
+    /// message id deletes the registered old id through `delete_messages`
+    /// and CHECKs the registry erase.
+    #[test]
+    fn m10_6_delete_fans_out_to_the_update_registry_old_id() {
+        let dialog_id = DialogId::from_user_id(UserId::new(2000));
+        let server_id = MessageId::from_server_message_id(ServerMessageId::new(500));
+        let old_local_id = MessageId::new(MessageId::TYPE_LOCAL as i64);
+        let mut global = crate::global::Global::new();
+        let mut manager = MessagesManager::default();
+        manager.add_dialog_for_new_message(dialog_id);
+        manager
+            .update_message_ids
+            .insert((dialog_id, server_id), old_local_id);
+
+        delete_message_from_database(
+            &mut global,
+            &mut manager,
+            dialog_id,
+            server_id,
+            None,
+            true,
+            "test",
+        );
+
+        assert!(
+            !manager
+                .update_message_ids
+                .contains_key(&(dialog_id, server_id)),
+            "the registry entry is erased"
+        );
+        assert!(
+            manager
+                .get_dialog(dialog_id)
+                .unwrap()
+                .deleted_message_ids
+                .contains(&old_local_id),
+            "the old id was deleted through the delete_messages fan-out"
+        );
+    }
+
+    /// The M.10.6 crash-recovery replay: the durable DeleteMessageLogEvent
+    /// lands in the binlog before the row erase can complete (the kill
+    /// window); the reopened engine replays the durable event through the
+    /// ported DeleteMessage replay arm and the row erase is re-applied.
+    /// (TdDb::open's replay callback collects the DeleteMessage events into
+    /// the `to_messages_manager` vector — the same events the Td init
+    /// replays.)
     #[test]
     fn m10_6_delete_survives_a_mid_delete_kill_via_binlog_replay() {
-        let binlog_path = std::env::temp_dir()
-            .join("m10_6_delete_binlog")
-            .to_string_lossy()
-            .into_owned();
-        let db_path = std::env::temp_dir()
-            .join("m10_6_delete_db")
-            .to_string_lossy()
-            .into_owned();
-        let _ = tddb::binlog::destroy(&binlog_path);
-        let _ = tddb::sqlite_db::destroy(&db_path);
+        use std::sync::Arc as StdArc;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
+        let base = std::env::temp_dir().join("m10_6_delete_run");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = base.canonicalize().unwrap().to_string_lossy().into_owned();
+        let row_stored = StdArc::new(AtomicUsize::new(0));
+        let rows_gone = StdArc::new(AtomicUsize::new(0));
+        let ids_recorded = StdArc::new(AtomicUsize::new(0));
         let dialog_id = DialogId::from_user_id(UserId::new(2000));
         let message_full_id = MessageFullId::new(
             dialog_id,
             MessageId::from_server_message_id(ServerMessageId::new(400)),
         );
 
-        // --- run 1: the message row exists; the delete's durable half (the
-        // binlog event) lands and the process "dies" before the row erase
-        // completes ---
-        {
-            let mut binlog = tddb::binlog::concurrent::ConcurrentBinlog::new();
-            binlog
-                .init(
-                    &binlog_path,
-                    &mut |_: &tddb::binlog::BinlogEvent| {},
-                    DbKey::empty(),
-                    DbKey::empty(),
-                )
-                .unwrap();
-            let db =
-                tddb::sqlite_db::SqliteDb::open_with_key(&db_path, true, &DbKey::empty(), None)
-                    .unwrap();
-            let mut version = 0;
-            init_message_db(&db, &mut version).ensure();
-            let mut db_impl = MessageDbImpl::new(db).unwrap();
-            db_impl.add_message(
-                message_full_id,
-                ServerMessageId::new(9),
-                DialogId::new(777000),
-                1,
-                0,
-                0,
-                0,
-                String::new(),
-                NotificationId::new(0),
-                MessageId::default(),
-                Vec::new(),
-            );
-            assert!(db_impl.get_message(message_full_id).is_ok());
+        // phase A: the message row lands durably; the delete's durable half
+        // (the binlog event) is written and the process "dies" before the
+        // row erase completes — the crash window
+        let mut sched = ConcurrentScheduler::new(0);
+        sched.create_actor_unsafe(
+            0,
+            "KillMidDelete",
+            Job(Some({
+                let row_stored = row_stored.clone();
+                let dir = dir.clone();
+                move || {
+                    let (mut global, _) = open_delete_run(&dir);
+                    let mut manager = MessagesManager::default();
+                    manager.add_dialog_for_new_message(dialog_id);
+                    store_corpus_row(&mut global, &mut manager, dialog_id, message_full_id);
+                    global.flush_all();
 
-            // the durable half of do_delete_message_log_event: the event is
-            // in the binlog, the row erase has not run — the crash window
-            let log_event = DeleteMessageLogEvent {
-                id: 0,
-                message_full_id,
-                file_ids: Vec::new(),
-            };
-            let mut data = Vec::new();
-            log_event.store(&mut data);
-            binlog.add(LOG_EVENT_HANDLER_TYPE_DELETE_MESSAGE, &data);
-            binlog.close(None);
-        } // everything dropped — the "kill"
+                    // the durable half of do_delete_message_log_event: the
+                    // event is in the binlog, the row erase has not run
+                    let log_event = DeleteMessageLogEvent {
+                        id: 0,
+                        message_full_id,
+                        file_ids: vec![FileId::new(7, 0)],
+                    };
+                    let mut data = Vec::new();
+                    log_event.store(&mut data);
+                    global
+                        .td_db()
+                        .binlog()
+                        .add(LOG_EVENT_HANDLER_TYPE_DELETE_MESSAGE, &data);
+                    global.td_db().binlog().force_flush();
+                    row_stored.store(1, AtomicOrdering::SeqCst);
+                }
+            })),
+        );
+        sched.start();
+        while sched.run_main(30.0) && row_stored.load(AtomicOrdering::SeqCst) == 0 {}
+        sched.finish();
+        assert_eq!(row_stored.load(AtomicOrdering::SeqCst), 1);
 
-        // --- run 2: reopen; the binlog replays the durable event and the
-        // row erase is re-applied ---
-        {
-            let mut replayed = Vec::new();
-            let mut binlog = tddb::binlog::concurrent::ConcurrentBinlog::new();
-            binlog
-                .init(
-                    &binlog_path,
-                    &mut |event: &tddb::binlog::BinlogEvent| {
-                        if event.type_ == LOG_EVENT_HANDLER_TYPE_DELETE_MESSAGE
-                            && let Ok(parsed) = DeleteMessageLogEvent::parse_from(&mut Parser::new(
-                                event.get_data(),
-                            ))
-                        {
-                            replayed.push(parsed);
+        // phase B: reopen — TdDb::open's replay callback collects the durable
+        // DeleteMessage events into `messages_manager_events` (the
+        // `to_messages_manager` vector), and the ported replay arm — the same
+        // loop the Td init runs — re-applies the row erase
+        let mut sched = ConcurrentScheduler::new(0);
+        sched.create_actor_unsafe(
+            0,
+            "ReplayDeletes",
+            Job(Some({
+                let rows_gone = rows_gone.clone();
+                let ids_recorded = ids_recorded.clone();
+                let dir = dir.clone();
+                move || {
+                    let (mut global, message_events) = open_delete_run(&dir);
+                    let mut manager = MessagesManager::default();
+                    manager.add_dialog_for_new_message(dialog_id);
+                    let mut replay_count = 0;
+                    for event in &message_events {
+                        if event.type_ == LOG_EVENT_HANDLER_TYPE_DELETE_MESSAGE {
+                            replay_count += 1;
+                            replay_delete_message_log_event(&mut global, &mut manager, event);
                         }
-                    },
-                    DbKey::empty(),
-                    DbKey::empty(),
-                )
-                .unwrap();
-            assert_eq!(replayed.len(), 1, "the durable delete event replays");
-            assert_eq!(replayed[0].message_full_id, message_full_id);
+                    }
+                    assert_eq!(replay_count, 1, "the durable delete event replays");
+                    assert!(
+                        manager
+                            .get_dialog(dialog_id)
+                            .unwrap()
+                            .deleted_message_ids
+                            .contains(&MessageId::from_server_message_id(ServerMessageId::new(
+                                400
+                            ))),
+                        "the replay re-records the deleted id"
+                    );
 
-            // the replay re-applies the row erase
-            let db =
-                tddb::sqlite_db::SqliteDb::open_with_key(&db_path, true, &DbKey::empty(), None)
-                    .unwrap();
-            let mut version = 0;
-            init_message_db(&db, &mut version).ensure();
-            let mut db_impl = MessageDbImpl::new(db).unwrap();
-            for event in &replayed {
-                db_impl.delete_message(event.message_full_id);
-            }
-            assert!(
-                db_impl.get_message(message_full_id).is_error(),
-                "the replayed delete removed the row"
-            );
-        }
-        let _ = tddb::binlog::destroy(&binlog_path);
-        let _ = tddb::sqlite_db::destroy(&db_path);
+                    // the async read applies the buffered deletes first, so
+                    // the row must read back as erased (a missing row settles
+                    // the promise with the default, id-invalid) — the corpus
+                    // test's read-back shape
+                    let gone_flag = rows_gone.clone();
+                    let recorded_flag = ids_recorded.clone();
+                    global.message_db_async().get_message(
+                        message_full_id,
+                        tdutils::promise::PromiseCreator::lambda(
+                            move |result: crate::message_db::MessageDbDialogMessage| {
+                                assert!(
+                                    result.message_id == MessageId::default(),
+                                    "the replayed delete removed the row"
+                                );
+                                gone_flag.store(1, AtomicOrdering::SeqCst);
+                                recorded_flag.store(1, AtomicOrdering::SeqCst);
+                                Scheduler::instance().finish();
+                            },
+                        ),
+                    );
+                }
+            })),
+        );
+        sched.start();
+        while sched.run_main(30.0) && rows_gone.load(AtomicOrdering::SeqCst) == 0 {}
+        sched.finish();
+        assert_eq!(rows_gone.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(ids_recorded.load(AtomicOrdering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

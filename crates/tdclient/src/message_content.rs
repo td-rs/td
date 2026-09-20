@@ -7471,8 +7471,10 @@ pub trait MessageContentContext {
     fn try_merge_documents(&mut self, new_file_id: FileId, old_file_id: FileId);
 
     // -- Input family (MessageContent.cpp:4766-5408) --
-    /// `td->option_manager_->get_option_boolean(name)`.
-    fn get_option_boolean(&self, name: &str) -> bool;
+    /// `td->option_manager_->get_option_boolean(name, default_value)`
+    /// (Global.h:169 — one C++ method with `default_value = false`; Rust has
+    /// no default parameters, so the default is explicit here).
+    fn get_option_boolean(&self, name: &str, default_value: bool) -> bool;
     /// `UserManager::get_secret_chat_layer` (MessageEntity.cpp:4880).
     fn get_secret_chat_layer(&self, secret_chat_id: SecretChatId) -> i32;
     /// `UserManager::get_secret_chat_user_id` (MessageEntity.cpp:4736).
@@ -11337,7 +11339,7 @@ pub fn process_input_message_text(
         for_draft,
         for_draft,
         None,
-        td.get_option_boolean("always_parse_markdown"),
+        td.get_option_boolean("always_parse_markdown", false),
         td.get_option_integer("session_count", 0) as i32,
         Some(&mut |custom_emoji_id, is_premium| {
             is_premium || td.is_premium_custom_emoji(custom_emoji_id)
@@ -11583,7 +11585,7 @@ pub fn get_to_do_item(
         true,
         false,
         None,
-        td.get_option_boolean("always_parse_markdown"),
+        td.get_option_boolean("always_parse_markdown", false),
         td.get_option_integer("session_count", 0) as i32,
         Some(&mut |custom_emoji_id, is_premium| {
             is_premium || td.is_premium_custom_emoji(custom_emoji_id)
@@ -11626,7 +11628,7 @@ pub fn get_to_do_list(
         true,
         false,
         None,
-        td.get_option_boolean("always_parse_markdown"),
+        td.get_option_boolean("always_parse_markdown", false),
         td.get_option_integer("session_count", 0) as i32,
         Some(&mut |custom_emoji_id, is_premium| {
             is_premium || td.is_premium_custom_emoji(custom_emoji_id)
@@ -12222,7 +12224,7 @@ pub fn create_input_message_content(
                 true,
                 false,
                 None,
-                td.get_option_boolean("always_parse_markdown"),
+                td.get_option_boolean("always_parse_markdown", false),
                 td.get_option_integer("session_count", 0) as i32,
                 Some(&mut |custom_emoji_id, is_premium| {
                     is_premium || td.is_premium_custom_emoji(custom_emoji_id)
@@ -12263,7 +12265,7 @@ pub fn create_input_message_content(
                         true,
                         false,
                         None,
-                        td.get_option_boolean("always_parse_markdown"),
+                        td.get_option_boolean("always_parse_markdown", false),
                         td.get_option_integer("session_count", 0) as i32,
                         Some(&mut |custom_emoji_id, is_premium| {
                             is_premium || td.is_premium_custom_emoji(custom_emoji_id)
@@ -12680,7 +12682,7 @@ pub fn process_input_message_invoice(
             false,
             false,
             None,
-            td.get_option_boolean("always_parse_markdown"),
+            td.get_option_boolean("always_parse_markdown", false),
             td.get_option_integer("session_count", 0) as i32,
             Some(&mut |custom_emoji_id, is_premium| {
                 is_premium || td.is_premium_custom_emoji(custom_emoji_id)
@@ -12888,7 +12890,7 @@ pub fn get_input_message_content(
         false,
         false,
         None,
-        td.get_option_boolean("always_parse_markdown"),
+        td.get_option_boolean("always_parse_markdown", false),
         td.get_option_integer("session_count", 0) as i32,
         Some(&mut |custom_emoji_id, is_premium| {
             is_premium || td.is_premium_custom_emoji(custom_emoji_id)
@@ -15137,7 +15139,7 @@ pub fn dup_message_content(
         }
         MessageContent::Sticker(m) => {
             let mut result = m.clone();
-            result.is_premium = td.get_option_boolean("is_premium");
+            result.is_premium = td.get_option_boolean("is_premium", false);
             if to_secret && !td.has_secret_input_media_sticker(result.file_id) {
                 let file_id = fix_dup_file_id(td, result.file_id, dialog_id, to_secret);
                 if file_id != result.file_id {
@@ -15605,7 +15607,7 @@ pub fn get_message_content_object(
         MessageContent::Video(m) => {
             let mut alternative_videos = Vec::new();
             let mut storyboards = Vec::new();
-            if !td.get_option_boolean("video_ignore_alt_documents") {
+            if !td.get_option_boolean("video_ignore_alt_documents", false) {
                 for file_id in &m.alternative_file_ids {
                     if let Some(video) =
                         td.get_alternative_video_object(*file_id, &m.hls_file_ids)
@@ -16559,7 +16561,7 @@ pub fn get_poll_media_object(
         MessageContent::Video(m) => {
             let mut alternative_videos = Vec::new();
             let mut storyboards = Vec::new();
-            if !td.get_option_boolean("video_ignore_alt_documents") {
+            if !td.get_option_boolean("video_ignore_alt_documents", false) {
                 for file_id in &m.alternative_file_ids {
                     if let Some(video) = td.get_alternative_video_object(*file_id, &m.hls_file_ids)
                     {
@@ -18909,7 +18911,7 @@ pub fn get_poll_option(
         true,
         false,
         None,
-        td.get_option_boolean("always_parse_markdown"),
+        td.get_option_boolean("always_parse_markdown", false),
         td.get_option_integer("session_count", 0) as i32,
         Some(&mut |custom_emoji_id, is_premium| {
             is_premium || td.is_premium_custom_emoji(custom_emoji_id)
@@ -22172,8 +22174,13 @@ mod tests {
             ));
         }
 
-        fn get_option_boolean(&self, name: &str) -> bool {
-            name == "always_parse_markdown" && self.always_parse_markdown
+        fn get_option_boolean(&self, name: &str, default_value: bool) -> bool {
+            if name == "always_parse_markdown" {
+                self.always_parse_markdown
+            } else {
+                // an unset option answers the C++ default
+                default_value
+            }
         }
 
         fn get_secret_chat_layer(&self, _secret_chat_id: SecretChatId) -> i32 {

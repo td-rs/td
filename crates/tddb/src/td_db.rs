@@ -127,6 +127,11 @@ pub struct OpenedDatabase {
     /// server-sync handler types, in binlog order, for
     /// `DialogManager::on_binlog_dialog_events`.
     pub dialog_manager_events: Vec<BinlogEvent>,
+    /// The `to_messages_manager` replay vector (TdDb.cpp:122-136) — the
+    /// messages-manager handler types collected at open; of the C++ vector's
+    /// members only `DeleteMessage` is ported so far (MessagesManager.cpp
+    /// 36248-36264), the rest arrive with their slices.
+    pub messages_manager_events: Vec<BinlogEvent>,
 }
 
 /// `get_binlog_path` — `{database_directory}td{_test}.binlog`.
@@ -850,6 +855,7 @@ impl TdDb {
         let mut user_events: Vec<BinlogEvent> = Vec::new();
         let mut secret_chat_events: Vec<BinlogEvent> = Vec::new();
         let mut dialog_manager_events: Vec<BinlogEvent> = Vec::new();
+        let mut messages_manager_events: Vec<BinlogEvent> = Vec::new();
         let mut binlog = ConcurrentBinlog::new();
         {
             let binlog_pmc = &mut binlog_pmc;
@@ -857,6 +863,7 @@ impl TdDb {
             let user_events = &mut user_events;
             let secret_chat_events = &mut secret_chat_events;
             let dialog_manager_events = &mut dialog_manager_events;
+            let messages_manager_events = &mut messages_manager_events;
             let callback = |event: &BinlogEvent| match event.type_ {
                 BINLOG_PMC_MAGIC => binlog_pmc.external_init_handle(event),
                 CONFIG_PMC_MAGIC => config_pmc.external_init_handle(event),
@@ -870,6 +877,9 @@ impl TdDb {
                 | LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_TRANSLATABLE_ON_SERVER
                 | LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_VIEW_AS_MESSAGES_ON_SERVER => {
                     dialog_manager_events.push(event.clone())
+                }
+                LOG_EVENT_HANDLER_TYPE_DELETE_MESSAGE => {
+                    messages_manager_events.push(event.clone())
                 }
                 _ => {}
             };
@@ -952,6 +962,7 @@ impl TdDb {
             user_events,
             secret_chat_events,
             dialog_manager_events,
+            messages_manager_events,
         })
     }
 

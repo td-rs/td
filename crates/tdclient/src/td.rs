@@ -146,6 +146,7 @@ struct TdSink {
     users: Vec<tdmtproto::telegram_api::User>,
     chats: Vec<tdmtproto::telegram_api::Chat>,
     new_messages: Vec<(tdmtproto::telegram_api::Message, &'static str)>,
+    deletions: Vec<Vec<i32>>,
     message_ids: Vec<(i32, i64)>,
     gap: bool,
 }
@@ -173,7 +174,9 @@ impl UpdatesSink for TdSink {
     ) {
         self.new_messages.push((message, "updateNewChannelMessage"));
     }
-    fn on_delete_messages(&mut self, _messages: Vec<i32>, _pts: i32, _pts_count: i32) {}
+    fn on_delete_messages(&mut self, messages: Vec<i32>, _pts: i32, _pts_count: i32) {
+        self.deletions.push(messages);
+    }
     fn on_message_id(&mut self, id: i32, random_id: i64) {
         self.message_ids.push((id, random_id));
     }
@@ -506,10 +509,10 @@ impl crate::message_content::MessageContentContext for Td {
     fn try_merge_documents(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
         {}
     }
-    fn get_option_boolean(&self, name: &str) -> bool {
+    fn get_option_boolean(&self, name: &str, default_value: bool) -> bool {
         self.option_manager
             .as_ref()
-            .is_some_and(|om| om.get_option_boolean(name, false))
+            .is_some_and(|om| om.get_option_boolean(name, default_value))
     }
     fn get_secret_chat_layer(&self, _secret_chat_id: SecretChatId) -> i32 {
         0
@@ -1874,6 +1877,7 @@ impl Td {
         let user_events = std::mem::take(&mut opened_database.user_events);
         let secret_chat_events = std::mem::take(&mut opened_database.secret_chat_events);
         let dialog_manager_events = std::mem::take(&mut opened_database.dialog_manager_events);
+        let messages_manager_events = std::mem::take(&mut opened_database.messages_manager_events);
 
         if self.state == State::Close {
             // Close asynchronously opened database
@@ -2233,6 +2237,21 @@ impl Td {
         }
         for event in &dialog_manager_events {
             crate::dialog_manager::on_binlog_dialog_events(self, std::slice::from_ref(event));
+        }
+        // the `to_messages_manager` vector (Td.cpp:964-990 sends it to the
+        // MessagesManager actor; the port replays in place): the ported
+        // handler is the DeleteMessage binlog replay arm — the reopened
+        // engine re-applies the durable delete (MessagesManager.cpp:36248-36264).
+        for event in &messages_manager_events {
+            if event.type_ == tddb::td_db::LOG_EVENT_HANDLER_TYPE_DELETE_MESSAGE {
+                let mut manager = std::mem::take(&mut self.messages_manager);
+                crate::messages_manager::replay_delete_message_log_event(
+                    &mut self.global,
+                    &mut manager,
+                    event,
+                );
+                self.messages_manager = manager;
+            }
         }
         self.flush_user_updates();
 
@@ -3769,6 +3788,34 @@ impl Td {
         for (message, source) in &sink.new_messages {
             self.apply_new_message(message, source);
         }
+        for messages in &sink.deletions {
+            self.apply_delete_messages(messages);
+        }
+    }
+
+    /// The receive path for `updateDeleteMessages` (the M.10.6 delete
+    /// path): the server ids run through the manager's
+    /// `delete_messages_from_updates` — the rows resolve through the
+    /// message-db unique-id load and the durable deletes land through the
+    /// M.10.2 binlog spine. The `updateDeleteMessages` emission is the
+    /// update-plane seam.
+    fn apply_delete_messages(&mut self, messages: &[i32]) {
+        let message_ids: Vec<crate::messages_manager::MessageId> = messages
+            .iter()
+            .map(|&id| {
+                crate::messages_manager::MessageId::from_server_message_id(
+                    crate::messages_manager::ServerMessageId::new(id),
+                )
+            })
+            .collect();
+        let mut manager = std::mem::take(&mut self.messages_manager);
+        let _deleted = crate::messages_manager::delete_messages_from_updates(
+            &mut self.global,
+            &mut manager,
+            &message_ids,
+            true,
+        );
+        self.messages_manager = manager;
     }
 
     /// The receive path for a wire `updateNewMessage`/`updateNewChannelMessage`
