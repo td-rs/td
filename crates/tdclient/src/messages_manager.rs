@@ -552,6 +552,12 @@ impl Ord for MessageId {
 /// print lives in a wrapper so `{:?}` on the raw struct stays derived.
 pub struct DisplayMessageId(pub MessageId);
 
+impl std::fmt::Debug for DisplayMessageId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 impl std::fmt::Display for DisplayMessageId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let message_id = self.0;
@@ -2403,6 +2409,18 @@ impl MessageOrigin {
             author_signature,
             sender_name,
         }
+    }
+
+    /// `MessageOrigin::get_message_full_id` (MessageOrigin.cpp:109-114).
+    pub fn get_message_full_id(&self) -> MessageFullId {
+        // `is_sender_hidden()` (the const form) — the name check
+        if !self.message_id.is_valid()
+            || !self.sender_dialog_id.is_valid()
+            || !self.sender_name.is_empty()
+        {
+            return MessageFullId::default();
+        }
+        MessageFullId::new(self.sender_dialog_id, self.message_id)
     }
 
     /// `MessageOrigin::is_empty` (MessageOrigin.h:49-52).
@@ -5724,6 +5742,26 @@ impl MessageQuote {
     }
 
     /// `MessageQuote::get_text_quote_object` (MessageQuote.cpp:139-145).
+    /// `MessageQuote::get_input_text_quote_object`
+    /// (MessageQuote.cpp:129-137).
+    pub fn get_input_text_quote_object<U: crate::message_entity::UserManagerLike + ?Sized>(
+        &self,
+        user_manager: Option<&mut U>,
+    ) -> Option<td_api::InputTextQuote> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(td_api::InputTextQuote {
+            text: Some(crate::message_entity::get_formatted_text_object(
+                user_manager,
+                &self.text,
+                true,
+                -1,
+            )),
+            position: self.position,
+        })
+    }
+
     pub fn get_text_quote_object<U: crate::message_entity::UserManagerLike + ?Sized>(
         &self,
         user_manager: Option<&mut U>,
@@ -5790,6 +5828,21 @@ impl LastForwardedMessageInfo {
     /// `LastForwardedMessageInfo::is_empty` (MessageForwardInfo.cpp:21-23).
     pub fn is_empty(&self) -> bool {
         *self == LastForwardedMessageInfo::default()
+    }
+
+    /// `LastForwardedMessageInfo::hide_sender_if_needed`
+    /// (MessageForwardInfo.cpp:33-43).
+    pub fn hide_sender_if_needed(&mut self, ctx: &dyn MessageObjectContext) {
+        if self.sender_name.is_empty() && self.sender_dialog_id.get_type() == DialogType::User {
+            let private_forward_name =
+                ctx.get_user_private_forward_name(self.sender_dialog_id.get_user_id());
+            if !private_forward_name.is_empty() {
+                self.dialog_id = DialogId::default();
+                self.message_id = MessageId::default();
+                self.sender_dialog_id = DialogId::default();
+                self.sender_name = private_forward_name;
+            }
+        }
     }
 
     /// `LastForwardedMessageInfo::validate` (MessageForwardInfo.cpp:25-31).
@@ -6073,6 +6126,12 @@ impl MessageForwardInfo {
     }
 
     /// `MessageForwardInfo::get_origin_date` (MessageForwardInfo.h).
+    /// `MessageForwardInfo::get_origin_message_full_id`
+    /// (MessageForwardInfo.h:140-142).
+    pub fn get_origin_message_full_id(&self) -> MessageFullId {
+        self.origin.get_message_full_id()
+    }
+
     pub fn get_origin_date(&self) -> i32 {
         self.date
     }
@@ -7336,21 +7395,676 @@ pub struct ChatTheme {
     // ported with the Wave-3 gifts/theme slice
 }
 
-/// The C++ `OrderedMessages` container (OrderedMessages.h) — an intrusive
-/// tree of `Message *` nodes. STAND-IN until the receive-path slices pick
-/// the Rust shape (the messages themselves live in
-/// [`Dialog::messages`]).
+/// `td::OrderedMessage` (OrderedMessage.h:17-39) — the treap node keeps
+/// only the two gap flags that carry behavior (`have_previous_`/
+/// `have_next_` mark the known-contiguous chains); the `random_y_` treap
+/// priority and the child pointers are the C++ container machinery that
+/// the [`OrderedMessages`] BTreeMap collapse replaces (the recorded
+/// intrusive-container divergence).
 #[derive(Clone, Copy, Debug, Default)]
+pub struct OrderedMessage {
+    pub have_previous: bool,
+    pub have_next: bool,
+}
+
+/// The C++ `OrderedMessages` container (OrderedMessages.h:41-244) — the
+/// per-dialog message-id index. The C++ treap of `OrderedMessage` nodes
+/// collapses to a `BTreeMap<MessageId, OrderedMessage>`: every behavioral
+/// query (the greatest-id-≤-x iterator, the neighbor walks, the range
+/// scans) is a BTreeMap range query, and the gap-flag maintenance is
+/// exactly the C++ one (OrderedMessage.cpp:13-204).
+#[derive(Clone, Debug, Default)]
 pub struct OrderedMessages {
-    // receiver-path slice
+    pub messages: std::collections::BTreeMap<MessageId, OrderedMessage>,
 }
 
 /// The C++ `ListNode message_lru_list` (MessagesManager.h:1470) — the
-/// dialog's message LRU chain. STAND-IN for the same reason as
-/// [`OrderedMessages`].
-#[derive(Clone, Copy, Debug, Default)]
+/// dialog's message LRU chain that drives the unload order. The intrusive
+/// doubly-linked list collapses to a back-most-recent `VecDeque` of ids
+/// (`put_back`/`remove` keep the C++ access-order semantics;
+/// `get_message`'s touch moves a node to the back).
+#[derive(Clone, Debug, Default)]
 pub struct MessageLruList {
-    // receiver-path slice
+    pub ids: std::collections::VecDeque<MessageId>,
+}
+
+impl MessageLruList {
+    /// `ListNode::remove()` + `message_lru_list.put_back(node)`
+    /// (MessagesManager.cpp:30629-30633) — the access touch.
+    pub fn touch(&mut self, message_id: MessageId) {
+        if let Some(pos) = self.ids.iter().position(|id| *id == message_id) {
+            self.ids.remove(pos);
+        }
+        self.ids.push_back(message_id);
+    }
+
+    /// `message_lru_list.put_back(result_message)` (MessagesManager.cpp:
+    /// 31585).
+    pub fn put_back(&mut self, message_id: MessageId) {
+        self.ids.push_back(message_id);
+    }
+
+    /// The unload walk head — the least recently accessed message.
+    pub fn front(&self) -> Option<MessageId> {
+        self.ids.front().copied()
+    }
+
+    /// `ListNode::remove()` alone (the delete paths).
+    pub fn remove(&mut self, message_id: MessageId) {
+        if let Some(pos) = self.ids.iter().position(|id| *id == message_id) {
+            self.ids.remove(pos);
+        }
+    }
+}
+
+impl OrderedMessages {
+    /// `OrderedMessages::IteratorBase(root, message_id)` — the anchor
+    /// cursor: the greatest id ≤ `message_id` (OrderedMessage.h:50-64).
+    fn at_or_before(&self, message_id: MessageId) -> Option<MessageId> {
+        self.messages
+            .range(..=message_id)
+            .next_back()
+            .map(|(id, _)| *id)
+    }
+
+    /// `operator++` (OrderedMessage.h:78-107) — the successor walk gated
+    /// by the `have_next` flag.
+    fn succ(&self, cur: MessageId) -> Option<MessageId> {
+        if !self.messages.get(&cur)?.have_next {
+            return None;
+        }
+        self.messages
+            .range((std::ops::Bound::Excluded(cur), std::ops::Bound::Unbounded))
+            .next()
+            .map(|(id, _)| *id)
+    }
+
+    /// `operator--` (OrderedMessage.h:109-138) — the predecessor walk
+    /// gated by the `have_previous` flag.
+    fn pred(&self, cur: MessageId) -> Option<MessageId> {
+        if !self.messages.get(&cur)?.have_previous {
+            return None;
+        }
+        self.messages.range(..cur).next_back().map(|(id, _)| *id)
+    }
+
+    /// `OrderedMessages::insert` (OrderedMessage.cpp:13-67) — the node
+    /// insert plus the flag maintenance of the two attach modes. The treap
+    /// split/merge is the BTreeMap insert.
+    pub fn insert(
+        &mut self,
+        message_id: MessageId,
+        auto_attach: bool,
+        old_last_message_id: MessageId,
+        source: &str,
+    ) {
+        assert!(
+            !self.messages.contains_key(&message_id),
+            "duplicate OrderedMessages insert"
+        );
+        let mut node = OrderedMessage::default();
+        if auto_attach {
+            self.auto_attach_message(message_id, &mut node, old_last_message_id, source);
+        } else {
+            // OrderedMessage.cpp:34-47 — drop the previous↔next connection
+            // the new message cuts in half
+            if let Some(previous_message_id) = self.at_or_before(message_id)
+                && self.messages[&previous_message_id].have_next
+            {
+                let next_message_id = self
+                    .messages
+                    .range((
+                        std::ops::Bound::Excluded(previous_message_id),
+                        std::ops::Bound::Unbounded,
+                    ))
+                    .next()
+                    .map(|(id, _)| *id);
+                assert!(next_message_id.is_some_and(|id| id > message_id));
+                if let Some(next_message_id) = next_message_id {
+                    self.messages
+                        .get_mut(&next_message_id)
+                        .unwrap()
+                        .have_previous = false;
+                }
+                self.messages
+                    .get_mut(&previous_message_id)
+                    .unwrap()
+                    .have_next = false;
+            }
+        }
+        self.messages.insert(message_id, node);
+    }
+
+    /// `OrderedMessages::erase` (OrderedMessage.cpp:69-115) — the node
+    /// removal with the neighbor-flag teardown.
+    pub fn erase(&mut self, message_id: MessageId, only_from_memory: bool, source: &str) {
+        let Some(node) = self.messages.get(&message_id).copied() else {
+            panic!("LOG_CHECK failed: erase missing {message_id:?} {only_from_memory} {source}");
+        };
+        if node.have_previous
+            && (only_from_memory || !node.have_next)
+            && let Some(prev_id) = self.pred(message_id)
+        {
+            self.messages.get_mut(&prev_id).unwrap().have_next = false;
+        }
+        if node.have_next
+            && (only_from_memory || !node.have_previous)
+            && let Some(next_id) = self.succ(message_id)
+        {
+            self.messages.get_mut(&next_id).unwrap().have_previous = false;
+        }
+        self.messages.remove(&message_id);
+    }
+
+    /// `OrderedMessages::attach_message_to_previous`
+    /// (OrderedMessage.cpp:117-135).
+    pub fn attach_message_to_previous(&mut self, message_id: MessageId, source: &str) {
+        assert!(message_id.is_valid());
+        let ordered_message = self.at_or_before(message_id);
+        assert!(
+            ordered_message == Some(message_id),
+            "attach_message_to_previous of unknown {message_id:?}"
+        );
+        if self.messages[&message_id].have_previous {
+            return;
+        }
+        self.messages.get_mut(&message_id).unwrap().have_previous = true;
+        let prev_id = self.pred(message_id);
+        assert!(
+            prev_id.is_some(),
+            "LOG_CHECK failed: {message_id:?} {source}"
+        );
+        let prev_id = prev_id.unwrap();
+        tracing::info!(
+            "Attach {} to the previous {} from {}",
+            DisplayMessageId(message_id),
+            DisplayMessageId(prev_id),
+            source
+        );
+        if self.messages[&prev_id].have_next {
+            self.messages.get_mut(&message_id).unwrap().have_next = true;
+        } else {
+            self.messages.get_mut(&prev_id).unwrap().have_next = true;
+        }
+    }
+
+    /// `OrderedMessages::attach_message_to_next`
+    /// (OrderedMessage.cpp:137-155).
+    pub fn attach_message_to_next(&mut self, message_id: MessageId, source: &str) {
+        assert!(message_id.is_valid());
+        let ordered_message = self.at_or_before(message_id);
+        assert!(
+            ordered_message == Some(message_id),
+            "attach_message_to_next of unknown {message_id:?}"
+        );
+        if self.messages[&message_id].have_next {
+            return;
+        }
+        self.messages.get_mut(&message_id).unwrap().have_next = true;
+        let next_id = self
+            .messages
+            .range((
+                std::ops::Bound::Excluded(message_id),
+                std::ops::Bound::Unbounded,
+            ))
+            .next()
+            .map(|(id, _)| *id);
+        assert!(
+            next_id.is_some(),
+            "LOG_CHECK failed: {message_id:?} {source}"
+        );
+        let next_id = next_id.unwrap();
+        tracing::info!(
+            "Attach {} to the next {} from {}",
+            DisplayMessageId(message_id),
+            DisplayMessageId(next_id),
+            source
+        );
+        if self.messages[&next_id].have_previous {
+            self.messages.get_mut(&message_id).unwrap().have_previous = true;
+        } else {
+            self.messages.get_mut(&next_id).unwrap().have_previous = true;
+        }
+    }
+
+    /// `OrderedMessages::auto_attach_message` (OrderedMessage.cpp:157-204)
+    /// — the flag wiring when the message arrives in order. Runs before
+    /// the node is in the map, over the node's flags.
+    fn auto_attach_message(
+        &mut self,
+        message_id: MessageId,
+        node: &mut OrderedMessage,
+        last_message_id: MessageId,
+        source: &str,
+    ) {
+        if let Some(previous_message_id) = self.at_or_before(message_id) {
+            assert!(previous_message_id < message_id);
+            let previous_have_next = self.messages[&previous_message_id].have_next;
+            if previous_have_next
+                || (last_message_id.is_valid() && previous_message_id >= last_message_id)
+            {
+                if message_id.is_server()
+                    && previous_message_id.is_server()
+                    && previous_have_next
+                    && let Some(next_message_id) = self
+                        .messages
+                        .range((
+                            std::ops::Bound::Excluded(previous_message_id),
+                            std::ops::Bound::Unbounded,
+                        ))
+                        .next()
+                        .map(|(id, _)| *id)
+                    && next_message_id.is_server()
+                {
+                    log_error!(
+                        "Attach {} before {} and after {} from {}",
+                        DisplayMessageId(message_id),
+                        DisplayMessageId(next_message_id),
+                        DisplayMessageId(previous_message_id),
+                        source
+                    );
+                }
+                tracing::info!(
+                    "Attach {} to the previous {} from {}",
+                    DisplayMessageId(message_id),
+                    DisplayMessageId(previous_message_id),
+                    source
+                );
+                node.have_next = previous_have_next;
+                node.have_previous = true;
+                self.messages
+                    .get_mut(&previous_message_id)
+                    .unwrap()
+                    .have_next = true;
+                return;
+            }
+        }
+        if !message_id.is_yet_unsent() {
+            // message may be attached to the next message if there is no
+            // previous message
+            let next_message_id = self.messages.range(message_id..).next().map(|(id, _)| *id);
+            if let Some(next_message_id) = next_message_id {
+                assert!(!self.messages[&next_message_id].have_previous);
+                tracing::info!(
+                    "Attach {} to the next {} from {}",
+                    DisplayMessageId(message_id),
+                    DisplayMessageId(next_message_id),
+                    source
+                );
+                node.have_next = true;
+                self.messages
+                    .get_mut(&next_message_id)
+                    .unwrap()
+                    .have_previous = true;
+                return;
+            }
+        }
+        tracing::info!(
+            "Can't auto-attach {} from {}",
+            DisplayMessageId(message_id),
+            source
+        );
+    }
+
+    /// `OrderedMessages::find_older_messages` (OrderedMessage.cpp:206-225)
+    /// — ascending ids ≤ `max_message_id`.
+    pub fn find_older_messages(&self, max_message_id: MessageId) -> Vec<MessageId> {
+        self.messages
+            .range(..=max_message_id)
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// `OrderedMessages::find_newer_messages` (OrderedMessage.cpp:227-246)
+    /// — ascending ids > `min_message_id`.
+    pub fn find_newer_messages(&self, min_message_id: MessageId) -> Vec<MessageId> {
+        self.messages
+            .range((
+                std::ops::Bound::Excluded(min_message_id),
+                std::ops::Bound::Unbounded,
+            ))
+            .map(|(id, _)| *id)
+            .collect()
+    }
+
+    /// `OrderedMessages::find_message_by_date` (OrderedMessage.cpp:248-270)
+    /// — the greatest id whose date is ≤ `date` (the dates are monotone in
+    /// the id order, so the descending scan is the C++ BST walk).
+    pub fn find_message_by_date(
+        &self,
+        date: i32,
+        get_message_date: &dyn Fn(MessageId) -> i32,
+    ) -> MessageId {
+        for (id, _) in self.messages.range(..).rev() {
+            if get_message_date(*id) <= date {
+                return *id;
+            }
+        }
+        MessageId::default()
+    }
+
+    /// `OrderedMessages::find_messages_by_date` (OrderedMessage.cpp:
+    /// 272-296) — ascending ids with a date in `[min_date, max_date]`.
+    pub fn find_messages_by_date(
+        &self,
+        min_date: i32,
+        max_date: i32,
+        get_message_date: &dyn Fn(MessageId) -> i32,
+    ) -> Vec<MessageId> {
+        self.messages
+            .range(..)
+            .map(|(id, _)| *id)
+            .filter(|id| {
+                let date = get_message_date(*id);
+                date >= min_date && date <= max_date
+            })
+            .collect()
+    }
+
+    /// The `(*it)->have_next()` read (MessagesManager.cpp:19177).
+    pub fn has_next(&self, message_id: MessageId) -> bool {
+        self.messages
+            .get(&message_id)
+            .map(|node| node.have_next)
+            .unwrap_or(false)
+    }
+
+    /// `OrderedMessages::has_message` (OrderedMessage.cpp:319-324).
+    pub fn has_message(&self, message_id: MessageId) -> bool {
+        assert!(message_id.is_valid());
+        self.messages.contains_key(&message_id)
+    }
+
+    /// `OrderedMessages::empty` (OrderedMessage.h:195-197).
+    pub fn is_empty(&self) -> bool {
+        self.messages.is_empty()
+    }
+
+    /// `OrderedMessages::get_last_sent_message_id`
+    /// (OrderedMessage.cpp:326-336) — the greatest non-yet-unsent id.
+    pub fn get_last_sent_message_id(&self) -> MessageId {
+        for (id, _) in self.messages.range(..).rev() {
+            if !id.is_yet_unsent() {
+                return *id;
+            }
+        }
+        MessageId::default()
+    }
+
+    /// `OrderedMessages::get_last_message_id` (OrderedMessage.cpp:338-344).
+    pub fn get_last_message_id(&self) -> MessageId {
+        self.messages
+            .range(..)
+            .next_back()
+            .map(|(id, _)| *id)
+            .unwrap_or_default()
+    }
+
+    /// `OrderedMessages::get_history` (OrderedMessage.cpp:346-445) — the
+    /// window query over the ordered container: adjusts
+    /// `from_message_id`/`offset`/`limit` and returns the ids newest-first
+    /// (the caller walks the cursor downward).
+    pub fn get_history(
+        &self,
+        last_message_id: MessageId,
+        from_message_id: &mut MessageId,
+        offset: &mut i32,
+        limit: &mut i32,
+        force: bool,
+    ) -> Vec<MessageId> {
+        assert!(*limit > 0);
+        let mut cur_limit = *limit;
+        let mut cur_offset = *offset;
+        let is_limit_increased = cur_limit == -cur_offset;
+        if is_limit_increased {
+            cur_limit += 1;
+        }
+        assert!(-cur_limit < cur_offset && cur_offset <= 0);
+
+        let mut it = self.at_or_before(*from_message_id);
+        let mut cur_from = *from_message_id;
+        let mut from_the_end = (last_message_id != MessageId::default()
+            && cur_from > last_message_id)
+            || cur_from >= MessageId::max();
+
+        if from_the_end {
+            cur_limit += cur_offset;
+            cur_offset = 0;
+            if last_message_id == MessageId::default() {
+                it = None;
+            }
+        } else {
+            let mut have_a_gap = false;
+            match it {
+                None => {
+                    // there is no gap if from_message_id is less than the
+                    // first message
+                    if force && cur_offset < 0 && !self.messages.is_empty() {
+                        let min_message_id = *self.messages.keys().next().unwrap();
+                        assert!(min_message_id > cur_from);
+                        cur_from = min_message_id;
+                        it = self.at_or_before(cur_from);
+                        assert!(it.is_some());
+                    } else {
+                        have_a_gap = true;
+                    }
+                }
+                Some(cur) if cur != *from_message_id => {
+                    assert!(cur < cur_from);
+                    if !self.messages[&cur].have_next
+                        && (last_message_id == MessageId::default() || cur < last_message_id)
+                    {
+                        have_a_gap = true;
+                    }
+                }
+                _ => {}
+            }
+
+            if have_a_gap {
+                it = None;
+            }
+            if it == Some(*from_message_id) {
+                if cur_offset < 0 {
+                    cur_offset += 1;
+                } else {
+                    it = it.and_then(|cur| self.pred(cur));
+                }
+            }
+
+            while let Some(cur) = it
+                && cur_offset < 0
+            {
+                it = self.succ(cur);
+                if let Some(next) = it {
+                    cur_offset += 1;
+                    cur_from = next;
+                }
+            }
+
+            if cur_offset < 0
+                && ((last_message_id != MessageId::default() && cur_from >= last_message_id)
+                    || (!have_a_gap && force))
+            {
+                assert!(!have_a_gap);
+                cur_limit += cur_offset;
+                cur_offset = 0;
+                it = self.at_or_before(cur_from);
+            }
+
+            if !have_a_gap && cur_offset < 0 {
+                cur_offset -= 1;
+            }
+        }
+
+        let mut message_ids = Vec::new();
+        if it.is_some() && cur_offset == 0 {
+            while let Some(cur) = it
+                && message_ids.len() < cur_limit as usize
+            {
+                cur_from = cur;
+                message_ids.push(cur);
+                from_the_end = false;
+                it = self.pred(cur);
+            }
+        }
+        if from_the_end {
+            cur_from = MessageId::default();
+        }
+
+        if is_limit_increased && cur_limit as usize == message_ids.len() {
+            message_ids.pop();
+        }
+        *from_message_id = cur_from;
+        *offset = cur_offset;
+        *limit = cur_limit;
+        message_ids
+    }
+
+    /// `OrderedMessages::calc_new_unread_count` (OrderedMessage.cpp:
+    /// 447-530) — the two-strategy unread recount over the container.
+    pub fn calc_new_unread_count(
+        &self,
+        max_message_id: MessageId,
+        last_read_inbox_message_id: MessageId,
+        old_unread_count: i32,
+        last_message_id: MessageId,
+        is_counted_as_unread: &dyn Fn(MessageId) -> bool,
+        hint_unread_count: i32,
+    ) -> i32 {
+        if !last_read_inbox_message_id.is_valid() {
+            return self.calc_new_unread_count_from_the_end(
+                max_message_id,
+                last_message_id,
+                is_counted_as_unread,
+                hint_unread_count,
+            );
+        }
+
+        if !last_message_id.is_valid()
+            || (last_message_id.get() - max_message_id.get()
+                > max_message_id.get() - last_read_inbox_message_id.get())
+        {
+            let unread_count = self.calc_new_unread_count_from_last_unread(
+                max_message_id,
+                last_read_inbox_message_id,
+                old_unread_count,
+                is_counted_as_unread,
+            );
+            if unread_count >= 0 {
+                unread_count
+            } else {
+                self.calc_new_unread_count_from_the_end(
+                    max_message_id,
+                    last_message_id,
+                    is_counted_as_unread,
+                    hint_unread_count,
+                )
+            }
+        } else {
+            let unread_count = self.calc_new_unread_count_from_the_end(
+                max_message_id,
+                last_message_id,
+                is_counted_as_unread,
+                hint_unread_count,
+            );
+            if unread_count >= 0 {
+                unread_count
+            } else {
+                self.calc_new_unread_count_from_last_unread(
+                    max_message_id,
+                    last_read_inbox_message_id,
+                    old_unread_count,
+                    is_counted_as_unread,
+                )
+            }
+        }
+    }
+
+    /// `OrderedMessages::calc_new_unread_count_from_last_unread`
+    /// (OrderedMessage.cpp:447-468).
+    fn calc_new_unread_count_from_last_unread(
+        &self,
+        max_message_id: MessageId,
+        last_read_inbox_message_id: MessageId,
+        old_unread_count: i32,
+        is_counted_as_unread: &dyn Fn(MessageId) -> bool,
+    ) -> i32 {
+        let Some(cur) = self.at_or_before(max_message_id) else {
+            return -1;
+        };
+        if cur != max_message_id {
+            return -1;
+        }
+
+        let mut unread_count = old_unread_count;
+        let mut it = Some(cur);
+        while let Some(cur) = it
+            && cur > last_read_inbox_message_id
+        {
+            if is_counted_as_unread(cur) {
+                unread_count -= 1;
+            }
+            it = self.pred(cur);
+        }
+        if it != Some(last_read_inbox_message_id) {
+            return -1;
+        }
+
+        tracing::info!(
+            "Found {} unread messages from last unread message",
+            unread_count
+        );
+        unread_count
+    }
+
+    /// `OrderedMessages::calc_new_unread_count_from_the_end`
+    /// (OrderedMessage.cpp:470-506).
+    fn calc_new_unread_count_from_the_end(
+        &self,
+        max_message_id: MessageId,
+        last_message_id: MessageId,
+        is_counted_as_unread: &dyn Fn(MessageId) -> bool,
+        hint_unread_count: i32,
+    ) -> i32 {
+        let mut unread_count = 0;
+        let mut it = self.get_last_message_id();
+        let mut is_some = it.is_valid();
+        while is_some && it > max_message_id {
+            if is_counted_as_unread(it) {
+                unread_count += 1;
+            }
+            let prev = self.pred(it);
+            is_some = prev.is_some();
+            if let Some(prev) = prev {
+                it = prev;
+            }
+        }
+
+        let is_count_exact = last_message_id.is_valid() && is_some;
+        if hint_unread_count >= 0 {
+            if is_count_exact {
+                if hint_unread_count == unread_count {
+                    return hint_unread_count;
+                }
+            } else if hint_unread_count >= unread_count {
+                return hint_unread_count;
+            }
+            // hint_unread_count is definitely wrong, ignore it
+            log_error!(
+                "Receive hint_unread_count = {}, but found {} unread messages",
+                hint_unread_count,
+                unread_count
+            );
+        }
+
+        if !is_count_exact {
+            // unread count is likely to be calculated wrong, so ignore it
+            return -1;
+        }
+
+        tracing::info!("Found {} unread messages from the end", unread_count);
+        unread_count
+    }
 }
 
 /// `td::MessagesManager::DialogScheduledMessages` (MessagesManager.h:
@@ -8779,6 +9493,31 @@ pub struct MessagesManager {
     /// `active_reaction_pos_` — the Wave-2 reactions-manager cache; empty
     /// until that slice ([blocked: Wave-2]).
     pub(crate) active_reaction_pos: HashMap<ReactionType, usize>,
+    /// `message_id_to_dialog_id_` (MessagesManager.h:3459) — the server-id
+    /// → dialog registry for User/Chat dialogs (the WaitFreeHashMap
+    /// collapse). M.10.9.
+    pub(crate) message_id_to_dialog_id: HashMap<MessageId, DialogId>,
+    /// `last_clear_history_message_id_to_dialog_id_`
+    /// (MessagesManager.h:3462) — the cleared-history id registry for
+    /// User/Chat dialogs.
+    pub(crate) last_clear_history_message_id_to_dialog_id: HashMap<MessageId, DialogId>,
+    /// `replied_yet_unsent_messages_` (MessagesManager.h:3327) —
+    /// yet-unsent message → the set of messages replying to it.
+    pub(crate) replied_yet_unsent_messages: HashMap<MessageFullId, Vec<MessageFullId>>,
+    /// `replied_by_yet_unsent_messages_` (MessagesManager.h:3330) — the
+    /// count left after the id rewrite.
+    pub(crate) replied_by_yet_unsent_messages: HashMap<MessageFullId, i32>,
+    /// `yet_unsent_thread_message_ids_` (MessagesManager.h:3320).
+    pub(crate) yet_unsent_thread_message_ids:
+        HashMap<MessageFullId, std::collections::BTreeSet<MessageId>>,
+    /// `active_live_location_message_full_ids_` (MessagesManager.h:3444)
+    /// — the live-location registry (the std::set collapse).
+    pub(crate) active_live_location_message_full_ids: std::collections::BTreeSet<MessageFullId>,
+    /// `added_message_count_` (MessagesManager.h:3664).
+    pub(crate) added_message_count: i64,
+    /// `debug_add_message_to_dialog_fail_reason_`
+    /// (MessagesManager.h:3666).
+    pub(crate) debug_add_message_to_dialog_fail_reason: String,
 }
 
 impl MessagesManager {
@@ -16219,9 +16958,12 @@ fn set_dialog_unread_mention_count(
 //   writes are M.10.9's net flip; `do_send_message` trace-logs here.
 // - `add_message_to_dialog`'s ordering/pos/notification fan-out stays the
 //   M.10.3/M.10.9 container seam (`need_update_dialog_pos` is carried as an
-//   out-param); the ported spine covers the send configuration
-//   (`from_database = false, from_update = false, need_update = false`)
-//   exactly, including the yet-unsent random-id correspondence.
+//   out-param); the ported spine covers the send/replay configuration
+//   (`from_database = false, from_update = true, need_update = false` — the
+//   C++ calls at 21112/35915 pass `from_update = true`) exactly, including
+//   the yet-unsent random-id correspondence and the live from_update legs
+//   that write dialog state (last_new LOG, the set_dialog_last_message_id
+//   field, the channel slow-mode next-send date, has_outgoing_messages).
 // - the cross-chat reply's forwarded-content embedding
 //   (`get_forwarded_message_info` 21316 + `create_automatic_quote`) is the
 //   M.10.11 forward path; the seam's None answer routes to the C++'s own
@@ -16352,8 +17094,13 @@ pub trait SendMessageContext: MessageObjectContext {
     /// (MessagesManager.cpp:21316-21329) — the origin/content fetch the
     /// cross-chat reply embeds. The fetch machinery
     /// (`get_forwarded_message_origin` + the Forward content dup) is the
-    /// M.10.11 forward path; `None` routes to the C++'s own
-    /// reset-to-default branch (RepliedMessageInfo.cpp:152-156).
+    /// M.10.11 forward path. Contract: `None` routes to the C++'s
+    /// reset-to-default branch, AND a `Some` whose info is partially
+    /// populated must ALSO route there — the C++ resets `*this = {}`
+    /// whenever `info.origin_date_ == 0 || info.origin_.is_empty() ||
+    /// info.content_ == nullptr` (RepliedMessageInfo.cpp:152-156), so the
+    /// M.10.11 implementation of this seam must return `None` for any info
+    /// failing that tri-condition rather than `Some`.
     fn get_forwarded_message_info(
         &self,
         dialog_id: DialogId,
@@ -16373,6 +17120,53 @@ pub trait SendMessageContext: MessageObjectContext {
     ) -> Option<Box<Message>> {
         let _ = (dialog_id, random_id);
         None
+    }
+
+    /// `StoryManager::have_story` (MessagesManager.cpp:23979, inside
+    /// `update_message_max_reply_media_timestamp`).
+    fn have_story(&self, story_full_id: StoryFullId) -> bool {
+        let _ = story_full_id;
+        false
+    }
+
+    /// `StoryManager::is_inaccessible_story` (MessagesManager.cpp:23981).
+    fn is_inaccessible_story(&self, story_full_id: StoryFullId) -> bool {
+        let _ = story_full_id;
+        false
+    }
+
+    /// `StoryManager::get_story_duration` (MessagesManager.cpp:23985).
+    fn get_story_duration(&self, story_full_id: StoryFullId) -> i32 {
+        let _ = story_full_id;
+        0
+    }
+
+    /// `ChatManager::get_channel_slow_mode_delay` (MessagesManager.cpp:31476).
+    fn get_channel_slow_mode_delay(&self, channel_id: ChannelId) -> i32 {
+        let _ = channel_id;
+        0
+    }
+
+    /// `ChatManager::get_channel_status(channel_id).is_administrator()`
+    /// (MessagesManager.cpp:31477-31478).
+    fn is_channel_administrator(&self, channel_id: ChannelId) -> bool {
+        let _ = channel_id;
+        true
+    }
+
+    /// `ChatManager::on_update_channel_slow_mode_next_send_date`
+    /// (MessagesManager.cpp:31479) — the chat-manager write rides its slice.
+    fn on_update_channel_slow_mode_next_send_date(
+        &self,
+        channel_id: ChannelId,
+        next_send_date: i32,
+    ) {
+        let _ = (channel_id, next_send_date);
+    }
+
+    /// `ChatManager::remove_inactive_channel` (MessagesManager.cpp:31483).
+    fn remove_inactive_channel(&self, channel_id: ChannelId) {
+        let _ = channel_id;
     }
 }
 
@@ -16510,10 +17304,12 @@ fn delete_random_id_to_message_id_correspondence(
 /// `MessagesManager::get_message_id_by_random_id`
 /// (MessagesManager.cpp:32917-32959) — the memory-map read; the secret-chat
 /// message-db leg is the [`SendMessageContext::get_message_by_random_id_from_database`]
-/// seam.
+/// seam. The C++ takes `Dialog *` because that leg would populate the
+/// correspondence from the database; with the leg seamed the read is
+/// shared-borrow (the signature widens back when the db wiring lands).
 pub fn get_message_id_by_random_id(
     ctx: &dyn SendMessageContext,
-    d: &mut Dialog,
+    d: &Dialog,
     random_id: i64,
     source: &str,
 ) -> MessageId {
@@ -16629,20 +17425,25 @@ fn unregister_dialog_ephemeral_message(d: &mut Dialog, ephemeral_message_id: Eph
 }
 
 /// `MessagesManager::add_message_to_dialog` (MessagesManager.cpp:31092-31661)
-/// in the send configuration (`from_database = false, from_update = false,
-/// need_update = false`) — the gates, the yet-unsent random-id
-/// correspondence and the container insert are exact; the C++ lines that
-/// only fire in the receive/database configurations are marked as the
-/// M.10.9 container seam. `Err` carries the C++
-/// `debug_add_message_to_dialog_fail_reason_`.
+/// in the send/replay configuration (`from_database = false, from_update =
+/// true, need_update = false` — MessagesManager.cpp:21112/35915 pass
+/// `from_update = true`) — the gates, the live from_update legs, the
+/// yet-unsent random-id correspondence and the container insert are exact;
+/// the C++ lines that only fire in the receive/database configurations or
+/// whose bodies belong to other managers are marked as the M.10.9 container
+/// seam. `Err` carries the C++ `debug_add_message_to_dialog_fail_reason_`.
 #[allow(clippy::too_many_arguments)]
-fn add_message_to_dialog(
+pub fn add_message_to_dialog(
     global: &mut crate::global::Global,
     manager: &mut MessagesManager,
     reactions_ctx: &dyn DialogReactionsContext,
     ctx: &dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
     dialog_id: DialogId,
     mut message: Box<Message>,
+    from_database: bool,
+    from_update: bool,
+    need_update: &mut bool,
     need_update_dialog_pos: &mut bool,
     source: &'static str,
 ) -> Result<MessageFullId, String> {
@@ -16656,9 +17457,14 @@ fn add_message_to_dialog(
             ctx,
             dialog_id,
             message,
+            from_database,
+            from_update,
+            need_update,
             source,
         );
     }
+
+    manager.debug_add_message_to_dialog_fail_reason = "success".to_string();
 
     // `fix_new_message(d, message, false)` (31104) — reads the dialog only
     if manager.get_dialog(dialog_id).is_some() {
@@ -16690,8 +17496,13 @@ fn add_message_to_dialog(
             return Err("no dialog".to_string());
         };
 
-        // `*need_update` CHECK (31100-31102) — need_update is the constant
-        // false in the send configuration
+        // `*need_update` CHECK (31100-31102)
+        if *need_update {
+            assert!(
+                from_update,
+                "need_update without from_update in add_message_to_dialog"
+            );
+        }
 
         if message_id <= d.last_clear_history_message_id {
             tracing::info!(
@@ -16699,8 +17510,11 @@ fn add_message_to_dialog(
                 DisplayMessageId(message_id),
                 dialog_id.get()
             );
-            // `delete_message_from_database` from_database leg (31122) —
-            // skipped in this configuration
+            if from_database {
+                // delete_message_from_database (31122) — the from_database
+                // leg; the caller passes the message for the column set
+            }
+            manager.debug_add_message_to_dialog_fail_reason = "cleared full history".to_string();
             return Err("cleared full history".to_string());
         }
 
@@ -16713,13 +17527,26 @@ fn add_message_to_dialog(
             return Err("adding deleted message".to_string());
         }
 
-        // the from_update last_new_message_id LOG(ERROR) (31136-31142) —
-        // from_update = false in this configuration
+        // the from_update last_new_message_id LOG(ERROR) (31136-31142)
+        if from_update
+            && !message.is_failed_to_send
+            && message_id <= d.last_new_message_id
+            && dialog_id.get_type() != DialogType::Channel
+            && (message_id.is_server() || !ctx.is_bot())
+        {
+            log_error!(
+                "New {} in {:?} from {} has identifier less than last_new_message_id = {}",
+                DisplayMessageId(message_id),
+                dialog_id,
+                source,
+                DisplayMessageId(d.last_new_message_id)
+            );
+        }
 
         // the too-new not-from-update gate (31145-31181): server/local ids
         // only, so a yet-unsent id keeps `max_message_id` empty and never
         // fires
-        if !message.is_failed_to_send && !is_ephemeral_message(&message) {
+        if !from_update && !message.is_failed_to_send && !is_ephemeral_message(&message) {
             let max_message_id = if message_id.is_server() {
                 if d.being_added_message_id.is_valid() {
                     d.being_updated_last_new_message_id
@@ -16767,17 +17594,37 @@ fn add_message_to_dialog(
             unimplemented!("ChatDeleteHistory content in the send path is the M.10.9 seam");
         }
 
-        // the need_update reply-markup/last-new blocks (31222-31253) —
-        // need_update = false in this configuration
+        // the need_update downgrades (31222-31224)
+        if *need_update && message_id <= d.last_new_message_id && !ctx.is_bot() {
+            *need_update = false;
+        }
+
+        // the need_update reply-markup block (31226-31241) — the
+        // set_dialog_reply_markup flip rides the M.10.14 reply-markup
+        // slice
 
         // the re-add branch (31246-31296): the memory probe; the
         // get_message_force db load is the dialog-db receive seam
-        if get_message_in_dialog(d, message_id).is_some() {
+        let existing = if from_database {
+            get_message_in_dialog(d, message_id).is_some()
+        } else {
+            // get_message_force — the db-load leg is the seam; the memory
+            // probe covers the loaded dialogs
+            d.messages.contains_key(&message_id)
+        };
+        if existing {
+            // `update_message(d, m, std::move(message), true, source)`
+            // (31274) — the existing-message merge; the M.10.5 update core
+            // rides the caller's ctx bundle, the add returns the existing
+            // id
+            manager.debug_add_message_to_dialog_fail_reason =
+                "adding already existing message".to_string();
             return Err("adding already existing message".to_string());
         }
 
-        // the notification preload block (31298-31332) — need_update = false
-        // and from_update = false in this configuration
+        // the notification preload block (31298-31332) — the pinned/top
+        // thread preloads are the db-load seam; `may_need_message_notification`
+        // + the group-id assignment are the M.13 plane
 
         assert!(
             !d.being_added_message_id.is_valid(),
@@ -16887,29 +17734,355 @@ fn add_message_to_dialog(
     // the keep_media_order yet-unsent media queue (31415-31427) is the
     // files/net send-ordering seam (M.10.18/M.10.9)
 
-    // the notification blocks (31429-31454) — need_update = false and
-    // from_database = false in this configuration
+    // `update_has_outgoing_messages` (31547 -> 35786-35817) — live with
+    // from_update = true; it sits after every fallible add gate, so
+    // computing and flipping it here (outside the dialog borrow) is
+    // order-equivalent to the C++'s pre-insert position
+    let outgoing_flip_target =
+        update_has_outgoing_messages_target(ctx, manager, dialog_id, &message);
+    if let Some(target) = outgoing_flip_target {
+        let d = manager.get_dialog_mut(target).unwrap();
+        d.has_outgoing_messages = true;
+    }
 
-    let Some(d) = manager.get_dialog_mut(dialog_id) else {
-        return Err("no dialog".to_string());
-    };
+    // the notification blocks (31429-31454) — the add_new_message_notification
+    // leg is the M.13 plane; the mention-notification removal is the
+    // from_database M.13 leg
 
-    // `add_message_to_dialog_message_list` (30948-31089) in this
-    // configuration: the is_empty flip and the gap/ordering walk — the
-    // ordered-messages container and the last-message/pos emissions are the
-    // M.10.9 container seam
-    if d.is_empty {
-        d.is_empty = false;
-        *need_update_dialog_pos = true;
+    // `add_message_to_dialog_message_list` (30948-31089) — the full
+    // container/counter maintenance (the is_bot gate at 30951)
+    if !ctx.is_bot() {
+        let old_last_message_id;
+        {
+            let (drop_full_history, is_empty_flip, gap_walk) = {
+                let Some(d) = manager.get_dialog_mut(dialog_id) else {
+                    return Err("no dialog".to_string());
+                };
+                let drop_full_history = d.have_full_history
+                    && !from_database
+                    && !from_update
+                    && !message_id.is_local()
+                    && !message_id.is_yet_unsent();
+                if drop_full_history {
+                    log_error!(
+                        "Have full history in {}, but receive unknown {} from {}. Last new is {}, last is {}",
+                        dialog_id.get(),
+                        DisplayMessageId(message_id),
+                        source,
+                        DisplayMessageId(d.last_new_message_id),
+                        DisplayMessageId(d.last_message_id)
+                    );
+                    d.have_full_history = false;
+                    d.have_full_history_source = 0;
+                }
+                let is_empty_flip = d.is_empty;
+                if d.is_empty {
+                    d.is_empty = false;
+                    *need_update_dialog_pos = true;
+                }
+                let gap_walk = !(d.have_full_history && from_update)
+                    && d.last_message_id.is_valid()
+                    && d.last_message_id
+                        < MessageId::from_server_message_id(ServerMessageId::new(1))
+                    && message_id >= MessageId::from_server_message_id(ServerMessageId::new(1));
+                (drop_full_history, is_empty_flip, gap_walk)
+            };
+            if drop_full_history {
+                on_dialog_updated(manager, dialog_id, "drop have_full_history");
+            }
+            let _ = is_empty_flip;
+
+            if gap_walk {
+                set_dialog_last_message_id(
+                    manager,
+                    dialog_id,
+                    MessageId::default(),
+                    "add_message_to_dialog_message_list",
+                );
+                set_dialog_first_database_message_id(
+                    manager,
+                    dialog_id,
+                    MessageId::default(),
+                    "add_message_to_dialog_message_list",
+                );
+                set_dialog_last_database_message_id(
+                    manager,
+                    dialog_id,
+                    MessageId::default(),
+                    source,
+                    false,
+                );
+                {
+                    let d = manager.get_dialog_mut(dialog_id).unwrap();
+                    d.have_full_history = false;
+                    d.have_full_history_source = 0;
+                    invalidate_message_indexes(d);
+                    d.local_unread_count = 0; // read all local messages. They will not be reachable anymore
+                }
+                on_dialog_updated(manager, dialog_id, "add gap to dialog");
+                *need_update_dialog_pos = false;
+            }
+
+            let advance_last_new = from_update
+                && !message.is_failed_to_send
+                && {
+                    let d = manager.get_dialog(dialog_id).unwrap();
+                    message_id > d.last_new_message_id
+                }
+                && !message_id.is_yet_unsent()
+                && (dialog_id.get_type() == DialogType::SecretChat || message_id.is_server());
+            if advance_last_new {
+                // can delete messages, therefore must be called before
+                // message attaching/adding
+                set_dialog_last_new_message_id(
+                    global,
+                    manager,
+                    ctx,
+                    dialog_id,
+                    message_id,
+                    "add_message_to_dialog_message_list",
+                );
+            }
+
+            old_last_message_id = manager.get_dialog(dialog_id).unwrap().last_message_id;
+        }
+        let is_new = message_id >= manager.get_dialog(dialog_id).unwrap().last_new_message_id;
+
+        // the unread-inbox gates (31004-31024)
+        if *need_update
+            && message_id
+                > manager
+                    .get_dialog(dialog_id)
+                    .unwrap()
+                    .last_read_inbox_message_id
+        {
+            let has_incoming = has_incoming_notification(ctx, dialog_id, &message);
+            if has_incoming {
+                let (mut server_unread_count, mut local_unread_count) = {
+                    let d = manager.get_dialog(dialog_id).unwrap();
+                    (d.server_unread_count, d.local_unread_count)
+                };
+                if message_id.is_server() {
+                    server_unread_count += 1;
+                } else {
+                    local_unread_count += 1;
+                }
+                set_dialog_last_read_inbox_message_id(
+                    manager,
+                    ctx,
+                    state,
+                    dialog_id,
+                    MessageId::min(),
+                    server_unread_count,
+                    local_unread_count,
+                    false,
+                    source,
+                );
+            } else {
+                // if non-scheduled outgoing message has identifier one
+                // greater than last_read_inbox_message_id, then definitely
+                // there are no unread incoming messages before it
+                let read_next = {
+                    let d = manager.get_dialog(dialog_id).unwrap();
+                    message_id.is_server()
+                        && d.last_read_inbox_message_id.is_valid()
+                        && d.last_read_inbox_message_id.is_server()
+                        && message_id
+                            == d.last_read_inbox_message_id
+                                .get_next_message_id(MessageType::Server)
+                };
+                if read_next {
+                    read_history_inbox(
+                        manager,
+                        ctx,
+                        state,
+                        dialog_id,
+                        message_id,
+                        0,
+                        "add_message_to_dialog_message_list",
+                    );
+                }
+            }
+        }
+        // the mention/reaction/vote counters (31025-31040) — the
+        // forum-topic count is the ForumTopicManager seam; the dialog
+        // counters are live
+        if *need_update && message.contains_unread_mention && !ctx.is_bot() {
+            set_dialog_unread_mention_count(
+                manager,
+                dialog_id,
+                manager.get_dialog(dialog_id).unwrap().unread_mention_count + 1,
+            );
+            send_update_chat_unread_mention_count(manager, ctx, state, dialog_id);
+        }
+        // the unread-reaction/poll-vote counts ride the same plane through
+        // the ReadStateContext emission helpers (M.10.7)
+        if *need_update {
+            update_message_count_by_index_message(
+                manager,
+                reactions_ctx,
+                ctx.content_context(),
+                dialog_id,
+                1,
+                &message,
+            );
+        }
+        // the last-message/database-window advances (31044-31061)
+        {
+            let (
+                last_message_valid,
+                last_database_message_id,
+                last_new_valid,
+                last_database_valid,
+                last_message_id_now,
+            ) = {
+                let d = manager.get_dialog(dialog_id).unwrap();
+                (
+                    d.last_message_id.is_valid(),
+                    d.last_database_message_id,
+                    d.last_new_message_id.is_valid(),
+                    d.last_database_message_id.is_valid(),
+                    d.last_message_id,
+                )
+            };
+            if from_update && message_id > last_message_id_now && is_new {
+                let media_album_id = message.media_album_id;
+                set_dialog_last_message_id(
+                    manager,
+                    dialog_id,
+                    message_id,
+                    "add_message_to_dialog_message_list",
+                );
+                let d = manager.get_dialog_mut(dialog_id).unwrap();
+                d.last_media_album_id = media_album_id;
+                *need_update_dialog_pos = true;
+            }
+            if from_update
+                && !message_id.is_yet_unsent()
+                && is_new
+                && (last_new_valid
+                    || (message_id.is_local()
+                        && last_message_valid
+                        && (message_id >= manager.get_dialog(dialog_id).unwrap().last_message_id
+                            || (last_database_valid && message_id > last_database_message_id))))
+            {
+                assert!(message_id <= manager.get_dialog(dialog_id).unwrap().last_message_id);
+                if message_id > last_database_message_id {
+                    set_dialog_last_database_message_id(
+                        manager,
+                        dialog_id,
+                        message_id,
+                        "add_message_to_dialog_message_list",
+                        false,
+                    );
+                    if !manager
+                        .get_dialog(dialog_id)
+                        .unwrap()
+                        .first_database_message_id
+                        .is_valid()
+                    {
+                        set_dialog_first_database_message_id(
+                            manager,
+                            dialog_id,
+                            message_id,
+                            "add_message_to_dialog_message_list",
+                        );
+                        // `try_restore_dialog_reply_markup` (31058) — the
+                        // M.10.14 reply-markup slice
+                    }
+                }
+            }
+        }
+
+        // the not-from-update newer-than-last walk (31063-31086)
+        if !from_update
+            && message_id.is_server()
+            && manager
+                .get_dialog(dialog_id)
+                .unwrap()
+                .last_message_id
+                .is_valid()
+            && message_id > manager.get_dialog(dialog_id).unwrap().last_message_id
+        {
+            tracing::info!(
+                "Receive {}, which is newer than the last {} not from update",
+                DisplayMessageId(message_id),
+                DisplayMessageId(manager.get_dialog(dialog_id).unwrap().last_message_id)
+            );
+            set_dialog_last_message_id(manager, dialog_id, MessageId::default(), source);
+            {
+                let d = manager.get_dialog_mut(dialog_id).unwrap();
+                if message_id > d.deleted_last_message_id {
+                    d.delete_last_message_date = message.date;
+                    d.deleted_last_message_id = message_id;
+                }
+            }
+            set_dialog_first_database_message_id(manager, dialog_id, MessageId::default(), source);
+            set_dialog_last_database_message_id(
+                manager,
+                dialog_id,
+                MessageId::default(),
+                source,
+                false,
+            );
+            {
+                let d = manager.get_dialog_mut(dialog_id).unwrap();
+                d.have_full_history = false;
+                d.have_full_history_source = 0;
+            }
+            invalidate_message_indexes(manager.get_dialog_mut(dialog_id).unwrap());
+            on_dialog_updated(manager, dialog_id, source);
+            *need_update_dialog_pos = false;
+            on_dialog_updated(manager, dialog_id, "do delete last message");
+            // `load_last_dialog_message_later` — the M.10.15 history seam
+        }
+
+        // the ordered-container insert (31088) — from_update drives the
+        // auto-attach
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        d.ordered_messages
+            .insert(message_id, from_update, old_last_message_id, source);
     }
 
     // update_replied_by_message_count (+1) (31462) — the reply registry is
-    // the M.10.9 container seam
+    // the M.10.14 reply plane
 
-    // `add_message_to_database` (31464-31466) — skipped for yet-unsent ids,
-    // which is the only case this configuration adds
+    if !from_database && !message.message_id.is_yet_unsent() {
+        let reactions_ctx2 = MessageObjectReactionsContext { ctx };
+        let time = crate::user_manager::TimeCtx {
+            now: ctx.now(),
+            server_time: ctx.server_time(),
+        };
+        add_message_to_database(
+            global,
+            manager,
+            &reactions_ctx2,
+            ctx.content_context(),
+            &time,
+            dialog_id,
+            &message,
+            "add_message_to_dialog",
+        );
+    }
 
-    // the Channel slow-mode/repair walk (31468-31485) — from_update = false
+    // the Channel slow-mode/repair walk (31468-31485) — the repair arm
+    // (31470-31473) only fires from the "updateNewChannelMessage" source
+    if from_update && !message.is_failed_to_send && dialog_id.get_type() == DialogType::Channel {
+        let now = ctx.unix_time().max(message.date);
+        if message.date + 3600 >= now && message.is_outgoing {
+            let channel_id = dialog_id.get_channel_id();
+            let slow_mode_delay = ctx.get_channel_slow_mode_delay(channel_id);
+            if (message.date + slow_mode_delay) > now && !ctx.is_channel_administrator(channel_id) {
+                ctx.on_update_channel_slow_mode_next_send_date(
+                    channel_id,
+                    message.date + slow_mode_delay,
+                );
+            }
+        }
+        if message.date > now - 14 * 86400 {
+            ctx.remove_inactive_channel(dialog_id.get_channel_id());
+        }
+    }
 
     let message_content_type = message
         .content
@@ -16917,58 +18090,93 @@ fn add_message_to_dialog(
         .expect("message without content")
         .get_type();
     if message_content_type == MessageContentType::ContactRegistered
-        && !d.has_contact_registered_message
+        && !manager
+            .get_dialog(dialog_id)
+            .unwrap()
+            .has_contact_registered_message
     {
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
         d.has_contact_registered_message = true;
-        // `on_dialog_updated` — the binlog-pmc dirty marker is the dialog-db
-        // receive seam
+        on_dialog_updated(manager, dialog_id, "update_has_contact_registered_message");
     }
 
     // the story-reply fan-out (31492-31500) is the StoryManager seam;
     // `reget_message_from_server_if_needed` (31502) is [blocked: net];
     // `add_message_file_sources` (31504) is M.10.18; the content/reply
-    // registrations (31506/31508) are the M.10.9 container seam
+    // registrations (31506/31508) are the M.9.12 register plane through
+    // the Td wiring
 
-    // the from_update speculation blocks (31510-31576) and the forum-topic
-    // count (31578-31580) — from_update = false / the ForumTopicManager seam
+    // the PinMessage/SetBackground/ChatSetTheme/Create ttl flips
+    // (31510-31536) ride the M.10.14 pinned/background/theme slices
+
+    // the from_update speculation family (31538-31576) — the
+    // group-call/participant/hashtag/top-dialog/action-bar bodies are the
+    // manager seams; update_has_outgoing_messages flipped above
+
+    // the forum-topic count (31578-31580) is the ForumTopicManager seam
 
     let result_message_id = message.message_id;
     let random_id = message.random_id;
     let is_yet_unsent = message.message_id.is_yet_unsent();
     let is_scheduled_message = message.message_id.is_scheduled();
     message.debug_source = source;
-    d.messages.insert(message_id, message);
-    // `message_lru_list.put_back` (31585) — the unload container is the
-    // recorded stand-in
+    {
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        d.messages.insert(message_id, message);
+        d.message_lru_list.put_back(message_id);
+    }
 
     match dialog_id.get_type() {
-        DialogType::User => {
-            // `register_message_users` (31587-31591) — the UserManager
-            // receive seam; skipped for bots like the C++
+        DialogType::User | DialogType::Chat => {
+            if result_message_id.is_server() {
+                manager
+                    .message_id_to_dialog_id
+                    .insert(result_message_id, dialog_id);
+            }
         }
         DialogType::Channel => {
             // `register_message_users`/`register_message_channels`
-            // (31594-31598) — the same seam
+            // (31594-31598) — the UserManager/ChatManager receive seams
         }
-        DialogType::Chat | DialogType::SecretChat => {}
-        DialogType::None => unreachable!(),
+        DialogType::SecretChat | DialogType::None => {}
+    }
+    {
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        register_dialog_ephemeral_message(d, registered_ephemeral_message_id);
+
+        if is_yet_unsent || dialog_id.get_type() == DialogType::SecretChat {
+            add_random_id_to_message_id_correspondence(d, random_id, result_message_id);
+        }
     }
 
-    register_dialog_ephemeral_message(d, registered_ephemeral_message_id);
+    // the saved-messages topic/user/notification/bot-command
+    // media-timestamp fan-out (31612-31639) is the manager receive seam
 
-    if is_yet_unsent || dialog_id.get_type() == DialogType::SecretChat {
-        add_random_id_to_message_id_correspondence(d, random_id, result_message_id);
+    if !ctx.is_bot()
+        && is_yet_unsent
+        && !is_scheduled_message
+        && message_top_thread_valid(manager, dialog_id, result_message_id)
+    {
+        let top_thread_message_id = manager
+            .get_dialog(dialog_id)
+            .unwrap()
+            .messages
+            .get(&result_message_id)
+            .unwrap()
+            .top_thread_message_id;
+        let is_inserted = manager
+            .yet_unsent_thread_message_ids
+            .entry(MessageFullId::new(dialog_id, top_thread_message_id))
+            .or_default()
+            .insert(result_message_id);
+        assert!(is_inserted);
     }
-
-    // the saved-messages topic/yet-unsent thread/user/notification/bot
-    // command/media-timestamp fan-out (31612-31639) is the manager receive
-    // seam
 
     if is_yet_unsent && is_scheduled_message {
         // `send_update_chat_has_scheduled_messages` (31643) — the update
-        // plane is the M.10.9 seam
+        // plane rides the receive wiring
         tracing::info!(
-            "send_update_chat_has_scheduled_messages seam: {:?} after sending {}",
+            "send_update_chat_has_scheduled_messages: {:?} after sending {}",
             dialog_id,
             DisplayMessageId(message_id)
         );
@@ -16976,10 +18184,26 @@ fn add_message_to_dialog(
 
     // the paid-star pending walk (31645-31652) is the StarManager seam
 
-    d.being_added_message_id = MessageId::default();
-    // `added_message_count_++` (31658)
+    manager
+        .get_dialog_mut(dialog_id)
+        .unwrap()
+        .being_added_message_id = MessageId::default();
+    manager.added_message_count += 1;
 
     Ok(MessageFullId::new(dialog_id, result_message_id))
+}
+
+/// The `m->top_thread_message_id.is_valid()` read for the thread registry.
+fn message_top_thread_valid(
+    manager: &MessagesManager,
+    dialog_id: DialogId,
+    message_id: MessageId,
+) -> bool {
+    manager
+        .get_dialog(dialog_id)
+        .and_then(|d| d.messages.get(&message_id))
+        .map(|m| m.top_thread_message_id.is_valid())
+        .unwrap_or(false)
 }
 
 /// `MessagesManager::add_scheduled_message_to_dialog`
@@ -16993,6 +18217,9 @@ fn add_scheduled_message_to_dialog(
     ctx: &dyn SendMessageContext,
     dialog_id: DialogId,
     mut message: Box<Message>,
+    _from_database: bool,
+    _from_update: bool,
+    _need_update: &mut bool,
     source: &'static str,
 ) -> Result<MessageFullId, String> {
     let message_id = message.message_id;
@@ -17439,7 +18666,7 @@ pub fn can_reply_to_message_in_another_dialog(
     can_be_forwarded
         && m.is_some_and(|m| m.message_id.is_server())
         && m.is_none_or(|m| m.ephemeral_message.is_none())
-        && !ctx.content_context().is_broadcast_channel_dialog(dialog_id)
+        && !ctx.is_monoforum_channel_dialog(dialog_id)
         && !(m.is_some_and(|m| {
             m.message_id == MessageId::from_server_message_id(ServerMessageId::new(1))
         }) && dialog_id.get_type() == DialogType::Channel)
@@ -17535,7 +18762,11 @@ pub fn replied_message_info_from_input_reply_to(
             ctx.get_forwarded_message_info(input_reply_to.dialog_id, input_reply_to.message_id)
         else {
             // the C++ `*this = {}` reset when the replied message cannot be
-            // loaded (RepliedMessageInfo.cpp:152-156)
+            // loaded (RepliedMessageInfo.cpp:152-156); per the seam contract
+            // the M.10.11 implementation also answers None for a
+            // partially-populated info failing the C++
+            // `origin_date == 0 || origin.is_empty() || content == nullptr`
+            // tri-condition, which lands here the same way
             return RepliedMessageInfo::default();
         };
         result.origin_date = info.origin_date;
@@ -17566,6 +18797,7 @@ pub fn get_message_to_send(
     global: &mut crate::global::Global,
     manager: &mut MessagesManager,
     reactions_ctx: &dyn DialogReactionsContext,
+    state: &mut dyn ReadStateContext,
     dialog_id: DialogId,
     message_topic: &MessageTopic,
     input_reply_to: MessageInputReplyTo,
@@ -17615,13 +18847,18 @@ pub fn get_message_to_send(
         ctx.have_input_peer_read(dialog_id, true),
         "have_input_peer(Read) failed for {dialog_id:?} in get_message_to_send"
     );
+    let mut need_update = false;
     let result = add_message_to_dialog(
         global,
         manager,
         reactions_ctx,
-        ctx,
+        &*ctx,
+        state,
         dialog_id,
         message,
+        false,
+        true,
+        &mut need_update,
         need_update_dialog_pos,
         "send message",
     );
@@ -18069,7 +19306,7 @@ pub fn get_message_reply_to_random_id(d: &Dialog, m: &Message) -> i64 {
 /// registry walks (`unregister/register_message_reply`) are the M.10.9
 /// container seam.
 pub fn update_message_reply_to_message_id(
-    d: &mut Dialog,
+    d: &Dialog,
     m: &mut Message,
     reply_to_message_id: MessageId,
     _source: &'static str,
@@ -18091,27 +19328,161 @@ pub fn update_message_reply_to_message_id(
 
 /// `MessagesManager::set_message_reply` (MessagesManager.cpp:35822-35838) —
 /// the implicit-reply reset leg of the restore.
-fn set_message_reply(
+/// `MessagesManager::update_has_outgoing_messages`
+/// (MessagesManager.cpp:35786-35817) — the live from_update send leg:
+/// computes the C++ gates and answers the dialog whose
+/// `has_outgoing_messages` must flip (`None` when the C++ returns early).
+/// The caller performs the flip; `on_dialog_updated`
+/// ("update_has_outgoing_messages") — the binlog-pmc dirty marker — is the
+/// dialog-db receive seam, and the action-bar re-emit (35815-35817,
+/// `DialogActionBar::on_outgoing_message` → `send_update_chat_action_bar`)
+/// is the update/action-bar seam.
+fn update_has_outgoing_messages_target(
     ctx: &dyn SendMessageContext,
-    d: &mut Dialog,
+    manager: &MessagesManager,
+    dialog_id: DialogId,
+    m: &Message,
+) -> Option<DialogId> {
+    if ctx.is_bot()
+        || (!m.is_outgoing
+            && dialog_id != DialogId::from_user_id(ctx.content_context().get_my_id()))
+    {
+        return None;
+    }
+
+    // the dialog whose flag flips is the User dialog itself, or the peer
+    // user behind a secret chat
+    let target_dialog_id = match dialog_id.get_type() {
+        DialogType::User => dialog_id,
+        DialogType::SecretChat => {
+            let user_id = ctx
+                .content_context()
+                .get_secret_chat_user_id(dialog_id.get_secret_chat_id());
+            if !user_id.is_valid() {
+                return None;
+            }
+            DialogId::from_user_id(user_id)
+        }
+        DialogType::Chat | DialogType::Channel => return None,
+        DialogType::None => unreachable!(),
+    };
+    let d = manager.get_dialog(target_dialog_id)?;
+    // `get_dialog`/`get_dialog_force` — the db-load leg is the dialog-db
+    // receive seam
+    if d.has_outgoing_messages {
+        return None;
+    }
+    Some(target_dialog_id)
+}
+
+/// `MessagesManager::update_message_max_reply_media_timestamp`
+/// (MessagesManager.cpp:23959-24013). The closing update emission
+/// (24005-24012, `need_send_update_message_content = true`) is the M.10.9
+/// update plane over the M.9 `has_media_timestamps` helper.
+fn update_message_max_reply_media_timestamp(
+    manager: &MessagesManager,
+    ctx: &dyn SendMessageContext,
+    d: &Dialog,
+    m: &mut Message,
+    need_send_update_message_content: bool,
+) {
+    if ctx.is_bot() {
+        return;
+    }
+
+    let mut new_max_reply_media_timestamp = -1;
+    let reply_message_full_id = m
+        .replied_message_info
+        .get_reply_message_full_id(d.dialog_id, false);
+    let reply_message_id = reply_message_full_id.get_message_id();
+    if reply_message_id.is_valid() && !reply_message_id.is_yet_unsent() {
+        let reply_d = if reply_message_full_id.get_dialog_id() != d.dialog_id {
+            // `get_dialog(reply_message_full_id.get_dialog_id())` — the
+            // db-load leg is the dialog-db receive seam
+            manager.get_dialog(reply_message_full_id.get_dialog_id())
+        } else {
+            Some(d)
+        };
+        let Some(reply_d) = reply_d else {
+            // replied message isn't loaded yet
+            return;
+        };
+        match get_message_in_dialog(reply_d, reply_message_id) {
+            Some(replied_m) => {
+                new_max_reply_media_timestamp = get_message_own_max_media_timestamp(ctx, replied_m);
+            }
+            None => {
+                if !is_deleted_message(reply_d, reply_message_id)
+                    && reply_message_id > reply_d.last_clear_history_message_id
+                    && reply_message_id > reply_d.max_unavailable_message_id
+                {
+                    // replied message isn't deleted and isn't loaded yet
+                    return;
+                }
+            }
+        }
+    } else if m.reply_to_story_full_id != StoryFullId::default() {
+        if !ctx.have_story(m.reply_to_story_full_id) {
+            if !ctx.is_inaccessible_story(m.reply_to_story_full_id) {
+                // replied story isn't loaded yet
+                return;
+            }
+        } else {
+            new_max_reply_media_timestamp = ctx.get_story_duration(m.reply_to_story_full_id);
+        }
+    }
+
+    if m.max_reply_media_timestamp == new_max_reply_media_timestamp {
+        return;
+    }
+
+    let old_max_media_timestamp = get_message_max_media_timestamp(m);
+    m.max_reply_media_timestamp = new_max_reply_media_timestamp;
+    let new_max_media_timestamp = get_message_max_media_timestamp(m);
+    if need_send_update_message_content && old_max_media_timestamp != new_max_media_timestamp {
+        // the swap + has_media_timestamps range check +
+        // send_update_message_content_impl emission (24005-24012)
+        tracing::info!(
+            "update_message_max_reply_media_timestamp seam: updateMessageContent emission for {} in {:?} is the M.10.9 update plane",
+            DisplayMessageId(m.message_id),
+            d.dialog_id
+        );
+    }
+}
+
+fn set_message_reply(
+    manager: &MessagesManager,
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
     m: &mut Message,
     input_reply_to: MessageInputReplyTo,
+    is_message_in_dialog: bool,
 ) {
     tracing::info!(
         "Update replied message of {}:{}",
-        d.dialog_id.get(),
+        dialog_id.get(),
         DisplayMessageId(m.message_id)
     );
+    if is_message_in_dialog {
+        // `unregister_message_reply` (35827) — the M.10.9 container seam
+    }
     m.replied_message_info = replied_message_info_from_input_reply_to(
         ctx,
-        d.dialog_id,
+        dialog_id,
         &input_reply_to,
-        &get_message_topic(ctx, d.dialog_id, m),
+        &get_message_topic(ctx, dialog_id, m),
     );
     m.reply_to_story_full_id = StoryFullId::default();
-    m.reply_to_random_id = get_message_reply_to_random_id(d, m);
+    let d = manager.get_dialog(dialog_id);
+    m.reply_to_random_id = d.map_or(0, |d| get_message_reply_to_random_id(d, m));
     if !m.message_id.is_any_server() {
         m.input_reply_to = input_reply_to;
+    }
+    if is_message_in_dialog {
+        // `register_message_reply` (35836) — the same seam
+    }
+    if let Some(d) = manager.get_dialog(dialog_id) {
+        update_message_max_reply_media_timestamp(manager, ctx, d, m, is_message_in_dialog);
     }
 }
 
@@ -18120,8 +19491,9 @@ fn set_message_reply(
 /// replied-to yet-unsent id is rewritten to its persisted form, or the reply
 /// resets to the implicit topic reply.
 pub fn restore_message_reply_to_message_id(
+    manager: &MessagesManager,
     ctx: &dyn SendMessageContext,
-    d: &mut Dialog,
+    dialog_id: DialogId,
     m: &mut Message,
 ) {
     let input_reply_to_is_empty = get_message_input_reply_to(m).is_empty();
@@ -18129,42 +19501,48 @@ pub fn restore_message_reply_to_message_id(
         return;
     }
     let replied_message_full_id =
-        get_message_input_reply_to(m).get_reply_message_full_id(d.dialog_id);
+        get_message_input_reply_to(m).get_reply_message_full_id(dialog_id);
     let replied_message_id = replied_message_full_id.get_message_id();
     if replied_message_id == MessageId::default() || !replied_message_id.is_yet_unsent() {
         return;
     }
-    assert!(replied_message_full_id.get_dialog_id() == d.dialog_id);
+    assert!(replied_message_full_id.get_dialog_id() == dialog_id);
     let log_check_reply_full_id = m
         .replied_message_info
-        .get_reply_message_full_id(d.dialog_id, true);
+        .get_reply_message_full_id(dialog_id, true);
     assert!(
         log_check_reply_full_id == replied_message_full_id,
         "restore_message_reply_to_message_id reply mismatch: {replied_message_full_id:?} vs {log_check_reply_full_id:?}"
     );
-    let message_id = get_message_id_by_random_id(
-        ctx,
-        d,
-        m.reply_to_random_id,
-        "restore_message_reply_to_message_id",
-    );
+    let message_id = {
+        let d = manager.get_dialog(dialog_id).unwrap();
+        get_message_id_by_random_id(
+            ctx,
+            d,
+            m.reply_to_random_id,
+            "restore_message_reply_to_message_id",
+        )
+    };
     if (message_id.is_valid() || message_id.is_valid_scheduled())
         && !message_id.is_local()
         && (is_message_forward(m) || !message_id.is_yet_unsent())
     {
+        let d = manager.get_dialog(dialog_id).unwrap();
         update_message_reply_to_message_id(d, m, message_id, "restore_message_reply_to_message_id");
     } else {
         let implicit_reply_to_message_id =
-            get_message_topic(ctx, d.dialog_id, m).get_implicit_reply_to_message_id(ctx);
+            get_message_topic(ctx, dialog_id, m).get_implicit_reply_to_message_id(ctx);
         assert!(
             implicit_reply_to_message_id == MessageId::default()
                 || implicit_reply_to_message_id.is_server()
         );
         set_message_reply(
+            manager,
             ctx,
-            d,
+            dialog_id,
             m,
             MessageInputReplyTo::regular(implicit_reply_to_message_id),
+            false,
         );
     }
 }
@@ -18191,6 +19569,7 @@ pub fn continue_send_message(
     manager: &mut MessagesManager,
     reactions_ctx: &dyn DialogReactionsContext,
     ctx: &mut dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
     dialog_id: DialogId,
     mut message: Box<Message>,
     need_update_dialog_pos: &mut bool,
@@ -18235,17 +19614,21 @@ pub fn continue_send_message(
     }
 
     {
-        let d = manager.get_dialog_mut(dialog_id).unwrap();
-        restore_message_reply_to_message_id(ctx, d, &mut message);
+        restore_message_reply_to_message_id(manager, ctx, dialog_id, &mut message);
     }
 
+    let mut need_update = false;
     let result_full_id = add_message_to_dialog(
         global,
         manager,
         reactions_ctx,
-        ctx,
+        &*ctx,
+        state,
         dialog_id,
         message,
+        false,
+        true,
+        &mut need_update,
         need_update_dialog_pos,
         "continue_send_message",
     );
@@ -18370,11 +19753,13 @@ pub fn replay_send_message_log_event(
     );
 
     let mut need_update_dialog_pos = false;
+    let mut state = NoReadStateContext;
     let result_full_id = continue_send_message(
         global,
         manager,
         reactions_ctx,
         ctx,
+        &mut state,
         dialog_id,
         message,
         &mut need_update_dialog_pos,
@@ -18394,6 +19779,3696 @@ pub fn replay_send_message_log_event(
             DisplayMessageId(result_full_id.get_message_id())
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// M.10.9 — the message containers + the receive/send-completion fan-out
+// ---------------------------------------------------------------------------
+
+/// The combined write plane the M.10.9+ slices drive: every read the
+/// object/send contexts answer plus the `Td::send_update` delivery leg and
+/// the read-state notification dialogs of [`ReadStateContext`]. `Td`
+/// implements all three supertraits; the blanket impl carries it.
+pub trait MessageManagerContext: ReadStateContext + SendMessageContext {}
+impl<T: ReadStateContext + SendMessageContext> MessageManagerContext for T {}
+
+/// `MessagesManager::get_message(const Dialog *, MessageId)`
+/// (MessagesManager.cpp:30605-30637) — the container read with the
+/// scheduled-date rewrite and the LRU access touch. The C++ returns a
+/// mutable-or-const pointer; the Rust callers pick
+/// [`get_message_in_dialog`] for the shared read or re-borrow the dialog
+/// for the write paths.
+pub fn get_message_touched(
+    d: &mut Dialog,
+    unix_time: i32,
+    message_id: MessageId,
+) -> Option<&Message> {
+    if message_id.is_scheduled() {
+        if let Some(scheduled_messages) = &d.scheduled_messages
+            && message_id.is_valid_scheduled()
+        {
+            let mut rewritten = message_id;
+            if message_id.is_scheduled_server() {
+                let server_message_id = message_id.get_scheduled_server_message_id();
+                if let Some(date) = scheduled_messages
+                    .scheduled_message_date
+                    .get(&server_message_id)
+                {
+                    rewritten = MessageId::from_scheduled(server_message_id, *date, false);
+                    assert!(rewritten.is_scheduled_server());
+                }
+            }
+            return scheduled_messages
+                .scheduled_messages
+                .get(&rewritten)
+                .map(|m| m.as_ref());
+        }
+        None
+    } else {
+        if let Some(m) = d.messages.get(&message_id)
+            && unix_time > m.last_access_date + 5
+        {
+            let last_access_date = &mut d.messages.get_mut(&message_id).unwrap().last_access_date;
+            *last_access_date = unix_time;
+            d.message_lru_list.touch(message_id);
+        }
+        d.messages.get(&message_id).map(|m| m.as_ref())
+    }
+}
+
+/// `MessagesManager::get_message_static` (MessagesManager.cpp:30640).
+pub fn get_message_static(d: &Dialog, message_id: MessageId) -> Option<&Message> {
+    get_message_in_dialog(d, message_id)
+}
+
+/// `MessagesManager::have_message_force(Dialog *, MessageId, const char *)`
+/// (MessagesManager.cpp:14632-14652) — the memory half; the message-db
+/// load leg is the dialog-db receive seam.
+pub fn have_message_in_dialog(
+    manager: &MessagesManager,
+    dialog_id: DialogId,
+    message_id: MessageId,
+) -> bool {
+    match manager.get_dialog(dialog_id) {
+        Some(d) => have_message_in_dialog_memory(d, message_id),
+        None => false,
+    }
+}
+
+/// The memory probe of `have_message_force`.
+pub fn have_message_in_dialog_memory(d: &Dialog, message_id: MessageId) -> bool {
+    if message_id.is_scheduled() {
+        if !message_id.is_valid_scheduled() {
+            return false;
+        }
+        let Some(scheduled_messages) = &d.scheduled_messages else {
+            return false;
+        };
+        if message_id.is_scheduled_server() {
+            // a scheduled server message must be found by the date-rewritten
+            // id; an unknown date means the message is unknown
+            let server_message_id = message_id.get_scheduled_server_message_id();
+            match scheduled_messages
+                .scheduled_message_date
+                .get(&server_message_id)
+            {
+                Some(date) => scheduled_messages
+                    .scheduled_messages
+                    .contains_key(&MessageId::from_scheduled(server_message_id, *date, false)),
+                None => false,
+            }
+        } else {
+            scheduled_messages
+                .scheduled_messages
+                .contains_key(&message_id)
+        }
+    } else {
+        d.messages.contains_key(&message_id)
+    }
+}
+
+/// `MessagesManager::update_message_count_by_index(Dialog *, int, const
+/// Message *)` (MessagesManager.cpp:4109-4119) — the per-message form.
+pub fn update_message_count_by_index_message(
+    manager: &mut MessagesManager,
+    reactions_ctx: &dyn DialogReactionsContext,
+    content_ctx: &dyn crate::message_content::MessageContentContext,
+    dialog_id: DialogId,
+    diff: i32,
+    m: &Message,
+) {
+    let mut index_mask = get_message_index_mask(manager, reactions_ctx, content_ctx, dialog_id, m);
+    index_mask &= !message_search_filter_index_mask(MessageSearchFilter::UnreadMention);
+    index_mask &= !message_search_filter_index_mask(MessageSearchFilter::UnreadReaction);
+    index_mask &= !message_search_filter_index_mask(MessageSearchFilter::UnreadPollVote);
+    update_message_count_by_index_mask(manager, dialog_id, diff, index_mask);
+}
+
+/// `MessagesManager::update_message_count_by_index(Dialog *, int, int32)`
+/// (MessagesManager.cpp:4121-4159) — the mask form with the calls-db tail.
+pub fn update_message_count_by_index_mask(
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    diff: i32,
+    index_mask: i32,
+) {
+    if index_mask == 0 {
+        return;
+    }
+    tracing::info!(
+        "Update message count by {} in index mask {}",
+        diff,
+        index_mask
+    );
+    let is_secret = dialog_id.get_type() == DialogType::SecretChat;
+    let failed_to_send_index =
+        message_search_filter_index(MessageSearchFilter::FailedToSend) as usize;
+    let mut changed = false;
+    if let Some(d) = manager.get_dialog_mut(dialog_id) {
+        for (i, message_count) in d.message_count_by_index.iter_mut().enumerate() {
+            if ((index_mask >> i) & 1) != 0 && *message_count != -1 {
+                *message_count += diff;
+                if *message_count < 0 {
+                    if is_secret || i == failed_to_send_index {
+                        *message_count = 0;
+                    } else {
+                        *message_count = -1;
+                    }
+                }
+                changed = true;
+            }
+        }
+    }
+    let mut calls_counts = manager.calls_db_state.message_count_by_index;
+    for (loop_i, message_count) in calls_counts.iter_mut().enumerate() {
+        let i = MessageSearchFilter::Call as i32 - 1 + loop_i as i32;
+        if ((index_mask >> i) & 1) != 0 && *message_count != -1 {
+            *message_count += diff;
+            if *message_count < 0 {
+                if is_secret {
+                    *message_count = 0;
+                } else {
+                    *message_count = -1;
+                }
+            }
+            save_calls_db_state(manager);
+        }
+    }
+    manager.calls_db_state.message_count_by_index = calls_counts;
+    if changed {
+        on_dialog_updated(manager, dialog_id, "update_message_count_by_index");
+    }
+}
+
+/// `MessagesManager::save_calls_db_state` (MessagesManager.cpp:3798-3808)
+/// — the `calls_db_state` pmc row; the sqlite write rides the TdDb pmc
+/// seam, the in-memory value is the engine.
+fn save_calls_db_state(manager: &MessagesManager) {
+    tracing::debug!(
+        "calls_db_state = {:?}",
+        manager.calls_db_state.message_count_by_index
+    );
+}
+
+/// `MessagesManager::invalidate_message_indexes`
+/// (MessagesManager.cpp:4093-4107).
+pub fn invalidate_message_indexes(d: &mut Dialog) {
+    let is_secret = d.dialog_id.get_type() == DialogType::SecretChat;
+    let failed_to_send_index =
+        message_search_filter_index(MessageSearchFilter::FailedToSend) as usize;
+    for (i, slot) in d
+        .message_count_by_index
+        .iter_mut()
+        .zip(d.first_database_message_id_by_index.iter_mut())
+        .enumerate()
+    {
+        let (message_count, first_database_message_id) = slot;
+        if is_secret || i == failed_to_send_index {
+            // always know all messages
+            *first_database_message_id = MessageId::min();
+            // keep the count
+        } else {
+            // some messages are unknown; drop first_database_message_id and
+            // count
+            *first_database_message_id = MessageId::default();
+            *message_count = -1;
+        }
+    }
+}
+
+/// `MessagesManager::set_dialog_last_new_message_id`
+/// (MessagesManager.cpp:12214-12236).
+pub fn set_dialog_last_new_message_id(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    last_new_message_id: MessageId,
+    source: &'static str,
+) {
+    assert!(!last_new_message_id.is_scheduled());
+    assert!(!ctx.is_bot());
+    {
+        let d = manager
+            .get_dialog(dialog_id)
+            .expect("set_dialog_last_new_message_id without the dialog");
+        assert!(
+            last_new_message_id > d.last_new_message_id,
+            "LOG_CHECK failed: {} {:?} {:?} {}",
+            DisplayMessageId(last_new_message_id),
+            DisplayMessageId(d.last_new_message_id),
+            dialog_id,
+            source
+        );
+        assert!(dialog_id.get_type() == DialogType::SecretChat || last_new_message_id.is_server());
+    }
+
+    if !manager
+        .get_dialog(dialog_id)
+        .unwrap()
+        .last_new_message_id
+        .is_valid()
+    {
+        // `remove_dialog_newer_messages` (12177-12210) — the gap repair
+        // deletes the too-new memory messages and resets the db window
+        remove_dialog_newer_messages(global, manager, dialog_id, last_new_message_id, source);
+
+        let has_last_new = {
+            let d = manager.get_dialog(dialog_id).unwrap();
+            d.messages.contains_key(&last_new_message_id)
+        };
+        if has_last_new {
+            let taken = manager
+                .get_dialog_mut(dialog_id)
+                .unwrap()
+                .messages
+                .remove(&last_new_message_id);
+            if let Some(m) = &taken {
+                let reactions_ctx = MessageObjectReactionsContext { ctx };
+                let time = crate::user_manager::TimeCtx {
+                    now: ctx.now(),
+                    server_time: ctx.server_time(),
+                };
+                add_message_to_database(
+                    global,
+                    manager,
+                    &reactions_ctx,
+                    ctx.content_context(),
+                    &time,
+                    dialog_id,
+                    m,
+                    "set_dialog_last_new_message_id",
+                );
+            }
+            manager
+                .get_dialog_mut(dialog_id)
+                .unwrap()
+                .messages
+                .insert(last_new_message_id, taken.unwrap());
+            set_dialog_first_database_message_id(manager, dialog_id, last_new_message_id, source);
+            set_dialog_last_database_message_id(
+                manager,
+                dialog_id,
+                last_new_message_id,
+                source,
+                false,
+            );
+            // `try_restore_dialog_reply_markup` — the reply-markup restore
+            // rides the M.10.14 pinned/reply-markup slice
+        }
+    }
+
+    tracing::info!(
+        "Set {} last new message to {} from {}",
+        dialog_id.get(),
+        DisplayMessageId(last_new_message_id),
+        source
+    );
+    let d = manager.get_dialog_mut(dialog_id).unwrap();
+    d.last_new_message_id = last_new_message_id;
+    on_dialog_updated(manager, dialog_id, source);
+}
+
+/// `MessagesManager::remove_dialog_newer_messages`
+/// (MessagesManager.cpp:12177-12210) — the channel-gap repair: everything
+/// newer than `from_message_id` leaves memory and the database.
+pub fn remove_dialog_newer_messages(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    from_message_id: MessageId,
+    source: &'static str,
+) {
+    tracing::info!(
+        "Remove messages in {} newer than {} from {}",
+        dialog_id.get(),
+        DisplayMessageId(from_message_id),
+        source
+    );
+    {
+        let d = manager.get_dialog(dialog_id).unwrap();
+        assert!(!d.last_new_message_id.is_valid());
+    }
+
+    // the function is called to handle channel gaps, and hence must always
+    // delete all database messages, even if first_database_message_id and
+    // last_database_message_id are empty
+    delete_all_dialog_messages_from_database(
+        global,
+        dialog_id,
+        MessageId::max(),
+        "remove_dialog_newer_messages",
+    );
+    set_dialog_first_database_message_id(
+        manager,
+        dialog_id,
+        MessageId::default(),
+        "remove_dialog_newer_messages",
+    );
+    set_dialog_last_database_message_id(manager, dialog_id, MessageId::default(), source, false);
+    {
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        if d.dialog_id.get_type() != DialogType::SecretChat && !d.is_empty {
+            d.have_full_history = false;
+            d.have_full_history_source = 0;
+        }
+        invalidate_message_indexes(d);
+    }
+
+    let to_delete_message_ids: Vec<MessageId> = {
+        let d = manager.get_dialog(dialog_id).unwrap();
+        d.ordered_messages
+            .find_newer_messages(from_message_id)
+            .into_iter()
+            .filter(|message_id| !message_id.is_yet_unsent())
+            .collect()
+    };
+    if !to_delete_message_ids.is_empty() {
+        tracing::info!(
+            "Delete {} messages newer than {} in {} from {}",
+            to_delete_message_ids.len(),
+            DisplayMessageId(from_message_id),
+            dialog_id.get(),
+            source
+        );
+        for message_id in to_delete_message_ids {
+            let mut need_update_dialog_pos = false;
+            let deleted = do_delete_message(
+                global,
+                manager,
+                dialog_id,
+                message_id,
+                true,
+                false,
+                &mut need_update_dialog_pos,
+                "remove_dialog_newer_messages",
+            );
+            if deleted.is_some() {
+                send_update_delete_messages(manager, dialog_id, &[message_id], true);
+            }
+        }
+    }
+}
+
+/// `MessagesManager::set_dialog_last_message_id`
+/// (MessagesManager.cpp:12110-12145).
+pub fn set_dialog_last_message_id(
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    last_message_id: MessageId,
+    source: &str,
+) {
+    assert!(!last_message_id.is_scheduled());
+    tracing::info!(
+        "Set {} last message to {} from {}",
+        dialog_id.get(),
+        DisplayMessageId(last_message_id),
+        source
+    );
+    let needs_delete_last_repair = {
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        d.last_message_id = last_message_id;
+
+        if !last_message_id.is_valid() {
+            d.last_media_album_id = 0;
+        } else {
+            match d.messages.get(&last_message_id) {
+                Some(m) => d.last_media_album_id = m.media_album_id,
+                None => {
+                    log_error!(
+                        "Failed to find last {} in {}",
+                        DisplayMessageId(last_message_id),
+                        dialog_id.get()
+                    );
+                    d.last_media_album_id = 0;
+                }
+            }
+        }
+        // the dialog_suffix_load_queries_ reset (12132-12137) rides the
+        // M.10.15 suffix-load slice
+        last_message_id.is_valid() && d.delete_last_message_date != 0
+    };
+    if needs_delete_last_repair {
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        d.delete_last_message_date = 0;
+        d.deleted_last_message_id = MessageId::default();
+        d.is_last_message_deleted_locally = false;
+        on_dialog_updated(manager, dialog_id, "update_delete_last_message_date");
+    }
+    let d = manager.get_dialog_mut(dialog_id).unwrap();
+    d.pending_order = DEFAULT_ORDER;
+}
+
+/// `MessagesManager::set_dialog_first_database_message_id`
+/// (MessagesManager.cpp:12147-12159).
+pub fn set_dialog_first_database_message_id(
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    first_database_message_id: MessageId,
+    source: &str,
+) {
+    assert!(!first_database_message_id.is_scheduled());
+    if manager
+        .get_dialog(dialog_id)
+        .map(|d| d.first_database_message_id == first_database_message_id)
+        .unwrap_or(true)
+    {
+        return;
+    }
+    tracing::info!(
+        "Set {} first database message to {} from {}",
+        dialog_id.get(),
+        DisplayMessageId(first_database_message_id),
+        source
+    );
+    let d = manager.get_dialog_mut(dialog_id).unwrap();
+    d.first_database_message_id = first_database_message_id;
+    on_dialog_updated(manager, dialog_id, "set_dialog_first_database_message_id");
+}
+
+/// `MessagesManager::set_dialog_last_database_message_id`
+/// (MessagesManager.cpp:12161-12175).
+pub fn set_dialog_last_database_message_id(
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    last_database_message_id: MessageId,
+    source: &'static str,
+    is_loaded_from_database: bool,
+) {
+    assert!(!last_database_message_id.is_scheduled());
+    if manager
+        .get_dialog(dialog_id)
+        .map(|d| d.last_database_message_id == last_database_message_id)
+        .unwrap_or(true)
+    {
+        return;
+    }
+    tracing::info!(
+        "Set {} last database message to {} from {}",
+        dialog_id.get(),
+        DisplayMessageId(last_database_message_id),
+        source
+    );
+    let d = manager.get_dialog_mut(dialog_id).unwrap();
+    d.debug_set_dialog_last_database_message_id = source;
+    d.last_database_message_id = last_database_message_id;
+    if !is_loaded_from_database {
+        on_dialog_updated(manager, dialog_id, "set_dialog_last_database_message_id");
+    }
+}
+
+/// `MessagesManager::delete_message` (MessagesManager.cpp:13244-13248).
+pub fn delete_message(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    message_id: MessageId,
+    is_permanently_deleted: bool,
+    need_update_dialog_pos: &mut bool,
+    source: &'static str,
+) -> Option<Box<Message>> {
+    do_delete_message(
+        global,
+        manager,
+        dialog_id,
+        message_id,
+        is_permanently_deleted,
+        false,
+        need_update_dialog_pos,
+        source,
+    )
+}
+
+/// `MessagesManager::do_delete_message`
+/// (MessagesManager.cpp:13494-13673) — the in-memory delete core with the
+/// last-message/database-window repairs. The notification teardown
+/// (`remove_message_notification_id`), the live-location persistence and
+/// the file-source removal ride their manager seams; the memory container
+/// walks are the port.
+#[allow(clippy::too_many_arguments)]
+pub fn do_delete_message(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    message_id: MessageId,
+    is_permanently_deleted: bool,
+    only_from_memory: bool,
+    need_update_dialog_pos: &mut bool,
+    source: &'static str,
+) -> Option<Box<Message>> {
+    if !message_id.is_valid() {
+        if message_id.is_valid_scheduled() {
+            return do_delete_scheduled_message(
+                global,
+                manager,
+                dialog_id,
+                message_id,
+                is_permanently_deleted,
+                source,
+            );
+        }
+        log_error!(
+            "Trying to delete {} in {} from {}",
+            DisplayMessageId(message_id),
+            dialog_id.get(),
+            source
+        );
+        return None;
+    }
+
+    let has_in_memory = manager
+        .get_dialog(dialog_id)
+        .map(|d| d.messages.contains_key(&message_id))
+        .unwrap_or(false);
+    if !has_in_memory {
+        if only_from_memory {
+            return None;
+        }
+        tracing::info!(
+            "{} is not found in {} to be deleted from {}",
+            DisplayMessageId(message_id),
+            dialog_id.get(),
+            source
+        );
+        // `get_message_force` db load — the dialog-db receive seam; the
+        // database-delete safety net fires anyway
+        delete_message_from_database(
+            global,
+            manager,
+            dialog_id,
+            message_id,
+            None,
+            is_permanently_deleted,
+            source,
+        );
+        if is_permanently_deleted
+            && manager
+                .get_dialog(dialog_id)
+                .map(|d| d.last_clear_history_message_id == message_id)
+                .unwrap_or(false)
+        {
+            set_dialog_last_clear_history_date(
+                manager,
+                dialog_id,
+                0,
+                MessageId::default(),
+                "do_delete_message",
+            );
+            *need_update_dialog_pos = true;
+        }
+        return None;
+    }
+
+    // `can_unload_message` (only_from_memory leg) — the pinned/open
+    // message gate rides the M.10.13 unload slice; an in-memory message
+    // with open_count == 0 unloads like the C++ default
+    {
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        assert!(
+            !d.being_deleted_message_id.is_valid(),
+            "{} {} {}",
+            DisplayMessageId(d.being_deleted_message_id),
+            DisplayMessageId(message_id),
+            source
+        );
+        d.being_deleted_message_id = message_id;
+    }
+
+    let mut need_get_history = false;
+    if !only_from_memory {
+        tracing::info!(
+            "Deleting {}:{} from {}",
+            dialog_id.get(),
+            DisplayMessageId(message_id),
+            source
+        );
+
+        delete_message_from_database(
+            global,
+            manager,
+            dialog_id,
+            message_id,
+            None,
+            is_permanently_deleted,
+            source,
+        );
+
+        if delete_active_live_location(manager, MessageFullId::new(dialog_id, message_id)) {
+            // `send_update_active_live_location_messages` + the db save
+            // ride the live-location plane; the registry removal above is
+            // the state change
+        }
+        // `remove_message_file_sources` — the M.10.18 files seam
+
+        if message_id == manager.get_dialog(dialog_id).unwrap().last_message_id {
+            let previous = {
+                let d = manager.get_dialog(dialog_id).unwrap();
+                d.ordered_messages.pred(message_id)
+            };
+            if let Some(previous) = previous {
+                set_dialog_last_message_id(manager, dialog_id, previous, "do_delete_message");
+            } else {
+                need_get_history = true;
+                let m_date = manager
+                    .get_dialog(dialog_id)
+                    .unwrap()
+                    .messages
+                    .get(&message_id)
+                    .unwrap()
+                    .date;
+                set_dialog_last_message_id(
+                    manager,
+                    dialog_id,
+                    MessageId::default(),
+                    "do_delete_message",
+                );
+                let d = manager.get_dialog_mut(dialog_id).unwrap();
+                d.delete_last_message_date = m_date;
+                d.deleted_last_message_id = message_id;
+                d.is_last_message_deleted_locally = source == DELETE_MESSAGE_USER_REQUEST_SOURCE;
+                on_dialog_updated(manager, dialog_id, "do delete last message");
+            }
+            *need_update_dialog_pos = true;
+        }
+
+        if message_id
+            == manager
+                .get_dialog(dialog_id)
+                .unwrap()
+                .last_database_message_id
+        {
+            // walk down past the yet-unsent ids to the newest database one
+            let mut it = manager
+                .get_dialog(dialog_id)
+                .unwrap()
+                .ordered_messages
+                .pred(message_id);
+            while let Some(cur) = it
+                && cur.is_yet_unsent()
+            {
+                it = manager
+                    .get_dialog(dialog_id)
+                    .unwrap()
+                    .ordered_messages
+                    .pred(cur);
+            }
+            let previous = it;
+            match previous {
+                Some(previous)
+                    if previous
+                        < manager
+                            .get_dialog(dialog_id)
+                            .unwrap()
+                            .first_database_message_id
+                        && dialog_id.get_type() == DialogType::Channel =>
+                {
+                    // possible if messages were deleted from database, but
+                    // not from memory after updateChannelTooLong
+                    set_dialog_last_database_message_id(
+                        manager,
+                        dialog_id,
+                        MessageId::default(),
+                        "do_delete_message 1",
+                        false,
+                    );
+                }
+                Some(previous) => {
+                    set_dialog_last_database_message_id(
+                        manager,
+                        dialog_id,
+                        previous,
+                        "do_delete_message 2",
+                        false,
+                    );
+                    let d = manager.get_dialog(dialog_id).unwrap();
+                    if d.last_database_message_id < d.first_database_message_id {
+                        log_error!(
+                            "Last database {} became less than first database {} after deletion of {}:{}",
+                            DisplayMessageId(d.last_database_message_id),
+                            DisplayMessageId(d.first_database_message_id),
+                            dialog_id.get(),
+                            DisplayMessageId(message_id)
+                        );
+                        let last = d.last_database_message_id;
+                        set_dialog_first_database_message_id(
+                            manager,
+                            dialog_id,
+                            last,
+                            "do_delete_message 2",
+                        );
+                    }
+                }
+                None => {
+                    let d = manager.get_dialog(dialog_id).unwrap();
+                    if d.first_database_message_id == d.last_database_message_id {
+                        // database definitely has no more messages
+                        set_dialog_last_database_message_id(
+                            manager,
+                            dialog_id,
+                            MessageId::default(),
+                            "do_delete_message 3",
+                            false,
+                        );
+                    } else {
+                        tracing::info!(
+                            "Need to get history to repair last_database_message_id in {}",
+                            dialog_id.get()
+                        );
+                        need_get_history = true;
+                    }
+                }
+            }
+        }
+        {
+            let d = manager.get_dialog(dialog_id).unwrap();
+            if d.last_database_message_id.is_valid() {
+                assert!(d.first_database_message_id.is_valid());
+            } else if d.first_database_message_id.is_valid() {
+                set_dialog_first_database_message_id(
+                    manager,
+                    dialog_id,
+                    MessageId::default(),
+                    "do_delete_message",
+                );
+            }
+        }
+        // the dialog_suffix_load_queries_ repair (13624-13637) rides the
+        // M.10.15 suffix-load slice
+    }
+
+    let result = {
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        let result = d.messages.remove(&message_id);
+        if result.is_some() {
+            d.message_lru_list.remove(message_id);
+        }
+        d.ordered_messages
+            .erase(message_id, only_from_memory, source);
+        d.being_deleted_message_id = MessageId::default();
+        result
+    };
+
+    if need_get_history {
+        // `load_last_dialog_message_later` — the net/history seam
+        // (M.10.15)
+    }
+
+    if let Some(result) = &result {
+        on_message_deleted(manager, dialog_id, result, is_permanently_deleted, source);
+    }
+
+    result
+}
+
+/// `MessagesManager::do_delete_scheduled_message`
+/// (MessagesManager.cpp:13800-13863).
+pub fn do_delete_scheduled_message(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    message_id: MessageId,
+    is_permanently_deleted: bool,
+    source: &str,
+) -> Option<Box<Message>> {
+    assert!(
+        message_id.is_valid_scheduled(),
+        "{} {:?} {}",
+        dialog_id.get(),
+        message_id,
+        source
+    );
+
+    if manager
+        .get_dialog(dialog_id)
+        .map(|d| d.scheduled_messages.is_none())
+        .unwrap_or(true)
+    {
+        delete_message_from_database(
+            global,
+            manager,
+            dialog_id,
+            message_id,
+            None,
+            is_permanently_deleted,
+            source,
+        );
+        return None;
+    }
+    let in_container = manager
+        .get_dialog(dialog_id)
+        .unwrap()
+        .scheduled_messages
+        .as_ref()
+        .unwrap()
+        .scheduled_messages
+        .contains_key(&message_id);
+    if !in_container {
+        tracing::info!(
+            "{} is not found in {} to be deleted from {}",
+            DisplayMessageId(message_id),
+            dialog_id.get(),
+            source
+        );
+        delete_message_from_database(
+            global,
+            manager,
+            dialog_id,
+            message_id,
+            None,
+            is_permanently_deleted,
+            source,
+        );
+        return None;
+    }
+
+    tracing::info!(
+        "Deleting {}:{} from {}",
+        dialog_id.get(),
+        DisplayMessageId(message_id),
+        source
+    );
+    delete_message_from_database(
+        global,
+        manager,
+        dialog_id,
+        message_id,
+        None,
+        is_permanently_deleted,
+        source,
+    );
+
+    let result = {
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        let scheduled_messages = d.scheduled_messages.as_mut().unwrap();
+        let result = scheduled_messages.scheduled_messages.remove(&message_id);
+        if message_id.is_scheduled_server() {
+            assert!(
+                scheduled_messages
+                    .scheduled_message_date
+                    .remove(&message_id.get_scheduled_server_message_id())
+                    .is_some()
+            );
+        }
+        result
+    };
+
+    if let Some(result) = &result {
+        // `cancel_send_deleted_message` — the net cancel seam (M.10.9 net
+        // flip)
+        if result.is_topic_message {
+            // the ForumTopicManager count seam
+        }
+        if message_id.is_yet_unsent() {
+            let d = manager.get_dialog_mut(dialog_id).unwrap();
+            delete_random_id_to_message_id_correspondence(d, result.random_id, result.message_id);
+        }
+    }
+    result
+}
+
+/// `MessagesManager::on_message_deleted` (MessagesManager.cpp:13721-13789)
+/// — the container/index teardown after the memory removal.
+pub fn on_message_deleted(
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    m: &Message,
+    _is_permanently_deleted: bool,
+    source: &str,
+) {
+    // also called for unloaded messages, but not for scheduled messages
+    assert!(m.message_id.is_valid());
+
+    if m.message_id.is_yet_unsent()
+        && !m.message_id.is_scheduled()
+        && m.top_thread_message_id.is_valid()
+        && let Some(thread_ids) = manager
+            .yet_unsent_thread_message_ids
+            .get_mut(&MessageFullId::new(dialog_id, m.top_thread_message_id))
+    {
+        assert!(thread_ids.remove(&m.message_id));
+        if thread_ids.is_empty() {
+            manager
+                .yet_unsent_thread_message_ids
+                .remove(&MessageFullId::new(dialog_id, m.top_thread_message_id));
+        }
+    }
+
+    // `cancel_send_deleted_message` — the net cancel seam; the upload
+    // cancel rides the M.12/M.10.9 net flip
+
+    match dialog_id.get_type() {
+        DialogType::User | DialogType::Chat => {
+            if m.message_id.is_server() {
+                manager.message_id_to_dialog_id.remove(&m.message_id);
+            }
+        }
+        DialogType::Channel => {
+            // `unregister_message_users`/`unregister_message_channels` —
+            // the UserManager/ChatManager receive seams
+        }
+        DialogType::SecretChat | DialogType::None => {}
+    }
+    {
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        unregister_dialog_ephemeral_message(d, m.ephemeral_message_id);
+    }
+    // `ttl_unregister_message`/`ttl_period_unregister_message` — the ttl
+    // scheduler seam
+    // `unregister_message_content`/`unregister_message_reply` — the M.9.12
+    // register family through the content context; rides the Td wiring
+    if m.is_topic_message {
+        // the ForumTopicManager count seam
+    }
+    let _ = source;
+
+    manager.added_message_count -= 1;
+}
+
+/// `MessagesManager::try_add_active_live_location`
+/// (MessagesManager.cpp:18634-18670).
+pub fn try_add_active_live_location(
+    ctx: &dyn SendMessageContext,
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    m: &Message,
+) -> bool {
+    if ctx.is_bot()
+        || m.content.as_ref().map(|c| c.get_type()) != Some(MessageContentType::LiveLocation)
+        || m.message_id.is_scheduled()
+        || m.message_id.is_local()
+        || m.message_id.is_yet_unsent()
+        || m.via_bot_user_id.is_valid()
+        || m.guest_bot_via_dialog_id.is_valid()
+        || m.via_business_bot_user_id.is_valid()
+        || m.forward_info.is_some()
+    {
+        return false;
+    }
+    let live_period = crate::message_content::get_message_content_live_location_period(
+        m.content.as_ref().unwrap(),
+    );
+    if live_period <= ctx.unix_time() - m.date + 1 {
+        // live location is expired
+        return false;
+    }
+    add_active_live_location(manager, MessageFullId::new(dialog_id, m.message_id))
+}
+
+/// `MessagesManager::add_active_live_location`
+/// (MessagesManager.cpp:18650-18671) — the registry insert; the db
+/// save/load legs ride the TdDb seam.
+pub fn add_active_live_location(
+    manager: &mut MessagesManager,
+    message_full_id: MessageFullId,
+) -> bool {
+    assert!(message_full_id.get_message_id().is_valid());
+    if !manager
+        .active_live_location_message_full_ids
+        .insert(message_full_id)
+    {
+        return false;
+    }
+    true
+}
+
+/// `MessagesManager::delete_active_live_location`
+/// (MessagesManager.cpp:18672-18674).
+pub fn delete_active_live_location(
+    manager: &mut MessagesManager,
+    message_full_id: MessageFullId,
+) -> bool {
+    manager
+        .active_live_location_message_full_ids
+        .remove(&message_full_id)
+}
+
+/// `MessagesManager::update_reply_to_message_id`
+/// (MessagesManager.cpp:27808-27846) — the yet-unsent id rewrite fanned
+/// out to every replying message.
+pub fn update_reply_to_message_id(
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    old_message_id: MessageId,
+    new_message_id: MessageId,
+    have_new_message: bool,
+    source: &'static str,
+) {
+    let old_message_full_id = MessageFullId::new(dialog_id, old_message_id);
+    let Some(replies) = manager
+        .replied_yet_unsent_messages
+        .get(&old_message_full_id)
+    else {
+        return;
+    };
+    let replies = replies.clone();
+    tracing::debug!(
+        "Update replies to {}:{} to its new {} from {}",
+        dialog_id.get(),
+        DisplayMessageId(old_message_id),
+        DisplayMessageId(new_message_id),
+        source
+    );
+    assert!(old_message_id.is_yet_unsent());
+    assert!(
+        new_message_id == MessageId::default()
+            || new_message_id.is_valid()
+            || new_message_id.is_valid_scheduled()
+    );
+
+    let replies_count = replies.len();
+    for message_full_id in replies {
+        let reply_dialog_id = message_full_id.get_dialog_id();
+        let reply_message_id = message_full_id.get_message_id();
+        let has_message = manager
+            .get_dialog(reply_dialog_id)
+            .map(|d| d.messages.contains_key(&reply_message_id))
+            .unwrap_or(false);
+        assert!(has_message, "missing replying message {message_full_id:?}");
+        if new_message_id != MessageId::default() {
+            let checked = manager
+                .get_dialog(reply_dialog_id)
+                .and_then(|d| d.messages.get(&reply_message_id))
+                .map(|m| {
+                    m.replied_message_info
+                        .get_reply_message_full_id(reply_dialog_id, true)
+                })
+                .is_some_and(|full_id| full_id == old_message_full_id);
+            assert!(
+                checked,
+                "{} {:?} replied-message info mismatch in update_reply_to_message_id",
+                dialog_id.get(),
+                message_full_id
+            );
+            let d = manager.get_dialog_mut(reply_dialog_id).unwrap();
+            let m = d.messages.get_mut(&reply_message_id).unwrap();
+            m.replied_message_info.set_message_id(new_message_id);
+            if !m.message_id.is_any_server() {
+                m.input_reply_to.set_message_id(new_message_id, source);
+            }
+        } else {
+            // `set_message_reply(reply_d, replied_m, MessageInputReplyTo(),
+            // true)` — the reset; rides the reply plane through the empty
+            // input
+            let d = manager.get_dialog_mut(reply_dialog_id).unwrap();
+            let m = d.messages.get_mut(&reply_message_id).unwrap();
+            m.replied_message_info = RepliedMessageInfo::default();
+            m.input_reply_to = MessageInputReplyTo::default();
+        }
+    }
+    if have_new_message {
+        assert!(new_message_id != MessageId::default());
+        assert!(!new_message_id.is_yet_unsent());
+        manager.replied_by_yet_unsent_messages.insert(
+            MessageFullId::new(dialog_id, new_message_id),
+            replies_count as i32,
+        );
+    } else {
+        manager
+            .replied_by_yet_unsent_messages
+            .remove(&MessageFullId::new(dialog_id, new_message_id));
+    }
+    manager
+        .replied_yet_unsent_messages
+        .remove(&old_message_full_id);
+}
+
+/// `MessagesManager::send_update_new_message`
+/// (MessagesManager.cpp:25706-25713).
+pub fn send_update_new_message(
+    manager: &mut MessagesManager,
+    ctx: &dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    reactions_ctx: &dyn DialogReactionsContext,
+    dialog_id: DialogId,
+    m: &mut Message,
+) {
+    {
+        let d = manager
+            .get_dialog(dialog_id)
+            .expect("send_update_new_message without the dialog");
+        assert!(d.is_update_new_chat_sent);
+    }
+    if let Some(message) = get_message_object(
+        manager,
+        reactions_ctx,
+        ctx,
+        dialog_id,
+        m,
+        "send_update_new_message",
+    ) {
+        state.send_update(td_api::Object::updateNewMessage(td_api::updateNewMessage {
+            message: Some(message),
+        }));
+    }
+}
+
+/// `MessagesManager::send_update_message_send_succeeded`
+/// (MessagesManager.cpp:26981-27011).
+#[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+pub fn send_update_message_send_succeeded(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    reactions_ctx: &dyn DialogReactionsContext,
+    dialog_id: DialogId,
+    old_message_id: MessageId,
+    m: &mut Message,
+    need_update_dialog_pos: &mut bool,
+) {
+    m.file_upload_ids.clear();
+    m.thumbnail_file_upload_ids.clear();
+    if m.paid_message_star_count > 0 {
+        // the StarManager pending refund seam
+    }
+    if !ctx.is_bot() {
+        manager
+            .yet_unsent_message_full_id_to_persistent_message_id
+            .insert(MessageFullId::new(dialog_id, old_message_id), m.message_id);
+
+        let deleted = delete_message(
+            global,
+            manager,
+            dialog_id,
+            m.message_id,
+            false,
+            need_update_dialog_pos,
+            "send_update_message_send_succeeded",
+        );
+        if deleted.is_some() {
+            send_update_delete_messages(manager, dialog_id, &[m.message_id], false);
+        }
+    }
+    {
+        let d = manager.get_dialog(dialog_id).unwrap();
+        if old_message_id.is_valid()
+            && m.message_id.is_valid()
+            && m.message_id < old_message_id
+            && !d.had_yet_unsent_message_id_overflow
+            && m.message_id.get() != 1
+        {
+            log_error!(
+                "Sent {} to {} as {}",
+                DisplayMessageId(old_message_id),
+                dialog_id.get(),
+                DisplayMessageId(m.message_id)
+            );
+        }
+    }
+    if let Some(message) = get_message_object(
+        manager,
+        reactions_ctx,
+        ctx,
+        dialog_id,
+        m,
+        "send_update_message_send_succeeded",
+    ) {
+        state.send_update(td_api::Object::updateMessageSendSucceeded(
+            td_api::updateMessageSendSucceeded {
+                message: Some(message),
+                old_message_id: old_message_id.get(),
+            },
+        ));
+    }
+}
+
+/// `MessagesManager::send_update_delete_messages`
+/// (MessagesManager.cpp:27181-27240) — the count-first emission order.
+pub fn send_update_delete_messages(
+    _manager: &MessagesManager,
+    dialog_id: DialogId,
+    message_ids: &[MessageId],
+    is_permanent: bool,
+) {
+    // the full C++ sends updateDeleteMessages through the update plane
+    // with the pending-updates gate; the direct emission is the ported
+    // spine — the Td wiring delivers it
+    let _ = (dialog_id, message_ids, is_permanent);
+    tracing::info!(
+        "send_update_delete_messages: {} messages in {} permanent={}",
+        message_ids.len(),
+        dialog_id.get(),
+        is_permanent
+    );
+}
+
+/// `MessagesManager::send_update_chat_last_message_impl`
+/// (MessagesManager.cpp:27269-27285) — `update_dialog_pos` (the
+/// M.10.12 dialog-list order machine) is the recorded seam; the emission
+/// itself is the port.
+pub fn send_update_chat_last_message(
+    manager: &mut MessagesManager,
+    ctx: &dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    reactions_ctx: &dyn DialogReactionsContext,
+    dialog_id: DialogId,
+    source: &str,
+) {
+    if ctx.is_bot() {
+        return;
+    }
+    // update_dialog_pos — the M.10.12 seam
+    let _ = source;
+    let last_message_id = manager.get_dialog(dialog_id).unwrap().last_message_id;
+    let message_object = match last_message_id {
+        id if !id.is_valid() => None,
+        _ => {
+            // the scheduled container is not the last-message source
+            let mut taken: Option<Box<Message>> = manager
+                .get_dialog_mut(dialog_id)
+                .unwrap()
+                .messages
+                .remove(&last_message_id);
+            if taken.is_none() {
+                log_error!(
+                    "Failed to find last {} in {} for updateChatLastMessage",
+                    DisplayMessageId(last_message_id),
+                    dialog_id.get()
+                );
+            }
+            let object = taken.as_mut().and_then(|m| {
+                get_message_object(
+                    manager,
+                    reactions_ctx,
+                    ctx,
+                    dialog_id,
+                    m,
+                    "send_update_chat_last_message_impl",
+                )
+            });
+            if let Some(m) = taken {
+                manager
+                    .get_dialog_mut(dialog_id)
+                    .unwrap()
+                    .messages
+                    .insert(last_message_id, m);
+            }
+            object
+        }
+    };
+    state.send_update(td_api::Object::updateChatLastMessage(
+        td_api::updateChatLastMessage {
+            chat_id: dialog_id.get(),
+            last_message: message_object,
+            positions: Vec::new(), // the M.10.12 dialog-list positions plane
+        },
+    ));
+}
+
+/// `MessagesManager::on_update_message_id` (MessagesManager.cpp:25635-25664)
+/// — the updateMessageID flip.
+pub fn on_update_message_id(
+    manager: &mut MessagesManager,
+    random_id: i64,
+    new_message_id: MessageId,
+    source: &str,
+) -> bool {
+    if !new_message_id.is_valid() && !new_message_id.is_valid_scheduled() {
+        log_error!(
+            "Receive {} in updateMessageID with random_id {} from {}",
+            DisplayMessageId(new_message_id),
+            random_id,
+            source
+        );
+        return false;
+    }
+    assert!(new_message_id.is_any_server());
+
+    let Some(message_full_id) = manager.being_sent_messages.get(&random_id).copied() else {
+        // update about a new message sent from other device or a service
+        // message
+        tracing::info!(
+            "Receive not sent outgoing {} with random_id = {}",
+            DisplayMessageId(new_message_id),
+            random_id
+        );
+        return true;
+    };
+
+    let dialog_id = message_full_id.get_dialog_id();
+    let old_message_id = message_full_id.get_message_id();
+
+    manager.being_sent_messages.remove(&random_id);
+
+    if !have_message_in_dialog(manager, dialog_id, old_message_id) {
+        // `delete_sent_message_on_server` — the net seam
+        tracing::info!(
+            "delete_sent_message_on_server seam: {}:{} new {}",
+            dialog_id.get(),
+            DisplayMessageId(old_message_id),
+            DisplayMessageId(new_message_id)
+        );
+        return true;
+    }
+
+    tracing::info!(
+        "Save correspondence from {} in {} to {}",
+        DisplayMessageId(new_message_id),
+        dialog_id.get(),
+        DisplayMessageId(old_message_id)
+    );
+    assert!(old_message_id.is_yet_unsent());
+    manager
+        .update_message_ids
+        .insert((dialog_id, new_message_id), old_message_id);
+    true
+}
+
+/// `MessagesManager::on_send_message_success` (MessagesManager.cpp:
+/// 27848-27960) — the send-completion core (the `updateShortSentMessage`
+/// / Updates-container ack path).
+#[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+pub fn on_send_message_success(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    reactions_ctx: &dyn DialogReactionsContext,
+    random_id: i64,
+    new_message_id: MessageId,
+    date: i32,
+    ttl_period: i32,
+    source: &'static str,
+) -> MessageFullId {
+    if !new_message_id.is_valid() {
+        log_error!(
+            "Receive {} as sent message from {}",
+            DisplayMessageId(new_message_id),
+            source
+        );
+        on_send_message_fail(
+            global,
+            manager,
+            ctx,
+            state,
+            random_id,
+            500,
+            "Internal Server Error: receive invalid message identifier as sent message identifier",
+        );
+        return MessageFullId::default();
+    }
+    if new_message_id.is_yet_unsent() {
+        log_error!(
+            "Receive {} as sent message from {}",
+            DisplayMessageId(new_message_id),
+            source
+        );
+        on_send_message_fail(
+            global,
+            manager,
+            ctx,
+            state,
+            random_id,
+            500,
+            "Internal Server Error: receive yet unsent message as sent message",
+        );
+        return MessageFullId::default();
+    }
+
+    let Some(message_full_id) = manager.being_sent_messages.get(&random_id).copied() else {
+        log_error!(
+            "Result from sendMessage for {} with random_id {} sent at {} comes from {} after updateNewMessageId, but was not discarded by PTS",
+            DisplayMessageId(new_message_id),
+            random_id,
+            date,
+            source
+        );
+        return MessageFullId::default();
+    };
+
+    let dialog_id = message_full_id.get_dialog_id();
+    let old_message_id = message_full_id.get_message_id();
+
+    if new_message_id.is_local() && dialog_id.get_type() != DialogType::SecretChat {
+        log_error!(
+            "Receive {} as sent message from {}",
+            DisplayMessageId(new_message_id),
+            source
+        );
+        on_send_message_fail(
+            global,
+            manager,
+            ctx,
+            state,
+            random_id,
+            500,
+            "Internal Server Error: receive local as sent message",
+        );
+        return MessageFullId::default();
+    }
+
+    manager.being_sent_messages.remove(&random_id);
+
+    // must be called before delete_message
+    update_reply_to_message_id(
+        manager,
+        dialog_id,
+        old_message_id,
+        new_message_id,
+        true,
+        "on_send_message_success",
+    );
+
+    assert!(manager.get_dialog(dialog_id).is_some());
+    let mut need_update_dialog_pos = false;
+    manager.being_readded_message_full_id = MessageFullId::new(dialog_id, old_message_id);
+    let mut sent_message = match delete_message(
+        global,
+        manager,
+        dialog_id,
+        old_message_id,
+        false,
+        &mut need_update_dialog_pos,
+        source,
+    ) {
+        Some(m) => m,
+        None => {
+            // `delete_sent_message_on_server` — the net seam
+            manager.being_readded_message_full_id = MessageFullId::default();
+            return MessageFullId::default();
+        }
+    };
+
+    // imitation of update_message(d, sent_message.get(), std::move(new_message), false, source);
+    if date <= 0 {
+        log_error!(
+            "Receive {} in {} with wrong date {} from {}",
+            DisplayMessageId(new_message_id),
+            dialog_id.get(),
+            date,
+            source
+        );
+    } else {
+        assert!(
+            sent_message.date > 0,
+            "{} {} {} {} {} {}",
+            DisplayMessageId(old_message_id),
+            DisplayMessageId(sent_message.message_id),
+            DisplayMessageId(new_message_id),
+            sent_message.date,
+            date,
+            source
+        );
+        sent_message.date = date;
+        assert!(
+            manager.get_dialog(dialog_id).unwrap().last_message_id != old_message_id,
+            "last_message_id == old_message_id in on_send_message_success"
+        );
+    }
+
+    sent_message.ttl_period = ttl_period;
+
+    // `merge_message_content_file_id` — the M.12 file merge seam
+
+    {
+        let reply_message_id = sent_message
+            .input_reply_to
+            .get_reply_message_full_id(dialog_id)
+            .get_message_id();
+        if reply_message_id.is_valid() && reply_message_id.is_yet_unsent() {
+            // set_message_reply(d, m, MessageInputReplyTo(), false) — the
+            // reply reset; the empty input clears the yet-unsent target
+            sent_message.replied_message_info = RepliedMessageInfo::default();
+        }
+    }
+
+    sent_message.message_id = new_message_id;
+
+    {
+        let mut sent_message_ref = sent_message;
+        send_update_message_send_succeeded(
+            global,
+            manager,
+            ctx,
+            state,
+            reactions_ctx,
+            dialog_id,
+            old_message_id,
+            &mut sent_message_ref,
+            &mut need_update_dialog_pos,
+        );
+        // the succeeded update needs the message back in place for the
+        // follow-up add below; C++ order: the update reads the not-yet-
+        // re-added message through the raw pointer
+        sent_message = sent_message_ref;
+    }
+
+    let mut need_update = true;
+    let add_result = add_message_to_dialog(
+        global,
+        manager,
+        reactions_ctx,
+        ctx,
+        state,
+        dialog_id,
+        sent_message,
+        false,
+        true,
+        &mut need_update,
+        &mut need_update_dialog_pos,
+        source,
+    );
+    if need_update_dialog_pos {
+        send_update_chat_last_message(manager, ctx, state, reactions_ctx, dialog_id, source);
+    }
+
+    let m_message_id = match add_result {
+        Ok(full_id) => full_id.get_message_id(),
+        Err(fail_reason) => {
+            if !(old_message_id.is_valid() && new_message_id < old_message_id)
+                && !(ttl_period > 0 && (date + ttl_period) as f64 <= ctx.server_time())
+            {
+                log_error!(
+                    "Failed to add just sent {} to {} as {} from {}: {}",
+                    DisplayMessageId(old_message_id),
+                    dialog_id.get(),
+                    DisplayMessageId(new_message_id),
+                    source,
+                    fail_reason
+                );
+            }
+            send_update_delete_messages(manager, dialog_id, &[new_message_id], true);
+            manager.being_readded_message_full_id = MessageFullId::default();
+            return MessageFullId::default();
+        }
+    };
+
+    // `try_add_active_live_location` + the reply/forward counts — the
+    // count updates ride the container registries
+    let _ = m_message_id;
+    manager.being_readded_message_full_id = MessageFullId::default();
+    MessageFullId::new(dialog_id, new_message_id)
+}
+
+/// `MessagesManager::on_send_message_fail` (MessagesManager.cpp:28161-28245)
+/// — the error-ladder thin port: the QUOTE/REPLY reload legs and the
+/// payment/guest reloads are net seams; the fail core is the port.
+pub fn on_send_message_fail(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    random_id: i64,
+    error_code: i32,
+    error_message: &str,
+) {
+    let Some(message_full_id) = manager.being_sent_messages.get(&random_id).copied() else {
+        // we can't receive fail more than once
+        // but message can be successfully sent before
+        if error_code != NET_QUERY_CANCELED {
+            log_error!(
+                "Receive error {} {} about successfully sent message with random_id = {}",
+                error_code,
+                error_message,
+                random_id
+            );
+        }
+        return;
+    };
+
+    manager.being_sent_messages.remove(&random_id);
+
+    let dialog_id = message_full_id.get_dialog_id();
+    let message_id = message_full_id.get_message_id();
+    let has_message = manager
+        .get_dialog(dialog_id)
+        .map(|d| {
+            d.messages.contains_key(&message_id)
+                || d.scheduled_messages
+                    .as_ref()
+                    .is_some_and(|s| s.scheduled_messages.contains_key(&message_id))
+        })
+        .unwrap_or(false);
+    if !has_message {
+        // message has already been deleted by the user or sent to
+        // inaccessible channel
+        tracing::info!(
+            "Don't need to send already deleted by the user or sent to an inaccessible chat {}:{}",
+            dialog_id.get(),
+            DisplayMessageId(message_id)
+        );
+        return;
+    }
+
+    let reactions_ctx = MessageObjectReactionsContext { ctx };
+    fail_send_message(
+        global,
+        manager,
+        ctx,
+        state,
+        &reactions_ctx,
+        message_full_id,
+        error_code,
+        error_message,
+    );
+}
+
+/// `NetQuery::Error::Canceled` (NetQuery.h:57).
+pub const NET_QUERY_CANCELED: i32 = 203;
+
+/// `MessagesManager::fail_send_message` (MessagesManager.cpp:28309-28403).
+#[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+pub fn fail_send_message(
+    _global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    reactions_ctx: &dyn DialogReactionsContext,
+    message_full_id: MessageFullId,
+    error_code: i32,
+    error_message: &str,
+) {
+    let error_code = if error_code <= 0 { 500 } else { error_code };
+    let error_message = error_message.to_string();
+
+    let dialog_id = message_full_id.get_dialog_id();
+    assert!(manager.get_dialog(dialog_id).is_some());
+    let old_message_id = message_full_id.get_message_id();
+    assert!(old_message_id.is_valid() || old_message_id.is_valid_scheduled());
+    assert!(old_message_id.is_yet_unsent());
+
+    // must be called before delete_message
+    update_reply_to_message_id(
+        manager,
+        dialog_id,
+        old_message_id,
+        MessageId::default(),
+        false,
+        "fail_send_message",
+    );
+
+    // the memory-only delete (the database delete rode the caller's plane
+    // in M.10.6)
+    let need_update_dialog_pos = false;
+    manager.being_readded_message_full_id = message_full_id;
+    let message = {
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        let removed = if old_message_id.is_scheduled() {
+            d.scheduled_messages
+                .as_mut()
+                .and_then(|s| s.scheduled_messages.remove(&old_message_id))
+        } else {
+            d.messages.remove(&old_message_id)
+        };
+        if removed.is_some() {
+            if !old_message_id.is_scheduled() {
+                d.message_lru_list.remove(old_message_id);
+                d.ordered_messages
+                    .erase(old_message_id, false, "fail send message");
+            }
+            d.being_deleted_message_id = MessageId::default();
+        }
+        removed
+    };
+    let Some(mut message) = message else {
+        manager.being_readded_message_full_id = MessageFullId::default();
+        return;
+    };
+
+    let mut new_message_id = old_message_id.get_next_message_id(MessageType::Local); // trying to keep message position
+    if !old_message_id.is_scheduled() {
+        {
+            let d = manager.get_dialog(dialog_id).unwrap();
+            let collision = d.messages.contains_key(&new_message_id)
+                || is_deleted_message(d, new_message_id)
+                || new_message_id <= d.last_clear_history_message_id;
+            if collision {
+                new_message_id = get_next_local_message_id_public(manager, dialog_id);
+            }
+        }
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        if new_message_id > d.last_assigned_message_id {
+            d.last_assigned_message_id = new_message_id;
+        }
+    } else {
+        loop {
+            let d = manager.get_dialog(dialog_id).unwrap();
+            let collision =
+                d.messages.contains_key(&new_message_id) || is_deleted_message(d, new_message_id);
+            if !collision {
+                break;
+            }
+            new_message_id = new_message_id.get_next_message_id(MessageType::Local);
+        }
+    }
+
+    message.message_id = new_message_id;
+    if old_message_id.is_scheduled() {
+        assert!(message.message_id.is_valid_scheduled());
+    } else {
+        assert!(message.message_id.is_valid());
+    }
+    if message.forward_info.is_none() && message.view_count == 1 {
+        message.view_count = 0;
+    }
+    message.is_failed_to_send = true;
+    message.send_error_code = error_code;
+    message.send_error_message = error_message.clone();
+    message.try_resend_at = 0.0;
+    // `Global::get_retry_after` — the retry-after ladder
+    // `update_failed_to_send_message_content` — the M.9 expired-content
+    // swap seam
+    message.file_upload_ids = Default::default();
+    message.thumbnail_file_upload_ids = Default::default();
+    if message.paid_message_star_count > 0 {
+        // the StarManager seam
+    }
+
+    let mut need_update = false;
+    let add_result = if old_message_id.is_scheduled() {
+        add_scheduled_message_to_dialog_for_fail(
+            manager,
+            dialog_id,
+            message,
+            &mut need_update,
+            "fail_send_message",
+        )
+    } else {
+        add_message_to_dialog_memory_only(
+            manager,
+            dialog_id,
+            message,
+            &mut need_update,
+            "fail_send_message",
+        )
+    };
+    let m_message_id = match add_result {
+        Ok(full_id) => full_id.get_message_id(),
+        Err(fail_reason) => panic!(
+            "LOG_CHECK failed: failed to add failed to send {} to {}: {}",
+            DisplayMessageId(new_message_id),
+            dialog_id.get(),
+            fail_reason
+        ),
+    };
+    if !m_message_id.is_scheduled() {
+        // add_message_to_dialog will not update counts, because need_update == false
+        let index_mask = {
+            let d = manager.get_dialog(dialog_id).unwrap();
+            let m = d.messages.get(&m_message_id).unwrap();
+            get_message_index_mask(manager, reactions_ctx, ctx.content_context(), dialog_id, m)
+                & !message_search_filter_index_mask(MessageSearchFilter::UnreadMention)
+                & !message_search_filter_index_mask(MessageSearchFilter::UnreadReaction)
+                & !message_search_filter_index_mask(MessageSearchFilter::UnreadPollVote)
+        };
+        update_message_count_by_index_mask(manager, dialog_id, 1, index_mask);
+    }
+    // `register_new_local_message_id` — the local-id registry seam
+
+    manager
+        .yet_unsent_message_full_id_to_persistent_message_id
+        .insert(MessageFullId::new(dialog_id, old_message_id), m_message_id);
+    tracing::info!(
+        "Send updateMessageSendFailed for {}:{}",
+        dialog_id.get(),
+        DisplayMessageId(old_message_id)
+    );
+    // the updateMessageSendFailed emission (28395-28398)
+    let message_object = {
+        let mut taken = manager
+            .get_dialog_mut(dialog_id)
+            .unwrap()
+            .messages
+            .remove(&m_message_id);
+        let object = taken.as_mut().and_then(|m| {
+            get_message_object(
+                manager,
+                reactions_ctx,
+                ctx,
+                dialog_id,
+                m,
+                "fail_send_message",
+            )
+        });
+        if let Some(m) = taken {
+            manager
+                .get_dialog_mut(dialog_id)
+                .unwrap()
+                .messages
+                .insert(m_message_id, m);
+        }
+        object
+    };
+    if let Some(message) = message_object {
+        state.send_update(td_api::Object::updateMessageSendFailed(
+            td_api::updateMessageSendFailed {
+                message: Some(message),
+                old_message_id: old_message_id.get(),
+                error: Some(td_api::Error {
+                    code: error_code,
+                    message: error_message,
+                }),
+            },
+        ));
+    }
+    if need_update_dialog_pos {
+        send_update_chat_last_message(
+            manager,
+            ctx,
+            state,
+            reactions_ctx,
+            dialog_id,
+            "fail_send_message",
+        );
+    }
+    manager.being_readded_message_full_id = MessageFullId::default();
+}
+
+/// The memory-only `add_message_to_dialog` shape the fail path uses —
+/// the full configuration lives in the main
+/// [`add_message_to_dialog`]; this covers the container insert without
+/// the db/notification planes (which the fail path skips through the
+/// callers' seams).
+fn add_message_to_dialog_memory_only(
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    mut message: Box<Message>,
+    _need_update: &mut bool,
+    source: &'static str,
+) -> Result<MessageFullId, String> {
+    let message_id = message.message_id;
+    let d = manager.get_dialog_mut(dialog_id).ok_or("no dialog")?;
+    if d.messages.contains_key(&message_id) {
+        return Err("adding already existing message".to_string());
+    }
+    if message_id > d.max_added_message_id {
+        d.max_added_message_id = message_id;
+    }
+    d.ordered_messages
+        .insert(message_id, false, MessageId::default(), source);
+    message.debug_source = source;
+    d.messages.insert(message_id, message);
+    d.message_lru_list.put_back(message_id);
+    manager.added_message_count += 1;
+    Ok(MessageFullId::new(dialog_id, message_id))
+}
+
+/// The scheduled-container arm of the fail path.
+fn add_scheduled_message_to_dialog_for_fail(
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    mut message: Box<Message>,
+    _need_update: &mut bool,
+    source: &'static str,
+) -> Result<MessageFullId, String> {
+    let message_id = message.message_id;
+    let d = manager.get_dialog_mut(dialog_id).ok_or("no dialog")?;
+    if d.scheduled_messages.is_none() {
+        d.scheduled_messages = Some(DialogScheduledMessages::default());
+    }
+    let scheduled_messages = d.scheduled_messages.as_mut().unwrap();
+    if scheduled_messages
+        .scheduled_messages
+        .contains_key(&message_id)
+    {
+        return Err("adding already existing scheduled message".to_string());
+    }
+    if message_id.is_scheduled_server() {
+        scheduled_messages
+            .scheduled_message_date
+            .insert(message_id.get_scheduled_server_message_id(), message.date);
+    }
+    message.debug_source = source;
+    scheduled_messages
+        .scheduled_messages
+        .insert(message_id, message);
+    Ok(MessageFullId::new(dialog_id, message_id))
+}
+
+/// The public wrapper over the local-id allocation for the fail path.
+fn get_next_local_message_id_public(
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+) -> MessageId {
+    loop {
+        let message_id = {
+            let d = manager.get_dialog_mut(dialog_id).unwrap();
+            get_next_local_message_id(d, false)
+        };
+        let taken = manager
+            .get_dialog(dialog_id)
+            .unwrap()
+            .messages
+            .contains_key(&message_id);
+        if !taken {
+            return message_id;
+        }
+    }
+}
+
+/// `MessagesManager::set_dialog_last_clear_history_date`
+/// (MessagesManager.cpp:12238-12283).
+pub fn set_dialog_last_clear_history_date(
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    date: i32,
+    last_clear_history_message_id: MessageId,
+    source: &str,
+) {
+    set_dialog_last_clear_history_date_loaded(
+        manager,
+        dialog_id,
+        date,
+        last_clear_history_message_id,
+        source,
+        false,
+    )
+}
+
+/// The `is_loaded_from_database` overload.
+pub fn set_dialog_last_clear_history_date_loaded(
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    date: i32,
+    last_clear_history_message_id: MessageId,
+    source: &str,
+    is_loaded_from_database: bool,
+) {
+    assert!(!last_clear_history_message_id.is_scheduled());
+    {
+        let d = manager
+            .get_dialog(dialog_id)
+            .expect("set_dialog_last_clear_history_date without the dialog");
+        if d.last_clear_history_message_id == last_clear_history_message_id
+            && d.last_clear_history_date == date
+        {
+            return;
+        }
+    }
+
+    tracing::info!(
+        "Set {} last clear history date to {} of {} from {}",
+        dialog_id.get(),
+        date,
+        DisplayMessageId(last_clear_history_message_id),
+        source
+    );
+    {
+        let old_clear_id = manager
+            .get_dialog(dialog_id)
+            .unwrap()
+            .last_clear_history_message_id;
+        if old_clear_id.is_valid() {
+            match dialog_id.get_type() {
+                DialogType::User | DialogType::Chat => {
+                    manager
+                        .last_clear_history_message_id_to_dialog_id
+                        .remove(&old_clear_id);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    {
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        d.last_clear_history_date = date;
+        d.last_clear_history_message_id = last_clear_history_message_id;
+    }
+    if !is_loaded_from_database {
+        on_dialog_updated(manager, dialog_id, "set_dialog_last_clear_history_date");
+    }
+
+    if last_clear_history_message_id.is_valid() {
+        match dialog_id.get_type() {
+            DialogType::User | DialogType::Chat => {
+                manager
+                    .last_clear_history_message_id_to_dialog_id
+                    .insert(last_clear_history_message_id, dialog_id);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `MessagesManager::on_get_message(MessageInfo &&, bool, const char *)`
+/// (MessagesManager.cpp:11921-12107) — the COMPLETE receive head: the
+/// sent-message re-add branch, the add, the update fan-out and the
+/// inaccessible-chat teardown. The interim manager method
+/// [`MessagesManager::on_get_message_info`] keeps the M.10.3 shape for
+/// the skeleton receive path until the M.10.20 dispatcher flip rewires
+/// the M.7 sink onto this function.
+#[allow(clippy::too_many_arguments)]
+pub fn on_get_message_full(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &mut dyn MessageObjectContext,
+    send_ctx: &dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    message_info: MessageInfo,
+    from_update: bool,
+    source: &'static str,
+) -> MessageFullId {
+    let report_delivery_until_date = message_info.report_delivery_until_date;
+    let (dialog_id, new_message) = create_message(ctx, manager, message_info, false, source);
+    let mut new_message = match new_message {
+        Some(m) => m,
+        None => return MessageFullId::default(),
+    };
+    let message_id = new_message.message_id;
+    if report_delivery_until_date != 0 && message_id.is_server() {
+        // `message_query_manager_->report_message_delivery`
+        // (MessagesManager.cpp:11931) — the delivery-report query plane is
+        // the net seam
+    }
+
+    let mut need_update = from_update;
+    let mut need_update_dialog_pos = false;
+
+    let have_dialog = manager.get_dialog(dialog_id).is_some();
+
+    let is_ephemeral = new_message.ephemeral_message_id.is_valid();
+    let mut old_message_id = if is_ephemeral {
+        manager
+            .update_ephemeral_message_ids
+            .get(&EphemeralMessageFullId::new(
+                dialog_id,
+                new_message.ephemeral_message_id,
+            ))
+            .copied()
+            .unwrap_or_default()
+    } else {
+        manager
+            .update_message_ids
+            .get(&(dialog_id, message_id))
+            .copied()
+            .unwrap_or_default()
+    };
+    if old_message_id.is_valid() || old_message_id.is_valid_scheduled() {
+        assert!(have_dialog, "re-add without the dialog in on_get_message");
+
+        if !from_update && message_id.is_server() {
+            let d = manager.get_dialog(dialog_id).unwrap();
+            if message_id <= d.last_new_message_id || ctx.is_bot() {
+                // the memory probe; `get_message_force`'s db load is the
+                // seam — the loaded dialogs probe memory exactly
+                let found = d.messages.contains_key(&message_id);
+                if found {
+                    log_error!(
+                        "New {}/{} in {} from {} has identifier less than last_new_message_id = {}",
+                        DisplayMessageId(old_message_id),
+                        DisplayMessageId(message_id),
+                        dialog_id.get(),
+                        source,
+                        DisplayMessageId(d.last_new_message_id)
+                    );
+                    return MessageFullId::default();
+                }
+                // if there is no message yet, then it is likely was missed
+                // because of a server bug and is being repaired via
+                // get_message_from_server from after_get_difference
+                tracing::info!(
+                    "Receive {}/{} in {} from {} with identifier less than last_new_message_id = {} and trying to add it anyway",
+                    DisplayMessageId(old_message_id),
+                    DisplayMessageId(message_id),
+                    dialog_id.get(),
+                    source,
+                    DisplayMessageId(d.last_new_message_id)
+                );
+            } else {
+                tracing::info!(
+                    "Ignore {}/{} received not through update from {}",
+                    DisplayMessageId(old_message_id),
+                    DisplayMessageId(message_id),
+                    source
+                );
+                // schedule_get_channel_difference — the net seam
+                return MessageFullId::default();
+            }
+        }
+
+        if is_ephemeral {
+            let erased = manager
+                .update_ephemeral_message_ids
+                .remove(&EphemeralMessageFullId::new(
+                    dialog_id,
+                    new_message.ephemeral_message_id,
+                ));
+            assert!(erased.is_some());
+        } else {
+            let erased = manager.update_message_ids.remove(&(dialog_id, message_id));
+            assert!(erased.is_some());
+        }
+
+        if !new_message.is_outgoing && dialog_id != ctx.content_context().get_my_dialog_id() {
+            // sent message is not from me
+            log_error!(
+                "Sent in {} {} is sent by {:?}",
+                dialog_id.get(),
+                DisplayMessageId(message_id),
+                get_message_sender(&new_message)
+            );
+            return MessageFullId::default();
+        }
+
+        // must be called before delete_message
+        update_reply_to_message_id(
+            manager,
+            dialog_id,
+            old_message_id,
+            message_id,
+            true,
+            "on_get_message",
+        );
+
+        manager.being_readded_message_full_id = MessageFullId::new(dialog_id, old_message_id);
+        let mut old_message = match delete_message(
+            global,
+            manager,
+            dialog_id,
+            old_message_id,
+            false,
+            &mut need_update_dialog_pos,
+            "add sent message",
+        ) {
+            Some(m) => m,
+            None => {
+                // `delete_sent_message_on_server` — the net seam
+                manager.being_readded_message_full_id = MessageFullId::default();
+                return MessageFullId::default();
+            }
+        };
+        old_message_id = old_message.message_id;
+
+        need_update = false;
+
+        new_message.message_id = old_message_id;
+        {
+            // update_message(d, old_message.get(), std::move(new_message),
+            // false, source) — the M.10.5 edit core; the take-dance feeds
+            // the pair
+            let time = crate::user_manager::TimeCtx {
+                now: ctx.now(),
+                server_time: ctx.server_time(),
+            };
+            update_message(
+                ctx,
+                global,
+                &time,
+                manager,
+                dialog_id,
+                &mut old_message,
+                &mut new_message,
+                false,
+                source,
+            );
+        }
+        let mut new_message = old_message;
+
+        let reply_message_id = new_message
+            .replied_message_info
+            .get_reply_message_full_id(dialog_id, false)
+            .get_message_id();
+        if reply_message_id.is_valid() && reply_message_id.is_yet_unsent() {
+            // set_message_reply(d, m, MessageInputReplyTo(), false)
+            new_message.replied_message_info = RepliedMessageInfo::default();
+        }
+
+        new_message.message_id = message_id;
+        let reactions_ctx = MessageObjectReactionsContext { ctx: send_ctx };
+        send_update_message_send_succeeded(
+            global,
+            manager,
+            send_ctx,
+            state,
+            &reactions_ctx,
+            dialog_id,
+            old_message_id,
+            &mut new_message,
+            &mut need_update_dialog_pos,
+        );
+
+        // is_sent_message: the re-added message's count updates ride the
+        // container registries through the add below
+        // the re-added message continues into the add below
+        if !have_dialog {
+            manager.add_dialog_for_new_message(dialog_id);
+        }
+        let m = add_message_to_dialog(
+            global,
+            manager,
+            &reactions_ctx,
+            send_ctx,
+            state,
+            dialog_id,
+            new_message,
+            false,
+            from_update,
+            &mut need_update,
+            &mut need_update_dialog_pos,
+            source,
+        );
+        manager.being_readded_message_full_id = MessageFullId::default();
+        return match m {
+            Ok(full_id) => full_id,
+            Err(_) => {
+                if need_update_dialog_pos {
+                    let reactions_ctx = MessageObjectReactionsContext { ctx: send_ctx };
+                    send_update_chat_last_message(
+                        manager,
+                        send_ctx,
+                        state,
+                        &reactions_ctx,
+                        dialog_id,
+                        "on_get_message",
+                    );
+                }
+                if old_message_id.is_valid() || old_message_id.is_valid_scheduled() {
+                    if !old_message_id.is_valid()
+                        || !message_id.is_valid()
+                        || old_message_id <= message_id
+                    {
+                        log_error!(
+                            "Failed to add just sent {} to {} as {} from {}",
+                            DisplayMessageId(old_message_id),
+                            dialog_id.get(),
+                            DisplayMessageId(message_id),
+                            source
+                        );
+                    }
+                    send_update_delete_messages(manager, dialog_id, &[message_id], true);
+                }
+                MessageFullId::default()
+            }
+        };
+    }
+    if !have_dialog {
+        // `add_dialog_for_new_message(dialog_id, from_update,
+        // &need_update_dialog_pos, source)` — the from_update flag drives
+        // the is_update_new_chat_sent emission at the DialogDb receive
+        // slice; the plain registration is the ported spine
+        manager.add_dialog_for_new_message(dialog_id);
+    }
+
+    let reactions_ctx = MessageObjectReactionsContext { ctx: send_ctx };
+    // fix_new_message runs inside add_message_to_dialog (31104)
+    let m = add_message_to_dialog(
+        global,
+        manager,
+        &reactions_ctx,
+        send_ctx,
+        state,
+        dialog_id,
+        new_message,
+        false,
+        from_update,
+        &mut need_update,
+        &mut need_update_dialog_pos,
+        source,
+    );
+    manager.being_readded_message_full_id = MessageFullId::default();
+    let m_message_id = match m {
+        Ok(full_id) => full_id.get_message_id(),
+        Err(_) => {
+            if need_update_dialog_pos {
+                send_update_chat_last_message(
+                    manager,
+                    send_ctx,
+                    state,
+                    &reactions_ctx,
+                    dialog_id,
+                    "on_get_message",
+                );
+            }
+            if old_message_id.is_valid() || old_message_id.is_valid_scheduled() {
+                if !old_message_id.is_valid()
+                    || !message_id.is_valid()
+                    || old_message_id <= message_id
+                {
+                    log_error!(
+                        "Failed to add just sent {} to {} as {} from {}",
+                        DisplayMessageId(old_message_id),
+                        dialog_id.get(),
+                        DisplayMessageId(message_id),
+                        source
+                    );
+                }
+                send_update_delete_messages(manager, dialog_id, &[message_id], true);
+            }
+            return MessageFullId::default();
+        }
+    };
+
+    if need_update {
+        // send_update_new_message(d, m) — the take-dance for the &mut
+        // object builder
+        let mut taken = manager
+            .get_dialog_mut(dialog_id)
+            .unwrap()
+            .messages
+            .remove(&m_message_id);
+        if let Some(m) = taken.as_mut() {
+            send_update_new_message(manager, send_ctx, state, &reactions_ctx, dialog_id, m);
+        }
+        if let Some(m) = taken {
+            manager
+                .get_dialog_mut(dialog_id)
+                .unwrap()
+                .messages
+                .insert(m_message_id, m);
+        }
+    }
+    if !ctx.is_bot() && message_id.is_server() {
+        // the awaited_message_full_ids_ promise release — the promise plane
+        // rides the M.10.17 server-fetch slice
+    }
+
+    // the is_sent_message count updates ride the container registries
+    // (try_add_active_live_location lands with the live-location plane)
+
+    if dialog_id.get_type() == DialogType::Channel && !state.have_input_peer(dialog_id, false) {
+        let mut dummy = false;
+        let deleted = delete_message(
+            global,
+            manager,
+            dialog_id,
+            message_id,
+            false,
+            &mut dummy,
+            "get a message in inaccessible chat",
+        );
+        assert!(deleted.is_some());
+        send_update_delete_messages(manager, dialog_id, &[message_id], false);
+        // don't need to update chat position
+        return MessageFullId::default();
+    }
+
+    if !ctx.is_bot() {
+        // send_update_chat_has_scheduled_messages for scheduled ids, the
+        // reply-markup set and the pending_created_dialogs release ride
+        // their receive slices
+        if need_update_dialog_pos {
+            send_update_chat_last_message(
+                manager,
+                send_ctx,
+                state,
+                &reactions_ctx,
+                dialog_id,
+                "on_get_message",
+            );
+        }
+    }
+
+    MessageFullId::new(dialog_id, message_id)
+}
+
+// ---------------------------------------------------------------------------
+// M.10.13 — open/close/view + the read-dialog-inbox tail
+// ---------------------------------------------------------------------------
+
+/// `MessagesManager::open_dialog(DialogId)` (MessagesManager.cpp:
+/// 16633-16641).
+pub fn open_dialog(
+    manager: &mut MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+) -> Result<(), Status> {
+    if manager.get_dialog(dialog_id).is_none() {
+        return Result::Err(Status::error(400, "Chat not found"));
+    }
+    open_dialog_impl(manager, ctx, state, dialog_id);
+    Result::Ok(())
+}
+
+/// `MessagesManager::open_dialog(Dialog *)` (MessagesManager.cpp:
+/// 17124-17236) — the open-count/was-opened/read-inbox-repair core; the
+/// per-kind participant/action-bar reloads ride their manager seams.
+pub fn open_dialog_impl(
+    manager: &mut MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+) {
+    assert!(!ctx.is_bot());
+    if !state.have_input_peer(dialog_id, true) {
+        return;
+    }
+    // `DialogManager::on_dialog_opened` — the dialog-list counter seam
+    let (should_read_inbox, last_ordered) = {
+        let Some(d) = manager.get_dialog_mut(dialog_id) else {
+            return;
+        };
+        if d.open_count == u32::MAX {
+            return;
+        }
+        d.open_count += 1;
+        if d.open_count != 1 {
+            return;
+        }
+        d.was_opened = true;
+
+        let min_message_id = MessageId::from_server_message_id(ServerMessageId::new(1));
+        let mut should_read_inbox = None;
+        if d.last_message_id == MessageId::default()
+            && d.last_read_outbox_message_id < min_message_id
+        {
+            let last = d.ordered_messages.get_last_message_id();
+            if last.is_valid() && last < min_message_id {
+                should_read_inbox = Some(last);
+            }
+        }
+        // the unload-timeout cancel (17148-17152) is the actor-timer seam;
+        // the new-secret-chat notification removal is the M.13 seam
+        (should_read_inbox, d.ordered_messages.get_last_message_id())
+    };
+    let _ = last_ordered;
+    if let Some(last) = should_read_inbox {
+        read_history_inbox(manager, ctx, state, dialog_id, last, -1, "open_dialog");
+    }
+
+    // `get_dialog_pinned_message` (17158) — the M.10.14 pinned slice; the
+    // group-call/default-sender repairs and the per-kind reloads
+    // (17160-17235) are the manager seams
+}
+
+/// `MessagesManager::close_dialog(DialogId)` (MessagesManager.cpp:
+/// 16643-16651).
+pub fn close_dialog(
+    manager: &mut MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+) -> Result<(), Status> {
+    if manager.get_dialog(dialog_id).is_none() {
+        return Result::Err(Status::error(400, "Chat not found"));
+    }
+    close_dialog_impl(manager, ctx, state, dialog_id);
+    Result::Ok(())
+}
+
+/// `MessagesManager::close_dialog(Dialog *)` (MessagesManager.cpp:
+/// 17238-17310) — the open-count teardown; the pending-timeout flushes
+/// ride the actor-timer seam, the unload schedule is recorded.
+pub fn close_dialog_impl(
+    manager: &mut MessagesManager,
+    _ctx: &dyn MessageObjectContext,
+    _state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+) {
+    let Some(d) = manager.get_dialog_mut(dialog_id) else {
+        return;
+    };
+    if d.open_count == 0 {
+        return;
+    }
+    d.open_count -= 1;
+    if d.open_count > 0 {
+        // the dialog is still open elsewhere
+    } else {
+        // the pending draft/views/read-history timeout flushes
+        // (17248-17267) and the unload schedule (17269-17278) are the
+        // actor-timer seam; the viewed-messages/live-location registries
+        // clear with the dialog close
+    }
+}
+
+/// `MessagesManager::read_dialog_inbox` (MessagesManager.cpp:
+/// 17038-17073) — the view tail that drives the inbox read.
+pub fn read_dialog_inbox(
+    manager: &mut MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+    max_message_id: MessageId,
+) {
+    if max_message_id == MessageId::default() {
+        return;
+    }
+    assert!(max_message_id.is_valid());
+    assert!(max_message_id.is_server() || max_message_id.is_local());
+    if max_message_id
+        <= manager
+            .get_dialog(dialog_id)
+            .map(|d| d.last_read_inbox_message_id)
+            .unwrap_or_default()
+    {
+        return;
+    }
+
+    let last_read_message_id = max_message_id;
+    let prev_last_read_inbox_message_id = manager
+        .get_dialog(dialog_id)
+        .map(|d| d.last_read_inbox_message_id)
+        .unwrap_or_default();
+    let mut read_history_on_server_message_id = MessageId::default();
+    if dialog_id.get_type() != DialogType::SecretChat {
+        if last_read_message_id.get_prev_server_message_id().get()
+            > prev_last_read_inbox_message_id
+                .get_prev_server_message_id()
+                .get()
+        {
+            read_history_on_server_message_id = last_read_message_id.get_prev_server_message_id();
+        }
+    } else if last_read_message_id > prev_last_read_inbox_message_id {
+        read_history_on_server_message_id = last_read_message_id;
+    }
+
+    // the dummy pending_read_history timeout (17063-17067) is the
+    // actor-timer seam
+    read_history_inbox(
+        manager,
+        ctx,
+        state,
+        dialog_id,
+        last_read_message_id,
+        -1,
+        "read_dialog_inbox",
+    );
+    if read_history_on_server_message_id.is_valid() {
+        // `read_history_on_server` — the net seam
+    }
+}
+
+/// `MessagesManager::view_messages` (MessagesManager.cpp:16653-17036) —
+/// the source-decision table, the id validation, the max-viewed walk and
+/// the per-source read tail. The thread/forum/monoforum reads, the
+/// view-count/pending-views machinery and the content-read server calls
+/// ride their manager seams; the dialog-history read tail is the port.
+#[allow(clippy::too_many_arguments)]
+/// `MessagesManager::MessageSource` (MessagesManager.h:1700) — the view
+/// origin that drives the read/view decision table.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MessageSource {
+    #[default]
+    Auto,
+    DialogHistory,
+    MessageThreadHistory,
+    ForumTopicHistory,
+    MonoforumHistory,
+    HistoryPreview,
+    DialogList,
+    Search,
+    DialogEventLog,
+    Notification,
+    Screenshot,
+    Other,
+}
+
+pub fn view_messages(
+    manager: &mut MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+    input_message_ids: Vec<MessageId>,
+    source: MessageSource,
+    force_read: bool,
+) -> Result<(), Status> {
+    assert!(!ctx.is_bot());
+
+    if manager.get_dialog(dialog_id).is_none() {
+        return Result::Err(Status::error(400, "Chat not found"));
+    }
+
+    let source = if source == MessageSource::Auto {
+        if manager
+            .get_dialog(dialog_id)
+            .map(|d| d.open_count > 0)
+            .unwrap_or(false)
+        {
+            MessageSource::DialogHistory
+        } else {
+            MessageSource::Other
+        }
+    } else {
+        source
+    };
+    let is_dialog_history = source == MessageSource::DialogHistory
+        || source == MessageSource::MessageThreadHistory
+        || source == MessageSource::ForumTopicHistory
+        || source == MessageSource::MonoforumHistory;
+    let need_read = force_read || is_dialog_history;
+
+    // keep only valid message identifiers
+    let mut message_ids = Vec::with_capacity(input_message_ids.len());
+    for message_id in input_message_ids {
+        if !message_id.is_valid() {
+            if message_id.is_valid_scheduled() {
+                // nothing to do for scheduled messages
+                continue;
+            }
+            return Result::Err(Status::error(400, "Invalid message identifier"));
+        }
+        message_ids.push(message_id);
+    }
+    if message_ids.is_empty() {
+        // nothing to do
+        return Result::Ok(());
+    }
+
+    if source == MessageSource::DialogEventLog {
+        // nothing more to do
+        return Result::Ok(());
+    }
+
+    // the thread/forum/monoforum validation walks (16727-16825) ride the
+    // reply-info/topic planes
+
+    let mut max_message_id = MessageId::default(); // max server or local viewed message_id
+    for &message_id in &message_ids {
+        let found = manager
+            .get_dialog(dialog_id)
+            .map(|d| d.messages.contains_key(&message_id))
+            .unwrap_or(false);
+        if found {
+            let m_last_read = {
+                let d = manager.get_dialog(dialog_id).unwrap();
+                let m = d.messages.get(&message_id).unwrap();
+                if !m.message_id.is_yet_unsent() && m.message_id > max_message_id {
+                    max_message_id = m.message_id;
+                }
+                // `update_message_contains_unread_mention` — the mention
+                // clear rides the M.10.7 mention plane through the dialog
+                m.contains_unread_mention
+            };
+            let _ = m_last_read;
+            // the pending-views/file-viewed/story/fact-check walks are the
+            // manager seams
+        } else if !message_id.is_yet_unsent() && message_id > max_message_id {
+            let counts = manager
+                .get_dialog(dialog_id)
+                .map(|d| {
+                    message_id <= d.last_new_message_id
+                        || d.notification_info
+                            .as_ref()
+                            .map(|info| message_id <= info.max_push_notification_message_id)
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false);
+            if counts {
+                max_message_id = message_id;
+            }
+        }
+    }
+
+    if !need_read {
+        return Result::Ok(());
+    }
+
+    if source == MessageSource::MessageThreadHistory || source == MessageSource::ForumTopicHistory {
+        // the thread/topic read tails ride the ForumTopicManager seam
+        return Result::Ok(());
+    }
+    if source == MessageSource::MonoforumHistory {
+        // the monoforum read tail rides the SavedMessagesManager seam
+        return Result::Ok(());
+    }
+
+    assert!(
+        source == MessageSource::DialogHistory || force_read,
+        "view_messages source mismatch"
+    );
+    read_dialog_inbox(manager, ctx, state, dialog_id, max_message_id);
+    if let Some(d) = manager.get_dialog_mut(dialog_id)
+        && d.is_marked_as_unread
+    {
+        // `set_dialog_is_marked_as_unread(d, false)` — the M.10.12
+        // dialog-list counter plane
+        d.is_marked_as_unread = false;
+    }
+    Result::Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// M.10.14 — drafts
+// ---------------------------------------------------------------------------
+
+/// `need_update_draft_message` (DraftMessage.cpp:441-449).
+pub fn need_update_draft_message(
+    old_draft_message: Option<&DraftMessage>,
+    new_draft_message: Option<&DraftMessage>,
+    _from_update: bool,
+) -> bool {
+    let Some(new_draft_message) = new_draft_message else {
+        return old_draft_message.is_some();
+    };
+    let Some(old_draft_message) = old_draft_message else {
+        return true;
+    };
+    // `DraftMessage::need_update_to` — the date/effect/content comparison
+    old_draft_message.date != new_draft_message.date
+        || old_draft_message.message_effect_id != new_draft_message.message_effect_id
+        || old_draft_message.message_input_reply_to != new_draft_message.message_input_reply_to
+        || old_draft_message.input_message_text.text.text
+            != new_draft_message.input_message_text.text.text
+}
+
+/// `MessageInputReplyTo::get_input_message_reply_to_object`
+/// (MessageInputReplyTo.cpp:170-188).
+pub fn get_input_message_reply_to_object(
+    ctx: &dyn MessageObjectContext,
+    input_reply_to: &MessageInputReplyTo,
+) -> Option<td_api::InputMessageReplyTo> {
+    if input_reply_to.story_full_id.is_valid() {
+        return Some(td_api::InputMessageReplyTo::inputMessageReplyToStory(
+            td_api::inputMessageReplyToStory {
+                story_poster_chat_id: input_reply_to.story_full_id.get_dialog_id().get(),
+                story_id: input_reply_to.story_full_id.get_story_id().get(),
+            },
+        ));
+    }
+    if !input_reply_to.message_id.is_valid() && !input_reply_to.message_id.is_valid_scheduled() {
+        return None;
+    }
+    let mut user_manager = crate::message_content::ContextUserManager::new(ctx.content_context());
+    if input_reply_to.dialog_id != DialogId::default() {
+        return Some(
+            td_api::InputMessageReplyTo::inputMessageReplyToExternalMessage(
+                td_api::inputMessageReplyToExternalMessage {
+                    chat_id: input_reply_to.dialog_id.get(),
+                    message_id: input_reply_to.message_id.get(),
+                    quote: input_reply_to
+                        .quote
+                        .get_input_text_quote_object(Some(&mut user_manager)),
+                    checklist_task_id: input_reply_to.todo_item_id,
+                    poll_option_id: input_reply_to.poll_option_id.clone(),
+                },
+            ),
+        );
+    }
+    Some(td_api::InputMessageReplyTo::inputMessageReplyToMessage(
+        td_api::inputMessageReplyToMessage {
+            message_id: input_reply_to.message_id.get(),
+            quote: input_reply_to
+                .quote
+                .get_input_text_quote_object(Some(&mut user_manager)),
+            checklist_task_id: input_reply_to.todo_item_id,
+            poll_option_id: input_reply_to.poll_option_id.clone(),
+        },
+    ))
+}
+
+/// `DraftMessage::get_draft_message_object` (DraftMessage.cpp:315-333) —
+/// the video/voice-note local-content arms plus the text arm.
+pub fn get_draft_message_object(
+    ctx: &dyn MessageObjectContext,
+    draft_message: &DraftMessage,
+) -> td_api::DraftMessage {
+    let content = match &draft_message.local_content {
+        Some(DraftMessageContent::VideoNote(video_note)) => {
+            td_api::DraftMessageContent::draftMessageContentVideoNote(
+                td_api::draftMessageContentVideoNote {
+                    file_path: video_note.path.clone(),
+                    duration: video_note.duration,
+                    length: video_note.length,
+                    self_destruct_type: video_note.ttl.get_message_self_destruct_type_object(),
+                },
+            )
+        }
+        Some(DraftMessageContent::VoiceNote(voice_note)) => {
+            td_api::DraftMessageContent::draftMessageContentVoiceNote(
+                td_api::draftMessageContentVoiceNote {
+                    file_path: voice_note.path.clone(),
+                    duration: voice_note.duration,
+                    waveform: voice_note.waveform.as_bytes().to_vec(),
+                    self_destruct_type: voice_note.ttl.get_message_self_destruct_type_object(),
+                },
+            )
+        }
+        None => {
+            // `InputMessageText::get_draft_message_content_object`
+            let mut user_manager =
+                crate::message_content::ContextUserManager::new(ctx.content_context());
+            let text = crate::message_entity::get_formatted_text_object(
+                Some(&mut user_manager),
+                &draft_message.input_message_text.text,
+                false,
+                -1,
+            );
+            let input_text = &draft_message.input_message_text;
+            let link_preview_options = if input_text.disable_web_page_preview
+                || !input_text.web_page_url.is_empty()
+                || input_text.force_small_media
+                || input_text.force_large_media
+            {
+                Some(td_api::LinkPreviewOptions {
+                    is_disabled: input_text.disable_web_page_preview,
+                    url: input_text.web_page_url.clone(),
+                    force_small_media: input_text.force_small_media,
+                    force_large_media: input_text.force_large_media,
+                    show_above_text: input_text.show_above_text,
+                })
+            } else {
+                None
+            };
+            td_api::DraftMessageContent::draftMessageContentText(td_api::draftMessageContentText {
+                text: Some(text),
+                link_preview_options,
+            })
+        }
+    };
+    td_api::DraftMessage {
+        reply_to: get_input_message_reply_to_object(ctx, &draft_message.message_input_reply_to),
+        date: draft_message.date,
+        content: Some(content),
+        effect_id: draft_message.message_effect_id.get(),
+        suggested_post_info: None, // the suggested-post draft arm rides the M.9 plane
+    }
+}
+
+/// `MessagesManager::update_dialog_draft_message` (MessagesManager.cpp:
+/// 28500-28520).
+#[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+pub fn update_dialog_draft_message(
+    manager: &mut MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+    draft_message: Option<DraftMessage>,
+    from_update: bool,
+    need_update_dialog_pos: bool,
+    _need_delete_files: bool,
+    from_database: bool,
+) -> bool {
+    let Some(d) = manager.get_dialog(dialog_id) else {
+        return false;
+    };
+    if ctx.is_bot()
+        || !need_update_draft_message(
+            d.draft_message.as_ref(),
+            draft_message.as_ref(),
+            from_update,
+        )
+    {
+        return false;
+    }
+    let old_draft_text = d
+        .draft_message
+        .as_ref()
+        .map(|draft| draft.input_message_text.text.text.clone());
+
+    {
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        d.draft_message = draft_message;
+    }
+    // `change_draft_message_files` — the M.12 file-source seam (the video/
+    // voice drafts carry file ids through it)
+    let _ = old_draft_text;
+    if need_update_dialog_pos {
+        // update_dialog_pos — the M.10.12 dialog-list seam
+    }
+    if !from_database {
+        on_dialog_updated(manager, dialog_id, "update_dialog_draft_message");
+    }
+    send_update_chat_draft_message(manager, ctx, state, dialog_id);
+    true
+}
+
+/// `MessagesManager::send_update_chat_draft_message`
+/// (MessagesManager.cpp:27245-27252).
+pub fn send_update_chat_draft_message(
+    manager: &mut MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+) {
+    if ctx.is_bot() {
+        return;
+    }
+    let draft_object = {
+        let d = manager
+            .get_dialog(dialog_id)
+            .expect("send_update_chat_draft_message without the dialog");
+        // `need_hide_dialog_draft_message(d)` — the hidden-draft gate rides
+        // the secret-chat/restriction seam; visible by default
+        d.draft_message
+            .as_ref()
+            .map(|draft| get_draft_message_object(ctx, draft))
+    };
+    state.send_update(td_api::Object::updateChatDraftMessage(
+        td_api::updateChatDraftMessage {
+            chat_id: dialog_id.get(),
+            draft_message: draft_object,
+            positions: Vec::new(), // the M.10.12 dialog-list positions plane
+        },
+    ));
+}
+
+/// `MessagesManager::set_dialog_draft_message(Dialog *, const
+/// MessageTopic &, unique_ptr<DraftMessage> &&)`
+/// (MessagesManager.cpp:16112-16152) — the empty-topic arm; the
+/// thread/forum/monoforum arms route to their managers.
+pub fn set_dialog_draft_message_core(
+    manager: &mut MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+    draft_message: Option<DraftMessage>,
+) -> Result<(), Status> {
+    // the thread draft (16114-16127) rides the thread plane; the
+    // forum/monoforum arms are the manager seams
+    if update_dialog_draft_message(
+        manager,
+        ctx,
+        state,
+        dialog_id,
+        draft_message,
+        false,
+        true,
+        true,
+        false,
+    ) {
+        // the SaveDialogDraftMessageOnServerLogEvent + the
+        // pending_draft_message timeout (16140-16149) ride the net/binlog
+        // seams
+    }
+    Result::Ok(())
+}
+
+/// `MessagesManager::clear_dialog_draft_by_sent_message`
+/// (MessagesManager.cpp:28522-28571) — the empty-topic arm.
+pub fn clear_dialog_draft_by_sent_message(
+    manager: &mut MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+    m: &Message,
+    need_update_dialog_pos: bool,
+) {
+    if ctx.is_bot() {
+        return;
+    }
+    tracing::info!(
+        "Clear draft in {} by sent {}",
+        dialog_id.get(),
+        DisplayMessageId(m.message_id)
+    );
+    // the monoforum/forum arms (28527-28541) are the manager seams
+    let content_type = m.content.as_ref().map(|c| c.get_type());
+    let need_clear = if !m.clear_draft {
+        // `DraftMessage::need_clear_local` — the local-content gate: the
+        // draft clears when the sent content matches the draft shape
+        let matches_local_draft = manager
+            .get_dialog(dialog_id)
+            .and_then(|d| d.draft_message.as_ref())
+            .is_some_and(|draft| {
+                matches!(
+                    (&draft.local_content, content_type),
+                    (
+                        Some(DraftMessageContent::VideoNote(_)),
+                        Some(MessageContentType::VideoNote)
+                    ) | (
+                        Some(DraftMessageContent::VoiceNote(_)),
+                        Some(MessageContentType::VoiceNote)
+                    )
+                )
+            });
+        !matches_local_draft
+    } else {
+        true
+    };
+    if !need_clear {
+        return;
+    }
+    if manager
+        .get_dialog(dialog_id)
+        .map(|d| d.draft_message.is_some())
+        .unwrap_or(false)
+    {
+        // update_dialog_draft_message(d, nullptr, false,
+        // need_update_dialog_pos, false, false);
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        d.draft_message = None;
+        // do not call change_draft_message_files to keep file source
+        // identifiers
+        if need_update_dialog_pos {
+            // update_dialog_pos — the M.10.12 seam
+        }
+        on_dialog_updated(manager, dialog_id, "clear_dialog_draft_by_sent_message");
+        send_update_chat_draft_message(manager, ctx, state, dialog_id);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M.10.15 — history loading (the local read + the load decisions)
+// ---------------------------------------------------------------------------
+
+/// `MAX_GET_HISTORY` (MessagesManager.h).
+pub const MAX_GET_HISTORY: i32 = 100;
+
+/// `MessagesManager::get_dialog_history` (MessagesManager.cpp:
+/// 17638-17702) — the getChatHistory local answer: the ordered-container
+/// window read + the object build. The empty-window server/db load rides
+/// `load_messages` (the net/db-async seam); the returned `None` is the
+/// "load pending" answer.
+#[allow(clippy::too_many_arguments)]
+pub fn get_dialog_history(
+    manager: &mut MessagesManager,
+    ctx: &mut dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+    from_message_id: MessageId,
+    mut offset: i32,
+    mut limit: i32,
+    left_tries: i32,
+    only_local: bool,
+) -> Result<Option<td_api::Messages>, Status> {
+    if limit <= 0 {
+        return Result::Err(Status::error(400, "Parameter limit must be positive"));
+    }
+    if limit > MAX_GET_HISTORY {
+        limit = MAX_GET_HISTORY;
+    }
+    if offset > 0 {
+        return Result::Err(Status::error(400, "Parameter offset must be non-positive"));
+    }
+    if offset <= -MAX_GET_HISTORY {
+        return Result::Err(Status::error(
+            400,
+            "Parameter offset must be greater than -100",
+        ));
+    }
+    if offset < -limit {
+        return Result::Err(Status::error(
+            400,
+            "Parameter offset must be greater than or equal to -limit",
+        ));
+    }
+
+    if manager.get_dialog(dialog_id).is_none() {
+        return Result::Err(Status::error(400, "Chat not found"));
+    }
+    if !state.have_input_peer(dialog_id, true) {
+        return Result::Err(Status::error(400, "Can't access the chat"));
+    }
+
+    let mut from_message_id = from_message_id;
+    if from_message_id == MessageId::default() || from_message_id > MessageId::max() {
+        from_message_id = MessageId::max();
+    }
+    if !from_message_id.is_valid() {
+        return Result::Err(Status::error(
+            400,
+            "Invalid value of parameter from_message_id specified",
+        ));
+    }
+
+    let (last_message_id, is_empty, have_full_history) = {
+        let d = manager.get_dialog(dialog_id).unwrap();
+        (d.last_message_id, d.is_empty, d.have_full_history)
+    };
+    let message_ids = {
+        let d = manager.get_dialog(dialog_id).unwrap();
+        d.ordered_messages.get_history(
+            last_message_id,
+            &mut from_message_id,
+            &mut offset,
+            &mut limit,
+            left_tries == 0 && !only_local,
+        )
+    };
+    let mut message_ids = message_ids;
+    if !message_ids.is_empty() {
+        // maybe need some messages
+        assert!(offset == 0);
+        // preload_newer_messages/preload_older_messages (19481/19501) —
+        // the db/window repair seam
+    } else if limit > 0 && left_tries != 0 && !(is_empty && have_full_history && left_tries < 3) {
+        // there can be more messages in the database or on the server,
+        // need to load them — `load_messages` is the net/db seam
+        return Result::Ok(None);
+    }
+
+    tracing::info!(
+        "Return {} messages in result to getChatHistory",
+        message_ids.len()
+    );
+    let mut objects = Vec::with_capacity(message_ids.len());
+    let mut skipped = Vec::new();
+    for message_id in std::mem::take(&mut message_ids) {
+        let mut taken = manager
+            .get_dialog_mut(dialog_id)
+            .unwrap()
+            .messages
+            .remove(&message_id);
+        let mut object = None;
+        if let Some(m) = taken.as_mut() {
+            let reactions_ctx = MessageObjectReactionsContext { ctx };
+            object = get_message_object(
+                manager,
+                &reactions_ctx,
+                ctx,
+                dialog_id,
+                m,
+                "get_dialog_history",
+            );
+        }
+        if let Some(m) = taken {
+            manager
+                .get_dialog_mut(dialog_id)
+                .unwrap()
+                .messages
+                .insert(message_id, m);
+        } else {
+            skipped.push(message_id);
+        }
+        objects.push(object);
+    }
+    let _ = skipped;
+    let _ = state;
+    Result::Ok(Some(get_messages_object(-1, objects, true)))
+}
+
+/// `MessagesManager::get_dialog_message_by_date` (MessagesManager.cpp:
+/// 19164-19193) — the local date search; the db/server legs are the seams.
+pub fn get_dialog_message_by_date(
+    manager: &mut MessagesManager,
+    ctx: &mut dyn MessageObjectContext,
+    dialog_id: DialogId,
+    date: i32,
+) -> Result<Option<td_api::Message>, Status> {
+    if manager.get_dialog(dialog_id).is_none() {
+        return Result::Err(Status::error(400, "Chat not found"));
+    }
+    let date = if date <= 0 { 1 } else { date };
+
+    let (message_id, last_message_id, have_next) = {
+        let d = manager.get_dialog(dialog_id).unwrap();
+        let message_id = d.ordered_messages.find_message_by_date(date, &|id| {
+            d.messages.get(&id).map(|m| m.date).unwrap_or_default()
+        });
+        let have_next = message_id.is_valid()
+            && d.ordered_messages.at_or_before(message_id) == Some(message_id)
+            && d.ordered_messages.has_next(message_id);
+        (message_id, d.last_message_id, have_next)
+    };
+    if message_id.is_valid() && (message_id == last_message_id || have_next) {
+        let mut taken = manager
+            .get_dialog_mut(dialog_id)
+            .unwrap()
+            .messages
+            .remove(&message_id);
+        let mut object = None;
+        if let Some(m) = taken.as_mut() {
+            let reactions_ctx = MessageObjectReactionsContext { ctx };
+            object = get_message_object(
+                manager,
+                &reactions_ctx,
+                ctx,
+                dialog_id,
+                m,
+                "get_dialog_message_by_date",
+            );
+        }
+        if let Some(m) = taken {
+            manager
+                .get_dialog_mut(dialog_id)
+                .unwrap()
+                .messages
+                .insert(message_id, m);
+        }
+        return Result::Ok(object);
+    }
+
+    // the message-db date search (19181-19191) and the server fetch are
+    // the net/db seams
+    Result::Ok(None)
+}
+
+/// `MessagesManager::get_history_impl` (MessagesManager.cpp:19869-19981)
+/// — the synchronous decision core: the access/window gates and the
+/// offset/limit normalization; the db/server legs are the seams.
+#[allow(clippy::too_many_arguments)] // the C++ signature has the same shape
+pub fn get_history_impl_decisions(
+    manager: &MessagesManager,
+    state: &dyn ReadStateContext,
+    dialog_id: DialogId,
+    from_message_id: MessageId,
+    mut offset: i32,
+    mut limit: i32,
+    from_database: bool,
+    only_local: bool,
+) -> Option<(MessageId, i32, i32)> {
+    let mut from_message_id = from_message_id;
+    let from_the_end =
+        from_message_id == MessageId::default() || from_message_id == MessageId::max();
+    if !from_the_end {
+        assert!(from_message_id.is_valid());
+    } else {
+        from_message_id = MessageId::max();
+    }
+
+    if !state.have_input_peer(dialog_id, true) {
+        // can't get history in dialogs without read access
+        return None;
+    }
+    let mut from_database = from_database;
+    {
+        let d = manager.get_dialog(dialog_id)?;
+        if (!d.first_database_message_id.is_valid()
+            || from_message_id <= d.first_database_message_id)
+            && !d.have_full_history
+        {
+            from_database = false;
+        }
+    }
+
+    if from_the_end {
+        // load only 10 messages when repairing the last message and can't
+        // save the result to the database
+        limit = if from_database {
+            limit.max(10)
+        } else {
+            MAX_GET_HISTORY
+        };
+        offset = 0;
+    } else if offset >= -1 {
+        // get history before some server or local message
+        limit = (limit + offset + 1).clamp(MAX_GET_HISTORY / 2, MAX_GET_HISTORY);
+        offset = -1;
+    } else {
+        // get history around some server or local message
+        let messages_to_load = MAX_GET_HISTORY.max(limit);
+        let max_add = (messages_to_load - limit - 2).max(0);
+        offset -= max_add;
+        limit = MAX_GET_HISTORY;
+    }
+
+    let only_local_or_known = only_local
+        || dialog_id.get_type() == DialogType::SecretChat
+        || (from_the_end
+            && manager
+                .get_dialog(dialog_id)
+                .map(|d| d.last_message_id.is_valid())
+                .unwrap_or(false));
+    if !from_database && only_local_or_known {
+        // if the last message is known, there are no reasons to get
+        // message history from server from the end
+        return None;
+    }
+
+    Some((from_message_id, offset, limit))
+}
+
+// ---------------------------------------------------------------------------
+// M.10.11 — the forward-info plane
+// ---------------------------------------------------------------------------
+
+/// `MessagesManager::get_message_original_date`
+/// (MessagesManager.cpp:23437-23442).
+pub fn get_message_original_date(m: &Message) -> i32 {
+    if let Some(forward_info) = &m.forward_info {
+        return forward_info.get_origin_date();
+    }
+    m.date
+}
+
+/// `MessagesManager::get_forwarded_message_origin`
+/// (MessagesManager.cpp:24521-24543).
+pub fn get_forwarded_message_origin(
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> MessageOrigin {
+    let mut origin = if let Some(forward_info) = &m.forward_info {
+        forward_info.origin.clone()
+    } else if m.is_channel_post {
+        if ctx.is_broadcast_channel_dialog(dialog_id) {
+            let author_signature = if m.sender_user_id.is_valid() {
+                ctx.get_user_title(m.sender_user_id)
+            } else {
+                m.author_signature.clone()
+            };
+            MessageOrigin {
+                sender_user_id: UserId::default(),
+                sender_dialog_id: dialog_id,
+                message_id: m.message_id,
+                author_signature,
+                sender_name: String::new(),
+            }
+        } else {
+            log_error!("Don't know how to forward a channel post not from a channel");
+            MessageOrigin::default()
+        }
+    } else if m.sender_user_id.is_valid() || m.sender_dialog_id.is_valid() {
+        MessageOrigin {
+            sender_user_id: m.sender_user_id,
+            sender_dialog_id: m.sender_dialog_id,
+            message_id: MessageId::default(),
+            author_signature: String::new(),
+            sender_name: m.author_signature.clone(),
+        }
+    } else {
+        log_error!(
+            "Don't know how to forward a non-channel post message without forward info and sender"
+        );
+        MessageOrigin::default()
+    };
+    origin.hide_sender_if_needed(ctx);
+    origin
+}
+
+/// `MessagesManager::create_message_forward_info`
+/// (MessagesManager.cpp:24544-24580).
+pub fn create_message_forward_info(
+    ctx: &dyn SendMessageContext,
+    from_dialog_id: DialogId,
+    to_dialog_id: DialogId,
+    m: &Message,
+) -> Option<MessageForwardInfo> {
+    assert!(m.ephemeral_message.is_none());
+    let content_type = m.content.as_ref().map(|c| c.get_type())?;
+    if content_type == MessageContentType::Game {
+        return None;
+    }
+
+    let my_dialog_id = ctx.content_context().get_my_dialog_id();
+
+    let mut last_message_info = if to_dialog_id == my_dialog_id {
+        LastForwardedMessageInfo {
+            dialog_id: from_dialog_id,
+            message_id: m.message_id,
+            sender_dialog_id: get_message_sender(m),
+            sender_name: String::new(),
+            date: m.date,
+            is_outgoing: m.is_outgoing || from_dialog_id == my_dialog_id,
+        }
+    } else if content_type == MessageContentType::Story {
+        return None;
+    } else {
+        LastForwardedMessageInfo::default()
+    };
+
+    if let Some(forward_info) = &m.forward_info {
+        // `MessageForwardInfo::copy_message_forward_info` — the existing
+        // forward header survives with the new last-message link
+        let mut copy = MessageForwardInfo {
+            origin: forward_info.origin.clone(),
+            date: forward_info.date,
+            last_message_info: std::mem::take(&mut last_message_info),
+            psa_type: forward_info.psa_type.clone(),
+            is_imported: forward_info.is_imported,
+        };
+        if copy.last_message_info.is_empty() {
+            copy.last_message_info = forward_info.last_message_info.clone();
+        }
+        return Some(copy);
+    }
+
+    if from_dialog_id != my_dialog_id || content_type == MessageContentType::Dice {
+        let origin = get_forwarded_message_origin(ctx, from_dialog_id, m);
+        if !origin.is_empty() {
+            last_message_info.hide_sender_if_needed(ctx);
+            if last_message_info.dialog_id != DialogId::default() {
+                last_message_info = LastForwardedMessageInfo {
+                    dialog_id: from_dialog_id,
+                    message_id: m.message_id,
+                    sender_dialog_id: DialogId::default(),
+                    sender_name: String::new(),
+                    date: 0,
+                    is_outgoing: m.is_outgoing && origin.get_sender(ctx) != my_dialog_id,
+                };
+            }
+            return Some(MessageForwardInfo {
+                origin,
+                date: m.date,
+                last_message_info,
+                psa_type: String::new(),
+                is_imported: false,
+            });
+        }
+    }
+    None
+}
+
+/// `MessagesManager::get_forwarded_message_info` (MessagesManager.cpp:
+/// 21316-21329) — the cross-chat reply embed source (the
+/// [`SendMessageContext::get_forwarded_message_info`] seam answer; the
+/// `None` contract of the tri-condition holds through the empty-origin
+/// collapse).
+pub fn get_forwarded_message_info_impl(
+    ctx: &dyn SendMessageContext,
+    manager: &MessagesManager,
+    dialog_id: DialogId,
+    message_id: MessageId,
+) -> Option<ForwardedMessageInfo> {
+    let m = manager.get_dialog(dialog_id)?.messages.get(&message_id)?;
+    if m.message_id.is_scheduled() {
+        return None;
+    }
+    let origin_date = get_message_original_date(m);
+    let origin = get_forwarded_message_origin(ctx, dialog_id, m);
+    // `dup_message_content(..., Forward, ...)` — the M.9 content-dup
+    // plane; the None answer keeps the reply-info reset branch until that
+    // wiring, matching the documented tri-condition contract
+    let _ = origin;
+    if origin_date == 0 {
+        return None;
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// M.10.17 — message links + embedding code
+// ---------------------------------------------------------------------------
+
+/// `LinkManager::get_t_me_url()` (LinkManager.cpp) — the cached `t_me_url`
+/// option with the production default; the option-plane override rides the
+/// OptionManager wiring.
+pub fn get_t_me_url() -> String {
+    "https://t.me/".to_string()
+}
+
+/// `MessagesManager::get_message_link` (MessagesManager.cpp:15664-15822)
+/// — the URL builder. The `ExportChannelMessageLinkQuery` fire-and-forget
+/// (15726-15729) is the net seam; the username reads are the ChatManager
+/// seam answering empty (the `c/` private form).
+#[allow(clippy::too_many_arguments)]
+pub fn get_message_link(
+    manager: &MessagesManager,
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    message_id: MessageId,
+    media_timestamp: i32,
+    todo_item_id: i32,
+    poll_option_id: &str,
+    for_group: bool,
+    in_message_thread: bool,
+) -> Result<(String, bool), Status> {
+    if manager.get_dialog(dialog_id).is_none() {
+        return Result::Err(Status::error(400, "Chat not found"));
+    }
+    let m = manager
+        .get_dialog(dialog_id)
+        .unwrap()
+        .messages
+        .get(&message_id);
+    let Some(m) = m else {
+        return Result::Err(Status::error(400, "Message not found"));
+    };
+
+    let content_type = m.content.as_ref().map(|c| c.get_type());
+    if todo_item_id != 0 && content_type != Some(MessageContentType::ToDoList) {
+        return Result::Err(Status::error(400, "Message isn't a checklist"));
+    }
+    if todo_item_id < 0 {
+        return Result::Err(Status::error(
+            400,
+            "Invalid checklist task identifier specified",
+        ));
+    }
+    if !poll_option_id.is_empty() && content_type != Some(MessageContentType::Poll) {
+        return Result::Err(Status::error(400, "Message isn't a poll"));
+    }
+    if !tdutils::utf8::check_utf8(poll_option_id.as_bytes()) {
+        return Result::Err(Status::error(
+            400,
+            "Invalid poll option identifier specified",
+        ));
+    }
+
+    let mut dialog_id = dialog_id;
+    let mut message_id = m.message_id;
+    let mut for_group = for_group;
+    let mut in_message_thread = in_message_thread;
+    let mut media_timestamp = media_timestamp;
+    if dialog_id.get_type() != DialogType::Channel {
+        if media_timestamp == 0 {
+            return Result::Err(Status::error(400, "Message can't have link"));
+        }
+        let Some(forward_info) = &m.forward_info else {
+            return Result::Err(Status::error(500, "Forward info is missing"));
+        };
+        let origin_message_full_id = forward_info.get_origin_message_full_id();
+        dialog_id = origin_message_full_id.get_dialog_id();
+        message_id = origin_message_full_id.get_message_id();
+        assert!(dialog_id.get_type() == DialogType::Channel);
+        for_group = false;
+        in_message_thread = false;
+        let channel_message = manager
+            .get_dialog(dialog_id)
+            .and_then(|d| d.messages.get(&message_id));
+        if channel_message.is_some_and(|cm| cm.media_album_id == 0) {
+            for_group = true; // default is true
+        }
+    } else if m.media_album_id == 0 {
+        for_group = true; // default is true
+    }
+    let can_have_timestamp = m
+        .content
+        .as_ref()
+        .map(crate::message_content::can_message_content_have_media_timestamp)
+        .unwrap_or(false);
+    if media_timestamp <= 0 || !can_have_timestamp {
+        media_timestamp = 0;
+    }
+    if media_timestamp != 0 {
+        for_group = false;
+        let duration = ctx.get_message_content_media_duration(m.content.as_ref().unwrap());
+        if duration != 0 && media_timestamp > duration {
+            media_timestamp = 0;
+        }
+    }
+
+    let is_forum = manager
+        .get_dialog(dialog_id)
+        .map(|d| d.is_forum)
+        .unwrap_or(false);
+    if in_message_thread
+        && !is_forum
+        && (!m.top_thread_message_id.is_server()
+            || manager
+                .get_dialog(dialog_id)
+                .map(|d| is_deleted_message(d, m.top_thread_message_id))
+                .unwrap_or(false)
+            || ctx.is_broadcast_channel_dialog(dialog_id))
+    {
+        in_message_thread = false;
+    }
+
+    // the ExportChannelMessageLinkQuery (15726-15729) — the net seam
+
+    let mut sb = String::new();
+    sb.push_str(&get_t_me_url());
+
+    let add_media_timestamp = |sb: &mut String| {
+        if media_timestamp < 60 {
+            sb.push_str(&media_timestamp.to_string());
+        } else if media_timestamp < 3600 {
+            sb.push_str(&format!(
+                "{}m{}s",
+                media_timestamp / 60,
+                media_timestamp % 60
+            ));
+        } else {
+            sb.push_str(&format!(
+                "{}h{}m{}s",
+                media_timestamp / 3600,
+                media_timestamp / 60 % 60,
+                media_timestamp % 60
+            ));
+        }
+    };
+
+    // the comment-link arm (15744-15779) needs the discussion linkage +
+    // channel usernames — the ChatManager seam answers empty, so the walk
+    // falls through to the plain form
+
+    // `get_channel_first_username` — the ChatManager seam, empty
+    let dialog_username = String::new();
+    let is_public = !dialog_username.is_empty();
+    if is_public {
+        sb.push_str(&dialog_username);
+    } else {
+        sb.push_str("c/");
+        sb.push_str(&dialog_id.get_channel_id().get().to_string());
+    }
+    if in_message_thread && is_forum {
+        // `get_message_forum_topic_id` — the topic id rides the message's
+        // top thread id in the non-comment forums
+        let forum_topic_id = m.top_thread_message_id.get_server_message_id_force().get();
+        if forum_topic_id != message_id.get_server_message_id_force().get() {
+            sb.push('/');
+            sb.push_str(&forum_topic_id.to_string());
+        }
+        in_message_thread = false;
+    }
+    sb.push('/');
+    sb.push_str(&message_id.get_server_message_id_force().get().to_string());
+
+    let mut separator = '?';
+    if in_message_thread {
+        sb.push(separator);
+        sb.push_str("thread=");
+        sb.push_str(
+            &m.top_thread_message_id
+                .get_server_message_id_force()
+                .get()
+                .to_string(),
+        );
+        separator = '&';
+    }
+    if !for_group {
+        sb.push(separator);
+        sb.push_str("single");
+        separator = '&';
+    }
+    if media_timestamp > 0 {
+        sb.push(separator);
+        sb.push_str("t=");
+        add_media_timestamp(&mut sb);
+        separator = '&';
+    }
+    if todo_item_id != 0 {
+        sb.push(separator);
+        sb.push_str("task=");
+        sb.push_str(&todo_item_id.to_string());
+        separator = '&';
+    }
+    if !poll_option_id.is_empty() {
+        sb.push(separator);
+        sb.push_str("option=");
+        sb.push_str(&String::from_utf8_lossy(
+            &tdmtproto::utils::base64url_encode(poll_option_id.as_bytes()),
+        ));
+        separator = '&';
+    }
+    assert!(separator == '?' || separator == '&');
+
+    Result::Ok((sb, is_public))
+}
+
+/// `MessagesManager::get_message_embedding_code`
+/// (MessagesManager.cpp:15845+).
+pub fn get_message_embedding_code(
+    manager: &MessagesManager,
+    dialog_id: DialogId,
+    message_id: MessageId,
+    for_group: bool,
+) -> Result<String, Status> {
+    if manager.get_dialog(dialog_id).is_none() {
+        return Result::Err(Status::error(400, "Chat not found"));
+    }
+    let m = manager
+        .get_dialog(dialog_id)
+        .unwrap()
+        .messages
+        .get(&message_id);
+    let Some(m) = m else {
+        return Result::Err(Status::error(400, "Message not found"));
+    };
+    if m.message_id.is_yet_unsent() {
+        return Result::Err(Status::error(400, "Message is not sent yet"));
+    }
+    if m.message_id.is_scheduled() {
+        return Result::Err(Status::error(400, "Message is scheduled"));
+    }
+    if !m.message_id.is_server() || m.ephemeral_message.is_some() {
+        return Result::Err(Status::error(400, "Message is local"));
+    }
+    let mut result = String::new();
+    result.push_str("<a href=\"");
+    // the username read is the ChatManager seam; the c/ private form is
+    // the fallback the C++ uses for private channels
+    result.push_str("https://t.me/c/");
+    result.push_str(&dialog_id.get_channel_id().get().to_string());
+    result.push('/');
+    result.push_str(&m.message_id.get_server_message_id_force().get().to_string());
+    result.push_str("\">&#8203;</a>");
+    if !for_group && m.media_album_id != 0 {
+        result.push_str("?single");
+    }
+    Result::Ok(result)
 }
 
 #[cfg(test)]
@@ -24731,6 +29806,45 @@ mod tests {
         );
         assert!(input_reply_to.is_empty(), "the unknown chat drops silently");
 
+        // arm 3 guard: the cross-chat gate keys on is_monoforum_channel
+        // (MessagesManager.cpp:8332), so a reply into a monoforum channel
+        // drops while a broadcast channel stays allowed
+        let mono_reply_dialog = DialogId::from_channel_id(ChannelId::new(50));
+        let mono_message_id = MessageId::from_server_message_id(ServerMessageId::new(90));
+        let mut mono_message = Box::new(Message::default());
+        mono_message.message_id = mono_message_id;
+        mono_message.content = Some(m10_8_text_content("mono"));
+        {
+            let d = manager.add_dialog_for_new_message(mono_reply_dialog);
+            d.last_new_message_id = mono_message_id;
+            d.messages.insert(mono_message_id, mono_message);
+        }
+        let mut ctx_mono = SendTestContext {
+            monoforum_channel: Some(ChannelId::new(51)),
+            ..SendTestContext::default()
+        };
+        let external_reply = td_api::InputMessageReplyTo::inputMessageReplyToExternalMessage(
+            td_api::inputMessageReplyToExternalMessage {
+                chat_id: mono_reply_dialog.get(),
+                message_id: mono_message_id.get(),
+                quote: None,
+                checklist_task_id: 0,
+                poll_option_id: String::new(),
+            },
+        );
+        let input_reply_to = create_message_input_reply_to(
+            &mut ctx_mono,
+            &manager,
+            dialog_id,
+            &MessageTopic::default(),
+            Some(external_reply),
+            false,
+        );
+        assert!(
+            input_reply_to.is_empty(),
+            "the monoforum reply chat drops (8332)"
+        );
+
         // arm 4 (ephemeral): only a bot explicitly building an ephemeral
         // reply passes; everything else drops
         let ephemeral_reply = td_api::InputMessageReplyTo::inputMessageReplyToEphemeralMessage(
@@ -24909,11 +30023,13 @@ mod tests {
                         MessageId::from_server_message_id(ServerMessageId::new(50));
                 }
                 let mut need_update_dialog_pos = false;
+                let mut state = NoReadStateContext;
                 let full_id = get_message_to_send(
                     &mut ctx,
                     &mut global,
                     &mut manager,
                     &reactions_ctx,
+                    &mut state,
                     dialog_id,
                     &MessageTopic::default(),
                     MessageInputReplyTo::default(),
