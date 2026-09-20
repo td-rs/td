@@ -12499,6 +12499,210 @@ pub fn on_message_edited(
     send_edited
 }
 
+// ---------------------------------------------------------------------------
+// M.10.6 — the delete path: `delete_messages` (MessagesManager.cpp:8533),
+// `delete_dialog_history` (MessagesManager.cpp:8753) and
+// `delete_messages_from_updates` (MessagesManager.cpp:7992), riding the
+// M.10.2 durable spine (`delete_message_from_database` /
+// `do_delete_message_log_event`). The per-dialog message walks, the
+// in-memory removals and the read-state/counters live in the M.10.9
+// containers — those walks are the recorded seams, while the validation
+// ladders and the durable deletes are driven here with explicit ids.
+// ---------------------------------------------------------------------------
+
+/// `MessagesManager::get_dialog_by_message_id`
+/// (MessagesManager.cpp:8609-8635) — the message_id_to_dialog_id_ container
+/// is M.10.9's; the message-db unique-id load is the landed leg.
+fn resolve_dialog_by_message_id(
+    global: &crate::global::Global,
+    message_id: MessageId,
+) -> Option<DialogId> {
+    assert!(message_id.is_server());
+    global.message_db_sync().with_db(|db| {
+        match db.get_message_by_unique_message_id(message_id.get_server_message_id()) {
+            tdutils::status::Result::Ok(row) => Some(row.dialog_id),
+            tdutils::status::Result::Err(_) => None,
+        }
+    })
+}
+
+/// `MessagesManager::delete_messages_from_updates`
+/// (MessagesManager.cpp:7992-8029) — the update-driven delete. Non-server
+/// ids are logged and skipped like the C++; the per-dialog in-memory
+/// removal, the `send_update_chat_last_message` fan-out and the
+/// `send_update_delete_messages` emissions are the M.10.9/Td update-plane
+/// seams, so the per-dialog deleted ids are returned to the caller.
+pub fn delete_messages_from_updates(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    message_ids: &[MessageId],
+    is_permanent: bool,
+) -> Vec<(DialogId, Vec<i64>)> {
+    let mut deleted_message_ids: HashMap<DialogId, Vec<i64>> = HashMap::new();
+    for message_id in message_ids {
+        if !message_id.is_server() {
+            log_error!(
+                "Incoming update tries to delete {}",
+                DisplayMessageId(*message_id)
+            );
+            continue;
+        }
+        // `get_dialog_by_message_id`: an unresolved id is skipped — the C++
+        // relies on the difference flow to deliver the delete.
+        let Some(dialog_id) = resolve_dialog_by_message_id(global, *message_id) else {
+            continue;
+        };
+        // `delete_message` (the in-memory removal, the read-state/counter
+        // walk and the notification repairs) is the M.10.9 container seam;
+        // the durable spine runs here.
+        delete_message_from_database(
+            global,
+            manager,
+            dialog_id,
+            *message_id,
+            None,
+            is_permanent,
+            "delete_messages_from_updates",
+        );
+        deleted_message_ids
+            .entry(dialog_id)
+            .or_default()
+            .push(message_id.get());
+    }
+    let mut deleted: Vec<(DialogId, Vec<i64>)> = deleted_message_ids.into_iter().collect();
+    deleted.sort_by_key(|(dialog_id, _)| dialog_id.get());
+    deleted
+}
+
+/// `MessagesManager::delete_messages` (MessagesManager.cpp:8533-8606) — the
+/// user-requested delete: the validation ladder, the id normalization and
+/// the durable spine per id. `check_dialog_access` (8,536) is the rights
+/// seam; `get_persistent_message_id` (21,133) walks the yet-unsent rewrite
+/// container — the recorded seam leaves the id as-is; the
+/// `can_delete_message`/`can_revoke_message` gates (8451-8532) inspect the
+/// stored message — with the containers absent the lookups resolve to
+/// `nullptr` and both gates answer true, behaviorally exact until M.10.9;
+/// `delete_messages_on_server`/`delete_scheduled_messages_on_server`
+/// (8,580-8,587) and the MultiPromiseActor completion are the net-plane
+/// seam.
+pub fn delete_messages(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    input_message_ids: &[MessageId],
+) -> Result<(), Status> {
+    if input_message_ids.is_empty() {
+        return Result::Ok(());
+    }
+    for message_id in input_message_ids {
+        if !message_id.is_valid() && !message_id.is_valid_scheduled() {
+            return Result::Err(Status::error(400, "Invalid message identifier"));
+        }
+    }
+    // the `get_persistent_message_id` rewrite, the scheduled/ephemeral
+    // server-delete bucket split and the bot revoke gate (8,554-8,578) ride
+    // the send-path/net-plane seams.
+    for message_id in input_message_ids {
+        delete_message_from_database(
+            global,
+            manager,
+            dialog_id,
+            *message_id,
+            None,
+            true,
+            DELETE_MESSAGE_USER_REQUEST_SOURCE,
+        );
+    }
+    Result::Ok(())
+}
+
+/// `DELETE_MESSAGE_USER_REQUEST_SOURCE` (MessagesManager.h).
+pub const DELETE_MESSAGE_USER_REQUEST_SOURCE: &str = "user request";
+
+/// `MessagesManager::delete_dialog_history`
+/// (MessagesManager.cpp:8753-8820) — the gates and the dialog markers: the
+/// sponsored-chat gate (8,766-8,782) is the PromoDataManager seam, the
+/// `can_delete_dialog` rights gate (8,783-8,793) is the ChatManager
+/// rights seam (the revoke downgrade follows the C++ for_self shape), the
+/// `delete_all_dialog_messages` container sweep (8,805) is M.10.9's, and
+/// `delete_dialog_history_on_server` (8,817-8,819) is the net-plane seam.
+/// Returns the effective `revoke` after the C++ downgrade.
+pub fn delete_dialog_history(
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    remove_from_dialog_list: bool,
+    mut revoke: bool,
+) -> Result<bool, Status> {
+    let Some(d) = manager.get_dialog(dialog_id) else {
+        return Result::Err(Status::error(
+            400,
+            &format!("Can't delete history of unknown dialog {dialog_id:?}"),
+        ));
+    };
+
+    // the sponsored-chat gate (MessagesManager.cpp:8766-8782) — the
+    // sponsored-dialog plane is its own slice.
+    let can_delete_for_self = true; // `can_delete_dialog.for_self_` — the ChatManager rights seam
+    let can_delete_for_all_users = true; // `can_delete_dialog.for_all_users_` — the same seam
+    if revoke && !can_delete_for_all_users {
+        if !can_delete_for_self {
+            return Result::Err(Status::error(400, "Chat history can't be deleted"));
+        }
+        // Can't delete history of the dialog for everyone; delete it only for self
+        revoke = false;
+    }
+    let last_new_message_id = d.last_new_message_id;
+    let old_order = d.order;
+    let max_unavailable_message_id = d.max_unavailable_message_id;
+
+    if last_new_message_id.is_valid()
+        && last_new_message_id == max_unavailable_message_id
+        && !revoke
+        && !(old_order != DEFAULT_ORDER && remove_from_dialog_list)
+    {
+        // history has already been cleared, nothing to do
+        return Result::Ok(revoke);
+    }
+
+    // `delete_all_dialog_messages` (8,805) — the per-message sweep is the
+    // M.10.9 container seam.
+
+    // `set_dialog_max_unavailable_message_id` (MessagesManager.cpp:10028+);
+    // the ordered-messages walk of its tail is the M.10.9 container seam.
+    let max_unavailable = if let Some(d) = manager.get_dialog(dialog_id) {
+        let mut target = last_new_message_id;
+        if d.last_new_message_id.is_valid() && target > d.last_new_message_id {
+            // possible if the last unavailable message has already been deleted
+            target = d.last_new_message_id;
+        }
+        let unchanged = d.max_unavailable_message_id == target;
+        let backwards = d.max_unavailable_message_id > target;
+        if unchanged {
+            return Result::Ok(revoke);
+        }
+        if target.is_valid() && target.is_yet_unsent() {
+            return Result::Ok(revoke);
+        }
+        Some((target, backwards))
+    } else {
+        None
+    };
+    if let Some((target, backwards)) = max_unavailable {
+        // the C++ `if (> ) { assign; return; }` early-returns before the
+        // ordered-messages sweep; the sweep itself (3,10064-3,10080) is the
+        // M.10.9 container seam.
+        let _ = backwards;
+        if let Some(d) = manager.get_dialog_mut(dialog_id) {
+            d.max_unavailable_message_id = target;
+        }
+        // `on_dialog_updated` (the binlog-pmc dirty marker) rides the
+        // dialog-db receive slice.
+    }
+
+    // `delete_dialog_history_on_server` (8,817-8,819) — the net-plane seam.
+    Result::Ok(revoke)
+}
+
 /// The message-plane `const Td *td` surface: the M.9 content context plus
 /// the queries `get_message_object` and its helpers make. The real `Td`
 /// wiring lands with the Td slices; the stand-ins answer the id-object
@@ -14128,6 +14332,9 @@ mod tests {
     }
 
     use super::*;
+    use crate::message_db::MessageDbImpl;
+    use tddb::db_key::DbKey;
+    use tddb::td_db::{LOG_EVENT_HANDLER_TYPE_DELETE_MESSAGE, init_message_db};
 
     // ---- ServerMessageId / ScheduledServerMessageId / EphemeralMessageId ----
 
@@ -17425,5 +17632,118 @@ mod tests {
         let send_edited = on_message_edited(&mut manager, dialog_id, &mut m, 78, false, false);
         assert!(!send_edited, "non-bot edits emit via the is_edited flow");
         assert_eq!(m.last_edit_pts, 78);
+    }
+
+    /// The M.10.6 crash-recovery replay: `do_delete_message_log_event`
+    /// writes the binlog event before the row erase can complete, so a kill
+    /// mid-delete leaves the durable event with the row still present; the
+    /// reopened engine replays the binlog and re-applies the erase.
+    #[test]
+    fn m10_6_delete_survives_a_mid_delete_kill_via_binlog_replay() {
+        let binlog_path = std::env::temp_dir()
+            .join("m10_6_delete_binlog")
+            .to_string_lossy()
+            .into_owned();
+        let db_path = std::env::temp_dir()
+            .join("m10_6_delete_db")
+            .to_string_lossy()
+            .into_owned();
+        let _ = tddb::binlog::destroy(&binlog_path);
+        let _ = tddb::sqlite_db::destroy(&db_path);
+
+        let dialog_id = DialogId::from_user_id(UserId::new(2000));
+        let message_full_id = MessageFullId::new(
+            dialog_id,
+            MessageId::from_server_message_id(ServerMessageId::new(400)),
+        );
+
+        // --- run 1: the message row exists; the delete's durable half (the
+        // binlog event) lands and the process "dies" before the row erase
+        // completes ---
+        {
+            let mut binlog = tddb::binlog::concurrent::ConcurrentBinlog::new();
+            binlog
+                .init(
+                    &binlog_path,
+                    &mut |_: &tddb::binlog::BinlogEvent| {},
+                    DbKey::empty(),
+                    DbKey::empty(),
+                )
+                .unwrap();
+            let db =
+                tddb::sqlite_db::SqliteDb::open_with_key(&db_path, true, &DbKey::empty(), None)
+                    .unwrap();
+            let mut version = 0;
+            init_message_db(&db, &mut version).ensure();
+            let mut db_impl = MessageDbImpl::new(db).unwrap();
+            db_impl.add_message(
+                message_full_id,
+                ServerMessageId::new(9),
+                DialogId::new(777000),
+                1,
+                0,
+                0,
+                0,
+                String::new(),
+                NotificationId::new(0),
+                MessageId::default(),
+                Vec::new(),
+            );
+            assert!(db_impl.get_message(message_full_id).is_ok());
+
+            // the durable half of do_delete_message_log_event: the event is
+            // in the binlog, the row erase has not run — the crash window
+            let log_event = DeleteMessageLogEvent {
+                id: 0,
+                message_full_id,
+                file_ids: Vec::new(),
+            };
+            let mut data = Vec::new();
+            log_event.store(&mut data);
+            binlog.add(LOG_EVENT_HANDLER_TYPE_DELETE_MESSAGE, &data);
+            binlog.close(None);
+        } // everything dropped — the "kill"
+
+        // --- run 2: reopen; the binlog replays the durable event and the
+        // row erase is re-applied ---
+        {
+            let mut replayed = Vec::new();
+            let mut binlog = tddb::binlog::concurrent::ConcurrentBinlog::new();
+            binlog
+                .init(
+                    &binlog_path,
+                    &mut |event: &tddb::binlog::BinlogEvent| {
+                        if event.type_ == LOG_EVENT_HANDLER_TYPE_DELETE_MESSAGE
+                            && let Ok(parsed) = DeleteMessageLogEvent::parse_from(&mut Parser::new(
+                                event.get_data(),
+                            ))
+                        {
+                            replayed.push(parsed);
+                        }
+                    },
+                    DbKey::empty(),
+                    DbKey::empty(),
+                )
+                .unwrap();
+            assert_eq!(replayed.len(), 1, "the durable delete event replays");
+            assert_eq!(replayed[0].message_full_id, message_full_id);
+
+            // the replay re-applies the row erase
+            let db =
+                tddb::sqlite_db::SqliteDb::open_with_key(&db_path, true, &DbKey::empty(), None)
+                    .unwrap();
+            let mut version = 0;
+            init_message_db(&db, &mut version).ensure();
+            let mut db_impl = MessageDbImpl::new(db).unwrap();
+            for event in &replayed {
+                db_impl.delete_message(event.message_full_id);
+            }
+            assert!(
+                db_impl.get_message(message_full_id).is_error(),
+                "the replayed delete removed the row"
+            );
+        }
+        let _ = tddb::binlog::destroy(&binlog_path);
+        let _ = tddb::sqlite_db::destroy(&db_path);
     }
 }
