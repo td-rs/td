@@ -22,6 +22,7 @@
 //!   via `log_error!`.
 
 use crate::chat_manager::{ChannelId, ChannelType, ChatId};
+use crate::files::{FileId, FileSourceId};
 use crate::message_content::{
     BackgroundInfo, InputGroupCallId, MessageContent, MessageContentType, SuggestedPostPrice,
     can_be_secret_message_content,
@@ -31,7 +32,7 @@ use crate::message_entity::FormattedText;
 use crate::restriction_reason::RestrictionReason;
 use crate::store_parse::{Parser, store_flags, store_i32, store_i64, store_string};
 use crate::td_api;
-use crate::user_manager::{FileId, SecretChatId, UserId};
+use crate::user_manager::{SecretChatId, UserId};
 use std::collections::{HashMap, HashSet};
 use tdmtproto::telegram_api;
 use tdutils::hash::{combine_hashes, hash_int64, hash_uint32};
@@ -9513,6 +9514,9 @@ pub struct MessagesManager {
     /// `active_live_location_message_full_ids_` (MessagesManager.h:3444)
     /// — the live-location registry (the std::set collapse).
     pub(crate) active_live_location_message_full_ids: std::collections::BTreeSet<MessageFullId>,
+    /// `message_full_id_to_file_source_id_` (MessagesManager.h:3442) —
+    /// the per-message file-source registry (M.10.18).
+    pub(crate) message_full_id_to_file_source_id: HashMap<MessageFullId, FileSourceId>,
     /// `added_message_count_` (MessagesManager.h:3664).
     pub(crate) added_message_count: i64,
     /// `debug_add_message_to_dialog_fail_reason_`
@@ -17026,6 +17030,20 @@ pub trait SendMessageContext: MessageObjectContext {
     /// `G()->unix_time()`.
     fn unix_time(&self) -> i32;
 
+    /// `ChatManager::get_channel_permissions(channel_id).can_edit_messages()`
+    /// (MessagesManager.cpp:23239).
+    fn channel_can_edit_messages(&self, channel_id: ChannelId) -> bool {
+        let _ = channel_id;
+        true
+    }
+
+    /// `ChatManager::get_channel_permissions(channel_id).can_pin_messages()`
+    /// (MessagesManager.cpp:23253).
+    fn channel_can_pin_messages(&self, channel_id: ChannelId) -> bool {
+        let _ = channel_id;
+        true
+    }
+
     /// `DialogManager::is_broadcast_channel` (MessagesManager.cpp:20957).
     fn is_broadcast_channel_dialog(&self, dialog_id: DialogId) -> bool;
 
@@ -23469,6 +23487,531 @@ pub fn get_message_embedding_code(
         result.push_str("?single");
     }
     Result::Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// M.10.10 — the edit validation plane
+// ---------------------------------------------------------------------------
+
+/// `MessageContentType.cpp:729` — `is_editable_message_content`.
+pub fn is_editable_message_content(content_type: MessageContentType) -> bool {
+    matches!(
+        content_type,
+        MessageContentType::Animation
+            | MessageContentType::Audio
+            | MessageContentType::Document
+            | MessageContentType::Game
+            | MessageContentType::PaidMedia
+            | MessageContentType::Photo
+            | MessageContentType::RichText
+            | MessageContentType::Text
+            | MessageContentType::ToDoList
+            | MessageContentType::Video
+            | MessageContentType::VoiceNote
+    )
+}
+
+/// `MessageContentType.cpp:835` — `is_editable_media_message_content`.
+pub fn is_editable_media_message_content(content_type: MessageContentType) -> bool {
+    matches!(
+        content_type,
+        MessageContentType::Animation
+            | MessageContentType::Audio
+            | MessageContentType::Document
+            | MessageContentType::Photo
+            | MessageContentType::Video
+    )
+}
+
+/// `DEFAULT_EDIT_TIME_LIMIT` (MessagesManager.cpp:23268).
+pub const DEFAULT_EDIT_TIME_LIMIT: i64 = 2 * 86400;
+
+/// `MessagesManager::can_edit_message` (MessagesManager.cpp:23183-23292).
+#[allow(clippy::too_many_arguments)]
+pub fn can_edit_message(
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    m: Option<&Message>,
+    is_editing: bool,
+    only_reply_markup: bool,
+) -> bool {
+    let Some(m) = m else {
+        return false;
+    };
+    if m.message_id.is_yet_unsent()
+        || m.message_id.is_local()
+        || is_message_forward(m)
+        || m.had_reply_markup
+        || m.ephemeral_message.is_some()
+    {
+        return false;
+    }
+    if m.reply_markup
+        .as_ref()
+        .is_some_and(|reply_markup| reply_markup.r#type != ReplyMarkupType::InlineKeyboard)
+    {
+        return false;
+    }
+    if m.is_paid_suggested_post_stars || m.is_paid_suggested_post_ton {
+        return false;
+    }
+    if m.suggested_post
+        .as_ref()
+        .is_some_and(|suggested_post| !suggested_post.is_pending())
+    {
+        return false;
+    }
+
+    let my_id = ctx.content_context().get_my_id();
+    let is_inline_message = m.via_bot_user_id.is_valid();
+    if is_inline_message && (m.via_bot_user_id != my_id || m.message_id.is_scheduled()) {
+        return false;
+    }
+
+    let is_bot = ctx.is_bot();
+    let content_type = m
+        .content
+        .as_ref()
+        .map(|c| c.get_type())
+        .unwrap_or(MessageContentType::Unsupported);
+    let my_dialog_id = DialogId::from_user_id(my_id);
+    let mut has_edit_time_limit = !(is_bot && m.is_outgoing)
+        && dialog_id != my_dialog_id
+        && content_type != MessageContentType::Poll
+        && content_type != MessageContentType::ToDoList
+        && content_type != MessageContentType::LiveLocation
+        && !m.message_id.is_scheduled();
+    match dialog_id.get_type() {
+        DialogType::User => {
+            if !m.is_outgoing && dialog_id != my_dialog_id && !is_inline_message {
+                return false;
+            }
+        }
+        DialogType::Chat => {
+            if !m.is_outgoing && !is_inline_message {
+                return false;
+            }
+        }
+        DialogType::Channel => {
+            if is_inline_message {
+                // outgoing via_bot messages can always be edited
+            } else {
+                let channel_id = dialog_id.get_channel_id();
+                if m.is_channel_post {
+                    if m.message_id.is_scheduled() {
+                        if !ctx.channel_can_post_messages(channel_id) {
+                            return false;
+                        }
+                    } else {
+                        if !ctx.channel_can_edit_messages(channel_id)
+                            && !(ctx.channel_can_post_messages(channel_id) && m.is_outgoing)
+                        {
+                            return false;
+                        }
+                        if ctx.channel_can_edit_messages(channel_id) {
+                            has_edit_time_limit = false;
+                        }
+                    }
+                    if is_bot && only_reply_markup {
+                        has_edit_time_limit = false;
+                    }
+                } else {
+                    if !m.is_outgoing {
+                        return false;
+                    }
+                    if ctx.channel_can_pin_messages(channel_id) {
+                        has_edit_time_limit = false;
+                    }
+                }
+            }
+        }
+        DialogType::SecretChat => return false,
+        DialogType::None => unreachable!(),
+    }
+
+    if has_edit_time_limit {
+        let edit_time_limit = ctx
+            .content_context()
+            .get_option_integer("edit_time_limit", DEFAULT_EDIT_TIME_LIMIT);
+        if (ctx.unix_time() - m.date - (if is_editing { 300 } else { 0 })) as i64 >= edit_time_limit
+        {
+            return false;
+        }
+    }
+
+    if is_editable_message_content(content_type) {
+        return true;
+    }
+    if is_bot
+        && only_reply_markup
+        && !crate::message_content::is_service_message_content(content_type)
+        && !crate::message_content::is_expired_message_content(content_type)
+    {
+        return true;
+    }
+    match content_type {
+        MessageContentType::LiveLocation => {
+            // live location can be edited only during the period
+            ctx.unix_time() - m.date
+                < crate::message_content::get_message_content_live_location_period(
+                    m.content.as_ref().unwrap(),
+                )
+        }
+        MessageContentType::Poll => {
+            // non-closed non-scheduled polls can be closed
+            !m.message_id.is_scheduled()
+                && !crate::message_content::get_message_content_poll_is_closed(
+                    ctx.content_context(),
+                    m.content.as_ref().unwrap(),
+                )
+        }
+        _ => false,
+    }
+}
+
+/// `MessagesManager::can_edit_message_media` (MessagesManager.cpp:
+/// 23294-23310).
+pub fn can_edit_message_media(
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    m: Option<&Message>,
+    is_editing: bool,
+) -> bool {
+    if !can_edit_message(ctx, dialog_id, m, is_editing, false) {
+        return false;
+    }
+    let m = m.unwrap();
+    if m.video_processing_pending {
+        return false;
+    }
+    if !m.ttl.is_empty() {
+        return false;
+    }
+    let content_type = m
+        .content
+        .as_ref()
+        .map(|c| c.get_type())
+        .unwrap_or(MessageContentType::Unsupported);
+    if !is_editable_media_message_content(content_type)
+        && content_type != MessageContentType::RichText
+        && content_type != MessageContentType::Text
+    {
+        return false;
+    }
+    true
+}
+
+/// `MessagesManager::can_edit_message_scheduling_state`
+/// (MessagesManager.cpp:23312-23320).
+pub fn can_edit_message_scheduling_state(m: &Message) -> bool {
+    if !m.message_id.is_valid_scheduled() || !m.message_id.is_scheduled_server() {
+        return false;
+    }
+    if m.is_paid_suggested_post_stars || m.is_paid_suggested_post_ton {
+        return false;
+    }
+    true
+}
+
+/// `MessagesManager::is_message_edited_recently`
+/// (MessagesManager.cpp:15531-15544).
+pub fn is_message_edited_recently(
+    ctx: &dyn SendMessageContext,
+    manager: &MessagesManager,
+    message_full_id: MessageFullId,
+    seconds: i32,
+) -> bool {
+    if seconds < 0 {
+        return false;
+    }
+    if !message_full_id.get_message_id().is_valid() {
+        return false;
+    }
+    let m = manager
+        .get_dialog(message_full_id.get_dialog_id())
+        .and_then(|d| d.messages.get(&message_full_id.get_message_id()));
+    match m {
+        None => true,
+        Some(m) => m.edit_date >= ctx.unix_time() - seconds,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// M.10.16 — call search + the calendar assembly
+// ---------------------------------------------------------------------------
+
+/// `MAX_SEARCH_MESSAGES` (MessagesManager.h).
+pub const MAX_SEARCH_MESSAGES: i32 = 100;
+
+/// `MessagesManager::search_call_messages` (MessagesManager.cpp:
+/// 18520-18572) — the validation head, the offset parse and the
+/// in-memory decision table; the message-db `get_calls` query and the
+/// `SearchCallMessagesQuery` server send are the net/db seams. Returns
+/// the normalized (offset_message_id, limit, filter) when a load is
+/// pending.
+pub fn search_call_messages_decisions(
+    global: &crate::global::Global,
+    manager: &MessagesManager,
+    offset: &str,
+    limit: i32,
+    only_missed: bool,
+) -> Result<Option<(MessageId, i32, MessageSearchFilter)>, Status> {
+    if limit <= 0 {
+        return Result::Err(Status::error(400, "Parameter limit must be positive"));
+    }
+    let limit = if limit > MAX_SEARCH_MESSAGES {
+        MAX_SEARCH_MESSAGES
+    } else {
+        limit
+    };
+
+    let mut offset_message_id = MessageId::default();
+    if !offset.is_empty() {
+        match offset.parse::<i32>() {
+            Ok(server_message_id) => {
+                offset_message_id =
+                    MessageId::from_server_message_id(ServerMessageId::new(server_message_id));
+            }
+            Err(_) => {
+                return Result::Err(Status::error(400, "Invalid offset specified"));
+            }
+        }
+    }
+
+    let filter = if only_missed {
+        MessageSearchFilter::MissedCall
+    } else {
+        MessageSearchFilter::Call
+    };
+    if global.use_message_database() {
+        // try to use database
+        let call_index = call_message_search_filter_index(filter) as usize;
+        let first_db_message_id = manager
+            .calls_db_state
+            .first_calls_database_message_id_by_index[call_index];
+        let message_count = manager.calls_db_state.message_count_by_index[call_index];
+        let mut fixed_from_message_id = offset_message_id;
+        if fixed_from_message_id == MessageId::default() {
+            fixed_from_message_id = MessageId::max();
+        }
+        assert!(fixed_from_message_id.is_server());
+        if first_db_message_id < fixed_from_message_id && message_count != -1 {
+            // the MessageDbCallsQuery get_calls leg is the db-async seam;
+            // the decisions below are what on_message_db_calls_result
+            // consumes
+            return Result::Ok(None);
+        }
+    }
+
+    // the SearchCallMessagesQuery send is the net seam
+    Result::Ok(Some((offset_message_id, limit, filter)))
+}
+
+/// `MessagesManager::on_get_message_calendar_from_database`
+/// (MessagesManager.cpp:18290-18337) — the post-db-result assembly: the
+/// rows become (message, total_count) periods, then calendar days. The
+/// db query itself and the server fallback are the seams.
+pub fn on_get_message_calendar_from_database(
+    manager: &mut MessagesManager,
+    ctx: &mut dyn MessageObjectContext,
+    dialog_id: DialogId,
+    from_message_id: MessageId,
+    first_db_message_id: MessageId,
+    filter: MessageSearchFilter,
+    rows: Vec<(Box<Message>, i32)>,
+) -> Result<td_api::MessageCalendar, Status> {
+    assert!(!from_message_id.is_scheduled());
+    assert!(!first_db_message_id.is_scheduled());
+
+    let mut periods = Vec::with_capacity(rows.len());
+    for (m, total_count) in rows {
+        // on_get_message_from_database — the db-loaded message registers
+        // into the dialog container
+        let message_id = m.message_id;
+        {
+            let d = manager
+                .get_dialog_mut(dialog_id)
+                .expect("on_get_message_calendar_from_database without the dialog");
+            d.messages.insert(message_id, m);
+        }
+        if first_db_message_id <= message_id {
+            assert!(!message_id.is_scheduled());
+            periods.push((message_id, total_count));
+        }
+    }
+
+    let total_count = manager
+        .get_dialog(dialog_id)
+        .map(|d| d.message_count_by_index[message_search_filter_index(filter) as usize])
+        .unwrap_or(-1);
+    let mut days = Vec::with_capacity(periods.len());
+    for (message_id, total_count) in periods {
+        let mut taken = manager
+            .get_dialog_mut(dialog_id)
+            .unwrap()
+            .messages
+            .remove(&message_id);
+        let mut object = None;
+        if let Some(m) = taken.as_mut() {
+            let reactions_ctx = MessageObjectReactionsContext { ctx };
+            object = get_message_object(
+                manager,
+                &reactions_ctx,
+                ctx,
+                dialog_id,
+                m,
+                "on_get_message_calendar_from_database",
+            );
+        }
+        if let Some(m) = taken {
+            manager
+                .get_dialog_mut(dialog_id)
+                .unwrap()
+                .messages
+                .insert(message_id, m);
+        }
+        days.push(td_api::MessageCalendarDay {
+            total_count,
+            message: object,
+        });
+    }
+    Result::Ok(td_api::MessageCalendar { total_count, days })
+}
+
+// ---------------------------------------------------------------------------
+// M.10.18 — the message file-source registry
+// ---------------------------------------------------------------------------
+
+/// `MessagesManager::get_message_file_source_id`
+/// (MessagesManager.cpp:18835-18856) — the per-message file-source
+/// registry; the `FileReferenceManager::create_message_file_source`
+/// allocation is the M.12 seam (the id creation lands with it — the
+/// registry returns the default until then).
+pub fn get_message_file_source_id(
+    ctx: &dyn SendMessageContext,
+    manager: &mut MessagesManager,
+    message_full_id: MessageFullId,
+    force: bool,
+) -> FileSourceId {
+    if !force {
+        if ctx.is_bot() {
+            return FileSourceId::default();
+        }
+        let dialog_id = message_full_id.get_dialog_id();
+        let message_id = message_full_id.get_message_id();
+        if !dialog_id.is_valid()
+            || !(message_id.is_valid() || message_id.is_valid_scheduled())
+            || dialog_id.get_type() == DialogType::SecretChat
+            || !message_id.is_any_server()
+        {
+            return FileSourceId::default();
+        }
+    }
+    let entry = manager
+        .message_full_id_to_file_source_id
+        .entry(message_full_id)
+        .or_default();
+    // `FileReferenceManager::create_message_file_source` — the M.12 seam
+    *entry
+}
+
+/// `MessagesManager::get_message_file_ids` (MessagesManager.cpp:
+/// 21353-21362) — the message-level file-id collection. The
+/// `get_message_content_file_ids` full form (all alternative ids) rides
+/// the M.9/M.12 file planes; the ported `get_message_content_any_file_ids`
+/// covers the main ids — the recorded approximation.
+pub fn get_message_file_ids(
+    content_ctx: &dyn crate::message_content::MessageContentContext,
+    m: &Message,
+) -> Vec<FileId> {
+    let mut file_ids = m
+        .content
+        .as_ref()
+        .map(|content| {
+            crate::message_content::get_message_content_any_file_ids(content_ctx, content)
+        })
+        .unwrap_or_default();
+    if !m.replied_message_info.is_empty()
+        && let Some(content) = &m.replied_message_info.content
+    {
+        file_ids.extend(crate::message_content::get_message_content_any_file_ids(
+            content_ctx,
+            content,
+        ));
+    }
+    file_ids
+}
+
+/// `MessagesManager::add_message_file_sources`
+/// (MessagesManager.cpp:18858-18884) — the file-id → source registration
+/// walk; the `FileManager::add_file_source` calls are the M.12 seam.
+pub fn add_message_file_sources(
+    ctx: &dyn SendMessageContext,
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    m: &Message,
+    source: &str,
+) {
+    if ctx.is_bot() {
+        return;
+    }
+    let file_ids = get_message_file_ids(ctx.content_context(), m);
+    if file_ids.is_empty() {
+        return;
+    }
+    let file_source_id = get_message_file_source_id(
+        ctx,
+        manager,
+        MessageFullId::new(dialog_id, m.message_id),
+        false,
+    );
+    if file_source_id.is_valid() {
+        // `FileManager::add_file_source(file_id, file_source_id, source)`
+        // — the M.12 seam
+        tracing::info!(
+            "add_message_file_sources: {} files for {}:{} from {}",
+            file_ids.len(),
+            dialog_id.get(),
+            DisplayMessageId(m.message_id),
+            source
+        );
+    }
+}
+
+/// `MessagesManager::remove_message_file_sources`
+/// (MessagesManager.cpp:18886-18902) — the teardown walk; the
+/// `DownloadManager::remove_file` + `FileManager::remove_file_source`
+/// calls are the M.12 seam.
+pub fn remove_message_file_sources(
+    ctx: &dyn SendMessageContext,
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    m: &Message,
+    source: &str,
+) {
+    if ctx.is_bot() {
+        return;
+    }
+    let file_ids = get_message_file_ids(ctx.content_context(), m);
+    if file_ids.is_empty() {
+        return;
+    }
+    let file_source_id = get_message_file_source_id(
+        ctx,
+        manager,
+        MessageFullId::new(dialog_id, m.message_id),
+        false,
+    );
+    if file_source_id.is_valid() {
+        // the DownloadManager/FileManager removal calls are the M.12 seam
+        tracing::info!(
+            "remove_message_file_sources: {} files for {}:{} from {}",
+            file_ids.len(),
+            dialog_id.get(),
+            DisplayMessageId(m.message_id),
+            source
+        );
+    }
 }
 
 #[cfg(test)]
@@ -30298,5 +30841,384 @@ mod tests {
         sched.finish();
         assert_eq!(cleaned.load(AtomicOrdering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- M.10.10 the edit validation plane --
+
+    fn m10_10_ctx(unix_time: i32) -> SendTestContext {
+        SendTestContext {
+            unix_time,
+            ..SendTestContext::default()
+        }
+    }
+
+    fn m10_10_editable_message(sender_user_id: i64, is_outgoing: bool) -> Message {
+        Message {
+            message_id: m10_7_server_id(5),
+            date: 1700000000,
+            is_outgoing,
+            sender_user_id: crate::user_manager::UserId::new(sender_user_id),
+            content: Some(m10_8_text_content("hello")),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn m10_10_can_edit_message_tables() {
+        let ctx = m10_10_ctx(1700000000 + 100);
+        let user_dialog = DialogId::from_user_id(UserId::new(7));
+        let my_dialog = DialogId::from_user_id(
+            crate::message_content::MessageContentContext::get_my_id(&ctx.inner.content),
+        );
+
+        // my outgoing message in a user dialog is editable
+        assert!(can_edit_message(
+            &ctx,
+            user_dialog,
+            Some(&m10_10_editable_message(1, true)),
+            false,
+            false
+        ));
+        // an incoming message in a user dialog is not
+        assert!(!can_edit_message(
+            &ctx,
+            user_dialog,
+            Some(&m10_10_editable_message(2, false)),
+            false,
+            false
+        ));
+        // ... unless it is my saved-messages dialog
+        assert!(can_edit_message(
+            &ctx,
+            my_dialog,
+            Some(&m10_10_editable_message(2, false)),
+            false,
+            false
+        ));
+        // forwarded messages are never editable
+        let mut forwarded = m10_10_editable_message(1, true);
+        forwarded.forward_info = Some(MessageForwardInfo::default());
+        assert!(!can_edit_message(
+            &ctx,
+            user_dialog,
+            Some(&forwarded),
+            false,
+            false
+        ));
+        // yet-unsent/local/ephemeral messages are never editable
+        let mut yet_unsent = m10_10_editable_message(1, true);
+        yet_unsent.message_id = m10_8_yet_unsent(1);
+        assert!(!can_edit_message(
+            &ctx,
+            user_dialog,
+            Some(&yet_unsent),
+            false,
+            false
+        ));
+        let mut ephemeral = m10_10_editable_message(1, true);
+        ephemeral.ephemeral_message = Some(Box::new(m10_10_editable_message(1, true)));
+        assert!(!can_edit_message(
+            &ctx,
+            user_dialog,
+            Some(&ephemeral),
+            false,
+            false
+        ));
+
+        // a non-inline reply markup blocks editing
+        let mut with_keyboard = m10_10_editable_message(1, true);
+        with_keyboard.reply_markup = Some(Box::new(ReplyMarkup {
+            r#type: ReplyMarkupType::ShowKeyboard,
+            ..Default::default()
+        }));
+        assert!(!can_edit_message(
+            &ctx,
+            user_dialog,
+            Some(&with_keyboard),
+            false,
+            false
+        ));
+        let mut with_inline = m10_10_editable_message(1, true);
+        with_inline.reply_markup = Some(Box::new(ReplyMarkup {
+            r#type: ReplyMarkupType::InlineKeyboard,
+            ..Default::default()
+        }));
+        assert!(can_edit_message(
+            &ctx,
+            user_dialog,
+            Some(&with_inline),
+            false,
+            false
+        ));
+
+        // the edit time limit: 2 days + 300s grace for is_editing
+        let old_ctx = m10_10_ctx(1700000000 + 2 * 86400 + 100);
+        assert!(!can_edit_message(
+            &old_ctx,
+            user_dialog,
+            Some(&m10_10_editable_message(1, true)),
+            false,
+            false
+        ));
+        assert!(can_edit_message(
+            &old_ctx,
+            user_dialog,
+            Some(&m10_10_editable_message(1, true)),
+            true,
+            false
+        ));
+        // ... but never in my own dialog
+        assert!(can_edit_message(
+            &old_ctx,
+            my_dialog,
+            Some(&m10_10_editable_message(1, true)),
+            false,
+            false
+        ));
+
+        // channel posts: the default all-rights seam allows both shapes
+        let channel_dialog = DialogId::from_channel_id(ChannelId::new(9));
+        let mut channel_post = m10_10_editable_message(1, true);
+        channel_post.is_channel_post = true;
+        assert!(can_edit_message(
+            &ctx,
+            channel_dialog,
+            Some(&channel_post),
+            false,
+            false
+        ));
+        // an incoming non-post in a channel is not editable
+        assert!(!can_edit_message(
+            &ctx,
+            channel_dialog,
+            Some(&m10_10_editable_message(2, false)),
+            false,
+            false
+        ));
+        // secret chats are never editable
+        let secret_dialog = DialogId::from_secret_chat_id(SecretChatId::new(3));
+        assert!(!can_edit_message(
+            &ctx,
+            secret_dialog,
+            Some(&m10_10_editable_message(1, true)),
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn m10_10_can_edit_media_and_scheduling_tables() {
+        let ctx = m10_10_ctx(1700000000 + 100);
+        let user_dialog = DialogId::from_user_id(UserId::new(7));
+        let editable = m10_10_editable_message(1, true);
+        assert!(can_edit_message_media(
+            &ctx,
+            user_dialog,
+            Some(&editable),
+            false
+        ));
+
+        // the ttl gate
+        let mut with_ttl = m10_10_editable_message(1, true);
+        with_ttl.ttl = MessageSelfDestructType::with_ttl(60, true);
+        assert!(!can_edit_message_media(
+            &ctx,
+            user_dialog,
+            Some(&with_ttl),
+            false
+        ));
+
+        // the video-processing gate
+        let mut processing = m10_10_editable_message(1, true);
+        processing.video_processing_pending = true;
+        assert!(!can_edit_message_media(
+            &ctx,
+            user_dialog,
+            Some(&processing),
+            false
+        ));
+
+        // a voice note (editable content but not editable media) passes the
+        // text arm only for Text/RichText — VoiceNote fails media editing
+        let mut voice_note = m10_10_editable_message(1, true);
+        voice_note.content = Some(MessageContent::VoiceNote(
+            crate::message_content::MessageVoiceNote::default(),
+        ));
+        assert!(can_edit_message(
+            &ctx,
+            user_dialog,
+            Some(&voice_note),
+            false,
+            false
+        ));
+        assert!(!can_edit_message_media(
+            &ctx,
+            user_dialog,
+            Some(&voice_note),
+            false
+        ));
+
+        // scheduling state: scheduled server messages only
+        let scheduled = Message {
+            message_id: MessageId::from_scheduled(
+                ScheduledServerMessageId::new(4),
+                1700000000,
+                true,
+            ),
+            ..Default::default()
+        };
+        assert!(can_edit_message_scheduling_state(&scheduled));
+        let server = m10_10_editable_message(1, true);
+        assert!(!can_edit_message_scheduling_state(&server));
+    }
+
+    #[test]
+    fn m10_10_edited_recently_table() {
+        let mut manager = MessagesManager::new();
+        let dialog_id = DialogId::from_user_id(UserId::new(7));
+        let d = manager.add_dialog_for_new_message(dialog_id);
+        let message_id = m10_7_server_id(5);
+        d.messages.insert(
+            message_id,
+            Box::new(Message {
+                message_id,
+                edit_date: 1700000000,
+                ..Default::default()
+            }),
+        );
+        let ctx = m10_10_ctx(1700000000 + 50);
+        let full_id = MessageFullId::new(dialog_id, message_id);
+        assert!(is_message_edited_recently(&ctx, &manager, full_id, 60));
+        assert!(!is_message_edited_recently(&ctx, &manager, full_id, 30));
+        assert!(!is_message_edited_recently(&ctx, &manager, full_id, -1));
+        // a missing message answers true like the C++ nullptr leg
+        assert!(is_message_edited_recently(
+            &ctx,
+            &manager,
+            MessageFullId::new(dialog_id, m10_7_server_id(99)),
+            60
+        ));
+    }
+
+    // -- M.10.16 call search + calendar assembly --
+
+    #[test]
+    fn m10_16_search_call_decisions_table() {
+        let global = crate::global::Global::new();
+        let manager = MessagesManager::new();
+
+        // validation
+        let err = search_call_messages_decisions(&global, &manager, "", 0, false).unwrap_err();
+        assert_eq!(err.code(), 400);
+        let err = search_call_messages_decisions(&global, &manager, "abc", 10, false).unwrap_err();
+        assert_eq!(err.code(), 400);
+        let err = search_call_messages_decisions(&global, &manager, "1.5", 10, false).unwrap_err();
+        assert_eq!(err.code(), 400);
+
+        // limit clamp + the empty-calls-state answer (the db leg is the seam)
+        let decision = search_call_messages_decisions(&global, &manager, "", 500, false).unwrap();
+        let (_, limit, filter) = decision.unwrap();
+        assert_eq!(limit, MAX_SEARCH_MESSAGES);
+        assert_eq!(filter, MessageSearchFilter::Call);
+        let decision = search_call_messages_decisions(&global, &manager, "12", 10, true).unwrap();
+        let (offset_message_id, _, filter) = decision.unwrap();
+        assert_eq!(offset_message_id, m10_7_server_id(12));
+        assert_eq!(filter, MessageSearchFilter::MissedCall);
+    }
+
+    #[test]
+    fn m10_16_calendar_assembly_table() {
+        let mut manager = MessagesManager::new();
+        let mut ctx = TestObjectContext::default();
+        let dialog_id = DialogId::from_user_id(UserId::new(7));
+        manager.add_dialog_for_new_message(dialog_id);
+        {
+            let d = manager.get_dialog_mut(dialog_id).unwrap();
+            d.message_count_by_index
+                [message_search_filter_index(MessageSearchFilter::Photo) as usize] = 3;
+        }
+        let first = m10_7_server_id(11);
+        // message 9 is below the first-database-id gate and is dropped like
+        // the C++ `first_db_message_id <= m->message_id` filter
+        let rows = vec![
+            (Box::new(m10_7_incoming_message(11)), 2),
+            (Box::new(m10_7_incoming_message(12)), 1),
+            (Box::new(m10_7_incoming_message(9)), 9),
+        ];
+        let calendar = on_get_message_calendar_from_database(
+            &mut manager,
+            &mut ctx,
+            dialog_id,
+            m10_7_server_id(1),
+            first,
+            MessageSearchFilter::Photo,
+            rows,
+        )
+        .unwrap();
+        assert_eq!(calendar.total_count, 3);
+        assert_eq!(calendar.days.len(), 2);
+        assert_eq!(calendar.days[0].total_count, 2);
+        assert!(calendar.days[0].message.is_some());
+        assert_eq!(calendar.days[1].total_count, 1);
+        // the messages registered into the dialog container
+        assert!(
+            manager
+                .get_dialog(dialog_id)
+                .unwrap()
+                .messages
+                .contains_key(&m10_7_server_id(11))
+        );
+    }
+
+    // -- M.10.18 the file-source registry --
+
+    #[test]
+    fn m10_18_file_source_registry_table() {
+        let mut manager = MessagesManager::new();
+        let ctx = m10_10_ctx(1700000000);
+        let dialog_id = DialogId::from_user_id(UserId::new(7));
+        let full_id = MessageFullId::new(dialog_id, m10_7_server_id(5));
+
+        // the non-force gates: the server-id shape passes and yields the
+        // (empty until M.12) registry slot
+        let source_id = get_message_file_source_id(&ctx, &mut manager, full_id, false);
+        assert!(!source_id.is_valid());
+        // a secret-chat id never gets a slot
+        let secret_id = MessageFullId::new(
+            DialogId::from_secret_chat_id(SecretChatId::new(3)),
+            m10_7_server_id(5),
+        );
+        assert!(!get_message_file_source_id(&ctx, &mut manager, secret_id, false).is_valid());
+        // a yet-unsent id never gets a slot either
+        let yet_unsent = MessageFullId::new(dialog_id, m10_8_yet_unsent(1));
+        assert!(!get_message_file_source_id(&ctx, &mut manager, yet_unsent, false).is_valid());
+
+        // the file walk: a text message collects no ids, a photo message
+        // registers through the seam (the add/remove are no-ops until M.12)
+        let text_message = m10_10_editable_message(1, true);
+        add_message_file_sources(&ctx, &mut manager, dialog_id, &text_message, "test");
+        remove_message_file_sources(&ctx, &mut manager, dialog_id, &text_message, "test");
+        assert_eq!(
+            get_message_file_ids(&ctx.inner.content, &text_message).len(),
+            0
+        );
+        let mut photo_message = m10_10_editable_message(1, true);
+        let photo = crate::photo::Photo {
+            photos: vec![crate::photo::PhotoSize {
+                file_id: crate::files::FileId::new(1, 0),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        photo_message.content = Some(MessageContent::Photo(
+            crate::message_content::MessagePhoto {
+                photo,
+                ..Default::default()
+            },
+        ));
+        assert_eq!(
+            get_message_file_ids(&ctx.inner.content, &photo_message).len(),
+            1
+        );
     }
 }
