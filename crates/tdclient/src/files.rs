@@ -5785,6 +5785,12 @@ pub trait FileManagerWorker {
     fn finish_download(&mut self, _file_id: FileId) {}
     /// `FileManager::finish_uploads(file_id, Status::OK())` post-merge.
     fn finish_upload(&mut self, _file_id: FileId) {}
+    /// `FileManager::clear_from_pmc` — the pmc record deletion; the
+    /// TdDb wiring lands with the live flip (M.12.10).
+    fn clear_from_pmc(&mut self, _node: &FileNode) {}
+    /// `DownloadManager::remove_file_if_finished` — a no-op until the
+    /// DownloadManager component lands under M.12.
+    fn remove_file_if_finished(&mut self, _file_id: FileId) {}
     /// `FileManager::run_generate` + `run_download` + `run_upload`.
     fn run_node(&mut self, _node: &FileNode) {}
     /// The `flush_node_info` half of `FileManager::try_flush_node_info`.
@@ -16482,6 +16488,888 @@ fn check_generate_mtime(
     )))
 }
 
+/// `FileTypeStat` (FileStats.h:19-22) — the per-file-type byte/count
+/// accumulator; the binlog record is `store(size)` + `store(cnt)`
+/// (FileStats.cpp:24-33), which the fast-stat persistence rides.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileTypeStat {
+    pub size: i64,
+    pub cnt: i32,
+}
+
+/// `FullFileInfo` (FileStats.h:43-50) — one file as the gc and the
+/// stats worker see it.
+#[derive(Clone, Debug)]
+pub struct FullFileInfo {
+    pub file_type: FileType,
+    pub path: String,
+    pub owner_dialog_id: DialogId,
+    pub size: i64,
+    pub atime_nsec: u64,
+    pub mtime_nsec: u64,
+}
+
+/// `FileStatsFast` (FileStats.h:52-67).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FileStatsFast {
+    pub size: i64,
+    pub count: i32,
+    pub database_size: i64,
+    pub language_pack_database_size: i64,
+    pub log_size: i64,
+}
+
+impl FileStatsFast {
+    /// `get_storage_statistics_fast_object` (FileStats.cpp:26-30).
+    pub fn get_storage_statistics_fast_object(&self) -> td_api::StorageStatisticsFast {
+        td_api::StorageStatisticsFast {
+            files_size: self.size,
+            file_count: self.count,
+            database_size: self.database_size,
+            language_pack_database_size: self.language_pack_database_size,
+            log_size: self.log_size,
+        }
+    }
+}
+
+/// The per-type stat array (`FileStats::StatByType`).
+pub type StatByType = Vec<FileTypeStat>;
+
+fn new_stat_by_type() -> StatByType {
+    vec![FileTypeStat::default(); MAX_FILE_TYPE as usize]
+}
+
+/// `td::FileStats` (FileStats.h:69-117) — the accumulator behind
+/// `getStorageStatistics`/`optimizeStorage`.
+pub struct FileStats {
+    need_all_files: bool,
+    split_by_owner_dialog_id: bool,
+    stat_by_type: StatByType,
+    /// The C++ `std::unordered_map` becomes a `BTreeMap`: the td_api
+    /// `by_chat` order is a full sort (size desc, chat-id-0 last) whose
+    /// ties the C++ leaves hash-order dependent; the BTreeMap key order
+    /// makes the tie-break chat-id ascending.
+    stat_by_owner_dialog_id: BTreeMap<DialogId, StatByType>,
+    all_files: Vec<FullFileInfo>,
+}
+
+impl FileStats {
+    /// `FileStats::FileStats` (FileStats.cpp:106-110).
+    pub fn new(need_all_files: bool, split_by_owner_dialog_id: bool) -> FileStats {
+        FileStats {
+            need_all_files,
+            split_by_owner_dialog_id,
+            stat_by_type: new_stat_by_type(),
+            stat_by_owner_dialog_id: BTreeMap::new(),
+            all_files: Vec::new(),
+        }
+    }
+
+    /// `FileStats::add(StatByType&, ...)` (FileStats.cpp:32-38).
+    fn add_to(by_type: &mut StatByType, file_type: FileType, size: i64) {
+        let pos = file_type as usize;
+        by_type[pos].size += size;
+        by_type[pos].cnt += 1;
+    }
+
+    /// `FileStats::add_impl` (FileStats.cpp:40-47).
+    fn add_impl(&mut self, info: &FullFileInfo) {
+        if self.split_by_owner_dialog_id {
+            Self::add_to(
+                self.stat_by_owner_dialog_id
+                    .entry(info.owner_dialog_id)
+                    .or_insert_with(new_stat_by_type),
+                info.file_type,
+                info.size,
+            );
+        } else {
+            Self::add_to(&mut self.stat_by_type, info.file_type, info.size);
+        }
+    }
+
+    /// `FileStats::add_copy` (FileStats.cpp:49-54).
+    pub fn add_copy(&mut self, info: &FullFileInfo) {
+        self.add_impl(info);
+        if self.need_all_files {
+            self.all_files.push(info.clone());
+        }
+    }
+
+    /// `FileStats::add` (FileStats.cpp:56-61).
+    pub fn add(&mut self, info: FullFileInfo) {
+        self.add_impl(&info);
+        if self.need_all_files {
+            self.all_files.push(info);
+        }
+    }
+
+    /// `FileStats::get_nontemp_stat` (FileStats.cpp:63-72).
+    fn get_nontemp_stat(by_type: &StatByType) -> FileTypeStat {
+        let mut stat = FileTypeStat::default();
+        for i in 0..MAX_FILE_TYPE {
+            if FileType::from_raw(i) != FileType::Temp {
+                stat.size += by_type[i as usize].size;
+                stat.cnt += by_type[i as usize].cnt;
+            }
+        }
+        stat
+    }
+
+    /// `FileStats::get_total_nontemp_stat` (FileStats.cpp:74-87).
+    pub fn get_total_nontemp_stat(&self) -> FileTypeStat {
+        if !self.split_by_owner_dialog_id {
+            return Self::get_nontemp_stat(&self.stat_by_type);
+        }
+        let mut stat = FileTypeStat::default();
+        for by_type in self.stat_by_owner_dialog_id.values() {
+            let tmp = Self::get_nontemp_stat(by_type);
+            stat.size += tmp.size;
+            stat.cnt += tmp.cnt;
+        }
+        stat
+    }
+
+    /// `FileStats::apply_dialog_limit` (FileStats.cpp:89-112) — keeps
+    /// the `limit` biggest dialogs, folding the rest into the default
+    /// (invalid) dialog id.
+    pub fn apply_dialog_limit(&mut self, limit: i32) {
+        if limit == -1 || !self.split_by_owner_dialog_id {
+            return;
+        }
+        let mut dialogs: Vec<(i64, DialogId)> = self
+            .stat_by_owner_dialog_id
+            .iter()
+            .filter(|(dialog_id, _)| dialog_id.is_valid())
+            .map(|(dialog_id, by_type)| (by_type.iter().map(|s| s.size).sum(), *dialog_id))
+            .collect();
+        let prefix = dialogs.len().min(limit as usize);
+        dialogs.sort_by_key(|dialog| std::cmp::Reverse(dialog.0));
+        dialogs.truncate(prefix);
+
+        let dialog_ids: Vec<DialogId> = dialogs.iter().map(|(_, dialog_id)| *dialog_id).collect();
+        self.apply_dialog_ids(&dialog_ids);
+    }
+
+    /// `FileStats::apply_dialog_ids` (FileStats.cpp:114-141) — drops
+    /// every dialog outside `dialog_ids` into the default id bucket.
+    pub fn apply_dialog_ids(&mut self, dialog_ids: &[DialogId]) {
+        let all_dialog_ids: BTreeSet<DialogId> = dialog_ids.iter().copied().collect();
+        let mut other_stats = new_stat_by_type();
+        let mut other_flag = false;
+        let mut removed = Vec::new();
+        for (dialog_id, by_type) in &self.stat_by_owner_dialog_id {
+            if !all_dialog_ids.contains(dialog_id) {
+                for i in 0..MAX_FILE_TYPE as usize {
+                    other_stats[i].size += by_type[i].size;
+                    other_stats[i].cnt += by_type[i].cnt;
+                }
+                other_flag = true;
+                removed.push(*dialog_id);
+            }
+        }
+        for dialog_id in removed {
+            self.stat_by_owner_dialog_id.remove(&dialog_id);
+        }
+        if other_flag {
+            self.stat_by_owner_dialog_id
+                .insert(DialogId::default(), other_stats);
+        }
+    }
+
+    /// `FileStats::get_storage_statistics_by_chat_object`
+    /// (FileStats.cpp:143-166) — aggregates by main file type and
+    /// returns the non-zero entries.
+    fn get_storage_statistics_by_chat_object(
+        dialog_id: DialogId,
+        stat_by_type: &StatByType,
+    ) -> td_api::StorageStatisticsByChat {
+        let mut stats = td_api::StorageStatisticsByChat {
+            chat_id: dialog_id.get(),
+            size: 0,
+            count: 0,
+            by_file_type: Vec::new(),
+        };
+        let mut aggregated = new_stat_by_type();
+        for i in 0..MAX_FILE_TYPE {
+            let main = get_main_file_type(FileType::from_raw(i)) as usize;
+            aggregated[main].size += stat_by_type[i as usize].size;
+            aggregated[main].cnt += stat_by_type[i as usize].cnt;
+        }
+        for i in 0..MAX_FILE_TYPE {
+            let size = aggregated[i as usize].size;
+            let cnt = aggregated[i as usize].cnt;
+            if size == 0 {
+                continue;
+            }
+            stats.size += size;
+            stats.count += cnt;
+            stats
+                .by_file_type
+                .push(td_api::StorageStatisticsByFileType {
+                    file_type: Some(get_file_type_object(FileType::from_raw(i))),
+                    size,
+                    count: cnt,
+                });
+        }
+        stats
+    }
+
+    /// `FileStats::get_storage_statistics_object` (FileStats.cpp:168-190).
+    pub fn get_storage_statistics_object(&self) -> td_api::StorageStatistics {
+        let mut stats = td_api::StorageStatistics {
+            size: 0,
+            count: 0,
+            by_chat: Vec::new(),
+        };
+        if !self.split_by_owner_dialog_id {
+            stats
+                .by_chat
+                .push(Self::get_storage_statistics_by_chat_object(
+                    DialogId::default(),
+                    &self.stat_by_type,
+                ));
+        } else {
+            let mut by_chat: Vec<td_api::StorageStatisticsByChat> = self
+                .stat_by_owner_dialog_id
+                .iter()
+                .map(|(dialog_id, by_type)| {
+                    Self::get_storage_statistics_by_chat_object(*dialog_id, by_type)
+                })
+                .collect();
+            // size desc, the empty chat_id last — the C++ comparator
+            by_chat.sort_by(|x, y| {
+                let x_zero = x.chat_id == 0;
+                let y_zero = y.chat_id == 0;
+                x_zero
+                    .cmp(&y_zero)
+                    .then_with(|| y.size.cmp(&x.size))
+                    .then_with(|| x.chat_id.cmp(&y.chat_id))
+            });
+            stats.by_chat = by_chat;
+        }
+        for by_dialog in &stats.by_chat {
+            stats.size += by_dialog.size;
+            stats.count += by_dialog.count;
+        }
+        stats
+    }
+
+    /// `FileStats::get_dialog_ids` (FileStats.cpp:192-204).
+    pub fn get_dialog_ids(&self) -> Vec<DialogId> {
+        if !self.split_by_owner_dialog_id {
+            return Vec::new();
+        }
+        self.stat_by_owner_dialog_id
+            .keys()
+            .filter(|dialog_id| dialog_id.is_valid())
+            .copied()
+            .collect()
+    }
+
+    /// `FileStats::get_all_files` (FileStats.cpp:206-209).
+    pub fn get_all_files(&mut self) -> Vec<FullFileInfo> {
+        std::mem::take(&mut self.all_files)
+    }
+}
+
+/// `FileGcParameters` (FileGcParameters.h:19-31).
+#[derive(Clone, Debug)]
+pub struct FileGcParameters {
+    pub max_files_size: i64,
+    pub max_time_from_last_access: u32,
+    pub max_file_count: u32,
+    pub immunity_delay: u32,
+    pub file_types: Vec<FileType>,
+    pub owner_dialog_ids: Vec<DialogId>,
+    pub exclude_owner_dialog_ids: Vec<DialogId>,
+    pub dialog_limit: i32,
+}
+
+impl Default for FileGcParameters {
+    /// `FileGcParameters()` (FileGcParameters.h:23) — all -1/0 sentinels.
+    fn default() -> FileGcParameters {
+        FileGcParameters {
+            max_files_size: -1,
+            max_time_from_last_access: -1i32 as u32,
+            max_file_count: -1i32 as u32,
+            immunity_delay: -1i32 as u32,
+            file_types: Vec::new(),
+            owner_dialog_ids: Vec::new(),
+            exclude_owner_dialog_ids: Vec::new(),
+            dialog_limit: 0,
+        }
+    }
+}
+
+impl FileGcParameters {
+    /// The `FileGcParameters::FileGcParameters` ctor
+    /// (FileGcParameters.cpp:19-33) — the -1 sentinels fall back to the
+    /// `storage_*` option reads with their defaults.
+    pub fn from_options(
+        ctx: &mut dyn FileManagerContext,
+        size: i64,
+        ttl: i32,
+        count: i32,
+        immunity_delay: i32,
+    ) -> FileGcParameters {
+        let max_files_size = if size >= 0 {
+            size
+        } else {
+            ctx.option_integer("storage_max_files_size", 100 << 10) << 10
+        };
+        let max_time_from_last_access = if ttl >= 0 {
+            ttl
+        } else {
+            ctx.option_integer("storage_max_time_from_last_access", 60 * 60 * 23) as i32
+        };
+        let max_file_count = if count >= 0 {
+            count
+        } else {
+            ctx.option_integer("storage_max_file_count", 40000) as i32
+        };
+        let immunity_delay = if immunity_delay >= 0 {
+            immunity_delay
+        } else {
+            ctx.option_integer("storage_immunity_delay", 60 * 60) as i32
+        };
+        FileGcParameters {
+            max_files_size,
+            max_time_from_last_access: max_time_from_last_access as u32,
+            max_file_count: max_file_count as u32,
+            immunity_delay: immunity_delay as u32,
+            file_types: Vec::new(),
+            owner_dialog_ids: Vec::new(),
+            exclude_owner_dialog_ids: Vec::new(),
+            dialog_limit: 0,
+        }
+    }
+}
+
+/// `FileGcResult` (FileGcWorker.h:24-27).
+pub struct FileGcResult {
+    pub kept_file_stats: FileStats,
+    pub removed_file_stats: FileStats,
+}
+
+/// The gc's outside world: the `G()->use_file_database()` immunity
+/// switch, the `FileManager::on_file_unlink` update plane and the
+/// cancellation probe. The C++ `CancellationToken` collapses to the
+/// `is_canceled()` probe.
+pub trait FileGcSink {
+    fn use_file_database(&self) -> bool {
+        false
+    }
+    fn is_canceled(&self) -> bool {
+        false
+    }
+    /// `FileManager::on_file_unlink` (FileManager.cpp:1676-1688).
+    fn on_file_unlink(&mut self, _location: FullLocalFileLocation) {}
+}
+
+/// `FileGcWorker::run_gc` (FileGcWorker.cpp:32-197) — the immunity and
+/// removal decision machine over the scanned `files`. The VLOG counters
+/// are logging-only in the C++ and are dropped here.
+pub fn run_file_gc(
+    sink: &mut dyn FileGcSink,
+    parameters: &FileGcParameters,
+    mut files: Vec<FullFileInfo>,
+    send_updates: bool,
+) -> Result<FileGcResult, Status> {
+    let mut immune_types = vec![false; MAX_FILE_TYPE as usize];
+    if sink.use_file_database() {
+        // immune by default (FileGcWorker.cpp:44-53)
+        for file_type in [
+            FileType::Sticker,
+            FileType::ProfilePhoto,
+            FileType::Thumbnail,
+            FileType::Wallpaper,
+            FileType::Background,
+            FileType::Ringtone,
+        ] {
+            immune_types[file_type as usize] = true;
+        }
+    }
+
+    if !parameters.file_types.is_empty() {
+        immune_types.fill(true);
+        for file_type in &parameters.file_types {
+            immune_types[*file_type as usize] = false;
+        }
+        for i in 0..MAX_FILE_TYPE {
+            let main_file_type = get_main_file_type(FileType::from_raw(i)) as usize;
+            if !immune_types[main_file_type] {
+                immune_types[i as usize] = false;
+            }
+        }
+    }
+
+    if sink.use_file_database() {
+        immune_types[FileType::EncryptedThumbnail as usize] = true;
+    }
+
+    for info in &mut files {
+        if info.atime_nsec < info.mtime_nsec {
+            info.atime_nsec = info.mtime_nsec;
+        }
+    }
+
+    let mut new_stats = FileStats::new(false, parameters.dialog_limit != 0);
+    let mut removed_stats = FileStats::new(false, parameters.dialog_limit != 0);
+
+    let now = tdutils::time::system();
+
+    // Remove all suitable files with (atime > now - max_time_from_last_access)
+    let mut kept = Vec::with_capacity(files.len());
+    for info in files.drain(..) {
+        if sink.is_canceled() {
+            kept.push(info);
+            continue;
+        }
+        if immune_types[info.file_type as usize] {
+            new_stats.add_copy(&info);
+            continue;
+        }
+        if parameters
+            .exclude_owner_dialog_ids
+            .contains(&info.owner_dialog_id)
+        {
+            new_stats.add_copy(&info);
+            continue;
+        }
+        if !parameters.owner_dialog_ids.is_empty()
+            && !parameters.owner_dialog_ids.contains(&info.owner_dialog_id)
+        {
+            new_stats.add_copy(&info);
+            continue;
+        }
+        if info.mtime_nsec as f64 * 1e-9 > now - parameters.immunity_delay as f64 {
+            // new files are immune to gc
+            new_stats.add_copy(&info);
+            continue;
+        }
+        if info.atime_nsec as f64 * 1e-9 < now - parameters.max_time_from_last_access as f64 {
+            // do_remove_file (FileGcWorker.cpp:74-82)
+            removed_stats.add_copy(&info);
+            let _ = std::fs::remove_file(&info.path);
+            if send_updates {
+                sink.on_file_unlink(FullLocalFileLocation::new(
+                    info.file_type,
+                    info.path.clone(),
+                    info.mtime_nsec,
+                ));
+            }
+            continue;
+        }
+        kept.push(info);
+    }
+    if sink.is_canceled() {
+        return Err(Status::error(500, "Request aborted"));
+    }
+
+    // sort by atime (the C++ comment says max(atime, mtime); the
+    // comparator is atime alone)
+    kept.sort_by_key(|info| info.atime_nsec);
+
+    // 1. Total size must be less than parameters.max_files_size_
+    // 2. Total file count must be less than parameters.max_file_count_
+    let mut remove_count = kept
+        .len()
+        .saturating_sub(parameters.max_file_count as usize);
+    let mut remove_size = -parameters.max_files_size;
+    for file in &kept {
+        remove_size += file.size;
+    }
+
+    let mut pos = 0;
+    while pos < kept.len() && (remove_count > 0 || remove_size > 0) {
+        if sink.is_canceled() {
+            return Err(Status::error(500, "Request aborted"));
+        }
+        remove_size -= kept[pos].size;
+
+        removed_stats.add_copy(&kept[pos]);
+        let _ = std::fs::remove_file(&kept[pos].path);
+        if send_updates {
+            sink.on_file_unlink(FullLocalFileLocation::new(
+                kept[pos].file_type,
+                kept[pos].path.clone(),
+                kept[pos].mtime_nsec,
+            ));
+        }
+        remove_count = remove_count.saturating_sub(1);
+        pos += 1;
+    }
+
+    for info in &kept[pos..] {
+        new_stats.add_copy(info);
+    }
+
+    Ok(FileGcResult {
+        kept_file_stats: new_stats,
+        removed_file_stats: removed_stats,
+    })
+}
+
+/// The `scan_fs` file record (FileStatsWorker.cpp:56-63).
+struct FsFileInfo {
+    file_type: FileType,
+    path: String,
+    size: i64,
+    atime_nsec: u64,
+    mtime_nsec: u64,
+}
+
+/// The stats-worker environment: the files dirs, the db scan and the
+/// stat source — the `FileStatsWorker`'s `G()` plane over the
+/// [`FileManagerContext`] and [`FileGcSink`].
+pub trait FileStatsSink: FileManagerContext + FileGcSink {
+    /// `log_interface->get_file_paths()` — the fast-stat log size.
+    fn log_file_paths(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// The `SqliteDb::with_db_path` pair for the database size.
+    fn database_paths(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// `G()->get_option_string("language_pack_database_path")`.
+    fn language_pack_database_path(&self) -> String {
+        String::new()
+    }
+    /// `scan_db` (FileStatsWorker.cpp:39-94) — the `file0`..`file:`
+    /// pmc range join. The callback receives (file_type, path,
+    /// owner_dialog_id, size); relative paths are already resolved.
+    fn scan_file_db(&mut self, _callback: &mut dyn FnMut(FileType, String, DialogId, i64)) {}
+}
+
+/// `walk_path` (td/utils/port/path) over the regular files of one dir.
+fn walk_regular_files(dir: &str, callback: &mut dyn FnMut(String)) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            walk_regular_files(&path.to_string_lossy(), callback);
+        } else if file_type.is_file() {
+            callback(path.to_string_lossy().into_owned());
+        }
+    }
+}
+
+/// `scan_fs` (FileStatsWorker.cpp:66-114) — every main file type's dir
+/// plus the secure-decrypted and video temp dirs, deduplicated.
+fn scan_fs(sink: &mut dyn FileStatsSink, callback: &mut dyn FnMut(FsFileInfo)) {
+    let mut scanned_file_dirs: BTreeSet<String> = BTreeSet::new();
+    let files_dir = sink.files_dir();
+    let secure_dir = sink.secure_files_dir();
+    let mut scan_dir = |file_type: FileType, file_dir: String| {
+        if file_dir.is_empty() || !scanned_file_dirs.insert(file_dir.clone()) {
+            return;
+        }
+        walk_regular_files(&file_dir, &mut |path| {
+            let Ok(stat) = sink.stat(&path) else {
+                return;
+            };
+            if stat.size == 0 && path.ends_with("/.nomedia") {
+                // skip .nomedia file
+                return;
+            }
+            callback(FsFileInfo {
+                file_type: guess_file_type_by_path(&path, file_type),
+                path: path.clone(),
+                size: stat.real_size,
+                atime_nsec: 0,
+                mtime_nsec: stat.mtime_nsec,
+            });
+        });
+    };
+    for i in 0..MAX_FILE_TYPE {
+        let file_type = FileType::from_raw(i);
+        let dir = get_files_dir(file_type, &files_dir, &secure_dir);
+        scan_dir(get_main_file_type(file_type), dir);
+    }
+    scan_dir(
+        get_main_file_type(FileType::Temp),
+        get_files_temp_dir(FileType::SecureDecrypted, &files_dir, &secure_dir),
+    );
+    scan_dir(
+        get_main_file_type(FileType::Temp),
+        get_files_temp_dir(FileType::Video, &files_dir, &secure_dir),
+    );
+}
+
+/// `FileStatsWorker::get_stats` (FileStatsWorker.cpp:117-200)
+/// collapsed: the fs scan joined with the db scan by path hash.
+pub fn get_file_stats(
+    sink: &mut dyn FileStatsSink,
+    need_all_files: bool,
+    split_by_owner_dialog_id: bool,
+) -> FileStats {
+    let mut full_infos: Vec<FullFileInfo> = Vec::new();
+    scan_fs(sink, &mut |fs_info| {
+        full_infos.push(FullFileInfo {
+            file_type: fs_info.file_type,
+            path: fs_info.path,
+            owner_dialog_id: DialogId::default(),
+            size: fs_info.size,
+            atime_nsec: fs_info.atime_nsec,
+            mtime_nsec: fs_info.mtime_nsec,
+        });
+    });
+
+    if !sink.use_file_database() {
+        let mut file_stats = FileStats::new(need_all_files, false);
+        for info in full_infos {
+            file_stats.add(info);
+        }
+        return file_stats;
+    }
+
+    let mut hash_to_pos: HashMap<u64, usize> = HashMap::new();
+    for (pos, full_info) in full_infos.iter().enumerate() {
+        let hash = default_path_hash(&full_info.path);
+        hash_to_pos.insert(hash, pos);
+    }
+    {
+        let mut join = |file_type: FileType, path: String, owner_dialog_id: DialogId, size: i64| {
+            let hash = default_path_hash(&path);
+            if let Some(&pos) = hash_to_pos.get(&hash) {
+                let full_info = &mut full_infos[pos];
+                full_info.owner_dialog_id = owner_dialog_id;
+                full_info.file_type = file_type; // database file_type is the correct one
+                full_info.size = size;
+            }
+        };
+        sink.scan_file_db(&mut join);
+    }
+
+    let mut file_stats = FileStats::new(need_all_files, split_by_owner_dialog_id);
+    for full_info in full_infos {
+        file_stats.add(full_info);
+    }
+    file_stats
+}
+
+/// The `Hash<std::string>()` stand-in for the scan join.
+fn default_path_hash(path: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// `StorageManager` (StorageManager.cpp:32-366) collapsed: the
+/// actors/workers disappear, `run_gc` runs the scan + gc synchronously
+/// and the auto-gc timer is `tick`ed by the owner.
+pub struct StorageManager {
+    /// `fast_stat_` (StorageManager.cpp:45-58).
+    fast_stat: FileTypeStat,
+    /// `last_gc_timestamp_` (StorageManager.cpp:310-318).
+    last_gc_timestamp: u32,
+}
+
+/// The StorageManager environment: the binlog pmc persistence, the
+/// option reads and the database/log size sources.
+pub trait StorageContext: FileStatsSink {
+    /// `get_binlog_pmc()->get/set` (StorageManager.cpp:240-252).
+    fn pmc_get(&mut self, _key: &str) -> Vec<u8> {
+        Vec::new()
+    }
+    fn pmc_set(&mut self, _key: &str, _value: &[u8]) {}
+    /// `G()->get_option_boolean("use_storage_optimizer")`.
+    fn use_storage_optimizer(&self) -> bool {
+        false
+    }
+    /// `G()->use_file_database()`.
+    fn use_file_database(&self) -> bool {
+        false
+    }
+    /// `G()->td_db()->get_stats()` (StorageManager.cpp:95-99).
+    fn database_stats(&mut self) -> Result<String, Status> {
+        Err(Status::error_message(
+            "Database statistics are not available",
+        ))
+    }
+    /// `MessagesManager::load_dialogs` pre-warm — the collapsed
+    /// client resolves dialog names lazily, so this is a no-op seam.
+    fn preload_dialogs(&mut self, _dialog_ids: &[DialogId]) {}
+}
+
+const GC_EACH: u32 = 60 * 60 * 24; // 1 day
+const GC_DELAY: u32 = 60;
+const GC_RAND_DELAY: u32 = 60 * 15;
+
+impl Default for StorageManager {
+    fn default() -> StorageManager {
+        StorageManager::new()
+    }
+}
+
+impl StorageManager {
+    pub fn new() -> StorageManager {
+        StorageManager {
+            fast_stat: FileTypeStat::default(),
+            last_gc_timestamp: 0,
+        }
+    }
+
+    /// `StorageManager::on_new_file` (StorageManager.cpp:44-62) — the
+    /// `Context::on_new_file` sink of the FileManager.
+    pub fn on_new_file(&mut self, _size: i64, real_size: i64, cnt: i32) {
+        self.fast_stat.cnt += cnt;
+        // the non-Windows arm of StorageManager.cpp:49-54 (the Windows
+        // arm adds `size`)
+        let add_size = real_size;
+        self.fast_stat.size += add_size;
+        if self.fast_stat.cnt < 0 || self.fast_stat.size < 0 {
+            self.fast_stat = FileTypeStat::default();
+        }
+    }
+
+    /// `save_fast_stat`/`load_fast_stat` (StorageManager.cpp:240-252) —
+    /// the binlog record is `store(size)` + `store(cnt)` (i64 + i32).
+    pub fn save_fast_stat(&mut self, ctx: &mut dyn StorageContext) {
+        let mut out = Vec::with_capacity(12);
+        store_parse::store_i64(&mut out, self.fast_stat.size);
+        store_parse::store_i32(&mut out, self.fast_stat.cnt);
+        ctx.pmc_set("fast_file_stat", &out);
+    }
+
+    pub fn load_fast_stat(&mut self, ctx: &mut dyn StorageContext) {
+        let data = ctx.pmc_get("fast_file_stat");
+        let mut parser = Parser::new(&data);
+        self.fast_stat = match (parser.i64_(), parser.i32_()) {
+            (Ok(size), Ok(cnt)) if parser.left_len() == 0 => FileTypeStat { size, cnt },
+            _ => FileTypeStat::default(),
+        };
+    }
+
+    /// `update_fast_stats` (StorageManager.cpp:254-260).
+    pub fn update_fast_stats(&mut self, stats: &FileStats) -> bool {
+        self.fast_stat = stats.get_total_nontemp_stat();
+        true
+    }
+
+    /// `get_storage_stats_fast` (StorageManager.cpp:89-93) minus the
+    /// database sizes, which the context answers.
+    pub fn get_storage_stats_fast(&mut self, ctx: &mut dyn StorageContext) -> FileStatsFast {
+        let mut database_size = 0i64;
+        for path in ctx.database_paths() {
+            database_size += file_size_of(&path);
+        }
+        let mut language_pack_database_size = 0i64;
+        let language_path = ctx.language_pack_database_path();
+        if !language_path.is_empty() {
+            language_pack_database_size += file_size_of(&language_path);
+        }
+        let mut log_size = 0i64;
+        for path in ctx.log_file_paths() {
+            log_size += file_size_of(&path);
+        }
+        FileStatsFast {
+            size: self.fast_stat.size,
+            count: self.fast_stat.cnt,
+            database_size,
+            language_pack_database_size,
+            log_size,
+        }
+    }
+
+    /// `load_last_gc_timestamp`/`save_last_gc_timestamp`
+    /// (StorageManager.cpp:310-324).
+    pub fn load_last_gc_timestamp(&mut self, ctx: &mut dyn StorageContext) {
+        let data = ctx.pmc_get("files_gc_ts");
+        self.last_gc_timestamp = std::str::from_utf8(&data)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+    }
+
+    pub fn save_last_gc_timestamp(&mut self, ctx: &mut dyn StorageContext, now: f64) {
+        self.last_gc_timestamp = now as u32;
+        ctx.pmc_set("files_gc_ts", self.last_gc_timestamp.to_string().as_bytes());
+    }
+
+    /// `schedule_next_gc` + `timeout_expired` (StorageManager.cpp:326-364)
+    /// collapsed into a tick: the caller passes the monotonic `now`
+    /// (seconds); the answer is whether an automatic gc is due. The
+    /// caller then runs [`StorageManager::run_gc`] with the default
+    /// parameters and saves the timestamp when it did not abort.
+    pub fn auto_gc_due(&self, ctx: &mut dyn StorageContext, now: f64) -> bool {
+        if !ctx.use_storage_optimizer() {
+            return false;
+        }
+        let sys_time = now as u32;
+        let mut next_gc_at = self.last_gc_timestamp + GC_EACH;
+        if next_gc_at < sys_time {
+            next_gc_at = sys_time;
+        }
+        if next_gc_at > sys_time + GC_EACH {
+            next_gc_at = sys_time + GC_EACH;
+        }
+        let jitter =
+            tdutils::random::fast(GC_DELAY as i32, (GC_DELAY + GC_RAND_DELAY) as i32) as u32;
+        next_gc_at += GC_DELAY + jitter;
+        now >= next_gc_at as f64
+    }
+
+    /// `StorageManager::run_gc` → `on_all_files` → `FileGcWorker::run_gc`
+    /// (StorageManager.cpp:101-133, 160-176) — the scan, the join and
+    /// the gc in one synchronous pass. `send_updates` is the C++
+    /// `!G()->get_option_string("my_phone_number").empty()` probe.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_gc(
+        &mut self,
+        ctx: &mut dyn StorageContext,
+        gc_sink: &mut dyn FileGcSink,
+        parameters: FileGcParameters,
+        return_deleted_file_statistics: bool,
+    ) -> Result<FileStats, Status> {
+        let split_by_owner_dialog_id = !parameters.owner_dialog_ids.is_empty()
+            || !parameters.exclude_owner_dialog_ids.is_empty()
+            || parameters.dialog_limit != 0;
+        let mut file_stats = get_file_stats(ctx, true, split_by_owner_dialog_id);
+
+        self.update_fast_stats(&file_stats);
+        let all_files = file_stats.get_all_files();
+        let gc_result = run_file_gc(gc_sink, &parameters, all_files, true)?;
+
+        self.update_fast_stats(&gc_result.kept_file_stats);
+
+        let mut kept = gc_result.kept_file_stats;
+        kept.apply_dialog_limit(parameters.dialog_limit);
+        let dialog_ids = kept.get_dialog_ids();
+        ctx.preload_dialogs(&dialog_ids);
+        if return_deleted_file_statistics {
+            let mut removed = gc_result.removed_file_stats;
+            removed.apply_dialog_limit(parameters.dialog_limit);
+            return Ok(removed);
+        }
+        Ok(kept)
+    }
+}
+
+/// `StorageManager::get_file_size` (StorageManager.cpp:178-187) — the
+/// allocated size of one path, 0 on a failed stat.
+fn file_size_of(path: &str) -> i64 {
+    std::fs::metadata(path)
+        .map(|meta| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                (meta.blocks() * 512) as i64
+            }
+            #[cfg(not(unix))]
+            {
+                meta.len() as i64
+            }
+        })
+        .unwrap_or(0)
+}
+
 impl FileManager {
     /// Sets `user_download_file_callback_` (FileManager.h:841) — the
     /// callback the user download requests finish through.
@@ -18416,6 +19304,37 @@ impl FileManager {
                 fllm.update_local_file_location(old_upload_id, &LocalFileLocation::Full(local));
             }
         }
+    }
+
+    /// `FileManager::on_file_unlink` (FileManager.cpp:1676-1688) — the
+    /// gc's removal plane: the node drops its local location and its
+    /// pmc records, and the download manager reaps finished queries.
+    pub fn on_file_unlink(&mut self, location: &FullLocalFileLocation) {
+        let Some(&file_id) = self.local_location_to_file_id.get(location) else {
+            return;
+        };
+        // get_sync_file_node: the pmc load collapses to a direct node
+        // fetch — a missing node means the location table is stale
+        let Some(node_id) = self.node_id_of(file_id) else {
+            return;
+        };
+        {
+            let node = self.file_nodes[node_id].as_ref().expect("node");
+            if let Some(worker) = self.worker.as_deref_mut() {
+                worker.clear_from_pmc(node);
+            }
+        }
+        let main_file_id = self.file_nodes[node_id]
+            .as_ref()
+            .expect("node")
+            .main_file_id;
+        if let Some(worker) = self.worker.as_deref_mut() {
+            worker.remove_file_if_finished(main_file_id);
+        }
+        if let Some(node) = self.file_nodes[node_id].as_mut() {
+            node.drop_local_location();
+        }
+        self.try_flush_node(node_id);
     }
 
     /// `FileManager::on_generate_error` (FileManager.cpp:5085-5095).
@@ -20634,6 +21553,265 @@ mod file_load_manager_tests {
         let mut conversion = "#mtime#abc#convert".to_owned();
         check_generate_mtime(&mut ctx, &mut conversion, &path).unwrap();
         assert_eq!(conversion, "#mtime#abc#convert");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ==== M.12.9 FileStats / FileGcWorker / StorageManager ====
+
+    /// The gc/stats test sink: real temp files, recorded unlinks and an
+    /// optional db-record feed.
+    struct GcContext {
+        root: std::path::PathBuf,
+        unlinked: Rc<RefCell<Vec<String>>>,
+        use_file_database: bool,
+        db_records: RefCell<Vec<(FileType, String, DialogId, i64)>>,
+    }
+
+    impl FileManagerContext for GcContext {
+        fn files_dir(&self) -> String {
+            self.root.to_string_lossy().into_owned()
+        }
+    }
+
+    impl FileGcSink for GcContext {
+        fn use_file_database(&self) -> bool {
+            self.use_file_database
+        }
+
+        fn on_file_unlink(&mut self, location: FullLocalFileLocation) {
+            self.unlinked.borrow_mut().push(location.path);
+        }
+    }
+
+    impl FileStatsSink for GcContext {
+        fn scan_file_db(&mut self, callback: &mut dyn FnMut(FileType, String, DialogId, i64)) {
+            for (file_type, path, owner_dialog_id, size) in self.db_records.borrow().iter() {
+                callback(*file_type, path.clone(), *owner_dialog_id, *size);
+            }
+        }
+    }
+
+    /// The `FileGcWorker::run_gc` decision machine
+    /// (FileGcWorker.cpp:32-197): type/owner immunities, the time
+    /// immunity, the atime pass and the count/size passes.
+    #[test]
+    fn file_gc_decision_table_matches_the_cpp() {
+        let dialog = DialogId::new(42);
+        let excluded = DialogId::new(43);
+        let make = |path: &str, file_type: FileType, owner: DialogId, age_sec: u64, size: i64| {
+            let now = tdutils::time::system() as u64;
+            FullFileInfo {
+                file_type,
+                path: path.to_owned(),
+                owner_dialog_id: owner,
+                size,
+                atime_nsec: (now.saturating_sub(age_sec)) * 1_000_000_000,
+                mtime_nsec: (now.saturating_sub(age_sec)) * 1_000_000_000,
+            }
+        };
+        let parameters = FileGcParameters {
+            max_files_size: 1 << 20,
+            max_time_from_last_access: 60 * 60 * 24,
+            max_file_count: u32::MAX,
+            immunity_delay: 60 * 60,
+            file_types: vec![FileType::Document],
+            owner_dialog_ids: vec![dialog],
+            exclude_owner_dialog_ids: vec![excluded],
+            dialog_limit: 0,
+        };
+
+        let files = vec![
+            // removed: selected type, requested owner, old enough
+            make("old.bin", FileType::Document, dialog, 100_000, 10),
+            // kept: time immunity (mtime inside the immunity delay)
+            make("fresh.bin", FileType::Document, dialog, 10, 20),
+            // kept: type immunity — stickers are immune with a file db
+            make("old.webp", FileType::Sticker, dialog, 100_000, 30),
+            // kept: the owner is excluded
+            make("excluded.bin", FileType::Document, excluded, 100_000, 40),
+            // kept: the type is not selected
+            make("old.jpg", FileType::Photo, dialog, 100_000, 50),
+        ];
+        let unlinked = Rc::new(RefCell::new(Vec::new()));
+        let mut sink = GcContext {
+            root: test_root(),
+            unlinked: unlinked.clone(),
+            use_file_database: true,
+            db_records: RefCell::new(Vec::new()),
+        };
+        let result = run_file_gc(&mut sink, &parameters, files, true).expect("gc");
+
+        assert_eq!(unlinked.borrow().len(), 1);
+        assert_eq!(unlinked.borrow()[0], "old.bin");
+        assert_eq!(result.removed_file_stats.get_total_nontemp_stat().size, 10);
+        assert_eq!(
+            result.kept_file_stats.get_total_nontemp_stat().size,
+            20 + 30 + 40 + 50
+        );
+
+        // the count pass: three same-type files, one may survive
+        let files = vec![
+            make("a.bin", FileType::Document, DialogId::default(), 30_000, 1),
+            make("b.bin", FileType::Document, DialogId::default(), 20_000, 2),
+            make("c.bin", FileType::Document, DialogId::default(), 10_000, 4),
+        ];
+        let parameters = FileGcParameters {
+            max_files_size: i64::MAX,
+            max_time_from_last_access: 60 * 60 * 24,
+            max_file_count: 1,
+            immunity_delay: 0,
+            file_types: Vec::new(),
+            owner_dialog_ids: Vec::new(),
+            exclude_owner_dialog_ids: Vec::new(),
+            dialog_limit: 0,
+        };
+        let unlinked2 = Rc::new(RefCell::new(Vec::new()));
+        let mut sink2 = GcContext {
+            root: sink.root.clone(),
+            unlinked: unlinked2.clone(),
+            use_file_database: false,
+            db_records: RefCell::new(Vec::new()),
+        };
+        let result = run_file_gc(&mut sink2, &parameters, files, true).expect("gc");
+        // the two oldest go by count, in the atime order
+        assert_eq!(
+            *unlinked2.borrow(),
+            vec!["a.bin".to_owned(), "b.bin".to_owned()]
+        );
+        assert_eq!(result.kept_file_stats.get_total_nontemp_stat().size, 4);
+        let _ = std::fs::remove_dir_all(&sink.root);
+    }
+
+    /// `FileStats` aggregation, the dialog limit fold and the td_api
+    /// ordering (FileStats.cpp:32-190).
+    #[test]
+    fn file_stats_aggregates_and_limits_dialogs() {
+        let dialog = DialogId::new(7);
+        let mut stats = FileStats::new(false, true);
+        stats.add(FullFileInfo {
+            file_type: FileType::Document,
+            path: "a".to_owned(),
+            owner_dialog_id: dialog,
+            size: 100,
+            atime_nsec: 0,
+            mtime_nsec: 0,
+        });
+        stats.add(FullFileInfo {
+            file_type: FileType::Photo,
+            path: "b".to_owned(),
+            owner_dialog_id: dialog,
+            size: 50,
+            atime_nsec: 0,
+            mtime_nsec: 0,
+        });
+        stats.add(FullFileInfo {
+            file_type: FileType::Document,
+            path: "c".to_owned(),
+            owner_dialog_id: DialogId::default(),
+            size: 30,
+            atime_nsec: 0,
+            mtime_nsec: 0,
+        });
+        assert_eq!(stats.get_total_nontemp_stat().size, 180);
+        assert_eq!(stats.get_dialog_ids(), vec![dialog]);
+
+        stats.apply_dialog_limit(1);
+        // the default-id bucket survives the limit fold
+        assert_eq!(stats.get_total_nontemp_stat().size, 180);
+        let object = stats.get_storage_statistics_object();
+        // the zero chat sorts last; its stats still count
+        assert_eq!(object.size, 180);
+        assert_eq!(object.count, 3);
+        assert_eq!(object.by_chat.len(), 2);
+        assert_eq!(object.by_chat[0].chat_id, 7);
+        assert_eq!(object.by_chat[0].size, 150);
+        assert_eq!(object.by_chat[0].count, 2);
+        // per-type aggregation folds Photo into Photo by main type
+        assert_eq!(object.by_chat[0].by_file_type.len(), 2);
+        assert_eq!(object.by_chat[1].chat_id, 0);
+        assert_eq!(object.by_chat[1].size, 30);
+    }
+
+    /// `StorageManager::on_new_file` + the fast-stat pmc persistence
+    /// (StorageManager.cpp:44-62, 240-252).
+    #[test]
+    fn fast_stat_round_trips_through_pmc() {
+        struct PmcContext {
+            store: RefCell<BTreeMap<String, Vec<u8>>>,
+        }
+        impl FileManagerContext for PmcContext {}
+        impl FileGcSink for PmcContext {}
+        impl FileStatsSink for PmcContext {}
+        impl StorageContext for PmcContext {
+            fn pmc_get(&mut self, key: &str) -> Vec<u8> {
+                self.store.borrow().get(key).cloned().unwrap_or_default()
+            }
+            fn pmc_set(&mut self, key: &str, value: &[u8]) {
+                self.store
+                    .borrow_mut()
+                    .insert(key.to_owned(), value.to_vec());
+            }
+        }
+
+        let ctx = RefCell::new(BTreeMap::new());
+        let mut pmc = PmcContext { store: ctx };
+        let mut manager = StorageManager::new();
+        manager.on_new_file(100, 128, 1);
+        manager.on_new_file(50, 64, 1);
+        manager.save_fast_stat(&mut pmc);
+
+        let mut reloaded = StorageManager::new();
+        reloaded.load_fast_stat(&mut pmc);
+        let fast = reloaded.get_storage_stats_fast(&mut pmc);
+        assert_eq!(fast.size, 192);
+        assert_eq!(fast.count, 2);
+    }
+
+    /// `FileStatsWorker::get_stats` (FileStatsWorker.cpp:117-200): the
+    /// fs scan, the db join by path and the owner/file-type override.
+    #[test]
+    fn get_stats_joins_fs_and_db_scans() {
+        let root = test_root();
+        // scan_fs walks the per-type dirs (FileLoaderUtils.cpp:255-257)
+        let doc_dir = get_files_dir(FileType::Document, &root.to_string_lossy(), "");
+        let photo_dir = get_files_dir(FileType::Photo, &root.to_string_lossy(), "");
+        std::fs::create_dir_all(&doc_dir).unwrap();
+        std::fs::create_dir_all(&photo_dir).unwrap();
+        let doc_path = format!("{doc_dir}doc.txt");
+        std::fs::write(&doc_path, vec![7u8; 300]).unwrap();
+        std::fs::write(format!("{photo_dir}pic.jpg"), vec![7u8; 500]).unwrap();
+        std::fs::write(format!("{photo_dir}.nomedia"), b"").unwrap();
+
+        let mut sink2 = GcContext {
+            root: root.clone(),
+            unlinked: Rc::new(RefCell::new(Vec::new())),
+            use_file_database: true,
+            db_records: RefCell::new(vec![(
+                FileType::Video,
+                doc_path.clone(),
+                DialogId::new(9),
+                321,
+            )]),
+        };
+        let mut with_files = get_file_stats(&mut sink2, true, true);
+        let mut paths: Vec<(String, FileType, DialogId, i64)> = Vec::new();
+        for info in with_files.get_all_files() {
+            paths.push((
+                info.path.rsplit('/').next().unwrap().to_owned(),
+                info.file_type,
+                info.owner_dialog_id,
+                info.size,
+            ));
+        }
+        paths.sort();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0].0, "doc.txt");
+        assert_eq!(paths[0].1, FileType::Video, "db file_type wins");
+        assert_eq!(paths[0].2, DialogId::new(9));
+        assert_eq!(paths[0].3, 321);
+        assert_eq!(paths[1].0, "pic.jpg");
+        assert_eq!(paths[1].1, FileType::Photo);
+        drop(with_files);
         let _ = std::fs::remove_dir_all(&root);
     }
 
