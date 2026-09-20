@@ -14277,6 +14277,1789 @@ pub fn get_messages_object(
     }
 }
 
+// ---------------------------------------------------------------------------
+// M.10.7 — the read counters + mentions path: `read_all_dialog_mentions`
+// (MessagesManager.cpp:9134-9188), `read_history_inbox`/`read_history_outbox`
+// (MessagesManager.cpp:9506-9670), `set_dialog_last_read_inbox_message_id`/
+// `set_dialog_last_read_outbox_message_id` (MessagesManager.cpp:9885-10026),
+// the `OrderedMessages` unread-count calc trio (OrderedMessage.cpp:447-534)
+// and the unread-counter decision tables (`need_unread_counter`, the
+// `DialogList` walks, `set_dialog_is_marked_as_unread` 28738-28771). Seams:
+// - `ReadStateContext` — the slice's context plane: the `Td::send_update`
+//   delivery, the DialogManager access reads, the DialogList counter walks +
+//   `have_dialog_filters`/`update_dialog_lists` (no `DialogList` exists yet —
+//   the walk table is owned by the M.10 dialog-list slice; the ported
+//   per-list table lives on [`DialogListUnreadCounters`]), the
+//   difference-engine state (`running_get_difference_`-class reads) and the
+//   NotificationManager sends (M.13 integration).
+// - Server legs — `read_all_dialog_mentions_on_server` /
+//   `read_all_topic_mentions_on_server` (MessageQueryManager),
+//   `repair_server_unread_count`'s delayed `send_get_dialog_query`,
+//   `schedule_get_channel_difference` — [blocked: net], seam-logged.
+// - `ttl_read_history` (MessagesManager.cpp:10229) — the SecretChats track;
+//   the computed view date is seam-logged.
+// - the admined-monoforum read walk inside the inbox setter
+//   (MessagesManager.cpp:9906-9928) — the SavedMessages track (Wave-2/3);
+//   the arm condition is ported, the walk + `on_update_read_*_monoforum_inbox`
+//   arms are seam-logged.
+// - the `OrderedMessages` tree is the zero-size stand-in: the calc trio is
+//   ported as pure functions over `(MessageId, is_counted_as_unread)`
+//   slices in descending id order, and the callers derive the slices from
+//   `Dialog::messages` until the receive-path container slice gives them a
+//   tree ([blocked: M.10.9]).
+// - the read-state corpus verify rides the `updateReadHistoryInbox` /
+//   `updateReadHistoryOutbox` intake, which the M.7 `UpdatesSink` does not
+//   carry yet — the decision-table tests below carry the slice
+//   ([blocked: M.7 read-state updates]).
+// ---------------------------------------------------------------------------
+
+/// The M.10.7 context plane — the cross-manager reads and sends the read
+/// counters + mentions paths make through `Td *` in the C++. The real
+/// wiring lands with the owning slices; [`NoReadStateContext`] answers
+/// like an empty deployment (no peers, no lists, no difference running,
+/// no notifications).
+pub trait ReadStateContext {
+    /// `Td::send_update` (Td.cpp:1356-1397) — the update delivery leg.
+    fn send_update(&mut self, update: td_api::Object);
+
+    /// `DialogManager::have_input_peer(dialog_id, allow_secret_chats, Read)`
+    /// (DialogManager.cpp:1480) — the only rights level this slice checks.
+    fn have_input_peer(&self, dialog_id: DialogId, allow_secret_chats: bool) -> bool;
+
+    /// `MessagesManager::is_dialog_muted` (MessagesManager.h:1714).
+    fn is_dialog_muted(&self, dialog_id: DialogId) -> bool;
+
+    /// `MessagesManager::is_dialog_sponsored` (MessagesManager.cpp:33747) —
+    /// the `sponsored_dialog_id_` read is the sponsored-source seam.
+    fn is_dialog_sponsored(&self, dialog_id: DialogId) -> bool;
+
+    /// The `get_dialog_lists(d)` counter walk of
+    /// `set_dialog_last_read_inbox_message_id` (MessagesManager.cpp:9942-9965)
+    /// plus the `send_update_unread_message_count`/`send_update_unread_chat_count`
+    /// emissions (MessagesManager.cpp:27287/27330) — owned by the M.10
+    /// dialog-list slice; the ported per-list arithmetic is
+    /// [`DialogListUnreadCounters::apply_unread_count_change`].
+    fn on_unread_count_change(
+        &mut self,
+        dialog_id: DialogId,
+        old_unread_count: i32,
+        new_unread_count: i32,
+        is_marked_as_unread: bool,
+        force_update: bool,
+        source: &str,
+    );
+
+    /// The `get_dialog_lists(d)` counter walk of
+    /// `set_dialog_is_marked_as_unread` (MessagesManager.cpp:28755-28764)
+    /// plus its forced `send_update_unread_chat_count` — the same owner.
+    fn on_is_marked_as_unread_change(&mut self, dialog_id: DialogId, delta: i32, source: &str);
+
+    /// `DialogFilterManager::have_dialog_filters()`.
+    fn have_dialog_filters(&self) -> bool;
+
+    /// `update_dialog_lists(d, get_dialog_positions(d), true, false, source)`
+    /// — the M.10 dialog-list slice.
+    fn update_dialog_lists(&mut self, dialog_id: DialogId, source: &str);
+
+    /// `running_get_difference_` (MessagesManager.h).
+    fn is_running_get_difference(&self) -> bool;
+
+    /// `running_get_channel_difference(dialog_id)` (MessagesManager.h).
+    fn is_running_get_channel_difference(&self, dialog_id: DialogId) -> bool;
+
+    /// `get_channel_difference_to_log_event_id_.count(dialog_id) != 0`.
+    fn has_channel_difference_to_log_event(&self, dialog_id: DialogId) -> bool;
+
+    /// `NotificationManager::remove_notification_group` via
+    /// `send_closure_later` — the M.13 integration.
+    fn remove_notification_group(
+        &mut self,
+        group_id: NotificationGroupId,
+        max_notification_message_id: MessageId,
+        total_count: i32,
+        force: bool,
+        source: &str,
+    );
+
+    /// `NotificationManager::remove_notification` via `send_closure_later`
+    /// — the M.13 integration.
+    fn remove_notification(
+        &mut self,
+        group_id: NotificationGroupId,
+        notification_id: NotificationId,
+        is_permanent: bool,
+        force_update: bool,
+    );
+
+    /// `flush_pending_new_message_notifications`
+    /// (MessagesManager.cpp:26868) — the message walk + notification adds
+    /// are the M.13 plane.
+    fn flush_pending_new_message_notifications(
+        &mut self,
+        dialog_id: DialogId,
+        from_mentions: bool,
+        settings_dialog_id: DialogId,
+    );
+
+    /// `remove_dialog_pinned_message_notification`
+    /// (MessagesManager.cpp:12544) — `set_dialog_pinned_message_notification`
+    /// with the zero id; the M.13 plane owns the local group repair.
+    fn remove_dialog_pinned_message_notification(&mut self, dialog_id: DialogId, source: &str);
+}
+
+/// The no-context stand-in: nothing delivered, no access, no lists, no
+/// difference running, no notifications (tests and pre-wiring slices).
+#[derive(Debug, Default)]
+pub struct NoReadStateContext;
+
+impl ReadStateContext for NoReadStateContext {
+    fn send_update(&mut self, _update: td_api::Object) {}
+
+    fn have_input_peer(&self, _dialog_id: DialogId, _allow_secret_chats: bool) -> bool {
+        false
+    }
+
+    fn is_dialog_muted(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn is_dialog_sponsored(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn on_unread_count_change(
+        &mut self,
+        _dialog_id: DialogId,
+        _old_unread_count: i32,
+        _new_unread_count: i32,
+        _is_marked_as_unread: bool,
+        _force_update: bool,
+        _source: &str,
+    ) {
+    }
+
+    fn on_is_marked_as_unread_change(&mut self, _dialog_id: DialogId, _delta: i32, _source: &str) {}
+
+    fn have_dialog_filters(&self) -> bool {
+        false
+    }
+
+    fn update_dialog_lists(&mut self, _dialog_id: DialogId, _source: &str) {}
+
+    fn is_running_get_difference(&self) -> bool {
+        false
+    }
+
+    fn is_running_get_channel_difference(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn has_channel_difference_to_log_event(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn remove_notification_group(
+        &mut self,
+        _group_id: NotificationGroupId,
+        _max_notification_message_id: MessageId,
+        _total_count: i32,
+        _force: bool,
+        _source: &str,
+    ) {
+    }
+
+    fn remove_notification(
+        &mut self,
+        _group_id: NotificationGroupId,
+        _notification_id: NotificationId,
+        _is_permanent: bool,
+        _force_update: bool,
+    ) {
+    }
+
+    fn flush_pending_new_message_notifications(
+        &mut self,
+        _dialog_id: DialogId,
+        _from_mentions: bool,
+        _settings_dialog_id: DialogId,
+    ) {
+    }
+
+    fn remove_dialog_pinned_message_notification(&mut self, _dialog_id: DialogId, _source: &str) {}
+}
+
+/// The `DialogList` unread-counter block the read-state tables touch
+/// (MessagesManager.h:1180-1210) — the six counters and the two inited
+/// flags. One block per dialog list the dialog is in; the container walk
+/// is the M.10 dialog-list slice's ([`ReadStateContext`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DialogListUnreadCounters {
+    pub unread_message_total_count: i32,
+    pub unread_message_muted_count: i32,
+    pub unread_dialog_total_count: i32,
+    pub unread_dialog_marked_count: i32,
+    pub unread_dialog_muted_count: i32,
+    pub unread_dialog_muted_marked_count: i32,
+    pub is_message_unread_count_inited: bool,
+    pub is_dialog_unread_count_inited: bool,
+}
+
+impl DialogListUnreadCounters {
+    /// The unread-count half of the `set_dialog_last_read_inbox_message_id`
+    /// list walk (MessagesManager.cpp:9942-9965) applied to one list.
+    /// `is_marked_as_unread` is the dialog's current flag — a marked dialog
+    /// routes the dialog-count delta into `unread_dialog_marked_count_`
+    /// with the sign flipped. Returns whether
+    /// `send_update_unread_message_count`/`send_update_unread_chat_count`
+    /// must fire for the list.
+    pub fn apply_unread_count_change(
+        &mut self,
+        old_unread_count: i32,
+        new_unread_count: i32,
+        is_marked_as_unread: bool,
+        is_muted: bool,
+    ) -> (bool, bool) {
+        let mut send_message_count = false;
+        let mut send_chat_count = false;
+        let mut delta = new_unread_count - old_unread_count;
+        if delta != 0 && self.is_message_unread_count_inited {
+            self.unread_message_total_count += delta;
+            if is_muted {
+                self.unread_message_muted_count += delta;
+            }
+            send_message_count = true;
+        }
+        delta = i32::from(new_unread_count != 0) - i32::from(old_unread_count != 0);
+        if delta != 0 && self.is_dialog_unread_count_inited {
+            if is_marked_as_unread {
+                self.unread_dialog_marked_count -= delta;
+            } else {
+                self.unread_dialog_total_count += delta;
+            }
+            if is_muted {
+                if is_marked_as_unread {
+                    self.unread_dialog_muted_marked_count -= delta;
+                } else {
+                    self.unread_dialog_muted_count += delta;
+                }
+            }
+            send_chat_count = true;
+        }
+        (send_message_count, send_chat_count)
+    }
+
+    /// The `set_dialog_is_marked_as_unread` list walk
+    /// (MessagesManager.cpp:28755-28764) applied to one list. Returns
+    /// whether the forced `send_update_unread_chat_count` must fire.
+    pub fn apply_is_marked_as_unread_change(&mut self, delta: i32, is_muted: bool) -> bool {
+        if !self.is_dialog_unread_count_inited {
+            return false;
+        }
+        self.unread_dialog_total_count += delta;
+        self.unread_dialog_marked_count += delta;
+        if is_muted {
+            self.unread_dialog_muted_count += delta;
+            self.unread_dialog_muted_marked_count += delta;
+        }
+        true
+    }
+}
+
+/// `MessagesManager::need_unread_counter` (MessagesManager.cpp:9672-9674).
+pub fn need_unread_counter(dialog_order: i64) -> bool {
+    dialog_order != DEFAULT_ORDER
+}
+
+/// One `(message_id, is_counted_as_unread)` entry of the ordered-messages
+/// slice — the pure-function form of the `OrderedMessages` tree node until
+/// the receive-path container slice lands the tree ([blocked: M.10.9]).
+/// The slice is in descending `MessageId` order, the order the C++ `--it`
+/// walk visits.
+///
+/// `OrderedMessages::calc_new_unread_count_from_last_unread`
+/// (OrderedMessage.cpp:447-467): walk down from `max_message_id`
+/// decrementing for counted messages until `last_read_inbox_message_id`;
+/// -1 when either endpoint node is missing.
+pub fn calc_new_unread_count_from_last_unread(
+    ordered_messages: &[(MessageId, bool)],
+    max_message_id: MessageId,
+    last_read_inbox_message_id: MessageId,
+    old_unread_count: i32,
+) -> i32 {
+    // `get_const_iterator(max_message_id)` — the greatest id <= the bound
+    let mut pos = ordered_messages.partition_point(|elt| elt.0 > max_message_id);
+    if pos >= ordered_messages.len() || ordered_messages[pos].0 != max_message_id {
+        return -1;
+    }
+    let mut unread_count = old_unread_count;
+    while pos < ordered_messages.len() && ordered_messages[pos].0 > last_read_inbox_message_id {
+        if ordered_messages[pos].1 {
+            unread_count -= 1;
+        }
+        pos += 1;
+    }
+    if pos >= ordered_messages.len() || ordered_messages[pos].0 != last_read_inbox_message_id {
+        return -1;
+    }
+    unread_count
+}
+
+/// `OrderedMessages::calc_new_unread_count_from_the_end`
+/// (OrderedMessage.cpp:470-505): count counted messages above
+/// `max_message_id` from the top. The count is exact only when
+/// `last_message_id` is valid and the walk stopped on a node; a non-negative
+/// `hint_unread_count` wins per the C++ acceptance rules (exact ⇒ equal,
+/// inexact ⇒ >=), else it is logged and ignored; an inexact count without a
+/// usable hint is -1.
+pub fn calc_new_unread_count_from_the_end(
+    ordered_messages: &[(MessageId, bool)],
+    max_message_id: MessageId,
+    last_message_id: MessageId,
+    hint_unread_count: i32,
+) -> i32 {
+    let mut unread_count: i32 = 0;
+    let mut pos = 0usize;
+    while pos < ordered_messages.len() && ordered_messages[pos].0 > max_message_id {
+        if ordered_messages[pos].1 {
+            unread_count += 1;
+        }
+        pos += 1;
+    }
+
+    let is_count_exact = last_message_id.is_valid() && pos < ordered_messages.len();
+    if hint_unread_count >= 0 {
+        let hint_accepted = if is_count_exact {
+            hint_unread_count == unread_count
+        } else {
+            hint_unread_count >= unread_count
+        };
+        if hint_accepted {
+            return hint_unread_count;
+        }
+        // hint_unread_count is definitely wrong, ignore it
+        log_error!(
+            "Receive hint_unread_count = {}, but found {} unread messages",
+            hint_unread_count,
+            unread_count
+        );
+    }
+
+    if !is_count_exact {
+        // unread count is likely to be calculated wrong, so ignore it
+        return -1;
+    }
+    unread_count
+}
+
+/// `OrderedMessages::calc_new_unread_count` (OrderedMessage.cpp:508-534) —
+/// the dispatcher: from-the-end only when `last_read_inbox_message_id` is
+/// invalid; otherwise try the closer endpoint first (by the raw id
+/// distance the C++ compares) and fall back to the other one on -1.
+pub fn calc_new_unread_count(
+    ordered_messages: &[(MessageId, bool)],
+    max_message_id: MessageId,
+    last_read_inbox_message_id: MessageId,
+    old_unread_count: i32,
+    last_message_id: MessageId,
+    hint_unread_count: i32,
+) -> i32 {
+    if !last_read_inbox_message_id.is_valid() {
+        return calc_new_unread_count_from_the_end(
+            ordered_messages,
+            max_message_id,
+            last_message_id,
+            hint_unread_count,
+        );
+    }
+
+    if !last_message_id.is_valid()
+        || last_message_id.get() - max_message_id.get()
+            > max_message_id.get() - last_read_inbox_message_id.get()
+    {
+        let unread_count = calc_new_unread_count_from_last_unread(
+            ordered_messages,
+            max_message_id,
+            last_read_inbox_message_id,
+            old_unread_count,
+        );
+        if unread_count >= 0 {
+            return unread_count;
+        }
+        calc_new_unread_count_from_the_end(
+            ordered_messages,
+            max_message_id,
+            last_message_id,
+            hint_unread_count,
+        )
+    } else {
+        let unread_count = calc_new_unread_count_from_the_end(
+            ordered_messages,
+            max_message_id,
+            last_message_id,
+            hint_unread_count,
+        );
+        if unread_count >= 0 {
+            return unread_count;
+        }
+        calc_new_unread_count_from_last_unread(
+            ordered_messages,
+            max_message_id,
+            last_read_inbox_message_id,
+            old_unread_count,
+        )
+    }
+}
+
+/// `MessagesManager::has_incoming_notification` (MessagesManager.cpp:9402-9414).
+pub fn has_incoming_notification(
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    m: &Message,
+) -> bool {
+    if m.is_from_scheduled {
+        return true;
+    }
+    if m.message_id.is_scheduled() {
+        return false;
+    }
+    if m.is_outgoing {
+        return false;
+    }
+    if dialog_id == ctx.content_context().get_my_dialog_id() {
+        return false;
+    }
+    true
+}
+
+/// `MessagesManager::get_is_counted_as_unread` (MessagesManager.cpp:
+/// 19205-19215) — the closure collapses to a per-message predicate; the
+/// slice builder below feeds it per ordered entry.
+pub fn is_counted_as_unread(
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    message_type: MessageType,
+    m: &Message,
+) -> bool {
+    m.message_id.get_type() == message_type && has_incoming_notification(ctx, dialog_id, m)
+}
+
+/// The descending `(message_id, is_counted_as_unread)` slice of the
+/// dialog's ordinary messages for one `MessageType` — the stand-in walk
+/// over `Dialog::messages` that the `OrderedMessages` tree replaces
+/// ([blocked: M.10.9]).
+fn ordered_unread_entries(
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    d: &Dialog,
+    message_type: MessageType,
+) -> Vec<(MessageId, bool)> {
+    let mut entries: Vec<(MessageId, bool)> = d
+        .messages
+        .values()
+        .map(|m| {
+            (
+                m.message_id,
+                is_counted_as_unread(ctx, dialog_id, message_type, m),
+            )
+        })
+        .collect();
+    entries.sort_unstable_by_key(|elt| std::cmp::Reverse(elt.0));
+    entries
+}
+
+/// `MessagesManager::find_dialog_messages` (MessagesManager.cpp:8816-8827)
+/// — the `d->messages.foreach` walk; the container's ascending-id order is
+/// reproduced with the explicit sort (the `CHECK(message_id ==
+/// message->message_id)` is the map key invariant).
+fn find_dialog_messages<F>(d: &Dialog, condition: F) -> Vec<MessageId>
+where
+    F: Fn(&Message) -> bool,
+{
+    let mut message_ids: Vec<MessageId> = d
+        .messages
+        .values()
+        .filter(|m| condition(m))
+        .map(|m| m.message_id)
+        .collect();
+    message_ids.sort_unstable();
+    message_ids
+}
+
+/// `MessagesManager::on_dialog_updated` — the binlog-pmc dialog dirty
+/// marker rides the dialog-db receive slice; the marker is a no-op here,
+/// the call sites are kept for parity.
+fn on_dialog_updated(_manager: &MessagesManager, _dialog_id: DialogId, _source: &str) {}
+
+/// `MessagesManager::read_history_inbox(DialogId, ...)` (MessagesManager.cpp:
+/// 9506-9520) — the `get_dialog_force` dispatch; the db-load leg is the
+/// dialog-db receive seam, so an unknown dialog is only logged (the C++
+/// `LOG(INFO)`, dropped).
+pub fn read_history_inbox(
+    manager: &mut MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+    max_message_id: MessageId,
+    unread_count: i32,
+    source: &str,
+) {
+    assert!(!max_message_id.is_scheduled());
+
+    if ctx.is_bot() {
+        return;
+    }
+
+    if manager.get_dialog(dialog_id).is_some() {
+        read_history_inbox_dialog(
+            manager,
+            ctx,
+            state,
+            dialog_id,
+            max_message_id,
+            unread_count,
+            source,
+        );
+    }
+    // else: the db-load leg of `get_dialog_force` is the dialog-db receive
+    // seam; "Receive read inbox about unknown dialog" is `LOG(INFO)`, dropped
+}
+
+/// `MessagesManager::read_history_inbox(Dialog *, ...)` (MessagesManager.cpp:
+/// 9522-9613) — the inbox read gate ladder and the server/local unread
+/// recount. The recount slices are derived from `Dialog::messages` per the
+/// [`OrderedMessages`] stand-in note.
+#[allow(clippy::too_many_arguments)] // the C++ carries these through `Td *`
+fn read_history_inbox_dialog(
+    manager: &mut MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+    max_message_id: MessageId,
+    mut unread_count: i32,
+    source: &str,
+) {
+    if ctx.is_bot() {
+        return;
+    }
+    assert!(
+        manager.get_dialog(dialog_id).is_some(),
+        "read_history_inbox without the dialog {dialog_id:?}"
+    );
+
+    let need_update_always = {
+        let d = manager.get_dialog(dialog_id).unwrap();
+        d.need_repair_channel_server_unread_count
+    };
+    if need_update_always {
+        manager
+            .get_dialog_mut(dialog_id)
+            .unwrap()
+            .need_repair_channel_server_unread_count = false;
+        on_dialog_updated(manager, dialog_id, "read_history_inbox");
+    }
+
+    // there can be updateReadHistoryInbox up to message 0, if messages where read and then all messages where deleted
+    if !max_message_id.is_valid() && max_message_id != MessageId::default() {
+        log_error!(
+            "Receive read inbox update in {:?} up to {} from {}",
+            dialog_id,
+            DisplayMessageId(max_message_id),
+            source
+        );
+        return;
+    }
+    let already_read = {
+        let d = manager.get_dialog(dialog_id).unwrap();
+        d.is_last_read_inbox_message_id_inited && max_message_id <= d.last_read_inbox_message_id
+    };
+    if already_read {
+        let (equal, server_unread_count, local_unread_count) = {
+            let d = manager.get_dialog(dialog_id).unwrap();
+            (
+                max_message_id == d.last_read_inbox_message_id,
+                d.server_unread_count,
+                d.local_unread_count,
+            )
+        };
+        if equal && unread_count >= 0 && unread_count != server_unread_count && need_update_always {
+            set_dialog_last_read_inbox_message_id(
+                manager,
+                ctx,
+                state,
+                dialog_id,
+                MessageId::min(),
+                unread_count,
+                local_unread_count,
+                true,
+                source,
+            );
+        }
+        return;
+    }
+
+    if max_message_id != MessageId::default() && max_message_id.is_yet_unsent() {
+        log_error!(
+            "Tried to update last read inbox message in {:?} with {} from {}",
+            dialog_id,
+            DisplayMessageId(max_message_id),
+            source
+        );
+        return;
+    }
+
+    let (last_new_message_id, last_message_id, last_database_message_id, server_unread_count_old) = {
+        let d = manager.get_dialog(dialog_id).unwrap();
+        (
+            d.last_new_message_id,
+            d.last_message_id,
+            d.last_database_message_id,
+            d.server_unread_count,
+        )
+    };
+    if max_message_id != MessageId::default()
+        && unread_count > 0
+        && max_message_id >= last_new_message_id
+        && max_message_id >= last_message_id
+        && max_message_id >= last_database_message_id
+    {
+        if last_new_message_id.is_valid() {
+            log_error!(
+                "Have unknown {} unread messages up to {} in {:?} with last_new_message_id = {}, \
+                 last_message_id = {}, last_database_message_id = {}, and {} unread messages from {}",
+                unread_count,
+                DisplayMessageId(max_message_id),
+                dialog_id,
+                DisplayMessageId(last_new_message_id),
+                DisplayMessageId(last_message_id),
+                DisplayMessageId(last_database_message_id),
+                server_unread_count_old,
+                source
+            );
+            unread_count = server_unread_count_old;
+        } else {
+            unread_count = 0;
+        }
+    }
+
+    // the `LOG_IF(INFO, ...)` "read inbox update up to unknown message"
+    // warning is `LOG(INFO)`, dropped
+
+    if dialog_id.get_type() == DialogType::SecretChat {
+        // `ttl_read_history(d, false, max_message_id, d->last_read_inbox_message_id,
+        // Time::now())` — the SecretChats track; the suffix-load + per-message
+        // `ttl_on_view` walk is seam-logged
+        tracing::info!(
+            "ttl_read_history seam: dialog {:?} is_outgoing=false from {} till {} now",
+            dialog_id,
+            DisplayMessageId(max_message_id),
+            DisplayMessageId(last_read_inbox_of(manager, dialog_id)),
+        );
+    }
+
+    if max_message_id > last_new_message_id && dialog_id.get_type() == DialogType::Channel {
+        // `schedule_get_channel_difference(dialog_id, 0, max_message_id, 0.001, ...)` —
+        // [blocked: net], the difference engine's
+        tracing::info!(
+            "schedule_get_channel_difference seam: dialog {:?} up to {} from read_history_inbox",
+            dialog_id,
+            DisplayMessageId(max_message_id)
+        );
+    }
+
+    let (server_unread_count, local_unread_count) = {
+        let d = manager.get_dialog(dialog_id).unwrap();
+        let server_entries = ordered_unread_entries(ctx, dialog_id, d, MessageType::Server);
+        let server_unread_count = calc_new_unread_count(
+            &server_entries,
+            max_message_id,
+            d.last_read_inbox_message_id,
+            d.server_unread_count,
+            d.last_message_id,
+            unread_count,
+        );
+        let local_unread_count = if d.local_unread_count == 0 {
+            0
+        } else {
+            let local_entries = ordered_unread_entries(ctx, dialog_id, d, MessageType::Local);
+            calc_new_unread_count(
+                &local_entries,
+                max_message_id,
+                d.last_read_inbox_message_id,
+                d.local_unread_count,
+                d.last_message_id,
+                -1,
+            )
+        };
+        (server_unread_count, local_unread_count)
+    };
+
+    let mut server_unread_count = server_unread_count;
+    if server_unread_count < 0 {
+        server_unread_count = if unread_count >= 0 {
+            unread_count
+        } else {
+            server_unread_count_old
+        };
+        let order = manager
+            .get_dialog(dialog_id)
+            .map(|d| d.order)
+            .unwrap_or(DEFAULT_ORDER);
+        // `td_->dialog_manager_->have_input_peer(dialog_id, false, Read)`
+        if state.have_input_peer(dialog_id, false) && need_unread_counter(order) {
+            manager
+                .get_dialog_mut(dialog_id)
+                .unwrap()
+                .need_repair_server_unread_count = true;
+            on_dialog_updated(manager, dialog_id, "read_history_inbox");
+            repair_server_unread_count(ctx, state, dialog_id, server_unread_count, source);
+        }
+    }
+    let mut local_unread_count = local_unread_count;
+    if local_unread_count < 0 {
+        // TODO repair local unread count
+        local_unread_count = manager
+            .get_dialog(dialog_id)
+            .map(|d| d.local_unread_count)
+            .unwrap_or(0);
+    }
+
+    set_dialog_last_read_inbox_message_id(
+        manager,
+        ctx,
+        state,
+        dialog_id,
+        max_message_id,
+        server_unread_count,
+        local_unread_count,
+        true,
+        source,
+    );
+
+    let is_marked_as_unread = manager
+        .get_dialog(dialog_id)
+        .map(|d| d.is_marked_as_unread)
+        .unwrap_or(false);
+    if is_marked_as_unread && max_message_id != MessageId::default() {
+        set_dialog_is_marked_as_unread(manager, ctx, state, dialog_id, false);
+    }
+}
+
+/// The `d->last_read_inbox_message_id` read for the ttl seam log.
+fn last_read_inbox_of(manager: &MessagesManager, dialog_id: DialogId) -> MessageId {
+    manager
+        .get_dialog(dialog_id)
+        .map(|d| d.last_read_inbox_message_id)
+        .unwrap_or_default()
+}
+
+/// `MessagesManager::read_history_outbox(DialogId, ...)` (MessagesManager.cpp:
+/// 9615-9628) — the `get_dialog_force` dispatch; the db-load leg is the
+/// dialog-db receive seam.
+pub fn read_history_outbox(
+    manager: &mut MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+    max_message_id: MessageId,
+    read_date: i32,
+) {
+    assert!(!max_message_id.is_scheduled());
+
+    if ctx.is_bot() {
+        return;
+    }
+
+    if manager.get_dialog(dialog_id).is_some() {
+        read_history_outbox_dialog(manager, ctx, state, dialog_id, max_message_id, read_date);
+    }
+    // else: "Receive read outbox update about unknown dialog" is `LOG(INFO)`, dropped
+}
+
+/// `MessagesManager::read_history_outbox(Dialog *, ...)`
+/// (MessagesManager.cpp:9630-9670) — the monotonic gate has no
+/// `is_last_read_outbox_message_id_inited` arm, unlike the inbox.
+fn read_history_outbox_dialog(
+    manager: &mut MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+    max_message_id: MessageId,
+    read_date: i32,
+) {
+    if ctx.is_bot() {
+        return;
+    }
+    assert!(
+        manager.get_dialog(dialog_id).is_some(),
+        "read_history_outbox without the dialog {dialog_id:?}"
+    );
+
+    if !max_message_id.is_valid() {
+        log_error!(
+            "Receive read outbox update in {:?} with {}",
+            dialog_id,
+            DisplayMessageId(max_message_id)
+        );
+        return;
+    }
+    let already_read = {
+        let d = manager.get_dialog(dialog_id).unwrap();
+        max_message_id <= d.last_read_outbox_message_id
+    };
+    if already_read {
+        // `LOG(INFO)`, dropped
+        return;
+    }
+
+    if max_message_id.is_yet_unsent() {
+        log_error!(
+            "Tried to update last read outbox message with {} in {:?}",
+            DisplayMessageId(max_message_id),
+            dialog_id
+        );
+        return;
+    }
+
+    // it is impossible for just sent outgoing messages because updates are ordered by PTS
+    // (the deleted-outgoing arm is `LOG(INFO)`, dropped)
+
+    if dialog_id.get_type() == DialogType::SecretChat {
+        let server_time = ctx.server_time();
+        let mut read_time = ctx.now();
+        if read_date <= 0 {
+            log_error!("Receive wrong read date {read_date} in {dialog_id:?}");
+        } else if f64::from(read_date) < server_time {
+            read_time -= server_time - f64::from(read_date);
+        }
+        // `ttl_read_history(d, true, max_message_id, d->last_read_outbox_message_id,
+        // read_time)` — the SecretChats track
+        let till = manager
+            .get_dialog(dialog_id)
+            .map(|d| d.last_read_outbox_message_id)
+            .unwrap_or_default();
+        tracing::info!(
+            "ttl_read_history seam: dialog {:?} is_outgoing=true from {} till {} view_date {}",
+            dialog_id,
+            DisplayMessageId(max_message_id),
+            DisplayMessageId(till),
+            read_time
+        );
+    }
+
+    set_dialog_last_read_outbox_message_id(manager, ctx, state, dialog_id, max_message_id);
+}
+
+/// `MessagesManager::repair_server_unread_count` (MessagesManager.cpp:
+/// 9419-9440) — the gates are ported (`pending_read_history_timeout_`
+/// answers "no pending timeout" until the M.10.13 view/read slice brings
+/// the timer plane); the 0.2s-delayed `send_get_dialog_query` re-sync is
+/// [blocked: net], the MessageQueryManager owner.
+fn repair_server_unread_count(
+    ctx: &dyn MessageObjectContext,
+    state: &dyn ReadStateContext,
+    dialog_id: DialogId,
+    unread_count: i32,
+    source: &str,
+) {
+    if ctx.is_bot() || !state.have_input_peer(dialog_id, false) {
+        return;
+    }
+    // if (pending_read_history_timeout_.has_timeout(...)) return; — the timer
+    // plane rides the M.10.13 view/read slice
+    tracing::info!(
+        "repair_server_unread_count seam: dialog {:?} from {} from {} — the delayed getDialog re-sync is [blocked: net]",
+        dialog_id,
+        unread_count,
+        source
+    );
+}
+
+/// `MessagesManager::set_dialog_last_read_inbox_message_id`
+/// (MessagesManager.cpp:9885-10011) — the setter: the `MessageId::min()`
+/// counters-only form skips both id halves; the list-counter table and the
+/// notification flush ride the [`ReadStateContext`] seams; the literal
+/// source string "read_dialog_inbox" is the
+/// `remove_notification_group` force flag.
+#[allow(clippy::too_many_arguments)] // the C++ signature
+pub fn set_dialog_last_read_inbox_message_id(
+    manager: &mut MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+    message_id: MessageId,
+    server_unread_count: i32,
+    local_unread_count: i32,
+    force_update: bool,
+    source: &str,
+) {
+    assert!(!message_id.is_scheduled());
+
+    if ctx.is_bot() {
+        return;
+    }
+
+    assert!(
+        manager.get_dialog(dialog_id).is_some(),
+        "set_dialog_last_read_inbox_message_id without the dialog {dialog_id:?}"
+    );
+
+    if message_id != MessageId::min() {
+        if ctx.is_admined_monoforum_channel(dialog_id) {
+            // the per-topic `get_const_iterator` walk and the
+            // `on_update_read_monoforum_inbox`/`on_update_read_all_monoforum_inbox`
+            // arms — the SavedMessages track (Wave-2/3)
+            tracing::info!(
+                "monoforum read walk seam: dialog {:?} up to {} from {}",
+                dialog_id,
+                DisplayMessageId(message_id),
+                source
+            );
+        }
+
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        d.last_read_inbox_message_id = message_id;
+        d.is_last_read_inbox_message_id_inited = true;
+    }
+    let old_unread_count = {
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        let old_unread_count = d.server_unread_count + d.local_unread_count;
+        d.server_unread_count = server_unread_count;
+        d.local_unread_count = local_unread_count;
+        old_unread_count
+    };
+
+    let (order, is_marked_as_unread) = {
+        let d = manager.get_dialog(dialog_id).unwrap();
+        (d.order, d.is_marked_as_unread)
+    };
+    if need_unread_counter(order) {
+        let new_unread_count = server_unread_count + local_unread_count;
+        state.on_unread_count_change(
+            dialog_id,
+            old_unread_count,
+            new_unread_count,
+            is_marked_as_unread,
+            force_update,
+            source,
+        );
+
+        let was_unread = old_unread_count != 0 || is_marked_as_unread;
+        let is_unread = new_unread_count != 0 || is_marked_as_unread;
+        if state.have_dialog_filters() && was_unread != is_unread {
+            state.update_dialog_lists(dialog_id, "set_dialog_last_read_inbox_message_id");
+        }
+    }
+
+    if message_id != MessageId::min() {
+        let last_read_inbox_message_id = manager
+            .get_dialog(dialog_id)
+            .map(|d| d.last_read_inbox_message_id)
+            .unwrap_or_default();
+        let sponsored = state.is_dialog_sponsored(dialog_id);
+        if last_read_inbox_message_id.is_valid() && (order != DEFAULT_ORDER || sponsored) {
+            let notification_block = {
+                let d = manager.get_dialog(dialog_id).unwrap();
+                d.notification_info
+                    .as_ref()
+                    .map(|info| {
+                        (
+                            info.message_notification_group.is_valid(),
+                            info.mention_notification_group.is_valid(),
+                            info.pinned_message_notification_message_id,
+                        )
+                    })
+                    .unwrap_or((false, false, MessageId::default()))
+            };
+            let (message_group_valid, mention_group_valid, pinned_message_notification_message_id) =
+                notification_block;
+            if message_group_valid {
+                let total_count =
+                    get_dialog_pending_notification_count(manager, state, dialog_id, false);
+                if total_count == 0 {
+                    // `set_dialog_last_notification(dialog_id, group_info, 0,
+                    // NotificationId(), source)` (MessagesManager.cpp:12627-12633)
+                    if let Some(info) = manager
+                        .get_dialog_mut(dialog_id)
+                        .and_then(|d| d.notification_info.as_mut())
+                    {
+                        info.message_notification_group
+                            .set_last_notification(0, NotificationId::default());
+                    }
+                }
+                let pending_len = manager
+                    .get_dialog(dialog_id)
+                    .and_then(|d| d.notification_info.as_ref())
+                    .map(|info| info.pending_new_message_notifications.len())
+                    .unwrap_or(0);
+                let has_pending = pending_len != 0;
+                if has_pending {
+                    if let Some(info) = manager
+                        .get_dialog_mut(dialog_id)
+                        .and_then(|d| d.notification_info.as_mut())
+                    {
+                        for it in &mut info.pending_new_message_notifications {
+                            if it.1 <= message_id {
+                                it.0 = DialogId::default();
+                            }
+                        }
+                    }
+                    state.flush_pending_new_message_notifications(
+                        dialog_id,
+                        false,
+                        DialogId::from_user_id(UserId::new(1)),
+                    );
+                }
+                let mut total_count = total_count - pending_len as i32;
+                if total_count < 0 {
+                    log_error!(
+                        "Total message notification count is {total_count} in {dialog_id:?} with old unread_count = \
+                         {old_unread_count} after reading history up to {}",
+                        DisplayMessageId(message_id)
+                    );
+                    total_count = 0;
+                }
+                let group_id = manager
+                    .get_dialog(dialog_id)
+                    .and_then(|d| d.notification_info.as_ref())
+                    .map(|info| info.message_notification_group.get_group_id())
+                    .unwrap_or_default();
+                state.remove_notification_group(
+                    group_id,
+                    last_read_inbox_message_id,
+                    total_count,
+                    source == "read_dialog_inbox",
+                    source,
+                );
+            }
+
+            if mention_group_valid
+                && pinned_message_notification_message_id.is_valid()
+                && pinned_message_notification_message_id <= last_read_inbox_message_id
+            {
+                // remove pinned message notification when it is read
+                state.remove_dialog_pinned_message_notification(dialog_id, source);
+            }
+        }
+    }
+
+    on_dialog_updated(manager, dialog_id, source);
+    send_update_chat_read_inbox(manager, ctx, state, dialog_id, force_update, source);
+}
+
+/// `MessagesManager::set_dialog_last_read_outbox_message_id`
+/// (MessagesManager.cpp:10013-10026).
+pub fn set_dialog_last_read_outbox_message_id(
+    manager: &mut MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+    message_id: MessageId,
+) {
+    assert!(!message_id.is_scheduled());
+
+    if ctx.is_bot() {
+        return;
+    }
+
+    assert!(
+        manager.get_dialog(dialog_id).is_some(),
+        "set_dialog_last_read_outbox_message_id without the dialog {dialog_id:?}"
+    );
+    let d = manager.get_dialog_mut(dialog_id).unwrap();
+    d.last_read_outbox_message_id = message_id;
+    d.is_last_read_outbox_message_id_inited = true;
+    send_update_chat_read_outbox(manager, ctx, state, dialog_id);
+}
+
+/// `MessagesManager::send_update_chat_read_inbox` (MessagesManager.cpp:
+/// 27395-27422) — the postpone decision table is ported; the postponed set
+/// (`postponed_chat_read_inbox_updates_`) and the 0.1s retry timeout ride
+/// the difference-engine slice, so a postponed update is dropped here like
+/// the C++ defers it past the difference.
+pub fn send_update_chat_read_inbox(
+    manager: &MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+    force: bool,
+    source: &str,
+) {
+    if ctx.is_bot() {
+        return;
+    }
+
+    let d = manager
+        .get_dialog(dialog_id)
+        .unwrap_or_else(|| panic!("send_update_chat_read_inbox without the dialog {dialog_id:?}"));
+    if !d.is_update_new_chat_sent {
+        tracing::warn!(
+            "Wrong {dialog_id:?} in send_update_chat_read_inbox from {source} (updateNewChat not sent yet)"
+        );
+    }
+    let unread_count = d.server_unread_count + d.local_unread_count;
+    if !force
+        && (state.is_running_get_difference()
+            || state.is_running_get_channel_difference(dialog_id)
+            || state.has_channel_difference_to_log_event(dialog_id)
+            || (d.open_count > 0 && unread_count > 0))
+    {
+        // postponed to `postponed_chat_read_inbox_updates_` (the
+        // difference-engine slice owns the set + the timeout)
+        tracing::info!(
+            "Postpone updateChatReadInbox in {dialog_id:?} to {} + {} from {source}",
+            d.server_unread_count,
+            d.local_unread_count
+        );
+    } else {
+        state.send_update(td_api::Object::updateChatReadInbox(
+            td_api::updateChatReadInbox {
+                chat_id: ctx
+                    .content_context()
+                    .get_chat_id_object(dialog_id, "updateChatReadInbox"),
+                last_read_inbox_message_id: d.last_read_inbox_message_id.get(),
+                unread_count,
+            },
+        ));
+    }
+}
+
+/// `MessagesManager::send_update_chat_read_outbox` (MessagesManager.cpp:
+/// 27425-27436).
+pub fn send_update_chat_read_outbox(
+    manager: &MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+) {
+    if ctx.is_bot() {
+        return;
+    }
+
+    let d = manager
+        .get_dialog(dialog_id)
+        .unwrap_or_else(|| panic!("send_update_chat_read_outbox without the dialog {dialog_id:?}"));
+    if !d.is_update_new_chat_sent {
+        tracing::warn!(
+            "Wrong {dialog_id:?} in send_update_chat_read_outbox (updateNewChat not sent yet)"
+        );
+    }
+    let last_read_outbox_message_id = d.last_read_outbox_message_id;
+    on_dialog_updated(manager, dialog_id, "send_update_chat_read_outbox");
+    state.send_update(td_api::Object::updateChatReadOutbox(
+        td_api::updateChatReadOutbox {
+            chat_id: ctx
+                .content_context()
+                .get_chat_id_object(dialog_id, "updateChatReadOutbox"),
+            last_read_outbox_message_id: last_read_outbox_message_id.get(),
+        },
+    ));
+}
+
+/// `MessagesManager::send_update_message_mention_read` (MessagesManager.cpp:
+/// 27077-27097) — the not-yet-sent message arm degrades to the chat-level
+/// `updateChatUnreadMentionCount`.
+pub fn send_update_message_mention_read(
+    manager: &MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+    m: &Message,
+    unread_mention_count: i32,
+) {
+    let _ = manager;
+    if ctx.is_bot() {
+        return;
+    }
+    if !m.is_update_sent {
+        state.send_update(td_api::Object::updateChatUnreadMentionCount(
+            td_api::updateChatUnreadMentionCount {
+                chat_id: ctx
+                    .content_context()
+                    .get_chat_id_object(dialog_id, "updateChatUnreadMentionCount"),
+                unread_mention_count,
+            },
+        ));
+        return;
+    }
+
+    state.send_update(td_api::Object::updateMessageMentionRead(
+        td_api::updateMessageMentionRead {
+            chat_id: ctx
+                .content_context()
+                .get_chat_id_object(dialog_id, "updateMessageMentionRead"),
+            message_id: m.message_id.get(),
+            unread_mention_count,
+        },
+    ));
+}
+
+/// `MessagesManager::send_update_chat_unread_mention_count`
+/// (MessagesManager.cpp:27438-27455).
+pub fn send_update_chat_unread_mention_count(
+    manager: &MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+) {
+    if ctx.is_bot() {
+        return;
+    }
+
+    let d = manager.get_dialog(dialog_id).unwrap_or_else(|| {
+        panic!("send_update_chat_unread_mention_count without the dialog {dialog_id:?}")
+    });
+    if !d.is_update_new_chat_sent {
+        tracing::warn!(
+            "Wrong {dialog_id:?} in send_update_chat_unread_mention_count (updateNewChat not sent yet)"
+        );
+    }
+    let unread_mention_count = d.unread_mention_count;
+    on_dialog_updated(manager, dialog_id, "send_update_chat_unread_mention_count");
+    state.send_update(td_api::Object::updateChatUnreadMentionCount(
+        td_api::updateChatUnreadMentionCount {
+            chat_id: ctx
+                .content_context()
+                .get_chat_id_object(dialog_id, "updateChatUnreadMentionCount"),
+            unread_mention_count,
+        },
+    ));
+}
+
+/// `MessagesManager::set_dialog_is_marked_as_unread` (MessagesManager.cpp:
+/// 28738-28771) — the flag flip + the `updateChatIsMarkedAsUnread`
+/// emission + the marked/unread counter walk (gated on the unread sum
+/// being zero) + the dialog-filter update.
+pub fn set_dialog_is_marked_as_unread(
+    manager: &mut MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+    is_marked_as_unread: bool,
+) {
+    // just in case
+    if ctx.is_bot() {
+        return;
+    }
+
+    let old_is_marked_as_unread = manager
+        .get_dialog(dialog_id)
+        .map(|d| d.is_marked_as_unread)
+        .unwrap_or(false);
+    assert!(
+        old_is_marked_as_unread != is_marked_as_unread,
+        "set_dialog_is_marked_as_unread without a change in {dialog_id:?}"
+    );
+    manager
+        .get_dialog_mut(dialog_id)
+        .unwrap()
+        .is_marked_as_unread = is_marked_as_unread;
+    on_dialog_updated(manager, dialog_id, "set_dialog_is_marked_as_unread");
+
+    let (unread_sum, order) = {
+        let d = manager.get_dialog(dialog_id).unwrap();
+        (d.server_unread_count + d.local_unread_count, d.order)
+    };
+    state.send_update(td_api::Object::updateChatIsMarkedAsUnread(
+        td_api::updateChatIsMarkedAsUnread {
+            chat_id: ctx
+                .content_context()
+                .get_chat_id_object(dialog_id, "updateChatIsMarkedAsUnread"),
+            is_marked_as_unread,
+        },
+    ));
+
+    if unread_sum == 0 && need_unread_counter(order) {
+        let delta = if is_marked_as_unread { 1 } else { -1 };
+        state.on_is_marked_as_unread_change(dialog_id, delta, "set_dialog_is_marked_as_unread");
+
+        if state.have_dialog_filters() {
+            state.update_dialog_lists(dialog_id, "set_dialog_is_marked_as_unread");
+        }
+    }
+}
+
+/// `MessagesManager::can_use_forum_topic_id` (MessagesManager.cpp:21870-21882).
+pub fn can_use_forum_topic_id(
+    manager: &MessagesManager,
+    dialog_id: DialogId,
+    forum_topic_id: ForumTopicId,
+) -> Result<(), Status> {
+    if forum_topic_id == ForumTopicId::default() {
+        return Result::Ok(());
+    }
+    if !forum_topic_id.is_valid() {
+        return Result::Err(Status::error(
+            400,
+            "Invalid forum topic identifier specified",
+        ));
+    }
+    if !manager.get_dialog(dialog_id).is_some_and(|d| d.is_forum) {
+        return Result::Err(Status::error(400, "Chat doesn't have topics"));
+    }
+    Result::Ok(())
+}
+
+/// `MessagesManager::read_all_dialog_mentions` (MessagesManager.cpp:9134-9188).
+/// The `check_dialog_access` opener is inlined per the M.10.6 convention:
+/// the in-memory registration here, the db-load leg and the
+/// `have_input_peer` rights half the [`ReadStateContext`] seam carries.
+pub fn read_all_dialog_mentions(
+    global: &crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    time: &crate::user_manager::TimeCtx,
+    dialog_id: DialogId,
+    forum_topic_id: ForumTopicId,
+) -> Result<(), Status> {
+    // `check_dialog_access(dialog_id, true, AccessRights::Read,
+    // "read_all_dialog_mentions")` (DialogManager.cpp:1350-1375)
+    if manager.get_dialog(dialog_id).is_none() {
+        // the `get_dialog_force` db load leg is the dialog-db receive seam
+        if !dialog_id.is_valid() {
+            return Result::Err(Status::error(400, "Invalid chat identifier specified"));
+        }
+        return Result::Err(Status::error(400, "Chat not found"));
+    }
+    if !state.have_input_peer(dialog_id, true) {
+        // the Read-rights failure arm of `check_dialog_access_in_memory`
+        return Result::Err(Status::error(400, "Can't access the chat"));
+    }
+    can_use_forum_topic_id(manager, dialog_id, forum_topic_id)?;
+
+    if forum_topic_id.is_valid() {
+        // `ForumTopicManager::on_topic_mention_count_changed(dialog_id,
+        // forum_topic_id, 0, false)` + `MessageQueryManager::
+        // read_all_topic_mentions_on_server` — [blocked: net], the
+        // MessageQueryManager owner
+        tracing::info!(
+            "read_all_topic_mentions_on_server seam: dialog {dialog_id:?} topic {}",
+            forum_topic_id.get()
+        );
+        return Result::Ok(());
+    }
+
+    let unread_mention_count = manager
+        .get_dialog(dialog_id)
+        .map(|d| d.unread_mention_count)
+        .unwrap_or(0);
+    // (the dropped `LOG(INFO)` reported the count above)
+
+    if dialog_id.get_type() == DialogType::SecretChat {
+        assert!(
+            unread_mention_count == 0,
+            "a secret chat cannot have unread mentions"
+        );
+        return Result::Ok(());
+    }
+
+    let (last_new_message_id, last_read_all_mentions_message_id) = {
+        let d = manager.get_dialog(dialog_id).unwrap();
+        (d.last_new_message_id, d.last_read_all_mentions_message_id)
+    };
+    if last_new_message_id > last_read_all_mentions_message_id {
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        d.last_read_all_mentions_message_id = d.last_new_message_id;
+        on_dialog_updated(manager, dialog_id, "read_all_dialog_mentions");
+    }
+
+    let message_ids = {
+        let d = manager.get_dialog(dialog_id).unwrap();
+        find_dialog_messages(d, |m| m.contains_unread_mention)
+    };
+    let mut is_update_sent = false;
+    for message_id in message_ids {
+        {
+            let m = manager
+                .get_dialog(dialog_id)
+                .and_then(|d| d.messages.get(&message_id))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "get_message CHECK failed for {} in read_all_dialog_mentions",
+                        DisplayMessageId(message_id)
+                    )
+                });
+            assert!(m.contains_unread_mention);
+            assert_eq!(m.message_id, message_id);
+            assert!(m.message_id.is_valid());
+        }
+        // hold the message node for the iteration — the C++ `Message *m`
+        // walks all four calls; the map round-trip is the port's ownership
+        // shape
+        let mut m = manager
+            .get_dialog_mut(dialog_id)
+            .and_then(|d| d.messages.remove(&message_id))
+            .expect("message vanished mid-iteration");
+        // must be called before contains_unread_mention is updated
+        remove_message_notification_id(
+            manager,
+            state,
+            dialog_id,
+            &mut m,
+            true,
+            false,
+            false,
+            "read_all_dialog_mentions",
+        );
+        m.contains_unread_mention = false;
+        send_update_message_mention_read(manager, ctx, state, dialog_id, &m, 0);
+        is_update_sent = true;
+        on_message_changed(
+            global,
+            manager,
+            ctx,
+            time,
+            dialog_id,
+            &m,
+            true,
+            "read_all_dialog_mentions",
+        );
+        let prev = manager
+            .get_dialog_mut(dialog_id)
+            .unwrap()
+            .messages
+            .insert(message_id, m);
+        assert!(prev.is_none(), "message reappeared mid-iteration");
+    }
+
+    let unread_mention_count = manager
+        .get_dialog(dialog_id)
+        .map(|d| d.unread_mention_count)
+        .unwrap_or(0);
+    if unread_mention_count != 0 {
+        set_dialog_unread_mention_count(manager, dialog_id, 0);
+        if !is_update_sent {
+            send_update_chat_unread_mention_count(manager, ctx, state, dialog_id);
+        } else {
+            // (the dropped `LOG(INFO)` reported the count above)
+            on_dialog_updated(manager, dialog_id, "read_all_dialog_mentions");
+        }
+    }
+    remove_message_dialog_notifications(
+        manager,
+        ctx,
+        state,
+        dialog_id,
+        MessageId::max(),
+        true,
+        "read_all_dialog_mentions",
+    );
+
+    // `MessageQueryManager::read_all_dialog_mentions_on_server(dialog_id, 0,
+    // promise)` — [blocked: net]
+    tracing::info!("read_all_dialog_mentions_on_server seam: dialog {dialog_id:?}");
+    Result::Ok(())
+}
+
+/// `MessagesManager::is_from_mention_notification_group`
+/// (MessagesManager.cpp:26013-26017).
+fn is_from_mention_notification_group(m: &Message) -> bool {
+    m.contains_mention && !m.is_mention_notification_disabled
+}
+
+/// `MessagesManager::is_message_notification_active` (MessagesManager.cpp:
+/// 26018-26038).
+pub fn is_message_notification_active(d: &Dialog, m: &Message) -> bool {
+    assert!(!m.message_id.is_scheduled());
+    let Some(notification_info) = d.notification_info.as_ref() else {
+        if is_from_mention_notification_group(m) {
+            return m.contains_unread_mention;
+        }
+        return m.message_id > d.last_read_inbox_message_id;
+    };
+    if is_from_mention_notification_group(m) {
+        !notification_info
+            .mention_notification_group
+            .is_removed_notification(
+                m.notification_id,
+                NotificationObjectId::from_message_id(m.message_id),
+            )
+            && (m.contains_unread_mention
+                || m.message_id == notification_info.pinned_message_notification_message_id)
+    } else {
+        !notification_info
+            .message_notification_group
+            .is_removed_notification(
+                m.notification_id,
+                NotificationObjectId::from_message_id(m.message_id),
+            )
+            && m.message_id > d.last_read_inbox_message_id
+    }
+}
+
+/// `MessagesManager::remove_message_notification_id` (MessagesManager.cpp:
+/// 13353-13401) — the dialog-local correspondence move; the group-id
+/// materialization (`add_dialog_notification_info`), the
+/// `fix_dialog_last_notification_id` re-walk (ordered container) and the
+/// `remove_notification` send ride the M.13 notification plane /
+/// M.10.9 container slice. Until the M.13 plane lands,
+/// `m.notification_id` is never valid and the function early-returns like
+/// the C++ does for notification-less messages.
+#[allow(clippy::too_many_arguments)] // the C++ signature
+fn remove_message_notification_id(
+    manager: &mut MessagesManager,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+    m: &mut Message,
+    is_permanent: bool,
+    force_update: bool,
+    ignore_pinned_message_notification_removal: bool,
+    _source: &str,
+) {
+    assert!(m.message_id.is_valid());
+    let notification_id = m.notification_id;
+    if !notification_id.is_valid() {
+        return;
+    }
+
+    let from_mentions = is_from_mention_notification_group(m);
+    let Some(d) = manager.get_dialog_mut(dialog_id) else {
+        return;
+    };
+    // hoisted above the group borrow (a pure read of the same state — the
+    // C++ computes it after the group-valid check, with no observable
+    // difference)
+    let had_active_notification = is_message_notification_active(d, m);
+    // `get_notification_group_info(d, m)` — the `add_dialog_notification_info`
+    // creation leg is the M.13/notification slice; an unmaterialized
+    // notification_info answers like the C++ invalid-group arm
+    let Some(notification_info) = d.notification_info.as_mut() else {
+        tracing::info!(
+            "remove_message_notification_id seam: dialog {dialog_id:?} has no notification_info to materialize"
+        );
+        return;
+    };
+    let group_info = if from_mentions {
+        &mut notification_info.mention_notification_group
+    } else {
+        &mut notification_info.message_notification_group
+    };
+    if !group_info.is_valid() {
+        return;
+    }
+
+    let group_id = group_info.get_group_id();
+    // `delete_notification_id_to_message_id_correspondence`
+    notification_info
+        .notification_id_to_message_id
+        .remove(&notification_id);
+    m.removed_notification_id = m.notification_id;
+    m.notification_id = NotificationId::default();
+    let pinned_matches = notification_info.pinned_message_notification_message_id == m.message_id;
+    if pinned_matches && is_permanent && !ignore_pinned_message_notification_removal {
+        // must be called after notification_id is removed
+        state
+            .remove_dialog_pinned_message_notification(dialog_id, "remove_message_notification_id");
+    }
+    if group_info.get_last_notification_id() == notification_id {
+        // last notification is deleted, need to find new last notification —
+        // `fix_dialog_last_notification_id` walks the ordered container
+        // ([blocked: M.10.9]) and repairs the group state ([blocked: M.13])
+        tracing::info!(
+            "fix_dialog_last_notification_id seam: group {group_id:?} in {dialog_id:?} after removing {notification_id:?}"
+        );
+    }
+
+    if is_permanent && had_active_notification {
+        state.remove_notification(group_id, notification_id, is_permanent, force_update);
+    }
+
+    // on_message_changed will be called by the caller
+    // don't need to call there to not save twice/or to save just deleted message
+}
+
+/// `MessagesManager::get_dialog_pending_notification_count`
+/// (MessagesManager.cpp:26574-26594).
+fn get_dialog_pending_notification_count(
+    manager: &MessagesManager,
+    state: &dyn ReadStateContext,
+    dialog_id: DialogId,
+    from_mentions: bool,
+) -> i32 {
+    let d = manager.get_dialog(dialog_id).unwrap_or_else(|| {
+        panic!("get_dialog_pending_notification_count without the dialog {dialog_id:?}")
+    });
+    let notification_info = d.notification_info.as_ref().unwrap_or_else(|| {
+        panic!("get_dialog_pending_notification_count without notification_info")
+    });
+    if from_mentions {
+        let has_pinned_message = notification_info
+            .pinned_message_notification_message_id
+            .is_valid()
+            && notification_info.pinned_message_notification_message_id <= d.last_new_message_id;
+        d.unread_mention_count + i32::from(has_pinned_message)
+    } else if notification_info.new_secret_chat_notification_id.is_valid() {
+        1
+    } else if state.is_dialog_muted(dialog_id) {
+        // usually 0
+        i32::try_from(notification_info.pending_new_message_notifications.len()).unwrap_or(i32::MAX)
+    } else {
+        d.server_unread_count + d.local_unread_count
+    }
+}
+
+/// `MessagesManager::remove_message_dialog_notifications`
+/// (MessagesManager.cpp:26937-26988) — the pending-notification zeroing
+/// and the `set_dialog_last_notification` halves are local; the flush and
+/// the group removal sends ride the [`ReadStateContext`] seams.
+fn remove_message_dialog_notifications(
+    manager: &mut MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+    max_message_id: MessageId,
+    from_mentions: bool,
+    source: &str,
+) {
+    // removes up to max_message_id
+    assert!(!max_message_id.is_scheduled());
+
+    // `get_next_local_message_id` — computed before the mutable borrow
+    let next_local_message_id = manager
+        .get_dialog_mut(dialog_id)
+        .map(|d| get_next_local_message_id(d, ctx.is_bot()))
+        .unwrap_or_default();
+    let last_message_id = manager
+        .get_dialog(dialog_id)
+        .map(|d| d.last_message_id)
+        .unwrap_or_default();
+
+    let Some(d) = manager.get_dialog_mut(dialog_id) else {
+        return;
+    };
+    let Some(notification_info) = d.notification_info.as_mut() else {
+        return;
+    };
+    let NotificationInfo {
+        message_notification_group,
+        mention_notification_group,
+        pending_new_message_notifications,
+        pending_new_mention_notifications,
+        ..
+    } = notification_info;
+    let (group_info, pending) = if from_mentions {
+        (
+            mention_notification_group,
+            pending_new_mention_notifications,
+        )
+    } else {
+        (
+            message_notification_group,
+            pending_new_message_notifications,
+        )
+    };
+    if !group_info.is_valid() {
+        return;
+    }
+    let group_id = group_info.get_group_id();
+
+    if !pending.is_empty() {
+        for it in pending.iter_mut() {
+            if it.1 <= max_message_id {
+                it.0 = DialogId::default();
+            }
+        }
+        state.flush_pending_new_message_notifications(
+            dialog_id,
+            from_mentions,
+            DialogId::from_user_id(UserId::new(3)),
+        );
+    }
+
+    let mut max_notification_message_id = max_message_id;
+    if last_message_id.is_valid() && max_notification_message_id >= last_message_id {
+        max_notification_message_id = last_message_id;
+        group_info.set_last_notification(0, NotificationId::default()); // "remove_message_dialog_notifications 1"
+    } else if max_notification_message_id == MessageId::max() {
+        max_notification_message_id = next_local_message_id;
+        group_info.set_last_notification(0, NotificationId::default()); // "remove_message_dialog_notifications 2"
+    } else {
+        panic!(
+            "TODO support notification deletion up to {} if it would be ever needed from {}",
+            DisplayMessageId(max_message_id),
+            source
+        );
+    }
+
+    state.remove_notification_group(group_id, max_notification_message_id, 0, true, source);
+}
+
+/// `MessagesManager::get_next_message_id` (MessagesManager.cpp:28247-28277)
+/// — the allocator walk; the `get_message_force` probes collapse to the
+/// `Dialog::messages` map (the db-load leg is the dialog-db receive seam).
+fn get_next_message_id(d: &mut Dialog, is_bot: bool, message_type: MessageType) -> MessageId {
+    let last_message_id = if is_bot {
+        d.last_assigned_message_id.max(d.max_unavailable_message_id)
+    } else {
+        let candidate = [
+            d.last_message_id,
+            d.last_new_message_id,
+            d.last_database_message_id,
+            d.last_assigned_message_id,
+            d.last_clear_history_message_id,
+            d.deleted_last_message_id,
+            d.max_unavailable_message_id,
+            d.max_added_message_id,
+        ]
+        .into_iter()
+        .max()
+        .unwrap();
+        let mut candidate = candidate;
+        if candidate < d.last_read_inbox_message_id
+            && d.last_read_inbox_message_id < d.last_new_message_id.get_next_server_message_id()
+        {
+            candidate = d.last_read_inbox_message_id;
+        }
+        if candidate < d.last_read_outbox_message_id
+            && d.last_read_outbox_message_id < d.last_new_message_id.get_next_server_message_id()
+        {
+            candidate = d.last_read_outbox_message_id;
+        }
+        candidate
+    };
+
+    d.last_assigned_message_id = last_message_id.get_next_message_id(message_type);
+    assert!(
+        d.last_assigned_message_id <= MessageId::max(),
+        "Force restart because of message_id overflow"
+    );
+    assert!(d.last_assigned_message_id.is_valid());
+    if d.last_assigned_message_id.get_prev_server_message_id()
+        != last_message_id.get_prev_server_message_id()
+    {
+        d.had_yet_unsent_message_id_overflow = true;
+    }
+    d.last_assigned_message_id
+}
+
+/// `MessagesManager::get_next_local_message_id` (MessagesManager.cpp:28281-28287).
+fn get_next_local_message_id(d: &mut Dialog, is_bot: bool) -> MessageId {
+    let mut message_id = get_next_message_id(d, is_bot, MessageType::Local);
+    while d.messages.contains_key(&message_id) {
+        message_id = message_id.get_next_message_id(MessageType::Local);
+    }
+    message_id
+}
+
+/// `MessagesManager::set_dialog_unread_mention_count` (MessagesManager.cpp:
+/// 12288-12294) — the CHECK parity: unequal to the old value and >= 0.
+fn set_dialog_unread_mention_count(
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    unread_mention_count: i32,
+) {
+    let d = manager.get_dialog_mut(dialog_id).unwrap_or_else(|| {
+        panic!("set_dialog_unread_mention_count without the dialog {dialog_id:?}")
+    });
+    assert!(d.unread_mention_count != unread_mention_count);
+    assert!(unread_mention_count >= 0);
+
+    d.unread_mention_count = unread_mention_count;
+    d.message_count_by_index
+        [message_search_filter_index(MessageSearchFilter::UnreadMention) as usize] =
+        unread_mention_count;
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -18241,5 +20024,1112 @@ mod tests {
         assert_eq!(rows_gone.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(ids_recorded.load(AtomicOrdering::SeqCst), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------------
+    // M.10.7 — the read counters + mentions tables
+    // -------------------------------------------------------------------
+
+    /// The read-state seam capture: the emitted td_api updates, the fake
+    /// `DialogList` counter blocks the walk table applies to (the M.10
+    /// dialog-list slice owns the real containers), and the M.13 send log.
+    struct ReadStateTestContext {
+        updates: Vec<td_api::Object>,
+        lists: Vec<DialogListUnreadCounters>,
+        muted: bool,
+        have_input_peer_answer: bool,
+        have_filters: bool,
+        unread_message_count_updates: usize,
+        unread_chat_count_updates: usize,
+        dialog_list_updates: Vec<String>,
+        flushed: Vec<(bool, i64)>,
+        removed_groups: Vec<(i32, i64, i32, bool)>,
+        removed_notifications: Vec<(i32, i32)>,
+        pinned_removed: Vec<i64>,
+    }
+
+    impl Default for ReadStateTestContext {
+        fn default() -> Self {
+            ReadStateTestContext {
+                updates: Vec::new(),
+                lists: Vec::new(),
+                muted: false,
+                have_input_peer_answer: true,
+                have_filters: false,
+                unread_message_count_updates: 0,
+                unread_chat_count_updates: 0,
+                dialog_list_updates: Vec::new(),
+                flushed: Vec::new(),
+                removed_groups: Vec::new(),
+                removed_notifications: Vec::new(),
+                pinned_removed: Vec::new(),
+            }
+        }
+    }
+
+    impl ReadStateContext for ReadStateTestContext {
+        fn send_update(&mut self, update: td_api::Object) {
+            self.updates.push(update);
+        }
+
+        fn have_input_peer(&self, _dialog_id: DialogId, _allow_secret_chats: bool) -> bool {
+            self.have_input_peer_answer
+        }
+
+        fn is_dialog_muted(&self, _dialog_id: DialogId) -> bool {
+            self.muted
+        }
+
+        fn is_dialog_sponsored(&self, _dialog_id: DialogId) -> bool {
+            false
+        }
+
+        fn on_unread_count_change(
+            &mut self,
+            _dialog_id: DialogId,
+            old_unread_count: i32,
+            new_unread_count: i32,
+            is_marked_as_unread: bool,
+            _force_update: bool,
+            _source: &str,
+        ) {
+            // the per-list table over the fake list — the exact
+            // MessagesManager.cpp:9942-9965 arithmetic via the ported
+            // per-list block
+            for list in &mut self.lists {
+                let (send_message_count, send_chat_count) = list.apply_unread_count_change(
+                    old_unread_count,
+                    new_unread_count,
+                    is_marked_as_unread,
+                    self.muted,
+                );
+                if send_message_count {
+                    self.unread_message_count_updates += 1;
+                }
+                if send_chat_count {
+                    self.unread_chat_count_updates += 1;
+                }
+            }
+        }
+
+        fn on_is_marked_as_unread_change(
+            &mut self,
+            _dialog_id: DialogId,
+            delta: i32,
+            _source: &str,
+        ) {
+            for list in &mut self.lists {
+                if list.apply_is_marked_as_unread_change(delta, self.muted) {
+                    self.unread_chat_count_updates += 1;
+                }
+            }
+        }
+
+        fn have_dialog_filters(&self) -> bool {
+            self.have_filters
+        }
+
+        fn update_dialog_lists(&mut self, _dialog_id: DialogId, source: &str) {
+            self.dialog_list_updates.push(source.to_owned());
+        }
+
+        fn is_running_get_difference(&self) -> bool {
+            false
+        }
+
+        fn is_running_get_channel_difference(&self, _dialog_id: DialogId) -> bool {
+            false
+        }
+
+        fn has_channel_difference_to_log_event(&self, _dialog_id: DialogId) -> bool {
+            false
+        }
+
+        fn remove_notification_group(
+            &mut self,
+            group_id: NotificationGroupId,
+            max_notification_message_id: MessageId,
+            total_count: i32,
+            force: bool,
+            _source: &str,
+        ) {
+            self.removed_groups.push((
+                group_id.get(),
+                max_notification_message_id.get(),
+                total_count,
+                force,
+            ));
+        }
+
+        fn remove_notification(
+            &mut self,
+            group_id: NotificationGroupId,
+            notification_id: NotificationId,
+            _is_permanent: bool,
+            _force_update: bool,
+        ) {
+            self.removed_notifications
+                .push((group_id.get(), notification_id.get()));
+        }
+
+        fn flush_pending_new_message_notifications(
+            &mut self,
+            _dialog_id: DialogId,
+            from_mentions: bool,
+            settings_dialog_id: DialogId,
+        ) {
+            self.flushed.push((from_mentions, settings_dialog_id.get()));
+        }
+
+        fn remove_dialog_pinned_message_notification(
+            &mut self,
+            dialog_id: DialogId,
+            _source: &str,
+        ) {
+            self.pinned_removed.push(dialog_id.get());
+        }
+    }
+
+    /// A plain incoming server message (counted as unread by
+    /// `get_is_counted_as_unread` for the Server type).
+    fn m10_7_incoming_message(server_id: i32) -> Message {
+        Message {
+            message_id: MessageId::from_server_message_id(ServerMessageId::new(server_id)),
+            date: 1700000000,
+            content: Some(crate::message_content::MessageContent::Text(
+                crate::message_content::MessageText::default(),
+            )),
+            ..Default::default()
+        }
+    }
+
+    fn m10_7_server_id(server_id: i32) -> MessageId {
+        MessageId::from_server_message_id(ServerMessageId::new(server_id))
+    }
+
+    /// `OrderedMessage.cpp:447-534` — the calc trio over descending
+    /// `(id, is_counted)` slices: missing endpoints, hint acceptance, the
+    /// distance-based selection and the negative-result fallback.
+    #[test]
+    fn m10_7_calc_trio_tables() {
+        // descending: 10(counted) 8(counted) 5(not) 2(counted)
+        let slice = vec![
+            (m10_7_server_id(10), true),
+            (m10_7_server_id(8), true),
+            (m10_7_server_id(5), false),
+            (m10_7_server_id(2), true),
+        ];
+
+        // from_last_unread: the counted messages in (2, 10] are 10 and 8 →
+        // 5 - 2 = 3 (the uncounted 5 walks through untouched)
+        assert_eq!(
+            calc_new_unread_count_from_last_unread(
+                &slice,
+                m10_7_server_id(10),
+                m10_7_server_id(2),
+                5
+            ),
+            3
+        );
+        // a missing max node is -1
+        assert_eq!(
+            calc_new_unread_count_from_last_unread(
+                &slice,
+                m10_7_server_id(9),
+                m10_7_server_id(2),
+                5
+            ),
+            -1
+        );
+        // a missing last_read node is -1
+        assert_eq!(
+            calc_new_unread_count_from_last_unread(
+                &slice,
+                m10_7_server_id(10),
+                m10_7_server_id(7),
+                5
+            ),
+            -1
+        );
+        // counted messages beyond the old count propagate a negative result
+        assert_eq!(
+            calc_new_unread_count_from_last_unread(
+                &slice,
+                m10_7_server_id(10),
+                m10_7_server_id(2),
+                1
+            ),
+            -1
+        );
+
+        // from_the_end: two counted above 5; exact count (last_message valid,
+        // walk stopped on a node)
+        assert_eq!(
+            calc_new_unread_count_from_the_end(&slice, m10_7_server_id(5), m10_7_server_id(20), -1),
+            2
+        );
+        // exact ⇒ hint accepted only when equal
+        assert_eq!(
+            calc_new_unread_count_from_the_end(&slice, m10_7_server_id(5), m10_7_server_id(20), 2),
+            2
+        );
+        assert_eq!(
+            calc_new_unread_count_from_the_end(&slice, m10_7_server_id(5), m10_7_server_id(20), 3),
+            2
+        );
+        // inexact (last_message invalid) ⇒ hint accepted when >= the count
+        assert_eq!(
+            calc_new_unread_count_from_the_end(&slice, m10_7_server_id(5), MessageId::default(), 5),
+            5
+        );
+        assert_eq!(
+            calc_new_unread_count_from_the_end(&slice, m10_7_server_id(5), MessageId::default(), 1),
+            -1
+        );
+        // inexact without a usable hint is -1
+        assert_eq!(
+            calc_new_unread_count_from_the_end(
+                &slice,
+                m10_7_server_id(5),
+                MessageId::default(),
+                -1
+            ),
+            -1
+        );
+
+        // dispatcher: last_read(2) is closer to max(10) than last_message(20)
+        // (20-10 > 10-2) ⇒ from_last_unread first (3), no fallback needed
+        assert_eq!(
+            calc_new_unread_count(
+                &slice,
+                m10_7_server_id(10),
+                m10_7_server_id(2),
+                5,
+                m10_7_server_id(20),
+                2
+            ),
+            3
+        );
+        // dispatcher: max(5) is closer to last_message(20) than to
+        // last_read(2)? No (20-5 > 5-2) ⇒ still from_last_unread first —
+        // the node 5 walk is uncounted, so 5
+        assert_eq!(
+            calc_new_unread_count(
+                &slice,
+                m10_7_server_id(5),
+                m10_7_server_id(2),
+                5,
+                m10_7_server_id(20),
+                -1
+            ),
+            5
+        );
+        // dispatcher: max(9) closer to last_message(11) (11-9 <= 9-2) ⇒
+        // from_the_end first: one counted message above 9
+        assert_eq!(
+            calc_new_unread_count(
+                &slice,
+                m10_7_server_id(9),
+                m10_7_server_id(2),
+                5,
+                m10_7_server_id(11),
+                -1
+            ),
+            1
+        );
+        // dispatcher: invalid last_message ⇒ from_last_unread first; its -1
+        // (missing max node) falls back to from_the_end, which is -1 too
+        // (inexact, no hint)
+        assert_eq!(
+            calc_new_unread_count(
+                &slice,
+                m10_7_server_id(9),
+                m10_7_server_id(2),
+                5,
+                MessageId::default(),
+                -1
+            ),
+            -1
+        );
+        // dispatcher: negative from_last_unread propagates into the
+        // from_the_end fallback (exact ⇒ 0 — nothing above 10)
+        assert_eq!(
+            calc_new_unread_count(
+                &slice,
+                m10_7_server_id(10),
+                m10_7_server_id(2),
+                1,
+                m10_7_server_id(20),
+                -1
+            ),
+            0
+        );
+        // dispatcher: invalid last_read ⇒ from_the_end only, no fallback
+        assert_eq!(
+            calc_new_unread_count(
+                &slice,
+                m10_7_server_id(5),
+                MessageId::default(),
+                9,
+                m10_7_server_id(20),
+                -1
+            ),
+            2
+        );
+
+        // need_unread_counter (MessagesManager.cpp:9672-9674)
+        assert!(!need_unread_counter(DEFAULT_ORDER));
+        assert!(need_unread_counter(0));
+        assert!(need_unread_counter(5));
+    }
+
+    /// The `read_history_inbox` gate ladder (MessagesManager.cpp:9522-9613):
+    /// the invalid-id rejection, the `MessageId()` zero sentinel, the
+    /// stale-id re-arm behind the consumed
+    /// `need_repair_channel_server_unread_count` flag (counters-only
+    /// `MessageId::min()`), the yet-unsent rejection, the unknown-unread
+    /// clamp and the marked-as-unread clear.
+    #[test]
+    fn m10_7_inbox_gate_table() {
+        let ctx = TestObjectContext::default();
+        let mut state = ReadStateTestContext::default();
+        let mut manager = MessagesManager::new();
+        let dialog_id = DialogId::from_user_id(UserId::new(3000));
+
+        // (a) a non-zero invalid id is rejected without any state change
+        // (`MessageId::new(3)`: non-scheduled, type bits 3 → invalid)
+        manager.add_dialog_for_new_message(dialog_id);
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        d.server_unread_count = 4;
+        read_history_inbox(
+            &mut manager,
+            &ctx,
+            &mut state,
+            dialog_id,
+            MessageId::new(3),
+            4,
+            "test",
+        );
+        let d = manager.get_dialog(dialog_id).unwrap();
+        assert_eq!(d.server_unread_count, 4);
+        assert!(!d.is_last_read_inbox_message_id_inited);
+        assert!(state.updates.is_empty());
+
+        // (b) a yet-unsent id is rejected (the C++ `MessageId::min()` shape)
+        read_history_inbox(
+            &mut manager,
+            &ctx,
+            &mut state,
+            dialog_id,
+            MessageId::min(),
+            0,
+            "test",
+        );
+        let d = manager.get_dialog(dialog_id).unwrap();
+        assert!(!d.is_last_read_inbox_message_id_inited);
+        assert!(state.updates.is_empty());
+
+        // (c) the MessageId() zero sentinel passes ("read up to 0")
+        read_history_inbox(
+            &mut manager,
+            &ctx,
+            &mut state,
+            dialog_id,
+            MessageId::default(),
+            4,
+            "test",
+        );
+        let d = manager.get_dialog(dialog_id).unwrap();
+        assert_eq!(d.last_read_inbox_message_id, MessageId::default());
+        assert!(d.is_last_read_inbox_message_id_inited);
+        assert_eq!(
+            d.server_unread_count, 4,
+            "the unknown-unread hint wins over the empty slice"
+        );
+        match state.updates.remove(0) {
+            td_api::Object::updateChatReadInbox(update) => {
+                assert_eq!(update.last_read_inbox_message_id, 0);
+                assert_eq!(update.unread_count, 4);
+            }
+            other => panic!("expected updateChatReadInbox, got {other:?}"),
+        }
+        assert!(state.updates.is_empty());
+
+        // (d) the stale equal-id re-arm: the consumed
+        // need_repair_channel_server_unread_count flag arms a counters-only
+        // `MessageId::min()` setter call
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        d.last_read_inbox_message_id = m10_7_server_id(10);
+        d.need_repair_channel_server_unread_count = true;
+        read_history_inbox(
+            &mut manager,
+            &ctx,
+            &mut state,
+            dialog_id,
+            m10_7_server_id(10),
+            5,
+            "test",
+        );
+        let d = manager.get_dialog(dialog_id).unwrap();
+        assert_eq!(
+            d.last_read_inbox_message_id,
+            m10_7_server_id(10),
+            "the id is not rewritten"
+        );
+        assert!(d.is_last_read_inbox_message_id_inited);
+        assert_eq!(d.server_unread_count, 5, "only the counters move");
+        assert!(
+            !d.need_repair_channel_server_unread_count,
+            "the flag is consumed once"
+        );
+        match state.updates.remove(0) {
+            td_api::Object::updateChatReadInbox(update) => assert_eq!(update.unread_count, 5),
+            other => panic!("expected updateChatReadInbox, got {other:?}"),
+        }
+        assert!(state.updates.is_empty());
+
+        // (e) a stale smaller id without the re-arm arm is a plain return
+        read_history_inbox(
+            &mut manager,
+            &ctx,
+            &mut state,
+            dialog_id,
+            m10_7_server_id(8),
+            7,
+            "test",
+        );
+        let d = manager.get_dialog(dialog_id).unwrap();
+        assert_eq!(d.server_unread_count, 5);
+        assert!(state.updates.is_empty());
+
+        // (f) the unknown-unread clamp: an invalid last_new_message_id with a
+        // positive hint clamps the hint to 0
+        read_history_inbox(
+            &mut manager,
+            &ctx,
+            &mut state,
+            dialog_id,
+            m10_7_server_id(15),
+            7,
+            "test",
+        );
+        let d = manager.get_dialog(dialog_id).unwrap();
+        assert_eq!(
+            d.server_unread_count, 0,
+            "the clamp zeroed the unknown hint"
+        );
+        assert_eq!(d.last_read_inbox_message_id, m10_7_server_id(15));
+        let _ = state.updates.remove(0);
+
+        // (g) reading history clears the marked-as-unread flag
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        d.is_marked_as_unread = true;
+        d.is_last_read_inbox_message_id_inited = false; // re-open the stale gate
+        read_history_inbox(
+            &mut manager,
+            &ctx,
+            &mut state,
+            dialog_id,
+            m10_7_server_id(16),
+            0,
+            "test",
+        );
+        let d = manager.get_dialog(dialog_id).unwrap();
+        assert!(!d.is_marked_as_unread);
+        match state.updates.remove(0) {
+            td_api::Object::updateChatReadInbox(update) => assert_eq!(update.unread_count, 0),
+            other => panic!("expected updateChatReadInbox, got {other:?}"),
+        }
+        match state.updates.remove(0) {
+            td_api::Object::updateChatIsMarkedAsUnread(update) => {
+                assert!(!update.is_marked_as_unread)
+            }
+            other => panic!("expected updateChatIsMarkedAsUnread, got {other:?}"),
+        }
+        assert!(state.updates.is_empty());
+    }
+
+    /// The `read_history_inbox` recount over a populated ordered slice: the
+    /// clamp + recount override and the from-the-end selection with the
+    /// exact-count win over a stale hint.
+    #[test]
+    fn m10_7_read_inbox_recount_tables() {
+        let ctx = TestObjectContext::default();
+        let mut state = ReadStateTestContext::default();
+        let mut manager = MessagesManager::new();
+        let dialog_id = DialogId::from_user_id(UserId::new(8000));
+        manager.add_dialog_for_new_message(dialog_id);
+        {
+            let d = manager.get_dialog_mut(dialog_id).unwrap();
+            for server_id in 11..=15 {
+                let m = m10_7_incoming_message(server_id);
+                d.messages.insert(m.message_id, Box::new(m));
+            }
+            d.last_new_message_id = m10_7_server_id(15);
+            d.last_message_id = m10_7_server_id(15);
+            d.last_database_message_id = m10_7_server_id(15);
+            d.server_unread_count = 4;
+        }
+
+        // max == last_new with an unknown hint → the clamp keeps the old
+        // server count, then the exact recount finds all five messages read
+        // and lands on 0
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        d.last_read_inbox_message_id = m10_7_server_id(10);
+        d.is_last_read_inbox_message_id_inited = true;
+        read_history_inbox(
+            &mut manager,
+            &ctx,
+            &mut state,
+            dialog_id,
+            m10_7_server_id(15),
+            3,
+            "test",
+        );
+        let d = manager.get_dialog(dialog_id).unwrap();
+        assert_eq!(
+            d.server_unread_count, 0,
+            "4 - 5 counted between 10 and 15 clamps at the exact recount"
+        );
+        assert_eq!(d.last_read_inbox_message_id, m10_7_server_id(15));
+
+        // a mid-history max: from-the-end runs first (max 13 is closer to
+        // last_read 10 than to last_message 15) and its exact count of the
+        // two messages above (14, 15) beats the stale zero hint
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        d.last_read_inbox_message_id = m10_7_server_id(10);
+        d.server_unread_count = 4;
+        read_history_inbox(
+            &mut manager,
+            &ctx,
+            &mut state,
+            dialog_id,
+            m10_7_server_id(13),
+            0,
+            "test",
+        );
+        let d = manager.get_dialog(dialog_id).unwrap();
+        assert_eq!(
+            d.server_unread_count, 2,
+            "two counted messages (14, 15) above 13"
+        );
+        assert_eq!(d.last_read_inbox_message_id, m10_7_server_id(13));
+    }
+
+    /// The `read_history_outbox` gate ladder (MessagesManager.cpp:9630-9670):
+    /// the invalid rejection (the zero id included — no sentinel here), the
+    /// unguarded monotonic gate, the yet-unsent rejection and the setter +
+    /// `updateChatReadOutbox` emission.
+    #[test]
+    fn m10_7_outbox_gate_table() {
+        let ctx = TestObjectContext::default();
+        let mut state = ReadStateTestContext::default();
+        let mut manager = MessagesManager::new();
+        let dialog_id = DialogId::from_user_id(UserId::new(7000));
+        manager.add_dialog_for_new_message(dialog_id);
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        d.last_new_message_id = m10_7_server_id(12);
+        d.last_message_id = m10_7_server_id(12);
+
+        // the zero id is invalid for the outbox (no sentinel arm)
+        read_history_outbox(
+            &mut manager,
+            &ctx,
+            &mut state,
+            dialog_id,
+            MessageId::default(),
+            0,
+        );
+        let d = manager.get_dialog(dialog_id).unwrap();
+        assert!(!d.is_last_read_outbox_message_id_inited);
+        assert!(state.updates.is_empty());
+
+        // the yet-unsent id is rejected
+        read_history_outbox(
+            &mut manager,
+            &ctx,
+            &mut state,
+            dialog_id,
+            MessageId::min(),
+            0,
+        );
+        assert!(state.updates.is_empty());
+
+        // a stale id returns without the is_*_inited arm
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        d.last_read_outbox_message_id = m10_7_server_id(10);
+        read_history_outbox(
+            &mut manager,
+            &ctx,
+            &mut state,
+            dialog_id,
+            m10_7_server_id(9),
+            0,
+        );
+        let d = manager.get_dialog(dialog_id).unwrap();
+        assert_eq!(d.last_read_outbox_message_id, m10_7_server_id(10));
+        assert!(state.updates.is_empty());
+
+        // success: the monotonic move + the emitter
+        read_history_outbox(
+            &mut manager,
+            &ctx,
+            &mut state,
+            dialog_id,
+            m10_7_server_id(12),
+            1700000000,
+        );
+        let d = manager.get_dialog(dialog_id).unwrap();
+        assert_eq!(d.last_read_outbox_message_id, m10_7_server_id(12));
+        assert!(d.is_last_read_outbox_message_id_inited);
+        match state.updates.remove(0) {
+            td_api::Object::updateChatReadOutbox(update) => {
+                assert_eq!(
+                    update.last_read_outbox_message_id,
+                    m10_7_server_id(12).get()
+                );
+            }
+            other => panic!("expected updateChatReadOutbox, got {other:?}"),
+        }
+        assert!(state.updates.is_empty());
+    }
+
+    /// The `set_dialog_last_read_inbox_message_id` list-counter decision
+    /// table (MessagesManager.cpp:9942-9965) over a fake list: the delta
+    /// arithmetic, the 0↔nonzero crossing, the marked-as-unread sign flip,
+    /// the muted sub-counters, the *_inited guards, the
+    /// `need_unread_counter` gate and the counters-only `MessageId::min()`.
+    #[test]
+    fn m10_7_setter_counter_table() {
+        let ctx = TestObjectContext::default();
+        let mut state = ReadStateTestContext {
+            muted: true,
+            lists: vec![
+                DialogListUnreadCounters {
+                    unread_message_total_count: 100,
+                    unread_message_muted_count: 40,
+                    unread_dialog_total_count: 10,
+                    unread_dialog_marked_count: 2,
+                    unread_dialog_muted_count: 6,
+                    unread_dialog_muted_marked_count: 1,
+                    is_message_unread_count_inited: true,
+                    is_dialog_unread_count_inited: true,
+                },
+                DialogListUnreadCounters::default(), // nothing inited — a dead list
+            ],
+            ..Default::default()
+        };
+        let mut manager = MessagesManager::new();
+        let dialog_id = DialogId::from_user_id(UserId::new(5000));
+        manager.add_dialog_for_new_message(dialog_id);
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        d.order = 5; // need_unread_counter true
+        d.server_unread_count = 3;
+        d.local_unread_count = 1;
+
+        // non-crossing: 4 → 1 moves only the message counters (delta -3 on
+        // the muted list; the dialog count 1→1 has zero delta)
+        set_dialog_last_read_inbox_message_id(
+            &mut manager,
+            &ctx,
+            &mut state,
+            dialog_id,
+            m10_7_server_id(20),
+            1,
+            0,
+            false,
+            "test",
+        );
+        {
+            let list = state.lists[0];
+            assert_eq!(list.unread_message_total_count, 97);
+            assert_eq!(
+                list.unread_message_muted_count, 37,
+                "the muted sub-counter moves too"
+            );
+            assert_eq!(
+                list.unread_dialog_total_count, 10,
+                "no crossing — the dialog count holds"
+            );
+            assert_eq!(list.unread_dialog_marked_count, 2);
+        }
+        assert_eq!(
+            state.lists[1],
+            DialogListUnreadCounters::default(),
+            "the dead list is untouched"
+        );
+        assert_eq!(state.unread_message_count_updates, 1);
+        assert_eq!(state.unread_chat_count_updates, 0);
+        let d = manager.get_dialog(dialog_id).unwrap();
+        assert_eq!(d.last_read_inbox_message_id, m10_7_server_id(20));
+        assert!(d.is_last_read_inbox_message_id_inited);
+        match state.updates.remove(0) {
+            td_api::Object::updateChatReadInbox(update) => assert_eq!(update.unread_count, 1),
+            other => panic!("expected updateChatReadInbox, got {other:?}"),
+        }
+
+        // crossing to zero on an unmarked dialog: delta -1 lands on
+        // total + muted (the sign flip trap lives in the marked arm below)
+        set_dialog_last_read_inbox_message_id(
+            &mut manager,
+            &ctx,
+            &mut state,
+            dialog_id,
+            m10_7_server_id(21),
+            0,
+            0,
+            false,
+            "test",
+        );
+        {
+            let list = state.lists[0];
+            assert_eq!(list.unread_message_total_count, 96, "1 → 0 is delta -1");
+            assert_eq!(list.unread_message_muted_count, 36);
+            assert_eq!(list.unread_dialog_total_count, 9);
+            assert_eq!(list.unread_dialog_muted_count, 5);
+            assert_eq!(
+                list.unread_dialog_marked_count, 2,
+                "the marked count is untouched for an unmarked dialog"
+            );
+        }
+        assert_eq!(state.unread_chat_count_updates, 1);
+        let _ = state.updates.remove(0);
+
+        // the marked sign flip: refilling to 2 marked dialogs routes the
+        // +delta into unread_dialog_marked_count_ (decrement of a negative
+        // delta) and into the muted-marked sub-counter
+        let d = manager.get_dialog_mut(dialog_id).unwrap();
+        d.is_marked_as_unread = true;
+        set_dialog_last_read_inbox_message_id(
+            &mut manager,
+            &ctx,
+            &mut state,
+            dialog_id,
+            m10_7_server_id(22),
+            1,
+            1,
+            false,
+            "test",
+        );
+        {
+            let list = state.lists[0];
+            assert_eq!(list.unread_message_total_count, 98, "0 → 2 is delta +2");
+            assert_eq!(
+                list.unread_dialog_marked_count, 1,
+                "marked -= delta (2 - (+1))"
+            );
+            assert_eq!(
+                list.unread_dialog_muted_marked_count, 0,
+                "muted-marked -= delta (1 - (+1))"
+            );
+            assert_eq!(
+                list.unread_dialog_total_count, 9,
+                "the total is untouched for a marked dialog"
+            );
+        }
+        assert_eq!(state.unread_chat_count_updates, 2);
+        let _ = state.updates.remove(0);
+
+        // the counters-only MessageId::min(): the id halves are skipped, the
+        // counter table still runs
+        set_dialog_last_read_inbox_message_id(
+            &mut manager,
+            &ctx,
+            &mut state,
+            dialog_id,
+            MessageId::min(),
+            3,
+            1,
+            false,
+            "test",
+        );
+        let d = manager.get_dialog(dialog_id).unwrap();
+        assert_eq!(
+            d.last_read_inbox_message_id,
+            m10_7_server_id(22),
+            "min() never writes the id"
+        );
+        assert_eq!(d.server_unread_count, 3);
+        assert_eq!(d.local_unread_count, 1);
+        {
+            let list = state.lists[0];
+            assert_eq!(list.unread_message_total_count, 100, "2 → 4 is delta +2");
+            assert_eq!(
+                list.unread_dialog_marked_count, 1,
+                "no crossing — the marked count holds"
+            );
+        }
+
+        // the need_unread_counter gate: a DEFAULT_ORDER dialog skips the
+        // whole table
+        let mut state2 = ReadStateTestContext {
+            lists: vec![DialogListUnreadCounters {
+                is_message_unread_count_inited: true,
+                is_dialog_unread_count_inited: true,
+                ..DialogListUnreadCounters::default()
+            }],
+            ..Default::default()
+        };
+        let mut manager2 = MessagesManager::new();
+        let dialog_id2 = DialogId::from_user_id(UserId::new(5001));
+        manager2.add_dialog_for_new_message(dialog_id2);
+        let d = manager2.get_dialog_mut(dialog_id2).unwrap();
+        assert_eq!(d.order, DEFAULT_ORDER);
+        set_dialog_last_read_inbox_message_id(
+            &mut manager2,
+            &ctx,
+            &mut state2,
+            dialog_id2,
+            m10_7_server_id(20),
+            1,
+            0,
+            false,
+            "test",
+        );
+        assert_eq!(state2.unread_message_count_updates, 0);
+        assert_eq!(state2.unread_chat_count_updates, 0);
+        assert_eq!(
+            state2.lists[0],
+            DialogListUnreadCounters {
+                is_message_unread_count_inited: true,
+                is_dialog_unread_count_inited: true,
+                ..DialogListUnreadCounters::default()
+            }
+        );
+        assert!(state2.dialog_list_updates.is_empty());
+    }
+
+    /// `read_all_dialog_mentions` (MessagesManager.cpp:9134-9188): the
+    /// per-message clear (the notification removal strictly before the flag,
+    /// per the C++ comment), the emitter degradation for not-yet-sent
+    /// messages, the counter reset and the last_read_all_mentions bump.
+    #[test]
+    fn m10_7_mentions_clear_ordering() {
+        let ctx = TestObjectContext::default();
+        let mut state = ReadStateTestContext::default();
+        let global = crate::global::Global::new();
+        let time = crate::user_manager::TimeCtx::from_global(&global);
+        let mut manager = MessagesManager::new();
+        let dialog_id = DialogId::from_user_id(UserId::new(6000));
+        manager.add_dialog_for_new_message(dialog_id);
+        {
+            let d = manager.get_dialog_mut(dialog_id).unwrap();
+            for server_id in 11..=13 {
+                let mut m = m10_7_incoming_message(server_id);
+                m.contains_mention = true;
+                m.contains_unread_mention = true;
+                d.messages.insert(m.message_id, Box::new(m));
+            }
+            d.last_new_message_id = m10_7_server_id(13);
+            d.last_message_id = m10_7_server_id(13);
+            d.unread_mention_count = 3;
+            d.message_count_by_index
+                [message_search_filter_index(MessageSearchFilter::UnreadMention) as usize] = 3;
+        }
+
+        read_all_dialog_mentions(
+            &global,
+            &mut manager,
+            &ctx,
+            &mut state,
+            &time,
+            dialog_id,
+            ForumTopicId::default(),
+        )
+        .unwrap();
+
+        let d = manager.get_dialog(dialog_id).unwrap();
+        assert!(d.messages.values().all(|m| !m.contains_unread_mention));
+        assert!(
+            d.messages
+                .values()
+                .all(|m| m.removed_notification_id == NotificationId::default())
+        );
+        assert_eq!(d.unread_mention_count, 0);
+        assert_eq!(
+            d.message_count_by_index
+                [message_search_filter_index(MessageSearchFilter::UnreadMention) as usize],
+            0
+        );
+        assert_eq!(
+            d.last_read_all_mentions_message_id,
+            m10_7_server_id(13),
+            "bumped to last_new_message_id"
+        );
+        // every not-yet-sent message degrades updateMessageMentionRead to the
+        // chat-level update, one per message, then the tail skips the chat
+        // update because an update was already sent
+        assert_eq!(
+            state.updates.len(),
+            3,
+            "one updateChatUnreadMentionCount per mention"
+        );
+        for update in &state.updates {
+            match update {
+                td_api::Object::updateChatUnreadMentionCount(update) => {
+                    assert_eq!(update.unread_mention_count, 0)
+                }
+                other => panic!("expected updateChatUnreadMentionCount, got {other:?}"),
+            }
+        }
+
+        // the sent-message arm emits updateMessageMentionRead per message
+        let mut state2 = ReadStateTestContext::default();
+        let dialog_id2 = DialogId::from_user_id(UserId::new(6001));
+        manager.add_dialog_for_new_message(dialog_id2);
+        {
+            let d = manager.get_dialog_mut(dialog_id2).unwrap();
+            let mut m = m10_7_incoming_message(21);
+            m.contains_mention = true;
+            m.contains_unread_mention = true;
+            m.is_update_sent = true;
+            d.messages.insert(m.message_id, Box::new(m));
+            d.last_new_message_id = m10_7_server_id(21);
+            d.last_message_id = m10_7_server_id(21);
+            d.unread_mention_count = 1;
+        }
+        read_all_dialog_mentions(
+            &global,
+            &mut manager,
+            &ctx,
+            &mut state2,
+            &time,
+            dialog_id2,
+            ForumTopicId::default(),
+        )
+        .unwrap();
+        assert_eq!(state2.updates.len(), 1);
+        match state2.updates.remove(0) {
+            td_api::Object::updateMessageMentionRead(update) => {
+                assert_eq!(update.message_id, m10_7_server_id(21).get());
+                assert_eq!(update.unread_mention_count, 0);
+            }
+            other => panic!("expected updateMessageMentionRead, got {other:?}"),
+        }
+
+        // a valid topic id on a non-forum chat is a 400 before any state move
+        let err = read_all_dialog_mentions(
+            &global,
+            &mut manager,
+            &ctx,
+            &mut state2,
+            &time,
+            dialog_id,
+            ForumTopicId(7),
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), 400);
+        assert_eq!(err.message(), "Chat doesn't have topics");
+    }
+
+    /// The SecretChat arm CHECKs `unread_mention_count == 0`
+    /// (MessagesManager.cpp:9158) — the release-fatal parity.
+    #[test]
+    #[should_panic(expected = "a secret chat cannot have unread mentions")]
+    fn m10_7_mentions_secret_chat_check() {
+        let ctx = TestObjectContext::default();
+        let mut state = ReadStateTestContext::default();
+        let global = crate::global::Global::new();
+        let time = crate::user_manager::TimeCtx::from_global(&global);
+        let mut manager = MessagesManager::new();
+        let dialog_id = DialogId::from_secret_chat_id(SecretChatId::new(77));
+        manager.add_dialog_for_new_message(dialog_id);
+        manager
+            .get_dialog_mut(dialog_id)
+            .unwrap()
+            .unread_mention_count = 1;
+        let _ = read_all_dialog_mentions(
+            &global,
+            &mut manager,
+            &ctx,
+            &mut state,
+            &time,
+            dialog_id,
+            ForumTopicId::default(),
+        );
+    }
+
+    /// A mention message whose notification was already removed routes the
+    /// removal through the M.13 seams (`remove_message_notification_id`
+    /// ordering: the correspondence move and the id move precede the flag
+    /// clear the caller performs).
+    #[test]
+    fn m10_7_mention_notification_removal_routes_through_the_seam() {
+        let ctx = TestObjectContext::default();
+        let mut state = ReadStateTestContext::default();
+        let global = crate::global::Global::new();
+        let time = crate::user_manager::TimeCtx::from_global(&global);
+        let mut manager = MessagesManager::new();
+        let dialog_id = DialogId::from_user_id(UserId::new(6002));
+        manager.add_dialog_for_new_message(dialog_id);
+        let group_id = NotificationGroupId::new(5);
+        {
+            let d = manager.get_dialog_mut(dialog_id).unwrap();
+            let mut m = m10_7_incoming_message(31);
+            m.contains_mention = true;
+            m.contains_unread_mention = true;
+            m.notification_id = NotificationId::new(9);
+            let mut info = NotificationInfo {
+                // `is_from_mention_notification_group(m)` is true (contains_mention),
+                // so `get_notification_group_info(d, m)` reads the mention group
+                mention_notification_group: NotificationGroupInfo::with_group_id(group_id),
+                pending_new_mention_notifications: vec![(DialogId::default(), m.message_id)],
+                ..NotificationInfo::default()
+            };
+            info.notification_id_to_message_id
+                .insert(NotificationId::new(9), m.message_id);
+            d.notification_info = Some(info);
+            d.messages.insert(m.message_id, Box::new(m));
+            d.last_new_message_id = m10_7_server_id(31);
+            d.last_message_id = m10_7_server_id(31);
+            d.unread_mention_count = 1;
+        }
+
+        read_all_dialog_mentions(
+            &global,
+            &mut manager,
+            &ctx,
+            &mut state,
+            &time,
+            dialog_id,
+            ForumTopicId::default(),
+        )
+        .unwrap();
+
+        let d = manager.get_dialog(dialog_id).unwrap();
+        let m = d.messages.get(&m10_7_server_id(31)).unwrap();
+        assert!(m.notification_id == NotificationId::default());
+        assert_eq!(
+            m.removed_notification_id,
+            NotificationId::new(9),
+            "the id moved, then the flag cleared"
+        );
+        assert!(!m.contains_unread_mention);
+        assert!(
+            !d.notification_info
+                .as_ref()
+                .unwrap()
+                .notification_id_to_message_id
+                .contains_key(&NotificationId::new(9)),
+            "the correspondence is deleted"
+        );
+        // the group removal from `remove_message_dialog_notifications`:
+        // `MessageId::max() >= last_message_id` takes the C++ first arm and
+        // clamps the removal to last_message_id, total 0, force = true
+        assert_eq!(state.removed_groups.len(), 1);
+        let (_, max_id, total_count, force) = state.removed_groups[0];
+        assert_eq!(max_id, m10_7_server_id(31).get());
+        assert_eq!(total_count, 0);
+        assert!(force);
+        // the active notification removal for the mention message itself
+        assert_eq!(state.removed_notifications.len(), 1);
+        assert_eq!(state.removed_notifications[0].0, group_id.get());
+        assert_eq!(state.removed_notifications[0].1, 9);
+        assert_eq!(state.flushed.len(), 1);
+        assert!(state.flushed[0].0, "the mention plane flush");
+        assert_eq!(
+            state.flushed[0].1,
+            DialogId::from_user_id(UserId::new(3)).get()
+        );
     }
 }
