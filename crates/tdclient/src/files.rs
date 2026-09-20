@@ -5486,6 +5486,9 @@ pub struct FileStat {
     pub is_dir: bool,
     pub size: i64,
     pub mtime_nsec: u64,
+    /// `Stat::real_size_` (port/stat.cpp) — `st_blocks * 512`, the
+    /// allocated size quota consumers account.
+    pub real_size: i64,
 }
 
 /// The environment seam of the collapsed [`FileManager`] — the C++
@@ -5523,6 +5526,13 @@ pub trait FileManagerContext {
             is_dir: meta.is_dir(),
             size: meta.len() as i64,
             mtime_nsec,
+            #[cfg(unix)]
+            real_size: {
+                use std::os::unix::fs::MetadataExt as _;
+                (meta.blocks() * 512) as i64
+            },
+            #[cfg(not(unix))]
+            real_size: meta.len() as i64,
         })
     }
 
@@ -5585,6 +5595,30 @@ pub trait FileManagerContext {
     /// `#mtime#` prefix for logged paths.
     fn logged_file_paths(&self) -> Vec<String> {
         Vec::new()
+    }
+
+    /// `Td::send_update(updateFileGenerationStart)`
+    /// (FileGenerateManager.cpp:322-327).
+    fn on_file_generation_start(
+        &mut self,
+        _generation_id: i64,
+        _original_path: &str,
+        _path: &str,
+        _conversion: &str,
+    ) {
+    }
+
+    /// `Td::send_update(updateFileGenerationStop)` — the
+    /// `FileExternalGenerateActor::tear_down`
+    /// (FileGenerateManager.cpp:384-388).
+    fn on_file_generation_stop(&mut self, _generation_id: i64) {}
+
+    /// `Global::get_location_access_hash(latitude, longitude)`
+    /// (Global.cpp:338-346) — the `#map#` conversion's geo-point access
+    /// hash; the C++ map is option-populated, the default is the C++
+    /// not-found `0`.
+    fn location_access_hash(&mut self, _latitude: f64, _longitude: f64) -> i64 {
+        0
     }
 }
 
@@ -5850,7 +5884,44 @@ pub struct FileManager {
     next_internal_download_id: i64,
     /// `FileManager::get_internal_upload_id`'s counter.
     next_internal_upload_id: i64,
+    /// The `generate_queries_` container (FileManager.h:887) — the
+    /// FileManager side of the generation queries.
+    generate_queries: BTreeMap<u64, GenerateQuery>,
+    /// The `generate_queries_` id allocator (`QueryId` starts at 1).
+    next_generate_query_id: u64,
+    /// The collapsed `file_generate_manager_` (FileManager.cpp:1330).
+    generate: FileGenerateManager,
 }
+
+/// `FileManager::GenerateQuery` (FileManager.h:884-886).
+#[derive(Clone, Copy)]
+struct GenerateQuery {
+    file_id: FileId,
+}
+
+/// The node snapshot `run_generate` takes before the priority walk —
+/// the borrows end before the request tables are read.
+struct NodeGeneratePlan {
+    main_file_id: FileId,
+    old_priority: i8,
+    file_ids: Vec<FileId>,
+    generate: Option<FullGenerateFileLocation>,
+    local: LocalFileLocation,
+    suggested_path: String,
+}
+
+/// The Download-worker seam `run_generate` re-enters
+/// `FileManager::download` with: the referenced file id, the reserved
+/// internal download id and the event-queue bridge.
+type GenerateDownloadStart = (FileId, i64, Rc<RefCell<dyn DownloadCallback>>);
+
+/// One entry of `finish_uploads`' drained callbacks: the manager query
+/// id, the callback and its `was_active` flag.
+type PendingUploadFinish = (i64, Rc<RefCell<dyn UploadCallback>>, bool);
+
+/// The `external_path` answer: the worker state plus the pending
+/// download seam of a Download worker.
+type ExternalPathView<'a> = (&'a GenerateWorker, Option<(FileId, i64)>);
 
 /// The trait-default [`FileManagerContext`] (no filesystem overrides, no
 /// bad paths, `keep_exact_remote_location = false`).
@@ -9760,6 +9831,16 @@ pub trait FileDownloaderNet {
     /// `write` flag is false on the only_check paths, which must not
     /// modify the found local copy (FileDownloader.cpp:494, 514, 423).
     fn open_partial_file(&mut self, path: &str, write: bool) -> Result<File, Status>;
+
+    /// `FileFd::open(path_, FileFd::Create | FileFd::Write)` of the
+    /// `FileExternalGenerateActor::do_file_generate_write_part`
+    /// (FileGenerateManager.cpp:341) — the generated path may have just
+    /// been unlinked (a stale partial), so the open must create. The
+    /// default answers the unavailable-io error; real io (M.12.10) and
+    /// test mocks implement it.
+    fn open_generated_file(&mut self, _path: &str) -> Result<File, Status> {
+        Err(Status::error_message("File generation io is not available"))
+    }
 
     /// `search_file(file_type, name, size)` (FileLoaderUtils.cpp) — the
     /// need_search_file seam; the default never finds anything.
@@ -14693,6 +14774,7 @@ mod tests {
                     is_dir: false,
                     size: 5,
                     mtime_nsec: 1,
+                    real_size: 5,
                 })
             }
             fn db_paths(&self) -> Vec<String> {
@@ -15093,6 +15175,13 @@ pub trait FileLoadNetFactory {
     fn hash_net(&mut self) -> Box<dyn FileHashUploaderNet>;
     /// The FileLoaderUtils io seam (`save_file_bytes`/from-bytes).
     fn utils_net(&mut self) -> Box<dyn FileDownloaderNet>;
+    /// The [`FileGenerateManager`] io seam — the `FileExternalGenerateActor`
+    /// `FileFd` opens and the `WebFileDownloadGenerateActor`
+    /// `upload.getWebFile` query. The default reuses [`Self::utils_net`];
+    /// the C++ reaches both through the same `G()` plane.
+    fn generate_net(&mut self) -> Box<dyn FileDownloaderNet> {
+        self.utils_net()
+    }
     /// `G()->get_webfile_dc_id()` — the resource-pool key of a web
     /// download (FileDownloadManager.cpp:56).
     fn webfile_dc_id(&mut self) -> DcId {
@@ -15532,8 +15621,14 @@ impl FileLoadManager {
         }
     }
 
+    /// The [`FileLoadNetFactory::generate_net`] passthrough — the
+    /// [`FileGenerateManager`] io/net seam comes from the same factory.
+    pub fn generate_net(&mut self) -> Box<dyn FileDownloaderNet> {
+        self.factory.generate_net()
+    }
+
     /// `FileUploadManager::update_local_file_location`
-    /// (FileUploadManager.cpp:94-107).
+    /// (FileUploadManager.cpp:96-101).
     pub fn update_local_file_location(&mut self, query_id: u64, local: &LocalFileLocation) {
         let Some(node) = self.upload_nodes.get_mut(&query_id) else {
             return;
@@ -15732,6 +15827,661 @@ fn get_files_temp_dir(file_type: FileType, files_dir: &str, secure_files_dir: &s
     )
 }
 
+/// One event of the collapsed [`FileGenerateManager`] callback plane —
+/// each C++ `send_closure` into `FileManager`
+/// (`on_partial_generate`/`on_generate_ok`/`on_generate_error`,
+/// FileManager.cpp:4988-5095) becomes one queued event.
+/// [`FileGenerateEvent::DownloadOk`] is the
+/// `FileDownloadGenerateActor::on_download_ok` half
+/// (FileGenerateManager.cpp:93-115): the file-view read + file-type
+/// override before it re-enters the same plane as a `GenerateOk`.
+#[derive(Clone, Debug)]
+pub enum FileGenerateEvent {
+    PartialGenerate {
+        query_id: u64,
+        partial: PartialLocalFileLocation,
+        expected_size: i64,
+    },
+    GenerateOk {
+        query_id: u64,
+        local: FullLocalFileLocation,
+    },
+    GenerateError {
+        query_id: u64,
+        status: Status,
+    },
+    DownloadOk {
+        query_id: u64,
+        file_id: FileId,
+        file_type: FileType,
+    },
+}
+
+/// The shared event queue — the manager hands [`Rc`] clones to its
+/// per-query bridges.
+#[derive(Clone)]
+struct GenerateEventQueue(Rc<RefCell<Vec<FileGenerateEvent>>>);
+
+impl GenerateEventQueue {
+    fn push(&self, event: FileGenerateEvent) {
+        self.0.borrow_mut().push(event);
+    }
+}
+
+/// `FileDownloadGenerateActor`'s download `Callback`
+/// (FileGenerateManager.cpp:56-70): ok/error forward into the generate
+/// plane by query id. The C++ actor dies on cancel before the error can
+/// be delivered; in the collapse the manager's `canceled` guard drops it
+/// instead.
+struct DownloadGenerateBridge {
+    query_id: u64,
+    file_type: FileType,
+    events: GenerateEventQueue,
+}
+
+impl DownloadCallback for DownloadGenerateBridge {
+    fn on_progress(&mut self, _file_id: FileId) {}
+
+    fn on_download_ok(&mut self, file_id: FileId) {
+        self.events.push(FileGenerateEvent::DownloadOk {
+            query_id: self.query_id,
+            file_id,
+            file_type: self.file_type,
+        });
+    }
+
+    fn on_download_error(&mut self, _file_id: FileId, status: Status) {
+        self.events.push(FileGenerateEvent::GenerateError {
+            query_id: self.query_id,
+            status,
+        });
+    }
+}
+
+/// The worker state of one registered generation query.
+enum GenerateWorker {
+    /// `FileDownloadGenerateActor` (FileGenerateManager.cpp:41-121) —
+    /// the download re-entry is mediated by `FileManager::run_generate`
+    /// (the collapsed actor has no scheduler to `send_closure` from);
+    /// the worker carries only the cancel seam.
+    Download {
+        file_id: FileId,
+        internal_download_id: i64,
+    },
+    /// `FileExternalGenerateActor` (FileGenerateManager.cpp:299-391) —
+    /// the app-driven conversion flow.
+    External {
+        file_type: FileType,
+        name: String,
+        path: String,
+    },
+    // `WebFileDownloadGenerateActor` (FileGenerateManager.cpp:123-297)
+    // runs to completion inside `generate_file` — the collapsed worker
+    // has no pending state and never registers.
+}
+
+struct GenerateQueryState {
+    worker: GenerateWorker,
+    /// `FileGenerateManager::cancel` marks the query; the queued
+    /// terminal event finishes it (the C++ `worker_.reset()` + the
+    /// actor's asynchronous death).
+    canceled: bool,
+}
+
+/// `td::FileGenerateManager` (FileGenerateManager.cpp:393-519) collapsed
+/// per the single-scheduler convention: the actor map becomes a query
+/// table, the callbacks queue [`FileGenerateEvent`]s that
+/// `FileManager::apply_generate_events` drains in order, and the Web
+/// worker runs synchronously inside [`FileGenerateManager::generate_file`].
+pub struct FileGenerateManager {
+    queries: BTreeMap<u64, GenerateQueryState>,
+    events: GenerateEventQueue,
+}
+
+impl Default for FileGenerateManager {
+    fn default() -> FileGenerateManager {
+        FileGenerateManager::new()
+    }
+}
+
+impl FileGenerateManager {
+    pub fn new() -> FileGenerateManager {
+        FileGenerateManager {
+            queries: BTreeMap::new(),
+            events: GenerateEventQueue(Rc::new(RefCell::new(Vec::new()))),
+        }
+    }
+
+    fn take_event(&mut self) -> Option<FileGenerateEvent> {
+        let mut events = self.events.0.borrow_mut();
+        if events.is_empty() {
+            None
+        } else {
+            Some(events.remove(0))
+        }
+    }
+
+    /// `FileGenerateManager::generate_file` (FileGenerateManager.cpp:436-471)
+    /// — `check_mtime`, the `#file_id#`/web/external split, the External
+    /// `start_up` and the synchronous Web run. `Some(..)` is the Download
+    /// worker: the caller must re-enter `FileManager::download` with the
+    /// returned bridge (the C++ `start_up`'s download send).
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_file(
+        &mut self,
+        query_id: u64,
+        mut generate_location: FullGenerateFileLocation,
+        local_location: &LocalFileLocation,
+        name: String,
+        internal_download_id: i64,
+        net: &mut dyn FileDownloaderNet,
+        ctx: &mut dyn FileManagerContext,
+    ) -> Option<GenerateDownloadStart> {
+        debug_assert!(query_id != 0, "CHECK(query_id != 0)");
+        // check_mtime rewrites the conversion in place (the member is
+        // passed by reference in the C++, FileGenerateManager.cpp:444)
+        if let Err(error) = check_generate_mtime(
+            ctx,
+            &mut generate_location.conversion,
+            &generate_location.original_path,
+        ) {
+            self.events.push(FileGenerateEvent::GenerateError {
+                query_id,
+                status: error,
+            });
+            return None;
+        }
+
+        let file_id = generate_location
+            .conversion
+            .strip_prefix("#file_id#")
+            .map(|raw| FileId::new(raw.parse().unwrap_or(0), 0));
+        if let Some(file_id) = file_id {
+            self.queries.insert(
+                query_id,
+                GenerateQueryState {
+                    worker: GenerateWorker::Download {
+                        file_id,
+                        internal_download_id,
+                    },
+                    canceled: false,
+                },
+            );
+            let callback: Rc<RefCell<dyn DownloadCallback>> =
+                Rc::new(RefCell::new(DownloadGenerateBridge {
+                    query_id,
+                    file_type: generate_location.file_type,
+                    events: self.events.clone(),
+                }));
+            return Some((file_id, internal_download_id, callback));
+        }
+
+        if is_remotely_generated_file(&generate_location.conversion)
+            && generate_location.original_path.is_empty()
+        {
+            // `WebFileDownloadGenerateActor::start_up` + `on_result`
+            // (FileGenerateManager.cpp:212-253) — synchronous here.
+            let result = web_generate_download(&generate_location.conversion, net, ctx);
+            match result {
+                Ok(local) => self
+                    .events
+                    .push(FileGenerateEvent::GenerateOk { query_id, local }),
+                Err(status) => self
+                    .events
+                    .push(FileGenerateEvent::GenerateError { query_id, status }),
+            }
+            return None;
+        }
+
+        // `FileExternalGenerateActor::start_up` (FileGenerateManager.cpp:305-330)
+        let worker_path = match local_location {
+            LocalFileLocation::Full(full) => {
+                // callback_->on_ok + callback_.reset() + stop() — the
+                // worker registers only so the stop update fires at the
+                // terminal event (the C++ tear_down)
+                self.queries.insert(
+                    query_id,
+                    GenerateQueryState {
+                        worker: GenerateWorker::External {
+                            file_type: generate_location.file_type,
+                            name,
+                            path: String::new(),
+                        },
+                        canceled: false,
+                    },
+                );
+                self.events.push(FileGenerateEvent::GenerateOk {
+                    query_id,
+                    local: full.clone(),
+                });
+                return None;
+            }
+            LocalFileLocation::Partial(partial) => {
+                // LOG(INFO) "Unlink partially generated file at " + unlink
+                let _ = std::fs::remove_file(&partial.path);
+                Some(partial.path.clone())
+            }
+            LocalFileLocation::Empty => match net.open_temp_file(generate_location.file_type) {
+                Ok((file, path)) => {
+                    drop(file);
+                    Some(path)
+                }
+                Err(status) => {
+                    // check_status at start_up: the error path without a
+                    // path to unlink
+                    self.events
+                        .push(FileGenerateEvent::GenerateError { query_id, status });
+                    return None;
+                }
+            },
+        };
+        let path = worker_path.expect("worker path");
+        ctx.on_file_generation_start(
+            query_id as i64,
+            &generate_location.original_path,
+            &path,
+            &generate_location.conversion,
+        );
+        self.queries.insert(
+            query_id,
+            GenerateQueryState {
+                worker: GenerateWorker::External {
+                    file_type: generate_location.file_type,
+                    name,
+                    path,
+                },
+                canceled: false,
+            },
+        );
+        None
+    }
+
+    /// `FileGenerateManager::cancel` (FileGenerateManager.cpp:473-478)
+    /// plus the actors' `hangup` halves. Returns the pending download for
+    /// a `Download` worker — the caller must `FileManager::cancel_download`
+    /// it (the actor's hangup send, FileGenerateManager.cpp:117-120). The
+    /// worker stays registered (marked) until the queued terminal event
+    /// drains, keeping the stop update after the error, like the C++
+    /// queue order.
+    pub fn cancel(&mut self, query_id: u64) -> Option<(FileId, i64)> {
+        let state = self.queries.get_mut(&query_id)?;
+        match &state.worker {
+            GenerateWorker::Download {
+                file_id,
+                internal_download_id,
+            } => {
+                state.canceled = true;
+                self.events.push(FileGenerateEvent::GenerateError {
+                    query_id,
+                    status: Status::error(200, "Canceled"),
+                });
+                Some((*file_id, *internal_download_id))
+            }
+            GenerateWorker::External { path, .. } => {
+                state.canceled = true;
+                // `FileExternalGenerateActor::hangup`
+                // (FileGenerateManager.cpp:332-334): unlink + on_error
+                let _ = std::fs::remove_file(path);
+                self.events.push(FileGenerateEvent::GenerateError {
+                    query_id,
+                    status: Status::error(-1, "Canceled"),
+                });
+                None
+            }
+        }
+    }
+
+    fn external_path(&self, generation_id: u64) -> Result<ExternalPathView<'_>, Status> {
+        let Some(state) = self.queries.get(&generation_id) else {
+            return Err(Status::error(400, "Unknown generation_id"));
+        };
+        if state.canceled {
+            return Err(Status::error(400, "Unknown generation_id"));
+        }
+        let download = match &state.worker {
+            GenerateWorker::Download {
+                file_id,
+                internal_download_id,
+            } => Some((*file_id, *internal_download_id)),
+            GenerateWorker::External { .. } => None,
+        };
+        Ok((&state.worker, download))
+    }
+
+    /// `FileManager::external_file_generate_write_part` →
+    /// `FileGenerateActor::file_generate_write_part` +
+    /// `do_file_generate_write_part` (FileGenerateManager.cpp:305-341).
+    pub fn external_write_part(
+        &mut self,
+        generation_id: u64,
+        offset: i64,
+        data: &[u8],
+        net: &mut dyn FileDownloaderNet,
+    ) -> Result<(), Status> {
+        let path = match self.external_path(generation_id) {
+            Ok((GenerateWorker::External { path, .. }, _)) => path.clone(),
+            Ok(_) | Err(_) => return Err(Status::error(400, "Unknown generation_id")),
+        };
+        match generate_write_part(&path, offset, data, net) {
+            Ok(()) => Ok(()),
+            Err(status) => {
+                // check_status: the promise sees 400 + the message while
+                // the generation fails with the original status
+                let promise_status = Status::error(400, status.message());
+                self.fail_external(generation_id, status);
+                Err(promise_status)
+            }
+        }
+    }
+
+    /// `file_generate_progress` + `do_file_generate_progress`
+    /// (FileGenerateManager.cpp:315-318, 348-359).
+    pub fn external_progress(
+        &mut self,
+        generation_id: u64,
+        expected_size: i64,
+        local_prefix_size: i64,
+    ) -> Result<(), Status> {
+        let (file_type, path) = match self.external_path(generation_id) {
+            Ok((
+                GenerateWorker::External {
+                    file_type, path, ..
+                },
+                _,
+            )) => (*file_type, path.clone()),
+            Ok(_) | Err(_) => return Err(Status::error(400, "Unknown generation_id")),
+        };
+        let status = if local_prefix_size < 0 {
+            Err(Status::error(400, "Invalid local prefix size"))
+        } else {
+            let partial = PartialLocalFileLocation {
+                file_type,
+                part_size: local_prefix_size,
+                path: path.clone(),
+                iv: Vec::new(),
+                ready_bitmask: Bitmask::from_ones(1).encode(-1),
+                ready_size: local_prefix_size,
+            };
+            self.events.push(FileGenerateEvent::PartialGenerate {
+                query_id: generation_id,
+                partial,
+                expected_size,
+            });
+            Ok(())
+        };
+        match status {
+            Ok(()) => Ok(()),
+            Err(status) => {
+                let promise_status = Status::error(400, status.message());
+                self.fail_external(generation_id, status);
+                Err(promise_status)
+            }
+        }
+    }
+
+    /// `file_generate_finish` + `do_file_generate_finish`
+    /// (FileGenerateManager.cpp:319-322, 361-370). `error` is the
+    /// client-reported failure — the td_api result still resolves ok.
+    pub fn external_finish(
+        &mut self,
+        generation_id: u64,
+        error: Option<Status>,
+        net: &mut dyn FileDownloaderNet,
+    ) -> Result<(), Status> {
+        if let Some(status) = error {
+            self.fail_external(generation_id, status);
+            return Ok(());
+        }
+        let (file_type, name, path) = match self.external_path(generation_id) {
+            Ok((
+                GenerateWorker::External {
+                    file_type,
+                    name,
+                    path,
+                },
+                _,
+            )) => (*file_type, name.clone(), path.clone()),
+            Ok(_) | Err(_) => return Err(Status::error(400, "Unknown generation_id")),
+        };
+        match net.create_from_temp(file_type, &path, &name) {
+            Ok(perm_path) => {
+                self.events.push(FileGenerateEvent::GenerateOk {
+                    query_id: generation_id,
+                    local: FullLocalFileLocation::new(file_type, perm_path, 0),
+                });
+                Ok(())
+            }
+            Err(status) => {
+                let promise_status = Status::error(400, status.message());
+                self.fail_external(generation_id, status);
+                Err(promise_status)
+            }
+        }
+    }
+
+    /// The `check_status` error path (FileGenerateManager.cpp:372-383):
+    /// unlink the partial + `callback_->on_error` + stop. The stop update
+    /// rides `remove_worker` at the terminal event.
+    fn fail_external(&mut self, generation_id: u64, status: Status) {
+        if let Some(state) = self.queries.get_mut(&generation_id) {
+            if let GenerateWorker::External { path, .. } = &state.worker {
+                let _ = std::fs::remove_file(path);
+            }
+            state.canceled = true;
+        }
+        self.events.push(FileGenerateEvent::GenerateError {
+            query_id: generation_id,
+            status,
+        });
+    }
+}
+
+/// `FileExternalGenerateActor::do_file_generate_write_part`
+/// (FileGenerateManager.cpp:341-354).
+fn generate_write_part(
+    path: &str,
+    offset: i64,
+    data: &[u8],
+    net: &mut dyn FileDownloaderNet,
+) -> Result<(), Status> {
+    if offset < 0 {
+        return Err(Status::error_message("Wrong offset specified"));
+    }
+    let mut fd = net.open_generated_file(path)?;
+    use std::io::{Seek, Write as _};
+    fd.seek(std::io::SeekFrom::Start(offset as u64))
+        .map_err(|e| Status::error_message(&format!("Failed to write file: {e}")))?;
+    let written = fd
+        .write(data)
+        .map_err(|e| Status::error_message(&format!("Failed to write file: {e}")))?
+        as i64;
+    if written != data.len() as i64 {
+        return Err(Status::error_message(&format!(
+            "Failed to write file: written {written} bytes instead of {}",
+            data.len()
+        )));
+    }
+    Ok(())
+}
+
+/// `WebFileDownloadGenerateActor::process_result` + `on_result`
+/// (FileGenerateManager.cpp:228-253): one `upload.getWebFile` query, the
+/// size sanity log (the collapsed net seam returns only the body — the
+/// `web_file.size_` cross-check has no carrier here), and
+/// `save_file_bytes` as a `Thumbnail`.
+fn web_generate_download(
+    conversion: &str,
+    net: &mut dyn FileDownloaderNet,
+    ctx: &mut dyn FileManagerContext,
+) -> Result<FullLocalFileLocation, Status> {
+    let (location, file_name) = parse_web_generate_conversion(conversion, ctx)?;
+    let meta = DownloadNetMeta {
+        dc_id: net.webfile_dc_id(),
+        auth_flag_on: true,
+        small: true,
+    };
+    let bytes = match net.download(
+        DownloadQuery::GetWebFile {
+            location,
+            offset: 0,
+            limit: 1 << 20,
+        },
+        DownloadQueryType::Default,
+        meta,
+    )? {
+        DownloadResult::Bytes(bytes) => bytes,
+        _ => return Err(Status::error_message("Wrong conversion result")),
+    };
+    save_file_bytes(net, FileType::Thumbnail, &bytes, &file_name)
+}
+
+/// `WebFileDownloadGenerateActor::parse_conversion`
+/// (FileGenerateManager.cpp:131-210) — the `#`-framed `audio_t` album
+/// thumb and the `map` geo-point conversions.
+fn parse_web_generate_conversion(
+    conversion: &str,
+    ctx: &mut dyn FileManagerContext,
+) -> Result<(telegram_api::InputWebFileLocation, String), Status> {
+    let parts: Vec<&str> = conversion.split('#').collect();
+    if parts.len() <= 2 || !parts[0].is_empty() || !parts.last().is_some_and(|p| p.is_empty()) {
+        return Err(Status::error_message("Wrong conversion"));
+    }
+    if parts.len() == 6 && parts[1] == "audio_t" {
+        // music thumbnail
+        if parts[2].is_empty() && parts[3].is_empty() {
+            return Err(Status::error_message(
+                "Title or performer must be non-empty",
+            ));
+        }
+        if parts[4] != "0" && parts[4] != "1" {
+            return Err(Status::error_message("Invalid conversion"));
+        }
+        let is_small = parts[4].as_bytes()[0] == b'1';
+        let file_name = format!(
+            "Album cover {}for {} - {}.jpg",
+            if is_small { "thumbnail " } else { "" },
+            parts[3],
+            parts[2]
+        );
+        // TITLE_MASK (flags.1) — title and performer share the bit
+        const TITLE_MASK: i32 = 1 << 1;
+        let flags = TITLE_MASK | if is_small { 1 << 2 } else { 0 };
+        return Ok((
+            telegram_api::InputWebFileLocation::inputWebFileAudioAlbumThumbLocation(
+                telegram_api::inputWebFileAudioAlbumThumbLocation {
+                    flags,
+                    small: is_small,
+                    document: None,
+                    title: parts[2].to_owned(),
+                    performer: parts[3].to_owned(),
+                },
+            ),
+            file_name,
+        ));
+    }
+
+    if parts.len() != 9 || parts[1] != "map" {
+        return Err(Status::error_message("Wrong conversion"));
+    }
+    let parse = |raw: &str| -> Result<i32, Status> {
+        raw.parse::<i32>()
+            .map_err(|_| Status::error_message("Wrong conversion"))
+    };
+    let zoom = parse(parts[2])?;
+    let x = parse(parts[3])?;
+    let y = parse(parts[4])?;
+    let width = parse(parts[5])?;
+    let height = parse(parts[6])?;
+    let scale = parse(parts[7])?;
+
+    if !(13..=20).contains(&zoom) {
+        return Err(Status::error_message("Wrong zoom"));
+    }
+    let size = 256i64 * (1i64 << zoom);
+    if !(0..size).contains(&(x as i64)) {
+        return Err(Status::error_message("Wrong x"));
+    }
+    if !(0..size).contains(&(y as i64)) {
+        return Err(Status::error_message("Wrong y"));
+    }
+    if !(16..=1024).contains(&width) || !(16..=1024).contains(&height) {
+        return Err(Status::error_message("Wrong dimensions"));
+    }
+    if !(1..=3).contains(&scale) {
+        return Err(Status::error_message("Wrong scale"));
+    }
+
+    let file_name = format!("map_{zoom}_{x}_{y}.png");
+
+    const PI: f64 = std::f64::consts::PI;
+    let longitude = (x as f64 + 0.1) * 360.0 / size as f64 - 180.0;
+    let latitude = 90.0
+        - 360.0
+            * (((y as f64 + 0.1) / size as f64 - 0.5) * 2.0 * PI)
+                .exp()
+                .atan()
+            / PI;
+
+    let access_hash = ctx.location_access_hash(latitude, longitude);
+    Ok((
+        telegram_api::InputWebFileLocation::inputWebFileGeoPointLocation(
+            telegram_api::inputWebFileGeoPointLocation {
+                geo_point: Some(telegram_api::InputGeoPoint::inputGeoPoint(
+                    telegram_api::inputGeoPoint {
+                        flags: 0,
+                        lat: latitude,
+                        long: longitude,
+                        accuracy_radius: 0,
+                    },
+                )),
+                access_hash,
+                w: width,
+                h: height,
+                zoom,
+                scale,
+            },
+        ),
+        file_name,
+    ))
+}
+
+/// `check_mtime` (FileGenerateManager.cpp:393-425) — the `#mtime#`
+/// staleness guard `register_generate` embeds. The conversion is
+/// rewritten in place on a parseable prefix, like the C++
+/// `ConstParser` walk.
+fn check_generate_mtime(
+    ctx: &mut dyn FileManagerContext,
+    conversion: &mut String,
+    original_path: &str,
+) -> Result<(), Status> {
+    if original_path.is_empty() {
+        return Ok(());
+    }
+    let Some(rest) = conversion.strip_prefix("#mtime#") else {
+        return Ok(());
+    };
+    let Some((mtime_raw, tail)) = rest.split_once('#') else {
+        return Ok(());
+    };
+    // the C++ keeps the last digit: strip while size() >= 2 && [0] == '0'
+    let mut mtime_str = mtime_raw;
+    while mtime_str.len() >= 2 && mtime_str.starts_with('0') {
+        mtime_str = &mtime_str[1..];
+    }
+    let Ok(expected_mtime) = mtime_str.parse::<u64>() else {
+        return Ok(());
+    };
+    *conversion = tail.to_owned();
+    let actual_mtime = ctx.stat(original_path).map(|s| s.mtime_nsec).unwrap_or(0);
+    if are_modification_times_equal(expected_mtime as i64, actual_mtime as i64) {
+        return Ok(());
+    }
+    Err(Status::error_message(&format!(
+        "FILE_GENERATE_LOCATION_INVALID: File \"{original_path}\" was modified: \
+         [expected modification time:{expected_mtime}][actual modification time:{actual_mtime}]"
+    )))
+}
+
 impl FileManager {
     /// Sets `user_download_file_callback_` (FileManager.h:841) — the
     /// callback the user download requests finish through.
@@ -15893,8 +16643,7 @@ impl FileManager {
             requests.user_download_priority = new_priority as i8;
         }
 
-        // run_generate is the M.12.8 plane; the generate_id gate inside
-        // run_download keeps the decision order
+        self.run_generate(node_id, fllm);
         self.run_download(node_id, true, fllm);
         self.try_flush_node(node_id);
     }
@@ -15980,6 +16729,7 @@ impl FileManager {
         callback
             .borrow_mut()
             .on_download_error(file_id, Status::error(200, "Canceled"));
+        self.run_generate(node_id, fllm);
         self.run_download(node_id, true, fllm);
         self.try_flush_node(node_id);
     }
@@ -16335,6 +17085,7 @@ impl FileManager {
                     }
                 }
                 if let Some(node_id) = self.node_id_of(file_id) {
+                    self.run_generate(node_id, fllm);
                     self.run_download(node_id, false, fllm);
                     self.run_upload(node_id, Vec::new(), fllm);
                 }
@@ -16364,9 +17115,8 @@ impl FileManager {
         fllm: &mut FileLoadManager,
     ) {
         // the C++ SCOPE_EXIT try_flush_node (FileManager.cpp:5125-5127)
-        let result = self.on_download_error_impl_inner(node_id, kind, was_active, status, fllm);
+        self.on_download_error_impl_inner(node_id, kind, was_active, status, fllm);
         self.try_flush_node(node_id);
-        result
     }
 
     /// The `on_download_error_impl` body.
@@ -16485,18 +17235,28 @@ impl FileManager {
     }
 
     /// `FileManager::do_cancel_generate` (FileManager.cpp:2183-2191) —
-    /// the FileGenerateManager is M.12.8 and `generate_id` is never set
-    /// today, so the guard makes this a natural no-op.
-    fn do_cancel_generate(&mut self, node_id: usize) {
-        let Some(node) = self.file_nodes[node_id].as_mut() else {
-            return;
+    /// resets the node first, then cancels the manager query (the C++
+    /// `send_closure` ordering: the node is already reset when the
+    /// cancel lands) and re-enters `cancel_download` for a Download
+    /// worker (the actor's hangup).
+    fn do_cancel_generate(&mut self, node_id: usize, fllm: &mut FileLoadManager) {
+        let query_id = {
+            let Some(node) = self.file_nodes[node_id].as_mut() else {
+                return;
+            };
+            if node.generate_id == 0 {
+                return;
+            }
+            let query_id = node.generate_id;
+            node.generate_id = 0;
+            node.generate_was_update = false;
+            node.set_generate_priority(0, 0);
+            query_id
         };
-        if node.generate_id == 0 {
-            return;
+        let download_cancel = self.generate.cancel(query_id);
+        if let Some((file_id, internal_download_id)) = download_cancel {
+            self.cancel_download(file_id, internal_download_id, false, fllm);
         }
-        node.generate_id = 0;
-        node.generate_was_update = false;
-        node.set_generate_priority(0, 0);
     }
 
     /// `FileManager::do_cancel_upload` (FileManager.cpp:2173-2181).
@@ -16516,7 +17276,7 @@ impl FileManager {
     /// `FileManager::on_file_load_error` (FileManager.cpp:5288-5299).
     fn on_file_load_error(&mut self, node_id: usize, status: Status, fllm: &mut FileLoadManager) {
         // Stop everything on error
-        self.do_cancel_generate(node_id);
+        self.do_cancel_generate(node_id, fllm);
         self.do_cancel_download(node_id, fllm);
         self.do_cancel_upload(node_id, fllm);
 
@@ -16571,7 +17331,7 @@ impl FileManager {
         let Some(mut requests) = self.file_upload_requests.remove(&file_id) else {
             return;
         };
-        let mut callbacks: Vec<(i64, Rc<RefCell<dyn UploadCallback>>, bool)> = requests
+        let mut callbacks: Vec<PendingUploadFinish> = requests
             .internal_uploads
             .iter_mut()
             .map(|(internal_upload_id, info)| {
@@ -16660,7 +17420,7 @@ impl FileManager {
         prefer_small: bool,
         fllm: &mut FileLoadManager,
     ) {
-        let result = self.resume_upload_inner(
+        self.resume_upload_inner(
             file_upload_id,
             bad_parts,
             callback,
@@ -16674,7 +17434,6 @@ impl FileManager {
         if let Some(node_id) = self.node_id_of(file_upload_id.file_id) {
             self.try_flush_node(node_id);
         }
-        result
     }
 
     /// The `resume_upload` body.
@@ -17075,10 +17834,7 @@ impl FileManager {
                 kind: UploadQueryKind::Upload,
             },
         );
-        self.file_nodes[node_id]
-            .as_mut()
-            .expect("node")
-            .upload_id = query_id;
+        self.file_nodes[node_id].as_mut().expect("node").upload_id = query_id;
         fllm.upload(
             query_id,
             file_id,
@@ -17122,6 +17878,48 @@ impl FileManager {
         for file_upload_id in file_upload_ids {
             self.cancel_upload(*file_upload_id, fllm);
         }
+    }
+
+    /// `FileManager::external_file_generate_write_part`
+    /// (FileManager.cpp:3656-3660) — the `writeGeneratedFilePart` arm.
+    /// The C++ SafePromise "Generation has already been finished" race
+    /// has no window in the collapse.
+    pub fn external_file_generate_write_part(
+        &mut self,
+        generation_id: i64,
+        offset: i64,
+        data: Vec<u8>,
+        fllm: &mut FileLoadManager,
+    ) -> Result<(), Status> {
+        let mut net = fllm.generate_net();
+        self.generate
+            .external_write_part(generation_id as u64, offset, &data, net.as_mut())
+    }
+
+    /// `FileManager::external_file_generate_progress`
+    /// (FileManager.cpp:3661-3667) — the `setFileGenerationProgress` arm.
+    pub fn external_file_generate_progress(
+        &mut self,
+        generation_id: i64,
+        expected_size: i64,
+        local_prefix_size: i64,
+    ) -> Result<(), Status> {
+        self.generate
+            .external_progress(generation_id as u64, expected_size, local_prefix_size)
+    }
+
+    /// `FileManager::external_file_generate_finish`
+    /// (FileManager.cpp:3668-3672) — the `finishFileGeneration` arm;
+    /// `error` is the client-reported failure.
+    pub fn external_file_generate_finish(
+        &mut self,
+        generation_id: i64,
+        error: Option<Status>,
+        fllm: &mut FileLoadManager,
+    ) -> Result<(), Status> {
+        let mut net = fllm.generate_net();
+        self.generate
+            .external_finish(generation_id as u64, error, net.as_mut())
     }
 
     /// `FileManager::finish_upload_query` (FileManager.cpp:5330-5345).
@@ -17296,9 +18094,8 @@ impl FileManager {
         fllm: &mut FileLoadManager,
     ) {
         // the C++ SCOPE_EXIT try_flush_node (FileManager.cpp:5230-5232)
-        let result = self.on_upload_error_impl_inner(node_id, kind, was_active, status, fllm);
+        self.on_upload_error_impl_inner(node_id, kind, was_active, status, fllm);
         self.try_flush_node(node_id);
-        result
     }
 
     /// The `on_upload_error_impl` body.
@@ -17403,6 +18200,395 @@ impl FileManager {
                     }
                 }
             }
+        }
+        self.apply_generate_events(fllm);
+    }
+
+    /// The drained generate-event dispatch — the `FileManager` handler
+    /// half of the [`FileGenerateManager`] callbacks
+    /// (`on_partial_generate`/`on_generate_ok`/`on_generate_error`, and
+    /// the `FileDownloadGenerateActor::on_download_ok` lambda), in queue
+    /// order. Events pushed while handling join the same drain, like the
+    /// C++ actor queue.
+    fn apply_generate_events(&mut self, fllm: &mut FileLoadManager) {
+        while let Some(event) = self.generate.take_event() {
+            match event {
+                FileGenerateEvent::PartialGenerate {
+                    query_id,
+                    partial,
+                    expected_size,
+                } => self.on_partial_generate(query_id, partial, expected_size, fllm),
+                FileGenerateEvent::GenerateOk { query_id, local } => {
+                    self.on_generate_ok(query_id, local, fllm);
+                    self.finish_generate_worker(query_id);
+                }
+                FileGenerateEvent::GenerateError { query_id, status } => {
+                    self.on_generate_error(query_id, status, fllm);
+                    self.finish_generate_worker(query_id);
+                }
+                FileGenerateEvent::DownloadOk {
+                    query_id,
+                    file_id,
+                    file_type,
+                } => {
+                    // the `on_download_ok` send_lambda
+                    // (FileGenerateManager.cpp:93-115): read the view,
+                    // override the file type, route like the callback's
+                    // on_ok
+                    let location = self
+                        .get_file_view(file_id)
+                        .and_then(|view| view.get_full_local_location().cloned());
+                    match location {
+                        Some(full) => {
+                            let local = FullLocalFileLocation { file_type, ..full };
+                            self.on_generate_ok(query_id, local, fllm);
+                        }
+                        None => {
+                            // LOG(ERROR) "Expected to have local location"
+                            self.on_generate_error(query_id, Status::error(500, "Unknown"), fllm);
+                        }
+                    }
+                    self.finish_generate_worker(query_id);
+                }
+            }
+        }
+    }
+
+    /// `FileGenerateManager::do_cancel` — the worker erase at a terminal
+    /// event, emitting the `FileExternalGenerateActor::tear_down` stop
+    /// update.
+    fn finish_generate_worker(&mut self, query_id: u64) {
+        if let Some(state) = self.generate.queries.remove(&query_id)
+            && matches!(state.worker, GenerateWorker::External { .. })
+            && let Some(ctx) = self.context.as_deref_mut()
+        {
+            ctx.on_file_generation_stop(query_id as i64);
+        }
+    }
+
+    /// `FileManager::on_partial_generate` (FileManager.cpp:4988-5022).
+    fn on_partial_generate(
+        &mut self,
+        query_id: u64,
+        partial: PartialLocalFileLocation,
+        expected_size: i64,
+        fllm: &mut FileLoadManager,
+    ) {
+        let Some(query) = self.generate_queries.get(&query_id) else {
+            unreachable!("CHECK(query != nullptr)");
+        };
+        let file_id = query.file_id;
+        let Some(node_id) = self.node_id_of(file_id) else {
+            return;
+        };
+        if self.file_nodes[node_id]
+            .as_ref()
+            .is_some_and(|node| node.generate_id != query_id)
+        {
+            return;
+        }
+        // TODO check for size and local_size, abort generation if needed
+        // (the C++ comment)
+        let (upload_id, need_run_upload) = {
+            let node = self.file_nodes[node_id].as_mut().expect("node");
+            node.set_local_location(LocalFileLocation::Partial(partial.clone()), -1, -1);
+            if expected_size > 0 {
+                node.set_expected_size(expected_size);
+            }
+            let need_run_upload = !node.generate_was_update;
+            if need_run_upload {
+                node.generate_was_update = true;
+            }
+            (node.upload_id, need_run_upload)
+        };
+        if need_run_upload {
+            self.run_upload(node_id, Vec::new(), fllm);
+        }
+        if upload_id != 0 {
+            fllm.update_local_file_location(upload_id, &LocalFileLocation::Partial(partial));
+        }
+        self.try_flush_node(node_id);
+    }
+
+    /// `FileManager::on_generate_ok` (FileManager.cpp:5024-5083).
+    fn on_generate_ok(
+        &mut self,
+        query_id: u64,
+        local: FullLocalFileLocation,
+        fllm: &mut FileLoadManager,
+    ) {
+        let Some((generate_file_id, was_active)) = self.finish_generate_query(query_id) else {
+            unreachable!("CHECK(query != nullptr)");
+        };
+        let Some(node_id) = self.node_id_of(generate_file_id) else {
+            return;
+        };
+        let old_upload_id = self.file_nodes[node_id]
+            .as_ref()
+            .map(|node| node.upload_id)
+            .unwrap_or(0);
+
+        let r_new_file_id = self.register_local(
+            local.clone(),
+            DialogId::default(),
+            0,
+            false,
+            false,
+            generate_file_id,
+        );
+        if let Err(register_error) = r_new_file_id {
+            let error = Status::error_message(&format!(
+                "Can't register local file after generate: {}",
+                register_error.message()
+            ));
+            if let Some(node_id) = self.node_id_of(generate_file_id) {
+                return self.on_generate_error_impl(node_id, was_active, error, fllm);
+            }
+            return;
+        }
+
+        // the register_local-triggered merge tail
+        // (FileManager.cpp:2432-2451): finish the settled queries of
+        // every merged file id and re-evaluate the queues — the C++
+        // reaches it through the merge this register_local triggered
+        let (node_file_ids, has_full_local, has_active_upload_remote) = self
+            .get_file_node(generate_file_id)
+            .map(|node| {
+                let view = FileView::new(node);
+                (
+                    node.file_ids.clone(),
+                    view.has_full_local_location(),
+                    view.has_active_upload_remote_location(),
+                )
+            })
+            .unwrap_or_default();
+        for merged_file_id in node_file_ids {
+            if has_full_local {
+                self.finish_downloads(merged_file_id, None);
+            }
+            if has_active_upload_remote {
+                self.finish_uploads(merged_file_id, None, fllm);
+            }
+        }
+        if let Some(merged_node_id) = self.node_id_of(generate_file_id) {
+            self.run_generate(merged_node_id, fllm);
+            self.run_download(merged_node_id, false, fllm);
+            self.run_upload(merged_node_id, Vec::new(), fllm);
+        }
+
+        if self.ctx().need_notify_on_new_files() {
+            let generate_conversion = self.file_nodes[node_id]
+                .as_ref()
+                .and_then(|node| FileView::new(node).get_generate_location().cloned())
+                .map(|generate| generate.conversion);
+            if generate_conversion.is_none()
+                || !generate_conversion
+                    .as_deref()
+                    .is_some_and(|conversion| conversion.starts_with("#file_id#"))
+            {
+                let (size, allocated) = {
+                    let view = self
+                        .get_file_view(generate_file_id)
+                        .expect("CHECK(file_node)");
+                    let size = view.size();
+                    let path = view.path().to_owned();
+                    // the C++ stats the path through the free `stat()`
+                    // (FileManager.cpp:1000-1010); a failed stat is 0
+                    let allocated = if path.is_empty() {
+                        0
+                    } else {
+                        self.ctx().stat(&path).map(|s| s.real_size).unwrap_or(0)
+                    };
+                    (size, allocated)
+                };
+                self.ctx().on_new_file(size, allocated, 1);
+            }
+        }
+
+        self.run_upload(node_id, Vec::new(), fllm);
+
+        if was_active {
+            let upload_id = self.file_nodes[node_id]
+                .as_ref()
+                .map(|node| node.upload_id)
+                .unwrap_or(0);
+            if old_upload_id != 0 && old_upload_id == upload_id {
+                fllm.update_local_file_location(old_upload_id, &LocalFileLocation::Full(local));
+            }
+        }
+    }
+
+    /// `FileManager::on_generate_error` (FileManager.cpp:5085-5095).
+    fn on_generate_error(&mut self, query_id: u64, status: Status, fllm: &mut FileLoadManager) {
+        let Some((file_id, was_active)) = self.finish_generate_query(query_id) else {
+            unreachable!("CHECK(query != nullptr)");
+        };
+        let Some(node_id) = self.node_id_of(file_id) else {
+            return;
+        };
+        self.on_generate_error_impl(node_id, was_active, status, fllm);
+    }
+
+    /// `FileManager::on_generate_error_impl` (FileManager.cpp:5204-5232).
+    fn on_generate_error_impl(
+        &mut self,
+        node_id: usize,
+        was_active: bool,
+        status: Status,
+        fllm: &mut FileLoadManager,
+    ) {
+        if status
+            .message()
+            .starts_with("FILE_GENERATE_LOCATION_INVALID")
+            && let Some(node) = self.file_nodes[node_id].as_mut()
+        {
+            node.set_generate_location(None);
+        }
+        if !was_active {
+            self.try_flush_node(node_id);
+            return;
+        }
+
+        // the C++ close-flag arm (`G()->close_flag()` collapses
+        // `request_aborted_error` statuses) lands with the close plane
+        if status.code() == 0 {
+            // Remove partial locations
+            if let Some(node) = self.file_nodes[node_id].as_mut() {
+                if matches!(node.local, LocalFileLocation::Partial(_)) {
+                    // the file itself has already been deleted
+                    node.drop_local_location();
+                }
+                node.delete_partial_remote_location();
+            }
+        }
+        let status = Status::error(400, status.message());
+        self.on_file_load_error(node_id, status, fllm);
+        self.try_flush_node(node_id);
+    }
+
+    /// `FileManager::finish_generate_query` (FileManager.cpp:5317-5333).
+    fn finish_generate_query(&mut self, query_id: u64) -> Option<(FileId, bool)> {
+        let query = self.generate_queries.remove(&query_id)?;
+        let res = query;
+        let node_id = self.node_id_of(res.file_id)?;
+        let was_active = self.file_nodes[node_id].as_mut().is_some_and(|node| {
+            if node.generate_id == query_id {
+                node.generate_id = 0;
+                node.generate_was_update = false;
+                node.set_generate_priority(0, 0);
+                true
+            } else {
+                false
+            }
+        });
+        Some((res.file_id, was_active))
+    }
+
+    /// `FileManager::run_generate` (FileManager.cpp:3673-3786).
+    fn run_generate(&mut self, node_id: usize, fllm: &mut FileLoadManager) {
+        let plan = {
+            let Some(node) = self.file_nodes[node_id].as_ref() else {
+                return;
+            };
+            let view = FileView::new(node);
+            if !view.can_generate()
+                || node.need_load_from_pmc
+                || view.has_full_local_location()
+                || view.can_download_from_server()
+            {
+                return;
+            }
+            NodeGeneratePlan {
+                main_file_id: node.main_file_id,
+                old_priority: node.generate_priority,
+                file_ids: node.file_ids.clone(),
+                generate: node.generate.clone(),
+                local: node.local.clone(),
+                suggested_path: node.suggested_path(),
+            }
+        };
+
+        let mut download_priority: i8 = 0;
+        let mut upload_priority: i8 = 0;
+        let mut file_id = plan.main_file_id;
+        for id in plan.file_ids {
+            if let Some(requests) = self.file_download_requests.get(&id) {
+                if requests.user_download_priority > download_priority {
+                    download_priority = requests.user_download_priority;
+                }
+                for info in requests.internal_downloads.values() {
+                    if info.download_priority > download_priority {
+                        download_priority = info.download_priority;
+                    }
+                }
+                if download_priority > upload_priority {
+                    file_id = id;
+                }
+            }
+            if let Some(requests) = self.file_upload_requests.get(&id) {
+                if requests.user_upload_priority > upload_priority {
+                    upload_priority = requests.user_upload_priority;
+                }
+                for info in requests.internal_uploads.values() {
+                    if info.upload_priority > upload_priority {
+                        upload_priority = info.upload_priority;
+                    }
+                }
+                if upload_priority > download_priority {
+                    file_id = id;
+                }
+            }
+        }
+
+        if let Some(node) = self.file_nodes[node_id].as_mut() {
+            node.set_generate_priority(download_priority, upload_priority);
+        }
+        if download_priority.max(upload_priority) == 0 {
+            if plan.old_priority != 0 {
+                self.do_cancel_generate(node_id, fllm);
+            }
+            return;
+        }
+        if plan.old_priority != 0 {
+            // TODO: change file generation priority (the C++ TODO)
+            return;
+        }
+        let Some(generate_location) = plan.generate else {
+            return;
+        };
+
+        self.next_generate_query_id += 1;
+        let query_id = self.next_generate_query_id;
+        self.generate_queries
+            .insert(query_id, GenerateQuery { file_id });
+        if let Some(node) = self.file_nodes[node_id].as_mut() {
+            node.generate_id = query_id;
+        }
+
+        let internal_download_id = self.get_internal_download_id();
+        if self.context.is_none() {
+            self.context = Some(Box::new(DefaultFileManagerContext));
+        }
+        let mut net = fllm.generate_net();
+        let start = self.generate.generate_file(
+            query_id,
+            generate_location,
+            &plan.local,
+            plan.suggested_path,
+            internal_download_id,
+            net.as_mut(),
+            self.context.as_deref_mut().expect("context"),
+        );
+        if let Some((download_file_id, internal_download_id, callback)) = start {
+            self.download(
+                download_file_id,
+                internal_download_id,
+                callback,
+                1,
+                -1,
+                -1,
+                fllm,
+            );
         }
     }
 
@@ -18915,6 +20101,539 @@ mod file_load_manager_tests {
         // ran through on_partial_download)
         let node = file_manager.get_file_node(file_id).expect("node");
         assert!(FileView::new(node).has_full_local_location());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ==== M.12.8 FileGenerateManager ====
+
+    /// The shared generate-test log: scripted web answers, recorded
+    /// queries and the generation updates.
+    #[derive(Default)]
+    struct GenerateLog {
+        queries: RefCell<Vec<String>>,
+        web_script: RefCell<std::collections::VecDeque<Result<Vec<u8>, Status>>>,
+        updates: RefCell<Vec<String>>,
+    }
+
+    /// The generate io/net seam: real temp-dir files plus the scripted
+    /// `upload.getWebFile` answers.
+    struct GenerateNet {
+        root: std::path::PathBuf,
+        log: Rc<GenerateLog>,
+    }
+
+    impl FileDownloaderNet for GenerateNet {
+        fn download(
+            &mut self,
+            query: DownloadQuery,
+            _query_type: DownloadQueryType,
+            _meta: DownloadNetMeta,
+        ) -> Result<DownloadResult, Status> {
+            match query {
+                DownloadQuery::GetWebFile { .. } => {
+                    self.log.queries.borrow_mut().push("GetWebFile".to_owned());
+                    self.log
+                        .web_script
+                        .borrow_mut()
+                        .pop_front()
+                        .unwrap_or_else(|| panic!("web script exhausted"))
+                        .map(DownloadResult::Bytes)
+                }
+                _ => panic!("unexpected generate query {query:?}"),
+            }
+        }
+
+        fn open_temp_file(&mut self, _file_type: FileType) -> Result<(File, String), Status> {
+            let path = self
+                .root
+                .join(format!("temp_{}.bin", tdutils::random::secure_int64()));
+            let fd = File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+                .map_err(|e| Status::error_message(format!("{e}").as_str()))?;
+            Ok((fd, path.to_string_lossy().into_owned()))
+        }
+
+        fn open_partial_file(&mut self, path: &str, write: bool) -> Result<File, Status> {
+            File::options()
+                .read(true)
+                .write(write)
+                .create(write)
+                .truncate(false)
+                .open(path)
+                .map_err(|e| Status::error_message(format!("{e}").as_str()))
+        }
+
+        fn open_generated_file(&mut self, path: &str) -> Result<File, Status> {
+            // the C++ opens Create | Write — the path may have been
+            // unlinked as a stale partial
+            File::options()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(path)
+                .map_err(|e| Status::error_message(format!("{e}").as_str()))
+        }
+
+        fn create_from_temp(
+            &mut self,
+            _file_type: FileType,
+            path: &str,
+            name: &str,
+        ) -> Result<String, Status> {
+            if name.is_empty() {
+                // the C++ keeps the temp name for an empty name
+                return Ok(path.to_owned());
+            }
+            let target = self.root.join(format!("done_{name}"));
+            std::fs::rename(path, &target)
+                .map_err(|e| Status::error_message(format!("{e}").as_str()))?;
+            Ok(target.to_string_lossy().into_owned())
+        }
+    }
+
+    /// The factory: the same seam everywhere (`utils`/`generate`).
+    struct GenerateFactory {
+        root: std::path::PathBuf,
+        log: Rc<GenerateLog>,
+    }
+
+    impl FileLoadNetFactory for GenerateFactory {
+        fn download_net(&mut self) -> Box<dyn FileDownloaderNet> {
+            Box::new(GenerateNet {
+                root: self.root.clone(),
+                log: self.log.clone(),
+            })
+        }
+
+        fn upload_net(&mut self) -> Box<dyn FileUploaderNet> {
+            unimplemented!("generate tests ride downloads")
+        }
+
+        fn hash_net(&mut self) -> Box<dyn FileHashUploaderNet> {
+            unimplemented!("generate tests ride downloads")
+        }
+
+        fn utils_net(&mut self) -> Box<dyn FileDownloaderNet> {
+            self.download_net()
+        }
+    }
+
+    /// The context mock: records the generation updates.
+    struct GenerateContext {
+        log: Rc<GenerateLog>,
+        access_hash: i64,
+    }
+
+    impl FileManagerContext for GenerateContext {
+        fn on_file_generation_start(
+            &mut self,
+            generation_id: i64,
+            original_path: &str,
+            path: &str,
+            conversion: &str,
+        ) {
+            self.log.updates.borrow_mut().push(format!(
+                "start:{generation_id}:{original_path}:{path}:{conversion}"
+            ));
+        }
+
+        fn on_file_generation_stop(&mut self, generation_id: i64) {
+            self.log
+                .updates
+                .borrow_mut()
+                .push(format!("stop:{generation_id}"));
+        }
+
+        fn location_access_hash(&mut self, _latitude: f64, _longitude: f64) -> i64 {
+            self.access_hash
+        }
+    }
+
+    #[test]
+    fn external_file_generate_completes_end_to_end() {
+        // the register-generate -> download -> write/progress/finish flow
+        // (FileManager.cpp:3673-3786 + FileGenerateManager.cpp:299-391)
+        let root = test_root();
+        let log = Rc::new(GenerateLog::default());
+        let mut file_manager = FileManager::new();
+        file_manager.set_context(Box::new(GenerateContext {
+            log: log.clone(),
+            access_hash: 0,
+        }));
+        let fllm = &mut FileLoadManager::new(
+            Box::new(GenerateFactory {
+                root: root.clone(),
+                log: log.clone(),
+            }),
+            FileLoadManagerOptions::default(),
+        );
+
+        let generate_id = file_manager.register_generate(
+            FileType::Document,
+            "source.jpg".to_owned(),
+            "convert_me".to_owned(),
+            DialogId::default(),
+            100,
+        );
+        // the C++ callers reach the node through `get_sync_file_node`,
+        // whose database load clears `need_load_from_pmc`; there is no db
+        // in the test
+        if let Some(node) = file_manager.get_file_node_mut(generate_id) {
+            node.need_load_from_pmc = false;
+        }
+        let log_dl = Rc::new(RefCell::new(DownloadLog::default()));
+        file_manager.set_user_download_callback(Rc::new(RefCell::new(DownloadCallbackHandle(
+            log_dl.clone(),
+        ))));
+        file_manager.download(
+            generate_id,
+            0,
+            Rc::new(RefCell::new(DownloadCallbackHandle(log_dl.clone())))
+                as Rc<RefCell<dyn DownloadCallback>>,
+            10,
+            -1,
+            -1,
+            fllm,
+        );
+        file_manager.apply_load_events(fllm);
+
+        // the generation started: the update carries the query id, the
+        // original path, the allocated temp path and the conversion
+        let updates = log.updates.borrow();
+        assert_eq!(updates.len(), 1, "updates={updates:?}");
+        assert!(
+            updates[0].starts_with("start:1:source.jpg:"),
+            "{:?}",
+            updates[0]
+        );
+        assert!(updates[0].ends_with(":convert_me"));
+        let temp_path = updates[0].split(':').nth(3).expect("path").to_owned();
+        drop(updates);
+
+        // the app feeds the conversion
+        file_manager
+            .external_file_generate_write_part(1, 0, b"hello".to_vec(), fllm)
+            .expect("write part");
+        file_manager
+            .external_file_generate_progress(1, 5, 5)
+            .expect("progress");
+        file_manager.apply_load_events(fllm);
+        // the partial event became the node's local location
+        {
+            let node = file_manager.get_file_node(generate_id).expect("node");
+            match &node.local {
+                LocalFileLocation::Partial(partial) => {
+                    assert_eq!(partial.ready_size, 5);
+                    assert_eq!(partial.path, temp_path);
+                }
+                other => panic!("expected a partial local location, got {other:?}"),
+            }
+        }
+
+        file_manager
+            .external_file_generate_finish(1, None, fllm)
+            .expect("finish");
+        file_manager.apply_load_events(fllm);
+
+        // the finished generation merged into the generate file id and
+        // finished the user download; the stop update follows the ok
+        assert_eq!(log_dl.borrow().messages(generate_id), vec!["ok".to_owned()]);
+        let node = file_manager.get_file_node(generate_id).expect("node");
+        match &node.local {
+            LocalFileLocation::Full(full) => {
+                // the suggested path is the generate original_path; the
+                // mock renames the temp into done_<name>
+                assert!(full.path.ends_with("done_source.jpg"), "{}", full.path);
+                assert_eq!(std::fs::read(&full.path).unwrap(), b"hello".to_vec());
+            }
+            other => panic!("expected a full local location, got {other:?}"),
+        }
+        let updates = log.updates.borrow();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[1], "stop:1");
+        drop(updates);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn web_file_generate_downloads_and_saves() {
+        // the `#map#` conversion rides upload.getWebFile and
+        // save_file_bytes (FileGenerateManager.cpp:212-253)
+        let root = test_root();
+        let log = Rc::new(GenerateLog::default());
+        log.web_script
+            .borrow_mut()
+            .push_back(Ok(b"png-bytes".to_vec()));
+        let mut file_manager = FileManager::new();
+        file_manager.set_context(Box::new(GenerateContext {
+            log: log.clone(),
+            access_hash: -311063606295967,
+        }));
+        let fllm = &mut FileLoadManager::new(
+            Box::new(GenerateFactory {
+                root: root.clone(),
+                log: log.clone(),
+            }),
+            FileLoadManagerOptions::default(),
+        );
+
+        let generate_id = file_manager.register_generate(
+            FileType::Thumbnail,
+            String::new(),
+            "#map#13#256#256#256#256#2#".to_owned(),
+            DialogId::default(),
+            0,
+        );
+        // the C++ callers reach the node through `get_sync_file_node`,
+        // whose database load clears `need_load_from_pmc`; there is no db
+        // in the test
+        if let Some(node) = file_manager.get_file_node_mut(generate_id) {
+            node.need_load_from_pmc = false;
+        }
+        let log_dl = Rc::new(RefCell::new(DownloadLog::default()));
+        file_manager.set_user_download_callback(Rc::new(RefCell::new(DownloadCallbackHandle(
+            log_dl.clone(),
+        ))));
+        file_manager.download(
+            generate_id,
+            0,
+            Rc::new(RefCell::new(DownloadCallbackHandle(log_dl.clone())))
+                as Rc<RefCell<dyn DownloadCallback>>,
+            10,
+            -1,
+            -1,
+            fllm,
+        );
+        file_manager.apply_load_events(fllm);
+
+        assert_eq!(*log.queries.borrow(), vec!["GetWebFile".to_owned()]);
+        assert_eq!(log_dl.borrow().messages(generate_id), vec!["ok".to_owned()]);
+        // the web worker emits no generation updates
+        assert!(log.updates.borrow().is_empty());
+        // the saved copy landed under the computed map name
+        let node = file_manager.get_file_node(generate_id).expect("node");
+        match &node.local {
+            LocalFileLocation::Full(full) => {
+                assert!(
+                    full.path.ends_with("done_map_13_256_256.png"),
+                    "{}",
+                    full.path
+                );
+                assert_eq!(std::fs::read(&full.path).unwrap(), b"png-bytes".to_vec());
+            }
+            other => panic!("expected a full local location, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn file_id_generate_downloads_the_referenced_file() {
+        // the `#file_id#` conversion downloads the referenced file and
+        // re-registers it under the generate file type
+        // (FileGenerateManager.cpp:41-121)
+        let root = test_root();
+        let payload: Vec<u8> = (0..=255).cycle().take(1024).collect();
+        let query_log: Rc<RefCell<Vec<(i64, i32)>>> = Rc::new(RefCell::new(Vec::new()));
+        let log = Rc::new(GenerateLog::default());
+        let mut file_manager = FileManager::new();
+        file_manager.set_context(Box::new(GenerateContext {
+            log: log.clone(),
+            access_hash: 0,
+        }));
+        let source_id = register_downloadable(&mut file_manager, 2, payload.len() as i64, 7);
+        let fllm = &mut FileLoadManager::new(
+            Box::new(TestFactory {
+                payload: payload.clone(),
+                root: root.clone(),
+                download_queries: Rc::clone(&query_log),
+            }),
+            FileLoadManagerOptions::default(),
+        );
+
+        let generate_id = file_manager.register_generate(
+            FileType::Thumbnail,
+            String::new(),
+            format!("#file_id#{}", source_id.get()),
+            DialogId::default(),
+            0,
+        );
+        // the C++ callers reach the node through `get_sync_file_node`,
+        // whose database load clears `need_load_from_pmc`; there is no db
+        // in the test
+        if let Some(node) = file_manager.get_file_node_mut(generate_id) {
+            node.need_load_from_pmc = false;
+        }
+        let log_dl = Rc::new(RefCell::new(DownloadLog::default()));
+        file_manager.set_user_download_callback(Rc::new(RefCell::new(DownloadCallbackHandle(
+            log_dl.clone(),
+        ))));
+        file_manager.download(
+            generate_id,
+            0,
+            Rc::new(RefCell::new(DownloadCallbackHandle(log_dl.clone())))
+                as Rc<RefCell<dyn DownloadCallback>>,
+            10,
+            -1,
+            -1,
+            fllm,
+        );
+        pump(&mut file_manager, fllm);
+
+        // the referenced file was downloaded once
+        assert_eq!(query_log.borrow().len(), 1);
+        // the generate file id finished with the downloaded bytes under
+        // the overridden file type
+        assert_eq!(log_dl.borrow().messages(generate_id), vec!["ok".to_owned()]);
+        let node = file_manager.get_file_node(generate_id).expect("node");
+        match &node.local {
+            LocalFileLocation::Full(full) => {
+                assert_eq!(full.file_type, FileType::Thumbnail);
+                assert!(full.path.contains("doc_7"), "{}", full.path);
+                assert_eq!(std::fs::read(&full.path).unwrap(), payload);
+            }
+            other => panic!("expected a full local location, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cancel_drops_the_generation_and_rejects_the_arms() {
+        let root = test_root();
+        let log = Rc::new(GenerateLog::default());
+        let mut file_manager = FileManager::new();
+        file_manager.set_context(Box::new(GenerateContext {
+            log: log.clone(),
+            access_hash: 0,
+        }));
+        let fllm = &mut FileLoadManager::new(
+            Box::new(GenerateFactory {
+                root: root.clone(),
+                log: log.clone(),
+            }),
+            FileLoadManagerOptions::default(),
+        );
+
+        let generate_id = file_manager.register_generate(
+            FileType::Document,
+            "source.jpg".to_owned(),
+            "convert_me".to_owned(),
+            DialogId::default(),
+            100,
+        );
+        // the C++ callers reach the node through `get_sync_file_node`,
+        // whose database load clears `need_load_from_pmc`; there is no db
+        // in the test
+        if let Some(node) = file_manager.get_file_node_mut(generate_id) {
+            node.need_load_from_pmc = false;
+        }
+        let log_dl = Rc::new(RefCell::new(DownloadLog::default()));
+        file_manager.set_user_download_callback(Rc::new(RefCell::new(DownloadCallbackHandle(
+            log_dl.clone(),
+        ))));
+        file_manager.download(
+            generate_id,
+            0,
+            Rc::new(RefCell::new(DownloadCallbackHandle(log_dl.clone())))
+                as Rc<RefCell<dyn DownloadCallback>>,
+            10,
+            -1,
+            -1,
+            fllm,
+        );
+        file_manager.apply_load_events(fllm);
+        let temp_path = {
+            let updates = log.updates.borrow();
+            updates[0].split(':').nth(3).expect("path").to_owned()
+        };
+        file_manager
+            .external_file_generate_write_part(1, 0, b"hello".to_vec(), fllm)
+            .expect("write part");
+
+        // the cancel: the user request gets 200 Canceled, the generation
+        // dies with -1 Canceled, the partial file is unlinked and the
+        // stop update follows
+        file_manager.cancel_download(generate_id, 0, true, fllm);
+        file_manager.apply_load_events(fllm);
+
+        assert_eq!(
+            log_dl.borrow().messages(generate_id),
+            vec!["error:Canceled".to_owned()]
+        );
+        assert!(!std::path::Path::new(&temp_path).exists(), "{temp_path}");
+        let updates = log.updates.borrow();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[1], "stop:1");
+        drop(updates);
+
+        // the canceled query id is unknown to the arms
+        let err = file_manager
+            .external_file_generate_write_part(1, 0, b"more".to_vec(), fllm)
+            .expect_err("canceled generation");
+        assert_eq!(err.code(), 400);
+        assert_eq!(err.message(), "Unknown generation_id");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn check_mtime_matches_the_cpp_semantics() {
+        let root = test_root();
+        let path = root.join("source.bin");
+        std::fs::write(&path, b"data").unwrap();
+        let path = path.to_string_lossy().into_owned();
+        let mut ctx = GenerateContext {
+            log: Rc::new(GenerateLog::default()),
+            access_hash: 0,
+        };
+        let actual_mtime = ctx.stat(&path).unwrap().mtime_nsec;
+
+        // no prefix: the conversion is untouched
+        let mut conversion = "plain".to_owned();
+        check_generate_mtime(&mut ctx, &mut conversion, &path).unwrap();
+        assert_eq!(conversion, "plain");
+
+        // an empty original path skips the check
+        let mut conversion = "#mtime#123#convert".to_owned();
+        check_generate_mtime(&mut ctx, &mut conversion, "").unwrap();
+        assert_eq!(conversion, "#mtime#123#convert");
+
+        // the matching nsec mtime rewrites the conversion away
+        let mut conversion = format!("#mtime#{actual_mtime}#convert");
+        check_generate_mtime(&mut ctx, &mut conversion, &path).unwrap();
+        assert_eq!(conversion, "convert");
+
+        // a stale mtime fails with the C++ message format
+        let expected = actual_mtime + 4_000_000_000;
+        let mut conversion = format!("#mtime#{expected}#convert");
+        let err = check_generate_mtime(&mut ctx, &mut conversion, &path).unwrap_err();
+        assert_eq!(
+            err.message(),
+            format!(
+                "FILE_GENERATE_LOCATION_INVALID: File \"{path}\" was modified: \
+                 [expected modification time:{expected}][actual modification time:{actual_mtime}]"
+            )
+        );
+
+        // the C++ strips leading zeros but keeps the last digit: "0"
+        // parses as 0 and fails the compare
+        let mut conversion = "#mtime#0#convert".to_owned();
+        let err = check_generate_mtime(&mut ctx, &mut conversion, &path).unwrap_err();
+        assert_eq!(
+            err.message(),
+            format!(
+                "FILE_GENERATE_LOCATION_INVALID: File \"{path}\" was modified: \
+                 [expected modification time:0][actual modification time:{actual_mtime}]"
+            )
+        );
+
+        // garbage digits leave the conversion untouched (no rewrite)
+        let mut conversion = "#mtime#abc#convert".to_owned();
+        check_generate_mtime(&mut ctx, &mut conversion, &path).unwrap();
+        assert_eq!(conversion, "#mtime#abc#convert");
         let _ = std::fs::remove_dir_all(&root);
     }
 
