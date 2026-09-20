@@ -10886,7 +10886,7 @@ mod tests {
     /// A stand-in `FileReferenceManager` for the serialization tests: the
     /// id itself is the wire payload (the real 28-variant `FileSource`
     /// format lands with M.12.2a).
-    struct TestFileSources;
+    pub(crate) struct TestFileSources;
 
     impl FileSourceStorage for TestFileSources {
         fn store_file_source(&mut self, file_source_id: FileSourceId, out: &mut Vec<u8>) {
@@ -22015,6 +22015,7 @@ mod file_downloader_tests {
 #[cfg(test)]
 mod file_load_manager_tests {
     use super::*;
+    use crate::files::tests::TestFileSources;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -23413,6 +23414,138 @@ mod file_load_manager_tests {
             .add_file(FileId::new(41, 0), FileSourceId::default(), "x", 8)
             .expect("add_file");
         assert!(store.borrow().contains_key("dlds#8"));
+    }
+
+    /// M.12.1h — the C++ FileDb oracle (`conformance/file_db_oracle`):
+    /// the pinned `FileData::store` bytes emitted by the real C++
+    /// FileData.hpp templates (TD_BUILD static libs), with a
+    /// parse -> re-store self-consistency check per record. The samples
+    /// carry no file sources: the with-sources branch needs the
+    /// FileReferenceManager plane and stays pinned by the
+    /// file_data_sources tests.
+    #[test]
+    fn file_data_matches_the_cpp_file_db_oracle() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "empty",
+                "100000003d00000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+            ),
+            (
+                "local",
+                "100000003d0000000000000000000000000000000200000005000000d2040000000000001e2f74642f757365726e616d652f646f63756d656e74732f646f632e62696e0000000000000400000000000007646f632e62696e0000000000000000",
+            ),
+            (
+                "remote",
+                "120000003d0000000000000000000000020000000500000201000000037265666400000000000000c80000000000000000000000000000000010000000000000000000000000000000000000",
+            ),
+            (
+                "photo",
+                "100000003d00000000000000000000000200000002000000020000002c010000000000009001000000000000010000000200000000000000000000000000000000000000000000000970686f746f2e6a706700000000000000000000",
+            ),
+            (
+                "web",
+                "100000003d00000000000000000000000200000000000001000000002168747470733a2f2f63646e2e74656c656772616d2e6f72672f6c6f676f2e706e6700002a0000000000000000000000000000000000000000000000000000002168747470733a2f2f63646e2e74656c656772616d2e6f72672f6c6f676f2e706e67000000000000",
+            ),
+            (
+                "generate",
+                "130000003d0000002a000000000000000000000000000000000000000000000001000000050000000b2f7372632f696e2e6a70670823636f6e766572740000002b02000000000000000000000000000000000000",
+            ),
+            (
+                "partial",
+                "100000003d00000000000000000000000000000001000000040000001c2f74642f757365726e616d652f766964656f732f706172742e6d703400000000000800ffffffff0000000001010000000000000020000000000000000000000000000000000000",
+            ),
+        ];
+        for (name, expected_hex) in cases {
+            let raw: Vec<u8> = (0..expected_hex.len() / 2)
+                .map(|i| u8::from_str_radix(&expected_hex[i * 2..i * 2 + 2], 16).unwrap())
+                .collect();
+
+            // the Rust store reproduces the C++ bytes
+            let mut out = Vec::new();
+            file_data_for_oracle_case(name).store(&mut out, &mut TestFileSources);
+            assert_eq!(out, raw, "{name}: store bytes diverge from the C++ oracle");
+
+            // and the parse -> re-store round trip is byte-stable
+            let mut parser = Parser::new(&out);
+            let parsed =
+                FileData::parse_from(&mut parser, false, Some(&mut TestFileSources)).unwrap();
+            parser.fetch_end().unwrap();
+            let mut restored = Vec::new();
+            parsed.store(&mut restored, &mut TestFileSources);
+            assert_eq!(restored, raw, "{name}: parse -> re-store diverges");
+        }
+    }
+
+    /// The `FileData` samples the oracle probe constructs
+    /// (conformance/file_db_oracle/probe.cpp main()).
+    fn file_data_for_oracle_case(name: &str) -> FileData {
+        match name {
+            "empty" => FileData::default(),
+            "local" => FileData {
+                local: LocalFileLocation::Full(FullLocalFileLocation::new(
+                    FileType::Document,
+                    "/td/username/documents/doc.bin".to_owned(),
+                    1234,
+                )),
+                size: 1024,
+                remote_name: "doc.bin".to_owned(),
+                ..FileData::default()
+            },
+            "remote" => FileData {
+                remote: RemoteFileLocation::Full(FullRemoteFileLocation::from_document(
+                    FileType::Document,
+                    100,
+                    200,
+                    DcId::internal(1),
+                    "ref".to_owned(),
+                )),
+                expected_size: 4096,
+                ..FileData::default()
+            },
+            "photo" => FileData {
+                remote: RemoteFileLocation::Full(FullRemoteFileLocation::from_photo(
+                    PhotoSizeSource::thumbnail(FileType::Photo, 0),
+                    300,
+                    400,
+                    DcId::internal(2),
+                    String::new(),
+                )),
+                remote_name: "photo.jpg".to_owned(),
+                ..FileData::default()
+            },
+            "web" => FileData {
+                remote: RemoteFileLocation::Full(FullRemoteFileLocation::from_web(
+                    FileType::Thumbnail,
+                    "https://cdn.telegram.org/logo.png".to_owned(),
+                    42,
+                )),
+                url: "https://cdn.telegram.org/logo.png".to_owned(),
+                ..FileData::default()
+            },
+            "generate" => FileData {
+                generate: Some(FullGenerateFileLocation::new(
+                    FileType::Document,
+                    "/src/in.jpg".to_owned(),
+                    "#convert".to_owned(),
+                )),
+                owner_dialog_id: DialogId::new(42),
+                expected_size: 555,
+                ..FileData::default()
+            },
+            "partial" => FileData {
+                local: LocalFileLocation::Partial(PartialLocalFileLocation {
+                    file_type: FileType::Video,
+                    part_size: 512 * 1024,
+                    path: "/td/username/videos/part.mp4".to_owned(),
+                    iv: Vec::new(),
+                    ready_bitmask: vec![1],
+                    ready_size: 4096,
+                }),
+                size: 8192,
+                ..FileData::default()
+            },
+            other => panic!("unknown oracle case {other}"),
+        }
     }
 
     #[test]
