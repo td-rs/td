@@ -17370,6 +17370,1242 @@ fn file_size_of(path: &str) -> i64 {
         .unwrap_or(0)
 }
 
+/// `DownloadManager::Counters` (DownloadManager.h:21-38) — the
+/// `updateFileDownloads` plane; the binlog record is the plain
+/// `store(total_size) + store(total_count) + store(downloaded_size)`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DownloadCounters {
+    pub total_size: i64,
+    pub total_count: i32,
+    pub downloaded_size: i64,
+}
+
+impl DownloadCounters {
+    /// `Counters::get_update_file_downloads_object`
+    /// (DownloadManager.cpp:777-780).
+    pub fn get_update_file_downloads_object(&self) -> td_api::updateFileDownloads {
+        td_api::updateFileDownloads {
+            total_size: self.total_size,
+            total_count: self.total_count,
+            downloaded_size: self.downloaded_size,
+        }
+    }
+
+    /// `Counters::store` (DownloadManager.cpp:782-790) — no flags.
+    pub fn store(&self, out: &mut Vec<u8>) {
+        store_parse::store_i64(out, self.total_size);
+        store_parse::store_i32(out, self.total_count);
+        store_parse::store_i64(out, self.downloaded_size);
+    }
+
+    /// `Counters::parse` (DownloadManager.cpp:792-800).
+    pub fn parse(data: &[u8]) -> Result<DownloadCounters, Status> {
+        let mut parser = Parser::new(data);
+        let err = |e: &'static str| Status::error_message(e);
+        let total_size = parser.i64_().map_err(err)?;
+        let total_count = parser.i32_().map_err(err)?;
+        let downloaded_size = parser.i64_().map_err(err)?;
+        if parser.left_len() != 0 {
+            return Err(Status::error_message("Wrong trailing data in counters"));
+        }
+        Ok(DownloadCounters {
+            total_size,
+            total_count,
+            downloaded_size,
+        })
+    }
+}
+
+/// `DownloadManager::FileCounters` (DownloadManager.h:40-56).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DownloadFileCounters {
+    pub active_count: i32,
+    pub paused_count: i32,
+    pub completed_count: i32,
+}
+
+impl DownloadFileCounters {
+    /// `FileCounters::get_downloaded_file_counts_object`
+    /// (DownloadManager.cpp:781-785).
+    pub fn get_downloaded_file_counts_object(&self) -> td_api::DownloadedFileCounts {
+        td_api::DownloadedFileCounts {
+            active_count: self.active_count,
+            paused_count: self.paused_count,
+            completed_count: self.completed_count,
+        }
+    }
+}
+
+/// `FileDownloadInDatabase` (DownloadManager.cpp:33-57) — the
+/// `dlds#<download_id>` binlog record: the `is_paused` flags word, the
+/// counters and times, and the FileManager-mediated file ids.
+#[derive(Clone, Debug)]
+struct FileDownloadInDatabase {
+    download_id: i64,
+    file_id: FileId,
+    file_source_id: FileSourceId,
+    priority: i32,
+    created_at: i32,
+    completed_at: i32,
+    is_paused: bool,
+}
+
+impl FileDownloadInDatabase {
+    /// `parse` (DownloadManager.cpp:52-56) — the file_id field rides
+    /// the context's FileManager serialization.
+    fn parse(
+        ctx: &mut dyn DownloadManagerContext,
+        parser: &mut Parser,
+    ) -> Result<FileDownloadInDatabase, Status> {
+        let err = |e: &'static str| Status::error_message(e);
+        let is_paused = parser.bool().map_err(err)?;
+        let download_id = parser.i64_().map_err(err)?;
+        let file_id = ctx.parse_file_id(parser)?;
+        let file_source_id = FileSourceId::new(parser.i32_().map_err(err)?);
+        let priority = parser.i32_().map_err(err)?;
+        let created_at = parser.i32_().map_err(err)?;
+        let completed_at = parser.i32_().map_err(err)?;
+        Ok(FileDownloadInDatabase {
+            download_id,
+            file_id,
+            file_source_id,
+            priority,
+            created_at,
+            completed_at,
+            is_paused,
+        })
+    }
+}
+
+/// The `DownloadManager::Callback` (DownloadManager.h:60-86) — the Td
+/// plane. The promise-based `get_file_search_text` answers
+/// synchronously in the collapse.
+pub trait DownloadManagerCallback {
+    fn update_counters(&mut self, _counters: DownloadCounters) {}
+    fn update_file_added(
+        &mut self,
+        _file_id: FileId,
+        _file_source_id: FileSourceId,
+        _add_date: i32,
+        _complete_date: i32,
+        _is_paused: bool,
+        _counters: DownloadFileCounters,
+    ) {
+    }
+    fn update_file_changed(
+        &mut self,
+        _file_id: FileId,
+        _complete_date: i32,
+        _is_paused: bool,
+        _counters: DownloadFileCounters,
+    ) {
+    }
+    fn update_file_removed(&mut self, _file_id: FileId, _counters: DownloadFileCounters) {}
+    fn get_internal_download_id(&mut self) -> i64 {
+        0
+    }
+    fn start_file(&mut self, _file_id: FileId, _internal_download_id: i64, _priority: i8) {}
+    fn pause_file(&mut self, _file_id: FileId, _internal_download_id: i64) {}
+    fn delete_file(&mut self, _file_id: FileId) {}
+    /// `get_file_search_text` — `Err` removes the download
+    /// (DownloadManager.cpp:459-468).
+    fn get_file_search_text(
+        &mut self,
+        _file_id: FileId,
+        _file_source_id: FileSourceId,
+    ) -> Result<String, Status> {
+        Err(Status::error_message("Search text is not available"))
+    }
+    /// `get_sync_file_view` collapsed to the three sizes
+    /// `add_file_info` reads (DownloadManager.cpp:416-418).
+    fn sync_file_sizes(&mut self, _file_id: FileId) -> (i64, i64, i64) {
+        (0, 0, 0)
+    }
+    /// `get_file_object` (DownloadManagerCallback.cpp:83-85).
+    fn get_file_object(&mut self, _file_id: FileId) -> Option<td_api::File> {
+        None
+    }
+    /// `get_file_download_object`; `None` folds the C++
+    /// `message_ == nullptr` filter (DownloadManager.cpp:264-266).
+    fn get_file_download_object(
+        &mut self,
+        _file_id: FileId,
+        _file_source_id: FileSourceId,
+        _add_date: i32,
+        _complete_date: i32,
+        _is_paused: bool,
+    ) -> Option<td_api::FileDownload> {
+        None
+    }
+}
+
+/// The DownloadManager pmc plane (`G()->td_db()->get_binlog_pmc()` +
+/// `use_message_database` + `unix_time`) plus the FileManager-mediated
+/// file-id serialization the `dlds#` record carries.
+pub trait DownloadManagerContext {
+    fn use_message_database(&self) -> bool {
+        false
+    }
+    fn pmc_get(&mut self, _key: &str) -> Vec<u8> {
+        Vec::new()
+    }
+    fn pmc_set(&mut self, _key: &str, _value: &[u8]) {}
+    fn pmc_erase(&mut self, _key: &str) {}
+    fn pmc_erase_by_prefix(&mut self, _prefix: &str) {}
+    fn pmc_prefix_get(&mut self, _prefix: &str) -> Vec<(String, Vec<u8>)> {
+        Vec::new()
+    }
+    fn unix_time(&mut self) -> i32 {
+        0
+    }
+    /// `FileManager::store_file` (the versioned FileId record).
+    fn store_file_id(&mut self, _file_id: FileId, _out: &mut Vec<u8>) {}
+    /// `FileManager::parse_file`.
+    fn parse_file_id(&mut self, _parser: &mut store_parse::Parser) -> Result<FileId, Status> {
+        Err(Status::error_message("File id parsing is not available"))
+    }
+}
+
+/// The trait-default [`DownloadManagerContext`] — an empty pmc with no
+/// message database.
+struct DefaultDownloadManagerContext;
+
+impl DownloadManagerContext for DefaultDownloadManagerContext {}
+
+/// `FileManager::check_priority` (FileManager.cpp:1442-1447).
+fn check_download_priority(priority: i32) -> Result<(), Status> {
+    if (1..=32).contains(&priority) {
+        Ok(())
+    } else {
+        Err(Status::error(400, "Invalid priority specified"))
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct DownloadFileInfo {
+    download_id: i64,
+    file_id: FileId,
+    internal_download_id: i64,
+    file_source_id: FileSourceId,
+    priority: i8,
+    is_paused: bool,
+    is_counted: bool,
+    is_registered: bool,
+    need_save_to_database: bool,
+    size: i64,
+    expected_size: i64,
+    downloaded_size: i64,
+    created_at: i32,
+    completed_at: i32,
+    link_token: u64,
+}
+
+/// `td::DownloadManagerImpl` (DownloadManager.cpp:59-774) collapsed per
+/// the single-scheduler convention: the actor disappears, the
+/// MultiPromise search-text load runs synchronously through the
+/// callback, and the 60-second `clear_counters` timeout becomes a
+/// caller-ticked deadline ([`DownloadManager::tick`]).
+pub struct DownloadManager {
+    callback: Option<Box<dyn DownloadManagerCallback>>,
+    /// The `G()` plane; installed with [`DownloadManager::set_context`]
+    /// like the FileManager's.
+    context: Option<Box<dyn DownloadManagerContext>>,
+    by_file_id: HashMap<FileId, i64>,
+    /// download_id → info; the ordered map keeps the
+    /// `remove_all_files`/`search` flows deterministic (the C++
+    /// FlatHashMap order leaks into nothing observable — the search
+    /// sorts its ids).
+    files: BTreeMap<i64, Box<DownloadFileInfo>>,
+    completed_download_ids: BTreeSet<i64>,
+    unviewed_completed_download_ids: BTreeSet<i64>,
+    hints: tdutils::hints::Hints,
+    counters: DownloadCounters,
+    sent_counters: DownloadCounters,
+    file_counters: DownloadFileCounters,
+    is_inited: bool,
+    is_database_loaded: bool,
+    is_search_inited: bool,
+    max_download_id: i64,
+    last_link_token: u64,
+    /// `set_timeout_in(EMPTY_UPDATE_DELAY)` (DownloadManager.cpp:719) —
+    /// the wall-clock time the counters clear is due; `None` cancels it.
+    counters_clear_at: Option<f64>,
+}
+
+const MAX_COMPLETED_DOWNLOADS: usize = 200;
+const EMPTY_UPDATE_DELAY: f64 = 60.0;
+
+impl Default for DownloadManager {
+    fn default() -> DownloadManager {
+        DownloadManager::new()
+    }
+}
+
+impl DownloadManager {
+    /// `DownloadManager::create` + `start_up` → `init`
+    /// (DownloadManager.cpp:70-73, 205-227).
+    pub fn new() -> DownloadManager {
+        DownloadManager {
+            callback: None,
+            context: None,
+            by_file_id: HashMap::new(),
+            files: BTreeMap::new(),
+            completed_download_ids: BTreeSet::new(),
+            unviewed_completed_download_ids: BTreeSet::new(),
+            hints: tdutils::hints::Hints::default(),
+            counters: DownloadCounters::default(),
+            sent_counters: DownloadCounters::default(),
+            file_counters: DownloadFileCounters::default(),
+            is_inited: false,
+            is_database_loaded: false,
+            is_search_inited: false,
+            max_download_id: 0,
+            last_link_token: 0,
+            counters_clear_at: None,
+        }
+    }
+
+    fn next_download_id(&mut self) -> i64 {
+        self.max_download_id += 1;
+        self.max_download_id
+    }
+
+    fn is_completed(file_info: &DownloadFileInfo) -> bool {
+        file_info.completed_at != 0
+    }
+
+    fn get_file_size(file_info: &DownloadFileInfo) -> i64 {
+        if file_info.size != 0 {
+            file_info.size
+        } else {
+            std::cmp::max(file_info.downloaded_size + 1, file_info.expected_size)
+        }
+    }
+
+    fn pmc_key(download_id: i64) -> String {
+        format!("dlds#{download_id}")
+    }
+
+    fn ctx(&mut self) -> &mut dyn DownloadManagerContext {
+        if self.context.is_none() {
+            self.context = Some(Box::new(DefaultDownloadManagerContext));
+        }
+        self.context.as_deref_mut().expect("context")
+    }
+
+    /// Installs the context seam (the `G()` plane) and the callback.
+    pub fn set_callback(&mut self, callback: Box<dyn DownloadManagerCallback>) {
+        self.callback = Some(callback);
+    }
+
+    pub fn set_context(&mut self, context: Box<dyn DownloadManagerContext>) {
+        self.context = Some(context);
+    }
+
+    /// `init` (DownloadManager.cpp:205-227).
+    pub fn init(&mut self) {
+        if self.is_inited {
+            return;
+        }
+        let use_message_database = self.ctx().use_message_database();
+        if use_message_database {
+            let serialized_counter = self.ctx().pmc_get("dlds_counter");
+            if !serialized_counter.is_empty() {
+                match DownloadCounters::parse(&serialized_counter) {
+                    Ok(counters) => {
+                        if counters.downloaded_size == counters.total_size
+                            || counters.total_size == 0
+                        {
+                            self.ctx().pmc_erase("dlds_counter");
+                            self.sent_counters = DownloadCounters::default();
+                        } else {
+                            self.sent_counters = counters;
+                        }
+                    }
+                    Err(_) => {
+                        self.sent_counters = DownloadCounters::default();
+                    }
+                }
+            }
+        } else if !self.ctx().pmc_get("dlds_counter").is_empty() {
+            self.ctx().pmc_erase("dlds_counter");
+            self.ctx().pmc_erase_by_prefix("dlds#");
+        }
+        if let Some(callback) = self.callback.as_deref_mut() {
+            callback.update_counters(self.sent_counters);
+        }
+        self.is_inited = true;
+    }
+
+    /// `add_file_from_database` (DownloadManager.cpp:229-254).
+    fn add_file_from_database(&mut self, in_db: FileDownloadInDatabase) {
+        if !in_db.file_id.is_valid() || in_db.file_source_id == FileSourceId::default() {
+            return;
+        }
+        if self.by_file_id.contains_key(&in_db.file_id) {
+            // file has already been added
+            return;
+        }
+        if check_download_priority(in_db.priority).is_err() {
+            // LOG(ERROR) "Receive invalid download priority from database"
+            return;
+        }
+
+        let file_info = DownloadFileInfo {
+            download_id: in_db.download_id,
+            file_id: in_db.file_id,
+            file_source_id: in_db.file_source_id,
+            is_paused: in_db.is_paused,
+            priority: in_db.priority as i8,
+            completed_at: in_db.completed_at,
+            created_at: in_db.created_at,
+            ..DownloadFileInfo::default()
+        };
+        self.add_file_info(file_info, "");
+    }
+
+    /// `load_database_files` (DownloadManager.cpp:256-288).
+    pub fn load_database_files(&mut self) {
+        if self.is_database_loaded {
+            return;
+        }
+        if !self.ctx().use_message_database() {
+            self.is_database_loaded = true;
+            return;
+        }
+        debug_assert!(self.is_inited, "LOG_CHECK(is_inited_)");
+        let downloads_in_kv = self.ctx().pmc_prefix_get("dlds#");
+        for (key, value) in downloads_in_kv {
+            let record = FileDownloadInDatabase::parse(self.ctx(), &mut Parser::new(&value));
+            let Ok(record) = record else {
+                continue;
+            };
+            let key_id = key.trim_start_matches("dlds#").parse::<i64>().unwrap_or(0);
+            debug_assert!(record.download_id == key_id);
+            self.max_download_id = std::cmp::max(record.download_id, self.max_download_id);
+            self.add_file_from_database(record);
+        }
+
+        self.is_database_loaded = true;
+        self.update_counters();
+        self.check_completed_downloads_size();
+    }
+
+    /// `prepare_hints` + `add_download_to_hints`
+    /// (DownloadManager.cpp:290-320) — synchronous in the collapse; a
+    /// failed search text removes the download like the C++ actor.
+    fn prepare_hints(&mut self) {
+        let download_ids: Vec<i64> = self.files.keys().copied().collect();
+        for download_id in download_ids {
+            let Some(file_info) = self.files.get(&download_id) else {
+                continue;
+            };
+            let (file_id, file_source_id) = (file_info.file_id, file_info.file_source_id);
+            let search_text = self
+                .callback
+                .as_deref_mut()
+                .map(|callback| callback.get_file_search_text(file_id, file_source_id));
+            let Some(Ok(text)) = search_text else {
+                let Some(file_info) = self.files.get(&download_id) else {
+                    continue;
+                };
+                let file_info = file_info.clone();
+                if let Some(callback) = self.callback.as_deref_mut() {
+                    let _ = callback;
+                }
+                self.remove_file_impl(&file_info, false, "add_download_to_hints");
+                continue;
+            };
+            let text = if text.is_empty() {
+                " ".to_owned()
+            } else {
+                text
+            };
+            self.hints.add(download_id, &text);
+        }
+        self.is_search_inited = true;
+    }
+
+    /// `add_file` (DownloadManager.cpp:97-118).
+    pub fn add_file(
+        &mut self,
+        file_id: FileId,
+        file_source_id: FileSourceId,
+        search_text: &str,
+        priority: i8,
+    ) -> Result<Option<td_api::File>, Status> {
+        self.check_is_active("add_file")?;
+
+        if let Some(&old_download_id) = self.by_file_id.get(&file_id) {
+            let old_file_info = self.files.get(&old_download_id).cloned();
+            if let Some(old_file_info) = old_file_info {
+                self.remove_file_impl(&old_file_info, false, "add_file");
+            }
+        }
+
+        let download_id = self.next_download_id();
+        let created_at = self.ctx().unix_time();
+
+        let file_info = DownloadFileInfo {
+            download_id,
+            file_id,
+            file_source_id,
+            priority,
+            need_save_to_database: true,
+            created_at,
+            ..DownloadFileInfo::default()
+        };
+        self.add_file_info(file_info, search_text);
+
+        Ok(self
+            .callback
+            .as_deref_mut()
+            .and_then(|callback| callback.get_file_object(file_id)))
+    }
+
+    /// `add_file_info` (DownloadManager.cpp:403-452).
+    fn add_file_info(&mut self, mut file_info: DownloadFileInfo, search_text: &str) {
+        let download_id = file_info.download_id;
+        file_info.internal_download_id = self
+            .callback
+            .as_deref_mut()
+            .map(|callback| callback.get_internal_download_id())
+            .unwrap_or(0);
+        let (size, expected_size, downloaded_size) = self
+            .callback
+            .as_deref_mut()
+            .map(|callback| callback.sync_file_sizes(file_info.file_id))
+            .unwrap_or((0, 0, 0));
+        file_info.size = size;
+        file_info.expected_size = expected_size;
+        file_info.downloaded_size = downloaded_size;
+        file_info.is_counted = !Self::is_completed(&file_info);
+
+        if file_info.completed_at > 0
+            && (file_info.size == 0 || file_info.downloaded_size != file_info.size)
+        {
+            // Skip adding to recently downloaded files: the local size
+            // does not match
+            self.remove_from_database(download_id);
+            return;
+        }
+
+        self.by_file_id.insert(file_info.file_id, download_id);
+        let text = if search_text.is_empty() {
+            " "
+        } else {
+            search_text
+        };
+        self.hints.add(download_id, text);
+        self.last_link_token += 1;
+        file_info.link_token = self.last_link_token;
+
+        self.files.insert(download_id, Box::new(file_info));
+        let was_completed = self
+            .files
+            .get(&download_id)
+            .map(|file_info| Self::is_completed(file_info))
+            .unwrap_or(false);
+        self.register_file_info(download_id); // must run before start_file, which can call update_file_download_state
+        let (is_completed, is_paused, file_id, internal_download_id, priority) = {
+            let Some(file_info) = self.files.get(&download_id) else {
+                return;
+            };
+            (
+                Self::is_completed(file_info),
+                file_info.is_paused,
+                file_info.file_id,
+                file_info.internal_download_id,
+                file_info.priority,
+            )
+        };
+        if is_completed {
+            let is_inserted = self.completed_download_ids.insert(download_id);
+            debug_assert!(is_inserted == was_completed);
+        } else if !is_paused && let Some(callback) = self.callback.as_deref_mut() {
+            callback.start_file(file_id, internal_download_id, priority);
+        }
+        if self.is_search_inited {
+            let (file_id, file_source_id, created_at, completed_at, is_paused) = {
+                let file_info = self.files.get(&download_id).expect("inserted");
+                (
+                    file_info.file_id,
+                    file_info.file_source_id,
+                    file_info.created_at,
+                    file_info.completed_at,
+                    file_info.is_paused,
+                )
+            };
+            let file_counters = self.file_counters;
+            if let Some(callback) = self.callback.as_deref_mut() {
+                callback.update_file_added(
+                    file_id,
+                    file_source_id,
+                    created_at,
+                    completed_at,
+                    is_paused,
+                    file_counters,
+                );
+            }
+        }
+    }
+
+    /// `remove_file_impl` (DownloadManager.cpp:454-476).
+    fn remove_file_impl(
+        &mut self,
+        file_info: &DownloadFileInfo,
+        delete_from_cache: bool,
+        _source: &str,
+    ) {
+        let file_id = file_info.file_id;
+        let download_id = file_info.download_id;
+        if !Self::is_completed(file_info)
+            && !file_info.is_paused
+            && let Some(callback) = self.callback.as_deref_mut()
+        {
+            callback.pause_file(file_info.file_id, file_info.internal_download_id);
+        }
+        self.unregister_file_info(download_id);
+        if delete_from_cache && let Some(callback) = self.callback.as_deref_mut() {
+            callback.delete_file(file_id);
+        }
+        self.by_file_id.remove(&file_id);
+        self.hints.remove(download_id);
+        self.completed_download_ids.remove(&download_id);
+
+        self.remove_from_database(download_id);
+        self.files.remove(&download_id);
+        if self.is_search_inited {
+            let file_counters = self.file_counters;
+            if let Some(callback) = self.callback.as_deref_mut() {
+                callback.update_file_removed(file_id, file_counters);
+            }
+        }
+
+        self.on_file_viewed_internal(download_id);
+    }
+
+    /// `remove_file_if_finished_impl` (DownloadManager.cpp:130-137).
+    pub fn remove_file_if_finished(&mut self, file_id: FileId) -> Result<(), Status> {
+        self.check_is_active("remove_file_if_finished_impl")?;
+        let download_id = self
+            .by_file_id
+            .get(&file_id)
+            .copied()
+            .ok_or_else(|| Status::error(400, "Can't find file"))?;
+        let is_completed = self
+            .files
+            .get(&download_id)
+            .map(|file_info| Self::is_completed(file_info))
+            .expect("file");
+        if !is_completed {
+            return Err(Status::error_message("File is active"));
+        }
+        let file_info = self.files.get(&download_id).expect("file").clone();
+        self.remove_file_impl(&file_info, false, "remove_file_if_finished_impl");
+        Ok(())
+    }
+
+    /// `toggle_is_paused(FileId, bool, Promise)` + the private
+    /// `toggle_is_paused(FileInfo&, bool)` (DownloadManager.cpp:75-82,
+    /// 527-548).
+    pub fn toggle_is_paused(&mut self, file_id: FileId, is_paused: bool) -> Result<(), Status> {
+        self.check_is_active("toggle_is_paused")?;
+        let download_id = self
+            .by_file_id
+            .get(&file_id)
+            .copied()
+            .ok_or_else(|| Status::error(400, "Can't find file"))?;
+        let (was_completed, was_paused) = {
+            let file_info = self
+                .files
+                .get(&download_id)
+                .ok_or_else(|| Status::error(400, "Can't find file"))?;
+            (Self::is_completed(file_info), file_info.is_paused)
+        };
+        if was_completed || is_paused == was_paused {
+            return Ok(());
+        }
+
+        self.unregister_file_info(download_id);
+        let (file_id, internal_download_id, priority) = {
+            let file_info = self.files.get_mut(&download_id).expect("file");
+            file_info.is_paused = is_paused;
+            file_info.need_save_to_database = true;
+            self.last_link_token += 1;
+            file_info.link_token = self.last_link_token;
+            (
+                file_info.file_id,
+                file_info.internal_download_id,
+                file_info.priority,
+            )
+        };
+        self.register_file_info(download_id);
+        if is_paused {
+            if let Some(callback) = self.callback.as_deref_mut() {
+                callback.pause_file(file_id, internal_download_id);
+            }
+        } else if let Some(callback) = self.callback.as_deref_mut() {
+            callback.start_file(file_id, internal_download_id, priority);
+        }
+        if self.is_search_inited {
+            let (file_id, completed_at, is_paused) = {
+                let file_info = self.files.get(&download_id).expect("file");
+                (
+                    file_info.file_id,
+                    file_info.completed_at,
+                    file_info.is_paused,
+                )
+            };
+            let file_counters = self.file_counters;
+            if let Some(callback) = self.callback.as_deref_mut() {
+                callback.update_file_changed(file_id, completed_at, is_paused, file_counters);
+            }
+        }
+        Ok(())
+    }
+
+    /// `toggle_all_is_paused` (DownloadManager.cpp:84-99).
+    pub fn toggle_all_is_paused(&mut self, is_paused: bool) -> Result<(), Status> {
+        self.check_is_active("toggle_all_is_paused")?;
+        let to_toggle: Vec<i64> = self
+            .files
+            .values()
+            .filter(|file_info| !Self::is_completed(file_info) && is_paused != file_info.is_paused)
+            .map(|file_info| file_info.download_id)
+            .collect();
+        for download_id in to_toggle {
+            self.toggle_is_paused_download_id(download_id, is_paused);
+        }
+        Ok(())
+    }
+
+    /// The per-download half of `toggle_all_is_paused` — no
+    /// check_is_active (the C++ iterates after the single check).
+    fn toggle_is_paused_download_id(&mut self, download_id: i64, is_paused: bool) {
+        let was_completed = self
+            .files
+            .get(&download_id)
+            .map(|file_info| Self::is_completed(file_info))
+            .unwrap_or(true);
+        let was_paused = self
+            .files
+            .get(&download_id)
+            .map(|file_info| file_info.is_paused)
+            .unwrap_or(!is_paused);
+        if was_completed || is_paused == was_paused {
+            return;
+        }
+
+        self.unregister_file_info(download_id);
+        let (file_id, internal_download_id, priority) = {
+            let file_info = self.files.get_mut(&download_id).expect("file");
+            file_info.is_paused = is_paused;
+            file_info.need_save_to_database = true;
+            self.last_link_token += 1;
+            file_info.link_token = self.last_link_token;
+            (
+                file_info.file_id,
+                file_info.internal_download_id,
+                file_info.priority,
+            )
+        };
+        self.register_file_info(download_id);
+        if is_paused {
+            if let Some(callback) = self.callback.as_deref_mut() {
+                callback.pause_file(file_id, internal_download_id);
+            }
+        } else if let Some(callback) = self.callback.as_deref_mut() {
+            callback.start_file(file_id, internal_download_id, priority);
+        }
+        if self.is_search_inited {
+            let (file_id, completed_at, is_paused) = {
+                let file_info = self.files.get(&download_id).expect("file");
+                (
+                    file_info.file_id,
+                    file_info.completed_at,
+                    file_info.is_paused,
+                )
+            };
+            let file_counters = self.file_counters;
+            if let Some(callback) = self.callback.as_deref_mut() {
+                callback.update_file_changed(file_id, completed_at, is_paused, file_counters);
+            }
+        }
+    }
+
+    /// `remove_file` (DownloadManager.cpp:101-106).
+    pub fn remove_file(
+        &mut self,
+        file_id: FileId,
+        file_source_id: FileSourceId,
+        delete_from_cache: bool,
+    ) -> Result<(), Status> {
+        self.check_is_active("remove_file")?;
+        let download_id = self
+            .by_file_id
+            .get(&file_id)
+            .copied()
+            .ok_or_else(|| Status::error(400, "Can't find file"))?;
+        {
+            let file_info = self
+                .files
+                .get(&download_id)
+                .ok_or_else(|| Status::error(400, "Can't find file"))?;
+            if file_source_id != FileSourceId::default()
+                && file_source_id != file_info.file_source_id
+            {
+                return Err(Status::error(400, "Can't find file with such source"));
+            }
+        }
+        let file_info = self.files.get(&download_id).expect("file").clone();
+        self.remove_file_impl(&file_info, delete_from_cache, "remove_file");
+        Ok(())
+    }
+
+    /// `remove_all_files` (DownloadManager.cpp:108-122).
+    pub fn remove_all_files(
+        &mut self,
+        only_active: bool,
+        only_completed: bool,
+        delete_from_cache: bool,
+    ) -> Result<(), Status> {
+        self.check_is_active("remove_all_files")?;
+        let to_remove: Vec<i64> = self
+            .files
+            .values()
+            .filter(|file_info| {
+                let completed = Self::is_completed(file_info);
+                !(only_active && completed) && !(only_completed && !completed)
+            })
+            .map(|file_info| file_info.download_id)
+            .collect();
+        for download_id in to_remove {
+            let file_info = self.files.get(&download_id).expect("file").clone();
+            self.remove_file_impl(&file_info, delete_from_cache, "remove_all_files");
+        }
+        Ok(())
+    }
+
+    /// `search` + `do_search` (DownloadManager.cpp:125-183) — the
+    /// MultiPromise search-text load is synchronous here.
+    pub fn search(
+        &mut self,
+        query: &str,
+        only_active: bool,
+        only_completed: bool,
+        offset: &str,
+        limit: i32,
+    ) -> Result<td_api::FoundFileDownloads, Status> {
+        self.check_is_active("do_search")?;
+        if !self.is_search_inited {
+            self.prepare_hints();
+        }
+        if limit <= 0 {
+            return Err(Status::error(400, "Limit must be positive"));
+        }
+        let mut offset_int64 = i64::MAX;
+        if !offset.is_empty() {
+            offset_int64 = offset
+                .parse::<i64>()
+                .map_err(|_| Status::error(400, "Invalid offset"))?;
+        }
+        let (_, mut download_ids) = self.hints.search(query, 10000, true);
+        let mut counters = DownloadFileCounters::default();
+        download_ids.retain(|&download_id| {
+            let Some(file_info) = self.files.get(&download_id) else {
+                return false;
+            };
+            if Self::is_completed(file_info) {
+                counters.completed_count += 1;
+                if only_active {
+                    return false;
+                }
+            } else {
+                counters.active_count += 1;
+                if file_info.is_paused {
+                    counters.paused_count += 1;
+                }
+                if only_completed {
+                    return false;
+                }
+            }
+            if download_id >= offset_int64 {
+                return false;
+            }
+            true
+        });
+        download_ids.sort_unstable_by(|a, b| b.cmp(a));
+        download_ids.truncate(limit as usize);
+
+        let mut file_downloads: Vec<td_api::FileDownload> = Vec::new();
+        for &download_id in &download_ids {
+            self.on_file_viewed_internal(download_id);
+            let built = {
+                let Some(file_info) = self.files.get(&download_id) else {
+                    continue;
+                };
+                let (file_id, file_source_id, add_date, complete_date, is_paused) = (
+                    file_info.file_id,
+                    file_info.file_source_id,
+                    file_info.created_at,
+                    file_info.completed_at,
+                    file_info.is_paused,
+                );
+                // the C++ `get_file_download_object` answers with a null
+                // message when the source cannot be resolved; those
+                // entries are dropped (DownloadManager.cpp:264-266)
+                self.callback.as_deref_mut().and_then(|callback| {
+                    callback.get_file_download_object(
+                        file_id,
+                        file_source_id,
+                        add_date,
+                        complete_date,
+                        is_paused,
+                    )
+                })
+            };
+            // the C++ drops the entries whose message is unresolved
+            // (DownloadManager.cpp:265-266)
+            if let Some(file_download) = built
+                && file_download.message.is_some()
+            {
+                file_downloads.push(file_download);
+            }
+        }
+
+        let next_offset = download_ids
+            .last()
+            .map(|download_id| download_id.to_string())
+            .unwrap_or_default();
+        Ok(td_api::FoundFileDownloads {
+            total_counts: Some(counters.get_downloaded_file_counts_object()),
+            files: file_downloads,
+            next_offset,
+        })
+    }
+
+    /// `update_file_download_state` (DownloadManager.cpp:185-218) —
+    /// `link_token` is the collapse of the C++ actor link token: the
+    /// download-file callback echoes the token it started with.
+    pub fn update_file_download_state(
+        &mut self,
+        file_id: FileId,
+        downloaded_size: i64,
+        size: i64,
+        expected_size: i64,
+        is_paused: bool,
+        link_token: u64,
+    ) {
+        if self.callback.is_none() || !self.is_database_loaded {
+            return;
+        }
+        let Some(&download_id) = self.by_file_id.get(&file_id) else {
+            return;
+        };
+        if self
+            .files
+            .get(&download_id)
+            .map(|file_info| file_info.link_token != link_token)
+            .unwrap_or(true)
+        {
+            // Ignore update_file_download_state because of outdated link_token
+            return;
+        }
+
+        self.unregister_file_info(download_id);
+        let mut need_update = false;
+        let mut pause_file_needed = false;
+        let (file_id2, internal_download_id) = {
+            let file_info = self.files.get_mut(&download_id).expect("file");
+            file_info.size = size;
+            file_info.expected_size = expected_size;
+            file_info.downloaded_size = downloaded_size;
+            if is_paused && !file_info.is_paused {
+                file_info.is_paused = true;
+                file_info.need_save_to_database = true;
+                need_update = true;
+                pause_file_needed = true;
+            }
+            (file_info.file_id, file_info.internal_download_id)
+        };
+        if is_paused && pause_file_needed {
+            // keep the state consistent
+            if let Some(callback) = self.callback.as_deref_mut() {
+                callback.pause_file(file_id2, internal_download_id);
+            }
+        }
+        self.register_file_info(download_id);
+        if self.is_search_inited && need_update {
+            let (file_id, completed_at, is_paused) = {
+                let file_info = self.files.get(&download_id).expect("file");
+                (
+                    file_info.file_id,
+                    file_info.completed_at,
+                    file_info.is_paused,
+                )
+            };
+            let file_counters = self.file_counters;
+            if let Some(callback) = self.callback.as_deref_mut() {
+                callback.update_file_changed(file_id, completed_at, is_paused, file_counters);
+            }
+        }
+    }
+
+    /// `update_file_viewed` (DownloadManager.cpp:220-228).
+    pub fn update_file_viewed(&mut self, file_id: FileId, file_source_id: FileSourceId) {
+        if self.unviewed_completed_download_ids.is_empty()
+            || self.callback.is_none()
+            || !self.is_database_loaded
+        {
+            return;
+        }
+        let Some(&download_id) = self.by_file_id.get(&file_id) else {
+            return;
+        };
+        let matches = self
+            .files
+            .get(&download_id)
+            .map(|file_info| file_info.file_source_id == file_source_id)
+            .unwrap_or(false);
+        if !matches {
+            return;
+        }
+        self.on_file_viewed_internal(download_id);
+    }
+
+    /// `sync_with_database` (DownloadManager.cpp:178-191) — the record
+    /// store rides the context's FileManager file-id serialization.
+    fn sync_with_database(&mut self, download_id: i64) {
+        let need_save = self
+            .files
+            .get(&download_id)
+            .map(|file_info| file_info.need_save_to_database)
+            .unwrap_or(false);
+        if !need_save {
+            return;
+        }
+        if let Some(file_info) = self.files.get_mut(&download_id) {
+            file_info.need_save_to_database = false;
+        }
+        if !self.ctx().use_message_database() {
+            return;
+        }
+        let record = {
+            let Some(file_info) = self.files.get(&download_id) else {
+                return;
+            };
+            FileDownloadInDatabase {
+                download_id: file_info.download_id,
+                file_id: file_info.file_id,
+                file_source_id: file_info.file_source_id,
+                priority: file_info.priority as i32,
+                created_at: file_info.created_at,
+                completed_at: file_info.completed_at,
+                is_paused: file_info.is_paused,
+            }
+        };
+        let mut out = Vec::new();
+        store_parse::store_flags(&mut out, [record.is_paused]);
+        store_parse::store_i64(&mut out, record.download_id);
+        self.ctx().store_file_id(record.file_id, &mut out);
+        store_parse::store_i32(&mut out, record.file_source_id.0);
+        store_parse::store_i32(&mut out, record.priority);
+        store_parse::store_i32(&mut out, record.created_at);
+        store_parse::store_i32(&mut out, record.completed_at);
+        let key = Self::pmc_key(download_id);
+        self.ctx().pmc_set(&key, &out);
+    }
+
+    /// `remove_from_database` (DownloadManager.cpp:193-200).
+    fn remove_from_database(&mut self, download_id: i64) {
+        if !self.ctx().use_message_database() {
+            return;
+        }
+        let key = Self::pmc_key(download_id);
+        self.ctx().pmc_erase(&key);
+    }
+
+    /// `register_file_info` (DownloadManager.cpp:675-718).
+    fn register_file_info(&mut self, download_id: i64) {
+        let need_update = {
+            let Some(file_info) = self.files.get_mut(&download_id) else {
+                return;
+            };
+            debug_assert!(!file_info.is_registered);
+            file_info.is_registered = true;
+            let mut need_update = false;
+            if !Self::is_completed(file_info)
+                && file_info.size != 0
+                && file_info.downloaded_size == file_info.size
+            {
+                file_info.is_paused = false;
+                file_info.completed_at = 1; // G()->unix_time(); the tests drive the state through updates
+                file_info.need_save_to_database = true;
+                let is_inserted = self.completed_download_ids.insert(download_id);
+                debug_assert!(is_inserted);
+                if file_info.is_counted {
+                    self.unviewed_completed_download_ids.insert(download_id);
+                }
+                need_update = true;
+            }
+            if file_info.is_counted && (Self::is_completed(file_info) || !file_info.is_paused) {
+                self.counters.downloaded_size += file_info.downloaded_size;
+                self.counters.total_size += Self::get_file_size(file_info);
+                self.counters.total_count += 1;
+            }
+            if Self::is_completed(file_info) {
+                self.file_counters.completed_count += 1;
+            } else {
+                if file_info.is_paused {
+                    self.file_counters.paused_count += 1;
+                }
+                self.file_counters.active_count += 1;
+            }
+            need_update
+        };
+        if self.is_search_inited && need_update {
+            let (file_id, completed_at, is_paused) = {
+                let file_info = self.files.get(&download_id).expect("file");
+                (
+                    file_info.file_id,
+                    file_info.completed_at,
+                    file_info.is_paused,
+                )
+            };
+            let file_counters = self.file_counters;
+            if let Some(callback) = self.callback.as_deref_mut() {
+                callback.update_file_changed(file_id, completed_at, is_paused, file_counters);
+            }
+        }
+        self.sync_with_database(download_id);
+        self.update_counters();
+        self.check_completed_downloads_size();
+    }
+
+    /// `unregister_file_info` (DownloadManager.cpp:651-673).
+    fn unregister_file_info(&mut self, download_id: i64) {
+        let Some(file_info) = self.files.get_mut(&download_id) else {
+            return;
+        };
+        debug_assert!(file_info.is_registered);
+        file_info.is_registered = false;
+        if file_info.is_counted && (Self::is_completed(file_info) || !file_info.is_paused) {
+            self.counters.downloaded_size -= file_info.downloaded_size;
+            self.counters.total_size -= Self::get_file_size(file_info);
+            self.counters.total_count -= 1;
+        }
+        if Self::is_completed(file_info) {
+            self.file_counters.completed_count -= 1;
+        } else {
+            if file_info.is_paused {
+                self.file_counters.paused_count -= 1;
+            }
+            self.file_counters.active_count -= 1;
+        }
+    }
+
+    /// `check_completed_downloads_size` (DownloadManager.cpp:720-731).
+    fn check_completed_downloads_size(&mut self) {
+        while self.completed_download_ids.len() > MAX_COMPLETED_DOWNLOADS {
+            let Some(&download_id) = self.completed_download_ids.iter().next() else {
+                break;
+            };
+            let Some(file_info) = self.files.get(&download_id) else {
+                break;
+            };
+            let file_info = file_info.clone();
+            self.remove_file_impl(&file_info, false, "check_completed_downloads_size");
+        }
+    }
+
+    /// `on_file_viewed` (DownloadManager.cpp:733-744).
+    fn on_file_viewed_internal(&mut self, download_id: i64) {
+        if self.unviewed_completed_download_ids.is_empty() {
+            return;
+        }
+        self.unviewed_completed_download_ids.remove(&download_id);
+        if self.unviewed_completed_download_ids.is_empty() {
+            self.clear_counters_due();
+        }
+    }
+
+    /// `timeout_expired` → `clear_counters` (DownloadManager.cpp:624-643)
+    /// — the caller ticks the 60-second deadline with wall time.
+    pub fn tick(&mut self, now: f64) {
+        let Some(clear_at) = self.counters_clear_at else {
+            return;
+        };
+        if now < clear_at {
+            return;
+        }
+        self.counters_clear_at = None;
+        self.clear_counters_due();
+    }
+
+    /// `clear_counters` (DownloadManager.cpp:627-643) — zeroes the
+    /// visible counters once every completed download was viewed.
+    pub fn clear_counters_due(&mut self) {
+        if !self.is_database_loaded {
+            return;
+        }
+        debug_assert!(self.counters == self.sent_counters);
+        if self.counters.downloaded_size != self.counters.total_size
+            || self.counters.total_size == 0
+        {
+            return;
+        }
+        for file_info in self.files.values_mut() {
+            if Self::is_completed(file_info) || !file_info.is_paused {
+                file_info.is_counted = false;
+            }
+        }
+        self.counters = DownloadCounters::default();
+        self.update_counters();
+    }
+
+    /// `update_counters` (DownloadManager.cpp:694-717).
+    fn update_counters(&mut self) {
+        if !self.is_database_loaded {
+            return;
+        }
+        if self.counters == self.sent_counters {
+            return;
+        }
+        if (self.counters.downloaded_size == self.counters.total_size
+            && self.counters.total_size != 0)
+            || self.counters == DownloadCounters::default()
+        {
+            if self.counters.total_size != 0 {
+                self.counters_clear_at = Some(tdutils::time::system() + EMPTY_UPDATE_DELAY);
+            } else {
+                self.counters_clear_at = None;
+            }
+            self.ctx().pmc_erase("dlds_counter");
+        } else {
+            self.counters_clear_at = None;
+            let mut out = Vec::new();
+            self.counters.store(&mut out);
+            self.ctx().pmc_set("dlds_counter", &out);
+        }
+        self.sent_counters = self.counters;
+        if let Some(callback) = self.callback.as_deref_mut() {
+            callback.update_counters(self.counters);
+        }
+    }
+
+    /// `check_is_active` (DownloadManager.cpp:746-754) — the database
+    /// load is synchronous in the collapse.
+    fn check_is_active(&mut self, _source: &str) -> Result<(), Status> {
+        if self.callback.is_none() {
+            return Err(Status::error(500, "DownloadManager is closed"));
+        }
+        debug_assert!(self.is_inited);
+        self.load_database_files();
+        Ok(())
+    }
+}
+
 impl FileManager {
     /// Sets `user_download_file_callback_` (FileManager.h:841) — the
     /// callback the user download requests finish through.
@@ -21813,6 +23049,370 @@ mod file_load_manager_tests {
         assert_eq!(paths[1].1, FileType::Photo);
         drop(with_files);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ==== DownloadManager (the downloadFile plane) ====
+
+    /// The shared DownloadManager test log.
+    #[derive(Default)]
+    struct DownloadManagerLog {
+        events: Vec<String>,
+        next_internal_download_id: i64,
+    }
+
+    /// The `DownloadManager::Callback` double: records every event and
+    /// answers the file sizes from a table.
+    struct DownloadTestCallback {
+        log: Rc<RefCell<DownloadManagerLog>>,
+        sizes: RefCell<HashMap<FileId, (i64, i64, i64)>>,
+    }
+
+    impl DownloadManagerCallback for DownloadTestCallback {
+        fn update_counters(&mut self, counters: DownloadCounters) {
+            self.log.borrow_mut().events.push(format!(
+                "counters:{}/{}",
+                counters.total_size, counters.total_count
+            ));
+        }
+
+        fn update_file_added(
+            &mut self,
+            file_id: FileId,
+            _file_source_id: FileSourceId,
+            _add_date: i32,
+            _complete_date: i32,
+            _is_paused: bool,
+            _counters: DownloadFileCounters,
+        ) {
+            self.log
+                .borrow_mut()
+                .events
+                .push(format!("added:{:?}", file_id.get()));
+        }
+
+        fn update_file_changed(
+            &mut self,
+            file_id: FileId,
+            _complete_date: i32,
+            is_paused: bool,
+            _counters: DownloadFileCounters,
+        ) {
+            self.log
+                .borrow_mut()
+                .events
+                .push(format!("changed:{:?}:{is_paused}", file_id.get()));
+        }
+
+        fn update_file_removed(&mut self, file_id: FileId, _counters: DownloadFileCounters) {
+            self.log
+                .borrow_mut()
+                .events
+                .push(format!("removed:{:?}", file_id.get()));
+        }
+
+        fn get_internal_download_id(&mut self) -> i64 {
+            let mut log = self.log.borrow_mut();
+            log.next_internal_download_id += 1;
+            log.next_internal_download_id
+        }
+
+        fn start_file(&mut self, file_id: FileId, internal_download_id: i64, priority: i8) {
+            self.log.borrow_mut().events.push(format!(
+                "start:{:?}:{internal_download_id}:{priority}",
+                file_id.get()
+            ));
+        }
+
+        fn pause_file(&mut self, file_id: FileId, internal_download_id: i64) {
+            self.log
+                .borrow_mut()
+                .events
+                .push(format!("pause:{:?}:{internal_download_id}", file_id.get()));
+        }
+
+        fn delete_file(&mut self, file_id: FileId) {
+            self.log
+                .borrow_mut()
+                .events
+                .push(format!("delete:{:?}", file_id.get()));
+        }
+
+        fn get_file_search_text(
+            &mut self,
+            _file_id: FileId,
+            _file_source_id: FileSourceId,
+        ) -> Result<String, Status> {
+            Ok("document.pdf".to_owned())
+        }
+
+        fn sync_file_sizes(&mut self, file_id: FileId) -> (i64, i64, i64) {
+            *self.sizes.borrow().get(&file_id).unwrap_or(&(0, 0, 0))
+        }
+
+        fn get_file_download_object(
+            &mut self,
+            file_id: FileId,
+            _file_source_id: FileSourceId,
+            add_date: i32,
+            complete_date: i32,
+            is_paused: bool,
+        ) -> Option<td_api::FileDownload> {
+            // the message plane (the source-message resolution) is the
+            // M.12.10 wiring; a `None` message drops the entry, exactly
+            // like the C++ `message_ == nullptr` filter
+            Some(td_api::FileDownload {
+                file_id: file_id.get(),
+                message: None,
+                add_date,
+                complete_date,
+                is_paused,
+            })
+        }
+    }
+
+    /// The pmc + file-id context double: a real map, the raw file id
+    /// record field (the FileManager-mediated serialization is the
+    /// M.12.10 wiring).
+    struct DownloadTestContext {
+        store: Rc<RefCell<BTreeMap<String, Vec<u8>>>>,
+    }
+
+    impl DownloadManagerContext for DownloadTestContext {
+        fn use_message_database(&self) -> bool {
+            true
+        }
+        fn pmc_get(&mut self, key: &str) -> Vec<u8> {
+            self.store.borrow().get(key).cloned().unwrap_or_default()
+        }
+        fn pmc_set(&mut self, key: &str, value: &[u8]) {
+            self.store
+                .borrow_mut()
+                .insert(key.to_owned(), value.to_vec());
+        }
+        fn pmc_erase(&mut self, key: &str) {
+            self.store.borrow_mut().remove(key);
+        }
+        fn pmc_erase_by_prefix(&mut self, prefix: &str) {
+            self.store
+                .borrow_mut()
+                .retain(|key, _| !key.starts_with(prefix));
+        }
+        fn pmc_prefix_get(&mut self, prefix: &str) -> Vec<(String, Vec<u8>)> {
+            self.store
+                .borrow()
+                .iter()
+                .filter(|(key, _)| key.starts_with(prefix))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        }
+        fn unix_time(&mut self) -> i32 {
+            1_800_000_000
+        }
+        fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>) {
+            store_parse::store_i32(out, file_id.get());
+        }
+        fn parse_file_id(&mut self, parser: &mut store_parse::Parser) -> Result<FileId, Status> {
+            let id = parser.i32_().map_err(Status::error_message)?;
+            Ok(FileId::new(id, 0))
+        }
+    }
+
+    fn download_manager_under_test(
+        log: &Rc<RefCell<DownloadManagerLog>>,
+        sizes: &RefCell<HashMap<FileId, (i64, i64, i64)>>,
+        store: &Rc<RefCell<BTreeMap<String, Vec<u8>>>>,
+    ) -> DownloadManager {
+        let mut manager = DownloadManager::new();
+        manager.set_callback(Box::new(DownloadTestCallback {
+            log: Rc::clone(log),
+            sizes: RefCell::new(sizes.borrow().clone()),
+        }));
+        manager.set_context(Box::new(DownloadTestContext {
+            store: Rc::clone(store),
+        }));
+        manager.init();
+        manager
+    }
+
+    #[test]
+    fn download_manager_add_file_starts_and_completes() {
+        let log = Rc::new(RefCell::new(DownloadManagerLog::default()));
+        let sizes = RefCell::new(HashMap::new());
+        let store = Rc::new(RefCell::new(BTreeMap::new()));
+        let mut manager = download_manager_under_test(&log, &sizes, &store);
+
+        let file_id = FileId::new(11, 0);
+        sizes.borrow_mut().insert(file_id, (100, 100, 0));
+        let added = manager
+            .add_file(file_id, FileSourceId::default(), "document.pdf", 16)
+            .expect("add_file");
+        assert!(added.is_none());
+
+        // the download started immediately (not paused)
+        let events = log.borrow().events.clone();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.starts_with(&format!("start:{:?}:1:16", file_id.get()))),
+            "{events:?}"
+        );
+        // update_file_added and update_file_changed are gated by
+        // is_search_inited (the hints load), exactly like the C++; the
+        // search below flips it
+        let found = manager.search("", false, false, "", 50).expect("search");
+        let counts = found.total_counts.expect("counts");
+        assert_eq!(counts.active_count, 1);
+        assert_eq!(counts.completed_count, 0);
+        // the message plane is the M.12.10 wiring, so the entries are
+        // dropped by the message == nullptr filter while the counters
+        // still answer
+        assert!(found.files.is_empty());
+
+        // the progress report completes the file (downloaded == size),
+        // so register_file_info flips completed_at and fires changed
+        manager.update_file_download_state(file_id, 100, 100, 100, false, 1);
+        let events = log.borrow().events.clone();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.starts_with(&format!("changed:{:?}:false", file_id.get()))),
+            "{events:?}"
+        );
+
+        // search sees the completed download in the counters
+        let found = manager.search("", false, false, "", 50).expect("search");
+        let counts = found.total_counts.expect("counts");
+        assert_eq!(counts.completed_count, 1);
+        assert_eq!(counts.active_count, 0);
+        assert_eq!(found.next_offset, "1");
+    }
+
+    #[test]
+    fn download_manager_pauses_and_resumes() {
+        let log = Rc::new(RefCell::new(DownloadManagerLog::default()));
+        let sizes = RefCell::new(HashMap::new());
+        let store = Rc::new(RefCell::new(BTreeMap::new()));
+        let mut manager = download_manager_under_test(&log, &sizes, &store);
+
+        let file_id = FileId::new(21, 0);
+        sizes.borrow_mut().insert(file_id, (100, 100, 0));
+        manager
+            .add_file(file_id, FileSourceId::default(), "movie.mp4", 8)
+            .expect("add_file");
+
+        manager.toggle_is_paused(file_id, true).expect("pause");
+        assert!(
+            log.borrow()
+                .events
+                .iter()
+                .any(|event| event.starts_with(&format!("pause:{:?}:1", file_id.get())))
+        );
+
+        manager.toggle_is_paused(file_id, false).expect("resume");
+        // the internal download id persists across the pause
+        assert!(
+            log.borrow()
+                .events
+                .iter()
+                .any(|event| event.starts_with(&format!("start:{:?}:1", file_id.get())))
+        );
+    }
+
+    #[test]
+    fn download_manager_remove_updates_counters_and_persists() {
+        let log = Rc::new(RefCell::new(DownloadManagerLog::default()));
+        let sizes = RefCell::new(HashMap::new());
+        let store = Rc::new(RefCell::new(BTreeMap::new()));
+        let mut manager = download_manager_under_test(&log, &sizes, &store);
+
+        let file_id = FileId::new(31, 0);
+        sizes.borrow_mut().insert(file_id, (100, 100, 0));
+        manager
+            .add_file(file_id, FileSourceId::default(), "doc.bin", 16)
+            .expect("add_file");
+        // the add persisted the download record
+        assert!(store.borrow().contains_key("dlds#1"), "dlds record missing");
+
+        // the update plane arms after the hints load (is_search_inited)
+        let _ = manager.search("", false, false, "", 50).expect("search");
+
+        manager
+            .remove_file(file_id, FileSourceId::default(), false)
+            .expect("remove");
+        assert!(
+            log.borrow()
+                .events
+                .iter()
+                .any(|event| event.starts_with(&format!("removed:{:?}", file_id.get())))
+        );
+        assert!(store.borrow().get("dlds#1").is_none());
+
+        // removing an unknown file fails with the C++ error
+        let err = manager
+            .remove_file(FileId::new(999, 0), FileSourceId::default(), false)
+            .expect_err("unknown file");
+        assert_eq!(err.code(), 400);
+
+        // remove_file_if_finished on an active file reports the state
+        let file_id2 = FileId::new(32, 0);
+        sizes.borrow_mut().insert(file_id2, (100, 100, 0));
+        manager
+            .add_file(file_id2, FileSourceId::default(), "doc2.bin", 16)
+            .expect("add_file");
+        let err = manager
+            .remove_file_if_finished(file_id2)
+            .expect_err("active file");
+        assert_eq!(err.message(), "File is active");
+    }
+
+    #[test]
+    fn download_manager_reloads_records_from_pmc() {
+        let log = Rc::new(RefCell::new(DownloadManagerLog::default()));
+        let sizes = RefCell::new(HashMap::new());
+        let store = Rc::new(RefCell::new(BTreeMap::new()));
+        sizes.borrow_mut().insert(FileId::new(41, 0), (100, 100, 0));
+        // seed the record the C++ `sync_with_database` writes: the flags
+        // word + the plain fields with the paused flag set
+        let mut record = Vec::new();
+        store_parse::store_flags(&mut record, [true]);
+        store_parse::store_i64(&mut record, 7);
+        store_parse::store_i32(&mut record, 41);
+        store_parse::store_i32(&mut record, 5);
+        store_parse::store_i32(&mut record, 16);
+        store_parse::store_i32(&mut record, 1_800_000_000);
+        store_parse::store_i32(&mut record, 0);
+        store.borrow_mut().insert("dlds#7".to_owned(), record);
+
+        let mut manager = download_manager_under_test(&log, &sizes, &store);
+        // the load rides the first active check (search in the C++ acts
+        // through check_is_active too)
+        let found = manager.search("", false, false, "", 50).expect("search");
+        let counts = found.total_counts.expect("counts");
+        // the paused download counts as active + paused and was not started
+        assert_eq!(counts.active_count, 1);
+        assert_eq!(counts.paused_count, 1);
+        assert!(
+            !log.borrow()
+                .events
+                .iter()
+                .any(|event| event.starts_with("start:"))
+        );
+
+        // the resumed download starts and the id sequence continues past
+        // the reloaded one
+        manager
+            .toggle_is_paused(FileId::new(41, 0), false)
+            .expect("resume");
+        assert!(
+            log.borrow()
+                .events
+                .iter()
+                .any(|event| event.starts_with("start:"))
+        );
+        manager
+            .add_file(FileId::new(41, 0), FileSourceId::default(), "x", 8)
+            .expect("add_file");
+        assert!(store.borrow().contains_key("dlds#8"));
     }
 
     #[test]
