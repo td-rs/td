@@ -39,6 +39,7 @@ use crate::notification_settings::{
 };
 use crate::notification_settings_manager::ScopeSettingsAnswer;
 use crate::td::NotificationEnv;
+use crate::td::QuickReplyEnv;
 use crate::td::Td;
 use crate::td_api::{self, Function, Object};
 use crate::user_manager::{FileId, PendingUserRequest, SecretChatId, UserEnv, UserId};
@@ -1876,6 +1877,69 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             }
         }
 
+        // --- quick replies (Requests.cpp) ---
+        Function::setQuickReplyShortcutName(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = crate::misc::clean_input_string(&request.name) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = QuickReplyEnv {
+                global: &mut td.global,
+            };
+            td.quick_reply_manager.set_quick_reply_shortcut_name(
+                &mut env,
+                request.shortcut_id,
+                &name,
+                promise,
+            );
+        }
+        Function::deleteQuickReplyShortcut(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = QuickReplyEnv {
+                global: &mut td.global,
+            };
+            td.quick_reply_manager.delete_quick_reply_shortcut(
+                &mut env,
+                request.shortcut_id,
+                promise,
+            );
+        }
+        Function::reorderQuickReplyShortcuts(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = QuickReplyEnv {
+                global: &mut td.global,
+            };
+            td.quick_reply_manager.reorder_quick_reply_shortcuts(
+                &mut env,
+                &request.shortcut_ids,
+                promise,
+            );
+        }
+        Function::deleteQuickReplyShortcutMessages(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = QuickReplyEnv {
+                global: &mut td.global,
+            };
+            td.quick_reply_manager.delete_quick_reply_shortcut_messages(
+                &mut env,
+                request.shortcut_id,
+                &request.message_ids,
+                promise,
+            );
+        }
+
         // Everything else waits for its manager step.
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
@@ -2176,13 +2240,16 @@ mod request_census_tests {
         // stays the 500 placeholder) + M.12.10's eighteen file-plane
         // dispatches (getFile/getRemoteFile, the download/upload/
         // generation arms, the DownloadManager list plane and the four
-        // storage-statistics arms). Fix per flip.
+        // storage-statistics arms) + M.37's four quick-reply arms
+        // (setQuickReplyShortcutName, deleteQuickReplyShortcut,
+        // reorderQuickReplyShortcuts, deleteQuickReplyShortcutMessages).
+        // Fix per flip.
         assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            110,
+            114,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 894, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 890, "interim count");
     }
 }

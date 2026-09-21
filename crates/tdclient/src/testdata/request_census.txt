@@ -183,8 +183,8 @@ deleteMessages	interim
 deletePassportElement	interim
 deletePollOption	interim
 deleteProfilePhoto	interim
-deleteQuickReplyShortcut	interim
-deleteQuickReplyShortcutMessages	interim
+deleteQuickReplyShortcut	dispatched
+deleteQuickReplyShortcutMessages	dispatched
 deleteRevokedChatInviteLink	interim
 deleteSavedCredentials	interim
 deleteSavedMessagesTopicHistory	interim
@@ -683,7 +683,7 @@ reorderChatFolders	interim
 reorderGiftCollectionGifts	interim
 reorderGiftCollections	interim
 reorderInstalledStickerSets	interim
-reorderQuickReplyShortcuts	interim
+reorderQuickReplyShortcuts	dispatched
 reorderStoryAlbumStories	interim
 reorderStoryAlbums	interim
 reorderSupergroupActiveUsernames	interim
@@ -896,7 +896,7 @@ setPollAnswer	interim
 setProfileAccentColor	interim
 setProfileAudioPosition	dispatched
 setProfilePhoto	interim
-setQuickReplyShortcutName	interim
+setQuickReplyShortcutName	dispatched
 setReactionNotificationSettings	dispatched
 setReadDatePrivacySettings	interim
 setRecoveryEmailAddress	interim

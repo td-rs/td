@@ -68,6 +68,7 @@ use crate::net::{AuthSender, BridgeConfig, NetBridge, QueryAnswer};
 use crate::notification_manager::NotificationManager;
 use crate::option_manager::OptionManager;
 use crate::query_merger::QueryMerger;
+use crate::quick_reply_manager::{QuickReplyManager, QuickReplyManagerEnv};
 use crate::requests;
 use crate::synchronous_requests;
 use crate::td_api::{self, Function, Object};
@@ -270,6 +271,8 @@ pub struct Td {
     /// `Td::notification_settings_manager_` (`Td.cpp:1254`, M.13S).
     pub(crate) notification_settings_manager:
         crate::notification_settings_manager::NotificationSettingsManager,
+    /// `Td::quick_reply_manager_` (the C++ init_managers block).
+    pub(crate) quick_reply_manager: QuickReplyManager,
     /// `Td::device_token_manager_` (`Td.cpp:1345`, M.13S).
     pub(crate) device_token_manager: crate::device_token_manager::DeviceTokenManager,
     /// The notification manager's `send_update` outbox — the collapsed
@@ -581,6 +584,7 @@ impl Td {
             notification_manager: NotificationManager::default(),
             notification_settings_manager:
                 crate::notification_settings_manager::NotificationSettingsManager::new(),
+            quick_reply_manager: QuickReplyManager::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
             notification_updates: Vec::new(),
             premium_required_contact_merger: None,
@@ -4979,6 +4983,19 @@ impl crate::device_token_manager::DeviceTokenManagerEnv for NotificationEnv<'_> 
     fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
         self.global.binlog_pmc().set_raw(key, value);
     }
+}
+
+/// The quick-reply env over the `Td` fields.
+pub(crate) struct QuickReplyEnv<'a> {
+    pub(crate) global: &'a mut Global,
+}
+
+impl QuickReplyManagerEnv for QuickReplyEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn send_update(&mut self, _update: td_api::Update) {}
 }
 
 /// The premium-required-to-contact QueryMerger merge function: build the
