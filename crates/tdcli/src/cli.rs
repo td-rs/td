@@ -739,6 +739,130 @@ fn background_type(parsed: ParsedBackgroundType) -> Option<td_api::BackgroundTyp
     }
 }
 
+/// `as_input_file_id` (cli.cpp:772).
+fn as_input_file_id(s: &str) -> Option<td_api::InputFile> {
+    Some(td_api::InputFile::inputFileId(td_api::inputFileId {
+        id: tokenizer::to_integer_i32(trim_td(s)),
+    }))
+}
+
+/// `as_sticker_format` (cli.cpp:648) — the trailing `a`/`v` picks
+/// tgs/webm, the default is webp.
+fn as_sticker_format(op: &str) -> td_api::StickerFormat {
+    if op.ends_with('a') {
+        return td_api::StickerFormat::stickerFormatTgs(td_api::stickerFormatTgs);
+    }
+    if op.ends_with('v') {
+        return td_api::StickerFormat::stickerFormatWebm(td_api::stickerFormatWebm);
+    }
+    td_api::StickerFormat::stickerFormatWebp(td_api::stickerFormatWebp)
+}
+
+/// `as_mask_position` (cli.cpp:668) — the trailing `m` puts the eyes mask
+/// with random offsets, itself dropped by another coin flip.
+fn as_mask_position(op: &str) -> Option<td_api::MaskPosition> {
+    if !op.ends_with('m') {
+        return None;
+    }
+    let position = td_api::MaskPosition {
+        point: Some(td_api::MaskPoint::maskPointEyes(td_api::maskPointEyes)),
+        x_shift: random::fast(-5, 5) as f64,
+        y_shift: random::fast(-5, 5) as f64,
+        scale: 1.0,
+    };
+    if random::fast_bool() {
+        None
+    } else {
+        Some(position)
+    }
+}
+
+/// `as_top_chat_category` (cli.cpp:2576) — lowercase, a trailing `s` is
+/// stripped, and everything unknown is the users category.
+fn as_top_chat_category(category: &str) -> td_api::TopChatCategory {
+    let category = to_lower(trim_td(category));
+    let category = category.strip_suffix('s').unwrap_or(&category);
+    match category {
+        "bot" => td_api::TopChatCategory::topChatCategoryBots(td_api::topChatCategoryBots),
+        "group" => td_api::TopChatCategory::topChatCategoryGroups(td_api::topChatCategoryGroups),
+        "channel" => {
+            td_api::TopChatCategory::topChatCategoryChannels(td_api::topChatCategoryChannels)
+        }
+        "inline" => {
+            td_api::TopChatCategory::topChatCategoryInlineBots(td_api::topChatCategoryInlineBots)
+        }
+        "guest" => {
+            td_api::TopChatCategory::topChatCategoryGuestBots(td_api::topChatCategoryGuestBots)
+        }
+        "app" => {
+            td_api::TopChatCategory::topChatCategoryWebAppBots(td_api::topChatCategoryWebAppBots)
+        }
+        "call" => td_api::TopChatCategory::topChatCategoryCalls(td_api::topChatCategoryCalls),
+        "forward" => td_api::TopChatCategory::topChatCategoryForwardChats(
+            td_api::topChatCategoryForwardChats,
+        ),
+        _ => td_api::TopChatCategory::topChatCategoryUsers(td_api::topChatCategoryUsers),
+    }
+}
+
+/// `as_network_type` (cli.cpp:2686).
+fn as_network_type(t: &str) -> td_api::NetworkType {
+    match to_lower(trim_td(t)).as_str() {
+        "none" => td_api::NetworkType::networkTypeNone(td_api::networkTypeNone),
+        "mobile" => td_api::NetworkType::networkTypeMobile(td_api::networkTypeMobile),
+        "roaming" => {
+            td_api::NetworkType::networkTypeMobileRoaming(td_api::networkTypeMobileRoaming)
+        }
+        "wifi" => td_api::NetworkType::networkTypeWiFi(td_api::networkTypeWiFi),
+        _ => td_api::NetworkType::networkTypeOther(td_api::networkTypeOther),
+    }
+}
+
+/// `as_chat_action` (cli.cpp:2603) — the typing-action spell; the callers
+/// land with the chain-12 draft/typing arms.
+#[allow(dead_code)]
+fn as_chat_action(action: &str) -> Option<td_api::ChatAction> {
+    use td_api::ChatAction as Ca;
+    let action = to_lower(trim_td(action));
+    match action.as_str() {
+        "c" | "cancel" => Some(Ca::chatActionCancel(td_api::chatActionCancel)),
+        "rvi" | "record_video" => Some(Ca::chatActionRecordingVideo(
+            td_api::chatActionRecordingVideo,
+        )),
+        "uvi" | "upload_video" => Some(Ca::chatActionUploadingVideo(
+            td_api::chatActionUploadingVideo { progress: 50 },
+        )),
+        "rvo" | "record_voice" => Some(Ca::chatActionRecordingVoiceNote(
+            td_api::chatActionRecordingVoiceNote,
+        )),
+        "uvo" | "upload_voice" => Some(Ca::chatActionUploadingVoiceNote(
+            td_api::chatActionUploadingVoiceNote { progress: 50 },
+        )),
+        "up" | "upload_photo" => Some(Ca::chatActionUploadingPhoto(
+            td_api::chatActionUploadingPhoto { progress: 50 },
+        )),
+        "ud" | "upload_document" => Some(Ca::chatActionUploadingDocument(
+            td_api::chatActionUploadingDocument { progress: 50 },
+        )),
+        "fl" | "find_location" => Some(Ca::chatActionChoosingLocation(
+            td_api::chatActionChoosingLocation,
+        )),
+        "cc" | "choose_contact" => Some(Ca::chatActionChoosingContact(
+            td_api::chatActionChoosingContact,
+        )),
+        "spg" | "start_play_game" => Some(Ca::chatActionStartPlayingGame(
+            td_api::chatActionStartPlayingGame,
+        )),
+        "rvn" | "record_video_note" => Some(Ca::chatActionRecordingVideoNote(
+            td_api::chatActionRecordingVideoNote,
+        )),
+        "uvn" | "upload_video_note" => Some(Ca::chatActionUploadingVideoNote(
+            td_api::chatActionUploadingVideoNote { progress: 50 },
+        )),
+        _ => None,
+    }
+}
+
 /// `td::base64url_decode(...).move_as_ok()`
 /// or unpadded (the `base64` crate wants the choice up front; the C++
 /// decoder accepts both shapes at once).
@@ -1982,6 +2106,11 @@ impl CliClient {
         tokenizer::to_integer_i64(s)
     }
 
+    /// `CliClient::as_chat_ids` (cli.cpp:577).
+    fn as_chat_ids(&self, s: &str) -> Vec<i64> {
+        autosplit(s).iter().map(|t| self.as_chat_id(t)).collect()
+    }
+
     /// `CliClient::as_message_sender` (cli.cpp:609).
     fn as_message_sender(&self, s: &str) -> Option<td_api::MessageSender> {
         let s = trim_td(s);
@@ -2379,7 +2508,6 @@ impl CliClient {
             }
             // The remainder after the option words — the C++
             // `get_args(args, limit, from_message_id, offset)` recursion.
-            #[allow(unused_assignments)]
             let (limit, from_message_id, offset) = {
                 let (w0, rest0) = tokenizer::split(&tail, ' ');
                 let (w1, w2) = tokenizer::split(&rest0, ' ');
@@ -4270,8 +4398,498 @@ impl CliClient {
         }
     }
 
-    fn op_block_history(&self, _op: &str, _args: &str) -> bool {
-        false
+    /// cli.cpp:4822 — the storage/network/web-browser/top-chats/stickers/
+    /// emoji chain (M.14.4b-part3).
+    fn op_block_history(&self, op: &str, args: &str) -> bool {
+        if op == "storage" {
+            self.send_request(Function::getStorageStatistics(
+                td_api::getStorageStatistics {
+                    chat_limit: tokenizer::to_integer_i32(args),
+                },
+            ));
+            true
+        } else if op == "storage_fast" {
+            self.send_request(Function::getStorageStatisticsFast(
+                td_api::getStorageStatisticsFast,
+            ));
+            true
+        } else if op == "database" {
+            self.send_request(Function::getDatabaseStatistics(
+                td_api::getDatabaseStatistics,
+            ));
+            true
+        } else if op == "optimize_storage" || op == "optimize_storage_all" {
+            let (chat_ids, exclude_chat_ids, chat_ids_limit) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::optimizeStorage(td_api::optimizeStorage {
+                size: 10000000,
+                ttl: -1,
+                count: -1,
+                immunity_delay: 0,
+                file_types: Vec::new(),
+                chat_ids: self.as_chat_ids(&chat_ids),
+                exclude_chat_ids: self.as_chat_ids(&exclude_chat_ids),
+                return_deleted_file_statistics: op == "optimize_storage",
+                chat_limit: tokenizer::to_integer_i32(&chat_ids_limit),
+            }));
+            true
+        } else if op == "clean_storage_default" {
+            self.send_request(Function::optimizeStorage(td_api::optimizeStorage::default()));
+            true
+        } else if op == "clean_photos" {
+            self.send_request(Function::optimizeStorage(td_api::optimizeStorage {
+                size: 0,
+                ttl: 0,
+                count: 0,
+                immunity_delay: 0,
+                file_types: vec![td_api::FileType::fileTypePhoto(td_api::fileTypePhoto)],
+                chat_ids: Vec::new(),
+                exclude_chat_ids: Vec::new(),
+                return_deleted_file_statistics: true,
+                chat_limit: 20,
+            }));
+            true
+        } else if op == "clean_storage" {
+            let file_type = |ctor: fn() -> td_api::FileType| ctor();
+            let _ = file_type;
+            self.send_request(Function::optimizeStorage(td_api::optimizeStorage {
+                size: 0,
+                ttl: -1,
+                count: -1,
+                immunity_delay: 0,
+                file_types: Vec::new(),
+                chat_ids: self.as_chat_ids(args),
+                exclude_chat_ids: Vec::new(),
+                return_deleted_file_statistics: true,
+                chat_limit: 20,
+            }));
+            true
+        } else if op == "network" {
+            self.send_request(Function::getNetworkStatistics(
+                td_api::getNetworkStatistics {
+                    only_current: false,
+                },
+            ));
+            true
+        } else if op == "current_network" {
+            self.send_request(Function::getNetworkStatistics(
+                td_api::getNetworkStatistics { only_current: true },
+            ));
+            true
+        } else if op == "reset_network" {
+            self.send_request(Function::resetNetworkStatistics(
+                td_api::resetNetworkStatistics,
+            ));
+            true
+        } else if op == "snt" {
+            self.send_request(Function::setNetworkType(td_api::setNetworkType {
+                r#type: Some(as_network_type(args)),
+            }));
+            true
+        } else if op == "gadsp" {
+            self.send_request(Function::getAutoDownloadSettingsPresets(
+                td_api::getAutoDownloadSettingsPresets,
+            ));
+            true
+        } else if op == "sads" {
+            self.send_request(Function::setAutoDownloadSettings(
+                td_api::setAutoDownloadSettings {
+                    settings: Some(td_api::AutoDownloadSettings::default()),
+                    r#type: Some(as_network_type(args)),
+                },
+            ));
+            true
+        } else if op == "gaus" {
+            self.send_request(Function::getAutosaveSettings(td_api::getAutosaveSettings));
+            true
+        } else if op == "saus" {
+            let (scope_str, autosave_photos, autosave_videos, max_video_file_size) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, rest1) = tokenizer::split(&rest0, ' ');
+                let (w2, w3) = tokenizer::split(&rest1, ' ');
+                (w0, w1, w2, w3)
+            };
+            let scope = if scope_str == "users" {
+                Some(
+                    td_api::AutosaveSettingsScope::autosaveSettingsScopePrivateChats(
+                        td_api::autosaveSettingsScopePrivateChats,
+                    ),
+                )
+            } else if scope_str == "groups" {
+                Some(
+                    td_api::AutosaveSettingsScope::autosaveSettingsScopeGroupChats(
+                        td_api::autosaveSettingsScopeGroupChats,
+                    ),
+                )
+            } else if scope_str == "channels" {
+                Some(
+                    td_api::AutosaveSettingsScope::autosaveSettingsScopeChannelChats(
+                        td_api::autosaveSettingsScopeChannelChats,
+                    ),
+                )
+            } else {
+                let chat_id = self.as_chat_id(&scope_str);
+                if chat_id != 0 {
+                    Some(td_api::AutosaveSettingsScope::autosaveSettingsScopeChat(
+                        td_api::autosaveSettingsScopeChat { chat_id },
+                    ))
+                } else {
+                    None
+                }
+            };
+            self.send_request(Function::setAutosaveSettings(td_api::setAutosaveSettings {
+                scope,
+                settings: Some(td_api::ScopeAutosaveSettings {
+                    autosave_photos: as_bool(&autosave_photos),
+                    autosave_videos: as_bool(&autosave_videos),
+                    max_video_file_size: tokenizer::to_integer_i64(&max_video_file_size),
+                }),
+            }));
+            true
+        } else if op == "cause" {
+            self.send_request(Function::clearAutosaveSettingsExceptions(
+                td_api::clearAutosaveSettingsExceptions,
+            ));
+            true
+        } else if op == "cwbs" {
+            let (open_external_browser, display_close_button) = tokenizer::split(args, ' ');
+            self.send_request(Function::changeWebBrowserSettings(
+                td_api::changeWebBrowserSettings {
+                    open_external_browser: as_bool(&open_external_browser),
+                    display_close_button: as_bool(&display_close_button),
+                },
+            ));
+            true
+        } else if op == "awbsee" || op == "awbsei" {
+            let (url, _) = tokenizer::split(args, ' ');
+            self.send_request(Function::addWebBrowserSettingsException(
+                td_api::addWebBrowserSettingsException {
+                    open_external_browser: op == "awbsee",
+                    url,
+                },
+            ));
+            true
+        } else if op == "rwbse" {
+            self.send_request(Function::removeWebBrowserSettingsException(
+                td_api::removeWebBrowserSettingsException {
+                    url: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "rawbse" {
+            self.send_request(Function::removeAllWebBrowserSettingsExceptions(
+                td_api::removeAllWebBrowserSettingsExceptions,
+            ));
+            true
+        } else if op == "ansc" {
+            let (sent_bytes, received_bytes, duration, network_type) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, rest1) = tokenizer::split(&rest0, ' ');
+                let (w2, w3) = tokenizer::split(&rest1, ' ');
+                (w0, w1, w2, w3)
+            };
+            self.send_request(Function::addNetworkStatistics(
+                td_api::addNetworkStatistics {
+                    entry: Some(td_api::NetworkStatisticsEntry::networkStatisticsEntryCall(
+                        td_api::networkStatisticsEntryCall {
+                            network_type: Some(as_network_type(&network_type)),
+                            sent_bytes: tokenizer::to_integer_i64(&sent_bytes),
+                            received_bytes: tokenizer::to_integer_i64(&received_bytes),
+                            duration: tokenizer::to_integer_i64(&duration) as f64,
+                        },
+                    )),
+                },
+            ));
+            true
+        } else if op == "ans" {
+            let (sent_bytes, received_bytes, network_type) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::addNetworkStatistics(
+                td_api::addNetworkStatistics {
+                    entry: Some(td_api::NetworkStatisticsEntry::networkStatisticsEntryFile(
+                        td_api::networkStatisticsEntryFile {
+                            file_type: Some(td_api::FileType::fileTypeDocument(
+                                td_api::fileTypeDocument,
+                            )),
+                            network_type: Some(as_network_type(&network_type)),
+                            sent_bytes: tokenizer::to_integer_i64(&sent_bytes),
+                            received_bytes: tokenizer::to_integer_i64(&received_bytes),
+                        },
+                    )),
+                },
+            ));
+            true
+        } else if op == "gtc" {
+            self.send_request(Function::getTopChats(td_api::getTopChats {
+                category: Some(as_top_chat_category(args)),
+                limit: 50,
+            }));
+            true
+        } else if op == "rtc" {
+            let (chat_id, category) = tokenizer::split(args, ' ');
+            self.send_request(Function::removeTopChat(td_api::removeTopChat {
+                category: Some(as_top_chat_category(&category)),
+                chat_id: self.as_chat_id(&chat_id),
+            }));
+            true
+        } else if op == "gsssn" {
+            self.send_request(Function::getSuggestedStickerSetName(
+                td_api::getSuggestedStickerSetName {
+                    title: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "cssn" {
+            self.send_request(Function::checkStickerSetName(td_api::checkStickerSetName {
+                name: args.to_owned(),
+            }));
+            true
+        } else if op == "usf" || op == "usfa" || op == "usfv" {
+            self.send_request(Function::uploadStickerFile(td_api::uploadStickerFile {
+                user_id: -1,
+                sticker_format: Some(as_sticker_format(op)),
+                sticker: as_input_file(args),
+            }));
+            true
+        } else if op == "cnss" || op == "cnssa" || op == "cnssv" || op == "cnssm" || op == "cnsse" {
+            let (title, name, stickers) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            let input_stickers = autosplit(&stickers)
+                .iter()
+                .map(|sticker| td_api::NewSticker {
+                    sticker: as_input_file(sticker),
+                    format: Some(as_sticker_format(op)),
+                    emojis: "\u{1f600}".to_owned(),
+                    mask_position: as_mask_position(op),
+                    keywords: vec!["keyword".to_owned()],
+                })
+                .collect();
+            self.send_request(Function::createNewStickerSet(td_api::createNewStickerSet {
+                user_id: self.my_id.load(Ordering::SeqCst),
+                title,
+                name,
+                sticker_type: as_sticker_type(op),
+                needs_repainting: false,
+                stickers: input_stickers,
+                source: "tg_cli".to_owned(),
+            }));
+            true
+        } else if op == "goss" {
+            let (sticker_set_id, limit) = tokenizer::split(args, ' ');
+            self.send_request(Function::getOwnedStickerSets(td_api::getOwnedStickerSets {
+                offset_sticker_set_id: tokenizer::to_integer_i64(&sticker_set_id),
+                limit: as_limit(&limit, 10),
+            }));
+            true
+        } else if op == "sss" || op == "sssf" {
+            self.send_request(Function::searchStickerSet(td_api::searchStickerSet {
+                name: args.to_owned(),
+                ignore_cache: op == "sssf",
+            }));
+            true
+        } else if op == "siss" {
+            self.send_request(Function::searchInstalledStickerSets(
+                td_api::searchInstalledStickerSets {
+                    sticker_type: None,
+                    query: args.to_owned(),
+                    limit: 2,
+                },
+            ));
+            true
+        } else if op == "ssss" || op == "ssssm" || op == "sssse" {
+            self.send_request(Function::searchStickerSets(td_api::searchStickerSets {
+                sticker_type: as_sticker_type(op),
+                query: args.to_owned(),
+            }));
+            true
+        } else if op == "css" {
+            let (set_id, is_installed, is_archived) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::changeStickerSet(td_api::changeStickerSet {
+                set_id: tokenizer::to_integer_i64(&set_id),
+                is_installed: as_bool(&is_installed),
+                is_archived: as_bool(&is_archived),
+            }));
+            true
+        } else if op == "vtss" {
+            self.send_request(Function::viewTrendingStickerSets(
+                td_api::viewTrendingStickerSets {
+                    sticker_set_ids: autosplit(args)
+                        .iter()
+                        .map(|t| tokenizer::to_integer_i64(trim_td(t)))
+                        .collect(),
+                },
+            ));
+            true
+        } else if op == "riss" || op == "rissm" || op == "risse" {
+            self.send_request(Function::reorderInstalledStickerSets(
+                td_api::reorderInstalledStickerSets {
+                    sticker_type: as_sticker_type(op),
+                    sticker_set_ids: autosplit(args)
+                        .iter()
+                        .map(|t| tokenizer::to_integer_i64(trim_td(t)))
+                        .collect(),
+                },
+            ));
+            true
+        } else if op == "grs" {
+            self.send_request(Function::getRecentStickers(td_api::getRecentStickers {
+                is_attached: as_bool(args),
+            }));
+            true
+        } else if op == "ars" || op == "rrs" {
+            let (is_attached, sticker_id) = tokenizer::split(args, ' ');
+            let file = as_input_file_id(&sticker_id);
+            if op == "ars" {
+                self.send_request(Function::addRecentSticker(td_api::addRecentSticker {
+                    is_attached: as_bool(&is_attached),
+                    sticker: file,
+                }));
+            } else {
+                self.send_request(Function::removeRecentSticker(td_api::removeRecentSticker {
+                    is_attached: as_bool(&is_attached),
+                    sticker: file,
+                }));
+            }
+            true
+        } else if op == "gfs" {
+            self.send_request(Function::getFavoriteStickers(td_api::getFavoriteStickers));
+            true
+        } else if op == "afs" {
+            self.send_request(Function::addFavoriteSticker(td_api::addFavoriteSticker {
+                sticker: as_input_file_id(args),
+            }));
+            true
+        } else if op == "rfs" {
+            self.send_request(Function::removeFavoriteSticker(
+                td_api::removeFavoriteSticker {
+                    sticker: as_input_file_id(args),
+                },
+            ));
+            true
+        } else if op == "crs" {
+            self.send_request(Function::clearRecentStickers(td_api::clearRecentStickers {
+                is_attached: as_bool(args),
+            }));
+            true
+        } else if op == "gse" {
+            self.send_request(Function::getStickerEmojis(td_api::getStickerEmojis {
+                sticker: as_input_file_id(args),
+            }));
+            true
+        } else if op == "se" {
+            self.send_request(Function::searchEmojis(td_api::searchEmojis {
+                text: args.to_owned(),
+                input_language_codes: Vec::new(),
+            }));
+            true
+        } else if op == "seru" {
+            self.send_request(Function::searchEmojis(td_api::searchEmojis {
+                text: args.to_owned(),
+                input_language_codes: vec!["ru_RU".to_owned()],
+            }));
+            true
+        } else if op == "gke" {
+            self.send_request(Function::getKeywordEmojis(td_api::getKeywordEmojis {
+                text: args.to_owned(),
+                input_language_codes: Vec::new(),
+            }));
+            true
+        } else if op == "gkeru" {
+            self.send_request(Function::getKeywordEmojis(td_api::getKeywordEmojis {
+                text: args.to_owned(),
+                input_language_codes: vec!["ru_RU".to_owned()],
+            }));
+            true
+        } else if op == "gec" || op == "geces" || op == "geccp" || op == "gecrs" {
+            let sticker_type = if op == "geces" {
+                Some(td_api::EmojiCategoryType::emojiCategoryTypeEmojiStatus(
+                    td_api::emojiCategoryTypeEmojiStatus,
+                ))
+            } else if op == "geccp" {
+                Some(td_api::EmojiCategoryType::emojiCategoryTypeChatPhoto(
+                    td_api::emojiCategoryTypeChatPhoto,
+                ))
+            } else if op == "gecrs" {
+                Some(td_api::EmojiCategoryType::emojiCategoryTypeRegularStickers(
+                    td_api::emojiCategoryTypeRegularStickers,
+                ))
+            } else {
+                Some(td_api::EmojiCategoryType::emojiCategoryTypeDefault(
+                    td_api::emojiCategoryTypeDefault,
+                ))
+            };
+            self.send_request(Function::getEmojiCategories(td_api::getEmojiCategories {
+                r#type: sticker_type,
+            }));
+            true
+        } else if op == "gae" {
+            self.send_request(Function::getAnimatedEmoji(td_api::getAnimatedEmoji {
+                emoji: args.to_owned(),
+            }));
+            true
+        } else if op == "gesu" {
+            self.send_request(Function::getEmojiSuggestionsUrl(
+                td_api::getEmojiSuggestionsUrl {
+                    language_code: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "gces" {
+            self.send_request(Function::getCustomEmojiStickers(
+                td_api::getCustomEmojiStickers {
+                    custom_emoji_ids: autosplit(args)
+                        .iter()
+                        .map(|t| tokenizer::to_integer_i64(trim_td(t)))
+                        .collect(),
+                },
+            ));
+            true
+        } else if op == "gdcpces" {
+            self.send_request(Function::getDefaultChatPhotoCustomEmojiStickers(
+                td_api::getDefaultChatPhotoCustomEmojiStickers,
+            ));
+            true
+        } else if op == "gdppces" {
+            self.send_request(Function::getDefaultProfilePhotoCustomEmojiStickers(
+                td_api::getDefaultProfilePhotoCustomEmojiStickers,
+            ));
+            true
+        } else if op == "gdbces" {
+            self.send_request(Function::getDefaultBackgroundCustomEmojiStickers(
+                td_api::getDefaultBackgroundCustomEmojiStickers,
+            ));
+            true
+        } else if op == "gsan" {
+            self.send_request(Function::getSavedAnimations(td_api::getSavedAnimations));
+            true
+        } else if op == "asan" {
+            self.send_request(Function::addSavedAnimation(td_api::addSavedAnimation {
+                animation: as_input_file_id(args),
+            }));
+            true
+        } else if op == "rsan" {
+            self.send_request(Function::removeSavedAnimation(
+                td_api::removeSavedAnimation {
+                    animation: as_input_file_id(args),
+                },
+            ));
+            true
+        } else {
+            false
+        }
     }
 
     fn op_block_files(&self, _op: &str, _args: &str) -> bool {
@@ -4917,6 +5535,79 @@ mod tests {
             ("tdmctcsum", 2),
             ("tsmtip", 2),
             ("uadmctm", 2),
+            ("afs", 5),
+            ("ans", 5),
+            ("ansc", 5),
+            ("ars", 5),
+            ("asan", 5),
+            ("awbsee", 5),
+            ("awbsei", 5),
+            ("cause", 5),
+            ("clean_photos", 5),
+            ("clean_storage", 5),
+            ("clean_storage_default", 5),
+            ("cnss", 5),
+            ("cnssa", 5),
+            ("cnsse", 5),
+            ("cnssm", 5),
+            ("cnssv", 5),
+            ("crs", 5),
+            ("css", 5),
+            ("cssn", 5),
+            ("current_network", 5),
+            ("cwbs", 5),
+            ("database", 5),
+            ("gadsp", 5),
+            ("gae", 5),
+            ("gaus", 5),
+            ("gces", 5),
+            ("gdbces", 5),
+            ("gdcpces", 5),
+            ("gdppces", 5),
+            ("gec", 5),
+            ("geccp", 5),
+            ("geces", 5),
+            ("gecrs", 5),
+            ("gesu", 5),
+            ("gfs", 5),
+            ("gke", 5),
+            ("gkeru", 5),
+            ("goss", 5),
+            ("grs", 5),
+            ("gsan", 5),
+            ("gse", 5),
+            ("gsssn", 5),
+            ("gtc", 5),
+            ("network", 5),
+            ("optimize_storage", 5),
+            ("optimize_storage_all", 5),
+            ("rawbse", 5),
+            ("reset_network", 5),
+            ("rfs", 5),
+            ("riss", 5),
+            ("risse", 5),
+            ("rissm", 5),
+            ("rrs", 5),
+            ("rsan", 5),
+            ("rtc", 5),
+            ("rwbse", 5),
+            ("sads", 5),
+            ("saus", 5),
+            ("se", 5),
+            ("seru", 5),
+            ("siss", 5),
+            ("snt", 5),
+            ("sss", 5),
+            ("sssf", 5),
+            ("ssss", 5),
+            ("sssse", 5),
+            ("ssssm", 5),
+            ("storage", 5),
+            ("storage_fast", 5),
+            ("usf", 5),
+            ("usfa", 5),
+            ("usfv", 5),
+            ("vtss", 5),
             ("apgc", 4),
             ("atos", 4),
             ("capr", 4),
