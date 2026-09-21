@@ -558,6 +558,30 @@ pub fn search_strings_by_prefix(
     )
 }
 
+/// `td::get_md5_string_hash` (misc.cpp:301-309) — the first 8 md5 bytes
+/// folded big-endian into one `u64`.
+pub fn get_md5_string_hash(s: &str) -> u64 {
+    let hash = tdutils::crypto::md5(s.as_bytes());
+    let mut result: u64 = 0;
+    for (i, byte) in hash.iter().take(8).enumerate() {
+        result += u64::from(*byte) << (56 - 8 * i);
+    }
+    result
+}
+
+/// `td::get_vector_hash` (misc.cpp:311-320) — the xor-shift accumulator
+/// fold behind every list hash (contacts, reactions, ...).
+pub fn get_vector_hash(numbers: &[u64]) -> i64 {
+    let mut acc: u64 = 0;
+    for number in numbers {
+        acc ^= acc >> 21;
+        acc ^= acc << 35;
+        acc ^= acc >> 4;
+        acc = acc.wrapping_add(*number);
+    }
+    acc as i64
+}
+
 #[cfg(test)]
 mod search_strings_by_prefix_tests {
     use super::search_strings_by_prefix;
