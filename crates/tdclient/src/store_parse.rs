@@ -22,7 +22,9 @@ pub mod version {
     pub const ADD_KEY_HASH_TO_SECRET_CHAT: i32 = 2;
     pub const ADD_ACCESS_HASH_TO_SECRET_CHAT: i32 = 5;
     pub const FIX_MIN_USERS: i32 = 10;
+    pub const ADD_PHOTO_SIZE_SOURCE: i32 = 22;
     pub const SUPPORT_BANNED_CHANNELS: i32 = 31;
+    pub const REMOVE_PHOTO_VOLUME_AND_LOCAL_ID: i32 = 32;
     pub const SUPPORT_64_BIT_IDS: i32 = 33;
     pub const MAKE_PARTICIPANT_FLAGS_64_BIT: i32 = 46;
     pub const ADD_USER_FLAGS2: i32 = 48;
@@ -63,7 +65,15 @@ pub fn store_bool(out: &mut Vec<u8>, value: bool) {
 /// and `0xff`-prefixed 32-bit forms, always zero-padded to a 4-byte
 /// boundary (verified against the C++ with the /tmp string probe).
 pub fn store_string(out: &mut Vec<u8>, value: &str) {
-    let bytes = value.as_bytes();
+    store_string_bytes(out, value.as_bytes());
+}
+
+/// The byte-exact form of [`store_string`] for binary payloads (the C++
+/// `store(string)` is raw bytes; [`store_string`] is the UTF-8
+/// convenience on top). The Files-step `FileEncryptionKey` stores raw
+/// key material.
+pub fn store_string_bytes(out: &mut Vec<u8>, value: &[u8]) {
+    let bytes = value;
     let len = bytes.len();
     let header = if len < 254 {
         out.push(len as u8);
@@ -153,6 +163,13 @@ impl<'a> Parser<'a> {
         self.version
     }
 
+    /// `TlParser::set_version` (tl_parsers.h) — a self-versioned blob
+    /// (the Files `FileData`) sets the parser version mid-parse; nested
+    /// formats branch on it (the photo-size-source legacy paths).
+    pub fn set_version(&mut self, version: i32) {
+        self.version = version;
+    }
+
     fn take(&mut self, len: usize) -> Result<&'a [u8], &'static str> {
         if self.data.len() < self.pos + len {
             return Err("Failed to read fixed-size data");
@@ -193,6 +210,13 @@ impl<'a> Parser<'a> {
     pub fn string(&mut self) -> Result<String, &'static str> {
         let bytes = self.tl_string_bytes()?;
         String::from_utf8(bytes.to_vec()).map_err(|_| "Invalid UTF-8 string")
+    }
+
+    /// `TlParser::fetch_string` over raw bytes — the binary-payload form
+    /// of [`Parser::string`] with no UTF-8 gate; the Files
+    /// `FileEncryptionKey` stores raw key material.
+    pub fn string_bytes(&mut self) -> Result<Vec<u8>, &'static str> {
+        Ok(self.tl_string_bytes()?.to_vec())
     }
 
     fn tl_string_bytes(&mut self) -> Result<&'a [u8], &'static str> {

@@ -295,6 +295,17 @@ impl BinlogKeyValue {
         }
     }
 
+    /// `KeyValueInterface::prefix_get` — the keyspace enumeration the
+    /// DownloadManager's dlds# init load uses.
+    pub fn prefix_get(&self, prefix: &str) -> Vec<(String, Vec<u8>)> {
+        let prefix = prefix.as_bytes();
+        self.map
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, (value, _))| (String::from_utf8_lossy(key).into_owned(), value.clone()))
+            .collect()
+    }
+
     /// `BinlogKeyValue::isset`
     pub fn isset(&self, key: &str) -> bool {
         self.map.contains_key(key.as_bytes())

@@ -167,6 +167,17 @@ fn get_binlog_path(parameters: &Parameters) -> String {
     )
 }
 
+/// `format::as_size` (format.h:185-208) — the B/KB/MB/GB formatter the
+/// stats string uses (`size / unit` after the 100000-of-unit step-up).
+fn format_size(size: i64) -> String {
+    const SIZES: [(&str, u64); 4] = [("B", 1), ("KB", 1 << 10), ("MB", 1 << 20), ("GB", 1 << 30)];
+    let mut i = 0;
+    while i + 1 < SIZES.len() && size.unsigned_abs() >= 100000 * SIZES[i].1 {
+        i += 1;
+    }
+    format!("{}{}", size / SIZES[i].1 as i64, SIZES[i].0)
+}
+
 /// `get_sqlite_path` — `{database_directory}db{_test}.sqlite`.
 fn get_sqlite_path(parameters: &Parameters) -> String {
     format!(
@@ -576,11 +587,16 @@ fn init_story_db(db: &SqliteDb, version: &mut i32) -> Status {
     Status::ok()
 }
 
-/// `init_file_db`
+/// `init_file_db` (files/FileDb.cpp:40-57)
 fn init_file_db(db: &SqliteDb, version: &mut i32) -> Status {
     let has_table = db.has_table("files").unwrap();
     let mut version_local = *version;
-    if !has_table || version_local < db_version::FIX_FILE_REMOTE_LOCATION_KEY_BUG {
+    if !has_table {
+        version_local = 0;
+    } else if version_local < db_version::FIX_FILE_REMOTE_LOCATION_KEY_BUG {
+        // `drop_file_db` (FileDb.cpp:34-38): a pre-fix database is
+        // dropped instead of migrated.
+        try_status!(SqliteKeyValue::drop_table(db, "files"));
         version_local = 0;
     }
     if version_local == 0 {
@@ -783,6 +799,16 @@ impl TdDb {
         self.was_dialog_db_created
     }
 
+    /// `TdDb::with_db_path` (TdDb.cpp:687-692) — the binlog and sqlite
+    /// paths every consumer iterates (the FileManager `bad_paths_`, the
+    /// storage fast-stat database size).
+    pub fn db_paths(&self) -> Vec<String> {
+        vec![
+            get_binlog_path(self.parameters()),
+            get_sqlite_path(self.parameters()),
+        ]
+    }
+
     /// `TdDb::get_sqlite_sync_pmc` — the synchronous view of the "common"
     /// table. The C++ also runs an async wrapper (`get_sqlite_pmc`) on a
     /// database scheduler; the database opens synchronously in the actor
@@ -807,6 +833,151 @@ impl TdDb {
         self.common_kv
             .as_mut()
             .expect("the common kv was just initialized")
+    }
+
+    /// `TdDb::file_db_`'s key-value handle — the "files" table behind the
+    /// C++ `SqliteKeyValueSafe` (created by `init_file_db` at open). The
+    /// FileDb access layer of the Files step (tdclient) wraps this; the
+    /// C++ actor marshaling collapses into the single scheduler thread.
+    pub fn files_kv(&mut self) -> &mut SqliteKeyValue {
+        self.files_kv
+            .as_mut()
+            .expect("TdDb is not initialized: the files key-value is missing")
+    }
+
+    /// `TdDb::get_stats` (TdDb.cpp:694-773) — the per-table size/count
+    /// aggregates plus the file-db `@@` reference-chain depth audit,
+    /// behind the `getDatabaseStatistics` request.
+    pub fn get_stats(&mut self) -> tdutils::status::Result<String> {
+        let sql = match self.sql_connection.as_ref() {
+            Some(connection) => connection.get(),
+            None => return Result::Err(Status::error_message("Database has no sqlite connection")),
+        };
+        let mut sb = String::new();
+        // `as_size` (format.h) — the human-readable <size> form
+        let as_size = |value: i64| format_size(value);
+        let run_query = |query: &str, desc: &str, sb: &mut String| -> Status {
+            let mut stmt = match sql.get_statement(query) {
+                Result::Ok(stmt) => stmt,
+                Result::Err(status) => return status,
+            };
+            let step_status = stmt.step();
+            if step_status.is_error() {
+                return step_status;
+            }
+            if !stmt.has_row() {
+                return Status::error_message("stats query returned no row");
+            }
+            let key_size = stmt.view_int64(0);
+            let value_size = stmt.view_int64(1);
+            let count = stmt.view_int64(2);
+            sb.push_str(query);
+            sb.push('\n');
+            sb.push_str(desc);
+            sb.push_str(":\n");
+            sb.push_str(&as_size(key_size + value_size));
+            sb.push('\t');
+            sb.push_str(&as_size(key_size));
+            sb.push('\t');
+            sb.push_str(&as_size(value_size));
+            sb.push('\t');
+            sb.push_str(&as_size((key_size + value_size) / count.max(1)));
+            sb.push_str("\n\n");
+            Status::ok()
+        };
+        for (query, desc) in [
+            (
+                "SELECT 0, SUM(length(data)), COUNT(*) FROM stories WHERE 1",
+                "stories",
+            ),
+            (
+                "SELECT 0, SUM(length(data)), COUNT(*) FROM messages WHERE 1",
+                "messages",
+            ),
+            (
+                "SELECT 0, SUM(length(data)), COUNT(*) FROM dialogs WHERE 1",
+                "dialogs",
+            ),
+        ] {
+            let status = run_query(query, desc, &mut sb);
+            if status.is_error() {
+                return Result::Err(status);
+            }
+        }
+        for (mask, table) in [
+            ("%", "common"),
+            ("%", "files"),
+            ("wp%", "common"),
+            ("wpurl%", "common"),
+            ("wpiv%", "common"),
+            ("us%", "common"),
+            ("ch%", "common"),
+            ("ss%", "common"),
+            ("gr%", "common"),
+        ] {
+            let query = format!(
+                "SELECT SUM(length(k)), SUM(length(v)), COUNT(*) FROM {table} WHERE k like '{mask}'"
+            );
+            let desc = format!("{table}:{mask}");
+            let status = run_query(&query, &desc, &mut sb);
+            if status.is_error() {
+                return Result::Err(status);
+            }
+        }
+
+        // the file-db `@@` reference-chain depth audit
+        let mut prev: Vec<i32> = vec![0];
+        let mut count: usize = 0;
+        let mut max_bad_to: i32 = 0;
+        let mut bad_count: usize = 0;
+        self.files_kv()
+            .get_by_range(b"file0", b"file:", &mut |key: &[u8], value: &[u8]| {
+                if !value.starts_with(b"@@") {
+                    return true;
+                }
+                count += 1;
+                // the key is "file<id>", the value "@@<id>" — decimal ids
+                let from = std::str::from_utf8(&key[4..])
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(0);
+                let to = std::str::from_utf8(&value[2..])
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(0);
+                if from <= to {
+                    if to > max_bad_to {
+                        max_bad_to = to;
+                    }
+                    bad_count += 1;
+                    return true;
+                }
+                if from as usize >= prev.len() {
+                    prev.resize(from as usize + 1, 0);
+                }
+                if to as usize >= prev.len() {
+                    prev.resize(to as usize + 1, 0);
+                }
+                prev[from as usize] = to;
+                true
+            });
+        for i in 1..prev.len() {
+            if prev[i] == 0 {
+                continue;
+            }
+            prev[i] = prev[prev[i] as usize] + 1;
+        }
+        sb.push_str(&format!(
+            "Max file database depth out of {}/{} elements: {}\n",
+            prev.len(),
+            count,
+            prev.iter().copied().max().unwrap_or(0)
+        ));
+        sb.push_str(&format!(
+            "Have {} forward references with maximum reference to {}",
+            bad_count, max_bad_to
+        ));
+        Result::Ok(sb)
     }
 
     /// `TdDb::get_binlog` — the raw log-event surface (`binlog_add` /

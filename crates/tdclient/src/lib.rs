@@ -25,6 +25,7 @@ pub mod dialog_id;
 pub mod dialog_manager;
 pub mod document;
 pub mod emoji_status;
+pub mod files;
 pub mod formatted_date;
 pub mod global;
 pub mod link_manager;

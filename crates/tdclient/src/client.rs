@@ -252,11 +252,16 @@ impl MultiImpl {
         scheduler.start();
         let scheduler = Arc::new(Mutex::new(scheduler));
         let thread_scheduler = Arc::clone(&scheduler);
-        let scheduler_thread = std::thread::spawn(move || {
-            // The C++ `while (concurrent_scheduler->run_main(10)) {}` — 10 ms
-            // slices; inbound events wake the idle pump immediately.
-            while thread_scheduler.lock().unwrap().run_main(0.01) {}
-        });
+        // the run_main pump rides the same 8 MiB actor-thread stack as the
+        // scheduler workers (the C++ pthread default; see scheduler.rs)
+        let scheduler_thread = std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(move || {
+                // The C++ `while (concurrent_scheduler->run_main(10)) {}` — 10 ms
+                // slices; inbound events wake the idle pump immediately.
+                while thread_scheduler.lock().unwrap().run_main(0.01) {}
+            })
+            .expect("the scheduler pump thread spawn");
         Self {
             scheduler,
             send_ptr,

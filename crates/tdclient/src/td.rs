@@ -31,9 +31,10 @@
 //!   C++ runs the net stack as actors; the observable JSON behavior is
 //!   identical for the single-client skeleton).
 
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use tdactor::{Actor, ActorOwn, Scheduler, actor_messages, send_closure_later};
 use tddb::td_db::{OpenedDatabase, Parameters as DbParameters, TdDb};
@@ -43,6 +44,7 @@ use tdutils::promise::Promise;
 use tdutils::status::Status;
 
 use crate::auth_manager::{AuthManager, AuthQuerySender};
+use crate::chat_manager::DcId;
 use crate::config_dispatch::{
     CompletedNetQueries, ConfigQueryCallback, SentNetQueries, TdConfigSink, TdSessionSink,
     build_config_net_query,
@@ -61,6 +63,7 @@ use crate::dialog_manager::DialogManager;
 use crate::global::Global;
 use crate::link_manager::LinkManager;
 use crate::manager_option_states::ManagerOptionStates;
+use crate::message_id::DialogId;
 use crate::net::{AuthSender, BridgeConfig, NetBridge, QueryAnswer};
 use crate::notification_manager::NotificationManager;
 use crate::option_manager::OptionManager;
@@ -71,6 +74,16 @@ use crate::td_api::{self, Function, Object};
 use crate::time_zone_manager::TimeZoneManager;
 use crate::updates_manager::{PendingUpdate, UpdatesManager, UpdatesManagerEnv, UpdatesSink};
 use crate::user_manager::{UserEnv, UserId, UserManager};
+
+use crate::files::{
+    DocumentByHash, DownloadCallback, DownloadCounters, DownloadManager, DownloadManagerCallback,
+    DownloadManagerContext, DownloadNetMeta, DownloadQuery, DownloadQueryType, DownloadResult,
+    FileData, FileDb, FileDbId, FileDownloaderNet, FileGcParameters, FileGcSink,
+    FileHashUploaderNet, FileId, FileLoadManager, FileLoadManagerOptions, FileLoadNetFactory,
+    FileManager, FileManagerContext, FileManagerWorker, FileNode, FileSourceId, FileStatsSink,
+    FileType, FileUploaderNet, FileView, FullLocalFileLocation, StorageContext, StorageManager,
+    UploadPartQuery,
+};
 
 #[cfg(target_endian = "big")]
 compile_error!("TDLib requires little-endian platform");
@@ -282,6 +295,29 @@ pub struct Td {
     /// through `timeout_expired` exactly like the C++ actor's
     /// `MAX_PTS_SAVE_DELAY` throttle.
     pub(crate) updates_manager: UpdatesManager<TdUpdatesSink>,
+    /// `Td::storage_manager_` (`Td::Td`, Td.cpp:940) — created with Td.
+    pub(crate) storage_manager: StorageManager,
+    /// `Td::file_manager_` (`Td::init_file_manager`, Td.cpp:1080) — behind
+    /// the RefCell because the stored file contexts/worker reach it (the
+    /// C++ raw `Td *td_`/`G()` hop); the Td drives borrow through the cell.
+    pub(crate) file_manager: Arc<parking_lot::Mutex<FileManager>>,
+    /// `Td::file_reference_manager_` (Td.cpp:1126) — the file-source
+    /// registry; per-call drives only.
+    pub(crate) file_reference_manager: crate::files::FileReferenceManager,
+    /// The `Td::file_load_manager_` loader plane — same RefCell story as
+    /// the file manager (the DownloadManager callbacks pass it into the
+    /// FileManager calls).
+    pub(crate) file_load_manager: Arc<parking_lot::Mutex<FileLoadManager>>,
+    /// `Td::download_manager_` (Td.cpp:1219, the `init_managers` block).
+    pub(crate) download_manager: Arc<parking_lot::Mutex<DownloadManager>>,
+    /// The `Td *td_`/`G()` plane cell behind the stored file context/worker
+    /// boxes (see [`TdFileShared`]).
+    pub(crate) file_shared: Arc<parking_lot::Mutex<TdFileShared>>,
+    /// `Td::parameters()->use_message_database` — the db-flag snapshot the
+    /// file contexts read (set with `setTdlibParameters`).
+    pub(crate) use_message_database: bool,
+    /// `Td::parameters()->use_file_database`.
+    pub(crate) use_file_database: bool,
     /// `Td::stop_cnt_` — the hangup and the close completion each drop one.
     stop_cnt: i32,
     /// The deferred-response outbox. The C++ request promises re-enter the
@@ -465,10 +501,52 @@ impl UpdatesManagerEnv for TdUpdatesEnv<'_> {
 
 /// The deferred-response outbox shared with the request promises (see the
 /// field docs).
-type DeferredResults = Arc<Mutex<Vec<(u64, Result<Object, Status>)>>>;
+type DeferredResults = Arc<parking_lot::Mutex<Vec<(u64, Result<Object, Status>)>>>;
 
 impl Td {
     pub fn new(callback: Box<dyn TdCallback>) -> Self {
+        // The files cluster (the C++ `Td::Td` → `init_file_manager` /
+        // `init_managers` order: file_manager, file_reference_manager,
+        // storage_manager, then the DownloadManager). The managers are
+        // built plain, the shared `Td *td_` cell is built over their
+        // handles, then the stored contexts/worker install (the boxes
+        // need `'static` handles, so the cycle resolves through `Rc`).
+        let file_manager = Arc::new(Mutex::new(FileManager::new()));
+        let file_load_manager = Arc::new(Mutex::new(FileLoadManager::new(
+            // the pre-init factory: its nets answer the session-down
+            // surface; the T.9 install (init) replaces it with the
+            // bridge-backed nets
+            Box::new(TdFileLoadNetFactory::new()),
+            FileLoadManagerOptions {
+                is_premium: false,
+                session_count: 1,
+                keep_media_order: false,
+            },
+        )));
+        let download_manager = Arc::new(Mutex::new(DownloadManager::new()));
+        let file_shared = Arc::new(Mutex::new(TdFileShared::new(
+            Arc::clone(&file_manager),
+            Arc::clone(&file_load_manager),
+        )));
+        {
+            let mut file_manager = file_manager.lock();
+            file_manager.set_context(Box::new(TdFilePlane(Arc::clone(&file_shared))));
+            file_manager.set_worker(Box::new(TdFileWorker {
+                shared: Arc::clone(&file_shared),
+                download_manager: Arc::clone(&download_manager),
+            }));
+            // the C++ constructor installs the `UserDownloadFileCallback`
+            // (FileManager.cpp:1310) — the completion hops queue for the
+            // drive-end replay into `on_user_file_download_finished`
+            file_manager.set_user_download_callback(Arc::new(Mutex::new(TdUserDownloadCallback {
+                events: Arc::clone(&file_shared.lock().user_download_finished_events),
+            })));
+        }
+        {
+            let mut download_manager = download_manager.lock();
+            download_manager.set_callback(Box::new(TdFilePlane(Arc::clone(&file_shared))));
+            download_manager.set_context(Box::new(TdFilePlane(Arc::clone(&file_shared))));
+        }
         Self {
             callback: Some(callback),
             state: State::WaitParameters,
@@ -487,8 +565,8 @@ impl Td {
             connection_creator: None,
             config_manager: None,
             net_query_dispatcher: None,
-            sent_net_queries: Arc::new(Mutex::new(Vec::new())),
-            completed_config_queries: Arc::new(Mutex::new(Vec::new())),
+            sent_net_queries: Arc::new(std::sync::Mutex::new(Vec::new())),
+            completed_config_queries: Arc::new(std::sync::Mutex::new(Vec::new())),
             config_recoverer: None,
             pending_recoverer_fetches: Vec::new(),
             recoverer_wakeup_at: 0.0,
@@ -509,6 +587,14 @@ impl Td {
             chat_manager: crate::chat_manager::ChatManager::new(),
             dialog_manager: DialogManager::new(),
             updates_manager: UpdatesManager::new(TdUpdatesSink),
+            storage_manager: StorageManager::default(),
+            file_manager,
+            file_reference_manager: crate::files::FileReferenceManager::new(),
+            file_load_manager,
+            download_manager,
+            file_shared,
+            use_message_database: false,
+            use_file_database: false,
             stop_cnt: 2,
             deferred_results: Arc::new(Mutex::new(Vec::new())),
             bridge: None,
@@ -644,6 +730,8 @@ impl Td {
 
         tracing::info!("Begin to open database");
         self.set_parameters_request_id = id;
+        self.use_message_database = db_parameters.use_message_database;
+        self.use_file_database = db_parameters.use_file_database;
         self.can_ignore_background_updates = !db_parameters.use_chat_info_database
             && !db_parameters.use_message_database
             && !parameters.use_secret_chats;
@@ -1013,6 +1101,65 @@ impl Td {
 
         self.parameters = Some(parameters);
 
+        // The db-dependent half of the files init: the C++ contexts read
+        // `G()->td_db()` lazily at first use; the snapshot refreshes here,
+        // the bad-paths re-seed runs through the context re-install, and
+        // the DownloadManager binlog plane loads (the counters + the
+        // `dlds#` prefix read).
+        self.refresh_file_shared();
+        self.file_manager
+            .lock()
+            .set_context(Box::new(TdFilePlane(Arc::clone(&self.file_shared))));
+        let dlds_records = self.global.binlog_pmc().prefix_get("dlds");
+        self.file_shared.lock().dlds_preload(dlds_records);
+        // the live nets install (T.9): the bridge handle + the shared
+        // snapshot fill the factory cell, and the file-name counters
+        // preload from the pmc (FileLoaderUtils.cpp:85-92, 116-122)
+        let bridge_handle = self.bridge.as_ref().map(NetBridge::handle);
+        let tmp_file_id = self
+            .global
+            .binlog_pmc()
+            .get("tmp_file_id")
+            .parse::<i32>()
+            .unwrap_or(0);
+        let perm_file_id = self
+            .global
+            .binlog_pmc()
+            .get("perm_file_id")
+            .parse::<i32>()
+            .unwrap_or(0);
+        self.file_shared
+            .lock()
+            .preload_file_name_counters(tmp_file_id, perm_file_id);
+        if let Some(bridge_handle) = bridge_handle {
+            let live_factory = TdFileLoadNetFactory::new();
+            live_factory.install(bridge_handle, Arc::clone(&self.file_shared));
+            self.file_load_manager
+                .lock()
+                .set_factory(Box::new(live_factory));
+        }
+        // T.7: the dlds records now ride the versioned
+        // `FileManager::store_file` layout (byte-compatible with the C++
+        // pmc), so the flush gate opens — the writes reach the real pmc
+        self.file_shared.lock().dlds_pmc_live = true;
+        self.download_manager.lock().init();
+        self.download_manager.lock().load_database_files();
+        // `StorageManager::start_up` (StorageManager.cpp:38-43): the
+        // fast-stat and last-gc-timestamp pmc loads
+        {
+            let mut env = TdStorageEnv {
+                shared: Arc::clone(&self.file_shared),
+                global: &mut self.global,
+                language_pack_database_path: self
+                    .option_manager
+                    .as_ref()
+                    .map(|options| options.get_option_string("language_pack_database_path", ""))
+                    .unwrap_or_default(),
+            };
+            self.storage_manager.load_fast_stat(&mut env);
+            self.storage_manager.load_last_gc_timestamp(&mut env);
+        }
+
         // `OptionManager::on_td_inited` (Td.cpp:943): the pending pre-init
         // getters are answered now — the content-settings names go through
         // the ConfigManager branch of the C++ `OptionManager::get_option`.
@@ -1293,6 +1440,12 @@ impl Td {
         self.drain_config_net_query_completions();
         self.sent_net_queries.lock().unwrap().clear();
         self.completed_config_queries.lock().unwrap().clear();
+
+        // The files cluster's hangup half (the C++ resets the manager
+        // actors in `Td::clear`, Td.cpp:707-712): the stored planes drop
+        // so the shared-cell cycle cannot outlive the Td.
+        self.file_manager.lock().teardown();
+        self.download_manager.lock().teardown();
 
         self.global.close_all(self.destroy_flag);
         self.option_manager = None;
@@ -1593,6 +1746,13 @@ impl Td {
             && (expire_time == 0.0 || updates_deadline < expire_time)
         {
             expire_time = updates_deadline;
+        }
+        // The StorageManager's auto-gc window joins it too (M.12.10 T.8):
+        // the fire re-checks `auto_gc_due` like the C++ actor timeout.
+        if let Some(storage_gc_deadline) = self.next_storage_gc_deadline()
+            && (expire_time == 0.0 || storage_gc_deadline < expire_time)
+        {
+            expire_time = storage_gc_deadline;
         }
         if expire_time == 0.0 {
             self.cancel_timeout();
@@ -1997,9 +2157,408 @@ impl Td {
 
     /// Drain the UserManager's queued `updateUser`-class broadcasts (the
     /// C++ sends them straight to `Td::send_update` from the manager).
+    /// The per-drive [`TdFileShared`] snapshot refresh (the C++ contexts
+    /// read the same surfaces off `Td*`/`G()` at call time).
+    pub(crate) fn refresh_file_shared(&mut self) {
+        let is_bot = self.auth_manager.is_bot();
+        let mut files_dir = String::new();
+        let mut secure_files_dir = String::new();
+        let mut use_storage_optimizer = false;
+        let mut ignore_inline_thumbnails = false;
+        let mut option_integers = BTreeMap::new();
+        let mut database_paths = Vec::new();
+        if self.global.has_db() {
+            let (files_directory, database_directory) = {
+                let db = self.global.td_db();
+                database_paths = db.db_paths();
+                (
+                    db.parameters().files_directory.clone(),
+                    db.parameters().database_directory.clone(),
+                )
+            };
+            // `G()->get_files_dir()`/`get_secure_files_dir()`
+            // (Global.cpp:149-155): the TdDb parameters, with the
+            // store-all flag choosing the secure base
+            files_dir = files_directory;
+            let store_all = self
+                .option_manager
+                .as_ref()
+                .map(|options| {
+                    options.get_option_boolean("store_all_files_in_files_directory", false)
+                })
+                .unwrap_or(false);
+            secure_files_dir = if store_all {
+                files_dir.clone()
+            } else {
+                database_directory
+            };
+        }
+        if let Some(options) = self.option_manager.as_ref() {
+            use_storage_optimizer = options.get_option_boolean("use_storage_optimizer", false);
+            ignore_inline_thumbnails =
+                options.get_option_boolean("ignore_inline_thumbnails", false);
+            for name in [
+                "video_note_size_max",
+                "storage_max_files_size",
+                "storage_max_time_from_last_access",
+                "storage_max_file_count",
+                "storage_immunity_delay",
+                "webfile_dc_id",
+            ] {
+                option_integers.insert(name.to_owned(), options.get_option_integer(name, 0));
+            }
+        }
+        let ignore_file_names = self
+            .option_manager
+            .as_ref()
+            .map(|options| options.get_option_boolean("ignore_file_names", false))
+            .unwrap_or(false);
+        self.file_shared.lock().refresh(TdFileSnapshot {
+            files_dir,
+            secure_files_dir,
+            is_bot,
+            use_message_database: self.use_message_database,
+            use_file_database: self.use_file_database,
+            use_storage_optimizer,
+            ignore_inline_thumbnails,
+            option_integers,
+            unix_time: self.global.unix_time(),
+            database_paths,
+            is_test_dc: self.global.is_test_dc(),
+            ignore_file_names,
+        });
+    }
+
+    /// The files drive — the collapsed files-actor pump: refresh the
+    /// shared snapshot, route the loader events into the FileManager,
+    /// drain the outboxes, tick the DownloadManager counters. Runs once
+    /// per actor turn (from [`Td::flush_user_updates`]), like the C++
+    /// `send_closure` hops.
+    pub(crate) fn drive_files(&mut self) {
+        if self.state != State::Run {
+            return;
+        }
+        self.refresh_file_shared();
+        for _round in 0..64u32 {
+            {
+                let mut file_load_manager = self.file_load_manager.lock();
+                file_load_manager.drive();
+                if !file_load_manager.has_queued_events()
+                    && !self.file_manager.lock().generate_has_events()
+                {
+                    // the generate callbacks queue independently of the
+                    // loader (the external generation finishes with no
+                    // loader events in flight) — the apply round must
+                    // still drain them
+                    break;
+                }
+            }
+            let mut file_manager = self.file_manager.lock();
+            let mut file_load_manager = self.file_load_manager.lock();
+            file_manager.apply_load_events(&mut file_load_manager);
+        }
+        self.drain_file_shared();
+        let now = self.global.unix_time();
+        self.download_manager.lock().tick(f64::from(now));
+    }
+
+    /// The `StorageManager::timeout_expired` collapse (T.8,
+    /// StorageManager.cpp:348-363): when the auto-gc window opens, run
+    /// the gc with the default parameters and save the timestamp unless
+    /// the pass aborted (the C++ skips the save on the 500 cancel).
+    fn tick_storage_gc(&mut self) {
+        let mut env = storage_env_fields(
+            &mut self.global,
+            &self.file_shared,
+            self.option_manager.as_ref(),
+        );
+        let now = tdutils::time::system();
+        if !self.storage_manager.auto_gc_due(&mut env, now) {
+            return;
+        }
+        let parameters = FileGcParameters::from_options(&mut env, -1, -1, -1, -1);
+        let mut gc_sink = TdFileGcSink(Arc::clone(&self.file_shared));
+        let outcome = self
+            .storage_manager
+            .run_gc(&mut env, &mut gc_sink, parameters, false);
+        // do not save the garbage collection timestamp if the request was
+        // canceled (the 500 abort)
+        if !matches!(&outcome, Err(status) if status.code() == 500) {
+            self.storage_manager.save_last_gc_timestamp(&mut env, now);
+        }
+    }
+
+    /// The StorageManager's deadline for the shared timeout slot (the C++
+    /// `schedule_next_gc` arms its own actor timeout; the collapse parks
+    /// at the window's upper bound and re-checks on fire).
+    fn next_storage_gc_deadline(&mut self) -> Option<f64> {
+        let use_storage_optimizer = self.file_shared.lock().use_storage_optimizer();
+        self.storage_manager.next_gc_at(
+            use_storage_optimizer,
+            tdutils::time::system() as u32,
+            tdutils::time::now(),
+        )
+    }
+
+    /// The `getStorageStatistics` body over the storage env
+    /// (Requests.cpp:2968-2979).
+    pub(crate) fn get_storage_stats_object(
+        &mut self,
+        need_all_files: bool,
+        dialog_limit: i32,
+    ) -> td_api::StorageStatistics {
+        let mut env = storage_env_fields(
+            &mut self.global,
+            &self.file_shared,
+            self.option_manager.as_ref(),
+        );
+        self.storage_manager
+            .get_storage_stats(&mut env, need_all_files, dialog_limit)
+            .get_storage_statistics_object()
+    }
+
+    /// The `getStorageStatisticsFast` body (Requests.cpp:2981-2992).
+    pub(crate) fn get_storage_stats_fast_object(&mut self) -> td_api::StorageStatisticsFast {
+        let mut env = storage_env_fields(
+            &mut self.global,
+            &self.file_shared,
+            self.option_manager.as_ref(),
+        );
+        self.storage_manager
+            .get_storage_stats_fast(&mut env)
+            .get_storage_statistics_fast_object()
+    }
+
+    /// The `getDatabaseStatistics` body (Requests.cpp:2994-3004).
+    pub(crate) fn get_database_statistics_object(
+        &mut self,
+    ) -> Result<td_api::DatabaseStatistics, tdutils::status::Status> {
+        let mut env = storage_env_fields(
+            &mut self.global,
+            &self.file_shared,
+            self.option_manager.as_ref(),
+        );
+        self.storage_manager
+            .get_database_stats(&mut env)
+            .map(|stats| stats.get_database_statistics_object())
+    }
+
+    /// The `optimizeStorage` body (Requests.cpp:3006-3033): the
+    /// `FileGcParameters` construction (the -1 sentinels read the
+    /// `storage_*` options through the env) and the gc pass.
+    pub(crate) fn optimize_storage(
+        &mut self,
+        request: td_api::optimizeStorage,
+    ) -> Result<td_api::StorageStatistics, tdutils::status::Status> {
+        let td_api::optimizeStorage {
+            size,
+            ttl,
+            count,
+            immunity_delay,
+            file_types,
+            chat_ids,
+            exclude_chat_ids,
+            return_deleted_file_statistics,
+            chat_limit,
+        } = request;
+        let mut env = storage_env_fields(
+            &mut self.global,
+            &self.file_shared,
+            self.option_manager.as_ref(),
+        );
+        let mut parameters =
+            FileGcParameters::from_options(&mut env, size, ttl, count, immunity_delay);
+        // the C++ rejects a null vector entry (Requests.cpp:3010-3012);
+        // the generated model has no null FileType, so every entry maps
+        for file_type in &file_types {
+            parameters
+                .file_types
+                .push(crate::files::get_file_type(file_type));
+        }
+        parameters.owner_dialog_ids = chat_ids
+            .iter()
+            .map(|&chat_id| DialogId::new(chat_id))
+            .collect();
+        parameters.exclude_owner_dialog_ids = exclude_chat_ids
+            .iter()
+            .map(|&chat_id| DialogId::new(chat_id))
+            .collect();
+        parameters.dialog_limit = chat_limit;
+        let mut gc_sink = TdFileGcSink(Arc::clone(&self.file_shared));
+        self.storage_manager
+            .run_gc(
+                &mut env,
+                &mut gc_sink,
+                parameters,
+                return_deleted_file_statistics,
+            )
+            .map(|stats| stats.get_storage_statistics_object())
+    }
+
+    /// The post-drive outbox drain — the `send_closure` hops land here,
+    /// once per drive, in emission order.
+    fn drain_file_shared(&mut self) {
+        let updates = std::mem::take(&mut self.file_shared.lock().updates);
+        for update in updates {
+            self.send_update(update.into());
+        }
+        let new_file_events = std::mem::take(&mut self.file_shared.lock().new_file_events);
+        for (size, real_size, cnt) in new_file_events {
+            self.storage_manager.on_new_file(size, real_size, cnt);
+        }
+        let state_events =
+            std::mem::take(&mut *self.file_shared.lock().download_state_events.lock());
+        for (file_id, is_paused) in state_events {
+            let (local_total_size, size, expected_size) = self
+                .file_manager
+                .lock()
+                .get_file_view(file_id)
+                .map(|view| {
+                    (
+                        view.local_total_size(),
+                        view.size(),
+                        view.expected_size(false),
+                    )
+                })
+                .unwrap_or((0, 0, 0));
+            // link_token 0: the C++ passes the actor token; the collapse
+            // has no token-retry plane yet
+            self.download_manager.lock().update_file_download_state(
+                file_id,
+                local_total_size,
+                size,
+                expected_size,
+                is_paused,
+                0,
+            );
+        }
+        let user_download_finished =
+            std::mem::take(&mut *self.file_shared.lock().user_download_finished_events.lock());
+        for file_id in user_download_finished {
+            self.file_manager
+                .lock()
+                .on_user_file_download_finished(file_id);
+        }
+        let worker_events = std::mem::take(&mut self.file_shared.lock().worker_events);
+        let mut merge_events = Vec::new();
+        if !worker_events.is_empty() {
+            let mut file_manager = self.file_manager.lock();
+            let mut file_load_manager = self.file_load_manager.lock();
+            for event in worker_events {
+                match event {
+                    FileWorkerEvent::CancelDownload(node) => {
+                        file_manager.replay_cancel_download(&node, &mut file_load_manager);
+                    }
+                    FileWorkerEvent::CancelUpload(node) => {
+                        file_manager.replay_cancel_upload(&node, &mut file_load_manager);
+                    }
+                    FileWorkerEvent::CancelGenerate(node) => {
+                        file_manager.replay_cancel_generate(&node, &mut file_load_manager);
+                    }
+                    FileWorkerEvent::FinishDownload(file_id) => {
+                        file_manager.replay_finish_downloads(file_id);
+                    }
+                    FileWorkerEvent::FinishUpload(file_id) => {
+                        file_manager.replay_finish_uploads(file_id, &mut file_load_manager);
+                    }
+                    FileWorkerEvent::RunNode(node) => {
+                        file_manager.replay_run_node(&node, &mut file_load_manager);
+                    }
+                    FileWorkerEvent::MergeFiles(from_file_id, to_file_id) => {
+                        merge_events.push((from_file_id, to_file_id));
+                    }
+                }
+            }
+        }
+        for (from_file_id, to_file_id) in merge_events {
+            self.file_reference_manager.merge(to_file_id, from_file_id);
+        }
+        let db_events = std::mem::take(&mut self.file_shared.lock().file_db_events);
+        for event in db_events {
+            self.apply_file_db_event(event);
+        }
+        self.flush_dlds();
+    }
+
+    /// The file-db replay: build the node's `FileData` (the C++
+    /// `try_flush_node_info`/`try_flush_node_full` bodies) and run it
+    /// through the `FileDb` gate over TdDb's "files" kv.
+    fn apply_file_db_event(&mut self, event: FileDbEvent) {
+        match event {
+            FileDbEvent::Flush {
+                node,
+                other_pmc_id,
+                new_remote,
+                new_local,
+                new_generate,
+            } => {
+                let data = self.node_file_data(&node);
+                let mut file_db = FileDb::new(self.global.td_db().files_kv());
+                file_db.set_file_data(
+                    self.global.td_db().files_kv(),
+                    node.pmc_id(),
+                    &data,
+                    new_remote,
+                    new_local,
+                    new_generate,
+                    &mut self.file_reference_manager,
+                );
+                // the merge-counter drop of `try_flush_node_full`
+                if other_pmc_id.is_valid() && other_pmc_id != node.pmc_id() {
+                    file_db.clear_file_data(self.global.td_db().files_kv(), other_pmc_id, &data);
+                }
+            }
+            FileDbEvent::Clear { node } => {
+                let data = self.node_file_data(&node);
+                let mut file_db = FileDb::new(self.global.td_db().files_kv());
+                file_db.clear_file_data(self.global.td_db().files_kv(), node.pmc_id(), &data);
+            }
+        }
+    }
+
+    /// The `FileData` construction from a node (`try_flush_node_info`,
+    /// FileManager.cpp) — the file sources ride the
+    /// `FileReferenceManager` (its `FileSourceStorage` impl).
+    fn node_file_data(&self, node: &FileNode) -> FileData {
+        node.to_file_data(
+            self.file_reference_manager
+                .get_some_file_sources(node.main_file_id()),
+        )
+    }
+
+    /// The `dlds#` pmc flush — gated on the T.7 record-layout unification
+    /// (the D1 warning: no raw-i32 records reach the real pmc).
+    fn flush_dlds(&mut self) {
+        if !self.file_shared.lock().dlds_pmc_live {
+            return;
+        }
+        let (current, saved) = {
+            let shared = self.file_shared.lock();
+            (shared.dlds.clone(), shared.dlds_saved.clone())
+        };
+        let keys: BTreeSet<_> = saved.keys().chain(current.keys()).collect();
+        {
+            let pmc = self.global.binlog_pmc();
+            for key in keys {
+                match (current.get(key), saved.get(key)) {
+                    (Some(value), Some(old)) if value == old => {}
+                    (Some(value), _) => {
+                        pmc.set_raw(key.as_bytes(), value);
+                    }
+                    (None, Some(_)) => {
+                        pmc.erase(key);
+                    }
+                    (None, None) => {}
+                }
+            }
+        }
+        self.file_shared.lock().dlds_saved = current;
+    }
+
     /// Drain the managers' queued update broadcasts (the C++ sends them
     /// straight to `Td::send_update` from the managers).
     pub(crate) fn flush_user_updates(&mut self) {
+        self.drive_files();
         for update in self.user_manager.take_updates() {
             self.send_update(update.into());
         }
@@ -2047,7 +2606,7 @@ impl Td {
     /// manager call, where a `&mut Td` is not available).
     pub(crate) fn flush_deferred_results(&mut self) {
         let deferred = {
-            let mut guard = self.deferred_results.lock().unwrap();
+            let mut guard = self.deferred_results.lock();
             std::mem::take(&mut *guard)
         };
         for (id, result) in deferred {
@@ -2072,7 +2631,7 @@ impl Td {
                     tdutils::status::Result::Ok(value) => Ok(map(value)),
                     tdutils::status::Result::Err(status) => Err(status),
                 };
-                outbox.lock().unwrap().push((id, result));
+                outbox.lock().push((id, result));
             },
         )
     }
@@ -2854,6 +3413,1298 @@ impl Td {
     }
 }
 
+// ═══ M.12.10 T.1 — the `Td *td_`/`G()` plane of the files managers ═══
+//
+// The C++ file contexts hold a raw `Td *` and read the option/time/db
+// surfaces at call time; the collapsed managers own their contexts in
+// `'static` boxes, so the shared plane lives in [`TdFileShared`] behind
+// `Arc<parking_lot::Mutex<>>` (the `ResourceManager` handle convention). Td refreshes
+// the snapshot when a drive starts ([`Td::drive_files`]) and drains the
+// outboxes after each loader pass — the collapsed `send_closure` hops.
+
+/// The [`FileManagerWorker`] effects that must re-enter `FileManager`
+/// (they fire while `&mut FileManager` is held, so the Td replays them
+/// through its `Rc` handle after the driving call returns).
+pub(crate) enum FileWorkerEvent {
+    CancelDownload(Box<FileNode>),
+    CancelUpload(Box<FileNode>),
+    CancelGenerate(Box<FileNode>),
+    FinishDownload(FileId),
+    FinishUpload(FileId),
+    RunNode(Box<FileNode>),
+    /// `Context::on_merge_files` → `FileReferenceManager::merge`.
+    MergeFiles(FileId, FileId),
+}
+
+/// The [`FileManagerWorker`] file-db effects, replayed against TdDb's
+/// "files" kv (the C++ calls `G()->td_db()->get_file_db()` inline).
+pub(crate) enum FileDbEvent {
+    /// `flush_node_info`/`flush_node_full` — write the node record.
+    Flush {
+        node: Box<FileNode>,
+        other_pmc_id: FileDbId,
+        new_remote: bool,
+        new_local: bool,
+        new_generate: bool,
+    },
+    /// `clear_from_pmc` — delete the node record.
+    Clear { node: Box<FileNode> },
+}
+
+/// The per-drive [`TdFileShared`] snapshot — the C++ contexts read the
+/// same surfaces off `Td*`/`G()` at call time; the cell takes them in one
+/// refresh per drive.
+pub(crate) struct TdFileSnapshot {
+    files_dir: String,
+    secure_files_dir: String,
+    is_bot: bool,
+    use_message_database: bool,
+    use_file_database: bool,
+    use_storage_optimizer: bool,
+    ignore_inline_thumbnails: bool,
+    option_integers: BTreeMap<String, i64>,
+    unix_time: i32,
+    /// `TdDb::with_db_path` — the binlog/sqlite paths (the fast-stat
+    /// database size and the FileManager `bad_paths_`).
+    database_paths: Vec<String>,
+    /// `G()->is_test_dc()` — the `webfile_dc_id` default source.
+    is_test_dc: bool,
+    /// `G()->get_option_boolean("ignore_file_names")` — the
+    /// `for_suggested_file_name` first arm.
+    ignore_file_names: bool,
+}
+
+/// The shared files plane: the manager handles the stored boxes reach
+/// through, the update/action outboxes, and the refreshed option/time
+/// snapshot.
+pub(crate) struct TdFileShared {
+    file_manager: Arc<parking_lot::Mutex<FileManager>>,
+    file_load_manager: Arc<parking_lot::Mutex<FileLoadManager>>,
+    /// `Td::send_update` outbox (updateFileDownloads,
+    /// updateFileAddedToDownloads, updateFileGeneration*, ...).
+    pub(crate) updates: Vec<td_api::Update>,
+    /// `StorageManager::on_new_file` hop.
+    pub(crate) new_file_events: Vec<(i64, i64, i32)>,
+    /// The worker replay queue.
+    pub(crate) worker_events: Vec<FileWorkerEvent>,
+    /// The file-db effects queue.
+    pub(crate) file_db_events: Vec<FileDbEvent>,
+    /// The `make_download_file_callback` state hops — deferred because
+    /// the FileManager borrow is held while the loader runs.
+    pub(crate) download_state_events: Arc<parking_lot::Mutex<Vec<(FileId, bool)>>>,
+    /// The `UserDownloadFileCallback` hops (FileManager.cpp:1268-1283) —
+    /// both completions re-enter `on_user_file_download_finished` at the
+    /// drive end.
+    pub(crate) user_download_finished_events: Arc<parking_lot::Mutex<Vec<FileId>>>,
+    // ── the snapshot (refreshed per drive) ──
+    files_dir: String,
+    secure_files_dir: String,
+    is_bot: bool,
+    use_message_database: bool,
+    use_file_database: bool,
+    use_storage_optimizer: bool,
+    ignore_inline_thumbnails: bool,
+    option_integers: BTreeMap<String, i64>,
+    unix_time: i32,
+    /// `TdDb::with_db_path` — the binlog/sqlite paths (the fast-stat
+    /// database size and the FileManager `bad_paths_`).
+    database_paths: Vec<String>,
+    /// `G()->is_test_dc()` — the `webfile_dc_id` default source.
+    is_test_dc: bool,
+    /// `G()->get_option_boolean("ignore_file_names")` — the
+    /// `for_suggested_file_name` first arm.
+    ignore_file_names: bool,
+    /// The `tmp_file_id`/`perm_file_id` pmc counters of
+    /// `open_temp_file`/`create_from_temp` (the increments stay in the
+    /// snapshot for the run — the random-suffix fallbacks cover a
+    /// restart's reused ids).
+    file_name_counters: crate::files::FileNameCounters,
+    /// The DownloadManager `dlds#` keyspace shadow — the stored context
+    /// box cannot borrow the binlog pmc, so the keyspace lives here:
+    /// preloaded from the real pmc at init and flushed back after drives
+    /// once the record layout is unified (T.7, the D1 gate).
+    pub(crate) dlds: BTreeMap<String, Vec<u8>>,
+    pub(crate) dlds_saved: BTreeMap<String, Vec<u8>>,
+    pub(crate) dlds_pmc_live: bool,
+}
+
+impl TdFileShared {
+    fn new(
+        file_manager: Arc<parking_lot::Mutex<FileManager>>,
+        file_load_manager: Arc<parking_lot::Mutex<FileLoadManager>>,
+    ) -> TdFileShared {
+        TdFileShared {
+            file_manager,
+            file_load_manager,
+            updates: Vec::new(),
+            new_file_events: Vec::new(),
+            worker_events: Vec::new(),
+            file_db_events: Vec::new(),
+            download_state_events: Arc::new(Mutex::new(Vec::new())),
+            user_download_finished_events: Arc::new(Mutex::new(Vec::new())),
+            files_dir: String::new(),
+            secure_files_dir: String::new(),
+            is_bot: false,
+            use_message_database: false,
+            use_file_database: false,
+            use_storage_optimizer: false,
+            ignore_inline_thumbnails: false,
+            option_integers: BTreeMap::new(),
+            unix_time: 0,
+            database_paths: Vec::new(),
+            is_test_dc: false,
+            ignore_file_names: false,
+            file_name_counters: crate::files::FileNameCounters::default(),
+            dlds: BTreeMap::new(),
+            dlds_saved: BTreeMap::new(),
+            dlds_pmc_live: false,
+        }
+    }
+
+    pub(crate) fn refresh(&mut self, snapshot: TdFileSnapshot) {
+        let TdFileSnapshot {
+            files_dir,
+            secure_files_dir,
+            is_bot,
+            use_message_database,
+            use_file_database,
+            use_storage_optimizer,
+            ignore_inline_thumbnails,
+            option_integers,
+            unix_time,
+            database_paths,
+            is_test_dc,
+            ignore_file_names,
+        } = snapshot;
+        self.files_dir = files_dir;
+        self.secure_files_dir = secure_files_dir;
+        self.is_bot = is_bot;
+        self.use_message_database = use_message_database;
+        self.use_file_database = use_file_database;
+        self.use_storage_optimizer = use_storage_optimizer;
+        self.ignore_inline_thumbnails = ignore_inline_thumbnails;
+        self.option_integers = option_integers;
+        self.unix_time = unix_time;
+        self.database_paths = database_paths;
+        self.is_test_dc = is_test_dc;
+        self.ignore_file_names = ignore_file_names;
+    }
+
+    /// The `TdDb::with_db_path` snapshot read.
+    pub(crate) fn database_paths(&self) -> Vec<String> {
+        self.database_paths.clone()
+    }
+
+    /// The dlds# keyspace preload (the init-time pmc prefix read).
+    pub(crate) fn dlds_preload(&mut self, records: Vec<(String, Vec<u8>)>) {
+        self.dlds = records.into_iter().collect();
+        self.dlds_saved = self.dlds.clone();
+    }
+
+    // ── the snapshot reads the storage/files planes share ──
+
+    pub(crate) fn files_dir(&self) -> String {
+        self.files_dir.clone()
+    }
+
+    pub(crate) fn secure_files_dir(&self) -> String {
+        self.secure_files_dir.clone()
+    }
+
+    pub(crate) fn option_integer(&self, name: &str, default: i64) -> i64 {
+        self.option_integers.get(name).copied().unwrap_or(default)
+    }
+
+    pub(crate) fn use_file_database(&self) -> bool {
+        self.use_file_database
+    }
+
+    pub(crate) fn use_storage_optimizer(&self) -> bool {
+        self.use_storage_optimizer
+    }
+
+    pub(crate) fn is_test_dc(&self) -> bool {
+        self.is_test_dc
+    }
+
+    /// `open_temp_file` (FileLoaderUtils.cpp:85-102) over the snapshot.
+    pub(crate) fn open_temp_file(
+        &mut self,
+        file_type: FileType,
+    ) -> Result<(std::fs::File, String), Status> {
+        crate::files::open_temp_file_impl(
+            file_type,
+            &self.files_dir,
+            &self.secure_files_dir,
+            &mut self.file_name_counters,
+        )
+    }
+
+    /// `create_from_temp` (FileLoaderUtils.cpp:126-140) over the snapshot.
+    pub(crate) fn create_from_temp(
+        &mut self,
+        file_type: FileType,
+        path: &str,
+        name: &str,
+    ) -> Result<String, Status> {
+        crate::files::create_from_temp_impl(
+            file_type,
+            path,
+            name,
+            &self.files_dir,
+            &self.secure_files_dir,
+            self.ignore_file_names,
+            &mut self.file_name_counters,
+        )
+    }
+
+    /// The `tmp_file_id`/`perm_file_id` pmc preload (the init-time read).
+    pub(crate) fn preload_file_name_counters(&mut self, tmp_file_id: i32, perm_file_id: i32) {
+        self.file_name_counters = crate::files::FileNameCounters {
+            tmp_file_id,
+            perm_file_id,
+        };
+    }
+}
+
+// ── the `'static` boxes the managers store — thin delegates to the cell ──
+
+/// The stored `FileManager::Context`/`DownloadManager::Callback`/
+/// `DownloadManager::Context` planes (the C++ `FileManagerContext(td)` /
+/// `DownloadManagerCallback(td, ...)` objects).
+pub(crate) struct TdFilePlane(pub(crate) Arc<parking_lot::Mutex<TdFileShared>>);
+
+impl FileManagerContext for TdFilePlane {
+    fn keep_exact_remote_location(&self) -> bool {
+        !self.0.lock().is_bot
+    }
+
+    fn files_dir(&self) -> String {
+        self.0.lock().files_dir.clone()
+    }
+
+    fn secure_files_dir(&self) -> String {
+        self.0.lock().secure_files_dir.clone()
+    }
+
+    fn option_integer(&self, name: &str, default: i64) -> i64 {
+        self.0
+            .lock()
+            .option_integers
+            .get(name)
+            .copied()
+            .unwrap_or(default)
+    }
+
+    fn need_notify_on_new_files(&self) -> bool {
+        !self.0.lock().is_bot
+    }
+
+    fn on_new_file(&mut self, size: i64, real_size: i64, cnt: i32) {
+        self.0.lock().new_file_events.push((size, real_size, cnt));
+    }
+
+    /// `FileReferenceManager::repair_file_reference` — the repair queries
+    /// are [blocked: net]; the collapse answers the failure the C++
+    /// promise would eventually carry.
+    fn repair_file_reference(&mut self, _file_id: FileId) -> Result<(), tdutils::status::Status> {
+        Err(tdutils::status::Status::error_message(
+            "Failed to repair file reference",
+        ))
+    }
+
+    /// `FileReferenceManager::reload_photo` — [blocked: net] like the
+    /// repair seam above.
+    fn reload_photo(&mut self, _file_id: FileId) -> Result<(), tdutils::status::Status> {
+        Err(tdutils::status::Status::error_message(
+            "Failed to reload photo",
+        ))
+    }
+
+    fn ignore_inline_thumbnails(&self) -> bool {
+        self.0.lock().ignore_inline_thumbnails
+    }
+
+    fn on_file_generation_start(
+        &mut self,
+        generation_id: i64,
+        original_path: &str,
+        path: &str,
+        conversion: &str,
+    ) {
+        self.0
+            .lock()
+            .updates
+            .push(td_api::Update::updateFileGenerationStart(
+                td_api::updateFileGenerationStart {
+                    generation_id,
+                    original_path: original_path.to_owned(),
+                    destination_path: path.to_owned(),
+                    conversion: conversion.to_owned(),
+                },
+            ));
+    }
+
+    fn on_file_generation_stop(&mut self, generation_id: i64) {
+        self.0
+            .lock()
+            .updates
+            .push(td_api::Update::updateFileGenerationStop(
+                td_api::updateFileGenerationStop { generation_id },
+            ));
+    }
+}
+
+impl DownloadManagerContext for TdFilePlane {
+    fn use_message_database(&self) -> bool {
+        self.0.lock().use_message_database
+    }
+
+    fn pmc_get(&mut self, key: &str) -> Vec<u8> {
+        self.0.lock().dlds.get(key).cloned().unwrap_or_default()
+    }
+
+    fn pmc_set(&mut self, key: &str, value: &[u8]) {
+        self.0.lock().dlds.insert(key.to_owned(), value.to_vec());
+    }
+
+    fn pmc_erase(&mut self, key: &str) {
+        self.0.lock().dlds.remove(key);
+    }
+
+    fn pmc_erase_by_prefix(&mut self, prefix: &str) {
+        self.0.lock().dlds.retain(|key, _| !key.starts_with(prefix));
+    }
+
+    fn pmc_prefix_get(&mut self, prefix: &str) -> Vec<(String, Vec<u8>)> {
+        self.0
+            .lock()
+            .dlds
+            .iter()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
+
+    fn unix_time(&mut self) -> i32 {
+        self.0.lock().unix_time
+    }
+
+    fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>) {
+        // the versioned `FileManager::store_file` serialization (T.7, the
+        // D1 unification — the dlds records are byte-compatible with the
+        // C++ DownloadManager pmc layout)
+        let file_manager = Arc::clone(&self.0.lock().file_manager);
+        file_manager.lock().store_file(file_id, out);
+    }
+
+    fn parse_file_id(
+        &mut self,
+        parser: &mut crate::store_parse::Parser,
+    ) -> Result<FileId, tdutils::status::Status> {
+        let file_manager = Arc::clone(&self.0.lock().file_manager);
+        file_manager
+            .lock()
+            .parse_file(parser)
+            .map_err(tdutils::status::Status::error_message)
+    }
+}
+
+impl DownloadManagerCallback for TdFilePlane {
+    fn update_counters(&mut self, counters: DownloadCounters) {
+        let mut shared = self.0.lock();
+        if !shared.is_bot {
+            shared.updates.push(td_api::Update::updateFileDownloads(
+                counters.get_update_file_downloads_object(),
+            ));
+        }
+    }
+
+    fn update_file_added(
+        &mut self,
+        file_id: FileId,
+        file_source_id: FileSourceId,
+        add_date: i32,
+        complete_date: i32,
+        is_paused: bool,
+        counters: crate::files::DownloadFileCounters,
+    ) {
+        let file_download = self.get_file_download_object(
+            file_id,
+            file_source_id,
+            add_date,
+            complete_date,
+            is_paused,
+        );
+        let mut shared = self.0.lock();
+        shared
+            .updates
+            .push(td_api::Update::updateFileAddedToDownloads(
+                td_api::updateFileAddedToDownloads {
+                    file_download,
+                    counts: Some(counters.get_downloaded_file_counts_object()),
+                },
+            ));
+    }
+
+    fn update_file_changed(
+        &mut self,
+        file_id: FileId,
+        complete_date: i32,
+        is_paused: bool,
+        counters: crate::files::DownloadFileCounters,
+    ) {
+        self.0
+            .lock()
+            .updates
+            .push(td_api::Update::updateFileDownload(
+                td_api::updateFileDownload {
+                    file_id: file_id.get(),
+                    complete_date,
+                    is_paused,
+                    counts: Some(counters.get_downloaded_file_counts_object()),
+                },
+            ));
+    }
+
+    fn update_file_removed(
+        &mut self,
+        file_id: FileId,
+        counters: crate::files::DownloadFileCounters,
+    ) {
+        self.0
+            .lock()
+            .updates
+            .push(td_api::Update::updateFileRemovedFromDownloads(
+                td_api::updateFileRemovedFromDownloads {
+                    file_id: file_id.get(),
+                    counts: Some(counters.get_downloaded_file_counts_object()),
+                },
+            ));
+    }
+
+    /// `FileManager::get_internal_download_id` (the shared id space the
+    /// download queries ride).
+    fn get_internal_download_id(&mut self) -> i64 {
+        let file_manager = Arc::clone(&self.0.lock().file_manager);
+        file_manager.lock().get_internal_download_id()
+    }
+
+    /// `DownloadManagerCallback::start_file` (DownloadManagerCallback.cpp:60)
+    /// — `FileManager::download` with the bridge callback, offset/limit -1.
+    /// The handles clone out of the shared cell first: the lock order is
+    /// always manager → shared (the worker callbacks re-enter the cell
+    /// under the manager borrow), never shared → manager.
+    fn start_file(&mut self, file_id: FileId, internal_download_id: i64, priority: i8) {
+        let (file_manager, file_load_manager, events) = {
+            let shared = self.0.lock();
+            (
+                Arc::clone(&shared.file_manager),
+                Arc::clone(&shared.file_load_manager),
+                Arc::clone(&shared.download_state_events),
+            )
+        };
+        let callback: Arc<parking_lot::Mutex<dyn DownloadCallback>> =
+            Arc::new(Mutex::new(TdDownloadBridge { events }));
+        file_manager.lock().download(
+            file_id,
+            internal_download_id,
+            callback,
+            i32::from(priority),
+            -1,
+            -1,
+            &mut file_load_manager.lock(),
+        );
+    }
+
+    /// `DownloadManagerCallback::pause_file` — `FileManager::cancel_download`
+    /// with `remove_from_download_manager = false`
+    /// (DownloadManagerCallback.cpp:66-68).
+    fn pause_file(&mut self, file_id: FileId, internal_download_id: i64) {
+        let (file_manager, file_load_manager) = {
+            let shared = self.0.lock();
+            (
+                Arc::clone(&shared.file_manager),
+                Arc::clone(&shared.file_load_manager),
+            )
+        };
+        file_manager.lock().cancel_download(
+            file_id,
+            internal_download_id,
+            false,
+            &mut file_load_manager.lock(),
+        );
+    }
+
+    /// `DownloadManagerCallback::delete_file` — routed through the gc
+    /// unlink plane (the local copy drops, the pmc record clears, the
+    /// download manager reaps the finished query); the C++
+    /// `FileManager::delete_file` promise surface has no td_api
+    /// observable here.
+    fn delete_file(&mut self, file_id: FileId) {
+        let file_manager = Arc::clone(&self.0.lock().file_manager);
+        let location = file_manager
+            .lock()
+            .get_file_view(file_id)
+            .and_then(|view| view.get_full_local_location().cloned());
+        if let Some(location) = location {
+            file_manager.lock().on_file_unlink(&location);
+        }
+    }
+
+    /// `get_file_search_text` — the C++ asks
+    /// `FileReferenceManager::get_file_search_text` (the message-plane
+    /// search text, M.10's seam); the empty text keeps the download
+    /// listed like a dialog-less file.
+    fn get_file_search_text(
+        &mut self,
+        _file_id: FileId,
+        _file_source_id: FileSourceId,
+    ) -> Result<String, tdutils::status::Status> {
+        Ok(String::new())
+    }
+
+    /// `get_sync_file_view` collapsed to the three sizes
+    /// (`add_file_info`'s size/expected_size/downloaded_size reads,
+    /// DownloadManager.cpp:532-535); the `check_local_location` half
+    /// re-stats through the drive.
+    fn sync_file_sizes(&mut self, file_id: FileId) -> (i64, i64, i64) {
+        let file_manager = Arc::clone(&self.0.lock().file_manager);
+        file_manager
+            .lock()
+            .get_file_view(file_id)
+            .map(|view: FileView<'_>| {
+                (
+                    view.size(),
+                    view.expected_size(false),
+                    view.local_total_size(),
+                )
+            })
+            .unwrap_or((0, 0, 0))
+    }
+
+    fn get_file_object(&mut self, file_id: FileId) -> Option<td_api::File> {
+        let file_manager = Arc::clone(&self.0.lock().file_manager);
+        Some(file_manager.lock().get_file_object(file_id))
+    }
+
+    fn get_file_download_object(
+        &mut self,
+        file_id: FileId,
+        _file_source_id: FileSourceId,
+        add_date: i32,
+        complete_date: i32,
+        is_paused: bool,
+    ) -> Option<td_api::FileDownload> {
+        let file_manager = Arc::clone(&self.0.lock().file_manager);
+        let file_id = file_manager
+            .lock()
+            .get_file_view(file_id)
+            .map(|view| view.get_main_file_id().get())
+            .unwrap_or(file_id.get());
+        // the message plane (the source-message resolution) is the M.10
+        // seam; the C++ `message_ == nullptr` filter applies downstream
+        Some(td_api::FileDownload {
+            file_id,
+            message: None,
+            add_date,
+            complete_date,
+            is_paused,
+        })
+    }
+}
+
+/// The `make_download_file_callback` bridge (DownloadManagerCallback.cpp:99-121)
+/// — the loader-side completions hop into
+/// `DownloadManager::update_file_download_state` at the drive end.
+struct TdDownloadBridge {
+    events: Arc<parking_lot::Mutex<Vec<(FileId, bool)>>>,
+}
+
+impl DownloadCallback for TdDownloadBridge {
+    fn on_progress(&mut self, file_id: FileId) {
+        self.events.lock().push((file_id, false));
+    }
+
+    fn on_download_ok(&mut self, file_id: FileId) {
+        self.events.lock().push((file_id, false));
+    }
+
+    fn on_download_error(&mut self, file_id: FileId, _status: tdutils::status::Status) {
+        self.events.lock().push((file_id, true));
+    }
+}
+
+/// `FileManager::UserDownloadFileCallback` (FileManager.cpp:1268-1283) —
+/// both completions of a user download release the parked synchronous
+/// `downloadFile` promises at the drive end.
+struct TdUserDownloadCallback {
+    events: Arc<parking_lot::Mutex<Vec<FileId>>>,
+}
+
+impl DownloadCallback for TdUserDownloadCallback {
+    fn on_download_ok(&mut self, file_id: FileId) {
+        self.events.lock().push(file_id);
+    }
+
+    fn on_download_error(&mut self, file_id: FileId, _status: tdutils::status::Status) {
+        self.events.lock().push(file_id);
+    }
+}
+
+/// The stored `FileManager::Worker` plane — the fm-touching effects are
+/// queued (the hooks fire under `&mut FileManager`); the DownloadManager
+/// reap is a separate handle and runs inline like the C++ `send_closure`.
+pub(crate) struct TdFileWorker {
+    pub(crate) shared: Arc<parking_lot::Mutex<TdFileShared>>,
+    pub(crate) download_manager: Arc<parking_lot::Mutex<DownloadManager>>,
+}
+
+impl FileManagerWorker for TdFileWorker {
+    fn cancel_download(&mut self, node: &FileNode) {
+        self.shared
+            .lock()
+            .worker_events
+            .push(FileWorkerEvent::CancelDownload(Box::new(node.clone())));
+    }
+
+    fn cancel_upload(&mut self, node: &FileNode) {
+        self.shared
+            .lock()
+            .worker_events
+            .push(FileWorkerEvent::CancelUpload(Box::new(node.clone())));
+    }
+
+    fn cancel_generate(&mut self, node: &FileNode) {
+        self.shared
+            .lock()
+            .worker_events
+            .push(FileWorkerEvent::CancelGenerate(Box::new(node.clone())));
+    }
+
+    fn finish_download(&mut self, file_id: FileId) {
+        self.shared
+            .lock()
+            .worker_events
+            .push(FileWorkerEvent::FinishDownload(file_id));
+    }
+
+    fn finish_upload(&mut self, file_id: FileId) {
+        self.shared
+            .lock()
+            .worker_events
+            .push(FileWorkerEvent::FinishUpload(file_id));
+    }
+
+    fn clear_from_pmc(&mut self, node: &FileNode) {
+        self.shared.lock().file_db_events.push(FileDbEvent::Clear {
+            node: Box::new(node.clone()),
+        });
+    }
+
+    fn remove_file_if_finished(&mut self, file_id: FileId) {
+        let _ = self
+            .download_manager
+            .lock()
+            .remove_file_if_finished(file_id);
+    }
+
+    fn run_node(&mut self, node: &FileNode) {
+        self.shared
+            .lock()
+            .worker_events
+            .push(FileWorkerEvent::RunNode(Box::new(node.clone())));
+    }
+
+    fn flush_node_info(&mut self, node: &FileNode) {
+        self.shared.lock().file_db_events.push(FileDbEvent::Flush {
+            node: Box::new(node.clone()),
+            other_pmc_id: FileDbId::default(),
+            new_remote: false,
+            new_local: false,
+            new_generate: false,
+        });
+    }
+
+    fn flush_node_full(
+        &mut self,
+        node: &FileNode,
+        new_remote: bool,
+        new_local: bool,
+        new_generate: bool,
+        other_pmc_id: FileDbId,
+    ) {
+        self.shared.lock().file_db_events.push(FileDbEvent::Flush {
+            node: Box::new(node.clone()),
+            other_pmc_id,
+            new_remote,
+            new_local,
+            new_generate,
+        });
+    }
+
+    fn on_merge_files(&mut self, from_file_id: FileId, to_file_id: FileId) {
+        self.shared
+            .lock()
+            .worker_events
+            .push(FileWorkerEvent::MergeFiles(from_file_id, to_file_id));
+    }
+}
+
+// ── the StorageManager environment (T.5/T.8) ──
+//
+// The C++ StorageManager/FileStatsWorker read `G()` (options, the binlog
+// pmc, TdDb, the FileManager) inline; the collapsed env takes the same
+// surfaces per drive — the shared files snapshot for the option reads,
+// the Global for the pmc/TdDb planes.
+
+/// The per-drive [`crate::files::StorageContext`] over the Td fields —
+/// built per call with the field-split borrows, never held across calls.
+pub(crate) struct TdStorageEnv<'a> {
+    shared: Arc<parking_lot::Mutex<TdFileShared>>,
+    global: &'a mut Global,
+    language_pack_database_path: String,
+}
+
+impl FileManagerContext for TdStorageEnv<'_> {
+    fn files_dir(&self) -> String {
+        self.shared.lock().files_dir()
+    }
+
+    fn secure_files_dir(&self) -> String {
+        self.shared.lock().secure_files_dir()
+    }
+
+    fn option_integer(&self, name: &str, default: i64) -> i64 {
+        self.shared.lock().option_integer(name, default)
+    }
+}
+
+impl FileGcSink for TdStorageEnv<'_> {
+    fn use_file_database(&self) -> bool {
+        self.shared.lock().use_file_database()
+    }
+
+    fn on_file_unlink(&mut self, location: FullLocalFileLocation) {
+        let shared = self.shared.lock();
+        shared.file_manager.lock().on_file_unlink(&location);
+    }
+}
+
+impl FileStatsSink for TdStorageEnv<'_> {
+    fn database_paths(&self) -> Vec<String> {
+        self.shared.lock().database_paths()
+    }
+
+    fn language_pack_database_path(&self) -> String {
+        self.language_pack_database_path.clone()
+    }
+
+    /// `scan_db` (FileStatsWorker.cpp:39-94) — the `file0`..`file:` range
+    /// join over the "files" kv: the `@@` refs skip, the FileData parse
+    /// carries the local path/type, the owner and the size.
+    fn scan_file_db(&mut self, callback: &mut dyn FnMut(FileType, String, DialogId, i64)) {
+        let (files_dir, secure_files_dir) = {
+            let shared = self.shared.lock();
+            (shared.files_dir(), shared.secure_files_dir())
+        };
+        self.global.td_db().files_kv().get_by_range(
+            b"file0",
+            b"file:",
+            &mut |key: &[u8], value: &[u8]| {
+                if !key.starts_with(b"file") {
+                    return true;
+                }
+                // skip reference to other data
+                if value.starts_with(b"@@") {
+                    return true;
+                }
+                let mut parser = crate::store_parse::Parser::new(value);
+                let data = match crate::files::FileData::parse_from(&mut parser, false, None) {
+                    Ok(data) => data,
+                    Err(_) => return true, // "Invalid FileData in the database"
+                };
+                let (file_type, path) = match &data.local {
+                    crate::files::LocalFileLocation::Full(full) => {
+                        (full.file_type, full.path.clone())
+                    }
+                    crate::files::LocalFileLocation::Partial(partial) => {
+                        (partial.file_type, partial.path.clone())
+                    }
+                    _ => return true,
+                };
+                let path = if std::path::Path::new(&path).is_relative() {
+                    format!(
+                        "{}{}",
+                        crate::files::get_files_base_dir(file_type, &files_dir, &secure_files_dir),
+                        path
+                    )
+                } else {
+                    path
+                };
+                let size = data.size;
+                if size == 0 && matches!(data.local, crate::files::LocalFileLocation::Full(_)) {
+                    // "Unknown size in the database"
+                    return true;
+                }
+                callback(file_type, path, data.owner_dialog_id, size);
+                true
+            },
+        );
+    }
+}
+
+impl StorageContext for TdStorageEnv<'_> {
+    fn pmc_get(&mut self, key: &str) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key.as_bytes())
+    }
+
+    fn pmc_set(&mut self, key: &str, value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key.as_bytes(), value);
+    }
+
+    fn use_storage_optimizer(&self) -> bool {
+        self.shared.lock().use_storage_optimizer()
+    }
+
+    fn use_file_database(&self) -> bool {
+        self.shared.lock().use_file_database()
+    }
+
+    fn database_stats(&mut self) -> Result<String, tdutils::status::Status> {
+        match self.global.td_db().get_stats() {
+            tdutils::status::Result::Ok(stats) => Ok(stats),
+            tdutils::status::Result::Err(status) => Err(status),
+        }
+    }
+}
+
+/// The `FileGcSink` over the shared files plane alone — `run_gc` takes
+/// the context and the sink as separate borrows, and the sink only needs
+/// the FileManager unlink hop and the `use_file_database` switch.
+struct TdFileGcSink(Arc<parking_lot::Mutex<TdFileShared>>);
+
+impl FileGcSink for TdFileGcSink {
+    fn use_file_database(&self) -> bool {
+        self.0.lock().use_file_database()
+    }
+
+    fn on_file_unlink(&mut self, location: FullLocalFileLocation) {
+        let file_manager = Arc::clone(&self.0.lock().file_manager);
+        file_manager.lock().on_file_unlink(&location);
+    }
+}
+
+/// Build the [`TdStorageEnv`] over disjoint Td field borrows (the
+/// `UserEnv` convention — the manager lives in another field).
+fn storage_env_fields<'a>(
+    global: &'a mut Global,
+    file_shared: &Arc<parking_lot::Mutex<TdFileShared>>,
+    options: Option<&OptionManager>,
+) -> TdStorageEnv<'a> {
+    TdStorageEnv {
+        shared: Arc::clone(file_shared),
+        global,
+        language_pack_database_path: options
+            .map(|options| options.get_option_string("language_pack_database_path", ""))
+            .unwrap_or_default(),
+    }
+}
+
+// ── the live net seams (T.9) ──
+//
+// The bridge-backed nets: every query rides `BridgeHandle::query` (the
+// established S76 blocking-invoke over the single bridge session; the
+// gzip_packed responses are unwrapped by the session layer) and the io
+// rides the FileLoaderUtils helpers over the per-drive files dirs. When
+// the bridge is not installed yet (pre-init drives) the nets answer the
+// session-down surface — the C++ parks the queries until a session
+// appears, so nothing progresses offline either way.
+
+/// The shared live-net environment: the bridge handle (filled at `init`,
+/// once the session exists) and the files snapshot cell (the io dirs and
+/// the file-name counters refresh per drive).
+#[derive(Default)]
+pub(crate) struct LiveNetCell {
+    bridge: Option<crate::net::BridgeHandle>,
+    shared: Option<Arc<parking_lot::Mutex<TdFileShared>>>,
+}
+
+impl LiveNetCell {
+    fn install(
+        &mut self,
+        bridge: crate::net::BridgeHandle,
+        shared: Arc<parking_lot::Mutex<TdFileShared>>,
+    ) {
+        self.bridge = Some(bridge);
+        self.shared = Some(shared);
+    }
+
+    /// The bridge handle clone (the cell keeps the canonical one).
+    fn bridge(&self) -> Option<crate::net::BridgeHandle> {
+        self.bridge.clone()
+    }
+
+    /// One query through the bridge as a `Status` result (the C++
+    /// NetQuery error surfaces: the RPC error code/message).
+    fn query(&self, function: telegram_api::Function) -> Result<Vec<u8>, Status> {
+        match self
+            .bridge()
+            .ok_or_else(|| Status::error(400, "Not connected"))?
+            .query(function)
+        {
+            crate::net::QueryAnswer::Ok(data) => Ok(data),
+            crate::net::QueryAnswer::Err(code, message) => Err(Status::error(code, &message)),
+        }
+    }
+
+    /// Run `f` against the shared files snapshot.
+    fn with_shared<R>(&self, f: impl FnOnce(&mut TdFileShared) -> R) -> Result<R, Status> {
+        let Some(shared) = self.shared.as_ref() else {
+            return Err(Status::error_message("The files snapshot is not installed"));
+        };
+        Ok(f(&mut shared.lock()))
+    }
+
+    /// The per-drive files dirs.
+    fn io_dirs(&self) -> Result<(String, String), Status> {
+        self.with_shared(|shared| (shared.files_dir(), shared.secure_files_dir()))
+    }
+}
+
+/// The per-query download net over the bridge (`upload.getFile` family +
+/// the FileLoaderUtils io).
+pub(crate) struct LiveDownloadNet {
+    cell: Arc<parking_lot::Mutex<LiveNetCell>>,
+}
+
+impl FileDownloaderNet for LiveDownloadNet {
+    fn download(
+        &mut self,
+        query: DownloadQuery,
+        _query_type: DownloadQueryType,
+        _meta: DownloadNetMeta,
+    ) -> Result<DownloadResult, Status> {
+        let cell = self.cell.lock();
+        let data = match query {
+            DownloadQuery::GetFile {
+                location,
+                offset,
+                limit,
+                cdn_supported,
+            } => {
+                let function =
+                    telegram_api::Function::upload_getFile(telegram_api::upload_getFile {
+                        flags: 0,
+                        precise: false,
+                        cdn_supported,
+                        location: Some(location),
+                        offset,
+                        limit,
+                    });
+                let data = cell.query(function)?;
+                match telegram_api::upload_File::parse(&data) {
+                    Ok(telegram_api::upload_File::upload_file(file)) => {
+                        DownloadResult::Bytes(file.bytes)
+                    }
+                    Ok(telegram_api::upload_File::upload_fileCdnRedirect(redirect)) => {
+                        DownloadResult::CdnRedirect {
+                            dc_id: redirect.dc_id,
+                            file_token: redirect.file_token,
+                            encryption_key: redirect.encryption_key,
+                            encryption_iv: redirect.encryption_iv,
+                            file_hashes: redirect.file_hashes,
+                        }
+                    }
+                    Err(error) => {
+                        return Err(Status::error_message(&format!("upload.file: {error}")));
+                    }
+                }
+            }
+            DownloadQuery::GetWebFile {
+                location,
+                offset,
+                limit,
+            } => {
+                let function =
+                    telegram_api::Function::upload_getWebFile(telegram_api::upload_getWebFile {
+                        location: Some(location),
+                        offset,
+                        limit,
+                    });
+                let data = cell.query(function)?;
+                match telegram_api::upload_WebFile::parse(&data) {
+                    Ok(web_file) => DownloadResult::Bytes(web_file.bytes),
+                    Err(error) => {
+                        return Err(Status::error_message(&format!("upload.webFile: {error}")));
+                    }
+                }
+            }
+            DownloadQuery::GetCdnFile {
+                file_token,
+                offset,
+                limit,
+            } => {
+                let function =
+                    telegram_api::Function::upload_getCdnFile(telegram_api::upload_getCdnFile {
+                        file_token,
+                        offset,
+                        limit,
+                    });
+                let data = cell.query(function)?;
+                match telegram_api::upload_CdnFile::parse(&data) {
+                    Ok(telegram_api::upload_CdnFile::upload_cdnFileReuploadNeeded(needed)) => {
+                        DownloadResult::ReuploadNeeded {
+                            request_token: needed.request_token,
+                        }
+                    }
+                    Ok(telegram_api::upload_CdnFile::upload_cdnFile(file)) => {
+                        DownloadResult::CdnBytes(file.bytes)
+                    }
+                    Err(error) => {
+                        return Err(Status::error_message(&format!("upload.cdnFile: {error}")));
+                    }
+                }
+            }
+            DownloadQuery::ReuploadCdnFile {
+                file_token,
+                request_token,
+            } => {
+                let function = telegram_api::Function::upload_reuploadCdnFile(
+                    telegram_api::upload_reuploadCdnFile {
+                        file_token,
+                        request_token,
+                    },
+                );
+                let data = cell.query(function)?;
+                match parse_vector_file_hash(&data) {
+                    Ok(hashes) => DownloadResult::Hashes(hashes),
+                    Err(error) => {
+                        return Err(Status::error_message(&format!(
+                            "upload.reuploadCdnFile: {error}"
+                        )));
+                    }
+                }
+            }
+            DownloadQuery::GetFileHashes { location, offset } => {
+                let function = telegram_api::Function::upload_getFileHashes(
+                    telegram_api::upload_getFileHashes {
+                        location: Some(location),
+                        offset,
+                    },
+                );
+                let data = cell.query(function)?;
+                match parse_vector_file_hash(&data) {
+                    Ok(hashes) => DownloadResult::Hashes(hashes),
+                    Err(error) => {
+                        return Err(Status::error_message(&format!(
+                            "upload.getFileHashes: {error}"
+                        )));
+                    }
+                }
+            }
+        };
+        Ok(data)
+    }
+
+    fn open_temp_file(&mut self, file_type: FileType) -> Result<(std::fs::File, String), Status> {
+        self.cell
+            .lock()
+            .with_shared(|shared| shared.open_temp_file(file_type))?
+    }
+
+    fn open_partial_file(&mut self, path: &str, write: bool) -> Result<std::fs::File, Status> {
+        crate::files::open_partial_file_impl(path, write)
+    }
+
+    fn open_generated_file(&mut self, path: &str) -> Result<std::fs::File, Status> {
+        // `FileFd::open(path_, FileFd::Create | FileFd::Write)` — the
+        // generated path may have just been unlinked (a stale partial)
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|e| Status::error_message(&format!("Can't open the generated file: {e}")))
+    }
+
+    fn search_file(
+        &mut self,
+        file_type: FileType,
+        name: &str,
+        size: i64,
+    ) -> Result<String, Status> {
+        let (files_dir, secure_files_dir) = self.cell.lock().io_dirs()?;
+        crate::files::search_file_impl(file_type, name, size, &files_dir, &secure_files_dir)
+    }
+
+    fn create_from_temp(
+        &mut self,
+        file_type: FileType,
+        path: &str,
+        name: &str,
+    ) -> Result<String, Status> {
+        self.cell
+            .lock()
+            .with_shared(|shared| shared.create_from_temp(file_type, path, name))?
+    }
+
+    fn webfile_dc_id(&mut self) -> DcId {
+        self.cell
+            .lock()
+            .with_shared(|shared| {
+                let id =
+                    shared.option_integer("webfile_dc_id", if shared.is_test_dc() { 2 } else { 4 });
+                DcId::internal(id as i32)
+            })
+            .unwrap_or_default()
+    }
+}
+
+/// The per-query upload net over the bridge (`upload.saveFilePart` /
+/// `upload.saveBigFilePart`).
+pub(crate) struct LiveUploadNet {
+    cell: Arc<parking_lot::Mutex<LiveNetCell>>,
+}
+
+impl FileUploaderNet for LiveUploadNet {
+    fn upload_part(&mut self, query: UploadPartQuery) -> Result<bool, Status> {
+        let function = match query {
+            UploadPartQuery::SaveFilePart {
+                file_id,
+                part_id,
+                bytes,
+            } => telegram_api::Function::upload_saveFilePart(telegram_api::upload_saveFilePart {
+                file_id,
+                file_part: part_id,
+                bytes,
+            }),
+            UploadPartQuery::SaveBigFilePart {
+                file_id,
+                part_id,
+                part_count,
+                bytes,
+            } => telegram_api::Function::upload_saveBigFilePart(
+                telegram_api::upload_saveBigFilePart {
+                    file_id,
+                    file_part: part_id,
+                    file_total_parts: part_count,
+                    bytes,
+                },
+            ),
+        };
+        let data = self.cell.lock().query(function)?;
+        // `!result.ok()` is the C++ 500 path (FileUploader.cpp:188-192);
+        // the `Bool` result is the id-checked bare constructor
+        let mut reader = telegram_api::tl::Reader::new(&data);
+        match reader.bool() {
+            Ok(ok) => Ok(ok),
+            Err(error) => Err(Status::error_message(&format!(
+                "upload.saveFilePart: {error}"
+            ))),
+        }
+    }
+}
+
+/// The per-query hash-upload net over the bridge
+/// (`messages.getDocumentByHash`).
+pub(crate) struct LiveHashNet {
+    cell: Arc<parking_lot::Mutex<LiveNetCell>>,
+}
+
+impl FileHashUploaderNet for LiveHashNet {
+    fn get_document_by_hash(
+        &mut self,
+        sha256: [u8; 32],
+        size: i64,
+        mime_type: String,
+    ) -> Result<DocumentByHash, Status> {
+        let function = telegram_api::Function::messages_getDocumentByHash(
+            telegram_api::messages_getDocumentByHash {
+                sha256: sha256.to_vec(),
+                size,
+                mime_type,
+            },
+        );
+        let data = self.cell.lock().query(function)?;
+        match telegram_api::Document::parse(&data) {
+            Ok(telegram_api::Document::documentEmpty(_)) => Ok(DocumentByHash::Empty),
+            Ok(telegram_api::Document::document(document)) => Ok(DocumentByHash::Document {
+                id: document.id,
+                access_hash: document.access_hash,
+                dc_id: document.dc_id,
+                file_reference: document.file_reference,
+            }),
+            Err(error) => Err(Status::error_message(&format!(
+                "messages.getDocumentByHash: {error}"
+            ))),
+        }
+    }
+}
+
+/// `Vector<fileHash>` (the `upload.getFileHashes`/`upload.reuploadCdnFile`
+/// result).
+fn parse_vector_file_hash(data: &[u8]) -> Result<Vec<telegram_api::FileHash>, &'static str> {
+    let mut reader = telegram_api::tl::Reader::new(data);
+    if reader.i32()? != telegram_api::tl::VECTOR_ID {
+        return Err("not a vector");
+    }
+    let count = reader.i32()? as u32 as usize;
+    let mut hashes = Vec::with_capacity(count);
+    for _ in 0..count {
+        // vector elements are bare (no constructor id)
+        hashes.push(telegram_api::FileHash::read_bare(&mut reader)?);
+    }
+    Ok(hashes)
+}
+
+/// The [`FileLoadNetFactory`] over the live bridge-backed nets.
+pub(crate) struct TdFileLoadNetFactory {
+    cell: Arc<parking_lot::Mutex<LiveNetCell>>,
+}
+
+impl TdFileLoadNetFactory {
+    pub(crate) fn new() -> TdFileLoadNetFactory {
+        TdFileLoadNetFactory {
+            cell: Arc::new(parking_lot::Mutex::new(LiveNetCell::default())),
+        }
+    }
+
+    /// Fills the cell once the session exists (Td `init`).
+    pub(crate) fn install(
+        &self,
+        bridge: crate::net::BridgeHandle,
+        shared: Arc<parking_lot::Mutex<TdFileShared>>,
+    ) {
+        self.cell.lock().install(bridge, shared);
+    }
+}
+
+impl FileLoadNetFactory for TdFileLoadNetFactory {
+    fn download_net(&mut self) -> Box<dyn FileDownloaderNet> {
+        Box::new(LiveDownloadNet {
+            cell: Arc::clone(&self.cell),
+        })
+    }
+
+    fn upload_net(&mut self) -> Box<dyn FileUploaderNet> {
+        Box::new(LiveUploadNet {
+            cell: Arc::clone(&self.cell),
+        })
+    }
+
+    fn hash_net(&mut self) -> Box<dyn FileHashUploaderNet> {
+        Box::new(LiveHashNet {
+            cell: Arc::clone(&self.cell),
+        })
+    }
+
+    fn utils_net(&mut self) -> Box<dyn FileDownloaderNet> {
+        self.download_net()
+    }
+}
+
 /// `get_message_text` for the plain-text shape (the walking-skeleton
 /// messages carry no media).
 fn wire_message_text(message: &telegram_api::message) -> String {
@@ -2980,6 +4831,10 @@ impl Actor for Td {
             self.chat_manager
                 .tick_timeouts(&mut self.user_manager, &mut env);
         }
+        // The StorageManager's auto-gc timeout (T.8): the C++ actor's own
+        // timer, collapsed into the shared slot's fire — before the flush
+        // so the gc's unlink updates ride the same drive.
+        self.tick_storage_gc();
         self.flush_user_updates();
         self.rearm_user_timeouts();
 
@@ -3346,22 +5201,22 @@ pub fn send_request(actor: &ActorOwn<Td>, request_id: u64, function: Function) {
 mod tests {
     use super::*;
     use crate::config_manager::StoredDcOptions;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use tdactor::{ConcurrentScheduler, create_actor};
     use tdmtproto::telegram_api;
 
     #[derive(Default)]
     struct CollectCallback {
-        responses: Arc<Mutex<Vec<(u64, Object)>>>,
-        errors: Arc<Mutex<Vec<(u64, td_api::Error)>>>,
+        responses: Arc<parking_lot::Mutex<Vec<(u64, Object)>>>,
+        errors: Arc<parking_lot::Mutex<Vec<(u64, td_api::Error)>>>,
     }
 
     impl TdCallback for CollectCallback {
         fn on_result(&mut self, id: u64, result: Object) {
-            self.responses.lock().unwrap().push((id, result));
+            self.responses.lock().push((id, result));
         }
         fn on_error(&mut self, id: u64, error: td_api::Error) {
-            self.errors.lock().unwrap().push((id, error));
+            self.errors.lock().push((id, error));
         }
     }
 
@@ -3406,7 +5261,6 @@ mod tests {
         callback
             .responses
             .lock()
-            .unwrap()
             .iter()
             .filter(|(response_id, _)| *response_id == id)
             .map(|(_, object)| object.clone())
@@ -3417,7 +5271,6 @@ mod tests {
         callback
             .errors
             .lock()
-            .unwrap()
             .iter()
             .find(|(error_id, _)| *error_id == id)
             .map(|(_, error)| error.clone())
@@ -3520,22 +5373,17 @@ mod tests {
             let _ = scheduler.run_main(0.01);
             let _ = scheduler.run_main(0.3);
         });
-        let fired = callback
-            .responses
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(id, object)| {
-                *id == 0
-                    && matches!(
-                        object,
-                        Object::updateUserStatus(update) if update.user_id == 5
-                            && matches!(
-                                update.status,
-                                Some(td_api::UserStatus::userStatusOffline(_))
-                            )
-                    )
-            });
+        let fired = callback.responses.lock().iter().any(|(id, object)| {
+            *id == 0
+                && matches!(
+                    object,
+                    Object::updateUserStatus(update) if update.user_id == 5
+                        && matches!(
+                            update.status,
+                            Some(td_api::UserStatus::userStatusOffline(_))
+                        )
+                )
+        });
         assert!(
             fired,
             "the expired online deadline must broadcast updateUserStatus"
@@ -3547,7 +5395,7 @@ mod tests {
         let callback = CollectCallback::default();
         run_actor_with(&callback, |_actor, callback, scheduler| {
             let _ = scheduler.run_main(0.01);
-            let responses = callback.responses.lock().unwrap();
+            let responses = callback.responses.lock();
             // version, commit_hash, then authorizationStateWaitTdlibParameters.
             assert_eq!(responses.len(), 3);
             assert_eq!(responses[0].0, 0);
@@ -3643,15 +5491,10 @@ mod tests {
                 }),
             );
             assert!(
-                callback
-                    .responses
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .all(|(id, _)| *id == 0),
+                callback.responses.lock().iter().all(|(id, _)| *id == 0),
                 "no request responses in WaitParameters"
             );
-            assert!(callback.errors.lock().unwrap().is_empty());
+            assert!(callback.errors.lock().is_empty());
         });
     }
 
@@ -3675,7 +5518,7 @@ mod tests {
 
             // The update stream ends with WaitPhoneNumber before the ok.
             {
-                let responses = callback.responses.lock().unwrap();
+                let responses = callback.responses.lock();
                 let ok_pos = responses
                     .iter()
                     .position(|(id, object)| *id == 20 && matches!(object, Object::ok(_)))
@@ -3758,7 +5601,7 @@ mod tests {
                     )),
                 }),
             );
-            assert!(callback.errors.lock().unwrap().is_empty());
+            assert!(callback.errors.lock().is_empty());
 
             send(actor, scheduler, 31, set_tdlib_parameters(db_dir, false));
             assert!(
@@ -3882,7 +5725,7 @@ mod tests {
                     .any(|object| matches!(object, Object::ok(_)))
             );
             let auth_updates: Vec<String> = {
-                let responses = callback.responses.lock().unwrap();
+                let responses = callback.responses.lock();
                 let closed_pos = responses
                     .iter()
                     .position(|(_, object)| auth_state_of(object) == "closed")
@@ -3938,7 +5781,7 @@ mod tests {
                     .any(|object| matches!(object, Object::ok(_)))
             );
             let auth_updates: Vec<String> = {
-                let responses = callback.responses.lock().unwrap();
+                let responses = callback.responses.lock();
                 responses
                     .iter()
                     .filter(|(id, _)| *id == 0)
@@ -4342,7 +6185,7 @@ mod tests {
             "token"
         );
 
-        let responses = callback.responses.lock().unwrap();
+        let responses = callback.responses.lock();
         let option_updates: Vec<(String, td_api::OptionValue)> = responses
             .iter()
             .filter_map(|(id, object)| {
@@ -4453,7 +6296,7 @@ mod tests {
         td.drain_config_net_query_completions();
         assert!(td.completed_config_queries.lock().unwrap().is_empty());
         assert_eq!(td.config_manager.as_ref().unwrap().config_sent_cnt(), 0);
-        let responses = callback.responses.lock().unwrap();
+        let responses = callback.responses.lock();
         assert!(responses.iter().any(|(id, object)| {
             *id == 0
                 && matches!(
@@ -4709,7 +6552,6 @@ mod tests {
             || callback
                 .errors
                 .lock()
-                .unwrap()
                 .iter()
                 .any(|(error_id, _)| *error_id == id)
     }
@@ -5175,7 +7017,6 @@ mod tests {
             let errors = callback
                 .errors
                 .lock()
-                .unwrap()
                 .iter()
                 .filter(|(error_id, _)| *error_id == 1)
                 .count();
