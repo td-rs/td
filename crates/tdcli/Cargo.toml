@@ -13,5 +13,6 @@ name = "td_cli"
 path = "src/main.rs"
 
 [dependencies]
+tdclient = { path = "../tdclient" }
 tdutils = { path = "../tdutils" }
 libc = "0.2"

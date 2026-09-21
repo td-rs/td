@@ -143,42 +143,66 @@ const CMD_HELLO: &str = "[ 3][t 1][ts][cli.rs][!CliClient]\tCMD:[hello]";
 const UNKNOWN_HELLO: &str =
     "[ 1][t 1][ts][cli.rs][!CliClient]\tUnknown command \"hello\" of length 5";
 
+/// M.14.2: `init_td` creates the first client, and `q` tears it down — the
+/// C++ `tg_cli` transcript for the same input carries the same lines (the
+/// Closed update prints through the `TlStorerToString` debug format, then
+/// the close accounting: `Td closed` → `Td with generation 1 is closed` →
+/// `Ready to stop`).
+const CREATING_TD: &str =
+    "[ 2][t 1][ts][cli.rs][!CliClient]\tCreating new Td ClientActor1 with generation 1";
+const QUIT_TAIL: &[&str] = &[
+    "[ 2][t 1][ts][cli.rs][!CliClient]\tQUIT",
+    "[ 2][t 1][ts][cli.rs][!CliClient]\tupdateAuthorizationState {",
+    "  authorization_state = authorizationStateClosed {",
+    "  }",
+    "}",
+    "[ 2][t 1][ts][cli.rs][!CliClient]\tTd closed",
+    "[ 2][t 1][ts][cli.rs][!CliClient]\tTd with generation 1 is closed",
+    "[ 2][t 1][ts][cli.rs][!CliClient]\tReady to stop",
+];
+
 #[test]
 fn echo_unknown_and_quit() {
-    let mut session = Session::spawn(b"hello\nfoo bar\nq\n");
-    session.assert_exit_0_and_stderr(&[
+    let mut expected: Vec<&str> = vec![
+        CREATING_TD,
         CMD_HELLO,
         UNKNOWN_HELLO,
         "[ 3][t 1][ts][cli.rs][!CliClient]\tCMD:[foo bar]",
         "[ 1][t 1][ts][cli.rs][!CliClient]\tUnknown command \"foo bar\" of length 7",
         "[ 3][t 1][ts][cli.rs][!CliClient]\tCMD:[q]",
-        "[ 2][t 1][ts][cli.rs][!CliClient]\tQUIT",
-    ]);
+    ];
+    expected.extend_from_slice(QUIT_TAIL);
+    let mut session = Session::spawn(b"hello\nfoo bar\nq\n");
+    session.assert_exit_0_and_stderr(&expected);
 }
 
 #[test]
 fn empty_line_and_leading_space() {
-    let mut session = Session::spawn(b"\n  leading space\nq\n");
-    session.assert_exit_0_and_stderr(&[
+    let mut expected: Vec<&str> = vec![
+        CREATING_TD,
         "[ 3][t 1][ts][cli.rs][!CliClient]\tCMD:[]",
         "[ 3][t 1][ts][cli.rs][!CliClient]\tCMD:[  leading space]",
         "[ 1][t 1][ts][cli.rs][!CliClient]\tUnknown command \"  leading space\" of length 15",
         "[ 3][t 1][ts][cli.rs][!CliClient]\tCMD:[q]",
-        "[ 2][t 1][ts][cli.rs][!CliClient]\tQUIT",
-    ]);
+    ];
+    expected.extend_from_slice(QUIT_TAIL);
+    let mut session = Session::spawn(b"\n  leading space\nq\n");
+    session.assert_exit_0_and_stderr(&expected);
 }
 
 #[test]
 fn ansi_and_control_chars() {
-    let mut session = Session::spawn(b"\t  tab   x\n\x1b[1Aansi\nq\n");
-    session.assert_exit_0_and_stderr(&[
+    let mut expected: Vec<&str> = vec![
+        CREATING_TD,
         "[ 3][t 1][ts][cli.rs][!CliClient]\tCMD:[  tab   x]",
         "[ 1][t 1][ts][cli.rs][!CliClient]\tUnknown command \"  tab   x\" of length 9",
         "[ 3][t 1][ts][cli.rs][!CliClient]\tCMD:[ansi]",
         "[ 1][t 1][ts][cli.rs][!CliClient]\tUnknown command \"ansi\" of length 4",
         "[ 3][t 1][ts][cli.rs][!CliClient]\tCMD:[q]",
-        "[ 2][t 1][ts][cli.rs][!CliClient]\tQUIT",
-    ]);
+    ];
+    expected.extend_from_slice(QUIT_TAIL);
+    let mut session = Session::spawn(b"\t  tab   x\n\x1b[1Aansi\nq\n");
+    session.assert_exit_0_and_stderr(&expected);
 }
 
 #[test]
@@ -187,7 +211,10 @@ fn eof_does_not_exit() {
     session.assert_alive();
     // stderr can only be drained after kill (the live child holds the pipe)
     session.kill();
-    assert_eq!(normalize(&session.stderr()), vec![CMD_HELLO, UNKNOWN_HELLO]);
+    assert_eq!(
+        normalize(&session.stderr()),
+        vec![CREATING_TD, CMD_HELLO, UNKNOWN_HELLO]
+    );
 }
 
 #[test]
@@ -195,16 +222,18 @@ fn partial_line_at_eof_is_dropped() {
     let mut session = Session::spawn(b"abc");
     session.assert_alive();
     session.kill();
-    assert_eq!(normalize(&session.stderr()), Vec::<String>::new());
+    assert_eq!(normalize(&session.stderr()), vec![CREATING_TD]);
 }
 
 #[test]
 fn quit_drops_the_queued_tail() {
-    let mut session = Session::spawn(b"x\nq\ny\n");
-    session.assert_exit_0_and_stderr(&[
+    let mut expected: Vec<&str> = vec![
+        CREATING_TD,
         "[ 3][t 1][ts][cli.rs][!CliClient]\tCMD:[x]",
         "[ 1][t 1][ts][cli.rs][!CliClient]\tUnknown command \"x\" of length 1",
         "[ 3][t 1][ts][cli.rs][!CliClient]\tCMD:[q]",
-        "[ 2][t 1][ts][cli.rs][!CliClient]\tQUIT",
-    ]);
+    ];
+    expected.extend_from_slice(QUIT_TAIL);
+    let mut session = Session::spawn(b"x\nq\ny\n");
+    session.assert_exit_0_and_stderr(&expected);
 }

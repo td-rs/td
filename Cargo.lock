@@ -1783,6 +1783,7 @@ name = "tdcli"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "tdclient",
  "tdutils",
 ]
 

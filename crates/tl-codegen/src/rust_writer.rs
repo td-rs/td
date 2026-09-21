@@ -2925,6 +2925,18 @@ impl ToStringStoreWriter<'_> {
         }
     }
 
+    /// The borrow form for the string/bytes arguments: an owned place takes
+    /// `&`, while a loop item (`*__v0`) is already a shared reference one
+    /// level out — pass the variable bare and let deref coercion produce the
+    /// `&str`/`&[u8]` (the `&**v` form trips clippy's `explicit_auto_deref`).
+    fn borrow_str(expr: &str) -> String {
+        if expr.starts_with('*') {
+            expr.trim_start_matches('*').to_owned()
+        } else {
+            format!("&{expr}")
+        }
+    }
+
     /// The borrow form for an `Option` match scrutinee: the place is an
     /// `Option<T>` (vector items arrive as `*__v0` derefs), so one deref
     /// level — `&*__v0` is `&Option<T>`, where the prim arm's [`Self::borrow`]
@@ -2949,7 +2961,11 @@ impl ToStringStoreWriter<'_> {
         };
         match ty {
             FieldType::Prim(prim) => {
-                let p = place(expr);
+                // A bare place expression: no parens — unary deref binds
+                // tighter than `as`, so `*__v0 as i64` parses correctly, and
+                // the parenthesized form trips `unused_parens` in the
+                // generated module.
+                let p = expr;
                 match prim {
                     Prim::Nat | Prim::Int32 => out.push_str(&format!(
                         "{ind}s.store_field_int(\"{name}\", {p} as i64);\n"
@@ -2965,11 +2981,11 @@ impl ToStringStoreWriter<'_> {
                     }
                     Prim::String => out.push_str(&format!(
                         "{ind}s.store_field_str(\"{name}\", {});\n",
-                        Self::borrow(expr)
+                        Self::borrow_str(expr)
                     )),
                     Prim::Bytes => out.push_str(&format!(
                         "{ind}s.store_bytes_field(\"{name}\", {});\n",
-                        Self::borrow(expr)
+                        Self::borrow_str(expr)
                     )),
                     Prim::True => unreachable!("?true is folded into its flags gate"),
                 }
