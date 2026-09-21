@@ -17,6 +17,7 @@
 use base64::Engine as _;
 use tdmtproto::telegram_api;
 
+use crate::store_parse::{Parser, store_flags, store_string};
 use crate::td_api;
 use crate::user_manager::FileId;
 
@@ -678,6 +679,67 @@ pub fn dialog_photo_get_file_ids(dialog_photo: &DialogPhoto) -> Vec<FileId> {
         result.push(dialog_photo.big_file_id);
     }
     result
+}
+
+/// The `storer.context()->td()` slice the DialogPhoto db record reads —
+/// the FileManager FileId codec (`FileManager::store_file`/`parse_file`,
+/// the M.40 icon-plane encoding).
+pub trait DialogPhotoStoreEnv {
+    fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>);
+    fn parse_file_id(&mut self, parser: &mut Parser<'_>) -> Result<FileId, &'static str>;
+}
+
+/// `store(const DialogPhoto &, StorerT &)` (DialogPhoto.hpp:13-31).
+pub fn store_dialog_photo(
+    dialog_photo: &DialogPhoto,
+    env: &mut impl DialogPhotoStoreEnv,
+    out: &mut Vec<u8>,
+) {
+    let has_file_ids = dialog_photo.small_file_id.is_valid() || dialog_photo.big_file_id.is_valid();
+    let has_minithumbnail = !dialog_photo.minithumbnail.is_empty();
+    store_flags(
+        out,
+        [
+            has_file_ids,
+            dialog_photo.has_animation,
+            has_minithumbnail,
+            dialog_photo.is_personal,
+        ],
+    );
+    if has_file_ids {
+        env.store_file_id(dialog_photo.small_file_id, out);
+        env.store_file_id(dialog_photo.big_file_id, out);
+    }
+    if has_minithumbnail {
+        store_string(out, &dialog_photo.minithumbnail);
+    }
+}
+
+/// `parse(DialogPhoto &, ParserT &)` (DialogPhoto.hpp:33-57) — pre-27
+/// blobs keep `has_file_ids = true` and carry neither the animation flag
+/// nor the minithumbnail.
+pub fn parse_dialog_photo(
+    env: &mut impl DialogPhotoStoreEnv,
+    parser: &mut Parser<'_>,
+) -> Result<DialogPhoto, &'static str> {
+    let mut dialog_photo = DialogPhoto::default();
+    let mut has_file_ids = true;
+    let mut has_minithumbnail = false;
+    if parser.version() >= crate::store_parse::version::ADD_DIALOG_PHOTO_HAS_ANIMATION {
+        let [h_file_ids, has_animation, h_minithumbnail, is_personal] = parser.parse_flags()?;
+        has_file_ids = h_file_ids;
+        dialog_photo.has_animation = has_animation;
+        has_minithumbnail = h_minithumbnail;
+        dialog_photo.is_personal = is_personal;
+    }
+    if has_file_ids {
+        dialog_photo.small_file_id = env.parse_file_id(parser)?;
+        dialog_photo.big_file_id = env.parse_file_id(parser)?;
+    }
+    if has_minithumbnail {
+        dialog_photo.minithumbnail = parser.string()?;
+    }
+    Ok(dialog_photo)
 }
 
 #[cfg(test)]

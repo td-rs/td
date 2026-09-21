@@ -34,6 +34,8 @@ pub mod manager_option_states;
 pub mod message_db;
 pub mod message_entity;
 pub mod message_id;
+pub mod message_reaction;
+pub mod message_reactor;
 pub mod misc;
 pub mod net;
 pub mod notification;
