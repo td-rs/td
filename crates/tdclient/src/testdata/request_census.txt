@@ -35,7 +35,7 @@ addSavedNotificationSound	interim
 addStickerToSet	interim
 addStoryAlbumStories	interim
 addTextCompositionStyle	interim
-addWebBrowserSettingsException	interim
+addWebBrowserSettingsException	dispatched
 allowBotToSendMessages	interim
 allowUnpaidMessagesFromUser	interim
 answerCallbackQuery	interim
@@ -66,7 +66,7 @@ cancelPreliminaryUploadFile	interim
 cancelRecoveryEmailAddressVerification	interim
 changeImportedContacts	dispatched
 changeStickerSet	interim
-changeWebBrowserSettings	interim
+changeWebBrowserSettings	dispatched
 checkAuthenticationBotToken	dispatched
 checkAuthenticationCode	dispatched
 checkAuthenticationEmailCode	interim
@@ -414,7 +414,7 @@ getLanguagePackInfo	interim
 getLanguagePackString	interim
 getLanguagePackStrings	interim
 getLinkPreview	interim
-getLinkWebBrowserType	interim
+getLinkWebBrowserType	dispatched
 getLiveStoryAvailableMessageSenders	interim
 getLiveStoryRtmpUrl	interim
 getLiveStoryStreamer	interim
@@ -648,7 +648,7 @@ refundStarPayment	interim
 registerDevice	dispatched
 registerUser	interim
 removeAllFilesFromDownloads	interim
-removeAllWebBrowserSettingsExceptions	interim
+removeAllWebBrowserSettingsExceptions	dispatched
 removeBusinessConnectedBotFromChat	interim
 removeChatActionBar	interim
 removeContacts	dispatched
@@ -675,7 +675,7 @@ removeStickerFromSet	interim
 removeStoryAlbumStories	interim
 removeTextCompositionStyle	interim
 removeTopChat	interim
-removeWebBrowserSettingsException	interim
+removeWebBrowserSettingsException	dispatched
 reorderActiveUsernames	dispatched
 reorderBotActiveUsernames	interim
 reorderBotMediaPreviews	interim

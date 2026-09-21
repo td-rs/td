@@ -41,6 +41,7 @@ pub mod notification_settings;
 pub mod notification_settings_manager;
 pub mod option_manager;
 pub mod peer_color;
+pub mod people_nearby_manager;
 pub mod photo;
 pub mod query_combiner;
 pub mod query_merger;
@@ -54,6 +55,8 @@ pub mod time_zone_manager;
 pub mod updates_manager;
 pub mod user_manager;
 pub mod usernames;
+pub mod web_browser_manager;
+pub mod web_browser_settings;
 
 // Generated code keeps C++-identical case-preserved names (`aiComposeTone`)
 // in types, fields and the JSON dispatch helpers alike.

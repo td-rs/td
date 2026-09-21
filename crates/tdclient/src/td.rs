@@ -71,6 +71,7 @@ use crate::td_api::{self, Function, Object};
 use crate::time_zone_manager::TimeZoneManager;
 use crate::updates_manager::{PendingUpdate, UpdatesManager, UpdatesManagerEnv, UpdatesSink};
 use crate::user_manager::{UserEnv, UserId, UserManager};
+use crate::web_browser_manager::WebBrowserManager;
 
 #[cfg(target_endian = "big")]
 compile_error!("TDLib requires little-endian platform");
@@ -259,6 +260,13 @@ pub struct Td {
         crate::notification_settings_manager::NotificationSettingsManager,
     /// `Td::device_token_manager_` (`Td.cpp:1345`, M.13S).
     pub(crate) device_token_manager: crate::device_token_manager::DeviceTokenManager,
+    /// `Td::web_browser_manager_` (`make_unique` at `Td.cpp:1332`, the
+    /// `init_managers` block).
+    pub(crate) web_browser_manager: WebBrowserManager,
+    /// The web browser manager's `send_update` outbox — the collapsed
+    /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) web_browser_updates: Vec<td_api::Update>,
     /// The notification manager's `send_update` outbox — the collapsed
     /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
     /// [`Td::flush_user_updates`].
@@ -504,6 +512,8 @@ impl Td {
             notification_settings_manager:
                 crate::notification_settings_manager::NotificationSettingsManager::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
+            web_browser_manager: WebBrowserManager::new(),
+            web_browser_updates: Vec::new(),
             notification_updates: Vec::new(),
             premium_required_contact_merger: None,
             chat_manager: crate::chat_manager::ChatManager::new(),
@@ -847,6 +857,7 @@ impl Td {
             self.auth_manager.set_state_ok();
             self.apply_self_user(&user, false);
             self.init_notification_manager();
+            self.on_web_browser_authorization_success();
         } else {
             let binlog_pmc = self.global.binlog_pmc();
             let auth_str = binlog_pmc.get("auth");
@@ -868,6 +879,7 @@ impl Td {
                     self.auth_manager
                         .restore_from_pmc("ok", is_bot, String::new());
                     self.init_notification_manager();
+                    self.on_web_browser_authorization_success();
                 }
                 "logout" => {
                     tracing::warn!("Continue to log out");
@@ -1096,6 +1108,22 @@ impl Td {
             };
             self.updates_manager.get_difference(&mut env, "init");
         }
+
+        // `make_unique<PeopleNearbyManager>` (Td.cpp:1258, the
+        // init_managers block) — the actor collapses to its constructor
+        // side effect (see crate::people_nearby_manager).
+        {
+            let is_bot = self.auth_manager.is_bot();
+            crate::people_nearby_manager::init(&mut PeopleNearbyEnv {
+                is_bot,
+                global: &mut self.global,
+            });
+        }
+
+        // `make_unique<WebBrowserManager>` (Td.cpp:1332, the init_managers
+        // block) + its `start_up` (WebBrowserManager.cpp:142-144) — loads
+        // the saved settings only while authorized and non-bot.
+        self.init_web_browser_manager();
 
         tracing::info!("Finish initialization");
 
@@ -2010,6 +2038,10 @@ impl Td {
         for update in notification_updates {
             self.send_update(update.into());
         }
+        let web_browser_updates = std::mem::take(&mut self.web_browser_updates);
+        for update in web_browser_updates {
+            self.send_update(update.into());
+        }
     }
 
     /// `td_->notification_manager_->init()` +
@@ -2025,6 +2057,32 @@ impl Td {
         };
         self.notification_manager.init(&mut env);
         self.notification_settings_manager.init(&mut env);
+    }
+
+    /// `make_unique<WebBrowserManager>` + its `start_up`
+    /// (WebBrowserManager.cpp:142-144) — loads the saved settings only
+    /// while authorized and non-bot; idempotent.
+    fn init_web_browser_manager(&mut self) {
+        let mut env = WebBrowserEnv {
+            global: &mut self.global,
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            updates: &mut self.web_browser_updates,
+        };
+        self.web_browser_manager.load_web_browser_settings(&mut env);
+    }
+
+    /// `WebBrowserManager::on_authorization_success`
+    /// (WebBrowserManager.cpp:150-156, called from AuthManager.cpp:1556) —
+    /// the auth-success moment shared with `init_notification_manager`.
+    fn on_web_browser_authorization_success(&mut self) {
+        let mut env = WebBrowserEnv {
+            global: &mut self.global,
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            updates: &mut self.web_browser_updates,
+        };
+        self.web_browser_manager.on_authorization_success(&mut env);
     }
 
     /// `DeviceTokenManager::start_up` (DeviceTokenManager.cpp:329) — the
@@ -2482,8 +2540,9 @@ impl Td {
 
         // the live `on_get_authorization` init (AuthManager.cpp:1545); the
         // C++ fires it after every manager init above — the notification
-        // manager is the only one on this tree
+        // and web browser managers are the ones on this tree
         self.init_notification_manager();
+        self.on_web_browser_authorization_success();
     }
 
     /// Store + broadcast the self user: `UserManager::set_my_id` (the
@@ -3023,6 +3082,56 @@ pub(crate) struct NotificationEnv<'a> {
     pub(crate) auth_is_authorized: bool,
     pub(crate) auth_is_bot: bool,
     pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+/// The [`crate::people_nearby_manager::PeopleNearbyManagerEnv`] over the
+/// `Td` fields — the collapsed constructor surface (built per call, never
+/// held across calls).
+pub(crate) struct PeopleNearbyEnv<'a> {
+    pub(crate) is_bot: bool,
+    pub(crate) global: &'a mut Global,
+}
+
+impl crate::people_nearby_manager::PeopleNearbyManagerEnv for PeopleNearbyEnv<'_> {
+    fn is_bot(&self) -> bool {
+        self.is_bot
+    }
+
+    fn pmc_erase(&mut self, key: &str) {
+        self.global.binlog_pmc().erase(key);
+    }
+}
+
+/// The [`crate::web_browser_manager::WebBrowserManagerEnv`] over the `Td`
+/// fields — built per call with the field-split borrows (the
+/// `NotificationEnv` convention), never held across calls.
+pub(crate) struct WebBrowserEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::web_browser_manager::WebBrowserManagerEnv for WebBrowserEnv<'_> {
+    fn is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
 }
 
 impl<'a> NotificationEnv<'a> {

@@ -40,6 +40,7 @@ use crate::notification_settings::{
 use crate::notification_settings_manager::ScopeSettingsAnswer;
 use crate::td::NotificationEnv;
 use crate::td::Td;
+use crate::td::WebBrowserEnv;
 use crate::td_api::{self, Function, Object};
 use crate::user_manager::{FileId, PendingUserRequest, SecretChatId, UserEnv, UserId};
 use tdutils::promise::Promise;
@@ -226,6 +227,18 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 };
                 td.notification_manager
                     .get_current_state(&env, &mut updates);
+            }
+
+            // WebBrowserManager::get_current_state (Requests.cpp:2259; the
+            // manager's own is_authorized/is_bot gate applies)
+            {
+                let env = WebBrowserEnv {
+                    global: &mut td.global,
+                    auth_is_authorized: td.auth_manager.is_authorized(),
+                    auth_is_bot: td.auth_manager.is_bot(),
+                    updates: &mut td.web_browser_updates,
+                };
+                td.web_browser_manager.get_current_state(&env, &mut updates);
             }
 
             // ConnectionStateManager and the remaining authorized-manager
@@ -1623,6 +1636,104 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             finish_unit_request(id, td, recorded);
         }
 
+        // --- web browser settings (Requests.cpp:3154-3180, 3603-3608) ---
+        Function::getLinkWebBrowserType(request) => {
+            // `Requests.cpp:3603-3608` — the classification is local, no
+            // net query; CHECK_IS_USER + CLEAN_INPUT_STRING.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(url) = crate::misc::clean_input_string(&request.link) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            match td.web_browser_manager.get_web_browser_type(&url) {
+                Ok(td_api::WebBrowserType::webBrowserTypeExternal(object)) => {
+                    td.send_result(id, Object::webBrowserTypeExternal(object))
+                }
+                Ok(td_api::WebBrowserType::webBrowserTypeInApp(object)) => {
+                    td.send_result(id, Object::webBrowserTypeInApp(object))
+                }
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::changeWebBrowserSettings(request) => {
+            // `Requests.cpp:3154-3160` — CHECK_IS_USER + the
+            // UpdateWebBrowserSettingsQuery ([blocked: net]); the promise
+            // parks until the query answer arrives.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = WebBrowserEnv {
+                global: &mut td.global,
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.web_browser_updates,
+            };
+            td.web_browser_manager.update_web_browser_settings(
+                &mut env,
+                request.open_external_browser,
+                request.display_close_button,
+                promise,
+            );
+        }
+        Function::addWebBrowserSettingsException(request) => {
+            // `Requests.cpp:3161-3168` — CLEAN_INPUT_STRING + the
+            // ToggleWebBrowserSettingsExceptionQuery ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(url) = crate::misc::clean_input_string(&request.url) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = WebBrowserEnv {
+                global: &mut td.global,
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.web_browser_updates,
+            };
+            td.web_browser_manager.add_web_browser_settings_exception(
+                &mut env,
+                request.open_external_browser,
+                &url,
+                promise,
+            );
+        }
+        Function::removeWebBrowserSettingsException(request) => {
+            // `Requests.cpp:3169-3174`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(url) = crate::misc::clean_input_string(&request.url) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = WebBrowserEnv {
+                global: &mut td.global,
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.web_browser_updates,
+            };
+            td.web_browser_manager
+                .remove_web_browser_settings_exception(&mut env, &url, promise);
+        }
+        Function::removeAllWebBrowserSettingsExceptions(_) => {
+            // `Requests.cpp:3176-3180`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = WebBrowserEnv {
+                global: &mut td.global,
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.web_browser_updates,
+            };
+            td.web_browser_manager
+                .remove_all_web_browser_settings_exceptions(&mut env, promise);
+        }
+
         // Everything else waits for its manager step.
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
@@ -1911,13 +2022,15 @@ mod request_census_tests {
         // merge: the m11 pins + M.13/M.13S's seven real dispatches
         // (removeNotification, removeNotificationGroup, registerDevice and
         // the four notification-settings arms; processPushNotification
-        // stays the 500 placeholder). Fix per flip.
+        // stays the 500 placeholder) + M.31's five web-browser arms
+        // (getLinkWebBrowserType, changeWebBrowserSettings,
+        // add/remove/removeAllWebBrowserSettingsExceptions). Fix per flip.
         assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            92,
+            97,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 912, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 907, "interim count");
     }
 }

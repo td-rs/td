@@ -693,6 +693,16 @@ pub trait UpdatesSink {
     fn on_update_user_status(&mut self, user_id: i64, status: telegram_api::UserStatus) {
         let _ = (user_id, status);
     }
+    /// `WebBrowserManager::on_update_web_browser_settings` (M.31) — the
+    /// td-level sink routes to the web browser manager; the ZST stand-in
+    /// no-ops until the sink-state refactor.
+    fn on_update_web_browser_settings(&mut self, update: telegram_api::updateWebBrowserSettings) {
+        let _ = update;
+    }
+    /// `WebBrowserManager::on_update_web_browser_exception` (M.31).
+    fn on_update_web_browser_exception(&mut self, update: telegram_api::updateWebBrowserException) {
+        let _ = update;
+    }
     /// `UserManager::on_update_user_name` (cpp:4369).
     fn on_update_user_name(&mut self, user_id: i64, first_name: String, last_name: String) {
         let _ = (user_id, first_name, last_name);
@@ -5460,23 +5470,17 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                     promise,
                 );
             }
-            PendingUpdate::Wire(telegram_api::Update::updateWebBrowserSettings(_)) => {
-                // web_browser_manager — Wave 2.
-                self.drop_unsupported(
-                    telegram_api::updateWebBrowserSettings::ID,
-                    "updateWebBrowserSettings",
-                    5134,
-                    promise,
-                );
+            PendingUpdate::Wire(telegram_api::Update::updateWebBrowserSettings(update)) => {
+                // WebBrowserManager::on_update_web_browser_settings — M.31;
+                // the td-level sink routes to the manager (the ZST
+                // stand-in no-ops until the sink-state refactor).
+                self.sink.on_update_web_browser_settings(update);
+                promise.set_value(());
             }
-            PendingUpdate::Wire(telegram_api::Update::updateWebBrowserException(_)) => {
-                // web_browser_manager — Wave 2.
-                self.drop_unsupported(
-                    telegram_api::updateWebBrowserException::ID,
-                    "updateWebBrowserException",
-                    5139,
-                    promise,
-                );
+            PendingUpdate::Wire(telegram_api::Update::updateWebBrowserException(update)) => {
+                // WebBrowserManager::on_update_web_browser_exception — M.31.
+                self.sink.on_update_web_browser_exception(update);
+                promise.set_value(());
             }
 
             // ---- the C++ log-only overloads --------------------------
