@@ -2703,6 +2703,115 @@ impl CliClient {
         })
     }
 
+    /// `CliClient::as_chat_folder` (cli.cpp:2549) — the six-word filter
+    /// spell (title, icon, pinned, included, excluded), 8 random exclusion
+    /// flags.
+    fn as_chat_folder(&self, filter: &str, is_shareable: bool) -> td_api::ChatFolder {
+        let (title, icon_name, pinned_chat_ids, included_chat_ids, excluded_chat_ids) = {
+            let (w0, rest0) = tokenizer::split(filter, ' ');
+            let (w1, rest1) = tokenizer::split(&rest0, ' ');
+            let (w2, rest2) = tokenizer::split(&rest1, ' ');
+            let (w3, rest3) = tokenizer::split(&rest2, ' ');
+            let (w4, _) = tokenizer::split(&rest3, ' ');
+            (w0, w1, w2, w3, w4)
+        };
+        td_api::ChatFolder {
+            name: Some(td_api::ChatFolderName {
+                text: Some(td_api::FormattedText {
+                    text: title,
+                    entities: Vec::new(),
+                }),
+                animate_custom_emoji: true,
+            }),
+            icon: Some(td_api::ChatFolderIcon { name: icon_name }),
+            color_id: -1,
+            is_shareable,
+            pinned_chat_ids: self.as_chat_ids(&pinned_chat_ids),
+            included_chat_ids: self.as_chat_ids(&included_chat_ids),
+            excluded_chat_ids: self.as_chat_ids(&excluded_chat_ids),
+            exclude_muted: random::fast_bool(),
+            exclude_read: random::fast_bool(),
+            exclude_archived: random::fast_bool(),
+            include_contacts: random::fast_bool(),
+            include_non_contacts: random::fast_bool(),
+            include_bots: random::fast_bool(),
+            include_groups: random::fast_bool(),
+            include_channels: random::fast_bool(),
+        }
+    }
+
+    /// The parsed `InputChatPhoto` get_args (cli.cpp:1486) — the integer is
+    /// the previous photo, `p` the static path, `a` an animation (with the
+    /// main-frame timestamp), `s` a sticker.
+    fn parse_input_chat_photo(&self, args: &str) -> Option<td_api::InputChatPhoto> {
+        let args = trim_td(args);
+        if args.is_empty() {
+            return None;
+        }
+        if args.parse::<i64>().is_ok() {
+            return Some(td_api::InputChatPhoto::inputChatPhotoPrevious(
+                td_api::inputChatPhotoPrevious {
+                    chat_photo_id: tokenizer::to_integer_i64(args),
+                },
+            ));
+        }
+        if args.starts_with('p') {
+            return Some(td_api::InputChatPhoto::inputChatPhotoStatic(
+                td_api::inputChatPhotoStatic {
+                    photo: as_input_file(args.strip_prefix('p').unwrap_or("")),
+                },
+            ));
+        }
+        if args.starts_with('a') {
+            let (photo, main_frame_timestamp) =
+                tokenizer::split(args.strip_prefix('a').unwrap_or(""), get_delimiter(args));
+            return Some(td_api::InputChatPhoto::inputChatPhotoAnimation(
+                td_api::inputChatPhotoAnimation {
+                    animation: as_input_file(&photo),
+                    main_frame_timestamp: main_frame_timestamp.trim().parse().unwrap_or(0.0),
+                },
+            ));
+        }
+        if args.starts_with('s') {
+            // ChatPhotoSticker get_args (cli.cpp:1446).
+            let (sticker_set_id, sticker_id) =
+                tokenizer::split(args.strip_prefix('s').unwrap_or(""), get_delimiter(args));
+            let sticker = if sticker_id.is_empty() {
+                // A custom-emoji sticker: the single id, 4-color fill.
+                td_api::ChatPhotoSticker {
+                    r#type: Some(
+                        td_api::ChatPhotoStickerType::chatPhotoStickerTypeCustomEmoji(
+                            td_api::chatPhotoStickerTypeCustomEmoji {
+                                custom_emoji_id: tokenizer::to_integer_i64(&sticker_set_id),
+                            },
+                        ),
+                    ),
+                    background_fill: background_fill_freeform(vec![
+                        0x000000, 0xFF0000, 0x00FF00, 0x0000FF,
+                    ]),
+                }
+            } else {
+                td_api::ChatPhotoSticker {
+                    r#type: Some(
+                        td_api::ChatPhotoStickerType::chatPhotoStickerTypeRegularOrMask(
+                            td_api::chatPhotoStickerTypeRegularOrMask {
+                                sticker_set_id: tokenizer::to_integer_i64(&sticker_set_id),
+                                sticker_id: tokenizer::to_integer_i64(&sticker_id),
+                            },
+                        ),
+                    ),
+                    background_fill: background_fill_solid(0x7FFFFFFF),
+                }
+            };
+            return Some(td_api::InputChatPhoto::inputChatPhotoSticker(
+                td_api::inputChatPhotoSticker {
+                    sticker: Some(sticker),
+                },
+            ));
+        }
+        None
+    }
+
     /// `CliClient::as_chat_ids` (cli.cpp:577).
     fn as_chat_ids(&self, s: &str) -> Vec<i64> {
         autosplit(s).iter().map(|t| self.as_chat_id(t)).collect()
@@ -5493,8 +5602,420 @@ impl CliClient {
         false
     }
 
-    fn op_block_stickers(&self, _op: &str, _args: &str) -> bool {
-        false
+    /// cli.cpp:7327 — the chat-folder/paid-messages/chat-settings chain
+    /// (the census chain 14 remainder).
+    fn op_block_stickers(&self, op: &str, args: &str) -> bool {
+        if op == "gcltac" {
+            self.send_request(Function::getChatListsToAddChat(
+                td_api::getChatListsToAddChat {
+                    chat_id: self.as_chat_id(args),
+                },
+            ));
+            true
+        } else if op == "actl" || op == "actla" || op.starts_with("actl-") {
+            self.send_request(Function::addChatToList(td_api::addChatToList {
+                chat_id: self.as_chat_id(args),
+                chat_list: as_chat_list(op),
+            }));
+            true
+        } else if op == "gcf" {
+            self.send_request(Function::getChatFolder(td_api::getChatFolder {
+                chat_folder_id: as_chat_folder_id(args),
+            }));
+            true
+        } else if op == "ccf" {
+            self.send_request(Function::createChatFolder(td_api::createChatFolder {
+                folder: Some(self.as_chat_folder(args, false)),
+            }));
+            true
+        } else if op == "ccfe" {
+            let folder = td_api::ChatFolder {
+                name: Some(td_api::ChatFolderName {
+                    text: Some(td_api::FormattedText {
+                        text: "empty".to_owned(),
+                        entities: Vec::new(),
+                    }),
+                    animate_custom_emoji: true,
+                }),
+                included_chat_ids: self.as_chat_ids(args),
+                ..Default::default()
+            };
+            self.send_request(Function::createChatFolder(td_api::createChatFolder {
+                folder: Some(folder),
+            }));
+            true
+        } else if op == "ecf" || op == "ecfs" {
+            let (chat_folder_id, filter) = tokenizer::split(args, ' ');
+            self.send_request(Function::editChatFolder(td_api::editChatFolder {
+                chat_folder_id: as_chat_folder_id(&chat_folder_id),
+                folder: Some(self.as_chat_folder(&filter, op == "ecfs")),
+            }));
+            true
+        } else if op == "dcf" {
+            let (chat_folder_id, chat_ids) = tokenizer::split(args, ' ');
+            self.send_request(Function::deleteChatFolder(td_api::deleteChatFolder {
+                chat_folder_id: as_chat_folder_id(&chat_folder_id),
+                leave_chat_ids: self.as_chat_ids(&chat_ids),
+            }));
+            true
+        } else if op == "gcfctl" {
+            self.send_request(Function::getChatFolderChatsToLeave(
+                td_api::getChatFolderChatsToLeave {
+                    chat_folder_id: as_chat_folder_id(args),
+                },
+            ));
+            true
+        } else if op == "gcfcc" {
+            self.send_request(Function::getChatFolderChatCount(
+                td_api::getChatFolderChatCount {
+                    folder: Some(self.as_chat_folder(args, false)),
+                },
+            ));
+            true
+        } else if op == "rcf" {
+            let (main_chat_list_position, chat_folder_ids) = tokenizer::split(args, ' ');
+            self.send_request(Function::reorderChatFolders(td_api::reorderChatFolders {
+                chat_folder_ids: autosplit(&chat_folder_ids)
+                    .iter()
+                    .map(|t| tokenizer::to_integer_i32(trim_td(t)))
+                    .collect(),
+                main_chat_list_position: tokenizer::to_integer_i32(&main_chat_list_position),
+            }));
+            true
+        } else if op == "tcft" {
+            self.send_request(Function::toggleChatFolderTags(
+                td_api::toggleChatFolderTags {
+                    are_tags_enabled: as_bool(args),
+                },
+            ));
+            true
+        } else if op == "gcfcfil" {
+            self.send_request(Function::getChatsForChatFolderInviteLink(
+                td_api::getChatsForChatFolderInviteLink {
+                    chat_folder_id: as_chat_folder_id(args),
+                },
+            ));
+            true
+        } else if op == "crcfil" {
+            let (chat_folder_id, name, chat_ids) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::createChatFolderInviteLink(
+                td_api::createChatFolderInviteLink {
+                    chat_folder_id: as_chat_folder_id(&chat_folder_id),
+                    name,
+                    chat_ids: self.as_chat_ids(&chat_ids),
+                },
+            ));
+            true
+        } else if op == "gcfil" {
+            self.send_request(Function::getChatFolderInviteLinks(
+                td_api::getChatFolderInviteLinks {
+                    chat_folder_id: as_chat_folder_id(args),
+                },
+            ));
+            true
+        } else if op == "ecfil" {
+            let (chat_folder_id, invite_link, name, chat_ids) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, rest1) = tokenizer::split(&rest0, ' ');
+                let (w2, w3) = tokenizer::split(&rest1, ' ');
+                (w0, w1, w2, w3)
+            };
+            self.send_request(Function::editChatFolderInviteLink(
+                td_api::editChatFolderInviteLink {
+                    chat_folder_id: as_chat_folder_id(&chat_folder_id),
+                    invite_link,
+                    name,
+                    chat_ids: self.as_chat_ids(&chat_ids),
+                },
+            ));
+            true
+        } else if op == "dcfil" {
+            let (chat_folder_id, invite_link) = tokenizer::split(args, ' ');
+            self.send_request(Function::deleteChatFolderInviteLink(
+                td_api::deleteChatFolderInviteLink {
+                    chat_folder_id: as_chat_folder_id(&chat_folder_id),
+                    invite_link,
+                },
+            ));
+            true
+        } else if op == "ccfil" {
+            self.send_request(Function::checkChatFolderInviteLink(
+                td_api::checkChatFolderInviteLink {
+                    invite_link: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "acfbil" {
+            let (invite_link, chat_ids) = tokenizer::split(args, ' ');
+            self.send_request(Function::addChatFolderByInviteLink(
+                td_api::addChatFolderByInviteLink {
+                    invite_link,
+                    chat_ids: self.as_chat_ids(&chat_ids),
+                },
+            ));
+            true
+        } else if op == "gcfnc" {
+            self.send_request(Function::getChatFolderNewChats(
+                td_api::getChatFolderNewChats {
+                    chat_folder_id: as_chat_folder_id(args),
+                },
+            ));
+            true
+        } else if op == "pcfnc" {
+            let (chat_folder_id, chat_ids) = tokenizer::split(args, ' ');
+            self.send_request(Function::processChatFolderNewChats(
+                td_api::processChatFolderNewChats {
+                    chat_folder_id: as_chat_folder_id(&chat_folder_id),
+                    added_chat_ids: self.as_chat_ids(&chat_ids),
+                },
+            ));
+            true
+        } else if op == "grcf" {
+            self.send_request(Function::getRecommendedChatFolders(
+                td_api::getRecommendedChatFolders,
+            ));
+            true
+        } else if op == "gcfdin" {
+            self.execute(Function::getChatFolderDefaultIconName(
+                td_api::getChatFolderDefaultIconName {
+                    folder: Some(self.as_chat_folder(args, false)),
+                },
+            ));
+            true
+        } else if op == "gacls" {
+            self.send_request(Function::getArchiveChatListSettings(
+                td_api::getArchiveChatListSettings,
+            ));
+            true
+        } else if op == "sacls" {
+            let (a, b, c) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::setArchiveChatListSettings(
+                td_api::setArchiveChatListSettings {
+                    settings: Some(td_api::ArchiveChatListSettings {
+                        archive_and_mute_new_chats_from_unknown_users: as_bool(&a),
+                        keep_unmuted_chats_archived: as_bool(&b),
+                        keep_chats_from_folders_archived: as_bool(&c),
+                    }),
+                },
+            ));
+            true
+        } else if op == "grdps" {
+            self.send_request(Function::getReadDatePrivacySettings(
+                td_api::getReadDatePrivacySettings,
+            ));
+            true
+        } else if op == "srdps" {
+            self.send_request(Function::setReadDatePrivacySettings(
+                td_api::setReadDatePrivacySettings {
+                    settings: Some(td_api::ReadDatePrivacySettings {
+                        show_read_date: as_bool(args),
+                    }),
+                },
+            ));
+            true
+        } else if op == "gncps" {
+            self.send_request(Function::getNewChatPrivacySettings(
+                td_api::getNewChatPrivacySettings,
+            ));
+            true
+        } else if op == "sncps" {
+            let (allow, paid) = tokenizer::split(args, ' ');
+            self.send_request(Function::setNewChatPrivacySettings(
+                td_api::setNewChatPrivacySettings {
+                    settings: Some(td_api::NewChatPrivacySettings {
+                        allow_new_chats_from_unknown_users: as_bool(&allow),
+                        incoming_paid_message_star_count: tokenizer::to_integer_i64(&paid),
+                    }),
+                },
+            ));
+            true
+        } else if op == "gpmr" {
+            self.send_request(Function::getPaidMessageRevenue(
+                td_api::getPaidMessageRevenue {
+                    user_id: self.as_user_id(args),
+                },
+            ));
+            true
+        } else if op == "aumfu" {
+            let (user_id, refund_payments) = tokenizer::split(args, ' ');
+            self.send_request(Function::allowUnpaidMessagesFromUser(
+                td_api::allowUnpaidMessagesFromUser {
+                    user_id: self.as_user_id(&user_id),
+                    refund_payments: as_bool(&refund_payments),
+                },
+            ));
+            true
+        } else if op == "scpmsc" {
+            let (chat_id, paid_message_star_count) = tokenizer::split(args, ' ');
+            self.send_request(Function::setChatPaidMessageStarCount(
+                td_api::setChatPaidMessageStarCount {
+                    chat_id: self.as_chat_id(&chat_id),
+                    paid_message_star_count: tokenizer::to_integer_i64(&paid_message_star_count),
+                },
+            ));
+            true
+        } else if op == "csmtu" || op == "csmtul" {
+            self.send_request(Function::canSendMessageToUser(
+                td_api::canSendMessageToUser {
+                    user_id: self.as_user_id(args),
+                    only_local: op == "csmtul",
+                },
+            ));
+            true
+        } else if op == "sct" {
+            let (chat_id, title) = tokenizer::split(args, ' ');
+            self.send_request(Function::setChatTitle(td_api::setChatTitle {
+                chat_id: self.as_chat_id(&chat_id),
+                title,
+            }));
+            true
+        } else if op == "scp" {
+            let (chat_id, tail) = tokenizer::split(args, ' ');
+            self.send_request(Function::setChatPhoto(td_api::setChatPhoto {
+                chat_id: self.as_chat_id(&chat_id),
+                photo: self.parse_input_chat_photo(&tail),
+            }));
+            true
+        } else if op == "scac" {
+            let (chat_id, accent_color_id, background_custom_emoji_id) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::setChatAccentColor(td_api::setChatAccentColor {
+                chat_id: self.as_chat_id(&chat_id),
+                accent_color_id: tokenizer::to_integer_i32(&accent_color_id),
+                background_custom_emoji_id: self.as_custom_emoji_id(&background_custom_emoji_id),
+            }));
+            true
+        } else if op == "scpac" {
+            let (chat_id, profile_accent_color_id, profile_background_custom_emoji_id) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::setChatProfileAccentColor(
+                td_api::setChatProfileAccentColor {
+                    chat_id: self.as_chat_id(&chat_id),
+                    profile_accent_color_id: tokenizer::to_integer_i32(&profile_accent_color_id),
+                    profile_background_custom_emoji_id: self
+                        .as_custom_emoji_id(&profile_background_custom_emoji_id),
+                },
+            ));
+            true
+        } else if op == "scmadt" {
+            let (chat_id, auto_delete_time) = tokenizer::split(args, ' ');
+            self.send_request(Function::setChatMessageAutoDeleteTime(
+                td_api::setChatMessageAutoDeleteTime {
+                    chat_id: self.as_chat_id(&chat_id),
+                    message_auto_delete_time: tokenizer::to_integer_i32(&auto_delete_time),
+                },
+            ));
+            true
+        } else if op == "sces" {
+            let (chat_id, custom_emoji_id, expiration_date) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::setChatEmojiStatus(td_api::setChatEmojiStatus {
+                chat_id: self.as_chat_id(&chat_id),
+                emoji_status: Some(td_api::EmojiStatus {
+                    r#type: Some(td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
+                        td_api::emojiStatusTypeCustomEmoji {
+                            custom_emoji_id: self.as_custom_emoji_id(&custom_emoji_id),
+                        },
+                    )),
+                    expiration_date: tokenizer::to_integer_i32(&expiration_date),
+                }),
+            }));
+            true
+        } else if op == "scese" {
+            self.send_request(Function::setChatEmojiStatus(td_api::setChatEmojiStatus {
+                chat_id: self.as_chat_id(args),
+                emoji_status: None,
+            }));
+            true
+        } else if op == "scperm" {
+            let (chat_id, permissions) = tokenizer::split(args, ' ');
+            const EXPECTED_SIZE: usize = 16;
+            if permissions.len() == EXPECTED_SIZE {
+                let bytes = permissions.as_bytes();
+                let perms: [bool; 16] = std::array::from_fn(|i| bytes[i] == b'1');
+                self.send_request(Function::setChatPermissions(td_api::setChatPermissions {
+                    chat_id: self.as_chat_id(&chat_id),
+                    permissions: Some(chat_permissions(perms)),
+                }));
+            } else {
+                tdutils::log_error!("Wrong permissions size, expected {}", EXPECTED_SIZE);
+            }
+            true
+        } else if op == "ggct" {
+            let (limit, offset) = tokenizer::split(args, ' ');
+            self.send_request(Function::getGiftChatThemes(td_api::getGiftChatThemes {
+                offset,
+                limit: as_limit(&limit, 10),
+            }));
+            true
+        } else if op == "scth" {
+            let (chat_id, name) = tokenizer::split(args, ' ');
+            let theme = if name
+                .as_bytes()
+                .first()
+                .is_some_and(|b| b.is_ascii_alphabetic())
+            {
+                Some(td_api::InputChatTheme::inputChatThemeGift(
+                    td_api::inputChatThemeGift { name: name.clone() },
+                ))
+            } else if !name.is_empty() {
+                Some(td_api::InputChatTheme::inputChatThemeEmoji(
+                    td_api::inputChatThemeEmoji { name: name.clone() },
+                ))
+            } else {
+                None
+            };
+            self.send_request(Function::setChatTheme(td_api::setChatTheme {
+                chat_id: self.as_chat_id(&chat_id),
+                theme,
+            }));
+            true
+        } else if op == "sccd" {
+            let (chat_id, client_data) = tokenizer::split(args, ' ');
+            self.send_request(Function::setChatClientData(td_api::setChatClientData {
+                chat_id: self.as_chat_id(&chat_id),
+                client_data,
+            }));
+            true
+        } else if op == "acm" {
+            let (chat_id, user_id, forward_limit) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::addChatMember(td_api::addChatMember {
+                chat_id: self.as_chat_id(&chat_id),
+                user_id: self.as_user_id(&user_id),
+                forward_limit: tokenizer::to_integer_i32(&forward_limit),
+            }));
+            true
+        } else if op == "acms" {
+            let (chat_id, user_ids) = tokenizer::split(args, ' ');
+            self.send_request(Function::addChatMembers(td_api::addChatMembers {
+                chat_id: self.as_chat_id(&chat_id),
+                user_ids: self.as_user_ids(&user_ids),
+            }));
+            true
+        } else {
+            false
+        }
     }
 
     fn op_block_web_pages(&self, _op: &str, _args: &str) -> bool {
@@ -7595,6 +8116,54 @@ mod tests {
             ("tdmctcsum", 2),
             ("tsmtip", 2),
             ("uadmctm", 2),
+            ("acfbil", 14),
+            ("acm", 14),
+            ("acms", 14),
+            ("actl", 14),
+            ("actla", 14),
+            ("aumfu", 14),
+            ("ccf", 14),
+            ("ccfe", 14),
+            ("ccfil", 14),
+            ("crcfil", 14),
+            ("csmtu", 14),
+            ("csmtul", 14),
+            ("dcf", 14),
+            ("dcfil", 14),
+            ("ecf", 14),
+            ("ecfil", 14),
+            ("ecfs", 14),
+            ("gacls", 14),
+            ("gcf", 14),
+            ("gcfcc", 14),
+            ("gcfcfil", 14),
+            ("gcfctl", 14),
+            ("gcfdin", 14),
+            ("gcfil", 14),
+            ("gcfnc", 14),
+            ("gcltac", 14),
+            ("ggct", 14),
+            ("gncps", 14),
+            ("gpmr", 14),
+            ("grcf", 14),
+            ("grdps", 14),
+            ("pcfnc", 14),
+            ("rcf", 14),
+            ("sacls", 14),
+            ("scac", 14),
+            ("sccd", 14),
+            ("sces", 14),
+            ("scese", 14),
+            ("scmadt", 14),
+            ("scp", 14),
+            ("scpac", 14),
+            ("scperm", 14),
+            ("scpmsc", 14),
+            ("sct", 14),
+            ("scth", 14),
+            ("sncps", 14),
+            ("srdps", 14),
+            ("tcft", 14),
             ("san", 12),
             ("sau", 12),
             ("schl", 12),
