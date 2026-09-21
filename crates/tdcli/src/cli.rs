@@ -139,6 +139,19 @@ pub struct CliClient {
     /// `int64 opened_chat_id_` — the `.` target of the id coercers (writers
     /// land with the M.14.4 open-chat commands).
     opened_chat_id: AtomicI64,
+    /// `string business_connection_id_` (empty = the plain request path).
+    business_connection_id: Mutex<String>,
+    /// `vector<int32> added_sticker_file_ids_`.
+    added_sticker_file_ids: Mutex<Vec<i32>>,
+    /// `int32 start_timestamp_`.
+    #[allow(dead_code)] // readers land with the M.14.5 video arms
+    start_timestamp: AtomicI32,
+    /// `string thumbnail_` (the `t` option of the media commands).
+    #[allow(dead_code)] // readers land with the M.14.5 media arms
+    thumbnail: Mutex<String>,
+    /// `string cover_`.
+    #[allow(dead_code)] // readers land with the M.14.5 media arms
+    cover: Mutex<String>,
 }
 
 /// `CliClient *CliClient::instance_` — the process-wide instance
@@ -189,6 +202,11 @@ pub fn instance() -> &'static CliClient {
         forum_topic_id: AtomicI32::new(0),
         message_thread_id: AtomicI64::new(0),
         opened_chat_id: AtomicI64::new(0),
+        business_connection_id: Mutex::new(String::new()),
+        added_sticker_file_ids: Mutex::new(Vec::new()),
+        start_timestamp: AtomicI32::new(0),
+        thumbnail: Mutex::new(String::new()),
+        cover: Mutex::new(String::new()),
     })
 }
 
@@ -744,6 +762,87 @@ fn as_input_file_id(s: &str) -> Option<td_api::InputFile> {
     Some(td_api::InputFile::inputFileId(td_api::inputFileId {
         id: tokenizer::to_integer_i32(trim_td(s)),
     }))
+}
+
+/// `as_location` (cli.cpp:930).
+fn as_location(latitude: &str, longitude: &str, accuracy: &str) -> Option<td_api::Location> {
+    if trim_td(latitude).is_empty() && trim_td(longitude).is_empty() {
+        return None;
+    }
+    Some(td_api::Location {
+        latitude: latitude.trim().parse().unwrap_or(0.0),
+        longitude: longitude.trim().parse().unwrap_or(0.0),
+        horizontal_accuracy: accuracy.trim().parse().unwrap_or(0.0),
+    })
+}
+
+/// `as_chat_administrator_rights` (cli.cpp:2563) — the 18-flag rights pack;
+/// callers land with the chain-13 member-status arms.
+#[allow(dead_code, clippy::too_many_arguments)]
+fn as_chat_administrator_rights(
+    can_manage_chat: bool,
+    can_change_info: bool,
+    can_post_messages: bool,
+    can_edit_messages: bool,
+    can_delete_messages: bool,
+    can_invite_users: bool,
+    can_restrict_members: bool,
+    can_pin_messages: bool,
+    can_manage_topics: bool,
+    can_promote_members: bool,
+    can_manage_video_chats: bool,
+    can_post_stories: bool,
+    can_edit_stories: bool,
+    can_delete_stories: bool,
+    can_manage_direct_messages: bool,
+    can_manage_tags: bool,
+    can_send_welcome_messages: bool,
+    is_anonymous: bool,
+) -> td_api::ChatAdministratorRights {
+    td_api::ChatAdministratorRights {
+        can_manage_chat,
+        can_change_info,
+        can_post_messages,
+        can_edit_messages,
+        can_delete_messages,
+        can_invite_users,
+        can_restrict_members,
+        can_pin_messages,
+        can_manage_topics,
+        can_promote_members,
+        can_manage_video_chats,
+        can_post_stories,
+        can_edit_stories,
+        can_delete_stories,
+        can_manage_direct_messages,
+        can_manage_tags,
+        can_send_welcome_messages,
+        is_anonymous,
+    }
+}
+
+/// `chatPermissions` from the C++ 16 positional bools; callers land with
+/// the chain-13 member-status arms.
+#[allow(dead_code, clippy::fn_params_excessive_bools)]
+fn chat_permissions(b: [bool; 16]) -> td_api::ChatPermissions {
+    td_api::ChatPermissions {
+        can_send_basic_messages: b[0],
+        can_send_audios: b[1],
+        can_send_documents: b[2],
+        can_send_photos: b[3],
+        can_send_videos: b[4],
+        can_send_video_notes: b[5],
+        can_send_voice_notes: b[6],
+        can_send_polls: b[7],
+        can_send_other_messages: b[8],
+        can_add_link_previews: b[9],
+        can_react_to_messages: b[10],
+        can_edit_tag: b[11],
+        can_change_info: b[12],
+        can_invite_users: b[13],
+        can_pin_messages: b[14],
+        can_create_topics: b[15],
+    }
 }
 
 /// `as_sticker_format` (cli.cpp:648) — the trailing `a`/`v` picks
@@ -2104,6 +2203,72 @@ impl CliClient {
             return 0;
         }
         tokenizer::to_integer_i64(s)
+    }
+
+    /// `get_input_thumbnail` (cli.cpp:820).
+    fn get_input_thumbnail(&self) -> Option<td_api::InputThumbnail> {
+        let thumbnail = self.thumbnail.lock().unwrap();
+        if thumbnail.is_empty() {
+            return None;
+        }
+        Some(td_api::InputThumbnail {
+            thumbnail: as_input_file(&thumbnail),
+            width: 0,
+            height: 0,
+        })
+    }
+
+    /// `get_input_cover` (cli.cpp:813).
+    fn get_input_cover(&self) -> Option<td_api::InputFile> {
+        let cover = self.cover.lock().unwrap();
+        if cover.is_empty() {
+            return None;
+        }
+        as_input_file(&cover)
+    }
+
+    /// `get_added_sticker_file_ids` (cli.cpp:827).
+    fn get_added_sticker_file_ids(&self) -> Vec<i32> {
+        self.added_sticker_file_ids.lock().unwrap().clone()
+    }
+
+    /// `as_input_photo` (cli.cpp:2267).
+    fn as_input_photo(&self, photo: &str) -> td_api::InputPhoto {
+        td_api::InputPhoto {
+            photo: as_input_file(photo),
+            thumbnail: self.get_input_thumbnail(),
+            video: None,
+            added_sticker_file_ids: self.get_added_sticker_file_ids(),
+            width: 0,
+            height: 0,
+        }
+    }
+
+    /// `as_input_video` (cli.cpp:2276).
+    fn as_input_video(&self, video: &str) -> td_api::InputVideo {
+        td_api::InputVideo {
+            video: as_input_file(video),
+            thumbnail: self.get_input_thumbnail(),
+            cover: self.get_input_cover(),
+            start_timestamp: self.start_timestamp.load(Ordering::SeqCst),
+            added_sticker_file_ids: self.get_added_sticker_file_ids(),
+            duration: 1,
+            width: 2,
+            height: 3,
+            supports_streaming: true,
+        }
+    }
+
+    /// `as_input_animation` (cli.cpp:2249).
+    fn as_input_animation(&self, animation: &str) -> td_api::InputAnimation {
+        td_api::InputAnimation {
+            animation: as_input_file(animation),
+            thumbnail: self.get_input_thumbnail(),
+            added_sticker_file_ids: self.get_added_sticker_file_ids(),
+            duration: 0,
+            width: 0,
+            height: 0,
+        }
     }
 
     /// `CliClient::as_chat_ids` (cli.cpp:577).
@@ -4916,8 +5081,204 @@ impl CliClient {
         false
     }
 
-    fn op_block_drafts(&self, _op: &str, _args: &str) -> bool {
-        false
+    /// cli.cpp:7554 — the polls/checklists/ban chain (M.14.4c).
+    fn op_block_drafts(&self, op: &str, args: &str) -> bool {
+        if op == "bcm" {
+            let (chat_id, member_id, banned_until_date, revoke_messages) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, rest1) = tokenizer::split(&rest0, ' ');
+                let (w2, w3) = tokenizer::split(&rest1, ' ');
+                (w0, w1, w2, w3)
+            };
+            self.send_request(Function::banChatMember(td_api::banChatMember {
+                chat_id: self.as_chat_id(&chat_id),
+                member_id: self.as_message_sender(&member_id),
+                banned_until_date: tokenizer::to_integer_i32(&banned_until_date),
+                revoke_messages: as_bool(&revoke_messages),
+            }));
+            true
+        } else if op == "apo"
+            || op == "apol"
+            || op == "apolo"
+            || op == "apop"
+            || op == "apov"
+            || op == "apoan"
+        {
+            let (chat_id, message_id, text, tail) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, rest1) = tokenizer::split(&rest0, ' ');
+                let (w2, w3) = tokenizer::split(&rest1, ' ');
+                (w0, w1, w2, w3)
+            };
+            let media = if op == "apol" {
+                let (link, _) = tokenizer::split(&tail, ' ');
+                Some(td_api::InputPollMedia::inputPollMediaLink(
+                    td_api::inputPollMediaLink { url: link },
+                ))
+            } else if op == "apolo" {
+                let (latitude, longitude) = tokenizer::split(&tail, ' ');
+                Some(td_api::InputPollMedia::inputPollMediaLocation(
+                    td_api::inputPollMediaLocation {
+                        location: as_location(&latitude, &longitude, ""),
+                    },
+                ))
+            } else if op == "apop" {
+                let (photo, _) = tokenizer::split(&tail, ' ');
+                Some(td_api::InputPollMedia::inputPollMediaPhoto(
+                    td_api::inputPollMediaPhoto {
+                        photo: Some(self.as_input_photo(&photo)),
+                    },
+                ))
+            } else if op == "apov" {
+                let (video, _) = tokenizer::split(&tail, ' ');
+                Some(td_api::InputPollMedia::inputPollMediaVideo(
+                    td_api::inputPollMediaVideo {
+                        video: Some(self.as_input_video(&video)),
+                    },
+                ))
+            } else if op == "apoan" {
+                let (animation, _) = tokenizer::split(&tail, ' ');
+                Some(td_api::InputPollMedia::inputPollMediaAnimation(
+                    td_api::inputPollMediaAnimation {
+                        animation: Some(self.as_input_animation(&animation)),
+                    },
+                ))
+            } else {
+                None
+            };
+            self.send_request(Function::addPollOption(td_api::addPollOption {
+                chat_id: self.as_chat_id(&chat_id),
+                message_id: as_message_id(&message_id),
+                option: Some(td_api::InputPollOption {
+                    text: Some(self.as_formatted_text(&text)),
+                    media,
+                }),
+            }));
+            true
+        } else if op == "dpo" {
+            let (chat_id, message_id, option_id) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::deletePollOption(td_api::deletePollOption {
+                chat_id: self.as_chat_id(&chat_id),
+                message_id: as_message_id(&message_id),
+                option_id,
+            }));
+            true
+        } else if op == "spolla" {
+            let (chat_id, message_id, option_ids) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::setPollAnswer(td_api::setPollAnswer {
+                chat_id: self.as_chat_id(&chat_id),
+                message_id: as_message_id(&message_id),
+                option_ids: autosplit(&option_ids)
+                    .iter()
+                    .map(|t| tokenizer::to_integer_i32(trim_td(t)))
+                    .collect(),
+            }));
+            true
+        } else if op == "gpollv" {
+            let (chat_id, message_id, option_id, offset, limit) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, rest1) = tokenizer::split(&rest0, ' ');
+                let (w2, rest2) = tokenizer::split(&rest1, ' ');
+                let (w3, w4) = tokenizer::split(&rest2, ' ');
+                (w0, w1, w2, w3, w4)
+            };
+            self.send_request(Function::getPollVoters(td_api::getPollVoters {
+                chat_id: self.as_chat_id(&chat_id),
+                message_id: as_message_id(&message_id),
+                option_id: tokenizer::to_integer_i32(&option_id),
+                offset: tokenizer::to_integer_i32(&offset),
+                limit: as_limit(&limit, 10),
+            }));
+            true
+        } else if op == "gpvst" {
+            let (chat_id, message_id, is_dark) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::getPollVoteStatistics(
+                td_api::getPollVoteStatistics {
+                    chat_id: self.as_chat_id(&chat_id),
+                    message_id: as_message_id(&message_id),
+                    is_dark: as_bool(&is_dark),
+                },
+            ));
+            true
+        } else if op == "stoppoll" {
+            let (chat_id, message_id) = tokenizer::split(args, ' ');
+            let business = self.business_connection_id.lock().unwrap().clone();
+            if !business.is_empty() {
+                self.send_request(Function::stopBusinessPoll(td_api::stopBusinessPoll {
+                    business_connection_id: business,
+                    chat_id: self.as_chat_id(&chat_id),
+                    message_id: as_message_id(&message_id),
+                    reply_markup: None,
+                }));
+            } else {
+                self.send_request(Function::stopPoll(td_api::stopPoll {
+                    chat_id: self.as_chat_id(&chat_id),
+                    message_id: as_message_id(&message_id),
+                    reply_markup: None,
+                }));
+            }
+            true
+        } else if op == "achlt" {
+            let (chat_id, message_id, task_id, tail) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, rest1) = tokenizer::split(&rest0, ' ');
+                let (w2, w3) = tokenizer::split(&rest1, ' ');
+                (w0, w1, w2, w3)
+            };
+            let mut task_id = tokenizer::to_integer_i32(&task_id);
+            let tasks = autosplit(&tail)
+                .iter()
+                .map(|task| {
+                    task_id += 1;
+                    td_api::InputChecklistTask {
+                        id: task_id,
+                        text: Some(self.as_formatted_text(task)),
+                    }
+                })
+                .collect();
+            self.send_request(Function::addChecklistTasks(td_api::addChecklistTasks {
+                chat_id: self.as_chat_id(&chat_id),
+                message_id: as_message_id(&message_id),
+                tasks,
+            }));
+            true
+        } else if op == "mchltad" {
+            let (chat_id, message_id, done_task_ids, not_done_task_ids) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, rest1) = tokenizer::split(&rest0, ' ');
+                let (w2, w3) = tokenizer::split(&rest1, ' ');
+                (w0, w1, w2, w3)
+            };
+            self.send_request(Function::markChecklistTasksAsDone(
+                td_api::markChecklistTasksAsDone {
+                    chat_id: self.as_chat_id(&chat_id),
+                    message_id: as_message_id(&message_id),
+                    marked_as_done_task_ids: autosplit(&done_task_ids)
+                        .iter()
+                        .map(|t| tokenizer::to_integer_i32(trim_td(t)))
+                        .collect(),
+                    marked_as_not_done_task_ids: autosplit(&not_done_task_ids)
+                        .iter()
+                        .map(|t| tokenizer::to_integer_i32(trim_td(t)))
+                        .collect(),
+                },
+            ));
+            true
+        } else {
+            false
+        }
     }
 
     fn op_block_media(&self, _op: &str, _args: &str) -> bool {
@@ -5535,6 +5896,20 @@ mod tests {
             ("tdmctcsum", 2),
             ("tsmtip", 2),
             ("uadmctm", 2),
+            ("bcm", 14),
+            ("apolo", 14),
+            ("apo", 14),
+            ("apol", 14),
+            ("apop", 14),
+            ("apov", 14),
+            ("apoan", 14),
+            ("dpo", 14),
+            ("spolla", 14),
+            ("gpollv", 14),
+            ("gpvst", 14),
+            ("stoppoll", 14),
+            ("achlt", 14),
+            ("mchltad", 14),
             ("afs", 5),
             ("ans", 5),
             ("ansc", 5),
@@ -5829,6 +6204,11 @@ mod tests {
             forum_topic_id: AtomicI32::new(0),
             message_thread_id: AtomicI64::new(0),
             opened_chat_id: AtomicI64::new(0),
+            business_connection_id: Mutex::new(String::new()),
+            added_sticker_file_ids: Mutex::new(Vec::new()),
+            start_timestamp: AtomicI32::new(0),
+            thumbnail: Mutex::new(String::new()),
+            cover: Mutex::new(String::new()),
         }
     }
 }
