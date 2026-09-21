@@ -1623,17 +1623,14 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             finish_unit_request(id, td, recorded);
         }
 
-        // Everything else waits for its manager step.
-        function => run_file_requests(td, id, function),
-    }
-}
-
-/// The M.12.10 Files arm group of the request dispatcher — the
-/// td_api file/download/upload/storage plane over the FileManager,
-/// DownloadManager and StorageManager (Requests.cpp:2947-3080, 6451-6572).
-#[inline(never)]
-fn run_file_requests(td: &mut Td, id: u64, function: Function) {
-    match function {
+        // ------------------------------------------------------------------
+        // The M.12.10 Files arm group (Requests.cpp:2947-3080, 6451-6572):
+        // the td_api file/download/upload/storage plane over the
+        // FileManager, DownloadManager and StorageManager. Inlined into
+        // the dialog match on purpose — a fifth by-value `Function` chain
+        // level would stack another ~360 KB debug frame and cross the
+        // 2 MB scheduler-thread guard (the stack-probe SIGSEGV the live
+        // gate caught).
         // ------------------------------------------------------------------
         // getFile (Requests.cpp:2947-2955)
         Function::getFile(request) => {

@@ -6033,6 +6033,19 @@ impl FileManager {
         self.worker = None;
     }
 
+    /// `load_from_pmc` (FileManager.cpp:2704-2714): the flag clears, then
+    /// the db-backed read + `on_pmc_loaded` merge runs (async in the C++).
+    /// The collapse clears the flag and proceeds on the in-memory node —
+    /// the db READ half stays `[blocked: db load]` (nothing ever loaded
+    /// stored nodes in the collapse; the writes go through the FileDb
+    /// flush plane).
+    fn load_from_pmc(&mut self, node_id: usize) {
+        let Some(node) = self.file_nodes[node_id].as_mut() else {
+            return;
+        };
+        node.need_load_from_pmc = false;
+    }
+
     /// `FileManager::next_file_id` (FileManager.cpp:4756-4766).
     fn next_file_id(&mut self) -> FileId {
         if let Some(id) = self.empty_file_ids.pop() {
@@ -15810,6 +15823,13 @@ impl FileHashUploaderCallback for ManagedHashUploadCallback {
 }
 
 impl FileLoadManager {
+    /// The T.9 factory re-install: the Td replaces the pre-init factory
+    /// (whose nets answer the session-down surface) with the bridge-backed
+    /// one once the session exists.
+    pub fn set_factory(&mut self, factory: Box<dyn FileLoadNetFactory>) {
+        self.factory = factory;
+    }
+
     /// The `FileDownloadManager::start_up` + `FileUploadManager::start_up`
     /// option reads.
     pub fn new(
@@ -16288,11 +16308,282 @@ impl FileLoadManager {
 
 /// `get_files_temp_dir` (FileLoaderUtils.cpp:251-253) — one shared
 /// per-base "temp" directory, not per-type.
-fn get_files_temp_dir(file_type: FileType, files_dir: &str, secure_files_dir: &str) -> String {
+pub fn get_files_temp_dir(file_type: FileType, files_dir: &str, secure_files_dir: &str) -> String {
     format!(
         "{}temp/",
         get_files_base_dir(file_type, files_dir, secure_files_dir)
     )
+}
+
+// ── the FileLoaderUtils io (FileLoaderUtils.cpp:32-158) — the real
+// files-dir file machinery behind the downloader/generation net seams ──
+
+/// The pmc counters `open_temp_file`/`create_from_temp` allocate names
+/// from (`tmp_file_id`/`perm_file_id`, FileLoaderUtils.cpp:85-92,
+/// 116-122). The Td preloads them from the binlog pmc; the increments
+/// stay in the shared snapshot for the run (the C++ persists every
+/// increment; a restart reusing an id hits `try_create_new_file`'s
+/// random-suffix fallback, so the divergence is unobservable).
+#[derive(Default)]
+pub struct FileNameCounters {
+    pub tmp_file_id: i32,
+    pub perm_file_id: i32,
+}
+
+/// `try_create_new_file` (FileLoaderUtils.cpp:32-56): open
+/// Read|Write|CreateNew under `path`, making the directory once on
+/// failure.
+pub fn try_create_new_file(path: &str, file_name: &str) -> Result<(File, String), Status> {
+    let name = format!("{path}{file_name}");
+    let mut r_fd = open_create_new(&name);
+    if r_fd.is_err() {
+        if std::fs::create_dir_all(path).is_err() {
+            let is_dir = std::fs::metadata(path).is_ok_and(|meta| meta.is_dir());
+            if !is_dir {
+                return Err(Status::error(
+                    500,
+                    &format!("Creation of directory \"{path}\" failed"),
+                ));
+            }
+        }
+        r_fd = open_create_new(&name);
+    }
+    let fd = r_fd.map_err(|_| Status::error(500, "Can't create a file"))?;
+    Ok((fd, name))
+}
+
+/// `FileFd::open(name, FileFd::Read | FileFd::Write | FileFd::CreateNew)`
+/// of `try_create_new_file` (the platform-flag spelling varies; the
+/// portable Rust form is CreateNew + read + write).
+fn open_create_new(name: &str) -> std::io::Result<File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(name)
+}
+
+/// `RandSuff{6}` (FileLoaderUtils.cpp:63-69): six random hex digits.
+fn rand_suffix() -> String {
+    (0..6)
+        .map(|_| format!("{:x}", tdutils::random::fast(0, 15)))
+        .collect()
+}
+
+/// `clean_filename` (filesystem.cpp:156-174) over the ported unicode
+/// tables (prepare_search_character + the simple categories).
+pub fn clean_filename(name: &str) -> String {
+    if !tdutils::utf8::check_utf8(name.as_bytes()) {
+        return String::new();
+    }
+    let view = tdutils::path_view::PathView::new(name);
+    let filename = clean_filename_part(view.file_stem(), 64);
+    let extension = clean_filename_part(view.extension(), 16);
+    if extension.is_empty() {
+        filename
+    } else if filename.is_empty() {
+        extension
+    } else {
+        format!("{filename}.{extension}")
+    }
+}
+
+/// `clean_filename_part` (filesystem.cpp:102-152).
+fn clean_filename_part(name: &str, max_length: usize) -> String {
+    let is_ok = |code: u32| -> bool {
+        if code < 32 {
+            return false;
+        }
+        if code < 127 {
+            // < > : " / \ | ? * & ` '
+            return !matches!(
+                code,
+                60 | 62 | 58 | 34 | 47 | 92 | 124 | 63 | 42 | 38 | 96 | 39
+            );
+        }
+        matches!(
+            tdutils::unicode::get_unicode_simple_category(code),
+            tdutils::unicode::UnicodeSimpleCategory::Letter
+                | tdutils::unicode::UnicodeSimpleCategory::DecimalNumber
+                | tdutils::unicode::UnicodeSimpleCategory::Number
+        )
+    };
+    let mut new_name = String::new();
+    let mut size = 0usize;
+    let mut rest = name.as_bytes();
+    while size < max_length {
+        let (code, len) = if rest.is_empty() {
+            break;
+        } else {
+            tdutils::utf8::next_utf8_unsafe(rest)
+        };
+        rest = &rest[len..];
+        let mut code = code;
+        if !is_ok(code) {
+            let search_character = tdutils::unicode::prepare_search_character(code);
+            if search_character == 0 {
+                continue;
+            }
+            code = b' ' as u32;
+        }
+        if new_name.is_empty() && (code == b' ' as u32 || code == b'.' as u32) {
+            continue;
+        }
+        new_name.push(char::from_u32(code).unwrap_or(' '));
+        size += 1;
+    }
+    while matches!(new_name.chars().last(), Some(' ') | Some('.')) {
+        new_name.pop();
+    }
+    new_name
+}
+
+/// `for_suggested_file_name` (FileLoaderUtils.cpp:104-140) over the
+/// caller-supplied counters (None = the `use_pmc`-free search mode).
+pub fn for_suggested_file_name(
+    name: &str,
+    use_pmc: bool,
+    use_random: bool,
+    ignore_file_names: bool,
+    mut counters: Option<&mut FileNameCounters>,
+    mut callback: impl FnMut(&str) -> bool,
+) -> bool {
+    let cleaned_name = clean_filename(name);
+    let view = tdutils::path_view::PathView::new(&cleaned_name);
+    let stem = view.file_stem().to_string();
+    let ext = view.extension().to_string();
+    let mut active = true;
+    if !stem.is_empty() && !ignore_file_names {
+        let with_ext = |stem: &str| {
+            if ext.is_empty() {
+                stem.to_string()
+            } else {
+                format!("{stem}.{ext}")
+            }
+        };
+        active = callback(&with_ext(&stem));
+        for i in 0..10 {
+            if !active {
+                break;
+            }
+            active = callback(&with_ext(&format!("{stem}_({i})")));
+        }
+        for _ in 2..12 {
+            if !active || !use_random {
+                break;
+            }
+            active = callback(&with_ext(&format!("{stem}_({})", rand_suffix())));
+        }
+    } else if use_pmc && let Some(counters) = counters.as_mut() {
+        let with_ext = |stem: &str| {
+            if ext.is_empty() {
+                stem.to_string()
+            } else {
+                format!("{stem}.{ext}")
+            }
+        };
+        let file_id = counters.perm_file_id;
+        counters.perm_file_id += 1;
+        active = callback(&with_ext(&format!("file_{file_id}")));
+        if active {
+            active = callback(&with_ext(&format!("file_{file_id}_{}", rand_suffix())));
+        }
+    }
+    active
+}
+
+/// `search_file` (FileLoaderUtils.cpp:142-161): the file-name search of
+/// the `need_search_file` path — returns the path of a file of exactly
+/// `expected_size` bytes, if one exists.
+pub fn search_file_impl(
+    file_type: FileType,
+    name: &str,
+    expected_size: i64,
+    files_dir: &str,
+    secure_files_dir: &str,
+) -> Result<String, Status> {
+    let dir = get_files_dir(file_type, files_dir, secure_files_dir);
+    let mut result: Result<String, Status> =
+        Err(Status::error(500, "Can't find suitable file name"));
+    for_suggested_file_name(name, false, false, false, None, |suggested_name| {
+        let path = format!("{dir}{suggested_name}");
+        let Some(fd) = open_partial_file_impl(&path, false).ok() else {
+            return false;
+        };
+        let size = fd.metadata().map(|meta| meta.len() as i64).unwrap_or(-1);
+        if size != expected_size {
+            return true;
+        }
+        result = Ok(path);
+        false
+    });
+    result
+}
+
+/// `FileFd::open(path, Write | Read)`/`open(path, Read)` of the partial
+/// file opens (FileDownloader.cpp:494, 514, 423).
+pub fn open_partial_file_impl(path: &str, write: bool) -> Result<File, Status> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    if write {
+        options.write(true);
+    }
+    options
+        .open(path)
+        .map_err(|e| Status::error(500, &format!("Can't open the file \"{path}\": {e}")))
+}
+
+/// `open_temp_file` (FileLoaderUtils.cpp:85-102): the id-named temp file
+/// under the per-base "temp" directory.
+pub fn open_temp_file_impl(
+    file_type: FileType,
+    files_dir: &str,
+    secure_files_dir: &str,
+    counters: &mut FileNameCounters,
+) -> Result<(File, String), Status> {
+    let temp_dir = get_files_temp_dir(file_type, files_dir, secure_files_dir);
+    let file_id = counters.tmp_file_id;
+    counters.tmp_file_id += 1;
+    let mut result = try_create_new_file(&temp_dir, &file_id.to_string());
+    if result.is_err() {
+        result = try_create_new_file(&temp_dir, &format!("{file_id}_{}", rand_suffix()));
+    }
+    result
+}
+
+/// `create_from_temp` (FileLoaderUtils.cpp:126-140): the suggested-name
+/// walk + rename into the per-type directory.
+pub fn create_from_temp_impl(
+    file_type: FileType,
+    temp_path: &str,
+    name: &str,
+    files_dir: &str,
+    secure_files_dir: &str,
+    ignore_file_names: bool,
+    counters: &mut FileNameCounters,
+) -> Result<String, Status> {
+    let dir = get_files_dir(file_type, files_dir, secure_files_dir);
+    let mut result: Result<String, Status> =
+        Err(Status::error(500, "Can't find suitable file name"));
+    for_suggested_file_name(
+        name,
+        true,
+        true,
+        ignore_file_names,
+        Some(counters),
+        |suggested_name| match try_create_new_file(&dir, suggested_name) {
+            Ok((fd, perm_path)) => {
+                drop(fd);
+                result = Ok(perm_path);
+                false
+            }
+            Err(_) => true,
+        },
+    );
+    let perm_path = result?;
+    std::fs::rename(temp_path, &perm_path)
+        .map_err(|e| Status::error(500, &format!("Can't rename the temporary file: {e}")))?;
+    Ok(perm_path)
 }
 
 /// One event of the collapsed [`FileGenerateManager`] callback plane —
@@ -16333,6 +16624,10 @@ struct GenerateEventQueue(Arc<parking_lot::Mutex<Vec<FileGenerateEvent>>>);
 impl GenerateEventQueue {
     fn push(&self, event: FileGenerateEvent) {
         self.0.lock().push(event);
+    }
+
+    fn has_events(&self) -> bool {
+        !self.0.lock().is_empty()
     }
 }
 
@@ -16418,6 +16713,12 @@ impl FileGenerateManager {
             queries: BTreeMap::new(),
             events: GenerateEventQueue(Arc::new(Mutex::new(Vec::new()))),
         }
+    }
+
+    /// Whether the callback queue carries unapplied events (the drive
+    /// loop's apply round must run even with an idle loader).
+    pub fn has_events(&self) -> bool {
+        self.events.has_events()
     }
 
     fn take_event(&mut self) -> Option<FileGenerateEvent> {
@@ -19584,7 +19885,9 @@ impl FileManager {
             return;
         }
         if need_load_from_pmc {
-            return;
+            // the C++ `get_sync_file_node` load_from_pmc: the flag clears
+            // before the run decision (the db read is the [blocked] half)
+            self.load_from_pmc(node_id);
         }
         if generate_id != 0 {
             // the M.12.8 generate plane never sets generate_id today
@@ -20393,6 +20696,9 @@ impl FileManager {
     /// `FileManager::run_upload` (FileManager.cpp:3775-3900) — the queue
     /// decision order.
     fn run_upload(&mut self, node_id: usize, mut bad_parts: Vec<i32>, fllm: &mut FileLoadManager) {
+        // the C++ callers reach here through `get_sync_file_node`, whose
+        // `load_from_pmc` clears the flag before the gates
+        self.load_from_pmc(node_id);
         let mut priority: i8 = 0;
         let mut file_id = self.file_nodes[node_id]
             .as_ref()
@@ -20430,13 +20736,6 @@ impl FileManager {
             if old_priority != 0 {
                 self.do_cancel_upload(node_id, fllm);
             }
-            return;
-        }
-        if self.file_nodes[node_id]
-            .as_ref()
-            .expect("node")
-            .need_load_from_pmc
-        {
             return;
         }
         if self.file_nodes[node_id]
@@ -21051,6 +21350,11 @@ impl FileManager {
     /// the `FileDownloadGenerateActor::on_download_ok` lambda), in queue
     /// order. Events pushed while handling join the same drain, like the
     /// C++ actor queue.
+    /// Whether the generate callbacks queue unapplied events.
+    pub fn generate_has_events(&self) -> bool {
+        self.generate.has_events()
+    }
+
     fn apply_generate_events(&mut self, fllm: &mut FileLoadManager) {
         while let Some(event) = self.generate.take_event() {
             match event {
@@ -21358,18 +21662,22 @@ impl FileManager {
 
     /// `FileManager::run_generate` (FileManager.cpp:3673-3786).
     fn run_generate(&mut self, node_id: usize, fllm: &mut FileLoadManager) {
+        // the C++ callers reach here through `get_sync_file_node`, whose
+        // `load_from_pmc` clears the flag before the gates (the db read
+        // half is async); the collapse clears it up front
+        self.load_from_pmc(node_id);
         let plan = {
             let Some(node) = self.file_nodes[node_id].as_ref() else {
                 return;
             };
             let view = FileView::new(node);
             if !view.can_generate()
-                || node.need_load_from_pmc
                 || view.has_full_local_location()
                 || view.can_download_from_server()
             {
                 return;
             }
+
             NodeGeneratePlan {
                 main_file_id: node.main_file_id,
                 old_priority: node.generate_priority,
@@ -21379,6 +21687,7 @@ impl FileManager {
                 suggested_path: node.suggested_path(),
             }
         };
+        let _ = node_id; // the load_from_pmc clear ran at the entry
 
         let mut download_priority: i8 = 0;
         let mut upload_priority: i8 = 0;

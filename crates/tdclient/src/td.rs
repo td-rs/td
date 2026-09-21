@@ -44,6 +44,7 @@ use tdutils::promise::Promise;
 use tdutils::status::Status;
 
 use crate::auth_manager::{AuthManager, AuthQuerySender};
+use crate::chat_manager::DcId;
 use crate::config_dispatch::{
     CompletedNetQueries, ConfigQueryCallback, SentNetQueries, TdConfigSink, TdSessionSink,
     build_config_net_query,
@@ -512,7 +513,10 @@ impl Td {
         // need `'static` handles, so the cycle resolves through `Rc`).
         let file_manager = Arc::new(Mutex::new(FileManager::new()));
         let file_load_manager = Arc::new(Mutex::new(FileLoadManager::new(
-            Box::new(TdFileLoadNetFactory),
+            // the pre-init factory: its nets answer the session-down
+            // surface; the T.9 install (init) replaces it with the
+            // bridge-backed nets
+            Box::new(TdFileLoadNetFactory::new()),
             FileLoadManagerOptions {
                 is_premium: false,
                 session_count: 1,
@@ -1108,6 +1112,32 @@ impl Td {
             .set_context(Box::new(TdFilePlane(Arc::clone(&self.file_shared))));
         let dlds_records = self.global.binlog_pmc().prefix_get("dlds");
         self.file_shared.lock().dlds_preload(dlds_records);
+        // the live nets install (T.9): the bridge handle + the shared
+        // snapshot fill the factory cell, and the file-name counters
+        // preload from the pmc (FileLoaderUtils.cpp:85-92, 116-122)
+        let bridge_handle = self.bridge.as_ref().map(NetBridge::handle);
+        let tmp_file_id = self
+            .global
+            .binlog_pmc()
+            .get("tmp_file_id")
+            .parse::<i32>()
+            .unwrap_or(0);
+        let perm_file_id = self
+            .global
+            .binlog_pmc()
+            .get("perm_file_id")
+            .parse::<i32>()
+            .unwrap_or(0);
+        self.file_shared
+            .lock()
+            .preload_file_name_counters(tmp_file_id, perm_file_id);
+        if let Some(bridge_handle) = bridge_handle {
+            let live_factory = TdFileLoadNetFactory::new();
+            live_factory.install(bridge_handle, Arc::clone(&self.file_shared));
+            self.file_load_manager
+                .lock()
+                .set_factory(Box::new(live_factory));
+        }
         // T.7: the dlds records now ride the versioned
         // `FileManager::store_file` layout (byte-compatible with the C++
         // pmc), so the flush gate opens — the writes reach the real pmc
@@ -2138,11 +2168,32 @@ impl Td {
         let mut option_integers = BTreeMap::new();
         let mut database_paths = Vec::new();
         if self.global.has_db() {
-            database_paths = self.global.td_db().db_paths();
+            let (files_directory, database_directory) = {
+                let db = self.global.td_db();
+                database_paths = db.db_paths();
+                (
+                    db.parameters().files_directory.clone(),
+                    db.parameters().database_directory.clone(),
+                )
+            };
+            // `G()->get_files_dir()`/`get_secure_files_dir()`
+            // (Global.cpp:149-155): the TdDb parameters, with the
+            // store-all flag choosing the secure base
+            files_dir = files_directory;
+            let store_all = self
+                .option_manager
+                .as_ref()
+                .map(|options| {
+                    options.get_option_boolean("store_all_files_in_files_directory", false)
+                })
+                .unwrap_or(false);
+            secure_files_dir = if store_all {
+                files_dir.clone()
+            } else {
+                database_directory
+            };
         }
         if let Some(options) = self.option_manager.as_ref() {
-            files_dir = options.get_option_string("files_dir", "");
-            secure_files_dir = options.get_option_string("secure_files_dir", "");
             use_storage_optimizer = options.get_option_boolean("use_storage_optimizer", false);
             ignore_inline_thumbnails =
                 options.get_option_boolean("ignore_inline_thumbnails", false);
@@ -2152,10 +2203,16 @@ impl Td {
                 "storage_max_time_from_last_access",
                 "storage_max_file_count",
                 "storage_immunity_delay",
+                "webfile_dc_id",
             ] {
                 option_integers.insert(name.to_owned(), options.get_option_integer(name, 0));
             }
         }
+        let ignore_file_names = self
+            .option_manager
+            .as_ref()
+            .map(|options| options.get_option_boolean("ignore_file_names", false))
+            .unwrap_or(false);
         self.file_shared.lock().refresh(TdFileSnapshot {
             files_dir,
             secure_files_dir,
@@ -2167,6 +2224,8 @@ impl Td {
             option_integers,
             unix_time: self.global.unix_time(),
             database_paths,
+            is_test_dc: self.global.is_test_dc(),
+            ignore_file_names,
         });
     }
 
@@ -2184,7 +2243,13 @@ impl Td {
             {
                 let mut file_load_manager = self.file_load_manager.lock();
                 file_load_manager.drive();
-                if !file_load_manager.has_queued_events() {
+                if !file_load_manager.has_queued_events()
+                    && !self.file_manager.lock().generate_has_events()
+                {
+                    // the generate callbacks queue independently of the
+                    // loader (the external generation finishes with no
+                    // loader events in flight) — the apply round must
+                    // still drain them
                     break;
                 }
             }
@@ -3402,6 +3467,11 @@ pub(crate) struct TdFileSnapshot {
     /// `TdDb::with_db_path` — the binlog/sqlite paths (the fast-stat
     /// database size and the FileManager `bad_paths_`).
     database_paths: Vec<String>,
+    /// `G()->is_test_dc()` — the `webfile_dc_id` default source.
+    is_test_dc: bool,
+    /// `G()->get_option_boolean("ignore_file_names")` — the
+    /// `for_suggested_file_name` first arm.
+    ignore_file_names: bool,
 }
 
 /// The shared files plane: the manager handles the stored boxes reach
@@ -3439,6 +3509,16 @@ pub(crate) struct TdFileShared {
     /// `TdDb::with_db_path` — the binlog/sqlite paths (the fast-stat
     /// database size and the FileManager `bad_paths_`).
     database_paths: Vec<String>,
+    /// `G()->is_test_dc()` — the `webfile_dc_id` default source.
+    is_test_dc: bool,
+    /// `G()->get_option_boolean("ignore_file_names")` — the
+    /// `for_suggested_file_name` first arm.
+    ignore_file_names: bool,
+    /// The `tmp_file_id`/`perm_file_id` pmc counters of
+    /// `open_temp_file`/`create_from_temp` (the increments stay in the
+    /// snapshot for the run — the random-suffix fallbacks cover a
+    /// restart's reused ids).
+    file_name_counters: crate::files::FileNameCounters,
     /// The DownloadManager `dlds#` keyspace shadow — the stored context
     /// box cannot borrow the binlog pmc, so the keyspace lives here:
     /// preloaded from the real pmc at init and flushed back after drives
@@ -3472,6 +3552,9 @@ impl TdFileShared {
             option_integers: BTreeMap::new(),
             unix_time: 0,
             database_paths: Vec::new(),
+            is_test_dc: false,
+            ignore_file_names: false,
+            file_name_counters: crate::files::FileNameCounters::default(),
             dlds: BTreeMap::new(),
             dlds_saved: BTreeMap::new(),
             dlds_pmc_live: false,
@@ -3490,6 +3573,8 @@ impl TdFileShared {
             option_integers,
             unix_time,
             database_paths,
+            is_test_dc,
+            ignore_file_names,
         } = snapshot;
         self.files_dir = files_dir;
         self.secure_files_dir = secure_files_dir;
@@ -3501,6 +3586,8 @@ impl TdFileShared {
         self.option_integers = option_integers;
         self.unix_time = unix_time;
         self.database_paths = database_paths;
+        self.is_test_dc = is_test_dc;
+        self.ignore_file_names = ignore_file_names;
     }
 
     /// The `TdDb::with_db_path` snapshot read.
@@ -3534,6 +3621,49 @@ impl TdFileShared {
 
     pub(crate) fn use_storage_optimizer(&self) -> bool {
         self.use_storage_optimizer
+    }
+
+    pub(crate) fn is_test_dc(&self) -> bool {
+        self.is_test_dc
+    }
+
+    /// `open_temp_file` (FileLoaderUtils.cpp:85-102) over the snapshot.
+    pub(crate) fn open_temp_file(
+        &mut self,
+        file_type: FileType,
+    ) -> Result<(std::fs::File, String), Status> {
+        crate::files::open_temp_file_impl(
+            file_type,
+            &self.files_dir,
+            &self.secure_files_dir,
+            &mut self.file_name_counters,
+        )
+    }
+
+    /// `create_from_temp` (FileLoaderUtils.cpp:126-140) over the snapshot.
+    pub(crate) fn create_from_temp(
+        &mut self,
+        file_type: FileType,
+        path: &str,
+        name: &str,
+    ) -> Result<String, Status> {
+        crate::files::create_from_temp_impl(
+            file_type,
+            path,
+            name,
+            &self.files_dir,
+            &self.secure_files_dir,
+            self.ignore_file_names,
+            &mut self.file_name_counters,
+        )
+    }
+
+    /// The `tmp_file_id`/`perm_file_id` pmc preload (the init-time read).
+    pub(crate) fn preload_file_name_counters(&mut self, tmp_file_id: i32, perm_file_id: i32) {
+        self.file_name_counters = crate::files::FileNameCounters {
+            tmp_file_id,
+            perm_file_id,
+        };
     }
 }
 
@@ -4181,96 +4311,397 @@ fn storage_env_fields<'a>(
     }
 }
 
-// ── the net seam before the live transfer step (T.9) ──
+// ── the live net seams (T.9) ──
 //
-// Every query answers the session-down surface and the io answers the
-// unavailable error (the C++ parks the queries until a session appears;
-// nothing progresses offline either way). The real bridge-backed nets
-// land with the transfer gate.
+// The bridge-backed nets: every query rides `BridgeHandle::query` (the
+// established S76 blocking-invoke over the single bridge session; the
+// gzip_packed responses are unwrapped by the session layer) and the io
+// rides the FileLoaderUtils helpers over the per-drive files dirs. When
+// the bridge is not installed yet (pre-init drives) the nets answer the
+// session-down surface — the C++ parks the queries until a session
+// appears, so nothing progresses offline either way.
 
-struct BlockedDownloadNet;
+/// The shared live-net environment: the bridge handle (filled at `init`,
+/// once the session exists) and the files snapshot cell (the io dirs and
+/// the file-name counters refresh per drive).
+#[derive(Default)]
+pub(crate) struct LiveNetCell {
+    bridge: Option<crate::net::BridgeHandle>,
+    shared: Option<Arc<parking_lot::Mutex<TdFileShared>>>,
+}
 
-impl FileDownloaderNet for BlockedDownloadNet {
+impl LiveNetCell {
+    fn install(
+        &mut self,
+        bridge: crate::net::BridgeHandle,
+        shared: Arc<parking_lot::Mutex<TdFileShared>>,
+    ) {
+        self.bridge = Some(bridge);
+        self.shared = Some(shared);
+    }
+
+    /// The bridge handle clone (the cell keeps the canonical one).
+    fn bridge(&self) -> Option<crate::net::BridgeHandle> {
+        self.bridge.clone()
+    }
+
+    /// One query through the bridge as a `Status` result (the C++
+    /// NetQuery error surfaces: the RPC error code/message).
+    fn query(&self, function: telegram_api::Function) -> Result<Vec<u8>, Status> {
+        match self
+            .bridge()
+            .ok_or_else(|| Status::error(400, "Not connected"))?
+            .query(function)
+        {
+            crate::net::QueryAnswer::Ok(data) => Ok(data),
+            crate::net::QueryAnswer::Err(code, message) => Err(Status::error(code, &message)),
+        }
+    }
+
+    /// Run `f` against the shared files snapshot.
+    fn with_shared<R>(&self, f: impl FnOnce(&mut TdFileShared) -> R) -> Result<R, Status> {
+        let Some(shared) = self.shared.as_ref() else {
+            return Err(Status::error_message("The files snapshot is not installed"));
+        };
+        Ok(f(&mut shared.lock()))
+    }
+
+    /// The per-drive files dirs.
+    fn io_dirs(&self) -> Result<(String, String), Status> {
+        self.with_shared(|shared| (shared.files_dir(), shared.secure_files_dir()))
+    }
+}
+
+/// The per-query download net over the bridge (`upload.getFile` family +
+/// the FileLoaderUtils io).
+pub(crate) struct LiveDownloadNet {
+    cell: Arc<parking_lot::Mutex<LiveNetCell>>,
+}
+
+impl FileDownloaderNet for LiveDownloadNet {
     fn download(
         &mut self,
-        _query: DownloadQuery,
+        query: DownloadQuery,
         _query_type: DownloadQueryType,
         _meta: DownloadNetMeta,
-    ) -> Result<DownloadResult, tdutils::status::Status> {
-        Err(tdutils::status::Status::error(400, "Not connected"))
+    ) -> Result<DownloadResult, Status> {
+        let cell = self.cell.lock();
+        let data = match query {
+            DownloadQuery::GetFile {
+                location,
+                offset,
+                limit,
+                cdn_supported,
+            } => {
+                let function =
+                    telegram_api::Function::upload_getFile(telegram_api::upload_getFile {
+                        flags: 0,
+                        precise: false,
+                        cdn_supported,
+                        location: Some(location),
+                        offset,
+                        limit,
+                    });
+                let data = cell.query(function)?;
+                match telegram_api::upload_File::parse(&data) {
+                    Ok(telegram_api::upload_File::upload_file(file)) => {
+                        DownloadResult::Bytes(file.bytes)
+                    }
+                    Ok(telegram_api::upload_File::upload_fileCdnRedirect(redirect)) => {
+                        DownloadResult::CdnRedirect {
+                            dc_id: redirect.dc_id,
+                            file_token: redirect.file_token,
+                            encryption_key: redirect.encryption_key,
+                            encryption_iv: redirect.encryption_iv,
+                            file_hashes: redirect.file_hashes,
+                        }
+                    }
+                    Err(error) => {
+                        return Err(Status::error_message(&format!("upload.file: {error}")));
+                    }
+                }
+            }
+            DownloadQuery::GetWebFile {
+                location,
+                offset,
+                limit,
+            } => {
+                let function =
+                    telegram_api::Function::upload_getWebFile(telegram_api::upload_getWebFile {
+                        location: Some(location),
+                        offset,
+                        limit,
+                    });
+                let data = cell.query(function)?;
+                match telegram_api::upload_WebFile::parse(&data) {
+                    Ok(web_file) => DownloadResult::Bytes(web_file.bytes),
+                    Err(error) => {
+                        return Err(Status::error_message(&format!("upload.webFile: {error}")));
+                    }
+                }
+            }
+            DownloadQuery::GetCdnFile {
+                file_token,
+                offset,
+                limit,
+            } => {
+                let function =
+                    telegram_api::Function::upload_getCdnFile(telegram_api::upload_getCdnFile {
+                        file_token,
+                        offset,
+                        limit,
+                    });
+                let data = cell.query(function)?;
+                match telegram_api::upload_CdnFile::parse(&data) {
+                    Ok(telegram_api::upload_CdnFile::upload_cdnFileReuploadNeeded(needed)) => {
+                        DownloadResult::ReuploadNeeded {
+                            request_token: needed.request_token,
+                        }
+                    }
+                    Ok(telegram_api::upload_CdnFile::upload_cdnFile(file)) => {
+                        DownloadResult::CdnBytes(file.bytes)
+                    }
+                    Err(error) => {
+                        return Err(Status::error_message(&format!("upload.cdnFile: {error}")));
+                    }
+                }
+            }
+            DownloadQuery::ReuploadCdnFile {
+                file_token,
+                request_token,
+            } => {
+                let function = telegram_api::Function::upload_reuploadCdnFile(
+                    telegram_api::upload_reuploadCdnFile {
+                        file_token,
+                        request_token,
+                    },
+                );
+                let data = cell.query(function)?;
+                match parse_vector_file_hash(&data) {
+                    Ok(hashes) => DownloadResult::Hashes(hashes),
+                    Err(error) => {
+                        return Err(Status::error_message(&format!(
+                            "upload.reuploadCdnFile: {error}"
+                        )));
+                    }
+                }
+            }
+            DownloadQuery::GetFileHashes { location, offset } => {
+                let function = telegram_api::Function::upload_getFileHashes(
+                    telegram_api::upload_getFileHashes {
+                        location: Some(location),
+                        offset,
+                    },
+                );
+                let data = cell.query(function)?;
+                match parse_vector_file_hash(&data) {
+                    Ok(hashes) => DownloadResult::Hashes(hashes),
+                    Err(error) => {
+                        return Err(Status::error_message(&format!(
+                            "upload.getFileHashes: {error}"
+                        )));
+                    }
+                }
+            }
+        };
+        Ok(data)
     }
 
-    fn open_temp_file(
-        &mut self,
-        _file_type: FileType,
-    ) -> Result<(std::fs::File, String), tdutils::status::Status> {
-        Err(tdutils::status::Status::error_message(
-            "Can't open a temporary file",
-        ))
+    fn open_temp_file(&mut self, file_type: FileType) -> Result<(std::fs::File, String), Status> {
+        self.cell
+            .lock()
+            .with_shared(|shared| shared.open_temp_file(file_type))?
     }
 
-    fn open_partial_file(
+    fn open_partial_file(&mut self, path: &str, write: bool) -> Result<std::fs::File, Status> {
+        crate::files::open_partial_file_impl(path, write)
+    }
+
+    fn open_generated_file(&mut self, path: &str) -> Result<std::fs::File, Status> {
+        // `FileFd::open(path_, FileFd::Create | FileFd::Write)` — the
+        // generated path may have just been unlinked (a stale partial)
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|e| Status::error_message(&format!("Can't open the generated file: {e}")))
+    }
+
+    fn search_file(
         &mut self,
-        _path: &str,
-        _write: bool,
-    ) -> Result<std::fs::File, tdutils::status::Status> {
-        Err(tdutils::status::Status::error_message(
-            "Can't open a partial file",
-        ))
+        file_type: FileType,
+        name: &str,
+        size: i64,
+    ) -> Result<String, Status> {
+        let (files_dir, secure_files_dir) = self.cell.lock().io_dirs()?;
+        crate::files::search_file_impl(file_type, name, size, &files_dir, &secure_files_dir)
     }
 
     fn create_from_temp(
         &mut self,
-        _file_type: FileType,
-        _path: &str,
-        _name: &str,
-    ) -> Result<String, tdutils::status::Status> {
-        Err(tdutils::status::Status::error_message(
-            "Can't create a file from a temporary one",
-        ))
+        file_type: FileType,
+        path: &str,
+        name: &str,
+    ) -> Result<String, Status> {
+        self.cell
+            .lock()
+            .with_shared(|shared| shared.create_from_temp(file_type, path, name))?
+    }
+
+    fn webfile_dc_id(&mut self) -> DcId {
+        self.cell
+            .lock()
+            .with_shared(|shared| {
+                let id =
+                    shared.option_integer("webfile_dc_id", if shared.is_test_dc() { 2 } else { 4 });
+                DcId::internal(id as i32)
+            })
+            .unwrap_or_default()
     }
 }
 
-struct BlockedUploadNet;
+/// The per-query upload net over the bridge (`upload.saveFilePart` /
+/// `upload.saveBigFilePart`).
+pub(crate) struct LiveUploadNet {
+    cell: Arc<parking_lot::Mutex<LiveNetCell>>,
+}
 
-impl FileUploaderNet for BlockedUploadNet {
-    fn upload_part(&mut self, _query: UploadPartQuery) -> Result<bool, Status> {
-        Err(Status::error(400, "Not connected"))
+impl FileUploaderNet for LiveUploadNet {
+    fn upload_part(&mut self, query: UploadPartQuery) -> Result<bool, Status> {
+        let function = match query {
+            UploadPartQuery::SaveFilePart {
+                file_id,
+                part_id,
+                bytes,
+            } => telegram_api::Function::upload_saveFilePart(telegram_api::upload_saveFilePart {
+                file_id,
+                file_part: part_id,
+                bytes,
+            }),
+            UploadPartQuery::SaveBigFilePart {
+                file_id,
+                part_id,
+                part_count,
+                bytes,
+            } => telegram_api::Function::upload_saveBigFilePart(
+                telegram_api::upload_saveBigFilePart {
+                    file_id,
+                    file_part: part_id,
+                    file_total_parts: part_count,
+                    bytes,
+                },
+            ),
+        };
+        let data = self.cell.lock().query(function)?;
+        // `!result.ok()` is the C++ 500 path (FileUploader.cpp:188-192);
+        // the `Bool` result is the id-checked bare constructor
+        let mut reader = telegram_api::tl::Reader::new(&data);
+        match reader.bool() {
+            Ok(ok) => Ok(ok),
+            Err(error) => Err(Status::error_message(&format!(
+                "upload.saveFilePart: {error}"
+            ))),
+        }
     }
 }
 
-struct BlockedHashNet;
+/// The per-query hash-upload net over the bridge
+/// (`messages.getDocumentByHash`).
+pub(crate) struct LiveHashNet {
+    cell: Arc<parking_lot::Mutex<LiveNetCell>>,
+}
 
-impl FileHashUploaderNet for BlockedHashNet {
+impl FileHashUploaderNet for LiveHashNet {
     fn get_document_by_hash(
         &mut self,
-        _sha256: [u8; 32],
-        _size: i64,
-        _mime_type: String,
+        sha256: [u8; 32],
+        size: i64,
+        mime_type: String,
     ) -> Result<DocumentByHash, Status> {
-        Err(Status::error(400, "Not connected"))
+        let function = telegram_api::Function::messages_getDocumentByHash(
+            telegram_api::messages_getDocumentByHash {
+                sha256: sha256.to_vec(),
+                size,
+                mime_type,
+            },
+        );
+        let data = self.cell.lock().query(function)?;
+        match telegram_api::Document::parse(&data) {
+            Ok(telegram_api::Document::documentEmpty(_)) => Ok(DocumentByHash::Empty),
+            Ok(telegram_api::Document::document(document)) => Ok(DocumentByHash::Document {
+                id: document.id,
+                access_hash: document.access_hash,
+                dc_id: document.dc_id,
+                file_reference: document.file_reference,
+            }),
+            Err(error) => Err(Status::error_message(&format!(
+                "messages.getDocumentByHash: {error}"
+            ))),
+        }
     }
 }
 
-/// The [`FileLoadNetFactory`] over the blocked nets (T.9 swaps the net
-/// bodies to the bridge-backed queries).
-pub(crate) struct TdFileLoadNetFactory;
+/// `Vector<fileHash>` (the `upload.getFileHashes`/`upload.reuploadCdnFile`
+/// result).
+fn parse_vector_file_hash(data: &[u8]) -> Result<Vec<telegram_api::FileHash>, &'static str> {
+    let mut reader = telegram_api::tl::Reader::new(data);
+    if reader.i32()? != telegram_api::tl::VECTOR_ID {
+        return Err("not a vector");
+    }
+    let count = reader.i32()? as u32 as usize;
+    let mut hashes = Vec::with_capacity(count);
+    for _ in 0..count {
+        // vector elements are bare (no constructor id)
+        hashes.push(telegram_api::FileHash::read_bare(&mut reader)?);
+    }
+    Ok(hashes)
+}
+
+/// The [`FileLoadNetFactory`] over the live bridge-backed nets.
+pub(crate) struct TdFileLoadNetFactory {
+    cell: Arc<parking_lot::Mutex<LiveNetCell>>,
+}
+
+impl TdFileLoadNetFactory {
+    pub(crate) fn new() -> TdFileLoadNetFactory {
+        TdFileLoadNetFactory {
+            cell: Arc::new(parking_lot::Mutex::new(LiveNetCell::default())),
+        }
+    }
+
+    /// Fills the cell once the session exists (Td `init`).
+    pub(crate) fn install(
+        &self,
+        bridge: crate::net::BridgeHandle,
+        shared: Arc<parking_lot::Mutex<TdFileShared>>,
+    ) {
+        self.cell.lock().install(bridge, shared);
+    }
+}
 
 impl FileLoadNetFactory for TdFileLoadNetFactory {
     fn download_net(&mut self) -> Box<dyn FileDownloaderNet> {
-        Box::new(BlockedDownloadNet)
+        Box::new(LiveDownloadNet {
+            cell: Arc::clone(&self.cell),
+        })
     }
 
     fn upload_net(&mut self) -> Box<dyn FileUploaderNet> {
-        Box::new(BlockedUploadNet)
+        Box::new(LiveUploadNet {
+            cell: Arc::clone(&self.cell),
+        })
     }
 
     fn hash_net(&mut self) -> Box<dyn FileHashUploaderNet> {
-        Box::new(BlockedHashNet)
+        Box::new(LiveHashNet {
+            cell: Arc::clone(&self.cell),
+        })
     }
 
     fn utils_net(&mut self) -> Box<dyn FileDownloaderNet> {
-        Box::new(BlockedDownloadNet)
+        self.download_net()
     }
 }
 
