@@ -49,6 +49,7 @@ use crate::config_dispatch::{
     CompletedNetQueries, ConfigQueryCallback, SentNetQueries, TdConfigSink, TdSessionSink,
     build_config_net_query,
 };
+use crate::boost_manager::{BoostManager, BoostManagerEnv};
 use crate::config_manager::{
     ConfigActions, ConfigManager, ConfigQuery, ConfigQueryResult, StoredDcOption,
 };
@@ -270,6 +271,8 @@ pub struct Td {
     /// `Td::notification_settings_manager_` (`Td.cpp:1254`, M.13S).
     pub(crate) notification_settings_manager:
         crate::notification_settings_manager::NotificationSettingsManager,
+    /// `Td::boost_manager_` (the C++ init_managers block).
+    pub(crate) boost_manager: BoostManager,
     /// `Td::device_token_manager_` (`Td.cpp:1345`, M.13S).
     pub(crate) device_token_manager: crate::device_token_manager::DeviceTokenManager,
     /// The notification manager's `send_update` outbox — the collapsed
@@ -581,6 +584,7 @@ impl Td {
             notification_manager: NotificationManager::default(),
             notification_settings_manager:
                 crate::notification_settings_manager::NotificationSettingsManager::new(),
+            boost_manager: BoostManager::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
             notification_updates: Vec::new(),
             premium_required_contact_merger: None,
@@ -4978,6 +4982,42 @@ impl crate::device_token_manager::DeviceTokenManagerEnv for NotificationEnv<'_> 
 
     fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
         self.global.binlog_pmc().set_raw(key, value);
+    }
+}
+
+/// The boost-plane env over the `Td` fields.
+pub(crate) struct BoostEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+}
+
+impl BoostManagerEnv for BoostEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_integer(name, default_value)
+        })
+    }
+
+    fn send_update(&mut self, _update: td_api::Update) {}
+
+    fn check_dialog_access(&mut self, dialog_id: crate::dialog_id::DialogId) -> std::result::Result<(), tdutils::status::Status> {
+        if dialog_id.is_valid() {
+            Ok(())
+        } else {
+            Err(tdutils::status::Status::error(400, "Chat not found"))
+        }
+    }
+
+    fn get_channel_first_username(&mut self, channel_id: crate::chat_manager::ChannelId) -> String {
+        // `ChatManager::get_channel_first_username` — the M.5 surface; the
+        // seam answers the empty username.
+        let _ = (self.chat_manager as &mut crate::chat_manager::ChatManager, channel_id);
+        String::new()
     }
 }
 

@@ -9,6 +9,7 @@
 
 pub mod auth_manager;
 pub mod birthdate;
+pub mod boost_manager;
 pub mod chat_manager;
 pub mod client;
 pub mod client_json;
