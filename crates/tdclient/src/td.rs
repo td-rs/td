@@ -69,6 +69,7 @@ use crate::notification_manager::NotificationManager;
 use crate::option_manager::OptionManager;
 use crate::query_merger::QueryMerger;
 use crate::requests;
+use crate::statistics_manager::{StatisticsManager, StatisticsManagerEnv};
 use crate::synchronous_requests;
 use crate::td_api::{self, Function, Object};
 use crate::time_zone_manager::TimeZoneManager;
@@ -270,6 +271,11 @@ pub struct Td {
     /// `Td::notification_settings_manager_` (`Td.cpp:1254`, M.13S).
     pub(crate) notification_settings_manager:
         crate::notification_settings_manager::NotificationSettingsManager,
+    /// `Td::statistics_manager_` (the C++ init_managers block).
+    pub(crate) statistics_manager: StatisticsManager,
+    /// The statistics plane's `send_update` outbox; drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) statistics_updates: Vec<td_api::Update>,
     /// `Td::device_token_manager_` (`Td.cpp:1345`, M.13S).
     pub(crate) device_token_manager: crate::device_token_manager::DeviceTokenManager,
     /// The notification manager's `send_update` outbox — the collapsed
@@ -581,6 +587,8 @@ impl Td {
             notification_manager: NotificationManager::default(),
             notification_settings_manager:
                 crate::notification_settings_manager::NotificationSettingsManager::new(),
+            statistics_manager: StatisticsManager::new(),
+            statistics_updates: Vec::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
             notification_updates: Vec::new(),
             premium_required_contact_merger: None,
@@ -2567,6 +2575,10 @@ impl Td {
         }
         let notification_updates = std::mem::take(&mut self.notification_updates);
         for update in notification_updates {
+            self.send_update(update.into());
+        }
+        let statistics_updates = std::mem::take(&mut self.statistics_updates);
+        for update in statistics_updates {
             self.send_update(update.into());
         }
     }
@@ -4978,6 +4990,35 @@ impl crate::device_token_manager::DeviceTokenManagerEnv for NotificationEnv<'_> 
 
     fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
         self.global.binlog_pmc().set_raw(key, value);
+    }
+}
+
+/// The statistics-plane env over the `Td` fields.
+pub(crate) struct StatisticsEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl StatisticsManagerEnv for StatisticsEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn get_channel_statistics_dc_id(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> std::result::Result<(), tdutils::status::Status> {
+        // `ChatManager::get_channel_statistics_dc_id` — the dc-id answer
+        // joins with the net step; the seam accepts valid dialogs.
+        if dialog_id.is_valid() {
+            Ok(())
+        } else {
+            Err(tdutils::status::Status::error(400, "Chat not found"))
+        }
     }
 }
 
