@@ -2374,12 +2374,124 @@ impl DialogListId {
         assert!(self.is_filter());
         DialogFilterId((self.0 - Self::FILTER_ID_SHIFT) as i32)
     }
+
+    /// `DialogListId::get_chat_list_object` (DialogListId.cpp:46-59).
+    pub fn get_chat_list_object(self) -> td_api::ChatList {
+        if self.is_folder() {
+            let folder_id = self.get_folder_id();
+            if folder_id == FolderId::archive() {
+                return td_api::ChatList::chatListArchive(td_api::chatListArchive);
+            }
+            return td_api::ChatList::chatListMain(td_api::chatListMain);
+        }
+        if self.is_filter() {
+            return td_api::ChatList::chatListFolder(td_api::chatListFolder {
+                chat_folder_id: self.get_filter_id().get(),
+            });
+        }
+        unreachable!()
+    }
 }
 
 /// `td::DialogListIdHash` (DialogListId.h:80-84).
 impl std::hash::Hash for DialogListId {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         state.write_u32(hash_int64(self.0));
+    }
+}
+
+/// `MessagesManager::SPONSORED_DIALOG_ORDER` (MessagesManager.h:1682) —
+/// `get_dialog_order(MessageId(), 2147483647)`.
+pub const SPONSORED_DIALOG_ORDER: i64 = 2147483647i64 << 32;
+
+/// `MessagesManager::MIN_PINNED_DIALOG_DATE` (MessagesManager.h:1683).
+pub const MIN_PINNED_DIALOG_DATE: i32 = 2147000000;
+
+/// `MessagesManager::MAX_ORDINARY_DIALOG_ORDER` (MessagesManager.h:1684-1685)
+/// — `get_dialog_order(MessageId(), MIN_PINNED_DIALOG_DATE - 1)`.
+pub const MAX_ORDINARY_DIALOG_ORDER: i64 = 9221294780217032704;
+
+/// `td::DialogDate` (DialogDate.h) — an `(order, dialog_id)` position key.
+/// The C++ `operator<` sorts by order **descending**, with the dialog id
+/// descending as the tiebreak, so ascending iteration (a `BTreeSet`, the
+/// C++ `std::set` collapse) walks the newest dialog first. `MIN_DIALOG_DATE`
+/// sorts before every real dialog and `MAX_DIALOG_DATE` after.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DialogDate {
+    order: i64,
+    dialog_id: DialogId,
+}
+
+impl DialogDate {
+    /// `DialogDate(order, dialog_id)` (DialogDate.h:25-27).
+    pub fn new(order: i64, dialog_id: DialogId) -> DialogDate {
+        DialogDate { order, dialog_id }
+    }
+
+    /// `MIN_DIALOG_DATE` (DialogDate.h:67).
+    pub fn min() -> DialogDate {
+        DialogDate::new(i64::MAX, DialogId::default())
+    }
+
+    /// `MAX_DIALOG_DATE` (DialogDate.h:68).
+    pub fn max() -> DialogDate {
+        DialogDate::new(0, DialogId::default())
+    }
+
+    /// `DialogDate::get_order` (DialogDate.h:44-46).
+    pub fn get_order(self) -> i64 {
+        self.order
+    }
+
+    /// `DialogDate::get_dialog_id` (DialogDate.h:48-50).
+    pub fn get_dialog_id(self) -> DialogId {
+        self.dialog_id
+    }
+
+    /// `DialogDate::get_date` (DialogDate.h:52-54).
+    pub fn get_date(self) -> i32 {
+        ((self.order >> 32) & 0x7FFFFFFF) as i32
+    }
+
+    /// `DialogDate::get_message_id` (DialogDate.h:56-58).
+    pub fn get_message_id(self) -> MessageId {
+        MessageId::from_server_message_id(ServerMessageId::new((self.order & 0x7FFFFFFF) as i32))
+    }
+
+    /// `DialogDate::get_dialog_order` (DialogDate.h:60-64) — the
+    /// `(date << 32) + previous_server_message_id` sort key of a message.
+    pub fn get_dialog_order(message_id: MessageId, message_date: i32) -> i64 {
+        assert!(!message_id.is_scheduled());
+        ((message_date as i64) << 32)
+            + message_id
+                .get_prev_server_message_id()
+                .get_server_message_id()
+                .get() as i64
+    }
+}
+
+/// The descending total order (DialogDate.h:28-30).
+impl Ord for DialogDate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .order
+            .cmp(&self.order)
+            .then(other.dialog_id.get().cmp(&self.dialog_id.get()))
+    }
+}
+
+impl PartialOrd for DialogDate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// `MIN_DIALOG_DATE` — the struct-default stand-in for the C++ in-class
+/// initializers (`= MIN_DIALOG_DATE`); every real field keeps the exact
+/// initializer through its owner's `Default` impl.
+impl Default for DialogDate {
+    fn default() -> DialogDate {
+        DialogDate::min()
     }
 }
 
@@ -9462,6 +9574,166 @@ impl CallsDbState {
     }
 }
 
+/// `MessagesManager::DialogPositionInList` (MessagesManager.h:1584-1600) —
+/// the dialog's position in one chat list. `order` is the raw dialog order,
+/// `private_order` the pin/sponsored-adjusted one, `public_order` the
+/// `chatPosition.order` value (0 while the position is past the loaded
+/// window).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DialogPositionInList {
+    pub order: i64,
+    pub private_order: i64,
+    pub public_order: i64,
+    pub is_pinned: bool,
+    pub is_sponsored: bool,
+    pub total_dialog_count: i32,
+}
+
+/// `MessagesManager::get_dialog_info_for_dialog_filter`'s return record
+/// (MessagesManager.h — the `DialogFilterDialogInfo` struct) — the
+/// classification input `DialogFilterManager::need_dialog_in_filter` reads.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DialogFilterDialogInfo {
+    pub dialog_id: DialogId,
+    pub folder_id: FolderId,
+    pub has_unread_mentions: bool,
+    pub is_muted: bool,
+    pub has_unread_messages: bool,
+}
+
+/// `MessagesManager::DialogList` (MessagesManager.h:1494-1521) — the
+/// per-chat-list runtime state: the unread counters, the pinned-dialog
+/// registry and the loaded-window cursors. Collapses:
+/// - `load_list_queries_` (`vector<Promise<Unit>>`) — the pending-load
+///   promise plumbing is the net/M.11 seam; the count is kept instead.
+/// - the `WaitFreeHashMap`-class containers → std maps (M.4/M.5 convention).
+#[derive(Debug, Default)]
+pub struct DialogList {
+    pub dialog_list_id: DialogListId,
+    pub is_message_unread_count_inited: bool,
+    pub is_dialog_unread_count_inited: bool,
+    pub need_unread_count_recalc: bool,
+    pub unread_message_total_count: i32,
+    pub unread_message_muted_count: i32,
+    pub unread_dialog_total_count: i32,
+    pub unread_dialog_muted_count: i32,
+    pub unread_dialog_marked_count: i32,
+    pub unread_dialog_muted_marked_count: i32,
+    pub in_memory_dialog_total_count: i32,
+    pub server_dialog_total_count: i32,
+    pub secret_chat_total_count: i32,
+    pub unique_id: i64,
+    /// `load_list_queries_` — the pending-load query count until the
+    /// promise plumbing lands ([blocked: net/M.11]).
+    pub load_list_query_count: usize,
+    pub pinned_dialog_id_orders: HashMap<DialogId, i64>,
+    pub pinned_dialogs: Vec<DialogDate>,
+    pub are_pinned_dialogs_inited: bool,
+    /// in memory
+    pub last_pinned_dialog_date: DialogDate,
+    /// date of the last loaded dialog — in memory
+    pub list_last_dialog_date: DialogDate,
+    /// `postponed_unread_message_count_updates_` collapsed onto the list
+    /// (the C++ separate set holds at most one entry per list); drained by
+    /// the difference-end walk (M.10.12b).
+    pub is_unread_message_count_update_postponed: bool,
+    /// `postponed_unread_chat_count_updates_` collapsed onto the list.
+    pub is_unread_chat_count_update_postponed: bool,
+}
+
+impl DialogList {
+    fn new(dialog_list_id: DialogListId) -> DialogList {
+        DialogList {
+            dialog_list_id,
+            need_unread_count_recalc: true,
+            server_dialog_total_count: -1,
+            secret_chat_total_count: -1,
+            last_pinned_dialog_date: DialogDate::min(),
+            list_last_dialog_date: DialogDate::min(),
+            ..DialogList::default()
+        }
+    }
+}
+
+/// `MessagesManager::DialogFolder` (MessagesManager.h:1523-1538) — the
+/// per-folder loaded-window state over the ordered dialog set. The
+/// `MultiPromiseActor` (`load_folder_dialog_list_multipromise_`) is the
+/// net fan-in seam — recorded, not carried.
+#[derive(Debug)]
+pub struct DialogFolder {
+    pub folder_id: FolderId,
+    /// date of the last loaded dialog in the folder — in memory
+    pub folder_last_dialog_date: DialogDate,
+    /// all known dialogs, including with default order — the `std::set`
+    /// collapse; ascending iteration is newest-first (the [`DialogDate`]
+    /// order).
+    pub ordered_dialogs: std::collections::BTreeSet<DialogDate>,
+    /// date of last known user/group/channel dialog in the right order
+    pub last_server_dialog_date: DialogDate,
+    pub last_loaded_database_dialog_date: DialogDate,
+    pub last_database_server_dialog_date: DialogDate,
+    pub load_dialog_list_limit_max: i32,
+    /// `load_folder_dialog_list_multipromise_` — the pending fan-in count
+    /// (the `MultiPromiseActor` itself is the net seam).
+    pub load_folder_dialog_list_promise_count: usize,
+}
+
+impl Default for DialogFolder {
+    /// The C++ field initializers (MessagesManager.h:1523-1538).
+    fn default() -> DialogFolder {
+        DialogFolder {
+            folder_id: FolderId::default(),
+            folder_last_dialog_date: DialogDate::new(
+                MAX_ORDINARY_DIALOG_ORDER,
+                DialogId::default(),
+            ),
+            ordered_dialogs: std::collections::BTreeSet::new(),
+            last_server_dialog_date: DialogDate::new(
+                MAX_ORDINARY_DIALOG_ORDER,
+                DialogId::default(),
+            ),
+            last_loaded_database_dialog_date: DialogDate::new(
+                MAX_ORDINARY_DIALOG_ORDER,
+                DialogId::default(),
+            ),
+            last_database_server_dialog_date: DialogDate::new(
+                MAX_ORDINARY_DIALOG_ORDER,
+                DialogId::default(),
+            ),
+            load_dialog_list_limit_max: 0,
+            load_folder_dialog_list_promise_count: 0,
+        }
+    }
+}
+
+/// `MessagesManager::GetDialogsTask` (MessagesManager.h:3451-3458) — the
+/// promise is the M.11 seam; the retry window state is real.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GetDialogsTask {
+    pub dialog_list_id: DialogListId,
+    pub dialog_list_unique_id: i64,
+    pub limit: i32,
+    pub retry_count: i32,
+    pub last_dialog_date: DialogDate,
+}
+
+impl Default for GetDialogsTask {
+    /// The C++ field initializers (MessagesManager.h:3451-3458).
+    fn default() -> GetDialogsTask {
+        GetDialogsTask {
+            dialog_list_id: DialogListId::default(),
+            dialog_list_unique_id: 0,
+            limit: 0,
+            retry_count: 5,
+            last_dialog_date: DialogDate::min(),
+        }
+    }
+}
+
+/// `MessagesManager::MAX_GET_DIALOGS` (MessagesManager.h:1673) — the
+/// server-side dialog-list page limit.
+pub const MAX_GET_DIALOGS: i32 = 100;
+
 /// The `td::MessagesManager` struct skeleton (MessagesManager.h:3300+): the
 /// per-dialog container set the database family and the receive path walk.
 /// The C++ class carries ~200 private fields; the ones the ported slices
@@ -9522,11 +9794,35 @@ pub struct MessagesManager {
     /// `debug_add_message_to_dialog_fail_reason_`
     /// (MessagesManager.h:3666).
     pub(crate) debug_add_message_to_dialog_fail_reason: String,
+    /// `current_pinned_dialog_order_` (MessagesManager.h:3392) — the next
+    /// pin order to hand out.
+    pub(crate) current_pinned_dialog_order: i64,
+    /// `current_dialog_list_unique_id_` (MessagesManager.h:3394).
+    pub(crate) current_dialog_list_unique_id: i64,
+    /// `dialog_lists_` (MessagesManager.h:3395) — the per-chat-list
+    /// runtime state (the `WaitFreeHashMap` collapse).
+    pub(crate) dialog_lists: HashMap<DialogListId, DialogList>,
+    /// `dialog_folders_` (MessagesManager.h:3396).
+    pub(crate) dialog_folders: HashMap<FolderId, DialogFolder>,
+    /// `sponsored_dialog_id_` (MessagesManager.h) — the sponsored-source
+    /// read is the sponsored seam (M.10.7's `is_dialog_sponsored`).
+    pub(crate) sponsored_dialog_id: DialogId,
+    /// `get_dialogs_tasks_` (MessagesManager.h:3460) — the pending
+    /// `getDialogs` task table (the promise plumbing is the M.11 seam; the
+    /// task state itself drives the retry decision table).
+    pub(crate) get_dialogs_tasks: HashMap<i64, GetDialogsTask>,
+    /// `current_get_dialogs_task_id_` (MessagesManager.h:3461).
+    pub(crate) current_get_dialogs_task_id: i64,
 }
 
 impl MessagesManager {
     pub fn new() -> MessagesManager {
-        MessagesManager::default()
+        // `= static_cast<int64>(MIN_PINNED_DIALOG_DATE) << 32`
+        // (MessagesManager.h:3392).
+        MessagesManager {
+            current_pinned_dialog_order: i64::from(MIN_PINNED_DIALOG_DATE) << 32,
+            ..MessagesManager::default()
+        }
     }
 
     /// `MessagesManager::get_dialog` (the map lookup form).
@@ -15193,7 +15489,55 @@ pub trait ReadStateContext {
     /// — the M.10 dialog-list slice.
     fn update_dialog_lists(&mut self, dialog_id: DialogId, source: &str);
 
-    /// `running_get_difference_` (MessagesManager.h).
+    /// `td_->option_manager_->get_option_integer(name, default)` — the
+    /// pinned-limit option reads.
+    fn option_integer(&self, name: &str, default: i64) -> i64;
+
+    /// `td_->option_manager_->get_option_boolean(name, default)`.
+    fn option_boolean(&self, name: &str, default: bool) -> bool;
+
+    /// `G()->td_db()->get_binlog_pmc()->get(key)`.
+    fn binlog_pmc_get(&self, key: &str) -> Option<String>;
+
+    /// `G()->td_db()->get_binlog_pmc()->set(key, value)`.
+    fn binlog_pmc_set(&mut self, key: &str, value: &str);
+
+    /// `G()->use_message_database()` — the persistence gates.
+    fn use_message_database(&self) -> bool;
+
+    /// `DialogFilterManager::get_dialog_filter_folder_ids(filter_id)`.
+    fn get_dialog_filter_folder_ids(&self, filter_id: DialogFilterId) -> Vec<FolderId>;
+
+    /// `DialogFilterManager::need_dialog_in_filter(filter_id, info)`.
+    fn need_dialog_in_filter(
+        &self,
+        filter_id: DialogFilterId,
+        info: &DialogFilterDialogInfo,
+    ) -> bool;
+
+    /// `DialogFilterManager::is_dialog_pinned(filter_id, dialog_id)`.
+    fn is_dialog_pinned_in_filter(&self, filter_id: DialogFilterId, dialog_id: DialogId) -> bool;
+
+    /// `DialogFilterManager::get_pinned_dialog_ids(filter_id)`.
+    fn get_pinned_dialog_ids_in_filter(&self, filter_id: DialogFilterId) -> Vec<DialogId>;
+
+    /// `NotificationSettingsManager::get_scope_disable_mention_notifications(scope)`
+    /// — the scope half of `is_dialog_mention_notifications_disabled`
+    /// (MessagesManager.cpp:16595-16605); the scope resolution is the
+    /// notification-settings seam.
+    fn get_scope_disable_mention_notifications(&self) -> bool;
+
+    /// `td_->auth_manager_->is_bot()` — the dialog-list plane is
+    /// user-only (the C++ family `CHECK`s it).
+    fn is_bot(&self) -> bool;
+
+    /// `G()->close_flag()`.
+    fn close_flag(&self) -> bool;
+
+    /// `sponsored_dialog_source_.get_chat_source_object()`
+    /// (MessagesManager.cpp:33781) — the sponsored-source object seam.
+    fn get_sponsored_chat_source_object(&self) -> Option<td_api::ChatSource>;
+
     fn is_running_get_difference(&self) -> bool;
 
     /// `running_get_channel_difference(dialog_id)` (MessagesManager.h).
@@ -15277,6 +15621,60 @@ impl ReadStateContext for NoReadStateContext {
     }
 
     fn update_dialog_lists(&mut self, _dialog_id: DialogId, _source: &str) {}
+
+    fn option_integer(&self, _name: &str, default: i64) -> i64 {
+        default
+    }
+
+    fn option_boolean(&self, _name: &str, default: bool) -> bool {
+        default
+    }
+
+    fn binlog_pmc_get(&self, _key: &str) -> Option<String> {
+        None
+    }
+
+    fn binlog_pmc_set(&mut self, _key: &str, _value: &str) {}
+
+    fn use_message_database(&self) -> bool {
+        false
+    }
+
+    fn get_dialog_filter_folder_ids(&self, _filter_id: DialogFilterId) -> Vec<FolderId> {
+        Vec::new()
+    }
+
+    fn need_dialog_in_filter(
+        &self,
+        _filter_id: DialogFilterId,
+        _info: &DialogFilterDialogInfo,
+    ) -> bool {
+        false
+    }
+
+    fn is_dialog_pinned_in_filter(&self, _filter_id: DialogFilterId, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn get_pinned_dialog_ids_in_filter(&self, _filter_id: DialogFilterId) -> Vec<DialogId> {
+        Vec::new()
+    }
+
+    fn get_scope_disable_mention_notifications(&self) -> bool {
+        false
+    }
+
+    fn is_bot(&self) -> bool {
+        false
+    }
+
+    fn close_flag(&self) -> bool {
+        false
+    }
+
+    fn get_sponsored_chat_source_object(&self) -> Option<td_api::ChatSource> {
+        None
+    }
 
     fn is_running_get_difference(&self) -> bool {
         false
@@ -15397,9 +15795,2305 @@ impl DialogListUnreadCounters {
     }
 }
 
+// ---------------------------------------------------------------------------
+// M.10.12a — the dialog-list model: the `DialogList`/`DialogFolder` registry
+// (MessagesManager.cpp:34586-34632), the list-membership plane
+// (MessagesManager.cpp:34451-34532), the position plane
+// (MessagesManager.cpp:33768-33784/34534-34576), the pinned plane
+// (MessagesManager.cpp:12371-12472/14514-14525/16194-16212/33824-33827), the
+// total-count table (MessagesManager.cpp:9676-9694) and the unread-count
+// emission plane (MessagesManager.cpp:27287-27393/36812-36839). Seams:
+// - `update_dialog_lists(d, positions, ...)` itself — the full
+//   position-application walk (MessagesManager.cpp:34007+) — is the M.10.12b
+//   slice; the callers here go through the [`ReadStateContext`] hook that
+//   M.10.7 recorded for exactly this.
+// - `DialogFilterManager` reads (the filter arms of membership/pins/folder
+//   resolution) go through the new [`ReadStateContext`] seams — the manager
+//   is in flight (M.6 line).
+// - `recalc_unread_count`/`repair_server_dialog_total_count`/
+//   `repair_secret_chat_total_count` (MessagesManager.cpp:9696-9883) — the
+//   GetDialogListQuery / DialogDb-async legs are [blocked: net]; they land
+//   with the M.10.12b `get_dialogs` slice.
+// - `get_next_message_order` — sponsored-source writes stay the M.13/M.12
+//   seam (`sponsored_dialog_id_` is read-only here).
+// ---------------------------------------------------------------------------
+
+/// `MessagesManager::add_dialog_list` (MessagesManager.cpp:34586-34596) —
+/// get-or-create with the per-list unique id.
+pub fn add_dialog_list(mm: &mut MessagesManager, dialog_list_id: DialogListId) -> &mut DialogList {
+    let is_new = !mm.dialog_lists.contains_key(&dialog_list_id);
+    let list = mm
+        .dialog_lists
+        .entry(dialog_list_id)
+        .or_insert_with(|| DialogList::new(dialog_list_id));
+    if is_new {
+        mm.current_dialog_list_unique_id += 1;
+        list.unique_id = mm.current_dialog_list_unique_id;
+    }
+    list
+}
+
+/// `MessagesManager::get_dialog_list` (MessagesManager.cpp:34598-34614).
+pub fn get_dialog_list(mm: &MessagesManager, dialog_list_id: DialogListId) -> Option<&DialogList> {
+    mm.dialog_lists.get(&dialog_list_id)
+}
+
+pub(crate) fn get_dialog_list_mut(
+    mm: &mut MessagesManager,
+    dialog_list_id: DialogListId,
+) -> Option<&mut DialogList> {
+    mm.dialog_lists.get_mut(&dialog_list_id)
+}
+
+/// `MessagesManager::get_dialog_folder` (MessagesManager.cpp:34616-34632).
+pub fn get_dialog_folder(mm: &MessagesManager, folder_id: FolderId) -> Option<&DialogFolder> {
+    mm.dialog_folders.get(&folder_id)
+}
+
+/// `MessagesManager::is_dialog_in_list` (MessagesManager.cpp:34476-34478).
+pub fn is_dialog_in_list(d: &Dialog, dialog_list_id: DialogListId) -> bool {
+    d.dialog_list_ids.contains(&dialog_list_id)
+}
+
+/// `MessagesManager::add_dialog_to_list(Dialog *, DialogListId)`
+/// (MessagesManager.cpp:34480-34488) — the membership append plus the
+/// `updateChatAddedToList` emission. The C++ `CHECK`s
+/// `d->is_update_new_chat_sent`.
+pub fn add_dialog_to_list(
+    ctx: &mut dyn ReadStateContext,
+    d: &mut Dialog,
+    dialog_list_id: DialogListId,
+) {
+    debug_assert!(
+        !is_dialog_in_list(d, dialog_list_id),
+        "add_dialog_to_list: already in list"
+    );
+    d.dialog_list_ids.push(dialog_list_id);
+    assert!(d.is_update_new_chat_sent);
+    ctx.send_update(td_api::Object::updateChatAddedToList(
+        td_api::updateChatAddedToList {
+            chat_id: d.dialog_id.get(),
+            chat_list: Some(dialog_list_id.get_chat_list_object()),
+        },
+    ));
+}
+
+/// `MessagesManager::remove_dialog_from_list`
+/// (MessagesManager.cpp:34490-34498).
+pub fn remove_dialog_from_list(
+    ctx: &mut dyn ReadStateContext,
+    d: &mut Dialog,
+    dialog_list_id: DialogListId,
+) {
+    if let Some(pos) = d
+        .dialog_list_ids
+        .iter()
+        .position(|&id| id == dialog_list_id)
+    {
+        d.dialog_list_ids.remove(pos);
+    } else {
+        panic!("remove_dialog_from_list: not in list");
+    }
+    assert!(d.is_update_new_chat_sent);
+    ctx.send_update(td_api::Object::updateChatRemovedFromList(
+        td_api::updateChatRemovedFromList {
+            chat_id: d.dialog_id.get(),
+            chat_list: Some(dialog_list_id.get_chat_list_object()),
+        },
+    ));
+}
+
+/// `MessagesManager::is_dialog_in_dialog_list`
+/// (MessagesManager.cpp:34512-34516).
+pub fn is_dialog_in_dialog_list(d: &Dialog) -> bool {
+    d.order != DEFAULT_ORDER
+}
+
+/// `MessagesManager::get_dialog_info_for_dialog_filter`
+/// (MessagesManager.cpp:34500-34510) — `CHECK`s the ordered status.
+pub fn get_dialog_info_for_dialog_filter(
+    ctx: &dyn ReadStateContext,
+    d: &Dialog,
+) -> DialogFilterDialogInfo {
+    assert!(d.order != DEFAULT_ORDER);
+    DialogFilterDialogInfo {
+        dialog_id: d.dialog_id,
+        folder_id: d.folder_id,
+        has_unread_mentions: d.unread_mention_count != 0
+            && !is_dialog_mention_notifications_disabled_read(ctx, d),
+        is_muted: ctx.is_dialog_muted(d.dialog_id),
+        has_unread_messages: d.server_unread_count + d.local_unread_count != 0
+            || d.is_marked_as_unread,
+    }
+}
+
+/// `MessagesManager::is_dialog_mention_notifications_disabled(const Dialog *)`
+/// (MessagesManager.cpp:16595-16605) over the read-state context — the
+/// default-scope arm resolves through the
+/// [`ReadStateContext::get_scope_disable_mention_notifications`] seam.
+fn is_dialog_mention_notifications_disabled_read(ctx: &dyn ReadStateContext, d: &Dialog) -> bool {
+    if d.notification_settings
+        .use_default_disable_mention_notifications
+    {
+        return ctx.get_scope_disable_mention_notifications();
+    }
+    d.notification_settings.disable_mention_notifications
+}
+
+/// `MessagesManager::need_dialog_in_list` (MessagesManager.cpp:34518-34532).
+pub fn need_dialog_in_list(ctx: &dyn ReadStateContext, d: &Dialog, list: &DialogList) -> bool {
+    if d.order == DEFAULT_ORDER {
+        return false;
+    }
+    if list.dialog_list_id.is_folder() {
+        return d.folder_id == list.dialog_list_id.get_folder_id();
+    }
+    if list.dialog_list_id.is_filter() {
+        return ctx.need_dialog_in_filter(
+            list.dialog_list_id.get_filter_id(),
+            &get_dialog_info_for_dialog_filter(ctx, d),
+        );
+    }
+    unreachable!()
+}
+
+/// `MessagesManager::get_dialog_list_folder_ids`
+/// (MessagesManager.cpp:34451-34461).
+pub fn get_dialog_list_folder_ids(ctx: &dyn ReadStateContext, list: &DialogList) -> Vec<FolderId> {
+    if list.dialog_list_id.is_folder() {
+        return vec![list.dialog_list_id.get_folder_id()];
+    }
+    if list.dialog_list_id.is_filter() {
+        return ctx.get_dialog_filter_folder_ids(list.dialog_list_id.get_filter_id());
+    }
+    unreachable!()
+}
+
+/// `MessagesManager::has_dialogs_from_folder`
+/// (MessagesManager.cpp:34463-34474).
+pub fn has_dialogs_from_folder(
+    ctx: &dyn ReadStateContext,
+    list: &DialogList,
+    folder: &DialogFolder,
+) -> bool {
+    if list.dialog_list_id.is_folder() {
+        return list.dialog_list_id.get_folder_id() == folder.folder_id;
+    }
+    if list.dialog_list_id.is_filter() {
+        return ctx
+            .get_dialog_filter_folder_ids(list.dialog_list_id.get_filter_id())
+            .contains(&folder.folder_id);
+    }
+    unreachable!()
+}
+
+/// `MessagesManager::need_send_update_chat_position`
+/// (MessagesManager.cpp:34534-34543).
+pub fn need_send_update_chat_position(
+    old_position: &DialogPositionInList,
+    new_position: &DialogPositionInList,
+) -> bool {
+    if old_position.public_order != new_position.public_order {
+        return true;
+    }
+    if old_position.public_order == 0 {
+        return false;
+    }
+    old_position.is_pinned != new_position.is_pinned
+        || old_position.is_sponsored != new_position.is_sponsored
+}
+
+/// `MessagesManager::get_dialog_pinned_order(const DialogList *, DialogId)`
+/// (MessagesManager.cpp:12385-12393) — the static form.
+pub fn get_dialog_pinned_order(list: &DialogList, dialog_id: DialogId) -> i64 {
+    if let Some(&order) = list.pinned_dialog_id_orders.get(&dialog_id) {
+        return order;
+    }
+    DEFAULT_ORDER
+}
+
+/// `MessagesManager::is_dialog_pinned(DialogListId, DialogId)`
+/// (MessagesManager.cpp:12371-12379).
+pub fn is_dialog_pinned(
+    ctx: &dyn ReadStateContext,
+    mm: &MessagesManager,
+    dialog_list_id: DialogListId,
+    dialog_id: DialogId,
+) -> bool {
+    if get_dialog_pinned_order_by_id(mm, dialog_list_id, dialog_id) != DEFAULT_ORDER {
+        return true;
+    }
+    if dialog_list_id.is_filter() {
+        return ctx.is_dialog_pinned_in_filter(dialog_list_id.get_filter_id(), dialog_id);
+    }
+    false
+}
+
+/// `MessagesManager::get_dialog_pinned_order(DialogListId, DialogId)`
+/// (MessagesManager.cpp:12381-12383).
+pub fn get_dialog_pinned_order_by_id(
+    mm: &MessagesManager,
+    dialog_list_id: DialogListId,
+    dialog_id: DialogId,
+) -> i64 {
+    match mm.dialog_lists.get(&dialog_list_id) {
+        Some(list) => get_dialog_pinned_order(list, dialog_id),
+        None => DEFAULT_ORDER,
+    }
+}
+
+/// `MessagesManager::get_dialog_private_order`
+/// (MessagesManager.cpp:33768-33784).
+pub fn get_dialog_private_order(
+    ctx: &dyn ReadStateContext,
+    list: Option<&DialogList>,
+    d: &Dialog,
+) -> i64 {
+    let Some(list) = list else {
+        return 0;
+    };
+    if ctx.is_dialog_sponsored(d.dialog_id)
+        && list.dialog_list_id == DialogListId::from_folder(FolderId::main())
+    {
+        return SPONSORED_DIALOG_ORDER;
+    }
+    if d.order == DEFAULT_ORDER {
+        return 0;
+    }
+    let pinned_order = get_dialog_pinned_order(list, d.dialog_id);
+    if pinned_order != DEFAULT_ORDER {
+        return pinned_order;
+    }
+    d.order
+}
+
+/// `DialogDate::operator<=` (DialogDate.h:32-34) — the C++ comparison the
+/// position-publication window uses; the derived [`Ord`] is the set order,
+/// not this one.
+fn dialog_date_le(a: DialogDate, b: DialogDate) -> bool {
+    a.order >= b.order && (a.order != b.order || a.dialog_id.get() >= b.dialog_id.get())
+}
+
+/// `MessagesManager::get_dialog_position_in_list`
+/// (MessagesManager.cpp:34545-34564).
+pub fn get_dialog_position_in_list(
+    ctx: &dyn ReadStateContext,
+    mm: &MessagesManager,
+    list: &DialogList,
+    d: &Dialog,
+    actual: bool,
+) -> DialogPositionInList {
+    let mut position = DialogPositionInList {
+        order: d.order,
+        ..DialogPositionInList::default()
+    };
+    let is_in_list = if actual {
+        need_dialog_in_list(ctx, d, list)
+    } else {
+        is_dialog_in_list(d, list.dialog_list_id)
+    };
+    if ctx.is_dialog_sponsored(d.dialog_id) || is_in_list {
+        position.private_order = get_dialog_private_order(ctx, Some(list), d);
+    }
+    if position.private_order != 0 {
+        position.public_order = if dialog_date_le(
+            DialogDate::new(position.private_order, d.dialog_id),
+            list.list_last_dialog_date,
+        ) {
+            position.private_order
+        } else {
+            0
+        };
+        position.is_pinned = get_dialog_pinned_order(list, d.dialog_id) != DEFAULT_ORDER;
+        position.is_sponsored = ctx.is_dialog_sponsored(d.dialog_id);
+    }
+    position.total_dialog_count = get_dialog_total_count(ctx, mm, list);
+    position
+}
+
+/// `MessagesManager::get_dialog_positions` (MessagesManager.cpp:34566-34576)
+/// — the position in every known list.
+pub fn get_dialog_positions(
+    ctx: &dyn ReadStateContext,
+    mm: &MessagesManager,
+    d: &Dialog,
+) -> HashMap<DialogListId, DialogPositionInList> {
+    let mut positions = HashMap::new();
+    for (list_id, list) in &mm.dialog_lists {
+        positions.insert(
+            *list_id,
+            get_dialog_position_in_list(ctx, mm, list, d, false),
+        );
+    }
+    positions
+}
+
+/// `MessagesManager::get_dialog_total_count`
+/// (MessagesManager.cpp:9676-9694).
+pub fn get_dialog_total_count(
+    ctx: &dyn ReadStateContext,
+    mm: &MessagesManager,
+    list: &DialogList,
+) -> i32 {
+    let mut sponsored_dialog_count = 0;
+    if mm.sponsored_dialog_id.is_valid()
+        && list.dialog_list_id == DialogListId::from_folder(FolderId::main())
+    {
+        sponsored_dialog_count = i32::from(ctx.is_dialog_sponsored(mm.sponsored_dialog_id));
+    }
+    if list.server_dialog_total_count != -1 && list.secret_chat_total_count != -1 {
+        return std::cmp::max(
+            list.server_dialog_total_count + list.secret_chat_total_count,
+            list.in_memory_dialog_total_count,
+        ) + sponsored_dialog_count;
+    }
+    if list.list_last_dialog_date == DialogDate::max() {
+        return list.in_memory_dialog_total_count + sponsored_dialog_count;
+    }
+    list.in_memory_dialog_total_count + sponsored_dialog_count + 1
+}
+
+/// `MessagesManager::get_next_pinned_dialog_order`
+/// (MessagesManager.cpp:33824-33827).
+pub fn get_next_pinned_dialog_order(mm: &mut MessagesManager) -> i64 {
+    mm.current_pinned_dialog_order += 1;
+    mm.current_pinned_dialog_order
+}
+
+/// `MessagesManager::save_pinned_folder_dialog_ids`
+/// (MessagesManager.cpp:12463-12472) — the folder lists only.
+pub fn save_pinned_folder_dialog_ids(ctx: &mut dyn ReadStateContext, list: &DialogList) {
+    if !list.dialog_list_id.is_folder() || !ctx.use_message_database() {
+        return;
+    }
+    let ids: Vec<String> = list
+        .pinned_dialogs
+        .iter()
+        .map(|pinned| pinned.get_dialog_id().get().to_string())
+        .collect();
+    ctx.binlog_pmc_set(
+        &format!(
+            "pinned_dialog_ids{}",
+            list.dialog_list_id.get_folder_id().get()
+        ),
+        &ids.join(","),
+    );
+}
+
+/// `MessagesManager::set_dialog_is_pinned(DialogId, bool)`
+/// (MessagesManager.cpp:12395-12403) — pins in the dialog's folder list.
+pub fn set_dialog_is_pinned(
+    ctx: &mut dyn ReadStateContext,
+    mm: &mut MessagesManager,
+    d: &Dialog,
+    is_pinned: bool,
+) -> bool {
+    set_dialog_is_pinned_in_list(
+        ctx,
+        mm,
+        DialogListId::from_folder(d.folder_id),
+        d,
+        is_pinned,
+        true,
+    )
+}
+
+/// `MessagesManager::set_dialog_is_pinned(DialogListId, Dialog *, bool,
+/// bool)` (MessagesManager.cpp:12406-12461) — the pin core; only touches
+/// the list, changes nothing in the corresponding DialogFilter. The
+/// `update_dialog_lists` tail goes through the [`ReadStateContext`] hook
+/// (the walk itself is M.10.12b).
+pub fn set_dialog_is_pinned_in_list(
+    ctx: &mut dyn ReadStateContext,
+    mm: &mut MessagesManager,
+    dialog_list_id: DialogListId,
+    d: &Dialog,
+    is_pinned: bool,
+    need_update_dialog_lists: bool,
+) -> bool {
+    let dialog_id = d.dialog_id;
+    if d.order == DEFAULT_ORDER && is_pinned {
+        // the chat can't be pinned
+        return false;
+    }
+
+    let positions = get_dialog_positions(ctx, mm, d);
+    let _ = positions;
+
+    if !mm.dialog_lists.contains_key(&dialog_list_id) {
+        return false;
+    }
+    if !mm
+        .dialog_lists
+        .get(&dialog_list_id)
+        .is_some_and(|list| list.are_pinned_dialogs_inited)
+    {
+        return false;
+    }
+    if is_pinned
+        && mm.dialog_lists.get(&dialog_list_id).is_some_and(|list| {
+            !list.pinned_dialogs.is_empty() && list.pinned_dialogs[0].get_dialog_id() == dialog_id
+        })
+    {
+        return false;
+    }
+
+    let new_order = if is_pinned {
+        Some(get_next_pinned_dialog_order(mm))
+    } else {
+        None
+    };
+
+    let Some(list) = mm.dialog_lists.get_mut(&dialog_list_id) else {
+        unreachable!()
+    };
+    if is_pinned {
+        let dialog_date = DialogDate::new(new_order.unwrap(), dialog_id);
+        let max_size = list.pinned_dialogs.len() + 1;
+        add_to_top_if(&mut list.pinned_dialogs, max_size, dialog_date, dialog_id);
+        match list.pinned_dialog_id_orders.entry(dialog_id) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                assert!(list.pinned_dialogs[0] != dialog_date);
+                list.pinned_dialogs[0] = dialog_date;
+                entry.insert(dialog_date.get_order());
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                assert!(list.pinned_dialogs[0] == dialog_date);
+                entry.insert(dialog_date.get_order());
+            }
+        }
+    } else {
+        let size_before = list.pinned_dialogs.len();
+        list.pinned_dialogs
+            .retain(|dialog_date| dialog_date.get_dialog_id() != dialog_id);
+        if list.pinned_dialogs.len() == size_before {
+            return false;
+        }
+        list.pinned_dialog_id_orders.remove(&dialog_id);
+    }
+
+    save_pinned_folder_dialog_ids(ctx, list);
+
+    if need_update_dialog_lists {
+        ctx.update_dialog_lists(dialog_id, "set_dialog_is_pinned");
+    }
+    true
+}
+
+/// `MessagesManager::get_pinned_dialog_ids`
+/// (MessagesManager.cpp:14514-14525).
+pub fn get_pinned_dialog_ids(
+    ctx: &dyn ReadStateContext,
+    mm: &MessagesManager,
+    dialog_list_id: DialogListId,
+) -> Vec<DialogId> {
+    if dialog_list_id.is_filter() {
+        return ctx.get_pinned_dialog_ids_in_filter(dialog_list_id.get_filter_id());
+    }
+    let Some(list) = mm.dialog_lists.get(&dialog_list_id) else {
+        return Vec::new();
+    };
+    if !list.are_pinned_dialogs_inited {
+        return Vec::new();
+    }
+    list.pinned_dialogs
+        .iter()
+        .map(|pinned_dialog| pinned_dialog.get_dialog_id())
+        .collect()
+}
+
+/// `MessagesManager::get_pinned_dialogs_limit`
+/// (MessagesManager.cpp:16194-16212).
+pub fn get_pinned_dialogs_limit(ctx: &dyn ReadStateContext, dialog_list_id: DialogListId) -> i32 {
+    if dialog_list_id.is_filter() {
+        return ctx.option_integer("chat_folder_chosen_chat_count_max", 100) as i32;
+    }
+
+    let key;
+    let mut default_limit = 5;
+    if !dialog_list_id.is_folder() || dialog_list_id.get_folder_id() != FolderId::main() {
+        key = "pinned_archived_chat_count_max";
+        default_limit = 100;
+    } else {
+        key = "pinned_chat_count_max";
+    }
+    let limit = (ctx.option_integer(key, 0) as i32).clamp(0, 1000);
+    if limit <= 0 {
+        if ctx.option_boolean("is_premium", false) {
+            default_limit *= 2;
+        }
+        return default_limit;
+    }
+    limit
+}
+
+impl DialogList {
+    /// `MessagesManager::get_update_unread_message_count_object`
+    /// (MessagesManager.cpp:36812-36822).
+    pub fn get_update_unread_message_count_object(&self) -> td_api::updateUnreadMessageCount {
+        assert!(self.is_message_unread_count_inited);
+        let unread_count = self.unread_message_total_count;
+        let unread_unmuted_count =
+            self.unread_message_total_count - self.unread_message_muted_count;
+        assert!(unread_count >= 0);
+        assert!(unread_unmuted_count >= 0);
+        td_api::updateUnreadMessageCount {
+            chat_list: Some(self.dialog_list_id.get_chat_list_object()),
+            unread_count,
+            unread_unmuted_count,
+        }
+    }
+}
+
+/// `MessagesManager::get_update_unread_chat_count_object`
+/// (MessagesManager.cpp:36824-36839).
+pub fn get_update_unread_chat_count_object(
+    ctx: &dyn ReadStateContext,
+    mm: &MessagesManager,
+    list: &DialogList,
+) -> td_api::updateUnreadChatCount {
+    assert!(list.is_dialog_unread_count_inited);
+    let unread_count = list.unread_dialog_total_count;
+    let unread_unmuted_count = unread_count - list.unread_dialog_muted_count;
+    let unread_marked_count = list.unread_dialog_marked_count;
+    let unread_unmuted_marked_count = unread_marked_count - list.unread_dialog_muted_marked_count;
+    assert!(unread_count >= 0);
+    assert!(unread_unmuted_count >= 0);
+    assert!(unread_marked_count >= 0);
+    assert!(unread_unmuted_marked_count >= 0);
+    td_api::updateUnreadChatCount {
+        chat_list: Some(list.dialog_list_id.get_chat_list_object()),
+        total_count: get_dialog_total_count(ctx, mm, list),
+        unread_count,
+        unread_unmuted_count,
+        marked_as_unread_count: unread_marked_count,
+        marked_as_unread_unmuted_count: unread_unmuted_marked_count,
+    }
+}
+
+/// `MessagesManager::send_update_unread_message_count`
+/// (MessagesManager.cpp:27287-27328) — the counter-repair table, the pmc
+/// save and the postpone/send decision.
+pub fn send_update_unread_message_count(
+    ctx: &mut dyn ReadStateContext,
+    list: &mut DialogList,
+    dialog_id: DialogId,
+    force: bool,
+    source: &str,
+    from_database: bool,
+) {
+    if !ctx.use_message_database() {
+        return;
+    }
+
+    let dialog_list_id = list.dialog_list_id;
+    assert!(list.is_message_unread_count_inited);
+    if list.unread_message_muted_count < 0
+        || list.unread_message_muted_count > list.unread_message_total_count
+    {
+        // the C++ LOG(ERROR) table — the repair happens unconditionally
+        if list.unread_message_muted_count < 0 {
+            list.unread_message_muted_count = 0;
+        }
+        if list.unread_message_muted_count > list.unread_message_total_count {
+            list.unread_message_total_count = list.unread_message_muted_count;
+        }
+    }
+
+    if !from_database {
+        ctx.binlog_pmc_set(
+            &format!("unread_message_count{}", dialog_list_id.get()),
+            &format!(
+                "{} {}",
+                list.unread_message_total_count, list.unread_message_muted_count
+            ),
+        );
+    }
+
+    let unread_unmuted_count = list.unread_message_total_count - list.unread_message_muted_count;
+    let _ = unread_unmuted_count; // the C++ LOG(INFO) line
+    if !force && ctx.is_running_get_difference() {
+        list.is_unread_message_count_update_postponed = true;
+    } else {
+        list.is_unread_message_count_update_postponed = false;
+        let update = list.get_update_unread_message_count_object();
+        let _ = dialog_id;
+        let _ = source;
+        ctx.send_update(td_api::Object::updateUnreadMessageCount(update));
+    }
+}
+
+/// `MessagesManager::send_update_unread_chat_count`
+/// (MessagesManager.cpp:27330-27384) — the five-counter repair table, the
+/// pmc save and the postpone/send decision.
+pub fn send_update_unread_chat_count(
+    ctx: &mut dyn ReadStateContext,
+    mm: &mut MessagesManager,
+    dialog_list_id: DialogListId,
+    force: bool,
+    source: &str,
+    from_database: bool,
+) {
+    if !ctx.use_message_database() {
+        return;
+    }
+
+    {
+        let list = get_dialog_list_mut(mm, dialog_list_id).expect("chat list");
+        assert!(list.is_dialog_unread_count_inited);
+        if list.unread_dialog_muted_marked_count < 0
+            || list.unread_dialog_marked_count < list.unread_dialog_muted_marked_count
+            || list.unread_dialog_muted_count < list.unread_dialog_muted_marked_count
+            || list.unread_dialog_total_count + list.unread_dialog_muted_marked_count
+                < list.unread_dialog_muted_count + list.unread_dialog_marked_count
+        {
+            if list.unread_dialog_muted_marked_count < 0 {
+                list.unread_dialog_muted_marked_count = 0;
+            }
+            if list.unread_dialog_marked_count < list.unread_dialog_muted_marked_count {
+                list.unread_dialog_marked_count = list.unread_dialog_muted_marked_count;
+            }
+            if list.unread_dialog_muted_count < list.unread_dialog_muted_marked_count {
+                list.unread_dialog_muted_count = list.unread_dialog_muted_marked_count;
+            }
+            if list.unread_dialog_total_count + list.unread_dialog_muted_marked_count
+                < list.unread_dialog_muted_count + list.unread_dialog_marked_count
+            {
+                list.unread_dialog_total_count = list.unread_dialog_muted_count
+                    + list.unread_dialog_marked_count
+                    - list.unread_dialog_muted_marked_count;
+            }
+        }
+    }
+
+    if !from_database {
+        save_unread_chat_count(
+            ctx,
+            mm.dialog_lists.get(&dialog_list_id).expect("chat list"),
+        );
+    }
+
+    let need_postpone = !force && ctx.is_running_get_difference();
+    if need_postpone {
+        mm.dialog_lists
+            .get_mut(&dialog_list_id)
+            .unwrap()
+            .is_unread_chat_count_update_postponed = true;
+    } else {
+        mm.dialog_lists
+            .get_mut(&dialog_list_id)
+            .unwrap()
+            .is_unread_chat_count_update_postponed = false;
+        let list = mm.dialog_lists.get(&dialog_list_id).unwrap();
+        let update = get_update_unread_chat_count_object(ctx, mm, list);
+        let _ = source;
+        ctx.send_update(td_api::Object::updateUnreadChatCount(update));
+    }
+}
+
+/// `MessagesManager::save_unread_chat_count`
+/// (MessagesManager.cpp:27386-27393).
+pub fn save_unread_chat_count(ctx: &mut dyn ReadStateContext, list: &DialogList) {
+    ctx.binlog_pmc_set(
+        &format!("unread_dialog_count{}", list.dialog_list_id.get()),
+        &format!(
+            "{} {} {} {} {} {}",
+            list.unread_dialog_total_count,
+            list.unread_dialog_muted_count,
+            list.unread_dialog_marked_count,
+            list.unread_dialog_muted_marked_count,
+            list.server_dialog_total_count,
+            list.secret_chat_total_count
+        ),
+    );
+}
+
+/// `add_to_top_if(v, max_size, value, is_equal_to_value)`
+/// (tdutils/td/utils/algorithm.h:139-160) over the pinned list — move the
+/// element matching `dialog_id` (or append, if there is room) to the top,
+/// shifting the skipped prefix down.
+fn add_to_top_if(v: &mut Vec<DialogDate>, max_size: usize, value: DialogDate, dialog_id: DialogId) {
+    let size = v.len();
+    let mut i = 0;
+    while i < size {
+        if v[i].get_dialog_id() == dialog_id {
+            break;
+        }
+        i += 1;
+    }
+    let mut value = value;
+    if i == size {
+        if size < max_size || size == 0 {
+            v.push(value);
+        } else {
+            i -= 1;
+        }
+    } else {
+        value = v[i];
+    }
+    while i > 0 {
+        v[i] = v[i - 1];
+        i -= 1;
+    }
+    v[0] = value;
+}
+
 /// `MessagesManager::need_unread_counter` (MessagesManager.cpp:9672-9674).
 pub fn need_unread_counter(dialog_order: i64) -> bool {
     dialog_order != DEFAULT_ORDER
+}
+
+// ---------------------------------------------------------------------------
+// M.10.12b — the dialog-list walk: `get_dialogs` + pagination, the
+// last-dialog-date maintenance and the `getDialogs` task table
+//
+// Seams (recorded, not silently dropped):
+// - the net/db legs — `GetDialogListQuery` (the server dialog-list page),
+//   `GetPinnedDialogsQuery`, `DialogFilterManager::load_dialog_filter_dialogs`
+//   / `schedule_reload_dialog_filters`, the DialogDb `get_dialogs` page and
+//   `get_secret_chat_count` — [blocked: net/M.6 db-async]; the decision
+//   tables ([`GetDialogsLoad`], [`FolderLoadAction`]) record the would-be
+//   sends and the receive halves drive the real cursor arithmetic.
+// - the per-dialog database blob loads — `get_dialog_force` /
+//   `on_load_dialog_from_database` — the Dialog db-blob plane is deferred
+//   with the M.10.12 dialog-db save slice; the in-memory map answers and
+//   the loads are counted.
+// - `load_list_queries_` / `get_dialogs_tasks_[].promise` — the promise
+//   plumbing is the M.11 seam; the counts and the retry state are real.
+// ---------------------------------------------------------------------------
+
+/// The `get_dialogs` promise outcome — the C++ `Promise<Unit>` collapses
+/// to the completion state.
+#[derive(Debug, PartialEq, Eq)]
+pub enum GetDialogsOutcome {
+    /// `promise.set_value(Unit())` — the ids are the C++ return value.
+    Done(Vec<DialogId>),
+    /// the promise rode a load query (the net/db seam) — the action
+    /// records what the C++ would send.
+    Pending(GetDialogsLoad),
+    /// `promise.set_error`.
+    Error(i32, String),
+}
+
+/// The load queries `get_dialogs` can ride (the net/db seams).
+#[derive(Debug, PartialEq, Eq)]
+pub enum GetDialogsLoad {
+    /// `reload_pinned_dialogs` — `GetPinnedDialogsQuery` (a folder list)
+    /// or `schedule_reload_dialog_filters` (a filter list).
+    ReloadPinnedDialogs,
+    /// `load_dialog_list` — the per-folder page loads (see
+    /// [`load_dialog_list`]); `limit` is the post-clamp C++ limit.
+    LoadDialogList { limit: i32 },
+    /// `DialogFilterManager::load_dialog_filter_dialogs` with the
+    /// not-yet-loaded pinned dialogs of the filter.
+    LoadFilterDialogs { dialog_ids: Vec<DialogId> },
+}
+
+/// `MessagesManager::get_dialogs` (MessagesManager.cpp:13972-14153) — the
+/// pagination walk: the sponsored head, the pinned walk, then the
+/// multi-folder merge over the ordered windows.
+#[allow(clippy::too_many_arguments)]
+pub fn get_dialogs(
+    state: &mut dyn ReadStateContext,
+    mm: &mut MessagesManager,
+    dialog_list_id: DialogListId,
+    mut offset: DialogDate,
+    mut limit: i32,
+    exact_limit: bool,
+    force: bool,
+) -> GetDialogsOutcome {
+    assert!(!state.is_bot());
+
+    if !mm.dialog_lists.contains_key(&dialog_list_id) {
+        return GetDialogsOutcome::Error(400, "Chat list not found".to_owned());
+    }
+
+    if limit <= 0 {
+        return GetDialogsOutcome::Error(400, "Parameter limit must be positive".to_owned());
+    }
+
+    let mut result: Vec<DialogId> = Vec::new();
+    if dialog_list_id == DialogListId::from_folder(FolderId::main())
+        && mm.sponsored_dialog_id.is_valid()
+    {
+        let sponsored_dialog_id = mm.sponsored_dialog_id;
+        let is_sponsored = mm
+            .dialogs
+            .get(&sponsored_dialog_id)
+            .is_some_and(|d| state.is_dialog_sponsored(d.dialog_id));
+        if is_sponsored {
+            let date = DialogDate::new(
+                get_dialog_private_order(
+                    state,
+                    Some(mm.dialog_lists.get(&dialog_list_id).unwrap()),
+                    mm.dialogs.get(&sponsored_dialog_id).unwrap(),
+                ),
+                sponsored_dialog_id,
+            );
+            if offset < date {
+                result.push(sponsored_dialog_id);
+                offset = date;
+                limit -= 1;
+            }
+        }
+    }
+
+    let are_pinned_dialogs_inited = mm
+        .dialog_lists
+        .get(&dialog_list_id)
+        .unwrap()
+        .are_pinned_dialogs_inited;
+    if !are_pinned_dialogs_inited {
+        if limit == 0 || force {
+            return GetDialogsOutcome::Done(result);
+        }
+        if dialog_list_id.is_folder() {
+            let folder_id = dialog_list_id.get_folder_id();
+            let folder = mm.dialog_folders.get(&folder_id).unwrap();
+            if folder.last_loaded_database_dialog_date == folder.last_database_server_dialog_date
+                && folder.folder_last_dialog_date != DialogDate::max()
+            {
+                return match load_dialog_list(state, mm, dialog_list_id, limit) {
+                    Ok(load) => GetDialogsOutcome::Pending(load),
+                    Err(error) => GetDialogsOutcome::Error(error.0, error.1),
+                };
+            }
+        }
+        reload_pinned_dialogs(dialog_list_id);
+        return GetDialogsOutcome::Pending(GetDialogsLoad::ReloadPinnedDialogs);
+    }
+    if dialog_list_id.is_filter() {
+        let dialog_filter_id = dialog_list_id.get_filter_id();
+        let mut input_dialog_ids: Vec<DialogId> = Vec::new();
+        for dialog_id in state.get_pinned_dialog_ids_in_filter(dialog_filter_id) {
+            if !have_dialog_force(mm, dialog_id) {
+                if dialog_id.get_type() == DialogType::SecretChat {
+                    // `have_dialog_info_force` + `force_create_dialog` —
+                    // the DialogManager info seam (the hook itself is the
+                    // M.10.20 wiring)
+                } else {
+                    input_dialog_ids.push(dialog_id);
+                }
+            }
+        }
+
+        if !input_dialog_ids.is_empty() {
+            if limit == 0 || force {
+                return GetDialogsOutcome::Done(result);
+            }
+            return GetDialogsOutcome::Pending(GetDialogsLoad::LoadFilterDialogs {
+                dialog_ids: input_dialog_ids,
+            });
+        }
+    }
+
+    let mut need_reload_pinned_dialogs = false;
+    let mut need_remove_unknown_secret_chats = false;
+    {
+        let pinned_dialogs: Vec<DialogDate> = mm
+            .dialog_lists
+            .get(&dialog_list_id)
+            .unwrap()
+            .pinned_dialogs
+            .clone();
+        if !pinned_dialogs.is_empty() && offset < *pinned_dialogs.last().unwrap() && limit > 0 {
+            for pinned_dialog in &pinned_dialogs {
+                if offset < *pinned_dialog {
+                    let dialog_id = pinned_dialog.get_dialog_id();
+                    // `get_dialog_force` — the database-load leg is the
+                    // Dialog db-blob seam
+                    let Some(d) = mm.dialogs.get(&dialog_id) else {
+                        log_error!("Failed to load pinned {dialog_id:?} from {dialog_list_id:?}");
+                        if dialog_id.get_type() != DialogType::SecretChat {
+                            need_reload_pinned_dialogs = true;
+                        } else {
+                            need_remove_unknown_secret_chats = true;
+                        }
+                        continue;
+                    };
+                    if d.order == DEFAULT_ORDER {
+                        // loaded pinned dialog with default order
+                        continue;
+                    }
+                    result.push(dialog_id);
+                    offset = *pinned_dialog;
+                    limit -= 1;
+                    if limit == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if need_reload_pinned_dialogs {
+        reload_pinned_dialogs(dialog_list_id);
+    }
+    if need_remove_unknown_secret_chats {
+        let pinned_snapshot: Vec<DialogDate> = mm
+            .dialog_lists
+            .get(&dialog_list_id)
+            .unwrap()
+            .pinned_dialogs
+            .clone();
+        let remove_ids: Vec<DialogId> = pinned_snapshot
+            .iter()
+            .filter(|dialog_date| {
+                let dialog_id = dialog_date.get_dialog_id();
+                dialog_id.get_type() == DialogType::SecretChat && !have_dialog_force(mm, dialog_id)
+            })
+            .map(|dialog_date| dialog_date.get_dialog_id())
+            .collect();
+        if let Some(list) = get_dialog_list_mut(mm, dialog_list_id) {
+            for dialog_id in &remove_ids {
+                list.pinned_dialog_id_orders.remove(dialog_id);
+            }
+            list.pinned_dialogs
+                .retain(|dialog_date| !remove_ids.contains(&dialog_date.get_dialog_id()));
+            save_pinned_folder_dialog_ids(state, list);
+        }
+    }
+    update_list_last_pinned_dialog_date(state, mm, dialog_list_id);
+
+    // the multi-folder merge — a per-folder iterator over the ordered
+    // window past `offset`
+    let folder_ids =
+        get_dialog_list_folder_ids(state, mm.dialog_lists.get(&dialog_list_id).unwrap());
+    let mut cursors: Vec<std::collections::btree_set::Range<'_, DialogDate>> = Vec::new();
+    for folder_id in folder_ids {
+        let folder = mm.dialog_folders.get(&folder_id).unwrap();
+        cursors.push(folder.ordered_dialogs.range((
+            std::ops::Bound::Excluded(offset),
+            std::ops::Bound::Unbounded,
+        )));
+    }
+    let list_last_dialog_date = mm
+        .dialog_lists
+        .get(&dialog_list_id)
+        .unwrap()
+        .list_last_dialog_date;
+    while limit > 0 {
+        let mut best_pos = 0;
+        let mut best_dialog_date = DialogDate::max();
+        for (i, cursor) in cursors.iter_mut().enumerate() {
+            while let Some(&head) = cursor.clone().next() {
+                if !(head <= list_last_dialog_date) {
+                    break;
+                }
+                let dialog_id = head.get_dialog_id();
+                let d = mm
+                    .dialogs
+                    .get(&dialog_id)
+                    .expect("ordered dialog registered");
+                if !is_dialog_in_list(d, dialog_list_id)
+                    || get_dialog_pinned_order(
+                        mm.dialog_lists.get(&dialog_list_id).unwrap(),
+                        dialog_id,
+                    ) != DEFAULT_ORDER
+                {
+                    cursor.next();
+                } else {
+                    break;
+                }
+            }
+            let Some(&head) = cursor.clone().next() else {
+                continue;
+            };
+            if head <= list_last_dialog_date && head < best_dialog_date {
+                best_pos = i;
+                best_dialog_date = head;
+            }
+        }
+        if best_dialog_date == DialogDate::max() || best_dialog_date.get_order() == DEFAULT_ORDER {
+            break;
+        }
+
+        limit -= 1;
+        result.push(best_dialog_date.get_dialog_id());
+        cursors[best_pos].next();
+    }
+
+    if (!result.is_empty() && (!exact_limit || limit == 0))
+        || force
+        || list_last_dialog_date == DialogDate::max()
+    {
+        if limit > 0 && list_last_dialog_date != DialogDate::max() {
+            // preload the next page — the promise-less `load_dialog_list`
+            let _ = load_dialog_list(state, mm, dialog_list_id, limit);
+        }
+        GetDialogsOutcome::Done(result)
+    } else {
+        match load_dialog_list(state, mm, dialog_list_id, limit) {
+            Ok(load) => GetDialogsOutcome::Pending(load),
+            Err(error) => GetDialogsOutcome::Error(error.0, error.1),
+        }
+    }
+}
+
+/// `MessagesManager::load_dialog_list` (MessagesManager.cpp:14155-14177).
+pub fn load_dialog_list(
+    state: &mut dyn ReadStateContext,
+    mm: &mut MessagesManager,
+    dialog_list_id: DialogListId,
+    mut limit: i32,
+) -> Result<GetDialogsLoad, (i32, String)> {
+    assert!(!state.is_bot());
+    if limit > MAX_GET_DIALOGS + 2 {
+        limit = MAX_GET_DIALOGS + 2;
+    }
+    let folder_ids = get_dialog_list_folder_ids(
+        state,
+        mm.dialog_lists.get(&dialog_list_id).expect("chat list"),
+    );
+    let mut is_request_sent = false;
+    for folder_id in folder_ids {
+        let folder = mm.dialog_folders.get(&folder_id).unwrap();
+        if folder.folder_last_dialog_date != DialogDate::max() {
+            load_folder_dialog_list(state, mm, folder_id, limit, false);
+            is_request_sent = true;
+        }
+    }
+    if is_request_sent {
+        // the C++ pushes the promise onto `list.load_list_queries_`
+        if let Some(list) = get_dialog_list_mut(mm, dialog_list_id) {
+            list.load_list_query_count += 1;
+        }
+        Ok(GetDialogsLoad::LoadDialogList { limit })
+    } else {
+        Err((404, "Not Found".to_owned()))
+    }
+}
+
+/// The per-folder load decision (the `load_folder_dialog_list` sends).
+#[derive(Debug, PartialEq, Eq)]
+pub enum FolderLoadAction {
+    /// `load_folder_dialog_list_from_database` — the DialogDb page.
+    FromDatabase { limit: i32 },
+    /// the server page — `GetDialogListQuery` at the folder cursor (plus
+    /// `reload_pinned_dialogs` and the `recalc_unread_count` latch); the
+    /// fields are the C++ `send(...)` arguments.
+    FromServer {
+        offset_date: i32,
+        offset_message_id: i32,
+        offset_dialog_id: DialogId,
+        limit: i32,
+    },
+    /// nothing to send — the folder is fully loaded or a load is already
+    /// in flight (`load_folder_dialog_list_multipromise_`).
+    None,
+}
+
+/// `MessagesManager::load_folder_dialog_list`
+/// (MessagesManager.cpp:14179-14229).
+pub fn load_folder_dialog_list(
+    state: &mut dyn ReadStateContext,
+    mm: &mut MessagesManager,
+    folder_id: FolderId,
+    limit: i32,
+    only_local: bool,
+) -> FolderLoadAction {
+    if state.close_flag() {
+        return FolderLoadAction::None;
+    }
+    assert!(!state.is_bot());
+
+    let folder_last_dialog_date = mm
+        .dialog_folders
+        .get(&folder_id)
+        .unwrap()
+        .folder_last_dialog_date;
+    if folder_last_dialog_date == DialogDate::max() {
+        return FolderLoadAction::None;
+    }
+
+    let use_database = state.use_message_database() && {
+        let folder = mm.dialog_folders.get(&folder_id).unwrap();
+        folder.last_loaded_database_dialog_date < folder.last_database_server_dialog_date
+    };
+    if only_local && !use_database {
+        return FolderLoadAction::None;
+    }
+
+    {
+        let folder = mm.dialog_folders.get_mut(&folder_id).unwrap();
+        if folder.load_folder_dialog_list_promise_count != 0 {
+            // queries have already been sent, just wait for the result
+            if use_database && folder.load_dialog_list_limit_max != 0 {
+                folder.load_dialog_list_limit_max = folder.load_dialog_list_limit_max.max(limit);
+            }
+            return FolderLoadAction::None;
+        }
+        folder.load_folder_dialog_list_promise_count += 1;
+    }
+
+    if use_database {
+        load_folder_dialog_list_from_database(mm, folder_id, limit);
+        FolderLoadAction::FromDatabase { limit }
+    } else {
+        let folder = mm.dialog_folders.get(&folder_id).unwrap();
+        let last_server_dialog_date = folder.last_server_dialog_date;
+        if folder.folder_last_dialog_date == last_server_dialog_date {
+            reload_pinned_dialogs(DialogListId::from_folder(folder_id));
+            return FolderLoadAction::FromServer {
+                offset_date: last_server_dialog_date.get_date(),
+                offset_message_id: last_server_dialog_date
+                    .get_message_id()
+                    .get_next_server_message_id()
+                    .get_server_message_id()
+                    .get(),
+                offset_dialog_id: last_server_dialog_date.get_dialog_id(),
+                limit: MAX_GET_DIALOGS,
+            };
+        }
+        // the main-folder draft preload (`draft_message_manager_`) and the
+        // multipromise lock release are net/draft-manager seams
+        FolderLoadAction::None
+    }
+}
+
+/// `load_folder_dialog_list_from_database` (MessagesManager.cpp:14288-14305)
+/// — the DialogDb page send plus the `load_dialog_list_limit_max` latch.
+pub(crate) fn load_folder_dialog_list_from_database(
+    mm: &mut MessagesManager,
+    folder_id: FolderId,
+    limit: i32,
+) {
+    let folder = mm.dialog_folders.get_mut(&folder_id).unwrap();
+    assert!(folder.load_dialog_list_limit_max == 0);
+    folder.load_dialog_list_limit_max = limit;
+    // `G()->td_db()->get_dialog_db_async()->get_dialogs(...)` — the M.6
+    // db-async seam; `on_get_dialogs_from_database` is the receive half
+}
+
+/// `MessagesManager::on_load_folder_dialog_list`
+/// (MessagesManager.cpp:14231-14265) — the load-completion half.
+pub fn on_load_folder_dialog_list(
+    state: &mut dyn ReadStateContext,
+    mm: &mut MessagesManager,
+    folder_id: FolderId,
+    result: Result<(), (i32, String)>,
+) {
+    if state.close_flag() {
+        return;
+    }
+    assert!(!state.is_bot());
+
+    if let Some(folder) = mm.dialog_folders.get_mut(&folder_id) {
+        folder.load_folder_dialog_list_promise_count = folder
+            .load_folder_dialog_list_promise_count
+            .saturating_sub(1);
+    }
+
+    if let Ok(()) = result {
+        let folder_last_dialog_date = mm
+            .dialog_folders
+            .get(&folder_id)
+            .map(|f| f.folder_last_dialog_date);
+        if folder_last_dialog_date == Some(DialogDate::max()) {
+            return;
+        }
+
+        let mut need_new_get_dialog_list = false;
+        let list_ids: Vec<DialogListId> = mm.dialog_lists.keys().copied().collect();
+        for list_id in list_ids {
+            let has = mm
+                .dialog_lists
+                .get(&list_id)
+                .is_some_and(|list| list.load_list_query_count != 0)
+                && {
+                    let list = mm.dialog_lists.get(&list_id).unwrap();
+                    has_dialogs_from_folder(state, list, mm.dialog_folders.get(&folder_id).unwrap())
+                };
+            if has {
+                need_new_get_dialog_list = true;
+            }
+        }
+        if need_new_get_dialog_list {
+            load_folder_dialog_list(state, mm, folder_id, MAX_GET_DIALOGS, false);
+        }
+        return;
+    }
+
+    let error = result.unwrap_err();
+    // fail every pending list query that spans this folder
+    let list_ids: Vec<DialogListId> = mm.dialog_lists.keys().copied().collect();
+    for list_id in list_ids {
+        let fails = mm
+            .dialog_lists
+            .get(&list_id)
+            .is_some_and(|list| list.load_list_query_count != 0)
+            && {
+                let list = mm.dialog_lists.get(&list_id).unwrap();
+                has_dialogs_from_folder(state, list, mm.dialog_folders.get(&folder_id).unwrap())
+            };
+        if fails {
+            // the C++ fails the promises — the count drops with them
+            if let Some(list) = get_dialog_list_mut(mm, list_id) {
+                list.load_list_query_count = 0;
+            }
+            let _ = error;
+        }
+    }
+}
+
+/// The DialogDb `get_dialogs` page — the row shape
+/// `on_get_dialogs_from_database` walks (the dialog blob itself is the
+/// deferred Dialog db-blob plane; only the ordering fields and the folder
+/// classification are live).
+#[derive(Debug)]
+pub struct DialogDbGetDialogsPage {
+    /// the loaded dialogs as `(dialog_id, folder_id)` — the folder comes
+    /// from the parsed row (`d->folder_id != folder_id` skip gate).
+    pub dialogs: Vec<(DialogId, FolderId)>,
+    pub next_order: i64,
+    pub next_dialog_id: DialogId,
+}
+
+/// The `on_get_dialogs_from_database` promise outcome.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LoadFromDatabaseOutcome {
+    /// `promise.set_value` — the page satisfied the load (the
+    /// `preload_folder_dialog_list_timeout_` re-arm is the timeout seam).
+    Done,
+    /// the next DialogDb page with the given limit.
+    LoadMore(i32),
+}
+
+/// `MessagesManager::on_get_dialogs_from_database`
+/// (MessagesManager.cpp:14307-14379) — the database-page receive half:
+/// the `load_dialog_list_limit_max` latch, the cursor repairs and the
+/// `last_server_dialog_date`/`update_last_dialog_date` fan-out.
+pub fn on_get_dialogs_from_database(
+    state: &mut dyn ReadStateContext,
+    mm: &mut MessagesManager,
+    folder_id: FolderId,
+    limit: i32,
+    page: DialogDbGetDialogsPage,
+) -> LoadFromDatabaseOutcome {
+    assert!(!state.is_bot());
+    let load_dialog_list_limit_max = mm
+        .dialog_folders
+        .get(&folder_id)
+        .unwrap()
+        .load_dialog_list_limit_max;
+    mm.dialog_folders
+        .get_mut(&folder_id)
+        .unwrap()
+        .load_dialog_list_limit_max = 0;
+
+    let have_more_dialogs_in_database = limit == page.dialogs.len() as i32;
+    let mut new_get_dialogs_limit = 0;
+    if have_more_dialogs_in_database && limit < load_dialog_list_limit_max {
+        new_get_dialogs_limit = load_dialog_list_limit_max - limit;
+    }
+
+    let mut dialogs_skipped = 0;
+    for (dialog_id, dialog_folder_id) in &page.dialogs {
+        // `on_load_dialog_from_database` — the Dialog db-blob seam; only
+        // the folder-classification skip gate is live
+        if !mm.dialogs.contains_key(dialog_id) {
+            dialogs_skipped += 1;
+            continue;
+        }
+        if dialog_folder_id != &folder_id {
+            dialogs_skipped += 1;
+            continue;
+        }
+    }
+
+    let max_dialog_date = DialogDate::new(page.next_order, page.next_dialog_id);
+    let mut need_update_last_dialog_date = false;
+    let folder = mm.dialog_folders.get_mut(&folder_id).unwrap();
+    if !have_more_dialogs_in_database {
+        folder.last_loaded_database_dialog_date = DialogDate::max();
+        folder.last_server_dialog_date = folder
+            .last_server_dialog_date
+            .max(folder.last_database_server_dialog_date);
+        need_update_last_dialog_date = true;
+    } else if folder.last_loaded_database_dialog_date < max_dialog_date {
+        folder.last_loaded_database_dialog_date =
+            max_dialog_date.min(folder.last_database_server_dialog_date);
+        folder.last_server_dialog_date = folder
+            .last_server_dialog_date
+            .max(folder.last_loaded_database_dialog_date);
+        need_update_last_dialog_date = true;
+    } else {
+        log_error!(
+            "Last loaded database dialog date didn't increase. Skipped {dialogs_skipped} chats out of {}",
+            page.dialogs.len()
+        );
+    }
+    if need_update_last_dialog_date {
+        update_last_dialog_date(state, mm, folder_id);
+        let list_ids: Vec<DialogListId> = mm.dialog_lists.keys().copied().collect();
+        for list_id in list_ids {
+            let bumps = mm
+                .dialog_lists
+                .get(&list_id)
+                .is_some_and(|list| list.load_list_query_count != 0)
+                && {
+                    let list = mm.dialog_lists.get(&list_id).unwrap();
+                    has_dialogs_from_folder(state, list, mm.dialog_folders.get(&folder_id).unwrap())
+                }
+                && new_get_dialogs_limit < limit;
+            if bumps {
+                new_get_dialogs_limit = limit;
+            }
+        }
+    }
+
+    let has_more_in_database = mm
+        .dialog_folders
+        .get(&folder_id)
+        .unwrap()
+        .last_loaded_database_dialog_date
+        < mm.dialog_folders
+            .get(&folder_id)
+            .unwrap()
+            .last_database_server_dialog_date;
+    if !has_more_in_database {
+        new_get_dialogs_limit = 0;
+    }
+
+    if new_get_dialogs_limit == 0 {
+        LoadFromDatabaseOutcome::Done
+    } else {
+        load_folder_dialog_list_from_database(mm, folder_id, new_get_dialogs_limit);
+        LoadFromDatabaseOutcome::LoadMore(new_get_dialogs_limit)
+    }
+}
+
+/// `MessagesManager::preload_folder_dialog_list`
+/// (MessagesManager.cpp:14381-14404) — the preload decision.
+pub fn preload_folder_dialog_list(
+    state: &mut dyn ReadStateContext,
+    mm: &mut MessagesManager,
+    folder_id: FolderId,
+) -> FolderLoadAction {
+    if state.close_flag() {
+        return FolderLoadAction::None;
+    }
+    assert!(!state.is_bot());
+    assert!(state.use_message_database());
+
+    if mm
+        .dialog_folders
+        .get(&folder_id)
+        .unwrap()
+        .load_folder_dialog_list_promise_count
+        != 0
+    {
+        // there is a pending load chat list request
+        return FolderLoadAction::None;
+    }
+
+    let folder = mm.dialog_folders.get(&folder_id).unwrap();
+    if folder.last_loaded_database_dialog_date < folder.last_database_server_dialog_date {
+        // if there are some dialogs in database, preload some of them
+        load_folder_dialog_list(state, mm, folder_id, 20, true)
+    } else if folder.folder_last_dialog_date != DialogDate::max() {
+        // otherwise load more dialogs from the server
+        load_folder_dialog_list(state, mm, folder_id, MAX_GET_DIALOGS, false)
+    } else {
+        recalc_unread_count(state, mm, DialogListId::from_folder(folder_id), -1, false);
+        FolderLoadAction::None
+    }
+}
+
+/// The `get_dialogs_from_list` promise outcome — the C++ promise resolves
+/// with `td_api::chats`.
+#[derive(Debug)]
+pub enum GetDialogsFromListResult {
+    Chats(td_api::Chats),
+    /// the task table entry — completed by [`on_get_dialogs_from_list`].
+    Pending(i64),
+    Error(i32, String),
+}
+
+/// `MessagesManager::get_dialogs_from_list`
+/// (MessagesManager.cpp:14385-14405).
+pub fn get_dialogs_from_list(
+    state: &mut dyn ReadStateContext,
+    mm: &mut MessagesManager,
+    dialog_list_id: DialogListId,
+    limit: i32,
+) -> GetDialogsFromListResult {
+    assert!(!state.is_bot());
+
+    let Some(list) = mm.dialog_lists.get(&dialog_list_id) else {
+        return GetDialogsFromListResult::Error(400, "Chat list not found".to_owned());
+    };
+    let dialog_list_unique_id = list.unique_id;
+
+    if limit <= 0 {
+        return GetDialogsFromListResult::Error(400, "Parameter limit must be positive".to_owned());
+    }
+
+    mm.current_get_dialogs_task_id += 1;
+    let task_id = mm.current_get_dialogs_task_id;
+    mm.get_dialogs_tasks.insert(
+        task_id,
+        GetDialogsTask {
+            dialog_list_id,
+            dialog_list_unique_id,
+            limit,
+            ..GetDialogsTask::default()
+        },
+    );
+    get_dialogs_from_list_impl(state, mm, task_id)
+}
+
+/// `MessagesManager::get_dialogs_from_list_impl`
+/// (MessagesManager.cpp:14407-14433).
+pub fn get_dialogs_from_list_impl(
+    state: &mut dyn ReadStateContext,
+    mm: &mut MessagesManager,
+    task_id: i64,
+) -> GetDialogsFromListResult {
+    let Some(task) = mm.get_dialogs_tasks.get(&task_id).copied() else {
+        panic!("get_dialogs task {task_id} not found");
+    };
+    let outcome = get_dialogs(
+        state,
+        mm,
+        task.dialog_list_id,
+        DialogDate::min(),
+        task.limit,
+        true,
+        false,
+    );
+    let total_count = mm
+        .dialog_lists
+        .get(&task.dialog_list_id)
+        .map(|list| get_dialog_total_count(state, mm, list))
+        .unwrap_or_default();
+    match outcome {
+        GetDialogsOutcome::Done(dialog_ids) => {
+            assert!(dialog_ids.len() as i32 <= total_count.min(task.limit));
+            if dialog_ids.len() as i32 == total_count.min(task.limit)
+                || mm
+                    .dialog_lists
+                    .get(&task.dialog_list_id)
+                    .is_some_and(|list| list.list_last_dialog_date == DialogDate::max())
+                || task.retry_count == 0
+            {
+                let _ = mm.get_dialogs_tasks.remove(&task_id);
+                return GetDialogsFromListResult::Chats(crate::dialog_manager::get_chats_object(
+                    total_count,
+                    &dialog_ids,
+                    "get_dialogs_from_list_impl",
+                ));
+            }
+            // neither the limit nor the end of the list were reached —
+            // wait for the promise ([blocked: net])
+            GetDialogsFromListResult::Pending(task_id)
+        }
+        GetDialogsOutcome::Pending(_) => GetDialogsFromListResult::Pending(task_id),
+        GetDialogsOutcome::Error(code, message) => {
+            let _ = mm.get_dialogs_tasks.remove(&task_id);
+            GetDialogsFromListResult::Error(code, message)
+        }
+    }
+}
+
+/// `MessagesManager::on_get_dialogs_from_list`
+/// (MessagesManager.cpp:14435-14464) — the task-completion half.
+pub fn on_get_dialogs_from_list(
+    state: &mut dyn ReadStateContext,
+    mm: &mut MessagesManager,
+    task_id: i64,
+    result: Result<(), (i32, String)>,
+) -> GetDialogsFromListResult {
+    let Some(task) = mm.get_dialogs_tasks.get(&task_id).copied() else {
+        // the task has already been completed
+        return GetDialogsFromListResult::Error(500, "Task already completed".to_owned());
+    };
+    let mut result = result;
+    let list_exists = mm.dialog_lists.contains_key(&task.dialog_list_id);
+    if result.is_ok()
+        && (!list_exists
+            || mm.dialog_lists.get(&task.dialog_list_id).unwrap().unique_id
+                != task.dialog_list_unique_id)
+    {
+        assert!(!task.dialog_list_id.is_folder());
+        result = Err((400, "Chat list not found".to_owned()));
+    }
+    if let Err((code, message)) = result {
+        let _ = mm.get_dialogs_tasks.remove(&task_id);
+        return GetDialogsFromListResult::Error(code, message);
+    }
+
+    let list_last_dialog_date = mm
+        .dialog_lists
+        .get(&task.dialog_list_id)
+        .unwrap()
+        .list_last_dialog_date;
+    let entry = mm.get_dialogs_tasks.get_mut(&task_id).unwrap();
+    if task.last_dialog_date == list_last_dialog_date {
+        // no new chats were loaded
+        entry.retry_count -= 1;
+    } else {
+        assert!(task.last_dialog_date < list_last_dialog_date);
+        entry.last_dialog_date = list_last_dialog_date;
+        entry.retry_count = 5;
+    }
+    get_dialogs_from_list_impl(state, mm, task_id)
+}
+
+/// `MessagesManager::reload_pinned_dialogs`
+/// (MessagesManager.cpp:14527-14537) — the decision table; the query sends
+/// are the net seams ([blocked: net]).
+pub fn reload_pinned_dialogs(dialog_list_id: DialogListId) {
+    if dialog_list_id.is_folder() {
+        // `GetPinnedDialogsQuery` — the net seam
+    } else if dialog_list_id.is_filter() {
+        // `schedule_reload_dialog_filters` — the DialogFilterManager seam
+    }
+}
+
+/// `MessagesManager::have_dialog_force` (MessagesManager.cpp:34289) — the
+/// in-memory registry form; the database-load leg is the Dialog db-blob
+/// seam.
+pub fn have_dialog_force(mm: &MessagesManager, dialog_id: DialogId) -> bool {
+    mm.dialogs.contains_key(&dialog_id)
+}
+
+/// `MessagesManager::sort_dialogs_by_order`
+/// (MessagesManager.cpp:14541-14560) — the `std::partial_sort` collapse
+/// over the fake-order ladder.
+pub fn sort_dialogs_by_order(
+    ctx: &dyn ReadStateContext,
+    mm: &MessagesManager,
+    dialog_ids: &[DialogId],
+    limit: i32,
+) -> Vec<DialogId> {
+    assert!(!ctx.is_bot());
+    let mut fake_order = dialog_ids.len() as i64 + 1;
+    let mut dialog_dates: Vec<DialogDate> = dialog_ids
+        .iter()
+        .map(|&dialog_id| {
+            let d = mm.dialogs.get(&dialog_id).expect("dialog registered");
+            let order = get_dialog_base_order(ctx, mm, d);
+            if is_dialog_inited(d) || order != DEFAULT_ORDER {
+                return DialogDate::new(order, dialog_id);
+            }
+            // if the dialog is not inited yet, the server is assumed to
+            // know better and the dialog needs to be returned
+            let order = fake_order;
+            fake_order -= 1;
+            DialogDate::new(order, dialog_id)
+        })
+        .collect();
+    if limit as usize >= dialog_dates.len() {
+        dialog_dates.sort();
+    } else {
+        dialog_dates.sort();
+        dialog_dates.truncate(limit as usize);
+    }
+    while dialog_dates
+        .last()
+        .is_some_and(|dialog_date| dialog_date.get_order() == DEFAULT_ORDER)
+    {
+        dialog_dates.pop();
+    }
+    dialog_dates
+        .into_iter()
+        .map(|dialog_date| dialog_date.get_dialog_id())
+        .collect()
+}
+
+/// `MessagesManager::is_dialog_inited` (MessagesManager.cpp:16564-16568).
+pub fn is_dialog_inited(d: &Dialog) -> bool {
+    d.notification_settings.is_synchronized
+        && d.is_last_read_inbox_message_id_inited
+        && d.is_last_read_outbox_message_id_inited
+}
+
+/// `MessagesManager::get_dialog_base_order`
+/// (MessagesManager.cpp:33751-33767).
+pub fn get_dialog_base_order(ctx: &dyn ReadStateContext, mm: &MessagesManager, d: &Dialog) -> i64 {
+    if ctx.is_bot() {
+        // to not call get_dialog_list
+        return 0;
+    }
+    if ctx.is_dialog_sponsored(d.dialog_id) {
+        return SPONSORED_DIALOG_ORDER;
+    }
+    if d.order == DEFAULT_ORDER {
+        return 0;
+    }
+    let pinned_order =
+        get_dialog_pinned_order_by_id(mm, DialogListId::from_folder(FolderId::main()), d.dialog_id);
+    if pinned_order != DEFAULT_ORDER {
+        return pinned_order;
+    }
+    d.order
+}
+
+/// `MessagesManager::get_chat_position_object`
+/// (MessagesManager.cpp:33777-33790).
+pub fn get_chat_position_object(
+    ctx: &dyn ReadStateContext,
+    mm: &MessagesManager,
+    dialog_list_id: DialogListId,
+    d: &Dialog,
+) -> Option<td_api::ChatPosition> {
+    if ctx.is_bot() {
+        return None;
+    }
+
+    let list = mm.dialog_lists.get(&dialog_list_id)?;
+    let position = get_dialog_position_in_list(ctx, mm, list, d, false);
+    if position.public_order == 0 {
+        return None;
+    }
+    let chat_source = if position.is_sponsored {
+        ctx.get_sponsored_chat_source_object()
+    } else {
+        None
+    };
+    Some(td_api::ChatPosition {
+        list: Some(dialog_list_id.get_chat_list_object()),
+        order: position.public_order,
+        is_pinned: position.is_pinned,
+        source: chat_source,
+    })
+}
+
+/// `MessagesManager::get_chat_positions_object`
+/// (MessagesManager.cpp:33792-33806).
+pub fn get_chat_positions_object(
+    ctx: &dyn ReadStateContext,
+    mm: &MessagesManager,
+    d: &Dialog,
+) -> Vec<td_api::ChatPosition> {
+    let mut positions = Vec::new();
+    if !ctx.is_bot() {
+        for dialog_list_id in &d.dialog_list_ids {
+            if let Some(position) = get_chat_position_object(ctx, mm, *dialog_list_id, d) {
+                positions.push(position);
+            }
+        }
+        if ctx.is_dialog_sponsored(d.dialog_id) {
+            assert!(positions.is_empty());
+            if let Some(position) =
+                get_chat_position_object(ctx, mm, DialogListId::from_folder(FolderId::main()), d)
+            {
+                positions.push(position);
+            }
+        }
+    }
+    positions
+}
+
+/// `MessagesManager::send_update_chat_position`
+/// (MessagesManager.cpp:27484-27504).
+pub fn send_update_chat_position(
+    state: &mut dyn ReadStateContext,
+    mm: &MessagesManager,
+    dialog_list_id: DialogListId,
+    d: &Dialog,
+    source: &str,
+) {
+    if state.is_bot() {
+        return;
+    }
+    assert!(
+        d.is_update_new_chat_sent,
+        "Wrong {:?} in send_update_chat_position ({source})",
+        d.dialog_id
+    );
+    let position =
+        get_chat_position_object(state, mm, dialog_list_id, d).unwrap_or(td_api::ChatPosition {
+            list: Some(dialog_list_id.get_chat_list_object()),
+            order: 0,
+            is_pinned: false,
+            source: None,
+        });
+    state.send_update(td_api::Object::updateChatPosition(
+        td_api::updateChatPosition {
+            chat_id: crate::dialog_manager::get_chat_id_object(d.dialog_id, "updateChatPosition"),
+            position: Some(position),
+        },
+    ));
+}
+
+/// `MessagesManager::repair_server_dialog_total_count`
+/// (MessagesManager.cpp:9696-9711) — the count-repair `GetDialogListQuery`
+/// (the net seam).
+pub fn repair_server_dialog_total_count(
+    state: &dyn ReadStateContext,
+    dialog_list_id: DialogListId,
+) {
+    if state.close_flag() || state.is_bot() {
+        return;
+    }
+    if dialog_list_id.is_folder() {
+        // `GetDialogListQuery` with limit 1 — the net seam
+    } else {
+        // can repair total count only in folders
+    }
+}
+
+/// `MessagesManager::repair_secret_chat_total_count`
+/// (MessagesManager.cpp:9713-9749).
+pub fn repair_secret_chat_total_count(
+    state: &mut dyn ReadStateContext,
+    mm: &mut MessagesManager,
+    dialog_list_id: DialogListId,
+) {
+    if state.close_flag() || state.is_bot() {
+        return;
+    }
+
+    if state.use_message_database() && dialog_list_id.is_folder() {
+        // the DialogDb `get_secret_chat_count` page — the M.6 db-async
+        // seam; `on_get_secret_chat_total_count` is the receive half
+    } else {
+        let mut total_count = 0;
+        let Some(list) = mm.dialog_lists.get(&dialog_list_id) else {
+            panic!("repair_secret_chat_total_count: chat list");
+        };
+        let folder_ids = get_dialog_list_folder_ids(state, list);
+        for folder_id in folder_ids {
+            let need_recalc = mm
+                .dialog_lists
+                .get(&DialogListId::from_folder(folder_id))
+                .is_some_and(|folder_list| folder_list.need_unread_count_recalc);
+            if need_recalc {
+                // can't repair total secret chat count yet
+                return;
+            }
+            let folder = mm.dialog_folders.get(&folder_id).unwrap();
+            for dialog_date in &folder.ordered_dialogs {
+                let dialog_id = dialog_date.get_dialog_id();
+                if dialog_id.get_type() == DialogType::SecretChat
+                    && dialog_date.get_order() != DEFAULT_ORDER
+                {
+                    total_count += 1;
+                }
+            }
+        }
+        on_get_secret_chat_total_count(state, mm, dialog_list_id, total_count);
+    }
+}
+
+/// `MessagesManager::on_get_secret_chat_total_count`
+/// (MessagesManager.cpp:9751-9776).
+pub fn on_get_secret_chat_total_count(
+    state: &mut dyn ReadStateContext,
+    mm: &mut MessagesManager,
+    dialog_list_id: DialogListId,
+    total_count: i32,
+) {
+    if state.close_flag() {
+        return;
+    }
+    assert!(!state.is_bot());
+    let Some(list) = mm.dialog_lists.get(&dialog_list_id) else {
+        // just in case
+        return;
+    };
+    assert!(total_count >= 0);
+    if list.secret_chat_total_count != total_count {
+        let old_dialog_total_count = get_dialog_total_count(state, mm, list);
+        let list = get_dialog_list_mut(mm, dialog_list_id).unwrap();
+        list.secret_chat_total_count = total_count;
+        if list.is_dialog_unread_count_inited {
+            let new_dialog_total_count =
+                get_dialog_total_count(state, mm, mm.dialog_lists.get(&dialog_list_id).unwrap());
+            if old_dialog_total_count != new_dialog_total_count {
+                send_update_unread_chat_count(
+                    state,
+                    mm,
+                    dialog_list_id,
+                    true,
+                    "on_get_secret_chat_total_count",
+                    false,
+                );
+            } else {
+                save_unread_chat_count(state, mm.dialog_lists.get(&dialog_list_id).unwrap());
+            }
+        }
+    }
+}
+
+/// `MessagesManager::recalc_unread_count` (MessagesManager.cpp:9778-9870)
+/// — the full list recount over the ordered windows.
+pub fn recalc_unread_count(
+    state: &mut dyn ReadStateContext,
+    mm: &mut MessagesManager,
+    dialog_list_id: DialogListId,
+    mut old_dialog_total_count: i32,
+    force: bool,
+) {
+    if state.close_flag() || state.is_bot() || !state.use_message_database() {
+        return;
+    }
+
+    if !mm
+        .dialog_lists
+        .get(&dialog_list_id)
+        .is_some_and(|list| list.need_unread_count_recalc)
+        && !force
+    {
+        return;
+    }
+    {
+        let list = get_dialog_list_mut(mm, dialog_list_id).unwrap();
+        list.need_unread_count_recalc = false;
+        list.is_message_unread_count_inited = true;
+        list.is_dialog_unread_count_inited = true;
+    }
+
+    let mut message_total_count = 0;
+    let mut message_muted_count = 0;
+    let mut dialog_total_count = 0;
+    let mut dialog_muted_count = 0;
+    let mut dialog_marked_count = 0;
+    let mut dialog_muted_marked_count = 0;
+    let mut server_dialog_total_count = 0;
+    let mut secret_chat_total_count = 0;
+    let folder_ids =
+        get_dialog_list_folder_ids(state, mm.dialog_lists.get(&dialog_list_id).unwrap());
+    for folder_id in folder_ids {
+        let folder = mm.dialog_folders.get(&folder_id).unwrap();
+        for dialog_date in &folder.ordered_dialogs {
+            if dialog_date.get_order() == DEFAULT_ORDER {
+                break;
+            }
+
+            let dialog_id = dialog_date.get_dialog_id();
+            let d = mm
+                .dialogs
+                .get(&dialog_id)
+                .expect("ordered dialog registered");
+            if !is_dialog_in_list(d, dialog_list_id) {
+                continue;
+            }
+
+            let unread_count = d.server_unread_count + d.local_unread_count;
+            if need_unread_counter(d.order) && (unread_count > 0 || d.is_marked_as_unread) {
+                message_total_count += unread_count;
+                dialog_total_count += 1;
+                if unread_count == 0 && d.is_marked_as_unread {
+                    dialog_marked_count += 1;
+                }
+                if state.is_dialog_muted(dialog_id) {
+                    message_muted_count += unread_count;
+                    dialog_muted_count += 1;
+                    if unread_count == 0 && d.is_marked_as_unread {
+                        dialog_muted_marked_count += 1;
+                    }
+                }
+            }
+            if d.order != DEFAULT_ORDER {
+                // must not count the sponsored dialog, which is added
+                // independently
+                if dialog_id.get_type() == DialogType::SecretChat {
+                    secret_chat_total_count += 1;
+                } else {
+                    server_dialog_total_count += 1;
+                }
+            }
+        }
+    }
+
+    {
+        let list = get_dialog_list_mut(mm, dialog_list_id).unwrap();
+        if list.unread_message_total_count != message_total_count
+            || list.unread_message_muted_count != message_muted_count
+        {
+            list.unread_message_total_count = message_total_count;
+            list.unread_message_muted_count = message_muted_count;
+            send_update_unread_message_count(
+                state,
+                list,
+                DialogId::default(),
+                true,
+                "recalc_unread_count",
+                false,
+            );
+        }
+    }
+
+    if old_dialog_total_count == -1 {
+        old_dialog_total_count =
+            get_dialog_total_count(state, mm, mm.dialog_lists.get(&dialog_list_id).unwrap());
+    }
+    let mut need_save = false;
+    {
+        let list = mm.dialog_lists.get(&dialog_list_id).unwrap();
+        if list.list_last_dialog_date == DialogDate::max() {
+            if server_dialog_total_count != list.server_dialog_total_count
+                || secret_chat_total_count != list.secret_chat_total_count
+            {
+                let list = get_dialog_list_mut(mm, dialog_list_id).unwrap();
+                list.server_dialog_total_count = server_dialog_total_count;
+                list.secret_chat_total_count = secret_chat_total_count;
+                need_save = true;
+            }
+        } else {
+            let need_repair_server = list.server_dialog_total_count == -1;
+            let need_repair_secret = list.secret_chat_total_count == -1;
+            if need_repair_server {
+                // recalc_unread_count is called only after getDialogs; it
+                // is unneeded to call getDialogs again
+                repair_server_dialog_total_count(state, dialog_list_id);
+            }
+            if need_repair_secret {
+                repair_secret_chat_total_count(state, mm, dialog_list_id);
+            }
+        }
+    }
+    {
+        let list = mm.dialog_lists.get(&dialog_list_id).unwrap();
+        let changed = list.unread_dialog_total_count != dialog_total_count
+            || list.unread_dialog_muted_count != dialog_muted_count
+            || list.unread_dialog_marked_count != dialog_marked_count
+            || list.unread_dialog_muted_marked_count != dialog_muted_marked_count
+            || old_dialog_total_count != get_dialog_total_count(state, mm, list);
+        if changed {
+            let list = get_dialog_list_mut(mm, dialog_list_id).unwrap();
+            list.unread_dialog_total_count = dialog_total_count;
+            list.unread_dialog_muted_count = dialog_muted_count;
+            list.unread_dialog_marked_count = dialog_marked_count;
+            list.unread_dialog_muted_marked_count = dialog_muted_marked_count;
+            send_update_unread_chat_count(
+                state,
+                mm,
+                dialog_list_id,
+                true,
+                "recalc_unread_count",
+                false,
+            );
+        } else if need_save {
+            let list = get_dialog_list_mut(mm, dialog_list_id).unwrap();
+            save_unread_chat_count(state, list);
+        }
+    }
+}
+
+/// `MessagesManager::do_update_list_last_pinned_dialog_date`
+/// (MessagesManager.cpp:34187-34212) — must not call get_dialog_filter.
+fn do_update_list_last_pinned_dialog_date(
+    mm: &mut MessagesManager,
+    dialog_list_id: DialogListId,
+) -> bool {
+    let (last_pinned_dialog_date, are_pinned_dialogs_inited, pinned_dialogs) = {
+        let list = mm.dialog_lists.get(&dialog_list_id).expect("chat list");
+        (
+            list.last_pinned_dialog_date,
+            list.are_pinned_dialogs_inited,
+            list.pinned_dialogs.clone(),
+        )
+    };
+    if last_pinned_dialog_date == DialogDate::max() {
+        return false;
+    }
+    if !are_pinned_dialogs_inited {
+        return false;
+    }
+
+    let mut max_dialog_date = DialogDate::min();
+    for pinned_dialog in &pinned_dialogs {
+        if !mm.dialogs.contains_key(&pinned_dialog.get_dialog_id()) {
+            break;
+        }
+        max_dialog_date = *pinned_dialog;
+    }
+    if pinned_dialogs.is_empty() || max_dialog_date == *pinned_dialogs.last().unwrap() {
+        max_dialog_date = DialogDate::max();
+    }
+    if last_pinned_dialog_date < max_dialog_date {
+        mm.dialog_lists
+            .get_mut(&dialog_list_id)
+            .unwrap()
+            .last_pinned_dialog_date = max_dialog_date;
+        return true;
+    }
+    false
+}
+
+/// `MessagesManager::update_list_last_pinned_dialog_date`
+/// (MessagesManager.cpp:34213-34218).
+pub fn update_list_last_pinned_dialog_date(
+    state: &mut dyn ReadStateContext,
+    mm: &mut MessagesManager,
+    dialog_list_id: DialogListId,
+) {
+    assert!(!state.is_bot());
+    if do_update_list_last_pinned_dialog_date(mm, dialog_list_id) {
+        update_list_last_dialog_date(state, mm, dialog_list_id);
+    }
+}
+
+/// `MessagesManager::do_update_list_last_dialog_date`
+/// (MessagesManager.cpp:34222-34250).
+fn do_update_list_last_dialog_date(
+    state: &dyn ReadStateContext,
+    mm: &mut MessagesManager,
+    dialog_list_id: DialogListId,
+    folder_ids: &[FolderId],
+) -> bool {
+    assert!(!state.is_bot());
+    let mut new_last_dialog_date = mm
+        .dialog_lists
+        .get(&dialog_list_id)
+        .expect("chat list")
+        .last_pinned_dialog_date;
+    for &folder_id in folder_ids {
+        let folder = mm.dialog_folders.get(&folder_id).unwrap();
+        if folder.folder_last_dialog_date < new_last_dialog_date {
+            new_last_dialog_date = folder.folder_last_dialog_date;
+        }
+    }
+
+    let old_last_dialog_date = mm
+        .dialog_lists
+        .get(&dialog_list_id)
+        .unwrap()
+        .list_last_dialog_date;
+    if old_last_dialog_date != new_last_dialog_date {
+        assert!(
+            old_last_dialog_date < new_last_dialog_date,
+            "{:?} {} {} {:?}",
+            dialog_list_id,
+            old_last_dialog_date.get_order(),
+            new_last_dialog_date.get_order(),
+            folder_ids
+        );
+        mm.dialog_lists
+            .get_mut(&dialog_list_id)
+            .unwrap()
+            .list_last_dialog_date = new_last_dialog_date;
+        return true;
+    }
+    false
+}
+
+/// `MessagesManager::update_list_last_dialog_date`
+/// (MessagesManager.cpp:34252-34303) — the window-advance walk: the
+/// `updateChatPosition` emissions for the newly-public dialogs, the
+/// end-of-list recount and the pending-query completion.
+pub fn update_list_last_dialog_date(
+    state: &mut dyn ReadStateContext,
+    mm: &mut MessagesManager,
+    dialog_list_id: DialogListId,
+) {
+    assert!(!state.is_bot());
+    let old_dialog_total_count = get_dialog_total_count(
+        state,
+        mm,
+        mm.dialog_lists.get(&dialog_list_id).expect("chat list"),
+    );
+    let folder_ids = get_dialog_list_folder_ids(
+        state,
+        mm.dialog_lists.get(&dialog_list_id).expect("chat list"),
+    );
+    let old_last_dialog_date = mm
+        .dialog_lists
+        .get(&dialog_list_id)
+        .unwrap()
+        .list_last_dialog_date;
+    if !do_update_list_last_dialog_date(state, mm, dialog_list_id, &folder_ids) {
+        return;
+    }
+    let list_last_dialog_date = mm
+        .dialog_lists
+        .get(&dialog_list_id)
+        .unwrap()
+        .list_last_dialog_date;
+
+    // the pinned bracket (old_last_dialog_date, list_last_dialog_date]
+    {
+        let pinned_dialogs = mm
+            .dialog_lists
+            .get(&dialog_list_id)
+            .unwrap()
+            .pinned_dialogs
+            .clone();
+        let start = pinned_dialogs.partition_point(|e| e <= &old_last_dialog_date);
+        for dd in &pinned_dialogs[start..] {
+            if *dd > list_last_dialog_date {
+                break;
+            }
+            let dialog_id = dd.get_dialog_id();
+            let d = mm
+                .dialogs
+                .get(&dialog_id)
+                .expect("pinned dialog registered");
+            send_update_chat_position(state, mm, dialog_list_id, d, "update_list_last_dialog_date");
+        }
+    }
+
+    let mut is_list_further_loaded = list_last_dialog_date == DialogDate::max();
+    for folder_id in folder_ids {
+        let folder = mm.dialog_folders.get(&folder_id).unwrap();
+        for dd in folder.ordered_dialogs.range((
+            std::ops::Bound::Excluded(old_last_dialog_date),
+            std::ops::Bound::Unbounded,
+        )) {
+            if *dd > folder.folder_last_dialog_date {
+                break;
+            }
+            if dd.get_order() == DEFAULT_ORDER {
+                break;
+            }
+            let dialog_id = dd.get_dialog_id();
+            if get_dialog_pinned_order(mm.dialog_lists.get(&dialog_list_id).unwrap(), dialog_id)
+                == DEFAULT_ORDER
+            {
+                let d = mm
+                    .dialogs
+                    .get(&dialog_id)
+                    .expect("ordered dialog registered");
+                if is_dialog_in_list(d, dialog_list_id) {
+                    send_update_chat_position(
+                        state,
+                        mm,
+                        dialog_list_id,
+                        d,
+                        "update_list_last_dialog_date 2",
+                    );
+                    is_list_further_loaded = true;
+                }
+            }
+        }
+    }
+
+    if list_last_dialog_date == DialogDate::max() {
+        recalc_unread_count(state, mm, dialog_list_id, old_dialog_total_count, true);
+    }
+
+    if is_list_further_loaded {
+        // set_promises(list.load_list_queries_) — the pending loads
+        // complete ([blocked: net/M.11])
+        if let Some(list) = get_dialog_list_mut(mm, dialog_list_id) {
+            list.load_list_query_count = 0;
+        }
+    }
+}
+
+/// `MessagesManager::update_last_dialog_date`
+/// (MessagesManager.cpp:34125-34166).
+pub fn update_last_dialog_date(
+    state: &mut dyn ReadStateContext,
+    mm: &mut MessagesManager,
+    folder_id: FolderId,
+) {
+    assert!(!state.is_bot());
+    let old_last_dialog_date = mm
+        .dialog_folders
+        .get(&folder_id)
+        .expect("dialog folder")
+        .folder_last_dialog_date;
+    {
+        let folder = mm.dialog_folders.get_mut(&folder_id).unwrap();
+        folder.folder_last_dialog_date = folder.last_server_dialog_date;
+        assert!(old_last_dialog_date <= folder.folder_last_dialog_date);
+    }
+
+    if old_last_dialog_date
+        != mm
+            .dialog_folders
+            .get(&folder_id)
+            .unwrap()
+            .folder_last_dialog_date
+    {
+        let list_ids: Vec<DialogListId> = mm.dialog_lists.keys().copied().collect();
+        for list_id in list_ids {
+            update_list_last_pinned_dialog_date(state, mm, list_id);
+            update_list_last_dialog_date(state, mm, list_id);
+        }
+    }
+
+    let folder = mm.dialog_folders.get(&folder_id).unwrap();
+    if state.use_message_database()
+        && folder.last_database_server_dialog_date < folder.last_server_dialog_date
+    {
+        state.binlog_pmc_set(
+            &format!("last_server_dialog_date{}", folder_id.get()),
+            &format!(
+                "{} {}",
+                folder.last_server_dialog_date.get_order(),
+                folder.last_server_dialog_date.get_dialog_id().get()
+            ),
+        );
+        let folder = mm.dialog_folders.get_mut(&folder_id).unwrap();
+        folder.last_database_server_dialog_date = folder.last_server_dialog_date;
+        folder.last_loaded_database_dialog_date = folder.last_server_dialog_date;
+    }
+}
+
+/// `MessagesManager::mark_dialog_as_read` (MessagesManager.cpp:14466-14483)
+/// — the read-out helper of `read_all_dialogs_from_list`.
+pub fn mark_dialog_as_read(
+    manager: &mut MessagesManager,
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+) {
+    if ctx.is_bot() {
+        return;
+    }
+    let (unread_total, last_message_id_valid, last_new_message_id, is_marked_as_unread) = {
+        let Some(d) = manager.get_dialog(dialog_id) else {
+            return;
+        };
+        (
+            d.server_unread_count + d.local_unread_count,
+            d.last_message_id.is_valid(),
+            d.last_new_message_id,
+            d.is_marked_as_unread,
+        )
+    };
+    // `d->is_forum` — the TODO read forum topics arm is upstream too
+    if unread_total > 0 && last_message_id_valid {
+        let d = manager.get_dialog(dialog_id).unwrap();
+        let mut message_id = d.ordered_messages.get_last_sent_message_id();
+        if message_id == MessageId::default() {
+            // if can't find the last message, then last_new_message_id is
+            // the best guess
+            message_id = last_new_message_id;
+        }
+        read_dialog_inbox(manager, ctx, state, dialog_id, message_id);
+    }
+    if is_marked_as_unread {
+        set_dialog_is_marked_as_unread(manager, ctx, state, dialog_id, false);
+    }
+}
+
+/// `MessagesManager::read_all_dialogs_from_list`
+/// (MessagesManager.cpp:14485-14512) — the recursive walk collapse: the
+/// `get_dialogs_from_list(10000)` preload round is the net seam (its
+/// promise re-entry carries `is_recursive = true`).
+pub fn read_all_dialogs_from_list(
+    ctx: &dyn MessageObjectContext,
+    state: &mut dyn ReadStateContext,
+    manager: &mut MessagesManager,
+    dialog_list_id: DialogListId,
+) -> Result<(), (i32, String)> {
+    if state.close_flag() {
+        return Err((500, "Request aborted".to_owned()));
+    }
+
+    if !manager.dialog_lists.contains_key(&dialog_list_id) {
+        return Err((400, "Chat list not found".to_owned()));
+    }
+
+    let dialog_ids: Vec<DialogId> = manager.dialogs.keys().copied().collect();
+    for dialog_id in dialog_ids {
+        let in_list = manager
+            .get_dialog(dialog_id)
+            .is_some_and(|d| is_dialog_in_list(d, dialog_list_id));
+        if in_list {
+            mark_dialog_as_read(manager, ctx, state, dialog_id);
+        }
+    }
+
+    // the C++ preloads up to 10000 chats via `get_dialogs_from_list` and
+    // re-enters with `is_recursive = true` — the preload is the net seam
+    Ok(())
 }
 
 /// One `(message_id, is_counted_as_unread)` entry of the ordered-messages
@@ -28000,6 +30694,7 @@ mod tests {
         removed_groups: Vec<(i32, i64, i32, bool)>,
         removed_notifications: Vec<(i32, i32)>,
         pinned_removed: Vec<i64>,
+        pmc: HashMap<String, String>,
     }
 
     impl Default for ReadStateTestContext {
@@ -28017,6 +30712,7 @@ mod tests {
                 removed_groups: Vec::new(),
                 removed_notifications: Vec::new(),
                 pinned_removed: Vec::new(),
+                pmc: HashMap::new(),
             }
         }
     }
@@ -28085,6 +30781,66 @@ mod tests {
 
         fn update_dialog_lists(&mut self, _dialog_id: DialogId, source: &str) {
             self.dialog_list_updates.push(source.to_owned());
+        }
+
+        fn option_integer(&self, _name: &str, default: i64) -> i64 {
+            default
+        }
+
+        fn option_boolean(&self, _name: &str, default: bool) -> bool {
+            default
+        }
+
+        fn binlog_pmc_get(&self, key: &str) -> Option<String> {
+            self.pmc.get(key).cloned()
+        }
+
+        fn binlog_pmc_set(&mut self, key: &str, value: &str) {
+            self.pmc.insert(key.to_owned(), value.to_owned());
+        }
+
+        fn use_message_database(&self) -> bool {
+            true
+        }
+
+        fn get_dialog_filter_folder_ids(&self, _filter_id: DialogFilterId) -> Vec<FolderId> {
+            Vec::new()
+        }
+
+        fn need_dialog_in_filter(
+            &self,
+            _filter_id: DialogFilterId,
+            _info: &DialogFilterDialogInfo,
+        ) -> bool {
+            false
+        }
+
+        fn is_dialog_pinned_in_filter(
+            &self,
+            _filter_id: DialogFilterId,
+            _dialog_id: DialogId,
+        ) -> bool {
+            false
+        }
+
+        fn get_pinned_dialog_ids_in_filter(&self, _filter_id: DialogFilterId) -> Vec<DialogId> {
+            Vec::new()
+        }
+
+        fn get_scope_disable_mention_notifications(&self) -> bool {
+            false
+        }
+
+        fn is_bot(&self) -> bool {
+            false
+        }
+
+        fn close_flag(&self) -> bool {
+            false
+        }
+
+        fn get_sponsored_chat_source_object(&self) -> Option<td_api::ChatSource> {
+            None
         }
 
         fn is_running_get_difference(&self) -> bool {
@@ -31220,5 +33976,751 @@ mod tests {
             get_message_file_ids(&ctx.inner.content, &photo_message).len(),
             1
         );
+    }
+
+    // -------------------------------------------------------------------
+    // M.10.12 — the dialog-list plane
+    // -------------------------------------------------------------------
+
+    /// The M.10.12 test harness: a main-folder chat list with the given
+    /// `(user id, date, server message id)` dialogs fully loaded.
+    fn m10_12_harness(entries: &[(i64, i32, i32)]) -> (MessagesManager, Vec<DialogId>) {
+        let mut mm = MessagesManager::new();
+        let main = DialogListId::from_folder(FolderId::main());
+        add_dialog_list(&mut mm, main);
+        {
+            let list = mm.dialog_lists.get_mut(&main).unwrap();
+            list.are_pinned_dialogs_inited = true;
+            // the pinned window opens (no pinned dialogs)
+            list.last_pinned_dialog_date = DialogDate::max();
+            list.list_last_dialog_date = DialogDate::max();
+        }
+        mm.dialog_folders.insert(
+            FolderId::main(),
+            DialogFolder {
+                folder_id: FolderId::main(),
+                ..DialogFolder::default()
+            },
+        );
+        let mut ids = Vec::new();
+        for &(user_id, date, server_message_id) in entries {
+            let dialog_id = DialogId::from_user_id(UserId::new(user_id));
+            let order = DialogDate::get_dialog_order(
+                MessageId::from_server_message_id(ServerMessageId::new(server_message_id)),
+                date,
+            );
+            {
+                let d = mm.add_dialog_for_new_message(dialog_id);
+                d.order = order;
+                d.folder_id = FolderId::main();
+                d.dialog_list_ids.push(main);
+                d.is_update_new_chat_sent = true;
+            }
+            mm.dialog_folders
+                .get_mut(&FolderId::main())
+                .unwrap()
+                .ordered_dialogs
+                .insert(DialogDate::new(order, dialog_id));
+            ids.push(dialog_id);
+        }
+        // the server cursor knows the folder is fully loaded; the loaded-window
+        // cursor (folder_last) stays at the fresh default until
+        // update_last_dialog_date advances it
+        mm.dialog_folders
+            .get_mut(&FolderId::main())
+            .unwrap()
+            .last_server_dialog_date = DialogDate::max();
+        (mm, ids)
+    }
+
+    #[test]
+    fn m10_12_dialog_date_order() {
+        // the newest-first total order + the MIN/MAX sentinels
+        let a = DialogDate::new(100, DialogId::default());
+        let b = DialogDate::new(200, DialogId::default());
+        assert!(b < a, "higher order sorts first");
+        assert!(DialogDate::min() < a);
+        assert!(a < DialogDate::max());
+        // get_dialog_order / the date-message id accessors round trip
+        let order = DialogDate::get_dialog_order(
+            MessageId::from_server_message_id(ServerMessageId::new(77)),
+            1700000000,
+        );
+        let dd = DialogDate::new(order, DialogId::default());
+        assert_eq!(dd.get_date(), 1700000000);
+        assert_eq!(
+            dd.get_message_id(),
+            MessageId::from_server_message_id(ServerMessageId::new(77))
+        );
+        assert_eq!(SPONSORED_DIALOG_ORDER, 2147483647i64 << 32);
+    }
+
+    #[test]
+    fn m10_12_get_dialogs_pagination() {
+        let (mut mm, ids) = m10_12_harness(&[
+            (1, 1700000000, 10),
+            (2, 1700000001, 20),
+            (3, 1700000002, 30),
+        ]);
+        let mut state = ReadStateTestContext::default();
+        let main = DialogListId::from_folder(FolderId::main());
+
+        // the full walk: newest first
+        match get_dialogs(
+            &mut state,
+            &mut mm,
+            main,
+            DialogDate::min(),
+            10,
+            true,
+            false,
+        ) {
+            GetDialogsOutcome::Done(result) => {
+                assert_eq!(result, vec![ids[2], ids[1], ids[0]]);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+
+        // the limit truncates
+        match get_dialogs(&mut state, &mut mm, main, DialogDate::min(), 2, true, false) {
+            GetDialogsOutcome::Done(result) => {
+                assert_eq!(result, vec![ids[2], ids[1]]);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+
+        // the offset walks past the newest dialog
+        let offset = DialogDate::new(
+            DialogDate::get_dialog_order(
+                MessageId::from_server_message_id(ServerMessageId::new(30)),
+                1700000002,
+            ),
+            ids[2],
+        );
+        match get_dialogs(&mut state, &mut mm, main, offset, 10, true, false) {
+            GetDialogsOutcome::Done(result) => {
+                assert_eq!(result, vec![ids[1], ids[0]]);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+
+        // a partially loaded window: the third dialog is below the window end
+        // and exact-limit misses drive the load
+        let window_end = DialogDate::new(
+            DialogDate::get_dialog_order(
+                MessageId::from_server_message_id(ServerMessageId::new(20)),
+                1700000001,
+            ),
+            ids[1],
+        );
+        mm.dialog_lists
+            .get_mut(&main)
+            .unwrap()
+            .list_last_dialog_date = window_end;
+        {
+            let folder = mm.dialog_folders.get_mut(&FolderId::main()).unwrap();
+            folder.folder_last_dialog_date = window_end;
+            folder.last_server_dialog_date = window_end;
+        }
+        match get_dialogs(&mut state, &mut mm, main, DialogDate::min(), 3, true, false) {
+            GetDialogsOutcome::Pending(GetDialogsLoad::LoadDialogList { .. }) => {}
+            other => panic!("expected Pending(LoadDialogList), got {other:?}"),
+        }
+        // the pending load parked a list query
+        assert_eq!(mm.dialog_lists.get(&main).unwrap().load_list_query_count, 1);
+        // a non-exact walk answers with the loaded prefix
+        match get_dialogs(
+            &mut state,
+            &mut mm,
+            main,
+            DialogDate::min(),
+            3,
+            false,
+            false,
+        ) {
+            GetDialogsOutcome::Done(result) => {
+                assert_eq!(result, vec![ids[2], ids[1]]);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+
+        // the validation table (archive is a folder, but has no list here)
+        match get_dialogs(
+            &mut state,
+            &mut mm,
+            DialogListId::from_folder(FolderId::archive()),
+            DialogDate::min(),
+            1,
+            false,
+            false,
+        ) {
+            GetDialogsOutcome::Error(400, message) => assert_eq!(message, "Chat list not found"),
+            other => panic!("expected Chat list not found, got {other:?}"),
+        }
+        match get_dialogs(
+            &mut state,
+            &mut mm,
+            main,
+            DialogDate::min(),
+            0,
+            false,
+            false,
+        ) {
+            GetDialogsOutcome::Error(400, message) => {
+                assert_eq!(message, "Parameter limit must be positive")
+            }
+            other => panic!("expected limit error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m10_12_get_dialogs_pinned_walk() {
+        let (mut mm, ids) = m10_12_harness(&[
+            (1, 1700000000, 10),
+            (2, 1700000001, 20),
+            (3, 1700000002, 30),
+        ]);
+        let mut state = ReadStateTestContext::default();
+        let main = DialogListId::from_folder(FolderId::main());
+
+        // pin the oldest dialog: it leads the list
+        let order = mm.get_dialog(ids[0]).unwrap().order;
+        let d = Dialog {
+            dialog_id: ids[0],
+            order,
+            ..Dialog::default()
+        };
+        assert!(set_dialog_is_pinned_in_list(
+            &mut state, &mut mm, main, &d, true, false
+        ));
+        // the pinned registry + the saved order
+        let list = mm.dialog_lists.get(&main).unwrap();
+        assert_eq!(list.pinned_dialogs.len(), 1);
+        assert_eq!(list.pinned_dialogs[0].get_dialog_id(), ids[0]);
+        assert!(list.pinned_dialog_id_orders.contains_key(&ids[0]));
+
+        match get_dialogs(
+            &mut state,
+            &mut mm,
+            main,
+            DialogDate::min(),
+            10,
+            true,
+            false,
+        ) {
+            GetDialogsOutcome::Done(result) => {
+                // the merge walk skips the pinned dialog (it came first)
+                assert_eq!(result, vec![ids[0], ids[2], ids[1]]);
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+
+        // unpin removes it from the registry
+        assert!(set_dialog_is_pinned_in_list(
+            &mut state, &mut mm, main, &d, false, false
+        ));
+        let list = mm.dialog_lists.get(&main).unwrap();
+        assert!(list.pinned_dialogs.is_empty());
+        assert!(list.pinned_dialog_id_orders.is_empty());
+
+        // the pinned-not-inited gate: with the db cursor exhausted the C++
+        // rides load_dialog_list for the folder
+        mm.dialog_lists
+            .get_mut(&main)
+            .unwrap()
+            .are_pinned_dialogs_inited = false;
+        match get_dialogs(
+            &mut state,
+            &mut mm,
+            main,
+            DialogDate::min(),
+            1,
+            false,
+            false,
+        ) {
+            GetDialogsOutcome::Pending(GetDialogsLoad::LoadDialogList { limit: 1 }) => {}
+            other => panic!("expected Pending(LoadDialogList), got {other:?}"),
+        }
+        // ...and a fully loaded folder rides the pinned reload
+        mm.dialog_folders
+            .get_mut(&FolderId::main())
+            .unwrap()
+            .folder_last_dialog_date = DialogDate::max();
+        match get_dialogs(
+            &mut state,
+            &mut mm,
+            main,
+            DialogDate::min(),
+            1,
+            false,
+            false,
+        ) {
+            GetDialogsOutcome::Pending(GetDialogsLoad::ReloadPinnedDialogs) => {}
+            other => panic!("expected Pending(ReloadPinnedDialogs), got {other:?}"),
+        }
+        // ...but force/limit==0 answers with what is loaded
+        match get_dialogs(&mut state, &mut mm, main, DialogDate::min(), 1, false, true) {
+            GetDialogsOutcome::Done(result) => assert!(result.is_empty()),
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m10_12_recalc_and_get_dialogs_from_list() {
+        let (mut mm, ids) = m10_12_harness(&[
+            (1, 1700000000, 10),
+            (2, 1700000001, 20),
+            (3, 1700000002, 30),
+        ]);
+        let mut state = ReadStateTestContext::default();
+        let main = DialogListId::from_folder(FolderId::main());
+
+        // unread state on the two newest dialogs, one muted
+        state.muted = false;
+        {
+            let d = mm.get_dialog_mut(ids[2]).unwrap();
+            d.server_unread_count = 2;
+            d.local_unread_count = 1;
+        }
+        {
+            let d = mm.get_dialog_mut(ids[1]).unwrap();
+            d.server_unread_count = 0;
+            d.is_marked_as_unread = true;
+        }
+
+        recalc_unread_count(&mut state, &mut mm, main, -1, true);
+
+        let list = mm.dialog_lists.get(&main).unwrap();
+        assert_eq!(list.unread_message_total_count, 3);
+        assert_eq!(list.unread_dialog_total_count, 2);
+        assert_eq!(list.unread_dialog_marked_count, 1);
+        assert_eq!(list.server_dialog_total_count, 3);
+        assert_eq!(list.secret_chat_total_count, 0);
+        assert!(list.is_message_unread_count_inited);
+        assert!(list.is_dialog_unread_count_inited);
+        assert!(
+            state
+                .updates
+                .iter()
+                .any(|u| matches!(u, td_api::Object::updateUnreadMessageCount(_)))
+        );
+        assert!(state.updates.iter().any(|u| matches!(
+            u,
+            td_api::Object::updateUnreadChatCount(u)
+                if u.total_count == 3 && u.unread_count == 2 && u.marked_as_unread_count == 1
+        )));
+        // the pmc save
+        assert!(
+            state
+                .pmc
+                .contains_key(&format!("unread_dialog_count{}", main.get()))
+        );
+
+        // get_dialogs_from_list answers the chats object synchronously
+        state.updates.clear();
+        match get_dialogs_from_list(&mut state, &mut mm, main, 10) {
+            GetDialogsFromListResult::Chats(chats) => {
+                assert_eq!(chats.total_count, 3);
+                assert_eq!(chats.chat_ids.len(), 3);
+            }
+            other => panic!("expected Chats, got {other:?}"),
+        }
+
+        // a short limit truncates the chats answer
+        match get_dialogs_from_list(&mut state, &mut mm, main, 2) {
+            GetDialogsFromListResult::Chats(chats) => {
+                assert_eq!(chats.total_count, 3);
+                assert_eq!(chats.chat_ids.len(), 2);
+            }
+            other => panic!("expected Chats, got {other:?}"),
+        }
+
+        // the validation table
+        match get_dialogs_from_list(&mut state, &mut mm, main, 0) {
+            GetDialogsFromListResult::Error(400, message) => {
+                assert_eq!(message, "Parameter limit must be positive")
+            }
+            other => panic!("expected limit error, got {other:?}"),
+        }
+        match get_dialogs_from_list(
+            &mut state,
+            &mut mm,
+            DialogListId::from_folder(FolderId::archive()),
+            1,
+        ) {
+            GetDialogsFromListResult::Error(400, message) => {
+                assert_eq!(message, "Chat list not found")
+            }
+            other => panic!("expected Chat list not found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m10_12_task_retry_table() {
+        let (mut mm, ids) = m10_12_harness(&[(1, 1700000000, 10), (2, 1700000001, 20)]);
+        let mut state = ReadStateTestContext::default();
+        let main = DialogListId::from_folder(FolderId::main());
+
+        // shrink the loaded window so the exact-limit walk can't complete
+        let window_end = DialogDate::new(
+            DialogDate::get_dialog_order(
+                MessageId::from_server_message_id(ServerMessageId::new(20)),
+                1700000001,
+            ),
+            ids[1],
+        );
+        mm.dialog_lists
+            .get_mut(&main)
+            .unwrap()
+            .list_last_dialog_date = window_end;
+        {
+            let folder = mm.dialog_folders.get_mut(&FolderId::main()).unwrap();
+            folder.folder_last_dialog_date = window_end;
+            folder.last_server_dialog_date = window_end;
+        }
+
+        let task_id = match get_dialogs_from_list(&mut state, &mut mm, main, 2) {
+            GetDialogsFromListResult::Pending(task_id) => task_id,
+            other => panic!("expected Pending, got {other:?}"),
+        };
+
+        // the first completion records the window (MIN -> window_end resets
+        // the retry count), still pending
+        match on_get_dialogs_from_list(&mut state, &mut mm, task_id, Ok(())) {
+            GetDialogsFromListResult::Pending(returned) => assert_eq!(returned, task_id),
+            other => panic!("expected Pending, got {other:?}"),
+        }
+        assert_eq!(mm.get_dialogs_tasks.get(&task_id).unwrap().retry_count, 5);
+
+        // no new chats loaded: the retry count decrements, still pending
+        match on_get_dialogs_from_list(&mut state, &mut mm, task_id, Ok(())) {
+            GetDialogsFromListResult::Pending(returned) => assert_eq!(returned, task_id),
+            other => panic!("expected Pending, got {other:?}"),
+        }
+        assert_eq!(mm.get_dialogs_tasks.get(&task_id).unwrap().retry_count, 4);
+
+        // the window advances: the retry count resets and the walk completes
+        mm.dialog_lists
+            .get_mut(&main)
+            .unwrap()
+            .list_last_dialog_date = DialogDate::max();
+        mm.dialog_lists
+            .get_mut(&main)
+            .unwrap()
+            .in_memory_dialog_total_count = 2;
+        mm.dialog_folders
+            .get_mut(&FolderId::main())
+            .unwrap()
+            .folder_last_dialog_date = DialogDate::max();
+        match on_get_dialogs_from_list(&mut state, &mut mm, task_id, Ok(())) {
+            GetDialogsFromListResult::Chats(chats) => {
+                assert_eq!(chats.chat_ids.len(), 2);
+            }
+            other => panic!("expected Chats, got {other:?}"),
+        }
+        assert!(mm.get_dialogs_tasks.is_empty());
+
+        // a filter-list task fails when the list is replaced (unique id) —
+        // the task is inserted directly (the filter-plane folder ids are the
+        // DialogFilterManager seam)
+        let filter = DialogListId::from_filter(DialogFilterId::new(1));
+        add_dialog_list(&mut mm, filter);
+        let task_id = 100;
+        mm.get_dialogs_tasks.insert(
+            task_id,
+            GetDialogsTask {
+                dialog_list_id: filter,
+                dialog_list_unique_id: mm.dialog_lists.get(&filter).unwrap().unique_id,
+                limit: 5,
+                ..GetDialogsTask::default()
+            },
+        );
+        // replacing the list bumps unique_id
+        add_dialog_list(&mut mm, filter);
+        mm.dialog_lists.get_mut(&filter).unwrap().unique_id += 100;
+        match on_get_dialogs_from_list(&mut state, &mut mm, task_id, Ok(())) {
+            GetDialogsFromListResult::Error(400, message) => {
+                assert_eq!(message, "Chat list not found")
+            }
+            other => panic!("expected unique-id error, got {other:?}"),
+        }
+
+        // an error result fails the task outright
+        mm.get_dialogs_tasks.insert(
+            task_id,
+            GetDialogsTask {
+                dialog_list_id: filter,
+                dialog_list_unique_id: mm.dialog_lists.get(&filter).unwrap().unique_id,
+                limit: 5,
+                ..GetDialogsTask::default()
+            },
+        );
+        match on_get_dialogs_from_list(
+            &mut state,
+            &mut mm,
+            task_id,
+            Err((404, "Not Found".to_owned())),
+        ) {
+            GetDialogsFromListResult::Error(404, message) => assert_eq!(message, "Not Found"),
+            other => panic!("expected Not Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m10_12_db_page_cursors() {
+        let (mut mm, _ids) = m10_12_harness(&[]);
+        let mut state = ReadStateTestContext::default();
+        let main = DialogListId::from_folder(FolderId::main());
+        let folder_id = FolderId::main();
+
+        // the db cursor starts at the top and the page advances it
+        let page1_order = DialogDate::get_dialog_order(
+            MessageId::from_server_message_id(ServerMessageId::new(50)),
+            1700000005,
+        );
+        let outcome = on_get_dialogs_from_database(
+            &mut state,
+            &mut mm,
+            folder_id,
+            1,
+            DialogDbGetDialogsPage {
+                dialogs: Vec::new(), // the blob plane is the seam
+                next_order: page1_order,
+                next_dialog_id: DialogId::from_user_id(UserId::new(5)),
+            },
+        );
+        assert_eq!(
+            outcome,
+            LoadFromDatabaseOutcome::Done,
+            "db exhausted (have_more false)"
+        );
+        let folder = mm.dialog_folders.get(&folder_id).unwrap();
+        assert_eq!(folder.last_loaded_database_dialog_date, DialogDate::max());
+
+        // a full page while the db knows more: LoadMore with the residual limit
+        let folder = mm.dialog_folders.get_mut(&folder_id).unwrap();
+        folder.last_loaded_database_dialog_date =
+            DialogDate::new(MAX_ORDINARY_DIALOG_ORDER, DialogId::default());
+        folder.last_database_server_dialog_date = DialogDate::new(0, DialogId::default());
+        folder.last_server_dialog_date =
+            DialogDate::new(MAX_ORDINARY_DIALOG_ORDER, DialogId::default());
+        folder.folder_last_dialog_date =
+            DialogDate::new(MAX_ORDINARY_DIALOG_ORDER, DialogId::default());
+        folder.load_dialog_list_limit_max = 4;
+        mm.dialog_lists
+            .get_mut(&main)
+            .unwrap()
+            .list_last_dialog_date = DialogDate::min();
+        let page2_order = DialogDate::get_dialog_order(
+            MessageId::from_server_message_id(ServerMessageId::new(40)),
+            1700000004,
+        );
+        let outcome = on_get_dialogs_from_database(
+            &mut state,
+            &mut mm,
+            folder_id,
+            2,
+            DialogDbGetDialogsPage {
+                dialogs: vec![
+                    (DialogId::from_user_id(UserId::new(4)), folder_id),
+                    (DialogId::from_user_id(UserId::new(5)), folder_id),
+                ],
+                next_order: page2_order,
+                next_dialog_id: DialogId::from_user_id(UserId::new(4)),
+            },
+        );
+        assert_eq!(outcome, LoadFromDatabaseOutcome::LoadMore(2));
+        assert_eq!(
+            mm.dialog_folders
+                .get(&folder_id)
+                .unwrap()
+                .load_dialog_list_limit_max,
+            2
+        );
+    }
+
+    #[test]
+    fn m10_12_update_last_dialog_date_walk() {
+        let (mut mm, ids) = m10_12_harness(&[(1, 1700000000, 10), (2, 1700000001, 20)]);
+        let mut state = ReadStateTestContext::default();
+        let main = DialogListId::from_folder(FolderId::main());
+        let folder_id = FolderId::main();
+
+        // park a pending load query, then open the window to the bottom: the
+        // pending query completes and the newly-public positions are emitted
+        mm.dialog_lists
+            .get_mut(&main)
+            .unwrap()
+            .load_list_query_count = 1;
+        let boundary = DialogDate::new(
+            DialogDate::get_dialog_order(
+                MessageId::from_server_message_id(ServerMessageId::new(20)),
+                1700000001,
+            ),
+            ids[1],
+        );
+        {
+            // folder_last stays at the fresh default; only the server cursor
+            // knows the boundary
+            let folder = mm.dialog_folders.get_mut(&folder_id).unwrap();
+            folder.last_server_dialog_date = boundary;
+        }
+        mm.dialog_lists
+            .get_mut(&main)
+            .unwrap()
+            .list_last_dialog_date = DialogDate::min();
+
+        update_last_dialog_date(&mut state, &mut mm, folder_id);
+
+        // the folder cursor + the list cursor advanced to the boundary
+        assert_eq!(
+            mm.dialog_folders
+                .get(&folder_id)
+                .unwrap()
+                .folder_last_dialog_date,
+            boundary
+        );
+        assert_eq!(
+            mm.dialog_lists.get(&main).unwrap().list_last_dialog_date,
+            boundary
+        );
+        // one newly-public dialog position (the boundary dialog itself)
+        let positions = state
+            .updates
+            .iter()
+            .filter(|u| matches!(u, td_api::Object::updateChatPosition(_)))
+            .count();
+        assert_eq!(positions, 1);
+        // the db gate saved the server date
+        assert!(
+            state
+                .pmc
+                .contains_key(&format!("last_server_dialog_date{}", folder_id.get()))
+        );
+
+        // a second run with no server change is a no-op
+        state.updates.clear();
+        update_last_dialog_date(&mut state, &mut mm, folder_id);
+        assert!(
+            state
+                .updates
+                .iter()
+                .all(|u| !matches!(u, td_api::Object::updateChatPosition(_)))
+        );
+    }
+
+    #[test]
+    fn m10_12_sort_dialogs_by_order_table() {
+        let (mm, ids) = m10_12_harness(&[
+            (1, 1700000000, 10),
+            (2, 1700000001, 20),
+            (3, 1700000002, 30),
+        ]);
+        let ctx = ReadStateTestContext::default();
+
+        // sorted by order (the dialog list order), truncated to the limit
+        assert_eq!(
+            sort_dialogs_by_order(&ctx, &mm, &[ids[0], ids[2], ids[1]], 2),
+            vec![ids[2], ids[1]]
+        );
+        assert_eq!(
+            sort_dialogs_by_order(&ctx, &mm, &[ids[0], ids[2], ids[1]], 10),
+            vec![ids[2], ids[1], ids[0]]
+        );
+
+        // an uninitialized dialog gets a fake order after the real ones
+        let mut mm2 = mm;
+        let extra = DialogId::from_user_id(UserId::new(99));
+        mm2.add_dialog_for_new_message(extra);
+        assert_eq!(
+            sort_dialogs_by_order(&ctx, &mm2, &[ids[2], extra], 10),
+            vec![ids[2], extra]
+        );
+    }
+
+    #[test]
+    fn m10_12_folder_load_decisions() {
+        let (mut mm, _ids) = m10_12_harness(&[]);
+        let mut state = ReadStateTestContext::default();
+        let folder_id = FolderId::main();
+
+        // a fully loaded folder sends nothing
+        mm.dialog_folders
+            .get_mut(&folder_id)
+            .unwrap()
+            .folder_last_dialog_date = DialogDate::max();
+        assert_eq!(
+            load_folder_dialog_list(&mut state, &mut mm, folder_id, 10, false),
+            FolderLoadAction::None
+        );
+
+        // an exhausted-in-db folder pages from the server at the cursor
+        {
+            let folder = mm.dialog_folders.get_mut(&folder_id).unwrap();
+            folder.folder_last_dialog_date = DialogDate::new(
+                DialogDate::get_dialog_order(
+                    MessageId::from_server_message_id(ServerMessageId::new(20)),
+                    1700000001,
+                ),
+                DialogId::from_user_id(UserId::new(2)),
+            );
+            folder.last_server_dialog_date = folder.folder_last_dialog_date;
+        }
+        match load_folder_dialog_list(&mut state, &mut mm, folder_id, 10, false) {
+            FolderLoadAction::FromServer {
+                offset_date,
+                offset_message_id,
+                offset_dialog_id,
+                limit,
+            } => {
+                assert_eq!(offset_date, 1700000001);
+                // get_next_server_message_id: the smallest server id not less
+                // than 20 — already aligned
+                assert_eq!(offset_message_id, 20);
+                assert_eq!(offset_dialog_id, DialogId::from_user_id(UserId::new(2)));
+                assert_eq!(limit, MAX_GET_DIALOGS);
+            }
+            other => panic!("expected FromServer, got {other:?}"),
+        }
+
+        // an in-flight load short-circuits
+        assert_eq!(
+            load_folder_dialog_list(&mut state, &mut mm, folder_id, 10, false),
+            FolderLoadAction::None
+        );
+        // and drains on completion back to a fresh page decision
+        on_load_folder_dialog_list(&mut state, &mut mm, folder_id, Ok(()));
+        assert!(matches!(
+            load_folder_dialog_list(&mut state, &mut mm, folder_id, 10, false),
+            FolderLoadAction::FromServer { .. }
+        ));
+
+        // the preload decisions: db rows pending -> the 20-row db page
+        {
+            let folder = mm.dialog_folders.get_mut(&folder_id).unwrap();
+            folder.load_folder_dialog_list_promise_count = 0;
+            folder.last_loaded_database_dialog_date = DialogDate::new(
+                DialogDate::get_dialog_order(
+                    MessageId::from_server_message_id(ServerMessageId::new(99)),
+                    1700000009,
+                ),
+                DialogId::from_user_id(UserId::new(9)),
+            );
+            folder.last_database_server_dialog_date = DialogDate::new(0, DialogId::default());
+        }
+        match preload_folder_dialog_list(&mut state, &mut mm, folder_id) {
+            FolderLoadAction::FromDatabase { limit } => assert_eq!(limit, 20),
+            other => panic!("expected FromDatabase(20), got {other:?}"),
+        }
+        // a fully exhausted folder falls back to the server page
+        on_load_folder_dialog_list(&mut state, &mut mm, folder_id, Ok(()));
+        {
+            let folder = mm.dialog_folders.get_mut(&folder_id).unwrap();
+            folder.last_loaded_database_dialog_date = folder.last_database_server_dialog_date;
+        }
+        assert!(matches!(
+            preload_folder_dialog_list(&mut state, &mut mm, folder_id),
+            FolderLoadAction::FromServer { .. }
+        ));
     }
 }
