@@ -12,6 +12,8 @@ pub mod birthdate;
 pub mod chat_manager;
 pub mod client;
 pub mod client_json;
+pub mod community_id;
+pub mod community_manager;
 pub mod config_dispatch;
 pub mod config_manager;
 pub mod config_recoverer;

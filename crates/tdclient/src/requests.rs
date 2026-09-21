@@ -31,6 +31,7 @@
 //! the `Td::run_request` state gate (Td.cpp:299-374).
 
 use crate::chat_manager::{ChannelId, DialogId};
+use crate::community_id::CommunityId;
 use crate::contact::Contact;
 use crate::notification::{NotificationGroupId, NotificationId, NotificationObjectId};
 use crate::notification_settings::{
@@ -38,6 +39,7 @@ use crate::notification_settings::{
     get_scope_notification_settings_object,
 };
 use crate::notification_settings_manager::ScopeSettingsAnswer;
+use crate::td::CommunityEnv;
 use crate::td::NotificationEnv;
 use crate::td::Td;
 use crate::td_api::{self, Function, Object};
@@ -1876,6 +1878,51 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             }
         }
 
+        // --- community (Requests.cpp:3415-3432) ---
+        Function::createCommunity(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = crate::misc::clean_input_string(&request.name) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, |community_id: td_api::CommunityId| {
+                Object::communityId(community_id)
+            });
+            let mut env = CommunityEnv {
+                global: &mut td.global,
+                dialog_manager: &mut td.dialog_manager,
+                updates: &mut td.community_updates,
+            };
+            td.community_manager.create_community(
+                &mut env,
+                &name,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                request.is_chat_hidden,
+                promise,
+            );
+        }
+        Function::setCommunityName(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = crate::misc::clean_input_string(&request.name) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = CommunityEnv {
+                global: &mut td.global,
+                dialog_manager: &mut td.dialog_manager,
+                updates: &mut td.community_updates,
+            };
+            td.community_manager.set_community_name(
+                &mut env,
+                CommunityId::new(request.community_id),
+                &name,
+                promise,
+            );
+        }
+
         // Everything else waits for its manager step.
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
@@ -2176,13 +2223,14 @@ mod request_census_tests {
         // stays the 500 placeholder) + M.12.10's eighteen file-plane
         // dispatches (getFile/getRemoteFile, the download/upload/
         // generation arms, the DownloadManager list plane and the four
-        // storage-statistics arms). Fix per flip.
+        // storage-statistics arms) + M.34's two community arms
+        // (createCommunity, setCommunityName). Fix per flip.
         assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            110,
+            112,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 894, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 892, "interim count");
     }
 }

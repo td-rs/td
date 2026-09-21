@@ -126,7 +126,7 @@ createChatFolder	interim
 createChatFolderInviteLink	interim
 createChatInviteLink	interim
 createChatSubscriptionInviteLink	interim
-createCommunity	interim
+createCommunity	dispatched
 createForumTopic	interim
 createGiftCollection	interim
 createGroupCall	interim
@@ -844,7 +844,7 @@ setChatTheme	interim
 setChatTitle	dispatched
 setCloseFriends	dispatched
 setCommands	interim
-setCommunityName	interim
+setCommunityName	dispatched
 setCustomEmojiStickerSetThumbnail	interim
 setCustomLanguagePack	interim
 setCustomLanguagePackString	interim
