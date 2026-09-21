@@ -8,6 +8,7 @@
 //! Options manager S69.
 
 pub mod auth_manager;
+pub mod autosave_manager;
 pub mod birthdate;
 pub mod chat_manager;
 pub mod client;

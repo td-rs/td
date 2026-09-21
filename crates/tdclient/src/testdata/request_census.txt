@@ -92,7 +92,7 @@ checkStickerSetName	interim
 checkWebAppFileDownload	interim
 cleanFileName	interim
 clearAllDraftMessages	interim
-clearAutosaveSettingsExceptions	interim
+clearAutosaveSettingsExceptions	dispatched
 clearImportedContacts	dispatched
 clearRecentEmojiStatuses	interim
 clearRecentReactions	interim
@@ -264,7 +264,7 @@ getAttachmentMenuBot	interim
 getAuthenticationPasskeyParameters	interim
 getAuthorizationState	dispatched
 getAutoDownloadSettingsPresets	interim
-getAutosaveSettings	interim
+getAutosaveSettings	dispatched
 getAvailableChatBoostSlots	interim
 getAvailableGifts	interim
 getBackgroundUrl	interim
@@ -797,7 +797,7 @@ setAuthenticationEmailAddress	interim
 setAuthenticationPhoneNumber	dispatched
 setAuthenticationPremiumPurchaseTransaction	interim
 setAutoDownloadSettings	interim
-setAutosaveSettings	interim
+setAutosaveSettings	dispatched
 setBio	dispatched
 setBirthdate	dispatched
 setBotInfoDescription	interim

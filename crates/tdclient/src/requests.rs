@@ -38,6 +38,7 @@ use crate::notification_settings::{
     get_scope_notification_settings_object,
 };
 use crate::notification_settings_manager::ScopeSettingsAnswer;
+use crate::td::AutosaveEnv;
 use crate::td::NotificationEnv;
 use crate::td::Td;
 use crate::td_api::{self, Function, Object};
@@ -226,6 +227,17 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 };
                 td.notification_manager
                     .get_current_state(&env, &mut updates);
+            }
+
+            // AutosaveManager::get_current_state (Requests.cpp:2243 —
+            // after the welcome-message block, before the account block;
+            // the manager's own are-inited gate applies)
+            {
+                let env = AutosaveEnv {
+                    global: &mut td.global,
+                    updates: &mut td.autosave_updates,
+                };
+                td.autosave_manager.get_current_state(&env, &mut updates);
             }
 
             // ConnectionStateManager and the remaining authorized-manager
@@ -1876,6 +1888,49 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             }
         }
 
+        // --- autosave (Requests.cpp:3136-3152) ---
+        Function::getAutosaveSettings(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |s: td_api::AutosaveSettings| {
+                Object::autosaveSettings(s)
+            });
+            let mut env = AutosaveEnv {
+                global: &mut td.global,
+                updates: &mut td.autosave_updates,
+            };
+            td.autosave_manager.get_autosave_settings(&mut env, promise);
+        }
+        Function::setAutosaveSettings(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = AutosaveEnv {
+                global: &mut td.global,
+                updates: &mut td.autosave_updates,
+            };
+            td.autosave_manager.set_autosave_settings(
+                &mut env,
+                request.scope,
+                request.settings,
+                promise,
+            );
+        }
+        Function::clearAutosaveSettingsExceptions(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = AutosaveEnv {
+                global: &mut td.global,
+                updates: &mut td.autosave_updates,
+            };
+            td.autosave_manager
+                .clear_autosave_settings_exceptions(&mut env, promise);
+        }
+
         // Everything else waits for its manager step.
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
@@ -2176,13 +2231,15 @@ mod request_census_tests {
         // stays the 500 placeholder) + M.12.10's eighteen file-plane
         // dispatches (getFile/getRemoteFile, the download/upload/
         // generation arms, the DownloadManager list plane and the four
-        // storage-statistics arms). Fix per flip.
+        // storage-statistics arms) + M.39's three autosave arms
+        // (getAutosaveSettings, setAutosaveSettings,
+        // clearAutosaveSettingsExceptions). Fix per flip.
         assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            110,
+            113,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 894, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 891, "interim count");
     }
 }

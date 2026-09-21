@@ -276,6 +276,12 @@ pub struct Td {
     /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) notification_updates: Vec<td_api::Update>,
+    /// `Td::autosave_manager_` (`Td.cpp:1166`, the init_managers block;
+    /// the M.39 Wave-3 slice).
+    pub(crate) autosave_manager: crate::autosave_manager::AutosaveManager,
+    /// The autosave manager's `send_update` outbox — the same collapsed
+    /// hop; drained by [`Td::flush_user_updates`].
+    pub(crate) autosave_updates: Vec<td_api::Update>,
     /// The premium-required-to-contact QueryMerger actor (a UserManager
     /// member in the C++; the Rust merger is an actor created by `init` —
     /// the `ActorOwn` keeps it alive, dropping it would hang the merged
@@ -582,6 +588,8 @@ impl Td {
             notification_settings_manager:
                 crate::notification_settings_manager::NotificationSettingsManager::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
+            autosave_manager: crate::autosave_manager::AutosaveManager::new(),
+            autosave_updates: Vec::new(),
             notification_updates: Vec::new(),
             premium_required_contact_merger: None,
             chat_manager: crate::chat_manager::ChatManager::new(),
@@ -2567,6 +2575,10 @@ impl Td {
         }
         let notification_updates = std::mem::take(&mut self.notification_updates);
         for update in notification_updates {
+            self.send_update(update.into());
+        }
+        let autosave_updates = std::mem::take(&mut self.autosave_updates);
+        for update in autosave_updates {
             self.send_update(update.into());
         }
     }
@@ -4878,6 +4890,61 @@ pub(crate) struct NotificationEnv<'a> {
     pub(crate) auth_is_authorized: bool,
     pub(crate) auth_is_bot: bool,
     pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+/// The [`crate::autosave_manager::AutosaveManagerEnv`] over the `Td`
+/// fields — built per call with the field-split borrows (the
+/// `NotificationEnv` convention), never held across calls. The sqlite pmc
+/// surface routes to `TdDb::common_kv` (the C++ `get_sqlite_pmc` home);
+/// the calls are gated on `use_message_database` by the manager, matching
+/// the C++ branch that guards them.
+pub(crate) struct AutosaveEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::autosave_manager::AutosaveManagerEnv for AutosaveEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn use_message_database(&self) -> bool {
+        self.global.use_message_database()
+    }
+
+    fn sqlite_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.td_db().common_kv().get(key)
+    }
+
+    fn sqlite_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.td_db().common_kv().set(key, value);
+    }
+
+    fn binlog_pmc_erase(&mut self, key: &str) {
+        self.global.binlog_pmc().erase(key);
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    /// the simplified dialog seam until the M.5/M.7 dialog integration
+    /// (the BoostEnv convention)
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> Result<(), tdutils::status::Status> {
+        if dialog_id.is_valid() {
+            Ok(())
+        } else {
+            Err(tdutils::status::Status::error(400, "Chat not found"))
+        }
+    }
+
+    fn force_create_dialog(&mut self, _dialog_id: crate::dialog_id::DialogId) {
+        // `dialog_manager::force_create_dialog` — the M.6/M.7 cache seam;
+        // every dialog id is resolvable in the collapsed cache
+    }
 }
 
 impl<'a> NotificationEnv<'a> {
