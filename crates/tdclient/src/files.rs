@@ -7057,8 +7057,7 @@ impl FileManager {
                 view.get_full_remote_location().cloned(),
             )
         };
-        if !is_encrypted
-            && !is_secure
+        if !(is_encrypted || is_secure)
             && real_type != type_
             && !(real_type == FileType::Temp && has_url)
             && !(is_document_file_type(real_type) && is_document_file_type(type_))
@@ -19014,7 +19013,7 @@ impl DownloadManager {
             .values()
             .filter(|file_info| {
                 let completed = Self::is_completed(file_info);
-                !(only_active && completed) && !(only_completed && !completed)
+                (!only_active || !completed) && (!only_completed || completed)
             })
             .map(|file_info| file_info.download_id)
             .collect();
