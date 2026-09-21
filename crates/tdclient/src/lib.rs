@@ -9,6 +9,9 @@
 
 pub mod auth_manager;
 pub mod birthdate;
+pub mod call_discard_reason;
+pub mod call_id;
+pub mod call_protocol;
 pub mod chat_manager;
 pub mod client;
 pub mod client_json;
