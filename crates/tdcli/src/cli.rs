@@ -152,6 +152,59 @@ pub struct CliClient {
     /// `string cover_`.
     #[allow(dead_code)] // readers land with the M.14.5 media arms
     cover: Mutex<String>,
+    // ---- the send-state block (cli.cpp:9133-9169) — writers land with the
+    // option/effect command arms; the send family reads them.
+    schedule_date: Mutex<String>,
+    #[allow(dead_code)]
+    schedule_repeat_period: AtomicI32,
+    #[allow(dead_code)]
+    paid_message_star_count: AtomicI64,
+    #[allow(dead_code)]
+    message_effect_id: AtomicI64,
+    #[allow(dead_code)]
+    only_preview: AtomicBool,
+    #[allow(dead_code)]
+    has_spoiler: AtomicBool,
+    #[allow(dead_code)]
+    message_self_destruct_time: AtomicI32,
+    #[allow(dead_code)]
+    reply_chat_id: AtomicI64,
+    #[allow(dead_code)]
+    reply_message_id: AtomicI64,
+    #[allow(dead_code)]
+    reply_quote: Mutex<String>,
+    #[allow(dead_code)]
+    reply_quote_position: AtomicI32,
+    #[allow(dead_code)]
+    reply_checklist_task_id: AtomicI32,
+    #[allow(dead_code)]
+    reply_poll_option_id: Mutex<String>,
+    #[allow(dead_code)]
+    reply_story_chat_id: AtomicI64,
+    #[allow(dead_code)]
+    reply_story_id: AtomicI32,
+    #[allow(dead_code)]
+    link_preview_url: Mutex<String>,
+    #[allow(dead_code)]
+    link_preview_is_disabled: AtomicBool,
+    #[allow(dead_code)]
+    link_preview_force_small_media: AtomicBool,
+    #[allow(dead_code)]
+    link_preview_force_large_media: AtomicBool,
+    #[allow(dead_code)]
+    link_preview_show_above_text: AtomicBool,
+    #[allow(dead_code)]
+    show_caption_above_media: AtomicBool,
+    #[allow(dead_code)]
+    send_welcome_message: AtomicBool,
+    #[allow(dead_code)]
+    edit_welcome_message_id: AtomicI32,
+    #[allow(dead_code)]
+    quick_reply_shortcut_name: Mutex<String>,
+    #[allow(dead_code)]
+    ephemeral_message_receiver_id: AtomicI64,
+    #[allow(dead_code)]
+    caption: Mutex<String>,
 }
 
 /// `CliClient *CliClient::instance_` — the process-wide instance
@@ -207,6 +260,32 @@ pub fn instance() -> &'static CliClient {
         start_timestamp: AtomicI32::new(0),
         thumbnail: Mutex::new(String::new()),
         cover: Mutex::new(String::new()),
+        schedule_date: Mutex::new(String::new()),
+        schedule_repeat_period: AtomicI32::new(0),
+        paid_message_star_count: AtomicI64::new(0),
+        message_effect_id: AtomicI64::new(0),
+        only_preview: AtomicBool::new(false),
+        has_spoiler: AtomicBool::new(false),
+        message_self_destruct_time: AtomicI32::new(0),
+        reply_chat_id: AtomicI64::new(0),
+        reply_message_id: AtomicI64::new(0),
+        reply_quote: Mutex::new(String::new()),
+        reply_quote_position: AtomicI32::new(0),
+        reply_checklist_task_id: AtomicI32::new(0),
+        reply_poll_option_id: Mutex::new(String::new()),
+        reply_story_chat_id: AtomicI64::new(0),
+        reply_story_id: AtomicI32::new(0),
+        link_preview_url: Mutex::new(String::new()),
+        link_preview_is_disabled: AtomicBool::new(false),
+        link_preview_force_small_media: AtomicBool::new(false),
+        link_preview_force_large_media: AtomicBool::new(false),
+        link_preview_show_above_text: AtomicBool::new(false),
+        show_caption_above_media: AtomicBool::new(false),
+        send_welcome_message: AtomicBool::new(false),
+        edit_welcome_message_id: AtomicI32::new(0),
+        quick_reply_shortcut_name: Mutex::new(String::new()),
+        ephemeral_message_receiver_id: AtomicI64::new(0),
+        caption: Mutex::new(String::new()),
     })
 }
 
@@ -2315,6 +2394,313 @@ impl CliClient {
     /// `as_custom_emoji_id` (cli.cpp:926).
     fn as_custom_emoji_id(&self, s: &str) -> i64 {
         tokenizer::to_integer_i64(trim_td(s))
+    }
+
+    /// `get_caption` (cli.cpp:806).
+    fn get_caption(&self) -> Option<td_api::FormattedText> {
+        let caption = self.caption.lock().unwrap();
+        if caption.is_empty() {
+            return None;
+        }
+        Some(self.as_formatted_text(&caption))
+    }
+
+    /// `get_message_self_destruct_type` (cli.cpp:2868).
+    fn get_message_self_destruct_type(&self) -> Option<td_api::MessageSelfDestructType> {
+        let time = self.message_self_destruct_time.load(Ordering::SeqCst);
+        if time == -1 {
+            return Some(
+                td_api::MessageSelfDestructType::messageSelfDestructTypeImmediately(
+                    td_api::messageSelfDestructTypeImmediately,
+                ),
+            );
+        }
+        if time > 0 {
+            return Some(
+                td_api::MessageSelfDestructType::messageSelfDestructTypeTimer(
+                    td_api::messageSelfDestructTypeTimer {
+                        self_destruct_time: time,
+                    },
+                ),
+            );
+        }
+        None
+    }
+
+    /// `as_message_scheduling_state` (cli.cpp:2878).
+    fn as_message_scheduling_state(&self) -> Option<td_api::MessageSchedulingState> {
+        let date = self.schedule_date.lock().unwrap().clone();
+        let date = trim_td(&date);
+        if date.is_empty() {
+            return None;
+        }
+        let send_date = tokenizer::to_integer_i32(date);
+        if send_date == -1 {
+            return Some(
+                td_api::MessageSchedulingState::messageSchedulingStateSendWhenOnline(
+                    td_api::messageSchedulingStateSendWhenOnline,
+                ),
+            );
+        }
+        Some(
+            td_api::MessageSchedulingState::messageSchedulingStateSendAtDate(
+                td_api::messageSchedulingStateSendAtDate {
+                    send_date,
+                    repeat_period: self.schedule_repeat_period.load(Ordering::SeqCst),
+                },
+            ),
+        )
+    }
+
+    /// `get_input_message_reply_to` (cli.cpp:1204).
+    fn get_input_message_reply_to(&self) -> Option<td_api::InputMessageReplyTo> {
+        let reply_message_id = self.reply_message_id.load(Ordering::SeqCst);
+        if reply_message_id != 0 {
+            let quote = {
+                let quote = self.reply_quote.lock().unwrap();
+                if quote.is_empty() {
+                    None
+                } else {
+                    Some(td_api::InputTextQuote {
+                        text: Some(self.as_formatted_text(&quote)),
+                        position: self.reply_quote_position.load(Ordering::SeqCst),
+                    })
+                }
+            };
+            let checklist_task_id = self.reply_checklist_task_id.load(Ordering::SeqCst);
+            let poll_option_id = self.reply_poll_option_id.lock().unwrap().clone();
+            let reply_chat_id = self.reply_chat_id.load(Ordering::SeqCst);
+            if reply_chat_id == 0 {
+                return Some(td_api::InputMessageReplyTo::inputMessageReplyToMessage(
+                    td_api::inputMessageReplyToMessage {
+                        message_id: reply_message_id,
+                        quote,
+                        checklist_task_id,
+                        poll_option_id,
+                    },
+                ));
+            }
+            return Some(
+                td_api::InputMessageReplyTo::inputMessageReplyToExternalMessage(
+                    td_api::inputMessageReplyToExternalMessage {
+                        chat_id: reply_chat_id,
+                        message_id: reply_message_id,
+                        quote,
+                        checklist_task_id,
+                        poll_option_id,
+                    },
+                ),
+            );
+        }
+        let story_chat_id = self.reply_story_chat_id.load(Ordering::SeqCst);
+        let story_id = self.reply_story_id.load(Ordering::SeqCst);
+        if story_chat_id != 0 || story_id != 0 {
+            return Some(td_api::InputMessageReplyTo::inputMessageReplyToStory(
+                td_api::inputMessageReplyToStory {
+                    story_poster_chat_id: story_chat_id,
+                    story_id,
+                },
+            ));
+        }
+        None
+    }
+
+    /// `get_link_preview_options` (cli.cpp:1262); the callers land with the
+    /// chain-16 text-send arms.
+    #[allow(dead_code)]
+    fn get_link_preview_options(&self) -> Option<td_api::LinkPreviewOptions> {
+        let url = self.link_preview_url.lock().unwrap().clone();
+        if !self.link_preview_is_disabled.load(Ordering::SeqCst)
+            && url.is_empty()
+            && !self.link_preview_force_small_media.load(Ordering::SeqCst)
+            && !self.link_preview_force_large_media.load(Ordering::SeqCst)
+            && !self.link_preview_show_above_text.load(Ordering::SeqCst)
+        {
+            return None;
+        }
+        Some(td_api::LinkPreviewOptions {
+            is_disabled: self.link_preview_is_disabled.load(Ordering::SeqCst),
+            url,
+            force_small_media: self.link_preview_force_small_media.load(Ordering::SeqCst),
+            force_large_media: self.link_preview_force_large_media.load(Ordering::SeqCst),
+            show_above_text: self.link_preview_show_above_text.load(Ordering::SeqCst),
+        })
+    }
+
+    /// `as_input_audio` (cli.cpp:2255).
+    fn as_input_audio(&self, audio: &str, duration: i32) -> td_api::InputAudio {
+        td_api::InputAudio {
+            audio: as_input_file(audio),
+            album_cover_thumbnail: self.get_input_thumbnail(),
+            duration,
+            title: "title".to_owned(),
+            performer: "performer".to_owned(),
+        }
+    }
+
+    /// `as_input_document` (cli.cpp:2261).
+    fn as_input_document(
+        &self,
+        document: &str,
+        disable_content_type_detection: bool,
+    ) -> td_api::InputDocument {
+        td_api::InputDocument {
+            document: as_input_file(document),
+            thumbnail: self.get_input_thumbnail(),
+            disable_content_type_detection,
+        }
+    }
+
+    /// `as_input_sticker` (cli.cpp:2272).
+    fn as_input_sticker(&self, sticker: &str) -> td_api::InputSticker {
+        td_api::InputSticker {
+            sticker: as_input_file(sticker),
+            thumbnail: self.get_input_thumbnail(),
+            width: 0,
+            height: 0,
+        }
+    }
+
+    /// `as_input_video_note` (cli.cpp:2281).
+    fn as_input_video_note(&self, video_note: &str) -> td_api::InputVideoNote {
+        td_api::InputVideoNote {
+            video_note: as_input_file(video_note),
+            thumbnail: self.get_input_thumbnail(),
+            duration: 10,
+            length: 5,
+        }
+    }
+
+    /// `as_input_voice_note` (cli.cpp:2285).
+    fn as_input_voice_note(&self, voice_note: &str) -> td_api::InputVoiceNote {
+        td_api::InputVoiceNote {
+            voice_note: as_input_file(voice_note),
+            duration: 5,
+            waveform: "abacaba".as_bytes().to_vec(),
+        }
+    }
+
+    /// `as_live_location` (cli.cpp:938).
+    fn as_live_location(
+        &self,
+        latitude: &str,
+        longitude: &str,
+        accuracy: &str,
+        period: i32,
+        heading: i32,
+        proximity_alert_radius: i32,
+    ) -> td_api::LiveLocation {
+        td_api::LiveLocation {
+            location: as_location(latitude, longitude, accuracy),
+            live_period: period,
+            heading,
+            proximity_alert_radius,
+        }
+    }
+
+    /// `CliClient::send_message` (cli.cpp:2998) — the central send dispatch:
+    /// the welcome/ephemeral/business/quick-reply branches, then the plain
+    /// sendMessage with the full messageSendOptions pack.
+    fn send_message(&self, chat_id: i64, content: td_api::InputMessageContent) {
+        if self.send_welcome_message.load(Ordering::SeqCst) {
+            self.send_request(Function::addChatWelcomeMessage(
+                td_api::addChatWelcomeMessage {
+                    chat_id,
+                    input_message_content: Some(Box::new(content)),
+                },
+            ));
+            return;
+        }
+        let edit_welcome = self.edit_welcome_message_id.load(Ordering::SeqCst);
+        if edit_welcome != 0 {
+            self.send_request(Function::editChatWelcomeMessage(
+                td_api::editChatWelcomeMessage {
+                    chat_id,
+                    welcome_message_id: edit_welcome,
+                    input_message_content: Some(Box::new(content)),
+                },
+            ));
+            return;
+        }
+        let ephemeral = self.ephemeral_message_receiver_id.load(Ordering::SeqCst);
+        if ephemeral != 0 {
+            self.send_request(Function::sendEphemeralMessage(
+                td_api::sendEphemeralMessage {
+                    chat_id,
+                    topic_id: self.get_message_topic_id(),
+                    receiver_user_id: ephemeral,
+                    callback_query_id: 0,
+                    replace_callback_query_message: false,
+                    reply_to: self.get_input_message_reply_to(),
+                    protect_content: false,
+                    sending_id: 123,
+                    only_preview: self.only_preview.load(Ordering::SeqCst),
+                    reply_markup: None,
+                    input_message_content: Some(Box::new(content)),
+                },
+            ));
+            return;
+        }
+        let business = self.business_connection_id.lock().unwrap().clone();
+        if !business.is_empty() {
+            self.send_request(Function::sendBusinessMessage(td_api::sendBusinessMessage {
+                business_connection_id: business,
+                chat_id,
+                reply_to: self.get_input_message_reply_to(),
+                disable_notification: false,
+                protect_content: random::fast_bool(),
+                effect_id: self.message_effect_id.load(Ordering::SeqCst),
+                reply_markup: None,
+                input_message_content: Some(Box::new(content)),
+            }));
+            return;
+        }
+        let shortcut = self.quick_reply_shortcut_name.lock().unwrap().clone();
+        if !shortcut.is_empty() {
+            self.send_request(Function::addQuickReplyShortcutMessage(
+                td_api::addQuickReplyShortcutMessage {
+                    shortcut_name: shortcut,
+                    reply_to_message_id: self.reply_message_id.load(Ordering::SeqCst),
+                    input_message_content: Some(Box::new(content)),
+                },
+            ));
+            return;
+        }
+        let options = td_api::MessageSendOptions {
+            suggested_post_info: self.get_input_suggested_post_info(),
+            disable_notification: false,
+            from_background: false,
+            protect_content: false,
+            allow_paid_broadcast: self.use_test_dc.load(Ordering::SeqCst),
+            paid_message_star_count: self.paid_message_star_count.load(Ordering::SeqCst),
+            update_order_of_installed_sticker_sets: false,
+            scheduling_state: self.as_message_scheduling_state(),
+            effect_id: self.message_effect_id.load(Ordering::SeqCst),
+            sending_id: random::fast(1, 1000),
+            only_preview: self.only_preview.load(Ordering::SeqCst),
+        };
+        self.send_request(Function::sendMessage(td_api::sendMessage {
+            chat_id,
+            topic_id: self.get_message_topic_id(),
+            reply_to: self.get_input_message_reply_to(),
+            options: Some(options),
+            reply_markup: None,
+            input_message_content: Some(Box::new(content)),
+        }));
+    }
+
+    /// `get_input_suggested_post_info` (cli.cpp:3028) — the suggested-post
+    /// price is unset until the chain-9 `spsp` arms land.
+    fn get_input_suggested_post_info(&self) -> Option<td_api::InputSuggestedPostInfo> {
+        let send_date = self.schedule_date.lock().unwrap().clone();
+        let send_date = tokenizer::to_integer_i32(&send_date);
+        if send_date == -1 {
+            return None;
+        }
+        Some(td_api::InputSuggestedPostInfo {
+            price: None,
+            send_date: send_date.max(0),
+        })
     }
 
     /// `CliClient::as_chat_ids` (cli.cpp:577).
@@ -6207,8 +6593,403 @@ impl CliClient {
         }
     }
 
-    fn op_block_dev_b(&self, _op: &str, _args: &str) -> bool {
-        false
+    /// cli.cpp:7032 — the send family (census chain 12): every `s*` message
+    /// command over [`CliClient::send_message`] and the input-media builders.
+    fn op_block_dev_b(&self, op: &str, args: &str) -> bool {
+        if op == "san" {
+            let (chat_id, animation, width, height) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, rest1) = tokenizer::split(&rest0, ' ');
+                let (w2, w3) = tokenizer::split(&rest1, ' ');
+                (w0, w1, w2, w3)
+            };
+            let animation = td_api::InputAnimation {
+                duration: 60,
+                width: tokenizer::to_integer_i32(&width),
+                height: tokenizer::to_integer_i32(&height),
+                ..self.as_input_animation(&animation)
+            };
+            self.send_message(
+                self.as_chat_id(&chat_id),
+                td_api::InputMessageContent::inputMessageAnimation(td_api::inputMessageAnimation {
+                    animation: Some(animation),
+                    caption: self.get_caption(),
+                    show_caption_above_media: self.show_caption_above_media.load(Ordering::SeqCst),
+                    has_spoiler: self.has_spoiler.load(Ordering::SeqCst),
+                }),
+            );
+            true
+        } else if op == "sau" {
+            let (chat_id, audio, duration, title, performer) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, rest1) = tokenizer::split(&rest0, ' ');
+                let (w2, rest2) = tokenizer::split(&rest1, ' ');
+                let (w3, w4) = tokenizer::split(&rest2, ' ');
+                (w0, w1, w2, w3, w4)
+            };
+            let mut audio = self.as_input_audio(&audio, tokenizer::to_integer_i32(&duration));
+            audio.title = title;
+            audio.performer = performer;
+            self.send_message(
+                self.as_chat_id(&chat_id),
+                td_api::InputMessageContent::inputMessageAudio(td_api::inputMessageAudio {
+                    audio: Some(audio),
+                    caption: self.get_caption(),
+                }),
+            );
+            true
+        } else if op == "svoice" {
+            let (chat_id, voice_note) = tokenizer::split(args, ' ');
+            self.send_message(
+                self.as_chat_id(&chat_id),
+                td_api::InputMessageContent::inputMessageVoiceNote(td_api::inputMessageVoiceNote {
+                    voice_note: Some(self.as_input_voice_note(&voice_note)),
+                    caption: self.get_caption(),
+                    self_destruct_type: self.get_message_self_destruct_type(),
+                }),
+            );
+            true
+        } else if op == "scontact" {
+            let (chat_id, phone_number, first_name, last_name, user_id) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, rest1) = tokenizer::split(&rest0, ' ');
+                let (w2, rest2) = tokenizer::split(&rest1, ' ');
+                let (w3, w4) = tokenizer::split(&rest2, ' ');
+                (w0, w1, w2, w3, w4)
+            };
+            self.send_message(
+                self.as_chat_id(&chat_id),
+                td_api::InputMessageContent::inputMessageContact(td_api::inputMessageContact {
+                    contact: Some(td_api::Contact {
+                        phone_number,
+                        first_name,
+                        last_name,
+                        vcard: String::new(),
+                        user_id: self.as_user_id(&user_id),
+                    }),
+                }),
+            );
+            true
+        } else if op == "sf" || op == "scopy" {
+            let (chat_id, from_chat_id, from_message_id, replace_video_start_timestamp) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, rest1) = tokenizer::split(&rest0, ' ');
+                let (w2, w3) = tokenizer::split(&rest1, ' ');
+                (w0, w1, w2, w3)
+            };
+            let copy_options = if op == "scopy" {
+                Some(td_api::MessageCopyOptions {
+                    send_copy: true,
+                    replace_caption: random::fast_bool(),
+                    new_caption: self.get_caption(),
+                    new_show_caption_above_media: self
+                        .show_caption_above_media
+                        .load(Ordering::SeqCst),
+                })
+            } else {
+                None
+            };
+            self.send_message(
+                self.as_chat_id(&chat_id),
+                td_api::InputMessageContent::inputMessageForwarded(td_api::inputMessageForwarded {
+                    from_chat_id: self.as_chat_id(&from_chat_id),
+                    message_id: as_message_id(&from_message_id),
+                    in_game_share: true,
+                    replace_video_start_timestamp: as_bool(&replace_video_start_timestamp),
+                    new_video_start_timestamp: self.start_timestamp.load(Ordering::SeqCst),
+                    copy_options,
+                }),
+            );
+            true
+        } else if op == "sdice" || op == "sdicecd" {
+            let (chat_id, emoji) = tokenizer::split(args, ' ');
+            self.send_message(
+                self.as_chat_id(&chat_id),
+                td_api::InputMessageContent::inputMessageDice(td_api::inputMessageDice {
+                    emoji,
+                    clear_draft: op == "sdicecd",
+                }),
+            );
+            true
+        } else if op == "stake" {
+            let (chat_id, state_hash, stake_gram_amount, clear_draft) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, rest1) = tokenizer::split(&rest0, ' ');
+                let (w2, w3) = tokenizer::split(&rest1, ' ');
+                (w0, w1, w2, w3)
+            };
+            self.send_message(
+                self.as_chat_id(&chat_id),
+                td_api::InputMessageContent::inputMessageStakeDice(td_api::inputMessageStakeDice {
+                    state_hash,
+                    stake_gram_amount: tokenizer::to_integer_i64(&stake_gram_amount),
+                    clear_draft: as_bool(&clear_draft),
+                }),
+            );
+            true
+        } else if op == "sd" || op == "sdf" {
+            let (chat_id, document) = tokenizer::split(args, ' ');
+            self.send_message(
+                self.as_chat_id(&chat_id),
+                td_api::InputMessageContent::inputMessageDocument(td_api::inputMessageDocument {
+                    document: Some(self.as_input_document(&document, op == "sdf")),
+                    caption: self.get_caption(),
+                }),
+            );
+            true
+        } else if op == "sg" {
+            let (chat_id, bot_user_id, game_short_name) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_message(
+                self.as_chat_id(&chat_id),
+                td_api::InputMessageContent::inputMessageGame(td_api::inputMessageGame {
+                    bot_user_id: self.as_user_id(&bot_user_id),
+                    game_short_name,
+                }),
+            );
+            true
+        } else if op == "sl" {
+            let (chat_id, latitude, longitude, accuracy) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, rest1) = tokenizer::split(&rest0, ' ');
+                let (w2, w3) = tokenizer::split(&rest1, ' ');
+                (w0, w1, w2, w3)
+            };
+            self.send_message(
+                self.as_chat_id(&chat_id),
+                td_api::InputMessageContent::inputMessageLocation(td_api::inputMessageLocation {
+                    location: as_location(&latitude, &longitude, &accuracy),
+                }),
+            );
+            true
+        } else if op == "sll" {
+            let (chat_id, period, latitude, longitude, accuracy, heading, proximity_alert_radius) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, rest1) = tokenizer::split(&rest0, ' ');
+                let (w2, rest2) = tokenizer::split(&rest1, ' ');
+                let (w3, rest3) = tokenizer::split(&rest2, ' ');
+                let (w4, rest4) = tokenizer::split(&rest3, ' ');
+                let (w5, w6) = tokenizer::split(&rest4, ' ');
+                (w0, w1, w2, w3, w4, w5, w6)
+            };
+            self.send_message(
+                self.as_chat_id(&chat_id),
+                td_api::InputMessageContent::inputMessageLiveLocation(
+                    td_api::inputMessageLiveLocation {
+                        location: Some(self.as_live_location(
+                            &latitude,
+                            &longitude,
+                            &accuracy,
+                            tokenizer::to_integer_i32(&period),
+                            tokenizer::to_integer_i32(&heading),
+                            tokenizer::to_integer_i32(&proximity_alert_radius),
+                        )),
+                    },
+                ),
+            );
+            true
+        } else if op == "spoll" || op == "spollp" || op == "squiz" {
+            let (chat_id, question, tail) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            let options = autosplit(&tail)
+                .iter()
+                .map(|option| {
+                    let media = if option.starts_with("https://") {
+                        Some(td_api::InputPollMedia::inputPollMediaLink(
+                            td_api::inputPollMediaLink {
+                                url: option.clone(),
+                            },
+                        ))
+                    } else {
+                        None
+                    };
+                    td_api::InputPollOption {
+                        text: Some(self.as_formatted_text(option)),
+                        media,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let poll_type = if op == "squiz" {
+                let mut correct_option_ids = vec![0i32];
+                if options.len() > 1 {
+                    correct_option_ids.push(options.len() as i32 - 1);
+                }
+                td_api::InputPollType::inputPollTypeQuiz(td_api::inputPollTypeQuiz {
+                    correct_option_ids,
+                    explanation: Some(self.as_formatted_text("_te*st*_")),
+                    explanation_media: None,
+                })
+            } else {
+                td_api::InputPollType::inputPollTypeRegular(td_api::inputPollTypeRegular {
+                    allow_adding_options: random::fast_bool() && op == "spollp",
+                })
+            };
+            let can_restrict = self
+                .channel_ids
+                .lock()
+                .unwrap()
+                .contains(&self.as_chat_id(&chat_id));
+            let country_codes = if random::fast_bool() && can_restrict {
+                vec!["US".to_owned()]
+            } else {
+                Vec::new()
+            };
+            self.send_message(
+                self.as_chat_id(&chat_id),
+                td_api::InputMessageContent::inputMessagePoll(td_api::inputMessagePoll {
+                    question: Some(self.as_formatted_text(&question)),
+                    options,
+                    description: self.get_caption(),
+                    media: None,
+                    is_anonymous: op != "spollp",
+                    allows_multiple_answers: random::fast_bool(),
+                    allows_revoting: random::fast_bool(),
+                    members_only: random::fast_bool() && can_restrict,
+                    country_codes,
+                    shuffle_options: random::fast_bool(),
+                    hide_results_until_closes: random::fast_bool(),
+                    r#type: Some(poll_type),
+                    open_period: 0,
+                    close_date: 0,
+                    is_closed: false,
+                }),
+            );
+            true
+        } else if op == "schl" {
+            let (chat_id, tail) = tokenizer::split(args, ' ');
+            let (title, tasks) = tokenizer::split(&tail, ' ');
+            let mut count = 0i32;
+            let tasks = autosplit(&tasks)
+                .iter()
+                .map(|task| {
+                    count += 1;
+                    td_api::InputChecklistTask {
+                        id: count,
+                        text: Some(self.as_formatted_text(task)),
+                    }
+                })
+                .collect();
+            self.send_message(
+                self.as_chat_id(&chat_id),
+                td_api::InputMessageContent::inputMessageChecklist(td_api::inputMessageChecklist {
+                    checklist: Some(td_api::InputChecklist {
+                        title: Some(self.as_formatted_text(&title)),
+                        tasks,
+                        others_can_add_tasks: random::fast_bool(),
+                        others_can_mark_tasks_as_done: random::fast_bool(),
+                    }),
+                }),
+            );
+            true
+        } else if op == "sp" {
+            let (chat_id, photo) = tokenizer::split(args, ' ');
+            self.send_message(
+                self.as_chat_id(&chat_id),
+                td_api::InputMessageContent::inputMessagePhoto(td_api::inputMessagePhoto {
+                    photo: Some(self.as_input_photo(&photo)),
+                    caption: self.get_caption(),
+                    show_caption_above_media: self.show_caption_above_media.load(Ordering::SeqCst),
+                    self_destruct_type: self.get_message_self_destruct_type(),
+                    has_spoiler: self.has_spoiler.load(Ordering::SeqCst),
+                }),
+            );
+            true
+        } else if op == "ss" {
+            let (chat_id, sticker, emoji) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_message(
+                self.as_chat_id(&chat_id),
+                td_api::InputMessageContent::inputMessageSticker(td_api::inputMessageSticker {
+                    sticker: Some(self.as_input_sticker(&sticker)),
+                    emoji,
+                }),
+            );
+            true
+        } else if op == "sstory" {
+            let (chat_id, story_poster_chat_id, story_id) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_message(
+                self.as_chat_id(&chat_id),
+                td_api::InputMessageContent::inputMessageStory(td_api::inputMessageStory {
+                    story_poster_chat_id: self.as_chat_id(&story_poster_chat_id),
+                    story_id: tokenizer::to_integer_i32(trim_td(&story_id)),
+                }),
+            );
+            true
+        } else if op == "sv" {
+            let (chat_id, video) = tokenizer::split(args, ' ');
+            self.send_message(
+                self.as_chat_id(&chat_id),
+                td_api::InputMessageContent::inputMessageVideo(td_api::inputMessageVideo {
+                    video: Some(self.as_input_video(&video)),
+                    caption: self.get_caption(),
+                    show_caption_above_media: self.show_caption_above_media.load(Ordering::SeqCst),
+                    self_destruct_type: self.get_message_self_destruct_type(),
+                    has_spoiler: self.has_spoiler.load(Ordering::SeqCst),
+                }),
+            );
+            true
+        } else if op == "svn" {
+            let (chat_id, video_note) = tokenizer::split(args, ' ');
+            self.send_message(
+                self.as_chat_id(&chat_id),
+                td_api::InputMessageContent::inputMessageVideoNote(td_api::inputMessageVideoNote {
+                    video_note: Some(self.as_input_video_note(&video_note)),
+                    self_destruct_type: self.get_message_self_destruct_type(),
+                }),
+            );
+            true
+        } else if op == "svenue" {
+            let (
+                chat_id,
+                latitude,
+                longitude,
+                accuracy,
+                title,
+                address,
+                provider,
+                venue_id,
+                venue_type,
+            ) = {
+                let (a, t1) = tokenizer::split(args, ' ');
+                let (b, t2) = tokenizer::split(&t1, ' ');
+                let (c, t3) = tokenizer::split(&t2, ' ');
+                let (d, t4) = tokenizer::split(&t3, ' ');
+                let (e, t5) = tokenizer::split(&t4, ' ');
+                let (f, t6) = tokenizer::split(&t5, ' ');
+                let (g, t7) = tokenizer::split(&t6, ' ');
+                let (h, i) = tokenizer::split(&t7, ' ');
+                (a, b, c, d, e, f, g, h, i)
+            };
+            self.send_message(
+                self.as_chat_id(&chat_id),
+                td_api::InputMessageContent::inputMessageVenue(td_api::inputMessageVenue {
+                    venue: Some(td_api::Venue {
+                        location: as_location(&latitude, &longitude, &accuracy),
+                        title,
+                        address,
+                        provider,
+                        id: venue_id,
+                        r#type: venue_type,
+                    }),
+                }),
+            );
+            true
+        } else {
+            false
+        }
     }
 
     fn op_block_dev_c(&self, _op: &str, _args: &str) -> bool {
@@ -6814,6 +7595,30 @@ mod tests {
             ("tdmctcsum", 2),
             ("tsmtip", 2),
             ("uadmctm", 2),
+            ("san", 12),
+            ("sau", 12),
+            ("schl", 12),
+            ("scontact", 12),
+            ("scopy", 12),
+            ("sd", 12),
+            ("sdf", 12),
+            ("sdice", 12),
+            ("sdicecd", 12),
+            ("sf", 12),
+            ("sg", 12),
+            ("sl", 12),
+            ("sll", 12),
+            ("sp", 12),
+            ("spoll", 12),
+            ("spollp", 12),
+            ("squiz", 12),
+            ("ss", 12),
+            ("sstory", 12),
+            ("stake", 12),
+            ("sv", 12),
+            ("svenue", 12),
+            ("svn", 12),
+            ("svoice", 12),
             ("DeleteChat", 13),
             ("alarm", 13),
             ("cbgc", 13),
@@ -7218,6 +8023,32 @@ mod tests {
             start_timestamp: AtomicI32::new(0),
             thumbnail: Mutex::new(String::new()),
             cover: Mutex::new(String::new()),
+            schedule_date: Mutex::new(String::new()),
+            schedule_repeat_period: AtomicI32::new(0),
+            paid_message_star_count: AtomicI64::new(0),
+            message_effect_id: AtomicI64::new(0),
+            only_preview: AtomicBool::new(false),
+            has_spoiler: AtomicBool::new(false),
+            message_self_destruct_time: AtomicI32::new(0),
+            reply_chat_id: AtomicI64::new(0),
+            reply_message_id: AtomicI64::new(0),
+            reply_quote: Mutex::new(String::new()),
+            reply_quote_position: AtomicI32::new(0),
+            reply_checklist_task_id: AtomicI32::new(0),
+            reply_poll_option_id: Mutex::new(String::new()),
+            reply_story_chat_id: AtomicI64::new(0),
+            reply_story_id: AtomicI32::new(0),
+            link_preview_url: Mutex::new(String::new()),
+            link_preview_is_disabled: AtomicBool::new(false),
+            link_preview_force_small_media: AtomicBool::new(false),
+            link_preview_force_large_media: AtomicBool::new(false),
+            link_preview_show_above_text: AtomicBool::new(false),
+            show_caption_above_media: AtomicBool::new(false),
+            send_welcome_message: AtomicBool::new(false),
+            edit_welcome_message_id: AtomicI32::new(0),
+            quick_reply_shortcut_name: Mutex::new(String::new()),
+            ephemeral_message_receiver_id: AtomicI64::new(0),
+            caption: Mutex::new(String::new()),
         }
     }
 }
