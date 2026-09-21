@@ -46,9 +46,9 @@ answerInlineQuery	interim
 answerPreCheckoutQuery	interim
 answerShippingQuery	interim
 answerWebAppQuery	interim
-applyPremiumGiftCode	interim
+applyPremiumGiftCode	dispatched
 approveSuggestedPost	interim
-assignStoreTransaction	interim
+assignStoreTransaction	dispatched
 banChatMember	interim
 banGroupCallParticipants	interim
 blockMessageSenderFromReplies	interim
@@ -85,7 +85,7 @@ checkLoginEmailAddressCode	interim
 checkOauthRequestMatchCode	interim
 checkPasswordRecoveryCode	interim
 checkPhoneNumberCode	interim
-checkPremiumGiftCode	interim
+checkPremiumGiftCode	dispatched
 checkQuickReplyShortcutName	interim
 checkRecoveryEmailAddressCode	interim
 checkStickerSetName	interim
@@ -101,7 +101,7 @@ clearRecentlyFoundChats	dispatched
 clearSearchedForTags	interim
 clickAnimatedEmojiMessage	interim
 clickChatSponsoredMessage	interim
-clickPremiumSubscriptionButton	interim
+clickPremiumSubscriptionButton	dispatched
 clickVideoMessageAdvertisement	interim
 close	dispatched
 closeChat	interim
@@ -284,7 +284,7 @@ getBusinessChatLinkInfo	interim
 getBusinessChatLinks	interim
 getBusinessConnectedBot	interim
 getBusinessConnection	interim
-getBusinessFeatures	interim
+getBusinessFeatures	dispatched
 getCallbackQueryAnswer	interim
 getCallbackQueryMessage	interim
 getChat	interim
@@ -474,12 +474,12 @@ getPollOptionProperties	interim
 getPollVoteStatistics	interim
 getPollVoters	interim
 getPreferredCountryLanguage	interim
-getPremiumFeatures	interim
-getPremiumGiftPaymentOptions	interim
-getPremiumGiveawayPaymentOptions	interim
+getPremiumFeatures	dispatched
+getPremiumGiftPaymentOptions	dispatched
+getPremiumGiveawayPaymentOptions	dispatched
 getPremiumInfoSticker	interim
-getPremiumLimit	interim
-getPremiumState	interim
+getPremiumLimit	dispatched
+getPremiumState	dispatched
 getPremiumStickerExamples	interim
 getPremiumStickers	interim
 getPreparedInlineMessage	interim
@@ -577,7 +577,7 @@ getWebAppLinkUrl	interim
 getWebAppPlaceholder	dispatched
 getWebAppUrl	interim
 getWebPageInstantView	interim
-giftPremiumWithStars	interim
+giftPremiumWithStars	dispatched
 hideContactCloseBirthdays	dispatched
 hideSuggestedAction	interim
 importContacts	dispatched
@@ -1015,7 +1015,7 @@ upgradeGift	interim
 uploadStickerFile	interim
 validateOrderInfo	interim
 viewMessages	interim
-viewPremiumFeature	interim
+viewPremiumFeature	dispatched
 viewSponsoredChat	interim
 viewTrendingStickerSets	interim
 viewVideoMessageAdvertisement	interim

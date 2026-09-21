@@ -49,6 +49,7 @@ use crate::config_dispatch::{
     CompletedNetQueries, ConfigQueryCallback, SentNetQueries, TdConfigSink, TdSessionSink,
     build_config_net_query,
 };
+use crate::premium::{PremiumEnv, PremiumManager};
 use crate::config_manager::{
     ConfigActions, ConfigManager, ConfigQuery, ConfigQueryResult, StoredDcOption,
 };
@@ -270,6 +271,8 @@ pub struct Td {
     /// `Td::notification_settings_manager_` (`Td.cpp:1254`, M.13S).
     pub(crate) notification_settings_manager:
         crate::notification_settings_manager::NotificationSettingsManager,
+    /// The premium plane (Premium.cpp is a free-function surface).
+    pub(crate) premium_manager: PremiumManager,
     /// `Td::device_token_manager_` (`Td.cpp:1345`, M.13S).
     pub(crate) device_token_manager: crate::device_token_manager::DeviceTokenManager,
     /// The notification manager's `send_update` outbox — the collapsed
@@ -581,6 +584,7 @@ impl Td {
             notification_manager: NotificationManager::default(),
             notification_settings_manager:
                 crate::notification_settings_manager::NotificationSettingsManager::new(),
+            premium_manager: PremiumManager::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
             notification_updates: Vec::new(),
             premium_required_contact_merger: None,
@@ -4979,6 +4983,28 @@ impl crate::device_token_manager::DeviceTokenManagerEnv for NotificationEnv<'_> 
     fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
         self.global.binlog_pmc().set_raw(key, value);
     }
+}
+
+/// The premium-plane env over the option manager.
+pub(crate) struct PremiumTdEnv<'a> {
+    pub(crate) options: Option<&'a mut OptionManager>,
+}
+
+impl PremiumEnv for PremiumTdEnv<'_> {
+    fn get_option_integer(&self, name: &str) -> i64 {
+        self.options
+            .as_ref()
+            .map_or(0, |options| options.get_option_integer(name, 0))
+    }
+
+    fn get_option_string(&self, name: &str, default_value: &str) -> String {
+        self.options.as_ref().map_or_else(
+            || default_value.to_string(),
+            |options| options.get_option_string(name, default_value),
+        )
+    }
+
+    fn send_update(&mut self, _update: td_api::Update) {}
 }
 
 /// The premium-required-to-contact QueryMerger merge function: build the

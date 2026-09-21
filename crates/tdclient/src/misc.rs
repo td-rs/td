@@ -182,6 +182,13 @@ fn trim(s: &str) -> &str {
 }
 
 /// `td::to_lower` (tdutils/misc.h:64-85) — ASCII-only.
+/// `check_currency_amount` (misc.cpp:390-393) — the C++ `MAX_AMOUNT`
+/// gate of 9999'9999'9999.
+pub(crate) fn check_currency_amount(amount: i64) -> bool {
+    const MAX_AMOUNT: i64 = 9_999_999_999_999;
+    (-MAX_AMOUNT..=MAX_AMOUNT).contains(&amount)
+}
+
 fn to_lower(s: &str) -> String {
     s.chars()
         .map(|c| {
