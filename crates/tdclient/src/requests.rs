@@ -32,6 +32,7 @@
 
 use crate::chat_manager::{ChannelId, DialogId};
 use crate::contact::Contact;
+use crate::messages_manager::{DialogId as MmDialogId, MessageId};
 use crate::notification::{NotificationGroupId, NotificationId, NotificationObjectId};
 use crate::notification_settings::{
     ReactionNotificationSettings, get_notification_settings_scope,
@@ -1623,6 +1624,91 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             finish_unit_request(id, td, recorded);
         }
 
+        // --- messages, read family (Requests.cpp:2626-2800) ---
+        Function::getMessageLocally(request) => {
+            // Requests.cpp:2637-2641 — the local lookup form: no force, no
+            // actor. A missing dialog/message answers the null result (the
+            // `Td::send_result(nullptr)` → 404 shape).
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let message_id = MessageId::new(request.message_id);
+            // take/put-back: the builder mutates the message
+            // (`is_update_sent`) while borrowing the manager immutably
+            let taken = td
+                .messages_manager
+                .get_dialog_mut(dialog_id)
+                .and_then(|d| d.messages.remove(&message_id));
+            let object = if let Some(mut m) = taken {
+                let object = crate::messages_manager::get_message_object(
+                    &td.messages_manager,
+                    td,
+                    td,
+                    dialog_id,
+                    &mut m,
+                    "getMessageLocally",
+                );
+                if let Some(d) = td.messages_manager.get_dialog_mut(dialog_id) {
+                    d.messages.insert(message_id, m);
+                }
+                object
+            } else {
+                None
+            };
+            match object {
+                Some(message) => td.send_result(id, Object::message(message)),
+                None => td.send_result(
+                    id,
+                    Object::error(td_api::Error {
+                        code: 404,
+                        message: "Not Found".to_string(),
+                    }),
+                ),
+            }
+        }
+        Function::getMessageLink(request) => {
+            // Requests.cpp:2771-2782 — the local link builder.
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let message_id = MessageId::new(request.message_id);
+            match crate::messages_manager::get_message_link(
+                &td.messages_manager,
+                td,
+                dialog_id,
+                message_id,
+                request.media_timestamp,
+                request.checklist_task_id,
+                &request.poll_option_id,
+                request.for_album,
+                request.in_message_thread,
+            ) {
+                Ok((link, is_public)) => td.send_result(
+                    id,
+                    Object::messageLink(td_api::MessageLink { link, is_public }),
+                ),
+                Err(status) => {
+                    td.send_error_impl(id, status.code(), status.message());
+                }
+            }
+        }
+        Function::getMessageEmbeddingCode(request) => {
+            // Requests.cpp:2783-2786 — the local embedding builder behind
+            // the request actor (the promise collapses synchronously).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let message_id = MessageId::new(request.message_id);
+            match crate::messages_manager::get_message_embedding_code(
+                &td.messages_manager,
+                dialog_id,
+                message_id,
+                request.for_album,
+            ) {
+                Ok(code) => td.send_result(id, Object::text(td_api::Text { text: code })),
+                Err(status) => {
+                    td.send_error_impl(id, status.code(), status.message());
+                }
+            }
+        }
+
         // Everything else waits for its manager step.
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
@@ -1907,17 +1993,16 @@ mod request_census_tests {
         // The scheme size from the S07 differential dump.
         assert_eq!(generated.len(), crate::td_api::SCHEME_FUNCTIONS);
 
-        // The flip-state ledger at the m13s↔master (4f716e8: M.7+M.11)
-        // merge: the m11 pins + M.13/M.13S's seven real dispatches
-        // (removeNotification, removeNotificationGroup, registerDevice and
-        // the four notification-settings arms; processPushNotification
-        // stays the 500 placeholder). Fix per flip.
+        // The flip-state ledger after the m10d master merge + the M.10.20
+        // read-family batch: the m13s pins (92) + the three M.10 dispatches
+        // (getMessageLocally, getMessageLink, getMessageEmbeddingCode).
+        // Fix per flip.
         assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            92,
+            95,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 912, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 909, "interim count");
     }
 }

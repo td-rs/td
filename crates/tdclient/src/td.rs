@@ -1537,6 +1537,150 @@ impl crate::messages_manager::MessageObjectContext for Td {
 
 /// The reactions half of the receive adapter: the banned-chat read is the
 /// ChatManager status cache, false until that receive slice lands.
+/// The Td-side [`crate::messages_manager::SendMessageContext`] adapter —
+/// the M.10.20 dispatch flip. The real reads are the Td-owned surfaces
+/// (clock, auth, the messages_manager registry); the manager-facade reads
+/// (titles, signatures, slow mode, boosts) answer the documented
+/// stand-ins until their const surfaces land with the sink-state
+/// refactor; the Wave-2/db reads (stories, forwarded info) answer the
+/// same stand-ins as the test contexts.
+impl crate::messages_manager::SendMessageContext for Td {
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn is_broadcast_channel_dialog(&self, dialog_id: DialogId) -> bool {
+        dialog_id.get_type() == crate::messages_manager::DialogType::Channel
+            && crate::message_content::MessageContentContext::is_broadcast_channel(
+                self,
+                dialog_id.get_channel_id(),
+            )
+    }
+
+    fn ignore_default_disable_notification(&self) -> bool {
+        false
+    }
+
+    fn get_channel_sign_messages(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn get_channel_show_message_sender(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn is_anonymous_administrator(&self, _dialog_id: DialogId) -> Option<String> {
+        None
+    }
+
+    fn get_dialog_title(&self, _dialog_id: DialogId) -> String {
+        String::new()
+    }
+
+    fn get_user_title(&self, user_id: UserId) -> String {
+        self.user_manager.get_user_title_of(user_id)
+    }
+
+    fn get_secret_chat_ttl(&self, secret_chat_id: SecretChatId) -> i32 {
+        self.user_manager.get_secret_chat_ttl(secret_chat_id)
+    }
+
+    fn get_channel_my_boost_count(&self, _channel_id: ChannelId) -> i32 {
+        0
+    }
+
+    fn can_send_message_to_dialog(&self, _dialog_id: DialogId) -> Result<(), (i32, String)> {
+        // the real table reads the manager state through a mutable Td —
+        // the sink-state refactor lands it; the local-answer flips are
+        // unaffected (they never send)
+        Ok(())
+    }
+
+    fn have_input_peer_read(&self, dialog_id: DialogId, allow_secret_chats: bool) -> bool {
+        // the DialogManager facade read needs `&mut Td` (its net/db
+        // fallbacks); the in-memory form rides the chat registry
+        if dialog_id.get_type() == crate::messages_manager::DialogType::SecretChat
+            && !allow_secret_chats
+        {
+            return false;
+        }
+        crate::messages_manager::have_dialog_force(&self.messages_manager, dialog_id)
+    }
+
+    fn can_send_message_to_forum_topic(
+        &self,
+        _dialog_id: DialogId,
+        _forum_topic_id: crate::messages_manager::ForumTopicId,
+    ) -> bool {
+        true
+    }
+
+    fn can_be_forum(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn have_dialog_force(&self, dialog_id: DialogId, _source: &str) -> bool {
+        crate::messages_manager::have_dialog_force(&self.messages_manager, dialog_id)
+    }
+
+    fn get_my_dialog_id(&self) -> DialogId {
+        crate::message_content::MessageContentContext::get_my_dialog_id(self)
+    }
+
+    fn get_saved_messages_topic_id_from_raw(
+        &self,
+        topic_id: i64,
+    ) -> crate::messages_manager::SavedMessagesTopicId {
+        crate::messages_manager::SavedMessagesTopicId::new(DialogId::new(topic_id))
+    }
+
+    fn get_forwarded_message_info(
+        &self,
+        _dialog_id: DialogId,
+        _message_id: crate::messages_manager::MessageId,
+    ) -> Option<crate::messages_manager::ForwardedMessageInfo> {
+        // the message-db load — the db seam
+        None
+    }
+
+    fn get_message_by_random_id_from_database(
+        &self,
+        _dialog_id: DialogId,
+        _random_id: i64,
+    ) -> Option<Box<crate::messages_manager::Message>> {
+        None
+    }
+
+    fn have_story(&self, _story_full_id: StoryFullId) -> bool {
+        false
+    }
+
+    fn is_inaccessible_story(&self, _story_full_id: StoryFullId) -> bool {
+        false
+    }
+
+    fn get_story_duration(&self, _story_full_id: StoryFullId) -> i32 {
+        0
+    }
+
+    fn get_channel_slow_mode_delay(&self, _channel_id: ChannelId) -> i32 {
+        0
+    }
+
+    fn is_channel_administrator(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn on_update_channel_slow_mode_next_send_date(
+        &self,
+        _channel_id: ChannelId,
+        _next_send_date: i32,
+    ) {
+    }
+
+    fn remove_inactive_channel(&self, _channel_id: ChannelId) {}
+}
+
 impl crate::messages_manager::DialogReactionsContext for Td {
     fn is_chat_banned(&self, _dialog_id: DialogId) -> bool {
         false
@@ -5602,6 +5746,74 @@ mod tests {
             tdactor::send_closure_later(actor, TdMessage::ConfigQueryResult { query, result });
         }
         let _ = scheduler.run_main(0.01);
+    }
+
+    /// The M.10.20 read-family flips through the real dispatcher: the
+    /// local lookups over an empty manager state (the null-result 404 and
+    /// the C++ "Chat not found" table).
+    #[test]
+    fn m10_20_read_family_arms() {
+        let callback = CollectCallback::default();
+        let dir = temp_db_dir("m10-20-reads");
+        let db_dir = dir.clone();
+        let mut td = Td::new(Box::new(CollectCallback {
+            responses: callback.responses.clone(),
+            errors: callback.errors.clone(),
+        }));
+        let Function::setTdlibParameters(parameters) = set_tdlib_parameters(db_dir, false) else {
+            unreachable!("setTdlibParameters helper");
+        };
+        td.on_set_tdlib_parameters(20, parameters);
+        assert_eq!(td.state, State::Run);
+        td.auth_manager.force_authorized_for_test();
+
+        // getMessageLocally: no dialog → the null-result 404
+        td.request(
+            101,
+            Function::getMessageLocally(td_api::getMessageLocally {
+                chat_id: 1,
+                message_id: 100,
+            }),
+        );
+        // the null-result 404 rides the response channel (the C++
+        // `Td::send_result(nullptr)` shape)
+        assert!(responses_of(&callback, 101).iter().any(|object| matches!(
+            object,
+            Object::error(e) if e.code == 404 && e.message == "Not Found"
+        )));
+
+        // getMessageLink: no dialog → the C++ 400
+        td.request(
+            102,
+            Function::getMessageLink(td_api::getMessageLink {
+                chat_id: 1,
+                message_id: 100,
+                media_timestamp: 0,
+                checklist_task_id: 0,
+                poll_option_id: String::new(),
+                for_album: false,
+                in_message_thread: false,
+            }),
+        );
+        let error = error_of(&callback, 102);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Chat not found");
+
+        // getMessageEmbeddingCode: the same local table
+        td.request(
+            103,
+            Function::getMessageEmbeddingCode(td_api::getMessageEmbeddingCode {
+                chat_id: 1,
+                message_id: 100,
+                for_album: false,
+            }),
+        );
+        let error = error_of(&callback, 103);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Chat not found");
+
+        td.close_impl(false);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The ConfigManager step gate, white-box: `setTdlibParameters` runs the

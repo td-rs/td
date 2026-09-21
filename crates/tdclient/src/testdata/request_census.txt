@@ -439,12 +439,12 @@ getMessageAddedReactions	interim
 getMessageAuthor	interim
 getMessageAvailableReactions	interim
 getMessageEffect	interim
-getMessageEmbeddingCode	interim
+getMessageEmbeddingCode	dispatched
 getMessageFileType	interim
 getMessageImportConfirmationText	interim
-getMessageLink	interim
+getMessageLink	dispatched
 getMessageLinkInfo	interim
-getMessageLocally	interim
+getMessageLocally	dispatched
 getMessageProperties	interim
 getMessagePublicForwards	interim
 getMessageReadDate	interim
