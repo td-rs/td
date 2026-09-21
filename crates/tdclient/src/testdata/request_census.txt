@@ -1,6 +1,6 @@
 acceptCall	interim
 acceptOauthRequest	interim
-acceptTermsOfService	interim
+acceptTermsOfService	dispatched
 activateStoryStealthMode	interim
 addBotMediaPreview	interim
 addChatFolderByInviteLink	interim
@@ -114,8 +114,8 @@ commitPendingPaidMessageReactions	interim
 composeRichMessageWithAi	interim
 composeTextWithAi	interim
 confirmBusinessConnectedBot	interim
-confirmQrCodeAuthentication	interim
-confirmSession	interim
+confirmQrCodeAuthentication	dispatched
+confirmSession	dispatched
 connectAffiliateProgram	interim
 craftGift	interim
 createBasicGroupChat	interim
@@ -199,8 +199,8 @@ disableAllSupergroupUsernames	interim
 disableProxy	interim
 discardCall	interim
 disconnectAffiliateProgram	interim
-disconnectAllWebsites	interim
-disconnectWebsite	interim
+disconnectAllWebsites	dispatched
+disconnectWebsite	dispatched
 downloadFile	dispatched
 dropGiftOriginalDetails	interim
 editBotMediaPreview	interim
@@ -250,8 +250,8 @@ finishFileGeneration	dispatched
 fixRichMessageWithAi	interim
 fixTextWithAi	interim
 forwardMessages	interim
-getAccountTtl	interim
-getActiveSessions	interim
+getAccountTtl	dispatched
+getActiveSessions	dispatched
 getAllPassportElements	interim
 getAllStickerEmojis	interim
 getAnimatedEmoji	interim
@@ -341,7 +341,7 @@ getCollectibleItemInfo	interim
 getCommands	interim
 getConnectedAffiliateProgram	interim
 getConnectedAffiliatePrograms	interim
-getConnectedWebsites	interim
+getConnectedWebsites	dispatched
 getContacts	dispatched
 getCountries	interim
 getCountry	interim
@@ -564,7 +564,7 @@ getUpgradedGiftsPromotionalAnimation	interim
 getUser	dispatched
 getUserChatBoosts	interim
 getUserFullInfo	dispatched
-getUserLink	interim
+getUserLink	dispatched
 getUserPrivacySettingRules	interim
 getUserProfileAudios	dispatched
 getUserProfilePhotos	dispatched
@@ -579,7 +579,7 @@ getWebAppUrl	interim
 getWebPageInstantView	interim
 giftPremiumWithStars	interim
 hideContactCloseBirthdays	dispatched
-hideSuggestedAction	interim
+hideSuggestedAction	dispatched
 importContacts	dispatched
 importMessages	interim
 increaseGiftAuctionBid	interim
@@ -789,7 +789,7 @@ sendTextMessageDraft	interim
 sendWebAppCustomRequest	interim
 sendWebAppData	interim
 setAccentColor	dispatched
-setAccountTtl	interim
+setAccountTtl	dispatched
 setAlarm	dispatched
 setApplicationVerificationToken	interim
 setArchiveChatListSettings	interim
@@ -940,8 +940,8 @@ suggestUserBirthdate	interim
 suggestUserProfilePhoto	interim
 summarizeMessage	interim
 synchronizeLanguagePack	interim
-terminateAllOtherSessions	interim
-terminateSession	interim
+terminateAllOtherSessions	dispatched
+terminateSession	dispatched
 testCallBytes	dispatched
 testCallEmpty	dispatched
 testCallString	dispatched
@@ -982,8 +982,8 @@ toggleGroupCallParticipantIsMuted	interim
 toggleGroupCallScreenSharingIsPaused	interim
 toggleHasSponsoredMessagesEnabled	dispatched
 toggleSavedMessagesTopicIsPinned	interim
-toggleSessionCanAcceptCalls	interim
-toggleSessionCanAcceptSecretChats	interim
+toggleSessionCanAcceptCalls	dispatched
+toggleSessionCanAcceptSecretChats	dispatched
 toggleStoryIsPostedToChatPage	interim
 toggleSupergroupCanHaveSponsoredMessages	interim
 toggleSupergroupHasAggressiveAntiSpamEnabled	interim

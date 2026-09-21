@@ -43,6 +43,7 @@ use tdnet::net_query::{NetQuery, NetQueryDispatcher};
 use tdutils::promise::Promise;
 use tdutils::status::Status;
 
+use crate::account_manager::{AccountManager, AccountManagerEnv};
 use crate::auth_manager::{AuthManager, AuthQuerySender};
 use crate::chat_manager::DcId;
 use crate::config_dispatch::{
@@ -270,6 +271,16 @@ pub struct Td {
     /// `Td::notification_settings_manager_` (`Td.cpp:1254`, M.13S).
     pub(crate) notification_settings_manager:
         crate::notification_settings_manager::NotificationSettingsManager,
+    /// `Td::account_manager_` (`make_unique` at `Td.cpp:1231`, the
+    /// `init_managers` block).
+    pub(crate) account_manager: AccountManager,
+    /// `Td::terms_of_service_manager_` (Td.cpp:1234).
+    pub(crate) terms_of_service_manager: crate::terms_of_service_manager::TermsOfServiceManager,
+    /// `Td::suggested_action_manager_` (Td.cpp:1236).
+    pub(crate) suggested_action_manager: crate::suggested_action_manager::SuggestedActionManager,
+    /// The account plane's `send_update` outbox; drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) account_updates: Vec<td_api::Update>,
     /// `Td::device_token_manager_` (`Td.cpp:1345`, M.13S).
     pub(crate) device_token_manager: crate::device_token_manager::DeviceTokenManager,
     /// The notification manager's `send_update` outbox — the collapsed
@@ -581,6 +592,11 @@ impl Td {
             notification_manager: NotificationManager::default(),
             notification_settings_manager:
                 crate::notification_settings_manager::NotificationSettingsManager::new(),
+            account_manager: AccountManager::new(),
+            terms_of_service_manager: crate::terms_of_service_manager::TermsOfServiceManager::new(),
+            suggested_action_manager: crate::suggested_action_manager::SuggestedActionManager::new(
+            ),
+            account_updates: Vec::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
             notification_updates: Vec::new(),
             premium_required_contact_merger: None,
@@ -935,6 +951,8 @@ impl Td {
             self.auth_manager.set_state_ok();
             self.apply_self_user(&user, false);
             self.init_notification_manager();
+            self.init_terms_of_service_manager();
+            self.init_terms_of_service_manager();
         } else {
             let binlog_pmc = self.global.binlog_pmc();
             let auth_str = binlog_pmc.get("auth");
@@ -956,6 +974,7 @@ impl Td {
                     self.auth_manager
                         .restore_from_pmc("ok", is_bot, String::new());
                     self.init_notification_manager();
+                    self.init_terms_of_service_manager();
                 }
                 "logout" => {
                     tracing::warn!("Continue to log out");
@@ -1242,6 +1261,23 @@ impl Td {
                 can_ignore_background_updates: self.can_ignore_background_updates,
             };
             self.updates_manager.get_difference(&mut env, "init");
+        }
+
+        // `AccountManager::start_up` + `SuggestedActionManager::start_up`
+        // (the C++ actors start in the init_managers block) — the pmc
+        // loads; the unconfirmed-session timeout is the recorded actor
+        // collapse.
+        {
+            let mut env = AccountEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+                user_manager: &mut self.user_manager,
+                device_token_manager: &mut self.device_token_manager,
+                auth_is_bot: self.auth_manager.is_bot(),
+                updates: &mut self.account_updates,
+            };
+            self.account_manager.start_up(&mut env);
+            self.suggested_action_manager.start_up(&mut env);
         }
 
         tracing::info!("Finish initialization");
@@ -2569,6 +2605,10 @@ impl Td {
         for update in notification_updates {
             self.send_update(update.into());
         }
+        let account_updates = std::mem::take(&mut self.account_updates);
+        for update in account_updates {
+            self.send_update(update.into());
+        }
     }
 
     /// `td_->notification_manager_->init()` +
@@ -2584,6 +2624,20 @@ impl Td {
         };
         self.notification_manager.init(&mut env);
         self.notification_settings_manager.init(&mut env);
+    }
+
+    /// `TermsOfServiceManager::init` (AuthManager.cpp:1549) — the
+    /// auth-success moment shared with `init_notification_manager`.
+    fn init_terms_of_service_manager(&mut self) {
+        let mut env = AccountEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            user_manager: &mut self.user_manager,
+            device_token_manager: &mut self.device_token_manager,
+            auth_is_bot: self.auth_manager.is_bot(),
+            updates: &mut self.account_updates,
+        };
+        self.terms_of_service_manager.init(&mut env);
     }
 
     /// `DeviceTokenManager::start_up` (DeviceTokenManager.cpp:329) — the
@@ -4978,6 +5032,137 @@ impl crate::device_token_manager::DeviceTokenManagerEnv for NotificationEnv<'_> 
 
     fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
         self.global.binlog_pmc().set_raw(key, value);
+    }
+}
+
+/// The account-plane env over the `Td` fields (AccountManager,
+/// TermsOfServiceManager, SuggestedActionManager) — built per call with
+/// the field-split borrows (the `NotificationEnv` convention).
+pub(crate) struct AccountEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) device_token_manager: &'a mut crate::device_token_manager::DeviceTokenManager,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl AccountManagerEnv for AccountEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_integer(name, default_value)
+        })
+    }
+
+    fn get_option_string(&self, name: &str, default_value: &str) -> String {
+        self.options.as_ref().map_or_else(
+            || default_value.to_string(),
+            |options| options.get_option_string(name, default_value),
+        )
+    }
+
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn pmc_erase(&mut self, key: &str) {
+        self.global.binlog_pmc().erase(key);
+    }
+
+    fn binlog_add(&mut self, handler_type: i32, data: &[u8]) -> u64 {
+        self.global.td_db().binlog().add(handler_type, data)
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn on_get_users(&mut self, users: Vec<tdmtproto::telegram_api::User>, source: &str) {
+        let mut env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_mut()
+                .expect("account manager runs with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.on_get_users(&mut env, users, source);
+    }
+
+    fn get_user_id_object(&mut self, user_id: i64, source: &str) -> i64 {
+        let mut env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_mut()
+                .expect("account manager runs with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager
+            .get_user_id_object(&mut env, UserId::new(user_id), source)
+    }
+
+    fn set_option_boolean(&mut self, name: &str, value: bool) {
+        if let Some(options) = self.options.as_mut() {
+            options.set_option_boolean(name, value);
+        }
+    }
+
+    fn reregister_device(&mut self) {
+        // the device-token env plumbing joins with the account plane
+        // later (the M.13S continuation); the seam no-ops
+        let _ = &mut self.device_token_manager;
+    }
+}
+
+impl crate::terms_of_service_manager::TermsOfServiceManagerEnv for AccountEnv<'_> {
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+}
+
+impl crate::suggested_action_manager::SuggestedActionManagerEnv for AccountEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn pmc_erase(&mut self, key: &str) {
+        self.global.binlog_pmc().erase(key);
+    }
+
+    fn get_option_string(&self, name: &str, default_value: &str) -> String {
+        self.options.as_ref().map_or_else(
+            || default_value.to_string(),
+            |options| options.get_option_string(name, default_value),
+        )
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
     }
 }
 
