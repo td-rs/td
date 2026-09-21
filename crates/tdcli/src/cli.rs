@@ -581,6 +581,19 @@ impl CliClient {
         }
     }
 
+    /// `CliClient::execute` (cli.cpp:2958) — the synchronous path with the
+    /// same `td_requests`-gated request/response prints.
+    fn execute(&self, request: Function) -> Object {
+        if self.requests_are_logged() {
+            tdutils::log_error!("Execute request: {}", request.to_debug_string());
+        }
+        let response = ClientManager::execute(request);
+        if self.requests_are_logged() {
+            tdutils::log_error!("Execute response: {}", response.to_debug_string());
+        }
+        response
+    }
+
     /// The `td_requests`-gated receive print (cli.cpp:1867/2026): results
     /// and errors are only logged when the tag verbosity is above the first
     /// log's level (`lts td_requests N` raises it).
@@ -3059,8 +3072,158 @@ impl CliClient {
         }
     }
 
-    fn op_block_messages(&self, _op: &str, _args: &str) -> bool {
-        false
+    /// cli.cpp:4398 — the options/account/session chain (M.14.4b part 1).
+    /// The `gbgu` background-URL probe stays unported until the M.14.6
+    /// background coercers land.
+    fn op_block_messages(&self, op: &str, args: &str) -> bool {
+        if op == "on" || op == "off" {
+            self.send_request(Function::setOption(td_api::setOption {
+                name: "online".to_owned(),
+                value: Some(OptionValue::optionValueBoolean(
+                    td_api::optionValueBoolean { value: op == "on" },
+                )),
+            }));
+            true
+        } else if op == "go" {
+            self.send_request(Function::getOption(td_api::getOption {
+                name: args.to_owned(),
+            }));
+            true
+        } else if op == "gos" {
+            self.execute(Function::getOption(td_api::getOption {
+                name: args.to_owned(),
+            }));
+            true
+        } else if op == "sob" {
+            let (name, value) = tokenizer::split(args, ' ');
+            self.send_request(Function::setOption(td_api::setOption {
+                name,
+                value: Some(OptionValue::optionValueBoolean(
+                    td_api::optionValueBoolean {
+                        value: as_bool(&value),
+                    },
+                )),
+            }));
+            true
+        } else if op == "soe" {
+            self.send_request(Function::setOption(td_api::setOption {
+                name: args.to_owned(),
+                value: Some(OptionValue::optionValueEmpty(td_api::optionValueEmpty)),
+            }));
+            true
+        } else if op == "soi" {
+            let (name, value) = tokenizer::split(args, ' ');
+            self.send_request(Function::setOption(td_api::setOption {
+                name,
+                value: Some(OptionValue::optionValueInteger(
+                    td_api::optionValueInteger {
+                        value: tokenizer::to_integer_i64(&value),
+                    },
+                )),
+            }));
+            true
+        } else if op == "sos" {
+            let (name, value) = tokenizer::split(args, ' ');
+            self.send_request(Function::setOption(td_api::setOption {
+                name,
+                value: Some(OptionValue::optionValueString(td_api::optionValueString {
+                    value,
+                })),
+            }));
+            true
+        } else if op == "me" {
+            self.send_request(Function::getMe(td_api::getMe));
+            true
+        } else if op == "sdmadt" {
+            self.send_request(Function::setDefaultMessageAutoDeleteTime(
+                td_api::setDefaultMessageAutoDeleteTime {
+                    message_auto_delete_time: Some(td_api::MessageAutoDeleteTime {
+                        time: tokenizer::to_integer_i32(args),
+                    }),
+                },
+            ));
+            true
+        } else if op == "gdmadt" {
+            self.send_request(Function::getDefaultMessageAutoDeleteTime(
+                td_api::getDefaultMessageAutoDeleteTime,
+            ));
+            true
+        } else if op == "sattl" {
+            self.send_request(Function::setAccountTtl(td_api::setAccountTtl {
+                ttl: Some(td_api::AccountTtl {
+                    days: tokenizer::to_integer_i32(args),
+                }),
+            }));
+            true
+        } else if op == "gattl" {
+            self.send_request(Function::getAccountTtl(td_api::getAccountTtl));
+            true
+        } else if op == "devices" || op == "sessions" {
+            self.send_request(Function::getActiveSessions(td_api::getActiveSessions));
+            true
+        } else if op == "ts" {
+            self.send_request(Function::terminateSession(td_api::terminateSession {
+                session_id: tokenizer::to_integer_i64(args),
+            }));
+            true
+        } else if op == "taos" {
+            self.send_request(Function::terminateAllOtherSessions(
+                td_api::terminateAllOtherSessions,
+            ));
+            true
+        } else if op == "cse" {
+            self.send_request(Function::confirmSession(td_api::confirmSession {
+                session_id: tokenizer::to_integer_i64(args),
+            }));
+            true
+        } else if op == "tscac" {
+            let (session_id, flag) = tokenizer::split(args, ' ');
+            self.send_request(Function::toggleSessionCanAcceptCalls(
+                td_api::toggleSessionCanAcceptCalls {
+                    session_id: tokenizer::to_integer_i64(&session_id),
+                    can_accept_calls: as_bool(&flag),
+                },
+            ));
+            true
+        } else if op == "tscasc" {
+            let (session_id, flag) = tokenizer::split(args, ' ');
+            self.send_request(Function::toggleSessionCanAcceptSecretChats(
+                td_api::toggleSessionCanAcceptSecretChats {
+                    session_id: tokenizer::to_integer_i64(&session_id),
+                    can_accept_secret_chats: as_bool(&flag),
+                },
+            ));
+            true
+        } else if op == "sist" {
+            self.send_request(Function::setInactiveSessionTtl(
+                td_api::setInactiveSessionTtl {
+                    inactive_session_ttl_days: tokenizer::to_integer_i32(args),
+                },
+            ));
+            true
+        } else if op == "gcw" {
+            self.send_request(Function::getConnectedWebsites(td_api::getConnectedWebsites));
+            true
+        } else if op == "dw" {
+            self.send_request(Function::disconnectWebsite(td_api::disconnectWebsite {
+                website_id: tokenizer::to_integer_i64(args),
+            }));
+            true
+        } else if op == "daw" {
+            self.send_request(Function::disconnectAllWebsites(
+                td_api::disconnectAllWebsites,
+            ));
+            true
+        } else if op == "gib" {
+            self.send_request(Function::getInstalledBackgrounds(
+                td_api::getInstalledBackgrounds {
+                    for_dark_theme: as_bool(args),
+                },
+            ));
+            true
+        } else {
+            false
+        }
     }
 
     fn op_block_dialogs(&self, _op: &str, _args: &str) -> bool {
@@ -3714,6 +3877,31 @@ mod tests {
             ("tdmctcsum", 2),
             ("tsmtip", 2),
             ("uadmctm", 2),
+            ("on", 3),
+            ("off", 3),
+            ("go", 3),
+            ("gos", 3),
+            ("sob", 3),
+            ("soe", 3),
+            ("soi", 3),
+            ("sos", 3),
+            ("me", 3),
+            ("sdmadt", 3),
+            ("gdmadt", 3),
+            ("sattl", 3),
+            ("gattl", 3),
+            ("devices", 3),
+            ("sessions", 3),
+            ("ts", 3),
+            ("taos", 3),
+            ("cse", 3),
+            ("tscac", 3),
+            ("tscasc", 3),
+            ("sist", 3),
+            ("gcw", 3),
+            ("dw", 3),
+            ("daw", 3),
+            ("gib", 3),
         ];
 
         let guard = TEST_LOCK.lock().unwrap();
@@ -3725,7 +3913,12 @@ mod tests {
             SINK.lines.lock().unwrap().clear();
             logging::set_log_interface(Some(&SINK));
             let client = test_client();
-            client.on_cmd(op.to_string());
+            // An arm may legitimately CHECK-fail on empty arguments (the
+            // C++ CLI would abort the same way) — the census gate only
+            // classifies ROUTING, so a panic counts as routed.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                client.on_cmd(op.to_string());
+            }));
             logging::set_log_interface(None);
             let unknown = SINK
                 .lines
