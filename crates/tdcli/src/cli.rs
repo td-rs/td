@@ -2298,6 +2298,20 @@ impl CliClient {
         result
     }
 
+    /// `CliClient::as_basic_group_id` (cli.cpp:712) — negative ids are
+    /// absolute-valued, `.` is the opened chat.
+    fn as_basic_group_id(&self, s: &str) -> i64 {
+        let s = trim_td(s);
+        let mut result = tokenizer::to_integer_i64(s);
+        if s == "." {
+            result = self.opened_chat_id.load(Ordering::SeqCst);
+        }
+        if result < 0 {
+            return -result;
+        }
+        result
+    }
+
     /// `as_custom_emoji_id` (cli.cpp:926).
     fn as_custom_emoji_id(&self, s: &str) -> i64 {
         tokenizer::to_integer_i64(trim_td(s))
@@ -5954,8 +5968,243 @@ impl CliClient {
         }
     }
 
-    fn op_block_dev_a(&self, _op: &str, _args: &str) -> bool {
-        false
+    /// cli.cpp:7209 — the dev/deletion/chat-creation chain (census chain 13).
+    fn op_block_dev_a(&self, op: &str, args: &str) -> bool {
+        if op == "test" {
+            self.send_request(Function::testNetwork(td_api::testNetwork));
+            true
+        } else if op == "alarm" {
+            self.send_request(Function::setAlarm(td_api::setAlarm {
+                seconds: args.trim().parse().unwrap_or(0.0),
+            }));
+            true
+        } else if op == "delete" {
+            let (chat_id, remove_from_the_chat_list, revoke) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::deleteChatHistory(td_api::deleteChatHistory {
+                chat_id: self.as_chat_id(&chat_id),
+                remove_from_chat_list: as_bool(&remove_from_the_chat_list),
+                revoke: as_bool(&revoke),
+            }));
+            true
+        } else if op == "dcmbd" {
+            let (chat_id, min_date, max_date, revoke) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, rest1) = tokenizer::split(&rest0, ' ');
+                let (w2, w3) = tokenizer::split(&rest1, ' ');
+                (w0, w1, w2, w3)
+            };
+            self.send_request(Function::deleteChatMessagesByDate(
+                td_api::deleteChatMessagesByDate {
+                    chat_id: self.as_chat_id(&chat_id),
+                    min_date: tokenizer::to_integer_i32(&min_date),
+                    max_date: tokenizer::to_integer_i32(&max_date),
+                    revoke: as_bool(&revoke),
+                },
+            ));
+            true
+        } else if op == "dcmbs" {
+            let (chat_id, sender_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::deleteChatMessagesBySender(
+                td_api::deleteChatMessagesBySender {
+                    chat_id: self.as_chat_id(&chat_id),
+                    sender_id: self.as_message_sender(&sender_id),
+                },
+            ));
+            true
+        } else if op == "cnbgc" {
+            let (user_ids_string, title, message_auto_delete_time) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::createNewBasicGroupChat(
+                td_api::createNewBasicGroupChat {
+                    user_ids: self.as_user_ids(&user_ids_string),
+                    title,
+                    message_auto_delete_time: tokenizer::to_integer_i32(&message_auto_delete_time),
+                },
+            ));
+            true
+        } else if op == "cnchc"
+            || op == "cnchcadt"
+            || op == "cnsgc"
+            || op == "cnsgcadt"
+            || op == "cnfc"
+            || op == "cnfcadt"
+        {
+            self.send_request(Function::createNewSupergroupChat(
+                td_api::createNewSupergroupChat {
+                    title: args.to_owned(),
+                    is_forum: op == "cnfc" || op == "cnfcadt",
+                    is_channel: op == "cnchc" || op == "cnchcadt",
+                    description: "Description".to_owned(),
+                    location: None,
+                    message_auto_delete_time: if op.ends_with("adt") { 86400 } else { 0 },
+                    for_import: false,
+                },
+            ));
+            true
+        } else if op == "cnsgcloc" {
+            self.send_request(Function::createNewSupergroupChat(
+                td_api::createNewSupergroupChat {
+                    title: args.to_owned(),
+                    is_forum: false,
+                    is_channel: false,
+                    description: "Description".to_owned(),
+                    location: Some(td_api::ChatLocation {
+                        location: as_location("40.0", "60.0", ""),
+                        address: "address".to_owned(),
+                    }),
+                    message_auto_delete_time: 0,
+                    for_import: false,
+                },
+            ));
+            true
+        } else if op == "cnsgcimport" {
+            self.send_request(Function::createNewSupergroupChat(
+                td_api::createNewSupergroupChat {
+                    title: args.to_owned(),
+                    is_forum: false,
+                    is_channel: false,
+                    description: "Description".to_owned(),
+                    location: None,
+                    message_auto_delete_time: 0,
+                    for_import: true,
+                },
+            ));
+            true
+        } else if op == "ubgctsc" {
+            self.send_request(Function::upgradeBasicGroupChatToSupergroupChat(
+                td_api::upgradeBasicGroupChatToSupergroupChat {
+                    chat_id: self.as_chat_id(args),
+                },
+            ));
+            true
+        } else if op == "DeleteChat" {
+            self.send_request(Function::deleteChat(td_api::deleteChat {
+                chat_id: self.as_chat_id(args),
+            }));
+            true
+        } else if op == "grc" {
+            self.send_request(Function::getRecommendedChats(td_api::getRecommendedChats));
+            true
+        } else if op == "gcsc" {
+            self.send_request(Function::getChatSimilarChats(td_api::getChatSimilarChats {
+                chat_id: self.as_chat_id(args),
+            }));
+            true
+        } else if op == "gcscc" {
+            let (chat_id, return_local) = tokenizer::split(args, ' ');
+            self.send_request(Function::getChatSimilarChatCount(
+                td_api::getChatSimilarChatCount {
+                    chat_id: self.as_chat_id(&chat_id),
+                    return_local: as_bool(&return_local),
+                },
+            ));
+            true
+        } else if op == "ocsc" {
+            let (chat_id, similar_chat_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::openChatSimilarChat(td_api::openChatSimilarChat {
+                chat_id: self.as_chat_id(&chat_id),
+                opened_chat_id: self.as_chat_id(&similar_chat_id),
+            }));
+            true
+        } else if op == "gbsb" {
+            self.send_request(Function::getBotSimilarBots(td_api::getBotSimilarBots {
+                bot_user_id: self.as_user_id(args),
+            }));
+            true
+        } else if op == "gbsbc" {
+            let (bot_user_id, return_local) = tokenizer::split(args, ' ');
+            self.send_request(Function::getBotSimilarBotCount(
+                td_api::getBotSimilarBotCount {
+                    bot_user_id: self.as_user_id(&bot_user_id),
+                    return_local: as_bool(&return_local),
+                },
+            ));
+            true
+        } else if op == "obsb" {
+            let (bot_user_id, similar_bot_user_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::openBotSimilarBot(td_api::openBotSimilarBot {
+                bot_user_id: self.as_user_id(&bot_user_id),
+                opened_bot_user_id: self.as_user_id(&similar_bot_user_id),
+            }));
+            true
+        } else if op == "gcpc" {
+            self.send_request(Function::getCreatedPublicChats(
+                td_api::getCreatedPublicChats { r#type: None },
+            ));
+            true
+        } else if op == "gcpcl" {
+            self.send_request(Function::getCreatedPublicChats(
+                td_api::getCreatedPublicChats {
+                    r#type: Some(td_api::PublicChatType::publicChatTypeIsLocationBased(
+                        td_api::publicChatTypeIsLocationBased,
+                    )),
+                },
+            ));
+            true
+        } else if op == "ccpcl" {
+            self.send_request(Function::checkCreatedPublicChatsLimit(
+                td_api::checkCreatedPublicChatsLimit { r#type: None },
+            ));
+            true
+        } else if op == "ccpcll" {
+            self.send_request(Function::checkCreatedPublicChatsLimit(
+                td_api::checkCreatedPublicChatsLimit {
+                    r#type: Some(td_api::PublicChatType::publicChatTypeIsLocationBased(
+                        td_api::publicChatTypeIsLocationBased,
+                    )),
+                },
+            ));
+            true
+        } else if op == "gsdc" {
+            self.send_request(Function::getSuitableDiscussionChats(
+                td_api::getSuitableDiscussionChats,
+            ));
+            true
+        } else if op == "gisc" {
+            self.send_request(Function::getInactiveSupergroupChats(
+                td_api::getInactiveSupergroupChats,
+            ));
+            true
+        } else if op == "gspc" {
+            self.send_request(Function::getSuitablePersonalChats(
+                td_api::getSuitablePersonalChats,
+            ));
+            true
+        } else if op == "cpc" {
+            let (user_id, force) = tokenizer::split(args, ' ');
+            self.send_request(Function::createPrivateChat(td_api::createPrivateChat {
+                user_id: self.as_user_id(&user_id),
+                force: as_bool(&force),
+            }));
+            true
+        } else if op == "cbgc" {
+            let (basic_group_id, force) = tokenizer::split(args, ' ');
+            self.send_request(Function::createBasicGroupChat(
+                td_api::createBasicGroupChat {
+                    basic_group_id: self.as_basic_group_id(&basic_group_id),
+                    force: as_bool(&force),
+                },
+            ));
+            true
+        } else if op == "csgc" || op == "cchc" {
+            let (supergroup_id, force) = tokenizer::split(args, ' ');
+            self.send_request(Function::createSupergroupChat(
+                td_api::createSupergroupChat {
+                    supergroup_id: self.as_supergroup_id(&supergroup_id),
+                    force: as_bool(&force),
+                },
+            ));
+            true
+        } else {
+            false
+        }
     }
 
     fn op_block_dev_b(&self, _op: &str, _args: &str) -> bool {
@@ -6565,6 +6814,40 @@ mod tests {
             ("tdmctcsum", 2),
             ("tsmtip", 2),
             ("uadmctm", 2),
+            ("DeleteChat", 13),
+            ("alarm", 13),
+            ("cbgc", 13),
+            ("cchc", 13),
+            ("ccpcl", 13),
+            ("ccpcll", 13),
+            ("cnbgc", 13),
+            ("cnchc", 13),
+            ("cnchcadt", 13),
+            ("cnfc", 13),
+            ("cnfcadt", 13),
+            ("cnsgc", 13),
+            ("cnsgcadt", 13),
+            ("cnsgcimport", 13),
+            ("cnsgcloc", 13),
+            ("cpc", 13),
+            ("csgc", 13),
+            ("dcmbd", 13),
+            ("dcmbs", 13),
+            ("delete", 13),
+            ("gbsb", 13),
+            ("gbsbc", 13),
+            ("gcpc", 13),
+            ("gcpcl", 13),
+            ("gcsc", 13),
+            ("gcscc", 13),
+            ("gisc", 13),
+            ("grc", 13),
+            ("gsdc", 13),
+            ("gspc", 13),
+            ("obsb", 13),
+            ("ocsc", 13),
+            ("test", 13),
+            ("ubgctsc", 13),
             ("ccun", 15),
             ("cres", 15),
             ("cto", 15),
