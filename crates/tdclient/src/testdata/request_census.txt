@@ -104,7 +104,7 @@ clickChatSponsoredMessage	interim
 clickPremiumSubscriptionButton	interim
 clickVideoMessageAdvertisement	interim
 close	dispatched
-closeChat	interim
+closeChat	dispatched
 closeGiftAuction	interim
 closeSecretChat	interim
 closeStory	interim
@@ -179,7 +179,7 @@ deleteGroupCallMessagesBySender	interim
 deleteLanguagePack	interim
 deleteMessageEphemeralContent	interim
 deleteMessageReactionsFromSender	interim
-deleteMessages	interim
+deleteMessages	dispatched
 deletePassportElement	interim
 deletePollOption	interim
 deleteProfilePhoto	interim
@@ -608,7 +608,7 @@ loadSavedMessagesTopics	interim
 logOut	interim
 markChecklistTasksAsDone	interim
 openBotSimilarBot	interim
-openChat	interim
+openChat	dispatched
 openChatSimilarChat	interim
 openGiftAuction	interim
 openMessageContent	interim
@@ -1014,7 +1014,7 @@ upgradeBasicGroupChatToSupergroupChat	dispatched
 upgradeGift	interim
 uploadStickerFile	interim
 validateOrderInfo	interim
-viewMessages	interim
+viewMessages	dispatched
 viewPremiumFeature	interim
 viewSponsoredChat	interim
 viewTrendingStickerSets	interim

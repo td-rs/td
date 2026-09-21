@@ -6036,6 +6036,38 @@ mod tests {
         assert_eq!(error.code, 400);
         assert_eq!(error.message, "Chat not found");
 
+        // the write family: the same local table through the aliasing
+        // adapter (openChat/closeChat/viewMessages are user-gated,
+        // deleteMessages is not in the C++)
+        for (id, function) in [
+            (106, Function::openChat(td_api::openChat { chat_id: 1 })),
+            (107, Function::closeChat(td_api::closeChat { chat_id: 1 })),
+            (
+                108,
+                Function::viewMessages(td_api::viewMessages {
+                    chat_id: 1,
+                    message_ids: vec![100],
+                    source: None,
+                    force_read: false,
+                }),
+            ),
+            (
+                109,
+                Function::deleteMessages(td_api::deleteMessages {
+                    chat_id: 1,
+                    message_ids: vec![100],
+                    revoke: false,
+                }),
+            ),
+        ] {
+            td.request(id, function);
+            let error = error_of(&callback, id);
+            assert_eq!(error.code, 400);
+            assert_eq!(error.message, "Chat not found");
+        }
+        // the manager survived every take/restore
+        assert!(td.messages_manager.dialogs.is_empty());
+
         td.close_impl(false);
         let _ = std::fs::remove_dir_all(&dir);
     }

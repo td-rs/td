@@ -26244,6 +26244,33 @@ pub enum MessageSource {
     Other,
 }
 
+/// `get_message_source(const td_api::object_ptr<td_api::MessageSource> &)`
+/// (MessageSource.cpp:42-68).
+pub fn get_message_source(source: Option<&td_api::MessageSource>) -> MessageSource {
+    let Some(source) = source else {
+        return MessageSource::Auto;
+    };
+    match source {
+        td_api::MessageSource::messageSourceChatHistory(_) => MessageSource::DialogHistory,
+        td_api::MessageSource::messageSourceMessageThreadHistory(_) => {
+            MessageSource::MessageThreadHistory
+        }
+        td_api::MessageSource::messageSourceForumTopicHistory(_) => {
+            MessageSource::ForumTopicHistory
+        }
+        td_api::MessageSource::messageSourceDirectMessagesChatTopicHistory(_) => {
+            MessageSource::MonoforumHistory
+        }
+        td_api::MessageSource::messageSourceHistoryPreview(_) => MessageSource::HistoryPreview,
+        td_api::MessageSource::messageSourceChatList(_) => MessageSource::DialogList,
+        td_api::MessageSource::messageSourceSearch(_) => MessageSource::Search,
+        td_api::MessageSource::messageSourceChatEventLog(_) => MessageSource::DialogEventLog,
+        td_api::MessageSource::messageSourceNotification(_) => MessageSource::Notification,
+        td_api::MessageSource::messageSourceScreenshot(_) => MessageSource::Screenshot,
+        td_api::MessageSource::messageSourceOther(_) => MessageSource::Other,
+    }
+}
+
 pub fn view_messages(
     manager: &mut MessagesManager,
     ctx: &dyn MessageObjectContext,

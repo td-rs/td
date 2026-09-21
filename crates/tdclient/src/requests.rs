@@ -1688,6 +1688,97 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 }
             }
         }
+        // --- messages, write family part 1 (Requests.cpp:3529-3548, :4139) ---
+        Function::openChat(request) => {
+            // Requests.cpp:3529-3532 — CHECK_IS_USER; the ok-promise
+            // answers the local open.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the sequential discipline on `split_context_alias`.
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(std::ptr::from_mut(td)) };
+            let result = crate::messages_manager::open_dialog(&mut manager, td, state, dialog_id);
+            td.messages_manager = manager;
+            match result {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::closeChat(request) => {
+            // Requests.cpp:3534-3537.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: as openChat above.
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(std::ptr::from_mut(td)) };
+            let result = crate::messages_manager::close_dialog(&mut manager, td, state, dialog_id);
+            td.messages_manager = manager;
+            match result {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::viewMessages(request) => {
+            // Requests.cpp:3539-3546.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let message_ids: Vec<MessageId> = request
+                .message_ids
+                .iter()
+                .map(|&message_id| MessageId::new(message_id))
+                .collect();
+            let source = crate::messages_manager::get_message_source(request.source.as_ref());
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: as openChat above.
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(std::ptr::from_mut(td)) };
+            let result = crate::messages_manager::view_messages(
+                &mut manager,
+                td,
+                state,
+                dialog_id,
+                message_ids,
+                source,
+                request.force_read,
+            );
+            td.messages_manager = manager;
+            match result {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::deleteMessages(request) => {
+            // Requests.cpp:4139-4144 — the local delete core over the
+            // durable spine; the server tail rides the net seam.
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let message_ids: Vec<MessageId> = request
+                .message_ids
+                .iter()
+                .map(|&message_id| MessageId::new(message_id))
+                .collect();
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            let mut global = std::mem::take(&mut td.global);
+            let result = crate::messages_manager::delete_messages(
+                &mut global,
+                &mut manager,
+                dialog_id,
+                &message_ids,
+            );
+            td.global = global;
+            td.messages_manager = manager;
+            match result {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
         Function::getChatHistory(request) => {
             // Requests.cpp:3642-3646 + GetChatHistoryRequest
             // (Requests.cpp:951-977): CHECK_IS_USER; the actor's first run
@@ -2072,13 +2163,14 @@ mod request_census_tests {
         // The flip-state ledger after the m10d master merge + the M.10.20
         // read-family batch: the m13s pins (92) + the five M.10 dispatches
         // (getMessageLocally, getMessageLink, getMessageEmbeddingCode,
-        // getChatHistory, getChatMessageByDate). Fix per flip.
+        // getChatHistory, getChatMessageByDate, openChat, closeChat,
+        // viewMessages, deleteMessages). Fix per flip.
         assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            97,
+            101,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 907, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 903, "interim count");
     }
 }
