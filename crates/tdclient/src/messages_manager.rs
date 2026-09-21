@@ -5178,6 +5178,613 @@ impl KeyboardButton {
     }
 }
 
+// ---------------------------------------------------------------------------
+// M.10.21 — the td_api reply-markup plane (the `sendMessage` flip):
+// `KeyboardButtonStyle(td_api::ButtonStyle &&, int64)`
+// (KeyboardButtonStyle.cpp:19-38), `KeyboardButton::get_keyboard_button`
+// (KeyboardButton.cpp:82-152), the `RequestedDialogType(td_api ...)` ctors
+// (RequestedDialogType.cpp:19-66), `get_inline_keyboard_button`
+// (InlineKeyboardButton.cpp:227-387) and `get_reply_markup(td_api ...)`
+// (ReplyMarkup.cpp:201-321).
+// ---------------------------------------------------------------------------
+
+impl KeyboardButtonStyle {
+    /// `KeyboardButtonStyle::KeyboardButtonStyle(td_api::ButtonStyle &&,
+    /// int64)` (KeyboardButtonStyle.cpp:19-38).
+    pub fn from_td_api(
+        style: Option<td_api::ButtonStyle>,
+        icon_custom_emoji_id: i64,
+    ) -> KeyboardButtonStyle {
+        let mut result = KeyboardButtonStyle {
+            icon_custom_emoji_id: crate::emoji_status::CustomEmojiId::new(icon_custom_emoji_id),
+            ..KeyboardButtonStyle::default()
+        };
+        match style {
+            None => {}
+            Some(td_api::ButtonStyle::buttonStylePrimary(_)) => {
+                result.r#type = KeyboardButtonStyleType::Primary;
+            }
+            Some(td_api::ButtonStyle::buttonStyleDanger(_)) => {
+                result.r#type = KeyboardButtonStyleType::Danger;
+            }
+            Some(td_api::ButtonStyle::buttonStyleSuccess(_)) => {
+                result.r#type = KeyboardButtonStyleType::Success;
+            }
+            // `buttonStyleDefault` and `buttonStyleLink` (never allowed)
+            // keep the Default type.
+            Some(td_api::ButtonStyle::buttonStyleDefault(_))
+            | Some(td_api::ButtonStyle::buttonStyleLink(_)) => {}
+        }
+        result
+    }
+}
+
+impl KeyboardButton {
+    /// `KeyboardButton::get_keyboard_button(td_api::keyboardButton &&, bool)`
+    /// (KeyboardButton.cpp:82-152).
+    pub fn get_keyboard_button(
+        button: td_api::KeyboardButton,
+        request_buttons_allowed: bool,
+    ) -> Result<KeyboardButton, Status> {
+        if crate::misc::clean_input_string(&button.text).is_none() {
+            return Err(Status::error(
+                400,
+                "Keyboard button text must be encoded in UTF-8",
+            ));
+        }
+        if button.text.is_empty() {
+            return Err(Status::error(400, "Keyboard button text must be non-empty"));
+        }
+
+        let mut current_button = KeyboardButton {
+            text: button.text,
+            style: KeyboardButtonStyle::from_td_api(button.style, button.icon_custom_emoji_id),
+            ..KeyboardButton::default()
+        };
+
+        match button.r#type {
+            None | Some(td_api::KeyboardButtonType::keyboardButtonTypeText(_)) => {
+                current_button.r#type = KeyboardButtonType::Text;
+            }
+            Some(td_api::KeyboardButtonType::keyboardButtonTypeRequestPhoneNumber(_)) => {
+                if !request_buttons_allowed {
+                    return Err(Status::error(
+                        400,
+                        "Phone number can be requested in private chats only",
+                    ));
+                }
+                current_button.r#type = KeyboardButtonType::RequestPhoneNumber;
+            }
+            Some(td_api::KeyboardButtonType::keyboardButtonTypeRequestLocation(_)) => {
+                if !request_buttons_allowed {
+                    return Err(Status::error(
+                        400,
+                        "Location can be requested in private chats only",
+                    ));
+                }
+                current_button.r#type = KeyboardButtonType::RequestLocation;
+            }
+            Some(td_api::KeyboardButtonType::keyboardButtonTypeRequestPoll(request_poll)) => {
+                if !request_buttons_allowed {
+                    return Err(Status::error(
+                        400,
+                        "Poll can be requested in private chats only",
+                    ));
+                }
+                if request_poll.force_quiz && request_poll.force_regular {
+                    return Err(Status::error(
+                        400,
+                        "Can't force quiz mode and regular poll simultaneously",
+                    ));
+                }
+                current_button.r#type = if request_poll.force_quiz {
+                    KeyboardButtonType::RequestPollQuiz
+                } else if request_poll.force_regular {
+                    KeyboardButtonType::RequestPollRegular
+                } else {
+                    KeyboardButtonType::RequestPoll
+                };
+            }
+            Some(td_api::KeyboardButtonType::keyboardButtonTypeWebApp(button_type)) => {
+                if !request_buttons_allowed {
+                    return Err(Status::error(
+                        400,
+                        "Web App buttons can be used in private chats only",
+                    ));
+                }
+                let user_id = crate::link_manager::get_link_user_id(&button_type.url);
+                if user_id.is_valid() {
+                    return Err(Status::error(
+                        400,
+                        "Link to a user can't be used in Web App URL buttons",
+                    ));
+                }
+                // `check_link(url, true, !G()->is_test_dc())` — the test-dc
+                // read is the config seam; the production dc answers https
+                let url = crate::link_manager::check_link(&button_type.url, true, true).map_err(
+                    |status| {
+                        Status::error(
+                            400,
+                            &format!("Keyboard button Web App {}", status.message()),
+                        )
+                    },
+                )?;
+                current_button.r#type = KeyboardButtonType::WebView;
+                current_button.url = url;
+            }
+            Some(td_api::KeyboardButtonType::keyboardButtonTypeRequestUsers(button_type)) => {
+                if !request_buttons_allowed {
+                    return Err(Status::error(
+                        400,
+                        "Users can be requested in private chats only",
+                    ));
+                }
+                current_button.r#type = KeyboardButtonType::RequestDialog;
+                current_button.requested_dialog_type =
+                    Some(RequestedDialogType::from_td_api_request_users(button_type));
+            }
+            Some(td_api::KeyboardButtonType::keyboardButtonTypeRequestChat(button_type)) => {
+                if !request_buttons_allowed {
+                    return Err(Status::error(
+                        400,
+                        "Chats can be requested in private chats only",
+                    ));
+                }
+                current_button.r#type = KeyboardButtonType::RequestDialog;
+                current_button.requested_dialog_type =
+                    Some(RequestedDialogType::from_td_api_request_chat(button_type));
+            }
+            Some(td_api::KeyboardButtonType::keyboardButtonTypeRequestManagedBot(button_type)) => {
+                if !request_buttons_allowed {
+                    return Err(Status::error(
+                        400,
+                        "Managed bots can be requested in private chats only",
+                    ));
+                }
+                current_button.r#type = KeyboardButtonType::RequestDialog;
+                current_button.requested_dialog_type = Some(
+                    RequestedDialogType::from_td_api_request_managed_bot(button_type),
+                );
+            }
+        }
+        Ok(current_button)
+    }
+}
+
+impl RequestedDialogType {
+    /// `RequestedDialogType(td_api::keyboardButtonTypeRequestUsers &&)`
+    /// (RequestedDialogType.cpp:19-31).
+    pub fn from_td_api_request_users(
+        request_users: td_api::keyboardButtonTypeRequestUsers,
+    ) -> RequestedDialogType {
+        RequestedDialogType {
+            r#type: RequestedDialogTypeType::User,
+            button_id: request_users.id,
+            max_quantity: request_users.max_quantity.max(1),
+            restrict_is_bot: request_users.restrict_user_is_bot,
+            is_bot: request_users.user_is_bot,
+            restrict_is_premium: request_users.restrict_user_is_premium,
+            is_premium: request_users.user_is_premium,
+            request_name: request_users.request_name,
+            request_username: request_users.request_username,
+            request_photo: request_users.request_photo,
+            ..RequestedDialogType::default()
+        }
+    }
+
+    /// `RequestedDialogType(td_api::keyboardButtonTypeRequestChat &&)`
+    /// (RequestedDialogType.cpp:33-51).
+    pub fn from_td_api_request_chat(
+        request_dialog: td_api::keyboardButtonTypeRequestChat,
+    ) -> RequestedDialogType {
+        let channel_type = if request_dialog.chat_is_channel {
+            crate::chat_manager::ChannelType::Broadcast
+        } else {
+            crate::chat_manager::ChannelType::Megagroup
+        };
+        RequestedDialogType {
+            r#type: if request_dialog.chat_is_channel {
+                RequestedDialogTypeType::Channel
+            } else {
+                RequestedDialogTypeType::Group
+            },
+            button_id: request_dialog.id,
+            restrict_is_forum: request_dialog.restrict_chat_is_forum,
+            is_forum: request_dialog.chat_is_forum,
+            bot_is_participant: request_dialog.bot_is_member,
+            restrict_has_username: request_dialog.restrict_chat_has_username,
+            has_username: request_dialog.chat_has_username,
+            is_created: request_dialog.chat_is_created,
+            restrict_user_administrator_rights: request_dialog.user_administrator_rights.is_some(),
+            restrict_bot_administrator_rights: request_dialog.bot_administrator_rights.is_some(),
+            user_administrator_rights:
+                crate::chat_manager::AdministratorRights::from_chat_administrator_rights(
+                    request_dialog.user_administrator_rights.as_ref(),
+                    channel_type,
+                ),
+            bot_administrator_rights:
+                crate::chat_manager::AdministratorRights::from_chat_administrator_rights(
+                    request_dialog.bot_administrator_rights.as_ref(),
+                    channel_type,
+                ),
+            request_name: request_dialog.request_title,
+            request_username: request_dialog.request_username,
+            request_photo: request_dialog.request_photo,
+            ..RequestedDialogType::default()
+        }
+    }
+
+    /// `RequestedDialogType(td_api::keyboardButtonTypeRequestManagedBot &&)`
+    /// (RequestedDialogType.cpp:53-66).
+    pub fn from_td_api_request_managed_bot(
+        request: td_api::keyboardButtonTypeRequestManagedBot,
+    ) -> RequestedDialogType {
+        RequestedDialogType {
+            r#type: RequestedDialogTypeType::CreateBot,
+            button_id: request.id,
+            suggested_name: crate::misc::clean_input_string(&request.suggested_name)
+                .unwrap_or_default(),
+            suggested_username: crate::misc::clean_input_string(&request.suggested_username)
+                .unwrap_or_default(),
+            ..RequestedDialogType::default()
+        }
+    }
+}
+
+impl TargetDialogTypes {
+    /// `TargetDialogTypes::get_target_dialog_types(const
+    /// td_api::targetChatTypes &)` (TargetDialogTypes.cpp:37-57).
+    pub fn get_target_dialog_types(
+        types: Option<&td_api::TargetChatTypes>,
+    ) -> Result<TargetDialogTypes, Status> {
+        let mut mask = 0;
+        if let Some(types) = types {
+            if types.allow_user_chats {
+                mask |= Self::USERS_MASK;
+            }
+            if types.allow_bot_chats {
+                mask |= Self::BOTS_MASK;
+            }
+            if types.allow_group_chats {
+                mask |= Self::CHATS_MASK;
+            }
+            if types.allow_channel_chats {
+                mask |= Self::BROADCASTS_MASK;
+            }
+        }
+        if mask == 0 {
+            return Err(Status::error(400, "At least one chat type must be allowed"));
+        }
+        Ok(TargetDialogTypes(mask))
+    }
+}
+
+/// `get_inline_keyboard_button(td_api::inlineKeyboardButton &&, bool)`
+/// (InlineKeyboardButton.cpp:227-387).
+pub fn get_inline_keyboard_button(
+    button: td_api::InlineKeyboardButton,
+    switch_inline_buttons_allowed: bool,
+) -> Result<InlineKeyboardButton, Status> {
+    if crate::misc::clean_input_string(&button.text).is_none() {
+        return Err(Status::error(
+            400,
+            "Inline keyboard button text must be encoded in UTF-8",
+        ));
+    }
+    if button.text.is_empty() {
+        return Err(Status::error(
+            400,
+            "Inline keyboard button text must be non-empty",
+        ));
+    }
+    let Some(button_type) = button.r#type else {
+        return Err(Status::error(
+            400,
+            "Inline keyboard button type must be non-empty",
+        ));
+    };
+
+    let mut current_button = InlineKeyboardButton {
+        text: button.text,
+        style: KeyboardButtonStyle::from_td_api(button.style, button.icon_custom_emoji_id),
+        ..InlineKeyboardButton::default()
+    };
+
+    match button_type {
+        td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeUrl(button_type) => {
+            let user_id = crate::link_manager::get_link_user_id(&button_type.url);
+            if user_id.is_valid() {
+                current_button.r#type = InlineKeyboardButtonType::User;
+                current_button.user_id = user_id;
+                return Ok(current_button);
+            }
+            let url = crate::link_manager::check_link(&button_type.url, false, false).map_err(
+                |status| {
+                    Status::error(400, &format!("Inline keyboard button {}", status.message()))
+                },
+            )?;
+            current_button.r#type = InlineKeyboardButtonType::Url;
+            current_button.data = url;
+        }
+        td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeCallback(button_type) => {
+            current_button.r#type = InlineKeyboardButtonType::Callback;
+            // the C++ keeps the raw callback bytes in a std::string
+            current_button.data = String::from_utf8_lossy(&button_type.data).into_owned();
+        }
+        td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeCallbackGame(_) => {
+            current_button.r#type = InlineKeyboardButtonType::CallbackGame;
+        }
+        td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeCallbackWithPassword(_) => {
+            return Err(Status::error(
+                400,
+                "Can't use CallbackWithPassword inline button",
+            ));
+        }
+        td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeSwitchInline(button_type) => {
+            let Some(target_chat) = button_type.target_chat else {
+                return Err(Status::error(400, "Target chat must be non-empty"));
+            };
+            match *target_chat {
+                td_api::TargetChat::targetChatChosen(chosen) => {
+                    let types = TargetDialogTypes::get_target_dialog_types(chosen.types.as_ref())?;
+                    current_button.id = types.get_mask();
+                    current_button.r#type = InlineKeyboardButtonType::SwitchInline;
+                }
+                td_api::TargetChat::targetChatCurrent(_) => {
+                    current_button.r#type = InlineKeyboardButtonType::SwitchInlineCurrentDialog;
+                }
+                td_api::TargetChat::targetChatInternalLink(_) => {
+                    return Err(Status::error(400, "Unsupported target chat specified"));
+                }
+            }
+            if !switch_inline_buttons_allowed {
+                let button_name = if current_button.r#type == InlineKeyboardButtonType::SwitchInline
+                {
+                    "switch_inline_query"
+                } else {
+                    "switch_inline_query_current_chat"
+                };
+                return Err(Status::error(
+                    400,
+                    &format!(
+                        "Can't use {} button in a channel chat, because users will not be able to use the button without knowing bot's username",
+                        button_name
+                    ),
+                ));
+            }
+            current_button.data =
+                crate::misc::clean_input_string(&button_type.query).ok_or_else(|| {
+                    Status::error(
+                        400,
+                        "Inline keyboard button switch inline query must be encoded in UTF-8",
+                    )
+                })?;
+        }
+        td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeBuy(_) => {
+            current_button.r#type = InlineKeyboardButtonType::Buy;
+        }
+        td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeLoginUrl(button_type) => {
+            let user_id = crate::link_manager::get_link_user_id(&button_type.url);
+            if user_id.is_valid() {
+                return Err(Status::error(
+                    400,
+                    "Link to a user can't be used in login URL buttons",
+                ));
+            }
+            // `check_link(url, true, !G()->is_test_dc())` — the test-dc read
+            // is the config seam; the production dc answers https
+            let url = crate::link_manager::check_link(&button_type.url, true, true).map_err(
+                |status| {
+                    Status::error(
+                        400,
+                        &format!("Inline keyboard button login {}", status.message()),
+                    )
+                },
+            )?;
+            current_button.r#type = InlineKeyboardButtonType::UrlAuth;
+            current_button.data = url;
+            current_button.forward_text =
+                crate::misc::clean_input_string(&button_type.forward_text).ok_or_else(|| {
+                    Status::error(
+                        400,
+                        "Inline keyboard button forward text must be encoded in UTF-8",
+                    )
+                })?;
+            current_button.id = button_type.id;
+            if current_button.id == i64::MIN {
+                return Err(Status::error(400, "Invalid bot_user_id specified"));
+            }
+            let bot_user_id = UserId::new(if current_button.id >= 0 {
+                current_button.id
+            } else {
+                -current_button.id - 1
+            });
+            if !bot_user_id.is_valid() && bot_user_id != UserId::default() {
+                return Err(Status::error(400, "Invalid bot_user_id specified"));
+            }
+        }
+        td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeUser(button_type) => {
+            current_button.r#type = InlineKeyboardButtonType::User;
+            current_button.user_id = UserId::new(button_type.user_id);
+            if !current_button.user_id.is_valid() {
+                return Err(Status::error(400, "Invalid user_id specified"));
+            }
+        }
+        td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeWebApp(button_type) => {
+            let user_id = crate::link_manager::get_link_user_id(&button_type.url);
+            if user_id.is_valid() {
+                return Err(Status::error(
+                    400,
+                    "Link to a user can't be used in Web App URL buttons",
+                ));
+            }
+            let url = crate::link_manager::check_link(&button_type.url, true, true).map_err(
+                |status| {
+                    Status::error(
+                        400,
+                        &format!("Inline keyboard button Web App {}", status.message()),
+                    )
+                },
+            )?;
+            current_button.r#type = InlineKeyboardButtonType::WebView;
+            current_button.data = url;
+        }
+        td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeCopyText(button_type) => {
+            current_button.r#type = InlineKeyboardButtonType::Copy;
+            current_button.data =
+                crate::misc::clean_input_string(&button_type.text).ok_or_else(|| {
+                    Status::error(
+                        400,
+                        "Inline keyboard button copied text must be encoded in UTF-8",
+                    )
+                })?;
+        }
+        td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeDisabled(_) => {
+            current_button.r#type = InlineKeyboardButtonType::Disabled;
+        }
+    }
+
+    Ok(current_button)
+}
+
+impl ReplyMarkup {
+    /// `get_reply_markup(td_api::ReplyMarkup &&, bool, bool, bool, bool,
+    /// bool)` (ReplyMarkup.cpp:201-321) — the input-side converter behind
+    /// `get_dialog_reply_markup`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_td_api(
+        reply_markup: Option<td_api::ReplyMarkup>,
+        is_bot: bool,
+        only_inline_keyboard: bool,
+        request_buttons_allowed: bool,
+        switch_inline_buttons_allowed: bool,
+        allow_personal: bool,
+    ) -> Result<Option<ReplyMarkup>, Status> {
+        let Some(reply_markup) = reply_markup else {
+            return Ok(None);
+        };
+        if !is_bot {
+            return Ok(None);
+        }
+
+        if only_inline_keyboard
+            && !matches!(
+                reply_markup,
+                td_api::ReplyMarkup::replyMarkupInlineKeyboard(_)
+            )
+        {
+            return Err(Status::error(400, "Inline keyboard expected"));
+        }
+
+        let mut markup = ReplyMarkup::default();
+        match reply_markup {
+            td_api::ReplyMarkup::replyMarkupShowKeyboard(show_keyboard_markup) => {
+                markup.r#type = ReplyMarkupType::ShowKeyboard;
+                markup.is_persistent = show_keyboard_markup.is_persistent;
+                markup.need_resize_keyboard = show_keyboard_markup.resize_keyboard;
+                markup.is_one_time_keyboard = show_keyboard_markup.one_time;
+                markup.is_personal = show_keyboard_markup.is_personal && allow_personal;
+                markup.force_reply = show_keyboard_markup.force_reply;
+                markup.placeholder = show_keyboard_markup.input_field_placeholder;
+
+                let mut total_button_count = 0;
+                for row in show_keyboard_markup.rows {
+                    let mut row_buttons = Vec::with_capacity(row.len());
+                    let mut row_button_count = 0;
+                    for button in row {
+                        if button.text.is_empty() && button.icon_custom_emoji_id == 0 {
+                            continue;
+                        }
+                        let current_button =
+                            KeyboardButton::get_keyboard_button(button, request_buttons_allowed)?;
+                        row_buttons.push(current_button);
+                        row_button_count += 1;
+                        total_button_count += 1;
+                        if row_button_count >= 12 || total_button_count >= 300 {
+                            break;
+                        }
+                    }
+                    if !row_buttons.is_empty() {
+                        markup.keyboard.push(row_buttons);
+                    }
+                    if total_button_count >= 300 {
+                        break;
+                    }
+                }
+                if markup.keyboard.is_empty() {
+                    return Ok(None);
+                }
+            }
+            td_api::ReplyMarkup::replyMarkupInlineKeyboard(inline_keyboard_markup) => {
+                markup.r#type = ReplyMarkupType::InlineKeyboard;
+
+                let mut total_button_count = 0;
+                for row in inline_keyboard_markup.rows {
+                    let mut row_buttons = Vec::with_capacity(row.len());
+                    let mut row_button_count = 0;
+                    for button in row {
+                        if button.text.is_empty() && button.icon_custom_emoji_id == 0 {
+                            continue;
+                        }
+                        let current_button =
+                            get_inline_keyboard_button(button, switch_inline_buttons_allowed)?;
+                        row_buttons.push(current_button);
+                        row_button_count += 1;
+                        total_button_count += 1;
+                        if row_button_count >= 12 || total_button_count >= 300 {
+                            break;
+                        }
+                    }
+                    if !row_buttons.is_empty() {
+                        markup.inline_keyboard.push(row_buttons);
+                    }
+                    if total_button_count >= 300 {
+                        break;
+                    }
+                }
+                if markup.inline_keyboard.is_empty() {
+                    return Ok(None);
+                }
+                markup.force_reply = inline_keyboard_markup.force_reply;
+            }
+            td_api::ReplyMarkup::replyMarkupRemoveKeyboard(remove_keyboard_markup) => {
+                markup.r#type = ReplyMarkupType::RemoveKeyboard;
+                markup.is_personal = remove_keyboard_markup.is_personal && allow_personal;
+            }
+            td_api::ReplyMarkup::replyMarkupForceReply(force_reply_markup) => {
+                markup.r#type = ReplyMarkupType::ForceReply;
+                markup.is_personal = force_reply_markup.is_personal && allow_personal;
+                markup.placeholder = force_reply_markup.input_field_placeholder;
+            }
+        }
+        Ok(Some(markup))
+    }
+}
+
+/// `MessagesManager::get_dialog_reply_markup(DialogId,
+/// td_api::ReplyMarkup &&)` (MessagesManager.cpp:24319-24328).
+pub fn get_dialog_reply_markup(
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    reply_markup: Option<td_api::ReplyMarkup>,
+) -> Result<Option<ReplyMarkup>, (i32, String)> {
+    let dialog_type = dialog_id.get_type();
+    let is_anonymous = ctx.is_anonymous_administrator(dialog_id).is_some();
+    let only_inline_keyboard = is_anonymous && !ctx.is_admined_monoforum_channel(dialog_id);
+    let request_buttons_allowed = dialog_type == DialogType::User;
+    let switch_inline_buttons_allowed = !is_anonymous;
+    let allow_personal = dialog_type != DialogType::User;
+    ReplyMarkup::from_td_api(
+        reply_markup,
+        ctx.is_bot(),
+        only_inline_keyboard,
+        request_buttons_allowed,
+        switch_inline_buttons_allowed,
+        allow_personal,
+    )
+    .map_err(|status| (status.code(), status.message().to_owned()))
+}
+
 /// `InlineKeyboardButton::Type` (InlineKeyboardButton.h:23-38) — append only.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(i32)]
@@ -7069,6 +7676,33 @@ impl SuggestedPost {
         Some(result)
     }
 
+    /// `SuggestedPost::get_suggested_post(const Td *,
+    /// td_api::inputSuggestedPostInfo &&)` (SuggestedPost.cpp:29-43) — the
+    /// input ctor of the draft plane.
+    pub fn get_suggested_post_from_td_api(
+        ctx: &dyn SendMessageContext,
+        post: Option<td_api::InputSuggestedPostInfo>,
+    ) -> Result<Option<SuggestedPost>, (i32, String)> {
+        let Some(post) = post else {
+            return Ok(None);
+        };
+        let price =
+            crate::message_content::SuggestedPostPrice::get_suggested_post_price_from_td_api(
+                ctx.content_context(),
+                post.price,
+            )
+            .map_err(|status| (status.code(), status.message().to_owned()))?;
+        let send_date = post.send_date;
+        if send_date < 0 {
+            return Err((400, "Invalid post send date specified".to_owned()));
+        }
+        Ok(Some(SuggestedPost {
+            price,
+            schedule_date: send_date,
+            ..SuggestedPost::default()
+        }))
+    }
+
     /// `SuggestedPost::is_pending` (SuggestedPost.h).
     pub fn is_pending(&self) -> bool {
         !self.is_accepted && !self.is_rejected
@@ -7361,6 +7995,126 @@ impl DraftMessage {
     /// `DraftMessage::is_local` (DraftMessage.h:71-73).
     pub fn is_local(&self) -> bool {
         self.local_content.is_some()
+    }
+
+    /// `DraftMessage::get_draft_message(Td *, DialogId, const
+    /// MessageTopic &, td_api::draftMessage &&)`
+    /// (DraftMessage.cpp:368-447) — the input ctor behind
+    /// `setChatDraftMessage`. The `draftMessageContentInputRichMessage`
+    /// arm rides the Wave-2 RichMessage plane (module doc in
+    /// `message_content`).
+    pub fn get_draft_message_from_td_api(
+        ctx: &mut dyn SendMessageContext,
+        manager: &MessagesManager,
+        dialog_id: DialogId,
+        message_topic: &MessageTopic,
+        draft_message: Option<td_api::DraftMessage>,
+    ) -> Result<Option<DraftMessage>, (i32, String)> {
+        let Some(draft_message) = draft_message else {
+            return Ok(None);
+        };
+
+        let message_input_reply_to = create_message_input_reply_to(
+            ctx,
+            manager,
+            dialog_id,
+            message_topic,
+            draft_message.reply_to,
+            true,
+        );
+        let message_effect_id = MessageEffectId::new(draft_message.effect_id);
+        let suggested_post =
+            SuggestedPost::get_suggested_post_from_td_api(ctx, draft_message.suggested_post_info)?;
+
+        let mut input_message_text = InputMessageText::default();
+        let mut local_content = None;
+        match draft_message.content {
+            None => {}
+            Some(td_api::DraftMessageContent::draftMessageContentText(text)) => {
+                let parsed = crate::message_content::process_input_message_text(
+                    ctx.content_context_mut(),
+                    dialog_id,
+                    td_api::InputMessageContent::inputMessageText(td_api::inputMessageText {
+                        text: text.text,
+                        link_preview_options: text.link_preview_options,
+                        clear_draft: true,
+                    }),
+                    false,
+                    true,
+                )
+                .map_err(|status| (status.code(), status.message().to_owned()))?;
+                // the same C++ `InputMessageText` lives twice here — the
+                // message_content input model and this module's store/parse
+                // model (field-identical); the rebuild bridges them
+                input_message_text = InputMessageText {
+                    text: parsed.text,
+                    web_page_url: parsed.web_page_url,
+                    disable_web_page_preview: parsed.disable_web_page_preview,
+                    force_small_media: parsed.force_small_media,
+                    force_large_media: parsed.force_large_media,
+                    show_above_text: parsed.show_above_text,
+                    clear_draft: parsed.clear_draft,
+                };
+            }
+            Some(td_api::DraftMessageContent::draftMessageContentRichMessage(_)) => {
+                return Err((
+                    400,
+                    "Use draftMessageContentInputRichMessage instead of draftMessageContentRichMessage"
+                        .to_owned(),
+                ));
+            }
+            Some(td_api::DraftMessageContent::draftMessageContentInputRichMessage(_)) => {
+                // `RichMessage::get_rich_message` — the Wave-2
+                // RichMessage/WebPageBlock plane (the same interim answer
+                // as `inputMessageRichMessage`)
+                return Err((400, "Rich message input is not supported yet".to_owned()));
+            }
+            Some(td_api::DraftMessageContent::draftMessageContentVideoNote(video_note)) => {
+                let ttl = MessageSelfDestructType::get_message_self_destruct_type(
+                    video_note.self_destruct_type,
+                )
+                .map_err(|status| (status.code(), status.message().to_owned()))?;
+                local_content = Some(DraftMessageContent::VideoNote(
+                    DraftMessageContentVideoNote {
+                        path: video_note.file_path,
+                        duration: video_note.duration,
+                        length: video_note.length,
+                        ttl,
+                    },
+                ));
+            }
+            Some(td_api::DraftMessageContent::draftMessageContentVoiceNote(voice_note)) => {
+                let ttl = MessageSelfDestructType::get_message_self_destruct_type(
+                    voice_note.self_destruct_type,
+                )
+                .map_err(|status| (status.code(), status.message().to_owned()))?;
+                local_content = Some(DraftMessageContent::VoiceNote(
+                    DraftMessageContentVoiceNote {
+                        path: voice_note.file_path,
+                        duration: voice_note.duration,
+                        waveform: String::from_utf8_lossy(&voice_note.waveform).into_owned(),
+                        ttl,
+                    },
+                ));
+            }
+        }
+
+        if !message_input_reply_to.is_valid()
+            && input_message_text.is_empty()
+            && local_content.is_none()
+        {
+            return Ok(None);
+        }
+
+        Ok(Some(DraftMessage {
+            date: ctx.unix_time(),
+            message_input_reply_to,
+            input_message_text,
+            rich_message_content: None,
+            local_content,
+            message_effect_id,
+            suggested_post,
+        }))
     }
 
     /// `DraftMessage::store` (DraftMessage.hpp:24-60). The rich-message
@@ -10007,7 +10761,16 @@ impl MessagesManager {
 /// `is_chat_banned` is the ChatManager status cache read; the standalone
 /// banned-chat queries land with the ChatManager receive slice.
 pub struct MessageObjectReactionsContext<'a> {
-    ctx: &'a dyn MessageObjectContext,
+    pub(crate) ctx: &'a dyn MessageObjectContext,
+}
+
+impl<'a> MessageObjectReactionsContext<'a> {
+    /// The 5-view send adapter builds the reactions view over the same Td
+    /// the ctx/state pair aliases (the sequential discipline of
+    /// `split_context_alias`).
+    pub(crate) fn new(ctx: &'a dyn MessageObjectContext) -> Self {
+        MessageObjectReactionsContext { ctx }
+    }
 }
 
 impl DialogReactionsContext for MessageObjectReactionsContext<'_> {
@@ -10562,8 +11325,7 @@ pub fn replay_delete_message_log_event(
         global.td_db().binlog().erase(event.id);
         return;
     }
-    let mut parser = Parser::new(event.get_data());
-    let mut log_event = DeleteMessageLogEvent::parse_from(&mut parser)
+    let mut log_event = DeleteMessageLogEvent::parse_from(event.get_data())
         .expect("corrupt DeleteMessageLogEvent in the binlog");
     log_event.id = event.id;
 
@@ -10713,7 +11475,15 @@ pub struct DeleteMessageLogEvent {
 }
 
 impl DeleteMessageLogEvent {
+    /// `log_event_store` framing (LogEvent.h:167-186): every binlog event
+    /// body carries the version word in front — the D1 cross-read
+    /// reconciliation (the M.10.8 SendMessageLogEvent shape).
     pub fn store(&self, out: &mut Vec<u8>) {
+        crate::store_parse::store_log_event_version(out);
+        self.store_body(out);
+    }
+
+    pub fn store_body(&self, out: &mut Vec<u8>) {
         let has_file_ids = !self.file_ids.is_empty();
         store_flags(out, [has_file_ids]);
         self.message_full_id.store(out);
@@ -10725,7 +11495,16 @@ impl DeleteMessageLogEvent {
         }
     }
 
-    pub fn parse_from(parser: &mut Parser) -> Result<DeleteMessageLogEvent, &'static str> {
+    /// `log_event_parse` (LogEvent.h:212-218): the version word first,
+    /// then the body — matches `Parser::new_log_event`.
+    pub fn parse_from(input: &[u8]) -> Result<DeleteMessageLogEvent, &'static str> {
+        let mut parser = Parser::new_log_event(input)?;
+        let event = Self::parse_body(&mut parser)?;
+        parser.fetch_end()?;
+        Ok(event)
+    }
+
+    pub fn parse_body(parser: &mut Parser) -> Result<DeleteMessageLogEvent, &'static str> {
         let [has_file_ids] = parser.parse_flags::<1>()?;
         let message_full_id = MessageFullId::parse_from(parser)?;
         let file_ids = if has_file_ids {
@@ -23099,6 +23878,199 @@ pub fn send_message_group(
     Ok(get_messages_object(-1, result, false))
 }
 
+/// `MessagesManager::send_message` (MessagesManager.cpp:21721-21868) — the
+/// single-message send entry behind the `sendMessage` arm: the topic/reply
+/// plumbing, the reply-markup conversion, `get_message_to_send`, the draft
+/// clear, the durable send log event and the wire kick. The
+/// `inputMessageForwarded` arm routes to `forward_message` in the C++ — the
+/// M.10.11 forward plane ([blocked: the forwardMessages flip]).
+#[allow(clippy::too_many_arguments)]
+pub fn send_message(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    reactions_ctx: &dyn DialogReactionsContext,
+    ctx: &mut dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+    topic_id: Option<td_api::MessageTopic>,
+    reply_to: Option<td_api::InputMessageReplyTo>,
+    options: Option<td_api::MessageSendOptions>,
+    reply_markup: Option<td_api::ReplyMarkup>,
+    input_message_content: Option<td_api::InputMessageContent>,
+) -> Result<td_api::Message, (i32, String)> {
+    let Some(input_message_content) = input_message_content else {
+        return Err((400, "Can't send message without content".to_owned()));
+    };
+
+    if manager.get_dialog(dialog_id).is_none() {
+        // `get_dialog_force` + the bot paid-broadcast force-create — the
+        // DialogManager info seam (as send_message_group)
+        if ctx.is_bot()
+            && options
+                .as_ref()
+                .is_some_and(|options| options.allow_paid_broadcast)
+            && dialog_id.get_type() == DialogType::User
+        {
+            // `force_create_dialog` — the M.10.20 wiring
+        }
+        return Err((400, "Chat not found".to_owned()));
+    }
+
+    let message_topic = get_send_message_topic(ctx, dialog_id, topic_id.as_ref())?;
+    let input_reply_to =
+        create_message_input_reply_to(ctx, manager, dialog_id, &message_topic, reply_to, false);
+
+    if matches!(
+        input_message_content,
+        td_api::InputMessageContent::inputMessageForwarded(_)
+    ) {
+        // forward_message (MessagesManager.cpp:21749-21760) — the
+        // M.10.11 forward plane owns the flip
+        return Err((
+            500,
+            "The forwarded send arm lands with the M.10.11 forward plane".to_owned(),
+        ));
+    }
+
+    can_send_message(ctx, dialog_id)?;
+    let message_reply_markup = get_dialog_reply_markup(ctx, dialog_id, reply_markup)?;
+    let message_send_options = MessageSendOptions::get_message_send_options(
+        ctx, dialog_id, options, true, true, true, true, 1,
+    )?;
+    let message_content = process_input_message_content(
+        ctx,
+        manager,
+        dialog_id,
+        Some(input_message_content),
+        !message_send_options.allow_paid,
+    )?;
+    message_send_options
+        .can_use_for_input(&message_content)
+        .map_err(|status| (status.0, status.1))?;
+
+    // there must be no errors after the get_message_to_send call
+
+    let ttl = message_content.ttl;
+    let invert_media = message_content.invert_media;
+    let content = *message_content.content;
+    let mut need_update_dialog_pos = false;
+    let message_full_id = get_message_to_send(
+        ctx,
+        global,
+        manager,
+        reactions_ctx,
+        state,
+        dialog_id,
+        &message_topic,
+        input_reply_to,
+        &message_send_options,
+        content,
+        invert_media,
+        &mut need_update_dialog_pos,
+        false,
+        None,
+        DialogId::default(),
+        message_content.via_bot_user_id.is_valid(),
+        DialogId::default(),
+        false,
+    );
+    let message_id = message_full_id.get_message_id();
+
+    // take/put-back dance: the reply-markup assignment, the object/update
+    // builders and the log-event writer borrow the manager while mutating
+    // the message
+    let mut m = manager
+        .get_dialog_mut(dialog_id)
+        .and_then(|d| d.messages.remove(&message_id))
+        .expect("get_message_to_send inserted the message");
+    m.reply_markup = message_reply_markup.map(Box::new);
+    m.via_bot_user_id = message_content.via_bot_user_id;
+    m.disable_web_page_preview = message_content.disable_web_page_preview;
+    m.clear_draft = message_content.clear_draft;
+    if ttl.is_valid() {
+        m.ttl = ttl;
+        m.is_content_secret =
+            ttl.is_secret_message_content(m.content.as_ref().expect("content").get_type());
+    }
+    m.send_emoji = message_content.emoji;
+
+    if message_send_options.only_preview {
+        let obj_ctx: &dyn MessageObjectContext = ctx;
+        let message_object = get_message_object(
+            manager,
+            reactions_ctx,
+            obj_ctx,
+            dialog_id,
+            &mut m,
+            "send_message",
+        );
+        manager
+            .get_dialog_mut(dialog_id)
+            .and_then(|d| d.messages.insert(message_id, m))
+            .expect("get_message_to_send inserted the message");
+        return message_object.ok_or_else(|| (500, "Can't send message".to_owned()));
+    }
+
+    let obj_ctx: &dyn MessageObjectContext = ctx;
+    clear_dialog_draft_by_sent_message(
+        manager,
+        obj_ctx,
+        state,
+        dialog_id,
+        &m,
+        !need_update_dialog_pos,
+    );
+
+    save_send_message_log_event(global, dialog_id, &mut m);
+    manager
+        .get_dialog_mut(dialog_id)
+        .and_then(|d| d.messages.insert(message_id, m))
+        .expect("get_message_to_send inserted the message");
+    do_send_message(manager, ctx, dialog_id, message_id, -1, Vec::new());
+
+    if !ctx.is_bot() {
+        let mut m = manager
+            .get_dialog_mut(dialog_id)
+            .and_then(|d| d.messages.remove(&message_id))
+            .expect("get_message_to_send inserted the message");
+        send_update_new_message(manager, ctx, state, reactions_ctx, dialog_id, &mut m);
+        manager
+            .get_dialog_mut(dialog_id)
+            .and_then(|d| d.messages.insert(message_id, m))
+            .expect("get_message_to_send inserted the message");
+
+        if need_update_dialog_pos {
+            send_update_chat_last_message(
+                manager,
+                ctx,
+                state,
+                reactions_ctx,
+                dialog_id,
+                "send_message",
+            );
+        }
+    }
+
+    let mut m = manager
+        .get_dialog_mut(dialog_id)
+        .and_then(|d| d.messages.remove(&message_id))
+        .expect("get_message_to_send inserted the message");
+    let obj_ctx: &dyn MessageObjectContext = ctx;
+    let message_object = get_message_object(
+        manager,
+        reactions_ctx,
+        obj_ctx,
+        dialog_id,
+        &mut m,
+        "send_message",
+    );
+    manager
+        .get_dialog_mut(dialog_id)
+        .and_then(|d| d.messages.insert(message_id, m))
+        .expect("get_message_to_send inserted the message");
+    message_object.ok_or_else(|| (500, "Can't send message".to_owned()))
+}
+
 /// `MessagesManager::on_message_media_uploaded`
 /// (MessagesManager.cpp:22198-22230) — the album/single dispatch head.
 pub fn on_message_media_uploaded(
@@ -26610,6 +27582,33 @@ pub fn send_update_chat_draft_message(
     ));
 }
 
+/// `MessagesManager::set_dialog_draft_message(DialogId, const
+/// td_api::MessageTopic &, td_api::draftMessage &&)`
+/// (MessagesManager.cpp:16099-16111) — the `setChatDraftMessage` entry.
+/// The C++ head runs `DialogManager::check_dialog_access(dialog_id, true,
+/// Write, ...)` through `td_`; the arm (the dispatcher) owns that call in
+/// the Rust split — it must run before this function.
+pub fn set_dialog_draft_message(
+    manager: &mut MessagesManager,
+    ctx: &mut dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+    topic_id: Option<td_api::MessageTopic>,
+    draft_message: Option<td_api::DraftMessage>,
+) -> Result<(), (i32, String)> {
+    can_send_message(ctx, dialog_id)?;
+    let message_topic = get_send_message_topic(ctx, dialog_id, topic_id.as_ref())?;
+    let new_draft_message = DraftMessage::get_draft_message_from_td_api(
+        ctx,
+        manager,
+        dialog_id,
+        &message_topic,
+        draft_message,
+    )?;
+    set_dialog_draft_message_core(manager, ctx, state, dialog_id, new_draft_message)
+        .map_err(|status| (status.code(), status.message().to_owned()))
+}
+
 /// `MessagesManager::set_dialog_draft_message(Dialog *, const
 /// MessageTopic &, unique_ptr<DraftMessage> &&)`
 /// (MessagesManager.cpp:16112-16152) — the empty-topic arm; the
@@ -30102,11 +31101,82 @@ mod tests {
         };
         let mut bytes = Vec::new();
         event.store(&mut bytes);
-        let mut parser = Parser::new(&bytes);
-        assert_eq!(
-            DeleteMessageLogEvent::parse_from(&mut parser).unwrap(),
-            event
+        // the round-trip rides the version-prefixed log-event framing
+        assert_eq!(DeleteMessageLogEvent::parse_from(&bytes).unwrap(), event);
+    }
+
+    /// M.10 D1 cross-read, direction C++→Rust: a binlog written by the C++
+    /// probe (`conformance/cpp/delete_message_log_event_sample.cpp` over
+    /// the real `TlStorerUnsafe`/`MessageFullId` stores + the
+    /// `LogEventStorer` version word) parses through the version-prefixed
+    /// log-event reader. Regenerate the fixture with the probe when the
+    /// C++ layout changes.
+    #[test]
+    fn d1_delete_message_cpp_binlog_cross_read() {
+        let path = format!(
+            "{}/src/testdata/d1_delete_message_cpp.binlog",
+            env!("CARGO_MANIFEST_DIR")
         );
+        let mut binlog = tddb::binlog::Binlog::new();
+        let mut events = Vec::new();
+        binlog
+            .init(
+                &path,
+                &mut |event: &tddb::binlog::BinlogEvent| {
+                    events.push((event.id, event.type_, event.get_data().to_vec()))
+                },
+                tddb::DbKey::empty(),
+                tddb::DbKey::empty(),
+            )
+            .ensure();
+        binlog.close(false).ensure();
+
+        let deletes: Vec<(u64, Vec<u8>)> = events
+            .into_iter()
+            .filter(|(_, type_, _)| *type_ == tddb::td_db::LOG_EVENT_HANDLER_TYPE_DELETE_MESSAGE)
+            .map(|(id, _, data)| (id, data))
+            .collect();
+        assert_eq!(deletes.len(), 3, "the three probe events");
+
+        // the user-dialog delete with two file ids: the version word, the
+        // flag, the raw dialog id 9 and the packed server id 4242 << 20
+        let first = DeleteMessageLogEvent::parse_from(&deletes[0].1).unwrap();
+        assert_eq!(deletes[0].0, 1);
+        assert_eq!(
+            first.message_full_id,
+            MessageFullId::new(
+                DialogId::from_user_id(UserId::new(9)),
+                MessageId::from_server_message_id(ServerMessageId::new(4242))
+            )
+        );
+        assert_eq!(first.file_ids.len(), 2);
+        assert_eq!(first.file_ids[0].get(), 7);
+        assert_eq!(first.file_ids[1].get(), 8);
+        // the version word the C++ LogEventStorer writes
+        assert_eq!(
+            i32::from_le_bytes(deletes[0].1[0..4].try_into().unwrap()),
+            crate::store_parse::version::LOG_EVENT_STORE_VERSION
+        );
+
+        // the chat-dialog delete with no files: the -77 packing
+        let second = DeleteMessageLogEvent::parse_from(&deletes[1].1).unwrap();
+        assert_eq!(
+            second.message_full_id,
+            MessageFullId::new(
+                DialogId::from_chat_id(ChatId::new(77)),
+                MessageId::from_server_message_id(ServerMessageId::new(17))
+            )
+        );
+        assert!(second.file_ids.is_empty());
+
+        // the default-id delete with one file
+        let third = DeleteMessageLogEvent::parse_from(&deletes[2].1).unwrap();
+        assert_eq!(
+            third.message_full_id,
+            MessageFullId::new(DialogId::from_user_id(UserId::new(9)), MessageId::default())
+        );
+        assert_eq!(third.file_ids.len(), 1);
+        assert_eq!(third.file_ids[0].get(), 5);
     }
 
     #[test]

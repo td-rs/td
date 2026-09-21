@@ -58,7 +58,7 @@ use crate::config_recoverer::{
 use crate::config_result;
 use crate::connection_creator::ConnectionCreator;
 use crate::contact::Contact;
-use crate::convert::{self, MessageSpec};
+use crate::convert;
 use crate::dialog_manager::DialogManager;
 use crate::emoji_status::CustomEmojiId;
 use crate::global::Global;
@@ -129,26 +129,24 @@ pub struct HeaderOptions {
     pub is_emulator: bool,
 }
 
-/// A `sendMessage` in flight: the temporary local message exists, the
-/// answer was already sent, and the wire ack completes it.
-struct PendingSend {
-    local_id: i64,
-    chat_id: i64,
-    text: String,
-}
-
 /// The td-level [`UpdatesSink`] — the collector form carrying the M.10
 /// receive path: the engine drives it (the users/chats pre-application
 /// and the applied pts updates) and `Td::drain_sink` converts/emits
-/// through the landed managers. The direct manager calls land with the
-/// sink-state refactor; the drain pattern keeps the M.10.3/M.10.6
-/// intakes live.
+/// through the landed managers (the M.10.3 receive head, the M.10.5 edit
+/// intake, the M.10.6 deletes and the M.10.7 reads).
 #[derive(Default)]
 pub(crate) struct TdSink {
     pub(crate) users: Vec<tdmtproto::telegram_api::User>,
     pub(crate) chats: Vec<tdmtproto::telegram_api::Chat>,
     pub(crate) new_messages: Vec<(tdmtproto::telegram_api::Message, &'static str)>,
     pub(crate) deletions: Vec<Vec<i32>>,
+    /// `updateEditMessage` — (message, pts) for the M.10.5 edit intake.
+    pub(crate) edits: Vec<(tdmtproto::telegram_api::Message, i32)>,
+    /// `updateReadHistoryInbox` — (peer, max_id, top_msg_id) for the
+    /// M.10.7 read intake.
+    pub(crate) reads_inbox: Vec<(tdmtproto::telegram_api::Peer, i32, i32)>,
+    /// `updateReadHistoryOutbox` — (peer, max_id).
+    pub(crate) reads_outbox: Vec<(tdmtproto::telegram_api::Peer, i32)>,
 }
 
 impl UpdatesSink for TdSink {
@@ -176,6 +174,26 @@ impl UpdatesSink for TdSink {
             PendingUpdate::Wire(telegram_api::Update::updateDeleteMessages(update)) => {
                 self.deletions.push(update.messages);
             }
+            PendingUpdate::Wire(telegram_api::Update::updateEditMessage(update)) => {
+                if let Some(message) = update.message {
+                    self.edits.push((message, update.pts));
+                }
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateReadHistoryInbox(update)) => {
+                if let Some(peer) = update.peer {
+                    self.reads_inbox
+                        .push((peer, update.max_id, update.top_msg_id));
+                }
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateReadHistoryOutbox(update)) => {
+                if let Some(peer) = update.peer {
+                    self.reads_outbox.push((peer, update.max_id));
+                }
+            }
+            // `updateReadMessagesContents` (read_message_content_from_updates,
+            // MessagesManager.cpp:9325) rides the TTL content-read plane and
+            // `updatePinnedMessages` the M.10.14 pinned tail — both collect
+            // nothing until their slices land.
             _ => {}
         }
     }
@@ -2021,10 +2039,6 @@ pub struct Td {
     chats: HashMap<i64, td_api::Chat>,
     /// user id → access hash (the peers the walking skeleton messages).
     peer_access: HashMap<i64, i64>,
-    /// `get_next_yet_unsent_message_id` — negative, decreasing.
-    next_local_message_id: i64,
-    /// random_id → the pending send.
-    pending_sends: HashMap<i64, PendingSend>,
 }
 
 /// A parked recoverer fetch — the C++ `get_simple_config_*` /
@@ -2198,8 +2212,6 @@ impl Td {
             users: HashMap::new(),
             chats: HashMap::new(),
             peer_access: HashMap::new(),
-            next_local_message_id: -1,
-            pending_sends: HashMap::new(),
         }
     }
 
@@ -4268,180 +4280,6 @@ impl Td {
         }
     }
 
-    /// The text `sendMessage` (MessagesManager.cpp:21721+): the temporary
-    /// local message (pending state) is answered synchronously; the wire
-    /// ack (`updateShortSentMessage` or the Updates container) completes
-    /// it with `updateMessageSendSucceeded`. The reply peer is a known
-    /// chat (the receive path created it).
-    pub(crate) fn on_send_message(&mut self, request_id: u64, args: td_api::sendMessage) {
-        if !self.auth_manager.is_authorized() {
-            return self.send_error_impl(request_id, 401, "Unauthorized");
-        }
-        if !self.chats.contains_key(&args.chat_id) {
-            return self.send_error_impl(request_id, 400, "Chat not found");
-        }
-        let text = match args.input_message_content.as_deref() {
-            Some(td_api::InputMessageContent::inputMessageText(content)) => content
-                .text
-                .as_ref()
-                .map(|formatted| formatted.text.clone())
-                .unwrap_or_default(),
-            _ => {
-                return self.send_error_impl(
-                    request_id,
-                    400,
-                    "Only text messages are supported by the walking skeleton",
-                );
-            }
-        };
-
-        let local_id = self.next_local_message_id;
-        self.next_local_message_id -= 1;
-        let random_id = nonzero_secure_i64();
-        let date = tdutils::time::now() as i32;
-        let temp = convert::message_object(&MessageSpec {
-            id: local_id,
-            chat_id: args.chat_id,
-            sender_user_id: self.my_id,
-            date,
-            text: text.clone(),
-            pending: true,
-            is_outgoing: true,
-            content: None,
-        });
-        self.send_result(request_id, Object::message(temp));
-
-        self.pending_sends.insert(
-            random_id,
-            PendingSend {
-                local_id,
-                chat_id: args.chat_id,
-                text: text.clone(),
-            },
-        );
-
-        // The wire query (the C++ defers it to the next actor event; the
-        // observable stream is identical — the answer is already out).
-        let access_hash = self.peer_access.get(&args.chat_id).copied().unwrap_or(0);
-        let query =
-            telegram_api::Function::messages_sendMessage(telegram_api::messages_sendMessage {
-                flags: 0,
-                no_webpage: false,
-                silent: false,
-                background: false,
-                clear_draft: false,
-                noforwards: false,
-                update_stickersets_order: false,
-                invert_media: false,
-                allow_paid_floodskip: false,
-                peer: Some(Box::new(telegram_api::InputPeer::inputPeerUser(
-                    telegram_api::inputPeerUser {
-                        user_id: args.chat_id,
-                        access_hash,
-                    },
-                ))),
-                reply_to: None,
-                message: text.clone(),
-                random_id,
-                reply_markup: None,
-                entities: Vec::new(),
-                schedule_date: 0,
-                schedule_repeat_period: 0,
-                send_as: None,
-                quick_reply_shortcut: None,
-                effect: 0,
-                allow_paid_stars: 0,
-                rich_message: None,
-                suggested_post: None,
-            });
-        let Some(owner) = self.bridge.as_ref() else {
-            return;
-        };
-        let bridge = owner.handle();
-        match bridge.query(query) {
-            QueryAnswer::Ok(data) => {
-                if let Ok(answer) = telegram_api::Updates::parse(&data) {
-                    self.on_send_answer(random_id, answer);
-                }
-            }
-            QueryAnswer::Err(code, message) => {
-                self.on_send_failed(random_id, code, &message);
-            }
-        }
-    }
-
-    /// The `messages.sendMessage` ack: `updateShortSentMessage` (the plain
-    /// text case) completes the pending send; an Updates container goes
-    /// through the generic update path (its updateNewMessage carries the
-    /// final message).
-    fn on_send_answer(&mut self, random_id: i64, answer: telegram_api::Updates) {
-        match answer {
-            telegram_api::Updates::updateShortSentMessage(m) => {
-                self.complete_pending_send(random_id, m.id as i64, m.date);
-            }
-            other => {
-                // Container: process like a pushed update (the final
-                // message arrives as updateNewMessage with the real id).
-                let mut bytes = Vec::new();
-                other.store(&mut bytes);
-                self.on_net_update(bytes);
-            }
-        }
-    }
-
-    /// `on_send_message_success` + `send_update_message_send_succeeded`:
-    /// the final message (server id/date, no sending state) replaces the
-    /// temporary one.
-    fn complete_pending_send(&mut self, random_id: i64, message_id: i64, date: i32) {
-        let Some(pending) = self.pending_sends.remove(&random_id) else {
-            return;
-        };
-        let final_message = convert::message_object(&MessageSpec {
-            id: message_id,
-            chat_id: pending.chat_id,
-            sender_user_id: self.my_id,
-            date,
-            text: pending.text,
-            pending: false,
-            is_outgoing: true,
-            content: None,
-        });
-        let old_message_id = pending.local_id;
-        self.send_update(Object::updateMessageSendSucceeded(
-            td_api::updateMessageSendSucceeded {
-                message: Some(final_message),
-                old_message_id,
-            },
-        ));
-    }
-
-    fn on_send_failed(&mut self, random_id: i64, code: i32, message: &str) {
-        let Some(pending) = self.pending_sends.remove(&random_id) else {
-            return;
-        };
-        let failed = convert::message_object(&MessageSpec {
-            id: pending.local_id,
-            chat_id: pending.chat_id,
-            sender_user_id: self.my_id,
-            date: tdutils::time::now() as i32,
-            text: pending.text,
-            pending: false,
-            is_outgoing: true,
-            content: None,
-        });
-        let old_message_id = pending.local_id;
-        self.send_update(Object::updateMessageSendFailed(
-            td_api::updateMessageSendFailed {
-                message: Some(failed),
-                old_message_id,
-                error: Some(td_api::Error {
-                    code,
-                    message: message.to_string(),
-                }),
-            },
-        ));
-    }
-
     /// Creates the private chat for a peer when first needed and emits
     /// `updateNewChat` (the C++ `send_update_new_chat`).
     fn ensure_chat(&mut self, chat_id: i64) {
@@ -4507,8 +4345,17 @@ impl Td {
         for (message, source) in &sink.new_messages {
             self.apply_new_message(message, source);
         }
+        for (message, pts) in &sink.edits {
+            self.apply_edit_message(message, *pts);
+        }
         for messages in &sink.deletions {
             self.apply_delete_messages(messages);
+        }
+        for (peer, max_id, top_msg_id) in &sink.reads_inbox {
+            self.apply_read_history_inbox(peer, *max_id, *top_msg_id);
+        }
+        for (peer, max_id) in &sink.reads_outbox {
+            self.apply_read_history_outbox(peer, *max_id);
         }
     }
 
@@ -4545,34 +4392,192 @@ impl Td {
     /// M.9.18 flip (wire media through `get_message_content`) now lives at
     /// its C++ call position inside `parse_telegram_api_message`.
     fn apply_new_message(&mut self, message: &telegram_api::Message, source: &str) {
-        // The manager and the context are both pieces of `Td`; the intake
-        // is driven over a taken manager to split the borrows.
-        let mut manager = std::mem::take(&mut self.messages_manager);
-        let received = manager.on_get_message(self, message.clone(), true, false, source);
-        self.messages_manager = manager;
-        let Some((dialog_id, mut m)) = received else {
-            return;
-        };
+        // The complete receive head (MessagesManager.cpp:11921-12107) over
+        // the M.10.2c manager: parse → create → add_message_to_dialog with
+        // the ordered insert, the counter maintenance and the
+        // updateNewMessage emission inside. The five views alias one Td —
+        // the sequential-call discipline of `split_context_alias` (no
+        // take/restore: the ctx reads must see the real manager/global).
+        // SAFETY: every alias below derives from `td_ptr` and the callee
+        // uses them strictly one at a time.
+        let td_ptr = std::ptr::from_mut(self);
+        let ctx: &mut dyn crate::messages_manager::MessageObjectContext = unsafe { &mut *td_ptr };
+        let message_info = crate::messages_manager::parse_telegram_api_message(
+            ctx,
+            message.clone(),
+            false,
+            false,
+            source,
+        );
         // `add_new_dialog` emits `updateNewChat` for the fresh dialog
         // (MessagesManager.cpp:33079+); the walking skeleton maps user
         // dialogs to its chat objects, the other dialog kinds ride the
         // ChatManager chat-object wiring.
-        if dialog_id.get_type() == crate::messages_manager::DialogType::User {
-            self.ensure_chat(dialog_id.get_user_id().get());
+        if message_info.dialog_id.get_type() == crate::messages_manager::DialogType::User {
+            self.ensure_chat(message_info.dialog_id.get_user_id().get());
         }
-        let object = crate::messages_manager::get_message_object(
-            &self.messages_manager,
-            self,
-            self,
-            dialog_id,
-            &mut m,
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let global: &mut crate::global::Global = unsafe { &mut (*td_ptr).global };
+        let state: &mut dyn crate::messages_manager::ReadStateContext =
+            unsafe { crate::td::split_context_alias(td_ptr) };
+        let ctx: &mut dyn crate::messages_manager::MessageObjectContext = unsafe { &mut *td_ptr };
+        let send_ctx: &dyn crate::messages_manager::SendMessageContext = unsafe { &*td_ptr };
+        crate::messages_manager::on_get_message_full(
+            global,
+            manager,
+            ctx,
+            send_ctx,
+            state,
+            message_info,
+            true,
             "updateNewMessage",
         );
-        if let Some(object) = object {
-            self.send_update(Object::updateNewMessage(td_api::updateNewMessage {
-                message: Some(object),
-            }));
+    }
+
+    /// The receive path for `updateEditMessage` (MessagesManager.cpp:5860):
+    /// `had_message` in memory, the complete receive head with
+    /// `from_update = false`, then the M.10.5 edit intake.
+    fn apply_edit_message(&mut self, message: &telegram_api::Message, pts: i32) {
+        let td_ptr = std::ptr::from_mut(self);
+        // SAFETY: as apply_new_message.
+        let ctx: &mut dyn crate::messages_manager::MessageObjectContext = unsafe { &mut *td_ptr };
+        let message_info = crate::messages_manager::parse_telegram_api_message(
+            ctx,
+            message.clone(),
+            false,
+            false,
+            "updateEditMessage",
+        );
+        let dialog_id = message_info.dialog_id;
+        let message_id = message_info.message_id;
+        // `have_message_force`'s database leg is the message-db seam — the
+        // in-memory probe answers
+        let had_message = unsafe { &*td_ptr }
+            .messages_manager
+            .get_dialog(dialog_id)
+            .is_some_and(|d| crate::messages_manager::have_message_in_dialog_memory(d, message_id));
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let global: &mut crate::global::Global = unsafe { &mut (*td_ptr).global };
+        let state: &mut dyn crate::messages_manager::ReadStateContext =
+            unsafe { crate::td::split_context_alias(td_ptr) };
+        let ctx: &mut dyn crate::messages_manager::MessageObjectContext = unsafe { &mut *td_ptr };
+        let send_ctx: &dyn crate::messages_manager::SendMessageContext = unsafe { &*td_ptr };
+        let full_id = crate::messages_manager::on_get_message_full(
+            global,
+            manager,
+            ctx,
+            send_ctx,
+            state,
+            message_info,
+            false,
+            "updateEditMessage",
+        );
+        if full_id.get_dialog_id() != crate::messages_manager::DialogId::default() {
+            let is_bot = self.auth_manager.is_bot();
+            let mut m = self
+                .messages_manager
+                .get_dialog_mut(dialog_id)
+                .and_then(|d| d.messages.remove(&message_id));
+            if let Some(m) = m.as_mut() {
+                let send_edited = crate::messages_manager::on_message_edited(
+                    &mut self.messages_manager,
+                    dialog_id,
+                    m,
+                    pts,
+                    had_message,
+                    is_bot,
+                );
+                if send_edited {
+                    // `send_update_message_edited` (MessagesManager.cpp:
+                    // 5985-6014's emission half)
+                    let edit_date = crate::messages_manager::get_message_shown_edit_date(m);
+                    let reply_markup = m
+                        .reply_markup
+                        .as_ref()
+                        .and_then(|reply_markup| reply_markup.get_reply_markup_object(self));
+                    self.send_update(Object::updateMessageEdited(td_api::updateMessageEdited {
+                        chat_id: dialog_id.get(),
+                        message_id: message_id.get(),
+                        edit_date,
+                        reply_markup,
+                    }));
+                }
+            }
+            if let Some(m) = m {
+                self.messages_manager
+                    .get_dialog_mut(dialog_id)
+                    .and_then(|d| d.messages.insert(message_id, m));
+            }
         }
+    }
+
+    /// The receive path for `updateReadHistoryInbox`
+    /// (MessagesManager.cpp:5885-5901): the folder read is the M.6 dialog
+    /// seam and the forum `top_msg_id` arm the topic-manager seam — the
+    /// plain arm runs the M.10.7 intake.
+    fn apply_read_history_inbox(
+        &mut self,
+        peer: &telegram_api::Peer,
+        max_id: i32,
+        top_msg_id: i32,
+    ) {
+        if top_msg_id != 0 {
+            // `on_update_forum_topic_unread` — the ForumTopicManager seam
+            return;
+        }
+        let dialog_id = crate::messages_manager::DialogId::from_peer(peer);
+        if !dialog_id.is_valid() {
+            return;
+        }
+        let last_read_inbox_message_id = crate::messages_manager::MessageId::from_server_message_id(
+            crate::messages_manager::ServerMessageId::new(max_id),
+        );
+        // SAFETY: the alias pair derives from `td_ptr`; the callee uses
+        // them strictly one at a time.
+        let td_ptr = std::ptr::from_mut(self);
+        let state: &mut dyn crate::messages_manager::ReadStateContext =
+            unsafe { crate::td::split_context_alias(td_ptr) };
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let ctx: &dyn crate::messages_manager::MessageObjectContext = unsafe { &*td_ptr };
+        crate::messages_manager::read_history_inbox(
+            manager,
+            ctx,
+            state,
+            dialog_id,
+            last_read_inbox_message_id,
+            -1,
+            "updateReadHistoryInbox",
+        );
+    }
+
+    /// The receive path for `updateReadHistoryOutbox`
+    /// (MessagesManager.cpp:5903-5910).
+    fn apply_read_history_outbox(&mut self, peer: &telegram_api::Peer, max_id: i32) {
+        let dialog_id = crate::messages_manager::DialogId::from_peer(peer);
+        if !dialog_id.is_valid() {
+            return;
+        }
+        let max_message_id = crate::messages_manager::MessageId::from_server_message_id(
+            crate::messages_manager::ServerMessageId::new(max_id),
+        );
+        // SAFETY: as apply_read_history_inbox.
+        let td_ptr = std::ptr::from_mut(self);
+        let state: &mut dyn crate::messages_manager::ReadStateContext =
+            unsafe { crate::td::split_context_alias(td_ptr) };
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let ctx: &dyn crate::messages_manager::MessageObjectContext = unsafe { &*td_ptr };
+        crate::messages_manager::read_history_outbox(
+            manager,
+            ctx,
+            state,
+            dialog_id,
+            max_message_id,
+            0,
+        );
     }
 
     /// `Td` close: dropping the callback sends the close notification; the
@@ -4599,16 +4604,6 @@ fn parse_vector_user(data: &[u8]) -> Option<Vec<telegram_api::user>> {
         }
     }
     Some(users)
-}
-
-/// A non-zero secure i64 (`MessagesManager::generate_new_random_id`).
-fn nonzero_secure_i64() -> i64 {
-    loop {
-        let value = tdutils::random::secure_uint64() as i64;
-        if value != 0 {
-            return value;
-        }
-    }
 }
 
 actor_messages! {

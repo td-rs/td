@@ -776,7 +776,7 @@ sendGiftPurchaseOffer	interim
 sendGroupCallMessage	interim
 sendInlineQueryResultMessage	interim
 sendMessage	dispatched
-sendMessageAlbum	interim
+sendMessageAlbum	dispatched
 sendMessageViewMetrics	interim
 sendPassportAuthorizationForm	interim
 sendPaymentForm	interim
@@ -826,7 +826,7 @@ setChatClientData	interim
 setChatDescription	dispatched
 setChatDirectMessagesGroup	interim
 setChatDiscussionGroup	interim
-setChatDraftMessage	interim
+setChatDraftMessage	dispatched
 setChatEmojiStatus	interim
 setChatLocation	dispatched
 setChatMemberStatus	interim

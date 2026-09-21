@@ -953,6 +953,53 @@ impl SuggestedPostPrice {
         self.r#type == SuggestedPostPriceType::None
     }
 
+    /// `SuggestedPostPrice::get_suggested_post_price(td,
+    /// td_api::SuggestedPostPrice &&)` (SuggestedPostPrice.cpp:54-84) — the
+    /// input-side price ctor of the draft plane.
+    pub fn get_suggested_post_price_from_td_api(
+        td: &dyn MessageContentContext,
+        price: Option<td_api::SuggestedPostPrice>,
+    ) -> Result<SuggestedPostPrice, Status> {
+        let Some(price) = price else {
+            return Ok(SuggestedPostPrice::default());
+        };
+        match price {
+            td_api::SuggestedPostPrice::suggestedPostPriceStar(star) => {
+                if star.star_count == 0 {
+                    return Ok(SuggestedPostPrice::default());
+                }
+                if star.star_count < td.get_option_integer("suggested_post_star_count_min", 0)
+                    || star.star_count > td.get_option_integer("suggested_post_star_count_max", 0)
+                {
+                    return Err(Status::error(
+                        400,
+                        "Invalid amount of Telegram Stars specified",
+                    ));
+                }
+                Ok(SuggestedPostPrice {
+                    r#type: SuggestedPostPriceType::Star,
+                    amount: star.star_count,
+                })
+            }
+            td_api::SuggestedPostPrice::suggestedPostPriceGram(gram) => {
+                if gram.gram_cent_count == 0 {
+                    return Ok(SuggestedPostPrice::default());
+                }
+                if gram.gram_cent_count
+                    < td.get_option_integer("suggested_post_gram_cent_count_min", 0)
+                    || gram.gram_cent_count
+                        > td.get_option_integer("suggested_post_gram_cent_count_max", 0)
+                {
+                    return Err(Status::error(400, "Invalid amount of Gram cents specified"));
+                }
+                Ok(SuggestedPostPrice {
+                    r#type: SuggestedPostPriceType::Ton,
+                    amount: gram.gram_cent_count,
+                })
+            }
+        }
+    }
+
     /// `SuggestedPostPrice::get_suggested_post_price_object`
     /// (SuggestedPostPrice.cpp:53-64).
     pub fn get_suggested_post_price_object(&self) -> Option<td_api::SuggestedPostPrice> {

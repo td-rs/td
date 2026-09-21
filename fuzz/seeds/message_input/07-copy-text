@@ -1,0 +1,1 @@
+{"@type":"replyMarkupInlineKeyboard","rows":[[{"text":"c","type":{"@type":"inlineKeyboardButtonTypeCopyText","text":"copied"}},{"text":"u","type":{"@type":"inlineKeyboardButtonTypeUser","user_id":42}},{"text":"d","type":{"@type":"inlineKeyboardButtonTypeDisabled"}}]]}
