@@ -152,6 +152,9 @@ pub struct CliClient {
     /// `string cover_`.
     #[allow(dead_code)] // readers land with the M.14.5 media arms
     cover: Mutex<String>,
+    /// `string rich_message_media_` (cli.cpp:9171).
+    #[allow(dead_code)]
+    rich_message_media: Mutex<String>,
     // ---- the send-state block (cli.cpp:9133-9169) — writers land with the
     // option/effect command arms; the send family reads them.
     schedule_date: Mutex<String>,
@@ -260,6 +263,7 @@ pub fn instance() -> &'static CliClient {
         start_timestamp: AtomicI32::new(0),
         thumbnail: Mutex::new(String::new()),
         cover: Mutex::new(String::new()),
+        rich_message_media: Mutex::new(String::new()),
         schedule_date: Mutex::new(String::new()),
         schedule_repeat_period: AtomicI32::new(0),
         paid_message_star_count: AtomicI64::new(0),
@@ -2810,6 +2814,308 @@ impl CliClient {
             ));
         }
         None
+    }
+
+    /// `CliClient::as_secret_chat_id` (cli.cpp:747) — the -2e12 shift.
+    fn as_secret_chat_id(&self, s: &str) -> i32 {
+        let s = trim_td(s);
+        let mut result = tokenizer::to_integer_i64(s);
+        if s == "." {
+            result = self.opened_chat_id.load(Ordering::SeqCst);
+        }
+        const SHIFT: i64 = -2_000_000_000_000;
+        if result <= SHIFT + i32::MAX as i64 {
+            return (result - SHIFT) as i32;
+        }
+        result as i32
+    }
+
+    /// `as_shortcut_id` (cli.cpp:1196).
+    fn as_shortcut_id(&self, s: &str) -> i32 {
+        tokenizer::to_integer_i32(trim_td(s))
+    }
+
+    /// `as_chat_members_filter` (cli.cpp:2474).
+    fn as_chat_members_filter(&self, filter: &str) -> Option<td_api::ChatMembersFilter> {
+        use td_api::ChatMembersFilter as Cmf;
+        let filter = to_lower(trim_td(filter));
+        match filter.as_str() {
+            "a" | "admin" | "administrators" => Some(Cmf::chatMembersFilterAdministrators(
+                td_api::chatMembersFilterAdministrators,
+            )),
+            "b" | "banned" => Some(Cmf::chatMembersFilterBanned(
+                td_api::chatMembersFilterBanned,
+            )),
+            "bot" | "bots" => Some(Cmf::chatMembersFilterBots(td_api::chatMembersFilterBots)),
+            "c" | "contacts" => Some(Cmf::chatMembersFilterContacts(
+                td_api::chatMembersFilterContacts,
+            )),
+            "m" | "members" => Some(Cmf::chatMembersFilterMembers(
+                td_api::chatMembersFilterMembers,
+            )),
+            "@" => Some(Cmf::chatMembersFilterMention(
+                td_api::chatMembersFilterMention {
+                    topic_id: self.get_message_topic_id(),
+                },
+            )),
+            "r" | "rest" | "restricted" => Some(Cmf::chatMembersFilterRestricted(
+                td_api::chatMembersFilterRestricted,
+            )),
+            _ => {
+                if !filter.is_empty() {
+                    tdutils::log_error!("Unsupported chat member filter {}", filter);
+                }
+                None
+            }
+        }
+    }
+
+    /// `as_supergroup_members_filter` (cli.cpp:2504) — the get/search/
+    /// supergroup prefix stripping and the query-aware filters.
+    fn as_supergroup_members_filter(
+        &self,
+        filter: &str,
+        query: &str,
+    ) -> Option<td_api::SupergroupMembersFilter> {
+        use td_api::SupergroupMembersFilter as Smf;
+        let filter = to_lower(trim_td(filter));
+        let filter = filter.strip_prefix("get").unwrap_or(&filter);
+        let filter = filter.strip_prefix("search").unwrap_or(filter);
+        let filter = filter.strip_prefix("supergroup").unwrap_or(filter);
+        match filter {
+            "administrators" => Some(Smf::supergroupMembersFilterAdministrators(
+                td_api::supergroupMembersFilterAdministrators,
+            )),
+            "banned" => Some(Smf::supergroupMembersFilterBanned(
+                td_api::supergroupMembersFilterBanned {
+                    query: query.to_owned(),
+                },
+            )),
+            "bots" => Some(Smf::supergroupMembersFilterBots(
+                td_api::supergroupMembersFilterBots,
+            )),
+            "contacts" => Some(Smf::supergroupMembersFilterContacts(
+                td_api::supergroupMembersFilterContacts {
+                    query: query.to_owned(),
+                },
+            )),
+            "members" => {
+                if query.is_empty() {
+                    Some(Smf::supergroupMembersFilterRecent(
+                        td_api::supergroupMembersFilterRecent,
+                    ))
+                } else {
+                    Some(Smf::supergroupMembersFilterSearch(
+                        td_api::supergroupMembersFilterSearch {
+                            query: query.to_owned(),
+                        },
+                    ))
+                }
+            }
+            "restricted" => Some(Smf::supergroupMembersFilterRestricted(
+                td_api::supergroupMembersFilterRestricted {
+                    query: query.to_owned(),
+                },
+            )),
+            "mentions" => Some(Smf::supergroupMembersFilterMention(
+                td_api::supergroupMembersFilterMention {
+                    query: query.to_owned(),
+                    topic_id: self.get_message_topic_id(),
+                },
+            )),
+            _ => None,
+        }
+    }
+
+    /// `as_tone` (cli.cpp:960).
+    fn as_tone(&self, tone: &str) -> String {
+        match tone.chars().last() {
+            Some('f') => "formal".to_owned(),
+            Some('n') => "neutral".to_owned(),
+            Some('c') => "casual".to_owned(),
+            _ => String::new(),
+        }
+    }
+
+    /// `as_input_rich_message` (cli.cpp:2289) — the `id;type media` list
+    /// over rich_message_media_, the `;`→newline message spell, the coin-flip
+    /// source selection.
+    fn as_input_rich_message(&self, message: &str) -> td_api::InputRichMessage {
+        let rich_media = self.rich_message_media.lock().unwrap().clone();
+        let mut input_blocks: Vec<Box<td_api::InputPageBlock>> = Vec::new();
+        let mut input_media: Vec<Box<td_api::InputRichMessageMedia>> = Vec::new();
+        for rich_message_media in tokenizer::full_split(&rich_media, ' ') {
+            let (id, media) = tokenizer::split(&rich_message_media, ';');
+            if media.len() <= 1 {
+                tdutils::log_error!("Ignore {}", rich_message_media);
+                continue;
+            }
+            let media_type = media.as_bytes()[0];
+            let media = &media[1..];
+            let block: Option<Box<td_api::InputPageBlock>>;
+            let content: Option<Box<td_api::InputMessageContent>>;
+            match media_type {
+                b'a' => {
+                    let animation = self.as_input_animation(media);
+                    block = Some(Box::new(td_api::InputPageBlock::inputPageBlockAnimation(
+                        td_api::inputPageBlockAnimation {
+                            animation: Some(animation.clone()),
+                            caption: None,
+                            has_spoiler: random::fast_bool(),
+                        },
+                    )));
+                    content = Some(Box::new(
+                        td_api::InputMessageContent::inputMessageAnimation(
+                            td_api::inputMessageAnimation {
+                                animation: Some(animation),
+                                caption: None,
+                                show_caption_above_media: false,
+                                has_spoiler: false,
+                            },
+                        ),
+                    ));
+                }
+                b'n' => {
+                    let voice_note = self.as_input_voice_note(media);
+                    block = Some(Box::new(td_api::InputPageBlock::inputPageBlockVoiceNote(
+                        td_api::inputPageBlockVoiceNote {
+                            voice_note: Some(voice_note.clone()),
+                            caption: None,
+                        },
+                    )));
+                    content = Some(Box::new(
+                        td_api::InputMessageContent::inputMessageVoiceNote(
+                            td_api::inputMessageVoiceNote {
+                                voice_note: Some(voice_note),
+                                caption: None,
+                                self_destruct_type: None,
+                            },
+                        ),
+                    ));
+                }
+                b'p' => {
+                    let photo = self.as_input_photo(media);
+                    block = Some(Box::new(td_api::InputPageBlock::inputPageBlockPhoto(
+                        td_api::inputPageBlockPhoto {
+                            photo: Some(photo.clone()),
+                            caption: None,
+                            has_spoiler: random::fast_bool(),
+                        },
+                    )));
+                    content = Some(Box::new(td_api::InputMessageContent::inputMessagePhoto(
+                        td_api::inputMessagePhoto {
+                            photo: Some(photo),
+                            caption: None,
+                            show_caption_above_media: false,
+                            self_destruct_type: None,
+                            has_spoiler: false,
+                        },
+                    )));
+                }
+                b'u' => {
+                    let audio = self.as_input_audio(media, 0);
+                    block = Some(Box::new(td_api::InputPageBlock::inputPageBlockAudio(
+                        td_api::inputPageBlockAudio {
+                            audio: Some(audio.clone()),
+                            caption: None,
+                        },
+                    )));
+                    content = Some(Box::new(td_api::InputMessageContent::inputMessageAudio(
+                        td_api::inputMessageAudio {
+                            audio: Some(audio),
+                            caption: None,
+                        },
+                    )));
+                }
+                b'v' => {
+                    let video = self.as_input_video(media);
+                    block = Some(Box::new(td_api::InputPageBlock::inputPageBlockVideo(
+                        td_api::inputPageBlockVideo {
+                            video: Some(video.clone()),
+                            caption: None,
+                            has_spoiler: random::fast_bool(),
+                        },
+                    )));
+                    content = Some(Box::new(td_api::InputMessageContent::inputMessageVideo(
+                        td_api::inputMessageVideo {
+                            video: Some(video),
+                            caption: None,
+                            show_caption_above_media: false,
+                            self_destruct_type: None,
+                            has_spoiler: false,
+                        },
+                    )));
+                }
+                _ => {
+                    block = None;
+                    content = None;
+                }
+            }
+            if let Some(block) = block {
+                input_blocks.push(block);
+            }
+            input_media.push(Box::new(td_api::InputRichMessageMedia {
+                id,
+                media: content,
+            }));
+        }
+        // The message `;`s become newlines (cli.cpp:2327), then the bold
+        // plain-text paragraph closes the block list.
+        let message = message.replace(';', "\n");
+        input_blocks.push(Box::new(td_api::InputPageBlock::inputPageBlockParagraph(
+            td_api::inputPageBlockParagraph {
+                text: Some(Box::new(td_api::RichText::richTextBold(
+                    td_api::richTextBold {
+                        text: Some(Box::new(td_api::RichText::richTextPlain(
+                            td_api::richTextPlain { text: message },
+                        ))),
+                    },
+                ))),
+            },
+        )));
+        if random::fast_bool() {
+            td_api::InputRichMessage {
+                source: Some(Box::new(
+                    td_api::RichMessageSource::richMessageSourceBlocks(
+                        td_api::richMessageSourceBlocks {
+                            blocks: input_blocks,
+                        },
+                    ),
+                )),
+                is_rtl: random::fast_bool(),
+                detect_automatic_blocks: random::fast_bool(),
+            }
+        } else {
+            td_api::InputRichMessage {
+                source: Some(Box::new(
+                    td_api::RichMessageSource::richMessageSourceMarkdown(
+                        td_api::richMessageSourceMarkdown {
+                            text: String::new(),
+                            media: input_media,
+                        },
+                    ),
+                )),
+                is_rtl: random::fast_bool(),
+                detect_automatic_blocks: random::fast_bool(),
+            }
+        }
+    }
+
+    /// `default_message_send_options` (cli.cpp:3038).
+    fn default_message_send_options(&self) -> td_api::MessageSendOptions {
+        td_api::MessageSendOptions {
+            suggested_post_info: self.get_input_suggested_post_info(),
+            disable_notification: false,
+            from_background: false,
+            protect_content: false,
+            allow_paid_broadcast: self.use_test_dc.load(Ordering::SeqCst),
+            paid_message_star_count: self.paid_message_star_count.load(Ordering::SeqCst),
+            update_order_of_installed_sticker_sets: true,
+            scheduling_state: self.as_message_scheduling_state(),
+            effect_id: self.message_effect_id.load(Ordering::SeqCst),
+            sending_id: random::fast(1, 1000),
+            only_preview: self.only_preview.load(Ordering::SeqCst),
+        }
     }
 
     /// `CliClient::as_chat_ids` (cli.cpp:577).
@@ -5598,8 +5904,866 @@ impl CliClient {
         }
     }
 
-    fn op_block_files(&self, _op: &str, _args: &str) -> bool {
-        false
+    /// cli.cpp:5054 — the info/getters/files/translate chain (census chain 6).
+    fn op_block_files(&self, op: &str, args: &str) -> bool {
+        if op == "guf" {
+            self.send_request(Function::getUserFullInfo(td_api::getUserFullInfo {
+                user_id: self.as_user_id(args),
+            }));
+            true
+        } else if op == "gbg" {
+            self.send_request(Function::getBasicGroup(td_api::getBasicGroup {
+                basic_group_id: self.as_basic_group_id(args),
+            }));
+            true
+        } else if op == "gbgf" {
+            self.send_request(Function::getBasicGroupFullInfo(
+                td_api::getBasicGroupFullInfo {
+                    basic_group_id: self.as_basic_group_id(args),
+                },
+            ));
+            true
+        } else if op == "gsg" || op == "gch" {
+            self.send_request(Function::getSupergroup(td_api::getSupergroup {
+                supergroup_id: self.as_supergroup_id(args),
+            }));
+            true
+        } else if op == "gsgf" || op == "gchf" {
+            self.send_request(Function::getSupergroupFullInfo(
+                td_api::getSupergroupFullInfo {
+                    supergroup_id: self.as_supergroup_id(args),
+                },
+            ));
+            true
+        } else if op == "gsc" {
+            self.send_request(Function::getSecretChat(td_api::getSecretChat {
+                secret_chat_id: self.as_secret_chat_id(args),
+            }));
+            true
+        } else if op == "scm" {
+            let (chat_id, filter, tail) = {
+                let (w0, r0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&r0, ' ');
+                (w0, w1, w2)
+            };
+            let (limit, query) = get_search_query(&tail);
+            self.send_request(Function::searchChatMembers(td_api::searchChatMembers {
+                chat_id: self.as_chat_id(&chat_id),
+                query,
+                limit,
+                filter: self.as_chat_members_filter(&filter),
+            }));
+            true
+        } else if op == "gcm" {
+            let (chat_id, member_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::getChatMember(td_api::getChatMember {
+                chat_id: self.as_chat_id(&chat_id),
+                member_id: self.as_message_sender(&member_id),
+            }));
+            true
+        } else if op == "GetChatAdministrators" {
+            self.send_request(Function::getChatAdministrators(
+                td_api::getChatAdministrators {
+                    chat_id: self.as_chat_id(args),
+                },
+            ));
+            true
+        } else if op == "GetSupergroupAdministrators"
+            || op == "GetSupergroupBanned"
+            || op == "GetSupergroupBots"
+            || op == "GetSupergroupContacts"
+            || op == "GetSupergroupMembers"
+            || op == "GetSupergroupRestricted"
+            || op == "SearchSupergroupMembers"
+            || op == "SearchSupergroupMentions"
+        {
+            let (supergroup_id, offset, tail) = {
+                let (w0, r0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&r0, ' ');
+                (w0, w1, w2)
+            };
+            let (limit, query) = get_search_query(&tail);
+            self.send_request(Function::getSupergroupMembers(
+                td_api::getSupergroupMembers {
+                    supergroup_id: self.as_supergroup_id(&supergroup_id),
+                    filter: self.as_supergroup_members_filter(op, &query),
+                    offset: tokenizer::to_integer_i32(&offset),
+                    limit,
+                },
+            ));
+            true
+        } else if op == "gd" {
+            self.send_request(Function::getChat(td_api::getChat {
+                chat_id: self.as_chat_id(args),
+            }));
+            true
+        } else if op == "lcfi" {
+            self.send_request(Function::loadCommunityFullInfo(
+                td_api::loadCommunityFullInfo {
+                    community_id: tokenizer::to_integer_i64(trim_td(args)),
+                },
+            ));
+            true
+        } else if op == "open" {
+            let chat_id = self.as_chat_id(args);
+            self.send_request(Function::openChat(td_api::openChat { chat_id }));
+            self.opened_chat_id.store(chat_id, Ordering::SeqCst);
+            true
+        } else if op == "close" {
+            self.send_request(Function::closeChat(td_api::closeChat {
+                chat_id: self.as_chat_id(args),
+            }));
+            true
+        } else if op == "gm" {
+            let (chat_id, message_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::getMessage(td_api::getMessage {
+                chat_id: self.as_chat_id(&chat_id),
+                message_id: as_message_id(&message_id),
+            }));
+            true
+        } else if op == "gmf" {
+            let (chat_id, from_message_id, to_message_id) = {
+                let (w0, r0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&r0, ' ');
+                (w0, w1, w2)
+            };
+            let chat_id = self.as_chat_id(&chat_id);
+            let mut message_id = tokenizer::to_integer_i64(&from_message_id);
+            let to = tokenizer::to_integer_i64(&to_message_id);
+            while message_id <= to {
+                self.send_request(Function::getMessage(td_api::getMessage {
+                    chat_id,
+                    message_id: message_id << 20,
+                }));
+                message_id += 1;
+            }
+            true
+        } else if op == "gml" {
+            let (chat_id, message_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::getMessageLocally(td_api::getMessageLocally {
+                chat_id: self.as_chat_id(&chat_id),
+                message_id: as_message_id(&message_id),
+            }));
+            true
+        } else if op == "grm" {
+            let (chat_id, message_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::getRepliedMessage(td_api::getRepliedMessage {
+                chat_id: self.as_chat_id(&chat_id),
+                message_id: as_message_id(&message_id),
+            }));
+            true
+        } else if op == "gmt" {
+            let (chat_id, message_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::getMessageThread(td_api::getMessageThread {
+                chat_id: self.as_chat_id(&chat_id),
+                message_id: as_message_id(&message_id),
+            }));
+            true
+        } else if op == "gmrd" {
+            let (chat_id, message_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::getMessageReadDate(td_api::getMessageReadDate {
+                chat_id: self.as_chat_id(&chat_id),
+                message_id: as_message_id(&message_id),
+            }));
+            true
+        } else if op == "gmv" {
+            let (chat_id, message_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::getMessageViewers(td_api::getMessageViewers {
+                chat_id: self.as_chat_id(&chat_id),
+                message_id: as_message_id(&message_id),
+            }));
+            true
+        } else if op == "gma" {
+            let (chat_id, message_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::getMessageAuthor(td_api::getMessageAuthor {
+                chat_id: self.as_chat_id(&chat_id),
+                message_id: as_message_id(&message_id),
+            }));
+            true
+        } else if op == "gcpm" {
+            self.send_request(Function::getChatPinnedMessage(
+                td_api::getChatPinnedMessage {
+                    chat_id: self.as_chat_id(args),
+                },
+            ));
+            true
+        } else if op == "gms" {
+            let (chat_id, message_ids) = tokenizer::split(args, ' ');
+            self.send_request(Function::getMessages(td_api::getMessages {
+                chat_id: self.as_chat_id(&chat_id),
+                message_ids: autosplit(&message_ids)
+                    .iter()
+                    .map(|t| as_message_id(trim_td(t)))
+                    .collect(),
+            }));
+            true
+        } else if op == "gfrm" {
+            let (chat_id, message_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::getFullRichMessage(td_api::getFullRichMessage {
+                chat_id: self.as_chat_id(&chat_id),
+                message_id: as_message_id(&message_id),
+            }));
+            true
+        } else if op == "gmp" {
+            let (chat_id, message_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::getMessageProperties(
+                td_api::getMessageProperties {
+                    chat_id: self.as_chat_id(&chat_id),
+                    message_id: as_message_id(&message_id),
+                },
+            ));
+            true
+        } else if op == "gpop" {
+            let (chat_id, message_id, option_id) = {
+                let (w0, r0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&r0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::getPollOptionProperties(
+                td_api::getPollOptionProperties {
+                    chat_id: self.as_chat_id(&chat_id),
+                    message_id: as_message_id(&message_id),
+                    poll_option_id: option_id,
+                },
+            ));
+            true
+        } else if op == "gcspm" {
+            self.send_request(Function::getChatSponsoredMessages(
+                td_api::getChatSponsoredMessages {
+                    chat_id: self.as_chat_id(args),
+                },
+            ));
+            true
+        } else if op == "ccspm" {
+            let (chat_id, message_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::clickChatSponsoredMessage(
+                td_api::clickChatSponsoredMessage {
+                    chat_id: self.as_chat_id(&chat_id),
+                    message_id: as_message_id(&message_id),
+                    is_media_click: random::fast_bool(),
+                    from_fullscreen: random::fast_bool(),
+                },
+            ));
+            true
+        } else if op == "rcspm" {
+            let (chat_id, message_id, option_id) = {
+                let (w0, r0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&r0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::reportChatSponsoredMessage(
+                td_api::reportChatSponsoredMessage {
+                    chat_id: self.as_chat_id(&chat_id),
+                    message_id: as_message_id(&message_id),
+                    option_id: option_id.into_bytes(),
+                },
+            ));
+            true
+        } else if op == "gssc" {
+            self.send_request(Function::getSearchSponsoredChats(
+                td_api::getSearchSponsoredChats {
+                    query: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "vsc" {
+            self.send_request(Function::viewSponsoredChat(td_api::viewSponsoredChat {
+                sponsored_chat_unique_id: tokenizer::to_integer_i64(args),
+            }));
+            true
+        } else if op == "osc" {
+            self.send_request(Function::openSponsoredChat(td_api::openSponsoredChat {
+                sponsored_chat_unique_id: tokenizer::to_integer_i64(args),
+            }));
+            true
+        } else if op == "rsc" {
+            let (unique_id, option_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::reportSponsoredChat(td_api::reportSponsoredChat {
+                sponsored_chat_unique_id: tokenizer::to_integer_i64(&unique_id),
+                option_id: option_id.into_bytes(),
+            }));
+            true
+        } else if op == "gvma" {
+            let (chat_id, message_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::getVideoMessageAdvertisements(
+                td_api::getVideoMessageAdvertisements {
+                    chat_id: self.as_chat_id(&chat_id),
+                    message_id: as_message_id(&message_id),
+                },
+            ));
+            true
+        } else if op == "vvma" {
+            self.send_request(Function::viewVideoMessageAdvertisement(
+                td_api::viewVideoMessageAdvertisement {
+                    advertisement_unique_id: tokenizer::to_integer_i64(args),
+                },
+            ));
+            true
+        } else if op == "cvma" {
+            self.send_request(Function::clickVideoMessageAdvertisement(
+                td_api::clickVideoMessageAdvertisement {
+                    advertisement_unique_id: tokenizer::to_integer_i64(args),
+                },
+            ));
+            true
+        } else if op == "rvma" {
+            let (unique_id, option_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::reportVideoMessageAdvertisement(
+                td_api::reportVideoMessageAdvertisement {
+                    advertisement_unique_id: tokenizer::to_integer_i64(&unique_id),
+                    option_id: option_id.into_bytes(),
+                },
+            ));
+            true
+        } else if op == "gmlink" {
+            let (
+                chat_id,
+                message_id,
+                media_timestamp,
+                checklist_task_id,
+                poll_option_id,
+                for_album,
+                for_comment,
+            ) = {
+                let (w0, r0) = tokenizer::split(args, ' ');
+                let (w1, r1) = tokenizer::split(&r0, ' ');
+                let (w2, r2) = tokenizer::split(&r1, ' ');
+                let (w3, r3) = tokenizer::split(&r2, ' ');
+                let (w4, r4) = tokenizer::split(&r3, ' ');
+                let (w5, w6) = tokenizer::split(&r4, ' ');
+                (w0, w1, w2, w3, w4, w5, w6)
+            };
+            self.send_request(Function::getMessageLink(td_api::getMessageLink {
+                chat_id: self.as_chat_id(&chat_id),
+                message_id: as_message_id(&message_id),
+                media_timestamp: tokenizer::to_integer_i32(&media_timestamp),
+                checklist_task_id: tokenizer::to_integer_i32(&checklist_task_id),
+                poll_option_id,
+                for_album: as_bool(&for_album),
+                in_message_thread: as_bool(&for_comment),
+            }));
+            true
+        } else if op == "gmec" {
+            let (chat_id, message_id, for_album) = {
+                let (w0, r0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&r0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::getMessageEmbeddingCode(
+                td_api::getMessageEmbeddingCode {
+                    chat_id: self.as_chat_id(&chat_id),
+                    message_id: as_message_id(&message_id),
+                    for_album: as_bool(&for_album),
+                },
+            ));
+            true
+        } else if op == "gmli" {
+            self.send_request(Function::getMessageLinkInfo(td_api::getMessageLinkInfo {
+                url: args.to_owned(),
+            }));
+            true
+        } else if op == "ctcs" || op == "ctcsp" {
+            let (title, custom_emoji_id, prompt) = {
+                let (w0, r0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&r0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::createTextCompositionStyle(
+                td_api::createTextCompositionStyle {
+                    title,
+                    custom_emoji_id: tokenizer::to_integer_i64(&custom_emoji_id),
+                    prompt,
+                    show_creator: op == "ctcsp",
+                },
+            ));
+            true
+        } else if op == "etcs" || op == "etcsp" {
+            let (name, title, custom_emoji_id, prompt) = {
+                let (w0, r0) = tokenizer::split(args, ' ');
+                let (w1, r1) = tokenizer::split(&r0, ' ');
+                let (w2, w3) = tokenizer::split(&r1, ' ');
+                (w0, w1, w2, w3)
+            };
+            self.send_request(Function::editTextCompositionStyle(
+                td_api::editTextCompositionStyle {
+                    name,
+                    title,
+                    custom_emoji_id: tokenizer::to_integer_i64(&custom_emoji_id),
+                    prompt,
+                    show_creator: op == "etcsp",
+                },
+            ));
+            true
+        } else if op == "dtcs" {
+            self.send_request(Function::deleteTextCompositionStyle(
+                td_api::deleteTextCompositionStyle {
+                    name: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "stcs" {
+            self.send_request(Function::searchTextCompositionStyle(
+                td_api::searchTextCompositionStyle {
+                    name: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "gtcse" {
+            let (name, example_number) = tokenizer::split(args, ' ');
+            self.send_request(Function::getTextCompositionStyleExample(
+                td_api::getTextCompositionStyleExample {
+                    name,
+                    example_number: tokenizer::to_integer_i32(&example_number),
+                },
+            ));
+            true
+        } else if op == "atcs" {
+            self.send_request(Function::addTextCompositionStyle(
+                td_api::addTextCompositionStyle {
+                    name: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "rtcs" {
+            self.send_request(Function::removeTextCompositionStyle(
+                td_api::removeTextCompositionStyle {
+                    name: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "tt" || op == "ttf" || op == "ttc" || op == "ttn" {
+            let (to_language_code, text) = tokenizer::split(args, ' ');
+            self.send_request(Function::translateText(td_api::translateText {
+                text: Some(self.as_formatted_text(&text)),
+                to_language_code,
+                tone: self.as_tone(op),
+            }));
+            true
+        } else if op == "trm" || op == "trmf" || op == "trmc" || op == "trmn" {
+            let (to_language_code, message) = tokenizer::split(args, ' ');
+            self.send_request(Function::translateRichMessage(
+                td_api::translateRichMessage {
+                    message: Some(Box::new(self.as_input_rich_message(&message))),
+                    to_language_code,
+                    tone: self.as_tone(op),
+                },
+            ));
+            true
+        } else if op == "tmt" || op == "tmtf" || op == "tmtc" || op == "tmtn" {
+            let (chat_id, message_id, to_language_code) = {
+                let (w0, r0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&r0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::translateMessageText(
+                td_api::translateMessageText {
+                    chat_id: self.as_chat_id(&chat_id),
+                    message_id: as_message_id(&message_id),
+                    to_language_code,
+                    tone: self.as_tone(op),
+                },
+            ));
+            true
+        } else if op == "tmrm" || op == "tmrmf" || op == "tmrmc" || op == "tmrmn" {
+            let (chat_id, message_id, to_language_code) = {
+                let (w0, r0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&r0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::translateMessageRichMessage(
+                td_api::translateMessageRichMessage {
+                    chat_id: self.as_chat_id(&chat_id),
+                    message_id: as_message_id(&message_id),
+                    to_language_code,
+                    tone: self.as_tone(op),
+                },
+            ));
+            true
+        } else if op == "sum" {
+            let (chat_id, message_id, to_language_code, tone) = {
+                let (w0, r0) = tokenizer::split(args, ' ');
+                let (w1, r1) = tokenizer::split(&r0, ' ');
+                let (w2, w3) = tokenizer::split(&r1, ' ');
+                (w0, w1, w2, w3)
+            };
+            self.send_request(Function::summarizeMessage(td_api::summarizeMessage {
+                chat_id: self.as_chat_id(&chat_id),
+                message_id: as_message_id(&message_id),
+                translate_to_language_code: to_language_code,
+                tone,
+            }));
+            true
+        } else if op == "ctwa" {
+            let (to_language_code, style_name, emojify, text) = {
+                let (w0, r0) = tokenizer::split(args, ' ');
+                let (w1, r1) = tokenizer::split(&r0, ' ');
+                let (w2, w3) = tokenizer::split(&r1, ' ');
+                (w0, w1, w2, w3)
+            };
+            self.send_request(Function::composeTextWithAi(td_api::composeTextWithAi {
+                text: Some(self.as_formatted_text(&text)),
+                translate_to_language_code: to_language_code,
+                style_name,
+                add_emojis: as_bool(&emojify),
+            }));
+            true
+        } else if op == "crmwa" || op == "crmwac" {
+            let (to_language_code, style_name, emojify, message) = {
+                let (w0, r0) = tokenizer::split(args, ' ');
+                let (w1, r1) = tokenizer::split(&r0, ' ');
+                let (w2, w3) = tokenizer::split(&r1, ' ');
+                (w0, w1, w2, w3)
+            };
+            self.send_request(Function::composeRichMessageWithAi(
+                td_api::composeRichMessageWithAi {
+                    message: Some(Box::new(self.as_input_rich_message(&message))),
+                    translate_to_language_code: to_language_code,
+                    style_name,
+                    custom_prompt: if op == "crmwac" {
+                        "Make text uppercase"
+                    } else {
+                        ""
+                    }
+                    .to_owned(),
+                    add_emojis: as_bool(&emojify),
+                },
+            ));
+            true
+        } else if op == "cnrmwa" {
+            let (language_code, emojify, prompt) = {
+                let (w0, r0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&r0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::createRichMessageWithAi(
+                td_api::createRichMessageWithAi {
+                    prompt,
+                    language_code,
+                    add_emojis: as_bool(&emojify),
+                },
+            ));
+            true
+        } else if op == "ftwa" {
+            self.send_request(Function::fixTextWithAi(td_api::fixTextWithAi {
+                text: Some(self.as_formatted_text(args)),
+            }));
+            true
+        } else if op == "frmwa" {
+            self.send_request(Function::fixRichMessageWithAi(
+                td_api::fixRichMessageWithAi {
+                    message: Some(Box::new(self.as_input_rich_message(args))),
+                },
+            ));
+            true
+        } else if op == "rs" {
+            let (chat_id, message_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::recognizeSpeech(td_api::recognizeSpeech {
+                chat_id: self.as_chat_id(&chat_id),
+                message_id: as_message_id(&message_id),
+            }));
+            true
+        } else if op == "rsr" {
+            let (chat_id, message_id, is_good) = {
+                let (w0, r0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&r0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::rateSpeechRecognition(
+                td_api::rateSpeechRecognition {
+                    chat_id: self.as_chat_id(&chat_id),
+                    message_id: as_message_id(&message_id),
+                    is_good: as_bool(&is_good),
+                },
+            ));
+            true
+        } else if op == "gf" {
+            self.send_request(Function::getFile(td_api::getFile {
+                file_id: tokenizer::to_integer_i32(trim_td(args)),
+            }));
+            true
+        } else if op == "gfdps" {
+            let (file_id, offset) = tokenizer::split(args, ' ');
+            self.send_request(Function::getFileDownloadedPrefixSize(
+                td_api::getFileDownloadedPrefixSize {
+                    file_id: tokenizer::to_integer_i32(trim_td(&file_id)),
+                    offset: tokenizer::to_integer_i64(&offset),
+                },
+            ));
+            true
+        } else if op == "rfp" {
+            let (file_id, offset, count) = {
+                let (w0, r0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&r0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::readFilePart(td_api::readFilePart {
+                file_id: tokenizer::to_integer_i32(trim_td(&file_id)),
+                offset: tokenizer::to_integer_i64(&offset),
+                count: tokenizer::to_integer_i64(&count),
+            }));
+            true
+        } else if op == "grf" {
+            self.send_request(Function::getRemoteFile(td_api::getRemoteFile {
+                remote_file_id: args.to_owned(),
+                file_type: None,
+            }));
+            true
+        } else if op == "gmtf" {
+            let (latitude, longitude, zoom, width, height, scale, chat_id) = {
+                let (w0, r0) = tokenizer::split(args, ' ');
+                let (w1, r1) = tokenizer::split(&r0, ' ');
+                let (w2, r2) = tokenizer::split(&r1, ' ');
+                let (w3, r3) = tokenizer::split(&r2, ' ');
+                let (w4, r4) = tokenizer::split(&r3, ' ');
+                let (w5, w6) = tokenizer::split(&r4, ' ');
+                (w0, w1, w2, w3, w4, w5, w6)
+            };
+            self.send_request(Function::getMapThumbnailFile(td_api::getMapThumbnailFile {
+                location: as_location(&latitude, &longitude, ""),
+                zoom: tokenizer::to_integer_i32(&zoom),
+                width: tokenizer::to_integer_i32(&width),
+                height: tokenizer::to_integer_i32(&height),
+                scale: tokenizer::to_integer_i32(&scale),
+                chat_id: self.as_chat_id(&chat_id),
+            }));
+            true
+        } else if op == "df" || op == "dff" || op == "dfs" {
+            let (file_id, offset, limit, priority) = {
+                let (w0, r0) = tokenizer::split(args, ' ');
+                let (w1, r1) = tokenizer::split(&r0, ' ');
+                let (w2, w3) = tokenizer::split(&r1, ' ');
+                (w0, w1, w2, w3)
+            };
+            let mut priority = tokenizer::to_integer_i32(&priority);
+            if priority <= 0 {
+                priority = 1;
+            }
+            let max_file_id = tokenizer::to_integer_i32(trim_td(&file_id));
+            let min_file_id = if op == "dff" { 1 } else { max_file_id };
+            for i in min_file_id..=max_file_id {
+                self.send_request(Function::downloadFile(td_api::downloadFile {
+                    file_id: i,
+                    priority,
+                    offset: tokenizer::to_integer_i64(&offset),
+                    limit: tokenizer::to_integer_i64(&limit),
+                    synchronous: op == "dfs",
+                }));
+            }
+            true
+        } else if op == "cdf" {
+            self.send_request(Function::cancelDownloadFile(td_api::cancelDownloadFile {
+                file_id: tokenizer::to_integer_i32(trim_td(args)),
+                only_if_pending: false,
+            }));
+            true
+        } else if op == "gsfn" {
+            let (file_id, directory_name) = tokenizer::split(args, ' ');
+            self.send_request(Function::getSuggestedFileName(
+                td_api::getSuggestedFileName {
+                    file_id: tokenizer::to_integer_i32(trim_td(&file_id)),
+                    directory: directory_name,
+                },
+            ));
+            true
+        } else if op == "uf" || op == "ufs" || op == "ufse" {
+            let (file_path, priority) = tokenizer::split(args, ' ');
+            let mut priority = tokenizer::to_integer_i32(&priority);
+            if priority <= 0 {
+                priority = 1;
+            }
+            let file_type = if op == "ufs" {
+                td_api::FileType::fileTypeSecret(td_api::fileTypeSecret)
+            } else if op == "ufse" {
+                td_api::FileType::fileTypeSecure(td_api::fileTypeSecure)
+            } else {
+                td_api::FileType::fileTypePhoto(td_api::fileTypePhoto)
+            };
+            self.send_request(Function::preliminaryUploadFile(
+                td_api::preliminaryUploadFile {
+                    file: as_input_file(&file_path),
+                    file_type: Some(file_type),
+                    priority,
+                },
+            ));
+            true
+        } else if op == "ufg" {
+            let (file_path, conversion) = tokenizer::split(args, ' ');
+            self.send_request(Function::preliminaryUploadFile(
+                td_api::preliminaryUploadFile {
+                    file: Some(td_api::InputFile::inputFileGenerated(
+                        td_api::inputFileGenerated {
+                            original_path: file_path,
+                            conversion,
+                            expected_size: 0,
+                        },
+                    )),
+                    file_type: Some(td_api::FileType::fileTypePhoto(td_api::fileTypePhoto)),
+                    priority: 1,
+                },
+            ));
+            true
+        } else if op == "cuf" {
+            self.send_request(Function::cancelPreliminaryUploadFile(
+                td_api::cancelPreliminaryUploadFile {
+                    file_id: tokenizer::to_integer_i32(trim_td(args)),
+                },
+            ));
+            true
+        } else if op == "delf" {
+            self.send_request(Function::deleteFile(td_api::deleteFile {
+                file_id: tokenizer::to_integer_i32(trim_td(args)),
+            }));
+            true
+        } else if op == "aftd" {
+            let (file_id, chat_id, message_id, priority) = {
+                let (w0, r0) = tokenizer::split(args, ' ');
+                let (w1, r1) = tokenizer::split(&r0, ' ');
+                let (w2, w3) = tokenizer::split(&r1, ' ');
+                (w0, w1, w2, w3)
+            };
+            self.send_request(Function::addFileToDownloads(td_api::addFileToDownloads {
+                file_id: tokenizer::to_integer_i32(trim_td(&file_id)),
+                chat_id: self.as_chat_id(&chat_id),
+                message_id: as_message_id(&message_id),
+                priority: tokenizer::to_integer_i32(&priority).max(1),
+            }));
+            true
+        } else if op == "tdip" {
+            let (file_id, is_paused) = tokenizer::split(args, ' ');
+            self.send_request(Function::toggleDownloadIsPaused(
+                td_api::toggleDownloadIsPaused {
+                    file_id: tokenizer::to_integer_i32(trim_td(&file_id)),
+                    is_paused: as_bool(&is_paused),
+                },
+            ));
+            true
+        } else if op == "tadap" {
+            self.send_request(Function::toggleAllDownloadsArePaused(
+                td_api::toggleAllDownloadsArePaused {
+                    are_paused: as_bool(args),
+                },
+            ));
+            true
+        } else if op == "rffd" {
+            let (file_id, delete_from_cache) = tokenizer::split(args, ' ');
+            self.send_request(Function::removeFileFromDownloads(
+                td_api::removeFileFromDownloads {
+                    file_id: tokenizer::to_integer_i32(trim_td(&file_id)),
+                    delete_from_cache: as_bool(&delete_from_cache),
+                },
+            ));
+            true
+        } else if op == "raffd" || op == "raffda" || op == "raffdc" {
+            self.send_request(Function::removeAllFilesFromDownloads(
+                td_api::removeAllFilesFromDownloads {
+                    only_active: op.ends_with('a'),
+                    only_completed: op.ends_with('c'),
+                    delete_from_cache: as_bool(args),
+                },
+            ));
+            true
+        } else if op == "sfd" || op == "sfda" || op == "sfdc" {
+            let (offset, tail) = tokenizer::split(args, ' ');
+            let (limit, query) = get_search_query(&tail);
+            self.send_request(Function::searchFileDownloads(td_api::searchFileDownloads {
+                query,
+                only_active: op.ends_with('a'),
+                only_completed: op.ends_with('c'),
+                offset,
+                limit,
+            }));
+            true
+        } else if op == "dm" || op == "dmr" {
+            let (chat_id, message_ids) = tokenizer::split(args, ' ');
+            self.send_request(Function::deleteMessages(td_api::deleteMessages {
+                chat_id: self.as_chat_id(&chat_id),
+                message_ids: autosplit(&message_ids)
+                    .iter()
+                    .map(|t| as_message_id(trim_td(t)))
+                    .collect(),
+                revoke: op == "dmr",
+            }));
+            true
+        } else if op == "fm" || op == "cm" {
+            let (chat_id, from_chat_id, message_ids) = {
+                let (w0, r0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&r0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::forwardMessages(td_api::forwardMessages {
+                chat_id: self.as_chat_id(&chat_id),
+                topic_id: self.get_message_topic_id(),
+                from_chat_id: self.as_chat_id(&from_chat_id),
+                message_ids: autosplit(&message_ids)
+                    .iter()
+                    .map(|t| as_message_id(trim_td(t)))
+                    .collect(),
+                options: Some(self.default_message_send_options()),
+                send_copy: op.starts_with('c'),
+                remove_caption: random::fast_bool(),
+            }));
+            true
+        } else if op == "sqrsm" {
+            let (chat_id, shortcut_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::sendQuickReplyShortcutMessages(
+                td_api::sendQuickReplyShortcutMessages {
+                    chat_id: self.as_chat_id(&chat_id),
+                    shortcut_id: self.as_shortcut_id(&shortcut_id),
+                    sending_id: random::fast(-1000, -1),
+                },
+            ));
+            true
+        } else if op == "resend" {
+            let (chat_id, message_ids, quote, quote_position) = {
+                let (w0, r0) = tokenizer::split(args, ' ');
+                let (w1, r1) = tokenizer::split(&r0, ' ');
+                let (w2, w3) = tokenizer::split(&r1, ' ');
+                (w0, w1, w2, w3)
+            };
+            let shortcut = self.quick_reply_shortcut_name.lock().unwrap().clone();
+            if shortcut.is_empty() {
+                self.send_request(Function::resendMessages(td_api::resendMessages {
+                    chat_id: self.as_chat_id(&chat_id),
+                    message_ids: autosplit(&message_ids)
+                        .iter()
+                        .map(|t| as_message_id(trim_td(t)))
+                        .collect(),
+                    quote: Some(td_api::InputTextQuote {
+                        text: Some(self.as_formatted_text(&quote)),
+                        position: tokenizer::to_integer_i32(&quote_position),
+                    }),
+                    paid_message_star_count: self.paid_message_star_count.load(Ordering::SeqCst),
+                }));
+            } else {
+                self.send_request(Function::readdQuickReplyShortcutMessages(
+                    td_api::readdQuickReplyShortcutMessages {
+                        shortcut_name: shortcut,
+                        message_ids: autosplit(&message_ids)
+                            .iter()
+                            .map(|t| as_message_id(trim_td(t)))
+                            .collect(),
+                    },
+                ));
+            }
+            true
+        } else if op == "csc" {
+            self.send_request(Function::createSecretChat(td_api::createSecretChat {
+                secret_chat_id: self.as_secret_chat_id(args),
+            }));
+            true
+        } else if op == "cnsc" {
+            self.send_request(Function::createNewSecretChat(td_api::createNewSecretChat {
+                user_id: self.as_user_id(args),
+            }));
+            true
+        } else if op == "closeSC" || op == "cancelSC" {
+            self.send_request(Function::closeSecretChat(td_api::closeSecretChat {
+                secret_chat_id: self.as_secret_chat_id(args),
+            }));
+            true
+        } else {
+            false
+        }
     }
 
     /// cli.cpp:7327 — the chat-folder/paid-messages/chat-settings chain
@@ -8116,6 +9280,121 @@ mod tests {
             ("tdmctcsum", 2),
             ("tsmtip", 2),
             ("uadmctm", 2),
+            ("GetChatAdministrators", 6),
+            ("GetSupergroupAdministrators", 6),
+            ("GetSupergroupBanned", 6),
+            ("GetSupergroupBots", 6),
+            ("aftd", 6),
+            ("atcs", 6),
+            ("cancelSC", 6),
+            ("ccspm", 6),
+            ("cdf", 6),
+            ("close", 6),
+            ("closeSC", 6),
+            ("cm", 6),
+            ("cnrmwa", 6),
+            ("cnsc", 6),
+            ("crmwa", 6),
+            ("crmwac", 6),
+            ("csc", 6),
+            ("ctcs", 6),
+            ("ctcsp", 6),
+            ("ctwa", 6),
+            ("cuf", 6),
+            ("cvma", 6),
+            ("delf", 6),
+            ("df", 6),
+            ("dff", 6),
+            ("dfs", 6),
+            ("dm", 6),
+            ("dmr", 6),
+            ("dtcs", 6),
+            ("etcs", 6),
+            ("etcsp", 6),
+            ("fm", 6),
+            ("frmwa", 6),
+            ("ftwa", 6),
+            ("gbg", 6),
+            ("gbgf", 6),
+            ("gch", 6),
+            ("gchf", 6),
+            ("gcm", 6),
+            ("gcpm", 6),
+            ("gcspm", 6),
+            ("gd", 6),
+            ("gf", 6),
+            ("gfdps", 6),
+            ("gfrm", 6),
+            ("gm", 6),
+            ("gma", 6),
+            ("gmec", 6),
+            ("gmf", 6),
+            ("gml", 6),
+            ("gmli", 6),
+            ("gmlink", 6),
+            ("gmp", 6),
+            ("gmrd", 6),
+            ("gms", 6),
+            ("gmt", 6),
+            ("gmtf", 6),
+            ("gmv", 6),
+            ("gpop", 6),
+            ("grf", 6),
+            ("grm", 6),
+            ("gsc", 6),
+            ("gsfn", 6),
+            ("gsg", 6),
+            ("gsgf", 6),
+            ("gssc", 6),
+            ("gtcse", 6),
+            ("guf", 6),
+            ("gvma", 6),
+            ("lcfi", 6),
+            ("open", 6),
+            ("osc", 6),
+            ("raffd", 6),
+            ("raffda", 6),
+            ("raffdc", 6),
+            ("rcspm", 6),
+            ("resend", 6),
+            ("rffd", 6),
+            ("rfp", 6),
+            ("rs", 6),
+            ("rsc", 6),
+            ("rsr", 6),
+            ("rtcs", 6),
+            ("rvma", 6),
+            ("scm", 6),
+            ("sfd", 6),
+            ("sfda", 6),
+            ("sfdc", 6),
+            ("sqrsm", 6),
+            ("stcs", 6),
+            ("sum", 6),
+            ("tadap", 6),
+            ("tdip", 6),
+            ("tmrm", 6),
+            ("tmrmc", 6),
+            ("tmrmf", 6),
+            ("tmrmn", 6),
+            ("tmt", 6),
+            ("tmtc", 6),
+            ("tmtf", 6),
+            ("tmtn", 6),
+            ("trm", 6),
+            ("trmc", 6),
+            ("trmf", 6),
+            ("trmn", 6),
+            ("tt", 6),
+            ("ttc", 6),
+            ("ttf", 6),
+            ("ttn", 6),
+            ("uf", 6),
+            ("ufg", 6),
+            ("ufs", 6),
+            ("ufse", 6),
+            ("vsc", 6),
+            ("vvma", 6),
             ("acfbil", 14),
             ("acm", 14),
             ("acms", 14),
@@ -8592,6 +9871,7 @@ mod tests {
             start_timestamp: AtomicI32::new(0),
             thumbnail: Mutex::new(String::new()),
             cover: Mutex::new(String::new()),
+            rich_message_media: Mutex::new(String::new()),
             schedule_date: Mutex::new(String::new()),
             schedule_repeat_period: AtomicI32::new(0),
             paid_message_star_count: AtomicI64::new(0),
