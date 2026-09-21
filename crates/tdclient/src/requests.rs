@@ -40,6 +40,7 @@ use crate::notification_settings::{
 use crate::notification_settings_manager::ScopeSettingsAnswer;
 use crate::td::NotificationEnv;
 use crate::td::Td;
+use crate::td::ThemeEnv;
 use crate::td_api::{self, Function, Object};
 use crate::user_manager::{FileId, PendingUserRequest, SecretChatId, UserEnv, UserId};
 use tdutils::promise::Promise;
@@ -1461,6 +1462,111 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             );
             finish_unit_slot(td, id, slot);
         }
+        // --- themes (Requests.cpp:5838-5850) ---
+        Function::getGiftChatThemes(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            // CLEAN_INPUT_STRING(request.offset_) (Requests.cpp:5841)
+            let Some(offset) = crate::misc::clean_input_string(&request.offset) else {
+                td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+                return;
+            };
+            let promise =
+                td.deferred_promise(id, |b: td_api::GiftChatThemes| Object::giftChatThemes(b));
+            let mut env = ThemeEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                user_manager: &mut td.user_manager,
+                chat_manager: &mut td.chat_manager,
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                updates: &mut td.theme_updates,
+            };
+            td.theme_manager
+                .get_unique_gift_chat_themes(&mut env, &offset, request.limit, promise);
+        }
+        Function::setChatTheme(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let mut promise = td.deferred_promise(id, |()| ok_object());
+            // MessagesManager::set_dialog_theme (MessagesManager.cpp:30479-30526)
+            let mut dialog_id = crate::dialog_id::DialogId::new(request.chat_id);
+            if let Result::Err(status) = crate::dialog_manager::check_dialog_access(
+                td,
+                dialog_id,
+                true,
+                crate::user_manager::AccessRights::Write,
+                "set_dialog_theme",
+            ) {
+                promise.set_error(status);
+                return;
+            }
+            let mut is_gift = false;
+            let mut theme_name = String::new();
+            if let Some(theme) = request.theme.as_ref() {
+                match theme {
+                    crate::td_api::InputChatTheme::inputChatThemeEmoji(theme) => {
+                        theme_name = theme.name.clone();
+                    }
+                    crate::td_api::InputChatTheme::inputChatThemeGift(theme) => {
+                        theme_name = theme.name.clone();
+                        is_gift = true;
+                    }
+                }
+                if theme_name.is_empty() {
+                    promise.set_error(tdutils::status::Status::error(
+                        400,
+                        "Invalid theme name specified",
+                    ));
+                    return;
+                }
+            }
+            let Some(theme_name) = crate::misc::clean_input_string(&theme_name) else {
+                promise.set_error(tdutils::status::Status::error(
+                    400,
+                    "Strings must be encoded in UTF-8",
+                ));
+                return;
+            };
+            match dialog_id.get_type() {
+                crate::dialog_id::DialogType::User => {}
+                crate::dialog_id::DialogType::Chat | crate::dialog_id::DialogType::Channel => {
+                    promise.set_error(tdutils::status::Status::error(
+                        400,
+                        "Can't change theme in the chat",
+                    ));
+                    return;
+                }
+                crate::dialog_id::DialogType::SecretChat => {
+                    let user_id = td
+                        .user_manager
+                        .get_secret_chat_user_id(dialog_id.get_secret_chat_id());
+                    if !user_id.is_valid() {
+                        promise.set_error(tdutils::status::Status::error(
+                            400,
+                            "Can't access the user",
+                        ));
+                        return;
+                    }
+                    dialog_id = crate::dialog_id::DialogId::from_user_id(user_id);
+                }
+                // check_dialog_access rejects invalid dialog ids first (the
+                // C++ UNREACHABLE default is unreachable for the same reason)
+                crate::dialog_id::DialogType::None => {
+                    unreachable!("check_dialog_access rejects invalid dialogs")
+                }
+            }
+            crate::dialog_manager::set_dialog_theme_on_server(
+                td,
+                dialog_id,
+                &theme_name,
+                is_gift,
+                promise,
+            );
+        }
         Function::toggleChatHasProtectedContent(request) => {
             if !check_is_user(td, id) {
                 return;
@@ -2176,13 +2282,15 @@ mod request_census_tests {
         // stays the 500 placeholder) + M.12.10's eighteen file-plane
         // dispatches (getFile/getRemoteFile, the download/upload/
         // generation arms, the DownloadManager list plane and the four
-        // storage-statistics arms). Fix per flip.
-        assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
+        // storage-statistics arms) + M.41's three theme flips (the
+        // getGiftChatThemes/setChatTheme dispatches and the
+        // getThemeParametersJsonString synchronous static). Fix per flip.
+        assert_eq!(*counts.get("sync").unwrap_or(&0), 19, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            110,
+            112,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 894, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 891, "interim count");
     }
 }
