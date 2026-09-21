@@ -9813,6 +9813,44 @@ pub struct MessagesManager {
     pub(crate) get_dialogs_tasks: HashMap<i64, GetDialogsTask>,
     /// `current_get_dialogs_task_id_` (MessagesManager.h:3461).
     pub(crate) current_get_dialogs_task_id: i64,
+    /// `pending_message_group_sends_` (MessagesManager.h:3333) — the
+    /// media-album upload fan-in table.
+    pub(crate) pending_message_group_sends: HashMap<i64, PendingMessageGroupSend>,
+    /// `pending_internal_media_sends_` (MessagesManager.h:3340) — the
+    /// multi-file content upload fan-in table.
+    pub(crate) pending_internal_media_sends: HashMap<MessageFullId, PendingInternalMediaSend>,
+    /// `being_uploaded_files_` (MessagesManager.h) — the in-flight upload
+    /// registry ([blocked: M.12] for the actual upload legs).
+    pub(crate) being_uploaded_files: HashMap<FileUploadId, UploadedFileInfo>,
+}
+
+/// `MessagesManager::PendingMessageGroupSend` (MessagesManager.h:3326-3332).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PendingMessageGroupSend {
+    pub dialog_id: DialogId,
+    pub finished_count: usize,
+    pub message_ids: Vec<MessageId>,
+    pub is_finished: Vec<bool>,
+    /// the C++ `vector<Status>` results — `Ok(())`/`Err((code, message))`.
+    pub results: Vec<Result<(), (i32, String)>>,
+}
+
+/// `MessagesManager::PendingInternalMediaSend`
+/// (MessagesManager.h:3335-3339).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PendingInternalMediaSend {
+    pub finished_count: usize,
+    pub is_finished: Vec<bool>,
+    pub results: Vec<Result<(), (i32, String)>>,
+}
+
+/// `MessagesManager::UploadedFileInfo` (MessagesManager.h) — the registry
+/// record for a file whose upload is in flight.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct UploadedFileInfo {
+    pub message_full_id: MessageFullId,
+    pub media_pos: i32,
+    pub edit_generation: u64,
 }
 
 impl MessagesManager {
@@ -11059,6 +11097,11 @@ impl Default for Dialog {
 pub struct ForumTopicId(i32);
 
 impl ForumTopicId {
+    /// The `ForumTopicId(int32)` ctor (ForumTopicId.h).
+    pub fn from_raw(forum_topic_id: i32) -> ForumTopicId {
+        ForumTopicId(forum_topic_id)
+    }
+
     /// `ForumTopicId::from_top_thread_message_id`.
     pub fn from_top_thread_message_id(top_thread_message_id: MessageId) -> ForumTopicId {
         ForumTopicId(top_thread_message_id.get_server_message_id().get())
@@ -19707,6 +19750,266 @@ pub struct MessageSendOptions {
     pub suggested_post: Option<SuggestedPost>,
 }
 
+/// `SCHEDULE_WHEN_ONLINE_DATE` (MessageSendOptions.cpp) — hoisted for the
+/// options builders (the object twin lives with
+/// [`get_message_scheduling_state_object`]).
+const MESSAGE_SEND_SCHEDULE_WHEN_ONLINE_DATE: i32 = 2147483646;
+
+impl MessageSendOptions {
+    /// `MessageSendOptions::get_message_schedule_date`
+    /// (MessageSendOptions.cpp:44-79).
+    pub fn get_message_schedule_date(
+        unix_time: i32,
+        is_test_dc: bool,
+        scheduling_state: Option<td_api::MessageSchedulingState>,
+        allow_repeat_period: bool,
+    ) -> Result<(i32, i32), (i32, String)> {
+        let Some(scheduling_state) = scheduling_state else {
+            return Ok((0, 0));
+        };
+
+        match scheduling_state {
+            td_api::MessageSchedulingState::messageSchedulingStateSendWhenVideoProcessed(_) => {
+                Err((400, "Can't force video processing".to_owned()))
+            }
+            td_api::MessageSchedulingState::messageSchedulingStateSendWhenOnline(_) => {
+                Ok((MESSAGE_SEND_SCHEDULE_WHEN_ONLINE_DATE, 0))
+            }
+            td_api::MessageSchedulingState::messageSchedulingStateSendAtDate(state) => {
+                let send_date = state.send_date;
+                if send_date <= 0 {
+                    return Err((400, "Invalid send date specified".to_owned()));
+                }
+                if send_date <= unix_time + 10 {
+                    return Ok((0, 0));
+                }
+                if send_date - unix_time > 367 * 86400 {
+                    return Err((400, "Send date is too far in the future".to_owned()));
+                }
+                let repeat_period = state.repeat_period;
+                if !allow_repeat_period && repeat_period != 0 {
+                    return Err((
+                        400,
+                        "Repeated scheduled messages aren't supported".to_owned(),
+                    ));
+                }
+                if repeat_period != 0
+                    && repeat_period != 86400
+                    && repeat_period != 7 * 86400
+                    && repeat_period != 14 * 86400
+                    && repeat_period != 30 * 86400
+                    && repeat_period != 91 * 86400
+                    && repeat_period != 182 * 86400
+                    && repeat_period != 365 * 86400
+                    && (!is_test_dc || (repeat_period != 60 && repeat_period != 300))
+                {
+                    return Err((400, "Invalid message repeat period specified".to_owned()));
+                }
+                Ok((send_date, repeat_period))
+            }
+        }
+    }
+
+    /// `MessageSendOptions::check_paid_message_star_count`
+    /// (MessageSendOptions.cpp:102-116).
+    pub fn check_paid_message_star_count(
+        ctx: &dyn SendMessageContext,
+        paid_message_star_count: &mut i64,
+        message_count: i32,
+    ) -> Result<(), (i32, String)> {
+        if *paid_message_star_count < 0 || *paid_message_star_count > 1000000 {
+            return Err((400, "Invalid price for paid message specified".to_owned()));
+        }
+        assert!(message_count > 0);
+        if *paid_message_star_count % i64::from(message_count) != 0 {
+            return Err((400, "Invalid price for paid messages specified".to_owned()));
+        }
+        if *paid_message_star_count > 0 && !ctx.has_owned_star_count(*paid_message_star_count) {
+            return Err((400, "Have not enough Telegram Stars".to_owned()));
+        }
+        *paid_message_star_count /= i64::from(message_count);
+        Ok(())
+    }
+
+    /// `MessageSendOptions::get_message_send_options`
+    /// (MessageSendOptions.cpp:118-184).
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_message_send_options(
+        ctx: &dyn SendMessageContext,
+        dialog_id: DialogId,
+        options: Option<td_api::MessageSendOptions>,
+        allow_update_stickersets_order: bool,
+        allow_effect: bool,
+        allow_suggested_post: bool,
+        allow_repeat_period: bool,
+        message_count: i32,
+    ) -> Result<MessageSendOptions, (i32, String)> {
+        let mut result = MessageSendOptions::default();
+        let Some(options) = options else {
+            return Ok(result);
+        };
+
+        result.disable_notification = options.disable_notification;
+        result.from_background = options.from_background;
+        if allow_update_stickersets_order {
+            result.update_stickersets_order = options.update_order_of_installed_sticker_sets;
+        }
+        if ctx.is_bot() {
+            result.protect_content = options.protect_content;
+            result.allow_paid = options.allow_paid_broadcast;
+        } else {
+            result.paid_message_star_count = options.paid_message_star_count;
+            Self::check_paid_message_star_count(
+                ctx,
+                &mut result.paid_message_star_count,
+                message_count,
+            )?;
+        }
+        result.only_preview = options.only_preview;
+        let (schedule_date, schedule_repeat_period) = Self::get_message_schedule_date(
+            ctx.unix_time(),
+            ctx.is_test_dc(),
+            options.scheduling_state,
+            allow_repeat_period,
+        )?;
+        result.schedule_date = schedule_date;
+        result.schedule_repeat_period = schedule_repeat_period;
+        result.sending_id = options.sending_id;
+
+        if result.schedule_date != 0 {
+            let dialog_type = dialog_id.get_type();
+            if dialog_type == DialogType::SecretChat {
+                return Err((400, "Can't schedule messages in secret chats".to_owned()));
+            }
+            if ctx.is_bot() {
+                return Err((400, "Bots can't send scheduled messages".to_owned()));
+            }
+
+            if result.schedule_date == MESSAGE_SEND_SCHEDULE_WHEN_ONLINE_DATE {
+                if dialog_type != DialogType::User {
+                    return Err((
+                        400,
+                        "Messages can be scheduled till online only in private chats".to_owned(),
+                    ));
+                }
+                if dialog_id == ctx.content_context().get_my_dialog_id() {
+                    return Err((
+                        400,
+                        "Can't scheduled till online messages in chat with self".to_owned(),
+                    ));
+                }
+            }
+            if result.paid_message_star_count > 0 {
+                return Err((400, "Can't schedule paid messages".to_owned()));
+            }
+            if ctx.is_admined_monoforum_channel(dialog_id) {
+                return Err((
+                    400,
+                    "Can't schedule messages in channel direct messages chats".to_owned(),
+                ));
+            }
+        }
+        if options.effect_id != 0 {
+            let dialog_type = dialog_id.get_type();
+            if dialog_type != DialogType::User {
+                return Err((400, "Can't use message effects in the chat".to_owned()));
+            }
+            if !allow_effect {
+                return Err((400, "Can't use message effects in the method".to_owned()));
+            }
+            result.effect_id = MessageEffectId::new(options.effect_id);
+        }
+        let suggested_post = Self::get_suggested_post_info(options.suggested_post_info)?;
+        if let Some(suggested_post) = suggested_post {
+            if !allow_suggested_post {
+                return Err((400, "Can't send suggested posts with the method".to_owned()));
+            }
+            if !ctx
+                .content_context()
+                .is_monoforum_channel(dialog_id.get_channel_id())
+            {
+                return Err((
+                    400,
+                    "Suggested posts can be sent only to channel direct messages".to_owned(),
+                ));
+            }
+            result.suggested_post = Some(suggested_post);
+        }
+
+        Ok(result)
+    }
+
+    /// `SuggestedPost::get_suggested_post(const Td *, td_api::...)`
+    /// (SuggestedPost.cpp:29-40).
+    fn get_suggested_post_info(
+        post: Option<td_api::InputSuggestedPostInfo>,
+    ) -> Result<Option<SuggestedPost>, (i32, String)> {
+        let Some(post) = post else {
+            return Ok(None);
+        };
+        let price = match post.price {
+            Some(td_api::SuggestedPostPrice::suggestedPostPriceStar(price)) => {
+                if price.star_count == 0 {
+                    SuggestedPostPrice::default()
+                } else {
+                    SuggestedPostPrice {
+                        r#type: crate::message_content::SuggestedPostPriceType::Star,
+                        amount: price.star_count,
+                    }
+                }
+            }
+            Some(_) => {
+                // the Gram/TON price arms ride the Wave-2 payment plane
+                SuggestedPostPrice::default()
+            }
+            None => SuggestedPostPrice::default(),
+        };
+        let send_date = post.send_date;
+        if send_date < 0 {
+            return Err((400, "Invalid post send date specified".to_owned()));
+        }
+        Ok(Some(SuggestedPost {
+            price,
+            schedule_date: send_date,
+            is_accepted: false,
+            is_rejected: false,
+        }))
+    }
+
+    /// `MessageSendOptions::can_use_for(const unique_ptr<MessageContent> &,
+    /// MessageSelfDestructType)` (MessageSendOptions.cpp:186-196).
+    pub fn can_use_for(
+        &self,
+        content: &crate::message_content::MessageContent,
+        ttl: &MessageSelfDestructType,
+    ) -> Result<(), (i32, String)> {
+        if self.schedule_date != 0 {
+            if ttl.is_valid() {
+                return Err((
+                    400,
+                    "Can't send scheduled self-destructing messages".to_owned(),
+                ));
+            }
+            if content.get_type() == crate::message_content::MessageContentType::LiveLocation {
+                return Err((
+                    400,
+                    "Can't send scheduled live location messages".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `MessageSendOptions::can_use_for(const InputMessageContent &)`
+    /// (MessageSendOptions.cpp:198-201).
+    pub fn can_use_for_input(
+        &self,
+        content: &crate::message_content::InputMessageContent,
+    ) -> Result<(), (i32, String)> {
+        self.can_use_for(&content.content, &content.ttl)
+    }
+}
+
 /// `MessagesManager::ForwardedMessageInfo` (MessagesManager.h:1160-1165) —
 /// the origin/content triple the cross-chat reply embeds.
 #[derive(Clone, Debug, Default)]
@@ -19723,6 +20026,19 @@ pub struct ForwardedMessageInfo {
 pub trait SendMessageContext: MessageObjectContext {
     /// `G()->unix_time()`.
     fn unix_time(&self) -> i32;
+
+    /// `StarManager::has_owned_star_count(count)`
+    /// (MessageSendOptions.cpp:112-114) — the balance read.
+    fn has_owned_star_count(&self, star_count: i64) -> bool {
+        let _ = star_count;
+        true
+    }
+
+    /// `td_->option_manager_->get_option_boolean("is_premium")`
+    /// (MessagesManager.cpp:21865).
+    fn is_premium(&self) -> bool {
+        false
+    }
 
     /// `ChatManager::get_channel_permissions(channel_id).can_edit_messages()`
     /// (MessagesManager.cpp:23239).
@@ -22263,13 +22579,857 @@ pub fn restore_message_reply_to_message_id(
 /// the wire/files plane: the messages.sendMessage query, the upload
 /// scheduling, the secret-media encryption. It is M.10.9's
 /// `on_message_sent` flip (net + Files owners); M.10.8 trace-logs the call.
-pub fn do_send_message(dialog_id: DialogId, m: &Message) {
-    tracing::info!(
-        "do_send_message seam: {}:{} (random_id {}) — the wire query is [blocked: M.10.9 net/files]",
-        dialog_id.get(),
-        DisplayMessageId(m.message_id),
-        m.random_id
-    );
+pub fn do_send_message(
+    manager: &mut MessagesManager,
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    message_id: MessageId,
+    media_pos: i32,
+    bad_parts: Vec<i32>,
+) -> DoSendAction {
+    let (media_album_id, edit_generation, content) = {
+        let Some(m) = manager
+            .get_dialog(dialog_id)
+            .and_then(|d| d.messages.get(&message_id))
+        else {
+            return DoSendAction::None;
+        };
+        (
+            m.media_album_id,
+            m.edit_generation,
+            m.content.clone().expect("message without content"),
+        )
+    };
+    let m = Message {
+        media_album_id,
+        edit_generation,
+        content: Some(content),
+        message_id,
+        ..Message::default()
+    };
+    let is_edit = m.message_id.is_any_server();
+    let is_secret = dialog_id.get_type() == DialogType::SecretChat;
+
+    // the album fan-in registration
+    if m.media_album_id != 0 && bad_parts.is_empty() && !is_secret && !is_edit {
+        let media_album_id = m.media_album_id;
+        let request = manager
+            .pending_message_group_sends
+            .entry(media_album_id)
+            .or_default();
+        if !request.message_ids.contains(&m.message_id) {
+            request.dialog_id = dialog_id;
+            request.message_ids.push(m.message_id);
+            request.is_finished.push(false);
+            request.results.push(Ok(()));
+        }
+    }
+
+    // the edit plane (`edited_messages_` reads) rides the M.10.5 wiring
+    // ([blocked: M.10.20])
+    let content = m.content.as_ref().expect("message without content");
+    let content_type = content.get_type();
+    if content_type == crate::message_content::MessageContentType::Text {
+        assert!(!is_edit);
+        // `on_text_message_ready_to_send` — the text wire send
+        return DoSendAction::TextReady;
+    }
+
+    if !is_secret {
+        // `get_message_content_need_to_upload_covers` +
+        // `upload_message_covers` — the covers upload (the
+        // MessageQueryManager seam; [blocked: M.12/net])
+    }
+
+    if bad_parts.is_empty() {
+        let file_ids = crate::message_content::get_message_content_any_file_ids(
+            ctx.content_context(),
+            content,
+        );
+        // `get_message_content_thumbnail_file_ids` — [blocked: M.12]: the
+        // per-document-manager thumbnail reads; the photo-class thumbnail
+        // clear rides the same FileView seam
+        let file_upload_ids: Vec<FileUploadId> = file_ids
+            .iter()
+            .map(|&file_id| FileUploadId::new(file_id, 0))
+            .collect();
+        if !is_edit {
+            let upload_ids = file_upload_ids.clone();
+            if let Some(stored) = manager
+                .get_dialog_mut(dialog_id)
+                .and_then(|d| d.messages.get_mut(&message_id))
+            {
+                stored.file_upload_ids = upload_ids;
+            }
+        }
+        if is_secret {
+            // the secret-chat upload arm — `get_message_content_secret_input_media`
+            // and the encrypted resume_upload are the SecretChats/M.12 seams
+            return DoSendAction::SecretUpload {
+                file_upload_id: file_upload_ids.first().copied().unwrap_or_default(),
+            };
+        }
+        let can_have_multiple_files =
+            crate::message_content::can_message_content_have_multiple_files(content_type);
+        // `get_message_content_input_media(...).is_empty()` — the
+        // FileView remote-location read is the M.12 seam; the port always
+        // takes the upload path (the conservative arm)
+        let input_media_is_empty = true;
+        if input_media_is_empty
+            || media_pos >= 0
+            || !bad_parts.is_empty()
+            || can_have_multiple_files
+        {
+            if content_type == crate::message_content::MessageContentType::Game
+                || content_type == crate::message_content::MessageContentType::Story
+            {
+                return DoSendAction::None;
+            }
+            if can_have_multiple_files && bad_parts.is_empty() {
+                debug_assert_eq!(media_pos, -1);
+                let request = manager
+                    .pending_internal_media_sends
+                    .entry(MessageFullId::new(dialog_id, message_id))
+                    .or_default();
+                assert!(request.is_finished.is_empty());
+                request.is_finished.resize(file_upload_ids.len(), false);
+                request
+                    .results
+                    .resize_with(file_upload_ids.len(), || Ok(()));
+            }
+            for (i, &file_upload_id) in file_upload_ids.iter().enumerate() {
+                if media_pos >= 0 && media_pos as usize != i {
+                    continue;
+                }
+                let is_inserted = manager
+                    .being_uploaded_files
+                    .insert(
+                        file_upload_id,
+                        UploadedFileInfo {
+                            message_full_id: MessageFullId::new(dialog_id, message_id),
+                            media_pos: if can_have_multiple_files {
+                                i as i32
+                            } else {
+                                -1
+                            },
+                            edit_generation: m.edit_generation,
+                        },
+                    )
+                    .is_none();
+                assert!(is_inserted);
+                // `td_->file_manager_->resume_upload(...)` — the M.12 seam
+            }
+            if can_have_multiple_files && file_upload_ids.is_empty() {
+                return DoSendAction::InternalMediaGroup;
+            }
+            return DoSendAction::UploadFiles {
+                file_upload_ids,
+                media_pos,
+            };
+        }
+        return DoSendAction::MediaReady;
+    }
+    DoSendAction::UploadFiles {
+        file_upload_ids: Vec::new(),
+        media_pos,
+    }
+}
+
+/// The `do_send_message` upload decision (the C++ void fn's observable
+/// effects) — every variant's wire leg is the net/M.12 seam.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DoSendAction {
+    /// `on_text_message_ready_to_send` — the text wire send.
+    TextReady,
+    /// `upload_message_covers` — the covers upload (recorded above).
+    UploadCovers,
+    /// `resume_upload` per file — the registry inserts happened.
+    UploadFiles {
+        file_upload_ids: Vec<FileUploadId>,
+        media_pos: i32,
+    },
+    /// the secret-chat upload arm.
+    SecretUpload { file_upload_id: FileUploadId },
+    /// `on_message_media_uploaded` with a ready input media.
+    MediaReady,
+    /// `do_send_internal_media_group` directly (no files to upload).
+    InternalMediaGroup,
+    /// nothing to do (Game/Story contents, missing dialogs).
+    None,
+}
+
+/// `MessageTopic::get_message_topic` (MessageTopic.cpp:138-207) — the
+/// td_api-object overload (the message form lives at
+/// [`MessageTopic::new_from_message`]).
+pub fn get_message_topic_from_td_api(
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    topic: Option<&td_api::MessageTopic>,
+) -> Result<MessageTopic, (i32, String)> {
+    let Some(topic) = topic else {
+        return Ok(MessageTopic::default());
+    };
+    if !ctx.have_dialog(dialog_id) {
+        // `have_dialog_force` — the registry form
+        return Err((400, "Chat not found".to_owned()));
+    }
+    let mut result = MessageTopic::default();
+    match topic {
+        td_api::MessageTopic::messageTopicThread(state) => {
+            let top_thread_message_id = MessageId::new(state.message_thread_id);
+            if dialog_id.get_type() != DialogType::Channel
+                || !ctx.is_megagroup_channel(dialog_id.get_channel_id())
+                || ctx
+                    .content_context()
+                    .is_monoforum_channel(dialog_id.get_channel_id())
+            {
+                return Err((400, "Chat doesn't have threads".to_owned()));
+            }
+            if !top_thread_message_id.is_server() {
+                return Err((
+                    400,
+                    "Invalid message thread identifier specified".to_owned(),
+                ));
+            }
+            result.r#type = MessageTopicType::Thread;
+            result.dialog_id = dialog_id;
+            result.top_thread_message_id = top_thread_message_id;
+        }
+        td_api::MessageTopic::messageTopicForum(state) => {
+            let forum_topic_id = ForumTopicId::from_raw(state.forum_topic_id);
+            if !forum_topic_id.is_valid() {
+                return Err((400, "Invalid topic identifier specified".to_owned()));
+            }
+            if !can_be_forum(ctx, dialog_id) {
+                return Err((400, "Chat is not a forum".to_owned()));
+            }
+            result.r#type = MessageTopicType::Forum;
+            result.dialog_id = dialog_id;
+            result.forum_topic_id = forum_topic_id;
+        }
+        td_api::MessageTopic::messageTopicDirectMessages(state) => {
+            if !ctx.is_admined_monoforum_channel(dialog_id) {
+                return Err((
+                    400,
+                    "Chat is not an administered channel direct messages chat".to_owned(),
+                ));
+            }
+            // `SavedMessagesManager::get_topic_id` — the id parse; the
+            // m10.4 readers answer raw ids
+            let saved_messages_topic_id =
+                SavedMessagesTopicId::new(DialogId::new(state.direct_messages_chat_topic_id));
+            if !saved_messages_topic_id.is_valid() {
+                return Err((400, "Topic not found".to_owned()));
+            }
+            result.r#type = MessageTopicType::Monoforum;
+            result.dialog_id = dialog_id;
+            result.saved_messages_topic_id = saved_messages_topic_id;
+        }
+        td_api::MessageTopic::messageTopicSavedMessages(state) => {
+            if dialog_id != ctx.content_context().get_my_dialog_id() {
+                return Err((400, "Chat is not the Saved Messages chat".to_owned()));
+            }
+            let saved_messages_topic_id =
+                SavedMessagesTopicId::new(DialogId::new(state.saved_messages_topic_id));
+            if !saved_messages_topic_id.is_valid() {
+                return Err((400, "Topic not found".to_owned()));
+            }
+            result.r#type = MessageTopicType::SavedMessages;
+            result.dialog_id = dialog_id;
+            result.saved_messages_topic_id = saved_messages_topic_id;
+        }
+    }
+    Ok(result)
+}
+
+/// `MessageTopic::get_send_message_topic(td, dialog_id, topic_id)`
+/// (MessageTopic.cpp:210-214).
+pub fn get_send_message_topic(
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    topic_id: Option<&td_api::MessageTopic>,
+) -> Result<MessageTopic, (i32, String)> {
+    let message_topic = get_message_topic_from_td_api(ctx, dialog_id, topic_id)?;
+    get_send_message_topic_parsed(ctx, dialog_id, message_topic)
+}
+
+/// `MessageTopic::get_send_message_topic(td, dialog_id, MessageTopic &&)`
+/// (MessageTopic.cpp:216-231).
+pub fn get_send_message_topic_parsed(
+    ctx: &dyn MessageObjectContext,
+    dialog_id: DialogId,
+    message_topic: MessageTopic,
+) -> Result<MessageTopic, (i32, String)> {
+    // topic is required in administered direct messages chats
+    if ctx.is_admined_monoforum_channel(dialog_id) && !message_topic.is_monoforum() {
+        return Err((
+            400,
+            "Channel direct messages topic must be specified".to_owned(),
+        ));
+    }
+
+    // in other chats the topic can be specified implicitly
+    if message_topic.is_empty() {
+        return Ok(MessageTopic::default());
+    }
+
+    if message_topic.is_saved_messages() {
+        return Err((
+            400,
+            "Messages can't be explicitly sent to a Saved Messages topic".to_owned(),
+        ));
+    }
+
+    Ok(message_topic)
+}
+
+/// `MessagesManager::process_input_message_content`
+/// (MessagesManager.cpp:21813-21879) — the non-copy arm is complete; the
+/// `inputMessageForwarded` copy leg rides the M.10.11 copy plane (the
+/// validation gates are live).
+pub fn process_input_message_content(
+    ctx: &mut dyn SendMessageContext,
+    // the copy arm's dialog/message reads land with the M.10.11 copy plane
+    _manager: &MessagesManager,
+    dialog_id: DialogId,
+    input_message_content: Option<td_api::InputMessageContent>,
+    check_permissions: bool,
+) -> Result<crate::message_content::InputMessageContent, (i32, String)> {
+    assert!(dialog_id.is_valid());
+    if let Some(td_api::InputMessageContent::inputMessageForwarded(input_message)) =
+        input_message_content
+    {
+        // for sendMessageAlbum/editMessageMedia/addLocalMessage
+        let _ = input_message;
+        // `MessageCopyOptions::get_message_copy_options` gates
+        // (!send_copy → "Can't use forwarded message",
+        // replace_video_start_timestamp → the error) + the copy walk —
+        // the M.10.11 copy plane ([blocked: M.10.20])
+        return Err((
+            500,
+            "The forwarded-content copy arm lands with the M.10.20 wiring".to_owned(),
+        ));
+    }
+    let is_premium = ctx.is_premium();
+    let content = crate::message_content::get_input_message_content(
+        ctx.content_context_mut(),
+        dialog_id,
+        input_message_content.expect("message content must be non-null"),
+        is_premium,
+    )
+    .map_err(|status| (status.code(), status.message().to_owned()))?;
+    crate::message_content::can_send_message_content(
+        ctx.content_context(),
+        dialog_id,
+        &content.content,
+        false,
+        check_permissions,
+    )
+    .map_err(|status| (status.code(), status.message().to_owned()))?;
+    Ok(content)
+}
+
+/// `MessagesManager::send_message_group` (MessagesManager.cpp:21896-21978)
+/// — the album send path: options, the M.9.5 group-content splat gate, the
+/// album id and the per-message send loop.
+#[allow(clippy::too_many_arguments)]
+pub fn send_message_group(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    reactions_ctx: &dyn DialogReactionsContext,
+    ctx: &mut dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    dialog_id: DialogId,
+    topic_id: Option<td_api::MessageTopic>,
+    reply_to: Option<td_api::InputMessageReplyTo>,
+    options: Option<td_api::MessageSendOptions>,
+    input_message_contents: Vec<Option<td_api::InputMessageContent>>,
+) -> Result<td_api::Messages, (i32, String)> {
+    if manager.get_dialog(dialog_id).is_none() {
+        // `get_dialog_force` + the bot paid-broadcast force-create — the
+        // DialogManager info seam
+        if ctx.is_bot()
+            && options
+                .as_ref()
+                .is_some_and(|options| options.allow_paid_broadcast)
+            && dialog_id.get_type() == DialogType::User
+        {
+            // `force_create_dialog` — the M.10.20 wiring
+        }
+        return Err((400, "Chat not found".to_owned()));
+    }
+
+    if input_message_contents.is_empty() {
+        return Err((400, "There are no messages to send".to_owned()));
+    }
+
+    can_send_message(ctx, dialog_id)?;
+
+    let message_send_options = MessageSendOptions::get_message_send_options(
+        ctx,
+        dialog_id,
+        options,
+        true,
+        true,
+        false,
+        false,
+        input_message_contents.len() as i32,
+    )?;
+
+    let mut message_contents: Vec<crate::message_content::InputMessageContent> = Vec::new();
+    for input_message_content in input_message_contents {
+        let message_content = process_input_message_content(
+            ctx,
+            manager,
+            dialog_id,
+            input_message_content,
+            !message_send_options.allow_paid,
+        )?;
+        message_send_options
+            .can_use_for_input(&message_content)
+            .map_err(|status| (status.0, status.1))?;
+        message_contents.push(message_content);
+    }
+    crate::message_content::check_message_group_message_contents(&message_contents)
+        .map_err(|status| (status.code(), status.message().to_owned()))?;
+
+    let topic_id_ref = topic_id.as_ref();
+    let message_topic = get_send_message_topic(ctx, dialog_id, topic_id_ref)?;
+    let input_reply_to =
+        create_message_input_reply_to(ctx, manager, dialog_id, &message_topic, reply_to, false);
+
+    let media_album_id = if message_contents.len() > 1 {
+        generate_new_media_album_id(manager)
+    } else {
+        0
+    };
+
+    // there must be no errors after get_message_to_send calls
+
+    let mut result: Vec<Option<td_api::Message>> = Vec::new();
+    let mut need_update_dialog_pos = false;
+    for (i, message_content) in message_contents.into_iter().enumerate() {
+        let ttl = message_content.ttl;
+        let invert_media = message_content.invert_media;
+        let content = *message_content.content;
+        let message_full_id = get_message_to_send(
+            ctx,
+            global,
+            manager,
+            reactions_ctx,
+            state,
+            dialog_id,
+            &message_topic,
+            input_reply_to.clone(),
+            &message_send_options,
+            content,
+            invert_media,
+            &mut need_update_dialog_pos,
+            i != 0,
+            None,
+            DialogId::default(),
+            false,
+            DialogId::default(),
+            false,
+        );
+        let message_id = message_full_id.get_message_id();
+
+        // take/put-back dance: the object/update builders borrow the
+        // manager while mutating the message
+        let mut m = manager
+            .get_dialog_mut(dialog_id)
+            .and_then(|d| d.messages.remove(&message_id))
+            .expect("get_message_to_send inserted the message");
+        if ttl.is_valid() {
+            m.ttl = ttl;
+            m.is_content_secret =
+                ttl.is_secret_message_content(m.content.as_ref().expect("content").get_type());
+        }
+        m.media_album_id = media_album_id;
+        let obj_ctx: &dyn MessageObjectContext = ctx;
+        let message_object = get_message_object(
+            manager,
+            reactions_ctx,
+            obj_ctx,
+            dialog_id,
+            &mut m,
+            "send_message_group",
+        );
+        result.push(message_object);
+
+        if !message_send_options.only_preview {
+            save_send_message_log_event(global, dialog_id, &mut m);
+            manager
+                .get_dialog_mut(dialog_id)
+                .and_then(|d| d.messages.insert(message_id, m))
+                .expect("get_message_to_send inserted the message");
+            do_send_message(manager, ctx, dialog_id, message_id, -1, Vec::new());
+
+            if !ctx.is_bot() {
+                let mut m = manager
+                    .get_dialog_mut(dialog_id)
+                    .and_then(|d| d.messages.remove(&message_id))
+                    .expect("get_message_to_send inserted the message");
+                send_update_new_message(manager, ctx, state, reactions_ctx, dialog_id, &mut m);
+                manager
+                    .get_dialog_mut(dialog_id)
+                    .and_then(|d| d.messages.insert(message_id, m))
+                    .expect("get_message_to_send inserted the message");
+            }
+        } else {
+            manager
+                .get_dialog_mut(dialog_id)
+                .and_then(|d| d.messages.insert(message_id, m))
+                .expect("get_message_to_send inserted the message");
+        }
+    }
+
+    if need_update_dialog_pos {
+        assert!(!message_send_options.only_preview);
+        send_update_chat_last_message(
+            manager,
+            ctx,
+            state,
+            reactions_ctx,
+            dialog_id,
+            "send_message_group",
+        );
+    }
+
+    Ok(get_messages_object(-1, result, false))
+}
+
+/// `MessagesManager::on_message_media_uploaded`
+/// (MessagesManager.cpp:22198-22230) — the album/single dispatch head.
+pub fn on_message_media_uploaded(
+    manager: &mut MessagesManager,
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    message_id: MessageId,
+    media_pos: i32,
+) -> MediaUploadedAction {
+    let Some(m) = manager
+        .get_dialog(dialog_id)
+        .and_then(|d| d.messages.get(&message_id))
+    else {
+        panic!("on_message_media_uploaded without the message");
+    };
+    let is_edit = message_id.is_any_server();
+    if (!is_edit && m.media_album_id != 0) || media_pos != -1 {
+        // `get_message_content_input_media` + `is_uploaded_input_media` —
+        // the ready-input decision is the M.9/M.12 file-view seam; the
+        // port always routes through the UploadMediaQuery leg
+        let _ = ctx;
+        return MediaUploadedAction::UploadMedia {
+            media_album_id: m.media_album_id,
+            media_pos,
+        };
+    }
+    MediaUploadedAction::DirectSend
+}
+
+/// The `on_message_media_uploaded` dispatch (the C++ void fn's observable
+/// effects).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaUploadedAction {
+    /// `UploadMediaQuery` — the net seam.
+    UploadMedia { media_album_id: i64, media_pos: i32 },
+    /// `do_send_message_media` — the single-message wire send (net seam).
+    DirectSend,
+}
+
+/// `MessagesManager::generate_new_media_album_id`
+/// (MessagesManager.cpp:21883-21889).
+pub fn generate_new_media_album_id(mm: &MessagesManager) -> i64 {
+    loop {
+        let media_album_id = tdutils::random::secure_int64();
+        if media_album_id < 0 && !mm.pending_message_group_sends.contains_key(&media_album_id) {
+            return media_album_id;
+        }
+    }
+}
+
+/// `MessagesManager::on_upload_message_media_file_error`
+/// (MessagesManager.cpp:22435-22458) — the retry re-entry.
+pub fn on_upload_message_media_file_error(
+    manager: &mut MessagesManager,
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    message_id: MessageId,
+    media_pos: i32,
+    edit_generation: u64,
+    bad_parts: Vec<i32>,
+) -> DoSendAction {
+    let Some(m) = manager
+        .get_dialog(dialog_id)
+        .and_then(|d| d.messages.get(&message_id))
+    else {
+        // the message has already been deleted by the user or sent to an
+        // inaccessible chat
+        return DoSendAction::None;
+    };
+    let is_edit = message_id.is_any_server();
+    if is_edit && m.edit_generation != edit_generation {
+        return DoSendAction::None;
+    }
+    if !ctx.have_input_peer_read(dialog_id, true) {
+        // the message should be deleted soon
+        return DoSendAction::None;
+    }
+    assert!(dialog_id.get_type() != DialogType::SecretChat);
+    do_send_message(manager, ctx, dialog_id, message_id, media_pos, bad_parts)
+}
+
+/// `MessagesManager::on_upload_message_media_fail`
+/// (MessagesManager.cpp:22460-22484) — the failure fan-in.
+pub fn on_upload_message_media_fail(
+    manager: &mut MessagesManager,
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    message_id: MessageId,
+    media_pos: i32,
+    edit_generation: u64,
+    error: (i32, String),
+) -> UploadFinishedAction {
+    let Some(m) = manager
+        .get_dialog(dialog_id)
+        .and_then(|d| d.messages.get(&message_id))
+    else {
+        return UploadFinishedAction::None;
+    };
+    let is_edit = message_id.is_any_server();
+    if is_edit && m.edit_generation != edit_generation {
+        return UploadFinishedAction::None;
+    }
+    if !ctx.have_input_peer_read(dialog_id, true) {
+        return UploadFinishedAction::None;
+    }
+    assert!(dialog_id.get_type() != DialogType::SecretChat);
+    let media_album_id = m.media_album_id;
+    on_upload_message_media_finished(
+        manager,
+        media_album_id,
+        dialog_id,
+        message_id,
+        media_pos,
+        edit_generation,
+        Err(error),
+    )
+}
+
+/// The `on_upload_message_media_finished` outcome.
+#[derive(Clone, Debug, PartialEq)]
+pub enum UploadFinishedAction {
+    /// nothing to do (unknown group, duplicate completion, generation
+    /// mismatch).
+    None,
+    /// `do_send_internal_media_group` for the message.
+    InternalMediaGroup,
+    /// the album completed (or failed early) — `do_send_message_group`.
+    Group(i64),
+}
+
+/// `MessagesManager::on_upload_message_media_finished`
+/// (MessagesManager.cpp:22486-22578) — the upload fan-in state machine over
+/// both pending tables.
+pub fn on_upload_message_media_finished(
+    manager: &mut MessagesManager,
+    media_album_id: i64,
+    dialog_id: DialogId,
+    message_id: MessageId,
+    media_pos: i32,
+    edit_generation: u64,
+    result: Result<(), (i32, String)>,
+) -> UploadFinishedAction {
+    let message_full_id = MessageFullId::new(dialog_id, message_id);
+    if media_pos >= 0 {
+        assert_eq!(media_album_id, 0);
+        if !manager
+            .pending_internal_media_sends
+            .contains_key(&message_full_id)
+        {
+            // the message may be already sent or failed to be sent
+            return UploadFinishedAction::None;
+        }
+        let is_edit = message_id.is_any_server();
+        let generation_matches = manager
+            .get_dialog(dialog_id)
+            .and_then(|d| d.messages.get(&message_id))
+            .is_some_and(|m| !is_edit || m.edit_generation == edit_generation);
+        if !generation_matches {
+            // the message edit generation doesn't match
+            return UploadFinishedAction::None;
+        }
+        let request = manager
+            .pending_internal_media_sends
+            .get_mut(&message_full_id)
+            .unwrap();
+        debug_assert!((media_pos as usize) < request.is_finished.len());
+        if request.is_finished[media_pos as usize] {
+            // already finished
+            return UploadFinishedAction::None;
+        }
+        request.results[media_pos as usize] = result;
+        request.is_finished[media_pos as usize] = true;
+        request.finished_count += 1;
+
+        if request.finished_count == request.results.len()
+            || request.results[media_pos as usize].is_err()
+        {
+            return UploadFinishedAction::InternalMediaGroup;
+        }
+        return UploadFinishedAction::None;
+    }
+    assert!(media_album_id < 0);
+    let Some(request) = manager.pending_message_group_sends.get_mut(&media_album_id) else {
+        // the group may be already sent or failed to be sent
+        return UploadFinishedAction::None;
+    };
+    assert!(request.dialog_id == dialog_id);
+    let Some(pos) = request.message_ids.iter().position(|&id| id == message_id) else {
+        // the message may be already deleted and the album recreated
+        // without it
+        assert!(message_id.is_yet_unsent());
+        return UploadFinishedAction::None;
+    };
+    if request.is_finished[pos] {
+        // already finished
+        return UploadFinishedAction::None;
+    }
+    request.results[pos] = result;
+    request.is_finished[pos] = true;
+    request.finished_count += 1;
+
+    if request.finished_count == request.results.len() || request.results[pos].is_err() {
+        // the C++ ready-to-send promise chain collapses to the direct
+        // group send (`on_media_message_ready_to_send` is the M.10.20
+        // wiring point)
+        return UploadFinishedAction::Group(media_album_id);
+    }
+    UploadFinishedAction::None
+}
+
+/// The `do_send_message_group` wire request record — the
+/// `SendMultiMediaQuery` send is the net seam ([blocked: net]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GroupSendWireRequest {
+    pub dialog_id: DialogId,
+    pub random_ids: Vec<i64>,
+    pub message_count: usize,
+    pub is_copy: bool,
+    pub paid_message_star_count: i64,
+}
+
+/// The `do_send_message_group` outcome.
+#[derive(Clone, Debug, PartialEq)]
+pub enum GroupSendOutcome {
+    /// the group completed — the wire request record.
+    Sent(GroupSendWireRequest),
+    /// nothing to do (unknown group).
+    None,
+    /// the group failed — `on_send_message_fail` fired per random id.
+    Failed,
+}
+
+/// `begin_send_message` over the stored message — the
+/// `do_send_message_group` walk form (the borrow-splitting twin of
+/// [`begin_send_message`], same body).
+fn begin_send_message_in_dialog(
+    manager: &mut MessagesManager,
+    dialog_id: DialogId,
+    message_id: MessageId,
+) -> i64 {
+    let random_id = manager
+        .get_dialog(dialog_id)
+        .and_then(|d| d.messages.get(&message_id))
+        .expect("begin_send_message_in_dialog: message gone")
+        .random_id;
+    assert!(random_id != 0);
+    assert!(message_id.is_yet_unsent());
+    let is_inserted = manager
+        .being_sent_messages
+        .insert(random_id, MessageFullId::new(dialog_id, message_id))
+        .is_none();
+    assert!(is_inserted);
+    random_id
+}
+
+/// `MessagesManager::do_send_message_group` (MessagesManager.cpp:22580-22700)
+/// — the album assembly: skip deleted messages, aggregate the results,
+/// allocate the random ids and either fail every message or record the
+/// `SendMultiMediaQuery`. The per-message inputSingleMedia assembly (the
+/// input media + caption entities) and the wire send are the net/M.12
+/// seams.
+pub fn do_send_message_group(
+    global: &mut crate::global::Global,
+    manager: &mut MessagesManager,
+    ctx: &mut dyn SendMessageContext,
+    state: &mut dyn ReadStateContext,
+    media_album_id: i64,
+) -> GroupSendOutcome {
+    assert!(media_album_id < 0);
+    let Some(request) = manager.pending_message_group_sends.get(&media_album_id) else {
+        // the group may be already sent or failed to be sent
+        return GroupSendOutcome::None;
+    };
+    let dialog_id = request.dialog_id;
+    let message_ids = request.message_ids.clone();
+    let results = request.results.clone();
+    let is_finished = request.is_finished.clone();
+
+    let default_status = can_send_message(ctx, dialog_id);
+    let mut success = default_status.is_ok();
+    let mut random_ids: Vec<i64> = Vec::new();
+    let mut is_copy = false;
+    let mut paid_message_star_count = 0i64;
+    for (i, &message_id) in message_ids.iter().enumerate() {
+        let Some(m) = manager
+            .get_dialog(dialog_id)
+            .and_then(|d| d.messages.get(&message_id))
+        else {
+            // skip deleted messages
+            random_ids.push(0);
+            continue;
+        };
+        is_copy = m.is_copy;
+        paid_message_star_count += m.paid_message_star_count;
+        let message_id = m.message_id;
+
+        let random_id = begin_send_message_in_dialog(manager, dialog_id, message_id);
+        random_ids.push(random_id);
+
+        if results[i].is_err() || !is_finished[i] {
+            success = false;
+        }
+    }
+
+    if !success {
+        let default_error = default_status
+            .err()
+            .unwrap_or_else(|| (400, "Group send failed".to_owned()));
+        for (i, &random_id) in random_ids.iter().enumerate() {
+            if random_id != 0 {
+                let error = results[i]
+                    .clone()
+                    .err()
+                    .unwrap_or_else(|| default_error.clone());
+                on_send_message_fail(global, manager, ctx, state, random_id, error.0, &error.1);
+            }
+        }
+        manager.pending_message_group_sends.remove(&media_album_id);
+        return GroupSendOutcome::Failed;
+    }
+    manager.pending_message_group_sends.remove(&media_album_id);
+
+    // the SendMultiMediaQuery assembly (flags, reply/topic, per-message
+    // inputSingleMedia) — the net seam
+    GroupSendOutcome::Sent(GroupSendWireRequest {
+        dialog_id,
+        random_ids,
+        message_count: message_ids.len(),
+        is_copy,
+        paid_message_star_count,
+    })
 }
 
 /// `MessagesManager::continue_send_message` (MessagesManager.cpp:35882-35941)
@@ -22479,11 +23639,18 @@ pub fn replay_send_message_log_event(
     );
     if let Some(result_full_id) = result_full_id {
         // uses send_closure_later internally
-        let result_message = manager
+        manager
             .get_dialog(dialog_id)
             .and_then(|d| get_message_in_dialog(d, result_full_id.get_message_id()))
             .expect("replayed message vanished");
-        do_send_message(dialog_id, result_message);
+        do_send_message(
+            manager,
+            ctx,
+            dialog_id,
+            result_full_id.get_message_id(),
+            -1,
+            Vec::new(),
+        );
         // `send_update_new_message` (35984) — the update plane is the M.10.9
         // seam; the pos update (35985-35987) is the M.10.12 seam
         tracing::info!(
@@ -31887,6 +33054,7 @@ mod tests {
         have_input_peer_answer: bool,
         ignore_default_disable_notification: bool,
         unix_time: i32,
+        owned_stars: i64,
     }
 
     impl Default for SendTestContext {
@@ -31907,6 +33075,7 @@ mod tests {
                 have_input_peer_answer: true,
                 ignore_default_disable_notification: false,
                 unix_time: 1_700_000_000,
+                owned_stars: i64::MAX,
             }
         }
     }
@@ -32062,6 +33231,10 @@ mod tests {
     }
 
     impl SendMessageContext for SendTestContext {
+        fn has_owned_star_count(&self, star_count: i64) -> bool {
+            star_count <= self.owned_stars
+        }
+
         fn unix_time(&self) -> i32 {
             self.unix_time
         }
@@ -33372,13 +34545,12 @@ mod tests {
                 }
                 global.td_db().binlog().force_flush();
                 do_send_message(
+                    &mut manager,
+                    &ctx,
                     dialog_id,
-                    manager
-                        .get_dialog(dialog_id)
-                        .unwrap()
-                        .messages
-                        .get(&full_id.get_message_id())
-                        .unwrap(),
+                    full_id.get_message_id(),
+                    -1,
+                    Vec::new(),
                 );
 
                 // the durable in-memory state before the crash window
@@ -34722,5 +35894,423 @@ mod tests {
             preload_folder_dialog_list(&mut state, &mut mm, folder_id),
             FolderLoadAction::FromServer { .. }
         ));
+    }
+
+    // -------------------------------------------------------------------
+    // M.10.19 — the media send glue
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn m10_19_schedule_date_table() {
+        use td_api::MessageSchedulingState as M;
+
+        let now = 1700000000;
+        // null state
+        assert_eq!(
+            MessageSendOptions::get_message_schedule_date(now, false, None, false),
+            Ok((0, 0))
+        );
+        // video processing can't be forced
+        assert_eq!(
+            MessageSendOptions::get_message_schedule_date(
+                now,
+                false,
+                Some(M::messageSchedulingStateSendWhenVideoProcessed(
+                    td_api::messageSchedulingStateSendWhenVideoProcessed { send_date: 0 },
+                )),
+                false
+            ),
+            Err((400, "Can't force video processing".to_owned()))
+        );
+        // till online
+        assert_eq!(
+            MessageSendOptions::get_message_schedule_date(
+                now,
+                false,
+                Some(M::messageSchedulingStateSendWhenOnline(
+                    td_api::messageSchedulingStateSendWhenOnline,
+                )),
+                false
+            ),
+            Ok((2147483646, 0))
+        );
+        let at = |date, repeat| {
+            Some(M::messageSchedulingStateSendAtDate(
+                td_api::messageSchedulingStateSendAtDate {
+                    send_date: date,
+                    repeat_period: repeat,
+                },
+            ))
+        };
+        // near-past dates send now
+        assert_eq!(
+            MessageSendOptions::get_message_schedule_date(now, false, at(now + 5, 0), false),
+            Ok((0, 0))
+        );
+        // invalid dates
+        assert_eq!(
+            MessageSendOptions::get_message_schedule_date(now, false, at(0, 0), false),
+            Err((400, "Invalid send date specified".to_owned()))
+        );
+        assert_eq!(
+            MessageSendOptions::get_message_schedule_date(
+                now,
+                false,
+                at(now + 368 * 86400, 0),
+                false
+            ),
+            Err((400, "Send date is too far in the future".to_owned()))
+        );
+        // repeat periods
+        assert_eq!(
+            MessageSendOptions::get_message_schedule_date(now, false, at(now + 86400, 60), false),
+            Err((
+                400,
+                "Repeated scheduled messages aren't supported".to_owned()
+            ))
+        );
+        assert_eq!(
+            MessageSendOptions::get_message_schedule_date(now, false, at(now + 86400, 60), true),
+            Err((400, "Invalid message repeat period specified".to_owned()))
+        );
+        // the test-dc-only 60/300 second periods
+        assert_eq!(
+            MessageSendOptions::get_message_schedule_date(now, true, at(now + 86400, 60), true),
+            Ok((now + 86400, 60))
+        );
+        assert_eq!(
+            MessageSendOptions::get_message_schedule_date(now, false, at(now + 86400, 86400), true),
+            Ok((now + 86400, 86400))
+        );
+    }
+
+    #[test]
+    fn m10_19_paid_star_count_table() {
+        let ctx = SendTestContext {
+            owned_stars: 100,
+            ..SendTestContext::default()
+        };
+
+        let mut stars = 100i64;
+        assert_eq!(
+            MessageSendOptions::check_paid_message_star_count(&ctx, &mut stars, 2),
+            Ok(())
+        );
+        assert_eq!(stars, 50);
+        let mut stars = 3i64;
+        assert_eq!(
+            MessageSendOptions::check_paid_message_star_count(&ctx, &mut stars, 2),
+            Err((400, "Invalid price for paid messages specified".to_owned()))
+        );
+        let mut stars = -1i64;
+        assert_eq!(
+            MessageSendOptions::check_paid_message_star_count(&ctx, &mut stars, 1),
+            Err((400, "Invalid price for paid message specified".to_owned()))
+        );
+        // the balance gate (100 owned)
+        let mut stars = 200i64;
+        assert_eq!(
+            MessageSendOptions::check_paid_message_star_count(&ctx, &mut stars, 1),
+            Err((400, "Have not enough Telegram Stars".to_owned()))
+        );
+    }
+
+    #[test]
+    fn m10_19_album_upload_fan_in() {
+        let ctx = SendTestContext::default();
+        let mut manager = MessagesManager::new();
+        let dialog_id = DialogId::from_user_id(UserId::new(10));
+        let album_id = -77i64;
+
+        // two album messages registered through do_send_message (distinct
+        // yet-unsent local ids)
+        for i in 0..2i64 {
+            let message_id = MessageId::new(MessageId::min().get() + 8 * i);
+            manager.add_dialog_for_new_message(dialog_id);
+            let d = manager.get_dialog_mut(dialog_id).unwrap();
+            let mut m = Box::new(m10_10_editable_message(1, true));
+            m.message_id = message_id;
+            m.random_id = 500 + i;
+            m.media_album_id = album_id;
+            m.content = Some(crate::message_content::MessageContent::Photo(
+                Default::default(),
+            ));
+            d.messages.insert(message_id, m);
+            let action = do_send_message(&mut manager, &ctx, dialog_id, message_id, -1, Vec::new());
+            assert!(matches!(action, DoSendAction::UploadFiles { .. }));
+        }
+        let (first_id, second_id) = {
+            let request = manager.pending_message_group_sends.get(&album_id).unwrap();
+            assert_eq!(request.message_ids.len(), 2);
+            assert_eq!(request.finished_count, 0);
+            (request.message_ids[0], request.message_ids[1])
+        };
+
+        // the first completion keeps the group pending
+        assert_eq!(
+            on_upload_message_media_finished(
+                &mut manager,
+                album_id,
+                dialog_id,
+                first_id,
+                -1,
+                0,
+                Ok(()),
+            ),
+            UploadFinishedAction::None
+        );
+        // a duplicate completion is a no-op
+        assert_eq!(
+            on_upload_message_media_finished(
+                &mut manager,
+                album_id,
+                dialog_id,
+                first_id,
+                -1,
+                0,
+                Ok(()),
+            ),
+            UploadFinishedAction::None
+        );
+        // an unknown message id is skipped
+        assert_eq!(
+            on_upload_message_media_finished(
+                &mut manager,
+                album_id,
+                dialog_id,
+                MessageId::min(),
+                -1,
+                0,
+                Ok(()),
+            ),
+            UploadFinishedAction::None
+        );
+
+        // the second completion fires the group
+        assert_eq!(
+            on_upload_message_media_finished(
+                &mut manager,
+                album_id,
+                dialog_id,
+                second_id,
+                -1,
+                0,
+                Ok(()),
+            ),
+            UploadFinishedAction::Group(album_id)
+        );
+
+        // an early error fires the group too
+        manager.pending_message_group_sends.insert(
+            -88,
+            PendingMessageGroupSend {
+                dialog_id,
+                message_ids: vec![MessageId::min()],
+                is_finished: vec![false],
+                results: vec![Ok(())],
+                finished_count: 0,
+            },
+        );
+        assert_eq!(
+            on_upload_message_media_finished(
+                &mut manager,
+                -88,
+                dialog_id,
+                MessageId::min(),
+                -1,
+                0,
+                Err((400, "Failed to upload file".to_owned())),
+            ),
+            UploadFinishedAction::Group(-88)
+        );
+    }
+
+    #[test]
+    fn m10_19_group_send_walk() {
+        let mut ctx = SendTestContext::default();
+        let mut state = ReadStateTestContext::default();
+        let mut manager = MessagesManager::new();
+        let mut global = crate::global::Global::default();
+        let dialog_id = DialogId::from_user_id(UserId::new(10));
+        manager.add_dialog_for_new_message(dialog_id);
+
+        // the group table with one finishing error
+        let message_ids: Vec<MessageId> = (0..2i64)
+            .map(|i| MessageId::new(MessageId::min().get() + 8 * i))
+            .collect();
+        for (i, &message_id) in message_ids.iter().enumerate() {
+            let d = manager.get_dialog_mut(dialog_id).unwrap();
+            let mut m = Box::new(m10_10_editable_message(1, true));
+            m.message_id = message_id;
+            m.random_id = 1000 + i as i64;
+            m.media_album_id = -42;
+            m.content = Some(crate::message_content::MessageContent::Photo(
+                Default::default(),
+            ));
+            let old_last = d.last_message_id;
+            d.ordered_messages
+                .insert(message_id, true, old_last, "test");
+            d.messages.insert(message_id, m);
+        }
+        manager.pending_message_group_sends.insert(
+            -42,
+            PendingMessageGroupSend {
+                dialog_id,
+                message_ids: message_ids.clone(),
+                is_finished: vec![true, true],
+                results: vec![Ok(()), Err((400, "Failed to upload file".to_owned()))],
+                finished_count: 2,
+            },
+        );
+        assert_eq!(
+            do_send_message_group(&mut global, &mut manager, &mut ctx, &mut state, -42),
+            GroupSendOutcome::Failed
+        );
+        assert!(manager.pending_message_group_sends.is_empty());
+        // the failed message dropped out of the being-sent registry
+        assert!(!manager.being_sent_messages.contains_key(&1001));
+
+        // the success walk records the wire request
+        manager.pending_message_group_sends.insert(
+            -43,
+            PendingMessageGroupSend {
+                dialog_id,
+                message_ids: message_ids.clone(),
+                is_finished: vec![true, true],
+                results: vec![Ok(()), Ok(())],
+                finished_count: 2,
+            },
+        );
+        match do_send_message_group(&mut global, &mut manager, &mut ctx, &mut state, -43) {
+            GroupSendOutcome::Sent(request) => {
+                assert_eq!(request.dialog_id, dialog_id);
+                assert_eq!(request.random_ids.len(), 2);
+                assert_eq!(request.message_count, 2);
+            }
+            other => panic!("expected Sent, got {other:?}"),
+        }
+
+        // an unknown album is a no-op
+        assert_eq!(
+            do_send_message_group(&mut global, &mut manager, &mut ctx, &mut state, -99),
+            GroupSendOutcome::None
+        );
+    }
+
+    #[test]
+    fn m10_19_send_message_group_gates() {
+        let mut ctx = SendTestContext::default();
+        let mut state = ReadStateTestContext::default();
+        let mut manager = MessagesManager::new();
+        let mut global = crate::global::Global::default();
+        let reactions_ctx = NoDialogReactionsContext;
+        let dialog_id = DialogId::from_user_id(UserId::new(10));
+
+        // no dialog
+        assert_eq!(
+            send_message_group(
+                &mut global,
+                &mut manager,
+                &reactions_ctx,
+                &mut ctx,
+                &mut state,
+                dialog_id,
+                None,
+                None,
+                None,
+                vec![Some(td_api::InputMessageContent::inputMessageText(
+                    td_api::inputMessageText {
+                        text: None,
+                        link_preview_options: None,
+                        clear_draft: false,
+                    },
+                ))],
+            ),
+            Err((400, "Chat not found".to_owned()))
+        );
+
+        manager.add_dialog_for_new_message(dialog_id);
+
+        // empty contents
+        assert_eq!(
+            send_message_group(
+                &mut global,
+                &mut manager,
+                &reactions_ctx,
+                &mut ctx,
+                &mut state,
+                dialog_id,
+                None,
+                None,
+                None,
+                Vec::new(),
+            ),
+            Err((400, "There are no messages to send".to_owned()))
+        );
+
+        // a text album is rejected by the M.9.5 splat gate
+        let text = || {
+            Some(td_api::InputMessageContent::inputMessageText(
+                td_api::inputMessageText {
+                    text: Some(td_api::FormattedText {
+                        text: "x".to_owned(),
+                        entities: Vec::new(),
+                    }),
+                    link_preview_options: None,
+                    clear_draft: false,
+                },
+            ))
+        };
+        let error = send_message_group(
+            &mut global,
+            &mut manager,
+            &reactions_ctx,
+            &mut ctx,
+            &mut state,
+            dialog_id,
+            None,
+            None,
+            None,
+            vec![text(), text()],
+        );
+        assert_eq!(error.unwrap_err().0, 400);
+    }
+
+    #[test]
+    fn m10_19_send_topic_gates() {
+        let mut ctx = SendTestContext::default();
+        let dialog_id = DialogId::from_user_id(UserId::new(7));
+        ctx.inner.known_dialogs.insert(dialog_id);
+
+        // the default (no topic) passes implicitly
+        assert_eq!(
+            get_send_message_topic(&ctx, dialog_id, None),
+            Ok(MessageTopic::default())
+        );
+        // a thread in a non-channel
+        let topic = td_api::MessageTopic::messageTopicThread(td_api::messageTopicThread {
+            message_thread_id: 100,
+        });
+        assert_eq!(
+            get_send_message_topic(&ctx, dialog_id, Some(&topic)),
+            Err((400, "Chat doesn't have threads".to_owned()))
+        );
+        // an invalid forum topic id
+        let topic = td_api::MessageTopic::messageTopicForum(td_api::messageTopicForum {
+            forum_topic_id: 0,
+        });
+        assert_eq!(
+            get_send_message_topic(&ctx, dialog_id, Some(&topic)),
+            Err((400, "Invalid topic identifier specified".to_owned()))
+        );
+        // an unknown chat with an explicit topic
+        let other = DialogId::from_user_id(UserId::new(8));
+        let topic = td_api::MessageTopic::messageTopicForum(td_api::messageTopicForum {
+            forum_topic_id: 1,
+        });
+        assert_eq!(
+            get_send_message_topic(&ctx, other, Some(&topic)),
+            Err((400, "Chat not found".to_owned()))
+        );
     }
 }
