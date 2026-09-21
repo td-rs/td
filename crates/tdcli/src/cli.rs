@@ -2271,6 +2271,38 @@ impl CliClient {
         }
     }
 
+    /// `CliClient::as_supergroup_id` (cli.cpp:724).
+    fn as_supergroup_id(&self, s: &str) -> i64 {
+        let s = trim_td(s);
+        let s = s.strip_prefix('@').unwrap_or(s);
+        if s.as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_alphabetic())
+        {
+            return self
+                .username_to_supergroup_id
+                .lock()
+                .unwrap()
+                .get(&to_lower(s))
+                .copied()
+                .unwrap_or(0);
+        }
+        let mut result = tokenizer::to_integer_i64(s);
+        if s == "." {
+            result = self.opened_chat_id.load(Ordering::SeqCst);
+        }
+        const SHIFT: i64 = -1_000_000_000_000;
+        if result <= SHIFT {
+            return SHIFT - result;
+        }
+        result
+    }
+
+    /// `as_custom_emoji_id` (cli.cpp:926).
+    fn as_custom_emoji_id(&self, s: &str) -> i64 {
+        tokenizer::to_integer_i64(trim_td(s))
+    }
+
     /// `CliClient::as_chat_ids` (cli.cpp:577).
     fn as_chat_ids(&self, s: &str) -> Vec<i64> {
         autosplit(s).iter().map(|t| self.as_chat_id(t)).collect()
@@ -5281,8 +5313,645 @@ impl CliClient {
         }
     }
 
-    fn op_block_media(&self, _op: &str, _args: &str) -> bool {
-        false
+    /// cli.cpp:7650 — the member-status/profile/supergroup-toggle chain
+    /// (census chain 15). The `scms` status spell carries the full
+    /// administrator-rights/permissions tables.
+    fn op_block_media(&self, op: &str, args: &str) -> bool {
+        if op == "scms" {
+            let (chat_id, member_id, status_str) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            let admin_rights = |anonymous: bool, mask: [bool; 18]| {
+                as_chat_administrator_rights(
+                    mask[0], mask[1], mask[2], mask[3], mask[4], mask[5], mask[6], mask[7],
+                    mask[8], mask[9], mask[10], mask[11], mask[12], mask[13], mask[14], mask[15],
+                    mask[16], anonymous,
+                )
+            };
+            let status = match status_str.as_str() {
+                "member" => Some(td_api::ChatMemberStatus::chatMemberStatusMember(
+                    td_api::chatMemberStatusMember {
+                        member_until_date: 0,
+                    },
+                )),
+                "left" => Some(td_api::ChatMemberStatus::chatMemberStatusLeft(
+                    td_api::chatMemberStatusLeft,
+                )),
+                "banned" => Some(td_api::ChatMemberStatus::chatMemberStatusBanned(
+                    td_api::chatMemberStatusBanned {
+                        banned_until_date: i32::MAX,
+                    },
+                )),
+                "creator" => Some(td_api::ChatMemberStatus::chatMemberStatusCreator(
+                    td_api::chatMemberStatusCreator {
+                        is_anonymous: false,
+                        is_member: true,
+                    },
+                )),
+                "creatoranon" => Some(td_api::ChatMemberStatus::chatMemberStatusCreator(
+                    td_api::chatMemberStatusCreator {
+                        is_anonymous: true,
+                        is_member: true,
+                    },
+                )),
+                "uncreator" => Some(td_api::ChatMemberStatus::chatMemberStatusCreator(
+                    td_api::chatMemberStatusCreator {
+                        is_anonymous: false,
+                        is_member: false,
+                    },
+                )),
+                "anonadmin" => Some(td_api::ChatMemberStatus::chatMemberStatusAdministrator(
+                    td_api::chatMemberStatusAdministrator {
+                        can_be_edited: true,
+                        rights: Some(admin_rights(true, [true; 18])),
+                    },
+                )),
+                "anon" => {
+                    let mut mask = [false; 18];
+                    mask[17] = true;
+                    Some(td_api::ChatMemberStatus::chatMemberStatusAdministrator(
+                        td_api::chatMemberStatusAdministrator {
+                            can_be_edited: false,
+                            rights: Some(admin_rights(false, mask)),
+                        },
+                    ))
+                }
+                "addadmin" => {
+                    let mut mask = [false; 18];
+                    mask[9] = true;
+                    Some(td_api::ChatMemberStatus::chatMemberStatusAdministrator(
+                        td_api::chatMemberStatusAdministrator {
+                            can_be_edited: false,
+                            rights: Some(admin_rights(false, mask)),
+                        },
+                    ))
+                }
+                "calladmin" => {
+                    let mut mask = [false; 18];
+                    mask[10] = true;
+                    Some(td_api::ChatMemberStatus::chatMemberStatusAdministrator(
+                        td_api::chatMemberStatusAdministrator {
+                            can_be_edited: false,
+                            rights: Some(admin_rights(false, mask)),
+                        },
+                    ))
+                }
+                "admin" | "adminq" => {
+                    let mut mask = [false; 18];
+                    mask[1] = true;
+                    mask[2] = true;
+                    mask[3] = true;
+                    mask[4] = true;
+                    mask[5] = true;
+                    mask[6] = true;
+                    mask[7] = true;
+                    mask[8] = true;
+                    mask[9] = true;
+                    mask[10] = true;
+                    mask[11] = true;
+                    mask[12] = true;
+                    mask[13] = true;
+                    mask[14] = true;
+                    mask[15] = true;
+                    mask[16] = true;
+                    Some(td_api::ChatMemberStatus::chatMemberStatusAdministrator(
+                        td_api::chatMemberStatusAdministrator {
+                            can_be_edited: true,
+                            rights: Some(admin_rights(false, mask)),
+                        },
+                    ))
+                }
+                "minadmin" => {
+                    let mut mask = [false; 18];
+                    mask[0] = true;
+                    Some(td_api::ChatMemberStatus::chatMemberStatusAdministrator(
+                        td_api::chatMemberStatusAdministrator {
+                            can_be_edited: true,
+                            rights: Some(admin_rights(false, mask)),
+                        },
+                    ))
+                }
+                "unadmin" => Some(td_api::ChatMemberStatus::chatMemberStatusAdministrator(
+                    td_api::chatMemberStatusAdministrator {
+                        can_be_edited: true,
+                        rights: None,
+                    },
+                )),
+                "rest" => {
+                    let until = 120 + time::now() as i32;
+                    Some(td_api::ChatMemberStatus::chatMemberStatusRestricted(
+                        td_api::chatMemberStatusRestricted {
+                            is_member: true,
+                            restricted_until_date: until,
+                            permissions: Some(chat_permissions([false; 16])),
+                        },
+                    ))
+                }
+                "restkick" => {
+                    let until = 120 + time::now() as i32;
+                    let mut perm = [false; 16];
+                    perm[0] = true;
+                    Some(td_api::ChatMemberStatus::chatMemberStatusRestricted(
+                        td_api::chatMemberStatusRestricted {
+                            is_member: false,
+                            restricted_until_date: until,
+                            permissions: Some(chat_permissions(perm)),
+                        },
+                    ))
+                }
+                "restunkick" => {
+                    let until = 120 + time::now() as i32;
+                    let mut perm = [false; 16];
+                    perm[0] = true;
+                    Some(td_api::ChatMemberStatus::chatMemberStatusRestricted(
+                        td_api::chatMemberStatusRestricted {
+                            is_member: true,
+                            restricted_until_date: until,
+                            permissions: Some(chat_permissions(perm)),
+                        },
+                    ))
+                }
+                "unrest" => Some(td_api::ChatMemberStatus::chatMemberStatusRestricted(
+                    td_api::chatMemberStatusRestricted {
+                        is_member: true,
+                        restricted_until_date: 0,
+                        permissions: Some(chat_permissions([true; 16])),
+                    },
+                )),
+                _ => None,
+            };
+            if let Some(status) = status {
+                self.send_request(Function::setChatMemberStatus(td_api::setChatMemberStatus {
+                    chat_id: self.as_chat_id(&chat_id),
+                    member_id: self.as_message_sender(&member_id),
+                    status: Some(status),
+                }));
+            } else {
+                tdutils::log_error!("Unknown status \"{}\"", status_str);
+            }
+            true
+        } else if op == "scmt" {
+            let (chat_id, user_id, tag) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::setChatMemberTag(td_api::setChatMemberTag {
+                chat_id: self.as_chat_id(&chat_id),
+                user_id: self.as_user_id(&user_id),
+                tag,
+            }));
+            true
+        } else if op == "cto" {
+            self.send_request(Function::canTransferOwnership(td_api::canTransferOwnership));
+            true
+        } else if op == "transferChatOwnership" {
+            let (chat_id, user_id, password) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::transferChatOwnership(
+                td_api::transferChatOwnership {
+                    chat_id: self.as_chat_id(&chat_id),
+                    user_id: self.as_user_id(&user_id),
+                    password,
+                },
+            ));
+            true
+        } else if op == "gcoal" {
+            self.send_request(Function::getChatOwnerAfterLeaving(
+                td_api::getChatOwnerAfterLeaving {
+                    chat_id: self.as_chat_id(args),
+                },
+            ));
+            true
+        } else if op == "log" {
+            let (chat_id, limit, user_ids) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::getChatEventLog(td_api::getChatEventLog {
+                chat_id: self.as_chat_id(&chat_id),
+                query: String::new(),
+                from_event_id: 0,
+                limit: as_limit(&limit, 10),
+                filters: None,
+                user_ids: self.as_user_ids(&user_ids),
+            }));
+            true
+        } else if op == "logf" {
+            let chat_id = self.as_chat_id(args);
+            self.get_log_chat_id.store(chat_id, Ordering::SeqCst);
+            self.send_request(Function::getChatEventLog(td_api::getChatEventLog {
+                chat_id,
+                query: String::new(),
+                from_event_id: 0,
+                limit: 100,
+                filters: None,
+                user_ids: Vec::new(),
+            }));
+            true
+        } else if op == "gtz" {
+            self.send_request(Function::getTimeZones(td_api::getTimeZones));
+            true
+        } else if op == "join" {
+            self.send_request(Function::joinChat(td_api::joinChat {
+                chat_id: self.as_chat_id(args),
+            }));
+            true
+        } else if op == "leave" {
+            self.send_request(Function::leaveChat(td_api::leaveChat {
+                chat_id: self.as_chat_id(args),
+            }));
+            true
+        } else if op == "dcm" {
+            let (chat_id, member_id) = tokenizer::split(args, ' ');
+            let status = if self.as_user_id(&member_id) == self.my_id.load(Ordering::SeqCst) {
+                td_api::ChatMemberStatus::chatMemberStatusLeft(td_api::chatMemberStatusLeft)
+            } else {
+                td_api::ChatMemberStatus::chatMemberStatusBanned(td_api::chatMemberStatusBanned {
+                    banned_until_date: 0,
+                })
+            };
+            self.send_request(Function::setChatMemberStatus(td_api::setChatMemberStatus {
+                chat_id: self.as_chat_id(&chat_id),
+                member_id: self.as_message_sender(&member_id),
+                status: Some(status),
+            }));
+            true
+        } else if op == "sn" {
+            let (first_name, last_name) = tokenizer::split(args, ' ');
+            self.send_request(Function::setName(td_api::setName {
+                first_name,
+                last_name,
+            }));
+            true
+        } else if op == "sb" {
+            self.send_request(Function::setBio(td_api::setBio {
+                bio: format!("\\n{}\\n{}\\n", args, args),
+            }));
+            true
+        } else if op == "sun" {
+            self.send_request(Function::setUsername(td_api::setUsername {
+                username: args.to_owned(),
+            }));
+            true
+        } else if op == "tunia" {
+            let (username, is_active) = tokenizer::split(args, ' ');
+            self.send_request(Function::toggleUsernameIsActive(
+                td_api::toggleUsernameIsActive {
+                    username,
+                    is_active: as_bool(&is_active),
+                },
+            ));
+            true
+        } else if op == "raun" {
+            self.send_request(Function::reorderActiveUsernames(
+                td_api::reorderActiveUsernames {
+                    usernames: autosplit(args),
+                },
+            ));
+            true
+        } else if op == "sbd" {
+            let (day, month, year) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            let birthdate = if tokenizer::to_integer_i32(&day) == 0 {
+                None
+            } else {
+                Some(td_api::Birthdate {
+                    day: tokenizer::to_integer_i32(&day),
+                    month: tokenizer::to_integer_i32(&month),
+                    year: tokenizer::to_integer_i32(&year),
+                })
+            };
+            self.send_request(Function::setBirthdate(td_api::setBirthdate { birthdate }));
+            true
+        } else if op == "smpt" || op == "smptg" {
+            let main_profile_tab = if op == "smptg" {
+                td_api::ProfileTab::profileTabGifts(td_api::profileTabGifts)
+            } else {
+                td_api::ProfileTab::profileTabPosts(td_api::profileTabPosts)
+            };
+            self.send_request(Function::setMainProfileTab(td_api::setMainProfileTab {
+                main_profile_tab: Some(main_profile_tab),
+            }));
+            true
+        } else if op == "spec" {
+            self.send_request(Function::setPersonalChat(td_api::setPersonalChat {
+                chat_id: self.as_chat_id(args),
+            }));
+            true
+        } else if op == "sese" {
+            self.send_request(Function::setEmojiStatus(td_api::setEmojiStatus {
+                emoji_status: None,
+            }));
+            true
+        } else if op == "ses" {
+            let (custom_emoji_id, expiration_date) = tokenizer::split(args, ' ');
+            self.send_request(Function::setEmojiStatus(td_api::setEmojiStatus {
+                emoji_status: Some(td_api::EmojiStatus {
+                    r#type: Some(td_api::EmojiStatusType::emojiStatusTypeCustomEmoji(
+                        td_api::emojiStatusTypeCustomEmoji {
+                            custom_emoji_id: self.as_custom_emoji_id(&custom_emoji_id),
+                        },
+                    )),
+                    expiration_date: tokenizer::to_integer_i32(&expiration_date),
+                }),
+            }));
+            true
+        } else if op == "sesg" {
+            let (
+                upgraded_gift_id,
+                title,
+                name,
+                model_custom_emoji_id,
+                symbol_custom_emoji_id,
+                center_color,
+                edge_color,
+                symbol_color,
+                text_color,
+                expiration_date,
+            ) = {
+                let (a, t1) = tokenizer::split(args, ' ');
+                let (b, t2) = tokenizer::split(&t1, ' ');
+                let (c, t3) = tokenizer::split(&t2, ' ');
+                let (d, t4) = tokenizer::split(&t3, ' ');
+                let (e, t5) = tokenizer::split(&t4, ' ');
+                let (f, t6) = tokenizer::split(&t5, ' ');
+                let (g, t7) = tokenizer::split(&t6, ' ');
+                let (h, t8) = tokenizer::split(&t7, ' ');
+                let (i, j) = tokenizer::split(&t8, ' ');
+                (a, b, c, d, e, f, g, h, i, j)
+            };
+            self.send_request(Function::setEmojiStatus(td_api::setEmojiStatus {
+                emoji_status: Some(td_api::EmojiStatus {
+                    r#type: Some(td_api::EmojiStatusType::emojiStatusTypeUpgradedGift(
+                        td_api::emojiStatusTypeUpgradedGift {
+                            upgraded_gift_id: tokenizer::to_integer_i64(&upgraded_gift_id),
+                            gift_title: title,
+                            gift_name: name,
+                            model_custom_emoji_id: self.as_custom_emoji_id(&model_custom_emoji_id),
+                            symbol_custom_emoji_id: self
+                                .as_custom_emoji_id(&symbol_custom_emoji_id),
+                            backdrop_colors: Some(td_api::UpgradedGiftBackdropColors {
+                                center_color: tokenizer::to_integer_i32(&center_color),
+                                edge_color: tokenizer::to_integer_i32(&edge_color),
+                                symbol_color: tokenizer::to_integer_i32(&symbol_color),
+                                text_color: tokenizer::to_integer_i32(&text_color),
+                            }),
+                        },
+                    )),
+                    expiration_date: tokenizer::to_integer_i32(&expiration_date),
+                }),
+            }));
+            true
+        } else if op == "thsme" {
+            self.send_request(Function::toggleHasSponsoredMessagesEnabled(
+                td_api::toggleHasSponsoredMessagesEnabled {
+                    has_sponsored_messages_enabled: as_bool(args),
+                },
+            ));
+            true
+        } else if op == "gtes" {
+            self.send_request(Function::getThemedEmojiStatuses(
+                td_api::getThemedEmojiStatuses,
+            ));
+            true
+        } else if op == "gdes" {
+            self.send_request(Function::getDefaultEmojiStatuses(
+                td_api::getDefaultEmojiStatuses,
+            ));
+            true
+        } else if op == "gres" {
+            self.send_request(Function::getRecentEmojiStatuses(
+                td_api::getRecentEmojiStatuses,
+            ));
+            true
+        } else if op == "guges" {
+            self.send_request(Function::getUpgradedGiftEmojiStatuses(
+                td_api::getUpgradedGiftEmojiStatuses,
+            ));
+            true
+        } else if op == "cres" {
+            self.send_request(Function::clearRecentEmojiStatuses(
+                td_api::clearRecentEmojiStatuses,
+            ));
+            true
+        } else if op == "gtces" {
+            self.send_request(Function::getThemedChatEmojiStatuses(
+                td_api::getThemedChatEmojiStatuses,
+            ));
+            true
+        } else if op == "gdces" {
+            self.send_request(Function::getDefaultChatEmojiStatuses(
+                td_api::getDefaultChatEmojiStatuses,
+            ));
+            true
+        } else if op == "gdices" {
+            self.send_request(Function::getDisallowedChatEmojiStatuses(
+                td_api::getDisallowedChatEmojiStatuses,
+            ));
+            true
+        } else if op == "ccun" {
+            let (chat_id, username) = tokenizer::split(args, ' ');
+            self.send_request(Function::checkChatUsername(td_api::checkChatUsername {
+                chat_id: self.as_chat_id(&chat_id),
+                username,
+            }));
+            true
+        } else if op == "ssgun" || op == "schun" {
+            let (supergroup_id, username) = tokenizer::split(args, ' ');
+            self.send_request(Function::setSupergroupUsername(
+                td_api::setSupergroupUsername {
+                    supergroup_id: self.as_supergroup_id(&supergroup_id),
+                    username,
+                },
+            ));
+            true
+        } else if op == "tsgunia" || op == "tchunia" {
+            let (supergroup_id, username, is_active) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::toggleSupergroupUsernameIsActive(
+                td_api::toggleSupergroupUsernameIsActive {
+                    supergroup_id: self.as_supergroup_id(&supergroup_id),
+                    username,
+                    is_active: as_bool(&is_active),
+                },
+            ));
+            true
+        } else if op == "dasgun" || op == "dachun" {
+            self.send_request(Function::disableAllSupergroupUsernames(
+                td_api::disableAllSupergroupUsernames {
+                    supergroup_id: self.as_supergroup_id(args),
+                },
+            ));
+            true
+        } else if op == "rsgaun" || op == "rchaun" {
+            let (supergroup_id, _) = tokenizer::split(args, ' ');
+            self.send_request(Function::reorderSupergroupActiveUsernames(
+                td_api::reorderSupergroupActiveUsernames {
+                    supergroup_id: self.as_supergroup_id(&supergroup_id),
+                    usernames: autosplit(&tokenizer::split(args, ' ').1),
+                },
+            ));
+            true
+        } else if op == "ssgss" {
+            let (supergroup_id, sticker_set_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::setSupergroupStickerSet(
+                td_api::setSupergroupStickerSet {
+                    supergroup_id: self.as_supergroup_id(&supergroup_id),
+                    sticker_set_id: tokenizer::to_integer_i64(&sticker_set_id),
+                },
+            ));
+            true
+        } else if op == "ssgcess" {
+            let (supergroup_id, sticker_set_id) = tokenizer::split(args, ' ');
+            self.send_request(Function::setSupergroupCustomEmojiStickerSet(
+                td_api::setSupergroupCustomEmojiStickerSet {
+                    supergroup_id: self.as_supergroup_id(&supergroup_id),
+                    custom_emoji_sticker_set_id: tokenizer::to_integer_i64(&sticker_set_id),
+                },
+            ));
+            true
+        } else if op == "ssgubc" {
+            let (supergroup_id, unrestrict_boost_count) = tokenizer::split(args, ' ');
+            self.send_request(Function::setSupergroupUnrestrictBoostCount(
+                td_api::setSupergroupUnrestrictBoostCount {
+                    supergroup_id: self.as_supergroup_id(&supergroup_id),
+                    unrestrict_boost_count: tokenizer::to_integer_i32(&unrestrict_boost_count),
+                },
+            ));
+            true
+        } else if op == "tsgp" {
+            let (supergroup_id, flag) = tokenizer::split(args, ' ');
+            self.send_request(Function::toggleSupergroupIsAllHistoryAvailable(
+                td_api::toggleSupergroupIsAllHistoryAvailable {
+                    supergroup_id: self.as_supergroup_id(&supergroup_id),
+                    is_all_history_available: as_bool(&flag),
+                },
+            ));
+            true
+        } else if op == "tsgchsm" {
+            let (supergroup_id, flag) = tokenizer::split(args, ' ');
+            self.send_request(Function::toggleSupergroupCanHaveSponsoredMessages(
+                td_api::toggleSupergroupCanHaveSponsoredMessages {
+                    supergroup_id: self.as_supergroup_id(&supergroup_id),
+                    can_have_sponsored_messages: as_bool(&flag),
+                },
+            ));
+            true
+        } else if op == "tsghat" {
+            let (supergroup_id, flag) = tokenizer::split(args, ' ');
+            self.send_request(Function::toggleSupergroupHasAutomaticTranslation(
+                td_api::toggleSupergroupHasAutomaticTranslation {
+                    supergroup_id: self.as_supergroup_id(&supergroup_id),
+                    has_automatic_translation: as_bool(&flag),
+                },
+            ));
+            true
+        } else if op == "tsghhm" {
+            let (supergroup_id, flag) = tokenizer::split(args, ' ');
+            self.send_request(Function::toggleSupergroupHasHiddenMembers(
+                td_api::toggleSupergroupHasHiddenMembers {
+                    supergroup_id: self.as_supergroup_id(&supergroup_id),
+                    has_hidden_members: as_bool(&flag),
+                },
+            ));
+            true
+        } else if op == "tsgas" {
+            let (supergroup_id, flag) = tokenizer::split(args, ' ');
+            self.send_request(Function::toggleSupergroupHasAggressiveAntiSpamEnabled(
+                td_api::toggleSupergroupHasAggressiveAntiSpamEnabled {
+                    supergroup_id: self.as_supergroup_id(&supergroup_id),
+                    has_aggressive_anti_spam_enabled: as_bool(&flag),
+                },
+            ));
+            true
+        } else if op == "tsgif" {
+            let (supergroup_id, is_forum, has_forum_tabs) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::toggleSupergroupIsForum(
+                td_api::toggleSupergroupIsForum {
+                    supergroup_id: self.as_supergroup_id(&supergroup_id),
+                    is_forum: as_bool(&is_forum),
+                    has_forum_tabs: as_bool(&has_forum_tabs),
+                },
+            ));
+            true
+        } else if op == "tsibg" {
+            self.send_request(Function::toggleSupergroupIsBroadcastGroup(
+                td_api::toggleSupergroupIsBroadcastGroup {
+                    supergroup_id: self.as_supergroup_id(args),
+                },
+            ));
+            true
+        } else if op == "ssmpt" || op == "ssmptg" {
+            let main_profile_tab = if op == "ssmptg" {
+                td_api::ProfileTab::profileTabGifs(td_api::profileTabGifs)
+            } else {
+                td_api::ProfileTab::profileTabPosts(td_api::profileTabPosts)
+            };
+            self.send_request(Function::setSupergroupMainProfileTab(
+                td_api::setSupergroupMainProfileTab {
+                    supergroup_id: self.as_supergroup_id(args),
+                    main_profile_tab: Some(main_profile_tab),
+                },
+            ));
+            true
+        } else if op == "tsgsm" {
+            let (supergroup_id, sign_messages, show_message_sender) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::toggleSupergroupSignMessages(
+                td_api::toggleSupergroupSignMessages {
+                    supergroup_id: self.as_supergroup_id(&supergroup_id),
+                    sign_messages: as_bool(&sign_messages),
+                    show_message_sender: as_bool(&show_message_sender),
+                },
+            ));
+            true
+        } else if op == "tsgjtsm" {
+            let (supergroup_id, join_to_send_message) = tokenizer::split(args, ' ');
+            self.send_request(Function::toggleSupergroupJoinToSendMessages(
+                td_api::toggleSupergroupJoinToSendMessages {
+                    supergroup_id: self.as_supergroup_id(&supergroup_id),
+                    join_to_send_messages: as_bool(&join_to_send_message),
+                },
+            ));
+            true
+        } else if op == "tsgjbr" || op == "tsgjbra" {
+            let (supergroup_id, join_by_request, guard_bot_user_id) = {
+                let (w0, rest0) = tokenizer::split(args, ' ');
+                let (w1, w2) = tokenizer::split(&rest0, ' ');
+                (w0, w1, w2)
+            };
+            self.send_request(Function::toggleSupergroupJoinByRequest(
+                td_api::toggleSupergroupJoinByRequest {
+                    supergroup_id: self.as_supergroup_id(&supergroup_id),
+                    join_by_request: as_bool(&join_by_request),
+                    guard_bot_user_id: self.as_user_id(&guard_bot_user_id),
+                    apply_to_invite_links: op == "tsgjbra",
+                },
+            ));
+            true
+        } else {
+            false
+        }
     }
 
     fn op_block_dev_a(&self, _op: &str, _args: &str) -> bool {
@@ -5896,6 +6565,63 @@ mod tests {
             ("tdmctcsum", 2),
             ("tsmtip", 2),
             ("uadmctm", 2),
+            ("ccun", 15),
+            ("cres", 15),
+            ("cto", 15),
+            ("dachun", 15),
+            ("dasgun", 15),
+            ("dcm", 15),
+            ("gcoal", 15),
+            ("gdces", 15),
+            ("gdes", 15),
+            ("gdices", 15),
+            ("gres", 15),
+            ("gtces", 15),
+            ("gtes", 15),
+            ("gtz", 15),
+            ("guges", 15),
+            ("join", 15),
+            ("leave", 15),
+            ("log", 15),
+            ("logf", 15),
+            ("raun", 15),
+            ("rchaun", 15),
+            ("rsgaun", 15),
+            ("sb", 15),
+            ("sbd", 15),
+            ("schun", 15),
+            ("scms", 15),
+            ("scmt", 15),
+            ("ses", 15),
+            ("sese", 15),
+            ("sesg", 15),
+            ("smpt", 15),
+            ("smptg", 15),
+            ("sn", 15),
+            ("spec", 15),
+            ("ssgcess", 15),
+            ("ssgss", 15),
+            ("ssgubc", 15),
+            ("ssgun", 15),
+            ("ssmpt", 15),
+            ("ssmptg", 15),
+            ("sun", 15),
+            ("tchunia", 15),
+            ("thsme", 15),
+            ("transferChatOwnership", 15),
+            ("tsgas", 15),
+            ("tsgchsm", 15),
+            ("tsghat", 15),
+            ("tsghhm", 15),
+            ("tsgif", 15),
+            ("tsgjbr", 15),
+            ("tsgjbra", 15),
+            ("tsgjtsm", 15),
+            ("tsgp", 15),
+            ("tsgsm", 15),
+            ("tsgunia", 15),
+            ("tsibg", 15),
+            ("tunia", 15),
             ("bcm", 14),
             ("apolo", 14),
             ("apo", 14),
