@@ -306,7 +306,7 @@ getChatFolderChatsToLeave	interim
 getChatFolderDefaultIconName	interim
 getChatFolderInviteLinks	interim
 getChatFolderNewChats	interim
-getChatHistory	interim
+getChatHistory	dispatched
 getChatInviteLink	interim
 getChatInviteLinkCounts	interim
 getChatInviteLinkMembers	interim
@@ -314,7 +314,7 @@ getChatInviteLinks	interim
 getChatJoinRequests	interim
 getChatListsToAddChat	interim
 getChatMember	interim
-getChatMessageByDate	interim
+getChatMessageByDate	dispatched
 getChatMessageCalendar	interim
 getChatMessageCount	interim
 getChatMessagePosition	interim

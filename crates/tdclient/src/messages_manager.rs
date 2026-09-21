@@ -15540,7 +15540,7 @@ pub trait ReadStateContext {
     fn option_boolean(&self, name: &str, default: bool) -> bool;
 
     /// `G()->td_db()->get_binlog_pmc()->get(key)`.
-    fn binlog_pmc_get(&self, key: &str) -> Option<String>;
+    fn binlog_pmc_get(&mut self, key: &str) -> Option<String>;
 
     /// `G()->td_db()->get_binlog_pmc()->set(key, value)`.
     fn binlog_pmc_set(&mut self, key: &str, value: &str);
@@ -15673,7 +15673,7 @@ impl ReadStateContext for NoReadStateContext {
         default
     }
 
-    fn binlog_pmc_get(&self, _key: &str) -> Option<String> {
+    fn binlog_pmc_get(&mut self, _key: &str) -> Option<String> {
         None
     }
 
@@ -31958,7 +31958,7 @@ mod tests {
             default
         }
 
-        fn binlog_pmc_get(&self, key: &str) -> Option<String> {
+        fn binlog_pmc_get(&mut self, key: &str) -> Option<String> {
             self.pmc.get(key).cloned()
         }
 

@@ -1535,6 +1535,190 @@ impl crate::messages_manager::MessageObjectContext for Td {
     }
 }
 
+/// The split-context aliasing adapter — the M.10 split functions take
+/// their ctx and state objects as separate trait parameters over the same
+/// `Td` (the C++ one-object model). The alias below is derived from the
+/// single `&mut Td` the arm holds and the pair is used strictly
+/// sequentially: every M.10 split function invokes one surface at a time.
+/// The full sink-state refactor (a field-destructure content-context
+/// view) retires this adapter.
+///
+/// # Safety
+/// The returned alias and the source reference must never be written
+/// through reentrantly — the M.10 split functions satisfy this by
+/// construction (they pass each object into one callee at a time).
+pub(crate) unsafe fn split_context_alias<'a>(
+    td: *mut Td,
+) -> &'a mut dyn crate::messages_manager::ReadStateContext {
+    unsafe { &mut *td }
+}
+
+/// The Td-side [`crate::messages_manager::ReadStateContext`] — the
+/// M.10.20 state half of the split-context convention. Real routes: the
+/// update channel (`Td::send_update`), the option reads, the pmc, the
+/// input-peer gate and the message-database gate. The manager-touching
+/// hooks (`on_unread_count_change`-family, `update_dialog_lists`) and the
+/// M.13 notification hooks answer the documented stand-ins until their
+/// receive slices flip (the same shape the test contexts pin).
+impl crate::messages_manager::ReadStateContext for Td {
+    fn send_update(&mut self, update: td_api::Object) {
+        Td::send_update(self, update);
+    }
+
+    fn have_input_peer(&self, dialog_id: DialogId, allow_secret_chats: bool) -> bool {
+        if dialog_id.get_type() == crate::messages_manager::DialogType::SecretChat
+            && !allow_secret_chats
+        {
+            return false;
+        }
+        crate::messages_manager::have_dialog_force(&self.messages_manager, dialog_id)
+    }
+
+    fn is_dialog_muted(&self, _dialog_id: DialogId) -> bool {
+        // NotificationSettingsManager::get_dialog_mute_until — the M.13
+        // receive flip
+        false
+    }
+
+    fn is_dialog_sponsored(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn on_unread_count_change(
+        &mut self,
+        _dialog_id: DialogId,
+        _old_unread_count: i32,
+        _new_unread_count: i32,
+        _is_marked_as_unread: bool,
+        _force_update: bool,
+        _source: &str,
+    ) {
+    }
+
+    fn on_is_marked_as_unread_change(&mut self, _dialog_id: DialogId, _delta: i32, _source: &str) {}
+
+    fn have_dialog_filters(&self) -> bool {
+        false
+    }
+
+    fn update_dialog_lists(&mut self, _dialog_id: DialogId, _source: &str) {}
+
+    fn option_integer(&self, name: &str, default: i64) -> i64 {
+        self.option_manager
+            .as_ref()
+            .map(|options| options.get_option_integer(name, default))
+            .unwrap_or(default)
+    }
+
+    fn option_boolean(&self, name: &str, default: bool) -> bool {
+        self.option_manager
+            .as_ref()
+            .map(|options| options.get_option_boolean(name, default))
+            .unwrap_or(default)
+    }
+
+    fn binlog_pmc_get(&mut self, key: &str) -> Option<String> {
+        let value = self.global.binlog_pmc().get(key);
+        if value.is_empty() { None } else { Some(value) }
+    }
+
+    fn binlog_pmc_set(&mut self, key: &str, value: &str) {
+        self.global.binlog_pmc().set(key, value);
+    }
+
+    fn use_message_database(&self) -> bool {
+        self.global.use_message_database()
+    }
+
+    fn get_dialog_filter_folder_ids(
+        &self,
+        _filter_id: crate::messages_manager::DialogFilterId,
+    ) -> Vec<crate::messages_manager::FolderId> {
+        Vec::new()
+    }
+
+    fn need_dialog_in_filter(
+        &self,
+        _filter_id: crate::messages_manager::DialogFilterId,
+        _info: &crate::messages_manager::DialogFilterDialogInfo,
+    ) -> bool {
+        true
+    }
+
+    fn is_dialog_pinned_in_filter(
+        &self,
+        _filter_id: crate::messages_manager::DialogFilterId,
+        _dialog_id: DialogId,
+    ) -> bool {
+        false
+    }
+
+    fn get_pinned_dialog_ids_in_filter(
+        &self,
+        _filter_id: crate::messages_manager::DialogFilterId,
+    ) -> Vec<DialogId> {
+        Vec::new()
+    }
+
+    fn get_scope_disable_mention_notifications(&self) -> bool {
+        false
+    }
+
+    fn is_bot(&self) -> bool {
+        crate::message_content::MessageContentContext::is_bot(self)
+    }
+
+    fn close_flag(&self) -> bool {
+        self.close_flag != 0
+    }
+
+    fn get_sponsored_chat_source_object(&self) -> Option<td_api::ChatSource> {
+        None
+    }
+
+    fn is_running_get_difference(&self) -> bool {
+        false
+    }
+
+    fn is_running_get_channel_difference(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn has_channel_difference_to_log_event(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn remove_notification_group(
+        &mut self,
+        _group_id: crate::messages_manager::NotificationGroupId,
+        _max_notification_message_id: crate::messages_manager::MessageId,
+        _total_count: i32,
+        _force: bool,
+        _source: &str,
+    ) {
+        // the M.13 notification flip
+    }
+
+    fn remove_notification(
+        &mut self,
+        _group_id: crate::messages_manager::NotificationGroupId,
+        _notification_id: crate::messages_manager::NotificationId,
+        _is_permanent: bool,
+        _force_update: bool,
+    ) {
+    }
+
+    fn flush_pending_new_message_notifications(
+        &mut self,
+        _dialog_id: DialogId,
+        _from_mentions: bool,
+        _settings_dialog_id: DialogId,
+    ) {
+    }
+
+    fn remove_dialog_pinned_message_notification(&mut self, _dialog_id: DialogId, _source: &str) {}
+}
+
 /// The reactions half of the receive adapter: the banned-chat read is the
 /// ChatManager status cache, false until that receive slice lands.
 /// The Td-side [`crate::messages_manager::SendMessageContext`] adapter —
@@ -5753,6 +5937,17 @@ mod tests {
     /// the C++ "Chat not found" table).
     #[test]
     fn m10_20_read_family_arms() {
+        // the deep debug frames of the history walk carry the 32 KB
+        // td_api::Object — run the body on a big-stack thread
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(m10_20_read_family_arms_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn m10_20_read_family_arms_impl() {
         let callback = CollectCallback::default();
         let dir = temp_db_dir("m10-20-reads");
         let db_dir = dir.clone();
@@ -5809,6 +6004,35 @@ mod tests {
             }),
         );
         let error = error_of(&callback, 103);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Chat not found");
+
+        // getChatHistory: the split-context adapter — the same local table
+        td.request(
+            104,
+            Function::getChatHistory(td_api::getChatHistory {
+                chat_id: 1,
+                from_message_id: 0,
+                offset: 0,
+                limit: 10,
+                only_local: false,
+            }),
+        );
+        let error = error_of(&callback, 104);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Chat not found");
+        // the manager survived the take/restore
+        assert!(td.messages_manager.dialogs.is_empty());
+
+        // getChatMessageByDate: same
+        td.request(
+            105,
+            Function::getChatMessageByDate(td_api::getChatMessageByDate {
+                chat_id: 1,
+                date: 1700000000,
+            }),
+        );
+        let error = error_of(&callback, 105);
         assert_eq!(error.code, 400);
         assert_eq!(error.message, "Chat not found");
 

@@ -1688,6 +1688,82 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 }
             }
         }
+        Function::getChatHistory(request) => {
+            // Requests.cpp:3642-3646 + GetChatHistoryRequest
+            // (Requests.cpp:951-977): CHECK_IS_USER; the actor's first run
+            // passes get_tries() - 1 = 1.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let from_message_id = MessageId::new(request.from_message_id);
+            // the split-context adapter: the manager is taken for the call
+            // and restored after; the ctx/state pair aliases Td (the
+            // sequential discipline on `split_context_alias`)
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the alias and the source are used strictly
+            // sequentially (see `split_context_alias`'s contract).
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(std::ptr::from_mut(td)) };
+            let result = crate::messages_manager::get_dialog_history(
+                &mut manager,
+                td,
+                state,
+                dialog_id,
+                from_message_id,
+                request.offset,
+                request.limit,
+                1,
+                request.only_local,
+            );
+            td.messages_manager = manager;
+            match result {
+                Ok(Some(messages)) => td.send_result(id, Object::messages(messages)),
+                Ok(None) => {
+                    // the load-needed window — the db/server legs are the
+                    // net seam ([blocked: net]); the caller-retry contract
+                    // answers the loaded (empty) window
+                    td.send_result(
+                        id,
+                        Object::messages(crate::messages_manager::get_messages_object(
+                            -1,
+                            Vec::new(),
+                            false,
+                        )),
+                    );
+                }
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::getChatMessageByDate(request) => {
+            // Requests.cpp:3840-3845 — the local by-date walk behind the
+            // promise.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: as getChatHistory above (the state surface rides
+            // the same alias when the by-date walk grows its state use).
+            let _state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(std::ptr::from_mut(td)) };
+            let result = crate::messages_manager::get_dialog_message_by_date(
+                &mut manager,
+                td,
+                dialog_id,
+                request.date,
+            );
+            td.messages_manager = manager;
+            match result {
+                Ok(Some(message)) => td.send_result(id, Object::message(message)),
+                Ok(None) => {
+                    // the by-date search parks on the db seam
+                    // ([blocked: net])
+                    td.send_error_impl(id, 500, "The message history is not loaded yet");
+                }
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
         Function::getMessageEmbeddingCode(request) => {
             // Requests.cpp:2783-2786 — the local embedding builder behind
             // the request actor (the promise collapses synchronously).
@@ -1994,15 +2070,15 @@ mod request_census_tests {
         assert_eq!(generated.len(), crate::td_api::SCHEME_FUNCTIONS);
 
         // The flip-state ledger after the m10d master merge + the M.10.20
-        // read-family batch: the m13s pins (92) + the three M.10 dispatches
-        // (getMessageLocally, getMessageLink, getMessageEmbeddingCode).
-        // Fix per flip.
+        // read-family batch: the m13s pins (92) + the five M.10 dispatches
+        // (getMessageLocally, getMessageLink, getMessageEmbeddingCode,
+        // getChatHistory, getChatMessageByDate). Fix per flip.
         assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            95,
+            97,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 909, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 907, "interim count");
     }
 }
