@@ -136,6 +136,9 @@ pub struct CliClient {
     /// `int64 message_thread_id_`.
     #[allow(dead_code)] // writers land with the M.14.4 commands
     message_thread_id: AtomicI64,
+    /// `int64 opened_chat_id_` — the `.` target of the id coercers (writers
+    /// land with the M.14.4 open-chat commands).
+    opened_chat_id: AtomicI64,
 }
 
 /// `CliClient *CliClient::instance_` — the process-wide instance
@@ -185,6 +188,7 @@ pub fn instance() -> &'static CliClient {
         direct_messages_chat_topic_id: AtomicI64::new(0),
         forum_topic_id: AtomicI32::new(0),
         message_thread_id: AtomicI64::new(0),
+        opened_chat_id: AtomicI64::new(0),
     })
 }
 
@@ -202,6 +206,160 @@ fn oneline(s: &str) -> String {
     s.chars()
         .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
         .collect()
+}
+
+/// `td::is_space` (the `td::trim` set): space, tab, LF, CR, FF, VT.
+fn is_td_space(c: char) -> bool {
+    matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{c}' | '\u{b}')
+}
+
+/// `td::trim` (ASCII whitespace only — `str::trim` would also strip Unicode).
+fn trim_td(s: &str) -> &str {
+    s.trim_matches(is_td_space)
+}
+
+/// `CliClient::get_delimiter` (cli.cpp:482): the single non-word character
+/// of the argument list, or a space (each word then stands alone).
+fn get_delimiter(s: &str) -> char {
+    let mut chars = std::collections::BTreeSet::<char>::new();
+    for c in trim_td(s).chars() {
+        if !c.is_ascii_alphanumeric()
+            && !matches!(c, '_' | '-' | '@' | '.' | '/' | '\0' | '$')
+            && (c as u32) <= 127
+        {
+            chars.insert(c);
+        }
+    }
+    match chars.len() {
+        0 => ' ',
+        1 => *chars.iter().next().unwrap(),
+        _ => {
+            tdutils::log_error!("Failed to determine delimiter in \"{}\"", s);
+            ' '
+        }
+    }
+}
+
+/// `CliClient::autosplit` (cli.cpp:500).
+fn autosplit(s: &str) -> Vec<String> {
+    tokenizer::full_split(trim_td(s), get_delimiter(s))
+}
+
+/// `CliClient::as_email_address_authentication` (cli.cpp:2741).
+fn as_email_address_authentication(arg: &str) -> Option<td_api::EmailAddressAuthentication> {
+    if let Some(rest) = arg.strip_prefix("a ") {
+        return Some(
+            td_api::EmailAddressAuthentication::emailAddressAuthenticationAppleId(
+                td_api::emailAddressAuthenticationAppleId {
+                    token: rest.to_owned(),
+                },
+            ),
+        );
+    }
+    if let Some(rest) = arg.strip_prefix("g ") {
+        return Some(
+            td_api::EmailAddressAuthentication::emailAddressAuthenticationGoogleId(
+                td_api::emailAddressAuthenticationGoogleId {
+                    token: rest.to_owned(),
+                },
+            ),
+        );
+    }
+    if !arg.is_empty() {
+        return Some(
+            td_api::EmailAddressAuthentication::emailAddressAuthenticationCode(
+                td_api::emailAddressAuthenticationCode {
+                    code: arg.to_owned(),
+                },
+            ),
+        );
+    }
+    None
+}
+
+/// `CliClient::as_passport_element_type` (cli.cpp:2752) — the unknown spell
+/// falls back to `passportElementTypePassport`, exactly like the C++.
+fn as_passport_element_type(t: &str) -> td_api::PassportElementType {
+    use td_api::PassportElementType as Pe;
+    if t == "address" || t == "a" {
+        return Pe::passportElementTypeAddress(td_api::passportElementTypeAddress);
+    }
+    if t == "email" || t == "e" {
+        return Pe::passportElementTypeEmailAddress(td_api::passportElementTypeEmailAddress);
+    }
+    if t == "phone" || t == "p" {
+        return Pe::passportElementTypePhoneNumber(td_api::passportElementTypePhoneNumber);
+    }
+    if t == "pd" {
+        return Pe::passportElementTypePersonalDetails(td_api::passportElementTypePersonalDetails);
+    }
+    if t == "dl" {
+        return Pe::passportElementTypeDriverLicense(td_api::passportElementTypeDriverLicense);
+    }
+    if t == "ip" {
+        return Pe::passportElementTypeInternalPassport(
+            td_api::passportElementTypeInternalPassport,
+        );
+    }
+    if t == "ic" {
+        return Pe::passportElementTypeIdentityCard(td_api::passportElementTypeIdentityCard);
+    }
+    if t == "ra" {
+        return Pe::passportElementTypeRentalAgreement(td_api::passportElementTypeRentalAgreement);
+    }
+    if t == "pr" {
+        return Pe::passportElementTypePassportRegistration(
+            td_api::passportElementTypePassportRegistration,
+        );
+    }
+    if t == "tr" {
+        return Pe::passportElementTypeTemporaryRegistration(
+            td_api::passportElementTypeTemporaryRegistration,
+        );
+    }
+    Pe::passportElementTypePassport(td_api::passportElementTypePassport)
+}
+
+/// `CliClient::as_passport_element_types` (cli.cpp:2786).
+fn as_passport_element_types(types: &str) -> Vec<td_api::PassportElementType> {
+    autosplit(types)
+        .iter()
+        .map(|t| as_passport_element_type(t))
+        .collect()
+}
+
+/// The `HttpReader::parse_args` URL decoding: `%XX` becomes the byte,
+/// everything else (including `+`) passes through.
+fn url_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() + 1 && i + 2 < bytes.len() + 1 {
+            let hex = bytes.get(i + 1..i + 3);
+            if let Some(hex) = hex
+                && let Ok(byte) = u8::from_str_radix(std::str::from_utf8(hex).unwrap_or(""), 16)
+            {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `td::base64url_decode(...).move_as_ok()` — the URL-safe alphabet, padded
+/// or unpadded (the `base64` crate wants the choice up front; the C++
+/// decoder accepts both shapes at once).
+fn base64url_decode(s: &str) -> Vec<u8> {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE
+        .decode(s)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(s))
+        .unwrap_or_else(|error| panic!("base64url_decode failed for {:?}: {}", s, error))
 }
 
 impl CliClient {
@@ -921,9 +1079,69 @@ impl CliClient {
         }
     }
 
-    /// cli.cpp:3098 — the auth/account chain. `gas` (the
-    /// authorization-state print) is live; the family lands in M.14.3.
-    fn op_block_auth(&self, op: &str, _args: &str) -> bool {
+    /// `CliClient::as_user_id` (cli.cpp:684) — `me`, `.` (the opened chat),
+    /// `@username` through the registry, else the plain integer.
+    fn as_user_id(&self, s: &str) -> i64 {
+        let s = trim_td(s);
+        if s == "me" {
+            return self.my_id.load(Ordering::SeqCst);
+        }
+        if s == "." {
+            return self.opened_chat_id.load(Ordering::SeqCst);
+        }
+        let s = s.strip_prefix('@').unwrap_or(s);
+        if s.as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_alphabetic())
+        {
+            if let Some(user_id) = self.username_to_user_id.lock().unwrap().get(&to_lower(s)) {
+                return *user_id;
+            }
+            tdutils::log_error!("Can't find user {}", s);
+            return 0;
+        }
+        tokenizer::to_integer_i64(s)
+    }
+
+    /// `CliClient::as_user_ids` (cli.cpp:708).
+    fn as_user_ids(&self, s: &str) -> Vec<i64> {
+        autosplit(s).iter().map(|t| self.as_user_id(t)).collect()
+    }
+
+    /// `as_phone_number_authentication_settings` (cli.cpp:2953).
+    fn as_phone_number_authentication_settings(&self) -> td_api::PhoneNumberAuthenticationSettings {
+        td_api::PhoneNumberAuthenticationSettings {
+            allow_flash_call: false,
+            allow_missed_call: true,
+            is_current_phone_number: false,
+            has_unknown_phone_number: false,
+            allow_sms_retriever_api: false,
+            firebase_authentication_settings: None,
+            authentication_tokens: self.authentication_tokens.lock().unwrap().clone(),
+        }
+    }
+
+    /// cli.cpp:3098 — the auth/account chain (M.14.3): the login/code/
+    /// passkey/password family, the account tools, the password state, the
+    /// Passport form probes, and the e-mail verification family. The C++
+    /// `get_args(args, a, b, …)` variadic is sugar for word-splits with the
+    /// last argument taking the remainder — spelled out per arm here.
+    fn op_block_auth(&self, op: &str, args: &str) -> bool {
+        // `get_args`'s word split: consume one space-separated word, the
+        // rest stays in `args` (the last argument takes the remainder).
+        macro_rules! words {
+            ($args:ident => $($word:ident),+ ; $rest:ident) => {{
+                let mut rest: String = $args.to_owned();
+                $(
+                    let ($word, tail) = tokenizer::split(&rest, ' ');
+                    rest = tail;
+                    let $word = $word;
+                )+
+                let $rest = rest;
+                ($($word),+, $rest)
+            }};
+        }
+
         if op == "gas" {
             let state = self.authorization_state.lock().unwrap();
             tdutils::log_error!(
@@ -934,13 +1152,402 @@ impl CliClient {
                 }
             );
             true
+        } else if op == "sap" || op == "sapn" {
+            self.send_request(Function::setAuthenticationPhoneNumber(
+                td_api::setAuthenticationPhoneNumber {
+                    phone_number: args.to_owned(),
+                    settings: Some(self.as_phone_number_authentication_settings()),
+                },
+            ));
+            true
+        } else if op == "capp" {
+            let (premium_day_count, currency, amount) =
+                words!(args => premium_day_count, currency ; amount);
+            self.send_request(Function::checkAuthenticationPremiumPurchase(
+                td_api::checkAuthenticationPremiumPurchase {
+                    premium_day_count: tokenizer::to_integer_i32(&premium_day_count),
+                    currency,
+                    amount: tokenizer::to_integer_i64(&amount),
+                },
+            ));
+            true
+        } else if op == "sae" || op == "saea" {
+            self.send_request(Function::setAuthenticationEmailAddress(
+                td_api::setAuthenticationEmailAddress {
+                    email_address: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "rac" {
+            self.send_request(Function::resendAuthenticationCode(
+                td_api::resendAuthenticationCode { reason: None },
+            ));
+            true
+        } else if op == "sdek" {
+            self.send_request(Function::setDatabaseEncryptionKey(
+                td_api::setDatabaseEncryptionKey {
+                    new_encryption_key: args.as_bytes().to_vec(),
+                },
+            ));
+            true
+        } else if op == "caec" {
+            self.send_request(Function::checkAuthenticationEmailCode(
+                td_api::checkAuthenticationEmailCode {
+                    code: as_email_address_authentication(args),
+                },
+            ));
+            true
+        } else if op == "cac" {
+            self.send_request(Function::checkAuthenticationCode(
+                td_api::checkAuthenticationCode {
+                    code: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "racmg" {
+            self.send_request(Function::reportAuthenticationCodeMissing(
+                td_api::reportAuthenticationCodeMissing {
+                    mobile_network_code: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "ru" || op == "rus" {
+            let (first_name, last_name) = tokenizer::split(args, ' ');
+            self.send_request(Function::registerUser(td_api::registerUser {
+                first_name,
+                last_name,
+                disable_notification: op == "rus",
+            }));
+            true
+        } else if op == "cap" {
+            self.send_request(Function::checkAuthenticationPassword(
+                td_api::checkAuthenticationPassword {
+                    password: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "cabt" {
+            self.send_request(Function::checkAuthenticationBotToken(
+                td_api::checkAuthenticationBotToken {
+                    token: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "qr" {
+            self.send_request(Function::requestQrCodeAuthentication(
+                td_api::requestQrCodeAuthentication {
+                    other_user_ids: self.as_user_ids(args),
+                },
+            ));
+            true
+        } else if op == "gapo" {
+            self.send_request(Function::getAuthenticationPasskeyParameters(
+                td_api::getAuthenticationPasskeyParameters,
+            ));
+            true
+        } else if op == "capk" {
+            let (credential_id, client_data, authenticator_data, signature, user_handle) = words!(args => credential_id, client_data, authenticator_data, signature ; user_handle);
+            self.send_request(Function::checkAuthenticationPasskey(
+                td_api::checkAuthenticationPasskey {
+                    credential_id,
+                    client_data,
+                    authenticator_data: base64url_decode(&authenticator_data),
+                    signature: base64url_decode(&signature),
+                    user_handle: base64url_decode(&user_handle),
+                },
+            ));
+            true
+        } else if op == "cawt" {
+            let (token, dc_id) = words!(args => token ; dc_id);
+            self.send_request(Function::checkAuthenticationWebToken(
+                td_api::checkAuthenticationWebToken {
+                    token,
+                    dc_id: tokenizer::to_integer_i32(&dc_id),
+                },
+            ));
+            true
+        } else if op == "cqr" {
+            self.send_request(Function::confirmQrCodeAuthentication(
+                td_api::confirmQrCodeAuthentication {
+                    link: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "gcs" {
+            self.send_request(Function::getCurrentState(td_api::getCurrentState));
+            true
+        } else if op == "raea" {
+            self.send_request(Function::resetAuthenticationEmailAddress(
+                td_api::resetAuthenticationEmailAddress,
+            ));
+            true
+        } else if op == "rapr" {
+            self.send_request(Function::requestAuthenticationPasswordRecovery(
+                td_api::requestAuthenticationPasswordRecovery,
+            ));
+            true
+        } else if op == "caprc" {
+            self.send_request(Function::checkAuthenticationPasswordRecoveryCode(
+                td_api::checkAuthenticationPasswordRecoveryCode {
+                    recovery_code: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "rap" {
+            let (recovery_code, new_password, new_hint) =
+                words!(args => recovery_code, new_password ; new_hint);
+            self.send_request(Function::recoverAuthenticationPassword(
+                td_api::recoverAuthenticationPassword {
+                    recovery_code,
+                    new_password,
+                    new_hint,
+                },
+            ));
+            true
+        } else if op == "lo" {
+            self.send_request(Function::logOut(td_api::logOut));
+            true
+        } else if op == "destroy" {
+            self.send_request(Function::destroy(td_api::destroy));
+            true
+        } else if op == "reset" {
+            // `td_client_.reset()` — the actor drop; the close notification
+            // arrives through the response queue and drives `on_closed`.
+            if let Some(client_id) = self.td_client.lock().unwrap().take() {
+                self.manager.close(client_id);
+            }
+            true
+        } else if op == "close_td" {
+            self.send_request(Function::close(td_api::close));
+            true
+        } else if op == "DeleteAccountYesIReallyWantToDeleteMyAccount" {
+            let (password, reason) = tokenizer::split(args, ' ');
+            self.send_request(Function::deleteAccount(td_api::deleteAccount {
+                reason,
+                password,
+            }));
+            true
+        } else if op == "gps" {
+            self.send_request(Function::getPasswordState(td_api::getPasswordState));
+            true
+        } else if op == "spass" {
+            let (mut password, mut new_password, mut new_hint, mut recovery_email_address) =
+                words!(args => password, new_password, new_hint ; recovery_email_address);
+            // The `#` spell stands for the empty string (the C++ `if (x ==
+            // "#") x = ""` quartet).
+            for value in [
+                &mut password,
+                &mut new_password,
+                &mut new_hint,
+                &mut recovery_email_address,
+            ] {
+                if value == "#" {
+                    *value = String::new();
+                }
+            }
+            self.send_request(Function::setPassword(td_api::setPassword {
+                old_password: password,
+                new_password,
+                new_hint,
+                set_recovery_email_address: true,
+                new_recovery_email_address: recovery_email_address,
+            }));
+            true
+        } else if op == "gpafhttp" {
+            // The C++ arm drives the request through `HttpReader` and reads
+            // the parsed query args; the Rust tdnet port carries no URL-arg
+            // parsing, so the same `?a=b&c=d` split (percent-decoded, first
+            // match wins — `HttpQuery::get_arg`) is spelled out here.
+            let mut query_args: Vec<(String, String)> = Vec::new();
+            if let Some((_, query)) = args.split_once('?') {
+                for pair in query.split('&') {
+                    let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                    query_args.push((url_decode(key), url_decode(value)));
+                }
+            }
+            let get_arg = |key: &str| -> &str {
+                query_args
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or("")
+            };
+            let bot_user_id = get_arg("bot_id");
+            let scope = get_arg("scope");
+            let public_key = get_arg("public_key");
+            let payload = get_arg("payload");
+            tdutils::log_info!("Callback URL:{}", get_arg("callback_url"));
+            self.send_request(Function::getPassportAuthorizationForm(
+                td_api::getPassportAuthorizationForm {
+                    bot_user_id: self.as_user_id(bot_user_id),
+                    scope: scope.to_owned(),
+                    public_key: public_key.to_owned(),
+                    nonce: payload.to_owned(),
+                },
+            ));
+            true
+        } else if op == "gpaf" {
+            let (bot_user_id, scope, payload) = words!(args => bot_user_id, scope ; payload);
+            const PUBLIC_KEY: &str = concat!(
+                "-----BEGIN PUBLIC KEY-----\n",
+                "MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAzmgKr0fPP4rB/TsNEweC\n",
+                "hoG3ntUxuBTmHsFBW6CpABGdaTmKZSjAI/cTofhBgtRQIOdX0YRGHHHhwyLf49Wv\n",
+                "9l+XexbJOa0lTsJSNMj8Y/9sZbqUl5ur8ZOTM0sxbXC0XKexu1tM9YavH+Lbrobk\n",
+                "jt0+cmo/zEYZWNtLVihnR2IDv+7tSgiDoFWi/koAUdfJ1VMw+hReUaLg3vE9CmPK\n",
+                "tQiTy+NvmrYaBPb75I0Jz3Lrz1+mZSjLKO25iT84RIsxarBDd8iYh2avWkCmvtiR\n",
+                "Lcif8wLxi2QWC1rZoCA3Ip+Hg9J9vxHlzl6xT01WjUStMhfwrUW6QBpur7FJ+aKM\n",
+                "oaMoHieFNCG4qIkWVEHHSsUpLum4SYuEnyNH3tkjbrdldZanCvanGq+TZyX0buRt\n",
+                "4zk7FGcu8iulUkAP/o/WZM0HKinFN/vuzNVA8iqcO/BBhewhzpqmmTMnWmAO8WPP\n",
+                "DJMABRtXJnVuPh1CI5pValzomLJM4/YvnJGppzI1QiHHNA9JtxVmj2xf8jaXa1LJ\n",
+                "WUNJK+RvUWkRUxpWiKQQO9FAyTPLRtDQGN9eUeDR1U0jqRk/gNT8smHGN6I4H+NR\n",
+                "3X3/1lMfcm1dvk654ql8mxjCA54IpTPr/icUMc7cSzyIiQ7Tp9PZTl1gHh281ZWf\n",
+                "P7d2+fuJMlkjtM7oAwf+tI8CAwEAAQ==\n",
+                "-----END PUBLIC KEY-----",
+            );
+            self.send_request(Function::getPassportAuthorizationForm(
+                td_api::getPassportAuthorizationForm {
+                    bot_user_id: self.as_user_id(&bot_user_id),
+                    scope,
+                    public_key: PUBLIC_KEY.to_owned(),
+                    nonce: payload,
+                },
+            ));
+            true
+        } else if op == "gpafae" {
+            let (form_id, password) = words!(args => form_id ; password);
+            self.send_request(Function::getPassportAuthorizationFormAvailableElements(
+                td_api::getPassportAuthorizationFormAvailableElements {
+                    authorization_form_id: tokenizer::to_integer_i32(&form_id),
+                    password,
+                },
+            ));
+            true
+        } else if op == "spaf" {
+            let (form_id, types) = words!(args => form_id ; types);
+            self.send_request(Function::sendPassportAuthorizationForm(
+                td_api::sendPassportAuthorizationForm {
+                    authorization_form_id: tokenizer::to_integer_i32(&form_id),
+                    types: as_passport_element_types(&types),
+                },
+            ));
+            true
+        } else if op == "gpcl" {
+            self.send_request(Function::getPreferredCountryLanguage(
+                td_api::getPreferredCountryLanguage {
+                    country_code: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "seavc" {
+            self.send_request(Function::sendEmailAddressVerificationCode(
+                td_api::sendEmailAddressVerificationCode {
+                    email_address: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "ceavc" {
+            self.send_request(Function::checkEmailAddressVerificationCode(
+                td_api::checkEmailAddressVerificationCode {
+                    code: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "reavc" {
+            self.send_request(Function::resendEmailAddressVerificationCode(
+                td_api::resendEmailAddressVerificationCode,
+            ));
+            true
+        } else if op == "ilear" {
+            self.send_request(Function::isLoginEmailAddressRequired(
+                td_api::isLoginEmailAddressRequired,
+            ));
+            true
+        } else if op == "slea" {
+            self.send_request(Function::setLoginEmailAddress(
+                td_api::setLoginEmailAddress {
+                    new_login_email_address: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "rleac" {
+            self.send_request(Function::resendLoginEmailAddressCode(
+                td_api::resendLoginEmailAddressCode,
+            ));
+            true
+        } else if op == "cleac" {
+            self.send_request(Function::checkLoginEmailAddressCode(
+                td_api::checkLoginEmailAddressCode {
+                    code: as_email_address_authentication(args),
+                },
+            ));
+            true
+        } else if op == "srea" {
+            let (password, recovery_email_address) = tokenizer::split(args, ' ');
+            self.send_request(Function::setRecoveryEmailAddress(
+                td_api::setRecoveryEmailAddress {
+                    password,
+                    new_recovery_email_address: recovery_email_address,
+                },
+            ));
+            true
+        } else if op == "grea" {
+            self.send_request(Function::getRecoveryEmailAddress(
+                td_api::getRecoveryEmailAddress {
+                    password: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "creac" {
+            self.send_request(Function::checkRecoveryEmailAddressCode(
+                td_api::checkRecoveryEmailAddressCode {
+                    code: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "rreac" {
+            self.send_request(Function::resendRecoveryEmailAddressCode(
+                td_api::resendRecoveryEmailAddressCode,
+            ));
+            true
+        } else if op == "creav" {
+            self.send_request(Function::cancelRecoveryEmailAddressVerification(
+                td_api::cancelRecoveryEmailAddressVerification,
+            ));
+            true
         } else {
             false
         }
     }
 
-    fn op_block_recovery(&self, _op: &str, _args: &str) -> bool {
-        false
+    /// cli.cpp:3289 — the recovery chain head (`rpr`/`cprc`/`rp`); the rest
+    /// of the chain lands with its M.14 slices.
+    fn op_block_recovery(&self, op: &str, args: &str) -> bool {
+        if op == "rpr" {
+            self.send_request(Function::requestPasswordRecovery(
+                td_api::requestPasswordRecovery,
+            ));
+            true
+        } else if op == "cprc" {
+            self.send_request(Function::checkPasswordRecoveryCode(
+                td_api::checkPasswordRecoveryCode {
+                    recovery_code: args.to_owned(),
+                },
+            ));
+            true
+        } else if op == "rp" {
+            let (recovery_code, tail) = tokenizer::split(args, ' ');
+            let (new_password, new_hint) = tokenizer::split(&tail, ' ');
+            self.send_request(Function::recoverAuthenticationPassword(
+                td_api::recoverAuthenticationPassword {
+                    recovery_code,
+                    new_password,
+                    new_hint,
+                },
+            ));
+            true
+        } else {
+            false
+        }
     }
 
     fn op_block_chats(&self, _op: &str, _args: &str) -> bool {
@@ -1418,8 +2025,63 @@ mod tests {
             "the C++ tree changed — regenerate the census with \
              conformance/cli_gate/extract_cli_census.sh"
         );
-        // (op, chain) pairs whose arms are ported so far.
-        const PORTED: &[(&str, u32)] = &[("gas", 0), ("q", 18)];
+        // (op, chain) pairs whose arms are ported so far: M.14.1 (q) +
+        // M.14.3 (the whole auth/account chain and the recovery head).
+        const PORTED: &[(&str, u32)] = &[
+            ("gas", 0),
+            ("sap", 0),
+            ("sapn", 0),
+            ("capp", 0),
+            ("sae", 0),
+            ("saea", 0),
+            ("rac", 0),
+            ("sdek", 0),
+            ("caec", 0),
+            ("cac", 0),
+            ("racmg", 0),
+            ("ru", 0),
+            ("rus", 0),
+            ("cap", 0),
+            ("cabt", 0),
+            ("qr", 0),
+            ("gapo", 0),
+            ("capk", 0),
+            ("cawt", 0),
+            ("cqr", 0),
+            ("gcs", 0),
+            ("raea", 0),
+            ("rapr", 0),
+            ("caprc", 0),
+            ("rap", 0),
+            ("lo", 0),
+            ("destroy", 0),
+            ("reset", 0),
+            ("close_td", 0),
+            ("DeleteAccountYesIReallyWantToDeleteMyAccount", 0),
+            ("gps", 0),
+            ("spass", 0),
+            ("gpafhttp", 0),
+            ("gpaf", 0),
+            ("gpafae", 0),
+            ("spaf", 0),
+            ("gpcl", 0),
+            ("seavc", 0),
+            ("ceavc", 0),
+            ("reavc", 0),
+            ("ilear", 0),
+            ("slea", 0),
+            ("rleac", 0),
+            ("cleac", 0),
+            ("srea", 0),
+            ("grea", 0),
+            ("creac", 0),
+            ("rreac", 0),
+            ("creav", 0),
+            ("rpr", 1),
+            ("cprc", 1),
+            ("rp", 1),
+            ("q", 18),
+        ];
 
         let guard = TEST_LOCK.lock().unwrap();
         for line in CENSUS.lines() {
@@ -1513,6 +2175,7 @@ mod tests {
             direct_messages_chat_topic_id: AtomicI64::new(0),
             forum_topic_id: AtomicI32::new(0),
             message_thread_id: AtomicI64::new(0),
+            opened_chat_id: AtomicI64::new(0),
         }
     }
 }

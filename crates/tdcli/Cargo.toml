@@ -13,6 +13,8 @@ name = "td_cli"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22"
 tdclient = { path = "../tdclient" }
+tdnet = { path = "../tdnet" }
 tdutils = { path = "../tdutils" }
 libc = "0.2"

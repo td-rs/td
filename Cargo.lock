@@ -1782,8 +1782,10 @@ dependencies = [
 name = "tdcli"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "libc",
  "tdclient",
+ "tdnet",
  "tdutils",
 ]
 
