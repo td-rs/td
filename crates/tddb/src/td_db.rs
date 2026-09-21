@@ -89,6 +89,24 @@ pub const LOG_EVENT_HANDLER_TYPE_USERS: i32 = 2;
 /// secret chat is unsaved (`SecretChatLogEvent`). Distinct from
 /// `SecretChats` = 1, which routes to the Wave-3 `SecretChatsManager`.
 pub const LOG_EVENT_HANDLER_TYPE_SECRET_CHAT_INFOS: i32 = 5;
+/// `LogEvent::HandlerType::UpdateScopeNotificationSettingsOnServer`
+/// (logevent/LogEvent.h:89) — the un-acked scope settings server update.
+pub const LOG_EVENT_HANDLER_TYPE_UPDATE_SCOPE_NOTIFICATION_SETTINGS_ON_SERVER: i32 = 0x110;
+/// `LogEvent::HandlerType::ResetAllNotificationSettingsOnServer`
+/// (logevent/LogEvent.h:90) — the un-acked reset-all server update.
+pub const LOG_EVENT_HANDLER_TYPE_RESET_ALL_NOTIFICATION_SETTINGS_ON_SERVER: i32 = 0x111;
+/// `LogEvent::HandlerType::UpdateReactionNotificationSettingsOnServer`
+/// (logevent/LogEvent.h:108) — the un-acked reaction settings server
+/// update.
+pub const LOG_EVENT_HANDLER_TYPE_UPDATE_REACTION_NOTIFICATION_SETTINGS_ON_SERVER: i32 = 0x129;
+/// `LogEvent::HandlerType::Chats` (logevent/LogEvent.h:66) — the raw
+/// basic-group log events the `ChatManager` mirror writes while a chat is
+/// unsaved (`ChatLogEvent`).
+pub const LOG_EVENT_HANDLER_TYPE_CHATS: i32 = 3;
+/// `LogEvent::HandlerType::Channels` (logevent/LogEvent.h:67) — the raw
+/// supergroup log events the `ChatManager` mirror writes while a channel
+/// is unsaved (`ChannelLogEvent`).
+pub const LOG_EVENT_HANDLER_TYPE_CHANNELS: i32 = 4;
 /// `LogEvent::HandlerType::ToggleDialogIsPinnedOnServer` (LogEvent.h:85) —
 /// the DialogManager server-sync mirror events (M.6.18). All seven collect
 /// into one replay vector for `DialogManager::on_binlog_dialog_events`.
@@ -126,6 +144,19 @@ pub struct OpenedDatabase {
     /// binlog event with the SecretChatInfos handler type, in binlog order,
     /// for `UserManager::on_binlog_secret_chat_event`.
     pub secret_chat_events: Vec<BinlogEvent>,
+    /// The on-server notification settings log events (Td.cpp:1034) — the
+    /// UpdateScopeNotificationSettingsOnServer / ResetAllNotificationSettings
+    /// OnServer / UpdateReactionNotificationSettingsOnServer events, in
+    /// binlog order, for `NotificationSettingsManager::on_binlog_events`.
+    pub notification_settings_events: Vec<BinlogEvent>,
+    /// The `chat_events` replay vector (TdDb.cpp:79-87) — every binlog
+    /// event with the Chats handler type, in binlog order, for
+    /// `ChatManager::on_binlog_chat_event`.
+    pub chat_events: Vec<BinlogEvent>,
+    /// The `channel_events` replay vector (TdDb.cpp:79-87) — every binlog
+    /// event with the Channels handler type, in binlog order, for
+    /// `ChatManager::on_binlog_channel_event`.
+    pub channel_events: Vec<BinlogEvent>,
     /// The `dialog_manager_events` replay vector (TdDb.cpp `dialog_events`
     /// shape) — every binlog event with one of the seven DialogManager
     /// server-sync handler types, in binlog order, for
@@ -854,11 +885,15 @@ impl TdDb {
         config_pmc.external_init_begin(CONFIG_PMC_MAGIC);
 
         // The combined replay callback: each pmc consumes only the events
-        // written with its own magic; the Users and SecretChatInfos events
-        // collect for the user manager (the remaining handlers wait for
-        // their owners).
+        // written with its own magic; the Users, SecretChatInfos, Chats and
+        // Channels events collect for their managers, the
+        // notification-settings on-server events for the settings manager
+        // (the remaining handlers wait for their owners).
         let mut user_events: Vec<BinlogEvent> = Vec::new();
         let mut secret_chat_events: Vec<BinlogEvent> = Vec::new();
+        let mut notification_settings_events: Vec<BinlogEvent> = Vec::new();
+        let mut chat_events: Vec<BinlogEvent> = Vec::new();
+        let mut channel_events: Vec<BinlogEvent> = Vec::new();
         let mut dialog_manager_events: Vec<BinlogEvent> = Vec::new();
         let mut messages_manager_events: Vec<BinlogEvent> = Vec::new();
         let mut binlog = ConcurrentBinlog::new();
@@ -867,6 +902,9 @@ impl TdDb {
             let config_pmc = &mut config_pmc;
             let user_events = &mut user_events;
             let secret_chat_events = &mut secret_chat_events;
+            let notification_settings_events = &mut notification_settings_events;
+            let chat_events = &mut chat_events;
+            let channel_events = &mut channel_events;
             let dialog_manager_events = &mut dialog_manager_events;
             let messages_manager_events = &mut messages_manager_events;
             let callback = |event: &BinlogEvent| match event.type_ {
@@ -874,6 +912,13 @@ impl TdDb {
                 CONFIG_PMC_MAGIC => config_pmc.external_init_handle(event),
                 LOG_EVENT_HANDLER_TYPE_USERS => user_events.push(event.clone()),
                 LOG_EVENT_HANDLER_TYPE_SECRET_CHAT_INFOS => secret_chat_events.push(event.clone()),
+                LOG_EVENT_HANDLER_TYPE_UPDATE_SCOPE_NOTIFICATION_SETTINGS_ON_SERVER
+                | LOG_EVENT_HANDLER_TYPE_RESET_ALL_NOTIFICATION_SETTINGS_ON_SERVER
+                | LOG_EVENT_HANDLER_TYPE_UPDATE_REACTION_NOTIFICATION_SETTINGS_ON_SERVER => {
+                    notification_settings_events.push(event.clone())
+                }
+                LOG_EVENT_HANDLER_TYPE_CHATS => chat_events.push(event.clone()),
+                LOG_EVENT_HANDLER_TYPE_CHANNELS => channel_events.push(event.clone()),
                 LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_IS_PINNED_ON_SERVER
                 | LOG_EVENT_HANDLER_TYPE_REORDER_PINNED_DIALOGS_ON_SERVER
                 | LOG_EVENT_HANDLER_TYPE_TOGGLE_DIALOG_REPORT_SPAM_STATE_ON_SERVER
@@ -966,6 +1011,9 @@ impl TdDb {
             since_last_open,
             user_events,
             secret_chat_events,
+            notification_settings_events,
+            chat_events,
+            channel_events,
             dialog_manager_events,
             messages_manager_events,
         })

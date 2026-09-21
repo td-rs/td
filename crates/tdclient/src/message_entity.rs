@@ -414,11 +414,12 @@ impl MessageEntity {
                 textEntityTypeExpandableBlockQuote {},
             ),
             Type::FormattedDate => {
-                // The C++ passes `get_date_time_formatting_type_object()`,
-                // which is null when no formatting was requested; since the
-                // M.10 union the generated td_api carries the `Option`
-                // through, so the null is passed on exactly like the C++
-                // (the S09-era default-Relative stand-in is gone).
+                // The S76 Option model carries the nullable formatting
+                // type through: `None` serializes to an explicit JSON
+                // null, matching the C++ `object_ptr` null (td_json
+                // emits `"formatting_type":null`) — the old flattened
+                // model had to default to Relative (the M.3.9.2
+                // convention this replaces).
                 let formatting_type = self.date.get_date_time_formatting_type_object();
                 TextEntityType::textEntityTypeDateTime(textEntityTypeDateTime {
                     unix_time: self.date.get_date(),
@@ -785,7 +786,13 @@ pub fn get_message_entities<U: UserManagerLike + ?Sized>(
     for input_entity in input_entities {
         let offset = input_entity.offset;
         let length = input_entity.length;
-        match input_entity.r#type.as_ref().unwrap() {
+        // `MessageEntity.cpp:3675`: a null entity type skips the entity
+        // (the JSON boundary usually pre-drops these via the null bridge;
+        // in-model callers get the same skip here).
+        let Some(entity_type) = input_entity.r#type else {
+            continue;
+        };
+        match entity_type {
             td_api::TextEntityType::textEntityTypeMention(_) => {
                 entities.push(MessageEntity::new(Type::Mention, offset, length));
             }
@@ -8838,9 +8845,10 @@ mod tests {
             dump(&entity(Type::ExpandableBlockQuote, 0, 1)),
             r#"{"@type":"textEntityTypeExpandableBlockQuote"}"#
         );
-        // The date entity: no formatting requested dumps the C++ null
-        // as-is — since the M.10 union the generated td_api carries the
-        // `Option` through, so the S09 default-Relative stand-in is gone.
+        // The date entity: the S76-era generated model carries the C++
+        // null `object_ptr` through (None → an explicit JSON null), so
+        // the unformatted date no longer needs the old Relative
+        // stand-in (oracle-verified byte-identical).
         assert_eq!(
             dump(&MessageEntity::formatted_date(
                 0,

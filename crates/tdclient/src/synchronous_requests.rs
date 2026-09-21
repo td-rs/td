@@ -88,12 +88,15 @@ pub fn is_synchronous_request(function: &Function) -> bool {
             | Function::getLogTagVerbosityLevel(_)
             | Function::addLogMessage(_)
             | Function::testReturnError(_)
+            | Function::getFileMimeType(_)
+            | Function::getFileExtension(_)
+            | Function::searchStringsByPrefix(_)
     ) || matches!(function, Function::getOption(g) if option_manager::is_synchronous_option(&g.name))
-    // Not ported yet (need their managers): searchQuote, searchStringsByPrefix,
-    // checkQuickReplyShortcutName, getCountryFlagEmoji, getFileMimeType,
-    // getFileExtension, cleanFileName, getLanguagePackString,
-    // getPhoneNumberInfoSync, getChatFolderDefaultIconName,
-    // getThemeParametersJsonString, getPushReceiverId.
+    // Not ported yet (need their managers): searchQuote,
+    // checkQuickReplyShortcutName, getCountryFlagEmoji, cleanFileName,
+    // getLanguagePackString, getPhoneNumberInfoSync,
+    // getChatFolderDefaultIconName, getThemeParametersJsonString,
+    // getPushReceiverId.
 }
 
 /// `JsonValue.cpp:get_json_value_object`: `tdutils::JsonValue` → td_api.
@@ -238,6 +241,44 @@ pub fn run_request(function: Function) -> Object {
             Object::ok(td_api::Ok)
         }
         Function::testReturnError(request) => Object::error(request.error.unwrap_or_default()),
+        // --- the M.11.4 generic (manager-free) synchronous set ---
+        Function::getFileMimeType(request) => {
+            // SynchronousRequests.cpp:262-265 — no UTF-8 check on the name.
+            let path_view = tdutils::path_view::PathView::new(&request.file_name);
+            Object::text(td_api::Text {
+                text: tdutils::mime_type::from_extension(path_view.extension()),
+            })
+        }
+        Function::getFileExtension(request) => {
+            // SynchronousRequests.cpp:267-269 — no UTF-8 check on the type.
+            Object::text(td_api::Text {
+                text: tdutils::mime_type::to_extension(&request.mime_type),
+            })
+        }
+        Function::searchStringsByPrefix(request) => {
+            // `do_request(searchStringsByPrefix)` → misc.cpp:406-417 — the
+            // UTF-8 gates run first.
+            let Some(query) = crate::misc::clean_input_string(&request.query) else {
+                return make_error(400, "Strings must be encoded in UTF-8");
+            };
+            let mut strings = Vec::with_capacity(request.strings.len());
+            for string in &request.strings {
+                let Some(string) = crate::misc::clean_input_string(string) else {
+                    return make_error(400, "Strings must be encoded in UTF-8");
+                };
+                strings.push(string);
+            }
+            let (total_count, positions) = crate::misc::search_strings_by_prefix(
+                strings,
+                &query,
+                request.limit,
+                !request.return_none_for_empty_query,
+            );
+            Object::foundPositions(td_api::FoundPositions {
+                total_count,
+                positions,
+            })
+        }
         Function::getTextEntities(request) => {
             if !tdutils::utf8::check_utf8(request.text.as_bytes()) {
                 return make_error(400, "Text must be encoded in UTF-8");
@@ -258,11 +299,12 @@ pub fn run_request(function: Function) -> Object {
                 return make_error(400, "Text must be encoded in UTF-8");
             }
 
-            // The null bridge above already rejected an absent parse_mode
-            // with the C++ error, so `None` is unreachable here.
-            let parse_mode_version = match request.parse_mode.as_ref().unwrap() {
-                td_api::TextParseMode::textParseModeHTML(_) => None,
-                td_api::TextParseMode::textParseModeMarkdown(markdown) => Some(markdown.version),
+            let parse_mode_version = match request.parse_mode.as_ref() {
+                None => return make_error(400, "Parse mode must be non-empty"),
+                Some(td_api::TextParseMode::textParseModeHTML(_)) => None,
+                Some(td_api::TextParseMode::textParseModeMarkdown(markdown)) => {
+                    Some(markdown.version)
+                }
             };
             let mut text = request.text;
             let r_entities: std::result::Result<Vec<message_entity::MessageEntity>, Status> = {
@@ -294,16 +336,19 @@ pub fn run_request(function: Function) -> Object {
             })
         }
         Function::parseMarkdown(request) => {
-            let text_struct = request.text.unwrap();
-            let mut text = text_struct.text;
-            let entities = match message_entity::get_message_entities::<()>(
-                None,
-                text_struct.entities,
-                true,
-            ) {
-                std::result::Result::Ok(entities) => entities,
-                std::result::Result::Err(status) => return make_error(400, status.message()),
+            // The null-text 400 normally arrives through the JSON null
+            // bridge (`null_pointer_request_error`); this is the same
+            // `SynchronousRequests.cpp:188` check for in-model callers.
+            let Some(request_text) = request.text else {
+                return make_error(400, "Text must be non-empty");
             };
+            let mut text = request_text.text;
+            let entities =
+                match message_entity::get_message_entities::<()>(None, request_text.entities, true)
+                {
+                    std::result::Result::Ok(entities) => entities,
+                    std::result::Result::Err(status) => return make_error(400, status.message()),
+                };
             let mut entities = entities;
             let status = message_entity::fix_formatted_text(
                 &mut text,
@@ -342,14 +387,20 @@ pub fn run_request(function: Function) -> Object {
             ))
         }
         Function::getMarkdownText(request) => {
-            let text_struct = request.text.unwrap();
-            let mut text = text_struct.text;
-            let entities =
-                match message_entity::get_message_entities::<()>(None, text_struct.entities, false)
-                {
-                    std::result::Result::Ok(entities) => entities,
-                    std::result::Result::Err(status) => return make_error(400, status.message()),
-                };
+            // `SynchronousRequests.cpp:215` via the null bridge; the
+            // in-model check for programmatic callers.
+            let Some(request_text) = request.text else {
+                return make_error(400, "Text must be non-empty");
+            };
+            let mut text = request_text.text;
+            let entities = match message_entity::get_message_entities::<()>(
+                None,
+                request_text.entities,
+                false,
+            ) {
+                std::result::Result::Ok(entities) => entities,
+                std::result::Result::Err(status) => return make_error(400, status.message()),
+            };
             let mut entities = entities;
             let status = message_entity::fix_formatted_text(
                 &mut text,
@@ -379,15 +430,15 @@ pub fn run_request(function: Function) -> Object {
     }
 }
 
-/// The flattened-model null bridge. The C++ keeps `object_ptr` nulls and
-/// checks them in `SynchronousRequests::do_request` with request-specific
-/// error strings. Since the M.10 union the generated td_api model carries
-/// `Option` object fields (the S76-era codegen), so the nullness would
-/// survive into `run_request`; the checks are still applied here at the
-/// JSON boundary, where every request passes, to keep the m8-gated
-/// byte-identical error delivery (including the `@extra` splice) — the
-/// `run_request` arms then `unwrap` the fields, which the bridge makes
-/// unreachable for JSON input.
+/// The flattened-model null bridge. The generated td_api model (S09)
+/// decodes a null or absent object field to its default variant, while the
+/// C++ keeps `object_ptr` nulls and checks them in
+/// `SynchronousRequests::do_request`. The checks that change the observable
+/// output cannot be expressed in `run_request` (the nullness is already
+/// lost), so `client_json.rs::to_request` applies them at the JSON
+/// boundary, where every request passes. The returned `testReturnError`
+/// serializes to the same `td_api::error` the C++ `make_error` response
+/// does, keeping the output byte-identical (including the `@extra` splice).
 ///
 /// `SynchronousRequests.cpp:188/215`: `parseMarkdown`/`getMarkdownText`
 /// require a non-null `text`; `SynchronousRequests.cpp:153`:
@@ -827,6 +878,82 @@ mod tests {
         assert_eq!(
             run_request(function).to_json(),
             r#"{"@type":"logStreamDefault"}"#
+        );
+    }
+
+    #[test]
+    fn get_file_mime_type_answers_the_canonical_type() {
+        // SynchronousRequests.cpp:262-265: `PathView(file_name).extension()`
+        // through `MimeType::from_extension`.
+        let function = Function::getFileMimeType(td_api::getFileMimeType {
+            file_name: "/music/song.mp3".to_string(),
+        });
+        assert_eq!(
+            run_request(function).to_json(),
+            r#"{"@type":"text","text":"audio/mpeg"}"#
+        );
+        let function = Function::getFileMimeType(td_api::getFileMimeType {
+            file_name: "archive.tar.gz".to_string(),
+        });
+        // the bundled mime_types.txt (byte-identical to the C++
+        // tdutils/generate/mime_types.txt) has no `gz` entry, so the C++
+        // answers the default empty string and logs the unknown extension
+        assert_eq!(
+            run_request(function).to_json(),
+            r#"{"@type":"text","text":""}"#
+        );
+        let function = Function::getFileMimeType(td_api::getFileMimeType {
+            file_name: "noextension".to_string(),
+        });
+        assert_eq!(
+            run_request(function).to_json(),
+            r#"{"@type":"text","text":""}"#
+        );
+    }
+
+    #[test]
+    fn get_file_extension_answers_the_canonical_extension() {
+        // SynchronousRequests.cpp:267-269: `MimeType::to_extension`.
+        let function = Function::getFileExtension(td_api::getFileExtension {
+            mime_type: "audio/mpeg".to_string(),
+        });
+        assert_eq!(
+            run_request(function).to_json(),
+            r#"{"@type":"text","text":"mp3"}"#
+        );
+        let function = Function::getFileExtension(td_api::getFileExtension {
+            mime_type: "no/such-type".to_string(),
+        });
+        assert_eq!(
+            run_request(function).to_json(),
+            r#"{"@type":"text","text":""}"#
+        );
+    }
+
+    #[test]
+    fn search_strings_by_prefix_answers_positions() {
+        let function = Function::searchStringsByPrefix(td_api::searchStringsByPrefix {
+            strings: vec!["Delta".to_string(), "charlie".to_string()],
+            query: "char".to_string(),
+            limit: 10,
+            return_none_for_empty_query: false,
+        });
+        assert_eq!(
+            run_request(function).to_json(),
+            // the C++ keys are the 0-based indices (`hints.add(i, ...)`,
+            // misc.cpp:406-419) and the Hints search is prefix-only:
+            // "char" prefix-matches only "charlie"
+            r#"{"@type":"foundPositions","total_count":1,"positions":[1]}"#
+        );
+        let function = Function::searchStringsByPrefix(td_api::searchStringsByPrefix {
+            strings: vec!["ab1".to_string(), "ab2".to_string(), "ab3".to_string()],
+            query: String::new(),
+            limit: 2,
+            return_none_for_empty_query: false,
+        });
+        assert_eq!(
+            run_request(function).to_json(),
+            r#"{"@type":"foundPositions","total_count":3,"positions":[0,1]}"#
         );
     }
 }

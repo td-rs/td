@@ -2,8 +2,10 @@
 # the td_api JSON request parser, the raw tdutils JSON parser, the binlog
 # event reader, the MTProto packet parser, the TL scheme text parser, the
 # UserManager database blobs (User/UserFull/SecretChat log events + the
-# EmojiStatus value parser) and the ConfigManager pair (the app-config
-# JSON application + the simple-config decoder). URL / HTML / entities
+# EmojiStatus value parser), the ConfigManager pair (the app-config
+# JSON application + the simple-config decoder) and the UpdatesManager
+# engine (M.7.19 `updates_container`: arbitrary Updates umbrellas +
+# difference responses through the full engine). URL / HTML / entities
 # targets arrive with their Track I components; the photo.rs value-parser
 # target arrives with M.4.13.
 #
@@ -93,6 +95,10 @@ doc = false
 [[bin]]
 name = "message_content"
 path = "fuzz_targets/message_content.rs"
+
+[[bin]]
+name = "updates_container"
+path = "fuzz_targets/updates_container.rs"
 doc = false
 
 # Panic = bug: the parsers must report errors, never crash (the tdlib

@@ -81,24 +81,28 @@ impl FormattedDate {
                     date_flags = date_flags::RELATIVE;
                 }
                 td_api::DateTimeFormattingType::dateTimeFormattingTypeAbsolute(type_) => {
-                    match &type_.time_precision {
-                        Some(td_api::DateTimePartPrecision::dateTimePartPrecisionNone(_))
-                        | None => {}
-                        Some(td_api::DateTimePartPrecision::dateTimePartPrecisionShort(_)) => {
-                            date_flags |= date_flags::SHORT_TIME;
-                        }
-                        Some(td_api::DateTimePartPrecision::dateTimePartPrecisionLong(_)) => {
-                            date_flags |= date_flags::LONG_TIME;
+                    // `FormattedDate.cpp:54/68`: null precisions contribute
+                    // no flags (the nullable object_ptr check).
+                    if let Some(precision) = type_.time_precision.as_ref() {
+                        match precision {
+                            td_api::DateTimePartPrecision::dateTimePartPrecisionNone(_) => {}
+                            td_api::DateTimePartPrecision::dateTimePartPrecisionShort(_) => {
+                                date_flags |= date_flags::SHORT_TIME;
+                            }
+                            td_api::DateTimePartPrecision::dateTimePartPrecisionLong(_) => {
+                                date_flags |= date_flags::LONG_TIME;
+                            }
                         }
                     }
-                    match &type_.date_precision {
-                        Some(td_api::DateTimePartPrecision::dateTimePartPrecisionNone(_))
-                        | None => {}
-                        Some(td_api::DateTimePartPrecision::dateTimePartPrecisionShort(_)) => {
-                            date_flags |= date_flags::SHORT_DATE;
-                        }
-                        Some(td_api::DateTimePartPrecision::dateTimePartPrecisionLong(_)) => {
-                            date_flags |= date_flags::LONG_DATE;
+                    if let Some(precision) = type_.date_precision.as_ref() {
+                        match precision {
+                            td_api::DateTimePartPrecision::dateTimePartPrecisionNone(_) => {}
+                            td_api::DateTimePartPrecision::dateTimePartPrecisionShort(_) => {
+                                date_flags |= date_flags::SHORT_DATE;
+                            }
+                            td_api::DateTimePartPrecision::dateTimePartPrecisionLong(_) => {
+                                date_flags |= date_flags::LONG_DATE;
+                            }
                         }
                     }
                     if type_.show_day_of_week {
