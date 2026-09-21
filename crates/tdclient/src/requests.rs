@@ -30,6 +30,8 @@
 //! `is_preauthentication_request` (Td.cpp:154-249, 26/12/37 entries) behind
 //! the `Td::run_request` state gate (Td.cpp:299-374).
 
+use crate::call_id::{CallId, InputCallId};
+use crate::call_protocol::CallProtocol;
 use crate::chat_manager::{ChannelId, DialogId};
 use crate::contact::Contact;
 use crate::notification::{NotificationGroupId, NotificationId, NotificationObjectId};
@@ -38,6 +40,7 @@ use crate::notification_settings::{
     get_scope_notification_settings_object,
 };
 use crate::notification_settings_manager::ScopeSettingsAnswer;
+use crate::td::CallEnv;
 use crate::td::NotificationEnv;
 use crate::td::Td;
 use crate::td_api::{self, Function, Object};
@@ -1876,6 +1879,170 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             }
         }
 
+        // --- calls (Requests.cpp:5088-5135) ---
+        Function::createCall(request) => {
+            // `Requests.cpp:5088-5100`: CHECK_IS_USER + the protocol gate;
+            // the manager settles the promise with the local CallId.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(protocol) = request.protocol.as_ref() else {
+                return td.send_error_impl(id, 400, "Call protocol must be non-empty");
+            };
+            let promise =
+                td.deferred_promise(id, |call_id: td_api::CallId| Object::callId(call_id));
+            let mut env = CallEnv {
+                user_env: user_env!(td),
+                user_manager: &mut td.user_manager,
+                notification_manager: &mut td.notification_manager,
+                updates: &mut td.call_updates,
+                dh_config: &mut td.call_dh_config,
+            };
+            td.call_manager.create_call(
+                &mut env,
+                UserId::new(request.user_id),
+                CallProtocol::from_td_api(protocol),
+                request.is_video,
+                promise,
+            );
+        }
+        Function::acceptCall(request) => {
+            // `Requests.cpp:5107-5115`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(protocol) = request.protocol.as_ref() else {
+                return td.send_error_impl(id, 400, "Call protocol must be non-empty");
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = CallEnv {
+                user_env: user_env!(td),
+                user_manager: &mut td.user_manager,
+                notification_manager: &mut td.notification_manager,
+                updates: &mut td.call_updates,
+                dh_config: &mut td.call_dh_config,
+            };
+            td.call_manager.accept_call(
+                &mut env,
+                CallId::new(request.call_id),
+                CallProtocol::from_td_api(protocol),
+                promise,
+            );
+        }
+        Function::sendCallSignalingData(request) => {
+            // `Requests.cpp:5117-5122`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = CallEnv {
+                user_env: user_env!(td),
+                user_manager: &mut td.user_manager,
+                notification_manager: &mut td.notification_manager,
+                updates: &mut td.call_updates,
+                dh_config: &mut td.call_dh_config,
+            };
+            td.call_manager.send_call_signaling_data(
+                &mut env,
+                CallId::new(request.call_id),
+                request.data,
+                promise,
+            );
+        }
+        Function::discardCall(request) => {
+            // `Requests.cpp:5124-5130`: CLEAN_INPUT_STRING on the invite
+            // link.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(invite_link) = crate::misc::clean_input_string(&request.invite_link) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = CallEnv {
+                user_env: user_env!(td),
+                user_manager: &mut td.user_manager,
+                notification_manager: &mut td.notification_manager,
+                updates: &mut td.call_updates,
+                dh_config: &mut td.call_dh_config,
+            };
+            td.call_manager.discard_call(
+                &mut env,
+                CallId::new(request.call_id),
+                request.is_disconnected,
+                &invite_link,
+                request.duration,
+                request.is_video,
+                request.connection_id,
+                promise,
+            );
+        }
+        Function::sendCallRating(request) => {
+            // `Requests.cpp:5132-5138`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(comment) = crate::misc::clean_input_string(&request.comment) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = CallEnv {
+                user_env: user_env!(td),
+                user_manager: &mut td.user_manager,
+                notification_manager: &mut td.notification_manager,
+                updates: &mut td.call_updates,
+                dh_config: &mut td.call_dh_config,
+            };
+            td.call_manager.rate_call(
+                &mut env,
+                &request.call_id,
+                request.rating,
+                comment,
+                request.problems,
+                promise,
+            );
+        }
+        Function::sendCallDebugInformation(request) => {
+            // `Requests.cpp:5140-5146`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(debug_information) =
+                crate::misc::clean_input_string(&request.debug_information)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let call_id = match InputCallId::get_input_call_id(&request.call_id) {
+                Ok(call_id) => call_id,
+                Err(status) => {
+                    return td.send_error_impl(id, status.code(), status.message());
+                }
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = CallEnv {
+                user_env: user_env!(td),
+                user_manager: &mut td.user_manager,
+                notification_manager: &mut td.notification_manager,
+                updates: &mut td.call_updates,
+                dh_config: &mut td.call_dh_config,
+            };
+            td.call_manager.send_call_debug_information(
+                &mut env,
+                call_id,
+                debug_information,
+                promise,
+            );
+        }
+        Function::sendCallLog(_) => {
+            // `Requests.cpp:5148-5153` — the FileManager call-log upload
+            // surface (FileType::CallLog + upload callback) queues on the
+            // M.12 upload continuation; the interim 500 stays.
+            if !check_is_user(td, id) {
+                return;
+            }
+            td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+        }
+
         // Everything else waits for its manager step.
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
@@ -2176,13 +2343,16 @@ mod request_census_tests {
         // stays the 500 placeholder) + M.12.10's eighteen file-plane
         // dispatches (getFile/getRemoteFile, the download/upload/
         // generation arms, the DownloadManager list plane and the four
-        // storage-statistics arms). Fix per flip.
+        // storage-statistics arms) + M.32's six call arms (createCall,
+        // acceptCall, discardCall, sendCallSignalingData, sendCallRating,
+        // sendCallDebugInformation; sendCallLog stays the 500 placeholder
+        // behind the M.12 call-log upload surface). Fix per flip.
         assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            110,
+            116,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 894, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 888, "interim count");
     }
 }

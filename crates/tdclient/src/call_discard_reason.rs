@@ -47,6 +47,28 @@ pub fn get_group_call_invite_link(slug: &str, is_internal: bool) -> String {
     }
 }
 
+/// `LinkManager::get_group_call_invite_link_slug`
+/// (LinkManager.cpp:4286-4297) — the minimal reverse parse for the
+/// `tg:call?slug=` and `t.me/call/` forms (the full `get_link_info`/
+/// `parse_url_query` machinery is Wave-2 M.23; this covers the call
+/// invite links).
+pub fn get_group_call_invite_link_slug(invite_link: &str) -> String {
+    let slug = if let Some(slug) = invite_link.strip_prefix("tg:call?slug=") {
+        slug
+    } else if let Some(slug) = invite_link.strip_prefix("https://t.me/call/") {
+        slug
+    } else if let Some(slug) = invite_link.strip_prefix("t.me/call/") {
+        slug
+    } else {
+        return String::new();
+    };
+    if is_base64url_characters(slug) {
+        slug.to_string()
+    } else {
+        String::new()
+    }
+}
+
 /// `get_call_discard_reason` (CallDiscardReason.cpp:5-25) — the wire
 /// `PhoneCallDiscardReason` union.
 pub fn get_call_discard_reason(

@@ -693,6 +693,16 @@ pub trait UpdatesSink {
     fn on_update_user_status(&mut self, user_id: i64, status: telegram_api::UserStatus) {
         let _ = (user_id, status);
     }
+    /// `CallManager::update_call` (M.32) — the td-level sink routes the
+    /// updatePhoneCall intake to the call manager; the ZST stand-in
+    /// no-ops until the sink-state refactor.
+    fn on_update_phone_call(&mut self, update: telegram_api::updatePhoneCall) {
+        let _ = update;
+    }
+    /// `CallManager::update_call_signaling_data` (M.32).
+    fn on_update_phone_call_signaling_data(&mut self, call_id: i64, data: Vec<u8>) {
+        let _ = (call_id, data);
+    }
     /// `UserManager::on_update_user_name` (cpp:4369).
     fn on_update_user_name(&mut self, user_id: i64, first_name: String, last_name: String) {
         let _ = (user_id, first_name, last_name);
@@ -5171,23 +5181,18 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                     promise,
                 );
             }
-            PendingUpdate::Wire(telegram_api::Update::updatePhoneCall(_)) => {
-                // call_manager — Wave 2.
-                self.drop_unsupported(
-                    telegram_api::updatePhoneCall::ID,
-                    "updatePhoneCall",
-                    4731,
-                    promise,
-                );
+            PendingUpdate::Wire(telegram_api::Update::updatePhoneCall(update)) => {
+                // CallManager::update_call — M.32; the td-level sink
+                // routes to the manager (the ZST stand-in no-ops until
+                // the sink-state refactor).
+                self.sink.on_update_phone_call(update);
+                promise.set_value(());
             }
-            PendingUpdate::Wire(telegram_api::Update::updatePhoneCallSignalingData(_)) => {
-                // call_manager — Wave 2.
-                self.drop_unsupported(
-                    telegram_api::updatePhoneCallSignalingData::ID,
-                    "updatePhoneCallSignalingData",
-                    4736,
-                    promise,
-                );
+            PendingUpdate::Wire(telegram_api::Update::updatePhoneCallSignalingData(update)) => {
+                // CallManager::update_call_signaling_data — M.32.
+                self.sink
+                    .on_update_phone_call_signaling_data(update.phone_call_id, update.data);
+                promise.set_value(());
             }
             PendingUpdate::Wire(telegram_api::Update::updateGroupCallConnection(_)) => {
                 // group_call_manager — Wave 2.
