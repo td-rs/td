@@ -37,6 +37,7 @@ pub mod version {
     pub const ADD_PHOTO_PROGRESSIVE_SIZES: i32 = 28;
     pub const ADD_LIVE_LOCATION_HEADING: i32 = 29;
     pub const ADD_LIVE_LOCATION_PROXIMITY_ALERT_DISTANCE: i32 = 30;
+    pub const SUPPORT_BANNED_CHANNELS: i32 = 31;
     pub const REMOVE_PHOTO_VOLUME_AND_LOCAL_ID: i32 = 32;
     pub const SUPPORT_64_BIT_IDS: i32 = 33;
     pub const ADD_INVITE_LINKS_REQUIRING_APPROVAL: i32 = 34;
@@ -56,6 +57,7 @@ pub mod version {
     pub const SUPPORT_BOT_TOPICS: i32 = 56;
     pub const ADD_DICE_FLAGS: i32 = 57;
     pub const ADD_POLL_CAPTION: i32 = 59;
+    pub const SUPPORT_EPHEMERAL_MESSAGES: i32 = 61;
     /// `Version::Next` of tdlib 1.8.67 (`SupportEphemeralMessages` + 1).
     pub const NEXT: i32 = 62;
     /// What `LogEventStorerUnsafe` writes (`Version::Next - 1`).

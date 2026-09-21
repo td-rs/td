@@ -137,19 +137,18 @@ struct PendingSend {
     text: String,
 }
 
-/// The collecting sink under the S72 UpdatesManager — Td drains it and
-/// converts/emits (the pts machine semantics stay in the manager). The
-/// new-message arm carries its update source: `updateNewMessage` and
-/// `updateNewChannelMessage` both feed the same MessagesManager intake
-/// (the C++ pts path treats the pair uniformly, UpdatesManager.cpp:1153-1160).
+/// The td-level [`UpdatesSink`] — the collector form carrying the M.10
+/// receive path: the engine drives it (the users/chats pre-application
+/// and the applied pts updates) and `Td::drain_sink` converts/emits
+/// through the landed managers. The direct manager calls land with the
+/// sink-state refactor; the drain pattern keeps the M.10.3/M.10.6
+/// intakes live.
 #[derive(Default)]
-struct TdSink {
-    users: Vec<tdmtproto::telegram_api::User>,
-    chats: Vec<tdmtproto::telegram_api::Chat>,
-    new_messages: Vec<(tdmtproto::telegram_api::Message, &'static str)>,
-    deletions: Vec<Vec<i32>>,
-    message_ids: Vec<(i32, i64)>,
-    gap: bool,
+pub(crate) struct TdSink {
+    pub(crate) users: Vec<tdmtproto::telegram_api::User>,
+    pub(crate) chats: Vec<tdmtproto::telegram_api::Chat>,
+    pub(crate) new_messages: Vec<(tdmtproto::telegram_api::Message, &'static str)>,
+    pub(crate) deletions: Vec<Vec<i32>>,
 }
 
 impl UpdatesSink for TdSink {
@@ -159,40 +158,39 @@ impl UpdatesSink for TdSink {
     fn on_chat(&mut self, chat: tdmtproto::telegram_api::Chat) {
         self.chats.push(chat);
     }
+    /// `MessagesManager::process_pts_update` — the applied update switch:
+    /// the new-message and delete kinds collect for the drain (the
+    /// M.10.3/M.10.6 intakes); the rest are the manager flips.
     fn process_pts_update(&mut self, update: PendingUpdate) {
-        if let PendingUpdate::Wire(telegram_api::Update::updateNewMessage(new_message)) = update
-            && let Some(message) = new_message.message
-        {
-            self.new_messages.push(message);
+        match update {
+            PendingUpdate::Wire(telegram_api::Update::updateNewMessage(update)) => {
+                if let Some(message) = update.message {
+                    self.new_messages.push((message, "updateNewMessage"));
+                }
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateNewChannelMessage(update)) => {
+                if let Some(message) = update.message {
+                    self.new_messages.push((message, "updateNewChannelMessage"));
+                }
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateDeleteMessages(update)) => {
+                self.deletions.push(update.messages);
+            }
+            _ => {}
         }
     }
+    /// `MessagesManager::add_pending_channel_update` — the channel-pts
+    /// machine's applied updates ride the same collector.
     fn add_pending_channel_update(
         &mut self,
         _peer: Option<tdmtproto::telegram_api::Peer>,
-        _update: PendingUpdate,
+        update: PendingUpdate,
         _pts: i32,
         _pts_count: i32,
         _promise: Promise<()>,
         _source: &str,
     ) {
-        self.new_messages.push((message, "updateNewMessage"));
-    }
-    fn on_new_channel_message(
-        &mut self,
-        message: tdmtproto::telegram_api::Message,
-        _pts: i32,
-        _pts_count: i32,
-    ) {
-        self.new_messages.push((message, "updateNewChannelMessage"));
-    }
-    fn on_delete_messages(&mut self, messages: Vec<i32>, _pts: i32, _pts_count: i32) {
-        self.deletions.push(messages);
-    }
-    fn on_message_id(&mut self, id: i32, random_id: i64) {
-        self.message_ids.push((id, random_id));
-    }
-    fn on_gap(&mut self) {
-        self.gap = true;
+        self.process_pts_update(update);
     }
 }
 
@@ -1667,7 +1665,7 @@ pub struct Td {
     /// on the first pts access (`init_state`), and the pmc writes flush
     /// through `timeout_expired` exactly like the C++ actor's
     /// `MAX_PTS_SAVE_DELAY` throttle.
-    pub(crate) updates_manager: UpdatesManager<TdUpdatesSink>,
+    pub(crate) updates_manager: UpdatesManager<TdSink>,
     /// `Td::messages_manager_` — the M.10 manager state (the dialog/message
     /// container set + the database family bookkeeping); the receive path
     /// (M.10.3+) is the first reader.
@@ -1699,7 +1697,6 @@ pub struct Td {
     next_local_message_id: i64,
     /// random_id → the pending send.
     pending_sends: HashMap<i64, PendingSend>,
-    updates: UpdatesManager<TdSink>,
 }
 
 /// A parked recoverer fetch — the C++ `get_simple_config_*` /
@@ -1712,41 +1709,6 @@ pub struct Td {
 pub(crate) enum RecovererFetch {
     Simple(crate::config_recoverer::SimpleConfigFetch),
     Full(crate::config_recoverer::FullConfigFetch),
-}
-
-/// The td-level [`UpdatesSink`]: the manager fan-outs land here as their
-/// slices land — the M.7.12 user-group intakes call into `user_manager`
-/// with its env (the M.3.9 manager convention), the message-family seams
-/// call the landed MessagesManager. Until then the trait defaults apply;
-/// the live update flow itself arrives with the net step (the session
-/// intake of `Td.cpp:404-408`), so the defaults are unobservable today.
-pub(crate) struct TdUpdatesSink;
-
-impl UpdatesSink for TdUpdatesSink {
-    /// `UserManager::on_get_users` — the users pre-application flips here
-    /// with the sink-state refactor (the ZST cannot reach the managers;
-    /// no live update flow exists before the net step, so nothing is
-    /// dropped today).
-    fn on_user(&mut self, _user: telegram_api::User) {}
-
-    /// `ChatManager::on_get_chats` — the M.5 flip, as `on_user`.
-    fn on_chat(&mut self, _chat: telegram_api::Chat) {}
-
-    /// `MessagesManager::process_pts_update` — the MessagesManager flip.
-    fn process_pts_update(&mut self, _update: PendingUpdate) {}
-
-    /// `MessagesManager::add_pending_channel_update` — the
-    /// MessagesManager flip.
-    fn add_pending_channel_update(
-        &mut self,
-        _peer: Option<telegram_api::Peer>,
-        _update: PendingUpdate,
-        _pts: i32,
-        _pts_count: i32,
-        _promise: Promise<()>,
-        _source: &str,
-    ) {
-    }
 }
 
 /// The [`UpdatesManagerEnv`] over the `Td` fields: built per drive with
@@ -1898,7 +1860,7 @@ impl Td {
             premium_required_contact_merger: None,
             chat_manager: crate::chat_manager::ChatManager::new(),
             dialog_manager: DialogManager::new(),
-            updates_manager: UpdatesManager::new(TdUpdatesSink),
+            updates_manager: UpdatesManager::new(TdSink::default()),
             messages_manager: crate::messages_manager::MessagesManager::new(),
             stop_cnt: 2,
             deferred_results: Arc::new(Mutex::new(Vec::new())),
@@ -1910,7 +1872,6 @@ impl Td {
             peer_access: HashMap::new(),
             next_local_message_id: -1,
             pending_sends: HashMap::new(),
-            updates: UpdatesManager::new(TdSink::default()),
         }
     }
 
@@ -3880,7 +3841,7 @@ impl Td {
                     my_id: self.user_manager.get_my_id().get(),
                     can_ignore_background_updates: self.can_ignore_background_updates,
                 };
-                self.updates
+                self.updates_manager
                     .on_get_updates_state(&mut env, m, "updates.getState");
             }
             bridge.mark_authorized();
@@ -4194,14 +4155,14 @@ impl Td {
             my_id: self.user_manager.get_my_id().get(),
             can_ignore_background_updates: self.can_ignore_background_updates,
         };
-        self.updates
+        self.updates_manager
             .on_get_updates(&mut env, umbrella, Promise::default());
         self.drain_sink();
     }
 
     /// Converts and emits what the sink collected.
     fn drain_sink(&mut self) {
-        let sink = std::mem::take(self.updates.sink());
+        let sink = std::mem::take(self.updates_manager.sink());
         for user in &sink.users {
             if let telegram_api::User::user(user) = user {
                 self.peer_access.insert(user.id, user.access_hash);
