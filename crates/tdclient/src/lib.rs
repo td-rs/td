@@ -11,6 +11,7 @@ pub mod boost_manager;
 pub mod account_manager;
 pub mod age_verification_parameters;
 pub mod auth_manager;
+pub mod autosave_manager;
 pub mod birthdate;
 pub mod call_actor;
 pub mod call_discard_reason;

@@ -43,6 +43,7 @@ use crate::notification_settings::{
 use crate::notification_settings_manager::ScopeSettingsAnswer;
 use crate::suggested_action::SuggestedAction;
 use crate::td::AccountEnv;
+use crate::td::AutosaveEnv;
 use crate::td::BoostEnv;
 use crate::td::QuickReplyEnv;
 use crate::td::CallEnv;
@@ -2492,6 +2493,51 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
         }
 
         // Everything else waits for its manager step.
+        // --- autosave (Requests.cpp:3136-3152) ---
+        Function::getAutosaveSettings(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |s: td_api::AutosaveSettings| {
+                Object::autosaveSettings(s)
+            });
+            let mut env = AutosaveEnv {
+                global: &mut td.global,
+                updates: &mut td.autosave_updates,
+            };
+            td.autosave_manager.get_autosave_settings(&mut env, promise);
+        }
+        Function::setAutosaveSettings(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = AutosaveEnv {
+                global: &mut td.global,
+                updates: &mut td.autosave_updates,
+            };
+            td.autosave_manager.set_autosave_settings(
+                &mut env,
+                request.scope,
+                request.settings,
+                promise,
+            );
+        }
+        Function::clearAutosaveSettingsExceptions(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = AutosaveEnv {
+                global: &mut td.global,
+                updates: &mut td.autosave_updates,
+            };
+            td.autosave_manager
+                .clear_autosave_settings_exceptions(&mut env, promise);
+        }
+
+
+        // Everything else waits for its manager step.
         Function::getChatBoostStatus(request) => {
             if !check_is_user(td, id) {
                 return;
@@ -3265,16 +3311,17 @@ mod request_census_tests {
 assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
 assert_eq!(
     *counts.get("dispatched").unwrap_or(&0),
-    167,
+    170,
     "dispatched count"
 );
 assert_eq!(
     *counts.get("interim").unwrap_or(&0),
-    837,
+    834,
     "interim count"
 );
     }
 }
+
 
 
 
