@@ -9,6 +9,14 @@
 
 pub mod auth_manager;
 pub mod birthdate;
+pub mod bot_access_settings;
+pub mod bot_command;
+pub mod bot_command_scope;
+pub mod bot_info_manager;
+pub mod bot_menu_button;
+pub mod bot_queries;
+pub mod bot_verification;
+pub mod bot_verifier_settings;
 pub mod chat_manager;
 pub mod client;
 pub mod client_json;
@@ -33,6 +41,7 @@ pub mod manager_option_states;
 pub mod message_db;
 pub mod message_entity;
 pub mod message_id;
+pub mod message_sender;
 pub mod misc;
 pub mod net;
 pub mod notification;
