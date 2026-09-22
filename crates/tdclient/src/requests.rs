@@ -2988,7 +2988,6 @@ fn run_forum_topic_requests(td: &mut Td, id: u64, function: Function) {
             promise.set_value(());
         }
 
-
         // Everything else waits for its manager step.
         // Everything else waits for its manager step.
         _ => run_story_requests(td, id, function),
@@ -6071,6 +6070,74 @@ fn run_bot_requests_46(td: &mut Td, id: u64, function: Function) {
         Function::answerCallbackQuery(request) => arm_answer_callback_query(td, id, request),
 
         // Everything else waits for its manager step.
+        _ => run_secret_chat_requests(td, id, function),
+    }
+}
+
+/// The M.50 SecretChatsManager arm group of the request dispatcher — see
+/// the frame note at the forward site in [`run_request`]. The arms route
+/// into `td_->secret_chats_manager_->...` (Requests.cpp:5082-5091,
+/// 7409-7415); the network tails are the [blocked: net] query seams.
+#[allow(clippy::too_many_lines)]
+fn run_secret_chat_requests(td: &mut Td, id: u64, function: Function) {
+    fn secret_chat_arm(
+        td: &mut Td,
+        run: impl FnOnce(
+            &mut crate::td::SecretChatsTdEnv<'_>,
+            &mut crate::secret_chats_manager::SecretChatsManager,
+        ),
+    ) {
+        let crate::td::Td {
+            secret_chats_manager,
+            global,
+            auth_manager,
+            user_manager,
+            notification_updates,
+            ..
+        } = td;
+        let mut env = crate::td::SecretChatsTdEnv {
+            global,
+            auth_is_authorized: auth_manager.is_authorized(),
+            use_secret_chats: true,
+            user_manager,
+            updates: notification_updates,
+        };
+        run(&mut env, secret_chats_manager);
+    }
+
+    match function {
+        // createNewSecretChat (Requests.cpp:5082-5091) — the C++ routes
+        // through user_manager_->create_new_secret_chat, which converts
+        // the created chat id to the chat object; both the net leg and
+        // the conversion park [blocked: net / the chat creation intake].
+        Function::createNewSecretChat(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Chat, _>(id, Object::chat);
+            secret_chat_arm(td, |env, manager| {
+                manager.create_chat_chat_object(
+                    env,
+                    crate::user_manager::UserId::new(request.user_id),
+                    promise,
+                );
+            });
+        }
+
+        // closeSecretChat (Requests.cpp:7409-7415)
+        Function::closeSecretChat(request) => {
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            secret_chat_arm(td, |env, manager| {
+                manager.cancel_chat(
+                    env,
+                    crate::secret_chat::SecretChatId::new(request.secret_chat_id),
+                    false,
+                    promise,
+                );
+            });
+        }
+
+        // Everything else waits for its manager step.
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
@@ -6780,23 +6847,13 @@ mod request_census_tests {
         assert_eq!(generated.len(), crate::td_api::SCHEME_FUNCTIONS);
 
         // The flip-state ledger — re-derived from the fixture at the wave-3
-// integration (the per-track flip histories compose).
-assert_eq!(*counts.get("sync").unwrap_or(&0), 19, "sync count");
-assert_eq!(
-    *counts.get("dispatched").unwrap_or(&0),
-    363,
-    "dispatched count"
-);
-assert_eq!(
-    *counts.get("interim").unwrap_or(&0),
-    640,
-    "interim count"
-);
+        // integration (the per-track flip histories compose).
+        assert_eq!(*counts.get("sync").unwrap_or(&0), 19, "sync count");
+        assert_eq!(
+            *counts.get("dispatched").unwrap_or(&0),
+            365,
+            "dispatched count"
+        );
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 638, "interim count");
     }
 }
-
-
-
-
-
-

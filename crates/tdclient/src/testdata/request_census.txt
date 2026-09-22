@@ -106,7 +106,7 @@ clickVideoMessageAdvertisement	interim
 close	dispatched
 closeChat	interim
 closeGiftAuction	dispatched
-closeSecretChat	interim
+closeSecretChat	dispatched
 closeStory	dispatched
 closeWebApp	dispatched
 commitPendingLiveStoryReactions	interim
@@ -132,7 +132,7 @@ createGiftCollection	dispatched
 createGroupCall	interim
 createInvoiceLink	dispatched
 createNewBasicGroupChat	interim
-createNewSecretChat	interim
+createNewSecretChat	dispatched
 createNewStickerSet	interim
 createNewSupergroupChat	interim
 createPrivateChat	interim

@@ -352,6 +352,8 @@ pub struct Td {
     pub(crate) community_updates: Vec<td_api::Update>,
     /// `Td::device_token_manager_` (`Td.cpp:1345`, M.13S).
     pub(crate) device_token_manager: crate::device_token_manager::DeviceTokenManager,
+    /// `Td::secret_chats_manager_` (`Td.cpp:1293`, M.50).
+    pub(crate) secret_chats_manager: crate::secret_chats_manager::SecretChatsManager,
     /// `Td::web_browser_manager_` (`make_unique` at `Td.cpp:1332`, the
     /// `init_managers` block).
     pub(crate) web_browser_manager: WebBrowserManager,
@@ -712,6 +714,7 @@ impl Td {
             community_manager: CommunityManager::new(),
             community_updates: Vec::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
+            secret_chats_manager: crate::secret_chats_manager::SecretChatsManager::new(true),
             web_browser_manager: WebBrowserManager::new(),
             web_browser_updates: Vec::new(),
             call_manager: CallManager::new(),
@@ -8186,6 +8189,36 @@ impl crate::forum_topic_manager::ForumTopicEnv for ForumTopicTdEnv<'_> {
     }
 }
 
+/// The `G()`/`td_` slice the secret-chats plane reads through (the M.50
+/// convention): field-split borrows off `Td`. The [blocked: net] tails
+/// and the tde2e actor halves keep their trait defaults.
+pub(crate) struct SecretChatsTdEnv<'a> {
+    /// The C++ `G()` reads — kept for the field parity; the halves land
+    /// with the tde2e actor plane.
+    #[allow(dead_code)]
+    pub(crate) global: &'a mut Global,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) use_secret_chats: bool,
+    /// The user-manager half for the access-hash read — kept for the
+    /// C++ field parity.
+    #[allow(dead_code)]
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::secret_chats_manager::SecretChatsEnv for SecretChatsTdEnv<'_> {
+    fn is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn use_secret_chats(&self) -> bool {
+        self.use_secret_chats
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+}
 
 #[cfg(test)]
 mod tests {
