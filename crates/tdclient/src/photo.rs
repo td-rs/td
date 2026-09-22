@@ -1098,6 +1098,7 @@ pub fn parse_dialog_photo(
     }
     dialog_photo.is_personal = is_personal;
     Ok(dialog_photo)
+}
 
 #[cfg(test)]
 mod tests {
@@ -1304,7 +1305,6 @@ mod tests {
             sticker_file_ids: Vec::new(),
             id: 42,
             date: 4242,
-            sticker_file_ids: Vec::new(),
             minithumbnail: String::from_utf8_lossy(&[0x01, 90, 60, 0x21]).into_owned(),
             photos: vec![PhotoSize {
                 size_type: b'm' as i32,

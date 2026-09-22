@@ -24,22 +24,20 @@
 //! - the welcome-message linkage is `[blocked: Wave 3]`
 //!   (WelcomeMessageManager owns `EphemeralMessageFullId`).
 
-use crate::document::Document;
 use crate::dialog_id::DialogId;
+use crate::document::Document;
 use crate::emoji_status::CustomEmojiId;
-use crate::files::{FileId, FileSourceId, QuickReplyMessageFullId, StoryFullId};
-use crate::message_entity::{find_entities, get_first_url, is_visible_url};
+use crate::files::{FileId, FileSourceId};
+use crate::message_entity::get_first_url;
 use crate::message_id::MessageFullId;
-use crate::photo::{DialogPhotoStoreEnv, Photo};
-use crate::store_parse::{store_flags, store_i32, store_i64, store_log_event_version, store_string, version, Parser};
+use crate::messages_manager::{QuickReplyMessageFullId, QuickReplyShortcutId, StoryFullId};
+use crate::photo::Photo;
+use crate::store_parse::{
+    Parser, store_flags, store_i32, store_i64, store_log_event_version, store_string,
+};
 use crate::td_api;
 use crate::user_manager::UserId;
-use crate::webpage::{
-    get_page_blocks_object, get_rich_text_from_telegram, get_web_page_block,
-    get_web_page_blocks_from_telegram, CloneWebPageBlockContext, DocumentsById,
-    MessageContentDupType, PhotosById, RichText, RichTextType, WebPageBlock,
-    WebPageBlockEnv, WebPageId,
-};
+use crate::webpage::{WebPageBlock, WebPageBlockEnv, WebPageId, get_page_blocks_object};
 use std::collections::{HashMap, HashSet};
 use tdmtproto::telegram_api;
 use tdutils::promise::Promise;
@@ -91,7 +89,10 @@ pub trait WebPagesManagerEnv: WebPageBlockEnv {
     /// `messages_manager_->on_external_update_message_content` [blocked: M.10].
     fn on_external_update_message_content(&mut self, message_full_id: MessageFullId, source: &str);
     /// `quick_reply_manager_->delete_pending_message_web_page`.
-    fn delete_quick_reply_pending_message_web_page(&mut self, message_full_id: QuickReplyMessageFullId);
+    fn delete_quick_reply_pending_message_web_page(
+        &mut self,
+        message_full_id: QuickReplyMessageFullId,
+    );
     /// `quick_reply_manager_->on_external_update_message_content`.
     fn quick_reply_on_external_update_message_content(
         &mut self,
@@ -103,8 +104,8 @@ pub trait WebPagesManagerEnv: WebPageBlockEnv {
     /// `quick_reply_manager_->reload_quick_reply_message` [blocked: net].
     fn reload_quick_reply_message(
         &mut self,
-        shortcut_id: crate::files::QuickReplyShortcutId,
-        message_id: crate::message_id::MessageId,
+        shortcut_id: QuickReplyShortcutId,
+        message_id: crate::messages_manager::MessageId,
     );
     /// `dialog_manager_->force_create_dialog` [blocked: M.6].
     fn force_create_dialog(&mut self, dialog_id: DialogId);
@@ -136,7 +137,11 @@ pub trait WebPagesManagerEnv: WebPageBlockEnv {
     fn get_message_link_media_timestamp(&self, url: &str) -> i32;
     /// `LinkManager::get_background_type_object(url, is_pattern)`
     /// [blocked: M.23].
-    fn get_background_type_object(&self, url: &str, is_pattern: bool) -> Option<td_api::BackgroundType>;
+    fn get_background_type_object(
+        &self,
+        url: &str,
+        is_pattern: bool,
+    ) -> Option<td_api::BackgroundType>;
     /// `LinkManager::has_video_chat_invite_hash(url)` [blocked: M.23].
     fn has_video_chat_invite_hash(&self, url: &str) -> bool;
     /// `option_manager_->get_option_boolean("is_premium")`.
@@ -169,7 +174,21 @@ pub trait WebPagesManagerEnv: WebPageBlockEnv {
 pub struct GetWebPagePreviewOptions {
     pub(crate) first_url: String,
     pub(crate) skip_confirmation: bool,
+    /// The ride-along options; consumed by the net query tail
+    /// ([blocked: net]).
+    #[allow(dead_code)]
     pub(crate) link_preview_options: Option<Box<td_api::LinkPreviewOptions>>,
+}
+
+impl GetWebPagePreviewOptions {
+    /// The `GetWebPagePreviewOptions` ctor (WebPagesManager.cpp:1203-1209)
+    /// — the skip_confirmation flag lifts out of the td_api options.
+    pub(crate) fn from_td_api(options: Option<td_api::LinkPreviewOptions>) -> Self {
+        Self {
+            link_preview_options: options.map(Box::new),
+            ..Self::default()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -198,7 +217,14 @@ impl WebPageInstantView {
         let has_view_count = self.view_count > 0;
         store_flags(
             out,
-            [self.is_full, self.is_loaded, self.is_rtl, self.is_v2, has_url, has_view_count],
+            [
+                self.is_full,
+                self.is_loaded,
+                self.is_rtl,
+                self.is_v2,
+                has_url,
+                has_view_count,
+            ],
         );
 
         store_i32(out, self.page_blocks.len() as i32);
@@ -212,7 +238,10 @@ impl WebPageInstantView {
         if has_view_count {
             store_i32(out, self.view_count);
         }
-        assert!(!self.is_empty, "the C++ CHECKs the instant view is not empty");
+        assert!(
+            !self.is_empty,
+            "the C++ CHECKs the instant view is not empty"
+        );
     }
 
     /// `parse` (WebPagesManager.cpp:212-235).
@@ -232,7 +261,9 @@ impl WebPageInstantView {
             return Err("Invalid vector size");
         }
         for _ in 0..blocks_len {
-            result.page_blocks.push(WebPageBlock::parse_block(env, parser)?);
+            result
+                .page_blocks
+                .push(WebPageBlock::parse_block(env, parser)?);
         }
         result.hash = parser.i32_()?;
         if has_url {
@@ -298,7 +329,8 @@ impl WebPage {
         let has_description = !self.description.is_empty();
         let has_photo = !self.photo.is_empty();
         let has_embed = !self.embed_url.is_empty();
-        let has_embed_dimensions = has_embed && self.embed_dimensions != crate::photo::Dimensions::default();
+        let has_embed_dimensions =
+            has_embed && self.embed_dimensions != crate::photo::Dimensions::default();
         let has_duration = self.duration > 0;
         let has_author = !self.author.is_empty();
         let has_document = !self.document.is_empty();
@@ -357,7 +389,7 @@ impl WebPage {
             store_string(out, &self.description);
         }
         if has_photo {
-            crate::photo::store_photo(env, &self.photo, out);
+            crate::photo::store_photo(env, out, &self.photo);
         }
         if has_embed {
             store_string(out, &self.embed_url);
@@ -413,7 +445,10 @@ impl WebPage {
     }
 
     /// `parse` (WebPagesManager.cpp:396-523).
-    pub fn parse(env: &mut impl WebPageBlockEnv, parser: &mut Parser<'_>) -> Result<WebPage, &'static str> {
+    pub fn parse(
+        env: &mut impl WebPageBlockEnv,
+        parser: &mut Parser<'_>,
+    ) -> Result<WebPage, &'static str> {
         let mut result = WebPage::default();
         let [
             has_type,
@@ -500,7 +535,8 @@ impl WebPage {
             for _ in 0..story_full_ids_len {
                 let story_full_id = StoryFullId::parse_from(parser)?;
                 // the C++ remove_if keeps server stories only
-                if story_full_id.get_dialog_id().get_type() == crate::dialog_id::DialogType::Channel {
+                if story_full_id.get_dialog_id().get_type() == crate::dialog_id::DialogType::Channel
+                {
                     result.story_full_ids.push(story_full_id);
                 }
             }
@@ -533,7 +569,9 @@ impl WebPage {
                 return Err("Invalid vector size");
             }
             for _ in 0..custom_emoji_ids_len {
-                result.custom_emoji_ids.push(CustomEmojiId::new(parser.i64_()?));
+                result
+                    .custom_emoji_ids
+                    .push(CustomEmojiId::new(parser.i64_()?));
             }
         }
 
@@ -619,12 +657,15 @@ pub struct WebPagesManager {
     pub(crate) url_to_web_page_id: HashMap<String, (WebPageId, bool)>,
     pub(crate) url_to_file_source_id: HashMap<String, FileSourceId>,
     pub(crate) web_page_messages: HashMap<WebPageId, HashSet<MessageFullId>>,
-    pub(crate) web_page_quick_reply_messages:
-        HashMap<WebPageId, HashSet<QuickReplyMessageFullId>>,
+    pub(crate) web_page_quick_reply_messages: HashMap<WebPageId, HashSet<QuickReplyMessageFullId>>,
     pub(crate) web_page_polls: HashMap<WebPageId, HashSet<i64>>,
     pub(crate) poll_web_pages: HashMap<i64, Vec<WebPageId>>,
     pub(crate) story_web_pages: HashMap<StoryFullId, HashSet<WebPageId>>,
+    /// The parked reload-query maps; consumed by the net query tails
+    /// ([blocked: net]).
+    #[allow(dead_code)]
     pub(crate) load_web_page_from_database_queries: HashMap<WebPageId, Vec<Promise<()>>>,
+    #[allow(dead_code)]
     pub(crate) load_web_page_instant_view_queries: HashMap<WebPageId, Vec<Promise<WebPageId>>>,
     pub(crate) load_server_web_page_instant_view_queries:
         HashMap<WebPageId, Vec<Promise<WebPageId>>>,
@@ -681,7 +722,7 @@ impl WebPagesManager {
                 return false;
             }
         };
-        self.update_web_page(web_page, web_page_id, false, true);
+        self.update_web_page(env, web_page, web_page_id, false, true);
         self.web_pages.contains_key(&web_page_id)
     }
 
@@ -760,16 +801,11 @@ impl WebPagesManager {
     ) {
         let old = self.web_pages.get(&web_page_id);
         let is_changed = old.map_or(true, |old| *old != web_page);
-        let old_instant_view = old.map_or_else(WebPageInstantView::default, |old| {
-            old.instant_view.clone()
-        });
+        let old_instant_view =
+            old.map_or_else(WebPageInstantView::default, |old| old.instant_view.clone());
         if old.is_some() {
             web_page.log_event_id = old.unwrap().log_event_id;
-        } else if let Some(file_source_id) = web_page
-            .url
-            .clone()
-            .and_then(|_| self.url_to_file_source_id.remove(&web_page.url))
-        {
+        } else if let Some(file_source_id) = self.url_to_file_source_id.remove(&web_page.url) {
             web_page.file_source_id = file_source_id;
         }
 
@@ -806,10 +842,10 @@ impl WebPagesManager {
             self.get_web_page_file_ids(page)
         };
         if old_file_ids != new_file_ids {
-            let source_id = self.get_web_page_file_source_id(
-                self.web_pages.get(&web_page_id).unwrap(),
-                web_page_id,
-            );
+            let source_id = {
+                let page = self.web_pages.get(&web_page_id).unwrap();
+                self.get_web_page_file_source_id(page, web_page_id)
+            };
             env.change_files_source(source_id, &old_file_ids, &new_file_ids, "update_web_page");
         }
 
@@ -823,7 +859,11 @@ impl WebPagesManager {
 
     /// `WebPagesManager::get_web_page_file_source_id`
     /// (WebPagesManager.cpp:2195-2203).
-    fn get_web_page_file_source_id(&mut self, web_page: &WebPage, web_page_id: WebPageId) -> FileSourceId {
+    fn get_web_page_file_source_id(
+        &self,
+        web_page: &WebPage,
+        web_page_id: WebPageId,
+    ) -> FileSourceId {
         if web_page.file_source_id.is_valid() {
             return web_page.file_source_id;
         }
@@ -836,7 +876,7 @@ impl WebPagesManager {
     pub fn get_web_page_file_ids(&self, web_page: &WebPage) -> Vec<FileId> {
         let mut file_ids = Vec::new();
         if !web_page.photo.is_empty() {
-            file_ids.extend(web_page.photo.get_file_ids());
+            file_ids.extend(crate::photo::photo_get_file_ids(&web_page.photo));
         }
         if !web_page.document.is_empty() {
             file_ids.push(web_page.document.get_file_id());
@@ -845,17 +885,24 @@ impl WebPagesManager {
     }
 
     /// `WebPagesManager::on_get_web_page_by_url` (WebPagesManager.cpp:994-1024).
-    pub fn on_get_web_page_by_url(&mut self, url: &str, web_page_id: WebPageId, from_database: bool) {
-        if !is_visible_url(url) {
+    pub fn on_get_web_page_by_url(
+        &mut self,
+        url: &str,
+        web_page_id: WebPageId,
+        from_database: bool,
+    ) {
+        if url.is_empty() {
             return;
         }
         match self.url_to_web_page_id.get(url) {
             Some((old_web_page_id, _)) if *old_web_page_id == web_page_id => {}
             Some(_) => {
-                self.url_to_web_page_id.insert(url.to_owned(), (web_page_id, from_database));
+                self.url_to_web_page_id
+                    .insert(url.to_owned(), (web_page_id, from_database));
             }
             None => {
-                self.url_to_web_page_id.insert(url.to_owned(), (web_page_id, from_database));
+                self.url_to_web_page_id
+                    .insert(url.to_owned(), (web_page_id, from_database));
             }
         }
     }
@@ -901,11 +948,7 @@ impl WebPagesManager {
     }
 
     /// `WebPagesManager::unregister_web_page` (WebPagesManager.cpp:1040-1053).
-    pub fn unregister_web_page(
-        &mut self,
-        web_page_id: WebPageId,
-        message_full_id: MessageFullId,
-    ) {
+    pub fn unregister_web_page(&mut self, web_page_id: WebPageId, message_full_id: MessageFullId) {
         if !web_page_id.is_valid() {
             return;
         }
@@ -981,7 +1024,11 @@ impl WebPagesManager {
             }
             return;
         }
-        let old_web_page_ids = self.poll_web_pages.get(&poll_id).cloned().unwrap_or_default();
+        let old_web_page_ids = self
+            .poll_web_pages
+            .get(&poll_id)
+            .cloned()
+            .unwrap_or_default();
         if old_web_page_ids == web_page_ids {
             return;
         }
@@ -1020,7 +1067,8 @@ impl WebPagesManager {
             return file_source_id;
         }
         let file_source_id = env.create_web_page_file_source(url);
-        self.url_to_file_source_id.insert(url.to_owned(), file_source_id);
+        self.url_to_file_source_id
+            .insert(url.to_owned(), file_source_id);
         file_source_id
     }
 
@@ -1042,7 +1090,7 @@ impl WebPagesManager {
         env: &mut impl WebPagesManagerEnv,
         url: String,
         _only_local: bool,
-        promise: Promise<WebPageId>,
+        mut promise: Promise<WebPageId>,
     ) {
         let web_page_id = self.get_web_page_by_url(&url);
         if web_page_id.is_valid() {
@@ -1084,7 +1132,7 @@ impl WebPagesManager {
         env: &mut impl WebPagesManagerEnv,
         url: &str,
         only_local: bool,
-        promise: Promise<WebPageId>,
+        mut promise: Promise<WebPageId>,
     ) {
         if url.is_empty() {
             promise.set_value(WebPageId::default());
@@ -1113,7 +1161,7 @@ impl WebPagesManager {
         env: &mut impl WebPagesManagerEnv,
         web_page_id: WebPageId,
         only_local: bool,
-        promise: Promise<WebPageId>,
+        mut promise: Promise<WebPageId>,
     ) {
         if env.close_flag() {
             return;
@@ -1143,7 +1191,7 @@ impl WebPagesManager {
         env: &mut impl WebPagesManagerEnv,
         web_page_id: WebPageId,
         only_local: bool,
-        promise: Promise<WebPageId>,
+        mut promise: Promise<WebPageId>,
     ) {
         if !env.use_message_database() || only_local {
             self.load_server_web_page_instant_view_queries
@@ -1161,7 +1209,8 @@ impl WebPagesManager {
             }
             return;
         }
-        let value = env.sqlite_pmc_get_raw(&Self::get_web_page_instant_view_database_key(web_page_id));
+        let value =
+            env.sqlite_pmc_get_raw(&Self::get_web_page_instant_view_database_key(web_page_id));
         if value.is_empty() {
             self.load_server_web_page_instant_view_queries
                 .entry(web_page_id)
@@ -1217,7 +1266,7 @@ impl WebPagesManager {
         };
         let formatted_text = match crate::message_entity::get_formatted_text_of_input::<()>(
             None,
-            DialogId::default(),
+            crate::message_content::to_message_entity_dialog_id(DialogId::default()),
             Some(text),
             false,
             false,
@@ -1226,15 +1275,32 @@ impl WebPagesManager {
             None,
             false,
             0,
+            None,
+            false,
         ) {
             Ok(formatted_text) => formatted_text,
             Err(status) => return promise.set_error(status),
         };
-        let Some(url) = get_first_url(&formatted_text) else {
+        // WebPagesManager.cpp:1226-1240 — the is-disabled and url bands.
+        // The known-web-page band (the local get_link_preview_object
+        // answer) is [blocked: M.17 residue — the link-preview object
+        // builder family] and rides the query seam with the rest.
+        if link_preview_options.as_ref().is_some_and(|o| o.is_disabled) {
             promise.set_value(None);
             return;
+        }
+        let url = match link_preview_options.as_ref() {
+            Some(o) if !o.url.is_empty() => o.url.clone(),
+            _ => get_first_url(&formatted_text).to_owned(),
         };
-        let options = GetWebPagePreviewOptions::from_td_api(link_preview_options);
+        if url.is_empty() {
+            promise.set_value(None);
+            return;
+        }
+        let skip_confirmation = crate::message_entity::is_visible_url(&formatted_text, &url);
+        let mut options = GetWebPagePreviewOptions::from_td_api(link_preview_options);
+        options.skip_confirmation = skip_confirmation;
+        options.first_url = url;
         env.send_get_web_page_preview_query(formatted_text, Box::new(options), promise);
     }
 
@@ -1251,12 +1317,14 @@ impl WebPagesManager {
     ) {
         let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
         let capture = std::sync::Arc::clone(&slot);
-        let inner = Promise::lambda_result(move |result: tdutils::status::Result<WebPageId>| {
-            *capture.lock().unwrap() = Some(result);
-        });
+        let inner = tdutils::promise::PromiseCreator::lambda_result(
+            move |result: tdutils::status::Result<WebPageId>| {
+                *capture.lock().unwrap() = Some(result);
+            },
+        );
         self.get_web_page_instant_view(env, url, only_local, inner);
         match slot.lock().unwrap().take() {
-            Some(Ok(web_page_id)) => {
+            Some(tdutils::status::Result::Ok(web_page_id)) => {
                 if web_page_id.is_valid() {
                     match self.get_web_page_instant_view_object(env, web_page_id) {
                         Some(object) => promise.set_value(object),
@@ -1266,7 +1334,7 @@ impl WebPagesManager {
                     promise.set_error(Status::error(400, "Web page not found"));
                 }
             }
-            Some(Err(status)) => promise.set_error(status),
+            Some(tdutils::status::Result::Err(status)) => promise.set_error(status),
             None => {
                 // [blocked: net]: the ladder parked; the promise parks.
             }
@@ -1314,7 +1382,6 @@ impl WebPagesManager {
             web_page.description.as_str(),
             web_page.site_name.as_str(),
             web_page.author.as_str(),
-            web_page.document.file_name.as_str(),
         ] {
             if !part.is_empty() {
                 if !result.is_empty() {
@@ -1357,7 +1424,10 @@ impl WebPagesManager {
 
     /// `WebPagesManager::get_web_page_channel_ids`
     /// (WebPagesManager.cpp:2146-2155 in the channel form).
-    pub fn get_web_page_channel_ids(&self, web_page_id: WebPageId) -> Vec<crate::chat_manager::ChannelId> {
+    pub fn get_web_page_channel_ids(
+        &self,
+        web_page_id: WebPageId,
+    ) -> Vec<crate::chat_manager::ChannelId> {
         let mut result = Vec::new();
         if let Some(web_page) = self.get_web_page(web_page_id) {
             for story_full_id in &web_page.story_full_ids {
@@ -1404,7 +1474,9 @@ impl WebPagesManager {
                 self.on_web_page_changed(env, web_page_id, false);
                 if env.use_message_database() {
                     env.sqlite_pmc_erase(&Self::get_web_page_database_key(web_page_id));
-                    env.sqlite_pmc_erase(&Self::get_web_page_instant_view_database_key(web_page_id));
+                    env.sqlite_pmc_erase(&Self::get_web_page_instant_view_database_key(
+                        web_page_id,
+                    ));
                 }
                 self.pending_web_page_urls.remove(&web_page_id);
                 WebPageId::default()
@@ -1433,7 +1505,10 @@ impl WebPagesManager {
                 page.site_name = web_page.site_name;
                 page.title = web_page.title;
                 page.description = web_page.description;
-                page.photo = web_page.photo.map(crate::photo::get_photo).unwrap_or_default();
+                page.photo = web_page
+                    .photo
+                    .map(crate::photo::get_photo)
+                    .unwrap_or_default();
                 page.embed_url = web_page.embed_url;
                 page.embed_type = web_page.embed_type;
                 page.embed_dimensions = crate::photo::get_dimensions(
@@ -1446,7 +1521,8 @@ impl WebPagesManager {
                 page.has_large_media = web_page.has_large_media;
                 page.video_cover_photo = web_page.video_cover_photo;
                 if let Some(document) = web_page.document {
-                    if let Some(document) = env.on_get_document(document, owner_dialog_id) {
+                    if let Some(document) = env.on_get_document(Box::new(document), owner_dialog_id)
+                    {
                         page.document = document;
                     }
                 }
@@ -1455,13 +1531,15 @@ impl WebPagesManager {
                 // (Wave 3), the story linkage resolves through
                 // `on_get_story`, the sticker sets through the M.15 seam.
                 for attribute in web_page.attributes {
-                    match attribute {
+                    match *attribute {
                         telegram_api::WebPageAttribute::webPageAttributeTheme(_) => {
                             page.has_theme_settings = true;
                         }
                         telegram_api::WebPageAttribute::webPageAttributeStory(attribute) => {
-                            let dialog_id = DialogId::from_peer(&attribute.peer);
-                            let story_id = crate::user_manager::StoryId::new(attribute.id);
+                            let dialog_id = DialogId::from_peer(
+                                attribute.peer.as_ref().expect("empty story peer"),
+                            );
+                            let story_id = crate::messages_manager::StoryId::new(attribute.id);
                             let story_full_id = StoryFullId::new(dialog_id, story_id);
                             if let Some(story) = attribute.story {
                                 let _ = env.on_get_story(dialog_id, story);
@@ -1471,7 +1549,7 @@ impl WebPagesManager {
                         }
                         telegram_api::WebPageAttribute::webPageAttributeStickerSet(attribute) => {
                             for sticker in attribute.stickers {
-                                let sticker_id = env.on_get_sticker_document(sticker);
+                                let sticker_id = env.on_get_sticker_document(Box::new(sticker));
                                 if sticker_id.is_valid() && page.sticker_ids.len() < 4 {
                                     page.sticker_ids.push(sticker_id);
                                 }
@@ -1480,25 +1558,30 @@ impl WebPagesManager {
                         telegram_api::WebPageAttribute::webPageAttributeUniqueStarGift(_) => {
                             page.has_star_gifts = true;
                         }
-                        telegram_api::WebPageAttribute::webPageAttributeStarGiftCollection(attribute) => {
+                        telegram_api::WebPageAttribute::webPageAttributeStarGiftCollection(
+                            attribute,
+                        ) => {
                             for icon in attribute.icons {
-                                let icon_file_id = env.on_get_sticker_document(icon);
+                                let icon_file_id = env.on_get_sticker_document(Box::new(icon));
                                 if icon_file_id.is_valid() && page.sticker_ids.len() < 4 {
                                     page.sticker_ids.push(icon_file_id);
                                 }
                             }
                         }
-                        telegram_api::WebPageAttribute::webPageAttributeStarGiftAuction(attribute) => {
+                        telegram_api::WebPageAttribute::webPageAttributeStarGiftAuction(
+                            attribute,
+                        ) => {
                             page.has_star_gifts = true;
                             page.auction_end_date = attribute.end_date;
                         }
-                        telegram_api::WebPageAttribute::webPageAttributeAiComposeTone(attribute) => {
+                        telegram_api::WebPageAttribute::webPageAttributeAiComposeTone(
+                            attribute,
+                        ) => {
                             let custom_emoji_id = CustomEmojiId::new(attribute.emoji_id);
                             if custom_emoji_id.is_valid() {
                                 page.custom_emoji_ids.push(custom_emoji_id);
                             }
                         }
-                        _ => {}
                     }
                 }
                 self.pending_web_page_urls.remove(&web_page_id);
@@ -1506,7 +1589,6 @@ impl WebPagesManager {
                 web_page_id
             }
             telegram_api::WebPage::webPageNotModified(_) => WebPageId::default(),
-            _ => WebPageId::default(),
         }
     }
 
@@ -1586,12 +1668,12 @@ mod tests {
 
     struct TestEnv {
         files: std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>>,
-        stored_media: std::cell::RefCell<Vec<i32>>,
+        file_counter: std::cell::Cell<i64>,
         timeouts: std::cell::RefCell<Vec<(i64, f64)>>,
         binlog: std::cell::RefCell<Vec<(i32, Vec<u8>)>>,
     }
 
-    impl crate::photo::DialogPhotoStoreEnv for TestEnv {
+    impl crate::photo::PhotoStoreEnv for TestEnv {
         fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>) {
             self.files.lock().store_file(file_id, out);
         }
@@ -1602,15 +1684,115 @@ mod tests {
     }
 
     impl WebPageBlockEnv for TestEnv {
-        fn store_document(&mut self, _document: &Document, _out: &mut Vec<u8>) {}
-        fn parse_document(&mut self, _parser: &mut Parser<'_>) -> Result<Document, &'static str> {
-            Err("document parse — [blocked: M.28]")
+        fn get_document_object(&self, _file_id: FileId) -> Option<td_api::Document> {
+            None
         }
-        fn store_web_page_media(&mut self, media_type: i32, _out: &mut Vec<u8>) {
-            self.stored_media.borrow_mut().push(media_type);
+        fn get_animation_object(&self, _file_id: FileId) -> Option<td_api::Animation> {
+            None
         }
-        fn parse_web_page_media(&mut self, _parser: &mut Parser<'_>) -> Result<i32, &'static str> {
-            Err("media parse — [blocked: M.9]")
+        fn get_audio_object(&self, _file_id: FileId) -> Option<td_api::Audio> {
+            None
+        }
+        fn get_video_object(&self, _file_id: FileId) -> Option<td_api::Video> {
+            None
+        }
+        fn get_video_note_object(&self, _file_id: FileId) -> Option<td_api::VideoNote> {
+            None
+        }
+        fn get_voice_note_object(&self, _file_id: FileId) -> Option<td_api::VoiceNote> {
+            None
+        }
+        fn get_accent_color_id_object(
+            &self,
+            accent_color_id: crate::peer_color::AccentColorId,
+            _fallback: crate::peer_color::AccentColorId,
+        ) -> Option<i32> {
+            Some(accent_color_id.get())
+        }
+        fn get_chat_photo_info_object(
+            &self,
+            _photo: &crate::photo::DialogPhoto,
+        ) -> Option<td_api::ChatPhotoInfo> {
+            None
+        }
+        fn get_instant_view_link(&self, url: &str, rhash: &str) -> String {
+            format!("https://t.me/iv?url={url}&rhash={rhash}")
+        }
+        fn get_instant_view_link_rhash(&self, _real_url: &str) -> String {
+            String::new()
+        }
+        fn get_instant_view_link_url(&self, _real_url: &str) -> String {
+            String::new()
+        }
+        fn as_input_document(
+            &mut self,
+            file_id: FileId,
+        ) -> Option<(i64, tdmtproto::telegram_api::InputDocument)> {
+            if !file_id.is_valid() {
+                return None;
+            }
+            self.file_counter.set(self.file_counter.get() + 1);
+            let id = self.file_counter.get();
+            Some((
+                id,
+                tdmtproto::telegram_api::InputDocument::inputDocument(
+                    tdmtproto::telegram_api::inputDocument {
+                        id,
+                        access_hash: 0,
+                        file_reference: Vec::new(),
+                    },
+                ),
+            ))
+        }
+        fn as_input_photo(
+            &mut self,
+            file_id: FileId,
+        ) -> Option<(i64, tdmtproto::telegram_api::InputPhoto)> {
+            if !file_id.is_valid() {
+                return None;
+            }
+            self.file_counter.set(self.file_counter.get() + 1);
+            let id = self.file_counter.get();
+            Some((
+                id,
+                tdmtproto::telegram_api::InputPhoto::inputPhoto(
+                    tdmtproto::telegram_api::inputPhoto {
+                        id,
+                        access_hash: 0,
+                        file_reference: Vec::new(),
+                    },
+                ),
+            ))
+        }
+        fn ensure_input_user(
+            &mut self,
+            _user_id: UserId,
+        ) -> std::result::Result<(), tdutils::status::Status> {
+            Ok(())
+        }
+        fn get_user_id_object(&mut self, user_id: UserId, _source: &str) -> i64 {
+            user_id.get()
+        }
+        fn is_my_user_bot(&self) -> bool {
+            false
+        }
+        fn on_get_page_block_channel(
+            &mut self,
+            channel: tdmtproto::telegram_api::channel,
+        ) -> Option<crate::webpage::ChatLinkInfo> {
+            let channel_id = crate::chat_manager::ChannelId::new(channel.id);
+            if !channel_id.is_valid() {
+                tdutils::log_error!("Receive invalid channel {}", channel.id);
+                return None;
+            }
+            let photo = crate::photo::DialogPhoto::get_dialog_photo(channel.photo);
+            Some(crate::webpage::ChatLinkInfo {
+                title: channel.title,
+                photo,
+                username: channel.username,
+                accent_color_id: crate::peer_color::AccentColorId::from_peer_id(channel.id),
+                channel_id,
+            })
         }
     }
 
@@ -1654,7 +1836,12 @@ mod tests {
         ) {
         }
         fn delete_pending_message_web_page(&mut self, _message_full_id: MessageFullId) {}
-        fn on_external_update_message_content(&mut self, _message_full_id: MessageFullId, _source: &str) {}
+        fn on_external_update_message_content(
+            &mut self,
+            _message_full_id: MessageFullId,
+            _source: &str,
+        ) {
+        }
         fn delete_quick_reply_pending_message_web_page(
             &mut self,
             _message_full_id: QuickReplyMessageFullId,
@@ -1669,12 +1856,16 @@ mod tests {
         fn get_messages_from_server(&mut self, _message_full_ids: &[MessageFullId]) {}
         fn reload_quick_reply_message(
             &mut self,
-            _shortcut_id: crate::files::QuickReplyShortcutId,
-            _message_id: crate::message_id::MessageId,
+            _shortcut_id: QuickReplyShortcutId,
+            _message_id: crate::messages_manager::MessageId,
         ) {
         }
         fn force_create_dialog(&mut self, _dialog_id: DialogId) {}
-        fn on_get_story(&mut self, _dialog_id: DialogId, _story: Box<telegram_api::StoryItem>) -> Option<i32> {
+        fn on_get_story(
+            &mut self,
+            _dialog_id: DialogId,
+            _story: Box<telegram_api::StoryItem>,
+        ) -> Option<i32> {
             None
         }
         fn get_chat_id_object(&self, _dialog_id: DialogId, _source: &str) -> i64 {
@@ -1699,7 +1890,11 @@ mod tests {
         fn get_message_link_media_timestamp(&self, _url: &str) -> i32 {
             0
         }
-        fn get_background_type_object(&self, _url: &str, _is_pattern: bool) -> Option<td_api::BackgroundType> {
+        fn get_background_type_object(
+            &self,
+            _url: &str,
+            _is_pattern: bool,
+        ) -> Option<td_api::BackgroundType> {
             None
         }
         fn has_video_chat_invite_hash(&self, _url: &str) -> bool {
@@ -1728,7 +1923,7 @@ mod tests {
     fn env() -> TestEnv {
         TestEnv {
             files: std::sync::Arc::new(parking_lot::Mutex::new(crate::files::FileManager::new())),
-            stored_media: std::cell::RefCell::new(Vec::new()),
+            file_counter: std::cell::Cell::new(0),
             timeouts: std::cell::RefCell::new(Vec::new()),
             binlog: std::cell::RefCell::new(Vec::new()),
         }
@@ -1739,6 +1934,7 @@ mod tests {
         let mut manager = WebPagesManager::new();
         let mut env = env();
         let pending = telegram_api::WebPage::webPagePending(telegram_api::webPagePending {
+            flags: 0,
             id: 7,
             date: 100,
             url: "https://t.me/".to_owned(),
@@ -1781,9 +1977,14 @@ mod tests {
     fn empty_page_erases_the_cache() {
         let mut manager = WebPagesManager::new();
         let mut env = env();
-        manager.url_to_web_page_id
+        manager
+            .url_to_web_page_id
             .insert("https://t.me/".to_owned(), (WebPageId::new(9), false));
-        let empty = telegram_api::WebPage::webPageEmpty(telegram_api::webPageEmpty { id: 9 });
+        let empty = telegram_api::WebPage::webPageEmpty(telegram_api::webPageEmpty {
+            flags: 0,
+            id: 9,
+            url: String::new(),
+        });
         let result = manager.on_get_web_page(&mut env, empty, DialogId::default());
         assert!(!result.is_valid());
         assert!(!manager.have_web_page(WebPageId::new(9)));
@@ -1795,7 +1996,7 @@ mod tests {
         let mut env = env();
         let message_full_id = MessageFullId::new(
             DialogId::default(),
-            crate::chat_manager::MessageId::new(1),
+            crate::messages_manager::MessageId::new(1),
         );
         manager.register_web_page(&mut env, WebPageId::new(5), message_full_id);
         assert_eq!(env.timeouts.borrow().len(), 1);

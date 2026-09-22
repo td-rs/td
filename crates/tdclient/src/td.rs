@@ -51,7 +51,7 @@ use tdutils::status::Status;
 use crate::account_manager::{AccountManager, AccountManagerEnv};
 
 use crate::auth_manager::{AuthManager, AuthQuerySender};
-use crate::chat_manager::{ChannelId, ChatId, ChatManager, DcId, MessageId, RestrictedRights};
+use crate::chat_manager::{ChannelId, ChatId, DcId, MessageId, RestrictedRights};
 use crate::config_dispatch::{
     CompletedNetQueries, ConfigQueryCallback, SentNetQueries, TdConfigSink, TdSessionSink,
     build_config_net_query,
@@ -76,7 +76,7 @@ use crate::message_content::*;
 use crate::message_entity::FormattedText;
 use crate::messages_manager::{
     DialogId, EphemeralMessageFullId, FileUploadId, MessageFullId, QuickReplyMessageFullId,
-    StoryFullId, StoryId,
+    QuickReplyShortcutId, StoryFullId, StoryId,
 };
 use crate::net::{AuthSender, BridgeConfig, NetBridge, QueryAnswer};
 use crate::notification_manager::NotificationManager;
@@ -101,8 +101,8 @@ use crate::files::{
     FileData, FileDb, FileDbId, FileDownloaderNet, FileGcParameters, FileGcSink,
     FileHashUploaderNet, FileId, FileLoadManager, FileLoadManagerOptions, FileLoadNetFactory,
     FileManager, FileManagerContext, FileManagerWorker, FileNode, FileSourceId, FileStatsSink,
-    FileType, FileUploaderNet, FileView, FullLocalFileLocation, QuickReplyMessageFullId,
-    QuickReplyShortcutId, StorageContext, StorageManager, StoryFullId, UploadPartQuery,
+    FileType, FileUploaderNet, FileView, FullLocalFileLocation, StorageContext, StorageManager,
+    UploadPartQuery,
 };
 
 #[cfg(target_endian = "big")]
@@ -6314,6 +6314,28 @@ impl FileManagerWorker for TdFileWorker {
 // seams. The dialog-manager half of `bot_start_autostart`
 // (LinkManager.cpp:641-646) stays behind the trait default.
 
+/// The `&self` option slice for the `LinkManager` statics
+/// (`get_instant_view_link*`, LinkManager.h:115-119) — they read
+/// `G()->get_option_string` only, so no manager instance is needed.
+pub(crate) struct TdStaticLinkEnv<'a> {
+    pub(crate) options: Option<&'a OptionManager>,
+}
+
+impl crate::link_manager::LinkEnv for TdStaticLinkEnv<'_> {
+    fn get_option_string_with_default(&self, name: &str, default_value: &str) -> String {
+        self.options.as_ref().map_or_else(
+            || default_value.to_owned(),
+            |options| options.get_option_string(name, default_value),
+        )
+    }
+
+    fn get_option_string(&self, name: &str) -> String {
+        self.options
+            .as_ref()
+            .map_or_else(String::new, |options| options.get_option_string(name, ""))
+    }
+}
+
 /// The per-call [`crate::link_manager::LinkEnv`] over the Td fields —
 /// built per arm with the field-split borrows, never held across calls.
 pub(crate) struct TdLinkEnv<'a> {
@@ -12227,9 +12249,8 @@ pub(crate) fn web_pages_env_split(
         option_manager,
         auth_manager,
         user_manager,
-        chat_manager,
         file_manager,
-        link_manager,
+        file_reference_manager,
         web_pages_manager,
         web_pages_timeouts,
         ..
@@ -12240,9 +12261,8 @@ pub(crate) fn web_pages_env_split(
             options: option_manager.as_mut(),
             auth_is_bot: auth_manager.is_bot(),
             user_manager,
-            chat_manager,
             file_manager: std::sync::Arc::clone(file_manager),
-            link_manager,
+            file_reference_manager,
             web_pages_timeouts,
         },
         web_pages_manager,
@@ -12257,13 +12277,12 @@ pub(crate) struct TdWebPagesEnv<'a> {
     pub(crate) options: Option<&'a mut OptionManager>,
     pub(crate) auth_is_bot: bool,
     pub(crate) user_manager: &'a mut UserManager,
-    pub(crate) chat_manager: &'a mut ChatManager,
     pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<FileManager>>,
-    pub(crate) link_manager: &'a mut Option<LinkManager>,
+    pub(crate) file_reference_manager: &'a mut crate::files::FileReferenceManager,
     pub(crate) web_pages_timeouts: &'a mut std::collections::HashMap<i64, f64>,
 }
 
-impl crate::photo::DialogPhotoStoreEnv for TdWebPagesEnv<'_> {
+impl crate::photo::PhotoStoreEnv for TdWebPagesEnv<'_> {
     fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>) {
         self.file_manager.lock().store_file(file_id, out);
     }
@@ -12277,7 +12296,7 @@ impl crate::photo::DialogPhotoStoreEnv for TdWebPagesEnv<'_> {
 }
 
 impl crate::webpage::WebPageBlockEnv for TdWebPagesEnv<'_> {
-    fn get_document_object(&self, file_id: FileId) -> Option<td_api::Document> {
+    fn get_document_object(&self, _file_id: FileId) -> Option<td_api::Document> {
         None // [blocked: M.28 DocumentsManager object]
     }
 
@@ -12327,24 +12346,30 @@ impl crate::webpage::WebPageBlockEnv for TdWebPagesEnv<'_> {
     }
 
     fn get_instant_view_link(&self, url: &str, rhash: &str) -> String {
-        self.link_manager.as_ref().map_or_else(
-            || format!("{url}?rhash={rhash}"),
-            |link_manager| link_manager.get_instant_view_link(url, rhash),
+        crate::link_manager::get_instant_view_link(
+            &TdStaticLinkEnv {
+                options: self.options.as_deref(),
+            },
+            url,
+            rhash,
         )
     }
 
     fn get_instant_view_link_rhash(&self, real_url: &str) -> String {
-        self.link_manager
-            .as_ref()
-            .map_or_else(String::new, |link_manager| {
-                link_manager.get_instant_view_link_rhash(real_url)
-            })
+        crate::link_manager::get_instant_view_link_rhash(
+            &TdStaticLinkEnv {
+                options: self.options.as_deref(),
+            },
+            real_url,
+        )
     }
 
     fn get_instant_view_link_url(&self, real_url: &str) -> String {
-        self.link_manager.as_ref().map_or_else(
-            || real_url.to_owned(),
-            |link_manager| link_manager.get_instant_view_link_url(real_url),
+        crate::link_manager::get_instant_view_link_url(
+            &TdStaticLinkEnv {
+                options: self.options.as_deref(),
+            },
+            real_url,
         )
     }
 
@@ -12364,7 +12389,7 @@ impl crate::webpage::WebPageBlockEnv for TdWebPagesEnv<'_> {
         let Some(options) = self.options.as_mut() else {
             return Err(Status::error(400, "Have no access to the user"));
         };
-        let mut env = UserEnv {
+        let env = UserEnv {
             global: &mut self.global,
             options,
             auth_is_bot: self.auth_is_bot,
@@ -12438,15 +12463,16 @@ impl crate::web_pages_manager::WebPagesManagerEnv for TdWebPagesEnv<'_> {
     }
 
     fn sqlite_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
-        self.global.sqlite_pmc().get_raw(key)
+        // G()->td_db()->get_sqlite_pmc() — the common_kv stand-in.
+        self.global.td_db().common_kv().get(key)
     }
 
     fn sqlite_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
-        self.global.sqlite_pmc().set_raw(key, value);
+        self.global.td_db().common_kv().set(key, value);
     }
 
     fn sqlite_pmc_erase(&mut self, key: &[u8]) {
-        self.global.sqlite_pmc().erase_raw(key);
+        self.global.td_db().common_kv().erase(key);
     }
 
     fn binlog_add_web_page(&mut self, data: &[u8]) -> u64 {
@@ -12485,7 +12511,7 @@ impl crate::web_pages_manager::WebPagesManagerEnv for TdWebPagesEnv<'_> {
     }
 
     fn create_web_page_file_source(&mut self, url: &str) -> FileSourceId {
-        self.file_manager.lock().create_web_page_file_source(url)
+        self.file_reference_manager.create_web_page_file_source(url)
     }
 
     fn change_files_source(
@@ -12495,9 +12521,12 @@ impl crate::web_pages_manager::WebPagesManagerEnv for TdWebPagesEnv<'_> {
         new_file_ids: &[FileId],
         source: &str,
     ) {
-        self.file_manager
-            .lock()
-            .change_files_source(source_id, old_file_ids, new_file_ids, source);
+        self.file_reference_manager.change_files_source(
+            source_id,
+            old_file_ids,
+            new_file_ids,
+            source,
+        );
     }
 
     fn delete_pending_message_web_page(&mut self, _message_full_id: MessageFullId) {

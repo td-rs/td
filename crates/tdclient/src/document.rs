@@ -1,6 +1,6 @@
 //! Port of the `Document` value record (`Document.h:22-46`) with the
 //! `Document.hpp` store/parse framing — the typed file-id payloads ride
-//! the [`crate::photo::DialogPhotoStoreEnv`] codec (the M.40 icon-plane
+//! the [`crate::photo::PhotoStoreEnv`] codec (the M.40 icon-plane
 //! encoding; the C++ per-type manager framings
 //! `store_animation`/`store_audio`/`store_document`/`store_sticker`/
 //! `store_video`/`store_video_note`/`store_voice_note` collapse to the
@@ -55,16 +55,21 @@ impl Document {
         }
     }
 
+    /// `Document::get_file_id` (Document.hpp) — the main file id.
+    pub fn get_file_id(&self) -> FileId {
+        self.file_id
+    }
+
     /// `store(Document)` (Document.hpp:27-57) — the type discriminant,
     /// then the (collapsed) typed file-id framing.
-    pub fn store(&self, env: &mut impl crate::photo::DialogPhotoStoreEnv, out: &mut Vec<u8>) {
+    pub fn store(&self, env: &mut impl crate::photo::PhotoStoreEnv, out: &mut Vec<u8>) {
         store_i32(out, self.type_ as i32);
         env.store_file_id(self.file_id, out);
     }
 
     /// `parse(Document)` (Document.hpp:59-100).
     pub fn parse(
-        env: &mut impl crate::photo::DialogPhotoStoreEnv,
+        env: &mut impl crate::photo::PhotoStoreEnv,
         parser: &mut Parser<'_>,
     ) -> Result<Document, &'static str> {
         let type_ = parser.i32_()?;

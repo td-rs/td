@@ -10,7 +10,7 @@
 //! Manager-mediated FileId payloads (the C++
 //! `DocumentsManager::store_document` / `AnimationsManager::store_animation`
 //! / audio/video/voice-note/sticker framings) ride the
-//! [`crate::photo::DialogPhotoStoreEnv`] codec — the M.40 icon-plane
+//! [`crate::photo::PhotoStoreEnv`] codec — the M.40 icon-plane
 //! encoding, M.16's documented divergence; every non-FileId byte stays
 //! C++-compatible. The InlineKeyboardButton/KeyboardButtonStyle/
 //! RichButtonStyle/TargetDialogTypes value planes live in
@@ -37,7 +37,7 @@ use crate::inline_keyboard_button::{
 };
 use crate::peer_color::AccentColorId;
 use crate::photo::{
-    DialogPhoto, DialogPhotoStoreEnv, Photo, get_dimensions, parse_dimensions, parse_photo,
+    DialogPhoto, Photo, PhotoStoreEnv, get_dimensions, parse_dimensions, parse_photo,
     store_dimensions, store_photo,
 };
 use crate::store_parse::{Parser, store_flags, store_i32, store_i64, store_string, version};
@@ -49,7 +49,7 @@ use tdutils::status::Status;
 /// The `Td *td`/manager slice the WebPageBlock planes read through. The
 /// media-object builders answer the collapsed `None` until their managers
 /// land; the rest are fully local.
-pub trait WebPageBlockEnv: DialogPhotoStoreEnv {
+pub trait WebPageBlockEnv: PhotoStoreEnv {
     // -- the media object builders (M.15/M.28/M.5 manager seams)
     /// `documents_manager_->get_document_object(file_id, PhotoFormat::Jpeg)`.
     fn get_document_object(&self, file_id: FileId) -> Option<td_api::Document>;
@@ -1805,7 +1805,7 @@ impl RelatedArticle {
             store_string(out, &self.description);
         }
         if has_photo {
-            store_photo(env, &self.photo, out);
+            store_photo(env, out, &self.photo);
         }
         if has_author {
             store_string(out, &self.author);
@@ -3605,7 +3605,7 @@ impl WebPageBlock {
                 has_spoiler,
             } => {
                 store_flags(out, [*has_spoiler]);
-                store_photo(env, photo, out);
+                store_photo(env, out, photo);
                 caption.store(env, out);
                 store_string(out, url);
                 web_page_id.store(out);
@@ -3641,7 +3641,7 @@ impl WebPageBlock {
                 store_flags(out, [*is_full_width, *allow_scrolling]);
                 store_string(out, url);
                 store_string(out, html);
-                store_photo(env, poster_photo, out);
+                store_photo(env, out, poster_photo);
                 store_dimensions(out, *dimensions);
                 caption.store(env, out);
             }
@@ -3655,7 +3655,7 @@ impl WebPageBlock {
             } => {
                 store_string(out, url);
                 store_string(out, author);
-                store_photo(env, author_photo, out);
+                store_photo(env, out, author_photo);
                 store_i32(out, *date);
                 store_page_blocks(env, page_blocks, out);
                 caption.store(env, out);
@@ -3695,7 +3695,7 @@ impl WebPageBlock {
                 }
                 if has_photo {
                     // the DialogPhoto persistence plane rides the same codec
-                    crate::photo::store_dialog_photo(env, &chat_link.photo, out);
+                    crate::photo::store_dialog_photo(env, out, &chat_link.photo);
                 }
                 if has_username {
                     store_string(out, &chat_link.username);
@@ -5872,7 +5872,7 @@ mod tests {
         file_counter: i32,
     }
 
-    impl crate::photo::DialogPhotoStoreEnv for TestEnv {
+    impl crate::photo::PhotoStoreEnv for TestEnv {
         fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>) {
             crate::store_parse::store_i32(out, file_id.get());
         }
@@ -6281,7 +6281,7 @@ mod tests {
             ..Photo::default()
         };
         round_trip(
-            |env, out| store_photo(env, &photo, out),
+            |env, out| store_photo(env, out, &photo),
             parse_photo,
             |parsed| {
                 assert_eq!(parsed.id, 12345);
@@ -6305,7 +6305,7 @@ mod tests {
             is_personal: false,
         };
         round_trip(
-            |env, out| store_dialog_photo(env, &dialog_photo, out),
+            |env, out| store_dialog_photo(env, out, &dialog_photo),
             parse_dialog_photo,
             |parsed| {
                 assert!(parsed.has_animation);

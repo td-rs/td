@@ -4184,6 +4184,38 @@ impl FileReferenceManager {
         }
     }
 
+    /// `FileManager::create_web_page_file_source` — the interned
+    /// `FileSource::WebPage` slot.
+    pub fn create_web_page_file_source(&mut self, url: &str) -> FileSourceId {
+        self.intern(FileSource::WebPage(url.to_owned()))
+    }
+
+    /// `FileManager::change_files_source` — the main-file-id dedup walk
+    /// collapses to the plain remove/add pair (the node's main id is the
+    /// node itself in this port).
+    pub fn change_files_source(
+        &mut self,
+        file_source_id: FileSourceId,
+        old_file_ids: &[FileId],
+        new_file_ids: &[FileId],
+        source: &str,
+    ) {
+        let _ = source;
+        if old_file_ids == new_file_ids {
+            return;
+        }
+        for file_id in old_file_ids {
+            if !new_file_ids.contains(file_id) {
+                self.remove_file_source(*file_id, file_source_id);
+            }
+        }
+        for file_id in new_file_ids {
+            if !old_file_ids.contains(file_id) {
+                self.add_file_source(*file_id, file_source_id);
+            }
+        }
+    }
+
     /// `get_some_file_sources` (FileReferenceManager.cpp:379-386).
     pub fn get_some_file_sources(&self, node_id: FileId) -> Vec<FileSourceId> {
         match self.nodes.get(&node_id) {
