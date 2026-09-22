@@ -56,6 +56,7 @@ pub mod forum_topic_manager;
 pub mod game;
 pub mod game_manager;
 pub mod global;
+pub mod group_call_manager;
 pub mod join_chat_bot_result;
 pub mod link_manager;
 pub mod manager_option_states;

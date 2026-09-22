@@ -354,6 +354,8 @@ pub struct Td {
     pub(crate) device_token_manager: crate::device_token_manager::DeviceTokenManager,
     /// `Td::secret_chats_manager_` (`Td.cpp:1293`, M.50).
     pub(crate) secret_chats_manager: crate::secret_chats_manager::SecretChatsManager,
+    /// `Td::group_call_manager_` (`Td.cpp:1294`, M.51).
+    pub(crate) group_call_manager: crate::group_call_manager::GroupCallManager,
     /// `Td::web_browser_manager_` (`make_unique` at `Td.cpp:1332`, the
     /// `init_managers` block).
     pub(crate) web_browser_manager: WebBrowserManager,
@@ -715,6 +717,7 @@ impl Td {
             community_updates: Vec::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
             secret_chats_manager: crate::secret_chats_manager::SecretChatsManager::new(true),
+            group_call_manager: crate::group_call_manager::GroupCallManager::new(),
             web_browser_manager: WebBrowserManager::new(),
             web_browser_updates: Vec::new(),
             call_manager: CallManager::new(),
@@ -8213,6 +8216,34 @@ impl crate::secret_chats_manager::SecretChatsEnv for SecretChatsTdEnv<'_> {
 
     fn use_secret_chats(&self) -> bool {
         self.use_secret_chats
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+}
+
+/// The `G()`/`td_` slice the group-call plane reads through (the M.51
+/// convention): field-split borrows off `Td`. Every query tail is a
+/// [blocked: net] seam (D4 signaling-only); the E2E-key functions are
+/// [blocked: tde2e].
+pub(crate) struct GroupCallTdEnv<'a> {
+    /// The C++ `G()` reads — kept for the field parity; the halves land
+    /// with the media-transport plane.
+    #[allow(dead_code)]
+    pub(crate) global: &'a mut Global,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::group_call_manager::GroupCallEnv for GroupCallTdEnv<'_> {
+    fn is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
     }
 
     fn send_update(&mut self, update: td_api::Update) {
