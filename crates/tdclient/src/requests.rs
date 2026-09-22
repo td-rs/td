@@ -6546,15 +6546,18 @@ mod request_census_tests {
 assert_eq!(*counts.get("sync").unwrap_or(&0), 19, "sync count");
 assert_eq!(
     *counts.get("dispatched").unwrap_or(&0),
-    317,
+    352,
     "dispatched count"
 );
 assert_eq!(
     *counts.get("interim").unwrap_or(&0),
-    686,
+    651,
     "interim count"
 );
     }
 }
+
+
+
 
 
