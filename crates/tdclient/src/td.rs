@@ -6350,11 +6350,6 @@ impl crate::theme_manager::ThemeManagerEnv for ThemeEnv<'_> {
     }
 }
 
-
-
-
-
-
 /// The `G()`/`td_` slice [`crate::star_gift_manager::StarGiftManager`]
 /// reads through (the C++ manager reads the same surfaces off its
 /// `Td *td_` directly; the collapsed manager runs inside a `&mut Td`
@@ -6615,6 +6610,172 @@ impl crate::star_gift_manager::StarGiftEnv for StarGiftTdEnv<'_> {
     }
 }
 
+/// The [`crate::payments::PaymentsEnv`] over the `Td` fields — built per
+/// request with the field-split borrows (the `NotificationEnv`
+/// convention), never held across calls. The UserManager reads are real;
+/// the DialogManager halves mirror the M.6 stub inventory (the chat/
+/// channel-backed reads stay the unloaded results until M.10), and the
+/// net/MessagesManager/StarManager/Files seams keep their trait defaults.
+pub(crate) struct PaymentsEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_bot: bool,
+    /// `dialog_manager::get_my_dialog_id(td)`, computed before the field
+    /// split (the free function needs the whole `Td`).
+    pub(crate) my_dialog_id: crate::dialog_id::DialogId,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+}
+
+impl crate::payments::PaymentsEnv for PaymentsEnv<'_> {
+    fn get_unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn get_option_integer(&mut self, name: &str) -> i64 {
+        self.options
+            .as_mut()
+            .map(|options| options.get_option_integer(name, 0))
+            .unwrap_or(0)
+    }
+
+    fn binlog_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn get_input_user(
+        &mut self,
+        user_id: UserId,
+    ) -> tdutils::status::Result<telegram_api::InputUser> {
+        let (env, user_manager) = self.split_user_env();
+        match user_manager.get_input_user(&env, user_id) {
+            Ok(input_user) => tdutils::status::Result::Ok(input_user),
+            Err(status) => tdutils::status::Result::Err(status),
+        }
+    }
+
+    fn get_input_users(
+        &mut self,
+        user_ids: &[UserId],
+    ) -> tdutils::status::Result<Vec<telegram_api::InputUser>> {
+        let (env, user_manager) = self.split_user_env();
+        match user_manager.get_input_users(&env, user_ids) {
+            Ok(input_users) => tdutils::status::Result::Ok(input_users),
+            Err(status) => tdutils::status::Result::Err(status),
+        }
+    }
+
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        let (mut env, user_manager) = self.split_user_env();
+        user_manager.on_get_users(&mut env, users, source);
+    }
+
+    fn get_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
+        let (mut env, user_manager) = self.split_user_env();
+        user_manager.get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn have_dialog_force(&mut self, dialog_id: crate::dialog_id::DialogId, _source: &str) -> bool {
+        // `DialogManager::have_dialog_force` → the M.6 stub inventory
+        // (dialog_manager::have_dialog_info): the chat/channel halves are
+        // the unloaded results until M.10
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User => self
+                .user_manager
+                .have_accessible_user(dialog_id.get_user_id()),
+            DialogType::SecretChat => self
+                .user_manager
+                .have_secret_chat(dialog_id.get_secret_chat_id()),
+            DialogType::Chat | DialogType::Channel | DialogType::None => false,
+        }
+    }
+
+    fn get_channel_status(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+    ) -> crate::chat_manager::DialogParticipantStatus {
+        self.chat_manager.get_channel_status(channel_id)
+    }
+
+    fn is_broadcast_channel(&mut self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        self.chat_manager.is_broadcast_channel(channel_id)
+    }
+
+    fn get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<telegram_api::InputPeer> {
+        // `DialogManager::get_input_peer` over the split fields (the M.6
+        // function re-derives the same `UserEnv`; its chat/channel halves
+        // are the stub inventory's `None` until M.10)
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User => {
+                let (env, user_manager) = self.split_user_env();
+                user_manager.get_input_peer_user(&env, dialog_id.get_user_id(), access_rights)
+            }
+            DialogType::Chat | DialogType::Channel | DialogType::SecretChat => None,
+            DialogType::None => Some(telegram_api::InputPeer::inputPeerEmpty(
+                telegram_api::inputPeerEmpty {},
+            )),
+        }
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        source: &str,
+    ) -> tdutils::status::Result<()> {
+        // `DialogManager::check_dialog_access(dialog_id, false, Read,
+        // source)` over the stub inventory (the in-memory halves the M.6
+        // inventory stubs to `true` for the accessible users)
+        if !self.have_dialog_force(dialog_id, source) {
+            if !dialog_id.is_valid() {
+                return tdutils::status::Result::from_status(tdutils::status::Status::error(
+                    400,
+                    "Invalid chat identifier specified",
+                ));
+            }
+            return tdutils::status::Result::from_status(tdutils::status::Status::error(
+                400,
+                "Chat not found",
+            ));
+        }
+        tdutils::status::Result::Ok(())
+    }
+
+    fn get_my_dialog_id(&self) -> crate::dialog_id::DialogId {
+        self.my_dialog_id
+    }
+}
+
+impl PaymentsEnv<'_> {
+    /// Field-split the env into the `UserEnv` plus the manager reference
+    /// (the `user_env!` shape; a `&mut self` helper cannot return both,
+    /// hence the manual destructuring at every call).
+    fn split_user_env(&mut self) -> (UserEnv<'_>, &mut UserManager) {
+        let Self {
+            global,
+            options,
+            auth_is_bot,
+            my_dialog_id: _,
+            user_manager,
+            chat_manager: _,
+        } = self;
+        (
+            UserEnv {
+                global,
+                options: options
+                    .as_mut()
+                    .expect("payment requests run with the initialized option manager"),
+                auth_is_bot: *auth_is_bot,
+            },
+            user_manager,
+        )
+    }
+}
 
 #[cfg(test)]
 mod tests {

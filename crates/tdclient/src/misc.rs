@@ -242,7 +242,7 @@ pub(crate) fn to_lower_ascii(s: &str) -> String {
 /// `check_currency_amount` (misc.cpp:390-393) — the C++ `MAX_AMOUNT`
 /// gate of 9999'9999'9999.
 pub(crate) fn check_currency_amount(amount: i64) -> bool {
-    const MAX_AMOUNT: i64 = 9_999_999_999_999;
+    const MAX_AMOUNT: i64 = 999_999_999_999;
     (-MAX_AMOUNT..=MAX_AMOUNT).contains(&amount)
 }
 
@@ -516,9 +516,19 @@ pub fn get_valid_short_usernames() -> &'static [&'static str] {
 #[cfg(test)]
 mod misc_helper_tests {
     use super::{
-        clean_name, clean_username, get_valid_short_usernames, is_allowed_username,
-        is_valid_username, replace_with_spaces, strip_empty_characters,
+        check_currency_amount, clean_name, clean_username, get_valid_short_usernames,
+        is_allowed_username, is_valid_username, replace_with_spaces, strip_empty_characters,
     };
+
+    #[test]
+    fn currency_amount_bounds_match_the_cpp_limit() {
+        // misc.cpp:390-393 — inclusive ±9999'9999'9999.
+        assert!(check_currency_amount(0));
+        assert!(check_currency_amount(9999_9999_9999));
+        assert!(check_currency_amount(-9999_9999_9999));
+        assert!(!check_currency_amount(9999_9999_9999 + 1));
+        assert!(!check_currency_amount(-9999_9999_9999 - 1));
+    }
 
     #[test]
     fn clean_username_strips_dots_lowercases_and_trims() {

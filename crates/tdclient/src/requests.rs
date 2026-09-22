@@ -41,12 +41,11 @@ use crate::notification_settings::{
     get_scope_notification_settings_object,
 };
 use crate::notification_settings_manager::ScopeSettingsAnswer;
-use crate::suggested_action::SuggestedAction;
-use crate::td::AccountEnv;
 use crate::star_gift_manager::{
     StarGiftCollectionId, StarGiftId, StarGiftResalePrice, get_message_sender_dialog_id,
 };
-use crate::td::ThemeEnv;
+use crate::suggested_action::SuggestedAction;
+use crate::td::AccountEnv;
 use crate::td::AutosaveEnv;
 use crate::td::BoostEnv;
 use crate::td::CallEnv;
@@ -56,6 +55,7 @@ use crate::td::PremiumTdEnv;
 use crate::td::QuickReplyEnv;
 use crate::td::StatisticsEnv;
 use crate::td::Td;
+use crate::td::ThemeEnv;
 use crate::td::WebBrowserEnv;
 use crate::td_api::{self, Function, Object};
 use crate::user_manager::{FileId, PendingUserRequest, SecretChatId, UserEnv, UserId};
@@ -2496,6 +2496,242 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
 
+        // -- the payments set (M.43): Requests.cpp:8372-8436, 8757-8771,
+        //    9247-9251; the CHECK_IS_USER/CHECK_IS_BOT gates match the
+        //    C++ arms, the flows park their net tails through the env --
+        Function::answerShippingQuery(request) => {
+            // Requests.cpp:8372-8378: CHECK_IS_BOT + CLEAN_INPUT_STRING +
+            // CREATE_OK_REQUEST_PROMISE
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(error_message) = clean_or_utf8_error(td, id, &request.error_message) else {
+                return;
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            payments_arm(
+                td,
+                |env| {
+                    crate::payments::answer_shipping_query(
+                        env,
+                        request.shipping_query_id,
+                        request.shipping_options,
+                        &error_message,
+                        promise,
+                    )
+                },
+                id,
+            );
+        }
+        Function::answerPreCheckoutQuery(request) => {
+            // Requests.cpp:8380-8386
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(error_message) = clean_or_utf8_error(td, id, &request.error_message) else {
+                return;
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            payments_arm(
+                td,
+                |env| {
+                    crate::payments::answer_pre_checkout_query(
+                        env,
+                        request.pre_checkout_query_id,
+                        &error_message,
+                        promise,
+                    )
+                },
+                id,
+            );
+        }
+        Function::getBankCardInfo(request) => {
+            // Requests.cpp:8387-8392
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(bank_card_number) = clean_or_utf8_error(td, id, &request.bank_card_number)
+            else {
+                return;
+            };
+            let promise =
+                td.deferred_promise(id, |b: td_api::BankCardInfo| Object::bankCardInfo(b));
+            payments_arm(
+                td,
+                |env| crate::payments::get_bank_card_info(env, &bank_card_number, promise),
+                id,
+            );
+        }
+        Function::getPaymentForm(request) => {
+            // Requests.cpp:8394-8398
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |b: td_api::PaymentForm| Object::paymentForm(b));
+            payments_arm(
+                td,
+                |env| {
+                    crate::payments::get_payment_form(
+                        env,
+                        request.input_invoice,
+                        request.theme.as_ref(),
+                        promise,
+                    )
+                },
+                id,
+            );
+        }
+        Function::validateOrderInfo(request) => {
+            // Requests.cpp:8400-8405
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |b: td_api::ValidatedOrderInfo| {
+                Object::validatedOrderInfo(b)
+            });
+            payments_arm(
+                td,
+                |env| {
+                    crate::payments::validate_order_info(
+                        env,
+                        request.input_invoice,
+                        request.order_info,
+                        request.allow_save,
+                        promise,
+                    )
+                },
+                id,
+            );
+        }
+        Function::sendPaymentForm(request) => {
+            // Requests.cpp:8407-8414: the order/shipping identifiers are
+            // cleaned before the flow
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(order_info_id) = clean_or_utf8_error(td, id, &request.order_info_id) else {
+                return;
+            };
+            let Some(shipping_option_id) = clean_or_utf8_error(td, id, &request.shipping_option_id)
+            else {
+                return;
+            };
+            let promise =
+                td.deferred_promise(id, |b: td_api::PaymentResult| Object::paymentResult(b));
+            payments_arm(
+                td,
+                |env| {
+                    crate::payments::send_payment_form(
+                        env,
+                        request.input_invoice,
+                        request.payment_form_id,
+                        &order_info_id,
+                        &shipping_option_id,
+                        request.credentials,
+                        request.tip_amount,
+                        promise,
+                    )
+                },
+                id,
+            );
+        }
+        Function::getPaymentReceipt(request) => {
+            // Requests.cpp:8416-8420: the MessageFullId comes from the
+            // (chat_id, message_id) pair
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise(id, |b: td_api::PaymentReceipt| Object::paymentReceipt(b));
+            payments_arm(
+                td,
+                |env| {
+                    crate::payments::get_payment_receipt(
+                        env,
+                        crate::dialog_id::MessageFullId::new(
+                            crate::dialog_id::DialogId::new(request.chat_id),
+                            crate::chat_manager::MessageId::new(request.message_id),
+                        ),
+                        promise,
+                    )
+                },
+                id,
+            );
+        }
+        Function::getSavedOrderInfo(_) => {
+            // Requests.cpp:8422-8426
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |b: td_api::OrderInfo| Object::orderInfo(b));
+            payments_arm(
+                td,
+                |env| crate::payments::get_saved_order_info(env, promise),
+                id,
+            );
+        }
+        Function::deleteSavedOrderInfo(_) => {
+            // Requests.cpp:8428-8432: CREATE_OK_REQUEST_PROMISE
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            payments_arm(
+                td,
+                |env| crate::payments::delete_saved_order_info(env, promise),
+                id,
+            );
+        }
+        Function::deleteSavedCredentials(_) => {
+            // Requests.cpp:8434-8438
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            payments_arm(
+                td,
+                |env| crate::payments::delete_saved_credentials(env, promise),
+                id,
+            );
+        }
+        Function::createInvoiceLink(request) => {
+            // Requests.cpp:8757-8762: CHECK_IS_BOT +
+            // CREATE_HTTP_URL_REQUEST_PROMISE — the exported invoice URL
+            // answers the httpUrl object
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(invoice) = request.invoice else {
+                return td.send_error_impl(id, 400, "Invoice must be non-empty");
+            };
+            let promise =
+                td.deferred_promise(id, |url: String| Object::httpUrl(td_api::HttpUrl { url }));
+            payments_arm(
+                td,
+                |env| {
+                    crate::payments::export_invoice(
+                        env,
+                        crate::payments::BusinessConnectionId::new(request.business_connection_id),
+                        *invoice,
+                        promise,
+                    )
+                },
+                id,
+            );
+        }
+        Function::getCollectibleItemInfo(request) => {
+            // Requests.cpp:9247-9251: no CHECK gate
+            let promise = td.deferred_promise(id, |b: td_api::CollectibleItemInfo| {
+                Object::collectibleItemInfo(b)
+            });
+            payments_arm(
+                td,
+                |env| crate::payments::get_collectible_info(env, request.r#type, promise),
+                id,
+            );
+        }
+
+        // Everything else waits for its manager step.
         // Everything else waits for its manager step.
         // Everything else waits for its manager step; the M.42 star gift
         // group follows in its own frame (see the frame note above).
@@ -3958,6 +4194,34 @@ fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
     }
 }
 
+/// Build the [`crate::td::PaymentsEnv`] over the disjoint `Td` fields and
+/// run the payment flow. The env is per-call (the `ThemeEnv` convention);
+/// `my_dialog_id` is read before the split.
+fn payments_arm(td: &mut Td, run: impl FnOnce(&mut crate::td::PaymentsEnv<'_>), _id: u64) {
+    let my_dialog_id = crate::dialog_manager::get_my_dialog_id(td);
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        chat_manager,
+        ..
+    } = td;
+    let mut env = crate::td::PaymentsEnv {
+        global,
+        options: Some(
+            option_manager
+                .as_mut()
+                .expect("payment requests run with the initialized option manager"),
+        ),
+        auth_is_bot: auth_manager.is_bot(),
+        my_dialog_id,
+        user_manager,
+        chat_manager,
+    };
+    run(&mut env);
+}
+
 /// `CHECK_IS_USER` (Requests.cpp:1997-2000).
 fn check_is_user(td: &mut Td, id: u64) -> bool {
     if td.auth_manager.is_bot() {
@@ -4245,20 +4509,13 @@ mod request_census_tests {
         assert_eq!(generated.len(), crate::td_api::SCHEME_FUNCTIONS);
 
         // The flip-state ledger — re-derived from the fixture at the wave-3
-// integration (the per-track flip histories compose).
-assert_eq!(*counts.get("sync").unwrap_or(&0), 19, "sync count");
-assert_eq!(
-    *counts.get("dispatched").unwrap_or(&0),
-    214,
-    "dispatched count"
-);
-assert_eq!(
-    *counts.get("interim").unwrap_or(&0),
-    789,
-    "interim count"
-);
+        // integration (the per-track flip histories compose).
+        assert_eq!(*counts.get("sync").unwrap_or(&0), 19, "sync count");
+        assert_eq!(
+            *counts.get("dispatched").unwrap_or(&0),
+            226,
+            "dispatched count"
+        );
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 777, "interim count");
     }
 }
-
-
-

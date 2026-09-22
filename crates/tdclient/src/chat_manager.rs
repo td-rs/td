@@ -12302,8 +12302,9 @@ impl ChatManager {
         ChannelType::Broadcast
     }
 
-    /// `is_broadcast_channel` (ChatManager.cpp:2879-2881).
-    fn is_broadcast_channel(&self, channel_id: ChannelId) -> bool {
+    /// `is_broadcast_channel` (ChatManager.cpp:2879-2881). The payment
+    /// plane's giveaway validation reads it through the env (M.43).
+    pub fn is_broadcast_channel(&self, channel_id: ChannelId) -> bool {
         self.get_channel(channel_id)
             .is_some_and(|c| Self::get_channel_type(c) == ChannelType::Broadcast)
     }

@@ -43,8 +43,8 @@ answerChatJoinRequestQuery	interim
 answerCustomQuery	interim
 answerGuestQuery	interim
 answerInlineQuery	interim
-answerPreCheckoutQuery	interim
-answerShippingQuery	interim
+answerPreCheckoutQuery	dispatched
+answerShippingQuery	dispatched
 answerWebAppQuery	interim
 applyPremiumGiftCode	dispatched
 approveSuggestedPost	interim
@@ -130,7 +130,7 @@ createCommunity	dispatched
 createForumTopic	interim
 createGiftCollection	dispatched
 createGroupCall	interim
-createInvoiceLink	interim
+createInvoiceLink	dispatched
 createNewBasicGroupChat	interim
 createNewSecretChat	interim
 createNewStickerSet	interim
@@ -186,10 +186,10 @@ deleteProfilePhoto	interim
 deleteQuickReplyShortcut	dispatched
 deleteQuickReplyShortcutMessages	dispatched
 deleteRevokedChatInviteLink	interim
-deleteSavedCredentials	interim
+deleteSavedCredentials	dispatched
 deleteSavedMessagesTopicHistory	interim
 deleteSavedMessagesTopicMessagesByDate	interim
-deleteSavedOrderInfo	interim
+deleteSavedOrderInfo	dispatched
 deleteStickerSet	interim
 deleteStory	interim
 deleteStoryAlbum	interim
@@ -268,7 +268,7 @@ getAutosaveSettings	dispatched
 getAvailableChatBoostSlots	interim
 getAvailableGifts	dispatched
 getBackgroundUrl	interim
-getBankCardInfo	interim
+getBankCardInfo	dispatched
 getBasicGroup	interim
 getBasicGroupFullInfo	interim
 getBlockedMessageSenders	dispatched
@@ -337,7 +337,7 @@ getChats	interim
 getChatsForChatFolderInviteLink	interim
 getChatsToPostStories	interim
 getCloseFriends	dispatched
-getCollectibleItemInfo	interim
+getCollectibleItemInfo	dispatched
 getCommands	interim
 getConnectedAffiliateProgram	interim
 getConnectedAffiliatePrograms	interim
@@ -465,8 +465,8 @@ getPassportAuthorizationForm	interim
 getPassportAuthorizationFormAvailableElements	interim
 getPassportElement	interim
 getPasswordState	interim
-getPaymentForm	interim
-getPaymentReceipt	interim
+getPaymentForm	dispatched
+getPaymentReceipt	dispatched
 getPersonalChatHistory	interim
 getPhoneNumberInfo	interim
 getPhoneNumberInfoSync	interim
@@ -506,7 +506,7 @@ getSavedMessagesTopicHistory	interim
 getSavedMessagesTopicMessageByDate	interim
 getSavedNotificationSound	interim
 getSavedNotificationSounds	interim
-getSavedOrderInfo	interim
+getSavedOrderInfo	dispatched
 getScopeNotificationSettings	dispatched
 getSearchSponsoredChats	interim
 getSearchedForTags	interim
@@ -779,7 +779,7 @@ sendMessage	dispatched
 sendMessageAlbum	interim
 sendMessageViewMetrics	interim
 sendPassportAuthorizationForm	interim
-sendPaymentForm	interim
+sendPaymentForm	dispatched
 sendPhoneNumberCode	interim
 sendPhoneNumberFirebaseSms	interim
 sendQuickReplyShortcutMessages	interim
@@ -1013,7 +1013,7 @@ unpinChatMessage	interim
 upgradeBasicGroupChatToSupergroupChat	dispatched
 upgradeGift	dispatched
 uploadStickerFile	interim
-validateOrderInfo	interim
+validateOrderInfo	dispatched
 viewMessages	interim
 viewPremiumFeature	dispatched
 viewSponsoredChat	interim
