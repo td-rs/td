@@ -148,7 +148,6 @@ pub trait WebPagesManagerEnv: WebPageBlockEnv {
     fn is_premium(&self) -> bool;
     /// `td_->user_manager_->get_user_id_object` — inherited via
     /// WebPageBlockEnv.
-
     // -- the `[blocked: net]` query tails; each drops/parks the promise,
     // -- keeping the C++ request unanswered offline
     /// `GetWebPagePreviewQuery` (WebPagesManager.cpp:77-115).
@@ -800,11 +799,11 @@ impl WebPagesManager {
         from_database: bool,
     ) {
         let old = self.web_pages.get(&web_page_id);
-        let is_changed = old.map_or(true, |old| *old != web_page);
+        let is_changed = old.is_none_or(|old| *old != web_page);
         let old_instant_view =
             old.map_or_else(WebPageInstantView::default, |old| old.instant_view.clone());
-        if old.is_some() {
-            web_page.log_event_id = old.unwrap().log_event_id;
+        if let Some(old) = &old {
+            web_page.log_event_id = old.log_event_id;
         } else if let Some(file_source_id) = self.url_to_file_source_id.remove(&web_page.url) {
             web_page.file_source_id = file_source_id;
         }
@@ -813,8 +812,8 @@ impl WebPagesManager {
         if let Some(old) = old {
             old_file_ids = self.get_web_page_file_ids(old);
         }
-        if !old.map_or(true, |old| old.story_full_ids == web_page.story_full_ids) {
-            for story_full_id in &old.unwrap().story_full_ids {
+        if let Some(old) = &old {
+            for story_full_id in &old.story_full_ids {
                 if let Some(web_page_ids) = self.story_web_pages.get_mut(story_full_id) {
                     web_page_ids.remove(&web_page_id);
                     if web_page_ids.is_empty() {
@@ -1007,7 +1006,7 @@ impl WebPagesManager {
         poll_id: i64,
         web_page_ids: Vec<WebPageId>,
     ) {
-        if poll_id < 0 || poll_id == 0 {
+        if poll_id <= 0 {
             return;
         }
         if web_page_ids.is_empty() {
@@ -1044,12 +1043,12 @@ impl WebPagesManager {
             }
         }
         for web_page_id in &old_web_page_ids {
-            if !web_page_ids.contains(web_page_id) {
-                if let Some(poll_ids) = self.web_page_polls.get_mut(web_page_id) {
-                    poll_ids.remove(&poll_id);
-                    if poll_ids.is_empty() {
-                        self.web_page_polls.remove(web_page_id);
-                    }
+            if !web_page_ids.contains(web_page_id)
+                && let Some(poll_ids) = self.web_page_polls.get_mut(web_page_id)
+            {
+                poll_ids.remove(&poll_id);
+                if poll_ids.is_empty() {
+                    self.web_page_polls.remove(web_page_id);
                 }
             }
         }
@@ -1241,12 +1240,12 @@ impl WebPagesManager {
         web_page_id: WebPageId,
         view_count: i32,
     ) {
-        if let Some(web_page) = self.web_pages.get_mut(&web_page_id) {
-            if web_page.instant_view.view_count != view_count {
-                web_page.instant_view.view_count = view_count;
-                let page = web_page.clone();
-                self.save_web_page(env, &page, web_page_id, false);
-            }
+        if let Some(web_page) = self.web_pages.get_mut(&web_page_id)
+            && web_page.instant_view.view_count != view_count
+        {
+            web_page.instant_view.view_count = view_count;
+            let page = web_page.clone();
+            self.save_web_page(env, &page, web_page_id, false);
         }
     }
 
@@ -1497,34 +1496,35 @@ impl WebPagesManager {
                 if !web_page_id.is_valid() {
                     return WebPageId::default();
                 }
-                let mut page = WebPage::default();
-                page.was_reloaded = true;
-                page.url = web_page.url;
-                page.display_url = web_page.display_url;
-                page.type_ = web_page.r#type;
-                page.site_name = web_page.site_name;
-                page.title = web_page.title;
-                page.description = web_page.description;
-                page.photo = web_page
-                    .photo
-                    .map(crate::photo::get_photo)
-                    .unwrap_or_default();
-                page.embed_url = web_page.embed_url;
-                page.embed_type = web_page.embed_type;
-                page.embed_dimensions = crate::photo::get_dimensions(
-                    web_page.embed_width,
-                    web_page.embed_height,
-                    "on_get_web_page",
-                );
-                page.duration = web_page.duration.max(0);
-                page.author = web_page.author;
-                page.has_large_media = web_page.has_large_media;
-                page.video_cover_photo = web_page.video_cover_photo;
-                if let Some(document) = web_page.document {
-                    if let Some(document) = env.on_get_document(Box::new(document), owner_dialog_id)
-                    {
-                        page.document = document;
-                    }
+                let mut page = WebPage {
+                    was_reloaded: true,
+                    url: web_page.url,
+                    display_url: web_page.display_url,
+                    type_: web_page.r#type,
+                    site_name: web_page.site_name,
+                    title: web_page.title,
+                    description: web_page.description,
+                    photo: web_page
+                        .photo
+                        .map(crate::photo::get_photo)
+                        .unwrap_or_default(),
+                    embed_url: web_page.embed_url,
+                    embed_type: web_page.embed_type,
+                    embed_dimensions: crate::photo::get_dimensions(
+                        web_page.embed_width,
+                        web_page.embed_height,
+                        "on_get_web_page",
+                    ),
+                    duration: web_page.duration.max(0),
+                    author: web_page.author,
+                    has_large_media: web_page.has_large_media,
+                    video_cover_photo: web_page.video_cover_photo,
+                    ..WebPage::default()
+                };
+                if let Some(document) = web_page.document
+                    && let Some(document) = env.on_get_document(Box::new(document), owner_dialog_id)
+                {
+                    page.document = document;
                 }
                 // The attribute planes ride their seams: themes + star
                 // gifts keep their store/parse presence flags false
