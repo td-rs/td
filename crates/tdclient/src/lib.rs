@@ -8,6 +8,7 @@
 //! Options manager S69.
 
 pub mod account_manager;
+pub mod active_story_state;
 pub mod age_verification_parameters;
 pub mod attach_menu_manager;
 pub mod auth_manager;
@@ -77,6 +78,7 @@ pub mod premium_gift_option;
 pub mod query_combiner;
 pub mod query_merger;
 pub mod quick_reply_manager;
+pub mod reaction_type;
 pub mod request_actor;
 pub mod requests;
 pub mod restriction_reason;
@@ -86,6 +88,16 @@ pub mod secure_value;
 pub mod star_gift_manager;
 pub mod statistics_manager;
 pub mod store_parse;
+pub mod story_album;
+pub mod story_content;
+pub mod story_db;
+pub mod story_forward_info;
+pub mod story_ids;
+pub mod story_interaction_info;
+pub mod story_manager;
+pub mod story_notification_settings;
+pub mod story_stealth_mode;
+pub mod story_viewer;
 pub mod suggested_action;
 pub mod suggested_action_manager;
 pub mod synchronous_requests;

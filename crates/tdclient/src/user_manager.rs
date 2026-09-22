@@ -321,29 +321,9 @@ impl SecretChatId {
 /// file-source maps below) until the FileReferenceManager lands.
 pub use crate::files::{FileId, FileSourceId};
 
-/// `td::StoryId` (StoryId.h).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct StoryId(i32);
-
-impl StoryId {
-    pub const MAX_SERVER_STORY_ID: i32 = 1_999_999_999;
-
-    pub fn new(id: i32) -> StoryId {
-        StoryId(id)
-    }
-
-    pub fn get(self) -> i32 {
-        self.0
-    }
-
-    pub fn is_valid(self) -> bool {
-        self.0 > 0
-    }
-
-    pub fn is_server(self) -> bool {
-        self.0 > 0 && self.0 <= Self::MAX_SERVER_STORY_ID
-    }
-}
+/// `td::StoryId` (StoryId.h) — the M.4.13 stand-in moved to the M.47
+/// canonical module (`crate::story_ids`).
+pub use crate::story_ids::StoryId;
 
 /// `td::CommunityId` (CommunityId.h).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]

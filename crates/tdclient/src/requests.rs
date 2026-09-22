@@ -2752,6 +2752,745 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
         }
 
         // Everything else waits for its manager step.
+        // Everything else waits for its manager step.
+        _ => run_story_requests(td, id, function),
+    }
+}
+
+/// The M.47 StoryManager arm group of the request dispatcher — see the
+/// frame note at the forward site in [`run_request`]. Every arm routes
+/// into `td_->story_manager_->...` (Requests.cpp:3763-3797, 4059-4119,
+/// 4538-4544, 4745-4830, 5927-6010); the network tails are the
+/// [blocked: net] query seams of the manager, the local validation halves
+/// answer inline.
+#[allow(clippy::too_many_lines)]
+fn run_story_requests(td: &mut Td, id: u64, function: Function) {
+    /// The `td_->` slice the story arms read through (the same field-split
+    /// borrow the [`crate::td::StoryEnv`] init site uses); the manager
+    /// field rides the closure as its own `&mut`.
+    fn story_arm(
+        td: &mut Td,
+        run: impl FnOnce(&mut crate::td::StoryEnv<'_>, &mut crate::story_manager::StoryManager),
+    ) {
+        let crate::td::Td {
+            story_manager,
+            global,
+            option_manager,
+            auth_manager,
+            user_manager,
+            chat_manager,
+            file_manager,
+            notification_updates,
+            ..
+        } = td;
+        let mut env = crate::td::StoryEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_authorized: auth_manager.is_authorized(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            chat_manager,
+            file_manager: file_manager.clone(),
+            updates: notification_updates,
+        };
+        run(&mut env, story_manager);
+    }
+
+    macro_rules! ok_promise {
+        ($td:expr) => {
+            $td.deferred_promise::<(), _>(id, |_| ok_object())
+        };
+    }
+
+    match function {
+        // searchPublicStoriesByTag (Requests.cpp:3763-3770)
+        Function::searchPublicStoriesByTag(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(tag) = clean_or_utf8_error(td, id, &request.tag) else {
+                return;
+            };
+            let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::FoundStories, _>(id, Object::foundStories);
+            story_arm(td, |env, manager| {
+                manager.search_hashtag_posts(
+                    env,
+                    crate::dialog_id::DialogId::new(request.story_poster_chat_id),
+                    tag,
+                    offset,
+                    request.limit,
+                    promise,
+                );
+            });
+        }
+
+        // searchPublicStoriesByLocation (Requests.cpp:3772-3785)
+        Function::searchPublicStoriesByLocation(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(address) = request.address else {
+                return td.send_error_impl(id, 400, "Address must be non-empty");
+            };
+            let Some(country_code) = clean_or_utf8_error(td, id, &address.country_code) else {
+                return;
+            };
+            let Some(state) = clean_or_utf8_error(td, id, &address.state) else {
+                return;
+            };
+            let Some(city) = clean_or_utf8_error(td, id, &address.city) else {
+                return;
+            };
+            let Some(street) = clean_or_utf8_error(td, id, &address.street) else {
+                return;
+            };
+            let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::FoundStories, _>(id, Object::foundStories);
+            story_arm(td, |env, manager| {
+                manager.search_location_posts(
+                    env,
+                    Some(td_api::LocationAddress {
+                        country_code,
+                        state,
+                        city,
+                        street,
+                    }),
+                    offset,
+                    request.limit,
+                    promise,
+                );
+            });
+        }
+
+        // searchPublicStoriesByVenue (Requests.cpp:3787-3796)
+        Function::searchPublicStoriesByVenue(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(venue_provider) = clean_or_utf8_error(td, id, &request.venue_provider) else {
+                return;
+            };
+            let Some(venue_id) = clean_or_utf8_error(td, id, &request.venue_id) else {
+                return;
+            };
+            let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::FoundStories, _>(id, Object::foundStories);
+            story_arm(td, |env, manager| {
+                manager.search_venue_posts(
+                    env,
+                    venue_provider,
+                    venue_id,
+                    offset,
+                    request.limit,
+                    promise,
+                );
+            });
+        }
+
+        // getChatStoryAlbums (Requests.cpp:4059-4063)
+        Function::getChatStoryAlbums(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::StoryAlbums, _>(id, Object::storyAlbums);
+            story_arm(td, |env, manager| {
+                manager.get_story_albums(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    promise,
+                );
+            });
+        }
+
+        // getStoryAlbumStories (Requests.cpp:4065-4070)
+        Function::getStoryAlbumStories(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Stories, _>(id, Object::stories);
+            story_arm(td, |env, manager| {
+                manager.get_story_album_stories(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::story_ids::StoryAlbumId::new(request.story_album_id),
+                    request.offset,
+                    request.limit,
+                    promise,
+                );
+            });
+        }
+
+        // createStoryAlbum (Requests.cpp:4072-4078)
+        Function::createStoryAlbum(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::StoryAlbum, _>(id, Object::storyAlbum);
+            let story_ids = crate::story_ids::StoryId::get_story_ids(&request.story_ids);
+            story_arm(td, |env, manager| {
+                manager.create_story_album(
+                    env,
+                    crate::dialog_id::DialogId::new(request.story_poster_chat_id),
+                    &name,
+                    &story_ids,
+                    promise,
+                );
+            });
+        }
+
+        // reorderStoryAlbums (Requests.cpp:4080-4085)
+        Function::reorderStoryAlbums(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let story_album_ids =
+                crate::story_ids::StoryAlbumId::get_story_album_ids(&request.story_album_ids);
+            story_arm(td, |env, manager| {
+                manager.reorder_story_albums(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    &story_album_ids,
+                    promise,
+                );
+            });
+        }
+
+        // deleteStoryAlbum (Requests.cpp:4087-4092)
+        Function::deleteStoryAlbum(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            story_arm(td, |env, manager| {
+                manager.delete_story_album(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::story_ids::StoryAlbumId::new(request.story_album_id),
+                    promise,
+                );
+            });
+        }
+
+        // setStoryAlbumName (Requests.cpp:4094-4100)
+        Function::setStoryAlbumName(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::StoryAlbum, _>(id, Object::storyAlbum);
+            story_arm(td, |env, manager| {
+                manager.set_story_album_title(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::story_ids::StoryAlbumId::new(request.story_album_id),
+                    &name,
+                    promise,
+                );
+            });
+        }
+
+        // addStoryAlbumStories (Requests.cpp:4102-4108)
+        Function::addStoryAlbumStories(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::StoryAlbum, _>(id, Object::storyAlbum);
+            let story_ids = crate::story_ids::StoryId::get_story_ids(&request.story_ids);
+            story_arm(td, |env, manager| {
+                manager.add_story_album_stories(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::story_ids::StoryAlbumId::new(request.story_album_id),
+                    &story_ids,
+                    promise,
+                );
+            });
+        }
+
+        // removeStoryAlbumStories (Requests.cpp:4110-4116)
+        Function::removeStoryAlbumStories(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::StoryAlbum, _>(id, Object::storyAlbum);
+            let story_ids = crate::story_ids::StoryId::get_story_ids(&request.story_ids);
+            story_arm(td, |env, manager| {
+                manager.remove_story_album_stories(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::story_ids::StoryAlbumId::new(request.story_album_id),
+                    &story_ids,
+                    promise,
+                );
+            });
+        }
+
+        // reorderStoryAlbumStories (Requests.cpp:4118-4120)
+        Function::reorderStoryAlbumStories(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::StoryAlbum, _>(id, Object::storyAlbum);
+            let story_ids = crate::story_ids::StoryId::get_story_ids(&request.story_ids);
+            story_arm(td, |env, manager| {
+                manager.reorder_story_album_stories(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::story_ids::StoryAlbumId::new(request.story_album_id),
+                    &story_ids,
+                    promise,
+                );
+            });
+        }
+
+        // editBusinessStory (Requests.cpp:4538-4544)
+        Function::editBusinessStory(request) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, story_optional_to_object);
+            story_arm(td, |env, manager| {
+                manager.edit_business_story(
+                    env,
+                    crate::dialog_id::DialogId::new(request.story_poster_chat_id),
+                    crate::story_ids::StoryId::new(request.story_id),
+                    request.content,
+                    request.areas,
+                    request.caption,
+                    request.privacy_settings,
+                    promise,
+                );
+            });
+        }
+
+        // getStory (Requests.cpp:4745-4750)
+        Function::getStory(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, story_optional_to_object);
+            story_arm(td, |env, manager| {
+                manager.get_story_request(
+                    env,
+                    crate::dialog_id::DialogId::new(request.story_poster_chat_id),
+                    crate::story_ids::StoryId::new(request.story_id),
+                    request.only_local,
+                    promise,
+                );
+            });
+        }
+
+        // getChatsToPostStories (Requests.cpp:4752-4756)
+        Function::getChatsToPostStories(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Chats, _>(id, Object::chats);
+            story_arm(td, |env, manager| {
+                manager.get_dialogs_to_send_stories(env, promise);
+            });
+        }
+
+        // canPostStory (Requests.cpp:4758-4762)
+        Function::canPostStory(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, can_post_story_result_to_object);
+            story_arm(td, |env, manager| {
+                manager.can_send_story(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    promise,
+                );
+            });
+        }
+
+        // postStory (Requests.cpp:4763-4771)
+        Function::postStory(request) => {
+            let promise = td.deferred_promise(id, story_optional_to_object);
+            let story_album_ids =
+                crate::story_ids::StoryAlbumId::get_story_album_ids(&request.album_ids);
+            story_arm(td, |env, manager| {
+                manager.send_story(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    request.content,
+                    request.areas,
+                    request.caption,
+                    request.privacy_settings,
+                    story_album_ids,
+                    request.active_period,
+                    request.from_story_full_id,
+                    request.is_posted_to_chat_page,
+                    request.protect_content,
+                    promise,
+                );
+            });
+        }
+
+        // startLiveStory (Requests.cpp:4773-4779)
+        Function::startLiveStory(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, start_live_story_result_to_object);
+            story_arm(td, |env, manager| {
+                manager.start_live_story(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    request.privacy_settings,
+                    false,
+                    request.protect_content,
+                    request.is_rtmp_stream,
+                    request.enable_messages,
+                    request.paid_message_star_count,
+                    promise,
+                );
+            });
+        }
+
+        // editStory (Requests.cpp:4781-4787)
+        Function::editStory(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            story_arm(td, |env, manager| {
+                manager.edit_story(
+                    env,
+                    crate::dialog_id::DialogId::new(request.story_poster_chat_id),
+                    crate::story_ids::StoryId::new(request.story_id),
+                    request.content,
+                    request.areas,
+                    request.caption,
+                    promise,
+                );
+            });
+        }
+
+        // editStoryCover (Requests.cpp:4789-4794)
+        Function::editStoryCover(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            story_arm(td, |env, manager| {
+                manager.edit_story_cover(
+                    env,
+                    crate::dialog_id::DialogId::new(request.story_poster_chat_id),
+                    crate::story_ids::StoryId::new(request.story_id),
+                    request.cover_frame_timestamp,
+                    promise,
+                );
+            });
+        }
+
+        // setStoryPrivacySettings (Requests.cpp:4796-4801)
+        Function::setStoryPrivacySettings(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            story_arm(td, |env, manager| {
+                manager.set_story_privacy_settings(
+                    env,
+                    crate::story_ids::StoryId::new(request.story_id),
+                    request.privacy_settings,
+                    promise,
+                );
+            });
+        }
+
+        // toggleStoryIsPostedToChatPage (Requests.cpp:4803-4808)
+        Function::toggleStoryIsPostedToChatPage(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            story_arm(td, |env, manager| {
+                manager.toggle_story_is_pinned(
+                    env,
+                    crate::dialog_id::DialogId::new(request.story_poster_chat_id),
+                    crate::story_ids::StoryId::new(request.story_id),
+                    request.is_posted_to_chat_page,
+                    promise,
+                );
+            });
+        }
+
+        // deleteStory (Requests.cpp:4810-4815)
+        Function::deleteStory(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            story_arm(td, |env, manager| {
+                manager.delete_story(
+                    env,
+                    crate::dialog_id::DialogId::new(request.story_poster_chat_id),
+                    crate::story_ids::StoryId::new(request.story_id),
+                    promise,
+                );
+            });
+        }
+
+        // loadActiveStories (Requests.cpp:4817-4821)
+        Function::loadActiveStories(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let story_list_id =
+                crate::story_ids::StoryListId::from_story_list_object(request.story_list.as_ref())
+                    .unwrap_or(crate::story_ids::StoryListId::None);
+            story_arm(td, |env, manager| {
+                manager.load_active_stories(env, story_list_id, promise);
+            });
+        }
+
+        // setChatActiveStoriesList (Requests.cpp:4823-4827)
+        Function::setChatActiveStoriesList(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let story_list_id =
+                crate::story_ids::StoryListId::from_story_list_object(request.story_list.as_ref())
+                    .unwrap_or(crate::story_ids::StoryListId::None);
+            story_arm(td, |env, manager| {
+                manager.toggle_dialog_stories_hidden(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    story_list_id,
+                    promise,
+                );
+            });
+        }
+
+        // getChatActiveStories (Requests.cpp:5927-5931)
+        Function::getChatActiveStories(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::ChatActiveStories, _>(id, Object::chatActiveStories);
+            story_arm(td, |env, manager| {
+                manager.get_dialog_expiring_stories(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    promise,
+                );
+            });
+        }
+
+        // getChatPostedToChatPageStories (Requests.cpp:5933-5938)
+        Function::getChatPostedToChatPageStories(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Stories, _>(id, Object::stories);
+            story_arm(td, |env, manager| {
+                manager.get_dialog_pinned_stories(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::story_ids::StoryId::new(request.from_story_id),
+                    request.limit,
+                    promise,
+                );
+            });
+        }
+
+        // getChatArchivedStories (Requests.cpp:5940-5945)
+        Function::getChatArchivedStories(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Stories, _>(id, Object::stories);
+            story_arm(td, |env, manager| {
+                manager.get_story_archive(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::story_ids::StoryId::new(request.from_story_id),
+                    request.limit,
+                    promise,
+                );
+            });
+        }
+
+        // setChatPinnedStories (Requests.cpp:5947-5952)
+        Function::setChatPinnedStories(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let story_ids = crate::story_ids::StoryId::get_story_ids(&request.story_ids);
+            story_arm(td, |env, manager| {
+                manager.set_pinned_stories(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    story_ids,
+                    promise,
+                );
+            });
+        }
+
+        // openStory (Requests.cpp:5954-5958)
+        Function::openStory(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            story_arm(td, |env, manager| {
+                manager.open_story(
+                    env,
+                    crate::dialog_id::DialogId::new(request.story_poster_chat_id),
+                    crate::story_ids::StoryId::new(request.story_id),
+                    promise,
+                );
+            });
+        }
+
+        // closeStory (Requests.cpp:5960-5964)
+        Function::closeStory(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            story_arm(td, |env, manager| {
+                manager.close_story(
+                    env,
+                    crate::dialog_id::DialogId::new(request.story_poster_chat_id),
+                    crate::story_ids::StoryId::new(request.story_id),
+                    promise,
+                );
+            });
+        }
+
+        // setStoryReaction (Requests.cpp:5973-5979)
+        Function::setStoryReaction(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let reaction_type =
+                crate::reaction_type::ReactionType::from_td_api(request.reaction_type.as_ref());
+            story_arm(td, |env, manager| {
+                manager.set_story_reaction(
+                    env,
+                    crate::story_ids::StoryFullId::new(
+                        crate::dialog_id::DialogId::new(request.story_poster_chat_id),
+                        crate::story_ids::StoryId::new(request.story_id),
+                    ),
+                    reaction_type,
+                    request.update_recent_reactions,
+                    promise,
+                );
+            });
+        }
+
+        // getStoryInteractions (Requests.cpp:5983-5990)
+        Function::getStoryInteractions(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<td_api::StoryInteractions, _>(id, Object::storyInteractions);
+            story_arm(td, |env, manager| {
+                manager.get_story_interactions(
+                    env,
+                    crate::story_ids::StoryId::new(request.story_id),
+                    &query,
+                    request.only_contacts,
+                    request.prefer_forwards,
+                    request.prefer_with_reaction,
+                    &offset,
+                    request.limit,
+                    promise,
+                );
+            });
+        }
+
+        // getChatStoryInteractions (Requests.cpp:5992-5999)
+        Function::getChatStoryInteractions(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<td_api::StoryInteractions, _>(id, Object::storyInteractions);
+            let reaction_type =
+                crate::reaction_type::ReactionType::from_td_api(request.reaction_type.as_ref());
+            story_arm(td, |env, manager| {
+                manager.get_dialog_story_interactions(
+                    env,
+                    crate::story_ids::StoryFullId::new(
+                        crate::dialog_id::DialogId::new(request.story_poster_chat_id),
+                        crate::story_ids::StoryId::new(request.story_id),
+                    ),
+                    reaction_type,
+                    request.prefer_forwards,
+                    &offset,
+                    request.limit,
+                    promise,
+                );
+            });
+        }
+
+        // reportStory (Requests.cpp:6001-6006)
+        Function::reportStory(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(text) = clean_or_utf8_error(td, id, &request.text) else {
+                return;
+            };
+            let promise = td.deferred_promise(id, report_story_result_to_object);
+            let option_id = String::from_utf8_lossy(&request.option_id).into_owned();
+            story_arm(td, |env, manager| {
+                manager.report_story(
+                    env,
+                    crate::story_ids::StoryFullId::new(
+                        crate::dialog_id::DialogId::new(request.story_poster_chat_id),
+                        crate::story_ids::StoryId::new(request.story_id),
+                    ),
+                    &option_id,
+                    &text,
+                    promise,
+                );
+            });
+        }
+
+        // activateStoryStealthMode (Requests.cpp:6007-6009)
+        Function::activateStoryStealthMode(_) => {
+            let promise = ok_promise!(td);
+            story_arm(td, |env, manager| {
+                manager.activate_stealth_mode(env, promise);
+            });
+        }
+
+        // Everything else waits for its manager step.
         Function::getSupportUser(_) => {
             // MessageEntity / UserFull ProfileTab / DialogManager / the
             // missing setter halves (M.4.12 deferred them with their types)
@@ -5451,6 +6190,71 @@ fn arm_answer_callback_query(td: &mut Td, id: u64, request: td_api::answerCallba
     td.callback_queries_manager = manager;
 }
 
+/// The `CanPostStoryResult` → `Object` rewrap (the Object umbrella has no
+/// single variant for the six-ctor type).
+fn can_post_story_result_to_object(value: td_api::CanPostStoryResult) -> Object {
+    match value {
+        td_api::CanPostStoryResult::canPostStoryResultOk(value) => {
+            Object::canPostStoryResultOk(value)
+        }
+        td_api::CanPostStoryResult::canPostStoryResultPremiumNeeded(value) => {
+            Object::canPostStoryResultPremiumNeeded(value)
+        }
+        td_api::CanPostStoryResult::canPostStoryResultBoostNeeded(value) => {
+            Object::canPostStoryResultBoostNeeded(value)
+        }
+        td_api::CanPostStoryResult::canPostStoryResultWeeklyLimitExceeded(value) => {
+            Object::canPostStoryResultWeeklyLimitExceeded(value)
+        }
+        td_api::CanPostStoryResult::canPostStoryResultMonthlyLimitExceeded(value) => {
+            Object::canPostStoryResultMonthlyLimitExceeded(value)
+        }
+        td_api::CanPostStoryResult::canPostStoryResultActiveStoryLimitExceeded(value) => {
+            Object::canPostStoryResultActiveStoryLimitExceeded(value)
+        }
+        td_api::CanPostStoryResult::canPostStoryResultLiveStoryIsActive(value) => {
+            Object::canPostStoryResultLiveStoryIsActive(value)
+        }
+    }
+}
+
+/// The `StartLiveStoryResult` → `Object` rewrap.
+fn start_live_story_result_to_object(value: td_api::StartLiveStoryResult) -> Object {
+    match value {
+        td_api::StartLiveStoryResult::startLiveStoryResultOk(value) => {
+            Object::startLiveStoryResultOk(value)
+        }
+        td_api::StartLiveStoryResult::startLiveStoryResultFail(value) => {
+            Object::startLiveStoryResultFail(value)
+        }
+    }
+}
+
+/// The `ReportStoryResult` → `Object` rewrap.
+fn report_story_result_to_object(value: td_api::ReportStoryResult) -> Object {
+    match value {
+        td_api::ReportStoryResult::reportStoryResultOk(value) => Object::reportStoryResultOk(value),
+        td_api::ReportStoryResult::reportStoryResultOptionRequired(value) => {
+            Object::reportStoryResultOptionRequired(value)
+        }
+        td_api::ReportStoryResult::reportStoryResultTextRequired(value) => {
+            Object::reportStoryResultTextRequired(value)
+        }
+    }
+}
+
+/// The `Option<Story>` → `Object` mapper for the null-result 404 (the
+/// C++ `send_result(nullptr)` convention, td.rs testUseUpdate precedent).
+fn story_optional_to_object(value: Option<td_api::Story>) -> Object {
+    match value {
+        Some(story) => Object::story(story),
+        None => Object::error(td_api::Error {
+            code: 404,
+            message: "Not Found".to_owned(),
+        }),
+    }
+}
+
 /// `CHECK_IS_USER` (Requests.cpp:1997-2000).
 fn check_is_user(td: &mut Td, id: u64) -> bool {
     if td.auth_manager.is_bot() {
@@ -5742,12 +6546,12 @@ mod request_census_tests {
 assert_eq!(*counts.get("sync").unwrap_or(&0), 19, "sync count");
 assert_eq!(
     *counts.get("dispatched").unwrap_or(&0),
-    281,
+    317,
     "dispatched count"
 );
 assert_eq!(
     *counts.get("interim").unwrap_or(&0),
-    722,
+    686,
     "interim count"
 );
     }
