@@ -272,6 +272,8 @@ pub struct Td {
         crate::notification_settings_manager::NotificationSettingsManager,
     /// `Td::device_token_manager_` (`Td.cpp:1345`, M.13S).
     pub(crate) device_token_manager: crate::device_token_manager::DeviceTokenManager,
+    /// `Td::referral_program_manager_` (`Td.cpp:1295`, M.52).
+    pub(crate) referral_program_manager: crate::referral_program::ReferralProgramManager,
     /// The notification manager's `send_update` outbox — the collapsed
     /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
     /// [`Td::flush_user_updates`].
@@ -582,6 +584,7 @@ impl Td {
             notification_settings_manager:
                 crate::notification_settings_manager::NotificationSettingsManager::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
+            referral_program_manager: crate::referral_program::ReferralProgramManager::new(),
             notification_updates: Vec::new(),
             premium_required_contact_merger: None,
             chat_manager: crate::chat_manager::ChatManager::new(),
@@ -5195,6 +5198,23 @@ pub fn send_request(actor: &ActorOwn<Td>, request_id: u64, function: Function) {
             function,
         },
     );
+}
+
+/// The `G()`/`td_` slice the referral plane reads through (the M.52
+/// convention): field-split borrows off `Td`. Every server leg is a
+/// [blocked: net] seam.
+pub(crate) struct ReferralTdEnv<'a> {
+    /// The C++ `G()` reads — kept for the field parity; the halves land
+    /// with the net step.
+    #[allow(dead_code)]
+    pub(crate) global: &'a mut Global,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::referral_program::ReferralProgramEnv for ReferralTdEnv<'_> {
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
 }
 
 #[cfg(test)]
