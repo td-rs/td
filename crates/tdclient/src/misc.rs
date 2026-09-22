@@ -370,6 +370,13 @@ pub fn strip_empty_characters(s: &str, max_length: usize, strip_rtlo: bool) -> S
     trimmed.to_owned()
 }
 
+/// `td::check_currency_amount` (misc.cpp:390-393): the currency-amount
+/// magnitude gate shared by the LabeledPricePart/payment validations.
+pub fn check_currency_amount(amount: i64) -> bool {
+    const MAX_AMOUNT: i64 = 9999_9999_9999;
+    (-MAX_AMOUNT..=MAX_AMOUNT).contains(&amount)
+}
+
 /// `td::is_empty_string` (misc.cpp:256-258).
 pub fn is_empty_string(s: &str) -> bool {
     strip_empty_characters(s, s.len(), false).is_empty()
@@ -451,9 +458,19 @@ pub fn get_valid_short_usernames() -> &'static [&'static str] {
 #[cfg(test)]
 mod misc_helper_tests {
     use super::{
-        clean_name, clean_username, get_valid_short_usernames, is_allowed_username,
-        is_valid_username, replace_with_spaces, strip_empty_characters,
+        check_currency_amount, clean_name, clean_username, get_valid_short_usernames,
+        is_allowed_username, is_valid_username, replace_with_spaces, strip_empty_characters,
     };
+
+    #[test]
+    fn currency_amount_bounds_match_the_cpp_limit() {
+        // misc.cpp:390-393 — inclusive ±9999'9999'9999.
+        assert!(check_currency_amount(0));
+        assert!(check_currency_amount(9999_9999_9999));
+        assert!(check_currency_amount(-9999_9999_9999));
+        assert!(!check_currency_amount(9999_9999_9999 + 1));
+        assert!(!check_currency_amount(-9999_9999_9999 - 1));
+    }
 
     #[test]
     fn clean_username_strips_dots_lowercases_and_trims() {

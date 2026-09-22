@@ -41,6 +41,7 @@ pub mod notification_manager;
 pub mod notification_settings;
 pub mod notification_settings_manager;
 pub mod option_manager;
+pub mod payments;
 pub mod peer_color;
 pub mod photo;
 pub mod query_combiner;
