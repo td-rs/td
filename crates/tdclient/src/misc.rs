@@ -12,7 +12,7 @@ const LENGTH_LIMIT: usize = 35000;
 
 /// `replace_offending_characters` (misc.cpp:62-77):
 /// `(U+200F|U+200E){N}(U+200F|U+200E)` -> `(U+200C){N}$2`.
-fn replace_offending_characters(s: &mut [u8]) {
+pub(crate) fn replace_offending_characters(s: &mut [u8]) {
     // The C++ reads up to two bytes past `pos` unconditionally (safe on
     // NUL-terminated strings); out-of-bounds reads are modeled as 0.
     fn at(s: &[u8], i: usize) -> u8 {
@@ -174,9 +174,11 @@ fn is_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\r' | b'\n' | 0 | 0x0b)
 }
 
-/// `td::trim` (tdutils/misc.h:133) over the shared whitespace set.
+/// `td::trim` (tdutils/misc.h:133) over the shared whitespace set; the
+/// ASCII gate keeps the byte-based C++ semantics (`is_space` is defined on
+/// bytes only, so no multi-byte character can be trimmed).
 fn trim(s: &str) -> &str {
-    s.trim_matches(|c: char| is_space(c as u8))
+    s.trim_matches(|c: char| c.is_ascii() && is_space(c as u8))
 }
 
 /// `td::to_lower` (tdutils/misc.h:64-85) — ASCII-only.
@@ -255,7 +257,7 @@ pub fn clean_name(s: &str, max_length: usize) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out[..new_len])
-        .trim_matches(|c: char| is_space(c as u8))
+        .trim_matches(|c: char| c.is_ascii() && is_space(c as u8))
         .to_owned()
 }
 
@@ -368,6 +370,11 @@ pub fn strip_empty_characters(s: &str, max_length: usize, strip_rtlo: bool) -> S
     trimmed.to_owned()
 }
 
+/// `td::is_empty_string` (misc.cpp:256-258).
+pub fn is_empty_string(s: &str) -> bool {
+    strip_empty_characters(s, s.len(), false).is_empty()
+}
+
 /// `td::is_valid_username` (misc.cpp:260-282).
 pub fn is_valid_username(username: &str) -> bool {
     let bytes = username.as_bytes();
@@ -426,12 +433,43 @@ pub fn is_allowed_username(username: &str) -> bool {
     true
 }
 
+/// `td::clean_username` (misc.cpp:52-56): remove all dots, ASCII-lowercase,
+/// trim the C whitespace set from both ends.
+pub fn clean_username(str: &str) -> String {
+    let without_dots: String = str.chars().filter(|&c| c != '.').collect();
+    let trimmed = without_dots.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\r'));
+    trimmed.to_ascii_lowercase()
+}
+
+/// `td::get_valid_short_usernames` (MessageEntity.cpp:1347-1350) — the
+/// mention-usable usernames shorter than the 4-character minimum. The data
+/// table is standalone; the rest of MessageEntity arrives with M.8.
+pub fn get_valid_short_usernames() -> &'static [&'static str] {
+    &["gif", "nft", "pic", "ufc", "vid"]
+}
+
 #[cfg(test)]
 mod misc_helper_tests {
     use super::{
-        clean_name, is_allowed_username, is_valid_username, replace_with_spaces,
-        strip_empty_characters,
+        clean_name, clean_username, get_valid_short_usernames, is_allowed_username,
+        is_valid_username, replace_with_spaces, strip_empty_characters,
     };
+
+    #[test]
+    fn clean_username_strips_dots_lowercases_and_trims() {
+        // misc.cpp:52-56.
+        assert_eq!(clean_username("Ab.C..D"), "abcd");
+        assert_eq!(clean_username("  User\tname \n"), "user\tname");
+        assert_eq!(clean_username(""), "");
+    }
+
+    #[test]
+    fn valid_short_usernames_match_the_cpp_table() {
+        assert_eq!(
+            get_valid_short_usernames(),
+            &["gif", "nft", "pic", "ufc", "vid"]
+        );
+    }
 
     #[test]
     fn clean_name_collapses_and_trims() {
@@ -495,5 +533,75 @@ mod misc_helper_tests {
         let mut s = "a\nb\nc".to_owned();
         replace_with_spaces(&mut s, "\n");
         assert_eq!(s, "a b c");
+    }
+}
+
+/// `search_strings_by_prefix` (misc.cpp:406-417): the `Hints`-backed prefix
+/// search behind the synchronous `searchStringsByPrefix` request. Keys are
+/// the string positions (empty strings enter as `" "`, a searchable
+/// stand-in), ratings equal the positions so ties answer in input order.
+pub fn search_strings_by_prefix(
+    strings: Vec<String>,
+    query: &str,
+    limit: i32,
+    return_all_for_empty_query: bool,
+) -> (i32, Vec<i32>) {
+    let mut hints = tdutils::hints::Hints::default();
+    for (index, string) in strings.iter().enumerate() {
+        hints.add(index as i64, if string.is_empty() { " " } else { string });
+        hints.set_rating(index as i64, index as i64);
+    }
+    let (total_count, keys) = hints.search(query, limit, return_all_for_empty_query);
+    (
+        total_count as i32,
+        keys.into_iter().map(|key| key as i32).collect(),
+    )
+}
+
+#[cfg(test)]
+mod search_strings_by_prefix_tests {
+    use super::search_strings_by_prefix;
+
+    #[test]
+    fn prefix_matches_answer_in_input_order() {
+        let strings = vec![
+            "Delta".to_owned(),
+            "charlie".to_owned(),
+            "Charlie".to_owned(),
+            "bravo".to_owned(),
+        ];
+        let (total, positions) = search_strings_by_prefix(strings, "char", 10, false);
+        assert_eq!(total, 2);
+        assert_eq!(positions, vec![1, 2]);
+    }
+
+    #[test]
+    fn limit_cuts_but_total_count_survives() {
+        let strings: Vec<String> = ["ab1", "ab2", "ab3", "ab4"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
+        let (total, positions) = search_strings_by_prefix(strings, "ab", 2, false);
+        assert_eq!(total, 4);
+        assert_eq!(positions, vec![0, 1]);
+    }
+
+    #[test]
+    fn empty_query_is_returned_only_on_request() {
+        let strings = vec!["one".to_owned(), String::new(), " ".to_owned()];
+        let (total, positions) = search_strings_by_prefix(strings.clone(), "", 10, true);
+        assert_eq!(total, 3);
+        assert_eq!(positions, vec![0, 1, 2]);
+        let (total, positions) = search_strings_by_prefix(strings, "", 10, false);
+        assert_eq!(total, 0);
+        assert!(positions.is_empty());
+    }
+
+    #[test]
+    fn no_match_answers_zero() {
+        let strings = vec!["alpha".to_owned(), "beta".to_owned()];
+        let (total, positions) = search_strings_by_prefix(strings, "gamma", 10, false);
+        assert_eq!(total, 0);
+        assert!(positions.is_empty());
     }
 }

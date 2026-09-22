@@ -1,22 +1,49 @@
-//! Port of `td/telegram/Requests.{h,cpp}` (Track I, Td M.1 subset): the
-//! `td_api` request dispatch. The C++ file is a ~9.5K-line per-function
-//! `on_request` overload set that hands each request to its manager through
-//! a `RequestActor`; the Rust dispatcher lives in one `run_request` match
-//! and grows with every manager step.
+//! Port of `td/telegram/Requests.{h,cpp}` (Track I): the `td_api` request
+//! dispatch. The C++ file is a ~9.5K-line per-function `on_request` overload
+//! set that hands each request to its manager through a `RequestActor`; the
+//! Rust dispatcher lives in one `run_request` match and grows with every
+//! manager step (the M.11 flip protocol,
+//! `RUST_REWRITE_PLAN_REQUESTS_M11.md`: arms + census fixture + corpus
+//! coverage land per slice, never the dispatcher internals).
 //!
-//! M.1 carries the handlers that need no network or manager actors: the
+//! M.1 carried the handlers that need no network or manager actors: the
 //! `test*` echo set, `getCurrentState`, `getAuthorizationState`, the
 //! `close`/`destroy` pair, and the `Run`-state `setTdlibParameters`
 //! rejection. Everything not yet ported answers the interim 500
-//! "TDLib function is not implemented yet"; the interim handlers below the
-//! `-- interim --` marker get their real bodies as their managers land.
+//! "TDLib function is not implemented yet".
+//!
+//! M.11.1 dispatcher audit (2026-09-17, vs the local C++ 1.8.67+ tree):
+//! byte-parity re-verified for the pre-existing core arms — the `test*`
+//! family (Requests.cpp:9483-9517; `testUseUpdate`'s `send_result(nullptr)`
+//! is the 404 "Not Found" `Td::send_result` rewrite, Td.cpp:1407-1409),
+//! `setTdlibParameters` (2044-2048), `close`/`destroy` (2160-2175, the ok
+//! answers before the close hop), `getAuthorizationState` (2051-2053 vs
+//! `AuthManager::get_state`, AuthManager.cpp:450-456 — the `State::None`
+//! park is unobservable: the fake-state path answers before `Run`, and the
+//! init pmc restore pins a concrete state in `Run`), `getCurrentState`
+//! (2192-2209: options → authorization → user → chat; the connection and
+//! authorized-manager blocks accumulate with their managers),
+//! `getOption`/`setOption` (8076-8086: `CLEAN_INPUT_STRING` first, then the
+//! OptionManager contract ported with M.3), the `CHECK_IS_USER`/
+//! `CHECK_IS_BOT` texts (1993-2000), and the classification lists
+//! `is_authentication_request`/`is_preinitialization_request`/
+//! `is_preauthentication_request` (Td.cpp:154-249, 26/12/37 entries) behind
+//! the `Td::run_request` state gate (Td.cpp:299-374).
 
+use crate::chat_manager::{ChannelId, DialogId};
 use crate::contact::Contact;
+use crate::notification::{NotificationGroupId, NotificationId, NotificationObjectId};
+use crate::notification_settings::{
+    ReactionNotificationSettings, get_notification_settings_scope,
+    get_scope_notification_settings_object,
+};
+use crate::notification_settings_manager::ScopeSettingsAnswer;
+use crate::td::NotificationEnv;
 use crate::td::Td;
 use crate::td_api::{self, Function, Object};
 use crate::user_manager::{FileId, PendingUserRequest, SecretChatId, UserEnv, UserId};
 use tdutils::promise::Promise;
-use tdutils::status::Status;
+use tdutils::status::{Result, Status};
 
 /// The interim message of the S70 skeleton, kept for the not-yet-ported
 /// handlers until the Waves complete.
@@ -153,6 +180,54 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 td.user_manager.get_current_state(&mut env, &mut updates);
             }
 
+            // the ChatManager state block (M.5.47): unknown placeholders,
+            // then channels before chats, then fulls — see
+            // ChatManager::get_current_state (Requests.cpp:2209, after the
+            // user block)
+            if let Some(options) = td.option_manager.as_mut() {
+                let mut env = crate::user_manager::UserEnv {
+                    global: &mut td.global,
+                    options,
+                    auth_is_bot: td.auth_manager.is_bot(),
+                };
+                let mut chat_updates = Vec::new();
+                td.chat_manager.get_current_state(
+                    &mut td.user_manager,
+                    &mut env,
+                    &mut chat_updates,
+                );
+                updates.extend(chat_updates);
+            }
+
+            // NotificationSettingsManager::get_current_state
+            // (Requests.cpp:2221 — before the notification block; the
+            // manager's own is_bot gate applies)
+            if td.auth_manager.is_authorized() {
+                let env = NotificationEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_authorized: true,
+                    auth_is_bot: td.auth_manager.is_bot(),
+                    updates: &mut td.notification_updates,
+                };
+                td.notification_settings_manager
+                    .get_current_state(&env, &mut updates);
+            }
+
+            // NotificationManager::get_current_state (Requests.cpp:2229 —
+            // deep in the authorized block, after user/chat)
+            if td.auth_manager.is_authorized() && !td.auth_manager.is_bot() {
+                let env = NotificationEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_authorized: true,
+                    auth_is_bot: false,
+                    updates: &mut td.notification_updates,
+                };
+                td.notification_manager
+                    .get_current_state(&env, &mut updates);
+            }
+
             // ConnectionStateManager and the remaining authorized-manager
             // state blocks (connection/chat/background/...) accumulate here
             // as their managers land.
@@ -227,9 +302,207 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             td.get_application_config(id);
         }
 
+        // -- the notification set (M.13.8): the manager-backed request
+        //    family (Requests.cpp:4123/4131/2403) --
+        Function::removeNotification(request) => {
+            // `Requests.cpp:4123`: is_permanent = false, force_update =
+            // true
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let mut env = NotificationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.notification_updates,
+            };
+            td.notification_manager.remove_notification(
+                &mut env,
+                NotificationGroupId::new(request.notification_group_id),
+                NotificationId::new(request.notification_id),
+                false,
+                true,
+                promise,
+                "td_api::removeNotification",
+            );
+        }
+        Function::removeNotificationGroup(request) => {
+            // `Requests.cpp:4131`: the request exposes no max object id —
+            // the C++ passes an invalid one; force_update = true
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let mut env = NotificationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.notification_updates,
+            };
+            td.notification_manager.remove_notification_group(
+                &mut env,
+                NotificationGroupId::new(request.notification_group_id),
+                NotificationId::new(request.max_notification_id),
+                NotificationObjectId::default(),
+                -1,
+                true,
+                promise,
+            );
+        }
+        Function::processPushNotification(request) => {
+            // `Requests.cpp:2403`: CHECK_IS_USER, the payload string is
+            // cleaned, then NotificationManager::process_push_notification
+            // parses the push payload and synthesizes the message — the
+            // pipeline needs MessagesManager/MessageDb and the secret-chat
+            // decryption ([blocked: M.13.6b, M.6/M.10]); the C++ answers ok
+            // only after processing.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _ = crate::misc::clean_input_string(&request.payload);
+            td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+        }
+
+        // -- the notification settings set (M.13S.4): Requests.cpp:7824/
+        //    7968/7977/7983 + the DeviceTokenManager arm at 2411 --
+        Function::getScopeNotificationSettings(request) => {
+            // `Requests.cpp:7824-7830`: CHECK_IS_USER + the null-scope gate
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(scope_object) = request.scope else {
+                return td.send_error_impl(id, 400, "Scope must be non-empty");
+            };
+            let scope = get_notification_settings_scope(&scope_object);
+            // `GetScopeNotificationSettingsRequest` (Requests.cpp:1340-1364):
+            // the synchronized settings answer the object, an unsynchronized
+            // scope defers into the (net-blocked) fetch and answers nothing
+            let unix_time = td.get_unix_time();
+            let answer = {
+                let env = NotificationEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_authorized: td.auth_manager.is_authorized(),
+                    auth_is_bot: td.auth_manager.is_bot(),
+                    updates: &mut td.notification_updates,
+                };
+                match td
+                    .notification_settings_manager
+                    .get_scope_notification_settings_for_request(&env, scope)
+                {
+                    ScopeSettingsAnswer::Ready(settings) => {
+                        Some(get_scope_notification_settings_object(settings, unix_time))
+                    }
+                    ScopeSettingsAnswer::Deferred => None,
+                }
+            };
+            if let Some(object) = answer {
+                td.send_result(id, Object::scopeNotificationSettings(object));
+            }
+        }
+        Function::setScopeNotificationSettings(request) => {
+            // `Requests.cpp:7968-7975`: CHECK_IS_USER + the null-scope gate;
+            // the answer is ok even before the server acks (the C++ answers
+            // via answer_ok_query with the Status converted by the macro)
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(scope_object) = request.scope else {
+                return td.send_error_impl(id, 400, "Scope must be non-empty");
+            };
+            let scope = get_notification_settings_scope(&scope_object);
+            let result = {
+                let mut env = NotificationEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_authorized: td.auth_manager.is_authorized(),
+                    auth_is_bot: td.auth_manager.is_bot(),
+                    updates: &mut td.notification_updates,
+                };
+                td.notification_settings_manager
+                    .set_scope_notification_settings(&mut env, scope, request.notification_settings)
+            };
+            match result {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::setReactionNotificationSettings(request) => {
+            // `Requests.cpp:7977-7981`
+            if !check_is_user(td, id) {
+                return;
+            }
+            let settings = ReactionNotificationSettings::from_td_api(request.notification_settings);
+            let result = {
+                let mut env = NotificationEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_authorized: td.auth_manager.is_authorized(),
+                    auth_is_bot: td.auth_manager.is_bot(),
+                    updates: &mut td.notification_updates,
+                };
+                td.notification_settings_manager
+                    .set_reaction_notification_settings(&mut env, settings)
+            };
+            match result {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => send_error_status(td, id, status),
+            }
+        }
+        Function::resetAllNotificationSettings(_) => {
+            // `Requests.cpp:7983-7987`: the local reset answers ok without
+            // waiting for the (net-blocked) ResetNotifySettingsQuery
+            if !check_is_user(td, id) {
+                return;
+            }
+            {
+                let mut env = NotificationEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_authorized: td.auth_manager.is_authorized(),
+                    auth_is_bot: td.auth_manager.is_bot(),
+                    updates: &mut td.notification_updates,
+                };
+                td.notification_settings_manager
+                    .reset_all_notification_settings(&mut env);
+            }
+            td.send_result(id, ok_object());
+        }
+        Function::registerDevice(request) => {
+            // `Requests.cpp:2411-2416`: CHECK_IS_USER, then the
+            // DeviceTokenManager takes the promise; the register ack is
+            // the [blocked: net] tail and the request stays unanswered
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td
+                .deferred_promise::<td_api::PushReceiverId, _>(id, |push_receiver_id| {
+                    Object::pushReceiverId(push_receiver_id)
+                });
+            {
+                let mut env = NotificationEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_authorized: td.auth_manager.is_authorized(),
+                    auth_is_bot: td.auth_manager.is_bot(),
+                    updates: &mut td.notification_updates,
+                };
+                td.device_token_manager.register_device(
+                    &mut env,
+                    request.device_token,
+                    &request.other_user_ids,
+                    promise,
+                );
+            }
+        }
+
         // -- the auth set (S76): the real `AuthManager` handlers over the
-        //    walking-skeleton bridge. logOut and the password-recovery
-        //    helpers keep their interim bodies until their managers land. --
+        //    net-step session drivers. logOut dispatches over the auth-net
+        //    slice; the password-recovery helpers keep their interim bodies
+        //    until their managers land. --
         Function::setAuthenticationPhoneNumber(request) => {
             td.set_authentication_phone_number(id, request.phone_number);
         }
@@ -256,6 +529,29 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
 
+        // --- the M.11.4 generic (manager-free) family ---
+        Function::setAlarm(request) => {
+            // Requests.cpp:8976-8979 → `AlarmManager::set_alarm`
+            // (AlarmManager.cpp:52-60): the ok answer parks until the
+            // deadline fires from the shared timeout slot.
+            td.set_alarm(id, request.seconds);
+        }
+
+        // The M.4.16/M.6.20 manager-arm groups live in dedicated
+        // `#[inline(never)]` functions: the merged dispatcher's single
+        // match frame pushed the scheduler-thread call chain over its
+        // 2 MiB stack in debug builds (the M.6 integration gate); the
+        // group frames unwind between groups instead of nesting.
+        function => run_user_requests(td, id, function),
+    }
+}
+
+/// The M.4.16 UserManager arm group of the request dispatcher — see the
+/// frame note at the forward site in [`run_request`]. Every arm fully
+/// answers the request; `return;` exits after answering.
+#[inline(never)]
+fn run_user_requests(td: &mut Td, id: u64, function: Function) {
+    match function {
         // ------------------------------------------------------------------
         // M.4.16: the UserManager slice (the `Requests.cpp` on_request
         // overloads routing to `user_manager_`). The C++ request actors'
@@ -876,6 +1172,457 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
 
+        function => run_dialog_requests(td, id, function),
+    }
+}
+
+/// The M.6.20 DialogManager arm group of the request dispatcher — see the
+/// frame note at the forward site in [`run_request`].
+#[inline(never)]
+fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
+    match function {
+        // ------------------------------------------------------------------
+        // M.6.20: the DialogManager-served requests
+        // (Requests.cpp:3425-3530, :3667, :5781-5873, :6096, :6608, :7842).
+        Function::searchPublicChat(request) => {
+            // the C++ has no CHECK_IS_USER here (Requests.cpp:3429-3432) —
+            // bots may resolve public chats
+            let Some(username) = clean_or_utf8_error(td, id, &request.username) else {
+                return;
+            };
+            // SearchPublicChatRequest: set_tries(4); get_tries() < 3 →
+            // false on the first try. The result object is the
+            // MessagesManager chat (the builder lands with M.10; on this
+            // base every reachable path errors first — stub inventory).
+            let (promise, slot) = unit_request_promise();
+            let _dialog_id =
+                crate::dialog_manager::search_public_dialog(td, &username, false, promise);
+            if fail_from_slot(td, id, &slot) {
+                return;
+            }
+            td.send_error_impl(id, 500, "Chat info not found");
+        }
+        Function::searchPublicChats(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let (promise, slot) = unit_request_promise();
+            let dialog_ids = crate::dialog_manager::search_public_dialogs(
+                td,
+                &query,
+                request.type_filter.as_ref(),
+                promise,
+            );
+            if fail_from_slot(td, id, &slot) {
+                return;
+            }
+            let chats =
+                crate::dialog_manager::get_chats_object(-1, &dialog_ids, "searchPublicChats");
+            td.send_result(id, Object::chats(chats));
+        }
+        Function::searchChats(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let (promise, slot) = unit_request_promise();
+            let (total_count, dialog_ids) = crate::dialog_manager::search_dialogs(
+                td,
+                &query,
+                request.type_filter.as_ref(),
+                request.limit,
+                promise,
+            );
+            if fail_from_slot(td, id, &slot) {
+                return;
+            }
+            let chats =
+                crate::dialog_manager::get_chats_object(total_count, &dialog_ids, "searchChats");
+            td.send_result(id, Object::chats(chats));
+        }
+        Function::searchChatsOnServer(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let (promise, slot) = unit_request_promise();
+            let dialog_ids = crate::dialog_manager::search_dialogs_on_server(
+                td,
+                &query,
+                request.type_filter.as_ref(),
+                request.limit,
+                promise,
+            );
+            if fail_from_slot(td, id, &slot) {
+                return;
+            }
+            let chats =
+                crate::dialog_manager::get_chats_object(-1, &dialog_ids, "searchChatsOnServer");
+            td.send_result(id, Object::chats(chats));
+        }
+        Function::searchRecentlyFoundChats(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let (promise, slot) = unit_request_promise();
+            let (total_count, dialog_ids) = crate::dialog_manager::search_recently_found_dialogs(
+                td,
+                &query,
+                request.type_filter.as_ref(),
+                request.limit,
+                promise,
+            );
+            if fail_from_slot(td, id, &slot) {
+                return;
+            }
+            let chats = crate::dialog_manager::get_chats_object(
+                total_count,
+                &dialog_ids,
+                "searchRecentlyFoundChats",
+            );
+            td.send_result(id, Object::chats(chats));
+        }
+        Function::getRecentlyOpenedChats(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, slot) = unit_request_promise();
+            let (total_count, dialog_ids) =
+                crate::dialog_manager::get_recently_opened_dialogs(td, request.limit, promise);
+            if fail_from_slot(td, id, &slot) {
+                return;
+            }
+            let chats = crate::dialog_manager::get_chats_object(
+                total_count,
+                &dialog_ids,
+                "getRecentlyOpenedChats",
+            );
+            td.send_result(id, Object::chats(chats));
+        }
+        Function::checkChatUsername(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(username) = clean_or_utf8_error(td, id, &request.username) else {
+                return;
+            };
+            let (promise, slot) = object_request_promise();
+            crate::dialog_manager::check_dialog_username(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                &username,
+                false,
+                promise,
+            );
+            finish_object_slot(td, id, slot);
+        }
+        Function::checkBotUsername(request) => {
+            let Some(username) = clean_or_utf8_error(td, id, &request.username) else {
+                return;
+            };
+            let (promise, slot) = object_request_promise();
+            crate::dialog_manager::check_dialog_username(
+                td,
+                crate::dialog_id::DialogId::new(0),
+                &username,
+                true,
+                promise,
+            );
+            finish_object_slot(td, id, slot);
+        }
+        Function::addRecentlyFoundChat(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            match crate::dialog_manager::add_recently_found_dialog(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+            ) {
+                Result::Ok(()) => td.send_result(id, ok_object()),
+                Result::Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::removeRecentlyFoundChat(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            match crate::dialog_manager::remove_recently_found_dialog(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+            ) {
+                Result::Ok(()) => td.send_result(id, ok_object()),
+                Result::Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::clearRecentlyFoundChats(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            crate::dialog_manager::clear_recently_found_dialogs(td);
+            td.send_result(id, ok_object());
+        }
+        Function::deleteChat(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, slot) = unit_request_promise();
+            crate::dialog_manager::delete_dialog(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                promise,
+            );
+            finish_unit_slot(td, id, slot);
+        }
+        Function::upgradeBasicGroupChatToSupergroupChat(request) => {
+            // Requests.cpp:5543 — `migrate_dialog_to_megagroup`.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, slot) = object_request_promise();
+            crate::dialog_manager::migrate_dialog_to_megagroup(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                promise,
+            );
+            finish_object_slot(td, id, slot);
+        }
+        Function::setChatTitle(request) => {
+            // the C++ has no CHECK_IS_USER here (Requests.cpp:5778-5782) —
+            // bots set basic-group titles through this method
+            let Some(title) = clean_or_utf8_error(td, id, &request.title) else {
+                return;
+            };
+            let (promise, slot) = unit_request_promise();
+            crate::dialog_manager::set_dialog_title(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                &title,
+                promise,
+            );
+            finish_unit_slot(td, id, slot);
+        }
+        Function::setChatPhoto(request) => {
+            // the C++ has no CHECK_IS_USER here (Requests.cpp:5784-5787)
+            let (promise, slot) = unit_request_promise();
+            crate::dialog_manager::set_dialog_photo(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                request.photo.as_ref(),
+                promise,
+            );
+            finish_unit_slot(td, id, slot);
+        }
+        Function::setChatAccentColor(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, slot) = unit_request_promise();
+            crate::dialog_manager::set_dialog_accent_color(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                crate::peer_color::AccentColorId::new(request.accent_color_id),
+                crate::emoji_status::CustomEmojiId::new(request.background_custom_emoji_id),
+                promise,
+            );
+            finish_unit_slot(td, id, slot);
+        }
+        Function::setChatProfileAccentColor(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, slot) = unit_request_promise();
+            crate::dialog_manager::set_dialog_profile_accent_color(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                crate::peer_color::AccentColorId::new(request.profile_accent_color_id),
+                crate::emoji_status::CustomEmojiId::new(request.profile_background_custom_emoji_id),
+                promise,
+            );
+            finish_unit_slot(td, id, slot);
+        }
+        Function::setChatPermissions(request) => {
+            // the C++ has no CHECK_IS_USER here (Requests.cpp:5818-5821)
+            let (promise, slot) = unit_request_promise();
+            crate::dialog_manager::set_dialog_permissions(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                request.permissions.as_ref(),
+                promise,
+            );
+            finish_unit_slot(td, id, slot);
+        }
+        Function::toggleChatHasProtectedContent(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, slot) = unit_request_promise();
+            crate::dialog_manager::toggle_dialog_has_protected_content(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                None,
+                request.has_protected_content,
+                promise,
+            );
+            finish_unit_slot(td, id, slot);
+        }
+        Function::processChatHasProtectedContentDisableRequest(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, slot) = unit_request_promise();
+            crate::dialog_manager::toggle_dialog_has_protected_content(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                Some(crate::chat_manager::MessageId::new(
+                    request.request_message_id,
+                )),
+                !request.approve,
+                promise,
+            );
+            finish_unit_slot(td, id, slot);
+        }
+        Function::setChatDescription(request) => {
+            // the C++ has no CHECK_IS_USER here (Requests.cpp:6093-6097)
+            let Some(description) = clean_or_utf8_error(td, id, &request.description) else {
+                return;
+            };
+            let (promise, slot) = unit_request_promise();
+            crate::dialog_manager::set_dialog_description(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                &description,
+                promise,
+            );
+            finish_unit_slot(td, id, slot);
+        }
+        Function::getBlockedMessageSenders(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let (promise, slot) = object_request_promise();
+            crate::dialog_manager::get_blocked_dialogs(
+                td,
+                request.block_list.as_ref(),
+                request.offset,
+                request.limit,
+                promise,
+            );
+            finish_object_slot(td, id, slot);
+        }
+        Function::reportChat(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(text) = clean_or_utf8_error(td, id, &request.text) else {
+                return;
+            };
+            let option_id = String::from_utf8_lossy(&request.option_id).into_owned();
+            let message_ids: Vec<crate::chat_manager::MessageId> = request
+                .message_ids
+                .iter()
+                .map(|&message_id| crate::chat_manager::MessageId::new(message_id))
+                .collect();
+            let (promise, slot) = object_request_promise();
+            crate::dialog_manager::report_dialog(
+                td,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                &option_id,
+                &message_ids,
+                &text,
+                promise,
+            );
+            finish_object_slot(td, id, slot);
+        }
+
+        // setChatEmojiStatus needs the td_api emojiStatus → EmojiStatus
+        // conversion (the collectible variants arrive with the emoji-status
+        // read surface), and reportChatPhoto needs ReportReason — both stay
+        // interim with those gaps.
+
+        // --- the chat-manager request family (M.5.47, folded in at the
+        // integration-m6b merge) — each local-validating entry settles its
+        // promise synchronously; the net queries terminate in the
+        // blocked-net 500 until the net step lands. setChatDescription and
+        // deleteChat stay with the dialog_manager arms above: the C++
+        // routes them through the DialogManager dialog type-switch
+        // (Requests.cpp:6093, :3655), unlike these channel-scoped ones.
+        Function::setSupergroupUsername(request) => {
+            let (promise, recorded) = record_unit_promise();
+            let username = crate::misc::clean_input_string(&request.username).unwrap_or_default();
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.set_channel_username(
+                user_manager,
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                &username,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::toggleSupergroupUsernameIsActive(request) => {
+            let (promise, recorded) = record_unit_promise();
+            let username = crate::misc::clean_input_string(&request.username).unwrap_or_default();
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.toggle_channel_username_is_active(
+                user_manager,
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                username,
+                request.is_active,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::setChatLocation(request) => {
+            let (promise, recorded) = record_unit_promise();
+            let location = crate::chat_manager::DialogLocation::from_td_api(
+                request.location.as_ref().unwrap(),
+            );
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.set_channel_location(
+                user_manager,
+                &mut env,
+                ChannelId::new(request.chat_id),
+                &location,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::setChatSlowModeDelay(request) => {
+            let (promise, recorded) = record_unit_promise();
+            let (mut env, user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.set_channel_slow_mode_delay(
+                user_manager,
+                &mut env,
+                DialogId::from_channel_id(ChannelId::new(request.chat_id)),
+                request.slow_mode_delay,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+        Function::toggleSupergroupIsForum(request) => {
+            let (promise, recorded) = record_unit_promise();
+            let (mut env, _user_manager, chat_manager) = chat_env_split(td);
+            chat_manager.toggle_channel_is_forum(
+                &mut env,
+                ChannelId::new(request.supergroup_id),
+                request.is_forum,
+                request.has_forum_tabs,
+                promise,
+            );
+            finish_unit_request(id, td, recorded);
+        }
+
         // Everything else waits for its manager step.
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
@@ -928,7 +1675,7 @@ fn search_contacts_request(td: &mut Td, id: u64, query: String, limit: i32) {
 /// the imported contacts. The `note` field is the MessageEntity step (the
 /// M.4.14 divergence keeps it unparsed and unstored); the vCard-less
 /// `importedContact` constructor builds an empty vCard.
-fn get_contacts(imported: &[td_api::ImportedContact]) -> Result<Vec<Contact>, Status> {
+fn get_contacts(imported: &[td_api::ImportedContact]) -> std::result::Result<Vec<Contact>, Status> {
     let mut contacts = Vec::with_capacity(imported.len());
     for imported_contact in imported {
         let mut contact = Contact::new(
@@ -942,6 +1689,142 @@ fn get_contacts(imported: &[td_api::ImportedContact]) -> Result<Vec<Contact>, St
         contacts.push(contact);
     }
     Ok(contacts)
+}
+
+type RecordedUnitResult = std::sync::Arc<parking_lot::Mutex<Option<tdutils::status::Result<()>>>>;
+
+/// The recording-promise bridge for synchronously-settling manager
+/// requests (Requests.cpp's `PromiseActor` hops collapse here): the
+/// manager errors or resolves the promise before this returns, and the
+/// recorded result forwards to `send_result`/`send_error`.
+fn record_unit_promise() -> (tdutils::promise::Promise<()>, RecordedUnitResult) {
+    let recorded = std::sync::Arc::new(parking_lot::Mutex::new(None));
+    let sink = recorded.clone();
+    let promise = tdutils::promise::PromiseCreator::lambda_result(
+        move |result: tdutils::status::Result<()>| {
+            *sink.lock() = Some(result);
+        },
+    );
+    (promise, recorded)
+}
+
+fn finish_unit_request(
+    id: u64,
+    td: &mut Td,
+    recorded: std::sync::Arc<parking_lot::Mutex<Option<tdutils::status::Result<()>>>>,
+) {
+    match &*recorded.lock() {
+        Some(tdutils::status::Result::Ok(())) => td.send_result(id, ok_object()),
+        Some(tdutils::status::Result::Err(status)) => {
+            td.send_error_impl(id, status.code(), status.message());
+        }
+        other => panic!("request {id} never settled: {other:?}"),
+    }
+}
+
+/// Field-split the `Td` for the manager calls that take `user_manager`
+/// plus an `env` borrowing `global`/`option_manager`.
+fn chat_env_split(
+    td: &mut Td,
+) -> (
+    crate::user_manager::UserEnv<'_>,
+    &mut crate::user_manager::UserManager,
+    &mut crate::chat_manager::ChatManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        chat_manager,
+        ..
+    } = td;
+    let env = crate::user_manager::UserEnv {
+        global,
+        options: option_manager
+            .as_mut()
+            .expect("option manager exists after init"),
+        auth_is_bot: auth_manager.is_bot(),
+    };
+    (env, user_manager, chat_manager)
+}
+
+/// `CLEAN_INPUT_STRING` (Requests.cpp:1989-1992) — `None` means the error
+/// was sent.
+fn clean_or_utf8_error(td: &mut Td, id: u64, s: &str) -> Option<String> {
+    match crate::misc::clean_input_string(s) {
+        Some(cleaned) => Some(cleaned),
+        None => {
+            td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            None
+        }
+    }
+}
+
+/// The unit-shaped slot half of the collapse, aliased to match `ObjectSlot`.
+type UnitSlot = std::sync::Arc<std::sync::Mutex<Option<Result<()>>>>;
+
+/// The synchronous collapse of `CREATE_REQUEST_PROMISE` for `Promise<Unit>`
+/// requests: the promise error surface lands in the slot; successes are
+/// signaled by an empty slot and the caller sends the result itself.
+fn unit_request_promise() -> (tdutils::promise::Promise<()>, UnitSlot) {
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let capture = std::sync::Arc::clone(&slot);
+    let promise = tdutils::promise::PromiseCreator::lambda_result(move |result: Result<()>| {
+        *capture.lock().unwrap() = Some(result);
+    });
+    (promise, slot)
+}
+
+/// The same collapse for object-returning requests: the value is the result.
+type ObjectSlot = std::sync::Arc<std::sync::Mutex<Option<Result<crate::td_api::Object>>>>;
+
+fn object_request_promise() -> (tdutils::promise::Promise<crate::td_api::Object>, ObjectSlot) {
+    let slot: ObjectSlot = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let capture = std::sync::Arc::clone(&slot);
+    let promise = tdutils::promise::PromiseCreator::lambda_result(
+        move |result: Result<crate::td_api::Object>| {
+            *capture.lock().unwrap() = Some(result);
+        },
+    );
+    (promise, slot)
+}
+
+/// Send the slot's error, if any; `true` means the error was sent.
+fn fail_from_slot(td: &mut Td, id: u64, slot: &std::sync::Mutex<Option<Result<()>>>) -> bool {
+    let outcome = slot.lock().unwrap().take();
+    match outcome {
+        Some(Result::Err(status)) => {
+            td.send_error_impl(id, status.code(), status.message());
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The synchronous collapse of `CREATE_OK_REQUEST_PROMISE`
+/// (Requests.cpp:1923-1930): the error is sent as-is, and a success sends
+/// `ok` — the C++ `create_ok_request_promise` answers `send_result(id, ok)`
+/// on `set_value`.
+fn finish_unit_slot(
+    td: &mut Td,
+    id: u64,
+    slot: std::sync::Arc<std::sync::Mutex<Option<Result<()>>>>,
+) {
+    match slot.lock().unwrap().take() {
+        Some(Result::Ok(())) => td.send_result(id, ok_object()),
+        Some(Result::Err(status)) => td.send_error_impl(id, status.code(), status.message()),
+        None => {}
+    }
+}
+
+/// Send the object slot's result or error.
+fn finish_object_slot(td: &mut Td, id: u64, slot: ObjectSlot) {
+    match slot.lock().unwrap().take() {
+        Some(Result::Ok(object)) => td.send_result(id, object),
+        Some(Result::Err(status)) => td.send_error_impl(id, status.code(), status.message()),
+        None => {}
+    }
 }
 
 fn ok_object() -> Object {
@@ -971,5 +1854,71 @@ pub(crate) fn json_value_to_object(value: td_api::JsonValue) -> Object {
         V::jsonValueString(v) => Object::jsonValueString(v),
         V::jsonValueArray(v) => Object::jsonValueArray(v),
         V::jsonValueObject(v) => Object::jsonValueObject(v),
+    }
+}
+
+#[cfg(test)]
+mod request_census_tests {
+    /// M.11.3 — the dispatcher census. The fixture
+    /// (`testdata/request_census.txt`, one `name<TAB>state` line per td_api
+    /// function) must cover the pinned scheme exactly: every generated
+    /// function appears once with a known state.
+    ///
+    /// States: `sync` — answered by `synchronous_requests` (native), while
+    /// `getOption` stays `dispatched` (its synchronous half is gated by
+    /// `is_synchronous_option`); `dispatched` — a real `run_request` arm
+    /// (the parked-net tails keep the C++ local behavior); `interim` — the
+    /// 500 "TDLib function is not implemented yet" placeholder. Every
+    /// manager flip moves its functions `interim → dispatched` (and bumps
+    /// the counts below); the S74 corpus records the flipped functions'
+    /// coverage.
+    #[test]
+    fn census_fixture_covers_every_scheme_function() {
+        let raw = include_str!("testdata/request_census.txt");
+        let mut names = std::collections::BTreeSet::new();
+        let mut counts = std::collections::BTreeMap::new();
+        for line in raw.lines() {
+            let Some((name, state)) = line.split_once('\t') else {
+                panic!("census line is not `name<TAB>state`: {line:?}");
+            };
+            assert!(
+                matches!(state, "sync" | "dispatched" | "interim"),
+                "unknown census state {state:?} for {name}"
+            );
+            assert!(names.insert(name), "duplicate census entry {name}");
+            *counts.entry(state).or_insert(0usize) += 1;
+        }
+
+        // The fixture set equals the generated scheme set exactly.
+        let generated: std::collections::BTreeSet<&str> =
+            crate::td_api::ALL_FUNCTION_NAMES.iter().copied().collect();
+        let fixture: std::collections::BTreeSet<&str> = names.into_iter().collect();
+        let missing: Vec<&str> = generated.difference(&fixture).copied().collect();
+        let stale: Vec<&str> = fixture.difference(&generated).copied().collect();
+        assert!(
+            missing.is_empty(),
+            "census is missing functions: {missing:?}"
+        );
+        assert!(
+            stale.is_empty(),
+            "census carries stale functions: {stale:?}"
+        );
+
+        // The scheme size from the S07 differential dump.
+        assert_eq!(generated.len(), crate::td_api::SCHEME_FUNCTIONS);
+
+        // The flip-state ledger at the m13s↔master (4f716e8: M.7+M.11)
+        // merge: the m11 pins + M.13/M.13S's seven real dispatches
+        // (removeNotification, removeNotificationGroup, registerDevice and
+        // the four notification-settings arms; processPushNotification
+        // stays the 500 placeholder), then the net reconciliation's logOut
+        // flip (the auth-net slice). Fix per flip.
+        assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
+        assert_eq!(
+            *counts.get("dispatched").unwrap_or(&0),
+            93,
+            "dispatched count"
+        );
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 911, "interim count");
     }
 }
