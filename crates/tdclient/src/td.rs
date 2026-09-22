@@ -289,6 +289,8 @@ pub struct Td {
     /// `Td::dialog_manager_` — the M.6 facade state (recent-dialog lists +
     /// search hints); the actor-dependent halves land with M.6.18+.
     pub(crate) dialog_manager: DialogManager,
+    /// `Td::star_gift_manager_` (Td.cpp:1286, the `Td::Td` manager block).
+    pub(crate) star_gift_manager: crate::star_gift_manager::StarGiftManager,
     /// `Td::updates_manager_` (`create_actor` at `Td.cpp:1319-1321`, after
     /// the config) — the update engine. The binlog-pmc state loads lazily
     /// on the first pts access (`init_state`), and the pmc writes flush
@@ -586,6 +588,7 @@ impl Td {
             premium_required_contact_merger: None,
             chat_manager: crate::chat_manager::ChatManager::new(),
             dialog_manager: DialogManager::new(),
+            star_gift_manager: crate::star_gift_manager::StarGiftManager::new(),
             updates_manager: UpdatesManager::new(TdUpdatesSink),
             storage_manager: StorageManager::default(),
             file_manager,
@@ -4978,6 +4981,266 @@ impl crate::device_token_manager::DeviceTokenManagerEnv for NotificationEnv<'_> 
 
     fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
         self.global.binlog_pmc().set_raw(key, value);
+    }
+}
+
+/// The `G()`/`td_` slice [`crate::star_gift_manager::StarGiftManager`]
+/// reads through (the C++ manager reads the same surfaces off its
+/// `Td *td_` directly; the collapsed manager runs inside a `&mut Td`
+/// borrow, so the env carries the disjoint field borrows). The
+/// StickersManager/StarManager/MessagesManager/PasswordManager/
+/// BusinessConnectionManager halves keep their trait defaults — those
+/// managers are their own tracks (see the star_gift_manager module
+/// header); the user/dialog halves below delegate to the real read
+/// surface with the M.6.15a chat stubs.
+pub(crate) struct StarGiftTdEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    /// `None` once the option manager is torn down; the getters answer
+    /// their defaults like the other envs.
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+    /// `dialog_manager_->get_my_dialog_id()` (the M.6.15a free-function
+    /// answer, snapshotted at construction).
+    pub(crate) my_dialog_id: crate::dialog_id::DialogId,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::star_gift_manager::StarGiftEnv for StarGiftTdEnv<'_> {
+    fn is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn get_option_integer(&mut self, name: &str) -> i64 {
+        self.options
+            .as_ref()
+            .map_or(0, |options| options.get_option_integer(name, 0))
+    }
+
+    fn get_option_boolean(&mut self, name: &str) -> bool {
+        self.options
+            .as_ref()
+            .is_some_and(|options| options.get_option_boolean(name, false))
+    }
+
+    fn get_option_string(&mut self, name: &str, default_value: &str) -> String {
+        self.options.as_ref().map_or_else(
+            || default_value.to_owned(),
+            |options| options.get_option_string(name, default_value),
+        )
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        let crate::td::StarGiftTdEnv {
+            global,
+            options,
+            auth_is_bot,
+            user_manager,
+            ..
+        } = self;
+        let Some(options) = options else {
+            return;
+        };
+        let mut env = UserEnv {
+            global,
+            options,
+            auth_is_bot: *auth_is_bot,
+        };
+        user_manager.on_get_users(&mut env, users, source);
+    }
+
+    fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
+        let crate::td::StarGiftTdEnv {
+            global,
+            options,
+            auth_is_bot,
+            user_manager,
+            chat_manager,
+            ..
+        } = self;
+        let Some(options) = options else {
+            return;
+        };
+        let mut env = UserEnv {
+            global,
+            options,
+            auth_is_bot: *auth_is_bot,
+        };
+        chat_manager.on_get_chats(user_manager, &mut env, chats, source);
+    }
+
+    fn have_user_force(&mut self, user_id: UserId, source: &str) -> bool {
+        let Some(options) = self.options.as_mut() else {
+            return false;
+        };
+        let mut env = UserEnv {
+            global: &mut *self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.have_user_force(&mut env, user_id, source)
+    }
+
+    fn get_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
+        let Some(options) = self.options.as_mut() else {
+            return user_id.get();
+        };
+        let mut env = UserEnv {
+            global: &mut *self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager
+            .get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn get_user_ids_object(&mut self, user_ids: &[UserId], _source: &str) -> Vec<i64> {
+        user_ids.iter().map(|user_id| user_id.get()).collect()
+    }
+
+    fn get_my_dialog_id(&self) -> crate::dialog_id::DialogId {
+        self.my_dialog_id
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        _source: &str,
+    ) -> std::result::Result<(), tdutils::status::Status> {
+        use crate::dialog_id::DialogType;
+        // the M.6.15a halves: the chat/channel/`have_dialog` lookups are
+        // the stub inventory, so only the user/secret-chat info can pass
+        let have = match dialog_id.get_type() {
+            DialogType::User => self
+                .user_manager
+                .have_accessible_user(dialog_id.get_user_id()),
+            DialogType::SecretChat => self
+                .user_manager
+                .have_secret_chat(dialog_id.get_secret_chat_id()),
+            _ => false,
+        };
+        if !have {
+            if !dialog_id.is_valid() {
+                return std::result::Result::Err(tdutils::status::Status::error(
+                    400,
+                    "Invalid chat identifier specified",
+                ));
+            }
+            return std::result::Result::Err(tdutils::status::Status::error(400, "Chat not found"));
+        }
+        // check_dialog_access_in_memory: the user half through the real
+        // input-peer check, the rest through the stub `false`
+        let have_input_peer = match dialog_id.get_type() {
+            DialogType::User => {
+                let global = &mut *self.global;
+                let Some(options) = self.options.as_mut() else {
+                    return std::result::Result::Err(tdutils::status::Status::error(
+                        400,
+                        "Can't access the chat",
+                    ));
+                };
+                let env = UserEnv {
+                    global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.user_manager.have_input_peer_user(
+                    &env,
+                    dialog_id.get_user_id(),
+                    crate::user_manager::AccessRights::Read,
+                )
+            }
+            _ => false,
+        };
+        if !have_input_peer {
+            return std::result::Result::Err(tdutils::status::Status::error(
+                400,
+                "Can't access the chat",
+            ));
+        }
+        std::result::Result::Ok(())
+    }
+
+    fn get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> Option<telegram_api::InputPeer> {
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User => {
+                let options = self.options.as_mut()?;
+                let env = UserEnv {
+                    global: &mut *self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.user_manager.get_input_peer_user(
+                    &env,
+                    dialog_id.get_user_id(),
+                    crate::user_manager::AccessRights::Read,
+                )
+            }
+            // the chat/secret-chat halves are the M.6.15a stubs
+            _ => None,
+        }
+    }
+
+    fn have_dialog_force(&mut self, dialog_id: crate::dialog_id::DialogId, _source: &str) -> bool {
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User => self
+                .user_manager
+                .have_accessible_user(dialog_id.get_user_id()),
+            DialogType::SecretChat => self
+                .user_manager
+                .have_secret_chat(dialog_id.get_secret_chat_id()),
+            _ => false,
+        }
+    }
+
+    fn get_chat_id_object(&mut self, dialog_id: crate::dialog_id::DialogId, _source: &str) -> i64 {
+        // the M.6.16 stub: the MessagesManager lookup answers the raw id
+        dialog_id.get()
+    }
+
+    // the user/chat gift-count updates and the channel-status read ride
+    // the UserManager-full/ChatManager planes (their own tracks); the
+    // force-create is the M.6 no-op stub
+
+    fn on_update_my_gift_count(&mut self, _delta: i32) {}
+
+    fn on_update_user_gift_count(&mut self, _user_id: UserId, _count: i32) {}
+
+    fn force_create_dialog(&mut self, _dialog_id: crate::dialog_id::DialogId, _source: &str) {}
+
+    fn is_broadcast_channel(&mut self, _dialog_id: crate::dialog_id::DialogId) -> bool {
+        false
+    }
+
+    fn can_channel_post_messages(&mut self, _channel_id: crate::chat_manager::ChannelId) -> bool {
+        false
+    }
+
+    fn on_update_channel_gift_count(
+        &mut self,
+        _channel_id: crate::chat_manager::ChannelId,
+        _count: i32,
+        _is_relax: bool,
+    ) {
     }
 }
 

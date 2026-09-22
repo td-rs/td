@@ -30,6 +30,8 @@ pub mod version {
     pub const ADD_USER_FLAGS2: i32 = 48;
     pub const ADD_CONTACT_VCARD: i32 = 16;
     pub const SUPPORT_EPHEMERAL_MESSAGES: i32 = 61;
+    /// `Version::AddStarGiftAttributeRarity` (Version.h:74).
+    pub const ADD_STAR_GIFT_ATTRIBUTE_RARITY: i32 = 58;
     /// `Version::Next` of tdlib 1.8.67 (`SupportEphemeralMessages` + 1).
     pub const NEXT: i32 = 62;
     /// What `LogEventStorerUnsafe` writes (`Version::Next - 1`).
