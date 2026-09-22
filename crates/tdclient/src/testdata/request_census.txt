@@ -180,7 +180,7 @@ deleteLanguagePack	interim
 deleteMessageEphemeralContent	interim
 deleteMessageReactionsFromSender	interim
 deleteMessages	interim
-deletePassportElement	interim
+deletePassportElement	dispatched
 deletePollOption	interim
 deleteProfilePhoto	interim
 deleteQuickReplyShortcut	interim
@@ -252,7 +252,7 @@ fixTextWithAi	interim
 forwardMessages	interim
 getAccountTtl	interim
 getActiveSessions	interim
-getAllPassportElements	interim
+getAllPassportElements	dispatched
 getAllStickerEmojis	interim
 getAnimatedEmoji	interim
 getApplicationConfig	dispatched
@@ -461,9 +461,9 @@ getOwnedBots	interim
 getOwnedStickerSets	interim
 getPaidMessageRevenue	interim
 getPasskeyParameters	interim
-getPassportAuthorizationForm	interim
-getPassportAuthorizationFormAvailableElements	interim
-getPassportElement	interim
+getPassportAuthorizationForm	dispatched
+getPassportAuthorizationFormAvailableElements	dispatched
+getPassportElement	dispatched
 getPasswordState	interim
 getPaymentForm	interim
 getPaymentReceipt	interim
@@ -473,7 +473,7 @@ getPhoneNumberInfoSync	interim
 getPollOptionProperties	interim
 getPollVoteStatistics	interim
 getPollVoters	interim
-getPreferredCountryLanguage	interim
+getPreferredCountryLanguage	dispatched
 getPremiumFeatures	interim
 getPremiumGiftPaymentOptions	interim
 getPremiumGiveawayPaymentOptions	interim
@@ -778,7 +778,7 @@ sendInlineQueryResultMessage	interim
 sendMessage	dispatched
 sendMessageAlbum	interim
 sendMessageViewMetrics	interim
-sendPassportAuthorizationForm	interim
+sendPassportAuthorizationForm	dispatched
 sendPaymentForm	interim
 sendPhoneNumberCode	interim
 sendPhoneNumberFirebaseSms	interim
@@ -884,8 +884,8 @@ setNetworkType	interim
 setNewChatPrivacySettings	interim
 setOption	dispatched
 setPaidMessageReactionType	interim
-setPassportElement	interim
-setPassportElementErrors	interim
+setPassportElement	dispatched
+setPassportElementErrors	dispatched
 setPassword	interim
 setPersonalChat	interim
 setPinnedChats	interim

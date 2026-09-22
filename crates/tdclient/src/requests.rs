@@ -66,6 +66,26 @@ macro_rules! user_env {
     };
 }
 
+/// The `SecureEnv` for the SecureManager calls — expanded inline like
+/// `user_env!` to keep the field-disjoint borrows (the M.12 file plane
+/// rides its `Arc` clone).
+macro_rules! secure_env {
+    ($td:expr) => {
+        crate::td::SecureEnv {
+            global: &mut $td.global,
+            options: $td
+                .option_manager
+                .as_mut()
+                .expect("passport requests run with the initialized option manager"),
+            auth_is_bot: $td.auth_manager.is_bot(),
+            user_manager: &mut $td.user_manager,
+            file_manager: std::sync::Arc::clone(&$td.file_manager),
+            file_load_manager: std::sync::Arc::clone(&$td.file_load_manager),
+            close_flag: $td.close_flag != 0,
+        }
+    };
+}
+
 /// `Requests::run_request` — the C++ `downcast_call` dispatch.
 pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
     match function {
@@ -1164,12 +1184,228 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
         | Function::toggleBotCanManageEmojiStatus(_)
         | Function::setProfileAccentColor(_)
         | Function::setUpgradedGiftColors(_)
-        | Function::getSupportUser(_)
-        | Function::setPassportElementErrors(_) => {
-            // MessageEntity / UserFull ProfileTab / DialogManager /
-            // passport / the missing setter halves (M.4.12 deferred them
-            // with their types)
+        | Function::getSupportUser(_) => {
+            // MessageEntity / UserFull ProfileTab / DialogManager / the
+            // missing setter halves (M.4.12 deferred them with their types)
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+        }
+
+        // --------------------------------------------------------------
+        // M.44: the SecureManager-served passport requests
+        // (Requests.cpp:8772-8830, :8854-8891).
+        Function::getPassportElement(request) => {
+            // Requests.cpp:8772-8781
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(password) = clean_or_utf8_error(td, id, &request.password) else {
+                return;
+            };
+            let Some(request_type) = &request.r#type else {
+                return td.send_error_impl(id, 400, "Type must be non-empty");
+            };
+            let promise =
+                td.deferred_promise(id, |element: crate::secure_manager::TdApiSecureValue| {
+                    match element {
+                        // the PassportElement umbrella flattens into the
+                        // per-ctor Object variants (the `From` impl)
+                        Some(element) => Object::from(element),
+                        // the C++ nullptr result rides `Td::send_result`'s
+                        // 404 "Not Found" rewrite (Td.cpp:1407-1409)
+                        None => Object::error(td_api::Error {
+                            code: 404,
+                            message: "Not Found".to_string(),
+                        }),
+                    }
+                });
+            let mut env = secure_env!(td);
+            td.secure_manager.get_secure_value(
+                &mut env,
+                &password,
+                crate::secure_value::get_secure_value_type_td_api(request_type),
+                promise,
+            );
+        }
+        Function::getAllPassportElements(request) => {
+            // Requests.cpp:8783-8789
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(password) = clean_or_utf8_error(td, id, &request.password) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise(id, |elements: crate::secure_manager::TdApiSecureValues| {
+                    Object::passportElements(elements)
+                });
+            let mut env = secure_env!(td);
+            td.secure_manager
+                .get_all_secure_values(&mut env, &password, promise);
+        }
+        Function::setPassportElement(request) => {
+            // Requests.cpp:8791-8801: the inline `get_secure_value` parse
+            // answers 400 before the promise is created
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(password) = clean_or_utf8_error(td, id, &request.password) else {
+                return;
+            };
+            let r_secure_value = {
+                let mut env = secure_env!(td);
+                crate::secure_value::get_secure_value(&mut env, request.element)
+            };
+            let secure_value = match r_secure_value {
+                Result::Ok(secure_value) => secure_value,
+                Result::Err(error) => {
+                    return td.send_error_impl(id, 400, error.message());
+                }
+            };
+            let promise =
+                td.deferred_promise(id, |element: crate::secure_manager::TdApiSecureValue| {
+                    match element {
+                        Some(element) => Object::from(element),
+                        None => Object::error(td_api::Error {
+                            code: 404,
+                            message: "Not Found".to_string(),
+                        }),
+                    }
+                });
+            let mut env = secure_env!(td);
+            td.secure_manager
+                .set_secure_value(&mut env, &password, secure_value, promise);
+        }
+        Function::deletePassportElement(request) => {
+            // Requests.cpp:8803-8811
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(request_type) = &request.r#type else {
+                return td.send_error_impl(id, 400, "Type must be non-empty");
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = secure_env!(td);
+            td.secure_manager.delete_secure_value(
+                &mut env,
+                crate::secure_value::get_secure_value_type_td_api(request_type),
+                promise,
+            );
+        }
+        Function::setPassportElementErrors(request) => {
+            // Requests.cpp:8813-8822
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let r_input_user = {
+                let env = user_env!(td);
+                td.user_manager
+                    .get_input_user(&env, UserId::new(request.user_id))
+            };
+            if let Err(error) = r_input_user {
+                return td.send_error_impl(id, error.code(), error.message());
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = secure_env!(td);
+            td.secure_manager.set_secure_value_errors(
+                &mut env,
+                r_input_user.unwrap(),
+                request.errors,
+                promise,
+            );
+        }
+        Function::getPreferredCountryLanguage(request) => {
+            // Requests.cpp:8824-8830
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(country_code) = clean_or_utf8_error(td, id, &request.country_code) else {
+                return;
+            };
+            let promise = td.deferred_promise(id, |text: Option<td_api::Text>| match text {
+                Some(text) => Object::text(text),
+                None => Object::error(td_api::Error {
+                    code: 404,
+                    message: "Not Found".to_string(),
+                }),
+            });
+            let mut env = secure_env!(td);
+            td.secure_manager
+                .get_preferred_country_language(&mut env, &country_code, promise);
+        }
+        Function::getPassportAuthorizationForm(request) => {
+            // Requests.cpp:8854-8870
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(public_key) = clean_or_utf8_error(td, id, &request.public_key) else {
+                return;
+            };
+            let Some(scope) = clean_or_utf8_error(td, id, &request.scope) else {
+                return;
+            };
+            let Some(nonce) = clean_or_utf8_error(td, id, &request.nonce) else {
+                return;
+            };
+            let bot_user_id = UserId::new(request.bot_user_id);
+            if !bot_user_id.is_valid() {
+                return td.send_error_impl(id, 400, "Bot user identifier invalid");
+            }
+            if nonce.is_empty() {
+                return td.send_error_impl(id, 400, "Nonce must be non-empty");
+            }
+            let promise =
+                td.deferred_promise(id, |form: crate::secure_manager::TdApiAuthorizationForm| {
+                    Object::passportAuthorizationForm(form)
+                });
+            let mut env = secure_env!(td);
+            td.secure_manager.get_passport_authorization_form(
+                &mut env,
+                bot_user_id,
+                &scope,
+                &public_key,
+                &nonce,
+                promise,
+            );
+        }
+        Function::getPassportAuthorizationFormAvailableElements(request) => {
+            // Requests.cpp:8872-8878
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(password) = clean_or_utf8_error(td, id, &request.password) else {
+                return;
+            };
+            let promise = td.deferred_promise(
+                id,
+                |elements: crate::secure_manager::TdApiSecureValuesWithErrors| {
+                    Object::passportElementsWithErrors(elements)
+                },
+            );
+            let mut env = secure_env!(td);
+            td.secure_manager
+                .get_passport_authorization_form_available_elements(
+                    &mut env,
+                    request.authorization_form_id,
+                    &password,
+                    promise,
+                );
+        }
+        Function::sendPassportAuthorizationForm(request) => {
+            // Requests.cpp:8880-8891
+            if !check_is_user(td, id) {
+                return;
+            }
+            // the C++ null-element walk (Requests.cpp:8882-8886) cannot
+            // fire: the generated vector holds plain `PassportElementType`
+            let types = crate::secure_value::get_secure_value_types_td_api(&request.types);
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = secure_env!(td);
+            td.secure_manager.send_passport_authorization_form(
+                &mut env,
+                request.authorization_form_id,
+                types,
+                promise,
+            );
         }
 
         function => run_dialog_requests(td, id, function),
@@ -2176,13 +2412,17 @@ mod request_census_tests {
         // stays the 500 placeholder) + M.12.10's eighteen file-plane
         // dispatches (getFile/getRemoteFile, the download/upload/
         // generation arms, the DownloadManager list plane and the four
-        // storage-statistics arms). Fix per flip.
+        // storage-statistics arms) + M.44's nine passport dispatches
+        // (getPassportElement/getAllPassportElements/setPassportElement/
+        // deletePassportElement/setPassportElementErrors/
+        // getPreferredCountryLanguage and the three authorization-form
+        // arms — the [blocked: net] query tails park). Fix per flip.
         assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            110,
+            119,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 894, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 885, "interim count");
     }
 }
