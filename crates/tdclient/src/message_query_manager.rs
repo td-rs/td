@@ -15,8 +15,9 @@
 //! carries the `G()`/option/cross-manager surfaces and the promise lands
 //! unanswered offline.
 
-use crate::chat_manager::{ChannelId, MessageId};
+use crate::chat_manager::ChannelId;
 use crate::dialog_id::{DialogId, MessageFullId, ServerMessageId};
+use crate::messages_manager::MessageId;
 use crate::store_parse::{self, Parser};
 use crate::td_api;
 use crate::user_manager::UserId;
@@ -534,7 +535,7 @@ impl MessageSearchOffset {
     /// first usable message position.
     pub fn update_from_message(&mut self, message: &telegram_api::Message) {
         let message_date = get_message_date(message);
-        let message_id = MessageId::from_telegram_message(message, false);
+        let message_id = MessageId::get_message_id(message, false);
         let dialog_id = DialogId::get_message_dialog_id(message);
         if message_date > 0 && message_id.is_valid() && dialog_id.is_valid() {
             self.date = message_date;

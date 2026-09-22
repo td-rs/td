@@ -4554,6 +4554,8 @@ impl Td {
         }
         let message_query_updates = std::mem::take(&mut self.message_query_updates);
         for update in message_query_updates {
+            self.send_update(update.into());
+        }
         let account_updates = std::mem::take(&mut self.account_updates);
         for update in account_updates {
             self.send_update(update.into());
@@ -7261,7 +7263,7 @@ pub(crate) struct MessageQueryEnv<'a> {
     pub(crate) can_ignore_background_updates: bool,
     pub(crate) updates: &'a mut Vec<td_api::Update>,
     pub(crate) user_manager: &'a mut UserManager,
-    pub(crate) updates_manager: &'a mut UpdatesManager<TdUpdatesSink>,
+    pub(crate) updates_manager: &'a mut UpdatesManager<TdSink>,
 }
 
 impl crate::message_query_manager::MessageQueryManagerEnv for MessageQueryEnv<'_> {
@@ -7359,6 +7361,9 @@ impl crate::message_query_manager::MessageQueryManagerEnv for MessageQueryEnv<'_
             promise,
             source,
         );
+    }
+}
+
 /// The [`crate::call_manager::CallManagerEnv`] over the `Td` fields —
 /// built per call with the field-split borrows (the `NotificationEnv`
 /// convention), never held across calls. The two call-notification seams
