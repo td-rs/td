@@ -231,6 +231,26 @@ pub(crate) fn to_lower_ascii(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c.is_ascii_uppercase() {
+                (c as u8 + 32) as char
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// `check_currency_amount` (misc.cpp:390-393) — the C++ `MAX_AMOUNT`
+/// gate of 9999'9999'9999.
+pub(crate) fn check_currency_amount(amount: i64) -> bool {
+    const MAX_AMOUNT: i64 = 9_999_999_999_999;
+    (-MAX_AMOUNT..=MAX_AMOUNT).contains(&amount)
+}
+
+#[allow(dead_code)] // the C++ to_lower twin; the ascii fast-path is the live one
+fn to_lower(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_uppercase() {
                 (c as u8 - b'A' + b'a') as char
             } else {
                 c

@@ -46,6 +46,7 @@ use crate::td::AccountEnv;
 use crate::td::CallEnv;
 use crate::td::CommunityEnv;
 use crate::td::NotificationEnv;
+use crate::td::PremiumTdEnv;
 use crate::td::StatisticsEnv;
 use crate::td::Td;
 use crate::td::WebBrowserEnv;
@@ -2489,6 +2490,160 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
         }
 
         // Everything else waits for its manager step.
+        Function::getPremiumLimit(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise(id, |l: td_api::PremiumLimit| Object::premiumLimit(l));
+            let env = PremiumTdEnv {
+                options: td.option_manager.as_mut(),
+            };
+            td.premium_manager
+                .get_premium_limit(&env, &request.limit_type, promise);
+        }
+        Function::getPremiumFeatures(request) => {
+            if !check_is_user(td, id) {
+                return;
+            };
+            let _ = request.source;
+            let promise =
+                td.deferred_promise(id, |f: td_api::PremiumFeatures| Object::premiumFeatures(f));
+            let env = PremiumTdEnv {
+                options: td.option_manager.as_mut(),
+            };
+            td.premium_manager.get_premium_features(&env, promise);
+        }
+        Function::getBusinessFeatures(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |f: td_api::BusinessFeatures| {
+                Object::businessFeatures(f)
+            });
+            let mut env = PremiumTdEnv {
+                options: td.option_manager.as_mut(),
+            };
+            td.premium_manager.get_business_features(&mut env, promise);
+        }
+        Function::viewPremiumFeature(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            // the view/click side effects join the premium promo surface;
+            // the promise parks with the seam
+            td.premium_manager.net_blocked_promises.push(promise);
+        }
+        Function::clickPremiumSubscriptionButton(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            // the view/click side effects join the premium promo surface;
+            // the promise parks with the seam
+            td.premium_manager.net_blocked_promises.push(promise);
+        }
+        Function::getPremiumState(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise(id, |s: td_api::PremiumState| Object::premiumState(s));
+            let mut env = PremiumTdEnv {
+                options: td.option_manager.as_mut(),
+            };
+            td.premium_manager.get_premium_state(&mut env, promise);
+        }
+        Function::getPremiumGiftPaymentOptions(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |o: td_api::PremiumGiftPaymentOptions| {
+                Object::premiumGiftPaymentOptions(o)
+            });
+            let mut env = PremiumTdEnv {
+                options: td.option_manager.as_mut(),
+            };
+            td.premium_manager
+                .get_premium_gift_payment_options(&mut env, promise);
+        }
+        Function::getPremiumGiveawayPaymentOptions(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |o: td_api::PremiumGiveawayPaymentOptions| {
+                Object::premiumGiveawayPaymentOptions(o)
+            });
+            let mut env = PremiumTdEnv {
+                options: td.option_manager.as_mut(),
+            };
+            td.premium_manager.get_premium_giveaway_options(
+                &mut env,
+                request.boosted_chat_id,
+                promise,
+            );
+        }
+        Function::checkPremiumGiftCode(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(code) = crate::misc::clean_input_string(&request.code) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, |i: td_api::PremiumGiftCodeInfo| {
+                Object::premiumGiftCodeInfo(i)
+            });
+            let mut env = PremiumTdEnv {
+                options: td.option_manager.as_mut(),
+            };
+            td.premium_manager
+                .check_premium_gift_code(&mut env, &code, promise);
+        }
+        Function::applyPremiumGiftCode(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(code) = crate::misc::clean_input_string(&request.code) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = PremiumTdEnv {
+                options: td.option_manager.as_mut(),
+            };
+            td.premium_manager
+                .apply_premium_gift_code(&mut env, &code, promise);
+        }
+        Function::giftPremiumWithStars(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = PremiumTdEnv {
+                options: td.option_manager.as_mut(),
+            };
+            td.premium_manager.gift_premium_with_stars(
+                &mut env,
+                request.user_id,
+                request.star_count,
+                request.month_count,
+                promise,
+            );
+        }
+        Function::assignStoreTransaction(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = PremiumTdEnv {
+                options: td.option_manager.as_mut(),
+            };
+            td.premium_manager
+                .assign_store_transaction(&mut env, promise);
+        }
+
+        // Everything else waits for its manager step.
+        // Everything else waits for its manager step.
         Function::getChatStatistics(request) => {
             if !check_is_user(td, id) {
                 return;
@@ -2944,13 +3099,18 @@ mod request_census_tests {
         assert_eq!(generated.len(), crate::td_api::SCHEME_FUNCTIONS);
 
         // The flip-state ledger — re-derived from the fixture at the wave-3
-        // integration (the per-track flip histories compose).
-        assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
-        assert_eq!(
-            *counts.get("dispatched").unwrap_or(&0),
-            146,
-            "dispatched count"
-        );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 858, "interim count");
+// integration (the per-track flip histories compose).
+assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
+assert_eq!(
+    *counts.get("dispatched").unwrap_or(&0),
+    158,
+    "dispatched count"
+);
+assert_eq!(
+    *counts.get("interim").unwrap_or(&0),
+    846,
+    "interim count"
+);
     }
 }
+

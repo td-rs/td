@@ -37,6 +37,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::community_manager::{CommunityManager, CommunityManagerEnv};
+use crate::premium::{PremiumEnv, PremiumManager};
 use crate::statistics_manager::{StatisticsManager, StatisticsManagerEnv};
 use tdactor::{Actor, ActorOwn, Scheduler, actor_messages, send_closure_later};
 use tddb::td_db::{OpenedDatabase, Parameters as DbParameters, TdDb};
@@ -288,6 +289,8 @@ pub struct Td {
     /// The account plane's `send_update` outbox; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) account_updates: Vec<td_api::Update>,
+    /// The premium plane (Premium.cpp is a free-function surface).
+    pub(crate) premium_manager: PremiumManager,
     /// `Td::statistics_manager_` (the C++ init_managers block).
     pub(crate) statistics_manager: StatisticsManager,
     /// The statistics plane's `send_update` outbox; drained by
@@ -631,6 +634,7 @@ impl Td {
             suggested_action_manager: crate::suggested_action_manager::SuggestedActionManager::new(
             ),
             account_updates: Vec::new(),
+            premium_manager: PremiumManager::new(),
             statistics_manager: StatisticsManager::new(),
             statistics_updates: Vec::new(),
             community_manager: CommunityManager::new(),
@@ -5694,6 +5698,28 @@ impl StatisticsManagerEnv for StatisticsEnv<'_> {
             Err(tdutils::status::Status::error(400, "Chat not found"))
         }
     }
+}
+
+/// The premium-plane env over the option manager.
+pub(crate) struct PremiumTdEnv<'a> {
+    pub(crate) options: Option<&'a mut OptionManager>,
+}
+
+impl PremiumEnv for PremiumTdEnv<'_> {
+    fn get_option_integer(&self, name: &str) -> i64 {
+        self.options
+            .as_ref()
+            .map_or(0, |options| options.get_option_integer(name, 0))
+    }
+
+    fn get_option_string(&self, name: &str, default_value: &str) -> String {
+        self.options.as_ref().map_or_else(
+            || default_value.to_string(),
+            |options| options.get_option_string(name, default_value),
+        )
+    }
+
+    fn send_update(&mut self, _update: td_api::Update) {}
 }
 
 #[cfg(test)]
