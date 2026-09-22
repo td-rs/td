@@ -291,6 +291,12 @@ pub struct Td {
     /// The account plane's `send_update` outbox; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) account_updates: Vec<td_api::Update>,
+    /// `Td::theme_manager_` (`Td.cpp:1304`, the init managers block; the
+    /// M.41 Wave-3 slice).
+    pub(crate) theme_manager: crate::theme_manager::ThemeManager,
+    /// The theme manager's `send_update` outbox — the same collapsed hop;
+    /// drained by [`Td::flush_user_updates`].
+    pub(crate) theme_updates: Vec<td_api::Update>,
     /// `Td::autosave_manager_` (`Td.cpp:1166`, the init_managers block;
     /// the M.39 Wave-3 slice).
     pub(crate) autosave_manager: crate::autosave_manager::AutosaveManager,
@@ -652,6 +658,8 @@ impl Td {
             suggested_action_manager: crate::suggested_action_manager::SuggestedActionManager::new(
             ),
             account_updates: Vec::new(),
+            theme_manager: crate::theme_manager::ThemeManager::new(),
+            theme_updates: Vec::new(),
             autosave_manager: crate::autosave_manager::AutosaveManager::new(),
             autosave_updates: Vec::new(),
             boost_manager: BoostManager::new(),
@@ -1020,8 +1028,6 @@ impl Td {
             // C++ emits Ready from the binlog restore and reads the user
             // from the UserManager cache — no updateUser broadcast).
             self.auth_manager.set_state_ok();
-            self.apply_self_user(&user, false);
-            self.init_notification_manager();
             self.apply_self_user(&user, false);
             self.init_notification_manager();
             self.init_attach_menu_manager();
@@ -2725,6 +2731,27 @@ impl Td {
         for update in account_updates {
             self.send_update(update.into());
         }
+        let theme_updates = std::mem::take(&mut self.theme_updates);
+        for update in theme_updates {
+            self.send_update(update.into());
+        }
+    }
+
+    /// `ThemeManager::init` (ThemeManager.cpp:439-452; the
+    /// AuthManager.cpp:1552 call) — idempotent; the manager no-ops while
+    /// unauthorized.
+    fn init_theme_manager(&mut self) {
+        let mut env = ThemeEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            user_manager: &mut self.user_manager,
+            chat_manager: &mut self.chat_manager,
+            file_manager: std::sync::Arc::clone(&self.file_manager),
+            updates: &mut self.theme_updates,
+        };
+        self.theme_manager.init(&mut env);
         let attach_menu_updates = std::mem::take(&mut self.attach_menu_updates);
         for update in attach_menu_updates {
             self.send_update(update.into());
@@ -3281,6 +3308,7 @@ impl Td {
         // and web browser managers are the ones on this tree
         self.init_notification_manager();
         self.on_web_browser_authorization_success();
+        self.init_theme_manager();
     }
 
     /// Store + broadcast the self user: `UserManager::set_my_id` (the
@@ -6096,6 +6124,233 @@ impl crate::attach_menu_manager::AttachMenuManagerEnv for AttachMenuEnv<'_> {
         self.file_manager.lock().parse_file(parser)
     }
 }
+
+/// The [`crate::theme_manager::ThemeManagerEnv`] over the `Td` fields —
+/// built per call with the field-split borrows (the `NotificationEnv`
+/// convention), never held across calls; the file manager rides its `Arc`
+/// clone so the disjoint borrows hold.
+pub(crate) struct ThemeEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+    pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>>,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::theme_manager::ThemeManagerEnv for ThemeEnv<'_> {
+    fn is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn binlog_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn get_option_integer(&mut self, name: &str) -> i64 {
+        self.options
+            .as_mut()
+            .map(|options| options.get_option_integer(name, 0))
+            .unwrap_or(0)
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        let mut user_env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_mut()
+                .expect("theme queries run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.on_get_users(&mut user_env, users, source);
+    }
+
+    fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
+        let mut user_env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_mut()
+                .expect("theme queries run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.chat_manager
+            .on_get_chats(self.user_manager, &mut user_env, chats, source);
+    }
+
+    fn on_get_theme_background(
+        &mut self,
+        wallpaper: Option<telegram_api::WallPaper>,
+        is_no_file_pattern: bool,
+    ) -> Option<(
+        crate::theme_manager::BackgroundId,
+        crate::theme_manager::BackgroundType,
+    )> {
+        use crate::chat_manager::DcId;
+        use crate::files::{FileType, FullRemoteFileLocation};
+
+        let wallpaper = wallpaper?;
+        match wallpaper {
+            // the wallPaperNoFile half (BackgroundManager.cpp:1287-1310):
+            // the settings are required, the id must be valid and remote;
+            // the local-id counter is [blocked: M.16 Backgrounds]
+            telegram_api::WallPaper::wallPaperNoFile(wallpaper) => {
+                let settings = wallpaper.settings?;
+                let background_id = crate::theme_manager::BackgroundId::new(wallpaper.id);
+                if !background_id.is_valid() || background_id.is_local() {
+                    tdutils::log_error!("Receive an invalid no-file wallpaper id");
+                    return None;
+                }
+                let background_type = crate::theme_manager::BackgroundType::from_settings(
+                    true,
+                    is_no_file_pattern,
+                    Some(&settings),
+                );
+                Some((background_id, background_type))
+            }
+            // the wallPaper half (BackgroundManager.cpp:1312-1360): the id
+            // checks are inline, the document registers into the M.12 file
+            // plane with the C++ FromServer source (the
+            // DocumentsManager::on_get_document General/wallpaper collapse)
+            telegram_api::WallPaper::wallPaper(wallpaper) => {
+                let background_id = crate::theme_manager::BackgroundId::new(wallpaper.id);
+                if !background_id.is_valid() || background_id.is_local() {
+                    tdutils::log_error!("Receive an invalid wallpaper id");
+                    return None;
+                }
+                let is_pattern = wallpaper.pattern;
+                let Some(document) = wallpaper.document.as_ref() else {
+                    tdutils::log_error!("Receive a wallpaper without a document");
+                    return None;
+                };
+                let telegram_api::Document::document(document) = document else {
+                    tdutils::log_error!("Receive a wallpaper with documentEmpty");
+                    return None;
+                };
+                let dc_id = if DcId::is_valid_raw(document.dc_id) {
+                    DcId::internal(document.dc_id)
+                } else {
+                    DcId::invalid()
+                };
+                let location = FullRemoteFileLocation::from_document(
+                    FileType::Wallpaper,
+                    document.id,
+                    document.access_hash,
+                    dc_id,
+                    String::from_utf8_lossy(&document.file_reference).into_owned(),
+                );
+                let remote_name = document
+                    .attributes
+                    .iter()
+                    .find_map(|attribute| match attribute {
+                        telegram_api::DocumentAttribute::documentAttributeFilename(name) => {
+                            Some(name.file_name.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| document.mime_type.clone());
+                let mut file_manager = self.file_manager.lock();
+                let file_id = file_manager.register_remote(
+                    location,
+                    crate::files::FileLocationSource::FromServer,
+                    crate::message_id::DialogId::new(0),
+                    document.size,
+                    document.size,
+                    remote_name,
+                );
+                if !file_id.is_valid() {
+                    tdutils::log_error!("Receive a wallpaper with an invalid document");
+                    return None;
+                }
+                let background_type = crate::theme_manager::BackgroundType::from_settings(
+                    false,
+                    is_pattern,
+                    wallpaper.settings.as_ref(),
+                );
+                Some((background_id, background_type))
+            }
+        }
+    }
+
+    fn get_theme_background_object(
+        &mut self,
+        info: &crate::theme_manager::BackgroundInfo,
+    ) -> Option<td_api::Background> {
+        // the BackgroundManager object cache ([blocked: M.16 Backgrounds])
+        let _ = info;
+        None
+    }
+
+    fn store_background_row(
+        &mut self,
+        background_id: crate::theme_manager::BackgroundId,
+        out: &mut Vec<u8>,
+    ) -> bool {
+        // the full Background row store ([blocked: M.16 Backgrounds]) —
+        // the Td-side cache cannot answer yet, so a wallpaper-bearing
+        // theme stores background-less
+        let _ = (background_id, out);
+        false
+    }
+
+    fn parse_background_row(
+        &mut self,
+        parser: &mut crate::store_parse::Parser,
+    ) -> Result<crate::theme_manager::BackgroundId, &'static str> {
+        // the symmetric half of the store seam; with the store returning
+        // false the has_background flag keeps the row out of the stream
+        let _ = parser;
+        Result::Ok(crate::theme_manager::BackgroundId::new(0))
+    }
+
+    fn star_gift_object_for_theme(
+        &mut self,
+        gift: telegram_api::StarGift,
+    ) -> Option<td_api::UpgradedGift> {
+        // the StarGift value plane ([blocked: M.42 StarGift])
+        let _ = gift;
+        tdutils::log_info!("StarGift for the chat theme — [blocked: M.42 StarGift]");
+        None
+    }
+
+    fn send_get_chat_themes_query(&mut self, hash: i64) {
+        tdutils::log_info!("Send account.getChatThemes(hash = {hash}) — [blocked: net]");
+    }
+
+    fn send_get_peer_colors_query(&mut self, hash: i32) {
+        tdutils::log_info!("Send help.getPeerColors(hash = {hash}) — [blocked: net]");
+    }
+
+    fn send_get_peer_profile_colors_query(&mut self, hash: i32) {
+        tdutils::log_info!("Send help.getPeerProfileColors(hash = {hash}) — [blocked: net]");
+    }
+
+    fn send_get_unique_gift_chat_themes_query(&mut self, offset: &str, limit: i32) {
+        tdutils::log_info!(
+            "Send account.getUniqueGiftChatThemes(offset = {offset}, limit = {limit}) — [blocked: net]"
+        );
+    }
+}
+
+
+
+
+
 
 #[cfg(test)]
 mod tests {

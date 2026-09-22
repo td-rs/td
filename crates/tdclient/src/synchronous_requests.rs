@@ -79,6 +79,7 @@ pub fn is_synchronous_request(function: &Function) -> bool {
             | Function::getMarkdownText(_)
             | Function::getJsonValue(_)
             | Function::getJsonString(_)
+            | Function::getThemeParametersJsonString(_)
             | Function::setLogStream(_)
             | Function::getLogStream(_)
             | Function::setLogVerbosityLevel(_)
@@ -95,8 +96,7 @@ pub fn is_synchronous_request(function: &Function) -> bool {
     // Not ported yet (need their managers): searchQuote,
     // checkQuickReplyShortcutName, getCountryFlagEmoji, cleanFileName,
     // getLanguagePackString, getPhoneNumberInfoSync,
-    // getChatFolderDefaultIconName, getThemeParametersJsonString,
-    // getPushReceiverId.
+    // getChatFolderDefaultIconName, getPushReceiverId.
 }
 
 /// `JsonValue.cpp:get_json_value_object`: `tdutils::JsonValue` → td_api.
@@ -198,6 +198,16 @@ pub fn run_request(function: Function) -> Object {
             let default_json = td_api::JsonValue::default();
             Object::text(td_api::Text {
                 text: get_json_string(request.json_value.as_deref().unwrap_or(&default_json)),
+            })
+        }
+        // `SynchronousRequests::do_request(getThemeParametersJsonString)`
+        // (SynchronousRequests.cpp:325-329) — the pure
+        // `ThemeManager::get_theme_parameters_json_string` static
+        Function::getThemeParametersJsonString(request) => {
+            let default_parameters = td_api::ThemeParameters::default();
+            let theme_parameters = request.theme.as_ref().unwrap_or(&default_parameters);
+            Object::text(td_api::Text {
+                text: crate::theme_manager::get_theme_parameters_json_string(theme_parameters),
             })
         }
         Function::setLogStream(request) => {

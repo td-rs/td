@@ -384,7 +384,7 @@ getFullRichMessage	interim
 getGameHighScores	interim
 getGiftAuctionAcquiredGifts	interim
 getGiftAuctionState	interim
-getGiftChatThemes	interim
+getGiftChatThemes	dispatched
 getGiftCollections	interim
 getGiftUpgradePreview	interim
 getGiftsForCrafting	interim
@@ -548,7 +548,7 @@ getSupportUser	interim
 getTemporaryPasswordState	interim
 getTextCompositionStyleExample	interim
 getTextEntities	sync
-getThemeParametersJsonString	interim
+getThemeParametersJsonString	sync
 getThemedChatEmojiStatuses	interim
 getThemedEmojiStatuses	interim
 getTimeZones	interim
@@ -840,7 +840,7 @@ setChatPhoto	dispatched
 setChatPinnedStories	interim
 setChatProfileAccentColor	dispatched
 setChatSlowModeDelay	dispatched
-setChatTheme	interim
+setChatTheme	dispatched
 setChatTitle	dispatched
 setCloseFriends	dispatched
 setCommands	interim
