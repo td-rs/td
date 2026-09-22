@@ -32,6 +32,7 @@
 
 use crate::chat_manager::{ChannelId, DialogId};
 use crate::contact::Contact;
+use crate::messages_manager::{DialogId as MmDialogId, MessageId};
 use crate::notification::{NotificationGroupId, NotificationId, NotificationObjectId};
 use crate::notification_settings::{
     ReactionNotificationSettings, get_notification_settings_scope,
@@ -520,9 +521,10 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
 
-        // -- the walking-skeleton messaging set (S76) --
+        // -- the walking-skeleton messaging set (S76): getMe stays the
+        //    UserManager arm; sendMessage flipped to the real M.10.8–M.10.19
+        //    send machinery (the write-family group below) --
         Function::getMe(_) => td.get_me(id),
-        Function::sendMessage(request) => td.on_send_message(id, request),
         Function::setDatabaseEncryptionKey(_) => {
             // `G()->td_db()->get_binlog()->change_key(...)` — the binlog
             // re-key lands with the TdDb binlog-close wiring.
@@ -1876,6 +1878,373 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             }
         }
 
+        // --- messages, read family (Requests.cpp:2626-2800) ---
+        Function::getMessageLocally(request) => {
+            // Requests.cpp:2637-2641 — the local lookup form: no force, no
+            // actor. A missing dialog/message answers the null result (the
+            // `Td::send_result(nullptr)` → 404 shape).
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let message_id = MessageId::new(request.message_id);
+            // take/put-back: the builder mutates the message
+            // (`is_update_sent`) while borrowing the manager immutably
+            let taken = td
+                .messages_manager
+                .get_dialog_mut(dialog_id)
+                .and_then(|d| d.messages.remove(&message_id));
+            let object = if let Some(mut m) = taken {
+                let object = crate::messages_manager::get_message_object(
+                    &td.messages_manager,
+                    td,
+                    td,
+                    dialog_id,
+                    &mut m,
+                    "getMessageLocally",
+                );
+                if let Some(d) = td.messages_manager.get_dialog_mut(dialog_id) {
+                    d.messages.insert(message_id, m);
+                }
+                object
+            } else {
+                None
+            };
+            match object {
+                Some(message) => td.send_result(id, Object::message(message)),
+                None => td.send_result(
+                    id,
+                    Object::error(td_api::Error {
+                        code: 404,
+                        message: "Not Found".to_string(),
+                    }),
+                ),
+            }
+        }
+        Function::getMessageLink(request) => {
+            // Requests.cpp:2771-2782 — the local link builder.
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let message_id = MessageId::new(request.message_id);
+            match crate::messages_manager::get_message_link(
+                &td.messages_manager,
+                td,
+                dialog_id,
+                message_id,
+                request.media_timestamp,
+                request.checklist_task_id,
+                &request.poll_option_id,
+                request.for_album,
+                request.in_message_thread,
+            ) {
+                Ok((link, is_public)) => td.send_result(
+                    id,
+                    Object::messageLink(td_api::MessageLink { link, is_public }),
+                ),
+                Err(status) => {
+                    td.send_error_impl(id, status.code(), status.message());
+                }
+            }
+        }
+        // --- messages, write family part 1 (Requests.cpp:3529-3548, :4139) ---
+        Function::openChat(request) => {
+            // Requests.cpp:3529-3532 — CHECK_IS_USER; the ok-promise
+            // answers the local open.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the sequential discipline on `split_context_alias`.
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(std::ptr::from_mut(td)) };
+            let result = crate::messages_manager::open_dialog(&mut manager, td, state, dialog_id);
+            td.messages_manager = manager;
+            match result {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::closeChat(request) => {
+            // Requests.cpp:3534-3537.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: as openChat above.
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(std::ptr::from_mut(td)) };
+            let result = crate::messages_manager::close_dialog(&mut manager, td, state, dialog_id);
+            td.messages_manager = manager;
+            match result {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::viewMessages(request) => {
+            // Requests.cpp:3539-3546.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let message_ids: Vec<MessageId> = request
+                .message_ids
+                .iter()
+                .map(|&message_id| MessageId::new(message_id))
+                .collect();
+            let source = crate::messages_manager::get_message_source(request.source.as_ref());
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: as openChat above.
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(std::ptr::from_mut(td)) };
+            let result = crate::messages_manager::view_messages(
+                &mut manager,
+                td,
+                state,
+                dialog_id,
+                message_ids,
+                source,
+                request.force_read,
+            );
+            td.messages_manager = manager;
+            match result {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::deleteMessages(request) => {
+            // Requests.cpp:4139-4144 — the local delete core over the
+            // durable spine; the server tail rides the net seam.
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let message_ids: Vec<MessageId> = request
+                .message_ids
+                .iter()
+                .map(|&message_id| MessageId::new(message_id))
+                .collect();
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            let mut global = std::mem::take(&mut td.global);
+            let result = crate::messages_manager::delete_messages(
+                &mut global,
+                &mut manager,
+                dialog_id,
+                &message_ids,
+            );
+            td.global = global;
+            td.messages_manager = manager;
+            match result {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::sendMessage(request) => {
+            // Requests.cpp:4231-4241 — the M.10.8/M.10.19 send machinery:
+            // the yet-unsent message (the durable send log event already
+            // written) answers synchronously; the wire query rides the net
+            // seam (`do_send_message`'s TextReady action, [blocked: net]).
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            let mut global = std::mem::take(&mut td.global);
+            // SAFETY: the ctx/state/reactions views alias one Td and are
+            // used strictly sequentially inside the callee (the
+            // split_context_alias contract); the manager and the global
+            // are taken out for the call and restored after.
+            let td_ptr = std::ptr::from_mut(td);
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(td_ptr) };
+            let ctx: &mut dyn crate::messages_manager::SendMessageContext = unsafe { &mut *td_ptr };
+            let reactions_ctx =
+                crate::messages_manager::MessageObjectReactionsContext::new(unsafe { &*td_ptr });
+            let result = crate::messages_manager::send_message(
+                &mut global,
+                &mut manager,
+                &reactions_ctx,
+                ctx,
+                state,
+                dialog_id,
+                request.topic_id,
+                request.reply_to,
+                request.options,
+                request.reply_markup,
+                request.input_message_content.map(|content| *content),
+            );
+            td.global = global;
+            td.messages_manager = manager;
+            match result {
+                Ok(message) => td.send_result(id, Object::message(message)),
+                Err((code, message)) => td.send_error_impl(id, code, &message),
+            }
+        }
+        Function::sendMessageAlbum(request) => {
+            // Requests.cpp:4242-4251 — the album path over the M.9.5 splat
+            // gate + the upload fan-in; the wire leg is the same net seam.
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            let mut global = std::mem::take(&mut td.global);
+            // SAFETY: as sendMessage above.
+            let td_ptr = std::ptr::from_mut(td);
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(td_ptr) };
+            let ctx: &mut dyn crate::messages_manager::SendMessageContext = unsafe { &mut *td_ptr };
+            let reactions_ctx =
+                crate::messages_manager::MessageObjectReactionsContext::new(unsafe { &*td_ptr });
+            let result = crate::messages_manager::send_message_group(
+                &mut global,
+                &mut manager,
+                &reactions_ctx,
+                ctx,
+                state,
+                dialog_id,
+                request.topic_id,
+                request.reply_to,
+                request.options,
+                request
+                    .input_message_contents
+                    .into_iter()
+                    .map(|content| Some(*content))
+                    .collect(),
+            );
+            td.global = global;
+            td.messages_manager = manager;
+            match result {
+                Ok(messages) => td.send_result(id, Object::messages(messages)),
+                Err((code, message)) => td.send_error_impl(id, code, &message),
+            }
+        }
+        Function::setChatDraftMessage(request) => {
+            // Requests.cpp:5851-5856 — CHECK_IS_USER; the ok answer behind
+            // the entry. The C++ `set_dialog_draft_message` head runs
+            // `check_dialog_access(dialog_id, true, Write, ...)` through
+            // td_ — the arm owns that call in the Rust split.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let access = crate::dialog_manager::check_dialog_access(
+                td,
+                dialog_id,
+                true,
+                crate::user_manager::AccessRights::Write,
+                "set_dialog_draft_message",
+            );
+            if access.is_error() {
+                let status = access.error();
+                td.send_error_impl(id, status.code(), status.message());
+                return;
+            }
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: as sendMessage above.
+            let td_ptr = std::ptr::from_mut(td);
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(td_ptr) };
+            let ctx: &mut dyn crate::messages_manager::SendMessageContext = unsafe { &mut *td_ptr };
+            let result = crate::messages_manager::set_dialog_draft_message(
+                &mut manager,
+                ctx,
+                state,
+                dialog_id,
+                request.topic_id,
+                request.draft_message,
+            );
+            td.messages_manager = manager;
+            match result {
+                Ok(()) => td.send_result(id, ok_object()),
+                Err((code, message)) => td.send_error_impl(id, code, &message),
+            }
+        }
+        Function::getChatHistory(request) => {
+            // Requests.cpp:3642-3646 + GetChatHistoryRequest
+            // (Requests.cpp:951-977): CHECK_IS_USER; the actor's first run
+            // passes get_tries() - 1 = 1.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let from_message_id = MessageId::new(request.from_message_id);
+            // the split-context adapter: the manager is taken for the call
+            // and restored after; the ctx/state pair aliases Td (the
+            // sequential discipline on `split_context_alias`)
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: the alias and the source are used strictly
+            // sequentially (see `split_context_alias`'s contract).
+            let state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(std::ptr::from_mut(td)) };
+            let result = crate::messages_manager::get_dialog_history(
+                &mut manager,
+                td,
+                state,
+                dialog_id,
+                from_message_id,
+                request.offset,
+                request.limit,
+                1,
+                request.only_local,
+            );
+            td.messages_manager = manager;
+            match result {
+                Ok(Some(messages)) => td.send_result(id, Object::messages(messages)),
+                Ok(None) => {
+                    // the load-needed window — the db/server legs are the
+                    // net seam ([blocked: net]); the caller-retry contract
+                    // answers the loaded (empty) window
+                    td.send_result(
+                        id,
+                        Object::messages(crate::messages_manager::get_messages_object(
+                            -1,
+                            Vec::new(),
+                            false,
+                        )),
+                    );
+                }
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::getChatMessageByDate(request) => {
+            // Requests.cpp:3840-3845 — the local by-date walk behind the
+            // promise.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let mut manager = std::mem::take(&mut td.messages_manager);
+            // SAFETY: as getChatHistory above (the state surface rides
+            // the same alias when the by-date walk grows its state use).
+            let _state: &mut dyn crate::messages_manager::ReadStateContext =
+                unsafe { crate::td::split_context_alias(std::ptr::from_mut(td)) };
+            let result = crate::messages_manager::get_dialog_message_by_date(
+                &mut manager,
+                td,
+                dialog_id,
+                request.date,
+            );
+            td.messages_manager = manager;
+            match result {
+                Ok(Some(message)) => td.send_result(id, Object::message(message)),
+                Ok(None) => {
+                    // the by-date search parks on the db seam
+                    // ([blocked: net])
+                    td.send_error_impl(id, 500, "The message history is not loaded yet");
+                }
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::getMessageEmbeddingCode(request) => {
+            // Requests.cpp:2783-2786 — the local embedding builder behind
+            // the request actor (the promise collapses synchronously).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = MmDialogId::new(request.chat_id);
+            let message_id = MessageId::new(request.message_id);
+            match crate::messages_manager::get_message_embedding_code(
+                &td.messages_manager,
+                dialog_id,
+                message_id,
+                request.for_album,
+            ) {
+                Ok(code) => td.send_result(id, Object::text(td_api::Text { text: code })),
+                Err(status) => {
+                    td.send_error_impl(id, status.code(), status.message());
+                }
+            }
+        }
+
         // Everything else waits for its manager step.
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
@@ -2169,20 +2538,20 @@ mod request_census_tests {
         // The scheme size from the S07 differential dump.
         assert_eq!(generated.len(), crate::td_api::SCHEME_FUNCTIONS);
 
-        // The flip-state ledger at the m13s↔master (4f716e8: M.7+M.11)
-        // merge: the m11 pins + M.13/M.13S's seven real dispatches
-        // (removeNotification, removeNotificationGroup, registerDevice and
-        // the four notification-settings arms; processPushNotification
-        // stays the 500 placeholder) + M.12.10's eighteen file-plane
-        // dispatches (getFile/getRemoteFile, the download/upload/
-        // generation arms, the DownloadManager list plane and the four
-        // storage-statistics arms). Fix per flip.
+        // The flip-state ledger at the m10d↔master merge: the m13s pins
+        // (92) + M.12.10's eighteen file-plane dispatches (getFile/
+        // getRemoteFile, the download/upload/generation arms, the
+        // DownloadManager list plane and the four storage-statistics arms)
+        // + the M.10 dispatches (getMessageLocally, getMessageLink,
+        // getMessageEmbeddingCode, getChatHistory, getChatByDate, openChat,
+        // closeChat, viewMessages, deleteMessages, sendMessage,
+        // sendMessageAlbum, setChatDraftMessage). Fix per flip.
         assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            110,
+            121,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 894, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 883, "interim count");
     }
 }

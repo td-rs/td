@@ -44,7 +44,7 @@ use tdutils::promise::Promise;
 use tdutils::status::Status;
 
 use crate::auth_manager::{AuthManager, AuthQuerySender};
-use crate::chat_manager::DcId;
+use crate::chat_manager::{ChannelId, ChatId, DcId, MessageId, RestrictedRights};
 use crate::config_dispatch::{
     CompletedNetQueries, ConfigQueryCallback, SentNetQueries, TdConfigSink, TdSessionSink,
     build_config_net_query,
@@ -58,21 +58,30 @@ use crate::config_recoverer::{
 };
 use crate::config_result;
 use crate::connection_creator::ConnectionCreator;
-use crate::convert::{self, MessageSpec};
+use crate::contact::Contact;
+use crate::convert;
 use crate::dialog_manager::DialogManager;
+use crate::emoji_status::CustomEmojiId;
 use crate::global::Global;
 use crate::link_manager::LinkManager;
 use crate::manager_option_states::ManagerOptionStates;
-use crate::message_id::DialogId;
+use crate::message_content::*;
+use crate::message_entity::FormattedText;
+use crate::messages_manager::{
+    DialogId, EphemeralMessageFullId, FileUploadId, MessageFullId, QuickReplyMessageFullId,
+    StoryFullId, StoryId,
+};
 use crate::net::{AuthSender, BridgeConfig, NetBridge, QueryAnswer};
 use crate::notification_manager::NotificationManager;
 use crate::option_manager::OptionManager;
+use crate::photo::{Dimensions, Photo, PhotoSize};
 use crate::query_merger::QueryMerger;
 use crate::requests;
 use crate::synchronous_requests;
 use crate::td_api::{self, Function, Object};
 use crate::time_zone_manager::TimeZoneManager;
 use crate::updates_manager::{PendingUpdate, UpdatesManager, UpdatesManagerEnv, UpdatesSink};
+use crate::user_manager::SecretChatId;
 use crate::user_manager::{UserEnv, UserId, UserManager};
 
 use crate::files::{
@@ -130,24 +139,24 @@ pub struct HeaderOptions {
     pub is_emulator: bool,
 }
 
-/// A `sendMessage` in flight: the temporary local message exists, the
-/// answer was already sent, and the wire ack completes it.
-struct PendingSend {
-    local_id: i64,
-    chat_id: i64,
-    text: String,
-}
-
-/// The collecting sink under the S76 walking-skeleton path — Td drains it
-/// and converts/emits. The S72 fan-outs became the M.7 engine's
-/// `process_pts_update` switch; the interim runs this second engine
-/// instance beside the Td-level one until MessagesManager lands (M.10)
-/// and retires the skeleton converter.
+/// The td-level [`UpdatesSink`] — the collector form carrying the M.10
+/// receive path: the engine drives it (the users/chats pre-application
+/// and the applied pts updates) and `Td::drain_sink` converts/emits
+/// through the landed managers (the M.10.3 receive head, the M.10.5 edit
+/// intake, the M.10.6 deletes and the M.10.7 reads).
 #[derive(Default)]
-struct TdSink {
-    users: Vec<tdmtproto::telegram_api::User>,
-    chats: Vec<tdmtproto::telegram_api::Chat>,
-    new_messages: Vec<tdmtproto::telegram_api::Message>,
+pub(crate) struct TdSink {
+    pub(crate) users: Vec<tdmtproto::telegram_api::User>,
+    pub(crate) chats: Vec<tdmtproto::telegram_api::Chat>,
+    pub(crate) new_messages: Vec<(tdmtproto::telegram_api::Message, &'static str)>,
+    pub(crate) deletions: Vec<Vec<i32>>,
+    /// `updateEditMessage` — (message, pts) for the M.10.5 edit intake.
+    pub(crate) edits: Vec<(tdmtproto::telegram_api::Message, i32)>,
+    /// `updateReadHistoryInbox` — (peer, max_id, top_msg_id) for the
+    /// M.10.7 read intake.
+    pub(crate) reads_inbox: Vec<(tdmtproto::telegram_api::Peer, i32, i32)>,
+    /// `updateReadHistoryOutbox` — (peer, max_id).
+    pub(crate) reads_outbox: Vec<(tdmtproto::telegram_api::Peer, i32)>,
 }
 
 impl UpdatesSink for TdSink {
@@ -157,22 +166,1740 @@ impl UpdatesSink for TdSink {
     fn on_chat(&mut self, chat: tdmtproto::telegram_api::Chat) {
         self.chats.push(chat);
     }
+    /// `MessagesManager::process_pts_update` — the applied update switch:
+    /// the new-message and delete kinds collect for the drain (the
+    /// M.10.3/M.10.6 intakes); the rest are the manager flips.
     fn process_pts_update(&mut self, update: PendingUpdate) {
-        if let PendingUpdate::Wire(telegram_api::Update::updateNewMessage(new_message)) = update
-            && let Some(message) = new_message.message
-        {
-            self.new_messages.push(message);
+        match update {
+            PendingUpdate::Wire(telegram_api::Update::updateNewMessage(update)) => {
+                if let Some(message) = update.message {
+                    self.new_messages.push((message, "updateNewMessage"));
+                }
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateNewChannelMessage(update)) => {
+                if let Some(message) = update.message {
+                    self.new_messages.push((message, "updateNewChannelMessage"));
+                }
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateDeleteMessages(update)) => {
+                self.deletions.push(update.messages);
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateEditMessage(update)) => {
+                if let Some(message) = update.message {
+                    self.edits.push((message, update.pts));
+                }
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateReadHistoryInbox(update)) => {
+                if let Some(peer) = update.peer {
+                    self.reads_inbox
+                        .push((peer, update.max_id, update.top_msg_id));
+                }
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateReadHistoryOutbox(update)) => {
+                if let Some(peer) = update.peer {
+                    self.reads_outbox.push((peer, update.max_id));
+                }
+            }
+            // `updateReadMessagesContents` (read_message_content_from_updates,
+            // MessagesManager.cpp:9325) rides the TTL content-read plane and
+            // `updatePinnedMessages` the M.10.14 pinned tail — both collect
+            // nothing until their slices land.
+            _ => {}
         }
     }
+    /// `MessagesManager::add_pending_channel_update` — the channel-pts
+    /// machine's applied updates ride the same collector.
     fn add_pending_channel_update(
         &mut self,
         _peer: Option<tdmtproto::telegram_api::Peer>,
-        _update: PendingUpdate,
+        update: PendingUpdate,
         _pts: i32,
         _pts_count: i32,
         _promise: Promise<()>,
         _source: &str,
     ) {
+        self.process_pts_update(update);
+    }
+}
+
+/// The Td-side [`crate::message_content::MessageContentContext`] adapter —
+/// the M.9.18 receive flip. The real reads are the Td-owned surfaces
+/// (auth, options, ids, unix time); the manager surfaces answer the
+/// documented stand-ins until their owners land.
+impl crate::message_content::MessageContentContext for Td {
+    fn get_user_default_permissions(&self, _user_id: UserId) -> RestrictedRights {
+        RestrictedRights::default()
+    }
+    fn get_secret_chat_default_permissions(
+        &self,
+        _secret_chat_id: SecretChatId,
+    ) -> RestrictedRights {
+        RestrictedRights::default()
+    }
+    fn is_user_bot(&self, user_id: UserId) -> bool {
+        self.users
+            .get(&user_id.get())
+            .is_some_and(|u| matches!(u.r#type, Some(td_api::UserType::userTypeBot(_))))
+    }
+    fn get_user_voice_messages_forbidden(&self, _user_id: UserId) -> bool {
+        false
+    }
+    fn get_chat_effective_restricted_rights(&self, _chat_id: ChatId) -> RestrictedRights {
+        RestrictedRights::default()
+    }
+    fn get_channel_effective_restricted_rights(&self, _channel_id: ChannelId) -> RestrictedRights {
+        RestrictedRights::default()
+    }
+    fn is_broadcast_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+    fn is_monoforum_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+    fn is_bot(&self) -> bool {
+        self.auth_manager.is_bot()
+    }
+    fn get_my_dialog_id(&self) -> DialogId {
+        crate::messages_manager::DialogId::from_user_id(crate::user_manager::UserId::new(
+            self.my_id,
+        ))
+    }
+    fn get_poll_is_anonymous(&self, _poll_id: PollId) -> bool {
+        false
+    }
+    fn get_poll_is_closed(&self, _poll_id: PollId) -> bool {
+        false
+    }
+    fn get_poll_can_add_option(&self, _poll_id: PollId) -> bool {
+        false
+    }
+    fn get_poll_can_view_stats(&self, _poll_id: PollId) -> bool {
+        false
+    }
+    fn get_poll_has_unread_votes(&self, _poll_id: PollId) -> bool {
+        false
+    }
+    fn remove_poll_has_unread_votes(&self, _poll_id: PollId) {
+        {}
+    }
+    fn has_input_media_poll(&self, _poll_id: PollId) -> bool {
+        false
+    }
+    fn get_poll_individual_message_contents(
+        &self,
+        _poll_id: PollId,
+        _attached_media: Option<&MessageContent>,
+    ) -> Vec<MessageContent> {
+        Vec::new()
+    }
+    fn get_poll_option_properties(
+        &self,
+        _poll_id: PollId,
+        _option_id: &str,
+        _dialog_id: DialogId,
+        _message_id: MessageId,
+        _can_be_replied: bool,
+        _can_be_replied_in_another_chat: bool,
+        _can_get_link: bool,
+        _is_forward: bool,
+        _is_outgoing: bool,
+        _promise: Promise<crate::td_api::PollOptionProperties>,
+    ) {
+        {}
+    }
+    fn get_sticker_type(&self, _file_id: FileId) -> StickerType {
+        StickerType::default()
+    }
+    fn get_web_page_user_ids(&self, _web_page_id: WebPageId) -> Vec<UserId> {
+        Vec::new()
+    }
+    fn get_web_page_channel_ids(&self, _web_page_id: WebPageId) -> Vec<ChannelId> {
+        Vec::new()
+    }
+    fn get_option_integer(&self, name: &str, default: i64) -> i64 {
+        self.option_manager
+            .as_ref()
+            .map_or(default, |om| om.get_option_integer(name, default))
+    }
+    fn register_web_page(
+        &mut self,
+        _web_page_id: WebPageId,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_web_page(
+        &mut self,
+        _web_page_id: WebPageId,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_quick_reply_web_page(
+        &mut self,
+        _web_page_id: WebPageId,
+        _message_full_id: QuickReplyMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_quick_reply_web_page(
+        &mut self,
+        _web_page_id: WebPageId,
+        _message_full_id: QuickReplyMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_welcome_message_web_page(
+        &mut self,
+        _web_page_id: WebPageId,
+        _message_full_id: EphemeralMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_welcome_message_web_page(
+        &mut self,
+        _web_page_id: WebPageId,
+        _message_full_id: EphemeralMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_premium_gift(
+        &mut self,
+        _months: i32,
+        _star_count: i64,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_premium_gift(
+        &mut self,
+        _months: i32,
+        _star_count: i64,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_ton_gift(
+        &mut self,
+        _ton_count: i64,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_ton_gift(
+        &mut self,
+        _ton_count: i64,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_dice(
+        &mut self,
+        _emoji: &str,
+        _value: i32,
+        _message_full_id: MessageFullId,
+        _quick_reply_message_full_id: QuickReplyMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_dice(
+        &mut self,
+        _emoji: &str,
+        _value: i32,
+        _message_full_id: MessageFullId,
+        _quick_reply_message_full_id: QuickReplyMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_emoji(
+        &mut self,
+        _emoji: &str,
+        _custom_emoji_id: CustomEmojiId,
+        _message_full_id: MessageFullId,
+        _quick_reply_message_full_id: QuickReplyMessageFullId,
+        _ephemeral_message_full_id: EphemeralMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_emoji(
+        &mut self,
+        _emoji: &str,
+        _custom_emoji_id: CustomEmojiId,
+        _message_full_id: MessageFullId,
+        _quick_reply_message_full_id: QuickReplyMessageFullId,
+        _ephemeral_message_full_id: EphemeralMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_voice(
+        &mut self,
+        _file_id: FileId,
+        _content_type: MessageContentType,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_voice(
+        &mut self,
+        _file_id: FileId,
+        _content_type: MessageContentType,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_poll(&mut self, _poll_id: PollId, _message_full_id: MessageFullId, _source: &str) {
+        {}
+    }
+    fn unregister_poll(
+        &mut self,
+        _poll_id: PollId,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_reply_poll(&mut self, _poll_id: PollId) {
+        {}
+    }
+    fn unregister_reply_poll(&mut self, _poll_id: PollId) {
+        {}
+    }
+    fn register_story(
+        &mut self,
+        _story_full_id: StoryFullId,
+        _message_full_id: MessageFullId,
+        _quick_reply_message_full_id: QuickReplyMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_story(
+        &mut self,
+        _story_full_id: StoryFullId,
+        _message_full_id: MessageFullId,
+        _quick_reply_message_full_id: QuickReplyMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_group_call(&mut self, _message_full_id: MessageFullId, _source: &str) {
+        {}
+    }
+    fn unregister_group_call(&mut self, _message_full_id: MessageFullId, _source: &str) {
+        {}
+    }
+    fn register_suggested_profile_photo(&mut self, _photo: &Photo) {
+        {}
+    }
+    fn register_noforwards_request(&mut self, _message_full_id: MessageFullId, _message_date: i32) {
+        {}
+    }
+    fn unregister_noforwards_request(&mut self, _message_full_id: MessageFullId) {
+        {}
+    }
+    fn merge_animations(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_audios(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_documents(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_stickers(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_videos(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_video_notes(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_voice_notes(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_files(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_photo_files(&mut self, _old_photo: &Photo, _new_photo: &Photo, _dialog_id: DialogId) {
+        {}
+    }
+    fn have_web_page(&self, _web_page_id: WebPageId) -> bool {
+        false
+    }
+    fn try_merge_documents(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn get_option_boolean(&self, name: &str, default_value: bool) -> bool {
+        self.option_manager
+            .as_ref()
+            .is_some_and(|om| om.get_option_boolean(name, default_value))
+    }
+    fn get_secret_chat_layer(&self, _secret_chat_id: SecretChatId) -> i32 {
+        0
+    }
+    fn get_secret_chat_user_id(&self, _secret_chat_id: SecretChatId) -> UserId {
+        UserId::default()
+    }
+    fn can_use_premium_custom_emoji_in_dialog(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+    fn is_premium_custom_emoji(&self, _custom_emoji_id: CustomEmojiId) -> bool {
+        false
+    }
+    fn get_channel_can_add_web_page_previews(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+    fn get_web_page_by_url(&self, _url: &str) -> WebPageId {
+        WebPageId::default()
+    }
+    fn have_user_force(&self, _user_id: UserId, _source: &str) -> bool {
+        false
+    }
+    fn ensure_input_user(&self, _user_id: UserId) -> Result<(), Status> {
+        unreachable!("send-path seam reached on the receive flip")
+    }
+    fn get_my_id(&self) -> UserId {
+        crate::user_manager::UserId::new(self.my_id)
+    }
+    fn get_file_view_details(&self, _file_id: FileId) -> Option<(String, String, String)> {
+        None
+    }
+    fn create_animation(
+        &mut self,
+        _file_id: FileId,
+        _thumbnail: PhotoSize,
+        _has_stickers: bool,
+        _sticker_file_ids: Vec<FileId>,
+        _file_name: String,
+        _mime_type: String,
+        _duration: i32,
+        _dimensions: Dimensions,
+    ) {
+        {}
+    }
+    fn create_audio(
+        &mut self,
+        _file_id: FileId,
+        _thumbnail: PhotoSize,
+        _file_name: String,
+        _mime_type: String,
+        _duration: i32,
+        _title: String,
+        _performer: String,
+    ) {
+        {}
+    }
+    fn create_document(
+        &mut self,
+        _file_id: FileId,
+        _thumbnail: PhotoSize,
+        _file_name: String,
+        _mime_type: String,
+    ) {
+        {}
+    }
+    fn create_sticker(&mut self, _file_id: FileId, _thumbnail: PhotoSize, _dimensions: Dimensions) {
+        {}
+    }
+    fn create_video(
+        &mut self,
+        _file_id: FileId,
+        _thumbnail: PhotoSize,
+        _has_stickers: bool,
+        _sticker_file_ids: Vec<FileId>,
+        _file_name: String,
+        _mime_type: String,
+        _duration: i32,
+        _dimensions: Dimensions,
+        _supports_streaming: bool,
+    ) {
+        {}
+    }
+    fn create_video_note(
+        &mut self,
+        _file_id: FileId,
+        _thumbnail: PhotoSize,
+        _duration: i32,
+        _dimensions: Dimensions,
+    ) {
+        {}
+    }
+    fn create_voice_note(
+        &mut self,
+        _file_id: FileId,
+        _mime_type: String,
+        _duration: i32,
+        _waveform: Vec<u8>,
+    ) {
+        {}
+    }
+    fn create_photo_input(
+        &mut self,
+        _file_id: FileId,
+        _thumbnail: PhotoSize,
+        _width: i32,
+        _height: i32,
+        _sticker_file_ids: Vec<FileId>,
+    ) -> Result<Photo, Status> {
+        unreachable!("send-path seam reached on the receive flip")
+    }
+    fn get_input_file_id(
+        &mut self,
+        _file_type: crate::files::FileType,
+        _input_file: Option<td_api::InputFile>,
+        _dialog_id: DialogId,
+        _allow_get_by_hash: bool,
+        _is_secret: bool,
+    ) -> Result<FileId, Status> {
+        unreachable!("send-path seam reached on the receive flip")
+    }
+    fn get_attached_sticker_file_ids(&self, _sticker_file_ids: Vec<i32>) -> Vec<FileId> {
+        Vec::new()
+    }
+    fn get_input_thumbnail_photo_size(
+        &mut self,
+        _thumbnail: Option<td_api::InputThumbnail>,
+        _dialog_id: DialogId,
+        _is_secret: bool,
+    ) -> Result<PhotoSize, Status> {
+        unreachable!("send-path seam reached on the receive flip")
+    }
+    fn from_persistent_id(
+        &self,
+        _persistent_id: &str,
+        _file_type: crate::files::FileType,
+    ) -> Result<FileId, Status> {
+        unreachable!("send-path seam reached on the receive flip")
+    }
+    fn is_broadcast_channel_dialog(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+    fn create_poll(
+        &mut self,
+        _question: FormattedText,
+        _options: Vec<PollOption>,
+        _is_anonymous: bool,
+        _allows_multiple_answers: bool,
+        _has_open_answers: bool,
+        _fixed_answers: bool,
+        _members_only: bool,
+        _country_codes: Vec<String>,
+        _shuffle_options: bool,
+        _hide_results_until_closes: bool,
+        _is_quiz: bool,
+        _correct_option_ids: Vec<i32>,
+        _explanation: FormattedText,
+        _explanation_media: Option<Box<MessageContent>>,
+        _open_period: i32,
+        _close_date: i32,
+        _is_closed: bool,
+    ) -> PollId {
+        PollId::default()
+    }
+    fn have_story_force(&self, _story_full_id: StoryFullId) -> bool {
+        false
+    }
+    fn has_read_access_input_peer(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+    fn get_input_user_force(&self, _user_id: UserId) -> Option<telegram_api::InputUser> {
+        None
+    }
+    fn get_animation_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputFile>,
+        _input_thumbnail: Option<telegram_api::InputFile>,
+        _has_spoiler: bool,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_audio_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputFile>,
+        _input_thumbnail: Option<telegram_api::InputFile>,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_document_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputFile>,
+        _input_thumbnail: Option<telegram_api::InputFile>,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_sticker_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputFile>,
+        _input_thumbnail: Option<telegram_api::InputFile>,
+        _emoji: &str,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_video_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputFile>,
+        _input_thumbnail: Option<telegram_api::InputFile>,
+        _cover: &Photo,
+        _start_timestamp: i32,
+        _ttl: i32,
+        _has_spoiler: bool,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_video_note_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputFile>,
+        _input_thumbnail: Option<telegram_api::InputFile>,
+        _ttl: i32,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_voice_note_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputFile>,
+        _ttl: i32,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_poll_input_media(
+        &self,
+        _poll_id: PollId,
+        _input_media: Vec<Option<telegram_api::InputMedia>>,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_story_input_media(
+        &self,
+        _story_full_id: StoryFullId,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn photo_get_input_media(
+        &self,
+        _photo: &Photo,
+        _input_file: Option<telegram_api::InputFile>,
+        _ttl: i32,
+        _has_spoiler: bool,
+        _video_file_id: FileId,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_animation_secret_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _caption: &FormattedText,
+        _thumbnail: Vec<u8>,
+        _layer: i32,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn get_audio_secret_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _caption: &FormattedText,
+        _thumbnail: Vec<u8>,
+        _layer: i32,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn get_document_secret_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _caption: &FormattedText,
+        _thumbnail: Vec<u8>,
+        _layer: i32,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn get_sticker_secret_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _thumbnail: Vec<u8>,
+        _layer: i32,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn get_video_secret_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _caption: &FormattedText,
+        _thumbnail: Vec<u8>,
+        _layer: i32,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn get_video_note_secret_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _thumbnail: Vec<u8>,
+        _layer: i32,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn get_voice_note_secret_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _caption: &FormattedText,
+        _layer: i32,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn photo_get_secret_input_media(
+        &self,
+        _photo: &Photo,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _caption: &FormattedText,
+        _thumbnail: Vec<u8>,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn get_input_web_document(&self, _photo: &Photo) -> Option<telegram_api::InputWebDocument> {
+        None
+    }
+    fn delete_animation_thumbnail(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn delete_audio_thumbnail(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn delete_document_thumbnail(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn delete_sticker_thumbnail(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn delete_video_thumbnail(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn delete_video_note_thumbnail(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn cancel_upload(&mut self, _file_upload_id: FileUploadId) {
+        {}
+    }
+    fn was_authorized(&self) -> bool {
+        self.auth_manager.is_authorized()
+    }
+    fn get_live_photo_video_file_id(
+        &mut self,
+        _video: Option<telegram_api::Document>,
+        _owner_dialog_id: DialogId,
+        _is_self_destructing: bool,
+    ) -> FileId {
+        FileId::default()
+    }
+    fn on_get_document(
+        &mut self,
+        _document: telegram_api::Document,
+        _owner_dialog_id: DialogId,
+        _is_self_destructing: bool,
+        _is_send_priority: bool,
+        _doc_type: Option<DocumentType>,
+    ) -> ParsedDocument {
+        ParsedDocument::default()
+    }
+    fn get_web_document_photo(
+        &mut self,
+        _web_document: Option<telegram_api::WebDocument>,
+        _owner_dialog_id: DialogId,
+    ) -> Photo {
+        Photo::default()
+    }
+    fn on_get_web_page(
+        &mut self,
+        _web_page: Option<telegram_api::WebPage>,
+        _owner_dialog_id: DialogId,
+    ) -> WebPageId {
+        WebPageId::default()
+    }
+    fn on_get_poll(
+        &mut self,
+        _poll: Option<telegram_api::Poll>,
+        _results: Option<telegram_api::PollResults>,
+        _source: &str,
+    ) -> PollId {
+        PollId::default()
+    }
+    fn on_get_story(
+        &mut self,
+        _dialog_id: DialogId,
+        _story: Option<telegram_api::StoryItem>,
+    ) -> StoryId {
+        StoryId::default()
+    }
+    fn force_create_dialog(&mut self, _dialog_id: DialogId, _source: &str) {
+        {}
+    }
+    fn is_file_encrypted_secret(&self, _file_id: FileId) -> bool {
+        false
+    }
+    fn copy_file_id_to_secret(&mut self, _file_id: FileId, _dialog_id: DialogId) -> FileId {
+        FileId::default()
+    }
+    fn dup_animation(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
+        FileId::default()
+    }
+    fn dup_audio(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
+        FileId::default()
+    }
+    fn dup_document(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
+        FileId::default()
+    }
+    fn dup_sticker(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
+        FileId::default()
+    }
+    fn dup_video(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
+        FileId::default()
+    }
+    fn dup_video_note(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
+        FileId::default()
+    }
+    fn dup_voice_note(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
+        FileId::default()
+    }
+    fn dup_poll(&mut self, _dialog_id: DialogId, _poll_id: PollId) -> PollId {
+        PollId::default()
+    }
+    fn has_secret_input_media_sticker(&self, _file_id: FileId) -> bool {
+        false
+    }
+    fn is_user_deleted(&self, _user_id: UserId) -> bool {
+        false
+    }
+    fn get_recent_call_access_hash(&self, _call_id: i64) -> i64 {
+        0
+    }
+    fn get_encrypted_secure_values(
+        &mut self,
+        _secure_values: Vec<telegram_api::SecureValue>,
+    ) -> Vec<EncryptedSecureValue> {
+        Vec::new()
+    }
+    fn get_shared_dialog_from_peer(
+        &mut self,
+        _peer: telegram_api::RequestedPeer,
+    ) -> Option<SharedDialog> {
+        None
+    }
+    fn get_background_info(
+        &mut self,
+        _wallpaper: Option<telegram_api::WallPaper>,
+        _is_local: bool,
+        _for_dark_theme: bool,
+    ) -> Option<BackgroundInfo> {
+        None
+    }
+    fn get_web_app_from_bot_app(
+        &mut self,
+        _bot_app: telegram_api::BotApp,
+        _owner_dialog_id: DialogId,
+    ) -> WebApp {
+        WebApp::default()
+    }
+    fn parse_poll_option_answer(
+        &mut self,
+        _answer: Option<telegram_api::PollAnswer>,
+    ) -> Option<(FormattedText, String)> {
+        None
+    }
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+    fn get_user_id_object(&self, user_id: UserId, _source: &str) -> i64 {
+        user_id.get()
+    }
+    fn get_user_ids_object(&self, user_ids: &[UserId], _source: &str) -> Vec<i64> {
+        user_ids.iter().map(|&u| u.get()).collect()
+    }
+    fn is_user_support(&self, _user_id: UserId) -> bool {
+        false
+    }
+    fn get_service_notifications_user_id(&self) -> UserId {
+        crate::user_manager::UserId::new(777000)
+    }
+    fn get_supergroup_id_object(&self, channel_id: ChannelId, _source: &str) -> i64 {
+        channel_id.get()
+    }
+    fn get_basic_group_id_object(&self, chat_id: ChatId, _source: &str) -> i64 {
+        chat_id.get()
+    }
+    fn get_chat_id_object(&self, dialog_id: DialogId, _source: &str) -> i64 {
+        match dialog_id.get_type() {
+            crate::messages_manager::DialogType::User => dialog_id.get_user_id().get(),
+            crate::messages_manager::DialogType::Chat => -dialog_id.get_chat_id().get(),
+            crate::messages_manager::DialogType::Channel => dialog_id.get_channel_id().get(),
+            crate::messages_manager::DialogType::SecretChat => {
+                i64::from(dialog_id.get_secret_chat_id().get())
+            }
+            crate::messages_manager::DialogType::None => 0,
+        }
+    }
+    fn have_input_peer(&self, _dialog_id: DialogId) -> bool {
+        true
+    }
+    fn get_group_call_id(
+        &self,
+        _input_group_call_id: InputGroupCallId,
+        _dialog_id: DialogId,
+    ) -> i64 {
+        0
+    }
+    fn get_message_sender_object(
+        &self,
+        _dialog_id: DialogId,
+        _source: &str,
+    ) -> Option<td_api::MessageSender> {
+        None
+    }
+    fn get_contact_object(&self, _contact: &Contact) -> td_api::Contact {
+        td_api::Contact::default()
+    }
+    fn get_animation_object(&self, _file_id: FileId) -> td_api::Animation {
+        td_api::Animation::default()
+    }
+    fn get_audio_object(&self, _file_id: FileId) -> td_api::Audio {
+        td_api::Audio::default()
+    }
+    fn get_document_object(&self, _file_id: FileId) -> td_api::Document {
+        td_api::Document::default()
+    }
+    fn get_video_object(&self, _file_id: FileId) -> td_api::Video {
+        td_api::Video::default()
+    }
+    fn get_video_note_object(&self, _file_id: FileId) -> td_api::VideoNote {
+        td_api::VideoNote::default()
+    }
+    fn get_voice_note_object(&self, _file_id: FileId) -> td_api::VoiceNote {
+        td_api::VoiceNote::default()
+    }
+    fn get_sticker_object(&self, _file_id: FileId) -> Option<td_api::Sticker> {
+        None
+    }
+    fn get_animated_emoji_object(
+        &self,
+        _text: &str,
+        _custom_emoji_id: CustomEmojiId,
+    ) -> Option<td_api::AnimatedEmoji> {
+        None
+    }
+    fn get_dice_stickers_object(&self, _emoji: &str, _value: i32) -> td_api::DiceStickers {
+        td_api::DiceStickers::default()
+    }
+    fn get_dice_success_animation_frame_number(&self, _emoji: &str, _value: i32) -> i32 {
+        0
+    }
+    fn get_premium_gift_sticker_object(
+        &self,
+        _month_count: i32,
+        _star_count: i64,
+    ) -> Option<td_api::Sticker> {
+        None
+    }
+    fn get_ton_gift_sticker_object(&self, _ton_count: i64) -> Option<td_api::Sticker> {
+        None
+    }
+    fn get_alternative_video_object(
+        &self,
+        _file_id: FileId,
+        _hls_file_ids: &[FileId],
+    ) -> Option<td_api::AlternativeVideo> {
+        None
+    }
+    fn get_video_storyboard_object(
+        &self,
+        _file_id: FileId,
+        _storyboard_map_file_ids: &[FileId],
+    ) -> Option<td_api::VideoStoryboard> {
+        None
+    }
+    fn get_link_preview_object(
+        &self,
+        _web_page_id: WebPageId,
+        _force_small_media: bool,
+        _force_large_media: bool,
+        _skip_confirmation: bool,
+        _invert_media: bool,
+    ) -> Option<td_api::LinkPreview> {
+        None
+    }
+    fn get_photo_object(&self, _photo: &Photo) -> Option<td_api::Photo> {
+        None
+    }
+    fn get_chat_photo_object(&self, _photo: &Photo) -> Option<td_api::ChatPhoto> {
+        None
+    }
+    fn get_poll_object(&self, _poll_id: PollId, _dialog_id: DialogId) -> td_api::Poll {
+        td_api::Poll::default()
+    }
+    fn get_message_invoice_object(
+        &self,
+        _input_invoice: &InputInvoice,
+        _is_server: bool,
+        _skip_bot_commands: bool,
+        _max_media_timestamp: i32,
+    ) -> td_api::MessageContent {
+        td_api::MessageContent::default()
+    }
+    fn get_game_object(
+        &self,
+        _game: &Game,
+        _is_server: bool,
+        _skip_bot_commands: bool,
+    ) -> td_api::Game {
+        td_api::Game::default()
+    }
+    fn get_web_app_object(&self, _web_app: &WebApp) -> td_api::WebApp {
+        td_api::WebApp::default()
+    }
+    fn get_paid_media_object(&self, _extended_media: &MessageExtendedMedia) -> td_api::PaidMedia {
+        td_api::PaidMedia::default()
+    }
+    fn get_shared_user_object(&self, _shared_dialog: &SharedDialog) -> td_api::SharedUser {
+        td_api::SharedUser::default()
+    }
+    fn get_shared_chat_object(&self, _shared_dialog: &SharedDialog) -> td_api::SharedChat {
+        td_api::SharedChat::default()
+    }
+    fn get_giveaway_parameters_object(
+        &self,
+        _parameters: &GiveawayParameters,
+    ) -> td_api::GiveawayParameters {
+        td_api::GiveawayParameters::default()
+    }
+    fn get_chat_background_object(
+        &self,
+        _background_info: &BackgroundInfo,
+    ) -> td_api::ChatBackground {
+        td_api::ChatBackground::default()
+    }
+    fn get_checklist_object(
+        &self,
+        _list: &ToDoList,
+        _completions: &[ToDoCompletion],
+        _dialog_id: DialogId,
+        _message_id: MessageId,
+        _is_outgoing: bool,
+        _is_forward: bool,
+        _is_real_message_content: bool,
+    ) -> td_api::Checklist {
+        td_api::Checklist::default()
+    }
+    fn get_encrypted_passport_element_object(
+        &self,
+        _values: &[EncryptedSecureValue],
+    ) -> Vec<td_api::EncryptedPassportElement> {
+        Vec::new()
+    }
+    fn get_community_id_object(
+        &self,
+        _community_id: CommunityId,
+        _source: &str,
+    ) -> td_api::CommunityId {
+        td_api::CommunityId::default()
+    }
+    fn get_animation_duration(&self, _file_id: FileId) -> i32 {
+        0
+    }
+    fn get_audio_duration(&self, _file_id: FileId) -> i32 {
+        0
+    }
+    fn get_video_duration(&self, _file_id: FileId) -> i32 {
+        0
+    }
+    fn get_video_note_duration(&self, _file_id: FileId) -> i32 {
+        0
+    }
+    fn get_voice_note_duration(&self, _file_id: FileId) -> i32 {
+        0
+    }
+    fn get_story_duration(&self, _story_full_id: StoryFullId) -> i32 {
+        0
+    }
+    fn get_web_page_media_duration(&self, _web_page_id: WebPageId) -> i32 {
+        0
+    }
+    fn has_video_cover_input_media(&self, _file_id: FileId, _is_bot: bool) -> bool {
+        false
+    }
+    fn has_photo_cover_input_media(&self, _photo: &Photo, _is_bot: bool) -> bool {
+        false
+    }
+    fn update_extended_media_to(
+        &mut self,
+        _media: &mut MessageExtendedMedia,
+        _extended_media: Option<telegram_api::MessageExtendedMedia>,
+        _owner_dialog_id: DialogId,
+    ) -> bool {
+        false
+    }
+    fn stop_local_poll(&mut self, _poll_id: PollId) {
+        {}
+    }
+    fn get_animated_emoji_click_sticker(
+        &self,
+        _text: &str,
+        _message_full_id: MessageFullId,
+        _promise: Promise<td_api::Sticker>,
+    ) {
+        {}
+    }
+    fn on_animated_emoji_message_clicked(
+        &mut self,
+        _emoji: &str,
+        _message_full_id: MessageFullId,
+        _data: &str,
+    ) -> Result<(), Status> {
+        unreachable!("send-path seam reached on the receive flip")
+    }
+    fn get_video_mime_type(&self, _file_id: FileId) -> String {
+        String::new()
+    }
+    fn get_poll_file_ids(&self, _poll_id: PollId) -> Vec<FileId> {
+        Vec::new()
+    }
+    fn get_web_page_story_full_id(&self, _web_page_id: WebPageId) -> StoryFullId {
+        StoryFullId::default()
+    }
+    fn get_web_page_search_text(&self, _web_page_id: WebPageId) -> String {
+        String::new()
+    }
+    fn get_animation_search_text(&self, _file_id: FileId) -> String {
+        String::new()
+    }
+    fn get_audio_search_text(&self, _file_id: FileId) -> String {
+        String::new()
+    }
+    fn get_document_search_text(&self, _file_id: FileId) -> String {
+        String::new()
+    }
+    fn get_video_search_text(&self, _file_id: FileId) -> String {
+        String::new()
+    }
+    fn get_poll_search_text(&self, _poll_id: PollId) -> String {
+        String::new()
+    }
+    fn get_message_from_server(&mut self, _message_full_id: MessageFullId, _source: &str) {
+        {}
+    }
+    fn on_forum_topic_edited(
+        &mut self,
+        _dialog_id: DialogId,
+        _forum_topic_id: i32,
+        _edited_data: &ForumTopicEditedData,
+    ) {
+        {}
+    }
+    fn on_update_user_noforwards(
+        &mut self,
+        _user_id: UserId,
+        _is_me: bool,
+        _new_value: bool,
+        _is_contact: bool,
+        _has_noforwards: bool,
+    ) {
+        {}
+    }
+    fn on_update_user_linked_community_id(&mut self, _user_id: UserId, _community_id: CommunityId) {
+        {}
+    }
+    fn on_update_channel_linked_community_id(
+        &mut self,
+        _channel_id: ChannelId,
+        _community_id: CommunityId,
+    ) {
+        {}
+    }
+    fn add_saved_animation_by_id(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn add_recent_sticker_by_id(&mut self, _is_attached: bool, _file_id: FileId) {
+        {}
+    }
+    fn move_sticker_set_to_top_by_sticker_id(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn move_sticker_set_to_top_by_custom_emoji_ids(
+        &mut self,
+        _custom_emoji_ids: Vec<CustomEmojiId>,
+    ) {
+        {}
+    }
+}
+
+/// The M.10.3 receive-flip adapter: `Td` as the intake/builder
+/// [`crate::messages_manager::MessageObjectContext`]. The reads the M.9.18
+/// surface already owns (users, auth, options, clock) answer for real, the
+/// manager-owned reads (`have_dialog`, the ephemeral-id registry) walk the
+/// M.10.2c skeleton, and the ChatManager/ForumTopic/NotificationSettings
+/// surfaces answer the documented stand-ins until their receive slices
+/// land (the same defaults the M.10.4 test context pins).
+impl crate::messages_manager::MessageObjectContext for Td {
+    fn content_context(&self) -> &dyn crate::message_content::MessageContentContext {
+        self
+    }
+
+    fn is_bot(&self) -> bool {
+        crate::message_content::MessageContentContext::is_bot(self)
+    }
+
+    fn now(&self) -> f64 {
+        tdutils::time::now()
+    }
+
+    fn server_time(&self) -> f64 {
+        self.global.unix_time() as f64
+    }
+
+    fn is_test_dc(&self) -> bool {
+        self.global.is_test_dc()
+    }
+
+    fn get_restriction_options(&self) -> crate::restriction_reason::RestrictionOptions {
+        crate::restriction_reason::RestrictionOptions {
+            ignored_restriction_reasons: String::new(),
+            restriction_add_platforms: String::new(),
+            ignore_platform_restrictions: false,
+        }
+    }
+
+    fn get_message_sender_object_const(
+        &self,
+        sender_user_id: UserId,
+        sender_dialog_id: DialogId,
+        _source: &str,
+    ) -> Option<td_api::MessageSender> {
+        if sender_dialog_id.is_valid() {
+            return Some(td_api::MessageSender::messageSenderChat(
+                td_api::messageSenderChat {
+                    chat_id: sender_dialog_id.get(),
+                },
+            ));
+        }
+        if !sender_user_id.is_valid() {
+            return None;
+        }
+        Some(td_api::MessageSender::messageSenderUser(
+            td_api::messageSenderUser {
+                user_id: sender_user_id.get(),
+            },
+        ))
+    }
+
+    fn have_min_user(&self, user_id: UserId) -> bool {
+        self.users.contains_key(&user_id.get())
+    }
+
+    fn have_dialog(&self, dialog_id: DialogId) -> bool {
+        self.messages_manager.get_dialog(dialog_id).is_some()
+    }
+
+    fn have_dialog_info(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn have_min_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn force_create_dialog(&self, _dialog_id: DialogId, _source: &str) {
+        // the C++ force-creates with a `send_closure` — the actor wiring is
+        // the Td receive slice's; the intake registers the dialog itself.
+    }
+
+    fn content_context_mut(&mut self) -> &mut dyn crate::message_content::MessageContentContext {
+        self
+    }
+
+    fn have_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn get_min_channel(
+        &self,
+        _channel_id: ChannelId,
+    ) -> Option<crate::messages_manager::MinChannel> {
+        None
+    }
+
+    fn can_dialog_have_threads(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn get_message_id_of_ephemeral_message_id(
+        &self,
+        dialog_id: DialogId,
+        ephemeral_message_id: crate::messages_manager::EphemeralMessageId,
+    ) -> crate::messages_manager::MessageId {
+        self.messages_manager
+            .update_ephemeral_message_ids
+            .get(&crate::messages_manager::EphemeralMessageFullId::new(
+                dialog_id,
+                ephemeral_message_id,
+            ))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn get_channel_has_linked_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn is_forum_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn is_megagroup_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn get_channel_linked_channel_id(&self, _channel_id: ChannelId, _source: &str) -> ChannelId {
+        ChannelId::default()
+    }
+
+    fn have_channel_force(&self, _channel_id: ChannelId, _source: &str) -> bool {
+        false
+    }
+
+    fn have_input_peer_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn get_user_private_forward_name(&self, _user_id: UserId) -> String {
+        String::new()
+    }
+
+    fn is_admined_monoforum_channel(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn is_monoforum_channel_dialog(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn get_monoforum_channel_id(&self, channel_id: ChannelId) -> ChannelId {
+        channel_id
+    }
+
+    fn channel_can_post_messages(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn get_dialog_has_protected_content_force(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn get_forum_topic_id_object(
+        &self,
+        _dialog_id: DialogId,
+        forum_topic_id: crate::messages_manager::ForumTopicId,
+    ) -> i32 {
+        forum_topic_id.get()
+    }
+
+    fn get_saved_messages_topic_id_object(
+        &self,
+        _dialog_id: DialogId,
+        saved_messages_topic_id: crate::messages_manager::SavedMessagesTopicId,
+    ) -> i64 {
+        saved_messages_topic_id.get_dialog_id().get()
+    }
+
+    fn get_message_content_media_duration(
+        &self,
+        _content: &crate::message_content::MessageContent,
+    ) -> i32 {
+        -1
+    }
+
+    fn get_message_sender_object_force(
+        &self,
+        dialog_id: DialogId,
+        _source: &str,
+    ) -> Option<td_api::MessageSender> {
+        Some(td_api::MessageSender::messageSenderChat(
+            td_api::messageSenderChat {
+                chat_id: dialog_id.get(),
+            },
+        ))
+    }
+
+    fn get_scope_disable_pinned_message_notifications(&self) -> bool {
+        false
+    }
+
+    fn get_scope_disable_mention_notifications(&self) -> bool {
+        false
+    }
+}
+
+/// The split-context aliasing adapter — the M.10 split functions take
+/// their ctx and state objects as separate trait parameters over the same
+/// `Td` (the C++ one-object model). The alias below is derived from the
+/// single `&mut Td` the arm holds and the pair is used strictly
+/// sequentially: every M.10 split function invokes one surface at a time.
+/// The full sink-state refactor (a field-destructure content-context
+/// view) retires this adapter.
+///
+/// # Safety
+/// The returned alias and the source reference must never be written
+/// through reentrantly — the M.10 split functions satisfy this by
+/// construction (they pass each object into one callee at a time).
+pub(crate) unsafe fn split_context_alias<'a>(
+    td: *mut Td,
+) -> &'a mut dyn crate::messages_manager::ReadStateContext {
+    unsafe { &mut *td }
+}
+
+/// The Td-side [`crate::messages_manager::ReadStateContext`] — the
+/// M.10.20 state half of the split-context convention. Real routes: the
+/// update channel (`Td::send_update`), the option reads, the pmc, the
+/// input-peer gate and the message-database gate. The manager-touching
+/// hooks (`on_unread_count_change`-family, `update_dialog_lists`) and the
+/// M.13 notification hooks answer the documented stand-ins until their
+/// receive slices flip (the same shape the test contexts pin).
+impl crate::messages_manager::ReadStateContext for Td {
+    fn send_update(&mut self, update: td_api::Object) {
+        Td::send_update(self, update);
+    }
+
+    fn have_input_peer(&self, dialog_id: DialogId, allow_secret_chats: bool) -> bool {
+        if dialog_id.get_type() == crate::messages_manager::DialogType::SecretChat
+            && !allow_secret_chats
+        {
+            return false;
+        }
+        crate::messages_manager::have_dialog_force(&self.messages_manager, dialog_id)
+    }
+
+    fn is_dialog_muted(&self, _dialog_id: DialogId) -> bool {
+        // NotificationSettingsManager::get_dialog_mute_until — the M.13
+        // receive flip
+        false
+    }
+
+    fn is_dialog_sponsored(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn on_unread_count_change(
+        &mut self,
+        _dialog_id: DialogId,
+        _old_unread_count: i32,
+        _new_unread_count: i32,
+        _is_marked_as_unread: bool,
+        _force_update: bool,
+        _source: &str,
+    ) {
+    }
+
+    fn on_is_marked_as_unread_change(&mut self, _dialog_id: DialogId, _delta: i32, _source: &str) {}
+
+    fn have_dialog_filters(&self) -> bool {
+        false
+    }
+
+    fn update_dialog_lists(&mut self, _dialog_id: DialogId, _source: &str) {}
+
+    fn option_integer(&self, name: &str, default: i64) -> i64 {
+        self.option_manager
+            .as_ref()
+            .map(|options| options.get_option_integer(name, default))
+            .unwrap_or(default)
+    }
+
+    fn option_boolean(&self, name: &str, default: bool) -> bool {
+        self.option_manager
+            .as_ref()
+            .map(|options| options.get_option_boolean(name, default))
+            .unwrap_or(default)
+    }
+
+    fn binlog_pmc_get(&mut self, key: &str) -> Option<String> {
+        let value = self.global.binlog_pmc().get(key);
+        if value.is_empty() { None } else { Some(value) }
+    }
+
+    fn binlog_pmc_set(&mut self, key: &str, value: &str) {
+        self.global.binlog_pmc().set(key, value);
+    }
+
+    fn use_message_database(&self) -> bool {
+        self.global.use_message_database()
+    }
+
+    fn get_dialog_filter_folder_ids(
+        &self,
+        _filter_id: crate::messages_manager::DialogFilterId,
+    ) -> Vec<crate::messages_manager::FolderId> {
+        Vec::new()
+    }
+
+    fn need_dialog_in_filter(
+        &self,
+        _filter_id: crate::messages_manager::DialogFilterId,
+        _info: &crate::messages_manager::DialogFilterDialogInfo,
+    ) -> bool {
+        true
+    }
+
+    fn is_dialog_pinned_in_filter(
+        &self,
+        _filter_id: crate::messages_manager::DialogFilterId,
+        _dialog_id: DialogId,
+    ) -> bool {
+        false
+    }
+
+    fn get_pinned_dialog_ids_in_filter(
+        &self,
+        _filter_id: crate::messages_manager::DialogFilterId,
+    ) -> Vec<DialogId> {
+        Vec::new()
+    }
+
+    fn get_scope_disable_mention_notifications(&self) -> bool {
+        false
+    }
+
+    fn is_bot(&self) -> bool {
+        crate::message_content::MessageContentContext::is_bot(self)
+    }
+
+    fn close_flag(&self) -> bool {
+        self.close_flag != 0
+    }
+
+    fn get_sponsored_chat_source_object(&self) -> Option<td_api::ChatSource> {
+        None
+    }
+
+    fn is_running_get_difference(&self) -> bool {
+        false
+    }
+
+    fn is_running_get_channel_difference(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn has_channel_difference_to_log_event(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn remove_notification_group(
+        &mut self,
+        _group_id: crate::messages_manager::NotificationGroupId,
+        _max_notification_message_id: crate::messages_manager::MessageId,
+        _total_count: i32,
+        _force: bool,
+        _source: &str,
+    ) {
+        // the M.13 notification flip
+    }
+
+    fn remove_notification(
+        &mut self,
+        _group_id: crate::messages_manager::NotificationGroupId,
+        _notification_id: crate::messages_manager::NotificationId,
+        _is_permanent: bool,
+        _force_update: bool,
+    ) {
+    }
+
+    fn flush_pending_new_message_notifications(
+        &mut self,
+        _dialog_id: DialogId,
+        _from_mentions: bool,
+        _settings_dialog_id: DialogId,
+    ) {
+    }
+
+    fn remove_dialog_pinned_message_notification(&mut self, _dialog_id: DialogId, _source: &str) {}
+}
+
+/// The reactions half of the receive adapter: the banned-chat read is the
+/// ChatManager status cache, false until that receive slice lands.
+/// The Td-side [`crate::messages_manager::SendMessageContext`] adapter —
+/// the M.10.20 dispatch flip. The real reads are the Td-owned surfaces
+/// (clock, auth, the messages_manager registry); the manager-facade reads
+/// (titles, signatures, slow mode, boosts) answer the documented
+/// stand-ins until their const surfaces land with the sink-state
+/// refactor; the Wave-2/db reads (stories, forwarded info) answer the
+/// same stand-ins as the test contexts.
+impl crate::messages_manager::SendMessageContext for Td {
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn is_broadcast_channel_dialog(&self, dialog_id: DialogId) -> bool {
+        dialog_id.get_type() == crate::messages_manager::DialogType::Channel
+            && crate::message_content::MessageContentContext::is_broadcast_channel(
+                self,
+                dialog_id.get_channel_id(),
+            )
+    }
+
+    fn ignore_default_disable_notification(&self) -> bool {
+        false
+    }
+
+    fn get_channel_sign_messages(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn get_channel_show_message_sender(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn is_anonymous_administrator(&self, _dialog_id: DialogId) -> Option<String> {
+        None
+    }
+
+    fn get_dialog_title(&self, _dialog_id: DialogId) -> String {
+        String::new()
+    }
+
+    fn get_user_title(&self, user_id: UserId) -> String {
+        self.user_manager.get_user_title_of(user_id)
+    }
+
+    fn get_secret_chat_ttl(&self, secret_chat_id: SecretChatId) -> i32 {
+        self.user_manager.get_secret_chat_ttl(secret_chat_id)
+    }
+
+    fn get_channel_my_boost_count(&self, _channel_id: ChannelId) -> i32 {
+        0
+    }
+
+    fn can_send_message_to_dialog(&self, _dialog_id: DialogId) -> Result<(), (i32, String)> {
+        // the real table reads the manager state through a mutable Td —
+        // the sink-state refactor lands it; the local-answer flips are
+        // unaffected (they never send)
+        Ok(())
+    }
+
+    fn have_input_peer_read(&self, dialog_id: DialogId, allow_secret_chats: bool) -> bool {
+        // the DialogManager facade read needs `&mut Td` (its net/db
+        // fallbacks); the in-memory form rides the chat registry
+        if dialog_id.get_type() == crate::messages_manager::DialogType::SecretChat
+            && !allow_secret_chats
+        {
+            return false;
+        }
+        crate::messages_manager::have_dialog_force(&self.messages_manager, dialog_id)
+    }
+
+    fn can_send_message_to_forum_topic(
+        &self,
+        _dialog_id: DialogId,
+        _forum_topic_id: crate::messages_manager::ForumTopicId,
+    ) -> bool {
+        true
+    }
+
+    fn can_be_forum(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn have_dialog_force(&self, dialog_id: DialogId, _source: &str) -> bool {
+        crate::messages_manager::have_dialog_force(&self.messages_manager, dialog_id)
+    }
+
+    fn get_my_dialog_id(&self) -> DialogId {
+        crate::message_content::MessageContentContext::get_my_dialog_id(self)
+    }
+
+    fn get_saved_messages_topic_id_from_raw(
+        &self,
+        topic_id: i64,
+    ) -> crate::messages_manager::SavedMessagesTopicId {
+        crate::messages_manager::SavedMessagesTopicId::new(DialogId::new(topic_id))
+    }
+
+    fn get_forwarded_message_info(
+        &self,
+        _dialog_id: DialogId,
+        _message_id: crate::messages_manager::MessageId,
+    ) -> Option<crate::messages_manager::ForwardedMessageInfo> {
+        // the message-db load — the db seam
+        None
+    }
+
+    fn get_message_by_random_id_from_database(
+        &self,
+        _dialog_id: DialogId,
+        _random_id: i64,
+    ) -> Option<Box<crate::messages_manager::Message>> {
+        None
+    }
+
+    fn have_story(&self, _story_full_id: StoryFullId) -> bool {
+        false
+    }
+
+    fn is_inaccessible_story(&self, _story_full_id: StoryFullId) -> bool {
+        false
+    }
+
+    fn get_story_duration(&self, _story_full_id: StoryFullId) -> i32 {
+        0
+    }
+
+    fn get_channel_slow_mode_delay(&self, _channel_id: ChannelId) -> i32 {
+        0
+    }
+
+    fn is_channel_administrator(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn on_update_channel_slow_mode_next_send_date(
+        &self,
+        _channel_id: ChannelId,
+        _next_send_date: i32,
+    ) {
+    }
+
+    fn remove_inactive_channel(&self, _channel_id: ChannelId) {}
+}
+
+impl crate::messages_manager::DialogReactionsContext for Td {
+    fn is_chat_banned(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn is_bot(&self) -> bool {
+        crate::message_content::MessageContentContext::is_bot(self)
     }
 }
 
@@ -294,7 +2021,7 @@ pub struct Td {
     /// on the first pts access (`init_state`), and the pmc writes flush
     /// through `timeout_expired` exactly like the C++ actor's
     /// `MAX_PTS_SAVE_DELAY` throttle.
-    pub(crate) updates_manager: UpdatesManager<TdUpdatesSink>,
+    pub(crate) updates_manager: UpdatesManager<TdSink>,
     /// `Td::storage_manager_` (`Td::Td`, Td.cpp:940) — created with Td.
     pub(crate) storage_manager: StorageManager,
     /// `Td::file_manager_` (`Td::init_file_manager`, Td.cpp:1080) — behind
@@ -318,6 +2045,10 @@ pub struct Td {
     pub(crate) use_message_database: bool,
     /// `Td::parameters()->use_file_database`.
     pub(crate) use_file_database: bool,
+    /// `Td::messages_manager_` — the M.10 manager state (the dialog/message
+    /// container set + the database family bookkeeping); the receive path
+    /// (M.10.3+) is the first reader.
+    pub(crate) messages_manager: crate::messages_manager::MessagesManager,
     /// `Td::stop_cnt_` — the hangup and the close completion each drop one.
     stop_cnt: i32,
     /// The deferred-response outbox. The C++ request promises re-enter the
@@ -341,11 +2072,6 @@ pub struct Td {
     chats: HashMap<i64, td_api::Chat>,
     /// user id → access hash (the peers the walking skeleton messages).
     peer_access: HashMap<i64, i64>,
-    /// `get_next_yet_unsent_message_id` — negative, decreasing.
-    next_local_message_id: i64,
-    /// random_id → the pending send.
-    pending_sends: HashMap<i64, PendingSend>,
-    updates: UpdatesManager<TdSink>,
 }
 
 /// A parked recoverer fetch — the C++ `get_simple_config_*` /
@@ -358,41 +2084,6 @@ pub struct Td {
 pub(crate) enum RecovererFetch {
     Simple(crate::config_recoverer::SimpleConfigFetch),
     Full(crate::config_recoverer::FullConfigFetch),
-}
-
-/// The td-level [`UpdatesSink`]: the manager fan-outs land here as their
-/// slices land — the M.7.12 user-group intakes call into `user_manager`
-/// with its env (the M.3.9 manager convention), the message-family seams
-/// call the landed MessagesManager. Until then the trait defaults apply;
-/// the live update flow itself arrives with the net step (the session
-/// intake of `Td.cpp:404-408`), so the defaults are unobservable today.
-pub(crate) struct TdUpdatesSink;
-
-impl UpdatesSink for TdUpdatesSink {
-    /// `UserManager::on_get_users` — the users pre-application flips here
-    /// with the sink-state refactor (the ZST cannot reach the managers;
-    /// no live update flow exists before the net step, so nothing is
-    /// dropped today).
-    fn on_user(&mut self, _user: telegram_api::User) {}
-
-    /// `ChatManager::on_get_chats` — the M.5 flip, as `on_user`.
-    fn on_chat(&mut self, _chat: telegram_api::Chat) {}
-
-    /// `MessagesManager::process_pts_update` — the MessagesManager flip.
-    fn process_pts_update(&mut self, _update: PendingUpdate) {}
-
-    /// `MessagesManager::add_pending_channel_update` — the
-    /// MessagesManager flip.
-    fn add_pending_channel_update(
-        &mut self,
-        _peer: Option<telegram_api::Peer>,
-        _update: PendingUpdate,
-        _pts: i32,
-        _pts_count: i32,
-        _promise: Promise<()>,
-        _source: &str,
-    ) {
-    }
 }
 
 /// The [`UpdatesManagerEnv`] over the `Td` fields: built per drive with
@@ -586,7 +2277,7 @@ impl Td {
             premium_required_contact_merger: None,
             chat_manager: crate::chat_manager::ChatManager::new(),
             dialog_manager: DialogManager::new(),
-            updates_manager: UpdatesManager::new(TdUpdatesSink),
+            updates_manager: UpdatesManager::new(TdSink::default()),
             storage_manager: StorageManager::default(),
             file_manager,
             file_reference_manager: crate::files::FileReferenceManager::new(),
@@ -595,6 +2286,7 @@ impl Td {
             file_shared,
             use_message_database: false,
             use_file_database: false,
+            messages_manager: crate::messages_manager::MessagesManager::new(),
             stop_cnt: 2,
             deferred_results: Arc::new(Mutex::new(Vec::new())),
             bridge: None,
@@ -603,9 +2295,6 @@ impl Td {
             users: HashMap::new(),
             chats: HashMap::new(),
             peer_access: HashMap::new(),
-            next_local_message_id: -1,
-            pending_sends: HashMap::new(),
-            updates: UpdatesManager::new(TdSink::default()),
         }
     }
 
@@ -766,6 +2455,7 @@ impl Td {
         let chat_events = std::mem::take(&mut opened_database.chat_events);
         let channel_events = std::mem::take(&mut opened_database.channel_events);
         let dialog_manager_events = std::mem::take(&mut opened_database.dialog_manager_events);
+        let messages_manager_events = std::mem::take(&mut opened_database.messages_manager_events);
 
         if self.state == State::Close {
             // Close asynchronously opened database
@@ -1218,6 +2908,21 @@ impl Td {
         }
         for event in &dialog_manager_events {
             crate::dialog_manager::on_binlog_dialog_events(self, std::slice::from_ref(event));
+        }
+        // the `to_messages_manager` vector (Td.cpp:964-990 sends it to the
+        // MessagesManager actor; the port replays in place): the ported
+        // handler is the DeleteMessage binlog replay arm — the reopened
+        // engine re-applies the durable delete (MessagesManager.cpp:36248-36264).
+        for event in &messages_manager_events {
+            if event.type_ == tddb::td_db::LOG_EVENT_HANDLER_TYPE_DELETE_MESSAGE {
+                let mut manager = std::mem::take(&mut self.messages_manager);
+                crate::messages_manager::replay_delete_message_log_event(
+                    &mut self.global,
+                    &mut manager,
+                    event,
+                );
+                self.messages_manager = manager;
+            }
         }
         self.flush_user_updates();
 
@@ -3032,7 +4737,7 @@ impl Td {
                     my_id: self.user_manager.get_my_id().get(),
                     can_ignore_background_updates: self.can_ignore_background_updates,
                 };
-                self.updates
+                self.updates_manager
                     .on_get_updates_state(&mut env, m, "updates.getState");
             }
             bridge.mark_authorized();
@@ -3131,177 +4836,6 @@ impl Td {
         }
     }
 
-    /// The text `sendMessage` (MessagesManager.cpp:21721+): the temporary
-    /// local message (pending state) is answered synchronously; the wire
-    /// ack (`updateShortSentMessage` or the Updates container) completes
-    /// it with `updateMessageSendSucceeded`. The reply peer is a known
-    /// chat (the receive path created it).
-    pub(crate) fn on_send_message(&mut self, request_id: u64, args: td_api::sendMessage) {
-        if !self.auth_manager.is_authorized() {
-            return self.send_error_impl(request_id, 401, "Unauthorized");
-        }
-        if !self.chats.contains_key(&args.chat_id) {
-            return self.send_error_impl(request_id, 400, "Chat not found");
-        }
-        let text = match args.input_message_content.as_deref() {
-            Some(td_api::InputMessageContent::inputMessageText(content)) => content
-                .text
-                .as_ref()
-                .map(|formatted| formatted.text.clone())
-                .unwrap_or_default(),
-            _ => {
-                return self.send_error_impl(
-                    request_id,
-                    400,
-                    "Only text messages are supported by the walking skeleton",
-                );
-            }
-        };
-
-        let local_id = self.next_local_message_id;
-        self.next_local_message_id -= 1;
-        let random_id = nonzero_secure_i64();
-        let date = tdutils::time::now() as i32;
-        let temp = convert::message_object(&MessageSpec {
-            id: local_id,
-            chat_id: args.chat_id,
-            sender_user_id: self.my_id,
-            date,
-            text: text.clone(),
-            pending: true,
-            is_outgoing: true,
-        });
-        self.send_result(request_id, Object::message(temp));
-
-        self.pending_sends.insert(
-            random_id,
-            PendingSend {
-                local_id,
-                chat_id: args.chat_id,
-                text: text.clone(),
-            },
-        );
-
-        // The wire query (the C++ defers it to the next actor event; the
-        // observable stream is identical — the answer is already out).
-        let access_hash = self.peer_access.get(&args.chat_id).copied().unwrap_or(0);
-        let query =
-            telegram_api::Function::messages_sendMessage(telegram_api::messages_sendMessage {
-                flags: 0,
-                no_webpage: false,
-                silent: false,
-                background: false,
-                clear_draft: false,
-                noforwards: false,
-                update_stickersets_order: false,
-                invert_media: false,
-                allow_paid_floodskip: false,
-                peer: Some(Box::new(telegram_api::InputPeer::inputPeerUser(
-                    telegram_api::inputPeerUser {
-                        user_id: args.chat_id,
-                        access_hash,
-                    },
-                ))),
-                reply_to: None,
-                message: text.clone(),
-                random_id,
-                reply_markup: None,
-                entities: Vec::new(),
-                schedule_date: 0,
-                schedule_repeat_period: 0,
-                send_as: None,
-                quick_reply_shortcut: None,
-                effect: 0,
-                allow_paid_stars: 0,
-                rich_message: None,
-                suggested_post: None,
-            });
-        let Some(owner) = self.bridge.as_ref() else {
-            return;
-        };
-        let bridge = owner.handle();
-        match bridge.query(query) {
-            QueryAnswer::Ok(data) => {
-                if let Ok(answer) = telegram_api::Updates::parse(&data) {
-                    self.on_send_answer(random_id, answer);
-                }
-            }
-            QueryAnswer::Err(code, message) => {
-                self.on_send_failed(random_id, code, &message);
-            }
-        }
-    }
-
-    /// The `messages.sendMessage` ack: `updateShortSentMessage` (the plain
-    /// text case) completes the pending send; an Updates container goes
-    /// through the generic update path (its updateNewMessage carries the
-    /// final message).
-    fn on_send_answer(&mut self, random_id: i64, answer: telegram_api::Updates) {
-        match answer {
-            telegram_api::Updates::updateShortSentMessage(m) => {
-                self.complete_pending_send(random_id, m.id as i64, m.date);
-            }
-            other => {
-                // Container: process like a pushed update (the final
-                // message arrives as updateNewMessage with the real id).
-                let mut bytes = Vec::new();
-                other.store(&mut bytes);
-                self.on_net_update(bytes);
-            }
-        }
-    }
-
-    /// `on_send_message_success` + `send_update_message_send_succeeded`:
-    /// the final message (server id/date, no sending state) replaces the
-    /// temporary one.
-    fn complete_pending_send(&mut self, random_id: i64, message_id: i64, date: i32) {
-        let Some(pending) = self.pending_sends.remove(&random_id) else {
-            return;
-        };
-        let final_message = convert::message_object(&MessageSpec {
-            id: message_id,
-            chat_id: pending.chat_id,
-            sender_user_id: self.my_id,
-            date,
-            text: pending.text,
-            pending: false,
-            is_outgoing: true,
-        });
-        let old_message_id = pending.local_id;
-        self.send_update(Object::updateMessageSendSucceeded(
-            td_api::updateMessageSendSucceeded {
-                message: Some(final_message),
-                old_message_id,
-            },
-        ));
-    }
-
-    fn on_send_failed(&mut self, random_id: i64, code: i32, message: &str) {
-        let Some(pending) = self.pending_sends.remove(&random_id) else {
-            return;
-        };
-        let failed = convert::message_object(&MessageSpec {
-            id: pending.local_id,
-            chat_id: pending.chat_id,
-            sender_user_id: self.my_id,
-            date: tdutils::time::now() as i32,
-            text: pending.text,
-            pending: false,
-            is_outgoing: true,
-        });
-        let old_message_id = pending.local_id;
-        self.send_update(Object::updateMessageSendFailed(
-            td_api::updateMessageSendFailed {
-                message: Some(failed),
-                old_message_id,
-                error: Some(td_api::Error {
-                    code,
-                    message: message.to_string(),
-                }),
-            },
-        ));
-    }
-
     /// Creates the private chat for a peer when first needed and emits
     /// `updateNewChat` (the C++ `send_update_new_chat`).
     fn ensure_chat(&mut self, chat_id: i64) {
@@ -3343,14 +4877,14 @@ impl Td {
             my_id: self.user_manager.get_my_id().get(),
             can_ignore_background_updates: self.can_ignore_background_updates,
         };
-        self.updates
+        self.updates_manager
             .on_get_updates(&mut env, umbrella, Promise::default());
         self.drain_sink();
     }
 
     /// Converts and emits what the sink collected.
     fn drain_sink(&mut self) {
-        let sink = std::mem::take(self.updates.sink());
+        let sink = std::mem::take(self.updates_manager.sink());
         for user in &sink.users {
             if let telegram_api::User::user(user) = user {
                 self.peer_access.insert(user.id, user.access_hash);
@@ -3364,43 +4898,242 @@ impl Td {
                 }
             }
         }
-        for message in &sink.new_messages {
-            self.apply_new_message(message);
+        for (message, source) in &sink.new_messages {
+            self.apply_new_message(message, source);
+        }
+        for (message, pts) in &sink.edits {
+            self.apply_edit_message(message, *pts);
+        }
+        for messages in &sink.deletions {
+            self.apply_delete_messages(messages);
+        }
+        for (peer, max_id, top_msg_id) in &sink.reads_inbox {
+            self.apply_read_history_inbox(peer, *max_id, *top_msg_id);
+        }
+        for (peer, max_id) in &sink.reads_outbox {
+            self.apply_read_history_outbox(peer, *max_id);
         }
     }
 
-    /// The receive path for a wire `updateNewMessage` (the container
-    /// users/chats were collected into the sink first): the fresh dialog
-    /// emits `updateNewChat`, then `updateNewMessage`. The sender's access
-    /// hash is remembered for the reply peer.
-    fn apply_new_message(&mut self, message: &telegram_api::Message) {
-        let telegram_api::Message::message(m) = message else {
+    /// The receive path for `updateDeleteMessages` (the M.10.6 delete
+    /// path): the server ids run through the manager's
+    /// `delete_messages_from_updates` — the rows resolve through the
+    /// message-db unique-id load and the durable deletes land through the
+    /// M.10.2 binlog spine. The `updateDeleteMessages` emission is the
+    /// update-plane seam.
+    fn apply_delete_messages(&mut self, messages: &[i32]) {
+        let message_ids: Vec<crate::messages_manager::MessageId> = messages
+            .iter()
+            .map(|&id| {
+                crate::messages_manager::MessageId::from_server_message_id(
+                    crate::messages_manager::ServerMessageId::new(id),
+                )
+            })
+            .collect();
+        let mut manager = std::mem::take(&mut self.messages_manager);
+        let _deleted = crate::messages_manager::delete_messages_from_updates(
+            &mut self.global,
+            &mut manager,
+            &message_ids,
+            true,
+        );
+        self.messages_manager = manager;
+    }
+
+    /// The receive path for a wire `updateNewMessage`/`updateNewChannelMessage`
+    /// (the container users/chats were collected into the sink first): the
+    /// full M.10.3 intake — `parse_telegram_api_message` → `create_message` →
+    /// `fix_new_message` — runs through the M.10.2c manager, and the
+    /// emitted object is the M.10.4 `get_message_object` builder. The
+    /// M.9.18 flip (wire media through `get_message_content`) now lives at
+    /// its C++ call position inside `parse_telegram_api_message`.
+    fn apply_new_message(&mut self, message: &telegram_api::Message, source: &str) {
+        // The complete receive head (MessagesManager.cpp:11921-12107) over
+        // the M.10.2c manager: parse → create → add_message_to_dialog with
+        // the ordered insert, the counter maintenance and the
+        // updateNewMessage emission inside. The five views alias one Td —
+        // the sequential-call discipline of `split_context_alias` (no
+        // take/restore: the ctx reads must see the real manager/global).
+        // SAFETY: every alias below derives from `td_ptr` and the callee
+        // uses them strictly one at a time.
+        let td_ptr = std::ptr::from_mut(self);
+        let ctx: &mut dyn crate::messages_manager::MessageObjectContext = unsafe { &mut *td_ptr };
+        let message_info = crate::messages_manager::parse_telegram_api_message(
+            ctx,
+            message.clone(),
+            false,
+            false,
+            source,
+        );
+        // `add_new_dialog` emits `updateNewChat` for the fresh dialog
+        // (MessagesManager.cpp:33079+); the walking skeleton maps user
+        // dialogs to its chat objects, the other dialog kinds ride the
+        // ChatManager chat-object wiring.
+        if message_info.dialog_id.get_type() == crate::messages_manager::DialogType::User {
+            self.ensure_chat(message_info.dialog_id.get_user_id().get());
+        }
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let global: &mut crate::global::Global = unsafe { &mut (*td_ptr).global };
+        let state: &mut dyn crate::messages_manager::ReadStateContext =
+            unsafe { crate::td::split_context_alias(td_ptr) };
+        let ctx: &mut dyn crate::messages_manager::MessageObjectContext = unsafe { &mut *td_ptr };
+        let send_ctx: &dyn crate::messages_manager::SendMessageContext = unsafe { &*td_ptr };
+        crate::messages_manager::on_get_message_full(
+            global,
+            manager,
+            ctx,
+            send_ctx,
+            state,
+            message_info,
+            true,
+            "updateNewMessage",
+        );
+    }
+
+    /// The receive path for `updateEditMessage` (MessagesManager.cpp:5860):
+    /// `had_message` in memory, the complete receive head with
+    /// `from_update = false`, then the M.10.5 edit intake.
+    fn apply_edit_message(&mut self, message: &telegram_api::Message, pts: i32) {
+        let td_ptr = std::ptr::from_mut(self);
+        // SAFETY: as apply_new_message.
+        let ctx: &mut dyn crate::messages_manager::MessageObjectContext = unsafe { &mut *td_ptr };
+        let message_info = crate::messages_manager::parse_telegram_api_message(
+            ctx,
+            message.clone(),
+            false,
+            false,
+            "updateEditMessage",
+        );
+        let dialog_id = message_info.dialog_id;
+        let message_id = message_info.message_id;
+        // `have_message_force`'s database leg is the message-db seam — the
+        // in-memory probe answers
+        let had_message = unsafe { &*td_ptr }
+            .messages_manager
+            .get_dialog(dialog_id)
+            .is_some_and(|d| crate::messages_manager::have_message_in_dialog_memory(d, message_id));
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let global: &mut crate::global::Global = unsafe { &mut (*td_ptr).global };
+        let state: &mut dyn crate::messages_manager::ReadStateContext =
+            unsafe { crate::td::split_context_alias(td_ptr) };
+        let ctx: &mut dyn crate::messages_manager::MessageObjectContext = unsafe { &mut *td_ptr };
+        let send_ctx: &dyn crate::messages_manager::SendMessageContext = unsafe { &*td_ptr };
+        let full_id = crate::messages_manager::on_get_message_full(
+            global,
+            manager,
+            ctx,
+            send_ctx,
+            state,
+            message_info,
+            false,
+            "updateEditMessage",
+        );
+        if full_id.get_dialog_id() != crate::messages_manager::DialogId::default() {
+            let is_bot = self.auth_manager.is_bot();
+            let mut m = self
+                .messages_manager
+                .get_dialog_mut(dialog_id)
+                .and_then(|d| d.messages.remove(&message_id));
+            if let Some(m) = m.as_mut() {
+                let send_edited = crate::messages_manager::on_message_edited(
+                    &mut self.messages_manager,
+                    dialog_id,
+                    m,
+                    pts,
+                    had_message,
+                    is_bot,
+                );
+                if send_edited {
+                    // `send_update_message_edited` (MessagesManager.cpp:
+                    // 5985-6014's emission half)
+                    let edit_date = crate::messages_manager::get_message_shown_edit_date(m);
+                    let reply_markup = m
+                        .reply_markup
+                        .as_ref()
+                        .and_then(|reply_markup| reply_markup.get_reply_markup_object(self));
+                    self.send_update(Object::updateMessageEdited(td_api::updateMessageEdited {
+                        chat_id: dialog_id.get(),
+                        message_id: message_id.get(),
+                        edit_date,
+                        reply_markup,
+                    }));
+                }
+            }
+            if let Some(m) = m {
+                self.messages_manager
+                    .get_dialog_mut(dialog_id)
+                    .and_then(|d| d.messages.insert(message_id, m));
+            }
+        }
+    }
+
+    /// The receive path for `updateReadHistoryInbox`
+    /// (MessagesManager.cpp:5885-5901): the folder read is the M.6 dialog
+    /// seam and the forum `top_msg_id` arm the topic-manager seam — the
+    /// plain arm runs the M.10.7 intake.
+    fn apply_read_history_inbox(
+        &mut self,
+        peer: &telegram_api::Peer,
+        max_id: i32,
+        top_msg_id: i32,
+    ) {
+        if top_msg_id != 0 {
+            // `on_update_forum_topic_unread` — the ForumTopicManager seam
             return;
-        };
-        let Some(telegram_api::Peer::peerUser(peer)) = m.peer_id.as_ref() else {
+        }
+        let dialog_id = crate::messages_manager::DialogId::from_peer(peer);
+        if !dialog_id.is_valid() {
             return;
-        };
-        // The walking-skeleton receive surface: a private incoming
-        // message. Bot sessions carry no `from_id` — the container users
-        // hold the sender, and the peer IS the sender here (the S76
-        // corpus peer).
-        let chat_id = peer.user_id;
-        self.ensure_chat(chat_id);
-        let message_id = m.id as i64;
-        let date = m.date;
-        let text = wire_message_text(m);
-        let final_message = convert::message_object(&MessageSpec {
-            id: message_id,
-            chat_id,
-            sender_user_id: chat_id,
-            date,
-            text,
-            pending: false,
-            is_outgoing: false,
-        });
-        self.send_update(Object::updateNewMessage(td_api::updateNewMessage {
-            message: Some(final_message),
-        }));
+        }
+        let last_read_inbox_message_id = crate::messages_manager::MessageId::from_server_message_id(
+            crate::messages_manager::ServerMessageId::new(max_id),
+        );
+        // SAFETY: the alias pair derives from `td_ptr`; the callee uses
+        // them strictly one at a time.
+        let td_ptr = std::ptr::from_mut(self);
+        let state: &mut dyn crate::messages_manager::ReadStateContext =
+            unsafe { crate::td::split_context_alias(td_ptr) };
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let ctx: &dyn crate::messages_manager::MessageObjectContext = unsafe { &*td_ptr };
+        crate::messages_manager::read_history_inbox(
+            manager,
+            ctx,
+            state,
+            dialog_id,
+            last_read_inbox_message_id,
+            -1,
+            "updateReadHistoryInbox",
+        );
+    }
+
+    /// The receive path for `updateReadHistoryOutbox`
+    /// (MessagesManager.cpp:5903-5910).
+    fn apply_read_history_outbox(&mut self, peer: &telegram_api::Peer, max_id: i32) {
+        let dialog_id = crate::messages_manager::DialogId::from_peer(peer);
+        if !dialog_id.is_valid() {
+            return;
+        }
+        let max_message_id = crate::messages_manager::MessageId::from_server_message_id(
+            crate::messages_manager::ServerMessageId::new(max_id),
+        );
+        // SAFETY: as apply_read_history_inbox.
+        let td_ptr = std::ptr::from_mut(self);
+        let state: &mut dyn crate::messages_manager::ReadStateContext =
+            unsafe { crate::td::split_context_alias(td_ptr) };
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let ctx: &dyn crate::messages_manager::MessageObjectContext = unsafe { &*td_ptr };
+        crate::messages_manager::read_history_outbox(
+            manager,
+            ctx,
+            state,
+            dialog_id,
+            max_message_id,
+            0,
+        );
     }
 
     /// `Td` close: dropping the callback sends the close notification; the
@@ -4705,12 +6438,6 @@ impl FileLoadNetFactory for TdFileLoadNetFactory {
     }
 }
 
-/// `get_message_text` for the plain-text shape (the walking-skeleton
-/// messages carry no media).
-fn wire_message_text(message: &telegram_api::message) -> String {
-    message.message.clone()
-}
-
 /// Parses a top-level boxed `Vector<user>` (the `users.getUsers` result).
 fn parse_vector_user(data: &[u8]) -> Option<Vec<telegram_api::user>> {
     let mut reader = telegram_api::tl::Reader::new(data);
@@ -4725,16 +6452,6 @@ fn parse_vector_user(data: &[u8]) -> Option<Vec<telegram_api::user>> {
         }
     }
     Some(users)
-}
-
-/// A non-zero secure i64 (`MessagesManager::generate_new_random_id`).
-fn nonzero_secure_i64() -> i64 {
-    loop {
-        let value = tdutils::random::secure_uint64() as i64;
-        if value != 0 {
-            return value;
-        }
-    }
 }
 
 actor_messages! {
@@ -6048,6 +7765,146 @@ mod tests {
             tdactor::send_closure_later(actor, TdMessage::ConfigQueryResult { query, result });
         }
         let _ = scheduler.run_main(0.01);
+    }
+
+    /// The M.10.20 read-family flips through the real dispatcher: the
+    /// local lookups over an empty manager state (the null-result 404 and
+    /// the C++ "Chat not found" table).
+    #[test]
+    fn m10_20_read_family_arms() {
+        // the deep debug frames of the history walk carry the 32 KB
+        // td_api::Object — run the body on a big-stack thread
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(m10_20_read_family_arms_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn m10_20_read_family_arms_impl() {
+        let callback = CollectCallback::default();
+        let dir = temp_db_dir("m10-20-reads");
+        let db_dir = dir.clone();
+        let mut td = Td::new(Box::new(CollectCallback {
+            responses: callback.responses.clone(),
+            errors: callback.errors.clone(),
+        }));
+        let Function::setTdlibParameters(parameters) = set_tdlib_parameters(db_dir, false) else {
+            unreachable!("setTdlibParameters helper");
+        };
+        td.on_set_tdlib_parameters(20, parameters);
+        assert_eq!(td.state, State::Run);
+        td.auth_manager.force_authorized_for_test();
+
+        // getMessageLocally: no dialog → the null-result 404
+        td.request(
+            101,
+            Function::getMessageLocally(td_api::getMessageLocally {
+                chat_id: 1,
+                message_id: 100,
+            }),
+        );
+        // the null-result 404 rides the response channel (the C++
+        // `Td::send_result(nullptr)` shape)
+        assert!(responses_of(&callback, 101).iter().any(|object| matches!(
+            object,
+            Object::error(e) if e.code == 404 && e.message == "Not Found"
+        )));
+
+        // getMessageLink: no dialog → the C++ 400
+        td.request(
+            102,
+            Function::getMessageLink(td_api::getMessageLink {
+                chat_id: 1,
+                message_id: 100,
+                media_timestamp: 0,
+                checklist_task_id: 0,
+                poll_option_id: String::new(),
+                for_album: false,
+                in_message_thread: false,
+            }),
+        );
+        let error = error_of(&callback, 102);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Chat not found");
+
+        // getMessageEmbeddingCode: the same local table
+        td.request(
+            103,
+            Function::getMessageEmbeddingCode(td_api::getMessageEmbeddingCode {
+                chat_id: 1,
+                message_id: 100,
+                for_album: false,
+            }),
+        );
+        let error = error_of(&callback, 103);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Chat not found");
+
+        // getChatHistory: the split-context adapter — the same local table
+        td.request(
+            104,
+            Function::getChatHistory(td_api::getChatHistory {
+                chat_id: 1,
+                from_message_id: 0,
+                offset: 0,
+                limit: 10,
+                only_local: false,
+            }),
+        );
+        let error = error_of(&callback, 104);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Chat not found");
+        // the manager survived the take/restore
+        assert!(td.messages_manager.dialogs.is_empty());
+
+        // getChatMessageByDate: same
+        td.request(
+            105,
+            Function::getChatMessageByDate(td_api::getChatMessageByDate {
+                chat_id: 1,
+                date: 1700000000,
+            }),
+        );
+        let error = error_of(&callback, 105);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Chat not found");
+
+        // the write family: the same local table through the aliasing
+        // adapter (openChat/closeChat/viewMessages are user-gated,
+        // deleteMessages is not in the C++)
+        for (id, function) in [
+            (106, Function::openChat(td_api::openChat { chat_id: 1 })),
+            (107, Function::closeChat(td_api::closeChat { chat_id: 1 })),
+            (
+                108,
+                Function::viewMessages(td_api::viewMessages {
+                    chat_id: 1,
+                    message_ids: vec![100],
+                    source: None,
+                    force_read: false,
+                }),
+            ),
+            (
+                109,
+                Function::deleteMessages(td_api::deleteMessages {
+                    chat_id: 1,
+                    message_ids: vec![100],
+                    revoke: false,
+                }),
+            ),
+        ] {
+            td.request(id, function);
+            let error = error_of(&callback, id);
+            assert_eq!(error.code, 400);
+            assert_eq!(error.message, "Chat not found");
+        }
+        // the manager survived every take/restore
+        assert!(td.messages_manager.dialogs.is_empty());
+
+        td.close_impl(false);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The ConfigManager step gate, white-box: `setTdlibParameters` runs the

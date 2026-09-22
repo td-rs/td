@@ -104,7 +104,7 @@ clickChatSponsoredMessage	interim
 clickPremiumSubscriptionButton	interim
 clickVideoMessageAdvertisement	interim
 close	dispatched
-closeChat	interim
+closeChat	dispatched
 closeGiftAuction	interim
 closeSecretChat	interim
 closeStory	interim
@@ -179,7 +179,7 @@ deleteGroupCallMessagesBySender	interim
 deleteLanguagePack	interim
 deleteMessageEphemeralContent	interim
 deleteMessageReactionsFromSender	interim
-deleteMessages	interim
+deleteMessages	dispatched
 deletePassportElement	interim
 deletePollOption	interim
 deleteProfilePhoto	interim
@@ -306,7 +306,7 @@ getChatFolderChatsToLeave	interim
 getChatFolderDefaultIconName	interim
 getChatFolderInviteLinks	interim
 getChatFolderNewChats	interim
-getChatHistory	interim
+getChatHistory	dispatched
 getChatInviteLink	interim
 getChatInviteLinkCounts	interim
 getChatInviteLinkMembers	interim
@@ -314,7 +314,7 @@ getChatInviteLinks	interim
 getChatJoinRequests	interim
 getChatListsToAddChat	interim
 getChatMember	interim
-getChatMessageByDate	interim
+getChatMessageByDate	dispatched
 getChatMessageCalendar	interim
 getChatMessageCount	interim
 getChatMessagePosition	interim
@@ -439,12 +439,12 @@ getMessageAddedReactions	interim
 getMessageAuthor	interim
 getMessageAvailableReactions	interim
 getMessageEffect	interim
-getMessageEmbeddingCode	interim
+getMessageEmbeddingCode	dispatched
 getMessageFileType	interim
 getMessageImportConfirmationText	interim
-getMessageLink	interim
+getMessageLink	dispatched
 getMessageLinkInfo	interim
-getMessageLocally	interim
+getMessageLocally	dispatched
 getMessageProperties	interim
 getMessagePublicForwards	interim
 getMessageReadDate	interim
@@ -608,7 +608,7 @@ loadSavedMessagesTopics	interim
 logOut	interim
 markChecklistTasksAsDone	interim
 openBotSimilarBot	interim
-openChat	interim
+openChat	dispatched
 openChatSimilarChat	interim
 openGiftAuction	interim
 openMessageContent	interim
@@ -776,7 +776,7 @@ sendGiftPurchaseOffer	interim
 sendGroupCallMessage	interim
 sendInlineQueryResultMessage	interim
 sendMessage	dispatched
-sendMessageAlbum	interim
+sendMessageAlbum	dispatched
 sendMessageViewMetrics	interim
 sendPassportAuthorizationForm	interim
 sendPaymentForm	interim
@@ -826,7 +826,7 @@ setChatClientData	interim
 setChatDescription	dispatched
 setChatDirectMessagesGroup	interim
 setChatDiscussionGroup	interim
-setChatDraftMessage	interim
+setChatDraftMessage	dispatched
 setChatEmojiStatus	interim
 setChatLocation	dispatched
 setChatMemberStatus	interim
@@ -1014,7 +1014,7 @@ upgradeBasicGroupChatToSupergroupChat	dispatched
 upgradeGift	interim
 uploadStickerFile	interim
 validateOrderInfo	interim
-viewMessages	interim
+viewMessages	dispatched
 viewPremiumFeature	interim
 viewSponsoredChat	interim
 viewTrendingStickerSets	interim

@@ -96,6 +96,21 @@ impl ChannelId {
     pub fn get(self) -> i64 {
         self.0
     }
+
+    /// `ChannelId::store` (ChannelId.h:56-58) — the raw id as int64.
+    pub fn store(self, out: &mut Vec<u8>) {
+        crate::store_parse::store_i64(out, self.0);
+    }
+
+    /// `ChannelId::parse` (ChannelId.h:60-67) — int64 from
+    /// `Version::Support64BitIds` (33) on, int32 before.
+    pub fn parse_from(parser: &mut crate::store_parse::Parser) -> Result<ChannelId, &'static str> {
+        if parser.version() >= crate::store_parse::version::SUPPORT_64_BIT_IDS {
+            Ok(ChannelId(parser.i64_()?))
+        } else {
+            Ok(ChannelId(parser.i32_()? as i64))
+        }
+    }
 }
 
 /// `td::ChannelType` (ChannelType.h) — the uint8 `Broadcast`/`Megagroup`/

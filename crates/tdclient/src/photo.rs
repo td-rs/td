@@ -85,14 +85,16 @@ pub enum StickerPhotoSizeType {
     CustomEmoji,
 }
 
-/// `td::StickerPhotoSize` (StickerPhotoSize.h:20).
+/// `td::StickerPhotoSize` (StickerPhotoSize.h:20). The fields are
+/// crate-visible for the member-style `parse` (the C++ parse is a
+/// member template doing the same).
 #[derive(Clone, Debug, PartialEq)]
 pub struct StickerPhotoSize {
-    type_: StickerPhotoSizeType,
-    custom_emoji_id: i64,
-    sticker_set_id: i64,
-    sticker_id: i64,
-    background_colors: Vec<i32>,
+    pub(crate) type_: StickerPhotoSizeType,
+    pub(crate) custom_emoji_id: i64,
+    pub(crate) sticker_set_id: i64,
+    pub(crate) sticker_id: i64,
+    pub(crate) background_colors: Vec<i32>,
 }
 
 impl StickerPhotoSize {
@@ -102,6 +104,41 @@ impl StickerPhotoSize {
     /// stand-in until the StickersManager step: only `inputStickerSetID`
     /// yields an id, every other InputStickerSet form is "invalid" and
     /// drops the size like the C++ validity check does.
+    /// `StickerPhotoSize::get_type` (StickerPhotoSize.h).
+    pub fn get_type(&self) -> StickerPhotoSizeType {
+        self.type_
+    }
+
+    pub fn get_custom_emoji_id(&self) -> i64 {
+        self.custom_emoji_id
+    }
+
+    pub fn get_sticker_set_id(&self) -> i64 {
+        self.sticker_set_id
+    }
+
+    pub fn get_sticker_id(&self) -> i64 {
+        self.sticker_id
+    }
+
+    pub fn get_background_colors(&self) -> &[i32] {
+        &self.background_colors
+    }
+}
+
+impl Default for StickerPhotoSize {
+    fn default() -> Self {
+        StickerPhotoSize {
+            type_: StickerPhotoSizeType::CustomEmoji,
+            custom_emoji_id: 0,
+            sticker_set_id: 0,
+            sticker_id: 0,
+            background_colors: Vec::new(),
+        }
+    }
+}
+
+impl StickerPhotoSize {
     pub fn get_sticker_photo_size(size_ptr: telegram_api::VideoSize) -> Option<StickerPhotoSize> {
         let mut result = StickerPhotoSize {
             type_: StickerPhotoSizeType::CustomEmoji,
@@ -138,6 +175,47 @@ impl StickerPhotoSize {
             *color &= 0xFFFFFF;
         }
         Some(result)
+    }
+
+    /// `StickerPhotoSize::store` (StickerPhotoSize.hpp:16-30).
+    pub fn store(&self, out: &mut Vec<u8>) {
+        let is_custom_emoji = self.type_ == StickerPhotoSizeType::CustomEmoji;
+        let is_sticker = self.type_ == StickerPhotoSizeType::Sticker;
+        crate::store_parse::store_flags(out, [is_custom_emoji, is_sticker]);
+        if is_custom_emoji {
+            crate::store_parse::store_i64(out, self.custom_emoji_id);
+        } else if is_sticker {
+            crate::store_parse::store_i64(out, self.sticker_set_id);
+            crate::store_parse::store_i64(out, self.sticker_id);
+        }
+        crate::store_parse::store_i32_vec(out, &self.background_colors);
+    }
+
+    /// `StickerPhotoSize::parse` (StickerPhotoSize.hpp:33-51). The C++
+    /// `UNREACHABLE()` on an all-zero flag block becomes an error (the
+    /// parser state is corrupted; the C++ would abort).
+    pub fn parse_from(
+        parser: &mut crate::store_parse::Parser,
+    ) -> Result<StickerPhotoSize, &'static str> {
+        let flags = parser.parse_flags::<2>()?;
+        let (type_, custom_emoji_id, sticker_set_id, sticker_id) = if flags[0] {
+            let id = parser.i64_()?;
+            (StickerPhotoSizeType::CustomEmoji, id, 0, 0)
+        } else if flags[1] {
+            let set_id = parser.i64_()?;
+            let sticker_id = parser.i64_()?;
+            (StickerPhotoSizeType::Sticker, 0, set_id, sticker_id)
+        } else {
+            return Err("StickerPhotoSize: unreachable type");
+        };
+        let background_colors = parser.i32_vec()?;
+        Ok(StickerPhotoSize {
+            type_,
+            custom_emoji_id,
+            sticker_set_id,
+            sticker_id,
+            background_colors,
+        })
     }
 
     /// `StickerPhotoSize::get_chat_photo_sticker_object`
@@ -189,8 +267,8 @@ impl StickerPhotoSize {
 }
 
 /// `td::Photo` (Photo.h:32). The empty id sentinel is the
-/// `MovableValue<int64, -2>` default; `sticker_file_ids` stays out until
-/// the Files step (nothing in the listing path reads it).
+/// `MovableValue<int64, -2>` default; `sticker_file_ids` (Photo.h:39)
+/// joins now that the Files step landed its `FileId`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Photo {
     pub id: i64,
@@ -200,6 +278,7 @@ pub struct Photo {
     pub animations: Vec<AnimationSize>,
     pub sticker_photo_size: Option<StickerPhotoSize>,
     pub has_stickers: bool,
+    pub sticker_file_ids: Vec<FileId>,
 }
 
 impl Default for Photo {
@@ -212,6 +291,7 @@ impl Default for Photo {
             animations: Vec::new(),
             sticker_photo_size: None,
             has_stickers: false,
+            sticker_file_ids: Vec::new(),
         }
     }
 }
@@ -230,6 +310,15 @@ pub fn photo_get_file_ids(photo: &Photo) -> Vec<FileId> {
     let mut file_ids = Vec::new();
     photo_append_file_ids(photo, &mut file_ids);
     file_ids
+}
+
+/// `get_photo_any_file_id` (Photo.cpp:451-457) — the file id of the last
+/// size, i.e. the best full representation.
+pub fn get_photo_any_file_id(photo: &Photo) -> FileId {
+    if let Some(last) = photo.photos.last() {
+        return last.file_id;
+    }
+    FileId::default()
 }
 
 /// `photo_append_file_ids` (Photo.cpp:440).
@@ -898,6 +987,7 @@ mod tests {
             animations: Vec::new(),
             sticker_photo_size: None,
             has_stickers: false,
+            sticker_file_ids: Vec::new(),
         };
         let object = get_chat_photo_object(&photo);
         assert_eq!(object.id, 42);
