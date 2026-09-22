@@ -23,6 +23,7 @@
 //!   `Contact`s directly.
 
 use crate::store_parse;
+use crate::td_api;
 use crate::user_manager::UserId;
 use tdutils::status::Status;
 
@@ -104,6 +105,24 @@ impl Contact {
 
     pub fn get_last_name(&self) -> &str {
         &self.last_name
+    }
+
+    /// `Contact::get_vcard` (Contact.h:83).
+    pub fn get_vcard(&self) -> &str {
+        &self.vcard
+    }
+
+    /// `Contact::get_contact_object` (Contact.cpp:142-149) — the td_api
+    /// builder (the M.21 InlineQueriesManager intake is the consumer that
+    /// needs it before the net step).
+    pub fn get_contact_object(&self) -> td_api::Contact {
+        td_api::Contact {
+            phone_number: self.phone_number.clone(),
+            first_name: self.first_name.clone(),
+            last_name: self.last_name.clone(),
+            vcard: self.vcard.clone(),
+            user_id: self.user_id.get(),
+        }
     }
 
     /// `Contact::store` (Contact.h:87-108) — the flag block gates the

@@ -3402,6 +3402,51 @@ impl Location {
             access_hash_,
         })
     }
+
+    /// `Location::get_latitude` (Location.h:62-64).
+    pub fn get_latitude(&self) -> f64 {
+        self.latitude_
+    }
+
+    /// `Location::get_longitude` (Location.h:66-68).
+    pub fn get_longitude(&self) -> f64 {
+        self.longitude_
+    }
+
+    /// `Location::get_location_object` (Location.cpp:83-89) — the td_api
+    /// builder; `None` is the C++ null for an empty location.
+    pub fn get_location_object(&self) -> Option<td_api::Location> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(td_api::Location {
+            latitude: self.latitude_,
+            longitude: self.longitude_,
+            horizontal_accuracy: self.horizontal_accuracy_,
+        })
+    }
+
+    /// `Location::get_input_geo_point` (Location.cpp:90-103) — the wire
+    /// input form; an empty location answers `inputGeoPointEmpty` like
+    /// the C++ null pointer dereference guard allows.
+    pub fn get_input_geo_point(&self) -> telegram_api::InputGeoPoint {
+        if self.is_empty() {
+            return telegram_api::InputGeoPoint::inputGeoPointEmpty(
+                telegram_api::inputGeoPointEmpty {},
+            );
+        }
+        let has_accuracy_radius = self.horizontal_accuracy_ > 0.0;
+        let mut flags = 0;
+        if has_accuracy_radius {
+            flags |= 1; // ACCURACY_RADIUS_MASK (flags.0)
+        }
+        telegram_api::InputGeoPoint::inputGeoPoint(telegram_api::inputGeoPoint {
+            flags,
+            lat: self.latitude_,
+            long: self.longitude_,
+            accuracy_radius: self.horizontal_accuracy_.ceil() as i32,
+        })
+    }
 }
 
 /// `td::DialogLocation` (DialogLocation.{h,cpp}) — a chat/channel location

@@ -41,8 +41,8 @@ allowUnpaidMessagesFromUser	interim
 answerCallbackQuery	interim
 answerChatJoinRequestQuery	interim
 answerCustomQuery	interim
-answerGuestQuery	interim
-answerInlineQuery	interim
+answerGuestQuery	dispatched
+answerInlineQuery	dispatched
 answerPreCheckoutQuery	interim
 answerShippingQuery	interim
 answerWebAppQuery	interim
@@ -222,11 +222,11 @@ editCustomLanguagePackInfo	interim
 editEphemeralMessage	interim
 editEphemeralMessageCaption	interim
 editForumTopic	interim
-editInlineMessageCaption	interim
-editInlineMessageLiveLocation	interim
-editInlineMessageMedia	interim
-editInlineMessageReplyMarkup	interim
-editInlineMessageText	interim
+editInlineMessageCaption	dispatched
+editInlineMessageLiveLocation	dispatched
+editInlineMessageMedia	dispatched
+editInlineMessageReplyMarkup	dispatched
+editInlineMessageText	dispatched
 editMessageCaption	interim
 editMessageChecklist	interim
 editMessageLiveLocation	interim
@@ -349,7 +349,7 @@ getCountryCode	interim
 getCountryFlagEmoji	interim
 getCreatedPublicChats	interim
 getCurrentState	dispatched
-getCurrentWeather	interim
+getCurrentWeather	dispatched
 getCustomEmojiReactionAnimations	interim
 getCustomEmojiStickers	interim
 getDatabaseStatistics	dispatched
@@ -401,8 +401,8 @@ getGroupsInCommon	interim
 getGuardBotWebAppUrl	interim
 getImportedContactCount	dispatched
 getInactiveSupergroupChats	interim
-getInlineGameHighScores	interim
-getInlineQueryResults	interim
+getInlineGameHighScores	dispatched
+getInlineQueryResults	dispatched
 getInstalledBackgrounds	interim
 getInstalledStickerSets	interim
 getInternalLink	interim
@@ -482,7 +482,7 @@ getPremiumLimit	interim
 getPremiumState	interim
 getPremiumStickerExamples	interim
 getPremiumStickers	interim
-getPreparedInlineMessage	interim
+getPreparedInlineMessage	dispatched
 getPreparedKeyboardButton	interim
 getProxies	interim
 getPublicPostSearchLimits	interim
@@ -720,7 +720,7 @@ reuseStarSubscription	interim
 revokeChatInviteLink	interim
 revokeGroupCallInviteLink	interim
 saveApplicationLogEvent	interim
-savePreparedInlineMessage	interim
+savePreparedInlineMessage	dispatched
 savePreparedKeyboardButton	interim
 searchAffiliatePrograms	interim
 searchBackground	interim
@@ -866,7 +866,7 @@ setGroupCallPaidMessageStarCount	interim
 setGroupCallParticipantIsSpeaking	interim
 setGroupCallParticipantVolumeLevel	interim
 setInactiveSessionTtl	interim
-setInlineGameScore	interim
+setInlineGameScore	dispatched
 setLiveStoryMessageSender	interim
 setLogStream	sync
 setLogTagVerbosityLevel	sync

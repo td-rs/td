@@ -692,6 +692,262 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             };
             search_contacts_request(td, id, query, request.limit);
         }
+        // --- the inline set (M.21): Requests.cpp:4342-4386, 4917-4941,
+        // 8195-8233, 4737-4740. The managers validate; the net query tails park
+        // the promises unanswered offline, exactly like the C++ request without
+        // a network ---
+        Function::editInlineMessageText(request) => {
+            // Requests.cpp:4342-4348
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(inline_message_id) = clean_or_utf8_error(td, id, &request.inline_message_id)
+            else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, _, inline_message_manager) = crate::td::inline_env_split(td);
+            inline_message_manager.edit_inline_message_text(
+                &mut env,
+                &inline_message_id,
+                request.reply_markup,
+                request.input_message_content,
+                promise,
+            );
+        }
+        Function::editInlineMessageLiveLocation(request) => {
+            // Requests.cpp:4350-4356
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(inline_message_id) = clean_or_utf8_error(td, id, &request.inline_message_id)
+            else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, _, inline_message_manager) = crate::td::inline_env_split(td);
+            inline_message_manager.edit_inline_message_live_location(
+                &mut env,
+                &inline_message_id,
+                request.reply_markup,
+                request.location,
+                promise,
+            );
+        }
+        Function::editInlineMessageMedia(request) => {
+            // Requests.cpp:4358-4365
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(inline_message_id) = clean_or_utf8_error(td, id, &request.inline_message_id)
+            else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, _, inline_message_manager) = crate::td::inline_env_split(td);
+            inline_message_manager.edit_inline_message_media(
+                &mut env,
+                &inline_message_id,
+                request.reply_markup,
+                request.input_message_content,
+                promise,
+            );
+        }
+        Function::editInlineMessageCaption(request) => {
+            // Requests.cpp:4367-4374
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(inline_message_id) = clean_or_utf8_error(td, id, &request.inline_message_id)
+            else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, _, inline_message_manager) = crate::td::inline_env_split(td);
+            inline_message_manager.edit_inline_message_caption(
+                &mut env,
+                &inline_message_id,
+                request.reply_markup,
+                request.caption,
+                request.show_caption_above_media,
+                promise,
+            );
+        }
+        Function::editInlineMessageReplyMarkup(request) => {
+            // Requests.cpp:4376-4382
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(inline_message_id) = clean_or_utf8_error(td, id, &request.inline_message_id)
+            else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, _, inline_message_manager) = crate::td::inline_env_split(td);
+            inline_message_manager.edit_inline_message_reply_markup(
+                &mut env,
+                &inline_message_id,
+                request.reply_markup,
+                promise,
+            );
+        }
+        Function::setInlineGameScore(request) => {
+            // Requests.cpp:4919-4927
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(inline_message_id) = clean_or_utf8_error(td, id, &request.inline_message_id)
+            else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, _, inline_message_manager) = crate::td::inline_env_split(td);
+            inline_message_manager.set_inline_game_score(
+                &mut env,
+                &inline_message_id,
+                request.edit_message,
+                crate::user_manager::UserId::new(request.user_id),
+                request.score,
+                request.force,
+                promise,
+            );
+        }
+        Function::getInlineGameHighScores(request) => {
+            // Requests.cpp:4931-4938
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(inline_message_id) = clean_or_utf8_error(td, id, &request.inline_message_id)
+            else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<crate::td_api::GameHighScores, _>(id, Object::gameHighScores);
+            let (mut env, _, inline_message_manager) = crate::td::inline_env_split(td);
+            inline_message_manager.get_inline_game_high_scores(
+                &mut env,
+                &inline_message_id,
+                crate::user_manager::UserId::new(request.user_id),
+                promise,
+            );
+        }
+        Function::getInlineQueryResults(request) => {
+            // Requests.cpp:8195-8203
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let promise = td
+                .deferred_promise::<Option<crate::td_api::InlineQueryResults>, _>(id, |results| {
+                    Object::inlineQueryResults(results.unwrap_or_default())
+                });
+            let user_location =
+                crate::inline_queries_manager::location_from_td_api(request.user_location.as_ref());
+            let (mut env, inline_queries_manager, _) = crate::td::inline_env_split(td);
+            inline_queries_manager.send_inline_query(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                DialogId::new(request.chat_id),
+                user_location,
+                &query,
+                &offset,
+                promise,
+            );
+        }
+        Function::answerInlineQuery(request) => {
+            // Requests.cpp:8205-8212
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(next_offset) = clean_or_utf8_error(td, id, &request.next_offset) else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, inline_queries_manager, _) = crate::td::inline_env_split(td);
+            inline_queries_manager.answer_inline_query(
+                &mut env,
+                request.inline_query_id,
+                request.is_personal,
+                request.button,
+                request.results,
+                request.cache_time,
+                next_offset,
+                promise,
+            );
+        }
+        Function::answerGuestQuery(request) => {
+            // Requests.cpp:8214-8220
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = td
+                .deferred_promise::<crate::td_api::InlineMessageId, _>(id, Object::inlineMessageId);
+            let (mut env, inline_queries_manager, _) = crate::td::inline_env_split(td);
+            inline_queries_manager.answer_guest_query(
+                &mut env,
+                request.guest_query_id,
+                request.result,
+                promise,
+            );
+        }
+        Function::savePreparedInlineMessage(request) => {
+            // Requests.cpp:8222-8227
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<crate::td_api::PreparedInlineMessageId, _>(
+                id,
+                Object::preparedInlineMessageId,
+            );
+            let (mut env, inline_queries_manager, _) = crate::td::inline_env_split(td);
+            inline_queries_manager.save_prepared_inline_message(
+                &mut env,
+                crate::user_manager::UserId::new(request.user_id),
+                request.result,
+                request.chat_types,
+                promise,
+            );
+        }
+        Function::getPreparedInlineMessage(request) => {
+            // Requests.cpp:8228-8234
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(prepared_message_id) =
+                clean_or_utf8_error(td, id, &request.prepared_message_id)
+            else {
+                return;
+            };
+            let promise = td.deferred_promise::<Option<crate::td_api::PreparedInlineMessage>, _>(
+                id,
+                |message| Object::preparedInlineMessage(message.unwrap_or_default()),
+            );
+            let (mut env, inline_queries_manager, _) = crate::td::inline_env_split(td);
+            inline_queries_manager.get_prepared_inline_message(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                &prepared_message_id,
+                promise,
+            );
+        }
+        Function::getCurrentWeather(request) => {
+            // Requests.cpp:4737-4740
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<crate::td_api::CurrentWeather, _>(id, Object::currentWeather);
+            let user_location =
+                crate::inline_queries_manager::location_from_td_api(request.location.as_ref());
+            let (mut env, inline_queries_manager, _) = crate::td::inline_env_split(td);
+            inline_queries_manager.get_weather(&mut env, user_location, promise);
+        }
+
         Function::addContact(request) => {
             // Requests.cpp:6611-6620 + `get_contact` (Contact.cpp:142-156):
             // the importedContact variant has no vcard and carries the
@@ -2180,9 +2436,9 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            110,
+            123,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 894, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 881, "interim count");
     }
 }
