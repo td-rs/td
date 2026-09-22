@@ -9,6 +9,17 @@
 
 pub mod auth_manager;
 pub mod birthdate;
+pub mod business_away_message;
+pub mod business_bot_manage_bar;
+pub mod business_bot_rights;
+pub mod business_chat_link;
+pub mod business_connected_bot;
+pub mod business_connection_manager;
+pub mod business_greeting_message;
+pub mod business_intro;
+pub mod business_manager;
+pub mod business_recipients;
+pub mod business_work_hours;
 pub mod chat_manager;
 pub mod client;
 pub mod client_json;

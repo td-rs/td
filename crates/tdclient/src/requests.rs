@@ -172,6 +172,15 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 ));
             }
 
+            // BusinessConnectionManager::get_current_state
+            // (Requests.cpp:2247 — the connection block, after
+            // authorization per the C++ order)
+            {
+                business_arm(td, |env, _, connection_manager| {
+                    connection_manager.get_current_state(env, &mut updates);
+                });
+            }
+
             // UserManager::get_current_state (UserManager.cpp:10533-10568;
             // the Requests.cpp order is options → authorization →
             // connection → community → user → chat → …)
@@ -1877,6 +1886,660 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
         }
 
         // Everything else waits for its manager step.
+        _ => run_business_requests(td, id, function),
+    }
+}
+
+/// The `td_->` slice the business arms read through (the same
+/// field-split borrow the [`crate::td::BusinessTdEnv`] init site
+/// uses); the managers ride the closure as their own `&mut`.
+#[allow(clippy::too_many_arguments)]
+fn business_arm(
+    td: &mut Td,
+    run: impl FnOnce(
+        &mut crate::td::BusinessTdEnv<'_>,
+        &mut crate::business_manager::BusinessManager,
+        &mut crate::business_connection_manager::BusinessConnectionManager,
+    ),
+) {
+    let crate::td::Td {
+        business_manager,
+        business_connection_manager,
+        global,
+        option_manager,
+        auth_manager,
+        time_zone_manager,
+        user_manager,
+        chat_manager,
+        ..
+    } = td;
+    let mut env = crate::td::BusinessTdEnv {
+        global,
+        options: option_manager.as_mut(),
+        auth_is_bot: auth_manager.is_bot(),
+        time_zone_manager,
+        user_manager,
+        chat_manager,
+    };
+    run(&mut env, business_manager, business_connection_manager);
+}
+
+/// The M.48 business arm group of the request dispatcher — see the frame
+/// note at the forward site in [`run_request`]. The connection arms route
+/// into `td_->business_connection_manager_->...` (Requests.cpp:4434-4600,
+/// 8161-8164), the business-manager arms into `td_->business_manager_`
+/// (Requests.cpp:7085-7250); the network tails are the [blocked: net]
+/// query seams, the message halves are [blocked: M.10 message plane].
+#[allow(clippy::too_many_lines)]
+fn run_business_requests(td: &mut Td, id: u64, function: Function) {
+    macro_rules! ok_promise {
+        ($td:expr) => {
+            $td.deferred_promise::<(), _>(id, |_| ok_object())
+        };
+    }
+
+    /// `BusinessConnectionId(std::move(request.business_connection_id_))`.
+    fn connection_id(request: &str) -> crate::business_connection_manager::BusinessConnectionId {
+        crate::business_connection_manager::BusinessConnectionId::new(request)
+    }
+
+    match function {
+        // getBusinessConnection (Requests.cpp:8161-8164)
+        Function::getBusinessConnection(request) => {
+            let promise = td
+                .deferred_promise::<td_api::BusinessConnection, _>(id, Object::businessConnection);
+            let cid = connection_id(&request.connection_id);
+            business_arm(td, |env, _, connection_manager| {
+                connection_manager.get_business_connection(env, &cid, promise);
+            });
+        }
+
+        // sendBusinessMessage (Requests.cpp:4434-4441)
+        Function::sendBusinessMessage(request) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::BusinessMessage, _>(id, Object::businessMessage);
+            let cid = connection_id(&request.business_connection_id);
+            business_arm(td, |env, _, connection_manager| {
+                connection_manager.send_message(
+                    env,
+                    cid,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    request.reply_to,
+                    request.disable_notification,
+                    request.protect_content,
+                    request.effect_id,
+                    request.reply_markup,
+                    request.input_message_content.map(|content| *content),
+                    promise,
+                );
+            });
+        }
+
+        // sendBusinessMessageAlbum (Requests.cpp:4444-4451)
+        Function::sendBusinessMessageAlbum(request) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::BusinessMessages, _>(id, Object::businessMessages);
+            let cid = connection_id(&request.business_connection_id);
+            business_arm(td, |env, _, connection_manager| {
+                connection_manager.send_message_album(
+                    env,
+                    cid,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    request.reply_to,
+                    request.disable_notification,
+                    request.protect_content,
+                    request.effect_id,
+                    request
+                        .input_message_contents
+                        .into_iter()
+                        .map(|content| *content)
+                        .collect(),
+                    promise,
+                );
+            });
+        }
+
+        // editBusinessMessageText (Requests.cpp:4453-4460)
+        Function::editBusinessMessageText(request) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::BusinessMessage, _>(id, Object::businessMessage);
+            let cid = connection_id(&request.business_connection_id);
+            business_arm(td, |env, _, connection_manager| {
+                connection_manager.edit_business_message_text(
+                    env,
+                    cid,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::message_id::MessageId::new(request.message_id),
+                    request.reply_markup,
+                    request.input_message_content.map(|content| *content),
+                    promise,
+                );
+            });
+        }
+
+        // editBusinessMessageLiveLocation (Requests.cpp:4462-4469)
+        Function::editBusinessMessageLiveLocation(request) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::BusinessMessage, _>(id, Object::businessMessage);
+            let cid = connection_id(&request.business_connection_id);
+            business_arm(td, |env, _, connection_manager| {
+                connection_manager.edit_business_message_live_location(
+                    env,
+                    cid,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::message_id::MessageId::new(request.message_id),
+                    request.reply_markup,
+                    request.location,
+                    promise,
+                );
+            });
+        }
+
+        // editBusinessMessageChecklist (Requests.cpp:4471-4478)
+        Function::editBusinessMessageChecklist(request) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::BusinessMessage, _>(id, Object::businessMessage);
+            let cid = connection_id(&request.business_connection_id);
+            business_arm(td, |env, _, connection_manager| {
+                connection_manager.edit_business_message_checklist(
+                    env,
+                    cid,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::message_id::MessageId::new(request.message_id),
+                    request.reply_markup,
+                    request.checklist,
+                    promise,
+                );
+            });
+        }
+
+        // editBusinessMessageMedia (Requests.cpp:4480-4487)
+        Function::editBusinessMessageMedia(request) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::BusinessMessage, _>(id, Object::businessMessage);
+            let cid = connection_id(&request.business_connection_id);
+            business_arm(td, |env, _, connection_manager| {
+                connection_manager.edit_business_message_media(
+                    env,
+                    cid,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::message_id::MessageId::new(request.message_id),
+                    request.reply_markup,
+                    request.input_message_content.map(|content| *content),
+                    promise,
+                );
+            });
+        }
+
+        // editBusinessMessageCaption (Requests.cpp:4489-4496)
+        Function::editBusinessMessageCaption(request) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::BusinessMessage, _>(id, Object::businessMessage);
+            let cid = connection_id(&request.business_connection_id);
+            business_arm(td, |env, _, connection_manager| {
+                connection_manager.edit_business_message_caption(
+                    env,
+                    cid,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::message_id::MessageId::new(request.message_id),
+                    request.reply_markup,
+                    request.caption,
+                    request.show_caption_above_media,
+                    promise,
+                );
+            });
+        }
+
+        // editBusinessMessageReplyMarkup (Requests.cpp:4498-4504)
+        Function::editBusinessMessageReplyMarkup(request) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::BusinessMessage, _>(id, Object::businessMessage);
+            let cid = connection_id(&request.business_connection_id);
+            business_arm(td, |env, _, connection_manager| {
+                connection_manager.edit_business_message_reply_markup(
+                    env,
+                    cid,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::message_id::MessageId::new(request.message_id),
+                    request.reply_markup,
+                    promise,
+                );
+            });
+        }
+
+        // stopBusinessPoll (Requests.cpp:4506-4510)
+        Function::stopBusinessPoll(request) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::BusinessMessage, _>(id, Object::businessMessage);
+            let cid = connection_id(&request.business_connection_id);
+            business_arm(td, |env, _, connection_manager| {
+                connection_manager.stop_poll(
+                    env,
+                    cid,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::message_id::MessageId::new(request.message_id),
+                    request.reply_markup,
+                    promise,
+                );
+            });
+        }
+
+        // readBusinessMessage (Requests.cpp:4522-4528)
+        Function::readBusinessMessage(request) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let cid = connection_id(&request.business_connection_id);
+            business_arm(td, |env, _, connection_manager| {
+                connection_manager.read_business_message(
+                    env,
+                    cid,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::message_id::MessageId::new(request.message_id),
+                    promise,
+                );
+            });
+        }
+
+        // deleteBusinessMessages (Requests.cpp:4530-4537)
+        Function::deleteBusinessMessages(request) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let cid = connection_id(&request.business_connection_id);
+            let message_ids: Vec<crate::message_id::MessageId> = request
+                .message_ids
+                .iter()
+                .copied()
+                .map(crate::message_id::MessageId::new)
+                .collect();
+            business_arm(td, |env, _, connection_manager| {
+                connection_manager.delete_business_messages(env, cid, &message_ids, promise);
+            });
+        }
+
+        // deleteBusinessStory (Requests.cpp:4546-4553)
+        Function::deleteBusinessStory(request) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let cid = connection_id(&request.business_connection_id);
+            business_arm(td, |env, _, connection_manager| {
+                connection_manager.delete_business_story(env, cid, request.story_id, promise);
+            });
+        }
+
+        // setBusinessAccountName (Requests.cpp:4555-4561)
+        Function::setBusinessAccountName(request) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(first_name) = clean_or_utf8_error(td, id, &request.first_name) else {
+                return;
+            };
+            let Some(last_name) = clean_or_utf8_error(td, id, &request.last_name) else {
+                return;
+            };
+            let promise = ok_promise!(td);
+            let cid = connection_id(&request.business_connection_id);
+            business_arm(td, |env, _, connection_manager| {
+                connection_manager.set_business_name(env, cid, &first_name, &last_name, promise);
+            });
+        }
+
+        // setBusinessAccountBio (Requests.cpp:4563-4570)
+        Function::setBusinessAccountBio(request) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(bio) = clean_or_utf8_error(td, id, &request.bio) else {
+                return;
+            };
+            let promise = ok_promise!(td);
+            let cid = connection_id(&request.business_connection_id);
+            business_arm(td, |env, _, connection_manager| {
+                connection_manager.set_business_about(env, cid, &bio, promise);
+            });
+        }
+
+        // setBusinessAccountUsername (Requests.cpp:4578-4584)
+        Function::setBusinessAccountUsername(request) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(username) = clean_or_utf8_error(td, id, &request.username) else {
+                return;
+            };
+            let promise = ok_promise!(td);
+            let cid = connection_id(&request.business_connection_id);
+            business_arm(td, |env, _, connection_manager| {
+                connection_manager.set_business_username(env, cid, &username, promise);
+            });
+        }
+
+        // setBusinessAccountGiftSettings (Requests.cpp:4585-4591)
+        Function::setBusinessAccountGiftSettings(request) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let cid = connection_id(&request.business_connection_id);
+            business_arm(td, |env, _, connection_manager| {
+                connection_manager.set_business_gift_settings(env, cid, request.settings, promise);
+            });
+        }
+
+        // getBusinessAccountStarAmount (Requests.cpp:4593-4598)
+        Function::getBusinessAccountStarAmount(request) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::StarAmount, _>(id, Object::starAmount);
+            let cid = connection_id(&request.business_connection_id);
+            business_arm(td, |env, _, connection_manager| {
+                connection_manager.get_business_star_status(env, cid, promise);
+            });
+        }
+
+        // transferBusinessAccountStars (Requests.cpp:4600-4607)
+        Function::transferBusinessAccountStars(request) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let cid = connection_id(&request.business_connection_id);
+            business_arm(td, |env, _, connection_manager| {
+                connection_manager.transfer_business_stars(env, cid, request.star_count, promise);
+            });
+        }
+
+        // setBusinessLocation (Requests.cpp:7085-7089)
+        Function::setBusinessLocation(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let location =
+                crate::chat_manager::DialogLocation::from_business_location(request.location);
+            business_arm(td, |env, business_manager, _| {
+                business_manager.set_business_location(env, location, promise);
+            });
+        }
+
+        // setBusinessOpeningHours (Requests.cpp:7091-7096)
+        Function::setBusinessOpeningHours(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let work_hours =
+                crate::business_work_hours::BusinessWorkHours::from_td_api(request.opening_hours);
+            business_arm(td, |env, business_manager, _| {
+                business_manager.set_business_work_hours(env, work_hours, promise);
+            });
+        }
+
+        // setBusinessGreetingMessageSettings (Requests.cpp:7098-7103)
+        Function::setBusinessGreetingMessageSettings(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let greeting_message =
+                crate::business_greeting_message::BusinessGreetingMessage::from_td_api(
+                    request.greeting_message_settings,
+                );
+            business_arm(td, |env, business_manager, _| {
+                business_manager.set_business_greeting_message(env, greeting_message, promise);
+            });
+        }
+
+        // setBusinessAwayMessageSettings (Requests.cpp:7105-7110)
+        Function::setBusinessAwayMessageSettings(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let away_message = crate::business_away_message::BusinessAwayMessage::from_td_api(
+                request.away_message_settings,
+            );
+            business_arm(td, |env, business_manager, _| {
+                business_manager.set_business_away_message(env, away_message, promise);
+            });
+        }
+
+        // setBusinessStartPage (Requests.cpp:7112-7117)
+        Function::setBusinessStartPage(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            business_arm(td, |env, business_manager, _| {
+                let intro =
+                    crate::business_intro::BusinessIntro::from_td_api(env, request.start_page);
+                business_manager.set_business_intro(env, intro, promise);
+            });
+        }
+
+        // getBusinessConnectedBot (Requests.cpp:7186-7190)
+        Function::getBusinessConnectedBot(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise(id, |value: Option<td_api::BusinessConnectedBotInfo>| {
+                    match value {
+                        Some(info) => Object::businessConnectedBotInfo(info),
+                        None => Object::error(td_api::Error {
+                            code: 404,
+                            message: "Not Found".to_owned(),
+                        }),
+                    }
+                });
+            business_arm(td, |env, business_manager, _| {
+                business_manager.get_business_connected_bot(env, promise);
+            });
+        }
+
+        // setBusinessConnectedBot (Requests.cpp:7192-7196)
+        Function::setBusinessConnectedBot(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            business_arm(td, |env, business_manager, _| {
+                business_manager.set_business_connected_bot(env, request.bot, promise);
+            });
+        }
+
+        // confirmBusinessConnectedBot (Requests.cpp:7198-7202)
+        Function::confirmBusinessConnectedBot(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            business_arm(td, |env, business_manager, _| {
+                business_manager.confirm_business_connected_bot(
+                    env,
+                    crate::user_manager::UserId::new(request.bot_user_id),
+                    promise,
+                );
+            });
+        }
+
+        // deleteBusinessConnectedBot (Requests.cpp:7204-7208)
+        Function::deleteBusinessConnectedBot(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            business_arm(td, |env, business_manager, _| {
+                business_manager.delete_business_connected_bot(
+                    env,
+                    crate::user_manager::UserId::new(request.bot_user_id),
+                    promise,
+                );
+            });
+        }
+
+        // toggleBusinessConnectedBotChatIsPaused (Requests.cpp:7210-7215)
+        Function::toggleBusinessConnectedBotChatIsPaused(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = crate::dialog_id::DialogId::new(request.chat_id);
+            let status = crate::dialog_manager::check_dialog_access(
+                td,
+                dialog_id,
+                false,
+                crate::user_manager::AccessRights::Write,
+                "toggle_business_connected_bot_dialog_is_paused",
+            );
+            let dialog_status = match status {
+                tdutils::status::Result::Ok(()) => tdutils::status::Status::ok(),
+                tdutils::status::Result::Err(status) => status,
+            };
+            let promise = ok_promise!(td);
+            business_arm(td, |env, business_manager, _| {
+                business_manager.toggle_business_connected_bot_dialog_is_paused(
+                    env,
+                    dialog_id,
+                    request.is_paused,
+                    dialog_status,
+                    promise,
+                );
+            });
+        }
+
+        // removeBusinessConnectedBotFromChat (Requests.cpp:7217-7221)
+        Function::removeBusinessConnectedBotFromChat(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let dialog_id = crate::dialog_id::DialogId::new(request.chat_id);
+            let status = crate::dialog_manager::check_dialog_access(
+                td,
+                dialog_id,
+                false,
+                crate::user_manager::AccessRights::Write,
+                "remove_business_connected_bot_from_dialog",
+            );
+            let dialog_status = match status {
+                tdutils::status::Result::Ok(()) => tdutils::status::Status::ok(),
+                tdutils::status::Result::Err(status) => status,
+            };
+            let promise = ok_promise!(td);
+            business_arm(td, |env, business_manager, _| {
+                business_manager.remove_business_connected_bot_from_dialog(
+                    env,
+                    dialog_id,
+                    dialog_status,
+                    promise,
+                );
+            });
+        }
+
+        // getBusinessChatLinks (Requests.cpp:7223-7227)
+        Function::getBusinessChatLinks(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::BusinessChatLinks, _>(id, Object::businessChatLinks);
+            business_arm(td, |env, business_manager, _| {
+                business_manager.get_business_chat_links(env, promise);
+            });
+        }
+
+        // createBusinessChatLink (Requests.cpp:7229-7234)
+        Function::createBusinessChatLink(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::BusinessChatLink, _>(id, Object::businessChatLink);
+            business_arm(td, |env, business_manager, _| {
+                business_manager.create_business_chat_link(env, request.link_info, promise);
+            });
+        }
+
+        // editBusinessChatLink (Requests.cpp:7236-7241)
+        Function::editBusinessChatLink(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(link) = clean_or_utf8_error(td, id, &request.link) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<td_api::BusinessChatLink, _>(id, Object::businessChatLink);
+            business_arm(td, |env, business_manager, _| {
+                business_manager.edit_business_chat_link(env, &link, request.link_info, promise);
+            });
+        }
+
+        // deleteBusinessChatLink (Requests.cpp:7243-7248)
+        Function::deleteBusinessChatLink(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(link) = clean_or_utf8_error(td, id, &request.link) else {
+                return;
+            };
+            let promise = ok_promise!(td);
+            business_arm(td, |env, business_manager, _| {
+                business_manager.delete_business_chat_link(env, &link, promise);
+            });
+        }
+
+        // getBusinessChatLinkInfo (Requests.cpp:7250-7255)
+        Function::getBusinessChatLinkInfo(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(link_name) = clean_or_utf8_error(td, id, &request.link_name) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::BusinessChatLinkInfo, _>(
+                id,
+                Object::businessChatLinkInfo,
+            );
+            business_arm(td, |env, business_manager, _| {
+                business_manager.get_business_chat_link_info(env, &link_name, promise);
+            });
+        }
+
+        // Everything else waits for its manager step.
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
@@ -2176,13 +2839,16 @@ mod request_census_tests {
         // stays the 500 placeholder) + M.12.10's eighteen file-plane
         // dispatches (getFile/getRemoteFile, the download/upload/
         // generation arms, the DownloadManager list plane and the four
-        // storage-statistics arms). Fix per flip.
+        // storage-statistics arms) + M.48's thirty-five business-plane
+        // dispatches (the business-connection message/edit/account/stars
+        // arms and the business-manager settings/connected-bot/chat-link
+        // arms). Fix per flip.
         assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            110,
+            145,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 894, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 859, "interim count");
     }
 }
