@@ -42,6 +42,7 @@ use tdmtproto::telegram_api;
 use tdnet::net_query::{NetQuery, NetQueryDispatcher};
 use tdutils::promise::Promise;
 use tdutils::status::Status;
+use crate::community_manager::{CommunityManager, CommunityManagerEnv};
 
 use crate::account_manager::{AccountManager, AccountManagerEnv};
 
@@ -286,6 +287,11 @@ pub struct Td {
     /// The account plane's `send_update` outbox; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) account_updates: Vec<td_api::Update>,
+    /// `Td::community_manager_` (the C++ init_managers block).
+    pub(crate) community_manager: CommunityManager,
+    /// The community plane's `send_update` outbox; drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) community_updates: Vec<td_api::Update>,
     /// `Td::device_token_manager_` (`Td.cpp:1345`, M.13S).
     pub(crate) device_token_manager: crate::device_token_manager::DeviceTokenManager,
     /// `Td::web_browser_manager_` (`make_unique` at `Td.cpp:1332`, the
@@ -618,6 +624,8 @@ impl Td {
             terms_of_service_manager: crate::terms_of_service_manager::TermsOfServiceManager::new(),
             suggested_action_manager: crate::suggested_action_manager::SuggestedActionManager::new(),
             account_updates: Vec::new(),
+            community_manager: CommunityManager::new(),
+            community_updates: Vec::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
             web_browser_manager: WebBrowserManager::new(),
             web_browser_updates: Vec::new(),
@@ -2650,6 +2658,10 @@ call_manager: CallManager::new(),
         }
         let account_updates = std::mem::take(&mut self.account_updates);
         for update in account_updates {
+            self.send_update(update.into());
+        }
+        let community_updates = std::mem::take(&mut self.community_updates);
+        for update in community_updates {
             self.send_update(update.into());
         }
         let web_browser_updates = std::mem::take(&mut self.web_browser_updates);
@@ -5604,6 +5616,44 @@ impl crate::suggested_action_manager::SuggestedActionManagerEnv for AccountEnv<'
         self.updates.push(update);
     }
 }
+
+/// The community-plane env over the `Td` fields — built per call with the
+/// field-split borrows (the `NotificationEnv` convention).
+pub(crate) struct CommunityEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) dialog_manager: &'a mut DialogManager,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl CommunityManagerEnv for CommunityEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> std::result::Result<(), tdutils::status::Status> {
+        // `DialogManager::check_dialog_access(dialog_id, false, Read,
+        // "create_community")` — the full access-check plane is the M.6
+        // continuation; the seam answers valid dialogs only.
+        if dialog_id.is_valid() {
+            Ok(())
+        } else {
+            Err(tdutils::status::Status::error(400, "Chat not found"))
+        }
+    }
+
+    fn get_chat_id_object(&mut self, dialog_id: crate::dialog_id::DialogId) -> i64 {
+        let _ = self.dialog_manager;
+        dialog_id.get()
+    }
+}
+
 
 #[cfg(test)]
 mod tests {

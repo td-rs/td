@@ -42,10 +42,12 @@ use crate::notification_settings::{
 use crate::notification_settings_manager::ScopeSettingsAnswer;
 use crate::suggested_action::SuggestedAction;
 use crate::td::AccountEnv;
+use crate::community_id::CommunityId;
 use crate::td::CallEnv;
 use crate::td::NotificationEnv;
 use crate::td::Td;
 use crate::td::WebBrowserEnv;
+use crate::td::CommunityEnv;
 use crate::td_api::{self, Function, Object};
 use crate::user_manager::{FileId, PendingUserRequest, SecretChatId, UserEnv, UserId};
 use tdutils::promise::Promise;
@@ -2441,6 +2443,52 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
 
+        // Everything else waits for its manager step.        // --- community (Requests.cpp:3415-3432) ---
+        Function::createCommunity(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = crate::misc::clean_input_string(&request.name) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, |community_id: td_api::CommunityId| {
+                Object::communityId(community_id)
+            });
+            let mut env = CommunityEnv {
+                global: &mut td.global,
+                dialog_manager: &mut td.dialog_manager,
+                updates: &mut td.community_updates,
+            };
+            td.community_manager.create_community(
+                &mut env,
+                &name,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                request.is_chat_hidden,
+                promise,
+            );
+        }
+        Function::setCommunityName(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = crate::misc::clean_input_string(&request.name) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = CommunityEnv {
+                global: &mut td.global,
+                dialog_manager: &mut td.dialog_manager,
+                updates: &mut td.community_updates,
+            };
+            td.community_manager.set_community_name(
+                &mut env,
+                CommunityId::new(request.community_id),
+                &name,
+                promise,
+            );
+        }
+
+
         // Everything else waits for its manager step.
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
@@ -2739,15 +2787,17 @@ mod request_census_tests {
 assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
 assert_eq!(
     *counts.get("dispatched").unwrap_or(&0),
-    136,
+    138,
     "dispatched count"
 );
 assert_eq!(
     *counts.get("interim").unwrap_or(&0),
-    868,
+    866,
     "interim count"
 );
     }
 }
+
+
 
 
