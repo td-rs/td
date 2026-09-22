@@ -114,6 +114,10 @@ pub struct MessageSpec {
     /// The received messages carry `is_outgoing = false`; the sent ones
     /// force it true (the C++ MessagesManager semantics).
     pub is_outgoing: bool,
+    /// The M.9.18 content object (the `get_message_content` intake →
+    /// `get_message_content_object` output); `None` keeps the text-only
+    /// walking-skeleton shape.
+    pub content: Option<td_api::MessageContent>,
 }
 
 /// `MessagesManager::get_message_object` for a text message (§3): the
@@ -138,14 +142,17 @@ pub fn message_object(spec: &MessageSpec) -> td_api::Message {
         can_be_saved: true,
         has_timestamped_media: true,
         date: spec.date,
-        content: Some(td_api::MessageContent::messageText(td_api::messageText {
-            text: Some(td_api::FormattedText {
-                text: spec.text.clone(),
-                entities: Vec::new(),
+        content: Some(match &spec.content {
+            Some(content) => content.clone(),
+            None => td_api::MessageContent::messageText(td_api::messageText {
+                text: Some(td_api::FormattedText {
+                    text: spec.text.clone(),
+                    entities: Vec::new(),
+                }),
+                link_preview: None,
+                link_preview_options: None,
             }),
-            link_preview: None,
-            link_preview_options: None,
-        })),
+        }),
         ..Default::default()
     }
 }

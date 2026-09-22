@@ -186,6 +186,35 @@ pub fn pkcs1_v1_5_decrypt(private_key: &rsa_crate::RsaPrivateKey, data: &[u8]) -
     }
 }
 
+/// `td::rsa_encrypt_pkcs1_oaep` (tdutils/td/utils/crypto.cpp:1048-1107) —
+/// the RSAES-OAEP encryption the Telegram Passport `encrypted_secret` rides
+/// (`SecureValue.cpp:1465`). The C++ reads the key with
+/// `PEM_read_bio_PUBKEY` — both the SPKI `PUBLIC KEY` and the PKCS#1
+/// `RSA PUBLIC KEY` PEM forms — and encrypts with
+/// `RSA_PKCS1_OAEP_PADDING`, whose default digests are SHA-1 (hash and
+/// MGF1); the `rsa` crate reproduces both. Unlike the MTProto [`Rsa`] key,
+/// arbitrary RSA key sizes are accepted, exactly like the C++.
+pub fn rsa_encrypt_pkcs1_oaep(public_key: &str, data: &[u8]) -> Result<Vec<u8>> {
+    let Some(der) = pem_decode_public_key(public_key) else {
+        return Result::Err(Status::error_message("Cannot read public key"));
+    };
+    let key = match rsa_crate::RsaPublicKey::from_public_key_der(&der)
+        .or_else(|_| rsa_crate::RsaPublicKey::from_pkcs1_der(&der))
+    {
+        Ok(key) => key,
+        Err(_) => {
+            return Result::Err(Status::error_message("Wrong key type, expected RSA"));
+        }
+    };
+    let mut rng = rsa_crate::rand_core::OsRng;
+    match key.encrypt(&mut rng, rsa_crate::Oaep::new::<sha1::Sha1>(), data) {
+        Ok(value) => Result::Ok(value),
+        Err(error) => Result::Err(Status::error_message(&format!(
+            "RSA encrypt failed: {error}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +274,30 @@ GwIDAQAB\n-----END PUBLIC KEY-----";
             Rsa::from_pem_public_key("-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----")
                 .is_error()
         );
+    }
+
+    #[test]
+    fn oaep_encrypt_matches_the_cpp_surface() {
+        // The C++ `rsa_encrypt_pkcs1_oaep` answers "Cannot read public key"
+        // on unparsable PEM and "Wrong key type, expected RSA" when the
+        // PEM parses but is not RSA (crypto.cpp:1056-1064).
+        assert_eq!(
+            rsa_encrypt_pkcs1_oaep("not a pem", b"x").error().message(),
+            "Cannot read public key"
+        );
+        assert_eq!(
+            rsa_encrypt_pkcs1_oaep(
+                "-----BEGIN PUBLIC KEY-----\nAAAA\n-----END PUBLIC KEY-----",
+                b"x"
+            )
+            .error()
+            .message(),
+            "Wrong key type, expected RSA"
+        );
+
+        // A valid key produces one modulus-sized ciphertext.
+        let encrypted = rsa_encrypt_pkcs1_oaep(CRYPTO_TEST_PUBLIC_KEY, b"secret payload").unwrap();
+        assert_eq!(encrypted.len(), 256);
     }
 
     #[test]

@@ -96,6 +96,21 @@ impl ChannelId {
     pub fn get(self) -> i64 {
         self.0
     }
+
+    /// `ChannelId::store` (ChannelId.h:56-58) — the raw id as int64.
+    pub fn store(self, out: &mut Vec<u8>) {
+        crate::store_parse::store_i64(out, self.0);
+    }
+
+    /// `ChannelId::parse` (ChannelId.h:60-67) — int64 from
+    /// `Version::Support64BitIds` (33) on, int32 before.
+    pub fn parse_from(parser: &mut crate::store_parse::Parser) -> Result<ChannelId, &'static str> {
+        if parser.version() >= crate::store_parse::version::SUPPORT_64_BIT_IDS {
+            Ok(ChannelId(parser.i64_()?))
+        } else {
+            Ok(ChannelId(parser.i32_()? as i64))
+        }
+    }
 }
 
 /// `td::ChannelType` (ChannelType.h) — the uint8 `Broadcast`/`Megagroup`/
@@ -3476,6 +3491,34 @@ impl DialogLocation {
     /// `DialogLocation::empty` (DialogLocation.cpp).
     pub fn empty(&self) -> bool {
         self.location_.is_empty() && self.address_.is_empty()
+    }
+
+    /// `DialogLocation(businessLocation)` (DialogLocation.cpp:38-45, M.48)
+    /// — the location record + the cleaned address.
+    pub fn from_business_location(
+        business_location: Option<td_api::BusinessLocation>,
+    ) -> DialogLocation {
+        let mut result = DialogLocation::default();
+        let Some(business_location) = business_location else {
+            return result;
+        };
+        if let Some(l) = business_location.location {
+            result.location_ = Location::from_geo_point(telegram_api::GeoPoint::geoPoint(
+                telegram_api::geoPoint {
+                    flags: 0,
+                    lat: l.latitude,
+                    long: l.longitude,
+                    accuracy_radius: l.horizontal_accuracy as i32,
+                    access_hash: 0,
+                },
+            ));
+        }
+        let mut address = business_location.address;
+        if crate::misc::clean_input_string(&address).is_none() {
+            address.clear();
+        }
+        result.address_ = address;
+        result
     }
 
     /// `as_dialog_location` (Td.cpp conversions) — the td_api chatLocation
@@ -12348,8 +12391,9 @@ impl ChatManager {
         ChannelType::Broadcast
     }
 
-    /// `is_broadcast_channel` (ChatManager.cpp:2879-2881).
-    fn is_broadcast_channel(&self, channel_id: ChannelId) -> bool {
+    /// `is_broadcast_channel` (ChatManager.cpp:2879-2881). The payment
+    /// plane's giveaway validation reads it through the env (M.43).
+    pub fn is_broadcast_channel(&self, channel_id: ChannelId) -> bool {
         self.get_channel(channel_id)
             .is_some_and(|c| Self::get_channel_type(c) == ChannelType::Broadcast)
     }
