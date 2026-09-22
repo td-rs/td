@@ -458,7 +458,7 @@ impl MessageId {
     }
 
     /// `MessageId::get_server_message_id_force` (MessageId.cpp:173-176).
-    fn get_server_message_id_force(self) -> ServerMessageId {
+    pub fn get_server_message_id_force(self) -> ServerMessageId {
         assert!(!self.is_scheduled());
         ServerMessageId::new((self.0 >> MessageId::SERVER_ID_SHIFT) as i32)
     }

@@ -49,6 +49,8 @@ pub mod version {
     pub const ADD_MESSAGE_CHAT_SET_TTL_FLAGS: i32 = 44;
     pub const ADD_MESSAGE_MEDIA_SPOILER: i32 = 45;
     pub const MAKE_PARTICIPANT_FLAGS_64_BIT: i32 = 46;
+    /// `Version::AddStarGiftAttributeRarity` (Version.h:74).
+    pub const ADD_STAR_GIFT_ATTRIBUTE_RARITY: i32 = 58;
     pub const ADD_USER_FLAGS2: i32 = 48;
     pub const ADD_MESSAGE_TEXT_FLAGS: i32 = 49;
     pub const SUPPORT_REPLIES_IN_OTHER_CHATS: i32 = 51;
