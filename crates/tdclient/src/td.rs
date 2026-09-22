@@ -45,6 +45,7 @@ use tdmtproto::telegram_api;
 use tdnet::net_query::{NetQuery, NetQueryDispatcher};
 use tdutils::promise::Promise;
 use tdutils::status::Status;
+use crate::quick_reply_manager::{QuickReplyManager, QuickReplyManagerEnv};
 
 use crate::account_manager::{AccountManager, AccountManagerEnv};
 
@@ -289,6 +290,8 @@ pub struct Td {
     /// The account plane's `send_update` outbox; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) account_updates: Vec<td_api::Update>,
+    /// `Td::quick_reply_manager_` (the C++ init_managers block).
+    pub(crate) quick_reply_manager: QuickReplyManager,
     /// The premium plane (Premium.cpp is a free-function surface).
     pub(crate) premium_manager: PremiumManager,
     /// `Td::statistics_manager_` (the C++ init_managers block).
@@ -634,6 +637,7 @@ impl Td {
             suggested_action_manager: crate::suggested_action_manager::SuggestedActionManager::new(
             ),
             account_updates: Vec::new(),
+            quick_reply_manager: QuickReplyManager::new(),
             premium_manager: PremiumManager::new(),
             statistics_manager: StatisticsManager::new(),
             statistics_updates: Vec::new(),
@@ -5721,6 +5725,20 @@ impl PremiumEnv for PremiumTdEnv<'_> {
 
     fn send_update(&mut self, _update: td_api::Update) {}
 }
+
+/// The quick-reply env over the `Td` fields.
+pub(crate) struct QuickReplyEnv<'a> {
+    pub(crate) global: &'a mut Global,
+}
+
+impl QuickReplyManagerEnv for QuickReplyEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn send_update(&mut self, _update: td_api::Update) {}
+}
+
 
 #[cfg(test)]
 mod tests {

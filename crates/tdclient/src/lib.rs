@@ -58,6 +58,7 @@ pub mod premium;
 pub mod premium_gift_option;
 pub mod query_combiner;
 pub mod query_merger;
+pub mod quick_reply_manager;
 pub mod request_actor;
 pub mod requests;
 pub mod restriction_reason;
