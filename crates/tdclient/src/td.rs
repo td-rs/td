@@ -291,6 +291,9 @@ pub struct Td {
     /// The account plane's `send_update` outbox; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) account_updates: Vec<td_api::Update>,
+    /// `Td::secure_manager_` (`Td.cpp:1353`, `init_pure_actor_managers`)
+    /// — the M.44 collapsed manager; the C++ actor's `start_up` is empty.
+    pub(crate) secure_manager: crate::secure_manager::SecureManager,
     /// `Td::star_gift_manager_` (Td.cpp:1286, the `Td::Td` manager block).
     pub(crate) star_gift_manager: crate::star_gift_manager::StarGiftManager,
     /// `Td::theme_manager_` (`Td.cpp:1304`, the init managers block; the
@@ -660,6 +663,7 @@ impl Td {
             suggested_action_manager: crate::suggested_action_manager::SuggestedActionManager::new(
             ),
             account_updates: Vec::new(),
+            secure_manager: crate::secure_manager::SecureManager::new(),
             star_gift_manager: crate::star_gift_manager::StarGiftManager::new(),
             theme_manager: crate::theme_manager::ThemeManager::new(),
             theme_updates: Vec::new(),
@@ -6776,6 +6780,188 @@ impl PaymentsEnv<'_> {
         )
     }
 }
+
+/// The [`crate::secure_value::SecureValueEnv`] +
+/// [`crate::secure_manager::SecureManagerEnv`] over the `Td` fields — built
+/// per call with the field-split borrows (the `NotificationEnv`
+/// convention), never held across calls; the M.12 file plane rides its
+/// `Arc` clone so the disjoint borrows hold.
+pub(crate) struct SecureEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    /// the user-only passport requests run after `init`
+    pub(crate) options: &'a mut OptionManager,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) file_manager: Arc<parking_lot::Mutex<FileManager>>,
+    pub(crate) file_load_manager: Arc<parking_lot::Mutex<FileLoadManager>>,
+    /// the snapshot of `Td::close_flag`
+    pub(crate) close_flag: bool,
+}
+
+impl crate::secure_value::SecureValueEnv for SecureEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.close_flag
+    }
+
+    fn unix_time(&mut self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn file_register_secure_encrypted(
+        &mut self,
+        id: i64,
+        access_hash: i64,
+        dc_id: DcId,
+        size: i64,
+        remote_name: String,
+    ) -> FileId {
+        self.file_manager.lock().register_remote(
+            crate::files::FullRemoteFileLocation::from_document(
+                FileType::SecureEncrypted,
+                id,
+                access_hash,
+                dc_id,
+                String::new(),
+            ),
+            crate::files::FileLocationSource::FromServer,
+            DialogId::default(),
+            size,
+            0,
+            remote_name,
+        )
+    }
+
+    fn file_register_secure_decrypted(
+        &mut self,
+        id: i64,
+        access_hash: i64,
+        dc_id: DcId,
+        expected_size: i64,
+        suggested_path: String,
+    ) -> FileId {
+        self.file_manager.lock().register_remote(
+            crate::files::FullRemoteFileLocation::from_document(
+                FileType::SecureDecrypted,
+                id,
+                access_hash,
+                dc_id,
+                String::new(),
+            ),
+            crate::files::FileLocationSource::FromServer,
+            DialogId::default(),
+            0,
+            expected_size,
+            suggested_path,
+        )
+    }
+
+    fn file_view(&mut self, file_id: FileId) -> Option<crate::secure_value::SecureFileView> {
+        let file_manager = self.file_manager.lock();
+        let view = file_manager.get_file_view(file_id)?;
+        let full_remote = view.get_full_remote_location();
+        Some(crate::secure_value::SecureFileView {
+            file_type: view.get_type(),
+            main_file_id: view.get_main_file_id(),
+            is_encrypted_secure: view.is_encrypted_secure(),
+            full_remote: full_remote.map(|location| crate::secure_value::SecureFullRemote {
+                id: location.get_id(),
+                access_hash: location.get_access_hash(),
+                dc_id: location.get_dc_id(),
+            }),
+            full_remote_is_web: full_remote.is_some_and(|location| location.is_web()),
+            encryption_key: view.encryption_key().clone(),
+            expected_size: view.expected_size(false),
+            suggested_path: view.suggested_path(),
+            size: view.size(),
+        })
+    }
+
+    fn file_set_encryption_key(&mut self, file_id: FileId, key: crate::files::FileEncryptionKey) {
+        self.file_manager.lock().set_encryption_key(file_id, key);
+    }
+
+    fn file_object(&mut self, file_id: FileId) -> td_api::File {
+        self.file_manager.lock().get_file_object(file_id)
+    }
+
+    fn file_get_input_file_id(
+        &mut self,
+        file: Option<&td_api::InputFile>,
+    ) -> tdutils::status::Result<FileId> {
+        match self.file_manager.lock().get_input_file_id(
+            FileType::SecureEncrypted,
+            file,
+            DialogId::default(),
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+        ) {
+            Ok(file_id) => tdutils::status::Result::Ok(file_id),
+            Err(status) => tdutils::status::Result::Err(status),
+        }
+    }
+
+    fn file_merge(
+        &mut self,
+        to_file_id: FileId,
+        from_file_id: FileId,
+    ) -> tdutils::status::Result<()> {
+        match self.file_manager.lock().merge(to_file_id, from_file_id) {
+            Ok(()) => tdutils::status::Result::Ok(()),
+            Err(status) => tdutils::status::Result::Err(status),
+        }
+    }
+
+    fn file_copy_file_id(&mut self, file_id: FileId) -> FileId {
+        self.file_manager.lock().copy_file_id(
+            file_id,
+            FileType::SecureEncrypted,
+            DialogId::default(),
+            "SetSecureValue",
+        )
+    }
+
+    fn file_cancel_upload(&mut self, file_upload_id: crate::files::FileUploadId) {
+        let mut file_load_manager = self.file_load_manager.lock();
+        self.file_manager
+            .lock()
+            .cancel_upload(file_upload_id, &mut file_load_manager);
+    }
+
+    fn file_get_internal_upload_id(&mut self) -> i64 {
+        self.file_manager.lock().get_internal_upload_id()
+    }
+}
+
+impl crate::secure_manager::SecureManagerEnv for SecureEnv<'_> {
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        let mut user_env = UserEnv {
+            global: self.global,
+            options: self.options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.on_get_users(&mut user_env, users, source);
+    }
+
+    fn get_input_user(
+        &mut self,
+        user_id: UserId,
+    ) -> tdutils::status::Result<telegram_api::InputUser> {
+        let user_env = UserEnv {
+            global: self.global,
+            options: self.options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        match self.user_manager.get_input_user(&user_env, user_id) {
+            Ok(input_user) => tdutils::status::Result::Ok(input_user),
+            Err(status) => tdutils::status::Result::Err(status),
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
