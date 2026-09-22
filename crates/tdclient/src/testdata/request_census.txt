@@ -1,4 +1,4 @@
-acceptCall	interim
+acceptCall	dispatched
 acceptOauthRequest	interim
 acceptTermsOfService	interim
 activateStoryStealthMode	interim
@@ -121,7 +121,7 @@ craftGift	interim
 createBasicGroupChat	interim
 createBot	interim
 createBusinessChatLink	interim
-createCall	interim
+createCall	dispatched
 createChatFolder	interim
 createChatFolderInviteLink	interim
 createChatInviteLink	interim
@@ -197,7 +197,7 @@ deleteTextCompositionStyle	interim
 destroy	dispatched
 disableAllSupergroupUsernames	interim
 disableProxy	interim
-discardCall	interim
+discardCall	dispatched
 disconnectAffiliateProgram	interim
 disconnectAllWebsites	interim
 disconnectWebsite	interim
@@ -763,10 +763,10 @@ sendAuthenticationFirebaseSms	interim
 sendBotStartMessage	interim
 sendBusinessMessage	interim
 sendBusinessMessageAlbum	interim
-sendCallDebugInformation	interim
+sendCallDebugInformation	dispatched
 sendCallLog	interim
-sendCallRating	interim
-sendCallSignalingData	interim
+sendCallRating	dispatched
+sendCallSignalingData	dispatched
 sendChatAction	interim
 sendCustomRequest	interim
 sendEmailAddressVerificationCode	interim

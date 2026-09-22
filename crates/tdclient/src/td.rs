@@ -76,6 +76,9 @@ use crate::updates_manager::{PendingUpdate, UpdatesManager, UpdatesManagerEnv, U
 use crate::user_manager::{UserEnv, UserId, UserManager};
 use crate::web_browser_manager::WebBrowserManager;
 
+use crate::call_manager::CallManager;
+use crate::dh_cache::DhConfig;
+
 use crate::files::{
     DocumentByHash, DownloadCallback, DownloadCounters, DownloadManager, DownloadManagerCallback,
     DownloadManagerContext, DownloadNetMeta, DownloadQuery, DownloadQueryType, DownloadResult,
@@ -280,6 +283,16 @@ pub struct Td {
     /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) web_browser_updates: Vec<td_api::Update>,
+/// `Td::call_manager_` (`make_unique` at `Td.cpp:1186`, the
+    /// `init_managers` block).
+    pub(crate) call_manager: CallManager,
+    /// The call plane's `send_update` outbox (updateCall /
+    /// updateNewCallSignalingData); drained by [`Td::flush_user_updates`].
+    pub(crate) call_updates: Vec<td_api::Update>,
+    /// The `G()->get_dh_config()` store — the C++ keeps the DhConfig in
+    /// the ConfigManager's persisted state; the collapsed Td field holds
+    /// it until that surface lands (M.3 continuation).
+    pub(crate) call_dh_config: Option<DhConfig>,
     /// The notification manager's `send_update` outbox — the collapsed
     /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
     /// [`Td::flush_user_updates`].
@@ -592,6 +605,9 @@ impl Td {
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
             web_browser_manager: WebBrowserManager::new(),
             web_browser_updates: Vec::new(),
+call_manager: CallManager::new(),
+            call_updates: Vec::new(),
+            call_dh_config: None,
             notification_updates: Vec::new(),
             premium_required_contact_merger: None,
             chat_manager: crate::chat_manager::ChatManager::new(),
@@ -2599,6 +2615,8 @@ impl Td {
         }
         let web_browser_updates = std::mem::take(&mut self.web_browser_updates);
         for update in web_browser_updates {
+let call_updates = std::mem::take(&mut self.call_updates);
+        for update in call_updates {
             self.send_update(update.into());
         }
     }
@@ -5087,6 +5105,101 @@ impl crate::device_token_manager::DeviceTokenManagerEnv for NotificationEnv<'_> 
 
     fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
         self.global.binlog_pmc().set_raw(key, value);
+    }
+}
+
+/// The [`crate::call_manager::CallManagerEnv`] over the `Td` fields —
+/// built per call with the field-split borrows (the `NotificationEnv`
+/// convention), never held across calls. The two call-notification seams
+/// keep their no-op trait defaults until the notification env plumbing
+/// joins the call plane (the M.7.12+ sink group).
+pub(crate) struct CallEnv<'a> {
+    pub(crate) user_env: UserEnv<'a>,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) notification_manager: &'a mut NotificationManager,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+    pub(crate) dh_config: &'a mut Option<DhConfig>,
+}
+
+impl crate::dh_cache::DhCacheEnv for CallEnv<'_> {
+    fn pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.user_env.global.binlog_pmc().get_raw(key)
+    }
+
+    fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.user_env.global.binlog_pmc().set_raw(key, value);
+    }
+}
+
+impl crate::call_actor::CallActorEnv for CallEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.user_env.global.close_flag()
+    }
+
+    fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
+        self.user_env
+            .options
+            .get_option_integer(name, default_value)
+    }
+
+    fn get_dh_config(&self) -> Option<DhConfig> {
+        self.dh_config.clone()
+    }
+
+    fn set_dh_config(&mut self, config: DhConfig) {
+        *self.dh_config = Some(config);
+    }
+
+    fn on_get_users(&mut self, users: Vec<tdmtproto::telegram_api::User>, source: &str) {
+        self.user_manager
+            .on_get_users(&mut self.user_env, users, source);
+    }
+
+    fn get_input_user(
+        &self,
+        user_id: UserId,
+    ) -> std::result::Result<tdmtproto::telegram_api::InputUser, tdutils::status::Status> {
+        self.user_manager.get_input_user(&self.user_env, user_id)
+    }
+
+    fn get_user_id_object(&mut self, user_id: UserId) -> i64 {
+        self.user_manager.get_user_id_object(
+            &mut self.user_env,
+            user_id,
+            "CallActor::flush_call_state",
+        )
+    }
+
+    fn add_call_notification(
+        &mut self,
+        dialog_id: crate::chat_manager::DialogId,
+        call_id: crate::call_id::CallId,
+    ) {
+        let _ = (dialog_id, call_id);
+        let _ = self.notification_manager;
+    }
+
+    fn remove_call_notification(
+        &mut self,
+        dialog_id: crate::chat_manager::DialogId,
+        call_id: crate::call_id::CallId,
+    ) {
+        let _ = (dialog_id, call_id);
+        let _ = self.notification_manager;
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+}
+
+impl crate::call_manager::CallManagerEnv for CallEnv<'_> {
+    fn close_status(&self) -> tdutils::status::Status {
+        if self.user_env.global.close_flag() {
+            crate::config_result::request_aborted_error()
+        } else {
+            tdutils::status::Status::ok()
+        }
     }
 }
 

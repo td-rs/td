@@ -9,6 +9,11 @@
 
 pub mod auth_manager;
 pub mod birthdate;
+pub mod call_actor;
+pub mod call_discard_reason;
+pub mod call_id;
+pub mod call_manager;
+pub mod call_protocol;
 pub mod chat_manager;
 pub mod client;
 pub mod client_json;
@@ -20,6 +25,7 @@ pub mod connection_creator;
 pub mod contact;
 pub mod convert;
 pub mod device_token_manager;
+pub mod dh_cache;
 pub mod dialog_db;
 pub mod dialog_id;
 pub mod dialog_manager;
