@@ -19,6 +19,8 @@ JSON, URL, HTML, entities, binlog reader, secret-chat crypto.
 | `user_full`       | the `UserFull` database blob — `usf<id>` rows                            |
 | `secret_chat`     | the `SecretChat` database blob — SecretChats binlog events + `sc<id>` rows |
 | `emoji_status`    | the `EmojiStatus` value parser — the payload inside `User` blobs         |
+| `message_content` | the `MessageContent` database blob — every message row + `StoreMessage` binlog event body (M.9.2/M.9.3) |
+| `message_input`   | the M.10.21 td_api input plane — `ReplyMarkup::from_td_api` (+ the keyboard/inline button converters) over JSON trees; seeds in `fuzz/seeds/message_input/` (M.10.22) |
 
 The M.4.17 database-blob targets (`user_log_event`, `user_full`,
 `secret_chat`, `emoji_status`) cover what is attacker-reachable from the
@@ -38,6 +40,7 @@ The crate is excluded from the workspace and builds standalone
 cd fuzz
 cargo build                                        # uninstrumented smoke builds
 cargo fuzz run td_api_json -- -max_total_time=60   # instrumented (nightly + cargo-fuzz)
+cargo fuzz run message_input fuzz/seeds/message_input   # seeded run
 ```
 
 CI: `fuzz-smoke` job in `.github/workflows/main.yml` — 60 s per target on
