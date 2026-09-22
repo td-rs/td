@@ -68,6 +68,7 @@ pub mod game;
 pub mod game_manager;
 pub mod global;
 pub mod group_call_manager;
+pub mod inline_keyboard_button;
 pub mod join_chat_bot_result;
 pub mod link_manager;
 pub mod manager_option_states;
@@ -132,6 +133,8 @@ pub mod web_app;
 pub mod web_app_manager;
 pub mod web_browser_manager;
 pub mod web_browser_settings;
+pub mod web_pages_manager;
+pub mod webpage;
 
 // Generated code keeps C++-identical case-preserved names (`aiComposeTone`)
 // in types, fields and the JSON dispatch helpers alike.

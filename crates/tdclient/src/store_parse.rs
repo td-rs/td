@@ -23,7 +23,12 @@ pub mod version {
     pub const ADD_KEY_HASH_TO_SECRET_CHAT: i32 = 2;
     pub const FIX_STORE_GAME_WITHOUT_ANIMATION: i32 = 4;
     pub const ADD_ACCESS_HASH_TO_SECRET_CHAT: i32 = 5;
+    /// `Version::FixWebPageInstantViewDatabase` — the WebPageBlock
+    /// animation/video stores gate the file-id payloads on it.
+    pub const FIX_WEB_PAGE_INSTANT_VIEW_DATABASE: i32 = 9;
     pub const FIX_MIN_USERS: i32 = 10;
+    pub const FIX_PAGE_BLOCK_AUDIO_EMPTY_FILE: i32 = 11;
+    pub const SUPPORT_INSTANT_VIEW_2_0: i32 = 18;
     pub const ADD_MESSAGE_INVOICE_PROVIDER_DATA: i32 = 12;
     pub const ADD_CAPTION_ENTITIES: i32 = 13;
     pub const ADD_VENUE_TYPE: i32 = 14;
@@ -31,8 +36,8 @@ pub mod version {
     pub const ADD_MESSAGE_UNSUPPORTED_VERSION: i32 = 17;
     pub const ADD_VIDEO_CALLS_SUPPORT: i32 = 21;
     pub const ADD_PHOTO_SIZE_SOURCE: i32 = 22;
-    pub const ADD_DICE_EMOJI: i32 = 25;
     pub const ADD_DIALOG_PHOTO_HAS_ANIMATION: i32 = 27;
+    pub const ADD_DICE_EMOJI: i32 = 25;
     pub const ADD_KEYBOARD_BUTTON_FLAGS: i32 = 35;
     pub const ADD_PHOTO_PROGRESSIVE_SIZES: i32 = 28;
     pub const ADD_LIVE_LOCATION_HEADING: i32 = 29;
@@ -52,6 +57,8 @@ pub mod version {
     /// `Version::AddStarGiftAttributeRarity` (Version.h:74).
     pub const ADD_STAR_GIFT_ATTRIBUTE_RARITY: i32 = 58;
     pub const ADD_USER_FLAGS2: i32 = 48;
+    pub const ADD_PAGE_BLOCK_CHAT_LINK_FLAGS: i32 = 50;
+    pub const SUPPORT_RICH_MESSAGES: i32 = 60;
     pub const ADD_MESSAGE_TEXT_FLAGS: i32 = 49;
     pub const SUPPORT_REPLIES_IN_OTHER_CHATS: i32 = 51;
     pub const SUPPORT_MULTIPLE_SHARED_USERS: i32 = 52;

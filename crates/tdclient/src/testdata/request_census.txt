@@ -413,7 +413,7 @@ getKeywordEmojis	interim
 getLanguagePackInfo	interim
 getLanguagePackString	interim
 getLanguagePackStrings	interim
-getLinkPreview	interim
+getLinkPreview	dispatched
 getLinkWebBrowserType	dispatched
 getLiveStoryAvailableMessageSenders	dispatched
 getLiveStoryRtmpUrl	dispatched
@@ -576,7 +576,7 @@ getVideoMessageAdvertisements	interim
 getWebAppLinkUrl	dispatched
 getWebAppPlaceholder	dispatched
 getWebAppUrl	interim
-getWebPageInstantView	interim
+getWebPageInstantView	dispatched
 giftPremiumWithStars	dispatched
 hideContactCloseBirthdays	dispatched
 hideSuggestedAction	dispatched

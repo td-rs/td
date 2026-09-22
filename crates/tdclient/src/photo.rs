@@ -324,7 +324,7 @@ pub fn get_photo_any_file_id(photo: &Photo) -> FileId {
 }
 
 /// `photo_append_file_ids` (Photo.cpp:440).
-fn photo_append_file_ids(photo: &Photo, file_ids: &mut Vec<FileId>) {
+pub fn photo_append_file_ids(photo: &Photo, file_ids: &mut Vec<FileId>) {
     for photo_size in &photo.photos {
         file_ids.push(photo_size.file_id);
     }
@@ -1033,6 +1033,71 @@ pub fn parse_photo(
         has_stickers,
         sticker_file_ids,
     })
+}
+
+/// `get_photo_object` (Photo.cpp:201-208) — the empty photo answers
+/// `None`; the file payloads are the codegen-forced empty objects (the
+/// listing-path FileManager reduction, module docs).
+pub fn get_photo_object(photo: &Photo) -> Option<td_api::Photo> {
+    if photo.is_empty() {
+        return None;
+    }
+    Some(td_api::Photo {
+        has_stickers: photo.has_stickers,
+        minithumbnail: Some(get_minithumbnail_object(photo.minithumbnail.as_bytes())),
+        sizes: get_photo_sizes_object(&photo.photos),
+    })
+}
+
+/// `store(DialogPhoto)` (DialogPhoto.hpp:16-34).
+pub fn store_dialog_photo(
+    env: &mut impl PhotoStoreEnv,
+    out: &mut Vec<u8>,
+    dialog_photo: &DialogPhoto,
+) {
+    let has_file_ids = dialog_photo.small_file_id.is_valid() || dialog_photo.big_file_id.is_valid();
+    let has_minithumbnail = !dialog_photo.minithumbnail.is_empty();
+    crate::store_parse::store_flags(
+        out,
+        [
+            has_file_ids,
+            dialog_photo.has_animation,
+            has_minithumbnail,
+            dialog_photo.is_personal,
+        ],
+    );
+    if has_file_ids {
+        env.store_file_id(dialog_photo.small_file_id, out);
+        env.store_file_id(dialog_photo.big_file_id, out);
+    }
+    if has_minithumbnail {
+        crate::store_parse::store_string(out, &dialog_photo.minithumbnail);
+    }
+}
+
+/// `parse(DialogPhoto)` (DialogPhoto.hpp:36-58) — the flags are
+/// `AddDialogPhotoHasAnimation`-gated.
+pub fn parse_dialog_photo(
+    env: &mut impl PhotoStoreEnv,
+    parser: &mut crate::store_parse::Parser<'_>,
+) -> Result<DialogPhoto, &'static str> {
+    let mut dialog_photo = DialogPhoto::default();
+    let [has_file_ids, has_animation, has_minithumbnail, is_personal] =
+        if parser.version() >= crate::store_parse::version::ADD_DIALOG_PHOTO_HAS_ANIMATION {
+            parser.parse_flags()?
+        } else {
+            [true, false, false, false]
+        };
+    if has_file_ids {
+        dialog_photo.small_file_id = env.parse_file_id(parser)?;
+        dialog_photo.big_file_id = env.parse_file_id(parser)?;
+    }
+    dialog_photo.has_animation = has_animation;
+    if has_minithumbnail {
+        dialog_photo.minithumbnail = parser.string()?;
+    }
+    dialog_photo.is_personal = is_personal;
+    Ok(dialog_photo)
 }
 
 #[cfg(test)]
