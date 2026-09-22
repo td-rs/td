@@ -91,6 +91,7 @@ pub mod payments;
 pub mod peer_color;
 pub mod people_nearby_manager;
 pub mod photo;
+pub mod poll_manager;
 pub mod premium;
 pub mod premium_gift_option;
 pub mod query_combiner;
