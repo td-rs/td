@@ -358,6 +358,11 @@ pub struct Td {
     pub(crate) group_call_manager: crate::group_call_manager::GroupCallManager,
     /// `Td::referral_program_manager_` (`Td.cpp:1295`, M.52).
     pub(crate) referral_program_manager: crate::referral_program::ReferralProgramManager,
+    /// `Td::business_manager_` (`Td.cpp:1292`, M.48).
+    pub(crate) business_manager: crate::business_manager::BusinessManager,
+    /// `Td::business_connection_manager_` (`Td.cpp:1291`, M.48).
+    pub(crate) business_connection_manager:
+        crate::business_connection_manager::BusinessConnectionManager,
     /// `Td::web_browser_manager_` (`make_unique` at `Td.cpp:1332`, the
     /// `init_managers` block).
     pub(crate) web_browser_manager: WebBrowserManager,
@@ -721,6 +726,9 @@ impl Td {
             secret_chats_manager: crate::secret_chats_manager::SecretChatsManager::new(true),
             group_call_manager: crate::group_call_manager::GroupCallManager::new(),
             referral_program_manager: crate::referral_program::ReferralProgramManager::new(),
+            business_manager: crate::business_manager::BusinessManager::new(),
+            business_connection_manager:
+                crate::business_connection_manager::BusinessConnectionManager::new(),
             web_browser_manager: WebBrowserManager::new(),
             web_browser_updates: Vec::new(),
             call_manager: CallManager::new(),
@@ -8268,6 +8276,109 @@ pub(crate) struct ReferralTdEnv<'a> {
 impl crate::referral_program::ReferralProgramEnv for ReferralTdEnv<'_> {
     fn send_update(&mut self, update: td_api::Update) {
         self.updates.push(update);
+    }
+}
+
+/// The `G()`/`td_` slice the business plane reads through (the M.48
+/// convention): field-split borrows off `Td`. The [blocked: net] query
+/// tails, the sticker/file-view halves and the messages-manager halves
+/// keep their trait defaults until their tracks land.
+pub(crate) struct BusinessTdEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) time_zone_manager: &'a mut TimeZoneManager,
+    pub(crate) user_manager: &'a mut UserManager,
+    /// The chat-manager half for the chat-link/recipient answer paths —
+    /// kept for the C++ field parity; the reads land with the chat plane.
+    #[allow(dead_code)]
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+}
+
+impl crate::business_manager::BusinessEnv for BusinessTdEnv<'_> {
+    // NOTE: the trait signatures use crate::dialog_id::DialogId (the
+    // canonical M.12 id space) while td.rs imports message_id::DialogId —
+    // qualify explicitly (the two-DialogIds convention).
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn get_time_zone_offset(&mut self, time_zone_id: &str) -> i32 {
+        let global = &mut *self.global;
+        let options = self
+            .options
+            .as_ref()
+            .expect("business requests run with the initialized option manager");
+        self.time_zone_manager
+            .get_time_zone_offset(global, options, time_zone_id)
+    }
+
+    fn get_option_integer(&mut self, name: &str, default_value: i64) -> i64 {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_integer(name, default_value)
+        })
+    }
+
+    fn force_create_dialog(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        source: &str,
+        force: bool,
+    ) {
+        // `DialogManager::force_create_dialog` — the master dialog plane
+        // stub is a no-op; the real force-create flips at the dialog step.
+        tdutils::log_info!(
+            "force_create_dialog({}, {source}, {force}) — the dialog-plane stub",
+            dialog_id.get()
+        );
+    }
+
+    fn get_chat_id_object(&mut self, dialog_id: crate::dialog_id::DialogId, source: &str) -> i64 {
+        crate::dialog_manager::get_chat_id_object(dialog_id, source)
+    }
+
+    fn get_input_users_force(
+        &mut self,
+        user_ids: &[crate::user_manager::UserId],
+    ) -> Vec<telegram_api::InputUser> {
+        let user_env = crate::user_manager::UserEnv {
+            global: &mut *self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("business requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_input_users_force(&user_env, user_ids)
+    }
+
+    fn get_user_id_object(&mut self, user_id: crate::user_manager::UserId, source: &str) -> i64 {
+        let mut user_env = crate::user_manager::UserEnv {
+            global: &mut *self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("business requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager
+            .get_user_id_object(&mut user_env, user_id, source)
+    }
+
+    fn get_input_user(
+        &mut self,
+        user_id: crate::user_manager::UserId,
+    ) -> std::result::Result<telegram_api::InputUser, tdutils::status::Status> {
+        let user_env = crate::user_manager::UserEnv {
+            global: &mut *self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("business requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_input_user(&user_env, user_id)
     }
 }
 
