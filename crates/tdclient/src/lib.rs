@@ -50,6 +50,7 @@ pub mod photo;
 pub mod query_combiner;
 pub mod query_merger;
 pub mod reaction_list_type;
+pub mod reaction_manager;
 pub mod reaction_type;
 pub mod request_actor;
 pub mod requests;

@@ -272,10 +272,15 @@ pub struct Td {
         crate::notification_settings_manager::NotificationSettingsManager,
     /// `Td::device_token_manager_` (`Td.cpp:1345`, M.13S).
     pub(crate) device_token_manager: crate::device_token_manager::DeviceTokenManager,
+    /// `Td::reaction_manager_` (`Td.cpp:1274`, M.16).
+    pub(crate) reaction_manager: crate::reaction_manager::ReactionManager,
     /// The notification manager's `send_update` outbox — the collapsed
     /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) notification_updates: Vec<td_api::Update>,
+    /// The reaction manager's `send_update` outbox — drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) reaction_updates: Vec<td_api::Update>,
     /// The premium-required-to-contact QueryMerger actor (a UserManager
     /// member in the C++; the Rust merger is an actor created by `init` —
     /// the `ActorOwn` keeps it alive, dropping it would hang the merged
@@ -582,6 +587,8 @@ impl Td {
             notification_settings_manager:
                 crate::notification_settings_manager::NotificationSettingsManager::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
+            reaction_manager: crate::reaction_manager::ReactionManager::new(),
+            reaction_updates: Vec::new(),
             notification_updates: Vec::new(),
             premium_required_contact_merger: None,
             chat_manager: crate::chat_manager::ChatManager::new(),
@@ -2569,6 +2576,10 @@ impl Td {
         for update in notification_updates {
             self.send_update(update.into());
         }
+        let reaction_updates = std::mem::take(&mut self.reaction_updates);
+        for update in reaction_updates {
+            self.send_update(update.into());
+        }
     }
 
     /// `td_->notification_manager_->init()` +
@@ -2584,6 +2595,19 @@ impl Td {
         };
         self.notification_manager.init(&mut env);
         self.notification_settings_manager.init(&mut env);
+
+        // `td_->reaction_manager_->init()` (AuthManager.cpp:1549, after
+        // notification settings and promo); idempotent
+        let mut env = ReactionEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            updates: &mut self.reaction_updates,
+            file_manager: std::sync::Arc::clone(&self.file_manager),
+            user_manager: &self.user_manager,
+        };
+        self.reaction_manager.init(&mut env);
     }
 
     /// `DeviceTokenManager::start_up` (DeviceTokenManager.cpp:329) — the
@@ -4968,6 +4992,239 @@ impl crate::notification_settings_manager::NotificationSettingsManagerEnv for No
 
     fn binlog_add(&mut self, handler_type: i32, data: &[u8]) -> u64 {
         self.global.td_db().binlog().add(handler_type, data)
+    }
+}
+
+/// The `G()`/manager slice the collapsed ReactionManager reads through
+/// (the C++ manager reads the same surfaces off its `Td *td_` directly).
+/// The `send_update`s buffer into [`Td::reaction_updates`] and Td drains
+/// them — the collapsed `send_closure(G()->td(), &Td::send_update)` hop.
+pub(crate) struct ReactionEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    /// `None` once the option manager is torn down; the getters answer
+    /// their defaults, matching the C++ close ordering closely enough for
+    /// the destroy path.
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+    /// The FileManager handle behind the `storer.context()->td()` FileId
+    /// codec (`store_file`/`parse_file`).
+    pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<FileManager>>,
+    /// The dialog-info probes of the paid-reaction peer fold.
+    pub(crate) user_manager: &'a UserManager,
+}
+
+impl crate::photo::DialogPhotoStoreEnv for ReactionEnv<'_> {
+    /// `storer.context()->td()...->file_manager_->store_file`.
+    fn store_file_id(&mut self, file_id: crate::files::FileId, out: &mut Vec<u8>) {
+        self.file_manager.lock().store_file(file_id, out);
+    }
+
+    /// `parser.context()->td()...->file_manager_->parse_file`.
+    fn parse_file_id(
+        &mut self,
+        parser: &mut crate::store_parse::Parser<'_>,
+    ) -> std::result::Result<crate::files::FileId, &'static str> {
+        self.file_manager.lock().parse_file(parser)
+    }
+}
+
+impl crate::paid_reaction_type::PaidReactionTypeEnv for ReactionEnv<'_> {
+    /// `dialog_manager_->have_dialog_info` (DialogManager.cpp:1573-1585,
+    /// the user/secret-chat halves; the chat/channel halves are the M.6
+    /// stub inventory).
+    fn have_dialog_info(&self, dialog_id: crate::dialog_id::DialogId) -> bool {
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User => self
+                .user_manager
+                .have_accessible_user(dialog_id.get_user_id()),
+            DialogType::Chat | DialogType::Channel => false,
+            DialogType::SecretChat => self
+                .user_manager
+                .have_secret_chat(dialog_id.get_secret_chat_id()),
+            DialogType::None => false,
+        }
+    }
+
+    /// `dialog_manager_->force_create_dialog` — the M.6 line stub is the
+    /// no-op.
+    fn force_create_dialog(&mut self, _dialog_id: crate::dialog_id::DialogId) {}
+
+    /// `dialog_manager_->check_dialog_access` — the line's dialog plane
+    /// answers the not-found band (the full access check is the M.6/M.10
+    /// integration).
+    fn check_dialog_access(
+        &self,
+        dialog_id: crate::dialog_id::DialogId,
+        _source: &str,
+    ) -> Result<(), tdutils::status::Status> {
+        if !dialog_id.is_valid() {
+            return Err(tdutils::status::Status::error(
+                400,
+                "Invalid chat identifier specified",
+            ));
+        }
+        Err(tdutils::status::Status::error(400, "Chat not found"))
+    }
+
+    /// `dialog_manager_->is_broadcast_channel` — the M.6 line stub.
+    fn is_broadcast_channel(&self, _dialog_id: crate::dialog_id::DialogId) -> bool {
+        false
+    }
+
+    /// `dialog_manager_->get_input_peer` — the full InputPeer family
+    /// stays with the dialog-plane integration.
+    fn get_input_peer(
+        &self,
+        _dialog_id: crate::dialog_id::DialogId,
+    ) -> Option<tdmtproto::telegram_api::InputPeer> {
+        None
+    }
+
+    /// `dialog_manager_->get_chat_id_object` (DialogManager.cpp:517).
+    fn get_chat_id_object(&self, dialog_id: crate::dialog_id::DialogId, source: &str) -> i64 {
+        crate::dialog_manager::get_chat_id_object(dialog_id, source)
+    }
+}
+
+impl crate::reaction_manager::ReactionManagerEnv for ReactionEnv<'_> {
+    fn auth_is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn get_option_boolean(&self, name: &str, default_value: bool) -> bool {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_boolean(name, default_value)
+        })
+    }
+
+    fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_integer(name, default_value)
+        })
+    }
+
+    fn get_option_string(&self, name: &str, default_value: &str) -> String {
+        self.options.as_ref().map_or_else(
+            || default_value.to_owned(),
+            |options| options.get_option_string(name, default_value),
+        )
+    }
+
+    fn have_option(&self, name: &str) -> bool {
+        self.options
+            .as_ref()
+            .is_some_and(|options| options.have_option(name))
+    }
+
+    fn set_option_string(&mut self, name: &str, value: &str) {
+        if let Some(options) = self.options.as_mut() {
+            options.set_option_string(name, value);
+        }
+    }
+
+    fn set_option_boolean(&mut self, name: &str, value: bool) {
+        if let Some(options) = self.options.as_mut() {
+            options.set_option_boolean(name, value);
+        }
+    }
+
+    fn set_option_empty(&mut self, name: &str) {
+        if let Some(options) = self.options.as_mut() {
+            options.set_option_empty(name);
+        }
+    }
+
+    fn binlog_pmc_get_raw(&mut self, key: &str) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key.as_bytes())
+    }
+
+    fn binlog_pmc_set_raw(&mut self, key: &str, value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key.as_bytes(), value);
+    }
+
+    fn sqlite_pmc_get_raw(&mut self, _key: &[u8]) -> Vec<u8> {
+        // the sqlite pmc plumbing is the M.12-database seam; the C++
+        // answers an empty string on a fresh key either way
+        if !self.global.use_sqlite_pmc() {
+            return Vec::new();
+        }
+        tdutils::log_info!("Sqlite pmc read — [blocked: database]");
+        Vec::new()
+    }
+
+    fn sqlite_pmc_set_raw(&mut self, _key: &[u8], _value: &[u8]) {
+        tdutils::log_info!("Sqlite pmc write — [blocked: database]");
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    /// `messages_manager_->set_active_reactions` — the M.10 consumer.
+    fn set_active_reactions(&mut self, _reactions: &[crate::reaction_type::ReactionType]) {
+        tdutils::log_info!("Set active reactions — [blocked: M.10]");
+    }
+
+    /// `stickers_manager_->get_sticker_object` — the M.15 seam.
+    fn get_sticker_object(&self, _file_id: crate::files::FileId) -> Option<td_api::Sticker> {
+        None
+    }
+
+    fn send_get_available_reactions_query(&mut self, hash: i32) {
+        tdutils::log_info!("Get available reactions query hash={hash} — [blocked: net]");
+    }
+
+    fn send_get_reaction_list_query(
+        &mut self,
+        reaction_list_type: crate::reaction_list_type::ReactionListType,
+        hash: i64,
+    ) {
+        tdutils::log_info!("Get {reaction_list_type} list hash={hash} — [blocked: net]");
+    }
+
+    fn send_clear_recent_reactions_query(&mut self, _promise: tdutils::promise::Promise<()>) {
+        tdutils::log_info!("Clear recent reactions query — [blocked: net]");
+    }
+
+    fn send_set_default_reaction_query(
+        &mut self,
+        _reaction_type: &crate::reaction_type::ReactionType,
+    ) {
+        tdutils::log_info!("Set default reaction query — [blocked: net]");
+    }
+
+    fn send_get_saved_reaction_tags_query(
+        &mut self,
+        saved_messages_topic_id: crate::reaction_manager::SavedMessagesTopicId,
+        hash: i64,
+    ) {
+        tdutils::log_info!(
+            "Get saved reaction tags topic={} hash={hash} — [blocked: net]",
+            saved_messages_topic_id.get_unique_id()
+        );
+    }
+
+    fn send_update_saved_reaction_tag_query(
+        &mut self,
+        _reaction_type: &crate::reaction_type::ReactionType,
+        _title: &str,
+    ) {
+        tdutils::log_info!("Update saved reaction tag query — [blocked: net]");
+    }
+
+    fn send_get_available_effects_query(&mut self, hash: i32) {
+        tdutils::log_info!("Get available effects hash={hash} — [blocked: net]");
     }
 }
 

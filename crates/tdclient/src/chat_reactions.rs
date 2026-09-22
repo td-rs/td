@@ -15,11 +15,11 @@ use tdmtproto::telegram_api;
 /// empty `reaction_types`, `allow_all_custom` implies `allow_all_regular`.
 #[derive(Clone, Debug, Default)]
 pub struct ChatReactions {
-    reaction_types: Vec<ReactionType>,
-    allow_all_regular: bool,
-    allow_all_custom: bool,
-    reactions_limit: i32,
-    paid_reactions_available: bool,
+    pub(crate) reaction_types: Vec<ReactionType>,
+    pub(crate) allow_all_regular: bool,
+    pub(crate) allow_all_custom: bool,
+    pub(crate) reactions_limit: i32,
+    pub(crate) paid_reactions_available: bool,
 }
 
 /// The `Td *td` slice [`ChatReactions::get_chat_available_reactions_object`]

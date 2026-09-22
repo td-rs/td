@@ -39,6 +39,7 @@ use crate::notification_settings::{
 };
 use crate::notification_settings_manager::ScopeSettingsAnswer;
 use crate::td::NotificationEnv;
+use crate::td::ReactionEnv;
 use crate::td::Td;
 use crate::td_api::{self, Function, Object};
 use crate::user_manager::{FileId, PendingUserRequest, SecretChatId, UserEnv, UserId};
@@ -197,6 +198,22 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                     &mut chat_updates,
                 );
                 updates.extend(chat_updates);
+            }
+
+            // ReactionManager::get_current_state (Requests.cpp:2219 —
+            // after stickers, before notification settings; the manager's
+            // own is_bot gate applies)
+            {
+                let env = ReactionEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_authorized: td.auth_manager.is_authorized(),
+                    auth_is_bot: td.auth_manager.is_bot(),
+                    updates: &mut td.reaction_updates,
+                    file_manager: std::sync::Arc::clone(&td.file_manager),
+                    user_manager: &td.user_manager,
+                };
+                td.reaction_manager.get_current_state(&env, &mut updates);
             }
 
             // NotificationSettingsManager::get_current_state
@@ -452,6 +469,169 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 Err(status) => send_error_status(td, id, status),
             }
         }
+
+        // --- the reactions set (M.16): Requests.cpp:3907-3916, 3930-3933,
+        // 4015-4039 and 5965-5967. The net tails stay [blocked: net]; the
+        // message-, chat- and story-scoped reaction arms route to
+        // MessagesManager/MessageQueryManager/Stories on their lines ---
+        Function::getEmojiReaction(request) => {
+            // Requests.cpp:3907-3911; the null object is the
+            // send_result(nullptr) 404 rewrite
+            let promise =
+                td.deferred_promise::<Option<td_api::EmojiReaction>, _>(
+                    id,
+                    |object| match object {
+                        Some(emoji_reaction) => Object::emojiReaction(emoji_reaction),
+                        None => Object::error(td_api::Error {
+                            code: 404,
+                            message: "Not Found".to_string(),
+                        }),
+                    },
+                );
+            let mut env = ReactionEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.reaction_updates,
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                user_manager: &td.user_manager,
+            };
+            td.reaction_manager
+                .get_emoji_reaction(&mut env, &request.emoji, promise);
+        }
+        Function::getCustomEmojiReactionAnimations(_) => {
+            // Requests.cpp:3913-3916 — StickersManager::get_custom_emoji_
+            // reaction_generic_animations owns this arm (M.15 integration)
+            td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+        }
+        Function::clearRecentReactions(_) => {
+            // Requests.cpp:3930-3933; an empty recent list answers here, a
+            // non-empty one parks behind the [blocked: net] query
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut env = ReactionEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.reaction_updates,
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                user_manager: &td.user_manager,
+            };
+            td.reaction_manager
+                .clear_recent_reactions(&mut env, promise);
+        }
+        Function::setDefaultReactionType(request) => {
+            // Requests.cpp:4015-4018
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut env = ReactionEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.reaction_updates,
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                user_manager: &td.user_manager,
+            };
+            td.reaction_manager.set_default_reaction(
+                &mut env,
+                crate::reaction_type::ReactionType::from_td_api(request.reaction_type),
+                promise,
+            );
+        }
+        Function::getStoryAvailableReactions(request) => {
+            // Requests.cpp:5965-5968 — the synchronous available-reactions
+            // builder
+            let available = {
+                let mut env = ReactionEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_authorized: td.auth_manager.is_authorized(),
+                    auth_is_bot: td.auth_manager.is_bot(),
+                    updates: &mut td.reaction_updates,
+                    file_manager: std::sync::Arc::clone(&td.file_manager),
+                    user_manager: &td.user_manager,
+                };
+                td.reaction_manager
+                    .get_available_reactions(&mut env, request.row_size)
+            };
+            td.send_result(id, Object::availableReactions(available));
+        }
+        Function::getMessageEffect(request) => {
+            // Requests.cpp:4036-4040; the null object is the
+            // send_result(nullptr) 404 rewrite
+            let promise =
+                td.deferred_promise::<Option<td_api::MessageEffect>, _>(
+                    id,
+                    |object| match object {
+                        Some(effect) => Object::messageEffect(effect),
+                        None => Object::error(td_api::Error {
+                            code: 404,
+                            message: "Not Found".to_string(),
+                        }),
+                    },
+                );
+            let mut env = ReactionEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.reaction_updates,
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                user_manager: &td.user_manager,
+            };
+            td.reaction_manager.get_message_effect(
+                &mut env,
+                crate::reaction_manager::MessageEffectId::new(request.effect_id),
+                promise,
+            );
+        }
+        Function::getSavedMessagesTags(request) => {
+            // Requests.cpp:4021-4030; the SavedMessagesManager topic
+            // translation is the Wave-3 seam — topic 0 is the default
+            // list, every other id takes the C++ invalid-marker 400
+            let saved_messages_topic_id = if request.saved_messages_topic_id == 0 {
+                crate::reaction_manager::SavedMessagesTopicId::default()
+            } else {
+                crate::reaction_manager::SavedMessagesTopicId::from_dialog_id(
+                    crate::dialog_id::DialogId::new(i64::MAX),
+                )
+            };
+            let promise =
+                td.deferred_promise::<td_api::SavedMessagesTags, _>(id, Object::savedMessagesTags);
+            let mut env = ReactionEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.reaction_updates,
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                user_manager: &td.user_manager,
+            };
+            td.reaction_manager
+                .get_saved_messages_tags(&mut env, saved_messages_topic_id, promise);
+        }
+        Function::setSavedMessagesTagLabel(request) => {
+            // Requests.cpp:4030-4036; the local tag machine runs here, the
+            // UpdateSavedReactionTagQuery tail stays [blocked: net]
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut env = ReactionEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.reaction_updates,
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                user_manager: &td.user_manager,
+            };
+            td.reaction_manager.set_saved_messages_tag_title(
+                &mut env,
+                crate::reaction_type::ReactionType::from_td_api(request.tag),
+                &request.label,
+                promise,
+            );
+        }
+
         Function::resetAllNotificationSettings(_) => {
             // `Requests.cpp:7983-7987`: the local reset answers ok without
             // waiting for the (net-blocked) ResetNotifySettingsQuery
@@ -2180,9 +2360,9 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            110,
+            117,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 894, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 887, "interim count");
     }
 }
