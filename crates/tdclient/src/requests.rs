@@ -6861,6 +6861,211 @@ fn run_group_call_requests(td: &mut Td, id: u64, function: Function) {
         }
 
         // Everything else waits for its manager step.
+        _ => run_referral_requests(td, id, function),
+    }
+}
+
+/// The M.52 ReferralProgramManager arm group of the request dispatcher —
+/// see the frame note at the forward site in [`run_request`]. The arms
+/// route into `td_->referral_program_manager_` (Requests.cpp:9151-9169);
+/// every server leg is the [blocked: net] seam.
+#[allow(clippy::too_many_lines)]
+fn run_referral_requests(td: &mut Td, id: u64, function: Function) {
+    fn referral_arm(
+        td: &mut Td,
+        run: impl FnOnce(
+            &mut crate::td::ReferralTdEnv<'_>,
+            &mut crate::referral_program::ReferralProgramManager,
+        ),
+    ) {
+        let crate::td::Td {
+            referral_program_manager,
+            global,
+            notification_updates,
+            ..
+        } = td;
+        let mut env = crate::td::ReferralTdEnv {
+            global,
+            updates: notification_updates,
+        };
+        run(&mut env, referral_program_manager);
+    }
+
+    macro_rules! ok_promise {
+        ($td:expr) => {
+            $td.deferred_promise::<(), _>(id, |_| ok_object())
+        };
+    }
+
+    /// The null-result 404 mapper (the chat answer).
+    fn chat_optional_to_object(value: Option<td_api::Chat>) -> Object {
+        match value {
+            Some(chat) => Object::chat(chat),
+            None => Object::error(td_api::Error {
+                code: 404,
+                message: "Not Found".to_owned(),
+            }),
+        }
+    }
+
+    match function {
+        // setChatAffiliateProgram (Requests.cpp:9146-9151)
+        Function::setChatAffiliateProgram(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let parameters =
+                crate::referral_program::ReferralProgramParameters::from_td_api(request.parameters);
+            referral_arm(td, |env, manager| {
+                manager.set_dialog_referral_program(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    parameters,
+                    promise,
+                );
+            });
+        }
+
+        // searchChatAffiliateProgram (Requests.cpp:9153-9159)
+        Function::searchChatAffiliateProgram(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(username) = clean_or_utf8_error(td, id, &request.username) else {
+                return;
+            };
+            let Some(referrer) = clean_or_utf8_error(td, id, &request.referrer) else {
+                return;
+            };
+            let promise = td.deferred_promise(id, chat_optional_to_object);
+            referral_arm(td, |env, manager| {
+                manager.search_dialog_referral_program(env, &username, &referrer, promise);
+            });
+        }
+
+        // searchAffiliatePrograms (Requests.cpp:9161-9166)
+        Function::searchAffiliatePrograms(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::FoundAffiliatePrograms, _>(id, |value| {
+                Object::foundAffiliatePrograms(value)
+            });
+            let sort_order =
+                crate::referral_program::ReferralProgramSortOrder::from_td_api(request.sort_order);
+            referral_arm(td, |env, manager| {
+                manager.search_referral_programs(
+                    env,
+                    request.affiliate,
+                    sort_order,
+                    &offset,
+                    request.limit,
+                    promise,
+                );
+            });
+        }
+
+        // connectAffiliateProgram (Requests.cpp:9168-9172)
+        Function::connectAffiliateProgram(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise(id, |value: Option<td_api::ConnectedAffiliateProgram>| {
+                    match value {
+                        Some(program) => Object::connectedAffiliateProgram(program),
+                        None => Object::error(td_api::Error {
+                            code: 404,
+                            message: "Not Found".to_owned(),
+                        }),
+                    }
+                });
+            referral_arm(td, |env, manager| {
+                manager.connect_referral_program(
+                    env,
+                    request.affiliate,
+                    crate::user_manager::UserId::new(request.bot_user_id),
+                    promise,
+                );
+            });
+        }
+
+        // disconnectAffiliateProgram (Requests.cpp:9174-9178)
+        Function::disconnectAffiliateProgram(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(url) = clean_or_utf8_error(td, id, &request.url) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise(id, |value: Option<td_api::ConnectedAffiliateProgram>| {
+                    match value {
+                        Some(program) => Object::connectedAffiliateProgram(program),
+                        None => Object::error(td_api::Error {
+                            code: 404,
+                            message: "Not Found".to_owned(),
+                        }),
+                    }
+                });
+            referral_arm(td, |env, manager| {
+                manager.revoke_referral_program(env, request.affiliate, &url, promise);
+            });
+        }
+
+        // getConnectedAffiliateProgram (Requests.cpp:9180-9184)
+        Function::getConnectedAffiliateProgram(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise(id, |value: Option<td_api::ConnectedAffiliateProgram>| {
+                    match value {
+                        Some(program) => Object::connectedAffiliateProgram(program),
+                        None => Object::error(td_api::Error {
+                            code: 404,
+                            message: "Not Found".to_owned(),
+                        }),
+                    }
+                });
+            referral_arm(td, |env, manager| {
+                manager.get_connected_referral_program(
+                    env,
+                    request.affiliate,
+                    crate::user_manager::UserId::new(request.bot_user_id),
+                    promise,
+                );
+            });
+        }
+
+        // getConnectedAffiliatePrograms (Requests.cpp:9186-9190)
+        Function::getConnectedAffiliatePrograms(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let promise = td
+                .deferred_promise::<td_api::ConnectedAffiliatePrograms, _>(id, |value| {
+                    Object::connectedAffiliatePrograms(value)
+                });
+            referral_arm(td, |env, manager| {
+                manager.get_connected_referral_programs(
+                    env,
+                    request.affiliate,
+                    &offset,
+                    request.limit,
+                    promise,
+                );
+            });
+        }
+
+        // Everything else waits for its manager step.
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
@@ -7592,9 +7797,9 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 19, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            418,
+            425,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 585, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 578, "interim count");
     }
 }

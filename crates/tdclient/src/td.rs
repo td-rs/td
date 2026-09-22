@@ -356,6 +356,8 @@ pub struct Td {
     pub(crate) secret_chats_manager: crate::secret_chats_manager::SecretChatsManager,
     /// `Td::group_call_manager_` (`Td.cpp:1294`, M.51).
     pub(crate) group_call_manager: crate::group_call_manager::GroupCallManager,
+    /// `Td::referral_program_manager_` (`Td.cpp:1295`, M.52).
+    pub(crate) referral_program_manager: crate::referral_program::ReferralProgramManager,
     /// `Td::web_browser_manager_` (`make_unique` at `Td.cpp:1332`, the
     /// `init_managers` block).
     pub(crate) web_browser_manager: WebBrowserManager,
@@ -718,6 +720,7 @@ impl Td {
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
             secret_chats_manager: crate::secret_chats_manager::SecretChatsManager::new(true),
             group_call_manager: crate::group_call_manager::GroupCallManager::new(),
+            referral_program_manager: crate::referral_program::ReferralProgramManager::new(),
             web_browser_manager: WebBrowserManager::new(),
             web_browser_updates: Vec::new(),
             call_manager: CallManager::new(),
@@ -8246,6 +8249,23 @@ impl crate::group_call_manager::GroupCallEnv for GroupCallTdEnv<'_> {
         self.auth_is_bot
     }
 
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+}
+
+/// The `G()`/`td_` slice the referral plane reads through (the M.52
+/// convention): field-split borrows off `Td`. Every server leg is a
+/// [blocked: net] seam.
+pub(crate) struct ReferralTdEnv<'a> {
+    /// The C++ `G()` reads — kept for the field parity; the halves land
+    /// with the net step.
+    #[allow(dead_code)]
+    pub(crate) global: &'a mut Global,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::referral_program::ReferralProgramEnv for ReferralTdEnv<'_> {
     fn send_update(&mut self, update: td_api::Update) {
         self.updates.push(update);
     }

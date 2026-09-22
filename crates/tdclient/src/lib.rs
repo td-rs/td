@@ -82,6 +82,7 @@ pub mod query_combiner;
 pub mod query_merger;
 pub mod quick_reply_manager;
 pub mod reaction_type;
+pub mod referral_program;
 pub mod request_actor;
 pub mod requests;
 pub mod restriction_reason;

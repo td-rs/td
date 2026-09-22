@@ -116,7 +116,7 @@ composeTextWithAi	interim
 confirmBusinessConnectedBot	dispatched
 confirmQrCodeAuthentication	dispatched
 confirmSession	dispatched
-connectAffiliateProgram	interim
+connectAffiliateProgram	dispatched
 craftGift	dispatched
 createBasicGroupChat	interim
 createBot	dispatched
@@ -198,7 +198,7 @@ destroy	dispatched
 disableAllSupergroupUsernames	interim
 disableProxy	interim
 discardCall	dispatched
-disconnectAffiliateProgram	interim
+disconnectAffiliateProgram	dispatched
 disconnectAllWebsites	dispatched
 disconnectWebsite	dispatched
 downloadFile	dispatched
@@ -339,8 +339,8 @@ getChatsToPostStories	dispatched
 getCloseFriends	dispatched
 getCollectibleItemInfo	dispatched
 getCommands	dispatched
-getConnectedAffiliateProgram	interim
-getConnectedAffiliatePrograms	interim
+getConnectedAffiliateProgram	dispatched
+getConnectedAffiliatePrograms	dispatched
 getConnectedWebsites	dispatched
 getContacts	dispatched
 getCountries	interim
@@ -722,10 +722,10 @@ revokeGroupCallInviteLink	dispatched
 saveApplicationLogEvent	interim
 savePreparedInlineMessage	interim
 savePreparedKeyboardButton	interim
-searchAffiliatePrograms	interim
+searchAffiliatePrograms	dispatched
 searchBackground	interim
 searchCallMessages	interim
-searchChatAffiliateProgram	interim
+searchChatAffiliateProgram	dispatched
 searchChatMembers	interim
 searchChatMessages	interim
 searchChatRecentLocationMessages	interim
@@ -819,7 +819,7 @@ setBusinessOpeningHours	dispatched
 setBusinessStartPage	dispatched
 setChatAccentColor	dispatched
 setChatActiveStoriesList	dispatched
-setChatAffiliateProgram	interim
+setChatAffiliateProgram	dispatched
 setChatAvailableReactions	interim
 setChatBackground	interim
 setChatClientData	interim
