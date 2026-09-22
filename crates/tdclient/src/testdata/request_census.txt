@@ -127,7 +127,7 @@ createChatFolderInviteLink	interim
 createChatInviteLink	interim
 createChatSubscriptionInviteLink	interim
 createCommunity	dispatched
-createForumTopic	interim
+createForumTopic	dispatched
 createGiftCollection	dispatched
 createGroupCall	interim
 createInvoiceLink	dispatched
@@ -172,7 +172,7 @@ deleteDirectMessagesChatTopicHistory	interim
 deleteDirectMessagesChatTopicMessagesByDate	interim
 deleteEphemeralMessage	interim
 deleteFile	interim
-deleteForumTopic	interim
+deleteForumTopic	dispatched
 deleteGiftCollection	dispatched
 deleteGroupCallMessages	interim
 deleteGroupCallMessagesBySender	interim
@@ -221,7 +221,7 @@ editChatWelcomeMessage	interim
 editCustomLanguagePackInfo	interim
 editEphemeralMessage	interim
 editEphemeralMessageCaption	interim
-editForumTopic	interim
+editForumTopic	dispatched
 editInlineMessageCaption	interim
 editInlineMessageLiveLocation	interim
 editInlineMessageMedia	interim
@@ -375,11 +375,11 @@ getFile	dispatched
 getFileDownloadedPrefixSize	interim
 getFileExtension	sync
 getFileMimeType	sync
-getForumTopic	interim
+getForumTopic	dispatched
 getForumTopicDefaultIcons	interim
 getForumTopicHistory	interim
-getForumTopicLink	interim
-getForumTopics	interim
+getForumTopicLink	dispatched
+getForumTopics	dispatched
 getFullRichMessage	interim
 getGameHighScores	dispatched
 getGiftAuctionAcquiredGifts	dispatched
@@ -857,7 +857,7 @@ setDefaultReactionType	interim
 setDirectMessagesChatTopicIsMarkedAsUnread	interim
 setEmojiStatus	dispatched
 setFileGenerationProgress	dispatched
-setForumTopicNotificationSettings	interim
+setForumTopicNotificationSettings	dispatched
 setGameScore	dispatched
 setGiftCollectionName	dispatched
 setGiftResalePrice	dispatched
@@ -889,7 +889,7 @@ setPassportElementErrors	dispatched
 setPassword	interim
 setPersonalChat	interim
 setPinnedChats	interim
-setPinnedForumTopics	interim
+setPinnedForumTopics	dispatched
 setPinnedGifts	dispatched
 setPinnedSavedMessagesTopics	interim
 setPollAnswer	interim
@@ -970,9 +970,9 @@ toggleChatIsTranslatable	interim
 toggleChatViewAsTopics	interim
 toggleDirectMessagesChatTopicCanSendUnpaidMessages	interim
 toggleDownloadIsPaused	dispatched
-toggleForumTopicIsClosed	interim
-toggleForumTopicIsPinned	interim
-toggleGeneralForumTopicIsHidden	interim
+toggleForumTopicIsClosed	dispatched
+toggleForumTopicIsPinned	dispatched
+toggleGeneralForumTopicIsHidden	dispatched
 toggleGiftIsSaved	dispatched
 toggleGroupCallAreMessagesAllowed	interim
 toggleGroupCallIsMyVideoEnabled	interim

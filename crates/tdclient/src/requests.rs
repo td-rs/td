@@ -2753,6 +2753,244 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
 
         // Everything else waits for its manager step.
         // Everything else waits for its manager step.
+        _ => run_forum_topic_requests(td, id, function),
+    }
+}
+
+/// The M.49 ForumTopicManager arm group of the request dispatcher — see
+/// the frame note at the forward site in [`run_request`]. Every arm routes
+/// into `td_->forum_topic_manager_->...` (Requests.cpp:4835-4904, 7963);
+/// the network tails are the [blocked: net] query seams.
+#[allow(clippy::too_many_lines)]
+fn run_forum_topic_requests(td: &mut Td, id: u64, function: Function) {
+    fn forum_arm(
+        td: &mut Td,
+        run: impl FnOnce(
+            &mut crate::td::ForumTopicTdEnv<'_>,
+            &mut crate::forum_topic_manager::ForumTopicManager,
+        ),
+    ) {
+        let crate::td::Td {
+            forum_topic_manager,
+            global,
+            auth_manager,
+            chat_manager,
+            notification_updates,
+            ..
+        } = td;
+        let mut env = crate::td::ForumTopicTdEnv {
+            global,
+            auth_is_bot: auth_manager.is_bot(),
+            chat_manager,
+            updates: notification_updates,
+        };
+        run(&mut env, forum_topic_manager);
+    }
+
+    macro_rules! ok_promise {
+        ($td:expr) => {
+            $td.deferred_promise::<(), _>(id, |_| ok_object())
+        };
+    }
+
+    /// The null-result 404 mapper (the forumTopic answer).
+    fn forum_topic_optional_to_object(value: Option<td_api::ForumTopic>) -> Object {
+        match value {
+            Some(topic) => Object::forumTopic(topic),
+            None => Object::error(td_api::Error {
+                code: 404,
+                message: "Not Found".to_owned(),
+            }),
+        }
+    }
+
+    match function {
+        // createForumTopic (Requests.cpp:4832-4838)
+        Function::createForumTopic(request) => {
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise(id, |value: Option<td_api::ForumTopicInfo>| match value {
+                    Some(info) => Object::forumTopicInfo(info),
+                    None => Object::error(td_api::Error {
+                        code: 404,
+                        message: "Not Found".to_owned(),
+                    }),
+                });
+            forum_arm(td, |env, manager| {
+                manager.create_forum_topic(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    &name,
+                    request.is_name_implicit,
+                    request.icon,
+                    promise,
+                );
+            });
+        }
+
+        // editForumTopic (Requests.cpp:4840-4847)
+        Function::editForumTopic(request) => {
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let promise = ok_promise!(td);
+            forum_arm(td, |env, manager| {
+                manager.edit_forum_topic(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::forum_topic::ForumTopicId::new(request.forum_topic_id),
+                    &name,
+                    request.edit_icon_custom_emoji,
+                    crate::emoji_status::CustomEmojiId::new(request.icon_custom_emoji_id),
+                    promise,
+                );
+            });
+        }
+
+        // getForumTopic (Requests.cpp:4849-4854)
+        Function::getForumTopic(request) => {
+            let promise = td.deferred_promise(id, forum_topic_optional_to_object);
+            forum_arm(td, |env, manager| {
+                manager.get_forum_topic(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::forum_topic::ForumTopicId::new(request.forum_topic_id),
+                    promise,
+                );
+            });
+        }
+
+        // getForumTopicLink (Requests.cpp:4860-4867)
+        Function::getForumTopicLink(request) => {
+            let promise = td.deferred_promise::<td_api::MessageLink, _>(id, Object::messageLink);
+            forum_arm(td, |env, manager| {
+                manager.get_forum_topic_link(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::forum_topic::ForumTopicId::new(request.forum_topic_id),
+                    promise,
+                );
+            });
+        }
+
+        // getForumTopics (Requests.cpp:4869-4877)
+        Function::getForumTopics(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::ForumTopics, _>(id, Object::forumTopics);
+            forum_arm(td, |env, manager| {
+                manager.get_forum_topics(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    query,
+                    request.offset_date,
+                    crate::message_id::MessageId::new(request.offset_message_id),
+                    crate::forum_topic::ForumTopicId::new(request.offset_forum_topic_id),
+                    request.limit,
+                    promise,
+                );
+            });
+        }
+
+        // toggleForumTopicIsClosed (Requests.cpp:4879-4885)
+        Function::toggleForumTopicIsClosed(request) => {
+            let promise = ok_promise!(td);
+            forum_arm(td, |env, manager| {
+                manager.toggle_forum_topic_is_closed(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::forum_topic::ForumTopicId::new(request.forum_topic_id),
+                    request.is_closed,
+                    promise,
+                );
+            });
+        }
+
+        // toggleGeneralForumTopicIsHidden (Requests.cpp:4887-4892)
+        Function::toggleGeneralForumTopicIsHidden(request) => {
+            let promise = ok_promise!(td);
+            forum_arm(td, |env, manager| {
+                manager.toggle_forum_topic_is_hidden(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    request.is_hidden,
+                    promise,
+                );
+            });
+        }
+
+        // toggleForumTopicIsPinned (Requests.cpp:4894-4899)
+        Function::toggleForumTopicIsPinned(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            forum_arm(td, |env, manager| {
+                manager.toggle_forum_topic_is_pinned(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::forum_topic::ForumTopicId::new(request.forum_topic_id),
+                    request.is_pinned,
+                    promise,
+                );
+            });
+        }
+
+        // setPinnedForumTopics (Requests.cpp:4901-4906)
+        Function::setPinnedForumTopics(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let forum_topic_ids =
+                crate::forum_topic::ForumTopicId::get_forum_topic_ids(&request.forum_topic_ids);
+            forum_arm(td, |env, manager| {
+                manager.set_pinned_forum_topics(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    forum_topic_ids,
+                    promise,
+                );
+            });
+        }
+
+        // deleteForumTopic (Requests.cpp:4908-4913)
+        Function::deleteForumTopic(request) => {
+            let promise = ok_promise!(td);
+            forum_arm(td, |env, manager| {
+                manager.delete_forum_topic(
+                    env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::forum_topic::ForumTopicId::new(request.forum_topic_id),
+                    promise,
+                );
+            });
+        }
+
+        // setForumTopicNotificationSettings (Requests.cpp:7963-7967) —
+        // [blocked: the notification-settings plane].
+        Function::setForumTopicNotificationSettings(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let mut promise = ok_promise!(td);
+            tdutils::log_info!(
+                "setForumTopicNotificationSettings({}, {}) — [blocked: the notification-settings plane]",
+                request.chat_id,
+                request.forum_topic_id
+            );
+            promise.set_value(());
+        }
+
+
+        // Everything else waits for its manager step.
+        // Everything else waits for its manager step.
         _ => run_story_requests(td, id, function),
     }
 }
@@ -6546,16 +6784,17 @@ mod request_census_tests {
 assert_eq!(*counts.get("sync").unwrap_or(&0), 19, "sync count");
 assert_eq!(
     *counts.get("dispatched").unwrap_or(&0),
-    352,
+    363,
     "dispatched count"
 );
 assert_eq!(
     *counts.get("interim").unwrap_or(&0),
-    651,
+    640,
     "interim count"
 );
     }
 }
+
 
 
 

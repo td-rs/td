@@ -315,6 +315,8 @@ pub struct Td {
     /// The account plane's `send_update` outbox; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) account_updates: Vec<td_api::Update>,
+    /// `Td::forum_topic_manager_` (`Td.cpp:1297`, M.49).
+    pub(crate) forum_topic_manager: crate::forum_topic_manager::ForumTopicManager,
     /// `Td::secure_manager_` (`Td.cpp:1353`, `init_pure_actor_managers`)
     /// — the M.44 collapsed manager; the C++ actor's `start_up` is empty.
     pub(crate) secure_manager: crate::secure_manager::SecureManager,
@@ -695,6 +697,7 @@ impl Td {
             suggested_action_manager: crate::suggested_action_manager::SuggestedActionManager::new(
             ),
             account_updates: Vec::new(),
+            forum_topic_manager: crate::forum_topic_manager::ForumTopicManager::new(),
             secure_manager: crate::secure_manager::SecureManager::new(),
             star_gift_manager: crate::star_gift_manager::StarGiftManager::new(),
             theme_manager: crate::theme_manager::ThemeManager::new(),
@@ -8154,6 +8157,35 @@ impl<'a> crate::story_manager::StoryManagerEnv for StoryEnv<'a> {
         None
     }
 }
+
+/// The `G()`/`td_` slice the forum plane reads through (the M.49
+/// convention): field-split borrows off `Td`. The [blocked: net] query
+/// tails and the notification-settings/draft halves keep their trait
+/// defaults until their tracks land.
+pub(crate) struct ForumTopicTdEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) auth_is_bot: bool,
+    /// The chat-manager half for the forum checks — kept for the C++
+    /// field parity; the is_forum read lands with the chat plane.
+    #[allow(dead_code)]
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::forum_topic_manager::ForumTopicEnv for ForumTopicTdEnv<'_> {
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn unix_time(&mut self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
