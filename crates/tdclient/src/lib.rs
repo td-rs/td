@@ -48,6 +48,8 @@ pub mod query_merger;
 pub mod request_actor;
 pub mod requests;
 pub mod restriction_reason;
+pub mod secret_chat;
+pub mod secret_chats_manager;
 pub mod store_parse;
 pub mod synchronous_requests;
 pub mod td;
