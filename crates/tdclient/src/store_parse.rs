@@ -24,6 +24,7 @@ pub mod version {
     pub const FIX_MIN_USERS: i32 = 10;
     pub const ADD_PHOTO_SIZE_SOURCE: i32 = 22;
     pub const SUPPORT_BANNED_CHANNELS: i32 = 31;
+    pub const ADD_DIALOG_PHOTO_HAS_ANIMATION: i32 = 27;
     pub const REMOVE_PHOTO_VOLUME_AND_LOCAL_ID: i32 = 32;
     pub const SUPPORT_64_BIT_IDS: i32 = 33;
     pub const MAKE_PARTICIPANT_FLAGS_64_BIT: i32 = 46;

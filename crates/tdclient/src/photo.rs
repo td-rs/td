@@ -680,6 +680,76 @@ pub fn dialog_photo_get_file_ids(dialog_photo: &DialogPhoto) -> Vec<FileId> {
     result
 }
 
+/// The `storer.context()->td()` FileId codec slice
+/// (`FileManager::store_file`/`parse_file`) — the indirection the
+/// `DialogPhoto`/`MinChannel` db records carry their file ids through.
+/// (The M.16 line carries the twin in photo.rs; dedupe at merge.)
+pub trait DialogPhotoStoreEnv {
+    fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>);
+    fn parse_file_id(
+        &mut self,
+        parser: &mut crate::store_parse::Parser<'_>,
+    ) -> Result<FileId, &'static str>;
+}
+
+/// `store(const DialogPhoto &, StorerT &)` (DialogPhoto.hpp:15-34).
+pub fn store_dialog_photo(
+    dialog_photo: &DialogPhoto,
+    env: &mut impl DialogPhotoStoreEnv,
+    out: &mut Vec<u8>,
+) {
+    let has_file_ids = dialog_photo.small_file_id.is_valid() || dialog_photo.big_file_id.is_valid();
+    let has_minithumbnail = !dialog_photo.minithumbnail.is_empty();
+    crate::store_parse::store_flags(
+        out,
+        [
+            has_file_ids,
+            dialog_photo.has_animation,
+            has_minithumbnail,
+            dialog_photo.is_personal,
+        ],
+    );
+    if has_file_ids {
+        env.store_file_id(dialog_photo.small_file_id, out);
+        env.store_file_id(dialog_photo.big_file_id, out);
+    }
+    if has_minithumbnail {
+        crate::store_parse::store_string(out, &dialog_photo.minithumbnail);
+    }
+}
+
+/// `parse(DialogPhoto &, ParserT &)` (DialogPhoto.hpp:36-59) — with the
+/// pre-`AddDialogPhotoHasAnimation` legacy band (the file ids stored
+/// unconditionally, no flags block).
+pub fn parse_dialog_photo(
+    env: &mut impl DialogPhotoStoreEnv,
+    parser: &mut crate::store_parse::Parser<'_>,
+) -> Result<DialogPhoto, &'static str> {
+    let mut dialog_photo = DialogPhoto::default();
+    let mut has_file_ids = true;
+    let mut has_minithumbnail = false;
+    if parser.version() >= crate::store_parse::version::ADD_DIALOG_PHOTO_HAS_ANIMATION {
+        let [
+            has_file_ids_flag,
+            has_animation,
+            has_minithumbnail_flag,
+            is_personal,
+        ] = parser.parse_flags()?;
+        has_file_ids = has_file_ids_flag;
+        dialog_photo.has_animation = has_animation;
+        has_minithumbnail = has_minithumbnail_flag;
+        dialog_photo.is_personal = is_personal;
+    }
+    if has_file_ids {
+        dialog_photo.small_file_id = env.parse_file_id(parser)?;
+        dialog_photo.big_file_id = env.parse_file_id(parser)?;
+    }
+    if has_minithumbnail {
+        dialog_photo.minithumbnail = parser.string()?;
+    }
+    Ok(dialog_photo)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

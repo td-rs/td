@@ -148,6 +148,16 @@ pub struct MessageId(i64);
 impl MessageId {
     /// `MessageId::SCHEDULED_MASK` (MessageId.h:31).
     const SCHEDULED_MASK: i64 = 4;
+    /// `MessageId::SERVER_ID_SHIFT` (MessageId.h:27).
+    const SERVER_ID_SHIFT: i64 = 20;
+    /// `MessageId::SHORT_TYPE_MASK` (MessageId.h:28).
+    const SHORT_TYPE_MASK: i64 = (1 << 2) - 1;
+    /// `MessageId::FULL_TYPE_MASK` (MessageId.h:30).
+    const FULL_TYPE_MASK: i64 = (1 << Self::SERVER_ID_SHIFT) - 1;
+    /// `MessageId::TYPE_YET_UNSENT` (MessageId.h:32).
+    const TYPE_YET_UNSENT: i64 = 1;
+    /// `MessageId::TYPE_LOCAL` (MessageId.h:33).
+    const TYPE_LOCAL: i64 = 2;
 
     pub fn new(id: i64) -> MessageId {
         MessageId(id)
@@ -160,6 +170,30 @@ impl MessageId {
     /// `MessageId::is_scheduled` (MessageId.h:107-109).
     pub fn is_scheduled(self) -> bool {
         (self.0 & Self::SCHEDULED_MASK) != 0
+    }
+
+    /// `MessageId::is_yet_unsent` (MessageId.h:111-113) — the caller
+    /// guarantees validness (the C++ CHECK).
+    pub fn is_yet_unsent(self) -> bool {
+        (self.0 & Self::SHORT_TYPE_MASK) == Self::TYPE_YET_UNSENT
+    }
+
+    /// `MessageId::is_local` (MessageId.h:116-118) — the caller guarantees
+    /// validness (the C++ CHECK).
+    pub fn is_local(self) -> bool {
+        (self.0 & Self::SHORT_TYPE_MASK) == Self::TYPE_LOCAL
+    }
+
+    /// `MessageId::is_server` (MessageId.h:121-124) — also checks validness.
+    pub fn is_server(self) -> bool {
+        (self.0 & Self::FULL_TYPE_MASK) == 0 && self.0 > 0 && self.0 <= Self::max().get()
+    }
+
+    /// `MessageId::get_server_message_id` (MessageId.h:135-137) — the
+    /// caller guarantees the server range (the C++ CHECK); the raw
+    /// `ServerMessageId` int.
+    pub fn get_server_message_id(self) -> i32 {
+        (self.0 >> Self::SERVER_ID_SHIFT) as i32
     }
 
     /// `MessageId::is_valid` (MessageId.cpp:115-124) — server ids keep the
