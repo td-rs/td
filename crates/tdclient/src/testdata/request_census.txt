@@ -38,7 +38,7 @@ addTextCompositionStyle	interim
 addWebBrowserSettingsException	interim
 allowBotToSendMessages	interim
 allowUnpaidMessagesFromUser	interim
-answerCallbackQuery	interim
+answerCallbackQuery	dispatched
 answerChatJoinRequestQuery	interim
 answerCustomQuery	interim
 answerGuestQuery	interim
@@ -89,7 +89,7 @@ checkPremiumGiftCode	interim
 checkQuickReplyShortcutName	interim
 checkRecoveryEmailAddressCode	interim
 checkStickerSetName	interim
-checkWebAppFileDownload	interim
+checkWebAppFileDownload	dispatched
 cleanFileName	interim
 clearAllDraftMessages	interim
 clearAutosaveSettingsExceptions	interim
@@ -108,7 +108,7 @@ closeChat	interim
 closeGiftAuction	interim
 closeSecretChat	interim
 closeStory	interim
-closeWebApp	interim
+closeWebApp	dispatched
 commitPendingLiveStoryReactions	interim
 commitPendingPaidMessageReactions	interim
 composeRichMessageWithAi	interim
@@ -277,15 +277,15 @@ getBotInfoShortDescription	interim
 getBotMediaPreviewInfo	interim
 getBotMediaPreviews	interim
 getBotName	interim
-getBotSimilarBotCount	interim
-getBotSimilarBots	interim
+getBotSimilarBotCount	dispatched
+getBotSimilarBots	dispatched
 getBusinessAccountStarAmount	interim
 getBusinessChatLinkInfo	interim
 getBusinessChatLinks	interim
 getBusinessConnectedBot	interim
 getBusinessConnection	interim
 getBusinessFeatures	interim
-getCallbackQueryAnswer	interim
+getCallbackQueryAnswer	dispatched
 getCallbackQueryMessage	interim
 getChat	interim
 getChatActiveStories	interim
@@ -381,7 +381,7 @@ getForumTopicHistory	interim
 getForumTopicLink	interim
 getForumTopics	interim
 getFullRichMessage	interim
-getGameHighScores	interim
+getGameHighScores	dispatched
 getGiftAuctionAcquiredGifts	interim
 getGiftAuctionState	interim
 getGiftChatThemes	interim
@@ -392,7 +392,7 @@ getGiveawayInfo	interim
 getGramRevenueStatistics	interim
 getGramWithdrawalUrl	interim
 getGreetingStickers	interim
-getGrossingWebAppBots	interim
+getGrossingWebAppBots	dispatched
 getGroupCall	interim
 getGroupCallParticipants	interim
 getGroupCallStreamSegment	interim
@@ -427,7 +427,7 @@ getLogVerbosityLevel	sync
 getLoginPasskeys	interim
 getLoginUrl	interim
 getLoginUrlInfo	interim
-getMainWebApp	interim
+getMainWebApp	dispatched
 getManagedBotAccessSettings	interim
 getManagedBotToken	interim
 getMapThumbnailFile	interim
@@ -573,7 +573,7 @@ getVideoChatAvailableParticipants	interim
 getVideoChatInviteLink	interim
 getVideoChatRtmpUrl	interim
 getVideoMessageAdvertisements	interim
-getWebAppLinkUrl	interim
+getWebAppLinkUrl	dispatched
 getWebAppPlaceholder	dispatched
 getWebAppUrl	interim
 getWebPageInstantView	interim
@@ -607,14 +607,14 @@ loadQuickReplyShortcuts	interim
 loadSavedMessagesTopics	interim
 logOut	interim
 markChecklistTasksAsDone	interim
-openBotSimilarBot	interim
+openBotSimilarBot	dispatched
 openChat	interim
 openChatSimilarChat	interim
 openGiftAuction	interim
 openMessageContent	interim
 openSponsoredChat	interim
 openStory	interim
-openWebApp	interim
+openWebApp	dispatched
 optimizeStorage	dispatched
 parseMarkdown	sync
 parseTextEntities	sync
@@ -757,7 +757,7 @@ searchStringsByPrefix	sync
 searchTextCompositionStyle	interim
 searchUserByPhoneNumber	dispatched
 searchUserByToken	interim
-searchWebApp	interim
+searchWebApp	dispatched
 sellGift	interim
 sendAuthenticationFirebaseSms	interim
 sendBotStartMessage	interim
@@ -786,7 +786,7 @@ sendQuickReplyShortcutMessages	interim
 sendResoldGift	interim
 sendRichMessageDraft	interim
 sendTextMessageDraft	interim
-sendWebAppCustomRequest	interim
+sendWebAppCustomRequest	dispatched
 sendWebAppData	interim
 setAccentColor	dispatched
 setAccountTtl	interim
@@ -858,7 +858,7 @@ setDirectMessagesChatTopicIsMarkedAsUnread	interim
 setEmojiStatus	dispatched
 setFileGenerationProgress	dispatched
 setForumTopicNotificationSettings	interim
-setGameScore	interim
+setGameScore	dispatched
 setGiftCollectionName	interim
 setGiftResalePrice	interim
 setGiftSettings	interim

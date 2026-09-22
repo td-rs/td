@@ -9,6 +9,8 @@
 
 pub mod auth_manager;
 pub mod birthdate;
+pub mod bot_recommendation_manager;
+pub mod callback_queries_manager;
 pub mod chat_manager;
 pub mod client;
 pub mod client_json;
@@ -27,6 +29,8 @@ pub mod document;
 pub mod emoji_status;
 pub mod files;
 pub mod formatted_date;
+pub mod game;
+pub mod game_manager;
 pub mod global;
 pub mod link_manager;
 pub mod manager_option_states;
@@ -55,6 +59,8 @@ pub mod time_zone_manager;
 pub mod updates_manager;
 pub mod user_manager;
 pub mod usernames;
+pub mod web_app;
+pub mod web_app_manager;
 
 // Generated code keeps C++-identical case-preserved names (`aiComposeTone`)
 // in types, fields and the JSON dispatch helpers alike.
