@@ -37,6 +37,19 @@ pub(crate) fn replace_offending_characters(s: &mut [u8]) {
     }
 }
 
+/// `td::get_vector_hash` (misc.cpp:311-320) — the xor/shift/add fold the
+/// multi-item hashes use (contacts, saved animations, ...).
+pub fn get_vector_hash(numbers: &[u64]) -> i64 {
+    let mut acc: u64 = 0;
+    for number in numbers {
+        acc ^= acc >> 21;
+        acc ^= acc << 35;
+        acc ^= acc >> 4;
+        acc = acc.wrapping_add(*number);
+    }
+    acc as i64
+}
+
 /// `td::clean_input_string` (misc.cpp:79-161): valid UTF-8 only; control
 /// characters 0-9, 11, 12 and 14-32 become spaces, `\r` is dropped, `\n`
 /// survives; the UTF-8 line/paragraph separators U+2028-U+202A and the

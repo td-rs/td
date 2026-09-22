@@ -40,6 +40,7 @@ use crate::notification_settings::{
 use crate::notification_settings_manager::ScopeSettingsAnswer;
 use crate::td::NotificationEnv;
 use crate::td::Td;
+use crate::td::TdAnimationsEnv;
 use crate::td_api::{self, Function, Object};
 use crate::user_manager::{FileId, PendingUserRequest, SecretChatId, UserEnv, UserId};
 use tdutils::promise::Promise;
@@ -226,6 +227,21 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 };
                 td.notification_manager
                     .get_current_state(&env, &mut updates);
+            }
+
+            // AnimationsManager::get_current_state (Requests.cpp:2213) —
+            // the saved-animations + search-parameters updates; the
+            // manager's own is_bot gate applies.
+            if !td.auth_manager.is_bot() {
+                let env = TdAnimationsEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_bot: false,
+                    file_manager: std::sync::Arc::clone(&td.file_manager),
+                    file_reference_manager: &mut td.file_reference_manager,
+                    updates: &mut Vec::new(),
+                };
+                td.animations_manager.get_current_state(&env, &mut updates);
             }
 
             // ConnectionStateManager and the remaining authorized-manager
@@ -1170,6 +1186,71 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             // passport / the missing setter halves (M.4.12 deferred them
             // with their types)
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+        }
+
+        // --- the AnimationsManager arm set (M.20): Requests.cpp:1793-1830.
+        // The saved-animations ring answers offline; the GetSavedGifsQuery/
+        // SaveGifQuery tails are the [blocked: net] env seams and park the
+        // promises exactly like the C++ request without a network ---
+        Function::getSavedAnimations(_) => {
+            // Requests.cpp:1793-1802; the two-step RequestActor collapses
+            // into the manager's promise (it answers the Animations
+            // object once the ring is loaded)
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Animations, _>(id, Object::animations);
+            let mut env = TdAnimationsEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                file_reference_manager: &mut td.file_reference_manager,
+                updates: &mut td.animations_updates,
+            };
+            td.animations_manager
+                .get_saved_animations(&mut env, promise);
+        }
+        Function::addSavedAnimation(request) => {
+            // Requests.cpp:1806-1812; the input file resolves locally,
+            // messages.saveGif parks
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut env = TdAnimationsEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                file_reference_manager: &mut td.file_reference_manager,
+                updates: &mut td.animations_updates,
+            };
+            td.animations_manager.add_saved_animation(
+                &mut env,
+                request.animation.as_ref(),
+                promise,
+            );
+        }
+        Function::removeSavedAnimation(request) => {
+            // Requests.cpp:1814-1820; messages.saveGif unsave parks
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut env = TdAnimationsEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                file_reference_manager: &mut td.file_reference_manager,
+                updates: &mut td.animations_updates,
+            };
+            td.animations_manager.remove_saved_animation(
+                &mut env,
+                request.animation.as_ref(),
+                promise,
+            );
         }
 
         function => run_dialog_requests(td, id, function),
@@ -2176,13 +2257,15 @@ mod request_census_tests {
         // stays the 500 placeholder) + M.12.10's eighteen file-plane
         // dispatches (getFile/getRemoteFile, the download/upload/
         // generation arms, the DownloadManager list plane and the four
-        // storage-statistics arms). Fix per flip.
+        // storage-statistics arms) + M.20's three saved-animations arms
+        // (getSavedAnimations, addSavedAnimation, removeSavedAnimation).
+        // Fix per flip.
         assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            110,
+            113,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 894, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 891, "interim count");
     }
 }

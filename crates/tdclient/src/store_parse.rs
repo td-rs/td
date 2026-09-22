@@ -19,10 +19,15 @@
 /// `td/telegram/Version.h` — the entries the ported formats branch on.
 /// Keep in sync with the C++ enum; `Version::Next` is the one-past value.
 pub mod version {
+    pub const ADD_DURATION_TO_ANIMATION: i32 = 3;
     pub const ADD_KEY_HASH_TO_SECRET_CHAT: i32 = 2;
     pub const ADD_ACCESS_HASH_TO_SECRET_CHAT: i32 = 5;
-    pub const FIX_MIN_USERS: i32 = 10;
+    pub const SUPPORT_MINITHUMBNAILS: i32 = 20;
     pub const ADD_PHOTO_SIZE_SOURCE: i32 = 22;
+    pub const ADD_ANIMATION_STICKERS: i32 = 26;
+    pub const ADD_DIALOG_PHOTO_HAS_ANIMATION: i32 = 27;
+    pub const ADD_PHOTO_PROGRESSIVE_SIZES: i32 = 28;
+    pub const FIX_MIN_USERS: i32 = 10;
     pub const SUPPORT_BANNED_CHANNELS: i32 = 31;
     pub const REMOVE_PHOTO_VOLUME_AND_LOCAL_ID: i32 = 32;
     pub const SUPPORT_64_BIT_IDS: i32 = 33;
