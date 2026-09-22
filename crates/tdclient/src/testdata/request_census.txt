@@ -260,7 +260,7 @@ getApplicationDownloadLink	interim
 getArchiveChatListSettings	interim
 getArchivedStickerSets	interim
 getAttachedStickerSets	interim
-getAttachmentMenuBot	interim
+getAttachmentMenuBot	dispatched
 getAuthenticationPasskeyParameters	interim
 getAuthorizationState	dispatched
 getAutoDownloadSettingsPresets	interim
@@ -957,7 +957,7 @@ testSquareInt	dispatched
 testUseUpdate	dispatched
 toggleAllDownloadsArePaused	dispatched
 toggleBotCanManageEmojiStatus	interim
-toggleBotIsAddedToAttachmentMenu	interim
+toggleBotIsAddedToAttachmentMenu	dispatched
 toggleBotUsernameIsActive	interim
 toggleBusinessConnectedBotChatIsPaused	interim
 toggleChatDefaultDisableNotification	interim

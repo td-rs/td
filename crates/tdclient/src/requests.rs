@@ -43,6 +43,7 @@ use crate::notification_settings::{
 use crate::notification_settings_manager::ScopeSettingsAnswer;
 use crate::suggested_action::SuggestedAction;
 use crate::td::AccountEnv;
+use crate::td::AttachMenuEnv;
 use crate::td::AutosaveEnv;
 use crate::td::BoostEnv;
 use crate::td::QuickReplyEnv;
@@ -2493,6 +2494,56 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
         }
 
         // Everything else waits for its manager step.
+        // --- attachment menu (Requests.cpp:6069-6081) ---
+        Function::getAttachmentMenuBot(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |b: td_api::AttachmentMenuBot| {
+                Object::attachmentMenuBot(b)
+            });
+            let mut env = AttachMenuEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                user_manager: &mut td.user_manager,
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                file_reference_manager: &mut td.file_reference_manager,
+                updates: &mut td.attach_menu_updates,
+            };
+            td.attach_menu_manager.get_attach_menu_bot_request(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                promise,
+            );
+        }
+        Function::toggleBotIsAddedToAttachmentMenu(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = AttachMenuEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                user_manager: &mut td.user_manager,
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                file_reference_manager: &mut td.file_reference_manager,
+                updates: &mut td.attach_menu_updates,
+            };
+            td.attach_menu_manager.toggle_bot_is_added_to_attach_menu(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                request.is_added,
+                request.allow_write_access,
+                promise,
+            );
+        }
+
+
+        // Everything else waits for its manager step.
         // --- autosave (Requests.cpp:3136-3152) ---
         Function::getAutosaveSettings(_) => {
             if !check_is_user(td, id) {
@@ -3311,16 +3362,18 @@ mod request_census_tests {
 assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
 assert_eq!(
     *counts.get("dispatched").unwrap_or(&0),
-    170,
+    172,
     "dispatched count"
 );
 assert_eq!(
     *counts.get("interim").unwrap_or(&0),
-    834,
+    832,
     "interim count"
 );
     }
 }
+
+
 
 
 

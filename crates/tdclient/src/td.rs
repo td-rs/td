@@ -291,6 +291,29 @@ pub struct Td {
     /// The account plane's `send_update` outbox; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) account_updates: Vec<td_api::Update>,
+    /// `AttachMenuManager::init` (AttachMenuManager.cpp:366-430, also
+    /// `start_up`; the C++ `AuthManager` on_get_authorization call at
+    /// AuthManager.cpp:1542) — idempotent; the manager no-ops while inactive.
+    fn init_attach_menu_manager(&mut self) {
+        let mut env = AttachMenuEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            user_manager: &mut self.user_manager,
+            file_manager: std::sync::Arc::clone(&self.file_manager),
+            file_reference_manager: &mut self.file_reference_manager,
+            updates: &mut self.attach_menu_updates,
+        };
+        self.attach_menu_manager.init(&mut env);
+    }
+
+    /// `Td::attach_menu_manager_` (`Td.cpp:1163`, the init_managers block;
+    /// the M.40 Wave-3 slice).
+    pub(crate) attach_menu_manager: crate::attach_menu_manager::AttachMenuManager,
+    /// The attach-menu manager's `send_update` outbox — the same collapsed
+    /// hop; drained by [`Td::flush_user_updates`].
+    pub(crate) attach_menu_updates: Vec<td_api::Update>,
     /// `Td::autosave_manager_` (`Td.cpp:1166`, the init_managers block;
     /// the M.39 Wave-3 slice).
     pub(crate) autosave_manager: crate::autosave_manager::AutosaveManager,
@@ -646,6 +669,8 @@ impl Td {
             suggested_action_manager: crate::suggested_action_manager::SuggestedActionManager::new(
             ),
             account_updates: Vec::new(),
+            attach_menu_manager: crate::attach_menu_manager::AttachMenuManager::new(),
+            attach_menu_updates: Vec::new(),
             autosave_manager: crate::autosave_manager::AutosaveManager::new(),
             autosave_updates: Vec::new(),
             boost_manager: BoostManager::new(),
@@ -2687,6 +2712,10 @@ impl Td {
         }
         let account_updates = std::mem::take(&mut self.account_updates);
         for update in account_updates {
+            self.send_update(update.into());
+        }
+        let attach_menu_updates = std::mem::take(&mut self.attach_menu_updates);
+        for update in attach_menu_updates {
             self.send_update(update.into());
         }
         let autosave_updates = std::mem::take(&mut self.autosave_updates);
@@ -5845,6 +5874,195 @@ impl crate::autosave_manager::AutosaveManagerEnv for AutosaveEnv<'_> {
     fn force_create_dialog(&mut self, _dialog_id: crate::dialog_id::DialogId) {
         // `dialog_manager::force_create_dialog` — the M.6/M.7 cache seam;
         // every dialog id is resolvable in the collapsed cache
+    }
+}
+
+
+/// The [`crate::attach_menu_manager::AttachMenuManagerEnv`] over the `Td`
+/// fields — built per call with the field-split borrows (the
+/// `NotificationEnv` convention), never held across calls; the file
+/// manager rides its `Arc` clone so the disjoint borrows hold.
+pub(crate) struct AttachMenuEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>>,
+    pub(crate) file_reference_manager: &'a mut crate::files::FileReferenceManager,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::attach_menu_manager::AttachMenuManagerEnv for AttachMenuEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn use_chat_info_database(&self) -> bool {
+        self.global.use_chat_info_database()
+    }
+
+    fn binlog_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn binlog_pmc_erase(&mut self, key: &str) {
+        self.global.binlog_pmc().erase(key);
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn get_input_user(
+        &mut self,
+        user_id: UserId,
+    ) -> Result<telegram_api::InputUser, tdutils::status::Status> {
+        let user_env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_mut()
+                .expect("attach-menu requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_input_user(&user_env, user_id)
+    }
+
+    fn get_bot_data(
+        &mut self,
+        user_id: UserId,
+    ) -> Result<crate::user_manager::BotData, tdutils::status::Status> {
+        self.user_manager.get_bot_data(user_id)
+    }
+
+    fn have_accessible_user(&self, user_id: UserId) -> bool {
+        self.user_manager.have_accessible_user(user_id)
+    }
+
+    fn get_user_id_object(&mut self, user_id: UserId) -> i64 {
+        let mut user_env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_mut()
+                .expect("attach-menu requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_user_id_object(
+            &mut user_env,
+            user_id,
+            "get_attachment_menu_bot_object",
+        )
+    }
+
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        let mut user_env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_mut()
+                .expect("attach-menu requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.on_get_users(&mut user_env, users, source)
+    }
+
+    fn get_attach_menu_bot_file_source_id(&mut self, user_id: UserId) -> FileSourceId {
+        // `FileReferenceManager::create_attach_menu_bot_file_source`
+        // (FileReferenceManager.cpp:282-286)
+        self.file_reference_manager
+            .intern(crate::files::FileSource::AttachMenuBot(user_id))
+    }
+
+    fn on_get_icon_document(
+        &mut self,
+        document: &telegram_api::document,
+        expected_sticker: bool,
+    ) -> FileId {
+        // the narrow `DocumentsManager::on_get_document` collapse: the
+        // General-vs-Sticker type derivation reads the document
+        // attributes; the remote location registers into the M.12 file
+        // plane with the C++ FromServer source
+        let has_sticker = document.attributes.iter().any(|attribute| {
+            matches!(
+                attribute,
+                telegram_api::DocumentAttribute::documentAttributeSticker(_)
+            )
+        });
+        if has_sticker != expected_sticker {
+            return FileId::new(0, 0);
+        }
+        let file_type = if has_sticker {
+            FileType::Sticker
+        } else {
+            FileType::Document
+        };
+        let dc_id = if DcId::is_valid_raw(document.dc_id) {
+            DcId::internal(document.dc_id)
+        } else {
+            DcId::invalid()
+        };
+        let location = crate::files::FullRemoteFileLocation::from_document(
+            file_type,
+            document.id,
+            document.access_hash,
+            dc_id,
+            String::from_utf8_lossy(&document.file_reference).into_owned(),
+        );
+        let remote_name = document
+            .attributes
+            .iter()
+            .find_map(|attribute| match attribute {
+                telegram_api::DocumentAttribute::documentAttributeFilename(name) => {
+                    Some(name.file_name.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| document.mime_type.clone());
+        let mut file_manager = self.file_manager.lock();
+        file_manager.register_remote(
+            location,
+            crate::files::FileLocationSource::FromServer,
+            crate::message_id::DialogId::new(0),
+            document.size,
+            document.size,
+            remote_name,
+        )
+    }
+
+    fn add_file_source(&mut self, file_id: FileId, source_id: FileSourceId) {
+        // the C++ `FileManager::add_file_source` hop routes into the
+        // FileReferenceManager, which owns the source registry
+        self.file_reference_manager
+            .add_file_source(file_id, source_id);
+    }
+
+    fn get_file_object(&mut self, file_id: FileId) -> td_api::File {
+        self.file_manager.lock().get_file_object(file_id)
+    }
+
+    fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>) {
+        self.file_manager.lock().store_file(file_id, out);
+    }
+
+    fn parse_file_id(
+        &mut self,
+        parser: &mut crate::store_parse::Parser,
+    ) -> Result<FileId, &'static str> {
+        self.file_manager.lock().parse_file(parser)
     }
 }
 

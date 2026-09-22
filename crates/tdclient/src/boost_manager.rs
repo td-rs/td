@@ -36,7 +36,11 @@ pub trait BoostManagerEnv {
 
     /// `ThemeManager::get_dialog_boost_available_count` — the M.41 seam
     /// (zero counts until the themes track lands).
-    fn get_dialog_boost_available_count(&mut self, _level: i32, _for_megagroup: bool) -> (i32, i32, i32) {
+    fn get_dialog_boost_available_count(
+        &mut self,
+        _level: i32,
+        _for_megagroup: bool,
+    ) -> (i32, i32, i32) {
         (0, 0, 0)
     }
 
@@ -51,7 +55,13 @@ pub trait BoostManagerEnv {
         tdutils::log_info!("Send premium.applyBoost for {dialog_id:?} — [blocked: net]");
         let _ = slot_ids;
     }
-    fn send_get_boosts_list_query(&mut self, dialog_id: DialogId, only_gift_codes: bool, offset: &str, limit: i32) {
+    fn send_get_boosts_list_query(
+        &mut self,
+        dialog_id: DialogId,
+        only_gift_codes: bool,
+        offset: &str,
+        limit: i32,
+    ) {
         tdutils::log_info!("Send premium.getBoostsList for {dialog_id:?} — [blocked: net]");
         let _ = (only_gift_codes, offset, limit);
     }
@@ -160,7 +170,11 @@ impl BoostManager {
     }
 
     /// `get_boost_slots` (cpp:416-419) — the query is the seam.
-    pub fn get_boost_slots(&mut self, env: &mut impl BoostManagerEnv, promise: Promise<td_api::ChatBoostSlots>) {
+    pub fn get_boost_slots(
+        &mut self,
+        env: &mut impl BoostManagerEnv,
+        promise: Promise<td_api::ChatBoostSlots>,
+    ) {
         env.send_get_my_boosts_query();
         self.parked_slots.push(promise);
     }
@@ -311,7 +325,8 @@ mod tests {
         }
 
         fn send_get_boosts_status_query(&mut self, dialog_id: DialogId) {
-            self.queries.push(format!("getBoostsStatus {}", dialog_id.get()));
+            self.queries
+                .push(format!("getBoostsStatus {}", dialog_id.get()));
         }
 
         fn send_apply_boost_query(&mut self, dialog_id: DialogId, slot_ids: &[i32]) {
@@ -326,8 +341,10 @@ mod tests {
             offset: &str,
             limit: i32,
         ) {
-            self.queries
-                .push(format!("getBoostsList {} {only_gift_codes} {offset} {limit}", dialog_id.get()));
+            self.queries.push(format!(
+                "getBoostsList {} {only_gift_codes} {offset} {limit}",
+                dialog_id.get()
+            ));
         }
 
         fn send_get_user_boosts_query(&mut self, dialog_id: DialogId, user_id: i64) {
@@ -398,12 +415,23 @@ mod tests {
         manager.get_boost_slots(&mut env, Promise::default());
         manager.get_dialog_boost_status(&mut env, DialogId::new(1), Promise::default());
         manager.boost_dialog(&mut env, DialogId::new(1), &[1, 2], Promise::default());
-        manager.get_dialog_boosts(&mut env, DialogId::new(1), true, "off", 10, Promise::default());
+        manager.get_dialog_boosts(
+            &mut env,
+            DialogId::new(1),
+            true,
+            "off",
+            10,
+            Promise::default(),
+        );
         manager.get_user_dialog_boosts(&mut env, DialogId::new(1), 5, Promise::default());
         assert!(env.queries.iter().any(|q| q == "getMyBoosts"));
         assert!(env.queries.iter().any(|q| q == "getBoostsStatus 1"));
         assert!(env.queries.iter().any(|q| q == "applyBoost 1 [1, 2]"));
-        assert!(env.queries.iter().any(|q| q == "getBoostsList 1 true off 10"));
+        assert!(
+            env.queries
+                .iter()
+                .any(|q| q == "getBoostsList 1 true off 10")
+        );
         assert!(env.queries.iter().any(|q| q == "getUserBoosts 1 5"));
         assert_eq!(manager.parked_slots.len(), 2);
         assert_eq!(manager.parked_status.len(), 1);
