@@ -15,10 +15,10 @@
 //! `StickerPhotoSize.cpp:95-128`).
 
 use crate::store_parse::{self, Parser};
-use base64::Engine as _;
-use tdmtproto::telegram_api;
 use crate::td_api;
 use crate::user_manager::FileId;
+use base64::Engine as _;
+use tdmtproto::telegram_api;
 
 /// The `storer.context()->td()` slice the FileId-carrying db records read —
 /// the FileManager FileId codec (`FileManager::store_file`/`parse_file`,

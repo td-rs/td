@@ -1549,7 +1549,6 @@ fn fail_saved_animation_calls(
 mod tests {
     use super::*;
 
-    use super::*;
     use crate::chat_manager::DcId;
     use crate::files::{FileLocationSource, FileType, FullRemoteFileLocation};
     use crate::store_parse::version;

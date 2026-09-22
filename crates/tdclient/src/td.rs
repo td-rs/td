@@ -6532,21 +6532,6 @@ impl crate::animations_manager::AnimationsManagerEnv for TdAnimationsEnv<'_> {
     }
 }
 
-impl crate::link_manager::LinkEnv for TdStaticLinkEnv<'_> {
-    fn get_option_string_with_default(&self, name: &str, default_value: &str) -> String {
-        self.options.as_ref().map_or_else(
-            || default_value.to_owned(),
-            |options| options.get_option_string(name, default_value),
-        )
-    }
-
-    fn get_option_string(&self, name: &str) -> String {
-        self.options
-            .as_ref()
-            .map_or_else(String::new, |options| options.get_option_string(name, ""))
-    }
-}
-
 /// The `&self` option slice for the `LinkManager` statics
 /// (`get_instant_view_link*`, LinkManager.h:115-119) — they read
 /// `G()->get_option_string` only, so no manager instance is needed.
