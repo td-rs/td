@@ -227,7 +227,7 @@ fn trim(s: &str) -> &str {
 }
 
 /// `td::to_lower` (tdutils/misc.h:64-85) — ASCII-only.
-fn to_lower(s: &str) -> String {
+pub(crate) fn to_lower_ascii(s: &str) -> String {
     s.chars()
         .map(|c| {
             if c.is_ascii_uppercase() {
@@ -460,7 +460,7 @@ pub fn is_allowed_username(username: &str) -> bool {
     if username.len() < 5 {
         return false;
     }
-    let username_lowered = to_lower(username);
+    let username_lowered = to_lower_ascii(username);
     for prefix in [
         "admin",
         "telegram",

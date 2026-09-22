@@ -40,6 +40,8 @@ use crate::notification_settings::{
     get_scope_notification_settings_object,
 };
 use crate::notification_settings_manager::ScopeSettingsAnswer;
+use crate::suggested_action::SuggestedAction;
+use crate::td::AccountEnv;
 use crate::td::CallEnv;
 use crate::td::NotificationEnv;
 use crate::td::Td;
@@ -243,6 +245,22 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 };
                 td.web_browser_manager.get_current_state(&env, &mut updates);
             }
+
+            // SuggestedActionManager::get_current_state
+            // (Requests.cpp:2237 — after notification)
+            {
+                let env = AccountEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    user_manager: &mut td.user_manager,
+                    device_token_manager: &mut td.device_token_manager,
+                    auth_is_bot: td.auth_manager.is_bot(),
+                    updates: &mut td.account_updates,
+                };
+                td.suggested_action_manager
+                    .get_current_state(&env, &mut updates);
+            }
+
 
             // ConnectionStateManager and the remaining authorized-manager
             // state blocks (connection/chat/background/...) accumulate here
@@ -2153,6 +2171,276 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
 
+        // --- account / sessions (Requests.cpp:2452-2478, 2515, …) ---
+        Function::confirmQrCodeAuthentication(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(link) = crate::misc::clean_input_string(&request.link) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise =
+                td.deferred_promise(id, |session: td_api::Session| Object::session(session));
+            let mut env = AccountEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                user_manager: &mut td.user_manager,
+                device_token_manager: &mut td.device_token_manager,
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.account_updates,
+            };
+            td.account_manager
+                .confirm_qr_code_authentication(&mut env, &link, promise);
+        }
+        Function::hideSuggestedAction(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(action) = request.action.as_ref() else {
+                return td.send_error_impl(id, 400, "Action must be non-empty");
+            };
+            let mut env = AccountEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                user_manager: &mut td.user_manager,
+                device_token_manager: &mut td.device_token_manager,
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.account_updates,
+            };
+            td.suggested_action_manager
+                .hide_suggested_action(&mut env, SuggestedAction::from_td_api(action));
+            td.send_result(id, ok_object());
+        }
+        Function::getUserLink(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |user_link: td_api::UserLink| {
+                Object::userLink(user_link)
+            });
+            let mut env = AccountEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                user_manager: &mut td.user_manager,
+                device_token_manager: &mut td.device_token_manager,
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.account_updates,
+            };
+            td.account_manager.get_user_link(&mut env, promise);
+        }
+        Function::getActiveSessions(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise(id, |sessions: td_api::Sessions| Object::sessions(sessions));
+            let mut env = AccountEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                user_manager: &mut td.user_manager,
+                device_token_manager: &mut td.device_token_manager,
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.account_updates,
+            };
+            td.account_manager.get_active_sessions(&mut env, promise);
+        }
+        Function::terminateSession(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = AccountEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                user_manager: &mut td.user_manager,
+                device_token_manager: &mut td.device_token_manager,
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.account_updates,
+            };
+            td.account_manager
+                .terminate_session(&mut env, request.session_id, promise);
+        }
+        Function::terminateAllOtherSessions(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = AccountEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                user_manager: &mut td.user_manager,
+                device_token_manager: &mut td.device_token_manager,
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.account_updates,
+            };
+            td.account_manager
+                .terminate_all_other_sessions(&mut env, promise);
+        }
+        Function::confirmSession(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = AccountEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                user_manager: &mut td.user_manager,
+                device_token_manager: &mut td.device_token_manager,
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.account_updates,
+            };
+            td.account_manager
+                .confirm_session(&mut env, request.session_id, promise);
+        }
+        Function::toggleSessionCanAcceptCalls(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = AccountEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                user_manager: &mut td.user_manager,
+                device_token_manager: &mut td.device_token_manager,
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.account_updates,
+            };
+            td.account_manager.toggle_session_can_accept_calls(
+                &mut env,
+                request.session_id,
+                request.can_accept_calls,
+                promise,
+            );
+        }
+        Function::toggleSessionCanAcceptSecretChats(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = AccountEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                user_manager: &mut td.user_manager,
+                device_token_manager: &mut td.device_token_manager,
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.account_updates,
+            };
+            td.account_manager.toggle_session_can_accept_secret_chats(
+                &mut env,
+                request.session_id,
+                request.can_accept_secret_chats,
+                promise,
+            );
+        }
+        Function::getConnectedWebsites(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |websites: td_api::ConnectedWebsites| {
+                Object::connectedWebsites(websites)
+            });
+            let mut env = AccountEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                user_manager: &mut td.user_manager,
+                device_token_manager: &mut td.device_token_manager,
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.account_updates,
+            };
+            td.account_manager.get_connected_websites(&mut env, promise);
+        }
+        Function::disconnectWebsite(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = AccountEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                user_manager: &mut td.user_manager,
+                device_token_manager: &mut td.device_token_manager,
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.account_updates,
+            };
+            td.account_manager
+                .disconnect_website(&mut env, request.website_id, promise);
+        }
+        Function::disconnectAllWebsites(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = AccountEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                user_manager: &mut td.user_manager,
+                device_token_manager: &mut td.device_token_manager,
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.account_updates,
+            };
+            td.account_manager
+                .disconnect_all_websites(&mut env, promise);
+        }
+        Function::setAccountTtl(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(ttl) = request.ttl.as_ref() else {
+                return td.send_error_impl(id, 400, "New account TTL must be non-empty");
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = AccountEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                user_manager: &mut td.user_manager,
+                device_token_manager: &mut td.device_token_manager,
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.account_updates,
+            };
+            td.account_manager
+                .set_account_ttl(&mut env, ttl.days, promise);
+        }
+        Function::getAccountTtl(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise(id, |ttl: td_api::AccountTtl| Object::accountTtl(ttl));
+            let mut env = AccountEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                user_manager: &mut td.user_manager,
+                device_token_manager: &mut td.device_token_manager,
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.account_updates,
+            };
+            td.account_manager.get_account_ttl(&mut env, promise);
+        }
+        Function::acceptTermsOfService(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(terms_of_service_id) =
+                crate::misc::clean_input_string(&request.terms_of_service_id)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let mut env = AccountEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                user_manager: &mut td.user_manager,
+                device_token_manager: &mut td.device_token_manager,
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.account_updates,
+            };
+            td.terms_of_service_manager.accept_terms_of_service(
+                &mut env,
+                terms_of_service_id,
+                promise,
+            );
+        }
+
         // Everything else waits for its manager step.
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
@@ -2446,37 +2734,20 @@ mod request_census_tests {
         // The scheme size from the S07 differential dump.
         assert_eq!(generated.len(), crate::td_api::SCHEME_FUNCTIONS);
 
-        // The flip-state ledger at the m13s↔master (4f716e8: M.7+M.11)
-        // merge: the m11 pins + M.13/M.13S's seven real dispatches
-        // (removeNotification, removeNotificationGroup, registerDevice and
-        // the four notification-settings arms; processPushNotification
-        // stays the 500 placeholder) + M.31's five web-browser arms
-        // (getLinkWebBrowserType, changeWebBrowserSettings,
-        // add/remove/removeAllWebBrowserSettingsExceptions) + M.12.10's
-        // eighteen file-plane dispatches (getFile/getRemoteFile, the
-        // download/upload/generation arms, the DownloadManager list
-        // plane and the four storage-statistics arms). Fix per flip.
-        // stays the 500 placeholder) + M.12.10's eighteen file-plane
-        // dispatches (getFile/getRemoteFile, the download/upload/
-        // generation arms, the DownloadManager list plane and the four
-        // storage-statistics arms). Fix per flip.
-// stays the 500 placeholder) + M.12.10's eighteen file-plane
-        // dispatches (getFile/getRemoteFile, the download/upload/
-        // generation arms, the DownloadManager list plane and the four
-        // storage-statistics arms) + M.32's six call arms (createCall,
-        // acceptCall, discardCall, sendCallSignalingData, sendCallRating,
-        // sendCallDebugInformation; sendCallLog stays the 500 placeholder
-        // behind the M.12 call-log upload surface). Fix per flip.
-        assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
-        assert_eq!(
-            *counts.get("dispatched").unwrap_or(&0),
-            115,
-            110,
-116,
-            "dispatched count"
-        );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 889, "interim count");
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 894, "interim count");
-assert_eq!(*counts.get("interim").unwrap_or(&0), 888, "interim count");
+        // The flip-state ledger — re-derived from the fixture at the wave-3
+// integration (the per-track flip histories compose).
+assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
+assert_eq!(
+    *counts.get("dispatched").unwrap_or(&0),
+    136,
+    "dispatched count"
+);
+assert_eq!(
+    *counts.get("interim").unwrap_or(&0),
+    868,
+    "interim count"
+);
     }
 }
+
+

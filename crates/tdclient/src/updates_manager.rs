@@ -702,7 +702,8 @@ pub trait UpdatesSink {
     /// `WebBrowserManager::on_update_web_browser_exception` (M.31).
     fn on_update_web_browser_exception(&mut self, update: telegram_api::updateWebBrowserException) {
         let _ = update;
-/// `CallManager::update_call` (M.32) — the td-level sink routes the
+    }
+    /// `CallManager::update_call` (M.32) — the td-level sink routes the
     /// updatePhoneCall intake to the call manager; the ZST stand-in
     /// no-ops until the sink-state refactor.
     fn on_update_phone_call(&mut self, update: telegram_api::updatePhoneCall) {
