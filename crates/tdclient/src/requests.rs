@@ -2752,6 +2752,613 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
         }
 
         // Everything else waits for its manager step.
+/// Field-split the `Td` for the bot-manager calls: the manager plus a
+/// [`crate::td::BotInfoEnv`] borrowing `global`/`option_manager`/the auth
+/// flags/`user_manager` (the `chat_env_split` convention).
+fn bot_env_split(
+    td: &mut Td,
+) -> (
+    &mut crate::bot_info_manager::BotInfoManager,
+    crate::td::BotInfoEnv<'_>,
+) {
+    let crate::td::Td {
+        bot_info_manager,
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        ..
+    } = td;
+    let env = crate::td::BotInfoEnv {
+        global,
+        options: option_manager.as_mut(),
+        auth_is_authorized: auth_manager.is_authorized(),
+        auth_is_bot: auth_manager.is_bot(),
+        user_manager,
+    };
+    (bot_info_manager, env)
+}
+
+/// The M.45 Bots I arm group of the request dispatcher — see the frame
+/// note at the forward site in [`run_dialog_requests`]. The local
+/// validation halves answer synchronously; the `bots.*` query sends are
+/// [blocked: net] and park their promises in the bot manager, so the
+/// request stays unanswered until the net step (the M.4.16 convention).
+#[inline(never)]
+fn run_bot_requests(td: &mut Td, id: u64, function: Function) {
+    match function {
+        // ------------------------------------------------------------------
+        // M.45: the bot-served requests. The C++ anchors name the
+        // `Requests::on_request` overloads; the flow bodies live in
+        // `bot_command.rs`/`bot_menu_button.rs`/`bot_info_manager.rs`/
+        // `bot_queries.rs`/`message_sender.rs`.
+        // ------------------------------------------------------------------
+
+        // --- the bot commands (BotCommand.cpp) ---
+        Function::setCommands(request) => {
+            // Requests.cpp:6857-6862: CHECK_IS_BOT + set_commands
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (manager, mut env) = bot_env_split(td);
+            crate::bot_command::set_commands(
+                manager,
+                &mut env,
+                request.scope,
+                request.language_code,
+                request.commands,
+                promise,
+            );
+        }
+        Function::deleteCommands(request) => {
+            // Requests.cpp:6864-6869
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (manager, mut env) = bot_env_split(td);
+            crate::bot_command::delete_commands(
+                manager,
+                &mut env,
+                request.scope,
+                request.language_code,
+                promise,
+            );
+        }
+        Function::getCommands(request) => {
+            // Requests.cpp:6870-6875
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |commands: td_api::BotCommands| {
+                Object::botCommands(commands)
+            });
+            let (manager, mut env) = bot_env_split(td);
+            crate::bot_command::get_commands(
+                manager,
+                &mut env,
+                request.scope,
+                request.language_code,
+                promise,
+            );
+        }
+
+        // --- the bot menu button (BotMenuButton.cpp) ---
+        Function::setMenuButton(request) => {
+            // Requests.cpp:6876-6881
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (manager, mut env) = bot_env_split(td);
+            crate::bot_menu_button::set_menu_button(
+                manager,
+                &mut env,
+                crate::user_manager::UserId::new(request.user_id),
+                request.menu_button,
+                promise,
+            );
+        }
+        Function::getMenuButton(request) => {
+            // Requests.cpp:6882-6887
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |button: td_api::BotMenuButton| {
+                Object::botMenuButton(button)
+            });
+            let (manager, mut env) = bot_env_split(td);
+            crate::bot_menu_button::get_menu_button(
+                manager,
+                &mut env,
+                crate::user_manager::UserId::new(request.user_id),
+                promise,
+            );
+        }
+
+        // --- the default administrator rights ---
+        Function::setDefaultGroupAdministratorRights(request) => {
+            // Requests.cpp:6888-6894
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (manager, mut env) = bot_env_split(td);
+            manager.set_default_group_administrator_rights(
+                &mut env,
+                crate::chat_manager::AdministratorRights::from_chat_administrator_rights(
+                    request.default_group_administrator_rights.as_ref(),
+                    crate::chat_manager::ChannelType::Megagroup,
+                ),
+                promise,
+            );
+        }
+        Function::setDefaultChannelAdministratorRights(request) => {
+            // Requests.cpp:6895-6901
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (manager, mut env) = bot_env_split(td);
+            manager.set_default_channel_administrator_rights(
+                &mut env,
+                crate::chat_manager::AdministratorRights::from_chat_administrator_rights(
+                    request.default_channel_administrator_rights.as_ref(),
+                    crate::chat_manager::ChannelType::Broadcast,
+                ),
+                promise,
+            );
+        }
+
+        // --- the bot administration surface (BotInfoManager.cpp) ---
+        Function::getOwnedBots(request) => {
+            // Requests.cpp:6741-6745: CHECK_IS_USER + get_owned_bots
+            if !check_is_user(td, id) {
+                return;
+            }
+            let _ = request;
+            let promise = td.deferred_promise(id, |users: td_api::Users| Object::users(users));
+            let (manager, mut env) = bot_env_split(td);
+            manager.get_owned_bots(&mut env, promise);
+        }
+        Function::canBotSendMessages(request) => {
+            // Requests.cpp:6902-6907: CHECK_IS_USER
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (manager, mut env) = bot_env_split(td);
+            manager.can_bot_send_messages(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                promise,
+            );
+        }
+        Function::allowBotToSendMessages(request) => {
+            // Requests.cpp:6908-6912: CHECK_IS_USER
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (manager, mut env) = bot_env_split(td);
+            manager.allow_bot_to_send_messages(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                promise,
+            );
+        }
+        Function::getBotMediaPreviews(request) => {
+            // Requests.cpp:6923-6928: CHECK_IS_USER
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |previews: td_api::BotMediaPreviews| {
+                Object::botMediaPreviews(previews)
+            });
+            let (manager, mut env) = bot_env_split(td);
+            manager.get_bot_media_previews(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                promise,
+            );
+        }
+        Function::getBotMediaPreviewInfo(request) => {
+            // Requests.cpp:6929-6935
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |info: td_api::BotMediaPreviewInfo| {
+                Object::botMediaPreviewInfo(info)
+            });
+            let (manager, mut env) = bot_env_split(td);
+            manager.get_bot_media_preview_info(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                &request.language_code,
+                promise,
+            );
+        }
+        Function::addBotMediaPreview(request) => {
+            // Requests.cpp:6936-6942
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |preview: td_api::BotMediaPreview| {
+                Object::botMediaPreview(preview)
+            });
+            let (manager, mut env) = bot_env_split(td);
+            manager.add_bot_media_preview(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                &request.language_code,
+                request.content,
+                promise,
+            );
+        }
+        Function::editBotMediaPreview(request) => {
+            // Requests.cpp:6943-6950: FileId(request.file_id_, 0)
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |preview: td_api::BotMediaPreview| {
+                Object::botMediaPreview(preview)
+            });
+            let (manager, mut env) = bot_env_split(td);
+            manager.edit_bot_media_preview(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                &request.language_code,
+                crate::files::FileId::new(request.file_id, 0),
+                request.content,
+                promise,
+            );
+        }
+        Function::reorderBotMediaPreviews(request) => {
+            // Requests.cpp:6951-6957
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (manager, mut env) = bot_env_split(td);
+            manager.reorder_bot_media_previews(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                &request.language_code,
+                &request.file_ids,
+                promise,
+            );
+        }
+        Function::deleteBotMediaPreviews(request) => {
+            // Requests.cpp:6958-6964
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (manager, mut env) = bot_env_split(td);
+            manager.delete_bot_media_previews(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                &request.language_code,
+                &request.file_ids,
+                promise,
+            );
+        }
+        Function::createBot(request) => {
+            // Requests.cpp:6979-6987: CHECK_IS_USER + the cleaned strings
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let Some(username) = clean_or_utf8_error(td, id, &request.username) else {
+                return;
+            };
+            let promise = td.deferred_promise(id, |user: td_api::User| Object::user(user));
+            let (manager, mut env) = bot_env_split(td);
+            manager.create_bot(
+                &mut env,
+                crate::user_manager::UserId::new(request.manager_bot_user_id),
+                &name,
+                &username,
+                request.via_link,
+                promise,
+            );
+        }
+        Function::getManagedBotToken(request) => {
+            // Requests.cpp:6988-6993: CHECK_IS_BOT
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |token: String| {
+                Object::text(td_api::Text { text: token })
+            });
+            let (manager, mut env) = bot_env_split(td);
+            manager.get_bot_token(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                request.revoke,
+                promise,
+            );
+        }
+        Function::getManagedBotAccessSettings(request) => {
+            // Requests.cpp:6994-6999: CHECK_IS_BOT
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |settings: td_api::BotAccessSettings| {
+                Object::botAccessSettings(settings)
+            });
+            let (manager, mut env) = bot_env_split(td);
+            manager.get_bot_access_settings(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                promise,
+            );
+        }
+        Function::setManagedBotAccessSettings(request) => {
+            // Requests.cpp:7000-7006: CHECK_IS_BOT
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (manager, mut env) = bot_env_split(td);
+            manager.set_bot_access_settings(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                request.settings,
+                promise,
+            );
+        }
+        Function::setBotName(request) => {
+            // Requests.cpp:7007-7013
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (manager, mut env) = bot_env_split(td);
+            manager.set_bot_name(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                &request.language_code,
+                &name,
+                promise,
+            );
+        }
+        Function::getBotName(request) => {
+            // Requests.cpp:7014-7019: CREATE_TEXT_REQUEST_PROMISE
+            let promise =
+                td.deferred_promise(id, |name: String| Object::text(td_api::Text { text: name }));
+            let (manager, mut env) = bot_env_split(td);
+            manager.get_bot_name(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                &request.language_code,
+                promise,
+            );
+        }
+        Function::setBotInfoDescription(request) => {
+            // Requests.cpp:7042-7048
+            let Some(description) = clean_or_utf8_error(td, id, &request.description) else {
+                return;
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (manager, mut env) = bot_env_split(td);
+            manager.set_bot_info_description(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                &request.language_code,
+                &description,
+                promise,
+            );
+        }
+        Function::getBotInfoDescription(request) => {
+            // Requests.cpp:7049-7054: CREATE_TEXT_REQUEST_PROMISE
+            let promise = td.deferred_promise(id, |description: String| {
+                Object::text(td_api::Text { text: description })
+            });
+            let (manager, mut env) = bot_env_split(td);
+            manager.get_bot_info_description(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                &request.language_code,
+                promise,
+            );
+        }
+        Function::setBotInfoShortDescription(request) => {
+            // Requests.cpp:7055-7061
+            let Some(short_description) = clean_or_utf8_error(td, id, &request.short_description)
+            else {
+                return;
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (manager, mut env) = bot_env_split(td);
+            manager.set_bot_info_about(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                &request.language_code,
+                &short_description,
+                promise,
+            );
+        }
+        Function::getBotInfoShortDescription(request) => {
+            // Requests.cpp:7062-7066: CREATE_TEXT_REQUEST_PROMISE
+            let promise = td.deferred_promise(id, |about: String| {
+                Object::text(td_api::Text { text: about })
+            });
+            let (manager, mut env) = bot_env_split(td);
+            manager.get_bot_info_about(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                &request.language_code,
+                promise,
+            );
+        }
+        Function::setMessageSenderBotVerification(request) => {
+            // Requests.cpp:7067-7074: get_message_sender_dialog_id with
+            // check_access = true
+            let Some(custom_description) = clean_or_utf8_error(td, id, &request.custom_description)
+            else {
+                return;
+            };
+            let dialog_id = {
+                let (_manager, mut env) = bot_env_split(td);
+                match crate::message_sender::get_message_sender_dialog_id(
+                    &mut env,
+                    request.verified_id.as_ref(),
+                    true,
+                    false,
+                ) {
+                    tdutils::status::Result::Ok(dialog_id) => dialog_id,
+                    tdutils::status::Result::Err(status) => {
+                        return send_error_status(td, id, status);
+                    }
+                }
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (manager, mut env) = bot_env_split(td);
+            manager.set_custom_bot_verification(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                dialog_id,
+                true,
+                &custom_description,
+                promise,
+            );
+        }
+        Function::removeMessageSenderBotVerification(request) => {
+            // Requests.cpp:7075-7081: check_access = false, empty description
+            let dialog_id = {
+                let (_manager, mut env) = bot_env_split(td);
+                match crate::message_sender::get_message_sender_dialog_id(
+                    &mut env,
+                    request.verified_id.as_ref(),
+                    false,
+                    false,
+                ) {
+                    tdutils::status::Result::Ok(dialog_id) => dialog_id,
+                    tdutils::status::Result::Err(status) => {
+                        return send_error_status(td, id, status);
+                    }
+                }
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (manager, mut env) = bot_env_split(td);
+            manager.set_custom_bot_verification(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                dialog_id,
+                false,
+                "",
+                promise,
+            );
+        }
+
+        // --- the bot custom queries (BotQueries.cpp) ---
+        Function::setBotUpdatesStatus(request) => {
+            // Requests.cpp:8954-8960: CHECK_IS_BOT; the fire-and-forget
+            // send answers ok immediately
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(error_message) = clean_or_utf8_error(td, id, &request.error_message) else {
+                return;
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (_manager, mut env) = bot_env_split(td);
+            crate::bot_queries::set_bot_updates_status(
+                &mut env,
+                request.pending_update_count,
+                error_message,
+                promise,
+            );
+        }
+        Function::sendCustomRequest(request) => {
+            // Requests.cpp:8961-8968: CHECK_IS_BOT
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(method) = clean_or_utf8_error(td, id, &request.method) else {
+                return;
+            };
+            let Some(parameters) = clean_or_utf8_error(td, id, &request.parameters) else {
+                return;
+            };
+            let promise = td.deferred_promise(id, |result: td_api::CustomRequestResult| {
+                Object::customRequestResult(result)
+            });
+            let (manager, mut env) = bot_env_split(td);
+            crate::bot_queries::send_bot_custom_query(
+                manager, &mut env, method, parameters, promise,
+            );
+        }
+        Function::answerCustomQuery(request) => {
+            // Requests.cpp:8969-8975: CHECK_IS_BOT
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(data) = clean_or_utf8_error(td, id, &request.data) else {
+                return;
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (manager, mut env) = bot_env_split(td);
+            crate::bot_queries::answer_bot_custom_query(
+                manager,
+                &mut env,
+                request.custom_query_id,
+                data,
+                promise,
+            );
+        }
+
+        // Everything else waits for its manager step.
+        _ => {
+            td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+        }
+    }
+}
+
+
+        // Everything else waits for its manager step.
+        // The M.45 bot-served requests route into their own
+        // `#[inline(never)]` group directly: the group frames unwind
+        // between groups instead of nesting (see the frame note above the
+        // M.4.16 forward, and the M.6.20 group).
+        Function::setCommands(_)
+        | Function::deleteCommands(_)
+        | Function::getCommands(_)
+        | Function::setMenuButton(_)
+        | Function::getMenuButton(_)
+        | Function::setDefaultGroupAdministratorRights(_)
+        | Function::setDefaultChannelAdministratorRights(_)
+        | Function::getOwnedBots(_)
+        | Function::canBotSendMessages(_)
+        | Function::allowBotToSendMessages(_)
+        | Function::getBotMediaPreviews(_)
+        | Function::getBotMediaPreviewInfo(_)
+        | Function::addBotMediaPreview(_)
+        | Function::editBotMediaPreview(_)
+        | Function::reorderBotMediaPreviews(_)
+        | Function::deleteBotMediaPreviews(_)
+        | Function::createBot(_)
+        | Function::getManagedBotToken(_)
+        | Function::getManagedBotAccessSettings(_)
+        | Function::setManagedBotAccessSettings(_)
+        | Function::setBotName(_)
+        | Function::getBotName(_)
+        | Function::setBotInfoDescription(_)
+        | Function::getBotInfoDescription(_)
+        | Function::setBotInfoShortDescription(_)
+        | Function::getBotInfoShortDescription(_)
+        | Function::setMessageSenderBotVerification(_)
+        | Function::removeMessageSenderBotVerification(_)
+        | Function::setBotUpdatesStatus(_)
+        | Function::sendCustomRequest(_)
+        | Function::answerCustomQuery(_) => run_bot_requests(td, id, function),
+
+
+        // Everything else waits for its manager step.
         | Function::getSupportUser(_) => {
             // MessageEntity / UserFull ProfileTab / DialogManager / the
             // missing setter halves (M.4.12 deferred them with their types)
@@ -4758,15 +5365,17 @@ mod request_census_tests {
 assert_eq!(*counts.get("sync").unwrap_or(&0), 19, "sync count");
 assert_eq!(
     *counts.get("dispatched").unwrap_or(&0),
-    235,
+    266,
     "dispatched count"
 );
 assert_eq!(
     *counts.get("interim").unwrap_or(&0),
-    768,
+    737,
     "interim count"
 );
     }
 }
+
+
 
 

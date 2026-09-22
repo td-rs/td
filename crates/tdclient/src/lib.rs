@@ -7,6 +7,14 @@
 //! ([`synchronous_requests`]); the full ClientManager port is S70, the
 //! Options manager S69.
 
+pub mod join_chat_bot_result;
+pub mod bot_verifier_settings;
+pub mod bot_verification;
+pub mod bot_menu_button;
+pub mod bot_info_manager;
+pub mod bot_command_scope;
+pub mod bot_command;
+pub mod bot_access_settings;
 pub mod secure_value;
 pub mod secure_storage;
 pub mod secure_manager;

@@ -219,10 +219,28 @@ fn is_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\r' | b'\n' | 0 | 0x0b)
 }
 
+/// `td::validate_bot_language_code` (misc.cpp:395-406): empty or a
+/// two-letter a-z code.
+pub(crate) fn validate_bot_language_code(
+    language_code: &str,
+) -> std::result::Result<(), tdutils::status::Status> {
+    if language_code.is_empty() {
+        return Ok(());
+    }
+    let bytes = language_code.as_bytes();
+    if bytes.len() == 2 && bytes.iter().all(|c| c.is_ascii_lowercase()) {
+        return Ok(());
+    }
+    Err(tdutils::status::Status::error(
+        400,
+        "Invalid language code specified",
+    ))
+}
+
 /// `td::trim` (tdutils/misc.h:133) over the shared whitespace set; the
 /// ASCII gate keeps the byte-based C++ semantics (`is_space` is defined on
 /// bytes only, so no multi-byte character can be trimmed).
-fn trim(s: &str) -> &str {
+pub(crate) fn trim(s: &str) -> &str {
     s.trim_matches(|c: char| c.is_ascii() && is_space(c as u8))
 }
 

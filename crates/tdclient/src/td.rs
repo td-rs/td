@@ -291,6 +291,101 @@ pub struct Td {
     /// The account plane's `send_update` outbox; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) account_updates: Vec<td_api::Update>,
+    /// The M.45 flip gate: a bot-session Td answers the bot request arms —
+    /// `setBotUpdatesStatus` answers ok through its fire-and-forget send,
+    /// the bad-language `setBotName` 400s from the local validation half,
+    /// and the user-only `getOwnedBots` hits the CHECK_IS_USER surface.
+    #[test]
+    fn bot_request_arms_answer_through_the_td() {
+        // seed the database with the bot auth keys through a first Td
+        // session (the auth restore reads the persisted pmc at init)
+        let dir = temp_db_dir("bot-request-arms");
+        {
+            let seeder = CollectCallback::default();
+            let mut td = Td::new(Box::new(CollectCallback {
+                responses: seeder.responses.clone(),
+                errors: seeder.errors.clone(),
+            }));
+            let Function::setTdlibParameters(parameters) = set_tdlib_parameters(dir.clone(), false)
+            else {
+                unreachable!("setTdlibParameters helper");
+            };
+            td.on_set_tdlib_parameters(1, parameters);
+            // the bot restore: the auth pmc keys the init reads (AuthManager
+            // restore + UserManager::load_my_id)
+            let pmc = td.global.binlog_pmc();
+            pmc.set("auth", "ok");
+            pmc.set("auth_is_bot", "true");
+            pmc.set("my_id", "1");
+            td.close_impl(false);
+        }
+
+        let callback = CollectCallback::default();
+        let db_dir = dir.clone();
+        let mut td = Td::new(Box::new(CollectCallback {
+            responses: callback.responses.clone(),
+            errors: callback.errors.clone(),
+        }));
+        let Function::setTdlibParameters(parameters) = set_tdlib_parameters(db_dir, false) else {
+            unreachable!("setTdlibParameters helper");
+        };
+        td.on_set_tdlib_parameters(20, parameters);
+        assert!(td.auth_manager.is_bot(), "restored as a bot");
+
+        // setBotUpdatesStatus: the C++ handler ignores the result and the
+        // promise answers ok immediately (BotQueries.cpp:111-114)
+        td.request(
+            41,
+            Function::setBotUpdatesStatus(td_api::setBotUpdatesStatus {
+                pending_update_count: 3,
+                error_message: String::new(),
+            }),
+        );
+        let responses = responses_of(&callback, 41);
+        assert!(matches!(responses.first(), Some(Object::ok(_))));
+
+        // setBotName: the bad language code 400s from the local half
+        td.request(
+            42,
+            Function::setBotName(td_api::setBotName {
+                bot_user_id: 0,
+                language_code: "e!".to_owned(),
+                name: "Bot".to_owned(),
+            }),
+        );
+        let errors = callback.errors.lock().clone();
+        let error = errors.iter().find(|(id, _)| *id == 42).expect("error");
+        assert_eq!(error.1.code, 400);
+        assert_eq!(error.1.message, "Invalid language code specified");
+
+        // getOwnedBots: the user-only surface rejects the bot session
+        td.request(43, Function::getOwnedBots(td_api::getOwnedBots {}));
+        let errors = callback.errors.lock().clone();
+        let error = errors.iter().find(|(id, _)| *id == 43).expect("error");
+        assert_eq!(error.1.code, 400);
+        assert_eq!(error.1.message, "The method is not available to bots");
+
+        // getMenuButton: the bots.getBotMenuButton send is [blocked: net] —
+        // the promise parks in the bot manager and the request stays
+        // unanswered
+        td.request(
+            44,
+            Function::getMenuButton(td_api::getMenuButton { user_id: 0 }),
+        );
+        assert!(responses_of(&callback, 44).is_empty());
+        assert!(!callback.errors.lock().iter().any(|(id, _)| *id == 44));
+        assert_eq!(td.bot_info_manager.next_deadline(), None);
+
+        td.close_impl(false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The C++ `Td::bot_info_manager_` (`make_unique` at `Td.cpp:1175`,
+    /// the `init_managers` block, before the LinkManager at :1239 and the
+    /// NotificationManager at :1251; `reset_manager` at Td.cpp:520) — the
+    /// M.45 bot-administration query surface; its parked query promises
+    /// and the bot-info fan-in live in it.
+    pub(crate) bot_info_manager: crate::bot_info_manager::BotInfoManager,
     /// `Td::secure_manager_` (`Td.cpp:1353`, `init_pure_actor_managers`)
     /// — the M.44 collapsed manager; the C++ actor's `start_up` is empty.
     pub(crate) secure_manager: crate::secure_manager::SecureManager,
@@ -663,6 +758,7 @@ impl Td {
             suggested_action_manager: crate::suggested_action_manager::SuggestedActionManager::new(
             ),
             account_updates: Vec::new(),
+            bot_info_manager: crate::bot_info_manager::BotInfoManager::new(),
             secure_manager: crate::secure_manager::SecureManager::new(),
             star_gift_manager: crate::star_gift_manager::StarGiftManager::new(),
             theme_manager: crate::theme_manager::ThemeManager::new(),
@@ -1147,6 +1243,12 @@ impl Td {
             }
         }
 
+        // `make_unique<BotInfoManager>` (Td.cpp:1175-1177, the
+        // init_managers block) — created with the manager set at Td
+        // construction in the collapsed init (the field initializer); the
+        // M.45 bot query surface drives it per call.
+        let _ = &self.bot_info_manager;
+
         // `make_unique<LinkManager>` (Td.cpp:1239, the init_managers
         // block) — the autologin-token slice (M.3.9.1); the link surface
         // is Wave 2.
@@ -1613,6 +1715,15 @@ impl Td {
         // Td.cpp:547) — the component slices drop with them.
         self.connection_creator = None;
         self.link_manager = None;
+        self.connection_creator = None;
+        self.link_manager = None;
+        // `reset_manager(bot_info_manager_, "BotInfoManager")`
+        // (Td.cpp:520): the manager's `hangup` fails the pending bot-info
+        // fan-ins and the parked query promises with
+        // `Global::request_aborted_error()` (BotInfoManager.cpp:784-796)
+        // before the reset drops the state.
+        self.bot_info_manager.hangup();
+        self.bot_info_manager = crate::bot_info_manager::BotInfoManager::new();
         self.config_manager = None;
         // The C++ `ConfigManager::hangup` drops `config_recoverer_`
         // (ConfigManager.cpp:892-896): the close releases the parent share
@@ -6958,6 +7069,327 @@ impl crate::secure_manager::SecureManagerEnv for SecureEnv<'_> {
         match self.user_manager.get_input_user(&user_env, user_id) {
             Ok(input_user) => tdutils::status::Result::Ok(input_user),
             Err(status) => tdutils::status::Result::Err(status),
+        }
+    }
+}
+
+
+/// The [`crate::bot_info_manager::BotInfoManagerEnv`] over the `Td` fields
+/// — built per call with the field-split borrows (the `ThemeEnv`
+/// convention, M.41), never held across calls.
+pub(crate) struct BotInfoEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+}
+
+impl crate::bot_info_manager::BotInfoManagerEnv for BotInfoEnv<'_> {
+    fn is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn is_test_dc(&self) -> bool {
+        self.global.is_test_dc()
+    }
+
+    fn binlog_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn get_option_integer(&mut self, name: &str) -> i64 {
+        self.options
+            .as_deref()
+            .map(|options| options.get_option_integer(name, 0))
+            .unwrap_or(0)
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        // the C++ BotInfoManager never sends updates; the outbox lands in
+        // the Td's own send path if a future slice needs it
+        tdutils::log_info!("BotInfoManager update send — collapsed into the Td: {update:?}");
+    }
+
+    fn get_my_id(&self) -> crate::user_manager::UserId {
+        self.user_manager.get_my_id()
+    }
+
+    fn get_bot_data(
+        &self,
+        user_id: crate::user_manager::UserId,
+    ) -> std::result::Result<crate::user_manager::BotData, Status> {
+        self.user_manager.get_bot_data(user_id)
+    }
+
+    fn get_input_user(
+        &mut self,
+        user_id: crate::user_manager::UserId,
+    ) -> std::result::Result<telegram_api::InputUser, Status> {
+        let env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("bot requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_input_user(&env, user_id)
+    }
+
+    fn get_input_users_force(
+        &mut self,
+        user_ids: &[crate::user_manager::UserId],
+    ) -> Vec<telegram_api::InputUser> {
+        let env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("bot requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_input_users_force(&env, user_ids)
+    }
+
+    fn get_user_id_object(&mut self, user_id: crate::user_manager::UserId, source: &str) -> i64 {
+        let mut env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("bot requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager
+            .get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn get_user_ids_object(
+        &mut self,
+        user_ids: &[crate::user_manager::UserId],
+        source: &str,
+    ) -> Vec<i64> {
+        user_ids
+            .iter()
+            .map(|user_id| self.get_user_id_object(*user_id, source))
+            .collect()
+    }
+
+    fn get_users_object(
+        &mut self,
+        total_count: i32,
+        user_ids: &[crate::user_manager::UserId],
+    ) -> td_api::Users {
+        let mut env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("bot requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager
+            .get_users_object_of(&mut env, total_count, user_ids)
+    }
+
+    fn on_get_user(
+        &mut self,
+        user: telegram_api::User,
+        source: &str,
+    ) -> crate::user_manager::UserId {
+        let mut env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("bot requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.on_get_user(&mut env, user, source)
+    }
+
+    fn invalidate_user_full(&mut self, user_id: crate::user_manager::UserId) {
+        let mut env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("bot requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.invalidate_user_full(&mut env, user_id);
+    }
+
+    fn have_user_force(&mut self, user_id: crate::user_manager::UserId, source: &str) -> bool {
+        let mut env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("bot requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.have_user_force(&mut env, user_id, source)
+    }
+
+    fn reload_user_full(&mut self, user_id: crate::user_manager::UserId, promise: Promise<()>) {
+        // `UserManager::reload_user_full` (the users.getFullUser reload)
+        // is [blocked: net]; the forwarded promise dies here like the
+        // other net tails — the request stays unanswered until the net
+        // step lands
+        let _ = (user_id, promise);
+        tdutils::log_info!("UserManager::reload_user_full — [blocked: net]");
+    }
+
+    fn reload_user(&mut self, user_id: crate::user_manager::UserId, promise: Promise<()>) {
+        let _ = (user_id, promise);
+        tdutils::log_info!("UserManager::reload_user — [blocked: net]");
+    }
+
+    fn on_update_bot_has_preview_medias(
+        &mut self,
+        user_id: crate::user_manager::UserId,
+        has_preview_medias: bool,
+    ) {
+        let _ = (user_id, has_preview_medias);
+        tdutils::log_info!(
+            "UserManager::on_update_bot_has_preview_medias — [blocked: the user bot-info step]"
+        );
+    }
+
+    // The dialog seams: the env-local mirror of the M.6.15a free
+    // functions (they take `&mut Td`, which the field-split env cannot
+    // reach) — the same UserManager halves, with the Chat/Channel
+    // stub inventory.
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        allow_secret_chats: bool,
+        access_rights: crate::user_manager::AccessRights,
+        source: &str,
+    ) -> tdutils::status::Result<()> {
+        use crate::dialog_id::DialogType;
+        if !self.have_dialog_force(dialog_id, source) {
+            if !dialog_id.is_valid() {
+                return tdutils::status::Result::from_status(Status::error(
+                    400,
+                    "Invalid chat identifier specified",
+                ));
+            }
+            return tdutils::status::Result::from_status(Status::error(400, "Chat not found"));
+        }
+        if !self.have_input_peer(dialog_id, allow_secret_chats, access_rights) {
+            if dialog_id.get_type() == DialogType::SecretChat && !allow_secret_chats {
+                return tdutils::status::Result::from_status(Status::error(
+                    400,
+                    "Not supported in secret chats",
+                ));
+            }
+            if matches!(
+                access_rights,
+                crate::user_manager::AccessRights::Write | crate::user_manager::AccessRights::Edit
+            ) {
+                return tdutils::status::Result::from_status(Status::error(
+                    400,
+                    "Have no write access to the chat",
+                ));
+            }
+            return tdutils::status::Result::from_status(Status::error(
+                400,
+                "Can't access the chat",
+            ));
+        }
+        tdutils::status::Result::Ok(())
+    }
+
+    fn have_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        allow_secret_chats: bool,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> bool {
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User => {
+                let env = UserEnv {
+                    global: self.global,
+                    options: self
+                        .options
+                        .as_deref_mut()
+                        .expect("bot requests run with the initialized option manager"),
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.user_manager
+                    .have_input_peer_user(&env, dialog_id.get_user_id(), access_rights)
+            }
+            // the ChatManager peers are the stub inventory (M.6.15a)
+            DialogType::Chat | DialogType::Channel => false,
+            DialogType::SecretChat => {
+                if !allow_secret_chats {
+                    return false;
+                }
+                self.user_manager
+                    .have_input_encrypted_peer(dialog_id.get_secret_chat_id(), access_rights)
+            }
+            DialogType::None => false,
+        }
+    }
+
+    fn get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<telegram_api::InputPeer> {
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User => {
+                let env = UserEnv {
+                    global: self.global,
+                    options: self
+                        .options
+                        .as_deref_mut()
+                        .expect("bot requests run with the initialized option manager"),
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.user_manager
+                    .get_input_peer_user(&env, dialog_id.get_user_id(), access_rights)
+            }
+            // the ChatManager peers are the stub inventory (M.6.15a); the
+            // C++ inputPeerSecretChat construction rides
+            // ChatManager::get_simple_input_peer (stub inventory too)
+            DialogType::Chat | DialogType::Channel | DialogType::SecretChat => None,
+            DialogType::None => Some(telegram_api::InputPeer::inputPeerEmpty(
+                telegram_api::inputPeerEmpty {},
+            )),
+        }
+    }
+
+    fn is_broadcast_channel(&mut self, dialog_id: crate::dialog_id::DialogId) -> bool {
+        // the ChatManager channel read is the stub inventory
+        // (dialog_manager::is_broadcast_channel)
+        let _ = dialog_id;
+        false
+    }
+
+    fn have_dialog_force(&mut self, dialog_id: crate::dialog_id::DialogId, source: &str) -> bool {
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User => self.have_user_force(dialog_id.get_user_id(), source),
+            // the ChatManager peers are the stub inventory
+            DialogType::Chat | DialogType::Channel => false,
+            DialogType::SecretChat => self
+                .user_manager
+                .have_secret_chat(dialog_id.get_secret_chat_id()),
+            DialogType::None => false,
         }
     }
 }
