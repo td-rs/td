@@ -43,6 +43,7 @@ use crate::notification_settings::{
 use crate::notification_settings_manager::ScopeSettingsAnswer;
 use crate::suggested_action::SuggestedAction;
 use crate::td::AccountEnv;
+use crate::td::BoostEnv;
 use crate::td::QuickReplyEnv;
 use crate::td::CallEnv;
 use crate::td::CommunityEnv;
@@ -2491,6 +2492,101 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
         }
 
         // Everything else waits for its manager step.
+        Function::getChatBoostStatus(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |s: td_api::ChatBoostStatus| Object::chatBoostStatus(s));
+            let mut env = BoostEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                chat_manager: &mut td.chat_manager,
+            };
+            td.boost_manager.get_dialog_boost_status(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                promise,
+            );
+        }
+        Function::boostChat(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |s: td_api::ChatBoostSlots| Object::chatBoostSlots(s));
+            let mut env = BoostEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                chat_manager: &mut td.chat_manager,
+            };
+            td.boost_manager.boost_dialog(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                &request.slot_ids,
+                promise,
+            );
+        }
+        Function::getChatBoostLink(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let result = {
+                let mut env = BoostEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    chat_manager: &mut td.chat_manager,
+                };
+                td.boost_manager
+                    .get_dialog_boost_link(&mut env, crate::dialog_id::DialogId::new(request.chat_id))
+            };
+            match result {
+                Ok((url, is_public)) => td.send_result(id, Object::chatBoostLink(td_api::ChatBoostLink {
+                    link: url,
+                    is_public,
+                })),
+                Err(status) => td.send_error_impl(id, status.code(), status.message()),
+            }
+        }
+        Function::getChatBoosts(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(offset) = crate::misc::clean_input_string(&request.offset) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, |b: td_api::FoundChatBoosts| Object::foundChatBoosts(b));
+            let mut env = BoostEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                chat_manager: &mut td.chat_manager,
+            };
+            td.boost_manager.get_dialog_boosts(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                request.only_gift_codes,
+                &offset,
+                request.limit,
+                promise,
+            );
+        }
+        Function::getUserChatBoosts(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |b: td_api::FoundChatBoosts| Object::foundChatBoosts(b));
+            let mut env = BoostEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                chat_manager: &mut td.chat_manager,
+            };
+            td.boost_manager.get_user_dialog_boosts(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                request.user_id,
+                promise,
+            );
+        }
+
+        // Everything else waits for its manager step.
         // --- quick replies (Requests.cpp) ---
         Function::setQuickReplyShortcutName(request) => {
             if !check_is_user(td, id) {
@@ -3169,15 +3265,18 @@ mod request_census_tests {
 assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
 assert_eq!(
     *counts.get("dispatched").unwrap_or(&0),
-    162,
+    167,
     "dispatched count"
 );
 assert_eq!(
     *counts.get("interim").unwrap_or(&0),
-    842,
+    837,
     "interim count"
 );
     }
 }
+
+
+
 
 

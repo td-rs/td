@@ -52,7 +52,7 @@ assignStoreTransaction	dispatched
 banChatMember	interim
 banGroupCallParticipants	interim
 blockMessageSenderFromReplies	interim
-boostChat	interim
+boostChat	dispatched
 buyGiftUpgrade	interim
 canBotSendMessages	interim
 canPostStory	interim
@@ -295,10 +295,10 @@ getChatAvailableMessageSenders	interim
 getChatAvailablePaidMessageReactionSenders	interim
 getChatBoostFeatures	interim
 getChatBoostLevelFeatures	interim
-getChatBoostLink	interim
+getChatBoostLink	dispatched
 getChatBoostLinkInfo	interim
-getChatBoostStatus	interim
-getChatBoosts	interim
+getChatBoostStatus	dispatched
+getChatBoosts	dispatched
 getChatEventLog	interim
 getChatFolder	interim
 getChatFolderChatCount	interim
@@ -562,7 +562,7 @@ getUpgradedGiftVariants	interim
 getUpgradedGiftWithdrawalUrl	interim
 getUpgradedGiftsPromotionalAnimation	interim
 getUser	dispatched
-getUserChatBoosts	interim
+getUserChatBoosts	dispatched
 getUserFullInfo	dispatched
 getUserLink	dispatched
 getUserPrivacySettingRules	interim

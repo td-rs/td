@@ -45,6 +45,7 @@ use tdmtproto::telegram_api;
 use tdnet::net_query::{NetQuery, NetQueryDispatcher};
 use tdutils::promise::Promise;
 use tdutils::status::Status;
+use crate::boost_manager::{BoostManager, BoostManagerEnv};
 use crate::quick_reply_manager::{QuickReplyManager, QuickReplyManagerEnv};
 
 use crate::account_manager::{AccountManager, AccountManagerEnv};
@@ -290,6 +291,8 @@ pub struct Td {
     /// The account plane's `send_update` outbox; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) account_updates: Vec<td_api::Update>,
+    /// `Td::boost_manager_` (the C++ init_managers block).
+    pub(crate) boost_manager: BoostManager,
     /// `Td::quick_reply_manager_` (the C++ init_managers block).
     pub(crate) quick_reply_manager: QuickReplyManager,
     /// The premium plane (Premium.cpp is a free-function surface).
@@ -637,6 +640,7 @@ impl Td {
             suggested_action_manager: crate::suggested_action_manager::SuggestedActionManager::new(
             ),
             account_updates: Vec::new(),
+            boost_manager: BoostManager::new(),
             quick_reply_manager: QuickReplyManager::new(),
             premium_manager: PremiumManager::new(),
             statistics_manager: StatisticsManager::new(),
@@ -5737,6 +5741,43 @@ impl QuickReplyManagerEnv for QuickReplyEnv<'_> {
     }
 
     fn send_update(&mut self, _update: td_api::Update) {}
+}
+
+
+/// The boost-plane env over the `Td` fields.
+pub(crate) struct BoostEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+}
+
+impl BoostManagerEnv for BoostEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_integer(name, default_value)
+        })
+    }
+
+    fn send_update(&mut self, _update: td_api::Update) {}
+
+    fn check_dialog_access(&mut self, dialog_id: crate::dialog_id::DialogId) -> std::result::Result<(), tdutils::status::Status> {
+        if dialog_id.is_valid() {
+            Ok(())
+        } else {
+            Err(tdutils::status::Status::error(400, "Chat not found"))
+        }
+    }
+
+    fn get_channel_first_username(&mut self, channel_id: crate::chat_manager::ChannelId) -> String {
+        // `ChatManager::get_channel_first_username` — the M.5 surface; the
+        // seam answers the empty username.
+        let _ = (self.chat_manager as &mut crate::chat_manager::ChatManager, channel_id);
+        String::new()
+    }
 }
 
 
