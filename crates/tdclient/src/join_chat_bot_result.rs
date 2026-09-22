@@ -27,9 +27,9 @@ impl JoinChatBotResult {
     /// WebView variant logs the error and keeps the queued default; the
     /// generated enum is exhaustive, so the C++ UNREACHABLE default is
     /// unreachable here too.
-    pub fn from_telegram(result: telegram_api::JoinChatBotResult) -> JoinChatBotResult {
+    pub fn from_telegram(telegram_result: telegram_api::JoinChatBotResult) -> JoinChatBotResult {
         let mut result = JoinChatBotResult::default();
-        match result {
+        match telegram_result {
             telegram_api::JoinChatBotResult::joinChatBotResultApproved(_) => {
                 result.type_ = Type::Approved;
             }
@@ -48,12 +48,12 @@ impl JoinChatBotResult {
 
     /// `JoinChatBotResult::JoinChatBotResult(const object_ptr<
     /// ChatJoinRequestResult> &)` (JoinChatBotResult.cpp:32-49).
-    pub fn from_td_api(result: Option<&td_api::ChatJoinRequestResult>) -> JoinChatBotResult {
+    pub fn from_td_api(td_result: Option<&td_api::ChatJoinRequestResult>) -> JoinChatBotResult {
         let mut result = JoinChatBotResult::default();
-        let Some(result) = result else {
+        let Some(td_result) = td_result else {
             return result;
         };
-        match result {
+        match td_result {
             td_api::ChatJoinRequestResult::chatJoinRequestResultApproved(_) => {
                 result.type_ = Type::Approved;
             }
@@ -170,6 +170,9 @@ mod tests {
         ));
 
         // the null is the queued default (JoinChatBotResult.cpp:32-35)
-        assert_eq!(JoinChatBotResult::from_td_api(None), JoinChatBotResult::default());
+        assert_eq!(
+            JoinChatBotResult::from_td_api(None),
+            JoinChatBotResult::default()
+        );
     }
 }

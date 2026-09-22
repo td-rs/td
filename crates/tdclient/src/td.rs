@@ -272,6 +272,12 @@ pub struct Td {
     /// `init_managers` block) — the M.3.9.1 autologin-token slice; the
     /// link surface is Wave 2.
     pub(crate) link_manager: Option<LinkManager>,
+    /// The C++ `Td::bot_info_manager_` (`make_unique` at `Td.cpp:1175`,
+    /// the `init_managers` block, before the LinkManager at :1239 and the
+    /// NotificationManager at :1251; `reset_manager` at Td.cpp:520) — the
+    /// M.45 bot-administration query surface; its parked query promises
+    /// and the bot-info fan-in live in it.
+    pub(crate) bot_info_manager: crate::bot_info_manager::BotInfoManager,
     pub(crate) auth_manager: AuthManager,
     /// `Td::user_manager_` — the user/secret-chat cache (created with Td,
     /// loaded from the binlog pmc in `init` like the C++ constructor).
@@ -291,101 +297,6 @@ pub struct Td {
     /// The account plane's `send_update` outbox; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) account_updates: Vec<td_api::Update>,
-    /// The M.45 flip gate: a bot-session Td answers the bot request arms —
-    /// `setBotUpdatesStatus` answers ok through its fire-and-forget send,
-    /// the bad-language `setBotName` 400s from the local validation half,
-    /// and the user-only `getOwnedBots` hits the CHECK_IS_USER surface.
-    #[test]
-    fn bot_request_arms_answer_through_the_td() {
-        // seed the database with the bot auth keys through a first Td
-        // session (the auth restore reads the persisted pmc at init)
-        let dir = temp_db_dir("bot-request-arms");
-        {
-            let seeder = CollectCallback::default();
-            let mut td = Td::new(Box::new(CollectCallback {
-                responses: seeder.responses.clone(),
-                errors: seeder.errors.clone(),
-            }));
-            let Function::setTdlibParameters(parameters) = set_tdlib_parameters(dir.clone(), false)
-            else {
-                unreachable!("setTdlibParameters helper");
-            };
-            td.on_set_tdlib_parameters(1, parameters);
-            // the bot restore: the auth pmc keys the init reads (AuthManager
-            // restore + UserManager::load_my_id)
-            let pmc = td.global.binlog_pmc();
-            pmc.set("auth", "ok");
-            pmc.set("auth_is_bot", "true");
-            pmc.set("my_id", "1");
-            td.close_impl(false);
-        }
-
-        let callback = CollectCallback::default();
-        let db_dir = dir.clone();
-        let mut td = Td::new(Box::new(CollectCallback {
-            responses: callback.responses.clone(),
-            errors: callback.errors.clone(),
-        }));
-        let Function::setTdlibParameters(parameters) = set_tdlib_parameters(db_dir, false) else {
-            unreachable!("setTdlibParameters helper");
-        };
-        td.on_set_tdlib_parameters(20, parameters);
-        assert!(td.auth_manager.is_bot(), "restored as a bot");
-
-        // setBotUpdatesStatus: the C++ handler ignores the result and the
-        // promise answers ok immediately (BotQueries.cpp:111-114)
-        td.request(
-            41,
-            Function::setBotUpdatesStatus(td_api::setBotUpdatesStatus {
-                pending_update_count: 3,
-                error_message: String::new(),
-            }),
-        );
-        let responses = responses_of(&callback, 41);
-        assert!(matches!(responses.first(), Some(Object::ok(_))));
-
-        // setBotName: the bad language code 400s from the local half
-        td.request(
-            42,
-            Function::setBotName(td_api::setBotName {
-                bot_user_id: 0,
-                language_code: "e!".to_owned(),
-                name: "Bot".to_owned(),
-            }),
-        );
-        let errors = callback.errors.lock().clone();
-        let error = errors.iter().find(|(id, _)| *id == 42).expect("error");
-        assert_eq!(error.1.code, 400);
-        assert_eq!(error.1.message, "Invalid language code specified");
-
-        // getOwnedBots: the user-only surface rejects the bot session
-        td.request(43, Function::getOwnedBots(td_api::getOwnedBots {}));
-        let errors = callback.errors.lock().clone();
-        let error = errors.iter().find(|(id, _)| *id == 43).expect("error");
-        assert_eq!(error.1.code, 400);
-        assert_eq!(error.1.message, "The method is not available to bots");
-
-        // getMenuButton: the bots.getBotMenuButton send is [blocked: net] —
-        // the promise parks in the bot manager and the request stays
-        // unanswered
-        td.request(
-            44,
-            Function::getMenuButton(td_api::getMenuButton { user_id: 0 }),
-        );
-        assert!(responses_of(&callback, 44).is_empty());
-        assert!(!callback.errors.lock().iter().any(|(id, _)| *id == 44));
-        assert_eq!(td.bot_info_manager.next_deadline(), None);
-
-        td.close_impl(false);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The C++ `Td::bot_info_manager_` (`make_unique` at `Td.cpp:1175`,
-    /// the `init_managers` block, before the LinkManager at :1239 and the
-    /// NotificationManager at :1251; `reset_manager` at Td.cpp:520) — the
-    /// M.45 bot-administration query surface; its parked query promises
-    /// and the bot-info fan-in live in it.
-    pub(crate) bot_info_manager: crate::bot_info_manager::BotInfoManager,
     /// `Td::secure_manager_` (`Td.cpp:1353`, `init_pure_actor_managers`)
     /// — the M.44 collapsed manager; the C++ actor's `start_up` is empty.
     pub(crate) secure_manager: crate::secure_manager::SecureManager,
@@ -748,6 +659,7 @@ impl Td {
             time_zone_manager: TimeZoneManager::default(),
             manager_states: ManagerOptionStates::default(),
             link_manager: None,
+            bot_info_manager: crate::bot_info_manager::BotInfoManager::new(),
             auth_manager: AuthManager::new(),
             user_manager: UserManager::new(),
             notification_manager: NotificationManager::default(),
@@ -758,7 +670,6 @@ impl Td {
             suggested_action_manager: crate::suggested_action_manager::SuggestedActionManager::new(
             ),
             account_updates: Vec::new(),
-            bot_info_manager: crate::bot_info_manager::BotInfoManager::new(),
             secure_manager: crate::secure_manager::SecureManager::new(),
             star_gift_manager: crate::star_gift_manager::StarGiftManager::new(),
             theme_manager: crate::theme_manager::ThemeManager::new(),
@@ -1243,7 +1154,9 @@ impl Td {
             }
         }
 
-        // `make_unique<BotInfoManager>` (Td.cpp:1175-1177, the
+        // `make_unique<LinkManager>` (Td.cpp:1239, the init_managers
+        // block) — the autologin-token slice (M.3.9.1); the link surface
+        // is Wave 2.        // `make_unique<BotInfoManager>` (Td.cpp:1175-1177, the
         // init_managers block) — created with the manager set at Td
         // construction in the collapsed init (the field initializer); the
         // M.45 bot query surface drives it per call.
@@ -7073,7 +6986,6 @@ impl crate::secure_manager::SecureManagerEnv for SecureEnv<'_> {
     }
 }
 
-
 /// The [`crate::bot_info_manager::BotInfoManagerEnv`] over the `Td` fields
 /// — built per call with the field-split borrows (the `ThemeEnv`
 /// convention, M.41), never held across calls.
@@ -7393,7 +7305,6 @@ impl crate::bot_info_manager::BotInfoManagerEnv for BotInfoEnv<'_> {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
