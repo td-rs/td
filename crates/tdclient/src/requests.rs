@@ -43,14 +43,13 @@ use crate::notification_settings::{
 use crate::notification_settings_manager::ScopeSettingsAnswer;
 use crate::suggested_action::SuggestedAction;
 use crate::td::AccountEnv;
-use crate::td::AttachMenuEnv;
 use crate::td::AutosaveEnv;
 use crate::td::BoostEnv;
-use crate::td::QuickReplyEnv;
 use crate::td::CallEnv;
 use crate::td::CommunityEnv;
 use crate::td::NotificationEnv;
 use crate::td::PremiumTdEnv;
+use crate::td::QuickReplyEnv;
 use crate::td::StatisticsEnv;
 use crate::td::Td;
 use crate::td::WebBrowserEnv;
@@ -2494,56 +2493,6 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
         }
 
         // Everything else waits for its manager step.
-        // --- attachment menu (Requests.cpp:6069-6081) ---
-        Function::getAttachmentMenuBot(request) => {
-            if !check_is_user(td, id) {
-                return;
-            }
-            let promise = td.deferred_promise(id, |b: td_api::AttachmentMenuBot| {
-                Object::attachmentMenuBot(b)
-            });
-            let mut env = AttachMenuEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                user_manager: &mut td.user_manager,
-                file_manager: std::sync::Arc::clone(&td.file_manager),
-                file_reference_manager: &mut td.file_reference_manager,
-                updates: &mut td.attach_menu_updates,
-            };
-            td.attach_menu_manager.get_attach_menu_bot_request(
-                &mut env,
-                crate::user_manager::UserId::new(request.bot_user_id),
-                promise,
-            );
-        }
-        Function::toggleBotIsAddedToAttachmentMenu(request) => {
-            if !check_is_user(td, id) {
-                return;
-            }
-            let promise = td.deferred_promise(id, |()| ok_object());
-            let mut env = AttachMenuEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                user_manager: &mut td.user_manager,
-                file_manager: std::sync::Arc::clone(&td.file_manager),
-                file_reference_manager: &mut td.file_reference_manager,
-                updates: &mut td.attach_menu_updates,
-            };
-            td.attach_menu_manager.toggle_bot_is_added_to_attach_menu(
-                &mut env,
-                crate::user_manager::UserId::new(request.bot_user_id),
-                request.is_added,
-                request.allow_write_access,
-                promise,
-            );
-        }
-
-
-        // Everything else waits for its manager step.
         // --- autosave (Requests.cpp:3136-3152) ---
         Function::getAutosaveSettings(_) => {
             if !check_is_user(td, id) {
@@ -2587,13 +2536,13 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 .clear_autosave_settings_exceptions(&mut env, promise);
         }
 
-
         // Everything else waits for its manager step.
         Function::getChatBoostStatus(request) => {
             if !check_is_user(td, id) {
                 return;
             }
-            let promise = td.deferred_promise(id, |s: td_api::ChatBoostStatus| Object::chatBoostStatus(s));
+            let promise =
+                td.deferred_promise(id, |s: td_api::ChatBoostStatus| Object::chatBoostStatus(s));
             let mut env = BoostEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -2609,7 +2558,8 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             if !check_is_user(td, id) {
                 return;
             }
-            let promise = td.deferred_promise(id, |s: td_api::ChatBoostSlots| Object::chatBoostSlots(s));
+            let promise =
+                td.deferred_promise(id, |s: td_api::ChatBoostSlots| Object::chatBoostSlots(s));
             let mut env = BoostEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -2632,14 +2582,19 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                     options: td.option_manager.as_mut(),
                     chat_manager: &mut td.chat_manager,
                 };
-                td.boost_manager
-                    .get_dialog_boost_link(&mut env, crate::dialog_id::DialogId::new(request.chat_id))
+                td.boost_manager.get_dialog_boost_link(
+                    &mut env,
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                )
             };
             match result {
-                Ok((url, is_public)) => td.send_result(id, Object::chatBoostLink(td_api::ChatBoostLink {
-                    link: url,
-                    is_public,
-                })),
+                Ok((url, is_public)) => td.send_result(
+                    id,
+                    Object::chatBoostLink(td_api::ChatBoostLink {
+                        link: url,
+                        is_public,
+                    }),
+                ),
                 Err(status) => td.send_error_impl(id, status.code(), status.message()),
             }
         }
@@ -2650,7 +2605,8 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             let Some(offset) = crate::misc::clean_input_string(&request.offset) else {
                 return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
             };
-            let promise = td.deferred_promise(id, |b: td_api::FoundChatBoosts| Object::foundChatBoosts(b));
+            let promise =
+                td.deferred_promise(id, |b: td_api::FoundChatBoosts| Object::foundChatBoosts(b));
             let mut env = BoostEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -2669,7 +2625,8 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             if !check_is_user(td, id) {
                 return;
             }
-            let promise = td.deferred_promise(id, |b: td_api::FoundChatBoosts| Object::foundChatBoosts(b));
+            let promise =
+                td.deferred_promise(id, |b: td_api::FoundChatBoosts| Object::foundChatBoosts(b));
             let mut env = BoostEnv {
                 global: &mut td.global,
                 options: td.option_manager.as_mut(),
@@ -2746,7 +2703,6 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 promise,
             );
         }
-
 
         // Everything else waits for its manager step.
         Function::getPremiumLimit(request) => {
@@ -3372,11 +3328,4 @@ assert_eq!(
 );
     }
 }
-
-
-
-
-
-
-
 

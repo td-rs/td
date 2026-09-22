@@ -9,6 +9,7 @@
 
 pub mod account_manager;
 pub mod age_verification_parameters;
+pub mod attach_menu_manager;
 pub mod auth_manager;
 pub mod autosave_manager;
 pub mod birthdate;

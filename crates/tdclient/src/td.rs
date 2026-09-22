@@ -36,8 +36,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::boost_manager::{BoostManager, BoostManagerEnv};
 use crate::community_manager::{CommunityManager, CommunityManagerEnv};
 use crate::premium::{PremiumEnv, PremiumManager};
+use crate::quick_reply_manager::{QuickReplyManager, QuickReplyManagerEnv};
 use crate::statistics_manager::{StatisticsManager, StatisticsManagerEnv};
 use tdactor::{Actor, ActorOwn, Scheduler, actor_messages, send_closure_later};
 use tddb::td_db::{OpenedDatabase, Parameters as DbParameters, TdDb};
@@ -45,8 +47,6 @@ use tdmtproto::telegram_api;
 use tdnet::net_query::{NetQuery, NetQueryDispatcher};
 use tdutils::promise::Promise;
 use tdutils::status::Status;
-use crate::boost_manager::{BoostManager, BoostManagerEnv};
-use crate::quick_reply_manager::{QuickReplyManager, QuickReplyManagerEnv};
 
 use crate::account_manager::{AccountManager, AccountManagerEnv};
 
@@ -291,29 +291,6 @@ pub struct Td {
     /// The account plane's `send_update` outbox; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) account_updates: Vec<td_api::Update>,
-    /// `AttachMenuManager::init` (AttachMenuManager.cpp:366-430, also
-    /// `start_up`; the C++ `AuthManager` on_get_authorization call at
-    /// AuthManager.cpp:1542) — idempotent; the manager no-ops while inactive.
-    fn init_attach_menu_manager(&mut self) {
-        let mut env = AttachMenuEnv {
-            global: &mut self.global,
-            options: self.option_manager.as_mut(),
-            auth_is_authorized: self.auth_manager.is_authorized(),
-            auth_is_bot: self.auth_manager.is_bot(),
-            user_manager: &mut self.user_manager,
-            file_manager: std::sync::Arc::clone(&self.file_manager),
-            file_reference_manager: &mut self.file_reference_manager,
-            updates: &mut self.attach_menu_updates,
-        };
-        self.attach_menu_manager.init(&mut env);
-    }
-
-    /// `Td::attach_menu_manager_` (`Td.cpp:1163`, the init_managers block;
-    /// the M.40 Wave-3 slice).
-    pub(crate) attach_menu_manager: crate::attach_menu_manager::AttachMenuManager,
-    /// The attach-menu manager's `send_update` outbox — the same collapsed
-    /// hop; drained by [`Td::flush_user_updates`].
-    pub(crate) attach_menu_updates: Vec<td_api::Update>,
     /// `Td::autosave_manager_` (`Td.cpp:1166`, the init_managers block;
     /// the M.39 Wave-3 slice).
     pub(crate) autosave_manager: crate::autosave_manager::AutosaveManager,
@@ -359,6 +336,12 @@ pub struct Td {
     /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) notification_updates: Vec<td_api::Update>,
+    /// `Td::attach_menu_manager_` (`Td.cpp:1163`, the init_managers block;
+    /// the M.40 Wave-3 slice).
+    pub(crate) attach_menu_manager: crate::attach_menu_manager::AttachMenuManager,
+    /// The attach-menu manager's `send_update` outbox — the same collapsed
+    /// hop; drained by [`Td::flush_user_updates`].
+    pub(crate) attach_menu_updates: Vec<td_api::Update>,
     /// The premium-required-to-contact QueryMerger actor (a UserManager
     /// member in the C++; the Rust merger is an actor created by `init` —
     /// the `ActorOwn` keeps it alive, dropping it would hang the merged
@@ -669,8 +652,6 @@ impl Td {
             suggested_action_manager: crate::suggested_action_manager::SuggestedActionManager::new(
             ),
             account_updates: Vec::new(),
-            attach_menu_manager: crate::attach_menu_manager::AttachMenuManager::new(),
-            attach_menu_updates: Vec::new(),
             autosave_manager: crate::autosave_manager::AutosaveManager::new(),
             autosave_updates: Vec::new(),
             boost_manager: BoostManager::new(),
@@ -687,6 +668,8 @@ impl Td {
             call_updates: Vec::new(),
             call_dh_config: None,
             notification_updates: Vec::new(),
+            attach_menu_manager: crate::attach_menu_manager::AttachMenuManager::new(),
+            attach_menu_updates: Vec::new(),
             premium_required_contact_merger: None,
             chat_manager: crate::chat_manager::ChatManager::new(),
             dialog_manager: DialogManager::new(),
@@ -1039,6 +1022,9 @@ impl Td {
             self.auth_manager.set_state_ok();
             self.apply_self_user(&user, false);
             self.init_notification_manager();
+            self.apply_self_user(&user, false);
+            self.init_notification_manager();
+            self.init_attach_menu_manager();
             self.init_terms_of_service_manager();
             self.on_web_browser_authorization_success();
         } else {
@@ -1062,6 +1048,7 @@ impl Td {
                     self.auth_manager
                         .restore_from_pmc("ok", is_bot, String::new());
                     self.init_notification_manager();
+                    self.init_attach_menu_manager();
                     self.init_terms_of_service_manager();
                     self.on_web_browser_authorization_success();
                 }
@@ -1350,6 +1337,23 @@ impl Td {
                 can_ignore_background_updates: self.can_ignore_background_updates,
             };
             self.updates_manager.get_difference(&mut env, "init");
+        }
+
+        self.init_attach_menu_manager();
+        // The AttachMenuManager's reload timeout (M.40): the C++ actor
+        // timer collapses into the shared slot's fire.
+        {
+            let mut env = AttachMenuEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+                auth_is_authorized: self.auth_manager.is_authorized(),
+                auth_is_bot: self.auth_manager.is_bot(),
+                user_manager: &mut self.user_manager,
+                file_manager: std::sync::Arc::clone(&self.file_manager),
+                file_reference_manager: &mut self.file_reference_manager,
+                updates: &mut self.attach_menu_updates,
+            };
+            self.attach_menu_manager.tick_timeouts(&mut env);
         }
 
         // `AccountManager::start_up` + `SuggestedActionManager::start_up`
@@ -1880,6 +1884,13 @@ impl Td {
             && (expire_time == 0.0 || alarm_deadline < expire_time)
         {
             expire_time = alarm_deadline;
+        }
+
+        // The AttachMenuManager's reload timeout joins the same slot (M.40).
+        if let Some(attach_menu_deadline) = self.attach_menu_manager.next_deadline()
+            && (expire_time == 0.0 || attach_menu_deadline < expire_time)
+        {
+            expire_time = attach_menu_deadline;
         }
         // The UpdatesManager's gap/save/retry/reload timers join the same
         // slot (M.7.18).
@@ -2767,6 +2778,23 @@ impl Td {
             updates: &mut self.account_updates,
         };
         self.terms_of_service_manager.init(&mut env);
+    }
+
+    /// `AttachMenuManager::init` (AttachMenuManager.cpp:366-430, also
+    /// `start_up`; the C++ `AuthManager` on_get_authorization call at
+    /// AuthManager.cpp:1542) — idempotent; the manager no-ops while inactive.
+    fn init_attach_menu_manager(&mut self) {
+        let mut env = AttachMenuEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            user_manager: &mut self.user_manager,
+            file_manager: std::sync::Arc::clone(&self.file_manager),
+            file_reference_manager: &mut self.file_reference_manager,
+            updates: &mut self.attach_menu_updates,
+        };
+        self.attach_menu_manager.init(&mut env);
     }
 
     /// `make_unique<WebBrowserManager>` + its `start_up`
@@ -5784,7 +5812,6 @@ impl QuickReplyManagerEnv for QuickReplyEnv<'_> {
     fn send_update(&mut self, _update: td_api::Update) {}
 }
 
-
 /// The boost-plane env over the `Td` fields.
 pub(crate) struct BoostEnv<'a> {
     pub(crate) global: &'a mut Global,
@@ -5805,7 +5832,10 @@ impl BoostManagerEnv for BoostEnv<'_> {
 
     fn send_update(&mut self, _update: td_api::Update) {}
 
-    fn check_dialog_access(&mut self, dialog_id: crate::dialog_id::DialogId) -> std::result::Result<(), tdutils::status::Status> {
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> std::result::Result<(), tdutils::status::Status> {
         if dialog_id.is_valid() {
             Ok(())
         } else {
@@ -5816,11 +5846,13 @@ impl BoostManagerEnv for BoostEnv<'_> {
     fn get_channel_first_username(&mut self, channel_id: crate::chat_manager::ChannelId) -> String {
         // `ChatManager::get_channel_first_username` — the M.5 surface; the
         // seam answers the empty username.
-        let _ = (self.chat_manager as &mut crate::chat_manager::ChatManager, channel_id);
+        let _ = (
+            self.chat_manager as &mut crate::chat_manager::ChatManager,
+            channel_id,
+        );
         String::new()
     }
 }
-
 
 /// The [`crate::autosave_manager::AutosaveManagerEnv`] over the `Td`
 /// fields — built per call with the field-split borrows (the
@@ -5876,7 +5908,6 @@ impl crate::autosave_manager::AutosaveManagerEnv for AutosaveEnv<'_> {
         // every dialog id is resolvable in the collapsed cache
     }
 }
-
 
 /// The [`crate::attach_menu_manager::AttachMenuManagerEnv`] over the `Td`
 /// fields — built per call with the field-split borrows (the
@@ -6065,7 +6096,6 @@ impl crate::attach_menu_manager::AttachMenuManagerEnv for AttachMenuEnv<'_> {
         self.file_manager.lock().parse_file(parser)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
