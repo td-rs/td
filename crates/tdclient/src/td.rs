@@ -272,6 +272,11 @@ pub struct Td {
         crate::notification_settings_manager::NotificationSettingsManager,
     /// `Td::device_token_manager_` (`Td.cpp:1345`, M.13S).
     pub(crate) device_token_manager: crate::device_token_manager::DeviceTokenManager,
+    /// `Td::story_manager_` (`Td.cpp:1296`, M.47): the story state
+    /// machine.
+    pub(crate) story_manager: crate::story_manager::StoryManager,
+    /// The story manager's `send_update` outbox — shares the notification
+    /// drain (`flush_user_updates`).
     /// The notification manager's `send_update` outbox — the collapsed
     /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
     /// [`Td::flush_user_updates`].
@@ -581,6 +586,7 @@ impl Td {
             notification_manager: NotificationManager::default(),
             notification_settings_manager:
                 crate::notification_settings_manager::NotificationSettingsManager::new(),
+            story_manager: crate::story_manager::StoryManager::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
             notification_updates: Vec::new(),
             premium_required_contact_merger: None,
@@ -935,6 +941,7 @@ impl Td {
             self.auth_manager.set_state_ok();
             self.apply_self_user(&user, false);
             self.init_notification_manager();
+            self.init_story_manager();
         } else {
             let binlog_pmc = self.global.binlog_pmc();
             let auth_str = binlog_pmc.get("auth");
@@ -956,6 +963,7 @@ impl Td {
                     self.auth_manager
                         .restore_from_pmc("ok", is_bot, String::new());
                     self.init_notification_manager();
+                    self.init_story_manager();
                 }
                 "logout" => {
                     tracing::warn!("Continue to log out");
@@ -2586,6 +2594,34 @@ impl Td {
         self.notification_settings_manager.init(&mut env);
     }
 
+    /// The `StoryManager` constructor + `start_up` collapse
+    /// (StoryManager.cpp:1999-2065, AuthManager.cpp:1545) — idempotent; the
+    /// manager no-ops while disabled.
+    fn init_story_manager(&mut self) {
+        let crate::td::Td {
+            story_manager,
+            global,
+            option_manager,
+            auth_manager,
+            user_manager,
+            chat_manager,
+            file_manager,
+            notification_updates,
+            ..
+        } = self;
+        let mut env = StoryEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_authorized: auth_manager.is_authorized(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            chat_manager,
+            file_manager: file_manager.clone(),
+            updates: notification_updates,
+        };
+        story_manager.init(&mut env);
+    }
+
     /// `DeviceTokenManager::start_up` (DeviceTokenManager.cpp:329) — the
     /// token pmc load runs at Td start, auth-independently; the sync loop
     /// is the [blocked: net] seam.
@@ -3041,8 +3077,9 @@ impl Td {
 
         // the live `on_get_authorization` init (AuthManager.cpp:1545); the
         // C++ fires it after every manager init above — the notification
-        // manager is the only one on this tree
+        // and story managers are the ones on this tree
         self.init_notification_manager();
+        self.init_story_manager();
     }
 
     /// Store + broadcast the self user: `UserManager::set_my_id` (the
@@ -5195,6 +5232,362 @@ pub fn send_request(actor: &ActorOwn<Td>, request_id: u64, function: Function) {
             function,
         },
     );
+}
+
+/// The `G()`/`td_` surface for the [`crate::story_manager::StoryManager`]
+/// (the M.47 conventions): field-split borrows off `Td`, the notification
+/// outbox for `send_update`, and the M.12 file manager behind its shared
+/// lock. The StoryDb seam answers `None` — the story tables are implemented
+/// standalone in [`crate::story_db`] over the tddb `SqliteDb` (the M.13S
+/// `notification_db.rs` precedent); the TdDb story-db plumbing lands at the
+/// db integration.
+pub(crate) struct StoryEnv<'a> {
+    pub global: &'a mut Global,
+    pub options: Option<&'a mut OptionManager>,
+    pub auth_is_authorized: bool,
+    pub auth_is_bot: bool,
+    pub user_manager: &'a mut UserManager,
+    pub chat_manager: &'a mut crate::chat_manager::ChatManager,
+    pub file_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>>,
+    pub updates: &'a mut Vec<td_api::Update>,
+}
+
+impl<'a> StoryEnv<'a> {
+    /// The `UserEnv` for the user-manager surfaces the story plane needs;
+    /// the caller halves land with the user-manager read surface.
+    #[allow(dead_code)]
+    fn user_env(&mut self) -> UserEnv<'_> {
+        UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("story requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        }
+    }
+}
+
+impl<'a> crate::story_manager::StoryManagerEnv for StoryEnv<'a> {
+    fn is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn use_message_database(&self) -> bool {
+        self.global.use_message_database()
+    }
+
+    fn unix_time(&mut self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn binlog_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn binlog_pmc_erase(&mut self, key: &[u8]) {
+        // BinlogKeyValue::erase is spelled &str; the story keys are ASCII.
+        self.global
+            .binlog_pmc()
+            .erase(&String::from_utf8_lossy(key));
+    }
+
+    fn get_option_integer(&mut self, name: &str, default_value: i64) -> i64 {
+        match self.options.as_deref_mut() {
+            Some(options) => options.get_option_integer(name, default_value),
+            None => default_value,
+        }
+    }
+
+    fn get_option_boolean(&mut self, name: &str) -> bool {
+        match self.options.as_deref_mut() {
+            Some(options) => options.get_option_boolean(name, false),
+            None => false,
+        }
+    }
+
+    fn set_option_empty(&mut self, name: &str) {
+        if let Some(options) = self.options.as_deref_mut() {
+            options.set_option_empty(name);
+        }
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn on_get_users(&mut self, users: Vec<tdmtproto::telegram_api::User>, source: &str) {
+        // Field-split borrows: the UserEnv holds `global`/`options` while
+        // `user_manager` is borrowed separately (the E0499 split).
+        let StoryEnv {
+            global,
+            options,
+            auth_is_bot,
+            user_manager,
+            ..
+        } = self;
+        let mut user_env = UserEnv {
+            global,
+            options: options
+                .as_deref_mut()
+                .expect("story requests run with the initialized option manager"),
+            auth_is_bot: *auth_is_bot,
+        };
+        user_manager.on_get_users(&mut user_env, users, source);
+    }
+
+    fn on_get_chats(&mut self, chats: Vec<tdmtproto::telegram_api::Chat>, source: &str) {
+        let StoryEnv {
+            global,
+            options,
+            auth_is_bot,
+            user_manager,
+            chat_manager,
+            ..
+        } = self;
+        let mut user_env = UserEnv {
+            global,
+            options: options
+                .as_deref_mut()
+                .expect("story requests run with the initialized option manager"),
+            auth_is_bot: *auth_is_bot,
+        };
+        chat_manager.on_get_chats(user_manager, &mut user_env, chats, source);
+    }
+
+    fn force_create_dialog(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        _source: &str,
+        _force: bool,
+    ) {
+        // `DialogManager::force_create_dialog` — the M.6 stub is a no-op
+        let _ = dialog_id;
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        allow_secret_chats: bool,
+        need_write_access: bool,
+        source: &str,
+    ) -> tdutils::status::Result<()> {
+        if !self.have_dialog_force(dialog_id, source) {
+            if !dialog_id.is_valid() {
+                return tdutils::status::Result::from_status(Status::error(
+                    400,
+                    "Invalid chat identifier specified",
+                ));
+            }
+            return tdutils::status::Result::from_status(Status::error(400, "Chat not found"));
+        }
+        // `check_dialog_access_in_memory` over the env surfaces
+        if !self.have_input_peer(dialog_id, allow_secret_chats, need_write_access) {
+            if dialog_id.get_type() == crate::dialog_id::DialogType::SecretChat
+                && !allow_secret_chats
+            {
+                return tdutils::status::Result::from_status(Status::error(
+                    400,
+                    "Not supported in secret chats",
+                ));
+            }
+            if need_write_access {
+                return tdutils::status::Result::from_status(Status::error(
+                    400,
+                    "Have no write access to the chat",
+                ));
+            }
+            return tdutils::status::Result::from_status(Status::error(
+                400,
+                "Can't access the chat",
+            ));
+        }
+        tdutils::status::Result::Ok(())
+    }
+
+    fn have_dialog_force(&mut self, dialog_id: crate::dialog_id::DialogId, source: &str) -> bool {
+        let _ = source;
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::User => self
+                .user_manager
+                .have_accessible_user(dialog_id.get_user_id()),
+            crate::dialog_id::DialogType::Chat | crate::dialog_id::DialogType::Channel => false,
+            crate::dialog_id::DialogType::SecretChat => self
+                .user_manager
+                .have_secret_chat(dialog_id.get_secret_chat_id()),
+            crate::dialog_id::DialogType::None => false,
+        }
+    }
+
+    fn have_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        allow_secret_chats: bool,
+        need_write: bool,
+    ) -> bool {
+        let access_rights = if need_write {
+            crate::user_manager::AccessRights::Write
+        } else {
+            crate::user_manager::AccessRights::Read
+        };
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::User => {
+                let StoryEnv {
+                    global,
+                    options,
+                    auth_is_bot,
+                    user_manager,
+                    ..
+                } = self;
+                let user_env = UserEnv {
+                    global,
+                    options: options
+                        .as_deref_mut()
+                        .expect("story requests run with the initialized option manager"),
+                    auth_is_bot: *auth_is_bot,
+                };
+                user_manager.have_input_peer_user(&user_env, dialog_id.get_user_id(), access_rights)
+            }
+            // ChatManager peers arrive with its read surface (stub inventory)
+            crate::dialog_id::DialogType::Chat | crate::dialog_id::DialogType::Channel => false,
+            crate::dialog_id::DialogType::SecretChat => {
+                allow_secret_chats
+                    && self
+                        .user_manager
+                        .have_input_encrypted_peer(dialog_id.get_secret_chat_id(), access_rights)
+            }
+            crate::dialog_id::DialogType::None => false,
+        }
+    }
+
+    fn get_my_dialog_id(&self) -> crate::dialog_id::DialogId {
+        crate::dialog_id::DialogId::from_user_id(self.user_manager.get_my_id())
+    }
+
+    fn get_chat_id_object(&mut self, dialog_id: crate::dialog_id::DialogId, source: &str) -> i64 {
+        crate::dialog_manager::get_chat_id_object(dialog_id, source)
+    }
+
+    fn is_group_dialog(&mut self, dialog_id: crate::dialog_id::DialogId) -> bool {
+        dialog_id.get_type() == crate::dialog_id::DialogType::Chat
+    }
+
+    fn get_my_id(&self) -> crate::user_manager::UserId {
+        self.user_manager.get_my_id()
+    }
+
+    fn have_min_user(&self, user_id: crate::user_manager::UserId) -> bool {
+        self.user_manager.have_min_user(user_id)
+    }
+
+    fn get_user_ids_object(
+        &mut self,
+        user_ids: &[crate::user_manager::UserId],
+        source: &str,
+    ) -> Vec<i64> {
+        let _ = source;
+        user_ids.iter().map(|user_id| user_id.get()).collect()
+    }
+
+    fn is_user_bot(&self, user_id: crate::user_manager::UserId) -> bool {
+        self.user_manager.is_user_bot_of(user_id)
+    }
+
+    fn is_user_premium(&self, user_id: crate::user_manager::UserId) -> bool {
+        self.user_manager.is_user_premium_of(user_id)
+    }
+
+    fn is_user_contact(&self, user_id: crate::user_manager::UserId) -> bool {
+        self.user_manager.is_user_contact_of(user_id, false)
+    }
+
+    fn get_user_stories_hidden(&self, user_id: crate::user_manager::UserId) -> bool {
+        self.user_manager.get_user_stories_hidden_of(user_id)
+    }
+
+    fn get_channel_status(&self, channel_id: i64) -> crate::chat_manager::DialogParticipantStatus {
+        self.chat_manager
+            .get_channel_status(crate::chat_manager::ChannelId::new(channel_id))
+    }
+
+    fn is_megagroup_channel(&self, channel_id: i64) -> bool {
+        // `get_channel_type(channel_id) == ChannelType::Megagroup`
+        // (StoryManager.cpp:4086).
+        self.chat_manager
+            .get_channel_type_by_id(crate::chat_manager::ChannelId::new(channel_id))
+            == crate::chat_manager::ChannelType::Megagroup
+    }
+
+    fn get_input_file_id(
+        &mut self,
+        file_type: crate::files::FileType,
+        file: Option<&td_api::InputFile>,
+        owner_dialog_id: crate::dialog_id::DialogId,
+        allow_zero: bool,
+        is_encrypted: bool,
+    ) -> tdutils::status::Result<crate::files::FileId> {
+        // files.rs rides the `message_id::DialogId` spelling; convert.
+        let owner_dialog_id = crate::message_id::DialogId::new(owner_dialog_id.get());
+        let mut file_manager = self.file_manager.lock();
+        tdutils::status::Result::from(file_manager.get_input_file_id(
+            file_type,
+            file,
+            owner_dialog_id,
+            allow_zero,
+            is_encrypted,
+            false,
+            false,
+            false,
+            false,
+        ))
+    }
+
+    fn copy_file_id(
+        &mut self,
+        file_id: crate::files::FileId,
+        file_type: crate::files::FileType,
+        owner_dialog_id: crate::dialog_id::DialogId,
+        source: &str,
+    ) -> crate::files::FileId {
+        let owner_dialog_id = crate::message_id::DialogId::new(owner_dialog_id.get());
+        let mut file_manager = self.file_manager.lock();
+        file_manager.copy_file_id(file_id, file_type, owner_dialog_id, source)
+    }
+
+    fn videos_store_video(&mut self, file_id: crate::files::FileId, out: &mut Vec<u8>) {
+        let file_manager = self.file_manager.lock();
+        file_manager.store_file(file_id, out);
+    }
+
+    fn videos_parse_video(
+        &mut self,
+        parser: &mut crate::store_parse::Parser,
+    ) -> std::result::Result<crate::files::FileId, &'static str> {
+        let mut file_manager = self.file_manager.lock();
+        file_manager.parse_file(parser)
+    }
+
+    fn videos_get_video_duration(&mut self, file_id: crate::files::FileId) -> i32 {
+        // `VideosManager::get_video_duration` reads the video record —
+        // [blocked: VideosManager]; the interim answer is the C++ "not a
+        // video" -1
+        let _ = file_id;
+        -1
+    }
+
+    fn story_db(&mut self) -> Option<&mut crate::story_db::StoryDb> {
+        // [blocked: TdDb story-db plumbing at integration] — the story
+        // tables live standalone in `crate::story_db` until then
+        None
+    }
 }
 
 #[cfg(test)]
