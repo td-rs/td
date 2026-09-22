@@ -38,6 +38,7 @@ use crate::notification_settings::{
     get_scope_notification_settings_object,
 };
 use crate::notification_settings_manager::ScopeSettingsAnswer;
+use crate::td::LanguagePackEnv;
 use crate::td::NotificationEnv;
 use crate::td::Td;
 use crate::td_api::{self, Function, Object};
@@ -232,6 +233,169 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             // state blocks (connection/chat/background/...) accumulate here
             // as their managers land.
             td.send_result(id, Object::updates(td_api::Updates { updates }));
+        }
+
+        // --- the language pack set (M.24): Requests.cpp:8005-8073. The
+        // local halves (custom packs, loaded strings, only_local target
+        // info) answer here; the server halves park behind the
+        // [blocked: net] langpack.* query seams ---
+        Function::getLocalizationTargetInfo(request) => {
+            // Requests.cpp:8005-8009
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::LocalizationTargetInfo, _>(
+                id,
+                Object::localizationTargetInfo,
+            );
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+            };
+            td.language_pack_manager
+                .get_languages(&mut env, request.only_local, promise);
+        }
+        Function::getLanguagePackInfo(request) => {
+            // Requests.cpp:8011-8017; the net tail parks unanswered
+            // offline, like the C++ request without a network
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(language_pack_id) = crate::misc::clean_input_string(&request.language_pack_id)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise =
+                td.deferred_promise::<td_api::LanguagePackInfo, _>(id, Object::languagePackInfo);
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+            };
+            td.language_pack_manager
+                .search_language_info(&mut env, language_pack_id, promise);
+        }
+        Function::getLanguagePackStrings(request) => {
+            // Requests.cpp:8019-8028; the loaded-pack halves answer, the
+            // rest parks on langpack.getLangPack/langpack.getStrings
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(language_pack_id) = crate::misc::clean_input_string(&request.language_pack_id)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let mut keys = Vec::with_capacity(request.keys.len());
+            for key in &request.keys {
+                let Some(key) = crate::misc::clean_input_string(key) else {
+                    return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+                };
+                keys.push(key);
+            }
+            let promise = td.deferred_promise::<td_api::LanguagePackStrings, _>(
+                id,
+                Object::languagePackStrings,
+            );
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+            };
+            td.language_pack_manager.get_language_pack_strings(
+                &mut env,
+                language_pack_id,
+                keys,
+                promise,
+            );
+        }
+        Function::synchronizeLanguagePack(request) => {
+            // Requests.cpp:8030-8036; custom codes answer ok locally, the
+            // server codes park behind langpack.getDifference
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(language_pack_id) = crate::misc::clean_input_string(&request.language_pack_id)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+            };
+            td.language_pack_manager
+                .synchronize_language_pack(&mut env, language_pack_id, promise);
+        }
+        Function::addCustomServerLanguagePack(request) => {
+            // Requests.cpp:8038-8043; the local info-move machinery
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(language_pack_id) = crate::misc::clean_input_string(&request.language_pack_id)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            td.language_pack_manager
+                .add_custom_server_language(language_pack_id, promise);
+        }
+        Function::setCustomLanguagePack(request) => {
+            // Requests.cpp:8046-8051; the fully local custom pack plane
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+            };
+            td.language_pack_manager.set_custom_language(
+                &mut env,
+                request.info,
+                request.strings,
+                promise,
+            );
+        }
+        Function::editCustomLanguagePackInfo(request) => {
+            // Requests.cpp:8053-8057; the fully local custom info edit
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            td.language_pack_manager
+                .edit_custom_language_info(request.info, promise);
+        }
+        Function::setCustomLanguagePackString(request) => {
+            // Requests.cpp:8060-8066; the fully local string set
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(language_pack_id) = crate::misc::clean_input_string(&request.language_pack_id)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+            };
+            td.language_pack_manager.set_custom_language_string(
+                &mut env,
+                language_pack_id,
+                request.new_string,
+                promise,
+            );
+        }
+        Function::deleteLanguagePack(request) => {
+            // Requests.cpp:8068-8073; the fully local delete
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(language_pack_id) = crate::misc::clean_input_string(&request.language_pack_id)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            td.language_pack_manager
+                .delete_language(language_pack_id, promise);
         }
 
         // --- options (Requests.cpp:8076-8090) ---
@@ -2176,13 +2340,19 @@ mod request_census_tests {
         // stays the 500 placeholder) + M.12.10's eighteen file-plane
         // dispatches (getFile/getRemoteFile, the download/upload/
         // generation arms, the DownloadManager list plane and the four
-        // storage-statistics arms). Fix per flip.
-        assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
+        // storage-statistics arms) + M.24's nine language-pack dispatches
+        // (getLocalizationTargetInfo, getLanguagePackInfo,
+        // getLanguagePackStrings, synchronizeLanguagePack,
+        // addCustomServerLanguagePack, setCustomLanguagePack,
+        // editCustomLanguagePackInfo, setCustomLanguagePackString,
+        // deleteLanguagePack) and getLanguagePackString moving to the
+        // synchronous set. Fix per flip.
+        assert_eq!(*counts.get("sync").unwrap_or(&0), 19, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            110,
+            119,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 894, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 884, "interim count");
     }
 }
