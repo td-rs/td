@@ -1877,8 +1877,749 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
         }
 
         // Everything else waits for its manager step.
+        _ => run_group_call_requests(td, id, function),
+    }
+}
+
+/// The M.51 GroupCallManager arm group of the request dispatcher — see
+/// the frame note at the forward site in [`run_request`]. The arms route
+/// into `td_->group_call_manager_` (Requests.cpp:5158-5445); every
+/// network tail is the [blocked: net] seam (D4 signaling-only).
+#[allow(clippy::too_many_lines)]
+fn run_group_call_requests(td: &mut Td, id: u64, function: Function) {
+    use crate::group_call_manager::GroupCallEnv;
+
+    fn group_call_arm(
+        td: &mut Td,
+        run: impl FnOnce(
+            &mut crate::td::GroupCallTdEnv<'_>,
+            &mut crate::group_call_manager::GroupCallManager,
+        ),
+    ) {
+        let crate::td::Td {
+            group_call_manager,
+            global,
+            auth_manager,
+            notification_updates,
+            ..
+        } = td;
+        let mut env = crate::td::GroupCallTdEnv {
+            global,
+            auth_is_authorized: auth_manager.is_authorized(),
+            auth_is_bot: auth_manager.is_bot(),
+            updates: notification_updates,
+        };
+        run(&mut env, group_call_manager);
+    }
+
+    macro_rules! ok_promise {
+        ($td:expr) => {
+            $td.deferred_promise::<(), _>(id, |_| ok_object())
+        };
+    }
+
+    match function {
+        // getVideoChatAvailableParticipants (Requests.cpp:5152-5157)
+        Function::getVideoChatAvailableParticipants(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::MessageSenders, _>(id, Object::messageSenders);
+            group_call_arm(td, |env, manager| {
+                env.send_group_call_query_message_senders(
+                    &format!(
+                        "channels.getParticipants (join-as list) for {}",
+                        request.chat_id
+                    ),
+                    promise,
+                );
+                let _ = manager;
+            });
+        }
+
+        // setVideoChatDefaultParticipant (Requests.cpp:5159-5165)
+        Function::setVideoChatDefaultParticipant(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "setVideoChatDefaultParticipant", promise);
+            });
+        }
+
+        // createVideoChat (Requests.cpp:5167-5174)
+        Function::createVideoChat(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(title) = clean_or_utf8_error(td, id, &request.title) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::GroupCallId, _>(id, Object::groupCallId);
+            group_call_arm(td, |env, manager| {
+                tdutils::log_info!(
+                    "createVideoChat({}, {title}) — [blocked: net]",
+                    request.chat_id
+                );
+                let _ = (env, manager, promise);
+            });
+        }
+
+        // createGroupCall (Requests.cpp:5176-5181)
+        Function::createGroupCall(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::GroupCallInfo, _>(id, Object::groupCallInfo);
+            group_call_arm(td, |env, manager| {
+                tdutils::log_info!("createGroupCall — [blocked: net]");
+                let _ = (env, manager, promise, request.join_parameters);
+            });
+        }
+
+        // getVideoChatRtmpUrl (Requests.cpp:5183-5187)
+        Function::getVideoChatRtmpUrl(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::RtmpUrl, _>(id, Object::rtmpUrl);
+            group_call_arm(td, |env, manager| {
+                env.send_group_call_query_rtmp_url(
+                    &format!("getVideoChatRtmpUrl for {}", request.chat_id),
+                    promise,
+                );
+                let _ = manager;
+            });
+        }
+
+        // replaceVideoChatRtmpUrl (Requests.cpp:5188-5192)
+        Function::replaceVideoChatRtmpUrl(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::RtmpUrl, _>(id, Object::rtmpUrl);
+            group_call_arm(td, |env, manager| {
+                env.send_group_call_query_rtmp_url(
+                    &format!("replaceVideoChatRtmpUrl for {}", request.chat_id),
+                    promise,
+                );
+                let _ = manager;
+            });
+        }
+
+        // getLiveStoryRtmpUrl (Requests.cpp:5194-5197)
+        Function::getLiveStoryRtmpUrl(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::RtmpUrl, _>(id, Object::rtmpUrl);
+            group_call_arm(td, |env, manager| {
+                env.send_group_call_query_rtmp_url(
+                    &format!("getLiveStoryRtmpUrl for {}", request.chat_id),
+                    promise,
+                );
+                let _ = manager;
+            });
+        }
+
+        // replaceLiveStoryRtmpUrl (Requests.cpp:5199-5203)
+        Function::replaceLiveStoryRtmpUrl(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::RtmpUrl, _>(id, Object::rtmpUrl);
+            group_call_arm(td, |env, manager| {
+                env.send_group_call_query_rtmp_url(
+                    &format!("replaceLiveStoryRtmpUrl for {}", request.chat_id),
+                    promise,
+                );
+                let _ = manager;
+            });
+        }
+
+        // getGroupCall (Requests.cpp:5205-5210)
+        Function::getGroupCall(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |value: Option<td_api::GroupCall>| match value {
+                Some(call) => Object::groupCall(call),
+                None => Object::error(td_api::Error {
+                    code: 404,
+                    message: "Not Found".to_owned(),
+                }),
+            });
+            group_call_arm(td, |env, manager| {
+                env.send_group_call_query_group_call(
+                    &format!("getGroupCall({})", request.group_call_id),
+                    promise,
+                );
+                let _ = manager;
+            });
+        }
+
+        // startScheduledVideoChat (Requests.cpp:5212-5216)
+        Function::startScheduledVideoChat(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "startScheduledVideoChat", promise);
+            });
+        }
+
+        // toggleVideoChatEnabledStartNotification (Requests.cpp:5218-5222)
+        Function::toggleVideoChatEnabledStartNotification(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "toggleVideoChatEnabledStartNotification", promise);
+            });
+        }
+
+        // getLiveStoryStreamer (Requests.cpp:5224-5228)
+        Function::getLiveStoryStreamer(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::GroupCallParticipant, _>(
+                id,
+                Object::groupCallParticipant,
+            );
+            group_call_arm(td, |env, manager| {
+                tdutils::log_info!("getLiveStoryStreamer — [blocked: net]");
+                let _ = (env, manager, promise, request.group_call_id);
+            });
+        }
+
+        // getLiveStoryAvailableMessageSenders (Requests.cpp:5230-5234)
+        Function::getLiveStoryAvailableMessageSenders(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td
+                .deferred_promise::<td_api::ChatMessageSenders, _>(id, Object::chatMessageSenders);
+            group_call_arm(td, |env, manager| {
+                tdutils::log_info!("getLiveStoryAvailableMessageSenders — [blocked: net]");
+                let _ = (env, manager, promise, request.group_call_id);
+            });
+        }
+
+        // setLiveStoryMessageSender (Requests.cpp:5236-5240)
+        Function::setLiveStoryMessageSender(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "setLiveStoryMessageSender", promise);
+            });
+        }
+
+        // joinGroupCall (Requests.cpp:5242-5248)
+        Function::joinGroupCall(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::GroupCallInfo, _>(id, Object::groupCallInfo);
+            group_call_arm(td, |env, manager| {
+                tdutils::log_info!("joinGroupCall — [blocked: net]");
+                let _ = (env, manager, promise, request.input_group_call);
+            });
+        }
+
+        // joinVideoChat (Requests.cpp:5250-5255)
+        Function::joinVideoChat(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(invite_hash) = clean_or_utf8_error(td, id, &request.invite_hash) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::Text, _>(id, Object::text);
+            group_call_arm(td, |env, manager| {
+                env.send_group_call_query_text(&format!("joinVideoChat({invite_hash})"), promise);
+                let _ = manager;
+            });
+        }
+
+        // joinLiveStory (Requests.cpp:5257-5261)
+        Function::joinLiveStory(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Text, _>(id, Object::text);
+            group_call_arm(td, |env, manager| {
+                env.send_group_call_query_text("joinLiveStory", promise);
+                let _ = manager;
+            });
+        }
+
+        // startGroupCallScreenSharing (Requests.cpp:5263-5269)
+        Function::startGroupCallScreenSharing(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(payload) = clean_or_utf8_error(td, id, &request.payload) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::Text, _>(id, Object::text);
+            group_call_arm(td, |env, manager| {
+                env.send_group_call_query_text(
+                    &format!("startGroupCallScreenSharing({payload})"),
+                    promise,
+                );
+                let _ = manager;
+            });
+        }
+
+        // toggleGroupCallScreenSharingIsPaused (Requests.cpp:5271-5275)
+        Function::toggleGroupCallScreenSharingIsPaused(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "toggleGroupCallScreenSharingIsPaused", promise);
+            });
+        }
+
+        // endGroupCallScreenSharing (Requests.cpp:5277-5281)
+        Function::endGroupCallScreenSharing(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "endGroupCallScreenSharing", promise);
+            });
+        }
+
+        // setVideoChatTitle (Requests.cpp:5283-5288)
+        Function::setVideoChatTitle(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(_title) = clean_or_utf8_error(td, id, &request.title) else {
+                return;
+            };
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "setVideoChatTitle", promise);
+            });
+        }
+
+        // toggleVideoChatMuteNewParticipants (Requests.cpp:5290-5294)
+        Function::toggleVideoChatMuteNewParticipants(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "toggleVideoChatMuteNewParticipants", promise);
+            });
+        }
+
+        // toggleGroupCallAreMessagesAllowed (Requests.cpp:5296-5300)
+        Function::toggleGroupCallAreMessagesAllowed(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "toggleGroupCallAreMessagesAllowed", promise);
+            });
+        }
+
+        // setGroupCallPaidMessageStarCount (Requests.cpp:5302-5307)
+        Function::setGroupCallPaidMessageStarCount(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "setGroupCallPaidMessageStarCount", promise);
+            });
+        }
+
+        // sendGroupCallMessage (Requests.cpp:5309-5314)
+        Function::sendGroupCallMessage(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "sendGroupCallMessage", promise);
+            });
+        }
+
+        // addPendingLiveStoryReaction (Requests.cpp:5316-5320)
+        Function::addPendingLiveStoryReaction(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "addPendingLiveStoryReaction", promise);
+            });
+        }
+
+        // commitPendingLiveStoryReactions (Requests.cpp:5322-5326)
+        Function::commitPendingLiveStoryReactions(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "commitPendingLiveStoryReactions", promise);
+            });
+        }
+
+        // removePendingLiveStoryReactions (Requests.cpp:5328-5332)
+        Function::removePendingLiveStoryReactions(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "removePendingLiveStoryReactions", promise);
+            });
+        }
+
+        // deleteGroupCallMessages (Requests.cpp:5334-5338)
+        Function::deleteGroupCallMessages(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "deleteGroupCallMessages", promise);
+            });
+        }
+
+        // deleteGroupCallMessagesBySender (Requests.cpp:5340-5344)
+        Function::deleteGroupCallMessagesBySender(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "deleteGroupCallMessagesBySender", promise);
+            });
+        }
+
+        // getLiveStoryTopDonors (Requests.cpp:5346-5350)
+        Function::getLiveStoryTopDonors(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::LiveStoryDonors, _>(id, Object::liveStoryDonors);
+            group_call_arm(td, |env, manager| {
+                tdutils::log_info!("getLiveStoryTopDonors — [blocked: net]");
+                let _ = (env, manager, promise, request.group_call_id);
+            });
+        }
+
+        // revokeGroupCallInviteLink (Requests.cpp:5352-5356)
+        Function::revokeGroupCallInviteLink(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "revokeGroupCallInviteLink", promise);
+            });
+        }
+
+        // inviteGroupCallParticipant (Requests.cpp:5358-5362)
+        Function::inviteGroupCallParticipant(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td
+                .deferred_promise::<td_api::InviteGroupCallParticipantResult, _>(id, |value| {
+                    invite_result_to_object(value)
+                });
+            group_call_arm(td, |env, manager| {
+                tdutils::log_info!("inviteGroupCallParticipant — [blocked: net]");
+                let _ = (env, manager, promise, request.group_call_id);
+            });
+        }
+
+        // declineGroupCallInvitation (Requests.cpp:5364-5368)
+        Function::declineGroupCallInvitation(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "declineGroupCallInvitation", promise);
+            });
+        }
+
+        // banGroupCallParticipants (Requests.cpp:5370-5374)
+        Function::banGroupCallParticipants(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "banGroupCallParticipants", promise);
+            });
+        }
+
+        // inviteVideoChatParticipants (Requests.cpp:5376-5380)
+        Function::inviteVideoChatParticipants(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "inviteVideoChatParticipants", promise);
+            });
+        }
+
+        // getVideoChatInviteLink (Requests.cpp:5382-5386)
+        Function::getVideoChatInviteLink(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::HttpUrl, _>(id, Object::httpUrl);
+            group_call_arm(td, |env, manager| {
+                tdutils::log_info!("getVideoChatInviteLink — [blocked: net]");
+                let _ = (env, manager, promise, request.group_call_id);
+            });
+        }
+
+        // startGroupCallRecording (Requests.cpp:5388-5393)
+        Function::startGroupCallRecording(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(_title) = clean_or_utf8_error(td, id, &request.title) else {
+                return;
+            };
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "startGroupCallRecording", promise);
+            });
+        }
+
+        // endGroupCallRecording (Requests.cpp:5395-5399)
+        Function::endGroupCallRecording(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "endGroupCallRecording", promise);
+            });
+        }
+
+        // toggleGroupCallIsMyVideoPaused (Requests.cpp:5401-5405)
+        Function::toggleGroupCallIsMyVideoPaused(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "toggleGroupCallIsMyVideoPaused", promise);
+            });
+        }
+
+        // toggleGroupCallIsMyVideoEnabled (Requests.cpp:5407-5411)
+        Function::toggleGroupCallIsMyVideoEnabled(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "toggleGroupCallIsMyVideoEnabled", promise);
+            });
+        }
+
+        // toggleGroupCallParticipantIsMuted (Requests.cpp:5413-5417)
+        Function::toggleGroupCallParticipantIsMuted(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "toggleGroupCallParticipantIsMuted", promise);
+            });
+        }
+
+        // toggleGroupCallParticipantIsHandRaised (Requests.cpp:5419-5423)
+        Function::toggleGroupCallParticipantIsHandRaised(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "toggleGroupCallParticipantIsHandRaised", promise);
+            });
+        }
+
+        // setGroupCallParticipantVolumeLevel (Requests.cpp:5425-5429)
+        Function::setGroupCallParticipantVolumeLevel(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "setGroupCallParticipantVolumeLevel", promise);
+            });
+        }
+
+        // setGroupCallParticipantIsSpeaking (Requests.cpp:5431-5435)
+        Function::setGroupCallParticipantIsSpeaking(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::MessageSender, _>(id, |value| match value {
+                    td_api::MessageSender::messageSenderUser(user) => {
+                        Object::messageSenderUser(user)
+                    }
+                    td_api::MessageSender::messageSenderChat(chat) => {
+                        Object::messageSenderChat(chat)
+                    }
+                });
+            group_call_arm(td, |env, manager| {
+                tdutils::log_info!("setGroupCallParticipantIsSpeaking — [blocked: net]");
+                let _ = (env, manager, promise, request.group_call_id);
+            });
+        }
+
+        // leaveGroupCall (Requests.cpp:5437-5441)
+        Function::leaveGroupCall(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "leaveGroupCall", promise);
+            });
+        }
+
+        // endGroupCall (Requests.cpp:5443-5447)
+        Function::endGroupCall(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "endGroupCall", promise);
+            });
+        }
+
+        // getGroupCallParticipants (Requests.cpp:5449-5453)
+        Function::getGroupCallParticipants(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::GroupCallParticipants, _>(id, |value| {
+                Object::groupCallParticipants(value)
+            });
+            group_call_arm(td, |env, manager| {
+                env.send_group_call_query_group_call_participants(
+                    "getGroupCallParticipants",
+                    promise,
+                );
+                let _ = manager;
+            });
+        }
+
+        // loadGroupCallParticipants (Requests.cpp:5455-5459)
+        Function::loadGroupCallParticipants(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            group_call_arm(td, |env, manager| {
+                manager.run_query(env, "loadGroupCallParticipants", promise);
+            });
+        }
+
+        // getGroupCallStreams (Requests.cpp:5461-5465)
+        Function::getGroupCallStreams(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::GroupCallStreams, _>(id, |value| {
+                Object::groupCallStreams(value)
+            });
+            group_call_arm(td, |env, manager| {
+                env.send_group_call_query_group_call_streams("getGroupCallStreams", promise);
+                let _ = manager;
+            });
+        }
+
+        // getGroupCallStreamSegment (Requests.cpp:5467-5471)
+        Function::getGroupCallStreamSegment(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Data, _>(id, Object::data);
+            group_call_arm(td, |env, manager| {
+                tdutils::log_info!("getGroupCallStreamSegment — [blocked: net]");
+                let _ = (env, manager, promise);
+            });
+        }
+
+        // encryptGroupCallData (Requests.cpp:5473-5477) — [blocked: tde2e]
+        Function::encryptGroupCallData(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Data, _>(id, Object::data);
+            group_call_arm(td, |env, manager| {
+                tdutils::log_info!("encryptGroupCallData — [blocked: tde2e]");
+                let _ = (env, manager, promise, request.group_call_id);
+            });
+        }
+
+        // decryptGroupCallData (Requests.cpp:5479-5483) — [blocked: tde2e]
+        Function::decryptGroupCallData(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Data, _>(id, Object::data);
+            group_call_arm(td, |env, manager| {
+                tdutils::log_info!("decryptGroupCallData — [blocked: tde2e]");
+                let _ = (env, manager, promise, request.group_call_id);
+            });
+        }
+
+        // Everything else waits for its manager step.
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+        }
+    }
+}
+
+/// The `InviteGroupCallParticipantResult` → `Object` rewrap.
+fn invite_result_to_object(value: td_api::InviteGroupCallParticipantResult) -> Object {
+    match value {
+        td_api::InviteGroupCallParticipantResult::inviteGroupCallParticipantResultSuccess(value) => {
+            Object::inviteGroupCallParticipantResultSuccess(value)
+        }
+        td_api::InviteGroupCallParticipantResult::inviteGroupCallParticipantResultUserAlreadyParticipant(value) => {
+            Object::inviteGroupCallParticipantResultUserAlreadyParticipant(value)
+        }
+        td_api::InviteGroupCallParticipantResult::inviteGroupCallParticipantResultUserPrivacyRestricted(value) => {
+            Object::inviteGroupCallParticipantResultUserPrivacyRestricted(value)
+        }
+        td_api::InviteGroupCallParticipantResult::inviteGroupCallParticipantResultUserWasBanned(value) => {
+            Object::inviteGroupCallParticipantResultUserWasBanned(value)
         }
     }
 }
@@ -2176,13 +2917,15 @@ mod request_census_tests {
         // stays the 500 placeholder) + M.12.10's eighteen file-plane
         // dispatches (getFile/getRemoteFile, the download/upload/
         // generation arms, the DownloadManager list plane and the four
-        // storage-statistics arms). Fix per flip.
+        // storage-statistics arms) + M.51's fifty-three group-call
+        // dispatches (the video-chat/rtmp/live-story signaling plane,
+        // D4 — the media transport stays deferred). Fix per flip.
         assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            110,
+            163,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 894, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 841, "interim count");
     }
 }

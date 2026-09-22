@@ -28,6 +28,7 @@ pub mod emoji_status;
 pub mod files;
 pub mod formatted_date;
 pub mod global;
+pub mod group_call_manager;
 pub mod link_manager;
 pub mod manager_option_states;
 pub mod message_db;

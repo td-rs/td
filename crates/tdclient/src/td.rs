@@ -272,6 +272,8 @@ pub struct Td {
         crate::notification_settings_manager::NotificationSettingsManager,
     /// `Td::device_token_manager_` (`Td.cpp:1345`, M.13S).
     pub(crate) device_token_manager: crate::device_token_manager::DeviceTokenManager,
+    /// `Td::group_call_manager_` (`Td.cpp:1294`, M.51).
+    pub(crate) group_call_manager: crate::group_call_manager::GroupCallManager,
     /// The notification manager's `send_update` outbox — the collapsed
     /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
     /// [`Td::flush_user_updates`].
@@ -582,6 +584,7 @@ impl Td {
             notification_settings_manager:
                 crate::notification_settings_manager::NotificationSettingsManager::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
+            group_call_manager: crate::group_call_manager::GroupCallManager::new(),
             notification_updates: Vec::new(),
             premium_required_contact_merger: None,
             chat_manager: crate::chat_manager::ChatManager::new(),
@@ -5195,6 +5198,34 @@ pub fn send_request(actor: &ActorOwn<Td>, request_id: u64, function: Function) {
             function,
         },
     );
+}
+
+/// The `G()`/`td_` slice the group-call plane reads through (the M.51
+/// convention): field-split borrows off `Td`. Every query tail is a
+/// [blocked: net] seam (D4 signaling-only); the E2E-key functions are
+/// [blocked: tde2e].
+pub(crate) struct GroupCallTdEnv<'a> {
+    /// The C++ `G()` reads — kept for the field parity; the halves land
+    /// with the media-transport plane.
+    #[allow(dead_code)]
+    pub(crate) global: &'a mut Global,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::group_call_manager::GroupCallEnv for GroupCallTdEnv<'_> {
+    fn is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
 }
 
 #[cfg(test)]
