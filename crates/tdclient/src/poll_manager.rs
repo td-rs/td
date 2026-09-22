@@ -240,7 +240,7 @@ pub fn get_vote_percentage(voter_counts: &[i32], total_voter_count: i32) -> Vec<
 /// The `storer.context()->td()` slice the poll db records read: the
 /// DialogPhoto codec of the min-channel records and the message-content
 /// codec of the option/explanation media.
-pub trait PollStoreEnv: crate::photo::DialogPhotoStoreEnv {
+pub trait PollStoreEnv: crate::photo::PhotoStoreEnv {
     /// `store_message_content` (MessageContent.cpp) — the option/explanation
     /// media bytes. [blocked: M.9 integration]: the codec lands with the
     /// message-content line; the C++ byte layout around it is preserved
@@ -271,7 +271,7 @@ pub fn store_min_channel(min_channel: &MinChannel, env: &mut impl PollStoreEnv, 
         store_string(out, &min_channel.title_);
     }
     if has_photo {
-        crate::photo::store_dialog_photo(&min_channel.photo_, env, out);
+        crate::photo::store_dialog_photo(env, out, &min_channel.photo_);
     }
     if has_accent_color_id {
         store_i32(out, min_channel.accent_color_id_.get());
@@ -1332,6 +1332,7 @@ impl PollManager {
 
     /// `PollManager::get_poll_vote_restriction_reason_object`
     /// (PollManager.cpp:738-773).
+    #[allow(clippy::too_many_arguments)]
     fn get_poll_vote_restriction_reason_object(
         &self,
         env: &impl PollManagerEnv,
@@ -1716,10 +1717,10 @@ impl PollManager {
             Some(poll) => (poll.is_closed, poll.is_updated_after_close),
             None => (false, false),
         };
-        if !env.auth_is_bot()
-            && !is_local_poll_id(poll_id)
-            && !(is_closed && is_updated_after_close)
-            && !env.close_flag()
+        if !(env.auth_is_bot()
+            || is_local_poll_id(poll_id)
+            || env.close_flag()
+            || (is_closed && is_updated_after_close))
         {
             timeout_add(&mut self.update_poll_timeout, poll_id.get(), 0.0, env.now());
         }
@@ -1912,6 +1913,7 @@ impl PollManager {
 
     /// `PollManager::get_poll_option_properties`
     /// (PollManager.cpp:1143-1170).
+    #[allow(clippy::too_many_arguments)]
     pub fn get_poll_option_properties(
         &mut self,
         env: &mut impl PollManagerEnv,
@@ -1984,7 +1986,7 @@ impl PollManager {
         mut promise: Promise<()>,
     ) {
         if let Err(status) = env.get_message_poll_id(&message_full_id, false) {
-            return promise.set_error(status);
+            promise.set_error(status);
         }
         // [blocked: M.10 integration] + [blocked: M.9]: the option text
         // validation half + the upload tail.
@@ -2000,7 +2002,7 @@ impl PollManager {
         mut promise: Promise<()>,
     ) {
         if let Err(status) = env.get_message_poll_id(&message_full_id, false) {
-            return promise.set_error(status);
+            promise.set_error(status);
         }
         // [blocked: net]: the DeletePollAnswerQuery tail.
     }
@@ -2177,6 +2179,9 @@ impl PollManager {
     /// `PollManager::on_set_poll_answer` (PollManager.cpp:1390-1429) — the
     /// query-result half; offline it stays parked, but the binlog replay
     /// reaches do_set_poll_answer directly.
+    /// The net-result intakes; wired by the M.10 message-plane union
+    /// ([blocked: M.10 integration]).
+    #[allow(dead_code)]
     fn on_set_poll_answer_result(
         &mut self,
         env: &mut impl PollManagerEnv,
@@ -2228,14 +2233,14 @@ impl PollManager {
                 .get(&poll_id)
                 .map(|poll| (poll.is_closed, poll.is_updated_after_close));
             let was_saved = self.was_saved(poll_id);
-            if let Some((is_closed, is_updated_after_close)) = poll {
-                if !was_saved {
-                    if !(is_closed && is_updated_after_close) {
-                        timeout_set(&mut self.update_poll_timeout, poll_id.get(), 0.0, env.now());
-                    }
-                    self.notify_on_poll_update(env, poll_id);
-                    self.set_was_saved(poll_id, true);
+            if let Some((is_closed, is_updated_after_close)) = poll
+                && !was_saved
+            {
+                if !(is_closed && is_updated_after_close) {
+                    timeout_set(&mut self.update_poll_timeout, poll_id.get(), 0.0, env.now());
                 }
+                self.notify_on_poll_update(env, poll_id);
+                self.set_was_saved(poll_id, true);
             }
         }
 
@@ -2557,6 +2562,9 @@ impl PollManager {
 
     /// `PollManager::on_stop_poll_finished` (PollManager.cpp:1790-1806) —
     /// the local halves of the query-result landing.
+    /// The net-result landing; wired by the M.10 message-plane union
+    /// ([blocked: M.10 integration]).
+    #[allow(dead_code)]
     fn on_stop_poll_finished(
         &mut self,
         env: &mut impl PollManagerEnv,
@@ -2636,16 +2644,9 @@ impl PollManager {
         let Some(poll) = self.get_poll(poll_id) else {
             return;
         };
-        if poll.is_closed && poll.is_updated_after_close {
-            return;
-        }
-        if self.pending_answers.contains_key(&poll_id) {
-            return;
-        }
-        if !self.server_poll_messages.contains_key(&poll_id) {
-            return;
-        }
-        // [blocked: net]: the query send.
+        // [blocked: net]: the query send; the closed-poll, pending-answers
+        // and server-poll guards ride it.
+        let _ = (poll.is_closed, poll.is_updated_after_close);
     }
 
     /// `PollManager::on_close_poll_timeout` (PollManager.cpp:1869-1894).
@@ -3049,20 +3050,20 @@ pub fn on_get_poll(
 ) -> PollId {
     let _ = source;
     let is_bot = env.auth_is_bot();
-    let mut need_update_poll = poll_id.is_valid() && is_bot;
+    let need_update_poll = poll_id.is_valid() && is_bot;
     let mut poll_id = poll_id;
-    if !poll_id.is_valid() {
-        if let Some(poll_server) = &poll_server {
-            poll_id = PollId::new(poll_server.id);
-        }
+    if !poll_id.is_valid()
+        && let Some(poll_server) = &poll_server
+    {
+        poll_id = PollId::new(poll_server.id);
     }
     if !poll_id.is_valid() || is_local_poll_id(poll_id) {
         return PollId::new(0);
     }
-    if let Some(poll_server) = &poll_server {
-        if poll_server.id != poll_id.get() {
-            return PollId::new(0);
-        }
+    if let Some(poll_server) = &poll_server
+        && poll_server.id != poll_id.get()
+    {
+        return PollId::new(0);
     }
     let max_poll_options = env
         .get_option_integer("poll_answer_count_max", 12)
@@ -3094,10 +3095,11 @@ pub fn on_get_poll(
             return PollId::new(0);
         }
         manager.polls.insert(poll_id, Poll::default());
-    } else if let Some(results) = &poll_results {
-        if results.min && manager.pending_answers.contains_key(&poll_id) {
-            return poll_id;
-        }
+    } else if let Some(results) = &poll_results
+        && results.min
+        && manager.pending_answers.contains_key(&poll_id)
+    {
+        return poll_id;
     }
 
     let mut is_changed = false;
@@ -3189,6 +3191,7 @@ pub fn on_get_poll(
         }
         poll_server_is_closed = poll_server.closed;
         let mut arm_close_timeout = false;
+        #[allow(unused_assignments)]
         let mut close_date = 0;
         {
             let poll = manager.polls.get_mut(&poll_id).unwrap();
@@ -3354,7 +3357,7 @@ pub fn on_get_poll(
                 is_changed = true;
             }
             let keep_recent =
-                !(is_min && poll.is_creator && poll.hide_results_until_close) && !is_bot;
+                !(is_bot || (is_min && poll.is_creator && poll.hide_results_until_close));
             if keep_recent {
                 let mut recent_option_voter_dialog_ids: Vec<DialogId> = Vec::new();
                 for recent_voter in &poll_result.recent_voters {
@@ -3528,11 +3531,12 @@ pub fn on_get_poll(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat_manager::{ChannelId, MessageId, MinChannel};
+    use crate::chat_manager::{ChannelId, MinChannel};
     use crate::dialog_id::MessageFullId;
     use crate::emoji_status::CustomEmojiId;
     use crate::files::FileManager;
     use crate::message_entity::{MessageEntity, Type};
+    use crate::messages_manager::MessageId;
     use crate::peer_color::AccentColorId;
     use crate::store_parse::{Parser, store_i32, store_log_event_version, store_string};
     use crate::user_manager::{FileId, UserId};
@@ -3555,7 +3559,7 @@ mod tests {
         }
     }
 
-    impl crate::photo::DialogPhotoStoreEnv for TestStoreEnv {
+    impl crate::photo::PhotoStoreEnv for TestStoreEnv {
         fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>) {
             self.files.store_file(file_id, out);
         }
