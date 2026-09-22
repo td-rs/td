@@ -54,6 +54,16 @@ impl MessageQueryManagerEnv for TestEnv {
     fn have_user_force(&mut self, user_id: UserId, _source: &str) -> bool {
         self.known_users.contains(&user_id.get())
     }
+
+    fn now(&self) -> f64 {
+        0.0
+    }
+
+    fn secure_random_i64(&self) -> i64 {
+        0
+    }
+
+    fn send_update(&mut self, _update: td_api::Update) {}
 }
 
 fn read_participant_date(user_id: i64, date: i32) -> telegram_api::ReadParticipantDate {
@@ -602,4 +612,780 @@ fn the_log_event_type_names_are_the_handler_identities() {
         MessageQueryLogEventType::BlockMessageSenderFromRepliesOnServer.to_string(),
         "BlockMessageSenderFromRepliesOnServer"
     );
+}
+
+// ---------------------------------------------------------------------------
+// M.18.3 machinery tests — the extended offline env records every seam call.
+// ---------------------------------------------------------------------------
+
+impl RecordingEnv {
+    fn recorded(&self, prefix: &str) -> Vec<&str> {
+        self.sent_queries
+            .iter()
+            .map(String::as_str)
+            .filter(|name| name.starts_with(prefix))
+            .collect()
+    }
+}
+
+/// The extended env: records every seam call by name (with payloads where a
+/// test pins them), drives `now` manually, and overrides the dialog-plane
+/// error bands to the `Ok` halves the tests need.
+type MetricRow = (i64, i32, i32, i32, i32);
+
+#[derive(Default)]
+struct RecordingEnv {
+    base: TestEnv,
+    sent_queries: Vec<String>,
+    updates: Vec<td_api::Update>,
+    pts_updates: Vec<(i32, i32)>,
+    channel_pts_updates: Vec<(i32, i32)>,
+    now: f64,
+    have_message: bool,
+    input_peer: bool,
+    viewer_source_id: crate::files::FileSourceId,
+    metrics: Vec<(DialogId, Vec<MetricRow>)>,
+    reactions_sent: Vec<(DialogId, Vec<i64>)>,
+}
+
+impl MessageQueryManagerEnv for RecordingEnv {
+    fn auth_is_bot(&self) -> bool {
+        self.base.is_bot
+    }
+
+    fn close_flag(&self) -> bool {
+        false
+    }
+
+    fn unix_time(&self) -> i32 {
+        self.base.unix_time
+    }
+
+    fn get_option_string(&self, name: &str, default_value: &str) -> String {
+        self.base.get_option_string(name, default_value)
+    }
+
+    fn get_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
+        self.base.get_user_id_object(user_id, source)
+    }
+
+    fn have_user_force(&mut self, user_id: UserId, source: &str) -> bool {
+        self.base.have_user_force(user_id, source)
+    }
+
+    fn now(&self) -> f64 {
+        self.now
+    }
+
+    fn secure_random_i64(&self) -> i64 {
+        424242
+    }
+
+    fn check_dialog_access(
+        &self,
+        dialog_id: DialogId,
+        _require_valid: bool,
+        _access_rights: crate::user_manager::AccessRights,
+        _source: &str,
+    ) -> Result<(), tdutils::status::Status> {
+        if dialog_id == user_dialog(777) {
+            Ok(())
+        } else {
+            Err(tdutils::status::Status::error(400, "Chat not found"))
+        }
+    }
+
+    fn have_input_peer(
+        &self,
+        _dialog_id: DialogId,
+        _from_group_chat: bool,
+        _access_rights: crate::user_manager::AccessRights,
+    ) -> bool {
+        self.input_peer
+    }
+
+    fn have_message_force(&mut self, _message_full_id: MessageFullId, _source: &str) -> bool {
+        self.have_message
+    }
+
+    fn can_get_message_viewers(
+        &self,
+        _message_full_id: MessageFullId,
+    ) -> Result<(), tdutils::status::Status> {
+        Ok(())
+    }
+
+    fn create_rich_message_file_source(
+        &mut self,
+        _message_full_id: MessageFullId,
+    ) -> crate::files::FileSourceId {
+        self.viewer_source_id
+    }
+
+    fn add_pending_pts_update(
+        &mut self,
+        pts: i32,
+        pts_count: i32,
+        _receive_time: f64,
+        _promise: Promise<()>,
+        _source: &str,
+    ) {
+        self.pts_updates.push((pts, pts_count));
+    }
+
+    fn add_pending_channel_update(
+        &mut self,
+        _dialog_id: DialogId,
+        pts: i32,
+        pts_count: i32,
+        _promise: Promise<()>,
+        _source: &str,
+    ) {
+        self.channel_pts_updates.push((pts, pts_count));
+    }
+
+    fn send_report_read_metrics_query(
+        &mut self,
+        dialog_id: DialogId,
+        metrics: Vec<MessageReadMetric>,
+    ) {
+        let rows: Vec<MetricRow> = metrics
+            .into_iter()
+            .map(|metric| {
+                (
+                    metric.view_id,
+                    metric.time_in_view_ms,
+                    metric.active_time_in_view_ms,
+                    metric.height_to_viewport_ratio_per_mille,
+                    metric.seen_range_ratio_per_mille,
+                )
+            })
+            .collect();
+        self.metrics.push((dialog_id, rows));
+    }
+
+    fn send_get_messages_reactions_query(
+        &mut self,
+        dialog_id: DialogId,
+        message_ids: Vec<MessageId>,
+    ) {
+        self.reactions_sent.push((
+            dialog_id,
+            message_ids
+                .iter()
+                .map(|id| i64::from(id.get_server_message_id().get()))
+                .collect(),
+        ));
+        self.sent_queries
+            .push("GetMessagesReactionsQuery".to_owned());
+    }
+
+    fn send_affected_history_query(
+        &mut self,
+        _dialog_id: DialogId,
+        _query: AffectedHistoryQueryKind,
+        _get_affected_messages: bool,
+        _promise: Promise<()>,
+    ) {
+        self.sent_queries.push("AffectedHistoryQuery".to_owned());
+    }
+
+    fn send_get_messages_views_query(
+        &mut self,
+        _dialog_id: DialogId,
+        message_ids: Vec<MessageId>,
+        increment_view_counter: bool,
+    ) {
+        self.sent_queries.push(format!(
+            "GetMessagesViewsQuery({increment_view_counter}, {})",
+            message_ids.len()
+        ));
+    }
+
+    fn send_read_message_contents_query(
+        &mut self,
+        _dialog_id: DialogId,
+        _message_ids: Vec<MessageId>,
+    ) {
+        self.sent_queries
+            .push("ReadMessageContentsQuery".to_owned());
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+}
+
+#[test]
+fn fix_delete_message_min_max_dates_normalizes_the_window() {
+    let env = TestEnv {
+        unix_time: 1700000000,
+        ..TestEnv::default()
+    };
+    let error = MessageQueryManager::fix_delete_message_min_max_dates(&env, 100, 50).unwrap_err();
+    assert_eq!(error.code(), 400);
+    assert_eq!(error.message(), "Wrong date interval specified");
+
+    // everything below the launch date zeroes out
+    assert_eq!(
+        MessageQueryManager::fix_delete_message_min_max_dates(&env, 1, 1376438399).unwrap(),
+        (0, 0)
+    );
+
+    // the min date clamps up to the launch date
+    assert_eq!(
+        MessageQueryManager::fix_delete_message_min_max_dates(&env, 100, 1400000000).unwrap(),
+        (1376438400, 1400000000)
+    );
+
+    // the recent window zeroes out
+    assert_eq!(
+        MessageQueryManager::fix_delete_message_min_max_dates(&env, 1700000000 - 20, 1700000000)
+            .unwrap(),
+        (0, 0)
+    );
+
+    // the max date clamps down below the last 30 seconds
+    assert_eq!(
+        MessageQueryManager::fix_delete_message_min_max_dates(&env, 1376438400, 1700000000)
+            .unwrap(),
+        (1376438400, 1700000000 - 31)
+    );
+}
+
+#[test]
+fn the_affected_history_loop_books_pts_and_continues() {
+    let mut manager = MessageQueryManager::new();
+    let mut env = RecordingEnv::default();
+
+    // a partial answer books the pts update and re-sends the query
+    let promise = Promise::<()>::default();
+    let _ = &promise;
+    manager.on_get_affected_history(
+        &mut env,
+        user_dialog(777),
+        AffectedHistoryQueryKind::ReadAllDialogMentions,
+        false,
+        AffectedHistory {
+            pts: 10,
+            pts_count: 2,
+            is_final: false,
+        },
+        promise,
+    );
+    assert_eq!(env.pts_updates, vec![(10, 2)]);
+    assert_eq!(env.recorded("AffectedHistoryQuery").len(), 1);
+
+    // the get_affected_messages form zeroes the booked pts_count
+    let promise = Promise::<()>::default();
+    manager.on_get_affected_history(
+        &mut env,
+        user_dialog(777),
+        AffectedHistoryQueryKind::ReadAllDialogMentions,
+        true,
+        AffectedHistory {
+            pts: 11,
+            pts_count: 2,
+            is_final: false,
+        },
+        promise,
+    );
+    assert_eq!(env.pts_updates.last(), Some(&(11, 0)));
+
+    // a channel dialog rides the channel update path
+    let promise = Promise::<()>::default();
+    manager.on_get_affected_history(
+        &mut env,
+        DialogId::from_channel_id(crate::chat_manager::ChannelId::new(42)),
+        AffectedHistoryQueryKind::ReadAllDialogMentions,
+        false,
+        AffectedHistory {
+            pts: 12,
+            pts_count: 1,
+            is_final: false,
+        },
+        promise,
+    );
+    assert_eq!(env.channel_pts_updates, vec![(12, 1)]);
+
+    // the final answer with no bookkeeping resolves the promise
+    let promise = Promise::<()>::default();
+    assert!(promise.is_empty());
+    manager.on_get_affected_history(
+        &mut env,
+        user_dialog(777),
+        AffectedHistoryQueryKind::ReadAllDialogMentions,
+        false,
+        AffectedHistory {
+            pts: 0,
+            pts_count: 0,
+            is_final: true,
+        },
+        promise,
+    );
+
+    // the final answer with bookkeeping hands the promise to the pts update
+    let promise = Promise::<()>::default();
+    manager.on_get_affected_history(
+        &mut env,
+        user_dialog(777),
+        AffectedHistoryQueryKind::ReadAllDialogMentions,
+        false,
+        AffectedHistory {
+            pts: 13,
+            pts_count: 1,
+            is_final: true,
+        },
+        promise,
+    );
+}
+
+#[test]
+fn the_reactions_reload_queue_drains_and_gates() {
+    let mut manager = MessageQueryManager::new();
+    let mut env = RecordingEnv {
+        input_peer: true,
+        ..RecordingEnv::default()
+    };
+
+    let ids: Vec<MessageId> = (1..=3)
+        .map(|id| MessageId::from_server_message_id(ServerMessageId::new(id)))
+        .collect();
+    manager.queue_message_reactions_reload_for_dialog(&mut env, user_dialog(777), &ids);
+    assert_eq!(env.reactions_sent.len(), 1);
+    assert_eq!(env.reactions_sent[0].1, vec![1, 2, 3]);
+
+    // the request flag holds further queues until the result arrives
+    manager.queue_message_reactions_reload_for_dialog(&mut env, user_dialog(777), &ids);
+    assert_eq!(env.reactions_sent.len(), 1);
+
+    // the finished flag re-drains the requeued ids, then the empty state erases
+    manager.try_reload_message_reactions(&mut env, user_dialog(777), true);
+    assert_eq!(env.reactions_sent.len(), 2);
+    manager.try_reload_message_reactions(&mut env, user_dialog(777), true);
+    assert!(manager.being_reloaded_reactions.is_empty());
+
+    // a pending read-reactions id is filtered out of the send
+    let pending_id = MessageId::from_server_message_id(ServerMessageId::new(1));
+    manager
+        .pending_read_reactions
+        .insert(MessageFullId::new(user_dialog(777), pending_id), 1);
+    manager.queue_message_reactions_reload(
+        &mut env,
+        MessageFullId::new(
+            user_dialog(777),
+            MessageId::from_server_message_id(ServerMessageId::new(2)),
+        ),
+    );
+    assert_eq!(env.reactions_sent.last().unwrap().1, vec![2]);
+
+    // the no-input-peer path parks a 0.2s retry instead of sending
+    let mut env = RecordingEnv {
+        input_peer: false,
+        ..RecordingEnv::default()
+    };
+    manager.try_reload_message_reactions(&mut env, user_dialog(777), true);
+    // the no-input-peer finished path sends nothing
+    assert_eq!(env.reactions_sent.len(), 0);
+    manager.queue_message_reactions_reload(
+        &mut env,
+        MessageFullId::new(
+            user_dialog(777),
+            MessageId::from_server_message_id(ServerMessageId::new(5)),
+        ),
+    );
+    assert_eq!(
+        manager
+            .reactions_reload_retry_deadlines
+            .get(&user_dialog(777)),
+        Some(&(env.now + 0.2))
+    );
+    // the retry fires at the deadline and re-enters the finished path
+    env.now += 0.3;
+    manager.tick_timeouts(&mut env);
+    assert!(manager.reactions_reload_retry_deadlines.is_empty());
+}
+
+#[test]
+fn the_reactions_reload_queue_chunks_at_the_server_limit() {
+    let mut manager = MessageQueryManager::new();
+    let mut env = RecordingEnv {
+        input_peer: true,
+        ..RecordingEnv::default()
+    };
+    let ids: Vec<MessageId> = (1..=150)
+        .map(|id| MessageId::from_server_message_id(ServerMessageId::new(id)))
+        .collect();
+    manager.queue_message_reactions_reload_for_dialog(&mut env, user_dialog(777), &ids);
+    assert_eq!(env.reactions_sent.len(), 1);
+    assert_eq!(env.reactions_sent[0].1.len(), 100);
+    // finishing the sent request drains the remainder
+    manager.try_reload_message_reactions(&mut env, user_dialog(777), true);
+    assert_eq!(env.reactions_sent.len(), 2);
+    assert_eq!(env.reactions_sent[1].1.len(), 50);
+}
+
+#[test]
+fn the_pending_read_counters_track_and_reload_on_error() {
+    let mut manager = MessageQueryManager::new();
+    let mut env = RecordingEnv {
+        input_peer: true,
+        ..RecordingEnv::default()
+    };
+    let message_full_id = MessageFullId::new(
+        user_dialog(777),
+        MessageId::from_server_message_id(ServerMessageId::new(9)),
+    );
+    manager.read_message_reactions_on_server(
+        &mut env,
+        user_dialog(777),
+        vec![message_full_id.get_message_id()],
+    );
+    assert!(manager.has_message_pending_read_reactions(message_full_id));
+    assert!(env.recorded("ReadMessageContentsQuery").len() == 1);
+
+    // the ok result clears the counter
+    manager.on_read_message_reactions(
+        &mut env,
+        user_dialog(777),
+        vec![message_full_id.get_message_id()],
+        false,
+    );
+    assert!(!manager.has_message_pending_read_reactions(message_full_id));
+
+    // the error result requeues a reload for a live message...
+    manager.read_message_reactions_on_server(
+        &mut env,
+        user_dialog(777),
+        vec![message_full_id.get_message_id()],
+    );
+    env.have_message = true;
+    manager.on_read_message_reactions(
+        &mut env,
+        user_dialog(777),
+        vec![message_full_id.get_message_id()],
+        true,
+    );
+    assert_eq!(env.recorded("GetMessagesReactionsQuery").len(), 1);
+    assert!(!manager.has_message_pending_read_reactions(message_full_id));
+
+    // ...and skips it for an unknown one
+    manager.read_message_reactions_on_server(
+        &mut env,
+        user_dialog(777),
+        vec![message_full_id.get_message_id()],
+    );
+    let send_count = env.recorded("GetMessagesReactionsQuery").len();
+    manager.on_read_message_reactions(
+        &mut env,
+        user_dialog(777),
+        vec![message_full_id.get_message_id()],
+        true,
+    );
+    assert_eq!(env.recorded("GetMessagesReactionsQuery").len(), send_count);
+
+    // the poll-vote counters mirror the machinery
+    manager.read_message_poll_votes_on_server(
+        &mut env,
+        user_dialog(777),
+        vec![message_full_id.get_message_id()],
+    );
+    assert!(manager.has_message_pending_read_poll_votes(message_full_id));
+    manager.on_read_message_poll_votes(
+        &mut env,
+        user_dialog(777),
+        vec![message_full_id.get_message_id()],
+        false,
+    );
+    assert!(!manager.has_message_pending_read_poll_votes(message_full_id));
+}
+
+#[test]
+fn send_message_view_metrics_validates_accumulates_and_folds() {
+    let mut manager = MessageQueryManager::new();
+    let mut env = RecordingEnv::default();
+    let message_id = MessageId::from_server_message_id(ServerMessageId::new(11));
+
+    // the access gate answers the dialog-plane error band
+    let promise = Promise::<()>::default();
+    manager.send_message_view_metrics(
+        &mut env,
+        user_dialog(1),
+        message_id,
+        500,
+        100,
+        100,
+        100,
+        promise,
+    );
+    assert!(env.metrics.is_empty());
+
+    // the invalid band
+    let promise = Promise::<()>::default();
+    manager.send_message_view_metrics(
+        &mut env,
+        user_dialog(777),
+        message_id,
+        -1,
+        100,
+        100,
+        100,
+        promise,
+    );
+    // the seen-range cap
+    let promise = Promise::<()>::default();
+    manager.send_message_view_metrics(
+        &mut env,
+        user_dialog(777),
+        message_id,
+        500,
+        100,
+        100,
+        1001,
+        promise,
+    );
+    assert!(env.metrics.is_empty());
+    assert!(manager.pending_message_view_metrics.is_empty());
+
+    // the below-300ms and non-server answers are ok without buffering
+    env.have_message = true;
+    let promise = Promise::<()>::default();
+    manager.send_message_view_metrics(
+        &mut env,
+        user_dialog(777),
+        message_id,
+        299,
+        100,
+        100,
+        100,
+        promise,
+    );
+    let promise = Promise::<()>::default();
+    manager.send_message_view_metrics(
+        &mut env,
+        user_dialog(777),
+        MessageId::new(2), // a local id, not a server one
+        500,
+        100,
+        100,
+        100,
+        promise,
+    );
+    assert!(env.metrics.is_empty());
+    assert!(manager.pending_message_view_metrics.is_empty());
+
+    // the live path buffers and re-arms the 5.0s deadline
+    let promise = Promise::<()>::default();
+    manager.send_message_view_metrics(
+        &mut env,
+        user_dialog(777),
+        message_id,
+        500,
+        100,
+        40,
+        500,
+        promise,
+    );
+    assert_eq!(
+        manager.pending_message_view_metrics[&user_dialog(777)].len(),
+        1
+    );
+    assert_eq!(
+        manager.view_metrics_deadlines[&user_dialog(777)],
+        env.now + 5.0
+    );
+
+    // the fold: summed times, max ratios, one metric per message
+    manager.send_message_view_metrics(
+        &mut env,
+        user_dialog(777),
+        message_id,
+        700,
+        300,
+        60,
+        400,
+        Promise::<()>::default(),
+    );
+    env.now += 6.0;
+    manager.tick_timeouts(&mut env);
+    assert_eq!(env.metrics.len(), 1);
+    assert_eq!(env.metrics[0].0, user_dialog(777));
+    assert_eq!(
+        env.metrics[0].1,
+        vec![(424242, 500 + 700, 100 + 300, 60, 500)]
+    );
+    assert!(manager.pending_message_view_metrics.is_empty());
+    assert!(manager.next_deadline().is_none());
+}
+
+#[test]
+fn view_messages_dedups_chunks_and_finishes() {
+    let mut manager = MessageQueryManager::new();
+    let mut env = RecordingEnv::default();
+    let ids: Vec<MessageId> = (1..=105)
+        .map(|id| MessageId::from_server_message_id(ServerMessageId::new(id)))
+        .collect();
+
+    manager.view_messages(&mut env, user_dialog(777), &ids, true);
+    assert_eq!(env.recorded("GetMessagesViewsQuery").len(), 2);
+    assert_eq!(manager.being_reloaded_views_message_full_ids.len(), 105);
+    assert_eq!(
+        manager.need_view_counter_increment_message_full_ids.len(),
+        105
+    );
+
+    // the dedup: everything is already being reloaded, nothing sends
+    manager.view_messages(&mut env, user_dialog(777), &ids, true);
+    assert_eq!(env.recorded("GetMessagesViewsQuery").len(), 2);
+
+    // the finish clears the sets and re-allows the view
+    manager.finish_get_message_views(user_dialog(777), &ids);
+    assert!(manager.being_reloaded_views_message_full_ids.is_empty());
+    assert!(
+        manager
+            .need_view_counter_increment_message_full_ids
+            .is_empty()
+    );
+    manager.view_messages(&mut env, user_dialog(777), &ids, false);
+    assert_eq!(env.recorded("GetMessagesViewsQuery").len(), 4);
+    assert_eq!(
+        env.sent_queries
+            .iter()
+            .filter(|query| query.contains("(false,"))
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn the_emoji_game_cache_updates_and_answers_the_state() {
+    let mut manager = MessageQueryManager::new();
+    let mut env = RecordingEnv::default();
+    env.base.options.insert(
+        "ton_stakedice_stake_suggested_amounts".to_owned(),
+        "1,2,3".to_owned(),
+    );
+    let wire = telegram_api::messages_EmojiGameInfo::messages_emojiGameDiceInfo(
+        telegram_api::messages_emojiGameDiceInfo {
+            flags: 0,
+            game_hash: "hash".to_owned(),
+            prev_stake: 1500000000,
+            current_streak: 1,
+            params: vec![1, 2, 3, 4, 5, 6, 7],
+            plays_left: 0,
+        },
+    );
+
+    // bots ignore the update
+    env.base.is_bot = true;
+    manager.on_update_emoji_game_info(&mut env, &wire);
+    assert!(!manager.is_emoji_game_info_inited);
+    assert!(env.updates.is_empty());
+    env.base.is_bot = false;
+
+    // the first update caches and emits the update
+    manager.on_update_emoji_game_info(&mut env, &wire);
+    assert!(manager.is_emoji_game_info_inited);
+    assert_eq!(env.updates.len(), 1);
+
+    // the same value is a no-op
+    manager.on_update_emoji_game_info(&mut env, &wire);
+    assert_eq!(env.updates.len(), 1);
+
+    // a changed value re-emits
+    let changed = telegram_api::messages_EmojiGameInfo::messages_emojiGameDiceInfo(
+        telegram_api::messages_emojiGameDiceInfo {
+            flags: 0,
+            game_hash: "hash2".to_owned(),
+            prev_stake: 1,
+            current_streak: 0,
+            params: vec![1, 2, 3, 4, 5, 6, 7],
+            plays_left: 0,
+        },
+    );
+    manager.on_update_emoji_game_info(&mut env, &changed);
+    assert_eq!(env.updates.len(), 2);
+
+    // the state block carries the update only within the 60s window
+    manager.emoji_game_info_receive_time = env.now - 30.0;
+    let mut updates = Vec::new();
+    manager.get_current_state(&env, &mut updates);
+    assert_eq!(updates.len(), 1);
+    manager.emoji_game_info_receive_time = env.now - 61.0;
+    let mut updates = Vec::new();
+    manager.get_current_state(&env, &mut updates);
+    assert!(updates.is_empty());
+
+    // the fetched answer builds the object
+    let promise = Promise::<td_api::StakeDiceState>::default();
+    manager.on_get_emoji_game_info(&mut env, &wire, promise);
+    assert_eq!(manager.emoji_game_info.game_hash, "hash");
+}
+
+#[test]
+fn the_rich_message_file_source_cache_is_bot_and_shape_gated() {
+    let mut manager = MessageQueryManager::new();
+    let mut env = RecordingEnv::default();
+
+    // bots answer the invalid id without touching the cache
+    env.base.is_bot = true;
+    let id = manager.get_rich_message_file_source_id(
+        &mut env,
+        MessageFullId::new(
+            user_dialog(777),
+            MessageId::from_server_message_id(ServerMessageId::new(3)),
+        ),
+    );
+    assert!(!id.is_valid());
+    assert!(manager.rich_message_full_id_to_file_source_id.is_empty());
+    env.base.is_bot = false;
+
+    // the invalid shapes too
+    assert!(
+        !manager
+            .get_rich_message_file_source_id(
+                &mut env,
+                MessageFullId::new(user_dialog(777), MessageId::new(2)), // local
+            )
+            .is_valid()
+    );
+    assert!(manager.rich_message_full_id_to_file_source_id.is_empty());
+
+    // the live shape allocates through the seam and caches
+    env.viewer_source_id = crate::files::FileSourceId::new(42);
+    let message_full_id = MessageFullId::new(
+        user_dialog(777),
+        MessageId::from_server_message_id(ServerMessageId::new(3)),
+    );
+    let id = manager.get_rich_message_file_source_id(&mut env, message_full_id);
+    assert_eq!(id.get(), 42);
+    assert_eq!(
+        manager
+            .get_rich_message_file_source_id(&mut env, message_full_id)
+            .get(),
+        42
+    );
+}
+
+#[test]
+fn the_extended_media_and_fact_check_dedup_sets_gate_the_sends() {
+    let mut manager = MessageQueryManager::new();
+    let mut env = RecordingEnv::default();
+    let ids = vec![MessageId::from_server_message_id(ServerMessageId::new(1))];
+
+    manager.reload_message_extended_media(&mut env, user_dialog(777), ids.clone());
+    manager.reload_message_fact_checks(&mut env, user_dialog(777), ids.clone());
+    // the C++ shared-set quirk: both reloads filter through the fact-check
+    // set (MessageQueryManager.cpp:3264-3265/3281-3283)
+    assert_eq!(manager.being_reloaded_fact_checks.len(), 1);
+    assert!(
+        manager
+            .being_reloaded_extended_media_message_full_ids
+            .is_empty()
+    );
+
+    // the finish erases the extended-media set (a no-op here, like the C++)
+    manager.finish_get_message_extended_media(user_dialog(777), &ids);
+    manager.on_reload_message_fact_checks(&mut env, user_dialog(777), &ids, false);
+    assert!(manager.being_reloaded_fact_checks.is_empty());
 }

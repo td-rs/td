@@ -212,7 +212,7 @@ editBusinessMessageMedia	interim
 editBusinessMessageReplyMarkup	interim
 editBusinessMessageText	interim
 editBusinessStory	interim
-editCallbackQueryMessage	interim
+editCallbackQueryMessage	dispatched
 editChatFolder	interim
 editChatFolderInviteLink	interim
 editChatInviteLink	interim

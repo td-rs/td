@@ -265,6 +265,13 @@ pub struct Td {
     /// `Td::user_manager_` — the user/secret-chat cache (created with Td,
     /// loaded from the binlog pmc in `init` like the C++ constructor).
     pub(crate) user_manager: UserManager,
+    /// `Td::message_query_manager_` (`Td.cpp:1245`, M.18) — the collapsed
+    /// MessageQueryManager; created with Td like the C++ `init_managers`.
+    pub(crate) message_query_manager: crate::message_query_manager::MessageQueryManager,
+    /// The message-query manager's `send_update` outbox — the collapsed
+    /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) message_query_updates: Vec<td_api::Update>,
     /// `Td::notification_manager_` (`Td.cpp:1251`).
     pub(crate) notification_manager: NotificationManager,
     /// `Td::notification_settings_manager_` (`Td.cpp:1254`, M.13S).
@@ -578,6 +585,8 @@ impl Td {
             link_manager: None,
             auth_manager: AuthManager::new(),
             user_manager: UserManager::new(),
+            message_query_manager: crate::message_query_manager::MessageQueryManager::new(),
+            message_query_updates: Vec::new(),
             notification_manager: NotificationManager::default(),
             notification_settings_manager:
                 crate::notification_settings_manager::NotificationSettingsManager::new(),
@@ -1733,6 +1742,14 @@ impl Td {
         {
             expire_time = token_deadline;
         }
+        // The MessageQueryManager's view-metrics and reactions-reload-retry
+        // deadlines share the same slot (M.18): the fired timeout runs
+        // `tick_timeouts` (the C++ MultiTimeout + SleepActor stand-ins).
+        if let Some(query_deadline) = self.message_query_manager.next_deadline()
+            && (expire_time == 0.0 || query_deadline < expire_time)
+        {
+            expire_time = query_deadline;
+        }
         // The AlarmManager timers share the same slot (M.11.4): the
         // earliest armed alarm wins.
         if let Some(alarm_deadline) = self.next_alarm_deadline()
@@ -2567,6 +2584,10 @@ impl Td {
         }
         let notification_updates = std::mem::take(&mut self.notification_updates);
         for update in notification_updates {
+            self.send_update(update.into());
+        }
+        let message_query_updates = std::mem::take(&mut self.message_query_updates);
+        for update in message_query_updates {
             self.send_update(update.into());
         }
     }
@@ -4802,6 +4823,22 @@ impl Actor for Td {
             self.notification_settings_manager.tick_timeouts(&mut env);
             self.device_token_manager.tick_timeouts(&mut env);
         }
+        // The MessageQueryManager timeout families (M.18): the C++
+        // `send_message_view_metrics_timeout_callback` and the reload
+        // SleepActor collapse into `tick_timeouts`.
+        {
+            let mut env = MessageQueryEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+                auth_is_authorized: self.auth_manager.is_authorized(),
+                auth_is_bot: self.auth_manager.is_bot(),
+                can_ignore_background_updates: self.can_ignore_background_updates,
+                updates: &mut self.message_query_updates,
+                user_manager: &mut self.user_manager,
+                updates_manager: &mut self.updates_manager,
+            };
+            self.message_query_manager.tick_timeouts(&mut env);
+        }
         let actions = self
             .config_manager
             .as_mut()
@@ -4978,6 +5015,123 @@ impl crate::device_token_manager::DeviceTokenManagerEnv for NotificationEnv<'_> 
 
     fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
         self.global.binlog_pmc().set_raw(key, value);
+    }
+}
+
+/// The `G()`/manager slice the collapsed MessageQueryManager reads through
+/// (M.18) — the C++ manager reads the same surfaces off its `Td *td_`
+/// directly. The `send_update`s buffer into [`Td::message_query_updates`]
+/// and Td drains them; every net query tail and message-plane probe keeps
+/// its default seam body (the honest error bands in
+/// [`crate::message_query_manager::MessageQueryManagerEnv`]).
+pub(crate) struct MessageQueryEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    /// `None` once the option manager is torn down; the getters answer
+    /// their defaults, matching the C++ close ordering.
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) can_ignore_background_updates: bool,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) updates_manager: &'a mut UpdatesManager<TdUpdatesSink>,
+}
+
+impl crate::message_query_manager::MessageQueryManagerEnv for MessageQueryEnv<'_> {
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    /// `Random::secure_int64` (td/utils/Random.h).
+    fn secure_random_i64(&self) -> i64 {
+        tdutils::random::secure_int64()
+    }
+
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn now(&self) -> f64 {
+        tdutils::time::now()
+    }
+
+    fn get_option_string(&self, name: &str, default_value: &str) -> String {
+        self.options.as_ref().map_or_else(
+            || default_value.to_owned(),
+            |options| options.get_option_string(name, default_value),
+        )
+    }
+
+    fn get_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
+        let global = &mut *self.global;
+        let options = self
+            .options
+            .as_deref_mut()
+            .expect("the option manager exists while the manager drives");
+        let mut user_env = UserEnv {
+            global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager
+            .get_user_id_object(&mut user_env, user_id, source)
+    }
+
+    fn have_user_force(&mut self, user_id: UserId, source: &str) -> bool {
+        let global = &mut *self.global;
+        let options = self
+            .options
+            .as_deref_mut()
+            .expect("the option manager exists while the manager drives");
+        let mut user_env = UserEnv {
+            global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager
+            .have_user_force(&mut user_env, user_id, source)
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    /// `updates_manager_->add_pending_pts_update` with the C++
+    /// `dummyUpdate` — routed to the real engine (M.7).
+    fn add_pending_pts_update(
+        &mut self,
+        pts: i32,
+        pts_count: i32,
+        receive_time: f64,
+        promise: tdutils::promise::Promise<()>,
+        source: &str,
+    ) {
+        let global = &mut *self.global;
+        let options = self
+            .options
+            .as_deref_mut()
+            .expect("the option manager exists while the updates engine drives");
+        let mut updates_env = TdUpdatesEnv {
+            global,
+            options,
+            auth_is_authorized: self.auth_is_authorized,
+            auth_is_bot: self.auth_is_bot,
+            my_id: self.user_manager.get_my_id().get(),
+            can_ignore_background_updates: self.can_ignore_background_updates,
+        };
+        self.updates_manager.add_pending_pts_update(
+            &mut updates_env,
+            PendingUpdate::Dummy,
+            pts,
+            pts_count,
+            receive_time,
+            promise,
+            source,
+        );
     }
 }
 

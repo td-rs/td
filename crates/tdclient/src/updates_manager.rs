@@ -2650,8 +2650,11 @@ impl<S: UpdatesSink> UpdatesManager<S> {
     /// `UpdatesManager::add_pending_pts_update` (cpp:3032) — the
     /// validation, the jump recovery, the postponement and the
     /// accumulated-pts bookkeeping with the fast path.
+    // `pub(crate)` — the M.18 affected-history loop routes the
+    // `on_get_affected_history` pts bookkeeping here (the C++ calls
+    // `updates_manager_->add_pending_pts_update` cross-manager).
     #[allow(clippy::too_many_arguments)]
-    fn add_pending_pts_update(
+    pub(crate) fn add_pending_pts_update(
         &mut self,
         env: &mut impl UpdatesManagerEnv,
         update: PendingUpdate,
