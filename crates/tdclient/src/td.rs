@@ -1043,6 +1043,16 @@ impl Td {
         // block) — the autologin-token slice (M.3.9.1); the link surface
         // is Wave 2.
         self.link_manager = Some(LinkManager::new());
+        // `LinkManager::start_up` (LinkManager.cpp:1895-1908) — the
+        // collapsed actor start restores the three pmc domain lists (M.23).
+        {
+            let link_manager = self.link_manager.as_mut().expect("link manager just set");
+            let mut env = TdLinkEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+            };
+            link_manager.start_up(&mut env);
+        }
 
         // `ConfigManager::start_up` (runs when the C++ manager actor
         // starts, i.e. after the auth restore): the post-init config fetch
@@ -1650,6 +1660,23 @@ impl Td {
             && let Some(link_manager) = self.link_manager.as_mut()
         {
             link_manager.update_autologin_token(autologin_token.clone());
+        }
+        // `LinkManager::update_autologin_domains` (ConfigManager.cpp:2047)
+        // — the three-list fan-out (M.23).
+        if let Some((autologin_domains, url_auth_domains, whitelisted_domains)) =
+            &actions.autologin_domains
+            && let Some(link_manager) = self.link_manager.as_mut()
+        {
+            let mut env = TdLinkEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+            };
+            link_manager.update_autologin_domains(
+                &mut env,
+                autologin_domains.clone(),
+                url_auth_domains.clone(),
+                whitelisted_domains.clone(),
+            );
         }
 
         for id in actions.ok_ids {
@@ -4148,6 +4175,54 @@ impl FileManagerWorker for TdFileWorker {
             .lock()
             .worker_events
             .push(FileWorkerEvent::MergeFiles(from_file_id, to_file_id));
+    }
+}
+
+// ── the LinkManager environment (M.23) ──
+//
+// The C++ LinkManager reads `G()` (options, close flag, the binlog pmc)
+// and sends its queries from the collapsed actor's `create_handler`s;
+// the env carries the same surfaces and the `[blocked: net]` query
+// seams. The dialog-manager half of `bot_start_autostart`
+// (LinkManager.cpp:641-646) stays behind the trait default.
+
+/// The per-call [`crate::link_manager::LinkEnv`] over the Td fields —
+/// built per arm with the field-split borrows, never held across calls.
+pub(crate) struct TdLinkEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+}
+
+impl crate::link_manager::LinkEnv for TdLinkEnv<'_> {
+    fn get_option_string_with_default(&self, name: &str, default_value: &str) -> String {
+        self.options.as_ref().map_or_else(
+            || default_value.to_owned(),
+            |options| options.get_option_string(name, default_value),
+        )
+    }
+
+    fn get_option_string(&self, name: &str) -> String {
+        self.options
+            .as_ref()
+            .map_or_else(String::new, |options| options.get_option_string(name, ""))
+    }
+
+    /// The option half of `InternalLinkBotStart`'s autostart
+    /// (LinkManager.cpp:638-640): the premium-bot username autostarts.
+    fn bot_start_autostart(&self, bot_username: &str) -> bool {
+        self.get_option_string("premium_bot_username") == bot_username
+    }
+
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn binlog_pmc_get(&mut self, key: &str) -> String {
+        self.global.binlog_pmc().get(key)
+    }
+
+    fn binlog_pmc_set(&mut self, key: &str, value: &str) {
+        self.global.binlog_pmc().set(key, value);
     }
 }
 

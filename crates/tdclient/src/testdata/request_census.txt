@@ -1,5 +1,5 @@
 acceptCall	interim
-acceptOauthRequest	interim
+acceptOauthRequest	dispatched
 acceptTermsOfService	interim
 activateStoryStealthMode	interim
 addBotMediaPreview	interim
@@ -82,7 +82,7 @@ checkChatUsername	dispatched
 checkCreatedPublicChatsLimit	interim
 checkEmailAddressVerificationCode	interim
 checkLoginEmailAddressCode	interim
-checkOauthRequestMatchCode	interim
+checkOauthRequestMatchCode	dispatched
 checkPasswordRecoveryCode	interim
 checkPhoneNumberCode	interim
 checkPremiumGiftCode	interim
@@ -144,7 +144,7 @@ createTemporaryPassword	interim
 createTextCompositionStyle	interim
 createVideoChat	interim
 declineGroupCallInvitation	interim
-declineOauthRequest	interim
+declineOauthRequest	dispatched
 declineSuggestedPost	interim
 decryptGroupCallData	interim
 deleteAccount	interim
@@ -353,7 +353,7 @@ getCurrentWeather	interim
 getCustomEmojiReactionAnimations	interim
 getCustomEmojiStickers	interim
 getDatabaseStatistics	dispatched
-getDeepLinkInfo	interim
+getDeepLinkInfo	dispatched
 getDefaultBackgroundCustomEmojiStickers	interim
 getDefaultChatEmojiStatuses	interim
 getDefaultChatPhotoCustomEmojiStickers	interim
@@ -368,8 +368,8 @@ getDisallowedChatEmojiStatuses	interim
 getEmojiCategories	interim
 getEmojiReaction	interim
 getEmojiSuggestionsUrl	interim
-getExternalLink	interim
-getExternalLinkInfo	interim
+getExternalLink	dispatched
+getExternalLinkInfo	dispatched
 getFavoriteStickers	interim
 getFile	dispatched
 getFileDownloadedPrefixSize	interim
@@ -425,8 +425,8 @@ getLogTagVerbosityLevel	sync
 getLogTags	sync
 getLogVerbosityLevel	sync
 getLoginPasskeys	interim
-getLoginUrl	interim
-getLoginUrlInfo	interim
+getLoginUrl	dispatched
+getLoginUrlInfo	dispatched
 getMainWebApp	interim
 getManagedBotAccessSettings	interim
 getManagedBotToken	interim
@@ -455,7 +455,7 @@ getMessageViewers	interim
 getMessages	interim
 getNetworkStatistics	interim
 getNewChatPrivacySettings	interim
-getOauthLinkInfo	interim
+getOauthLinkInfo	dispatched
 getOption	dispatched
 getOwnedBots	interim
 getOwnedStickerSets	interim
@@ -494,7 +494,7 @@ getRecentEmojiStatuses	interim
 getRecentInlineBots	interim
 getRecentStickers	interim
 getRecentlyOpenedChats	dispatched
-getRecentlyVisitedTMeUrls	interim
+getRecentlyVisitedTMeUrls	dispatched
 getRecommendedChatFolders	interim
 getRecommendedChats	interim
 getRecoveryEmailAddress	interim
