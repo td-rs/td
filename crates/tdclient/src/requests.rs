@@ -35,7 +35,8 @@ use crate::call_protocol::CallProtocol;
 use crate::chat_manager::{ChannelId, DialogId};
 use crate::community_id::CommunityId;
 use crate::contact::Contact;
-use crate::messages_manager::{DialogId as MmDialogId, MessageId};
+use crate::message_id::{MessageFullId, MessageId};
+use crate::messages_manager::DialogId as MmDialogId;
 use crate::notification::{NotificationGroupId, NotificationId, NotificationObjectId};
 use crate::notification_settings::{
     ReactionNotificationSettings, get_notification_settings_scope,
@@ -56,6 +57,7 @@ use crate::td::PremiumTdEnv;
 use crate::td::QuickReplyEnv;
 use crate::td::StatisticsEnv;
 use crate::td::Td;
+use crate::td::TdLinkEnv;
 use crate::td::ThemeEnv;
 use crate::td::WebBrowserEnv;
 use crate::td_api::{self, Function, Object};
@@ -1245,6 +1247,253 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             // passport / the missing setter halves (M.4.12 deferred them
             // with their types)
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+        }
+
+        // --- the LinkManager arm set (M.23): Requests.cpp:3592-3642 +
+        // 8948-8954 + 9258-9264. The local halves run in the collapsed
+        // manager; every net query tail is the [blocked: net] env seam
+        // and parks the promise offline, exactly like the C++ request
+        // without a network ---
+        // --- the dialog-scoped LinkManager arms (M.23): the
+        // button-URL resolution rides the [blocked: M.10 integration]
+        // message plane and answers the C++ not-found band offline; the
+        // net query tails are the [blocked: net] env seams ---
+        Function::getLoginUrlInfo(request) => {
+            // Requests.cpp:8166-8172; the RequestUrlAuthQuery tail parks
+            if !check_is_user(td, id) {
+                return;
+            }
+            let message_full_id = MessageFullId::new(
+                crate::message_id::DialogId::new(request.chat_id),
+                MessageId::new(request.message_id),
+            );
+            let promise = td.deferred_promise::<td_api::LoginUrlInfo, _>(id, Object::from);
+            let Some(link_manager) = td.link_manager.as_mut() else {
+                return td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+            };
+            let mut env = TdLinkEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+            };
+            link_manager.get_login_url_info(&mut env, message_full_id, request.button_id, promise);
+        }
+        Function::getLoginUrl(request) => {
+            // Requests.cpp:8174-8181; the HTTP-URL promise band answers
+            // the string as httpUrl, the AcceptUrlAuthQuery tail parks
+            if !check_is_user(td, id) {
+                return;
+            }
+            let message_full_id = MessageFullId::new(
+                crate::message_id::DialogId::new(request.chat_id),
+                MessageId::new(request.message_id),
+            );
+            let promise =
+                td.deferred_promise(id, |url: String| Object::httpUrl(td_api::HttpUrl { url }));
+            let Some(link_manager) = td.link_manager.as_mut() else {
+                return td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+            };
+            let mut env = TdLinkEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+            };
+            link_manager.get_login_url(
+                &mut env,
+                message_full_id,
+                request.button_id,
+                request.allow_write_access,
+                promise,
+            );
+        }
+        Function::getDeepLinkInfo(request) => {
+            // Requests.cpp:9258-9264: no auth gate; the local tg: strip +
+            // host split, then help.getDeepLinkInfo parks
+            let Some(link) = clean_or_utf8_error(td, id, &request.link) else {
+                return;
+            };
+            let promise = td.deferred_promise(id, |info: Option<td_api::DeepLinkInfo>| {
+                // the query's null-answer band (LinkManager.cpp:1607-1643
+                // `send_result(nullptr)`) surfaces as the M.18-outline 404
+                info.map_or_else(
+                    || {
+                        Object::error(td_api::Error {
+                            code: 404,
+                            message: "Not Found".to_string(),
+                        })
+                    },
+                    Object::deepLinkInfo,
+                )
+            });
+            let Some(link_manager) = td.link_manager.as_mut() else {
+                // Unreachable through the request gate: the manager is
+                // created in the Td init block before requests flow.
+                return td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+            };
+            let mut env = TdLinkEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+            };
+            link_manager.get_deep_link_info(&mut env, &link, promise);
+        }
+        Function::getExternalLinkInfo(request) => {
+            // Requests.cpp:3592-3598; the local machine answers
+            // loginUrlInfoOpen or parks on messages.requestUrlAuth
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(link) = clean_or_utf8_error(td, id, &request.link) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::LoginUrlInfo, _>(id, Object::from);
+            let Some(link_manager) = td.link_manager.as_mut() else {
+                return td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+            };
+            let mut env = TdLinkEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+            };
+            link_manager.get_external_link_info(&mut env, link, promise);
+        }
+        Function::getRecentlyVisitedTMeUrls(request) => {
+            // Requests.cpp:8948-8954; help.getRecentMeUrls parks
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(referrer) = clean_or_utf8_error(td, id, &request.referrer) else {
+                return;
+            };
+            let promise = td.deferred_promise(id, |urls: Option<td_api::TMeUrls>| {
+                // the query's null band → the M.18-outline 404 convention
+                urls.map_or_else(
+                    || {
+                        Object::error(td_api::Error {
+                            code: 404,
+                            message: "Not Found".to_string(),
+                        })
+                    },
+                    Object::tMeUrls,
+                )
+            });
+            let Some(link_manager) = td.link_manager.as_mut() else {
+                return td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+            };
+            let mut env = TdLinkEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+            };
+            link_manager.get_recent_me_urls(&mut env, referrer, promise);
+        }
+        Function::getExternalLink(request) => {
+            // Requests.cpp:3596-3601: the HTTP-URL promise band
+            // (Requests.cpp:1957-1967) answers the string as httpUrl; the
+            // messages.acceptUrlAuth tail parks
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(link) = clean_or_utf8_error(td, id, &request.link) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise(id, |url: String| Object::httpUrl(td_api::HttpUrl { url }));
+            let Some(link_manager) = td.link_manager.as_mut() else {
+                return td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+            };
+            let mut env = TdLinkEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+            };
+            link_manager.get_link_login_url(&mut env, link, request.allow_write_access, promise);
+        }
+        Function::getOauthLinkInfo(request) => {
+            // Requests.cpp:3612-3618; the local parse + type check, then
+            // messages.requestUrlAuth (with the in-app origin) parks
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(link) = clean_or_utf8_error(td, id, &request.url) else {
+                return;
+            };
+            let Some(in_app_origin) = clean_or_utf8_error(td, id, &request.in_app_origin) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<td_api::OauthLinkInfo, _>(id, Object::oauthLinkInfo);
+            let Some(link_manager) = td.link_manager.as_mut() else {
+                return td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+            };
+            let mut env = TdLinkEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+            };
+            link_manager.get_oauth_link_info(&mut env, link, in_app_origin, promise);
+        }
+        Function::checkOauthRequestMatchCode(request) => {
+            // Requests.cpp:3620-3626; messages.checkUrlAuthMatchCode parks
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(url) = clean_or_utf8_error(td, id, &request.url) else {
+                return;
+            };
+            let Some(match_code) = clean_or_utf8_error(td, id, &request.match_code) else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let Some(link_manager) = td.link_manager.as_mut() else {
+                return td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+            };
+            let mut env = TdLinkEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+            };
+            link_manager.check_oauth_request_match_code(&mut env, url, match_code, promise);
+        }
+        Function::acceptOauthRequest(request) => {
+            // Requests.cpp:3628-3636; messages.acceptUrlAuth parks, the
+            // HTTP-URL promise band answers the string as httpUrl
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(url) = clean_or_utf8_error(td, id, &request.url) else {
+                return;
+            };
+            let Some(match_code) = clean_or_utf8_error(td, id, &request.match_code) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise(id, |url: String| Object::httpUrl(td_api::HttpUrl { url }));
+            let Some(link_manager) = td.link_manager.as_mut() else {
+                return td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+            };
+            let mut env = TdLinkEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+            };
+            link_manager.accept_oauth_request(
+                &mut env,
+                url,
+                match_code,
+                request.allow_write_access,
+                request.allow_phone_number_access,
+                promise,
+            );
+        }
+        Function::declineOauthRequest(request) => {
+            // Requests.cpp:3638-3642; messages.declineUrlAuth parks
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(url) = clean_or_utf8_error(td, id, &request.url) else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let Some(link_manager) = td.link_manager.as_mut() else {
+                return td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+            };
+            let mut env = TdLinkEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+            };
+            link_manager.decline_oauth_request(&mut env, url, promise);
         }
 
         function => run_dialog_requests(td, id, function),
@@ -8825,13 +9074,16 @@ mod request_census_tests {
         assert_eq!(generated.len(), crate::td_api::SCHEME_FUNCTIONS);
 
         // The flip-state ledger — re-derived from the fixture at the wave-3
-        // integration (the per-track flip histories compose).
+        // integration (the per-track flip histories compose) + M.23's ten
+        // LinkManager dispatches (getDeepLinkInfo, getExternalLink,
+        // getExternalLinkInfo, getRecentlyVisitedTMeUrls, the two login-url
+        // arms and the four oauth arms). Fix per flip.
         assert_eq!(*counts.get("sync").unwrap_or(&0), 19, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            436,
+            446,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 567, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 557, "interim count");
     }
 }
