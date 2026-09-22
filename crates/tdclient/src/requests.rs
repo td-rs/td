@@ -43,6 +43,9 @@ use crate::notification_settings::{
 use crate::notification_settings_manager::ScopeSettingsAnswer;
 use crate::suggested_action::SuggestedAction;
 use crate::td::AccountEnv;
+use crate::star_gift_manager::{
+    StarGiftCollectionId, StarGiftId, StarGiftResalePrice, get_message_sender_dialog_id,
+};
 use crate::td::ThemeEnv;
 use crate::td::AutosaveEnv;
 use crate::td::BoostEnv;
@@ -2494,6 +2497,826 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
         }
 
         // Everything else waits for its manager step.
+        // Everything else waits for its manager step; the M.42 star gift
+        // group follows in its own frame (see the frame note above).
+        _ => run_star_gift_requests(td, id, function),
+    }
+}
+
+/// The `StarGiftTdEnv` for the star gift manager calls. Expanded inline
+/// (the same field-disjoint shape as `user_env!`); `get_my_dialog_id`
+/// reads through a shared reborrow before the mutable fields split off.
+macro_rules! star_gift_env {
+    ($td:expr) => {{
+        let my_dialog_id = crate::dialog_manager::get_my_dialog_id($td);
+        crate::td::StarGiftTdEnv {
+            global: &mut $td.global,
+            options: $td.option_manager.as_mut(),
+            auth_is_authorized: $td.auth_manager.is_authorized(),
+            auth_is_bot: $td.auth_manager.is_bot(),
+            user_manager: &mut $td.user_manager,
+            chat_manager: &mut $td.chat_manager,
+            my_dialog_id,
+            updates: &mut $td.notification_updates,
+        }
+    }};
+}
+
+/// The `CanSendGiftResult` → `Object` rewrap (the Object umbrella has no
+/// single variant for the two-ctor type).
+fn can_send_gift_result_to_object(value: td_api::CanSendGiftResult) -> Object {
+    match value {
+        td_api::CanSendGiftResult::canSendGiftResultOk(value) => Object::canSendGiftResultOk(value),
+        td_api::CanSendGiftResult::canSendGiftResultFail(value) => {
+            Object::canSendGiftResultFail(value)
+        }
+    }
+}
+
+/// The `CraftGiftResult` → `Object` rewrap.
+fn craft_gift_result_to_object(value: td_api::CraftGiftResult) -> Object {
+    match value {
+        td_api::CraftGiftResult::craftGiftResultSuccess(value) => {
+            Object::craftGiftResultSuccess(value)
+        }
+        td_api::CraftGiftResult::craftGiftResultTooEarly(value) => {
+            Object::craftGiftResultTooEarly(value)
+        }
+        td_api::CraftGiftResult::craftGiftResultInvalidGift(value) => {
+            Object::craftGiftResultInvalidGift(value)
+        }
+        td_api::CraftGiftResult::craftGiftResultFail(value) => Object::craftGiftResultFail(value),
+    }
+}
+
+/// The `GiftResaleResult` → `Object` rewrap.
+fn gift_resale_result_to_object(value: td_api::GiftResaleResult) -> Object {
+    match value {
+        td_api::GiftResaleResult::giftResaleResultOk(value) => Object::giftResaleResultOk(value),
+        td_api::GiftResaleResult::giftResaleResultPriceIncreased(value) => {
+            Object::giftResaleResultPriceIncreased(value)
+        }
+    }
+}
+
+/// The M.42 StarGiftManager arm group of the request dispatcher — see the
+/// frame note at the forward site in [`run_request`]. Every arm routes
+/// into `td_->star_gift_manager_->...` (Requests.cpp:8455-8756); the
+/// network tails are the [blocked: net] query seams of the manager, the
+/// local validation halves answer inline.
+#[allow(clippy::too_many_lines)]
+fn run_star_gift_requests(td: &mut Td, id: u64, function: Function) {
+    // `get_message_sender_dialog_id(td_, sender, true, false)` for the
+    // owner arms: the owner is parsed in one env, the manager runs in the
+    // next (the two-phase borrow of the collapsed dispatcher)
+    macro_rules! owner_dialog_id {
+        ($td:expr, $sender:expr) => {
+            get_message_sender_dialog_id(&mut star_gift_env!($td), $sender.as_ref())
+        };
+    }
+
+    macro_rules! ok_promise {
+        ($td:expr) => {
+            $td.deferred_promise::<(), _>(id, |_| ok_object())
+        };
+    }
+
+    match function {
+        // getAvailableGifts (Requests.cpp:8455-8458)
+        Function::getAvailableGifts(_) => {
+            let promise =
+                td.deferred_promise::<td_api::AvailableGifts, _>(id, Object::availableGifts);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager
+                .get_gift_payment_options(&mut env, promise);
+        }
+
+        // canSendGift (Requests.cpp:8460-8463)
+        Function::canSendGift(request) => {
+            let promise = td.deferred_promise::<td_api::CanSendGiftResult, _>(
+                id,
+                can_send_gift_result_to_object,
+            );
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager
+                .can_send_gift(&mut env, request.gift_id, promise);
+        }
+
+        // sendGift (Requests.cpp:8465-8470)
+        Function::sendGift(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let owner_dialog_id = match owner_dialog_id!(td, request.owner_id) {
+                std::result::Result::Ok(dialog_id) => dialog_id,
+                std::result::Result::Err(status) => return send_error_status(td, id, status),
+            };
+            let promise = ok_promise!(td);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.send_gift(
+                &mut env,
+                request.gift_id,
+                owner_dialog_id,
+                request.text,
+                request.is_private,
+                request.pay_for_upgrade,
+                promise,
+            );
+        }
+
+        // getGiftAuctionState (Requests.cpp:8472-8477)
+        Function::getGiftAuctionState(request) => {
+            let promise =
+                td.deferred_promise::<td_api::GiftAuctionState, _>(id, Object::giftAuctionState);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager
+                .get_gift_auction_state(&mut env, &request.auction_id, promise);
+        }
+
+        // getGiftAuctionAcquiredGifts (Requests.cpp:8479-8483)
+        Function::getGiftAuctionAcquiredGifts(request) => {
+            let promise = td.deferred_promise::<td_api::GiftAuctionAcquiredGifts, _>(
+                id,
+                Object::giftAuctionAcquiredGifts,
+            );
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.get_gift_auction_acquired_gifts(
+                &mut env,
+                request.gift_id,
+                promise,
+            );
+        }
+
+        // openGiftAuction (Requests.cpp:8485-8489)
+        Function::openGiftAuction(request) => {
+            let promise = ok_promise!(td);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager
+                .open_gift_auction(&mut env, request.gift_id, false, promise);
+        }
+
+        // closeGiftAuction (Requests.cpp:8491-8495)
+        Function::closeGiftAuction(request) => {
+            let promise = ok_promise!(td);
+            let mut env = star_gift_env!(td);
+            {
+                let _ = &mut env;
+                td.star_gift_manager
+                    .close_gift_auction(request.gift_id, promise);
+            }
+        }
+
+        // placeGiftAuctionBid (Requests.cpp:8497-8502)
+        Function::placeGiftAuctionBid(request) => {
+            let promise = ok_promise!(td);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.place_gift_auction_bid(
+                &mut env,
+                request.gift_id,
+                request.star_count,
+                UserId::new(request.user_id),
+                request.text,
+                request.is_private,
+                promise,
+            );
+        }
+
+        // increaseGiftAuctionBid (Requests.cpp:8504-8508)
+        Function::increaseGiftAuctionBid(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.update_gift_auction_bid(
+                &mut env,
+                request.gift_id,
+                request.star_count,
+                promise,
+            );
+        }
+
+        // sellGift (Requests.cpp:8510-8515)
+        Function::sellGift(request) => {
+            if td.auth_manager.is_bot() && request.business_connection_id.is_empty() {
+                return td.send_error_impl(id, 400, "The method is not available to bots");
+            }
+            let promise = ok_promise!(td);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.convert_gift(
+                &mut env,
+                crate::star_gift_manager::BusinessConnectionId::new(
+                    &request.business_connection_id,
+                ),
+                StarGiftId::from_string(&request.received_gift_id),
+                promise,
+            );
+        }
+
+        // toggleGiftIsSaved (Requests.cpp:8517-8521)
+        Function::toggleGiftIsSaved(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.save_gift(
+                &mut env,
+                StarGiftId::from_string(&request.received_gift_id),
+                request.is_saved,
+                promise,
+            );
+        }
+
+        // setPinnedGifts (Requests.cpp:8523-8529)
+        Function::setPinnedGifts(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let owner_dialog_id = match owner_dialog_id!(td, request.owner_id) {
+                std::result::Result::Ok(dialog_id) => dialog_id,
+                std::result::Result::Err(status) => return send_error_status(td, id, status),
+            };
+            let promise = ok_promise!(td);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.set_dialog_pinned_gifts(
+                &mut env,
+                owner_dialog_id,
+                StarGiftId::get_star_gift_ids(&request.received_gift_ids),
+                promise,
+            );
+        }
+
+        // toggleChatGiftNotifications (Requests.cpp:8531-8536)
+        Function::toggleChatGiftNotifications(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.toggle_chat_star_gift_notifications(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                request.are_enabled,
+                promise,
+            );
+        }
+
+        // getGiftUpgradePreview (Requests.cpp:8538-8542)
+        Function::getGiftUpgradePreview(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td
+                .deferred_promise::<td_api::GiftUpgradePreview, _>(id, Object::giftUpgradePreview);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.get_gift_upgrade_preview(
+                &mut env,
+                request.regular_gift_id,
+                promise,
+            );
+        }
+
+        // getUpgradedGiftVariants (Requests.cpp:8544-8549)
+        Function::getUpgradedGiftVariants(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::GiftUpgradeVariants, _>(
+                id,
+                Object::giftUpgradeVariants,
+            );
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.get_gift_upgrade_variants(
+                &mut env,
+                request.regular_gift_id,
+                request.return_upgrade_models,
+                request.return_craft_models,
+                promise,
+            );
+        }
+
+        // upgradeGift (Requests.cpp:8551-8557)
+        Function::upgradeGift(request) => {
+            if td.auth_manager.is_bot() && request.business_connection_id.is_empty() {
+                return td.send_error_impl(id, 400, "The method is not available to bots");
+            }
+            let promise =
+                td.deferred_promise::<td_api::UpgradeGiftResult, _>(id, Object::upgradeGiftResult);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.upgrade_gift(
+                &mut env,
+                crate::star_gift_manager::BusinessConnectionId::new(
+                    &request.business_connection_id,
+                ),
+                StarGiftId::from_string(&request.received_gift_id),
+                request.keep_original_details,
+                request.star_count,
+                promise,
+            );
+        }
+
+        // buyGiftUpgrade (Requests.cpp:8559-8566)
+        Function::buyGiftUpgrade(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(prepaid_upgrade_hash) =
+                clean_or_utf8_error(td, id, &request.prepaid_upgrade_hash)
+            else {
+                return;
+            };
+            let owner_dialog_id = match owner_dialog_id!(td, request.owner_id) {
+                std::result::Result::Ok(dialog_id) => dialog_id,
+                std::result::Result::Err(status) => return send_error_status(td, id, status),
+            };
+            let promise = ok_promise!(td);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.buy_gift_upgrade(
+                &mut env,
+                owner_dialog_id,
+                &prepaid_upgrade_hash,
+                request.star_count,
+                promise,
+            );
+        }
+
+        // craftGift (Requests.cpp:8568-8572)
+        Function::craftGift(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<td_api::CraftGiftResult, _>(id, craft_gift_result_to_object);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.craft_gift(
+                &mut env,
+                StarGiftId::get_star_gift_ids(&request.received_gift_ids),
+                promise,
+            );
+        }
+
+        // transferGift (Requests.cpp:8574-8581)
+        Function::transferGift(request) => {
+            if td.auth_manager.is_bot() && request.business_connection_id.is_empty() {
+                return td.send_error_impl(id, 400, "The method is not available to bots");
+            }
+            let new_owner_dialog_id = match owner_dialog_id!(td, request.new_owner_id) {
+                std::result::Result::Ok(dialog_id) => dialog_id,
+                std::result::Result::Err(status) => return send_error_status(td, id, status),
+            };
+            let promise = ok_promise!(td);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.transfer_gift(
+                &mut env,
+                crate::star_gift_manager::BusinessConnectionId::new(
+                    &request.business_connection_id,
+                ),
+                StarGiftId::from_string(&request.received_gift_id),
+                new_owner_dialog_id,
+                request.star_count,
+                promise,
+            );
+        }
+
+        // dropGiftOriginalDetails (Requests.cpp:8583-8587)
+        Function::dropGiftOriginalDetails(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.drop_gift_original_details(
+                &mut env,
+                StarGiftId::from_string(&request.received_gift_id),
+                request.star_count,
+                promise,
+            );
+        }
+
+        // sendResoldGift (Requests.cpp:8589-8599)
+        Function::sendResoldGift(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(gift_name) = clean_or_utf8_error(td, id, &request.gift_name) else {
+                return;
+            };
+            let owner_dialog_id = match owner_dialog_id!(td, request.owner_id) {
+                std::result::Result::Ok(dialog_id) => dialog_id,
+                std::result::Result::Err(status) => return send_error_status(td, id, status),
+            };
+            let price = {
+                let mut env = star_gift_env!(td);
+                StarGiftResalePrice::get_star_gift_resale_price(&mut env, request.price, true)
+            };
+            let price = match price {
+                std::result::Result::Ok(price) => price,
+                std::result::Result::Err(status) => return send_error_status(td, id, status),
+            };
+            let promise = td
+                .deferred_promise::<td_api::GiftResaleResult, _>(id, gift_resale_result_to_object);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.send_resold_gift(
+                &mut env,
+                &gift_name,
+                owner_dialog_id,
+                price,
+                request.text,
+                request.is_private,
+                promise,
+            );
+        }
+
+        // sendGiftPurchaseOffer (Requests.cpp:8601-8609)
+        Function::sendGiftPurchaseOffer(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(gift_name) = clean_or_utf8_error(td, id, &request.gift_name) else {
+                return;
+            };
+            let owner_dialog_id = match owner_dialog_id!(td, request.owner_id) {
+                std::result::Result::Ok(dialog_id) => dialog_id,
+                std::result::Result::Err(status) => return send_error_status(td, id, status),
+            };
+            let price = {
+                let mut env = star_gift_env!(td);
+                StarGiftResalePrice::get_star_gift_resale_price(&mut env, request.price, false)
+            };
+            let price = match price {
+                std::result::Result::Ok(price) => price,
+                std::result::Result::Err(status) => return send_error_status(td, id, status),
+            };
+            let promise = ok_promise!(td);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.send_gift_offer(
+                &mut env,
+                owner_dialog_id,
+                &gift_name,
+                price,
+                request.duration,
+                request.paid_message_star_count,
+                promise,
+            );
+        }
+
+        // processGiftPurchaseOffer (Requests.cpp:8611-8616)
+        Function::processGiftPurchaseOffer(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = ok_promise!(td);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.process_gift_offer(
+                &mut env,
+                request.message_id,
+                !request.accept,
+                promise,
+            );
+        }
+
+        // getReceivedGifts (Requests.cpp:8618-8629)
+        Function::getReceivedGifts(request) => {
+            let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let owner_dialog_id = match owner_dialog_id!(td, request.owner_id) {
+                std::result::Result::Ok(dialog_id) => dialog_id,
+                std::result::Result::Err(status) => return send_error_status(td, id, status),
+            };
+            let promise =
+                td.deferred_promise::<td_api::ReceivedGifts, _>(id, Object::receivedGifts);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.get_saved_star_gifts(
+                &mut env,
+                crate::star_gift_manager::BusinessConnectionId::new(
+                    &request.business_connection_id,
+                ),
+                owner_dialog_id,
+                StarGiftCollectionId::new(request.collection_id),
+                request.exclude_unsaved,
+                request.exclude_saved,
+                request.exclude_unlimited,
+                request.exclude_upgradable,
+                request.exclude_non_upgradable,
+                request.exclude_upgraded,
+                request.exclude_without_colors,
+                request.exclude_hosted,
+                request.sort_by_price,
+                &offset,
+                request.limit,
+                promise,
+            );
+        }
+
+        // getReceivedGift (Requests.cpp:8631-8634)
+        Function::getReceivedGift(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::ReceivedGift, _>(id, Object::receivedGift);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.get_saved_star_gift(
+                &mut env,
+                StarGiftId::from_string(&request.received_gift_id),
+                promise,
+            );
+        }
+
+        // getGiftsForCrafting (Requests.cpp:8636-8642)
+        Function::getGiftsForCrafting(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<td_api::GiftsForCrafting, _>(id, Object::giftsForCrafting);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.get_craft_star_gifts(
+                &mut env,
+                request.regular_gift_id,
+                &offset,
+                request.limit,
+                promise,
+            );
+        }
+
+        // getUpgradedGift (Requests.cpp:8644-8649)
+        Function::getUpgradedGift(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::UpgradedGift, _>(id, Object::upgradedGift);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager
+                .get_upgraded_gift(&mut env, &name, promise);
+        }
+
+        // getUpgradedGiftValueInfo (Requests.cpp:8651-8656)
+        Function::getUpgradedGiftValueInfo(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::UpgradedGiftValueInfo, _>(
+                id,
+                Object::upgradedGiftValueInfo,
+            );
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager
+                .get_upgraded_gift_value_info(&mut env, &name, promise);
+        }
+
+        // getUpgradedGiftWithdrawalUrl (Requests.cpp:8658-8662)
+        Function::getUpgradedGiftWithdrawalUrl(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td
+                .deferred_promise::<String, _>(id, |url| Object::httpUrl(td_api::HttpUrl { url }));
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.get_star_gift_withdrawal_url(
+                &mut env,
+                StarGiftId::from_string(&request.received_gift_id),
+                &request.password,
+                promise,
+            );
+        }
+
+        // getUpgradedGiftsPromotionalAnimation (Requests.cpp:8664-8668)
+        Function::getUpgradedGiftsPromotionalAnimation(_) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Animation, _>(id, Object::animation);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager
+                .get_star_gift_promo_animation(&mut env, promise);
+        }
+
+        // setGiftResalePrice (Requests.cpp:8670-8678)
+        Function::setGiftResalePrice(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let price = {
+                let mut env = star_gift_env!(td);
+                StarGiftResalePrice::get_star_gift_resale_price(&mut env, request.price, false)
+            };
+            let price = match price {
+                std::result::Result::Ok(price) => price,
+                std::result::Result::Err(status) => return send_error_status(td, id, status),
+            };
+            let promise = ok_promise!(td);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.set_star_gift_price(
+                &mut env,
+                StarGiftId::from_string(&request.received_gift_id),
+                price,
+                promise,
+            );
+        }
+
+        // searchGiftsForResale (Requests.cpp:8680-8687)
+        Function::searchGiftsForResale(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<td_api::GiftsForResale, _>(id, Object::giftsForResale);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.get_resale_star_gifts(
+                &mut env,
+                request.gift_id,
+                request.order.as_ref(),
+                request.for_crafting,
+                request.for_stars,
+                &request.attributes,
+                &offset,
+                request.limit,
+                promise,
+            );
+        }
+
+        // getGiftCollections (Requests.cpp:8689-8694)
+        Function::getGiftCollections(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let owner_dialog_id = match owner_dialog_id!(td, request.owner_id) {
+                std::result::Result::Ok(dialog_id) => dialog_id,
+                std::result::Result::Err(status) => return send_error_status(td, id, status),
+            };
+            let promise =
+                td.deferred_promise::<td_api::GiftCollections, _>(id, Object::giftCollections);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager
+                .get_gift_collections(&mut env, owner_dialog_id, promise);
+        }
+
+        // createGiftCollection (Requests.cpp:8696-8703)
+        Function::createGiftCollection(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let owner_dialog_id = match owner_dialog_id!(td, request.owner_id) {
+                std::result::Result::Ok(dialog_id) => dialog_id,
+                std::result::Result::Err(status) => return send_error_status(td, id, status),
+            };
+            let promise =
+                td.deferred_promise::<td_api::GiftCollection, _>(id, Object::giftCollection);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.create_gift_collection(
+                &mut env,
+                owner_dialog_id,
+                &name,
+                StarGiftId::get_star_gift_ids(&request.received_gift_ids),
+                promise,
+            );
+        }
+
+        // reorderGiftCollections (Requests.cpp:8705-8711)
+        Function::reorderGiftCollections(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let owner_dialog_id = match owner_dialog_id!(td, request.owner_id) {
+                std::result::Result::Ok(dialog_id) => dialog_id,
+                std::result::Result::Err(status) => return send_error_status(td, id, status),
+            };
+            let promise = ok_promise!(td);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.reorder_gift_collections(
+                &mut env,
+                owner_dialog_id,
+                StarGiftCollectionId::get_star_gift_collection_ids(&request.collection_ids),
+                promise,
+            );
+        }
+
+        // deleteGiftCollection (Requests.cpp:8713-8719)
+        Function::deleteGiftCollection(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let owner_dialog_id = match owner_dialog_id!(td, request.owner_id) {
+                std::result::Result::Ok(dialog_id) => dialog_id,
+                std::result::Result::Err(status) => return send_error_status(td, id, status),
+            };
+            let promise = ok_promise!(td);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.delete_gift_collection(
+                &mut env,
+                owner_dialog_id,
+                StarGiftCollectionId::new(request.collection_id),
+                promise,
+            );
+        }
+
+        // setGiftCollectionName (Requests.cpp:8721-8728)
+        Function::setGiftCollectionName(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = clean_or_utf8_error(td, id, &request.name) else {
+                return;
+            };
+            let owner_dialog_id = match owner_dialog_id!(td, request.owner_id) {
+                std::result::Result::Ok(dialog_id) => dialog_id,
+                std::result::Result::Err(status) => return send_error_status(td, id, status),
+            };
+            let promise =
+                td.deferred_promise::<td_api::GiftCollection, _>(id, Object::giftCollection);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.set_gift_collection_title(
+                &mut env,
+                owner_dialog_id,
+                StarGiftCollectionId::new(request.collection_id),
+                &name,
+                promise,
+            );
+        }
+
+        // addGiftCollectionGifts (Requests.cpp:8730-8737)
+        Function::addGiftCollectionGifts(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let owner_dialog_id = match owner_dialog_id!(td, request.owner_id) {
+                std::result::Result::Ok(dialog_id) => dialog_id,
+                std::result::Result::Err(status) => return send_error_status(td, id, status),
+            };
+            let promise =
+                td.deferred_promise::<td_api::GiftCollection, _>(id, Object::giftCollection);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.add_gift_collection_gifts(
+                &mut env,
+                owner_dialog_id,
+                StarGiftCollectionId::new(request.collection_id),
+                StarGiftId::get_star_gift_ids(&request.received_gift_ids),
+                promise,
+            );
+        }
+
+        // removeGiftCollectionGifts (Requests.cpp:8739-8746)
+        Function::removeGiftCollectionGifts(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let owner_dialog_id = match owner_dialog_id!(td, request.owner_id) {
+                std::result::Result::Ok(dialog_id) => dialog_id,
+                std::result::Result::Err(status) => return send_error_status(td, id, status),
+            };
+            let promise =
+                td.deferred_promise::<td_api::GiftCollection, _>(id, Object::giftCollection);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.remove_gift_collection_gifts(
+                &mut env,
+                owner_dialog_id,
+                StarGiftCollectionId::new(request.collection_id),
+                StarGiftId::get_star_gift_ids(&request.received_gift_ids),
+                promise,
+            );
+        }
+
+        // reorderGiftCollectionGifts (Requests.cpp:8748-8756)
+        Function::reorderGiftCollectionGifts(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let owner_dialog_id = match owner_dialog_id!(td, request.owner_id) {
+                std::result::Result::Ok(dialog_id) => dialog_id,
+                std::result::Result::Err(status) => return send_error_status(td, id, status),
+            };
+            let promise =
+                td.deferred_promise::<td_api::GiftCollection, _>(id, Object::giftCollection);
+            let mut env = star_gift_env!(td);
+            td.star_gift_manager.reorder_gift_collection_gifts(
+                &mut env,
+                owner_dialog_id,
+                StarGiftCollectionId::new(request.collection_id),
+                StarGiftId::get_star_gift_ids(&request.received_gift_ids),
+                promise,
+            );
+        }
+
+        // the group only carries the star gift arms
+
+        // Everything else waits for its manager step.
         // --- themes (Requests.cpp:5838-5850) ---
         Function::getGiftChatThemes(request) => {
             if !check_is_user(td, id) {
@@ -3426,15 +4249,16 @@ mod request_census_tests {
 assert_eq!(*counts.get("sync").unwrap_or(&0), 19, "sync count");
 assert_eq!(
     *counts.get("dispatched").unwrap_or(&0),
-    174,
+    214,
     "dispatched count"
 );
 assert_eq!(
     *counts.get("interim").unwrap_or(&0),
-    829,
+    789,
     "interim count"
 );
     }
 }
+
 
 

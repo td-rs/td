@@ -7,6 +7,7 @@
 //! ([`synchronous_requests`]); the full ClientManager port is S70, the
 //! Options manager S69.
 
+pub mod star_gift_manager;
 pub mod theme_manager;
 pub mod account_manager;
 pub mod age_verification_parameters;
