@@ -52,6 +52,7 @@ use crate::td::AutosaveEnv;
 use crate::td::BoostEnv;
 use crate::td::CallEnv;
 use crate::td::CommunityEnv;
+use crate::td::MessageQueryEnv;
 use crate::td::NotificationEnv;
 use crate::td::PremiumTdEnv;
 use crate::td::QuickReplyEnv;
@@ -274,6 +275,26 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                     updates: &mut td.notification_updates,
                 };
                 td.notification_manager
+                    .get_current_state(&env, &mut updates);
+            }
+
+            // MessageQueryManager::get_current_state
+            // (Requests.cpp:2255 — after the star/group-call blocks; the
+            // managers in between are pending). The manager's own is_bot
+            // gate applies; the emoji-game update carries the 60-second
+            // freshness window.
+            if !td.auth_manager.is_bot() {
+                let env = MessageQueryEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_authorized: td.auth_manager.is_authorized(),
+                    auth_is_bot: false,
+                    can_ignore_background_updates: td.can_ignore_background_updates,
+                    updates: &mut td.message_query_updates,
+                    user_manager: &mut td.user_manager,
+                    updates_manager: &mut td.updates_manager,
+                };
+                td.message_query_manager
                     .get_current_state(&env, &mut updates);
             }
 
@@ -2348,6 +2369,17 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
                 Ok(found) => td.send_result(id, Object::foundFileDownloads(found)),
                 Err(status) => send_error_status(td, id, status),
             }
+        }
+
+        // editCallbackQueryMessage (Requests.cpp:4405-4411): CHECK_IS_BOT,
+        // then MessageQueryManager::edit_callback_query_message answers
+        // 500 "Unsupported" unconditionally
+        // (MessageQueryManager.cpp:4200-4203) — the fully local band.
+        Function::editCallbackQueryMessage(_) => {
+            if !check_is_bot(td, id) {
+                return;
+            }
+            td.send_error_impl(id, 500, "Unsupported");
         }
 
         // --- messages, read family (Requests.cpp:2626-2800) ---
@@ -9134,9 +9166,9 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 19, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            448,
+            449,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 555, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 554, "interim count");
     }
 }

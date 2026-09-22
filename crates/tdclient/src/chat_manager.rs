@@ -233,6 +233,52 @@ impl MessageId {
         self.0
     }
 
+    /// `MessageId::get_message_id(message, is_scheduled)`
+    /// (MessageId.cpp:28-47) — the wire constructor; the Rust name
+    /// retires the C++ overload set.
+    pub fn from_telegram_message(
+        message: &tdmtproto::telegram_api::Message,
+        is_scheduled: bool,
+    ) -> MessageId {
+        match message {
+            tdmtproto::telegram_api::Message::messageEmpty(message) => {
+                if is_scheduled {
+                    MessageId::new(0)
+                } else {
+                    MessageId::from_server_message_id(crate::dialog_id::ServerMessageId::new(
+                        message.id,
+                    ))
+                }
+            }
+            tdmtproto::telegram_api::Message::message(message) => {
+                if is_scheduled {
+                    MessageId::from_scheduled(
+                        crate::dialog_id::ScheduledServerMessageId::new(message.id),
+                        message.date,
+                        false,
+                    )
+                } else {
+                    MessageId::from_server_message_id(crate::dialog_id::ServerMessageId::new(
+                        message.id,
+                    ))
+                }
+            }
+            tdmtproto::telegram_api::Message::messageService(message) => {
+                if is_scheduled {
+                    MessageId::from_scheduled(
+                        crate::dialog_id::ScheduledServerMessageId::new(message.id),
+                        message.date,
+                        false,
+                    )
+                } else {
+                    MessageId::from_server_message_id(crate::dialog_id::ServerMessageId::new(
+                        message.id,
+                    ))
+                }
+            }
+        }
+    }
+
     /// `MessageId::is_valid` (MessageId.cpp:104-117).
     pub fn is_valid(self) -> bool {
         if self.0 <= 0 || self.0 > Self::max().get() {

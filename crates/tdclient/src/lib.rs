@@ -76,6 +76,7 @@ pub mod message_content;
 pub mod message_db;
 pub mod message_entity;
 pub mod message_id;
+pub mod message_query_manager;
 pub mod message_sender;
 pub mod messages_manager;
 pub mod misc;
