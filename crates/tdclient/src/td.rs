@@ -278,6 +278,19 @@ pub struct Td {
     /// M.45 bot-administration query surface; its parked query promises
     /// and the bot-info fan-in live in it.
     pub(crate) bot_info_manager: crate::bot_info_manager::BotInfoManager,
+    /// `Td::callback_queries_manager_` (`Td.cpp:1151`,
+    /// `init_non_actor_managers` — the plain unique_ptr with no actor).
+    pub(crate) callback_queries_manager: crate::callback_queries_manager::CallbackQueriesManager,
+    /// `Td::bot_recommendation_manager_` (`Td.cpp:1178`,
+    /// `init_managers`).
+    pub(crate) bot_recommendation_manager:
+        crate::bot_recommendation_manager::BotRecommendationManager,
+    /// `Td::game_manager_` (`Td.cpp:1228-1230`, `init_managers`; the C++
+    /// also hands the actor to `G()->set_game_manager` — the net step).
+    pub(crate) game_manager: crate::game_manager::GameManager,
+    /// `Td::web_app_manager_` (`Td.cpp:1329-1331`, `init_managers`; the
+    /// actor id also lands in `G()->set_web_app_manager` — the net step).
+    pub(crate) web_app_manager: crate::web_app_manager::WebAppManager,
     pub(crate) auth_manager: AuthManager,
     /// `Td::user_manager_` — the user/secret-chat cache (created with Td,
     /// loaded from the binlog pmc in `init` like the C++ constructor).
@@ -660,6 +673,12 @@ impl Td {
             manager_states: ManagerOptionStates::default(),
             link_manager: None,
             bot_info_manager: crate::bot_info_manager::BotInfoManager::new(),
+            callback_queries_manager: crate::callback_queries_manager::CallbackQueriesManager::new(
+            ),
+            bot_recommendation_manager:
+                crate::bot_recommendation_manager::BotRecommendationManager::new(),
+            game_manager: crate::game_manager::GameManager::new(),
+            web_app_manager: crate::web_app_manager::WebAppManager::new(),
             auth_manager: AuthManager::new(),
             user_manager: UserManager::new(),
             notification_manager: NotificationManager::default(),
@@ -7303,6 +7322,429 @@ impl crate::bot_info_manager::BotInfoManagerEnv for BotInfoEnv<'_> {
                 .have_secret_chat(dialog_id.get_secret_chat_id()),
             DialogType::None => false,
         }
+    }
+}
+
+/// The `G()`/manager slice the four M.46 bot managers read through (the
+/// C++ managers read the same surfaces off their `Td *td_` directly):
+/// the whole `Td` rides the env, so the dialog/message free functions
+/// keep their `&mut Td` signatures (the NotificationEnv field-split is
+/// not enough here); the manager state itself is taken out of the `Td`
+/// for the call (see the request arms in [`crate::requests`]).
+pub(crate) struct BotEnv<'a> {
+    pub(crate) td: &'a mut Td,
+}
+
+/// The `tdutils::status::Result` → `std::result::Result` rewrap the
+/// env traits use (the manager modules return the std form).
+fn bot_dialog_result(result: tdutils::status::Result<()>) -> std::result::Result<(), Status> {
+    match result {
+        tdutils::status::Result::Ok(()) => Ok(()),
+        tdutils::status::Result::Err(status) => Err(status),
+    }
+}
+
+/// The disjoint `UserEnv` + manager borrow (the `chat_env_split`
+/// convention in requests.rs).
+fn bot_user_split(td: &mut Td) -> (UserEnv<'_>, &mut crate::user_manager::UserManager) {
+    let options = td
+        .option_manager
+        .as_mut()
+        .expect("bot requests run with the initialized option manager");
+    let env = UserEnv {
+        global: &mut td.global,
+        options,
+        auth_is_bot: td.auth_manager.is_bot(),
+    };
+    (env, &mut td.user_manager)
+}
+
+impl crate::photo::PhotoStoreEnv for BotEnv<'_> {
+    fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>) {
+        self.td.file_manager.lock().store_file(file_id, out);
+    }
+
+    fn parse_file_id(
+        &mut self,
+        parser: &mut crate::store_parse::Parser<'_>,
+    ) -> Result<FileId, &'static str> {
+        self.td.file_manager.lock().parse_file(parser)
+    }
+}
+
+impl crate::web_app::WebAppEnv for BotEnv<'_> {
+    // every WebAppEnv surface is a seam: the document classification is
+    // [blocked: Documents], the photo/animation object builders are the
+    // FileManager/AnimationsManager object seams
+}
+
+impl crate::message_entity::UserManagerLike for BotEnv<'_> {
+    fn resolve_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
+        let (mut env, user_manager) = bot_user_split(self.td);
+        user_manager.get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn ensure_input_user(&mut self, user_id: UserId) -> Result<(), Status> {
+        let (env, user_manager) = bot_user_split(self.td);
+        user_manager.get_input_user(&env, user_id).map(|_| ())
+    }
+
+    fn have_min_user(&self, user_id: UserId) -> bool {
+        self.td.user_manager.have_min_user(user_id)
+    }
+
+    fn get_input_user_force(&mut self, user_id: UserId) -> telegram_api::InputUser {
+        let (env, user_manager) = bot_user_split(self.td);
+        user_manager.get_input_user_force(&env, user_id)
+    }
+
+    fn is_user_bot(&self, user_id: UserId) -> bool {
+        self.td.user_manager.is_user_bot_of(user_id)
+    }
+}
+
+impl crate::game::GameEnv for BotEnv<'_> {}
+
+impl crate::web_app_manager::WebAppManagerEnv for BotEnv<'_> {
+    fn is_authorized(&self) -> bool {
+        self.td.auth_manager.is_authorized()
+    }
+
+    fn is_bot(&self) -> bool {
+        self.td.auth_manager.is_bot()
+    }
+
+    fn close_flag(&self) -> bool {
+        self.td.global.close_flag()
+    }
+
+    fn unix_time(&self) -> i32 {
+        self.td.global.unix_time()
+    }
+
+    fn get_input_user(&mut self, bot_user_id: UserId) -> Result<telegram_api::InputUser, Status> {
+        let (env, user_manager) = bot_user_split(self.td);
+        user_manager.get_input_user(&env, bot_user_id)
+    }
+
+    fn get_bot_data(
+        &mut self,
+        bot_user_id: UserId,
+    ) -> Result<crate::user_manager::BotData, Status> {
+        self.td.user_manager.get_bot_data(bot_user_id)
+    }
+
+    fn is_user_bot(&mut self, user_id: UserId) -> bool {
+        self.td.user_manager.is_user_bot_of(user_id)
+    }
+
+    fn on_get_user(&mut self, user: telegram_api::User, source: &str) -> UserId {
+        let (mut env, user_manager) = bot_user_split(self.td);
+        user_manager.on_get_user(&mut env, user, source)
+    }
+
+    fn get_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
+        let (mut env, user_manager) = bot_user_split(self.td);
+        user_manager.get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn have_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> bool {
+        crate::dialog_manager::have_input_peer(self.td, dialog_id, false, access_rights)
+    }
+
+    fn get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<telegram_api::InputPeer> {
+        crate::dialog_manager::get_input_peer(self.td, dialog_id, access_rights)
+    }
+
+    fn is_monoforum_channel(&mut self, dialog_id: crate::dialog_id::DialogId) -> bool {
+        crate::dialog_manager::is_monoforum_channel(self.td, dialog_id)
+    }
+
+    fn is_admined_monoforum_channel(&mut self, dialog_id: crate::dialog_id::DialogId) -> bool {
+        crate::dialog_manager::is_admined_monoforum_channel(self.td, dialog_id)
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+        source: &str,
+    ) -> Result<(), Status> {
+        bot_dialog_result(crate::dialog_manager::check_dialog_access(
+            self.td,
+            dialog_id,
+            false,
+            access_rights,
+            source,
+        ))
+    }
+
+    fn on_get_dialog_error(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        status: &Status,
+        source: &str,
+    ) -> bool {
+        crate::dialog_manager::on_get_dialog_error(self.td, dialog_id, status, source)
+    }
+
+    fn have_dialog_force(&mut self, dialog_id: crate::dialog_id::DialogId, source: &str) -> bool {
+        crate::dialog_manager::have_dialog_force(self.td, dialog_id, source)
+    }
+
+    fn is_megagroup_channel(&mut self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        // `chat_manager_->is_megagroup_channel` — the unloaded-channel
+        // C++ result (the stub inventory)
+        let _ = channel_id;
+        false
+    }
+
+    fn create_web_app_file_source(&mut self, user_id: UserId, short_name: &str) -> FileSourceId {
+        self.td
+            .file_reference_manager
+            .intern(crate::files::FileSource::WebApp {
+                user_id,
+                short_name: short_name.to_owned(),
+            })
+    }
+
+    fn add_file_source(&mut self, file_id: FileId, file_source_id: FileSourceId, source: &str) {
+        let _ = source;
+        self.td
+            .file_reference_manager
+            .add_file_source(file_id, file_source_id);
+    }
+}
+
+impl crate::callback_queries_manager::CallbackQueriesManagerEnv for BotEnv<'_> {
+    fn is_bot(&self) -> bool {
+        self.td.auth_manager.is_bot()
+    }
+
+    fn close_flag(&mut self) -> bool {
+        self.td.global.close_flag()
+    }
+
+    fn have_min_user(&mut self, sender_user_id: UserId) -> bool {
+        self.td.user_manager.have_min_user(sender_user_id)
+    }
+
+    fn get_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
+        let (mut env, user_manager) = bot_user_split(self.td);
+        user_manager.get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.td.notification_updates.push(update);
+    }
+
+    fn force_create_dialog(&mut self, dialog_id: crate::dialog_id::DialogId, source: &str) {
+        crate::dialog_manager::force_create_dialog(self.td, dialog_id, source)
+    }
+
+    fn get_chat_id_object(&mut self, dialog_id: crate::dialog_id::DialogId, source: &str) -> i64 {
+        crate::dialog_manager::get_chat_id_object(dialog_id, source)
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        source: &str,
+    ) -> Result<(), Status> {
+        bot_dialog_result(crate::dialog_manager::check_dialog_access(
+            self.td,
+            dialog_id,
+            false,
+            crate::user_manager::AccessRights::Read,
+            source,
+        ))
+    }
+
+    fn check_dialog_access_in_memory(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> Result<(), Status> {
+        bot_dialog_result(crate::dialog_manager::check_dialog_access_in_memory(
+            self.td,
+            dialog_id,
+            false,
+            crate::user_manager::AccessRights::Read,
+        ))
+    }
+
+    fn on_get_dialog_error(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        status: &Status,
+        source: &str,
+    ) -> bool {
+        crate::dialog_manager::on_get_dialog_error(self.td, dialog_id, status, source)
+    }
+
+    fn have_message_force(
+        &mut self,
+        message_full_id: crate::message_id::MessageFullId,
+        source: &str,
+    ) -> bool {
+        let _ = (message_full_id, source);
+        tdutils::log_info!("MessagesManager::have_message_force — [blocked: M.10 Messages]");
+        false
+    }
+}
+
+impl crate::bot_recommendation_manager::BotRecommendationManagerEnv for BotEnv<'_> {
+    fn is_user_bot(&mut self, bot_user_id: UserId) -> bool {
+        self.td.user_manager.is_user_bot_of(bot_user_id)
+    }
+
+    fn get_input_user(&mut self, bot_user_id: UserId) -> Result<telegram_api::InputUser, Status> {
+        let (env, user_manager) = bot_user_split(self.td);
+        user_manager.get_input_user(&env, bot_user_id)
+    }
+
+    fn on_get_user(&mut self, user: telegram_api::User, source: &str) -> UserId {
+        let (mut env, user_manager) = bot_user_split(self.td);
+        user_manager.on_get_user(&mut env, user, source)
+    }
+
+    fn get_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
+        let (mut env, user_manager) = bot_user_split(self.td);
+        user_manager.get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn get_users_object(&mut self, total_count: i32, user_ids: &[UserId]) -> td_api::Users {
+        let (mut env, user_manager) = bot_user_split(self.td);
+        user_manager.get_users_object_of(&mut env, total_count, user_ids)
+    }
+
+    fn get_option_boolean(&mut self, name: &str) -> bool {
+        self.td
+            .option_manager
+            .as_ref()
+            .is_some_and(|options| options.get_option_boolean(name, false))
+    }
+
+    fn use_message_database(&mut self) -> bool {
+        self.td.global.use_message_database()
+    }
+
+    fn close_flag(&mut self) -> bool {
+        self.td.global.close_flag()
+    }
+
+    fn sqlite_pmc_get_raw(&mut self, key: &str) -> Vec<u8> {
+        self.td.global.td_db().common_kv().get(key.as_bytes())
+    }
+
+    fn sqlite_pmc_set_raw(&mut self, key: &str, value: &[u8]) {
+        self.td
+            .global
+            .td_db()
+            .common_kv()
+            .set(key.as_bytes(), value);
+    }
+
+    fn sqlite_pmc_erase(&mut self, key: &str) {
+        self.td.global.td_db().common_kv().erase(key.as_bytes());
+    }
+}
+
+impl crate::game_manager::GameManagerEnv for BotEnv<'_> {
+    fn is_bot(&self) -> bool {
+        self.td.auth_manager.is_bot()
+    }
+
+    fn get_input_user(&mut self, user_id: UserId) -> Result<telegram_api::InputUser, Status> {
+        let (env, user_manager) = bot_user_split(self.td);
+        user_manager.get_input_user(&env, user_id)
+    }
+
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        let (mut env, user_manager) = bot_user_split(self.td);
+        user_manager.on_get_users(&mut env, users, source)
+    }
+
+    fn get_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
+        let (mut env, user_manager) = bot_user_split(self.td);
+        user_manager.get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+        source: &str,
+    ) -> Result<(), Status> {
+        bot_dialog_result(crate::dialog_manager::check_dialog_access(
+            self.td,
+            dialog_id,
+            false,
+            access_rights,
+            source,
+        ))
+    }
+
+    fn on_get_dialog_error(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        status: &Status,
+        source: &str,
+    ) {
+        crate::dialog_manager::on_get_dialog_error(self.td, dialog_id, status, source);
+    }
+
+    fn have_message_force(
+        &mut self,
+        message_full_id: crate::message_id::MessageFullId,
+        source: &str,
+    ) -> bool {
+        let _ = (message_full_id, source);
+        tdutils::log_info!("MessagesManager::have_message_force — [blocked: M.10 Messages]");
+        false
+    }
+
+    fn can_set_game_score(&mut self, message_full_id: crate::message_id::MessageFullId) -> bool {
+        let _ = message_full_id;
+        tdutils::log_info!("MessagesManager::can_set_game_score — [blocked: M.10 Messages]");
+        false
+    }
+
+    fn get_message_object(
+        &mut self,
+        message_full_id: crate::message_id::MessageFullId,
+        source: &str,
+    ) -> Option<td_api::Message> {
+        let _ = (message_full_id, source);
+        tdutils::log_info!("MessagesManager::get_message_object — [blocked: M.10 Messages]");
+        None
+    }
+
+    fn on_get_updates(&mut self, updates: telegram_api::Updates, promise: Promise<()>) {
+        let options = self
+            .td
+            .option_manager
+            .as_mut()
+            .expect("option manager exists after init");
+        let global = &mut self.td.global;
+        let mut env = TdUpdatesEnv {
+            global,
+            options,
+            auth_is_authorized: self.td.auth_manager.is_authorized(),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+            my_id: self.td.user_manager.get_my_id().get(),
+            can_ignore_background_updates: self.td.can_ignore_background_updates,
+        };
+        self.td
+            .updates_manager
+            .on_get_updates(&mut env, updates, promise);
     }
 }
 

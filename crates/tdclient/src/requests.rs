@@ -5015,12 +5015,442 @@ fn run_bot_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
 
+        // The M.46 bots arm group rides the same depth rule: a cheap
+        // predicate forwards it at this level instead of nesting it under
+        // the older groups.
+        function if is_bot_request(&function) => run_bot_requests_46(td, id, function),
         // Everything else waits for its manager step.
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
         }
     }
 }
+/// Whether the function is one of the M.46 bots arm group (the cheap
+/// reference match keeps the dispatcher frame small).
+fn is_bot_request(function: &Function) -> bool {
+    matches!(
+        function,
+        Function::getBotSimilarBots(_)
+            | Function::getBotSimilarBotCount(_)
+            | Function::openBotSimilarBot(_)
+            | Function::setGameScore(_)
+            | Function::getGameHighScores(_)
+            | Function::sendWebAppCustomRequest(_)
+            | Function::getGrossingWebAppBots(_)
+            | Function::searchWebApp(_)
+            | Function::getWebAppLinkUrl(_)
+            | Function::getMainWebApp(_)
+            | Function::openWebApp(_)
+            | Function::closeWebApp(_)
+            | Function::checkWebAppFileDownload(_)
+            | Function::getCallbackQueryAnswer(_)
+            | Function::answerCallbackQuery(_)
+    )
+}
+
+/// The M.46 bots arm group of the request dispatcher — see the
+/// frame note at the forward site in [`run_request`]. The manager state
+/// is `std::mem::take`-n out of the `Td` for the call because the
+/// [`crate::td::BotEnv`] holds the whole `Td` (the dialog/message free
+/// functions keep their `&mut Td` signatures); it is put back after the
+/// env drops. Every arm body is an `#[inline(never)]` helper so this
+/// frame stays small on the 2 MiB test-thread stack (the M.6 gate).
+#[inline(never)]
+fn run_bot_requests_46(td: &mut Td, id: u64, function: Function) {
+    match function {
+        // getBotSimilarBots (Requests.cpp:3210-3215)
+        Function::getBotSimilarBots(request) => arm_get_bot_similar_bots(td, id, request),
+        // getBotSimilarBotCount (Requests.cpp:3217-3222)
+        Function::getBotSimilarBotCount(request) => arm_get_bot_similar_bot_count(td, id, request),
+        // openBotSimilarBot (Requests.cpp:3224-3229)
+        Function::openBotSimilarBot(request) => arm_open_bot_similar_bot(td, id, request),
+        // setGameScore (Requests.cpp:4911-4918)
+        Function::setGameScore(request) => arm_set_game_score(td, id, request),
+        // getGameHighScores (Requests.cpp:4926-4931)
+        Function::getGameHighScores(request) => arm_get_game_high_scores(td, id, request),
+        // sendWebAppCustomRequest (Requests.cpp:6916-6922)
+        Function::sendWebAppCustomRequest(request) => {
+            arm_send_web_app_custom_request(td, id, request)
+        }
+        // getGrossingWebAppBots (Requests.cpp:8253-8257)
+        Function::getGrossingWebAppBots(request) => arm_get_grossing_web_app_bots(td, id, request),
+        // searchWebApp (Requests.cpp:8259-8264)
+        Function::searchWebApp(request) => arm_search_web_app(td, id, request),
+        // getWebAppLinkUrl (Requests.cpp:8274-8281)
+        Function::getWebAppLinkUrl(request) => arm_get_web_app_link_url(td, id, request),
+        // getMainWebApp (Requests.cpp:8283-8289)
+        Function::getMainWebApp(request) => arm_get_main_web_app(td, id, request),
+        // openWebApp (Requests.cpp:8318-8325)
+        Function::openWebApp(request) => arm_open_web_app(td, id, request),
+        // closeWebApp (Requests.cpp:8327-8330)
+        Function::closeWebApp(request) => arm_close_web_app(td, id, request),
+        // checkWebAppFileDownload (Requests.cpp:8342-8347)
+        Function::checkWebAppFileDownload(request) => {
+            arm_check_web_app_file_download(td, id, request)
+        }
+        // getCallbackQueryAnswer (Requests.cpp:8357-8361)
+        Function::getCallbackQueryAnswer(request) => arm_get_callback_query_answer(td, id, request),
+        // answerCallbackQuery (Requests.cpp:8363-8369)
+        Function::answerCallbackQuery(request) => arm_answer_callback_query(td, id, request),
+
+        // Everything else waits for its manager step.
+        _ => {
+            td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+        }
+    }
+}
+
+#[inline(never)]
+fn arm_get_bot_similar_bots(td: &mut Td, id: u64, request: td_api::getBotSimilarBots) {
+    if !check_is_user(td, id) {
+        return;
+    }
+    let users_promise = td.deferred_promise::<td_api::Users, _>(id, Object::users);
+    let mut manager = std::mem::take(&mut td.bot_recommendation_manager);
+    {
+        let mut env = crate::td::BotEnv { td };
+        manager.get_bot_recommendations(
+            &mut env,
+            UserId::new(request.bot_user_id),
+            false,
+            users_promise,
+            Promise::default(),
+        );
+    }
+    td.bot_recommendation_manager = manager;
+}
+
+#[inline(never)]
+fn arm_get_bot_similar_bot_count(td: &mut Td, id: u64, request: td_api::getBotSimilarBotCount) {
+    if !check_is_user(td, id) {
+        return;
+    }
+    let count_promise =
+        td.deferred_promise::<i32, _>(id, |count| Object::count(td_api::Count { count }));
+    let mut manager = std::mem::take(&mut td.bot_recommendation_manager);
+    {
+        let mut env = crate::td::BotEnv { td };
+        manager.get_bot_recommendations(
+            &mut env,
+            UserId::new(request.bot_user_id),
+            request.return_local,
+            Promise::default(),
+            count_promise,
+        );
+    }
+    td.bot_recommendation_manager = manager;
+}
+
+#[inline(never)]
+fn arm_open_bot_similar_bot(td: &mut Td, id: u64, request: td_api::openBotSimilarBot) {
+    if !check_is_user(td, id) {
+        return;
+    }
+    let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+    let mut manager = std::mem::take(&mut td.bot_recommendation_manager);
+    {
+        let mut env = crate::td::BotEnv { td };
+        manager.open_bot_recommended_bot(
+            &mut env,
+            UserId::new(request.bot_user_id),
+            UserId::new(request.opened_bot_user_id),
+            promise,
+        );
+    }
+    td.bot_recommendation_manager = manager;
+}
+
+#[inline(never)]
+fn arm_set_game_score(td: &mut Td, id: u64, request: td_api::setGameScore) {
+    if !check_is_bot(td, id) {
+        return;
+    }
+    let promise = td.deferred_promise::<td_api::Message, _>(id, Object::message);
+    let mut manager = std::mem::take(&mut td.game_manager);
+    {
+        let mut env = crate::td::BotEnv { td };
+        manager.set_game_score(
+            &mut env,
+            crate::message_id::MessageFullId::new(
+                crate::message_id::DialogId::new(request.chat_id),
+                crate::message_id::MessageId::new(request.message_id),
+            ),
+            request.edit_message,
+            UserId::new(request.user_id),
+            request.score,
+            request.force,
+            promise,
+        );
+    }
+    td.game_manager = manager;
+}
+
+#[inline(never)]
+fn arm_get_game_high_scores(td: &mut Td, id: u64, request: td_api::getGameHighScores) {
+    if !check_is_bot(td, id) {
+        return;
+    }
+    let promise = td.deferred_promise::<td_api::GameHighScores, _>(id, Object::gameHighScores);
+    let mut manager = std::mem::take(&mut td.game_manager);
+    {
+        let mut env = crate::td::BotEnv { td };
+        manager.get_game_high_scores(
+            &mut env,
+            crate::message_id::MessageFullId::new(
+                crate::message_id::DialogId::new(request.chat_id),
+                crate::message_id::MessageId::new(request.message_id),
+            ),
+            UserId::new(request.user_id),
+            promise,
+        );
+    }
+    td.game_manager = manager;
+}
+
+#[inline(never)]
+fn arm_send_web_app_custom_request(td: &mut Td, id: u64, request: td_api::sendWebAppCustomRequest) {
+    if !check_is_user(td, id) {
+        return;
+    }
+    let Some(method) = clean_or_utf8_error(td, id, &request.method) else {
+        return;
+    };
+    let Some(parameters) = clean_or_utf8_error(td, id, &request.parameters) else {
+        return;
+    };
+    let promise =
+        td.deferred_promise::<td_api::CustomRequestResult, _>(id, Object::customRequestResult);
+    let mut manager = std::mem::take(&mut td.web_app_manager);
+    {
+        let mut env = crate::td::BotEnv { td };
+        manager.invoke_web_view_custom_method(
+            &mut env,
+            UserId::new(request.bot_user_id),
+            &method,
+            &parameters,
+            promise,
+        );
+    }
+    td.web_app_manager = manager;
+}
+
+#[inline(never)]
+fn arm_get_grossing_web_app_bots(td: &mut Td, id: u64, request: td_api::getGrossingWebAppBots) {
+    if !check_is_user(td, id) {
+        return;
+    }
+    let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+        return;
+    };
+    let promise = td.deferred_promise::<td_api::FoundUsers, _>(id, Object::foundUsers);
+    let mut manager = std::mem::take(&mut td.web_app_manager);
+    {
+        let mut env = crate::td::BotEnv { td };
+        manager.get_popular_app_bots(&mut env, &offset, request.limit, promise);
+    }
+    td.web_app_manager = manager;
+}
+
+#[inline(never)]
+fn arm_search_web_app(td: &mut Td, id: u64, request: td_api::searchWebApp) {
+    if !check_is_user(td, id) {
+        return;
+    }
+    let Some(web_app_short_name) = clean_or_utf8_error(td, id, &request.web_app_short_name) else {
+        return;
+    };
+    // the C++ null foundWebApp (the BOT_APP_INVALID answer) becomes the
+    // 404 in send_result
+    let promise = td.deferred_promise::<Option<td_api::FoundWebApp>, _>(id, |found| match found {
+        Some(found) => Object::foundWebApp(found),
+        None => Object::error(td_api::Error {
+            code: 404,
+            message: "Not Found".to_owned(),
+        }),
+    });
+    let mut manager = std::mem::take(&mut td.web_app_manager);
+    {
+        let mut env = crate::td::BotEnv { td };
+        manager.get_web_app(
+            &mut env,
+            UserId::new(request.bot_user_id),
+            &web_app_short_name,
+            promise,
+        );
+    }
+    td.web_app_manager = manager;
+}
+
+#[inline(never)]
+fn arm_get_web_app_link_url(td: &mut Td, id: u64, request: td_api::getWebAppLinkUrl) {
+    if !check_is_user(td, id) {
+        return;
+    }
+    let Some(web_app_short_name) = clean_or_utf8_error(td, id, &request.web_app_short_name) else {
+        return;
+    };
+    let Some(start_parameter) = clean_or_utf8_error(td, id, &request.start_parameter) else {
+        return;
+    };
+    let parameters = crate::web_app::WebAppOpenParameters::from_td_api(request.parameters);
+    let promise = td.deferred_promise::<td_api::WebAppUrl, _>(id, Object::webAppUrl);
+    let mut manager = std::mem::take(&mut td.web_app_manager);
+    {
+        let mut env = crate::td::BotEnv { td };
+        manager.request_app_web_view(
+            &mut env,
+            crate::dialog_id::DialogId::new(request.chat_id),
+            UserId::new(request.bot_user_id),
+            &web_app_short_name,
+            &start_parameter,
+            &parameters,
+            request.allow_write_access,
+            promise,
+        );
+    }
+    td.web_app_manager = manager;
+}
+
+#[inline(never)]
+fn arm_get_main_web_app(td: &mut Td, id: u64, request: td_api::getMainWebApp) {
+    if !check_is_user(td, id) {
+        return;
+    }
+    let Some(start_parameter) = clean_or_utf8_error(td, id, &request.start_parameter) else {
+        return;
+    };
+    let parameters = crate::web_app::WebAppOpenParameters::from_td_api(request.parameters);
+    let promise = td.deferred_promise::<td_api::MainWebApp, _>(id, Object::mainWebApp);
+    let mut manager = std::mem::take(&mut td.web_app_manager);
+    {
+        let mut env = crate::td::BotEnv { td };
+        manager.request_main_web_view(
+            &mut env,
+            crate::dialog_id::DialogId::new(request.chat_id),
+            UserId::new(request.bot_user_id),
+            &start_parameter,
+            &parameters,
+            promise,
+        );
+    }
+    td.web_app_manager = manager;
+}
+
+#[inline(never)]
+fn arm_open_web_app(td: &mut Td, id: u64, request: td_api::openWebApp) {
+    if !check_is_user(td, id) {
+        return;
+    }
+    let Some(url) = clean_or_utf8_error(td, id, &request.url) else {
+        return;
+    };
+    let parameters = crate::web_app::WebAppOpenParameters::from_td_api(request.parameters);
+    let promise = td.deferred_promise::<td_api::WebAppInfo, _>(id, Object::webAppInfo);
+    let mut manager = std::mem::take(&mut td.web_app_manager);
+    {
+        let mut env = crate::td::BotEnv { td };
+        manager.request_web_view(
+            &mut env,
+            crate::dialog_id::DialogId::new(request.chat_id),
+            UserId::new(request.bot_user_id),
+            request.topic_id.as_ref(),
+            &url,
+            &parameters,
+            promise,
+        );
+    }
+    td.web_app_manager = manager;
+}
+
+#[inline(never)]
+fn arm_close_web_app(td: &mut Td, id: u64, request: td_api::closeWebApp) {
+    if !check_is_user(td, id) {
+        return;
+    }
+    // the promise completes synchronously
+    let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+    let mut manager = std::mem::take(&mut td.web_app_manager);
+    manager.close_web_view(request.web_app_launch_id, promise);
+    td.web_app_manager = manager;
+}
+
+#[inline(never)]
+fn arm_check_web_app_file_download(td: &mut Td, id: u64, request: td_api::checkWebAppFileDownload) {
+    if !check_is_user(td, id) {
+        return;
+    }
+    let Some(file_name) = clean_or_utf8_error(td, id, &request.file_name) else {
+        return;
+    };
+    let Some(url) = clean_or_utf8_error(td, id, &request.url) else {
+        return;
+    };
+    let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+    let mut manager = std::mem::take(&mut td.web_app_manager);
+    {
+        let mut env = crate::td::BotEnv { td };
+        manager.check_download_file_params(
+            &mut env,
+            UserId::new(request.bot_user_id),
+            &file_name,
+            &url,
+            promise,
+        );
+    }
+    td.web_app_manager = manager;
+}
+
+#[inline(never)]
+fn arm_get_callback_query_answer(td: &mut Td, id: u64, request: td_api::getCallbackQueryAnswer) {
+    if !check_is_user(td, id) {
+        return;
+    }
+    let promise =
+        td.deferred_promise::<td_api::CallbackQueryAnswer, _>(id, Object::callbackQueryAnswer);
+    let mut manager = std::mem::take(&mut td.callback_queries_manager);
+    {
+        let mut env = crate::td::BotEnv { td };
+        manager.send_callback_query(
+            &mut env,
+            crate::message_id::MessageFullId::new(
+                crate::message_id::DialogId::new(request.chat_id),
+                crate::message_id::MessageId::new(request.message_id),
+            ),
+            request.payload,
+            promise,
+        );
+    }
+    td.callback_queries_manager = manager;
+}
+
+#[inline(never)]
+fn arm_answer_callback_query(td: &mut Td, id: u64, request: td_api::answerCallbackQuery) {
+    if !check_is_bot(td, id) {
+        return;
+    }
+    let Some(text) = clean_or_utf8_error(td, id, &request.text) else {
+        return;
+    };
+    let Some(url) = clean_or_utf8_error(td, id, &request.url) else {
+        return;
+    };
+    let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+    let mut manager = std::mem::take(&mut td.callback_queries_manager);
+    {
+        let mut env = crate::td::BotEnv { td };
+        manager.answer_callback_query(
+            &mut env,
+            request.callback_query_id,
+            &text,
+            request.show_alert,
+            &url,
+            request.cache_time,
+            promise,
+        );
+    }
+    td.callback_queries_manager = manager;
+}
+
 /// `CHECK_IS_USER` (Requests.cpp:1997-2000).
 fn check_is_user(td: &mut Td, id: u64) -> bool {
     if td.auth_manager.is_bot() {
@@ -5308,13 +5738,19 @@ mod request_census_tests {
         assert_eq!(generated.len(), crate::td_api::SCHEME_FUNCTIONS);
 
         // The flip-state ledger — re-derived from the fixture at the wave-3
-        // integration (the per-track flip histories compose).
-        assert_eq!(*counts.get("sync").unwrap_or(&0), 19, "sync count");
-        assert_eq!(
-            *counts.get("dispatched").unwrap_or(&0),
-            266,
-            "dispatched count"
-        );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 737, "interim count");
+// integration (the per-track flip histories compose).
+assert_eq!(*counts.get("sync").unwrap_or(&0), 19, "sync count");
+assert_eq!(
+    *counts.get("dispatched").unwrap_or(&0),
+    281,
+    "dispatched count"
+);
+assert_eq!(
+    *counts.get("interim").unwrap_or(&0),
+    722,
+    "interim count"
+);
     }
 }
+
+

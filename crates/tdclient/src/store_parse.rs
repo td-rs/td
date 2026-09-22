@@ -22,7 +22,13 @@ pub mod version {
     pub const ADD_KEY_HASH_TO_SECRET_CHAT: i32 = 2;
     pub const ADD_ACCESS_HASH_TO_SECRET_CHAT: i32 = 5;
     pub const FIX_MIN_USERS: i32 = 10;
+    /// `Version::FixStoreGameWithoutAnimation` (Version.h, the 5th entry).
+    pub const FIX_STORE_GAME_WITHOUT_ANIMATION: i32 = 4;
     pub const ADD_PHOTO_SIZE_SOURCE: i32 = 22;
+    /// `Version::AddDialogPhotoHasAnimation` (Version.h, the 28th entry).
+    pub const ADD_DIALOG_PHOTO_HAS_ANIMATION: i32 = 27;
+    /// `Version::AddPhotoProgressiveSizes` (Version.h, the 29th entry).
+    pub const ADD_PHOTO_PROGRESSIVE_SIZES: i32 = 28;
     pub const SUPPORT_BANNED_CHANNELS: i32 = 31;
     pub const REMOVE_PHOTO_VOLUME_AND_LOCAL_ID: i32 = 32;
     pub const SUPPORT_64_BIT_IDS: i32 = 33;

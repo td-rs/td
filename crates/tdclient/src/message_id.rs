@@ -187,6 +187,51 @@ impl MessageId {
         MessageId((i32::MAX as i64) << 20)
     }
 
+    /// `MessageId::is_server` (MessageId.h:121-124) — also checks
+    /// validness.
+    pub fn is_server(self) -> bool {
+        const SERVER_ID_SHIFT: i64 = 20;
+        const FULL_TYPE_MASK: i64 = (1 << SERVER_ID_SHIFT) - 1;
+        (self.0 & FULL_TYPE_MASK) == 0 && self.0 > 0 && self.0 <= MessageId::max().get()
+    }
+
+    /// `MessageId::is_local` (MessageId.h:116-119) — the short type mask
+    /// excludes the scheduled bit.
+    pub fn is_local(self) -> bool {
+        debug_assert!(self.is_valid() || self.is_scheduled());
+        const SHORT_TYPE_MASK: i64 = (1 << 2) - 1;
+        const TYPE_LOCAL: i64 = 2;
+        (self.0 & SHORT_TYPE_MASK) == TYPE_LOCAL
+    }
+
+    /// `MessageId::is_valid_scheduled` (MessageId.cpp:126-136).
+    pub fn is_valid_scheduled(self) -> bool {
+        const TYPE_MASK: i64 = (1 << 3) - 1;
+        const TYPE_YET_UNSENT: i64 = 1;
+        const TYPE_LOCAL: i64 = 2;
+        if self.0 <= 0 || self.0 > (1i64 << 51) {
+            return false;
+        }
+        let id_type = self.0 & TYPE_MASK;
+        id_type == Self::SCHEDULED_MASK
+            || id_type == (Self::SCHEDULED_MASK | TYPE_YET_UNSENT)
+            || id_type == (Self::SCHEDULED_MASK | TYPE_LOCAL)
+    }
+
+    /// `MessageId::get_server_message_id_force` (MessageId.h:148-150) —
+    /// the C++ `ServerMessageId` is the plain `int32` newtype.
+    pub fn get_server_message_id_force(self) -> i32 {
+        const SERVER_ID_SHIFT: i64 = 20;
+        (self.0 >> SERVER_ID_SHIFT) as i32
+    }
+
+    /// `MessageId::get_server_message_id` (MessageId.h:135-138) — the
+    /// C++ `CHECK(id == 0 || is_server())` is the assert.
+    pub fn get_server_message_id(self) -> i32 {
+        assert!(self.0 == 0 || self.is_server());
+        self.get_server_message_id_force()
+    }
+
     /// `MessageId::store` (MessageId.h:193-195).
     pub fn store(self, out: &mut Vec<u8>) {
         store_parse::store_i64(out, self.0);
