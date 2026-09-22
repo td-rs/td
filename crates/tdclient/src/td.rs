@@ -272,6 +272,8 @@ pub struct Td {
         crate::notification_settings_manager::NotificationSettingsManager,
     /// `Td::device_token_manager_` (`Td.cpp:1345`, M.13S).
     pub(crate) device_token_manager: crate::device_token_manager::DeviceTokenManager,
+    /// `Td::forum_topic_manager_` (`Td.cpp:1297`, M.49).
+    pub(crate) forum_topic_manager: crate::forum_topic_manager::ForumTopicManager,
     /// The notification manager's `send_update` outbox — the collapsed
     /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
     /// [`Td::flush_user_updates`].
@@ -582,6 +584,7 @@ impl Td {
             notification_settings_manager:
                 crate::notification_settings_manager::NotificationSettingsManager::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
+            forum_topic_manager: crate::forum_topic_manager::ForumTopicManager::new(),
             notification_updates: Vec::new(),
             premium_required_contact_merger: None,
             chat_manager: crate::chat_manager::ChatManager::new(),
@@ -5195,6 +5198,34 @@ pub fn send_request(actor: &ActorOwn<Td>, request_id: u64, function: Function) {
             function,
         },
     );
+}
+
+/// The `G()`/`td_` slice the forum plane reads through (the M.49
+/// convention): field-split borrows off `Td`. The [blocked: net] query
+/// tails and the notification-settings/draft halves keep their trait
+/// defaults until their tracks land.
+pub(crate) struct ForumTopicTdEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) auth_is_bot: bool,
+    /// The chat-manager half for the forum checks — kept for the C++
+    /// field parity; the is_forum read lands with the chat plane.
+    #[allow(dead_code)]
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::forum_topic_manager::ForumTopicEnv for ForumTopicTdEnv<'_> {
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn unix_time(&mut self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
 }
 
 #[cfg(test)]

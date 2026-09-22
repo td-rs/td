@@ -27,6 +27,8 @@ pub mod document;
 pub mod emoji_status;
 pub mod files;
 pub mod formatted_date;
+pub mod forum_topic;
+pub mod forum_topic_manager;
 pub mod global;
 pub mod link_manager;
 pub mod manager_option_states;
