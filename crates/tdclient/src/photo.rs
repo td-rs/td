@@ -189,8 +189,9 @@ impl StickerPhotoSize {
 }
 
 /// `td::Photo` (Photo.h:32). The empty id sentinel is the
-/// `MovableValue<int64, -2>` default; `sticker_file_ids` stays out until
-/// the Files step (nothing in the listing path reads it).
+/// `MovableValue<int64, -2>` default; `sticker_file_ids` rides the
+/// `has_stickers` flag exactly like the C++ (`Photo.hpp` persistence
+/// plane, landed with its first consumer M.17).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Photo {
     pub id: i64,
@@ -200,6 +201,7 @@ pub struct Photo {
     pub animations: Vec<AnimationSize>,
     pub sticker_photo_size: Option<StickerPhotoSize>,
     pub has_stickers: bool,
+    pub sticker_file_ids: Vec<FileId>,
 }
 
 impl Default for Photo {
@@ -212,6 +214,7 @@ impl Default for Photo {
             animations: Vec::new(),
             sticker_photo_size: None,
             has_stickers: false,
+            sticker_file_ids: Vec::new(),
         }
     }
 }
@@ -233,7 +236,7 @@ pub fn photo_get_file_ids(photo: &Photo) -> Vec<FileId> {
 }
 
 /// `photo_append_file_ids` (Photo.cpp:440).
-fn photo_append_file_ids(photo: &Photo, file_ids: &mut Vec<FileId>) {
+pub fn photo_append_file_ids(photo: &Photo, file_ids: &mut Vec<FileId>) {
     for photo_size in &photo.photos {
         file_ids.push(photo_size.file_id);
     }
@@ -680,6 +683,314 @@ pub fn dialog_photo_get_file_ids(dialog_photo: &DialogPhoto) -> Vec<FileId> {
     result
 }
 
+// --- the Photo persistence plane (Photo.hpp / PhotoSize.hpp /
+// StickerPhotoSize.hpp), landed with its first consumer (M.17, the
+// WebPage/WebPageBlock records). FileIds ride the
+// [`DialogPhotoStoreEnv`] codec, the M.40 icon-plane encoding.
+
+/// The `FileManager` FileId codec of the persisted sizes.
+pub trait DialogPhotoStoreEnv {
+    /// `storer.context()->td()...->file_manager_->store_file`.
+    fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>);
+
+    /// `parser.context()->td()...->file_manager_->parse_file`.
+    fn parse_file_id(
+        &mut self,
+        parser: &mut crate::store_parse::Parser<'_>,
+    ) -> Result<FileId, &'static str>;
+}
+
+/// `store(Dimensions)` (Dimensions.hpp) — the packed width/height word.
+pub fn store_dimensions(out: &mut Vec<u8>, dimensions: Dimensions) {
+    crate::store_parse::store_u32(
+        out,
+        ((dimensions.width as u32) << 16) | dimensions.height as u32,
+    );
+}
+
+/// `parse(Dimensions)` (Dimensions.hpp).
+pub fn parse_dimensions(
+    parser: &mut crate::store_parse::Parser<'_>,
+) -> Result<Dimensions, &'static str> {
+    let width_height = parser.u32_()?;
+    Ok(Dimensions {
+        width: (width_height >> 16) as u16,
+        height: (width_height & 0xFFFF) as u16,
+    })
+}
+
+/// `store(PhotoSize)` (PhotoSize.hpp:19-29).
+pub fn store_photo_size(
+    env: &mut impl DialogPhotoStoreEnv,
+    photo_size: &PhotoSize,
+    out: &mut Vec<u8>,
+) {
+    crate::store_parse::store_i32(out, photo_size.size_type);
+    store_dimensions(out, photo_size.dimensions);
+    crate::store_parse::store_i32(out, photo_size.size);
+    env.store_file_id(photo_size.file_id, out);
+    crate::store_parse::store_i32_vec(out, &photo_size.progressive_sizes);
+}
+
+/// `parse(PhotoSize)` (PhotoSize.hpp:31-41) — the progressive-sizes tail
+/// is `AddPhotoProgressiveSizes`-gated.
+pub fn parse_photo_size(
+    env: &mut impl DialogPhotoStoreEnv,
+    parser: &mut crate::store_parse::Parser<'_>,
+) -> Result<PhotoSize, &'static str> {
+    let size_type = parser.i32_()?;
+    let dimensions = parse_dimensions(parser)?;
+    let size = parser.i32_()?;
+    let file_id = env.parse_file_id(parser)?;
+    let progressive_sizes =
+        if parser.version() >= crate::store_parse::version::ADD_PHOTO_PROGRESSIVE_SIZES {
+            parser.i32_vec()?
+        } else {
+            Vec::new()
+        };
+    Ok(PhotoSize {
+        size_type,
+        dimensions,
+        size,
+        file_id,
+        progressive_sizes,
+    })
+}
+
+/// `store(AnimationSize)` (PhotoSize.hpp:43-49).
+pub fn store_animation_size(
+    env: &mut impl DialogPhotoStoreEnv,
+    animation_size: &AnimationSize,
+    out: &mut Vec<u8>,
+) {
+    store_photo_size(env, &animation_size.photo_size, out);
+    crate::store_parse::store_f64(out, animation_size.main_frame_timestamp);
+}
+
+/// `parse(AnimationSize)` (PhotoSize.hpp:51-59) — the timestamp is
+/// `AddDialogPhotoHasAnimation`-gated.
+pub fn parse_animation_size(
+    env: &mut impl DialogPhotoStoreEnv,
+    parser: &mut crate::store_parse::Parser<'_>,
+) -> Result<AnimationSize, &'static str> {
+    let mut result = AnimationSize {
+        photo_size: parse_photo_size(env, parser)?,
+        main_frame_timestamp: 0.0,
+    };
+    if parser.version() >= crate::store_parse::version::ADD_DIALOG_PHOTO_HAS_ANIMATION {
+        result.main_frame_timestamp = parser.f64_()?;
+    }
+    Ok(result)
+}
+
+/// `StickerPhotoSize::store` (StickerPhotoSize.hpp:14-32).
+pub fn store_sticker_photo_size(sticker_photo_size: &StickerPhotoSize, out: &mut Vec<u8>) {
+    let is_custom_emoji = sticker_photo_size.type_ == StickerPhotoSizeType::CustomEmoji;
+    let is_sticker = sticker_photo_size.type_ == StickerPhotoSizeType::Sticker;
+    crate::store_parse::store_flags(out, [is_custom_emoji, is_sticker]);
+    if is_custom_emoji {
+        crate::store_parse::store_i64(out, sticker_photo_size.custom_emoji_id);
+    } else if is_sticker {
+        crate::store_parse::store_i64(out, sticker_photo_size.sticker_set_id);
+        crate::store_parse::store_i64(out, sticker_photo_size.sticker_id);
+    }
+    crate::store_parse::store_i32_vec(out, &sticker_photo_size.background_colors);
+}
+
+/// `StickerPhotoSize::parse` (StickerPhotoSize.hpp:34-52).
+pub fn parse_sticker_photo_size(
+    parser: &mut crate::store_parse::Parser<'_>,
+) -> Result<StickerPhotoSize, &'static str> {
+    let [is_custom_emoji, is_sticker] = parser.parse_flags()?;
+    let mut result = StickerPhotoSize {
+        type_: StickerPhotoSizeType::CustomEmoji,
+        custom_emoji_id: 0,
+        sticker_set_id: 0,
+        sticker_id: 0,
+        background_colors: Vec::new(),
+    };
+    if is_custom_emoji {
+        result.type_ = StickerPhotoSizeType::CustomEmoji;
+        result.custom_emoji_id = parser.i64_()?;
+    } else if is_sticker {
+        result.type_ = StickerPhotoSizeType::Sticker;
+        result.sticker_set_id = parser.i64_()?;
+        result.sticker_id = parser.i64_()?;
+    } else {
+        // the C++ UNREACHABLEs; the parser reports a garbage record
+        return Err("Empty StickerPhotoSize type");
+    }
+    result.background_colors = parser.i32_vec()?;
+    Ok(result)
+}
+
+/// `store(Photo)` (Photo.hpp:20-45).
+pub fn store_photo(env: &mut impl DialogPhotoStoreEnv, photo: &Photo, out: &mut Vec<u8>) {
+    let has_minithumbnail = !photo.minithumbnail.is_empty();
+    let has_animations = !photo.animations.is_empty();
+    let has_sticker_photo_size = photo.sticker_photo_size.is_some();
+    crate::store_parse::store_flags(
+        out,
+        [
+            photo.has_stickers,
+            has_minithumbnail,
+            has_animations,
+            has_sticker_photo_size,
+        ],
+    );
+    crate::store_parse::store_i64(out, photo.id);
+    crate::store_parse::store_i32(out, photo.date);
+    crate::store_parse::store_i32(out, photo.photos.len() as i32);
+    for photo_size in &photo.photos {
+        store_photo_size(env, photo_size, out);
+    }
+    if photo.has_stickers {
+        crate::store_parse::store_i32(out, photo.sticker_file_ids.len() as i32);
+        for file_id in &photo.sticker_file_ids {
+            env.store_file_id(*file_id, out);
+        }
+    }
+    if has_minithumbnail {
+        crate::store_parse::store_string(out, &photo.minithumbnail);
+    }
+    if has_animations {
+        crate::store_parse::store_i32(out, photo.animations.len() as i32);
+        for animation_size in &photo.animations {
+            store_animation_size(env, animation_size, out);
+        }
+    }
+    if has_sticker_photo_size {
+        store_sticker_photo_size(photo.sticker_photo_size.as_ref().unwrap(), out);
+    }
+}
+
+/// `parse(Photo)` (Photo.hpp:47-72).
+pub fn parse_photo(
+    env: &mut impl DialogPhotoStoreEnv,
+    parser: &mut crate::store_parse::Parser<'_>,
+) -> Result<Photo, &'static str> {
+    let [
+        has_stickers,
+        has_minithumbnail,
+        has_animations,
+        has_sticker_photo_size,
+    ] = parser.parse_flags()?;
+    let id = parser.i64_()?;
+    let date = parser.i32_()?;
+    let photo_sizes_len = parser.i32_()?;
+    if photo_sizes_len < 0 {
+        return Err("Invalid vector size");
+    }
+    let mut photos = Vec::with_capacity(photo_sizes_len as usize);
+    for _ in 0..photo_sizes_len {
+        photos.push(parse_photo_size(env, parser)?);
+    }
+    let mut sticker_file_ids = Vec::new();
+    if has_stickers {
+        let sticker_file_ids_len = parser.i32_()?;
+        if sticker_file_ids_len < 0 {
+            return Err("Invalid vector size");
+        }
+        for _ in 0..sticker_file_ids_len {
+            sticker_file_ids.push(env.parse_file_id(parser)?);
+        }
+    }
+    let mut minithumbnail = String::new();
+    if has_minithumbnail {
+        minithumbnail = parser.string()?;
+    }
+    let mut animations = Vec::new();
+    if has_animations {
+        let animations_len = parser.i32_()?;
+        if animations_len < 0 {
+            return Err("Invalid vector size");
+        }
+        for _ in 0..animations_len {
+            animations.push(parse_animation_size(env, parser)?);
+        }
+    }
+    let sticker_photo_size = if has_sticker_photo_size {
+        Some(parse_sticker_photo_size(parser)?)
+    } else {
+        None
+    };
+    Ok(Photo {
+        has_stickers,
+        id,
+        date,
+        photos,
+        sticker_file_ids,
+        minithumbnail,
+        animations,
+        sticker_photo_size,
+    })
+}
+
+/// `get_photo_object` (Photo.cpp:201-208) — the empty photo answers
+/// `None`; the file payloads are the codegen-forced empty objects (the
+/// listing-path FileManager reduction, module docs).
+pub fn get_photo_object(photo: &Photo) -> Option<td_api::Photo> {
+    if photo.is_empty() {
+        return None;
+    }
+    Some(td_api::Photo {
+        has_stickers: photo.has_stickers,
+        minithumbnail: Some(get_minithumbnail_object(photo.minithumbnail.as_bytes())),
+        sizes: get_photo_sizes_object(&photo.photos),
+    })
+}
+
+/// `store(DialogPhoto)` (DialogPhoto.hpp:16-34).
+pub fn store_dialog_photo(
+    env: &mut impl DialogPhotoStoreEnv,
+    dialog_photo: &DialogPhoto,
+    out: &mut Vec<u8>,
+) {
+    let has_file_ids = dialog_photo.small_file_id.is_valid() || dialog_photo.big_file_id.is_valid();
+    let has_minithumbnail = !dialog_photo.minithumbnail.is_empty();
+    crate::store_parse::store_flags(
+        out,
+        [
+            has_file_ids,
+            dialog_photo.has_animation,
+            has_minithumbnail,
+            dialog_photo.is_personal,
+        ],
+    );
+    if has_file_ids {
+        env.store_file_id(dialog_photo.small_file_id, out);
+        env.store_file_id(dialog_photo.big_file_id, out);
+    }
+    if has_minithumbnail {
+        crate::store_parse::store_string(out, &dialog_photo.minithumbnail);
+    }
+}
+
+/// `parse(DialogPhoto)` (DialogPhoto.hpp:36-58) — the flags are
+/// `AddDialogPhotoHasAnimation`-gated.
+pub fn parse_dialog_photo(
+    env: &mut impl DialogPhotoStoreEnv,
+    parser: &mut crate::store_parse::Parser<'_>,
+) -> Result<DialogPhoto, &'static str> {
+    let mut dialog_photo = DialogPhoto::default();
+    let [has_file_ids, has_animation, has_minithumbnail, is_personal] =
+        if parser.version() >= crate::store_parse::version::ADD_DIALOG_PHOTO_HAS_ANIMATION {
+            parser.parse_flags()?
+        } else {
+            [true, false, false, false]
+        };
+    if has_file_ids {
+        dialog_photo.small_file_id = env.parse_file_id(parser)?;
+        dialog_photo.big_file_id = env.parse_file_id(parser)?;
+    }
+    dialog_photo.has_animation = has_animation;
+    if has_minithumbnail {
+        dialog_photo.minithumbnail = parser.string()?;
+    }
+    dialog_photo.is_personal = is_personal;
+    Ok(dialog_photo)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -884,6 +1195,7 @@ mod tests {
         let mut photo = Photo {
             id: 42,
             date: 4242,
+            sticker_file_ids: Vec::new(),
             minithumbnail: String::from_utf8_lossy(&[0x01, 90, 60, 0x21]).into_owned(),
             photos: vec![PhotoSize {
                 size_type: b'm' as i32,

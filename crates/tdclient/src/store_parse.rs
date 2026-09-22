@@ -21,14 +21,32 @@
 pub mod version {
     pub const ADD_KEY_HASH_TO_SECRET_CHAT: i32 = 2;
     pub const ADD_ACCESS_HASH_TO_SECRET_CHAT: i32 = 5;
+    /// `Version::FixWebPageInstantViewDatabase` — the WebPageBlock
+    /// animation/video stores gate the file-id payloads on it.
+    pub const FIX_WEB_PAGE_INSTANT_VIEW_DATABASE: i32 = 9;
     pub const FIX_MIN_USERS: i32 = 10;
+    /// `Version::FixPageBlockAudioEmptyFile` — the WebPageBlockAudio flags.
+    pub const FIX_PAGE_BLOCK_AUDIO_EMPTY_FILE: i32 = 11;
+    /// `Version::SupportInstantView2_0` — the instant-view v2 fields.
+    pub const SUPPORT_INSTANT_VIEW_2_0: i32 = 18;
     pub const ADD_PHOTO_SIZE_SOURCE: i32 = 22;
+    /// `Version::AddPhotoProgressiveSizes` (PhotoSize.hpp).
+    pub const ADD_PHOTO_PROGRESSIVE_SIZES: i32 = 23;
+    /// `Version::AddDialogPhotoHasAnimation` (the AnimationSize tail).
+    pub const ADD_DIALOG_PHOTO_HAS_ANIMATION: i32 = 27;
     pub const SUPPORT_BANNED_CHANNELS: i32 = 31;
     pub const REMOVE_PHOTO_VOLUME_AND_LOCAL_ID: i32 = 32;
     pub const SUPPORT_64_BIT_IDS: i32 = 33;
+    /// `Version::AddKeyboardButtonFlags` (InlineKeyboardButton.hpp).
+    pub const ADD_KEYBOARD_BUTTON_FLAGS: i32 = 35;
     pub const MAKE_PARTICIPANT_FLAGS_64_BIT: i32 = 46;
     pub const ADD_USER_FLAGS2: i32 = 48;
+    /// `Version::AddPageBlockChatLinkFlags` (the WebPageBlockChatLink
+    /// store flags).
+    pub const ADD_PAGE_BLOCK_CHAT_LINK_FLAGS: i32 = 50;
     pub const ADD_CONTACT_VCARD: i32 = 16;
+    /// `Version::SupportRichMessages` — the rich-message list/button flags.
+    pub const SUPPORT_RICH_MESSAGES: i32 = 60;
     pub const SUPPORT_EPHEMERAL_MESSAGES: i32 = 61;
     /// `Version::Next` of tdlib 1.8.67 (`SupportEphemeralMessages` + 1).
     pub const NEXT: i32 = 62;

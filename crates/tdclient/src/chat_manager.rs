@@ -3402,6 +3402,56 @@ impl Location {
             access_hash_,
         })
     }
+
+    /// `Location::Location(td_api::location)` (Location.cpp:66-72) —
+    /// the access hash is a Files-step stub (0), like the C++ nullptr Td.
+    pub fn from_td_api_location(location: &td_api::Location) -> Location {
+        let mut result = Location::default();
+        if location.latitude.is_finite()
+            && location.longitude.is_finite()
+            && location.latitude.abs() <= 90.0
+            && location.longitude.abs() <= 180.0
+        {
+            result.is_empty_ = false;
+            result.latitude_ = location.latitude;
+            result.longitude_ = location.longitude;
+            result.horizontal_accuracy_ = Self::fix_accuracy(location.horizontal_accuracy);
+            result.access_hash_ = 0;
+        }
+        result
+    }
+
+    /// `Location::get_location_object` (Location.cpp:83-88).
+    pub fn get_location_object(&self) -> Option<td_api::Location> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(td_api::Location {
+            latitude: self.latitude_,
+            longitude: self.longitude_,
+            horizontal_accuracy: self.horizontal_accuracy_,
+        })
+    }
+
+    /// `Location::get_input_geo_point` (Location.cpp:90-102).
+    pub fn get_input_geo_point(&self) -> telegram_api::InputGeoPoint {
+        if self.is_empty() {
+            return telegram_api::InputGeoPoint::inputGeoPointEmpty(
+                telegram_api::inputGeoPointEmpty {},
+            );
+        }
+        let mut flags = 0;
+        if self.horizontal_accuracy_ > 0.0 {
+            // inputGeoPoint::ACCURACY_RADIUS_MASK
+            flags |= 1 << 0;
+        }
+        telegram_api::InputGeoPoint::inputGeoPoint(telegram_api::inputGeoPoint {
+            flags,
+            lat: self.latitude_,
+            long: self.longitude_,
+            accuracy_radius: self.horizontal_accuracy_.ceil() as i32,
+        })
+    }
 }
 
 /// `td::DialogLocation` (DialogLocation.{h,cpp}) — a chat/channel location

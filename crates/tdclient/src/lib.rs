@@ -28,6 +28,7 @@ pub mod emoji_status;
 pub mod files;
 pub mod formatted_date;
 pub mod global;
+pub mod inline_keyboard_button;
 pub mod link_manager;
 pub mod manager_option_states;
 pub mod message_db;
@@ -55,6 +56,7 @@ pub mod time_zone_manager;
 pub mod updates_manager;
 pub mod user_manager;
 pub mod usernames;
+pub mod webpage;
 
 // Generated code keeps C++-identical case-preserved names (`aiComposeTone`)
 // in types, fields and the JSON dispatch helpers alike.
