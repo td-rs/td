@@ -56,6 +56,7 @@ pub mod time_zone_manager;
 pub mod updates_manager;
 pub mod user_manager;
 pub mod usernames;
+pub mod web_pages_manager;
 pub mod webpage;
 
 // Generated code keeps C++-identical case-preserved names (`aiComposeTone`)

@@ -36,7 +36,7 @@ use crate::td_api;
 use crate::user_manager::UserId;
 use crate::webpage::{
     get_page_blocks_object, get_rich_text_from_telegram, get_web_page_block,
-    get_web_page_blocks_from_telegram, DocumentType as _, CloneWebPageBlockContext, DocumentsById,
+    get_web_page_blocks_from_telegram, CloneWebPageBlockContext, DocumentsById,
     MessageContentDupType, PhotosById, RichText, RichTextType, WebPageBlock,
     WebPageBlockEnv, WebPageId,
 };
@@ -603,5 +603,1203 @@ impl WebPage {
             }
         }
         self.is_album
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The WebPagesManager (M.17.2) — the collapsed actor
+// ---------------------------------------------------------------------------
+
+/// `td::WebPagesManager` (WebPagesManager.h:33-260) — the link-preview /
+/// instant-view cache.
+#[derive(Default)]
+pub struct WebPagesManager {
+    pub(crate) web_pages: HashMap<WebPageId, WebPage>,
+    pub(crate) pending_web_page_urls: HashMap<WebPageId, String>,
+    pub(crate) url_to_web_page_id: HashMap<String, (WebPageId, bool)>,
+    pub(crate) url_to_file_source_id: HashMap<String, FileSourceId>,
+    pub(crate) web_page_messages: HashMap<WebPageId, HashSet<MessageFullId>>,
+    pub(crate) web_page_quick_reply_messages:
+        HashMap<WebPageId, HashSet<QuickReplyMessageFullId>>,
+    pub(crate) web_page_polls: HashMap<WebPageId, HashSet<i64>>,
+    pub(crate) poll_web_pages: HashMap<i64, Vec<WebPageId>>,
+    pub(crate) story_web_pages: HashMap<StoryFullId, HashSet<WebPageId>>,
+    pub(crate) load_web_page_from_database_queries: HashMap<WebPageId, Vec<Promise<()>>>,
+    pub(crate) load_web_page_instant_view_queries: HashMap<WebPageId, Vec<Promise<WebPageId>>>,
+    pub(crate) load_server_web_page_instant_view_queries:
+        HashMap<WebPageId, Vec<Promise<WebPageId>>>,
+}
+
+impl WebPagesManager {
+    pub fn new() -> WebPagesManager {
+        WebPagesManager::default()
+    }
+
+    fn get_web_page_database_key(web_page_id: WebPageId) -> Vec<u8> {
+        format!("wp{}", web_page_id.get()).into_bytes()
+    }
+
+    fn get_web_page_instant_view_database_key(web_page_id: WebPageId) -> Vec<u8> {
+        format!("wpiv{}", web_page_id.get()).into_bytes()
+    }
+
+    /// `WebPagesManager::get_web_page` (WebPagesManager.cpp:2190-2192).
+    pub fn get_web_page(&self, web_page_id: WebPageId) -> Option<&WebPage> {
+        self.web_pages.get(&web_page_id)
+    }
+
+    /// `WebPagesManager::have_web_page` (WebPagesManager.cpp:1565-1570).
+    pub fn have_web_page(&self, web_page_id: WebPageId) -> bool {
+        self.web_pages.contains_key(&web_page_id)
+    }
+
+    /// `WebPagesManager::have_web_page_force` (WebPagesManager.cpp:2162-2188)
+    /// — the db-load half.
+    pub fn have_web_page_force(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        web_page_id: WebPageId,
+    ) -> bool {
+        if !web_page_id.is_valid() {
+            return false;
+        }
+        if self.web_pages.contains_key(&web_page_id) {
+            return true;
+        }
+        if !env.use_message_database() {
+            return false;
+        }
+        let value = env.sqlite_pmc_get_raw(&Self::get_web_page_database_key(web_page_id));
+        if value.is_empty() {
+            return false;
+        }
+        let mut parser = Parser::new(&value);
+        let web_page = match WebPage::parse(env, &mut parser) {
+            Ok(web_page) => web_page,
+            Err(_) => {
+                env.sqlite_pmc_erase(&Self::get_web_page_database_key(web_page_id));
+                return false;
+            }
+        };
+        self.update_web_page(web_page, web_page_id, false, true);
+        self.web_pages.contains_key(&web_page_id)
+    }
+
+    /// `WebPagesManager::save_web_page` (WebPagesManager.cpp:2003-2016) —
+    /// the binlog-add + pmc-set half.
+    fn save_web_page(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        web_page: &WebPage,
+        web_page_id: WebPageId,
+        from_binlog: bool,
+    ) {
+        let mut out = Vec::new();
+        store_log_event_version(&mut out);
+        web_page.store(env, &mut out);
+        if !from_binlog && env.use_message_database() {
+            let event_id = env.binlog_add_web_page(&out);
+            if let Some(page) = self.web_pages.get_mut(&web_page_id) {
+                page.log_event_id = event_id;
+            }
+        }
+        if env.use_message_database() {
+            env.sqlite_pmc_set_raw(&Self::get_web_page_database_key(web_page_id), &out);
+        }
+    }
+
+    /// `WebPagesManager::on_web_page_changed` (WebPagesManager.cpp:983-993)
+    /// — the message/poll registries fan-out.
+    fn on_web_page_changed(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        web_page_id: WebPageId,
+        have_web_page: bool,
+    ) {
+        let message_full_ids: Vec<MessageFullId> = self
+            .web_page_messages
+            .get(&web_page_id)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        for message_full_id in message_full_ids {
+            if have_web_page {
+                env.on_external_update_message_content(message_full_id, "on_web_page_changed");
+            } else {
+                env.delete_pending_message_web_page(message_full_id);
+            }
+        }
+        let quick_reply_ids: Vec<QuickReplyMessageFullId> = self
+            .web_page_quick_reply_messages
+            .get(&web_page_id)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        for message_full_id in quick_reply_ids {
+            if have_web_page {
+                env.quick_reply_on_external_update_message_content(
+                    message_full_id,
+                    "on_web_page_changed",
+                );
+            } else {
+                env.delete_quick_reply_pending_message_web_page(message_full_id);
+            }
+        }
+    }
+
+    /// `WebPagesManager::update_web_page` (WebPagesManager.cpp:823-903).
+    fn update_web_page(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        mut web_page: WebPage,
+        web_page_id: WebPageId,
+        from_binlog: bool,
+        from_database: bool,
+    ) {
+        let old = self.web_pages.get(&web_page_id);
+        let is_changed = old.map_or(true, |old| *old != web_page);
+        let old_instant_view = old.map_or_else(WebPageInstantView::default, |old| {
+            old.instant_view.clone()
+        });
+        if old.is_some() {
+            web_page.log_event_id = old.unwrap().log_event_id;
+        } else if let Some(file_source_id) = web_page
+            .url
+            .clone()
+            .and_then(|_| self.url_to_file_source_id.remove(&web_page.url))
+        {
+            web_page.file_source_id = file_source_id;
+        }
+
+        let mut old_file_ids = Vec::new();
+        if let Some(old) = old {
+            old_file_ids = self.get_web_page_file_ids(old);
+        }
+        if !old.map_or(true, |old| old.story_full_ids == web_page.story_full_ids) {
+            for story_full_id in &old.unwrap().story_full_ids {
+                if let Some(web_page_ids) = self.story_web_pages.get_mut(story_full_id) {
+                    web_page_ids.remove(&web_page_id);
+                    if web_page_ids.is_empty() {
+                        self.story_web_pages.remove(story_full_id);
+                    }
+                }
+            }
+            for story_full_id in &web_page.story_full_ids {
+                self.story_web_pages
+                    .entry(*story_full_id)
+                    .or_default()
+                    .insert(web_page_id);
+            }
+        }
+
+        self.web_pages.insert(web_page_id, web_page);
+
+        if !self.web_pages.get(&web_page_id).unwrap().url.is_empty() {
+            let url = self.web_pages.get(&web_page_id).unwrap().url.clone();
+            self.on_get_web_page_by_url(&url, web_page_id, from_database);
+        }
+
+        let new_file_ids = {
+            let page = self.web_pages.get(&web_page_id).unwrap();
+            self.get_web_page_file_ids(page)
+        };
+        if old_file_ids != new_file_ids {
+            let source_id = self.get_web_page_file_source_id(
+                self.web_pages.get(&web_page_id).unwrap(),
+                web_page_id,
+            );
+            env.change_files_source(source_id, &old_file_ids, &new_file_ids, "update_web_page");
+        }
+
+        let _ = old_instant_view;
+        if is_changed && !from_database {
+            self.on_web_page_changed(env, web_page_id, true);
+            let web_page = self.web_pages.get(&web_page_id).unwrap().clone();
+            self.save_web_page(env, &web_page, web_page_id, from_binlog);
+        }
+    }
+
+    /// `WebPagesManager::get_web_page_file_source_id`
+    /// (WebPagesManager.cpp:2195-2203).
+    fn get_web_page_file_source_id(&mut self, web_page: &WebPage, web_page_id: WebPageId) -> FileSourceId {
+        if web_page.file_source_id.is_valid() {
+            return web_page.file_source_id;
+        }
+        let _ = web_page_id;
+        FileSourceId::default()
+    }
+
+    /// `WebPagesManager::get_web_page_file_ids` (WebPagesManager.h:215)
+    /// — the collapsed line answers the photo+document files.
+    pub fn get_web_page_file_ids(&self, web_page: &WebPage) -> Vec<FileId> {
+        let mut file_ids = Vec::new();
+        if !web_page.photo.is_empty() {
+            file_ids.extend(web_page.photo.get_file_ids());
+        }
+        if !web_page.document.is_empty() {
+            file_ids.push(web_page.document.get_file_id());
+        }
+        file_ids
+    }
+
+    /// `WebPagesManager::on_get_web_page_by_url` (WebPagesManager.cpp:994-1024).
+    pub fn on_get_web_page_by_url(&mut self, url: &str, web_page_id: WebPageId, from_database: bool) {
+        if !is_visible_url(url) {
+            return;
+        }
+        match self.url_to_web_page_id.get(url) {
+            Some((old_web_page_id, _)) if *old_web_page_id == web_page_id => {}
+            Some(_) => {
+                self.url_to_web_page_id.insert(url.to_owned(), (web_page_id, from_database));
+            }
+            None => {
+                self.url_to_web_page_id.insert(url.to_owned(), (web_page_id, from_database));
+            }
+        }
+    }
+
+    /// `WebPagesManager::on_load_web_page_url_from_database`
+    /// (WebPagesManager.cpp:577-583).
+    pub fn on_load_web_page_url_from_database(&mut self, web_page_id: WebPageId, url: &str) {
+        if !url.is_empty() {
+            self.on_get_web_page_by_url(url, web_page_id, true);
+        }
+    }
+
+    /// `WebPagesManager::get_web_page_url` (WebPagesManager.cpp:1447-1453).
+    pub fn get_web_page_url(&self, web_page_id: WebPageId) -> String {
+        self.get_web_page(web_page_id)
+            .map_or_else(String::new, |web_page| web_page.url.clone())
+    }
+
+    /// `WebPagesManager::get_web_page_by_url` (WebPagesManager.cpp:1455-1468).
+    pub fn get_web_page_by_url(&self, url: &str) -> WebPageId {
+        self.url_to_web_page_id
+            .get(url)
+            .map_or(WebPageId::default(), |(web_page_id, _)| *web_page_id)
+    }
+
+    /// `WebPagesManager::register_web_page` (WebPagesManager.cpp:1025-1038).
+    pub fn register_web_page(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        web_page_id: WebPageId,
+        message_full_id: MessageFullId,
+    ) {
+        if !web_page_id.is_valid() {
+            return;
+        }
+        self.web_page_messages
+            .entry(web_page_id)
+            .or_default()
+            .insert(message_full_id);
+        if !env.auth_is_bot() && !self.have_web_page_force(env, web_page_id) {
+            env.add_pending_web_page_timeout(web_page_id.get(), 1.0);
+        }
+    }
+
+    /// `WebPagesManager::unregister_web_page` (WebPagesManager.cpp:1040-1053).
+    pub fn unregister_web_page(
+        &mut self,
+        web_page_id: WebPageId,
+        message_full_id: MessageFullId,
+    ) {
+        if !web_page_id.is_valid() {
+            return;
+        }
+        if let Some(message_ids) = self.web_page_messages.get_mut(&web_page_id) {
+            message_ids.remove(&message_full_id);
+            if message_ids.is_empty() {
+                self.web_page_messages.remove(&web_page_id);
+            }
+        }
+    }
+
+    /// `WebPagesManager::register_quick_reply_web_page`
+    /// (WebPagesManager.cpp:1055-1069).
+    pub fn register_quick_reply_web_page(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        web_page_id: WebPageId,
+        message_full_id: QuickReplyMessageFullId,
+    ) {
+        if !web_page_id.is_valid() {
+            return;
+        }
+        self.web_page_quick_reply_messages
+            .entry(web_page_id)
+            .or_default()
+            .insert(message_full_id);
+        if !self.have_web_page_force(env, web_page_id) {
+            env.add_pending_web_page_timeout(web_page_id.get(), 1.0);
+        }
+    }
+
+    /// `WebPagesManager::unregister_quick_reply_web_page`
+    /// (WebPagesManager.cpp:1071-1085).
+    pub fn unregister_quick_reply_web_page(
+        &mut self,
+        web_page_id: WebPageId,
+        message_full_id: QuickReplyMessageFullId,
+    ) {
+        if !web_page_id.is_valid() {
+            return;
+        }
+        if let Some(message_ids) = self.web_page_quick_reply_messages.get_mut(&web_page_id) {
+            message_ids.remove(&message_full_id);
+            if message_ids.is_empty() {
+                self.web_page_quick_reply_messages.remove(&web_page_id);
+            }
+        }
+    }
+
+    /// `WebPagesManager::register_poll_web_pages`
+    /// (WebPagesManager.cpp:1119-1173) — the `PollId` of the C++ rides the
+    /// raw i64 ([blocked: M.19]).
+    pub fn register_poll_web_pages(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        poll_id: i64,
+        web_page_ids: Vec<WebPageId>,
+    ) {
+        if poll_id < 0 || poll_id == 0 {
+            return;
+        }
+        if web_page_ids.is_empty() {
+            let Some(old_web_page_ids) = self.poll_web_pages.remove(&poll_id) else {
+                return;
+            };
+            for web_page_id in old_web_page_ids {
+                if let Some(poll_ids) = self.web_page_polls.get_mut(&web_page_id) {
+                    poll_ids.remove(&poll_id);
+                    if poll_ids.is_empty() {
+                        self.web_page_polls.remove(&web_page_id);
+                    }
+                }
+            }
+            return;
+        }
+        let old_web_page_ids = self.poll_web_pages.get(&poll_id).cloned().unwrap_or_default();
+        if old_web_page_ids == web_page_ids {
+            return;
+        }
+        for &web_page_id in &web_page_ids {
+            if !old_web_page_ids.contains(&web_page_id) {
+                self.web_page_polls
+                    .entry(web_page_id)
+                    .or_default()
+                    .insert(poll_id);
+                if !self.have_web_page_force(env, web_page_id) {
+                    env.add_pending_web_page_timeout(web_page_id.get(), 1.0);
+                }
+            }
+        }
+        for web_page_id in &old_web_page_ids {
+            if !web_page_ids.contains(web_page_id) {
+                if let Some(poll_ids) = self.web_page_polls.get_mut(web_page_id) {
+                    poll_ids.remove(&poll_id);
+                    if poll_ids.is_empty() {
+                        self.web_page_polls.remove(web_page_id);
+                    }
+                }
+            }
+        }
+        self.poll_web_pages.insert(poll_id, web_page_ids);
+    }
+
+    /// `WebPagesManager::get_url_file_source_id`
+    /// (WebPagesManager.cpp:2045-2060).
+    pub fn get_url_file_source_id(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        url: &str,
+    ) -> FileSourceId {
+        if let Some(&file_source_id) = self.url_to_file_source_id.get(url) {
+            return file_source_id;
+        }
+        let file_source_id = env.create_web_page_file_source(url);
+        self.url_to_file_source_id.insert(url.to_owned(), file_source_id);
+        file_source_id
+    }
+
+    /// `WebPagesManager::fetch_web_page_by_url`
+    /// (WebPagesManager.cpp:1470-1483).
+    pub fn fetch_web_page_by_url(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        url: &str,
+        promise: Promise<WebPageId>,
+    ) {
+        self.load_web_page_by_url(env, url.to_owned(), false, promise);
+    }
+
+    /// `WebPagesManager::load_web_page_by_url`
+    /// (WebPagesManager.cpp:1484-1499) — the db-load + net-reload half.
+    fn load_web_page_by_url(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        url: String,
+        _only_local: bool,
+        promise: Promise<WebPageId>,
+    ) {
+        let web_page_id = self.get_web_page_by_url(&url);
+        if web_page_id.is_valid() {
+            promise.set_value(web_page_id);
+            return;
+        }
+        if self.have_web_page_force(env, web_page_id) {
+            promise.set_value(web_page_id);
+            return;
+        }
+        // [blocked: net]: the GetWebPageQuery reload — the promise parks
+        // with the query, and the pending timeout keeps the URL alive.
+        if !env.close_flag() {
+            env.add_pending_web_page_timeout(0, 1.0);
+        }
+    }
+
+    /// `WebPagesManager::reload_web_page_by_url`
+    /// (WebPagesManager.cpp:1557-1564).
+    pub fn reload_web_page_by_url(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        url: &str,
+        only_local: bool,
+        promise: Promise<WebPageId>,
+    ) {
+        let web_page_id = self.get_web_page_by_url(url);
+        if web_page_id.is_valid() {
+            self.get_web_page_instant_view_impl(env, web_page_id, only_local, promise);
+            return;
+        }
+        self.load_web_page_by_url(env, url.to_owned(), only_local, promise);
+    }
+
+    /// `WebPagesManager::get_web_page_instant_view`
+    /// (WebPagesManager.cpp:1256-1282).
+    pub fn get_web_page_instant_view(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        url: &str,
+        only_local: bool,
+        promise: Promise<WebPageId>,
+    ) {
+        if url.is_empty() {
+            promise.set_value(WebPageId::default());
+            return;
+        }
+        if let Some((web_page_id, _)) = self.url_to_web_page_id.get(url) {
+            if !web_page_id.is_valid() {
+                self.reload_web_page_by_url(env, url, only_local, promise);
+                return;
+            }
+            self.get_web_page_instant_view_impl(env, *web_page_id, only_local, promise);
+            return;
+        }
+        let web_page_id = self.get_web_page_by_url(url);
+        if web_page_id.is_valid() {
+            self.get_web_page_instant_view_impl(env, web_page_id, only_local, promise);
+            return;
+        }
+        self.load_web_page_by_url(env, url.to_owned(), only_local, promise);
+    }
+
+    /// `WebPagesManager::get_web_page_instant_view_impl`
+    /// (WebPagesManager.cpp:1283-1300).
+    fn get_web_page_instant_view_impl(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        web_page_id: WebPageId,
+        only_local: bool,
+        promise: Promise<WebPageId>,
+    ) {
+        if env.close_flag() {
+            return;
+        }
+        let web_page_instant_view = match self.web_pages.get(&web_page_id) {
+            Some(web_page) if !web_page.instant_view.is_empty => {
+                Some(web_page.instant_view.clone())
+            }
+            _ => None,
+        };
+        let Some(web_page_instant_view) = web_page_instant_view else {
+            promise.set_value(WebPageId::default());
+            return;
+        };
+        if !web_page_instant_view.is_loaded || !only_local {
+            self.load_web_page_instant_view(env, web_page_id, only_local, promise);
+            return;
+        }
+        promise.set_value(web_page_id);
+    }
+
+    /// `WebPagesManager::load_web_page_instant_view`
+    /// (WebPagesManager.cpp:1305-1342) — the db half, then the
+    /// [blocked: net] server half.
+    fn load_web_page_instant_view(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        web_page_id: WebPageId,
+        only_local: bool,
+        promise: Promise<WebPageId>,
+    ) {
+        if !env.use_message_database() || only_local {
+            self.load_server_web_page_instant_view_queries
+                .entry(web_page_id)
+                .or_default()
+                .push(promise);
+            if self.load_server_web_page_instant_view_queries[&web_page_id].len() == 1 {
+                let url = self.get_web_page_url(web_page_id);
+                let hash = self
+                    .web_pages
+                    .get(&web_page_id)
+                    .map_or(0, |web_page| web_page.instant_view.hash);
+                let reload = Promise::default();
+                env.send_get_web_page_query(web_page_id, url, hash, reload);
+            }
+            return;
+        }
+        let value = env.sqlite_pmc_get_raw(&Self::get_web_page_instant_view_database_key(web_page_id));
+        if value.is_empty() {
+            self.load_server_web_page_instant_view_queries
+                .entry(web_page_id)
+                .or_default()
+                .push(promise);
+            return;
+        }
+        let mut parser = Parser::new(&value);
+        let instant_view = match WebPageInstantView::parse(env, &mut parser) {
+            Ok(instant_view) => instant_view,
+            Err(_) => {
+                env.sqlite_pmc_erase(&Self::get_web_page_instant_view_database_key(web_page_id));
+                promise.set_value(web_page_id);
+                return;
+            }
+        };
+        if let Some(web_page) = self.web_pages.get_mut(&web_page_id) {
+            web_page.instant_view = instant_view;
+        }
+        promise.set_value(web_page_id);
+    }
+
+    /// `WebPagesManager::on_get_web_page_instant_view_view_count`
+    /// (WebPagesManager.cpp:976-982).
+    pub fn on_get_web_page_instant_view_view_count(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        web_page_id: WebPageId,
+        view_count: i32,
+    ) {
+        if let Some(web_page) = self.web_pages.get_mut(&web_page_id) {
+            if web_page.instant_view.view_count != view_count {
+                web_page.instant_view.view_count = view_count;
+                let page = web_page.clone();
+                self.save_web_page(env, &page, web_page_id, false);
+            }
+        }
+    }
+
+    /// `WebPagesManager::get_web_page_preview`
+    /// (WebPagesManager.cpp:1219-1255) — the URL extraction + the
+    /// [blocked: net] query seam.
+    pub fn get_web_page_preview(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        text: Option<td_api::FormattedText>,
+        link_preview_options: Option<td_api::LinkPreviewOptions>,
+        mut promise: Promise<Option<td_api::LinkPreview>>,
+    ) {
+        let Some(text) = text else {
+            promise.set_value(None);
+            return;
+        };
+        let formatted_text = match crate::message_entity::get_formatted_text_of_input::<()>(
+            None,
+            DialogId::default(),
+            Some(text),
+            false,
+            false,
+            true,
+            true,
+            None,
+            false,
+            0,
+        ) {
+            Ok(formatted_text) => formatted_text,
+            Err(status) => return promise.set_error(status),
+        };
+        let Some(url) = get_first_url(&formatted_text) else {
+            promise.set_value(None);
+            return;
+        };
+        let options = GetWebPagePreviewOptions::from_td_api(link_preview_options);
+        env.send_get_web_page_preview_query(formatted_text, Box::new(options), promise);
+    }
+
+    /// The collapsed `GetWebPageInstantViewRequest` do_send_result
+    /// (Requests.cpp:1138-1146): resolve the id through the ladder, then
+    /// build the instant-view object for the answered band; the net
+    /// parking band leaves the promise unanswered offline.
+    pub fn get_web_page_instant_view_with_object(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        url: &str,
+        only_local: bool,
+        mut promise: Promise<td_api::WebPageInstantView>,
+    ) {
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let capture = std::sync::Arc::clone(&slot);
+        let inner = Promise::lambda_result(move |result: tdutils::status::Result<WebPageId>| {
+            *capture.lock().unwrap() = Some(result);
+        });
+        self.get_web_page_instant_view(env, url, only_local, inner);
+        match slot.lock().unwrap().take() {
+            Some(Ok(web_page_id)) => {
+                if web_page_id.is_valid() {
+                    match self.get_web_page_instant_view_object(env, web_page_id) {
+                        Some(object) => promise.set_value(object),
+                        None => promise.set_error(Status::error(400, "Web page not found")),
+                    }
+                } else {
+                    promise.set_error(Status::error(400, "Web page not found"));
+                }
+            }
+            Some(Err(status)) => promise.set_error(status),
+            None => {
+                // [blocked: net]: the ladder parked; the promise parks.
+            }
+        }
+    }
+
+    /// `WebPagesManager::on_pending_web_page_timeout`
+    /// (WebPagesManager.cpp:2062-2120) — the collapsed re-fetch half.
+    pub fn on_pending_web_page_timeout(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        web_page_id: i64,
+    ) {
+        if env.close_flag() {
+            return;
+        }
+        let web_page_id = WebPageId::new(web_page_id);
+        if self.have_web_page_force(env, web_page_id) {
+            return;
+        }
+        if let Some(url) = self.pending_web_page_urls.get(&web_page_id).cloned() {
+            let fetch = Promise::default();
+            self.fetch_web_page_by_url(env, &url, fetch);
+            return;
+        }
+        let message_full_ids: Vec<MessageFullId> = self
+            .web_page_messages
+            .get(&web_page_id)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+        env.get_messages_from_server(&message_full_ids);
+    }
+
+    /// `WebPagesManager::get_web_page_search_text`
+    /// (WebPagesManager.cpp:2146-2161).
+    pub fn get_web_page_search_text(&self, web_page_id: WebPageId) -> String {
+        let Some(web_page) = self.get_web_page(web_page_id) else {
+            return String::new();
+        };
+        let mut result = String::new();
+        for part in [
+            web_page.title.as_str(),
+            web_page.description.as_str(),
+            web_page.site_name.as_str(),
+            web_page.author.as_str(),
+            web_page.document.file_name.as_str(),
+        ] {
+            if !part.is_empty() {
+                if !result.is_empty() {
+                    result.push(' ');
+                }
+                result.push_str(part);
+            }
+        }
+        result
+    }
+
+    /// `WebPagesManager::get_web_page_media_duration`
+    /// (WebPagesManager.cpp:2165-2185) — the collapsed local band.
+    pub fn get_web_page_media_duration(&self, web_page_id: WebPageId) -> i32 {
+        self.get_web_page(web_page_id)
+            .map_or(-1, |web_page| web_page.duration)
+    }
+
+    /// `WebPagesManager::get_web_page_story_full_id`
+    /// (WebPagesManager.h:117-118).
+    pub fn get_web_page_story_full_id(&self, web_page_id: WebPageId) -> StoryFullId {
+        self.get_web_page(web_page_id)
+            .and_then(|web_page| web_page.story_full_ids.first().copied())
+            .unwrap_or_default()
+    }
+
+    /// `WebPagesManager::get_web_page_user_ids` (WebPagesManager.cpp:2132-2145).
+    pub fn get_web_page_user_ids(&self, web_page_id: WebPageId) -> Vec<UserId> {
+        let mut result = Vec::new();
+        if let Some(web_page) = self.get_web_page(web_page_id) {
+            for story_full_id in &web_page.story_full_ids {
+                let dialog_id = story_full_id.get_dialog_id();
+                if dialog_id.get_type() == crate::message_id::DialogType::User {
+                    result.push(UserId::new(dialog_id.get()));
+                }
+            }
+        }
+        result
+    }
+
+    /// `WebPagesManager::get_web_page_channel_ids`
+    /// (WebPagesManager.cpp:2146-2155 in the channel form).
+    pub fn get_web_page_channel_ids(&self, web_page_id: WebPageId) -> Vec<crate::chat_manager::ChannelId> {
+        let mut result = Vec::new();
+        if let Some(web_page) = self.get_web_page(web_page_id) {
+            for story_full_id in &web_page.story_full_ids {
+                let dialog_id = story_full_id.get_dialog_id();
+                if dialog_id.get_type() == crate::message_id::DialogType::Channel {
+                    result.push(crate::chat_manager::ChannelId::new(dialog_id.get()));
+                }
+            }
+        }
+        result
+    }
+
+    /// `WebPagesManager::on_get_web_page` (WebPagesManager.cpp:584-821) —
+    /// the wire intake.
+    pub fn on_get_web_page(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        web_page_ptr: telegram_api::WebPage,
+        owner_dialog_id: DialogId,
+    ) -> WebPageId {
+        if env.auth_is_bot() {
+            return WebPageId::default();
+        }
+        match web_page_ptr {
+            telegram_api::WebPage::webPageEmpty(web_page) => {
+                let web_page_id = WebPageId::new(web_page.id);
+                if !web_page_id.is_valid() {
+                    return WebPageId::default();
+                }
+                if let Some(page) = self.web_pages.remove(&web_page_id) {
+                    if page.log_event_id != 0 {
+                        env.binlog_erase(page.log_event_id);
+                    }
+                    if page.file_source_id.is_valid() {
+                        let old_file_ids = self.get_web_page_file_ids(&page);
+                        env.change_files_source(
+                            page.file_source_id,
+                            &old_file_ids,
+                            &[],
+                            "on_get_web_page",
+                        );
+                    }
+                }
+                self.on_web_page_changed(env, web_page_id, false);
+                if env.use_message_database() {
+                    env.sqlite_pmc_erase(&Self::get_web_page_database_key(web_page_id));
+                    env.sqlite_pmc_erase(&Self::get_web_page_instant_view_database_key(web_page_id));
+                }
+                self.pending_web_page_urls.remove(&web_page_id);
+                WebPageId::default()
+            }
+            telegram_api::WebPage::webPagePending(web_page) => {
+                let web_page_id = WebPageId::new(web_page.id);
+                if !web_page_id.is_valid() {
+                    return WebPageId::default();
+                }
+                let web_page_date = web_page.date;
+                let timeout = (web_page_date as f64 - env.server_time()).max(1.0);
+                env.add_pending_web_page_timeout(web_page_id.get(), timeout);
+                self.pending_web_page_urls.insert(web_page_id, web_page.url);
+                web_page_id
+            }
+            telegram_api::WebPage::webPage(web_page) => {
+                let web_page_id = WebPageId::new(web_page.id);
+                if !web_page_id.is_valid() {
+                    return WebPageId::default();
+                }
+                let mut page = WebPage::default();
+                page.was_reloaded = true;
+                page.url = web_page.url;
+                page.display_url = web_page.display_url;
+                page.type_ = web_page.r#type;
+                page.site_name = web_page.site_name;
+                page.title = web_page.title;
+                page.description = web_page.description;
+                page.photo = web_page.photo.map(crate::photo::get_photo).unwrap_or_default();
+                page.embed_url = web_page.embed_url;
+                page.embed_type = web_page.embed_type;
+                page.embed_dimensions = crate::photo::get_dimensions(
+                    web_page.embed_width,
+                    web_page.embed_height,
+                    "on_get_web_page",
+                );
+                page.duration = web_page.duration.max(0);
+                page.author = web_page.author;
+                page.has_large_media = web_page.has_large_media;
+                page.video_cover_photo = web_page.video_cover_photo;
+                if let Some(document) = web_page.document {
+                    if let Some(document) = env.on_get_document(document, owner_dialog_id) {
+                        page.document = document;
+                    }
+                }
+                // The attribute planes ride their seams: themes + star
+                // gifts keep their store/parse presence flags false
+                // (Wave 3), the story linkage resolves through
+                // `on_get_story`, the sticker sets through the M.15 seam.
+                for attribute in web_page.attributes {
+                    match attribute {
+                        telegram_api::WebPageAttribute::webPageAttributeTheme(_) => {
+                            page.has_theme_settings = true;
+                        }
+                        telegram_api::WebPageAttribute::webPageAttributeStory(attribute) => {
+                            let dialog_id = DialogId::from_peer(&attribute.peer);
+                            let story_id = crate::user_manager::StoryId::new(attribute.id);
+                            let story_full_id = StoryFullId::new(dialog_id, story_id);
+                            if let Some(story) = attribute.story {
+                                let _ = env.on_get_story(dialog_id, story);
+                            }
+                            env.force_create_dialog(dialog_id);
+                            page.story_full_ids.push(story_full_id);
+                        }
+                        telegram_api::WebPageAttribute::webPageAttributeStickerSet(attribute) => {
+                            for sticker in attribute.stickers {
+                                let sticker_id = env.on_get_sticker_document(sticker);
+                                if sticker_id.is_valid() && page.sticker_ids.len() < 4 {
+                                    page.sticker_ids.push(sticker_id);
+                                }
+                            }
+                        }
+                        telegram_api::WebPageAttribute::webPageAttributeUniqueStarGift(_) => {
+                            page.has_star_gifts = true;
+                        }
+                        telegram_api::WebPageAttribute::webPageAttributeStarGiftCollection(attribute) => {
+                            for icon in attribute.icons {
+                                let icon_file_id = env.on_get_sticker_document(icon);
+                                if icon_file_id.is_valid() && page.sticker_ids.len() < 4 {
+                                    page.sticker_ids.push(icon_file_id);
+                                }
+                            }
+                        }
+                        telegram_api::WebPageAttribute::webPageAttributeStarGiftAuction(attribute) => {
+                            page.has_star_gifts = true;
+                            page.auction_end_date = attribute.end_date;
+                        }
+                        telegram_api::WebPageAttribute::webPageAttributeAiComposeTone(attribute) => {
+                            let custom_emoji_id = CustomEmojiId::new(attribute.emoji_id);
+                            if custom_emoji_id.is_valid() {
+                                page.custom_emoji_ids.push(custom_emoji_id);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                self.pending_web_page_urls.remove(&web_page_id);
+                self.update_web_page(env, page, web_page_id, false, false);
+                web_page_id
+            }
+            telegram_api::WebPage::webPageNotModified(_) => WebPageId::default(),
+            _ => WebPageId::default(),
+        }
+    }
+
+    /// `WebPagesManager::get_web_page_instant_view_object`
+    /// (WebPagesManager.cpp:2199-2243) — the collapsed builder (the null
+    /// user-manager form; the feedback link + the v2 version split are
+    /// the local bands).
+    pub fn get_web_page_instant_view_object(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        web_page_id: WebPageId,
+    ) -> Option<td_api::WebPageInstantView> {
+        let web_page = self.get_web_page(web_page_id)?;
+        let instant_view = web_page.instant_view.clone();
+        if instant_view.is_empty {
+            return None;
+        }
+        let blocks = get_page_blocks_object(
+            &instant_view.page_blocks,
+            env,
+            &mut (),
+            &instant_view.url,
+            &web_page.url,
+            false,
+        );
+        Some(td_api::WebPageInstantView {
+            blocks,
+            view_count: instant_view.view_count,
+            version: if instant_view.is_v2 { 2 } else { 1 },
+            is_rtl: instant_view.is_rtl,
+            is_full: instant_view.is_full,
+            feedback_link: None,
+        })
+    }
+
+    /// `WebPagesManager::on_binlog_web_page_event`
+    /// (WebPagesManager.cpp:2040-2044) — the WebPages log-event replay.
+    pub fn on_binlog_web_page_event(
+        &mut self,
+        env: &mut impl WebPagesManagerEnv,
+        event_id: u64,
+        data: &[u8],
+    ) {
+        if env.close_flag() {
+            return;
+        }
+        let mut parser = match Parser::new_log_event(data) {
+            Ok(parser) => parser,
+            Err(_) => {
+                env.binlog_erase(event_id);
+                return;
+            }
+        };
+        let web_page = match WebPage::parse(env, &mut parser) {
+            Ok(web_page) => web_page,
+            Err(_) => {
+                env.binlog_erase(event_id);
+                return;
+            }
+        };
+        let web_page_id = match self.url_to_web_page_id.get(&web_page.url) {
+            Some((web_page_id, _)) => *web_page_id,
+            None => {
+                env.binlog_erase(event_id);
+                return;
+            }
+        };
+        let mut web_page = web_page;
+        web_page.log_event_id = event_id;
+        self.update_web_page(env, web_page, web_page_id, true, false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestEnv {
+        files: std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>>,
+        stored_media: std::cell::RefCell<Vec<i32>>,
+        timeouts: std::cell::RefCell<Vec<(i64, f64)>>,
+        binlog: std::cell::RefCell<Vec<(i32, Vec<u8>)>>,
+    }
+
+    impl crate::photo::DialogPhotoStoreEnv for TestEnv {
+        fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>) {
+            self.files.lock().store_file(file_id, out);
+        }
+
+        fn parse_file_id(&mut self, parser: &mut Parser<'_>) -> Result<FileId, &'static str> {
+            self.files.lock().parse_file(parser)
+        }
+    }
+
+    impl WebPageBlockEnv for TestEnv {
+        fn store_document(&mut self, _document: &Document, _out: &mut Vec<u8>) {}
+        fn parse_document(&mut self, _parser: &mut Parser<'_>) -> Result<Document, &'static str> {
+            Err("document parse — [blocked: M.28]")
+        }
+        fn store_web_page_media(&mut self, media_type: i32, _out: &mut Vec<u8>) {
+            self.stored_media.borrow_mut().push(media_type);
+        }
+        fn parse_web_page_media(&mut self, _parser: &mut Parser<'_>) -> Result<i32, &'static str> {
+            Err("media parse — [blocked: M.9]")
+        }
+    }
+
+    impl WebPagesManagerEnv for TestEnv {
+        fn auth_is_bot(&self) -> bool {
+            false
+        }
+        fn close_flag(&self) -> bool {
+            false
+        }
+        fn use_message_database(&self) -> bool {
+            false
+        }
+        fn server_time(&self) -> f64 {
+            0.0
+        }
+        fn sqlite_pmc_get_raw(&mut self, _key: &[u8]) -> Vec<u8> {
+            Vec::new()
+        }
+        fn sqlite_pmc_set_raw(&mut self, _key: &[u8], _value: &[u8]) {}
+        fn sqlite_pmc_erase(&mut self, _key: &[u8]) {}
+        fn binlog_add_web_page(&mut self, data: &[u8]) -> u64 {
+            self.binlog.borrow_mut().push((0x10, data.to_vec()));
+            1
+        }
+        fn binlog_rewrite_web_page(&mut self, _event_id: u64, _data: &[u8]) {}
+        fn binlog_erase(&mut self, _event_id: u64) {}
+        fn add_pending_web_page_timeout(&mut self, web_page_id: i64, timeout_in: f64) {
+            self.timeouts.borrow_mut().push((web_page_id, timeout_in));
+        }
+        fn cancel_pending_web_page_timeout(&mut self, _web_page_id: i64) {}
+        fn create_web_page_file_source(&mut self, _url: &str) -> FileSourceId {
+            FileSourceId::default()
+        }
+        fn change_files_source(
+            &mut self,
+            _source_id: FileSourceId,
+            _old_file_ids: &[FileId],
+            _new_file_ids: &[FileId],
+            _source: &str,
+        ) {
+        }
+        fn delete_pending_message_web_page(&mut self, _message_full_id: MessageFullId) {}
+        fn on_external_update_message_content(&mut self, _message_full_id: MessageFullId, _source: &str) {}
+        fn delete_quick_reply_pending_message_web_page(
+            &mut self,
+            _message_full_id: QuickReplyMessageFullId,
+        ) {
+        }
+        fn quick_reply_on_external_update_message_content(
+            &mut self,
+            _message_full_id: QuickReplyMessageFullId,
+            _source: &str,
+        ) {
+        }
+        fn get_messages_from_server(&mut self, _message_full_ids: &[MessageFullId]) {}
+        fn reload_quick_reply_message(
+            &mut self,
+            _shortcut_id: crate::files::QuickReplyShortcutId,
+            _message_id: crate::message_id::MessageId,
+        ) {
+        }
+        fn force_create_dialog(&mut self, _dialog_id: DialogId) {}
+        fn on_get_story(&mut self, _dialog_id: DialogId, _story: Box<telegram_api::StoryItem>) -> Option<i32> {
+            None
+        }
+        fn get_chat_id_object(&self, _dialog_id: DialogId, _source: &str) -> i64 {
+            0
+        }
+        fn get_story_duration(&self, _story_full_id: StoryFullId) -> i32 {
+            -1
+        }
+        fn on_get_sticker_document(&mut self, _document: Box<telegram_api::Document>) -> FileId {
+            FileId::default()
+        }
+        fn on_get_document(
+            &mut self,
+            _document: Box<telegram_api::Document>,
+            _owner_dialog_id: DialogId,
+        ) -> Option<Document> {
+            None
+        }
+        fn get_document_mime_type(&self, _file_id: FileId) -> String {
+            String::new()
+        }
+        fn get_message_link_media_timestamp(&self, _url: &str) -> i32 {
+            0
+        }
+        fn get_background_type_object(&self, _url: &str, _is_pattern: bool) -> Option<td_api::BackgroundType> {
+            None
+        }
+        fn has_video_chat_invite_hash(&self, _url: &str) -> bool {
+            false
+        }
+        fn is_premium(&self) -> bool {
+            false
+        }
+        fn send_get_web_page_preview_query(
+            &mut self,
+            _text: crate::message_entity::FormattedText,
+            _options: Box<GetWebPagePreviewOptions>,
+            _promise: Promise<Option<td_api::LinkPreview>>,
+        ) {
+        }
+        fn send_get_web_page_query(
+            &mut self,
+            _web_page_id: WebPageId,
+            _url: String,
+            _hash: i32,
+            _promise: Promise<WebPageId>,
+        ) {
+        }
+    }
+
+    fn env() -> TestEnv {
+        TestEnv {
+            files: std::sync::Arc::new(parking_lot::Mutex::new(crate::files::FileManager::new())),
+            stored_media: std::cell::RefCell::new(Vec::new()),
+            timeouts: std::cell::RefCell::new(Vec::new()),
+            binlog: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn pending_and_full_pages_register_urls() {
+        let mut manager = WebPagesManager::new();
+        let mut env = env();
+        let pending = telegram_api::WebPage::webPagePending(telegram_api::webPagePending {
+            id: 7,
+            date: 100,
+            url: "https://t.me/".to_owned(),
+        });
+        let web_page_id = manager.on_get_web_page(&mut env, pending, DialogId::default());
+        assert!(web_page_id.is_valid());
+        assert_eq!(manager.pending_web_page_urls.len(), 1);
+
+        let full = telegram_api::WebPage::webPage(telegram_api::webPage {
+            id: 7,
+            flags: 0,
+            url: "https://t.me/".to_owned(),
+            display_url: "t.me".to_owned(),
+            hash: 1,
+            r#type: "article".to_owned(),
+            site_name: String::new(),
+            title: "Title".to_owned(),
+            description: String::new(),
+            photo: None,
+            embed_url: String::new(),
+            embed_type: String::new(),
+            embed_width: 0,
+            embed_height: 0,
+            duration: 0,
+            author: String::new(),
+            document: None,
+            cached_page: None,
+            attributes: Vec::new(),
+            has_large_media: false,
+            video_cover_photo: false,
+        });
+        let web_page_id = manager.on_get_web_page(&mut env, full, DialogId::default());
+        assert!(web_page_id.is_valid());
+        assert!(manager.pending_web_page_urls.is_empty());
+        assert_eq!(manager.get_web_page_by_url("https://t.me/"), web_page_id);
+        assert_eq!(manager.get_web_page_search_text(web_page_id), "Title");
+    }
+
+    #[test]
+    fn empty_page_erases_the_cache() {
+        let mut manager = WebPagesManager::new();
+        let mut env = env();
+        manager.url_to_web_page_id
+            .insert("https://t.me/".to_owned(), (WebPageId::new(9), false));
+        let empty = telegram_api::WebPage::webPageEmpty(telegram_api::webPageEmpty { id: 9 });
+        let result = manager.on_get_web_page(&mut env, empty, DialogId::default());
+        assert!(!result.is_valid());
+        assert!(!manager.have_web_page(WebPageId::new(9)));
+    }
+
+    #[test]
+    fn register_unregister_arms_the_timeout() {
+        let mut manager = WebPagesManager::new();
+        let mut env = env();
+        let message_full_id = MessageFullId::new(
+            DialogId::default(),
+            crate::chat_manager::MessageId::new(1),
+        );
+        manager.register_web_page(&mut env, WebPageId::new(5), message_full_id);
+        assert_eq!(env.timeouts.borrow().len(), 1);
+        manager.unregister_web_page(WebPageId::new(5), message_full_id);
+        assert!(manager.web_page_messages.is_empty());
     }
 }

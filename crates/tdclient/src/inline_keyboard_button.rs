@@ -936,6 +936,26 @@ pub trait UserInputEnv {
     fn get_user_id_object(&mut self, user_id: UserId, source: &str) -> i64;
 }
 
+/// The `user_manager == nullptr` band of the object builders (the M.17
+/// instant-view builder passes it; the real manager surface rides the
+/// M.10 integration).
+impl UserInputEnv for () {
+    fn get_input_user(
+        &mut self,
+        _user_id: UserId,
+    ) -> std::result::Result<telegram_api::InputUser, Status> {
+        Err(Status::error(400, "User not found"))
+    }
+
+    fn is_my_user_bot(&self) -> bool {
+        false
+    }
+
+    fn get_user_id_object(&mut self, user_id: UserId, _source: &str) -> i64 {
+        user_id.get()
+    }
+}
+
 pub fn get_input_keyboard_inline_button<U: UserInputEnv + ?Sized>(
     user_manager: &mut U,
     keyboard_button: &InlineKeyboardButton,

@@ -692,6 +692,59 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             };
             search_contacts_request(td, id, query, request.limit);
         }
+        // --- the web-page set (M.17): Requests.cpp:5032-5042. The managers
+        // validate; the net query tails park the promises unanswered offline,
+        // exactly like the C++ request without a network ---
+        Function::getLinkPreview(request) => {
+            // Requests.cpp:5032-5036
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<Option<crate::td_api::LinkPreview>, _>(id, |preview| {
+                    // Td::send_result answers a null object with a 404 error.
+                    preview.map_or_else(
+                        || {
+                            Object::error(td_api::Error {
+                                code: 404,
+                                message: "Not Found".to_string(),
+                            })
+                        },
+                        Object::linkPreview,
+                    )
+                });
+            let (mut env, web_pages_manager) = crate::td::web_pages_env_split(td);
+            web_pages_manager.get_web_page_preview(
+                &mut env,
+                request.text,
+                request.link_preview_options,
+                promise,
+            );
+        }
+        Function::getWebPageInstantView(request) => {
+            // Requests.cpp:5041-5044 — the GetWebPageInstantViewRequest actor:
+            // the id resolves, then the result sends the instant-view object;
+            // the collapsed form resolves the id and builds the object inside
+            // the manager (the env stays alive there)
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(url) = clean_or_utf8_error(td, id, &request.url) else {
+                return;
+            };
+            let promise = td.deferred_promise::<crate::td_api::WebPageInstantView, _>(
+                id,
+                Object::webPageInstantView,
+            );
+            let (mut env, web_pages_manager) = crate::td::web_pages_env_split(td);
+            web_pages_manager.get_web_page_instant_view_with_object(
+                &mut env,
+                &url,
+                request.only_local,
+                promise,
+            );
+        }
+
         Function::addContact(request) => {
             // Requests.cpp:6611-6620 + `get_contact` (Contact.cpp:142-156):
             // the importedContact variant has no vcard and carries the
@@ -2180,9 +2233,9 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            110,
+            112,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 894, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 892, "interim count");
     }
 }

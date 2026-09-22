@@ -44,7 +44,7 @@ use tdutils::promise::Promise;
 use tdutils::status::Status;
 
 use crate::auth_manager::{AuthManager, AuthQuerySender};
-use crate::chat_manager::DcId;
+use crate::chat_manager::{ChatManager, DcId};
 use crate::config_dispatch::{
     CompletedNetQueries, ConfigQueryCallback, SentNetQueries, TdConfigSink, TdSessionSink,
     build_config_net_query,
@@ -63,7 +63,7 @@ use crate::dialog_manager::DialogManager;
 use crate::global::Global;
 use crate::link_manager::LinkManager;
 use crate::manager_option_states::ManagerOptionStates;
-use crate::message_id::DialogId;
+use crate::message_id::{DialogId, MessageFullId};
 use crate::net::{AuthSender, BridgeConfig, NetBridge, QueryAnswer};
 use crate::notification_manager::NotificationManager;
 use crate::option_manager::OptionManager;
@@ -81,8 +81,8 @@ use crate::files::{
     FileData, FileDb, FileDbId, FileDownloaderNet, FileGcParameters, FileGcSink,
     FileHashUploaderNet, FileId, FileLoadManager, FileLoadManagerOptions, FileLoadNetFactory,
     FileManager, FileManagerContext, FileManagerWorker, FileNode, FileSourceId, FileStatsSink,
-    FileType, FileUploaderNet, FileView, FullLocalFileLocation, StorageContext, StorageManager,
-    UploadPartQuery,
+    FileType, FileUploaderNet, FileView, FullLocalFileLocation, QuickReplyMessageFullId,
+    QuickReplyShortcutId, StorageContext, StorageManager, StoryFullId, UploadPartQuery,
 };
 
 #[cfg(target_endian = "big")]
@@ -276,6 +276,12 @@ pub struct Td {
     /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) notification_updates: Vec<td_api::Update>,
+    /// `Td::web_pages_manager_` (Td.cpp:1270, M.17).
+    pub(crate) web_pages_manager: crate::web_pages_manager::WebPagesManager,
+    /// The web-pages pending timeout deadlines (the collapsed
+    /// `pending_web_pages_timeout_` MultiTimeout; fired by
+    /// `timeout_expired`).
+    pub(crate) web_pages_timeouts: std::collections::HashMap<i64, f64>,
     /// The premium-required-to-contact QueryMerger actor (a UserManager
     /// member in the C++; the Rust merger is an actor created by `init` —
     /// the `ActorOwn` keeps it alive, dropping it would hang the merged
@@ -583,6 +589,8 @@ impl Td {
                 crate::notification_settings_manager::NotificationSettingsManager::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
             notification_updates: Vec::new(),
+            web_pages_manager: crate::web_pages_manager::WebPagesManager::new(),
+            web_pages_timeouts: std::collections::HashMap::new(),
             premium_required_contact_merger: None,
             chat_manager: crate::chat_manager::ChatManager::new(),
             dialog_manager: DialogManager::new(),
@@ -4802,6 +4810,22 @@ impl Actor for Td {
             self.notification_settings_manager.tick_timeouts(&mut env);
             self.device_token_manager.tick_timeouts(&mut env);
         }
+        // The WebPagesManager pending-page timeouts (M.17): the
+        // collapsed MultiTimeout fires each due id once.
+        {
+            let now = tdutils::time::now();
+            let due: Vec<i64> = self
+                .web_pages_timeouts
+                .iter()
+                .filter(|(_, deadline)| **deadline <= now)
+                .map(|(&key, _)| key)
+                .collect();
+            for web_page_id in due {
+                self.web_pages_timeouts.remove(&web_page_id);
+                let (mut env, web_pages_manager) = web_pages_env_split(self);
+                web_pages_manager.on_pending_web_page_timeout(&mut env, web_page_id);
+            }
+        }
         let actions = self
             .config_manager
             .as_mut()
@@ -7071,5 +7095,407 @@ mod tests {
             );
             assert!(matches!(responses_of(callback, 3)[0], Object::ok(_)));
         });
+    }
+}
+
+/// Field-split the `Td` for the WebPagesManager calls.
+pub(crate) fn web_pages_env_split(
+    td: &mut Td,
+) -> (
+    TdWebPagesEnv<'_>,
+    &mut crate::web_pages_manager::WebPagesManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        chat_manager,
+        file_manager,
+        link_manager,
+        web_pages_manager,
+        web_pages_timeouts,
+        ..
+    } = td;
+    (
+        TdWebPagesEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            chat_manager,
+            file_manager: std::sync::Arc::clone(file_manager),
+            link_manager,
+            web_pages_timeouts,
+        },
+        web_pages_manager,
+    )
+}
+
+/// The `G()`/manager slice of the collapsed WebPagesManager (M.17).
+pub(crate) struct TdWebPagesEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    /// `None` once the option manager is torn down; the getters answer
+    /// their defaults on the destroy path.
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) chat_manager: &'a mut ChatManager,
+    pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<FileManager>>,
+    pub(crate) link_manager: &'a mut Option<LinkManager>,
+    pub(crate) web_pages_timeouts: &'a mut std::collections::HashMap<i64, f64>,
+}
+
+impl crate::photo::DialogPhotoStoreEnv for TdWebPagesEnv<'_> {
+    fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>) {
+        self.file_manager.lock().store_file(file_id, out);
+    }
+
+    fn parse_file_id(
+        &mut self,
+        parser: &mut crate::store_parse::Parser<'_>,
+    ) -> Result<FileId, &'static str> {
+        self.file_manager.lock().parse_file(parser)
+    }
+}
+
+impl crate::webpage::WebPageBlockEnv for TdWebPagesEnv<'_> {
+    fn get_document_object(&self, file_id: FileId) -> Option<td_api::Document> {
+        None // [blocked: M.28 DocumentsManager object]
+    }
+
+    fn get_animation_object(&self, _file_id: FileId) -> Option<td_api::Animation> {
+        None // [blocked: M.20]
+    }
+
+    fn get_audio_object(&self, _file_id: FileId) -> Option<td_api::Audio> {
+        None // [blocked: M.28]
+    }
+
+    fn get_video_object(&self, _file_id: FileId) -> Option<td_api::Video> {
+        None // [blocked: M.28]
+    }
+
+    fn get_video_note_object(&self, _file_id: FileId) -> Option<td_api::VideoNote> {
+        None // [blocked: M.28]
+    }
+
+    fn get_voice_note_object(&self, _file_id: FileId) -> Option<td_api::VoiceNote> {
+        None // [blocked: M.28]
+    }
+
+    fn get_accent_color_id_object(
+        &self,
+        accent_color_id: crate::peer_color::AccentColorId,
+        fallback_accent_color_id: crate::peer_color::AccentColorId,
+    ) -> Option<i32> {
+        // ThemeManager::get_accent_color_id_object (ThemeManager.cpp:639):
+        // the is_built_in/light_colors_ server-data halves are [blocked:
+        // M.41 — the theme color sets], so the plain validity check stands
+        // in for the acceptance gate.
+        if accent_color_id.is_valid() {
+            return Some(accent_color_id.get());
+        }
+        if !fallback_accent_color_id.is_valid() {
+            return Some(5); // blue
+        }
+        Some(fallback_accent_color_id.get())
+    }
+
+    fn get_chat_photo_info_object(
+        &self,
+        _photo: &crate::photo::DialogPhoto,
+    ) -> Option<td_api::ChatPhotoInfo> {
+        None // [blocked: M.6]
+    }
+
+    fn get_instant_view_link(&self, url: &str, rhash: &str) -> String {
+        self.link_manager.as_ref().map_or_else(
+            || format!("{url}?rhash={rhash}"),
+            |link_manager| link_manager.get_instant_view_link(url, rhash),
+        )
+    }
+
+    fn get_instant_view_link_rhash(&self, real_url: &str) -> String {
+        self.link_manager
+            .as_ref()
+            .map_or_else(String::new, |link_manager| {
+                link_manager.get_instant_view_link_rhash(real_url)
+            })
+    }
+
+    fn get_instant_view_link_url(&self, real_url: &str) -> String {
+        self.link_manager.as_ref().map_or_else(
+            || real_url.to_owned(),
+            |link_manager| link_manager.get_instant_view_link_url(real_url),
+        )
+    }
+
+    fn as_input_document(
+        &mut self,
+        _file_id: FileId,
+    ) -> Option<(i64, telegram_api::InputDocument)> {
+        None // [blocked: M.12 file-reference plane]
+    }
+
+    fn as_input_photo(&mut self, _file_id: FileId) -> Option<(i64, telegram_api::InputPhoto)> {
+        None // [blocked: M.12]
+    }
+
+    fn ensure_input_user(&mut self, user_id: crate::user_manager::UserId) -> Result<(), Status> {
+        // Td::ensure_input_user — the get_input_user validation half.
+        let Some(options) = self.options.as_mut() else {
+            return Err(Status::error(400, "Have no access to the user"));
+        };
+        let mut env = UserEnv {
+            global: &mut self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_input_user(&env, user_id).map(|_| ())
+    }
+
+    fn get_user_id_object(&mut self, user_id: crate::user_manager::UserId, source: &str) -> i64 {
+        let Some(options) = self.options.as_mut() else {
+            return user_id.get();
+        };
+        let mut env = UserEnv {
+            global: &mut self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager
+            .get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn is_my_user_bot(&self) -> bool {
+        self.user_manager
+            .is_user_bot_of(self.user_manager.get_my_id())
+    }
+
+    fn on_get_page_block_channel(
+        &mut self,
+        channel: telegram_api::channel,
+    ) -> Option<crate::webpage::ChatLinkInfo> {
+        // WebPageId.cpp:5128 — the pageBlockChannel intake. The known-channel
+        // half (the on_get_chat store refresh + the get_channel_* accessors)
+        // is [blocked: M.5] and its force-get is [blocked: net], so both
+        // branches read the min-channel struct like the C++ unknown path;
+        // the photo's file registration is the documented Files-step no-op.
+        let channel_id = crate::chat_manager::ChannelId::new(channel.id);
+        if !channel_id.is_valid() {
+            tdutils::log_error!("Receive invalid channel id {}", channel.id);
+            return None;
+        }
+        let accent_color_id = channel
+            .color
+            .as_ref()
+            .map(crate::peer_color::PeerColor::from_telegram)
+            .map(|color| color.accent_color_id())
+            .unwrap_or_default();
+        Some(crate::webpage::ChatLinkInfo {
+            title: channel.title,
+            photo: crate::photo::DialogPhoto::get_dialog_photo(channel.photo),
+            username: channel.username,
+            accent_color_id,
+            channel_id,
+        })
+    }
+}
+
+impl crate::web_pages_manager::WebPagesManagerEnv for TdWebPagesEnv<'_> {
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn use_message_database(&self) -> bool {
+        self.global.use_message_database()
+    }
+
+    fn server_time(&self) -> f64 {
+        self.global.server_time()
+    }
+
+    fn sqlite_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.sqlite_pmc().get_raw(key)
+    }
+
+    fn sqlite_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.sqlite_pmc().set_raw(key, value);
+    }
+
+    fn sqlite_pmc_erase(&mut self, key: &[u8]) {
+        self.global.sqlite_pmc().erase_raw(key);
+    }
+
+    fn binlog_add_web_page(&mut self, data: &[u8]) -> u64 {
+        self.global.td_db().binlog().add(
+            crate::web_pages_manager::LOG_EVENT_HANDLER_TYPE_WEB_PAGES,
+            data,
+        )
+    }
+
+    fn binlog_rewrite_web_page(&mut self, event_id: u64, data: &[u8]) {
+        self.global.td_db().binlog().rewrite(
+            event_id,
+            crate::web_pages_manager::LOG_EVENT_HANDLER_TYPE_WEB_PAGES,
+            data,
+        );
+    }
+
+    fn binlog_erase(&mut self, event_id: u64) {
+        self.global.td_db().binlog().erase(event_id);
+    }
+
+    fn add_pending_web_page_timeout(&mut self, web_page_id: i64, timeout_in: f64) {
+        let deadline = tdutils::time::now() + timeout_in;
+        self.web_pages_timeouts
+            .entry(web_page_id)
+            .and_modify(|old| {
+                if deadline < *old {
+                    *old = deadline;
+                }
+            })
+            .or_insert(deadline);
+    }
+
+    fn cancel_pending_web_page_timeout(&mut self, web_page_id: i64) {
+        self.web_pages_timeouts.remove(&web_page_id);
+    }
+
+    fn create_web_page_file_source(&mut self, url: &str) -> FileSourceId {
+        self.file_manager.lock().create_web_page_file_source(url)
+    }
+
+    fn change_files_source(
+        &mut self,
+        source_id: FileSourceId,
+        old_file_ids: &[FileId],
+        new_file_ids: &[FileId],
+        source: &str,
+    ) {
+        self.file_manager
+            .lock()
+            .change_files_source(source_id, old_file_ids, new_file_ids, source);
+    }
+
+    fn delete_pending_message_web_page(&mut self, _message_full_id: MessageFullId) {
+        // [blocked: M.10]
+    }
+
+    fn on_external_update_message_content(
+        &mut self,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        // [blocked: M.10]
+    }
+
+    fn delete_quick_reply_pending_message_web_page(
+        &mut self,
+        _message_full_id: QuickReplyMessageFullId,
+    ) {
+        // [blocked: Wave 3]
+    }
+
+    fn quick_reply_on_external_update_message_content(
+        &mut self,
+        _message_full_id: QuickReplyMessageFullId,
+        _source: &str,
+    ) {
+        // [blocked: Wave 3]
+    }
+
+    fn get_messages_from_server(&mut self, _message_full_ids: &[MessageFullId]) {
+        // [blocked: M.10/net]
+    }
+
+    fn reload_quick_reply_message(
+        &mut self,
+        _shortcut_id: QuickReplyShortcutId,
+        _message_id: crate::message_id::MessageId,
+    ) {
+        // [blocked: Wave 3]
+    }
+
+    fn force_create_dialog(&mut self, _dialog_id: crate::dialog_id::DialogId) {
+        // [blocked: M.6]
+    }
+
+    fn on_get_story(
+        &mut self,
+        _dialog_id: crate::dialog_id::DialogId,
+        _story: Box<telegram_api::StoryItem>,
+    ) -> Option<i32> {
+        None // [blocked: Wave 3]
+    }
+
+    fn get_chat_id_object(&self, dialog_id: crate::dialog_id::DialogId, _source: &str) -> i64 {
+        dialog_id.get_chat_id().get()
+    }
+
+    fn get_story_duration(&self, _story_full_id: StoryFullId) -> i32 {
+        -1 // [blocked: Wave 3]
+    }
+
+    fn on_get_sticker_document(&mut self, _document: Box<telegram_api::Document>) -> FileId {
+        FileId::default() // [blocked: M.15]
+    }
+
+    fn on_get_document(
+        &mut self,
+        _document: Box<telegram_api::Document>,
+        _owner_dialog_id: crate::dialog_id::DialogId,
+    ) -> Option<crate::document::Document> {
+        None // [blocked: M.28]
+    }
+
+    fn get_document_mime_type(&self, _file_id: FileId) -> String {
+        String::new() // [blocked: M.28]
+    }
+
+    fn get_message_link_media_timestamp(&self, _url: &str) -> i32 {
+        0 // [blocked: M.23]
+    }
+
+    fn get_background_type_object(
+        &self,
+        _url: &str,
+        _is_pattern: bool,
+    ) -> Option<td_api::BackgroundType> {
+        None // [blocked: M.23]
+    }
+
+    fn has_video_chat_invite_hash(&self, _url: &str) -> bool {
+        false // [blocked: M.23]
+    }
+
+    fn is_premium(&self) -> bool {
+        self.options.as_ref().map_or(false, |options| {
+            options.get_option_boolean("is_premium", false)
+        })
+    }
+
+    fn send_get_web_page_preview_query(
+        &mut self,
+        _text: crate::message_entity::FormattedText,
+        _options: Box<crate::web_pages_manager::GetWebPagePreviewOptions>,
+        _promise: Promise<Option<td_api::LinkPreview>>,
+    ) {
+        // [blocked: net]
+    }
+
+    fn send_get_web_page_query(
+        &mut self,
+        _web_page_id: crate::webpage::WebPageId,
+        _url: String,
+        _hash: i32,
+        _promise: Promise<crate::webpage::WebPageId>,
+    ) {
+        // [blocked: net]
     }
 }
