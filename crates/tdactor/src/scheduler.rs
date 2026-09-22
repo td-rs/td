@@ -1044,6 +1044,12 @@ impl SchedulerState {
     fn next_timeout(&self) -> Option<Instant> {
         let mut heap = self.timeouts.borrow_mut();
         while let Some(TimeoutEntry(Reverse(at), id, generation)) = heap.peek() {
+            // the entry may outlive the actor (the same protocol as
+            // `run_timeout`): skip dead actors before touching the slot
+            if !id.is_alive() {
+                heap.pop();
+                continue;
+            }
             let info = self.info(id);
             if info.timeout_gen.get() == *generation {
                 return Some(*at);
@@ -1523,9 +1529,19 @@ impl ConcurrentScheduler {
         self.finished.store(false, Ordering::Relaxed);
         for state in self.schedulers.drain(..) {
             let finished = self.finished.clone();
-            self.threads.push(std::thread::spawn(move || {
-                scheduler_thread(state, finished);
-            }));
+            // The C++ actor threads ride the glibc pthread default stack
+            // (8 MiB); the Rust `std::thread` default is 2 MiB, which the
+            // debug-build dispatcher frames (the by-value `Function`
+            // chain, ~360 KiB per level) can cross — the live gate hit a
+            // stack-probe SIGSEGV on it. Match the C++ convention.
+            self.threads.push(
+                std::thread::Builder::new()
+                    .stack_size(8 * 1024 * 1024)
+                    .spawn(move || {
+                        scheduler_thread(state, finished);
+                    })
+                    .expect("scheduler thread spawn"),
+            );
         }
         self.state.set(ConcurrentSchedulerState::Run);
     }

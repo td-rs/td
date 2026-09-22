@@ -26,5 +26,6 @@ pub mod time;
 pub mod translit;
 pub mod unicode;
 pub mod utf8;
+pub mod zero_encode;
 
 mod unicode_tables;

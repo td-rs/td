@@ -10,7 +10,9 @@ publish = false
 description = "Golden vectors and differential harness for the td Rust rewrite"
 
 [dependencies]
+base64 = "0.22"
 rsa = "0.9"
+serde_json = "1"
 sha2 = "0.10"
 tdclient = { path = "../crates/tdclient" }
 tdjson = { path = "../crates/tdjson" }
@@ -52,3 +54,7 @@ path = "src/bin/recorder_replayer.rs"
 [[bin]]
 name = "hints_driver"
 path = "src/bin/hints_driver.rs"
+
+[[bin]]
+name = "transfer-gate"
+path = "src/bin/transfer_gate.rs"

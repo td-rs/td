@@ -1013,17 +1013,17 @@ mod tests {
         let photo = Photo {
             photos: vec![
                 PhotoSize {
-                    file_id: FileId::new(1),
+                    file_id: FileId::new(1, 0),
                     ..Default::default()
                 },
                 PhotoSize {
-                    file_id: FileId::new(2),
+                    file_id: FileId::new(2, 0),
                     ..Default::default()
                 },
             ],
             animations: vec![AnimationSize {
                 photo_size: PhotoSize {
-                    file_id: FileId::new(3),
+                    file_id: FileId::new(3, 0),
                     ..Default::default()
                 },
                 main_frame_timestamp: 0.0,
@@ -1032,7 +1032,7 @@ mod tests {
         };
         assert_eq!(
             photo_get_file_ids(&photo),
-            vec![FileId::new(1), FileId::new(2), FileId::new(3)]
+            vec![FileId::new(1, 0), FileId::new(2, 0), FileId::new(3, 0)]
         );
     }
 

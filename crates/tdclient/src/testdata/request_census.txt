@@ -60,9 +60,9 @@ canPurchaseFromStore	interim
 canSendGift	interim
 canSendMessageToUser	dispatched
 canTransferOwnership	interim
-cancelDownloadFile	interim
+cancelDownloadFile	dispatched
 cancelPasswordReset	interim
-cancelPreliminaryUploadFile	interim
+cancelPreliminaryUploadFile	dispatched
 cancelRecoveryEmailAddressVerification	interim
 changeImportedContacts	dispatched
 changeStickerSet	interim
@@ -201,7 +201,7 @@ discardCall	interim
 disconnectAffiliateProgram	interim
 disconnectAllWebsites	interim
 disconnectWebsite	interim
-downloadFile	interim
+downloadFile	dispatched
 dropGiftOriginalDetails	interim
 editBotMediaPreview	interim
 editBusinessChatLink	interim
@@ -246,7 +246,7 @@ encryptGroupCallData	interim
 endGroupCall	interim
 endGroupCallRecording	interim
 endGroupCallScreenSharing	interim
-finishFileGeneration	interim
+finishFileGeneration	dispatched
 fixRichMessageWithAi	interim
 fixTextWithAi	interim
 forwardMessages	interim
@@ -352,7 +352,7 @@ getCurrentState	dispatched
 getCurrentWeather	interim
 getCustomEmojiReactionAnimations	interim
 getCustomEmojiStickers	interim
-getDatabaseStatistics	interim
+getDatabaseStatistics	dispatched
 getDeepLinkInfo	interim
 getDefaultBackgroundCustomEmojiStickers	interim
 getDefaultChatEmojiStatuses	interim
@@ -371,7 +371,7 @@ getEmojiSuggestionsUrl	interim
 getExternalLink	interim
 getExternalLinkInfo	interim
 getFavoriteStickers	interim
-getFile	interim
+getFile	dispatched
 getFileDownloadedPrefixSize	interim
 getFileExtension	sync
 getFileMimeType	sync
@@ -498,7 +498,7 @@ getRecentlyVisitedTMeUrls	interim
 getRecommendedChatFolders	interim
 getRecommendedChats	interim
 getRecoveryEmailAddress	interim
-getRemoteFile	interim
+getRemoteFile	dispatched
 getRepliedMessage	interim
 getSavedAnimations	interim
 getSavedMessagesTags	interim
@@ -527,8 +527,8 @@ getStickerOutlineSvgPath	interim
 getStickerSet	interim
 getStickerSetName	interim
 getStickers	interim
-getStorageStatistics	interim
-getStorageStatisticsFast	interim
+getStorageStatistics	dispatched
+getStorageStatisticsFast	dispatched
 getStory	interim
 getStoryAlbumStories	interim
 getStoryAvailableReactions	interim
@@ -615,14 +615,14 @@ openMessageContent	interim
 openSponsoredChat	interim
 openStory	interim
 openWebApp	interim
-optimizeStorage	interim
+optimizeStorage	dispatched
 parseMarkdown	sync
 parseTextEntities	sync
 pinChatMessage	interim
 pingProxy	interim
 placeGiftAuctionBid	interim
 postStory	interim
-preliminaryUploadFile	interim
+preliminaryUploadFile	dispatched
 processChatFolderNewChats	interim
 processChatHasProtectedContentDisableRequest	dispatched
 processChatJoinRequest	interim
@@ -647,13 +647,13 @@ recoverPassword	interim
 refundStarPayment	interim
 registerDevice	dispatched
 registerUser	interim
-removeAllFilesFromDownloads	interim
+removeAllFilesFromDownloads	dispatched
 removeAllWebBrowserSettingsExceptions	dispatched
 removeBusinessConnectedBotFromChat	interim
 removeChatActionBar	interim
 removeContacts	dispatched
 removeFavoriteSticker	interim
-removeFileFromDownloads	interim
+removeFileFromDownloads	dispatched
 removeGiftCollectionGifts	interim
 removeInstalledBackground	interim
 removeLoginPasskey	interim
@@ -733,7 +733,7 @@ searchChats	dispatched
 searchChatsOnServer	dispatched
 searchContacts	dispatched
 searchEmojis	interim
-searchFileDownloads	interim
+searchFileDownloads	dispatched
 searchGiftsForResale	interim
 searchHashtags	interim
 searchInstalledStickerSets	interim
@@ -856,7 +856,7 @@ setDefaultMessageAutoDeleteTime	interim
 setDefaultReactionType	interim
 setDirectMessagesChatTopicIsMarkedAsUnread	interim
 setEmojiStatus	dispatched
-setFileGenerationProgress	interim
+setFileGenerationProgress	dispatched
 setForumTopicNotificationSettings	interim
 setGameScore	interim
 setGiftCollectionName	interim
@@ -955,7 +955,7 @@ testProxy	interim
 testReturnError	sync
 testSquareInt	dispatched
 testUseUpdate	dispatched
-toggleAllDownloadsArePaused	interim
+toggleAllDownloadsArePaused	dispatched
 toggleBotCanManageEmojiStatus	interim
 toggleBotIsAddedToAttachmentMenu	interim
 toggleBotUsernameIsActive	interim
@@ -969,7 +969,7 @@ toggleChatIsPinned	interim
 toggleChatIsTranslatable	interim
 toggleChatViewAsTopics	interim
 toggleDirectMessagesChatTopicCanSendUnpaidMessages	interim
-toggleDownloadIsPaused	interim
+toggleDownloadIsPaused	dispatched
 toggleForumTopicIsClosed	interim
 toggleForumTopicIsPinned	interim
 toggleGeneralForumTopicIsHidden	interim
@@ -1019,4 +1019,4 @@ viewPremiumFeature	interim
 viewSponsoredChat	interim
 viewTrendingStickerSets	interim
 viewVideoMessageAdvertisement	interim
-writeGeneratedFilePart	interim
+writeGeneratedFilePart	dispatched
