@@ -33,6 +33,7 @@
 use crate::call_id::{CallId, InputCallId};
 use crate::call_protocol::CallProtocol;
 use crate::chat_manager::{ChannelId, DialogId};
+use crate::community_id::CommunityId;
 use crate::contact::Contact;
 use crate::notification::{NotificationGroupId, NotificationId, NotificationObjectId};
 use crate::notification_settings::{
@@ -42,12 +43,12 @@ use crate::notification_settings::{
 use crate::notification_settings_manager::ScopeSettingsAnswer;
 use crate::suggested_action::SuggestedAction;
 use crate::td::AccountEnv;
-use crate::community_id::CommunityId;
 use crate::td::CallEnv;
+use crate::td::CommunityEnv;
 use crate::td::NotificationEnv;
+use crate::td::StatisticsEnv;
 use crate::td::Td;
 use crate::td::WebBrowserEnv;
-use crate::td::CommunityEnv;
 use crate::td_api::{self, Function, Object};
 use crate::user_manager::{FileId, PendingUserRequest, SecretChatId, UserEnv, UserId};
 use tdutils::promise::Promise;
@@ -262,7 +263,6 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 td.suggested_action_manager
                     .get_current_state(&env, &mut updates);
             }
-
 
             // ConnectionStateManager and the remaining authorized-manager
             // state blocks (connection/chat/background/...) accumulate here
@@ -2443,7 +2443,7 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
 
-        // Everything else waits for its manager step.        // --- community (Requests.cpp:3415-3432) ---
+        // --- community (Requests.cpp:3415-3432) ---
         Function::createCommunity(request) => {
             if !check_is_user(td, id) {
                 return;
@@ -2488,6 +2488,167 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
 
+        // Everything else waits for its manager step.
+        Function::getChatStatistics(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |s: td_api::ChatStatistics| match s {
+                td_api::ChatStatistics::chatStatisticsSupergroup(v) => {
+                    Object::chatStatisticsSupergroup(v)
+                }
+                td_api::ChatStatistics::chatStatisticsChannel(v) => {
+                    Object::chatStatisticsChannel(v)
+                }
+            });
+            let mut env = StatisticsEnv {
+                global: &mut td.global,
+                updates: &mut td.statistics_updates,
+            };
+            td.statistics_manager.get_channel_statistics(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                request.is_dark,
+                promise,
+            );
+        }
+        Function::getMessageStatistics(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |s: td_api::MessageStatistics| {
+                Object::messageStatistics(s)
+            });
+            let mut env = StatisticsEnv {
+                global: &mut td.global,
+                updates: &mut td.statistics_updates,
+            };
+            td.statistics_manager.get_channel_message_statistics(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                request.is_dark,
+                promise,
+            );
+        }
+        Function::getStoryStatistics(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise(id, |s: td_api::StoryStatistics| Object::storyStatistics(s));
+            let mut env = StatisticsEnv {
+                global: &mut td.global,
+                updates: &mut td.statistics_updates,
+            };
+            td.statistics_manager.get_channel_story_statistics(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                request.is_dark,
+                promise,
+            );
+        }
+        Function::getChatRevenueStatistics(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |s: td_api::ChatRevenueStatistics| {
+                Object::chatRevenueStatistics(s)
+            });
+            let mut env = StatisticsEnv {
+                global: &mut td.global,
+                updates: &mut td.statistics_updates,
+            };
+            td.statistics_manager.get_dialog_revenue_statistics(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                request.is_dark,
+                promise,
+            );
+        }
+        Function::getChatRevenueWithdrawalUrl(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(password) = crate::misc::clean_input_string(&request.password) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise =
+                td.deferred_promise(id, |url: String| Object::httpUrl(td_api::HttpUrl { url }));
+            let mut env = StatisticsEnv {
+                global: &mut td.global,
+                updates: &mut td.statistics_updates,
+            };
+            td.statistics_manager.get_dialog_revenue_withdrawal_url(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                &password,
+                promise,
+            );
+        }
+        Function::getChatRevenueTransactions(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(offset) = crate::misc::clean_input_string(&request.offset) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, |s: td_api::ChatRevenueTransactions| {
+                Object::chatRevenueTransactions(s)
+            });
+            let mut env = StatisticsEnv {
+                global: &mut td.global,
+                updates: &mut td.statistics_updates,
+            };
+            td.statistics_manager.get_dialog_revenue_transactions(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                &offset,
+                request.limit,
+                promise,
+            );
+        }
+        Function::getMessagePublicForwards(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(offset) = crate::misc::clean_input_string(&request.offset) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise =
+                td.deferred_promise(id, |s: td_api::PublicForwards| Object::publicForwards(s));
+            let mut env = StatisticsEnv {
+                global: &mut td.global,
+                updates: &mut td.statistics_updates,
+            };
+            td.statistics_manager.get_message_public_forwards(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                &offset,
+                request.limit,
+                promise,
+            );
+        }
+        Function::getStoryPublicForwards(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(offset) = crate::misc::clean_input_string(&request.offset) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise =
+                td.deferred_promise(id, |s: td_api::PublicForwards| Object::publicForwards(s));
+            let mut env = StatisticsEnv {
+                global: &mut td.global,
+                updates: &mut td.statistics_updates,
+            };
+            td.statistics_manager.get_story_public_forwards(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.story_poster_chat_id),
+                &offset,
+                request.limit,
+                promise,
+            );
+        }
 
         // Everything else waits for its manager step.
         _ => {
@@ -2783,21 +2944,13 @@ mod request_census_tests {
         assert_eq!(generated.len(), crate::td_api::SCHEME_FUNCTIONS);
 
         // The flip-state ledger — re-derived from the fixture at the wave-3
-// integration (the per-track flip histories compose).
-assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
-assert_eq!(
-    *counts.get("dispatched").unwrap_or(&0),
-    138,
-    "dispatched count"
-);
-assert_eq!(
-    *counts.get("interim").unwrap_or(&0),
-    866,
-    "interim count"
-);
+        // integration (the per-track flip histories compose).
+        assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
+        assert_eq!(
+            *counts.get("dispatched").unwrap_or(&0),
+            146,
+            "dispatched count"
+        );
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 858, "interim count");
     }
 }
-
-
-
-

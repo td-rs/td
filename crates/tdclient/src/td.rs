@@ -36,13 +36,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::community_manager::{CommunityManager, CommunityManagerEnv};
+use crate::statistics_manager::{StatisticsManager, StatisticsManagerEnv};
 use tdactor::{Actor, ActorOwn, Scheduler, actor_messages, send_closure_later};
 use tddb::td_db::{OpenedDatabase, Parameters as DbParameters, TdDb};
 use tdmtproto::telegram_api;
 use tdnet::net_query::{NetQuery, NetQueryDispatcher};
 use tdutils::promise::Promise;
 use tdutils::status::Status;
-use crate::community_manager::{CommunityManager, CommunityManagerEnv};
 
 use crate::account_manager::{AccountManager, AccountManagerEnv};
 
@@ -287,6 +288,11 @@ pub struct Td {
     /// The account plane's `send_update` outbox; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) account_updates: Vec<td_api::Update>,
+    /// `Td::statistics_manager_` (the C++ init_managers block).
+    pub(crate) statistics_manager: StatisticsManager,
+    /// The statistics plane's `send_update` outbox; drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) statistics_updates: Vec<td_api::Update>,
     /// `Td::community_manager_` (the C++ init_managers block).
     pub(crate) community_manager: CommunityManager,
     /// The community plane's `send_update` outbox; drained by
@@ -301,7 +307,7 @@ pub struct Td {
     /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) web_browser_updates: Vec<td_api::Update>,
-/// `Td::call_manager_` (`make_unique` at `Td.cpp:1186`, the
+    /// `Td::call_manager_` (`make_unique` at `Td.cpp:1186`, the
     /// `init_managers` block).
     pub(crate) call_manager: CallManager,
     /// The call plane's `send_update` outbox (updateCall /
@@ -622,14 +628,17 @@ impl Td {
                 crate::notification_settings_manager::NotificationSettingsManager::new(),
             account_manager: AccountManager::new(),
             terms_of_service_manager: crate::terms_of_service_manager::TermsOfServiceManager::new(),
-            suggested_action_manager: crate::suggested_action_manager::SuggestedActionManager::new(),
+            suggested_action_manager: crate::suggested_action_manager::SuggestedActionManager::new(
+            ),
             account_updates: Vec::new(),
+            statistics_manager: StatisticsManager::new(),
+            statistics_updates: Vec::new(),
             community_manager: CommunityManager::new(),
             community_updates: Vec::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
             web_browser_manager: WebBrowserManager::new(),
             web_browser_updates: Vec::new(),
-call_manager: CallManager::new(),
+            call_manager: CallManager::new(),
             call_updates: Vec::new(),
             call_dh_config: None,
             notification_updates: Vec::new(),
@@ -2658,6 +2667,10 @@ call_manager: CallManager::new(),
         }
         let account_updates = std::mem::take(&mut self.account_updates);
         for update in account_updates {
+            self.send_update(update.into());
+        }
+        let statistics_updates = std::mem::take(&mut self.statistics_updates);
+        for update in statistics_updates {
             self.send_update(update.into());
         }
         let community_updates = std::mem::take(&mut self.community_updates);
@@ -5654,6 +5667,34 @@ impl CommunityManagerEnv for CommunityEnv<'_> {
     }
 }
 
+/// The statistics-plane env over the `Td` fields.
+pub(crate) struct StatisticsEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl StatisticsManagerEnv for StatisticsEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn get_channel_statistics_dc_id(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> std::result::Result<(), tdutils::status::Status> {
+        // `ChatManager::get_channel_statistics_dc_id` — the dc-id answer
+        // joins with the net step; the seam accepts valid dialogs.
+        if dialog_id.is_valid() {
+            Ok(())
+        } else {
+            Err(tdutils::status::Status::error(400, "Chat not found"))
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

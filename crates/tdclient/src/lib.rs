@@ -59,6 +59,7 @@ pub mod query_merger;
 pub mod request_actor;
 pub mod requests;
 pub mod restriction_reason;
+pub mod statistics_manager;
 pub mod store_parse;
 pub mod suggested_action;
 pub mod suggested_action_manager;
