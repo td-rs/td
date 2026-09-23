@@ -51,7 +51,7 @@ use tdutils::status::Status;
 use crate::account_manager::{AccountManager, AccountManagerEnv};
 
 use crate::auth_manager::{AuthManager, AuthQuerySender};
-use crate::chat_manager::{ChannelType, ChannelId, ChatId, DcId, MessageId, RestrictedRights};
+use crate::chat_manager::{ChannelId, ChatId, DcId, MessageId, RestrictedRights};
 use crate::config_dispatch::{
     CompletedNetQueries, ConfigQueryCallback, SentNetQueries, TdConfigSink, TdSessionSink,
     build_config_net_query,
