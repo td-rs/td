@@ -334,6 +334,88 @@ mod tests {
     }
 
     #[test]
+    fn fresh_client_id_emits_the_startup_authorization_state() {
+        unsafe {
+            // The C++ creates the Td actor inside create_client_id, so a
+            // bare td_receive with no td_send yields the startup
+            // updateAuthorizationState — the receive-loop contract every
+            // shipped binding example relies on (S81 python run).
+            let client_id = td_create_client_id();
+            let mut startup = None;
+            for _ in 0..8 {
+                let received = td_receive(1.0);
+                assert!(!received.is_null(), "no updates for a fresh client id");
+                let received = cstr(received);
+                if received.starts_with(r#"{"@type":"updateAuthorizationState""#) {
+                    startup = Some(received.to_string());
+                    break;
+                }
+            }
+            let startup = startup.expect("startup updateAuthorizationState");
+            assert!(
+                startup.contains(r#""@type":"authorizationStateWaitTdlibParameters""#),
+                "unexpected startup authorization state: {startup}"
+            );
+            assert!(
+                startup.contains(&format!(r#""@client_id":{client_id}"#)),
+                "startup update not bound to the created client: {startup}"
+            );
+        }
+    }
+
+    /// The S81 python-example flow end to end: a bare receive reaches the
+    /// eager startup state, `close` settles in authorizationStateClosed, and
+    /// the legacy trio still answers on the same process afterwards.
+    #[test]
+    fn python_example_flow_bare_receive_then_close_then_legacy() {
+        unsafe {
+            let client_id = td_create_client_id();
+            let mut saw_wait_params = false;
+            for _ in 0..8 {
+                let received = td_receive(1.0);
+                assert!(!received.is_null(), "no updates for a fresh client id");
+                if cstr(received).contains("authorizationStateWaitTdlibParameters") {
+                    saw_wait_params = true;
+                    break;
+                }
+            }
+            assert!(saw_wait_params, "startup state never reached waitTdlibParameters");
+
+            let close = c"{\"@type\":\"close\"}";
+            td_send(client_id, close.as_ptr());
+            let mut saw_closed = false;
+            for _ in 0..20 {
+                let received = td_receive(1.0);
+                if received.is_null() {
+                    continue;
+                }
+                if cstr(received).contains("authorizationStateClosed") {
+                    saw_closed = true;
+                    break;
+                }
+            }
+            assert!(saw_closed, "close never reached authorizationStateClosed");
+
+            let client = td_json_client_create();
+            let request = c"{\"@type\":\"getOption\",\"name\":\"version\",\"@extra\":7}";
+            td_json_client_send(client, request.as_ptr());
+            let mut answered = false;
+            for _ in 0..20 {
+                let received = td_json_client_receive(client, 1.0);
+                if received.is_null() {
+                    continue;
+                }
+                if cstr(received).contains("@extra\":7") {
+                    answered = true;
+                    break;
+                }
+            }
+            td_json_client_destroy(client);
+            assert!(answered, "legacy client stopped answering after a manager close");
+        }
+    }
+
+    #[test]
     fn log_verbosity_level_is_set() {
         unsafe {
             td_set_log_verbosity_level(1);

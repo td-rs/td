@@ -312,9 +312,11 @@ pub fn get_reply_markup_from_telegram(
 
 /// `get_reply_markup(td_api::ReplyMarkup &&, is_bot, only_inline_keyboard,
 /// request_buttons_allowed, switch_inline_buttons_allowed, allow_personal)`
-/// (ReplyMarkup.cpp:201-317) — the td_api intake.
+/// (ReplyMarkup.cpp:201-317) — the td_api intake. Pub: the S78
+/// `message_input` fuzz target drives the raw five-bool matrix directly
+/// (the workspace callers go through `get_reply_markup`).
 #[allow(clippy::too_many_arguments)]
-fn get_reply_markup_from_td_api(
+pub fn get_reply_markup_from_td_api(
     reply_markup_ptr: Option<td_api::ReplyMarkup>,
     is_bot: bool,
     only_inline_keyboard: bool,

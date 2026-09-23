@@ -571,7 +571,11 @@ impl FormattedText {
     pub fn parse(input: &mut crate::store_parse::Parser) -> Result<FormattedText, &'static str> {
         let text = input.string()?;
         let len = input.i32_()?;
-        if len < 0 {
+        // The C++ gates the count against the bytes left in the input
+        // (`tl_helpers.h:170`) BEFORE the capacity allocation — a hostile
+        // count must reject, not reserve 30+ GB (the S78 message_content
+        // OOM, oom-bf05eca0).
+        if len < 0 || input.left_len() < len as usize {
             return Err("Wrong vector length");
         }
         let mut entities = Vec::with_capacity(len as usize);

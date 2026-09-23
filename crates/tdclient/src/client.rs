@@ -361,21 +361,11 @@ impl MultiImplPool {
         *best = Arc::downgrade(&fresh);
         fresh
     }
-
-    fn try_clear(&self) {
-        let mut impls = self.mutex.lock().unwrap();
-        if impls.is_empty() {
-            return;
-        }
-        if impls.iter().all(|weak| weak.strong_count() == 0) {
-            impls.clear();
-        }
-    }
 }
 
 /// `ClientManager::Impl` internals.
 struct Impl {
-    pool: MultiImplPool,
+    multi_impl: Arc<MultiImpl>,
     impls: RwLock<HashMap<i32, MultiImplInfo>>,
     receiver: TdReceiver,
 }
@@ -388,8 +378,17 @@ struct MultiImplInfo {
 
 impl Impl {
     fn new() -> Self {
+        // The C++ `ClientManager::Impl` owns its `MultiImpl` for its whole
+        // lifetime (`multi_impl_`); the per-client records only reference
+        // it. If the last per-client Arc were dropped inline — the
+        // close-notification erase in `receive` — the scheduler shutdown
+        // and thread join would race the pump that is still delivering the
+        // notification (the S81 python-example hang, 1-in-N). The manager
+        // holds the strong reference instead.
+        let pool = MultiImplPool::default();
+        let multi_impl = pool.get();
         Self {
-            pool: MultiImplPool::default(),
+            multi_impl,
             impls: RwLock::new(HashMap::new()),
             receiver: TdReceiver::new(),
         }
@@ -397,10 +396,19 @@ impl Impl {
 
     fn create_client_id(&self) -> i32 {
         let client_id = MultiImpl::create_id();
+        // The C++ creates the Td actor right here — Client.cpp marks the
+        // lazy variant with "TODO: create Td actor here lazily", i.e. the
+        // shipped behavior is eager — so the first td_receive on a fresh
+        // client id yields the startup updateAuthorizationState without any
+        // preceding td_send, which every shipped binding's receive loop
+        // expects (the S81 python-example run hangs otherwise).
+        let callback = self.receiver.create_callback(client_id);
+        let impl_ = Arc::clone(&self.multi_impl);
+        impl_.create(client_id, callback);
         self.impls.write().unwrap().insert(
             client_id,
             MultiImplInfo {
-                impl_: None,
+                impl_: Some(impl_),
                 is_closed: false,
             },
         );
@@ -431,7 +439,7 @@ impl Impl {
                 let info = write.get_mut(&client_id).expect("client known");
                 if info.impl_.is_none() {
                     let callback = self.receiver.create_callback(client_id);
-                    let impl_ = self.pool.get();
+                    let impl_ = Arc::clone(&self.multi_impl);
                     impl_.create(client_id, callback);
                     info.impl_ = Some(impl_);
                 }
@@ -495,9 +503,6 @@ impl Impl {
             assert!(info.is_closed, "unexpected close notification");
             lock.remove(&response.client_id);
             drop(lock);
-            if self.impls.read().unwrap().is_empty() {
-                self.pool.try_clear();
-            }
             return Response {
                 client_id: response.client_id,
                 request_id: 0,
