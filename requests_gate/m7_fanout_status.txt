@@ -1,0 +1,53 @@
+on_update_read_channel_outbox	live	`channel_reads_outbox` -> `apply_read_channel_history_outbox` -> `read_history_outbox` (MessagesManager.cpp:3676-3683)
+on_update_dialog_is_marked_as_unread	live	`set_dialog_is_marked_as_unread` via the TdSink `on_update_dialog_is_marked_as_unread` override (UpdatesManager.cpp:4096-4106)
+on_update_dialog_draft_message	seam	the update wrapper is the full draft machine (get_dialog_force + reply-id resolution + the repair query, MessagesManager.cpp:28430) over the ported update_dialog_draft_message core; lands with the M.10.14 tail + net
+on_update_read_channel_inbox	seam	needs the on_read_channel_inbox pts/pending machine + repair_channel_server_unread_count (MessagesManager.cpp:3688); the outbox twin is live
+on_update_channel_too_long	drop	[blocked: net] the get-difference repair pump rides the M.7.12-15 net step (schedule_get_difference)
+on_update_channel_max_unavailable_message_id	drop	[blocked: net] the channel-pts repair plane queues on the net step
+on_updated_dialog_folder_id	drop	[blocked: M.10.12 tail] the dialog folder-id flag plane (set_dialog_folder_id) is unported
+on_update_dialog_folder_id	drop	[blocked: M.10.12 tail] set_dialog_folder_id unported (addChatToList rides the same seam)
+on_updated_dialog_notification_settings	drop	[blocked: M.13 tail] the scope notification-settings flag setters are unported; the M.13S manager holds the read side
+on_update_delete_scheduled_messages	drop	[blocked: M.10 tail] the scheduled-messages delete walk (delete_scheduled_messages) is unported
+on_update_dialog_available_reactions	drop	[blocked: M.16 tail] set_dialog_available_reactions unported
+on_update_dialog_background	drop	[blocked: M.38] the dialog background intake lands with the Themes track's dialog plumbing
+on_update_dialog_business_bot_is_paused	drop	[blocked: M.44 Business] the business-bot manage-bar flag plane is unported
+on_update_dialog_business_bot_removed	drop	[blocked: M.44 Business] same business-bot plane
+on_update_dialog_chat_theme	drop	[blocked: M.38] the chat-theme intake lands with the Themes track
+on_update_dialog_default_join_group_call_as_dialog_id	drop	[blocked: M.50 GroupCall] the default join-as flag plane is unported
+on_update_dialog_default_send_message_as_dialog_id	drop	[blocked: M.27 tail] the created-public-broadcasts flag plane is unported
+on_update_dialog_group_call	drop	[blocked: M.50 GroupCall] the group-call dialog binding plane is unported
+on_update_dialog_group_call_id	drop	[blocked: M.50 GroupCall] same group-call plane
+on_update_dialog_group_call_rights	drop	[blocked: M.50 GroupCall] on_update_group_call_rights unported
+on_update_dialog_has_scheduled_server_messages	drop	[blocked: M.10 tail] the has-scheduled dialog flag plane is unported
+on_update_dialog_has_welcome_messages	drop	[blocked: M.10 tail] the welcome-messages dialog flag plane is unported
+on_update_dialog_is_blocked	drop	[blocked: M.5/ChatManager tail] on_update_user_is_blocked / the chat is-blocked plane is unported
+on_update_dialog_is_forum	drop	[blocked: M.40 Forums] set_dialog_is_forum unported (toggleSupergroupIsForum covers the request side)
+on_update_dialog_is_pinned	drop	[blocked: M.10.12 tail] the dialog order/pinned flag plane is unported
+on_update_dialog_is_translatable	drop	[blocked: M.10.12 tail] set_dialog_is_translatable unported
+on_update_dialog_last_pinned_message_id	drop	[blocked: M.10.14 pinned tail] set_dialog_last_pinned_message_id unported
+on_update_dialog_message_ttl	drop	[blocked: M.10.7 tail] the dialog ttl flag plane is unported
+on_update_dialog_notify_settings	drop	[blocked: M.13 tail] the per-dialog notification-settings intake lands with the M.13 difference hooks
+on_update_dialog_pending_join_requests	drop	[blocked: M.5/ChatManager tail] the pending join-requests counter plane is unported
+on_update_dialog_view_as_messages	drop	[blocked: M.10.12 tail] the view-as flag plane is unported
+on_update_dialog_view_as_topics	drop	[blocked: M.40 Forums] the view-as-topics flag plane is unported
+on_update_ephemeral_message_id	drop	[blocked: Wave-3 tde2e] the ephemeral-id registry rides the secret/tde2e plane
+on_update_live_location_viewed	drop	[blocked: M.10.9 tail] the live-location viewed registry is unported
+on_update_message_content	drop	[blocked: M.10 tail] the message-content refetch intake is unported
+on_update_message_extended_media	drop	[blocked: M.25 tail] the extended-media refetch machine is unported
+on_update_message_fact_check	drop	[blocked: M.10 tail] the fact-check flag plane is unported
+on_update_message_forward_count	drop	[blocked: M.18 tail] the forward-count interaction plane is unported
+on_update_message_interaction_info	drop	[blocked: M.18 tail] the interaction-info plane is unported
+on_update_message_reactions	drop	[blocked: M.16 tail] the reactions intake (on_get_message_reactions) is unported; the M.16 value plane landed
+on_update_message_view_count	drop	[blocked: M.18 tail] the view-count plane is unported
+on_update_notification_scope_is_muted	drop	[blocked: M.13 tail] the scope-mute flag plane is unported
+on_update_pinned_dialogs	drop	[blocked: M.10.12 tail] the pinned-dialogs order machine is unported
+on_update_poll_has_unread_votes	drop	[blocked: M.19 tail] the poll unread-votes plane is unported
+on_update_read_channel_messages_contents	drop	[blocked: M.10.7 tail] the TTL content-read plane (read_message_content_from_updates twin) is unported
+on_update_read_message_comments	drop	[blocked: M.40 Forums] the topic unread-comments plane is unported
+on_update_scope_mention_notifications	drop	[blocked: M.13 tail] the scope mention-notification flag plane is unported
+on_update_secret_chat_state	drop	[blocked: Wave-3 SecretChats] the secret-chat state machine rides the tde2e plane
+on_update_sent_text_message	drop	[blocked: M.10 tail] the sent-message refetch intake is unported
+on_update_service_notification	drop	[blocked: M.13 tail] the service-notification loc-key pipeline lands with the M.13.6b push plane
+on_update_some_live_location_viewed	drop	[blocked: M.10.9 tail] the live-location viewed registry is unported
+on_update_viewed_messages_timeout	drop	[blocked: M.16 tail] the viewed-messages expiry machine is unported
+on_update_viewed_messages_timeout_callback	drop	[blocked: M.16 tail] the viewed-messages timer callback is unported
