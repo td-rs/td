@@ -36,6 +36,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::boost_manager::{BoostManager, BoostManagerEnv};
+use crate::community_manager::{CommunityManager, CommunityManagerEnv};
+use crate::premium::{PremiumEnv, PremiumManager};
+use crate::quick_reply_manager::{QuickReplyManager, QuickReplyManagerEnv};
+use crate::statistics_manager::{StatisticsManager, StatisticsManagerEnv};
 use tdactor::{Actor, ActorOwn, Scheduler, actor_messages, send_closure_later};
 use tddb::td_db::{OpenedDatabase, Parameters as DbParameters, TdDb};
 use tdmtproto::telegram_api;
@@ -43,8 +48,10 @@ use tdnet::net_query::{NetQuery, NetQueryDispatcher};
 use tdutils::promise::Promise;
 use tdutils::status::Status;
 
+use crate::account_manager::{AccountManager, AccountManagerEnv};
+
 use crate::auth_manager::{AuthManager, AuthQuerySender};
-use crate::chat_manager::DcId;
+use crate::chat_manager::{ChannelId, ChatId, DcId, MessageId, RestrictedRights};
 use crate::config_dispatch::{
     CompletedNetQueries, ConfigQueryCallback, SentNetQueries, TdConfigSink, TdSessionSink,
     build_config_net_query,
@@ -58,22 +65,35 @@ use crate::config_recoverer::{
 };
 use crate::config_result;
 use crate::connection_creator::ConnectionCreator;
-use crate::convert::{self, MessageSpec};
+use crate::contact::Contact;
+use crate::convert;
 use crate::dialog_manager::DialogManager;
+use crate::emoji_status::CustomEmojiId;
 use crate::global::Global;
 use crate::link_manager::LinkManager;
 use crate::manager_option_states::ManagerOptionStates;
-use crate::message_id::DialogId;
+use crate::message_content::*;
+use crate::message_entity::FormattedText;
+use crate::messages_manager::{
+    DialogId, EphemeralMessageFullId, FileUploadId, MessageFullId, QuickReplyMessageFullId,
+    QuickReplyShortcutId, StoryFullId, StoryId,
+};
 use crate::net::{AuthSender, BridgeConfig, NetBridge, QueryAnswer};
 use crate::notification_manager::NotificationManager;
 use crate::option_manager::OptionManager;
+use crate::photo::{Dimensions, Photo, PhotoSize};
 use crate::query_merger::QueryMerger;
 use crate::requests;
 use crate::synchronous_requests;
 use crate::td_api::{self, Function, Object};
 use crate::time_zone_manager::TimeZoneManager;
 use crate::updates_manager::{PendingUpdate, UpdatesManager, UpdatesManagerEnv, UpdatesSink};
+use crate::user_manager::SecretChatId;
 use crate::user_manager::{UserEnv, UserId, UserManager};
+use crate::web_browser_manager::WebBrowserManager;
+
+use crate::call_manager::CallManager;
+use crate::dh_cache::DhConfig;
 
 use crate::files::{
     DocumentByHash, DownloadCallback, DownloadCounters, DownloadManager, DownloadManagerCallback,
@@ -130,24 +150,24 @@ pub struct HeaderOptions {
     pub is_emulator: bool,
 }
 
-/// A `sendMessage` in flight: the temporary local message exists, the
-/// answer was already sent, and the wire ack completes it.
-struct PendingSend {
-    local_id: i64,
-    chat_id: i64,
-    text: String,
-}
-
-/// The collecting sink under the S76 walking-skeleton path — Td drains it
-/// and converts/emits. The S72 fan-outs became the M.7 engine's
-/// `process_pts_update` switch; the interim runs this second engine
-/// instance beside the Td-level one until MessagesManager lands (M.10)
-/// and retires the skeleton converter.
+/// The td-level [`UpdatesSink`] — the collector form carrying the M.10
+/// receive path: the engine drives it (the users/chats pre-application
+/// and the applied pts updates) and `Td::drain_sink` converts/emits
+/// through the landed managers (the M.10.3 receive head, the M.10.5 edit
+/// intake, the M.10.6 deletes and the M.10.7 reads).
 #[derive(Default)]
-struct TdSink {
-    users: Vec<tdmtproto::telegram_api::User>,
-    chats: Vec<tdmtproto::telegram_api::Chat>,
-    new_messages: Vec<tdmtproto::telegram_api::Message>,
+pub(crate) struct TdSink {
+    pub(crate) users: Vec<tdmtproto::telegram_api::User>,
+    pub(crate) chats: Vec<tdmtproto::telegram_api::Chat>,
+    pub(crate) new_messages: Vec<(tdmtproto::telegram_api::Message, &'static str)>,
+    pub(crate) deletions: Vec<Vec<i32>>,
+    /// `updateEditMessage` — (message, pts) for the M.10.5 edit intake.
+    pub(crate) edits: Vec<(tdmtproto::telegram_api::Message, i32)>,
+    /// `updateReadHistoryInbox` — (peer, max_id, top_msg_id) for the
+    /// M.10.7 read intake.
+    pub(crate) reads_inbox: Vec<(tdmtproto::telegram_api::Peer, i32, i32)>,
+    /// `updateReadHistoryOutbox` — (peer, max_id).
+    pub(crate) reads_outbox: Vec<(tdmtproto::telegram_api::Peer, i32)>,
 }
 
 impl UpdatesSink for TdSink {
@@ -157,22 +177,1740 @@ impl UpdatesSink for TdSink {
     fn on_chat(&mut self, chat: tdmtproto::telegram_api::Chat) {
         self.chats.push(chat);
     }
+    /// `MessagesManager::process_pts_update` — the applied update switch:
+    /// the new-message and delete kinds collect for the drain (the
+    /// M.10.3/M.10.6 intakes); the rest are the manager flips.
     fn process_pts_update(&mut self, update: PendingUpdate) {
-        if let PendingUpdate::Wire(telegram_api::Update::updateNewMessage(new_message)) = update
-            && let Some(message) = new_message.message
-        {
-            self.new_messages.push(message);
+        match update {
+            PendingUpdate::Wire(telegram_api::Update::updateNewMessage(update)) => {
+                if let Some(message) = update.message {
+                    self.new_messages.push((message, "updateNewMessage"));
+                }
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateNewChannelMessage(update)) => {
+                if let Some(message) = update.message {
+                    self.new_messages.push((message, "updateNewChannelMessage"));
+                }
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateDeleteMessages(update)) => {
+                self.deletions.push(update.messages);
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateEditMessage(update)) => {
+                if let Some(message) = update.message {
+                    self.edits.push((message, update.pts));
+                }
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateReadHistoryInbox(update)) => {
+                if let Some(peer) = update.peer {
+                    self.reads_inbox
+                        .push((peer, update.max_id, update.top_msg_id));
+                }
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateReadHistoryOutbox(update)) => {
+                if let Some(peer) = update.peer {
+                    self.reads_outbox.push((peer, update.max_id));
+                }
+            }
+            // `updateReadMessagesContents` (read_message_content_from_updates,
+            // MessagesManager.cpp:9325) rides the TTL content-read plane and
+            // `updatePinnedMessages` the M.10.14 pinned tail — both collect
+            // nothing until their slices land.
+            _ => {}
         }
     }
+    /// `MessagesManager::add_pending_channel_update` — the channel-pts
+    /// machine's applied updates ride the same collector.
     fn add_pending_channel_update(
         &mut self,
         _peer: Option<tdmtproto::telegram_api::Peer>,
-        _update: PendingUpdate,
+        update: PendingUpdate,
         _pts: i32,
         _pts_count: i32,
         _promise: Promise<()>,
         _source: &str,
     ) {
+        self.process_pts_update(update);
+    }
+}
+
+/// The Td-side [`crate::message_content::MessageContentContext`] adapter —
+/// the M.9.18 receive flip. The real reads are the Td-owned surfaces
+/// (auth, options, ids, unix time); the manager surfaces answer the
+/// documented stand-ins until their owners land.
+impl crate::message_content::MessageContentContext for Td {
+    fn get_user_default_permissions(&self, _user_id: UserId) -> RestrictedRights {
+        RestrictedRights::default()
+    }
+    fn get_secret_chat_default_permissions(
+        &self,
+        _secret_chat_id: SecretChatId,
+    ) -> RestrictedRights {
+        RestrictedRights::default()
+    }
+    fn is_user_bot(&self, user_id: UserId) -> bool {
+        self.users
+            .get(&user_id.get())
+            .is_some_and(|u| matches!(u.r#type, Some(td_api::UserType::userTypeBot(_))))
+    }
+    fn get_user_voice_messages_forbidden(&self, _user_id: UserId) -> bool {
+        false
+    }
+    fn get_chat_effective_restricted_rights(&self, _chat_id: ChatId) -> RestrictedRights {
+        RestrictedRights::default()
+    }
+    fn get_channel_effective_restricted_rights(&self, _channel_id: ChannelId) -> RestrictedRights {
+        RestrictedRights::default()
+    }
+    fn is_broadcast_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+    fn is_monoforum_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+    fn is_bot(&self) -> bool {
+        self.auth_manager.is_bot()
+    }
+    fn get_my_dialog_id(&self) -> DialogId {
+        crate::messages_manager::DialogId::from_user_id(crate::user_manager::UserId::new(
+            self.my_id,
+        ))
+    }
+    fn get_poll_is_anonymous(&self, _poll_id: PollId) -> bool {
+        false
+    }
+    fn get_poll_is_closed(&self, _poll_id: PollId) -> bool {
+        false
+    }
+    fn get_poll_can_add_option(&self, _poll_id: PollId) -> bool {
+        false
+    }
+    fn get_poll_can_view_stats(&self, _poll_id: PollId) -> bool {
+        false
+    }
+    fn get_poll_has_unread_votes(&self, _poll_id: PollId) -> bool {
+        false
+    }
+    fn remove_poll_has_unread_votes(&self, _poll_id: PollId) {
+        {}
+    }
+    fn has_input_media_poll(&self, _poll_id: PollId) -> bool {
+        false
+    }
+    fn get_poll_individual_message_contents(
+        &self,
+        _poll_id: PollId,
+        _attached_media: Option<&MessageContent>,
+    ) -> Vec<MessageContent> {
+        Vec::new()
+    }
+    fn get_poll_option_properties(
+        &self,
+        _poll_id: PollId,
+        _option_id: &str,
+        _dialog_id: DialogId,
+        _message_id: MessageId,
+        _can_be_replied: bool,
+        _can_be_replied_in_another_chat: bool,
+        _can_get_link: bool,
+        _is_forward: bool,
+        _is_outgoing: bool,
+        _promise: Promise<crate::td_api::PollOptionProperties>,
+    ) {
+        {}
+    }
+    fn get_sticker_type(&self, _file_id: FileId) -> StickerType {
+        StickerType::default()
+    }
+    fn get_web_page_user_ids(&self, _web_page_id: WebPageId) -> Vec<UserId> {
+        Vec::new()
+    }
+    fn get_web_page_channel_ids(&self, _web_page_id: WebPageId) -> Vec<ChannelId> {
+        Vec::new()
+    }
+    fn get_option_integer(&self, name: &str, default: i64) -> i64 {
+        self.option_manager
+            .as_ref()
+            .map_or(default, |om| om.get_option_integer(name, default))
+    }
+    fn register_web_page(
+        &mut self,
+        _web_page_id: WebPageId,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_web_page(
+        &mut self,
+        _web_page_id: WebPageId,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_quick_reply_web_page(
+        &mut self,
+        _web_page_id: WebPageId,
+        _message_full_id: QuickReplyMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_quick_reply_web_page(
+        &mut self,
+        _web_page_id: WebPageId,
+        _message_full_id: QuickReplyMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_welcome_message_web_page(
+        &mut self,
+        _web_page_id: WebPageId,
+        _message_full_id: EphemeralMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_welcome_message_web_page(
+        &mut self,
+        _web_page_id: WebPageId,
+        _message_full_id: EphemeralMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_premium_gift(
+        &mut self,
+        _months: i32,
+        _star_count: i64,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_premium_gift(
+        &mut self,
+        _months: i32,
+        _star_count: i64,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_ton_gift(
+        &mut self,
+        _ton_count: i64,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_ton_gift(
+        &mut self,
+        _ton_count: i64,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_dice(
+        &mut self,
+        _emoji: &str,
+        _value: i32,
+        _message_full_id: MessageFullId,
+        _quick_reply_message_full_id: QuickReplyMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_dice(
+        &mut self,
+        _emoji: &str,
+        _value: i32,
+        _message_full_id: MessageFullId,
+        _quick_reply_message_full_id: QuickReplyMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_emoji(
+        &mut self,
+        _emoji: &str,
+        _custom_emoji_id: CustomEmojiId,
+        _message_full_id: MessageFullId,
+        _quick_reply_message_full_id: QuickReplyMessageFullId,
+        _ephemeral_message_full_id: EphemeralMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_emoji(
+        &mut self,
+        _emoji: &str,
+        _custom_emoji_id: CustomEmojiId,
+        _message_full_id: MessageFullId,
+        _quick_reply_message_full_id: QuickReplyMessageFullId,
+        _ephemeral_message_full_id: EphemeralMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_voice(
+        &mut self,
+        _file_id: FileId,
+        _content_type: MessageContentType,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_voice(
+        &mut self,
+        _file_id: FileId,
+        _content_type: MessageContentType,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_poll(&mut self, _poll_id: PollId, _message_full_id: MessageFullId, _source: &str) {
+        {}
+    }
+    fn unregister_poll(
+        &mut self,
+        _poll_id: PollId,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_reply_poll(&mut self, _poll_id: PollId) {
+        {}
+    }
+    fn unregister_reply_poll(&mut self, _poll_id: PollId) {
+        {}
+    }
+    fn register_story(
+        &mut self,
+        _story_full_id: StoryFullId,
+        _message_full_id: MessageFullId,
+        _quick_reply_message_full_id: QuickReplyMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn unregister_story(
+        &mut self,
+        _story_full_id: StoryFullId,
+        _message_full_id: MessageFullId,
+        _quick_reply_message_full_id: QuickReplyMessageFullId,
+        _source: &str,
+    ) {
+        {}
+    }
+    fn register_group_call(&mut self, _message_full_id: MessageFullId, _source: &str) {
+        {}
+    }
+    fn unregister_group_call(&mut self, _message_full_id: MessageFullId, _source: &str) {
+        {}
+    }
+    fn register_suggested_profile_photo(&mut self, _photo: &Photo) {
+        {}
+    }
+    fn register_noforwards_request(&mut self, _message_full_id: MessageFullId, _message_date: i32) {
+        {}
+    }
+    fn unregister_noforwards_request(&mut self, _message_full_id: MessageFullId) {
+        {}
+    }
+    fn merge_animations(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_audios(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_documents(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_stickers(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_videos(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_video_notes(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_voice_notes(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_files(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn merge_photo_files(&mut self, _old_photo: &Photo, _new_photo: &Photo, _dialog_id: DialogId) {
+        {}
+    }
+    fn have_web_page(&self, _web_page_id: WebPageId) -> bool {
+        false
+    }
+    fn try_merge_documents(&mut self, _new_file_id: FileId, _old_file_id: FileId) {
+        {}
+    }
+    fn get_option_boolean(&self, name: &str, default_value: bool) -> bool {
+        self.option_manager
+            .as_ref()
+            .is_some_and(|om| om.get_option_boolean(name, default_value))
+    }
+    fn get_secret_chat_layer(&self, _secret_chat_id: SecretChatId) -> i32 {
+        0
+    }
+    fn get_secret_chat_user_id(&self, _secret_chat_id: SecretChatId) -> UserId {
+        UserId::default()
+    }
+    fn can_use_premium_custom_emoji_in_dialog(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+    fn is_premium_custom_emoji(&self, _custom_emoji_id: CustomEmojiId) -> bool {
+        false
+    }
+    fn get_channel_can_add_web_page_previews(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+    fn get_web_page_by_url(&self, _url: &str) -> WebPageId {
+        WebPageId::default()
+    }
+    fn have_user_force(&self, _user_id: UserId, _source: &str) -> bool {
+        false
+    }
+    fn ensure_input_user(&self, _user_id: UserId) -> Result<(), Status> {
+        unreachable!("send-path seam reached on the receive flip")
+    }
+    fn get_my_id(&self) -> UserId {
+        crate::user_manager::UserId::new(self.my_id)
+    }
+    fn get_file_view_details(&self, _file_id: FileId) -> Option<(String, String, String)> {
+        None
+    }
+    fn create_animation(
+        &mut self,
+        _file_id: FileId,
+        _thumbnail: PhotoSize,
+        _has_stickers: bool,
+        _sticker_file_ids: Vec<FileId>,
+        _file_name: String,
+        _mime_type: String,
+        _duration: i32,
+        _dimensions: Dimensions,
+    ) {
+        {}
+    }
+    fn create_audio(
+        &mut self,
+        _file_id: FileId,
+        _thumbnail: PhotoSize,
+        _file_name: String,
+        _mime_type: String,
+        _duration: i32,
+        _title: String,
+        _performer: String,
+    ) {
+        {}
+    }
+    fn create_document(
+        &mut self,
+        _file_id: FileId,
+        _thumbnail: PhotoSize,
+        _file_name: String,
+        _mime_type: String,
+    ) {
+        {}
+    }
+    fn create_sticker(&mut self, _file_id: FileId, _thumbnail: PhotoSize, _dimensions: Dimensions) {
+        {}
+    }
+    fn create_video(
+        &mut self,
+        _file_id: FileId,
+        _thumbnail: PhotoSize,
+        _has_stickers: bool,
+        _sticker_file_ids: Vec<FileId>,
+        _file_name: String,
+        _mime_type: String,
+        _duration: i32,
+        _dimensions: Dimensions,
+        _supports_streaming: bool,
+    ) {
+        {}
+    }
+    fn create_video_note(
+        &mut self,
+        _file_id: FileId,
+        _thumbnail: PhotoSize,
+        _duration: i32,
+        _dimensions: Dimensions,
+    ) {
+        {}
+    }
+    fn create_voice_note(
+        &mut self,
+        _file_id: FileId,
+        _mime_type: String,
+        _duration: i32,
+        _waveform: Vec<u8>,
+    ) {
+        {}
+    }
+    fn create_photo_input(
+        &mut self,
+        _file_id: FileId,
+        _thumbnail: PhotoSize,
+        _width: i32,
+        _height: i32,
+        _sticker_file_ids: Vec<FileId>,
+    ) -> Result<Photo, Status> {
+        unreachable!("send-path seam reached on the receive flip")
+    }
+    fn get_input_file_id(
+        &mut self,
+        _file_type: crate::files::FileType,
+        _input_file: Option<td_api::InputFile>,
+        _dialog_id: DialogId,
+        _allow_get_by_hash: bool,
+        _is_secret: bool,
+    ) -> Result<FileId, Status> {
+        unreachable!("send-path seam reached on the receive flip")
+    }
+    fn get_attached_sticker_file_ids(&self, _sticker_file_ids: Vec<i32>) -> Vec<FileId> {
+        Vec::new()
+    }
+    fn get_input_thumbnail_photo_size(
+        &mut self,
+        _thumbnail: Option<td_api::InputThumbnail>,
+        _dialog_id: DialogId,
+        _is_secret: bool,
+    ) -> Result<PhotoSize, Status> {
+        unreachable!("send-path seam reached on the receive flip")
+    }
+    fn from_persistent_id(
+        &self,
+        _persistent_id: &str,
+        _file_type: crate::files::FileType,
+    ) -> Result<FileId, Status> {
+        unreachable!("send-path seam reached on the receive flip")
+    }
+    fn is_broadcast_channel_dialog(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+    fn create_poll(
+        &mut self,
+        _question: FormattedText,
+        _options: Vec<PollOption>,
+        _is_anonymous: bool,
+        _allows_multiple_answers: bool,
+        _has_open_answers: bool,
+        _fixed_answers: bool,
+        _members_only: bool,
+        _country_codes: Vec<String>,
+        _shuffle_options: bool,
+        _hide_results_until_closes: bool,
+        _is_quiz: bool,
+        _correct_option_ids: Vec<i32>,
+        _explanation: FormattedText,
+        _explanation_media: Option<Box<MessageContent>>,
+        _open_period: i32,
+        _close_date: i32,
+        _is_closed: bool,
+    ) -> PollId {
+        PollId::default()
+    }
+    fn have_story_force(&self, _story_full_id: StoryFullId) -> bool {
+        false
+    }
+    fn has_read_access_input_peer(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+    fn get_input_user_force(&self, _user_id: UserId) -> Option<telegram_api::InputUser> {
+        None
+    }
+    fn get_animation_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputFile>,
+        _input_thumbnail: Option<telegram_api::InputFile>,
+        _has_spoiler: bool,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_audio_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputFile>,
+        _input_thumbnail: Option<telegram_api::InputFile>,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_document_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputFile>,
+        _input_thumbnail: Option<telegram_api::InputFile>,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_sticker_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputFile>,
+        _input_thumbnail: Option<telegram_api::InputFile>,
+        _emoji: &str,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_video_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputFile>,
+        _input_thumbnail: Option<telegram_api::InputFile>,
+        _cover: &Photo,
+        _start_timestamp: i32,
+        _ttl: i32,
+        _has_spoiler: bool,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_video_note_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputFile>,
+        _input_thumbnail: Option<telegram_api::InputFile>,
+        _ttl: i32,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_voice_note_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputFile>,
+        _ttl: i32,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_poll_input_media(
+        &self,
+        _poll_id: PollId,
+        _input_media: Vec<Option<telegram_api::InputMedia>>,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_story_input_media(
+        &self,
+        _story_full_id: StoryFullId,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn photo_get_input_media(
+        &self,
+        _photo: &Photo,
+        _input_file: Option<telegram_api::InputFile>,
+        _ttl: i32,
+        _has_spoiler: bool,
+        _video_file_id: FileId,
+    ) -> Option<telegram_api::InputMedia> {
+        None
+    }
+    fn get_animation_secret_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _caption: &FormattedText,
+        _thumbnail: Vec<u8>,
+        _layer: i32,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn get_audio_secret_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _caption: &FormattedText,
+        _thumbnail: Vec<u8>,
+        _layer: i32,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn get_document_secret_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _caption: &FormattedText,
+        _thumbnail: Vec<u8>,
+        _layer: i32,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn get_sticker_secret_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _thumbnail: Vec<u8>,
+        _layer: i32,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn get_video_secret_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _caption: &FormattedText,
+        _thumbnail: Vec<u8>,
+        _layer: i32,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn get_video_note_secret_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _thumbnail: Vec<u8>,
+        _layer: i32,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn get_voice_note_secret_input_media(
+        &self,
+        _file_id: FileId,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _caption: &FormattedText,
+        _layer: i32,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn photo_get_secret_input_media(
+        &self,
+        _photo: &Photo,
+        _input_file: Option<telegram_api::InputEncryptedFile>,
+        _caption: &FormattedText,
+        _thumbnail: Vec<u8>,
+    ) -> SecretInputMedia {
+        SecretInputMedia::default()
+    }
+    fn get_input_web_document(&self, _photo: &Photo) -> Option<telegram_api::InputWebDocument> {
+        None
+    }
+    fn delete_animation_thumbnail(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn delete_audio_thumbnail(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn delete_document_thumbnail(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn delete_sticker_thumbnail(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn delete_video_thumbnail(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn delete_video_note_thumbnail(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn cancel_upload(&mut self, _file_upload_id: FileUploadId) {
+        {}
+    }
+    fn was_authorized(&self) -> bool {
+        self.auth_manager.is_authorized()
+    }
+    fn get_live_photo_video_file_id(
+        &mut self,
+        _video: Option<telegram_api::Document>,
+        _owner_dialog_id: DialogId,
+        _is_self_destructing: bool,
+    ) -> FileId {
+        FileId::default()
+    }
+    fn on_get_document(
+        &mut self,
+        _document: telegram_api::Document,
+        _owner_dialog_id: DialogId,
+        _is_self_destructing: bool,
+        _is_send_priority: bool,
+        _doc_type: Option<DocumentType>,
+    ) -> ParsedDocument {
+        ParsedDocument::default()
+    }
+    fn get_web_document_photo(
+        &mut self,
+        _web_document: Option<telegram_api::WebDocument>,
+        _owner_dialog_id: DialogId,
+    ) -> Photo {
+        Photo::default()
+    }
+    fn on_get_web_page(
+        &mut self,
+        _web_page: Option<telegram_api::WebPage>,
+        _owner_dialog_id: DialogId,
+    ) -> WebPageId {
+        WebPageId::default()
+    }
+    fn on_get_poll(
+        &mut self,
+        _poll: Option<telegram_api::Poll>,
+        _results: Option<telegram_api::PollResults>,
+        _source: &str,
+    ) -> PollId {
+        PollId::default()
+    }
+    fn on_get_story(
+        &mut self,
+        _dialog_id: DialogId,
+        _story: Option<telegram_api::StoryItem>,
+    ) -> StoryId {
+        StoryId::default()
+    }
+    fn force_create_dialog(&mut self, _dialog_id: DialogId, _source: &str) {
+        {}
+    }
+    fn is_file_encrypted_secret(&self, _file_id: FileId) -> bool {
+        false
+    }
+    fn copy_file_id_to_secret(&mut self, _file_id: FileId, _dialog_id: DialogId) -> FileId {
+        FileId::default()
+    }
+    fn dup_animation(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
+        FileId::default()
+    }
+    fn dup_audio(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
+        FileId::default()
+    }
+    fn dup_document(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
+        FileId::default()
+    }
+    fn dup_sticker(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
+        FileId::default()
+    }
+    fn dup_video(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
+        FileId::default()
+    }
+    fn dup_video_note(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
+        FileId::default()
+    }
+    fn dup_voice_note(&mut self, _new_file_id: FileId, _old_file_id: FileId) -> FileId {
+        FileId::default()
+    }
+    fn dup_poll(&mut self, _dialog_id: DialogId, _poll_id: PollId) -> PollId {
+        PollId::default()
+    }
+    fn has_secret_input_media_sticker(&self, _file_id: FileId) -> bool {
+        false
+    }
+    fn is_user_deleted(&self, _user_id: UserId) -> bool {
+        false
+    }
+    fn get_recent_call_access_hash(&self, _call_id: i64) -> i64 {
+        0
+    }
+    fn get_encrypted_secure_values(
+        &mut self,
+        _secure_values: Vec<telegram_api::SecureValue>,
+    ) -> Vec<EncryptedSecureValue> {
+        Vec::new()
+    }
+    fn get_shared_dialog_from_peer(
+        &mut self,
+        _peer: telegram_api::RequestedPeer,
+    ) -> Option<SharedDialog> {
+        None
+    }
+    fn get_background_info(
+        &mut self,
+        _wallpaper: Option<telegram_api::WallPaper>,
+        _is_local: bool,
+        _for_dark_theme: bool,
+    ) -> Option<BackgroundInfo> {
+        None
+    }
+    fn get_web_app_from_bot_app(
+        &mut self,
+        _bot_app: telegram_api::BotApp,
+        _owner_dialog_id: DialogId,
+    ) -> WebApp {
+        WebApp::default()
+    }
+    fn parse_poll_option_answer(
+        &mut self,
+        _answer: Option<telegram_api::PollAnswer>,
+    ) -> Option<(FormattedText, String)> {
+        None
+    }
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+    fn get_user_id_object(&self, user_id: UserId, _source: &str) -> i64 {
+        user_id.get()
+    }
+    fn get_user_ids_object(&self, user_ids: &[UserId], _source: &str) -> Vec<i64> {
+        user_ids.iter().map(|&u| u.get()).collect()
+    }
+    fn is_user_support(&self, _user_id: UserId) -> bool {
+        false
+    }
+    fn get_service_notifications_user_id(&self) -> UserId {
+        crate::user_manager::UserId::new(777000)
+    }
+    fn get_supergroup_id_object(&self, channel_id: ChannelId, _source: &str) -> i64 {
+        channel_id.get()
+    }
+    fn get_basic_group_id_object(&self, chat_id: ChatId, _source: &str) -> i64 {
+        chat_id.get()
+    }
+    fn get_chat_id_object(&self, dialog_id: DialogId, _source: &str) -> i64 {
+        match dialog_id.get_type() {
+            crate::messages_manager::DialogType::User => dialog_id.get_user_id().get(),
+            crate::messages_manager::DialogType::Chat => -dialog_id.get_chat_id().get(),
+            crate::messages_manager::DialogType::Channel => dialog_id.get_channel_id().get(),
+            crate::messages_manager::DialogType::SecretChat => {
+                i64::from(dialog_id.get_secret_chat_id().get())
+            }
+            crate::messages_manager::DialogType::None => 0,
+        }
+    }
+    fn have_input_peer(&self, _dialog_id: DialogId) -> bool {
+        true
+    }
+    fn get_group_call_id(
+        &self,
+        _input_group_call_id: InputGroupCallId,
+        _dialog_id: DialogId,
+    ) -> i64 {
+        0
+    }
+    fn get_message_sender_object(
+        &self,
+        _dialog_id: DialogId,
+        _source: &str,
+    ) -> Option<td_api::MessageSender> {
+        None
+    }
+    fn get_contact_object(&self, _contact: &Contact) -> td_api::Contact {
+        td_api::Contact::default()
+    }
+    fn get_animation_object(&self, _file_id: FileId) -> td_api::Animation {
+        td_api::Animation::default()
+    }
+    fn get_audio_object(&self, _file_id: FileId) -> td_api::Audio {
+        td_api::Audio::default()
+    }
+    fn get_document_object(&self, _file_id: FileId) -> td_api::Document {
+        td_api::Document::default()
+    }
+    fn get_video_object(&self, _file_id: FileId) -> td_api::Video {
+        td_api::Video::default()
+    }
+    fn get_video_note_object(&self, _file_id: FileId) -> td_api::VideoNote {
+        td_api::VideoNote::default()
+    }
+    fn get_voice_note_object(&self, _file_id: FileId) -> td_api::VoiceNote {
+        td_api::VoiceNote::default()
+    }
+    fn get_sticker_object(&self, _file_id: FileId) -> Option<td_api::Sticker> {
+        None
+    }
+    fn get_animated_emoji_object(
+        &self,
+        _text: &str,
+        _custom_emoji_id: CustomEmojiId,
+    ) -> Option<td_api::AnimatedEmoji> {
+        None
+    }
+    fn get_dice_stickers_object(&self, _emoji: &str, _value: i32) -> td_api::DiceStickers {
+        td_api::DiceStickers::default()
+    }
+    fn get_dice_success_animation_frame_number(&self, _emoji: &str, _value: i32) -> i32 {
+        0
+    }
+    fn get_premium_gift_sticker_object(
+        &self,
+        _month_count: i32,
+        _star_count: i64,
+    ) -> Option<td_api::Sticker> {
+        None
+    }
+    fn get_ton_gift_sticker_object(&self, _ton_count: i64) -> Option<td_api::Sticker> {
+        None
+    }
+    fn get_alternative_video_object(
+        &self,
+        _file_id: FileId,
+        _hls_file_ids: &[FileId],
+    ) -> Option<td_api::AlternativeVideo> {
+        None
+    }
+    fn get_video_storyboard_object(
+        &self,
+        _file_id: FileId,
+        _storyboard_map_file_ids: &[FileId],
+    ) -> Option<td_api::VideoStoryboard> {
+        None
+    }
+    fn get_link_preview_object(
+        &self,
+        _web_page_id: WebPageId,
+        _force_small_media: bool,
+        _force_large_media: bool,
+        _skip_confirmation: bool,
+        _invert_media: bool,
+    ) -> Option<td_api::LinkPreview> {
+        None
+    }
+    fn get_photo_object(&self, _photo: &Photo) -> Option<td_api::Photo> {
+        None
+    }
+    fn get_chat_photo_object(&self, _photo: &Photo) -> Option<td_api::ChatPhoto> {
+        None
+    }
+    fn get_poll_object(&self, _poll_id: PollId, _dialog_id: DialogId) -> td_api::Poll {
+        td_api::Poll::default()
+    }
+    fn get_message_invoice_object(
+        &self,
+        _input_invoice: &InputInvoice,
+        _is_server: bool,
+        _skip_bot_commands: bool,
+        _max_media_timestamp: i32,
+    ) -> td_api::MessageContent {
+        td_api::MessageContent::default()
+    }
+    fn get_game_object(
+        &self,
+        _game: &Game,
+        _is_server: bool,
+        _skip_bot_commands: bool,
+    ) -> td_api::Game {
+        td_api::Game::default()
+    }
+    fn get_web_app_object(&self, _web_app: &WebApp) -> td_api::WebApp {
+        td_api::WebApp::default()
+    }
+    fn get_paid_media_object(&self, _extended_media: &MessageExtendedMedia) -> td_api::PaidMedia {
+        td_api::PaidMedia::default()
+    }
+    fn get_shared_user_object(&self, _shared_dialog: &SharedDialog) -> td_api::SharedUser {
+        td_api::SharedUser::default()
+    }
+    fn get_shared_chat_object(&self, _shared_dialog: &SharedDialog) -> td_api::SharedChat {
+        td_api::SharedChat::default()
+    }
+    fn get_giveaway_parameters_object(
+        &self,
+        _parameters: &GiveawayParameters,
+    ) -> td_api::GiveawayParameters {
+        td_api::GiveawayParameters::default()
+    }
+    fn get_chat_background_object(
+        &self,
+        _background_info: &BackgroundInfo,
+    ) -> td_api::ChatBackground {
+        td_api::ChatBackground::default()
+    }
+    fn get_checklist_object(
+        &self,
+        _list: &ToDoList,
+        _completions: &[ToDoCompletion],
+        _dialog_id: DialogId,
+        _message_id: MessageId,
+        _is_outgoing: bool,
+        _is_forward: bool,
+        _is_real_message_content: bool,
+    ) -> td_api::Checklist {
+        td_api::Checklist::default()
+    }
+    fn get_encrypted_passport_element_object(
+        &self,
+        _values: &[EncryptedSecureValue],
+    ) -> Vec<td_api::EncryptedPassportElement> {
+        Vec::new()
+    }
+    fn get_community_id_object(
+        &self,
+        _community_id: CommunityId,
+        _source: &str,
+    ) -> td_api::CommunityId {
+        td_api::CommunityId::default()
+    }
+    fn get_animation_duration(&self, _file_id: FileId) -> i32 {
+        0
+    }
+    fn get_audio_duration(&self, _file_id: FileId) -> i32 {
+        0
+    }
+    fn get_video_duration(&self, _file_id: FileId) -> i32 {
+        0
+    }
+    fn get_video_note_duration(&self, _file_id: FileId) -> i32 {
+        0
+    }
+    fn get_voice_note_duration(&self, _file_id: FileId) -> i32 {
+        0
+    }
+    fn get_story_duration(&self, _story_full_id: StoryFullId) -> i32 {
+        0
+    }
+    fn get_web_page_media_duration(&self, _web_page_id: WebPageId) -> i32 {
+        0
+    }
+    fn has_video_cover_input_media(&self, _file_id: FileId, _is_bot: bool) -> bool {
+        false
+    }
+    fn has_photo_cover_input_media(&self, _photo: &Photo, _is_bot: bool) -> bool {
+        false
+    }
+    fn update_extended_media_to(
+        &mut self,
+        _media: &mut MessageExtendedMedia,
+        _extended_media: Option<telegram_api::MessageExtendedMedia>,
+        _owner_dialog_id: DialogId,
+    ) -> bool {
+        false
+    }
+    fn stop_local_poll(&mut self, _poll_id: PollId) {
+        {}
+    }
+    fn get_animated_emoji_click_sticker(
+        &self,
+        _text: &str,
+        _message_full_id: MessageFullId,
+        _promise: Promise<td_api::Sticker>,
+    ) {
+        {}
+    }
+    fn on_animated_emoji_message_clicked(
+        &mut self,
+        _emoji: &str,
+        _message_full_id: MessageFullId,
+        _data: &str,
+    ) -> Result<(), Status> {
+        unreachable!("send-path seam reached on the receive flip")
+    }
+    fn get_video_mime_type(&self, _file_id: FileId) -> String {
+        String::new()
+    }
+    fn get_poll_file_ids(&self, _poll_id: PollId) -> Vec<FileId> {
+        Vec::new()
+    }
+    fn get_web_page_story_full_id(&self, _web_page_id: WebPageId) -> StoryFullId {
+        StoryFullId::default()
+    }
+    fn get_web_page_search_text(&self, _web_page_id: WebPageId) -> String {
+        String::new()
+    }
+    fn get_animation_search_text(&self, _file_id: FileId) -> String {
+        String::new()
+    }
+    fn get_audio_search_text(&self, _file_id: FileId) -> String {
+        String::new()
+    }
+    fn get_document_search_text(&self, _file_id: FileId) -> String {
+        String::new()
+    }
+    fn get_video_search_text(&self, _file_id: FileId) -> String {
+        String::new()
+    }
+    fn get_poll_search_text(&self, _poll_id: PollId) -> String {
+        String::new()
+    }
+    fn get_message_from_server(&mut self, _message_full_id: MessageFullId, _source: &str) {
+        {}
+    }
+    fn on_forum_topic_edited(
+        &mut self,
+        _dialog_id: DialogId,
+        _forum_topic_id: i32,
+        _edited_data: &ForumTopicEditedData,
+    ) {
+        {}
+    }
+    fn on_update_user_noforwards(
+        &mut self,
+        _user_id: UserId,
+        _is_me: bool,
+        _new_value: bool,
+        _is_contact: bool,
+        _has_noforwards: bool,
+    ) {
+        {}
+    }
+    fn on_update_user_linked_community_id(&mut self, _user_id: UserId, _community_id: CommunityId) {
+        {}
+    }
+    fn on_update_channel_linked_community_id(
+        &mut self,
+        _channel_id: ChannelId,
+        _community_id: CommunityId,
+    ) {
+        {}
+    }
+    fn add_saved_animation_by_id(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn add_recent_sticker_by_id(&mut self, _is_attached: bool, _file_id: FileId) {
+        {}
+    }
+    fn move_sticker_set_to_top_by_sticker_id(&mut self, _file_id: FileId) {
+        {}
+    }
+    fn move_sticker_set_to_top_by_custom_emoji_ids(
+        &mut self,
+        _custom_emoji_ids: Vec<CustomEmojiId>,
+    ) {
+        {}
+    }
+}
+
+/// The M.10.3 receive-flip adapter: `Td` as the intake/builder
+/// [`crate::messages_manager::MessageObjectContext`]. The reads the M.9.18
+/// surface already owns (users, auth, options, clock) answer for real, the
+/// manager-owned reads (`have_dialog`, the ephemeral-id registry) walk the
+/// M.10.2c skeleton, and the ChatManager/ForumTopic/NotificationSettings
+/// surfaces answer the documented stand-ins until their receive slices
+/// land (the same defaults the M.10.4 test context pins).
+impl crate::messages_manager::MessageObjectContext for Td {
+    fn content_context(&self) -> &dyn crate::message_content::MessageContentContext {
+        self
+    }
+
+    fn is_bot(&self) -> bool {
+        crate::message_content::MessageContentContext::is_bot(self)
+    }
+
+    fn now(&self) -> f64 {
+        tdutils::time::now()
+    }
+
+    fn server_time(&self) -> f64 {
+        self.global.unix_time() as f64
+    }
+
+    fn is_test_dc(&self) -> bool {
+        self.global.is_test_dc()
+    }
+
+    fn get_restriction_options(&self) -> crate::restriction_reason::RestrictionOptions {
+        crate::restriction_reason::RestrictionOptions {
+            ignored_restriction_reasons: String::new(),
+            restriction_add_platforms: String::new(),
+            ignore_platform_restrictions: false,
+        }
+    }
+
+    fn get_message_sender_object_const(
+        &self,
+        sender_user_id: UserId,
+        sender_dialog_id: DialogId,
+        _source: &str,
+    ) -> Option<td_api::MessageSender> {
+        if sender_dialog_id.is_valid() {
+            return Some(td_api::MessageSender::messageSenderChat(
+                td_api::messageSenderChat {
+                    chat_id: sender_dialog_id.get(),
+                },
+            ));
+        }
+        if !sender_user_id.is_valid() {
+            return None;
+        }
+        Some(td_api::MessageSender::messageSenderUser(
+            td_api::messageSenderUser {
+                user_id: sender_user_id.get(),
+            },
+        ))
+    }
+
+    fn have_min_user(&self, user_id: UserId) -> bool {
+        self.users.contains_key(&user_id.get())
+    }
+
+    fn have_dialog(&self, dialog_id: DialogId) -> bool {
+        self.messages_manager.get_dialog(dialog_id).is_some()
+    }
+
+    fn have_dialog_info(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn have_min_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn force_create_dialog(&self, _dialog_id: DialogId, _source: &str) {
+        // the C++ force-creates with a `send_closure` — the actor wiring is
+        // the Td receive slice's; the intake registers the dialog itself.
+    }
+
+    fn content_context_mut(&mut self) -> &mut dyn crate::message_content::MessageContentContext {
+        self
+    }
+
+    fn have_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn get_min_channel(
+        &self,
+        _channel_id: ChannelId,
+    ) -> Option<crate::messages_manager::MinChannel> {
+        None
+    }
+
+    fn can_dialog_have_threads(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn get_message_id_of_ephemeral_message_id(
+        &self,
+        dialog_id: DialogId,
+        ephemeral_message_id: crate::messages_manager::EphemeralMessageId,
+    ) -> crate::messages_manager::MessageId {
+        self.messages_manager
+            .update_ephemeral_message_ids
+            .get(&crate::messages_manager::EphemeralMessageFullId::new(
+                dialog_id,
+                ephemeral_message_id,
+            ))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn get_channel_has_linked_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn is_forum_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn is_megagroup_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn get_channel_linked_channel_id(&self, _channel_id: ChannelId, _source: &str) -> ChannelId {
+        ChannelId::default()
+    }
+
+    fn have_channel_force(&self, _channel_id: ChannelId, _source: &str) -> bool {
+        false
+    }
+
+    fn have_input_peer_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn get_user_private_forward_name(&self, _user_id: UserId) -> String {
+        String::new()
+    }
+
+    fn is_admined_monoforum_channel(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn is_monoforum_channel_dialog(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn get_monoforum_channel_id(&self, channel_id: ChannelId) -> ChannelId {
+        channel_id
+    }
+
+    fn channel_can_post_messages(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn get_dialog_has_protected_content_force(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn get_forum_topic_id_object(
+        &self,
+        _dialog_id: DialogId,
+        forum_topic_id: crate::messages_manager::ForumTopicId,
+    ) -> i32 {
+        forum_topic_id.get()
+    }
+
+    fn get_saved_messages_topic_id_object(
+        &self,
+        _dialog_id: DialogId,
+        saved_messages_topic_id: crate::messages_manager::SavedMessagesTopicId,
+    ) -> i64 {
+        saved_messages_topic_id.get_dialog_id().get()
+    }
+
+    fn get_message_content_media_duration(
+        &self,
+        _content: &crate::message_content::MessageContent,
+    ) -> i32 {
+        -1
+    }
+
+    fn get_message_sender_object_force(
+        &self,
+        dialog_id: DialogId,
+        _source: &str,
+    ) -> Option<td_api::MessageSender> {
+        Some(td_api::MessageSender::messageSenderChat(
+            td_api::messageSenderChat {
+                chat_id: dialog_id.get(),
+            },
+        ))
+    }
+
+    fn get_scope_disable_pinned_message_notifications(&self) -> bool {
+        false
+    }
+
+    fn get_scope_disable_mention_notifications(&self) -> bool {
+        false
+    }
+}
+
+/// The split-context aliasing adapter — the M.10 split functions take
+/// their ctx and state objects as separate trait parameters over the same
+/// `Td` (the C++ one-object model). The alias below is derived from the
+/// single `&mut Td` the arm holds and the pair is used strictly
+/// sequentially: every M.10 split function invokes one surface at a time.
+/// The full sink-state refactor (a field-destructure content-context
+/// view) retires this adapter.
+///
+/// # Safety
+/// The returned alias and the source reference must never be written
+/// through reentrantly — the M.10 split functions satisfy this by
+/// construction (they pass each object into one callee at a time).
+pub(crate) unsafe fn split_context_alias<'a>(
+    td: *mut Td,
+) -> &'a mut dyn crate::messages_manager::ReadStateContext {
+    unsafe { &mut *td }
+}
+
+/// The Td-side [`crate::messages_manager::ReadStateContext`] — the
+/// M.10.20 state half of the split-context convention. Real routes: the
+/// update channel (`Td::send_update`), the option reads, the pmc, the
+/// input-peer gate and the message-database gate. The manager-touching
+/// hooks (`on_unread_count_change`-family, `update_dialog_lists`) and the
+/// M.13 notification hooks answer the documented stand-ins until their
+/// receive slices flip (the same shape the test contexts pin).
+impl crate::messages_manager::ReadStateContext for Td {
+    fn send_update(&mut self, update: td_api::Object) {
+        Td::send_update(self, update);
+    }
+
+    fn have_input_peer(&self, dialog_id: DialogId, allow_secret_chats: bool) -> bool {
+        if dialog_id.get_type() == crate::messages_manager::DialogType::SecretChat
+            && !allow_secret_chats
+        {
+            return false;
+        }
+        crate::messages_manager::have_dialog_force(&self.messages_manager, dialog_id)
+    }
+
+    fn is_dialog_muted(&self, _dialog_id: DialogId) -> bool {
+        // NotificationSettingsManager::get_dialog_mute_until — the M.13
+        // receive flip
+        false
+    }
+
+    fn is_dialog_sponsored(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn on_unread_count_change(
+        &mut self,
+        _dialog_id: DialogId,
+        _old_unread_count: i32,
+        _new_unread_count: i32,
+        _is_marked_as_unread: bool,
+        _force_update: bool,
+        _source: &str,
+    ) {
+    }
+
+    fn on_is_marked_as_unread_change(&mut self, _dialog_id: DialogId, _delta: i32, _source: &str) {}
+
+    fn have_dialog_filters(&self) -> bool {
+        false
+    }
+
+    fn update_dialog_lists(&mut self, _dialog_id: DialogId, _source: &str) {}
+
+    fn option_integer(&self, name: &str, default: i64) -> i64 {
+        self.option_manager
+            .as_ref()
+            .map(|options| options.get_option_integer(name, default))
+            .unwrap_or(default)
+    }
+
+    fn option_boolean(&self, name: &str, default: bool) -> bool {
+        self.option_manager
+            .as_ref()
+            .map(|options| options.get_option_boolean(name, default))
+            .unwrap_or(default)
+    }
+
+    fn binlog_pmc_get(&mut self, key: &str) -> Option<String> {
+        let value = self.global.binlog_pmc().get(key);
+        if value.is_empty() { None } else { Some(value) }
+    }
+
+    fn binlog_pmc_set(&mut self, key: &str, value: &str) {
+        self.global.binlog_pmc().set(key, value);
+    }
+
+    fn use_message_database(&self) -> bool {
+        self.global.use_message_database()
+    }
+
+    fn get_dialog_filter_folder_ids(
+        &self,
+        _filter_id: crate::messages_manager::DialogFilterId,
+    ) -> Vec<crate::messages_manager::FolderId> {
+        Vec::new()
+    }
+
+    fn need_dialog_in_filter(
+        &self,
+        _filter_id: crate::messages_manager::DialogFilterId,
+        _info: &crate::messages_manager::DialogFilterDialogInfo,
+    ) -> bool {
+        true
+    }
+
+    fn is_dialog_pinned_in_filter(
+        &self,
+        _filter_id: crate::messages_manager::DialogFilterId,
+        _dialog_id: DialogId,
+    ) -> bool {
+        false
+    }
+
+    fn get_pinned_dialog_ids_in_filter(
+        &self,
+        _filter_id: crate::messages_manager::DialogFilterId,
+    ) -> Vec<DialogId> {
+        Vec::new()
+    }
+
+    fn get_scope_disable_mention_notifications(&self) -> bool {
+        false
+    }
+
+    fn is_bot(&self) -> bool {
+        crate::message_content::MessageContentContext::is_bot(self)
+    }
+
+    fn close_flag(&self) -> bool {
+        self.close_flag != 0
+    }
+
+    fn get_sponsored_chat_source_object(&self) -> Option<td_api::ChatSource> {
+        None
+    }
+
+    fn is_running_get_difference(&self) -> bool {
+        false
+    }
+
+    fn is_running_get_channel_difference(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn has_channel_difference_to_log_event(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn remove_notification_group(
+        &mut self,
+        _group_id: crate::messages_manager::NotificationGroupId,
+        _max_notification_message_id: crate::messages_manager::MessageId,
+        _total_count: i32,
+        _force: bool,
+        _source: &str,
+    ) {
+        // the M.13 notification flip
+    }
+
+    fn remove_notification(
+        &mut self,
+        _group_id: crate::messages_manager::NotificationGroupId,
+        _notification_id: crate::messages_manager::NotificationId,
+        _is_permanent: bool,
+        _force_update: bool,
+    ) {
+    }
+
+    fn flush_pending_new_message_notifications(
+        &mut self,
+        _dialog_id: DialogId,
+        _from_mentions: bool,
+        _settings_dialog_id: DialogId,
+    ) {
+    }
+
+    fn remove_dialog_pinned_message_notification(&mut self, _dialog_id: DialogId, _source: &str) {}
+}
+
+/// The reactions half of the receive adapter: the banned-chat read is the
+/// ChatManager status cache, false until that receive slice lands.
+/// The Td-side [`crate::messages_manager::SendMessageContext`] adapter —
+/// the M.10.20 dispatch flip. The real reads are the Td-owned surfaces
+/// (clock, auth, the messages_manager registry); the manager-facade reads
+/// (titles, signatures, slow mode, boosts) answer the documented
+/// stand-ins until their const surfaces land with the sink-state
+/// refactor; the Wave-2/db reads (stories, forwarded info) answer the
+/// same stand-ins as the test contexts.
+impl crate::messages_manager::SendMessageContext for Td {
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn is_broadcast_channel_dialog(&self, dialog_id: DialogId) -> bool {
+        dialog_id.get_type() == crate::messages_manager::DialogType::Channel
+            && crate::message_content::MessageContentContext::is_broadcast_channel(
+                self,
+                dialog_id.get_channel_id(),
+            )
+    }
+
+    fn ignore_default_disable_notification(&self) -> bool {
+        false
+    }
+
+    fn get_channel_sign_messages(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn get_channel_show_message_sender(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn is_anonymous_administrator(&self, _dialog_id: DialogId) -> Option<String> {
+        None
+    }
+
+    fn get_dialog_title(&self, _dialog_id: DialogId) -> String {
+        String::new()
+    }
+
+    fn get_user_title(&self, user_id: UserId) -> String {
+        self.user_manager.get_user_title_of(user_id)
+    }
+
+    fn get_secret_chat_ttl(&self, secret_chat_id: SecretChatId) -> i32 {
+        self.user_manager.get_secret_chat_ttl(secret_chat_id)
+    }
+
+    fn get_channel_my_boost_count(&self, _channel_id: ChannelId) -> i32 {
+        0
+    }
+
+    fn can_send_message_to_dialog(&self, _dialog_id: DialogId) -> Result<(), (i32, String)> {
+        // the real table reads the manager state through a mutable Td —
+        // the sink-state refactor lands it; the local-answer flips are
+        // unaffected (they never send)
+        Ok(())
+    }
+
+    fn have_input_peer_read(&self, dialog_id: DialogId, allow_secret_chats: bool) -> bool {
+        // the DialogManager facade read needs `&mut Td` (its net/db
+        // fallbacks); the in-memory form rides the chat registry
+        if dialog_id.get_type() == crate::messages_manager::DialogType::SecretChat
+            && !allow_secret_chats
+        {
+            return false;
+        }
+        crate::messages_manager::have_dialog_force(&self.messages_manager, dialog_id)
+    }
+
+    fn can_send_message_to_forum_topic(
+        &self,
+        _dialog_id: DialogId,
+        _forum_topic_id: crate::messages_manager::ForumTopicId,
+    ) -> bool {
+        true
+    }
+
+    fn can_be_forum(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn have_dialog_force(&self, dialog_id: DialogId, _source: &str) -> bool {
+        crate::messages_manager::have_dialog_force(&self.messages_manager, dialog_id)
+    }
+
+    fn get_my_dialog_id(&self) -> DialogId {
+        crate::message_content::MessageContentContext::get_my_dialog_id(self)
+    }
+
+    fn get_saved_messages_topic_id_from_raw(
+        &self,
+        topic_id: i64,
+    ) -> crate::messages_manager::SavedMessagesTopicId {
+        crate::messages_manager::SavedMessagesTopicId::new(DialogId::new(topic_id))
+    }
+
+    fn get_forwarded_message_info(
+        &self,
+        _dialog_id: DialogId,
+        _message_id: crate::messages_manager::MessageId,
+    ) -> Option<crate::messages_manager::ForwardedMessageInfo> {
+        // the message-db load — the db seam
+        None
+    }
+
+    fn get_message_by_random_id_from_database(
+        &self,
+        _dialog_id: DialogId,
+        _random_id: i64,
+    ) -> Option<Box<crate::messages_manager::Message>> {
+        None
+    }
+
+    fn have_story(&self, _story_full_id: StoryFullId) -> bool {
+        false
+    }
+
+    fn is_inaccessible_story(&self, _story_full_id: StoryFullId) -> bool {
+        false
+    }
+
+    fn get_story_duration(&self, _story_full_id: StoryFullId) -> i32 {
+        0
+    }
+
+    fn get_channel_slow_mode_delay(&self, _channel_id: ChannelId) -> i32 {
+        0
+    }
+
+    fn is_channel_administrator(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+
+    fn on_update_channel_slow_mode_next_send_date(
+        &self,
+        _channel_id: ChannelId,
+        _next_send_date: i32,
+    ) {
+    }
+
+    fn remove_inactive_channel(&self, _channel_id: ChannelId) {}
+}
+
+impl crate::messages_manager::DialogReactionsContext for Td {
+    fn is_chat_banned(&self, _dialog_id: DialogId) -> bool {
+        false
+    }
+
+    fn is_bot(&self) -> bool {
+        crate::message_content::MessageContentContext::is_bot(self)
     }
 }
 
@@ -261,15 +1999,91 @@ pub struct Td {
     /// `init_managers` block) — the M.3.9.1 autologin-token slice; the
     /// link surface is Wave 2.
     pub(crate) link_manager: Option<LinkManager>,
+    /// The C++ `Td::bot_info_manager_` (`make_unique` at `Td.cpp:1175`,
+    /// the `init_managers` block, before the LinkManager at :1239 and the
+    /// NotificationManager at :1251; `reset_manager` at Td.cpp:520) — the
+    /// M.45 bot-administration query surface; its parked query promises
+    /// and the bot-info fan-in live in it.
+    pub(crate) bot_info_manager: crate::bot_info_manager::BotInfoManager,
+    /// `Td::story_manager_` (`Td.cpp:1296`, M.47): the story state
+    /// machine.
+    pub(crate) story_manager: crate::story_manager::StoryManager,
+    /// The story manager's `send_update` outbox — shares the notification
+    /// drain (`flush_user_updates`).
+    /// `Td::callback_queries_manager_` (`Td.cpp:1151`,
+    /// `init_non_actor_managers` — the plain unique_ptr with no actor).
+    pub(crate) callback_queries_manager: crate::callback_queries_manager::CallbackQueriesManager,
+    /// `Td::bot_recommendation_manager_` (`Td.cpp:1178`,
+    /// `init_managers`).
+    pub(crate) bot_recommendation_manager:
+        crate::bot_recommendation_manager::BotRecommendationManager,
+    /// `Td::game_manager_` (`Td.cpp:1228-1230`, `init_managers`; the C++
+    /// also hands the actor to `G()->set_game_manager` — the net step).
+    pub(crate) game_manager: crate::game_manager::GameManager,
+    /// `Td::web_app_manager_` (`Td.cpp:1329-1331`, `init_managers`; the
+    /// actor id also lands in `G()->set_web_app_manager` — the net step).
+    pub(crate) web_app_manager: crate::web_app_manager::WebAppManager,
     pub(crate) auth_manager: AuthManager,
     /// `Td::user_manager_` — the user/secret-chat cache (created with Td,
     /// loaded from the binlog pmc in `init` like the C++ constructor).
     pub(crate) user_manager: UserManager,
+    /// `Td::message_query_manager_` (`Td.cpp:1245`, M.18) — the collapsed
+    /// MessageQueryManager; created with Td like the C++ `init_managers`.
+    pub(crate) message_query_manager: crate::message_query_manager::MessageQueryManager,
+    /// The message-query manager's `send_update` outbox — the collapsed
+    /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) message_query_updates: Vec<td_api::Update>,
     /// `Td::notification_manager_` (`Td.cpp:1251`).
     pub(crate) notification_manager: NotificationManager,
     /// `Td::notification_settings_manager_` (`Td.cpp:1254`, M.13S).
     pub(crate) notification_settings_manager:
         crate::notification_settings_manager::NotificationSettingsManager,
+    /// `Td::account_manager_` (`make_unique` at `Td.cpp:1231`, the
+    /// `init_managers` block).
+    pub(crate) account_manager: AccountManager,
+    /// `Td::terms_of_service_manager_` (Td.cpp:1234).
+    pub(crate) terms_of_service_manager: crate::terms_of_service_manager::TermsOfServiceManager,
+    /// `Td::suggested_action_manager_` (Td.cpp:1236).
+    pub(crate) suggested_action_manager: crate::suggested_action_manager::SuggestedActionManager,
+    /// The account plane's `send_update` outbox; drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) account_updates: Vec<td_api::Update>,
+    /// `Td::forum_topic_manager_` (`Td.cpp:1297`, M.49).
+    pub(crate) forum_topic_manager: crate::forum_topic_manager::ForumTopicManager,
+    /// `Td::secure_manager_` (`Td.cpp:1353`, `init_pure_actor_managers`)
+    /// — the M.44 collapsed manager; the C++ actor's `start_up` is empty.
+    pub(crate) secure_manager: crate::secure_manager::SecureManager,
+    /// `Td::star_gift_manager_` (Td.cpp:1286, the `Td::Td` manager block).
+    pub(crate) star_gift_manager: crate::star_gift_manager::StarGiftManager,
+    /// `Td::theme_manager_` (`Td.cpp:1304`, the init managers block; the
+    /// M.41 Wave-3 slice).
+    pub(crate) theme_manager: crate::theme_manager::ThemeManager,
+    /// The theme manager's `send_update` outbox — the same collapsed hop;
+    /// drained by [`Td::flush_user_updates`].
+    pub(crate) theme_updates: Vec<td_api::Update>,
+    /// `Td::autosave_manager_` (`Td.cpp:1166`, the init_managers block;
+    /// the M.39 Wave-3 slice).
+    pub(crate) autosave_manager: crate::autosave_manager::AutosaveManager,
+    /// The autosave manager's `send_update` outbox — the same collapsed
+    /// hop; drained by [`Td::flush_user_updates`].
+    pub(crate) autosave_updates: Vec<td_api::Update>,
+    /// `Td::boost_manager_` (the C++ init_managers block).
+    pub(crate) boost_manager: BoostManager,
+    /// `Td::quick_reply_manager_` (the C++ init_managers block).
+    pub(crate) quick_reply_manager: QuickReplyManager,
+    /// The premium plane (Premium.cpp is a free-function surface).
+    pub(crate) premium_manager: PremiumManager,
+    /// `Td::statistics_manager_` (the C++ init_managers block).
+    pub(crate) statistics_manager: StatisticsManager,
+    /// The statistics plane's `send_update` outbox; drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) statistics_updates: Vec<td_api::Update>,
+    /// `Td::community_manager_` (the C++ init_managers block).
+    pub(crate) community_manager: CommunityManager,
+    /// The community plane's `send_update` outbox; drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) community_updates: Vec<td_api::Update>,
     /// `Td::device_token_manager_` (`Td.cpp:1345`, M.13S).
     pub(crate) device_token_manager: crate::device_token_manager::DeviceTokenManager,
     /// `Td::language_pack_manager_` (`Td.cpp:1348`, M.24) — the
@@ -280,10 +2094,56 @@ pub struct Td {
     /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) language_pack_updates: Vec<td_api::Update>,
+
+    /// `Td::poll_manager_` (Td.cpp:1263-1265, M.19).
+    pub(crate) poll_manager: crate::poll_manager::PollManager,
+    /// `Td::secret_chats_manager_` (`Td.cpp:1293`, M.50).
+    pub(crate) secret_chats_manager: crate::secret_chats_manager::SecretChatsManager,
+    /// `Td::group_call_manager_` (`Td.cpp:1294`, M.51).
+    pub(crate) group_call_manager: crate::group_call_manager::GroupCallManager,
+    /// `Td::referral_program_manager_` (`Td.cpp:1295`, M.52).
+    pub(crate) referral_program_manager: crate::referral_program::ReferralProgramManager,
+    /// `Td::business_manager_` (`Td.cpp:1292`, M.48).
+    pub(crate) business_manager: crate::business_manager::BusinessManager,
+    /// `Td::business_connection_manager_` (`Td.cpp:1291`, M.48).
+    pub(crate) business_connection_manager:
+        crate::business_connection_manager::BusinessConnectionManager,
+    /// `Td::web_browser_manager_` (`make_unique` at `Td.cpp:1332`, the
+    /// `init_managers` block).
+    pub(crate) web_browser_manager: WebBrowserManager,
+    /// The web browser manager's `send_update` outbox — the collapsed
+    /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) web_browser_updates: Vec<td_api::Update>,
+    /// `Td::call_manager_` (`make_unique` at `Td.cpp:1186`, the
+    /// `init_managers` block).
+    pub(crate) call_manager: CallManager,
+    /// The call plane's `send_update` outbox (updateCall /
+    /// updateNewCallSignalingData); drained by [`Td::flush_user_updates`].
+    pub(crate) call_updates: Vec<td_api::Update>,
+    /// The `G()->get_dh_config()` store — the C++ keeps the DhConfig in
+    /// the ConfigManager's persisted state; the collapsed Td field holds
+    /// it until that surface lands (M.3 continuation).
+    pub(crate) call_dh_config: Option<DhConfig>,
     /// The notification manager's `send_update` outbox — the collapsed
     /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) notification_updates: Vec<td_api::Update>,
+    /// `Td::web_pages_manager_` (Td.cpp:1270, M.17).
+    pub(crate) web_pages_manager: crate::web_pages_manager::WebPagesManager,
+    /// The web-pages pending timeout deadlines (the collapsed
+    /// `pending_web_pages_timeout_` MultiTimeout; fired by
+    /// `timeout_expired`).
+    pub(crate) web_pages_timeouts: std::collections::HashMap<i64, f64>,
+    /// The poll manager's `send_update` outbox — drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) poll_updates: Vec<td_api::Update>,
+    /// `Td::attach_menu_manager_` (`Td.cpp:1163`, the init_managers block;
+    /// the M.40 Wave-3 slice).
+    pub(crate) attach_menu_manager: crate::attach_menu_manager::AttachMenuManager,
+    /// The attach-menu manager's `send_update` outbox — the same collapsed
+    /// hop; drained by [`Td::flush_user_updates`].
+    pub(crate) attach_menu_updates: Vec<td_api::Update>,
     /// The premium-required-to-contact QueryMerger actor (a UserManager
     /// member in the C++; the Rust merger is an actor created by `init` —
     /// the `ActorOwn` keeps it alive, dropping it would hang the merged
@@ -302,7 +2162,7 @@ pub struct Td {
     /// on the first pts access (`init_state`), and the pmc writes flush
     /// through `timeout_expired` exactly like the C++ actor's
     /// `MAX_PTS_SAVE_DELAY` throttle.
-    pub(crate) updates_manager: UpdatesManager<TdUpdatesSink>,
+    pub(crate) updates_manager: UpdatesManager<TdSink>,
     /// `Td::storage_manager_` (`Td::Td`, Td.cpp:940) — created with Td.
     pub(crate) storage_manager: StorageManager,
     /// `Td::file_manager_` (`Td::init_file_manager`, Td.cpp:1080) — behind
@@ -326,6 +2186,10 @@ pub struct Td {
     pub(crate) use_message_database: bool,
     /// `Td::parameters()->use_file_database`.
     pub(crate) use_file_database: bool,
+    /// `Td::messages_manager_` — the M.10 manager state (the dialog/message
+    /// container set + the database family bookkeeping); the receive path
+    /// (M.10.3+) is the first reader.
+    pub(crate) messages_manager: crate::messages_manager::MessagesManager,
     /// `Td::stop_cnt_` — the hangup and the close completion each drop one.
     stop_cnt: i32,
     /// The deferred-response outbox. The C++ request promises re-enter the
@@ -349,11 +2213,6 @@ pub struct Td {
     chats: HashMap<i64, td_api::Chat>,
     /// user id → access hash (the peers the walking skeleton messages).
     peer_access: HashMap<i64, i64>,
-    /// `get_next_yet_unsent_message_id` — negative, decreasing.
-    next_local_message_id: i64,
-    /// random_id → the pending send.
-    pending_sends: HashMap<i64, PendingSend>,
-    updates: UpdatesManager<TdSink>,
 }
 
 /// A parked recoverer fetch — the C++ `get_simple_config_*` /
@@ -366,41 +2225,6 @@ pub struct Td {
 pub(crate) enum RecovererFetch {
     Simple(crate::config_recoverer::SimpleConfigFetch),
     Full(crate::config_recoverer::FullConfigFetch),
-}
-
-/// The td-level [`UpdatesSink`]: the manager fan-outs land here as their
-/// slices land — the M.7.12 user-group intakes call into `user_manager`
-/// with its env (the M.3.9 manager convention), the message-family seams
-/// call the landed MessagesManager. Until then the trait defaults apply;
-/// the live update flow itself arrives with the net step (the session
-/// intake of `Td.cpp:404-408`), so the defaults are unobservable today.
-pub(crate) struct TdUpdatesSink;
-
-impl UpdatesSink for TdUpdatesSink {
-    /// `UserManager::on_get_users` — the users pre-application flips here
-    /// with the sink-state refactor (the ZST cannot reach the managers;
-    /// no live update flow exists before the net step, so nothing is
-    /// dropped today).
-    fn on_user(&mut self, _user: telegram_api::User) {}
-
-    /// `ChatManager::on_get_chats` — the M.5 flip, as `on_user`.
-    fn on_chat(&mut self, _chat: telegram_api::Chat) {}
-
-    /// `MessagesManager::process_pts_update` — the MessagesManager flip.
-    fn process_pts_update(&mut self, _update: PendingUpdate) {}
-
-    /// `MessagesManager::add_pending_channel_update` — the
-    /// MessagesManager flip.
-    fn add_pending_channel_update(
-        &mut self,
-        _peer: Option<telegram_api::Peer>,
-        _update: PendingUpdate,
-        _pts: i32,
-        _pts_count: i32,
-        _promise: Promise<()>,
-        _source: &str,
-    ) {
-    }
 }
 
 /// The [`UpdatesManagerEnv`] over the `Td` fields: built per drive with
@@ -584,19 +2408,66 @@ impl Td {
             time_zone_manager: TimeZoneManager::default(),
             manager_states: ManagerOptionStates::default(),
             link_manager: None,
+            bot_info_manager: crate::bot_info_manager::BotInfoManager::new(),
+            story_manager: crate::story_manager::StoryManager::new(),
+            callback_queries_manager: crate::callback_queries_manager::CallbackQueriesManager::new(
+            ),
+            bot_recommendation_manager:
+                crate::bot_recommendation_manager::BotRecommendationManager::new(),
+            game_manager: crate::game_manager::GameManager::new(),
+            web_app_manager: crate::web_app_manager::WebAppManager::new(),
             auth_manager: AuthManager::new(),
             user_manager: UserManager::new(),
+            message_query_manager: crate::message_query_manager::MessageQueryManager::new(),
+            message_query_updates: Vec::new(),
             notification_manager: NotificationManager::default(),
             notification_settings_manager:
                 crate::notification_settings_manager::NotificationSettingsManager::new(),
+            account_manager: AccountManager::new(),
+            terms_of_service_manager: crate::terms_of_service_manager::TermsOfServiceManager::new(),
+            suggested_action_manager: crate::suggested_action_manager::SuggestedActionManager::new(
+            ),
+            account_updates: Vec::new(),
+            forum_topic_manager: crate::forum_topic_manager::ForumTopicManager::new(),
+            secure_manager: crate::secure_manager::SecureManager::new(),
+            star_gift_manager: crate::star_gift_manager::StarGiftManager::new(),
+            theme_manager: crate::theme_manager::ThemeManager::new(),
+            theme_updates: Vec::new(),
+            autosave_manager: crate::autosave_manager::AutosaveManager::new(),
+            autosave_updates: Vec::new(),
+            boost_manager: BoostManager::new(),
+            quick_reply_manager: QuickReplyManager::new(),
+            premium_manager: PremiumManager::new(),
+            statistics_manager: StatisticsManager::new(),
+            statistics_updates: Vec::new(),
+            community_manager: CommunityManager::new(),
+            community_updates: Vec::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
             language_pack_manager: crate::language_pack_manager::LanguagePackManager::new(),
             language_pack_updates: Vec::new(),
+
+            poll_manager: crate::poll_manager::PollManager::new(),
+            poll_updates: Vec::new(),
+            secret_chats_manager: crate::secret_chats_manager::SecretChatsManager::new(true),
+            group_call_manager: crate::group_call_manager::GroupCallManager::new(),
+            referral_program_manager: crate::referral_program::ReferralProgramManager::new(),
+            business_manager: crate::business_manager::BusinessManager::new(),
+            business_connection_manager:
+                crate::business_connection_manager::BusinessConnectionManager::new(),
+            web_browser_manager: WebBrowserManager::new(),
+            web_browser_updates: Vec::new(),
+            call_manager: CallManager::new(),
+            call_updates: Vec::new(),
+            call_dh_config: None,
             notification_updates: Vec::new(),
+            web_pages_manager: crate::web_pages_manager::WebPagesManager::new(),
+            web_pages_timeouts: std::collections::HashMap::new(),
+            attach_menu_manager: crate::attach_menu_manager::AttachMenuManager::new(),
+            attach_menu_updates: Vec::new(),
             premium_required_contact_merger: None,
             chat_manager: crate::chat_manager::ChatManager::new(),
             dialog_manager: DialogManager::new(),
-            updates_manager: UpdatesManager::new(TdUpdatesSink),
+            updates_manager: UpdatesManager::new(TdSink::default()),
             storage_manager: StorageManager::default(),
             file_manager,
             file_reference_manager: crate::files::FileReferenceManager::new(),
@@ -605,6 +2476,7 @@ impl Td {
             file_shared,
             use_message_database: false,
             use_file_database: false,
+            messages_manager: crate::messages_manager::MessagesManager::new(),
             stop_cnt: 2,
             deferred_results: Arc::new(Mutex::new(Vec::new())),
             bridge: None,
@@ -613,9 +2485,6 @@ impl Td {
             users: HashMap::new(),
             chats: HashMap::new(),
             peer_access: HashMap::new(),
-            next_local_message_id: -1,
-            pending_sends: HashMap::new(),
-            updates: UpdatesManager::new(TdSink::default()),
         }
     }
 
@@ -776,6 +2645,7 @@ impl Td {
         let chat_events = std::mem::take(&mut opened_database.chat_events);
         let channel_events = std::mem::take(&mut opened_database.channel_events);
         let dialog_manager_events = std::mem::take(&mut opened_database.dialog_manager_events);
+        let messages_manager_events = std::mem::take(&mut opened_database.messages_manager_events);
 
         if self.state == State::Close {
             // Close asynchronously opened database
@@ -950,6 +2820,9 @@ impl Td {
             self.auth_manager.set_state_ok();
             self.apply_self_user(&user, false);
             self.init_notification_manager();
+            self.init_attach_menu_manager();
+            self.init_terms_of_service_manager();
+            self.on_web_browser_authorization_success();
         } else {
             let binlog_pmc = self.global.binlog_pmc();
             let auth_str = binlog_pmc.get("auth");
@@ -971,6 +2844,9 @@ impl Td {
                     self.auth_manager
                         .restore_from_pmc("ok", is_bot, String::new());
                     self.init_notification_manager();
+                    self.init_attach_menu_manager();
+                    self.init_terms_of_service_manager();
+                    self.on_web_browser_authorization_success();
                 }
                 "logout" => {
                     tracing::warn!("Continue to log out");
@@ -1056,8 +2932,26 @@ impl Td {
 
         // `make_unique<LinkManager>` (Td.cpp:1239, the init_managers
         // block) — the autologin-token slice (M.3.9.1); the link surface
+        // is Wave 2.        // `make_unique<BotInfoManager>` (Td.cpp:1175-1177, the
+        // init_managers block) — created with the manager set at Td
+        // construction in the collapsed init (the field initializer); the
+        // M.45 bot query surface drives it per call.
+        let _ = &self.bot_info_manager;
+
+        // `make_unique<LinkManager>` (Td.cpp:1239, the init_managers
+        // block) — the autologin-token slice (M.3.9.1); the link surface
         // is Wave 2.
         self.link_manager = Some(LinkManager::new());
+        // `LinkManager::start_up` (LinkManager.cpp:1895-1908) — the
+        // collapsed actor start restores the three pmc domain lists (M.23).
+        {
+            let link_manager = self.link_manager.as_mut().expect("link manager just set");
+            let mut env = TdLinkEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+            };
+            link_manager.start_up(&mut env);
+        }
 
         // `ConfigManager::start_up` (runs when the C++ manager actor
         // starts, i.e. after the auth restore): the post-init config fetch
@@ -1234,6 +3128,21 @@ impl Td {
         for event in &dialog_manager_events {
             crate::dialog_manager::on_binlog_dialog_events(self, std::slice::from_ref(event));
         }
+        // the `to_messages_manager` vector (Td.cpp:964-990 sends it to the
+        // MessagesManager actor; the port replays in place): the ported
+        // handler is the DeleteMessage binlog replay arm — the reopened
+        // engine re-applies the durable delete (MessagesManager.cpp:36248-36264).
+        for event in &messages_manager_events {
+            if event.type_ == tddb::td_db::LOG_EVENT_HANDLER_TYPE_DELETE_MESSAGE {
+                let mut manager = std::mem::take(&mut self.messages_manager);
+                crate::messages_manager::replay_delete_message_log_event(
+                    &mut self.global,
+                    &mut manager,
+                    event,
+                );
+                self.messages_manager = manager;
+            }
+        }
         self.flush_user_updates();
 
         // The init ping: country code pre-auth — needs the net step. The
@@ -1258,6 +3167,56 @@ impl Td {
             };
             self.updates_manager.get_difference(&mut env, "init");
         }
+
+        self.init_attach_menu_manager();
+        // The AttachMenuManager's reload timeout (M.40): the C++ actor
+        // timer collapses into the shared slot's fire.
+        {
+            let mut env = AttachMenuEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+                auth_is_authorized: self.auth_manager.is_authorized(),
+                auth_is_bot: self.auth_manager.is_bot(),
+                user_manager: &mut self.user_manager,
+                file_manager: std::sync::Arc::clone(&self.file_manager),
+                file_reference_manager: &mut self.file_reference_manager,
+                updates: &mut self.attach_menu_updates,
+            };
+            self.attach_menu_manager.tick_timeouts(&mut env);
+        }
+
+        // `AccountManager::start_up` + `SuggestedActionManager::start_up`
+        // (the C++ actors start in the init_managers block) — the pmc
+        // loads; the unconfirmed-session timeout is the recorded actor
+        // collapse.
+        {
+            let mut env = AccountEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+                user_manager: &mut self.user_manager,
+                device_token_manager: &mut self.device_token_manager,
+                auth_is_bot: self.auth_manager.is_bot(),
+                updates: &mut self.account_updates,
+            };
+            self.account_manager.start_up(&mut env);
+            self.suggested_action_manager.start_up(&mut env);
+        }
+
+        // `make_unique<PeopleNearbyManager>` (Td.cpp:1258, the
+        // init_managers block) — the actor collapses to its constructor
+        // side effect (see crate::people_nearby_manager).
+        {
+            let is_bot = self.auth_manager.is_bot();
+            crate::people_nearby_manager::init(&mut PeopleNearbyEnv {
+                is_bot,
+                global: &mut self.global,
+            });
+        }
+
+        // `make_unique<WebBrowserManager>` (Td.cpp:1332, the init_managers
+        // block) + its `start_up` (WebBrowserManager.cpp:142-144) — loads
+        // the saved settings only while authorized and non-bot.
+        self.init_web_browser_manager();
 
         tracing::info!("Finish initialization");
 
@@ -1470,6 +3429,15 @@ impl Td {
         // Td.cpp:547) — the component slices drop with them.
         self.connection_creator = None;
         self.link_manager = None;
+        self.connection_creator = None;
+        self.link_manager = None;
+        // `reset_manager(bot_info_manager_, "BotInfoManager")`
+        // (Td.cpp:520): the manager's `hangup` fails the pending bot-info
+        // fan-ins and the parked query promises with
+        // `Global::request_aborted_error()` (BotInfoManager.cpp:784-796)
+        // before the reset drops the state.
+        self.bot_info_manager.hangup();
+        self.bot_info_manager = crate::bot_info_manager::BotInfoManager::new();
         self.config_manager = None;
         // The C++ `ConfigManager::hangup` drops `config_recoverer_`
         // (ConfigManager.cpp:892-896): the close releases the parent share
@@ -1666,6 +3634,23 @@ impl Td {
         {
             link_manager.update_autologin_token(autologin_token.clone());
         }
+        // `LinkManager::update_autologin_domains` (ConfigManager.cpp:2047)
+        // — the three-list fan-out (M.23).
+        if let Some((autologin_domains, url_auth_domains, whitelisted_domains)) =
+            &actions.autologin_domains
+            && let Some(link_manager) = self.link_manager.as_mut()
+        {
+            let mut env = TdLinkEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+            };
+            link_manager.update_autologin_domains(
+                &mut env,
+                autologin_domains.clone(),
+                url_auth_domains.clone(),
+                whitelisted_domains.clone(),
+            );
+        }
 
         for id in actions.ok_ids {
             self.send_result(id, ok_object());
@@ -1748,12 +3733,27 @@ impl Td {
         {
             expire_time = token_deadline;
         }
+        // The MessageQueryManager's view-metrics and reactions-reload-retry
+        // deadlines share the same slot (M.18): the fired timeout runs
+        // `tick_timeouts` (the C++ MultiTimeout + SleepActor stand-ins).
+        if let Some(query_deadline) = self.message_query_manager.next_deadline()
+            && (expire_time == 0.0 || query_deadline < expire_time)
+        {
+            expire_time = query_deadline;
+        }
         // The AlarmManager timers share the same slot (M.11.4): the
         // earliest armed alarm wins.
         if let Some(alarm_deadline) = self.next_alarm_deadline()
             && (expire_time == 0.0 || alarm_deadline < expire_time)
         {
             expire_time = alarm_deadline;
+        }
+
+        // The AttachMenuManager's reload timeout joins the same slot (M.40).
+        if let Some(attach_menu_deadline) = self.attach_menu_manager.next_deadline()
+            && (expire_time == 0.0 || attach_menu_deadline < expire_time)
+        {
+            expire_time = attach_menu_deadline;
         }
         // The UpdatesManager's gap/save/retry/reload timers join the same
         // slot (M.7.18).
@@ -2588,6 +4588,63 @@ impl Td {
         for update in language_pack_updates {
             self.send_update(update.into());
         }
+        let message_query_updates = std::mem::take(&mut self.message_query_updates);
+        for update in message_query_updates {
+            self.send_update(update.into());
+        }
+        let poll_updates = std::mem::take(&mut self.poll_updates);
+        for update in poll_updates {
+            self.send_update(update.into());
+        }
+        let account_updates = std::mem::take(&mut self.account_updates);
+        for update in account_updates {
+            self.send_update(update.into());
+        }
+        let theme_updates = std::mem::take(&mut self.theme_updates);
+        for update in theme_updates {
+            self.send_update(update.into());
+        }
+    }
+
+    /// `ThemeManager::init` (ThemeManager.cpp:439-452; the
+    /// AuthManager.cpp:1552 call) — idempotent; the manager no-ops while
+    /// unauthorized.
+    fn init_theme_manager(&mut self) {
+        let mut env = ThemeEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            user_manager: &mut self.user_manager,
+            chat_manager: &mut self.chat_manager,
+            file_manager: std::sync::Arc::clone(&self.file_manager),
+            updates: &mut self.theme_updates,
+        };
+        self.theme_manager.init(&mut env);
+        let attach_menu_updates = std::mem::take(&mut self.attach_menu_updates);
+        for update in attach_menu_updates {
+            self.send_update(update.into());
+        }
+        let autosave_updates = std::mem::take(&mut self.autosave_updates);
+        for update in autosave_updates {
+            self.send_update(update.into());
+        }
+        let statistics_updates = std::mem::take(&mut self.statistics_updates);
+        for update in statistics_updates {
+            self.send_update(update.into());
+        }
+        let community_updates = std::mem::take(&mut self.community_updates);
+        for update in community_updates {
+            self.send_update(update.into());
+        }
+        let web_browser_updates = std::mem::take(&mut self.web_browser_updates);
+        for update in web_browser_updates {
+            self.send_update(update.into());
+        }
+        let call_updates = std::mem::take(&mut self.call_updates);
+        for update in call_updates {
+            self.send_update(update.into());
+        }
     }
 
     /// `td_->notification_manager_->init()` +
@@ -2614,6 +4671,107 @@ impl Td {
             updates: &mut self.language_pack_updates,
         };
         self.language_pack_manager.init(&mut env);
+    }
+
+    /// `TermsOfServiceManager::init` (AuthManager.cpp:1549) — the
+    /// auth-success moment shared with `init_notification_manager`.
+    fn init_terms_of_service_manager(&mut self) {
+        let mut env = AccountEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            user_manager: &mut self.user_manager,
+            device_token_manager: &mut self.device_token_manager,
+            auth_is_bot: self.auth_manager.is_bot(),
+            updates: &mut self.account_updates,
+        };
+        self.terms_of_service_manager.init(&mut env);
+    }
+
+    /// `AttachMenuManager::init` (AttachMenuManager.cpp:366-430, also
+    /// `start_up`; the C++ `AuthManager` on_get_authorization call at
+    /// AuthManager.cpp:1542) — idempotent; the manager no-ops while inactive.
+    fn init_attach_menu_manager(&mut self) {
+        let mut env = AttachMenuEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            user_manager: &mut self.user_manager,
+            file_manager: std::sync::Arc::clone(&self.file_manager),
+            file_reference_manager: &mut self.file_reference_manager,
+            updates: &mut self.attach_menu_updates,
+        };
+        self.attach_menu_manager.init(&mut env);
+    }
+
+    /// The `StoryManager` constructor + `start_up` collapse
+    /// (StoryManager.cpp:1999-2065, AuthManager.cpp:1545) — idempotent; the
+    /// manager no-ops while disabled.
+    fn init_story_manager(&mut self) {
+        let crate::td::Td {
+            story_manager,
+
+            global,
+
+            option_manager,
+
+            auth_manager,
+
+            user_manager,
+
+            chat_manager,
+
+            file_manager,
+
+            notification_updates,
+            ..
+        } = self;
+
+        let mut env = StoryEnv {
+            global,
+
+            options: option_manager.as_mut(),
+
+            auth_is_authorized: auth_manager.is_authorized(),
+
+            auth_is_bot: auth_manager.is_bot(),
+
+            user_manager,
+
+            chat_manager,
+
+            file_manager: file_manager.clone(),
+
+            updates: notification_updates,
+        };
+
+        story_manager.init(&mut env);
+    }
+
+    /// `make_unique<WebBrowserManager>` + its `start_up`
+    /// (WebBrowserManager.cpp:142-144) — loads the saved settings only
+    /// while authorized and non-bot; idempotent.
+    fn init_web_browser_manager(&mut self) {
+        let mut env = WebBrowserEnv {
+            global: &mut self.global,
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            updates: &mut self.web_browser_updates,
+        };
+        self.web_browser_manager.load_web_browser_settings(&mut env);
+    }
+
+    /// `WebBrowserManager::on_authorization_success`
+    /// (WebBrowserManager.cpp:150-156, called from AuthManager.cpp:1556) —
+    /// the auth-success moment shared with `init_notification_manager`.
+    fn on_web_browser_authorization_success(&mut self) {
+        let mut env = WebBrowserEnv {
+            global: &mut self.global,
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            updates: &mut self.web_browser_updates,
+        };
+        self.web_browser_manager.on_authorization_success(&mut env);
     }
 
     /// `DeviceTokenManager::start_up` (DeviceTokenManager.cpp:329) — the
@@ -3062,7 +5220,7 @@ impl Td {
                     my_id: self.user_manager.get_my_id().get(),
                     can_ignore_background_updates: self.can_ignore_background_updates,
                 };
-                self.updates
+                self.updates_manager
                     .on_get_updates_state(&mut env, m, "updates.getState");
             }
             bridge.mark_authorized();
@@ -3071,8 +5229,11 @@ impl Td {
 
         // the live `on_get_authorization` init (AuthManager.cpp:1545); the
         // C++ fires it after every manager init above — the notification
-        // manager is the only one on this tree
+        // and web browser managers are the ones on this tree
         self.init_notification_manager();
+        self.on_web_browser_authorization_success();
+        self.init_theme_manager();
+        self.init_story_manager();
     }
 
     /// Store + broadcast the self user: `UserManager::set_my_id` (the
@@ -3161,177 +5322,6 @@ impl Td {
         }
     }
 
-    /// The text `sendMessage` (MessagesManager.cpp:21721+): the temporary
-    /// local message (pending state) is answered synchronously; the wire
-    /// ack (`updateShortSentMessage` or the Updates container) completes
-    /// it with `updateMessageSendSucceeded`. The reply peer is a known
-    /// chat (the receive path created it).
-    pub(crate) fn on_send_message(&mut self, request_id: u64, args: td_api::sendMessage) {
-        if !self.auth_manager.is_authorized() {
-            return self.send_error_impl(request_id, 401, "Unauthorized");
-        }
-        if !self.chats.contains_key(&args.chat_id) {
-            return self.send_error_impl(request_id, 400, "Chat not found");
-        }
-        let text = match args.input_message_content.as_deref() {
-            Some(td_api::InputMessageContent::inputMessageText(content)) => content
-                .text
-                .as_ref()
-                .map(|formatted| formatted.text.clone())
-                .unwrap_or_default(),
-            _ => {
-                return self.send_error_impl(
-                    request_id,
-                    400,
-                    "Only text messages are supported by the walking skeleton",
-                );
-            }
-        };
-
-        let local_id = self.next_local_message_id;
-        self.next_local_message_id -= 1;
-        let random_id = nonzero_secure_i64();
-        let date = tdutils::time::now() as i32;
-        let temp = convert::message_object(&MessageSpec {
-            id: local_id,
-            chat_id: args.chat_id,
-            sender_user_id: self.my_id,
-            date,
-            text: text.clone(),
-            pending: true,
-            is_outgoing: true,
-        });
-        self.send_result(request_id, Object::message(temp));
-
-        self.pending_sends.insert(
-            random_id,
-            PendingSend {
-                local_id,
-                chat_id: args.chat_id,
-                text: text.clone(),
-            },
-        );
-
-        // The wire query (the C++ defers it to the next actor event; the
-        // observable stream is identical — the answer is already out).
-        let access_hash = self.peer_access.get(&args.chat_id).copied().unwrap_or(0);
-        let query =
-            telegram_api::Function::messages_sendMessage(telegram_api::messages_sendMessage {
-                flags: 0,
-                no_webpage: false,
-                silent: false,
-                background: false,
-                clear_draft: false,
-                noforwards: false,
-                update_stickersets_order: false,
-                invert_media: false,
-                allow_paid_floodskip: false,
-                peer: Some(Box::new(telegram_api::InputPeer::inputPeerUser(
-                    telegram_api::inputPeerUser {
-                        user_id: args.chat_id,
-                        access_hash,
-                    },
-                ))),
-                reply_to: None,
-                message: text.clone(),
-                random_id,
-                reply_markup: None,
-                entities: Vec::new(),
-                schedule_date: 0,
-                schedule_repeat_period: 0,
-                send_as: None,
-                quick_reply_shortcut: None,
-                effect: 0,
-                allow_paid_stars: 0,
-                rich_message: None,
-                suggested_post: None,
-            });
-        let Some(owner) = self.bridge.as_ref() else {
-            return;
-        };
-        let bridge = owner.handle();
-        match bridge.query(query) {
-            QueryAnswer::Ok(data) => {
-                if let Ok(answer) = telegram_api::Updates::parse(&data) {
-                    self.on_send_answer(random_id, answer);
-                }
-            }
-            QueryAnswer::Err(code, message) => {
-                self.on_send_failed(random_id, code, &message);
-            }
-        }
-    }
-
-    /// The `messages.sendMessage` ack: `updateShortSentMessage` (the plain
-    /// text case) completes the pending send; an Updates container goes
-    /// through the generic update path (its updateNewMessage carries the
-    /// final message).
-    fn on_send_answer(&mut self, random_id: i64, answer: telegram_api::Updates) {
-        match answer {
-            telegram_api::Updates::updateShortSentMessage(m) => {
-                self.complete_pending_send(random_id, m.id as i64, m.date);
-            }
-            other => {
-                // Container: process like a pushed update (the final
-                // message arrives as updateNewMessage with the real id).
-                let mut bytes = Vec::new();
-                other.store(&mut bytes);
-                self.on_net_update(bytes);
-            }
-        }
-    }
-
-    /// `on_send_message_success` + `send_update_message_send_succeeded`:
-    /// the final message (server id/date, no sending state) replaces the
-    /// temporary one.
-    fn complete_pending_send(&mut self, random_id: i64, message_id: i64, date: i32) {
-        let Some(pending) = self.pending_sends.remove(&random_id) else {
-            return;
-        };
-        let final_message = convert::message_object(&MessageSpec {
-            id: message_id,
-            chat_id: pending.chat_id,
-            sender_user_id: self.my_id,
-            date,
-            text: pending.text,
-            pending: false,
-            is_outgoing: true,
-        });
-        let old_message_id = pending.local_id;
-        self.send_update(Object::updateMessageSendSucceeded(
-            td_api::updateMessageSendSucceeded {
-                message: Some(final_message),
-                old_message_id,
-            },
-        ));
-    }
-
-    fn on_send_failed(&mut self, random_id: i64, code: i32, message: &str) {
-        let Some(pending) = self.pending_sends.remove(&random_id) else {
-            return;
-        };
-        let failed = convert::message_object(&MessageSpec {
-            id: pending.local_id,
-            chat_id: pending.chat_id,
-            sender_user_id: self.my_id,
-            date: tdutils::time::now() as i32,
-            text: pending.text,
-            pending: false,
-            is_outgoing: true,
-        });
-        let old_message_id = pending.local_id;
-        self.send_update(Object::updateMessageSendFailed(
-            td_api::updateMessageSendFailed {
-                message: Some(failed),
-                old_message_id,
-                error: Some(td_api::Error {
-                    code,
-                    message: message.to_string(),
-                }),
-            },
-        ));
-    }
-
     /// Creates the private chat for a peer when first needed and emits
     /// `updateNewChat` (the C++ `send_update_new_chat`).
     fn ensure_chat(&mut self, chat_id: i64) {
@@ -3373,14 +5363,14 @@ impl Td {
             my_id: self.user_manager.get_my_id().get(),
             can_ignore_background_updates: self.can_ignore_background_updates,
         };
-        self.updates
+        self.updates_manager
             .on_get_updates(&mut env, umbrella, Promise::default());
         self.drain_sink();
     }
 
     /// Converts and emits what the sink collected.
     fn drain_sink(&mut self) {
-        let sink = std::mem::take(self.updates.sink());
+        let sink = std::mem::take(self.updates_manager.sink());
         for user in &sink.users {
             if let telegram_api::User::user(user) = user {
                 self.peer_access.insert(user.id, user.access_hash);
@@ -3394,43 +5384,242 @@ impl Td {
                 }
             }
         }
-        for message in &sink.new_messages {
-            self.apply_new_message(message);
+        for (message, source) in &sink.new_messages {
+            self.apply_new_message(message, source);
+        }
+        for (message, pts) in &sink.edits {
+            self.apply_edit_message(message, *pts);
+        }
+        for messages in &sink.deletions {
+            self.apply_delete_messages(messages);
+        }
+        for (peer, max_id, top_msg_id) in &sink.reads_inbox {
+            self.apply_read_history_inbox(peer, *max_id, *top_msg_id);
+        }
+        for (peer, max_id) in &sink.reads_outbox {
+            self.apply_read_history_outbox(peer, *max_id);
         }
     }
 
-    /// The receive path for a wire `updateNewMessage` (the container
-    /// users/chats were collected into the sink first): the fresh dialog
-    /// emits `updateNewChat`, then `updateNewMessage`. The sender's access
-    /// hash is remembered for the reply peer.
-    fn apply_new_message(&mut self, message: &telegram_api::Message) {
-        let telegram_api::Message::message(m) = message else {
+    /// The receive path for `updateDeleteMessages` (the M.10.6 delete
+    /// path): the server ids run through the manager's
+    /// `delete_messages_from_updates` — the rows resolve through the
+    /// message-db unique-id load and the durable deletes land through the
+    /// M.10.2 binlog spine. The `updateDeleteMessages` emission is the
+    /// update-plane seam.
+    fn apply_delete_messages(&mut self, messages: &[i32]) {
+        let message_ids: Vec<crate::messages_manager::MessageId> = messages
+            .iter()
+            .map(|&id| {
+                crate::messages_manager::MessageId::from_server_message_id(
+                    crate::messages_manager::ServerMessageId::new(id),
+                )
+            })
+            .collect();
+        let mut manager = std::mem::take(&mut self.messages_manager);
+        let _deleted = crate::messages_manager::delete_messages_from_updates(
+            &mut self.global,
+            &mut manager,
+            &message_ids,
+            true,
+        );
+        self.messages_manager = manager;
+    }
+
+    /// The receive path for a wire `updateNewMessage`/`updateNewChannelMessage`
+    /// (the container users/chats were collected into the sink first): the
+    /// full M.10.3 intake — `parse_telegram_api_message` → `create_message` →
+    /// `fix_new_message` — runs through the M.10.2c manager, and the
+    /// emitted object is the M.10.4 `get_message_object` builder. The
+    /// M.9.18 flip (wire media through `get_message_content`) now lives at
+    /// its C++ call position inside `parse_telegram_api_message`.
+    fn apply_new_message(&mut self, message: &telegram_api::Message, source: &str) {
+        // The complete receive head (MessagesManager.cpp:11921-12107) over
+        // the M.10.2c manager: parse → create → add_message_to_dialog with
+        // the ordered insert, the counter maintenance and the
+        // updateNewMessage emission inside. The five views alias one Td —
+        // the sequential-call discipline of `split_context_alias` (no
+        // take/restore: the ctx reads must see the real manager/global).
+        // SAFETY: every alias below derives from `td_ptr` and the callee
+        // uses them strictly one at a time.
+        let td_ptr = std::ptr::from_mut(self);
+        let ctx: &mut dyn crate::messages_manager::MessageObjectContext = unsafe { &mut *td_ptr };
+        let message_info = crate::messages_manager::parse_telegram_api_message(
+            ctx,
+            message.clone(),
+            false,
+            false,
+            source,
+        );
+        // `add_new_dialog` emits `updateNewChat` for the fresh dialog
+        // (MessagesManager.cpp:33079+); the walking skeleton maps user
+        // dialogs to its chat objects, the other dialog kinds ride the
+        // ChatManager chat-object wiring.
+        if message_info.dialog_id.get_type() == crate::messages_manager::DialogType::User {
+            self.ensure_chat(message_info.dialog_id.get_user_id().get());
+        }
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let global: &mut crate::global::Global = unsafe { &mut (*td_ptr).global };
+        let state: &mut dyn crate::messages_manager::ReadStateContext =
+            unsafe { crate::td::split_context_alias(td_ptr) };
+        let ctx: &mut dyn crate::messages_manager::MessageObjectContext = unsafe { &mut *td_ptr };
+        let send_ctx: &dyn crate::messages_manager::SendMessageContext = unsafe { &*td_ptr };
+        crate::messages_manager::on_get_message_full(
+            global,
+            manager,
+            ctx,
+            send_ctx,
+            state,
+            message_info,
+            true,
+            "updateNewMessage",
+        );
+    }
+
+    /// The receive path for `updateEditMessage` (MessagesManager.cpp:5860):
+    /// `had_message` in memory, the complete receive head with
+    /// `from_update = false`, then the M.10.5 edit intake.
+    fn apply_edit_message(&mut self, message: &telegram_api::Message, pts: i32) {
+        let td_ptr = std::ptr::from_mut(self);
+        // SAFETY: as apply_new_message.
+        let ctx: &mut dyn crate::messages_manager::MessageObjectContext = unsafe { &mut *td_ptr };
+        let message_info = crate::messages_manager::parse_telegram_api_message(
+            ctx,
+            message.clone(),
+            false,
+            false,
+            "updateEditMessage",
+        );
+        let dialog_id = message_info.dialog_id;
+        let message_id = message_info.message_id;
+        // `have_message_force`'s database leg is the message-db seam — the
+        // in-memory probe answers
+        let had_message = unsafe { &*td_ptr }
+            .messages_manager
+            .get_dialog(dialog_id)
+            .is_some_and(|d| crate::messages_manager::have_message_in_dialog_memory(d, message_id));
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let global: &mut crate::global::Global = unsafe { &mut (*td_ptr).global };
+        let state: &mut dyn crate::messages_manager::ReadStateContext =
+            unsafe { crate::td::split_context_alias(td_ptr) };
+        let ctx: &mut dyn crate::messages_manager::MessageObjectContext = unsafe { &mut *td_ptr };
+        let send_ctx: &dyn crate::messages_manager::SendMessageContext = unsafe { &*td_ptr };
+        let full_id = crate::messages_manager::on_get_message_full(
+            global,
+            manager,
+            ctx,
+            send_ctx,
+            state,
+            message_info,
+            false,
+            "updateEditMessage",
+        );
+        if full_id.get_dialog_id() != crate::messages_manager::DialogId::default() {
+            let is_bot = self.auth_manager.is_bot();
+            let mut m = self
+                .messages_manager
+                .get_dialog_mut(dialog_id)
+                .and_then(|d| d.messages.remove(&message_id));
+            if let Some(m) = m.as_mut() {
+                let send_edited = crate::messages_manager::on_message_edited(
+                    &mut self.messages_manager,
+                    dialog_id,
+                    m,
+                    pts,
+                    had_message,
+                    is_bot,
+                );
+                if send_edited {
+                    // `send_update_message_edited` (MessagesManager.cpp:
+                    // 5985-6014's emission half)
+                    let edit_date = crate::messages_manager::get_message_shown_edit_date(m);
+                    let reply_markup = m
+                        .reply_markup
+                        .as_ref()
+                        .and_then(|reply_markup| reply_markup.get_reply_markup_object(self));
+                    self.send_update(Object::updateMessageEdited(td_api::updateMessageEdited {
+                        chat_id: dialog_id.get(),
+                        message_id: message_id.get(),
+                        edit_date,
+                        reply_markup,
+                    }));
+                }
+            }
+            if let Some(m) = m {
+                self.messages_manager
+                    .get_dialog_mut(dialog_id)
+                    .and_then(|d| d.messages.insert(message_id, m));
+            }
+        }
+    }
+
+    /// The receive path for `updateReadHistoryInbox`
+    /// (MessagesManager.cpp:5885-5901): the folder read is the M.6 dialog
+    /// seam and the forum `top_msg_id` arm the topic-manager seam — the
+    /// plain arm runs the M.10.7 intake.
+    fn apply_read_history_inbox(
+        &mut self,
+        peer: &telegram_api::Peer,
+        max_id: i32,
+        top_msg_id: i32,
+    ) {
+        if top_msg_id != 0 {
+            // `on_update_forum_topic_unread` — the ForumTopicManager seam
             return;
-        };
-        let Some(telegram_api::Peer::peerUser(peer)) = m.peer_id.as_ref() else {
+        }
+        let dialog_id = crate::messages_manager::DialogId::from_peer(peer);
+        if !dialog_id.is_valid() {
             return;
-        };
-        // The walking-skeleton receive surface: a private incoming
-        // message. Bot sessions carry no `from_id` — the container users
-        // hold the sender, and the peer IS the sender here (the S76
-        // corpus peer).
-        let chat_id = peer.user_id;
-        self.ensure_chat(chat_id);
-        let message_id = m.id as i64;
-        let date = m.date;
-        let text = wire_message_text(m);
-        let final_message = convert::message_object(&MessageSpec {
-            id: message_id,
-            chat_id,
-            sender_user_id: chat_id,
-            date,
-            text,
-            pending: false,
-            is_outgoing: false,
-        });
-        self.send_update(Object::updateNewMessage(td_api::updateNewMessage {
-            message: Some(final_message),
-        }));
+        }
+        let last_read_inbox_message_id = crate::messages_manager::MessageId::from_server_message_id(
+            crate::messages_manager::ServerMessageId::new(max_id),
+        );
+        // SAFETY: the alias pair derives from `td_ptr`; the callee uses
+        // them strictly one at a time.
+        let td_ptr = std::ptr::from_mut(self);
+        let state: &mut dyn crate::messages_manager::ReadStateContext =
+            unsafe { crate::td::split_context_alias(td_ptr) };
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let ctx: &dyn crate::messages_manager::MessageObjectContext = unsafe { &*td_ptr };
+        crate::messages_manager::read_history_inbox(
+            manager,
+            ctx,
+            state,
+            dialog_id,
+            last_read_inbox_message_id,
+            -1,
+            "updateReadHistoryInbox",
+        );
+    }
+
+    /// The receive path for `updateReadHistoryOutbox`
+    /// (MessagesManager.cpp:5903-5910).
+    fn apply_read_history_outbox(&mut self, peer: &telegram_api::Peer, max_id: i32) {
+        let dialog_id = crate::messages_manager::DialogId::from_peer(peer);
+        if !dialog_id.is_valid() {
+            return;
+        }
+        let max_message_id = crate::messages_manager::MessageId::from_server_message_id(
+            crate::messages_manager::ServerMessageId::new(max_id),
+        );
+        // SAFETY: as apply_read_history_inbox.
+        let td_ptr = std::ptr::from_mut(self);
+        let state: &mut dyn crate::messages_manager::ReadStateContext =
+            unsafe { crate::td::split_context_alias(td_ptr) };
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let ctx: &dyn crate::messages_manager::MessageObjectContext = unsafe { &*td_ptr };
+        crate::messages_manager::read_history_outbox(
+            manager,
+            ctx,
+            state,
+            dialog_id,
+            max_message_id,
+            0,
+        );
     }
 
     /// `Td` close: dropping the callback sends the close notification; the
@@ -4181,6 +6370,76 @@ impl FileManagerWorker for TdFileWorker {
     }
 }
 
+// ── the LinkManager environment (M.23) ──
+//
+// The C++ LinkManager reads `G()` (options, close flag, the binlog pmc)
+// and sends its queries from the collapsed actor's `create_handler`s;
+// the env carries the same surfaces and the `[blocked: net]` query
+// seams. The dialog-manager half of `bot_start_autostart`
+// (LinkManager.cpp:641-646) stays behind the trait default.
+
+/// The `&self` option slice for the `LinkManager` statics
+/// (`get_instant_view_link*`, LinkManager.h:115-119) — they read
+/// `G()->get_option_string` only, so no manager instance is needed.
+pub(crate) struct TdStaticLinkEnv<'a> {
+    pub(crate) options: Option<&'a OptionManager>,
+}
+
+impl crate::link_manager::LinkEnv for TdStaticLinkEnv<'_> {
+    fn get_option_string_with_default(&self, name: &str, default_value: &str) -> String {
+        self.options.as_ref().map_or_else(
+            || default_value.to_owned(),
+            |options| options.get_option_string(name, default_value),
+        )
+    }
+
+    fn get_option_string(&self, name: &str) -> String {
+        self.options
+            .as_ref()
+            .map_or_else(String::new, |options| options.get_option_string(name, ""))
+    }
+}
+
+/// The per-call [`crate::link_manager::LinkEnv`] over the Td fields —
+/// built per arm with the field-split borrows, never held across calls.
+pub(crate) struct TdLinkEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+}
+
+impl crate::link_manager::LinkEnv for TdLinkEnv<'_> {
+    fn get_option_string_with_default(&self, name: &str, default_value: &str) -> String {
+        self.options.as_ref().map_or_else(
+            || default_value.to_owned(),
+            |options| options.get_option_string(name, default_value),
+        )
+    }
+
+    fn get_option_string(&self, name: &str) -> String {
+        self.options
+            .as_ref()
+            .map_or_else(String::new, |options| options.get_option_string(name, ""))
+    }
+
+    /// The option half of `InternalLinkBotStart`'s autostart
+    /// (LinkManager.cpp:638-640): the premium-bot username autostarts.
+    fn bot_start_autostart(&self, bot_username: &str) -> bool {
+        self.get_option_string("premium_bot_username") == bot_username
+    }
+
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn binlog_pmc_get(&mut self, key: &str) -> String {
+        self.global.binlog_pmc().get(key)
+    }
+
+    fn binlog_pmc_set(&mut self, key: &str, value: &str) {
+        self.global.binlog_pmc().set(key, value);
+    }
+}
+
 // ── the StorageManager environment (T.5/T.8) ──
 //
 // The C++ StorageManager/FileStatsWorker read `G()` (options, the binlog
@@ -4735,12 +6994,6 @@ impl FileLoadNetFactory for TdFileLoadNetFactory {
     }
 }
 
-/// `get_message_text` for the plain-text shape (the walking-skeleton
-/// messages carry no media).
-fn wire_message_text(message: &telegram_api::message) -> String {
-    message.message.clone()
-}
-
 /// Parses a top-level boxed `Vector<user>` (the `users.getUsers` result).
 fn parse_vector_user(data: &[u8]) -> Option<Vec<telegram_api::user>> {
     let mut reader = telegram_api::tl::Reader::new(data);
@@ -4755,16 +7008,6 @@ fn parse_vector_user(data: &[u8]) -> Option<Vec<telegram_api::user>> {
         }
     }
     Some(users)
-}
-
-/// A non-zero secure i64 (`MessagesManager::generate_new_random_id`).
-fn nonzero_secure_i64() -> i64 {
-    loop {
-        let value = tdutils::random::secure_uint64() as i64;
-        if value != 0 {
-            return value;
-        }
-    }
 }
 
 actor_messages! {
@@ -4832,6 +7075,44 @@ impl Actor for Td {
             self.notification_settings_manager.tick_timeouts(&mut env);
             self.device_token_manager.tick_timeouts(&mut env);
         }
+        // The WebPagesManager pending-page timeouts (M.17): the
+        // collapsed MultiTimeout fires each due id once.
+        {
+            let now = tdutils::time::now();
+            let due: Vec<i64> = self
+                .web_pages_timeouts
+                .iter()
+                .filter(|(_, deadline)| **deadline <= now)
+                .map(|(&key, _)| key)
+                .collect();
+            for web_page_id in due {
+                self.web_pages_timeouts.remove(&web_page_id);
+                let (mut env, web_pages_manager) = web_pages_env_split(self);
+                web_pages_manager.on_pending_web_page_timeout(&mut env, web_page_id);
+            }
+        }
+        // The MessageQueryManager timeout families (M.18): the C++
+        // `send_message_view_metrics_timeout_callback` and the reload
+        // SleepActor collapse into `tick_timeouts`.
+        {
+            let mut env = MessageQueryEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+                auth_is_authorized: self.auth_manager.is_authorized(),
+                auth_is_bot: self.auth_manager.is_bot(),
+                can_ignore_background_updates: self.can_ignore_background_updates,
+                updates: &mut self.message_query_updates,
+                user_manager: &mut self.user_manager,
+                updates_manager: &mut self.updates_manager,
+            };
+            self.message_query_manager.tick_timeouts(&mut env);
+        }
+        // The PollManager's three MultiTimeouts (M.19): the C++
+        // `on_*_poll_timeout_callback`s collapse into `tick_timeouts`.
+        {
+            let (mut env, poll_manager) = poll_env_split(self);
+            poll_manager.tick_timeouts(&mut env);
+        }
         let actions = self
             .config_manager
             .as_mut()
@@ -4894,6 +7175,39 @@ impl Actor for Td {
     // C++ `Td::loop` yields to drive the NetQueryDispatcher).
 }
 
+/// Field-split the `Td` for the PollManager calls: the env borrows the
+/// manager surfaces, the split returns the poll manager itself.
+pub(crate) fn poll_env_split(
+    td: &mut Td,
+) -> (
+    crate::poll_manager::PollManagerEnvImpl<'_>,
+    &mut crate::poll_manager::PollManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        chat_manager,
+        file_manager,
+        poll_manager,
+        poll_updates,
+        ..
+    } = td;
+    (
+        crate::poll_manager::PollManagerEnvImpl {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            chat_manager,
+            file_manager: std::sync::Arc::clone(file_manager),
+            updates: poll_updates,
+        },
+        poll_manager,
+    )
+}
+
 /// The `G()`/manager slice the collapsed NotificationManager reads through
 /// (the C++ manager reads the same surfaces off its `Td *td_` directly).
 /// The `send_update`s buffer into [`Td::notification_updates`] and Td
@@ -4908,6 +7222,56 @@ pub(crate) struct NotificationEnv<'a> {
     pub(crate) auth_is_authorized: bool,
     pub(crate) auth_is_bot: bool,
     pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+/// The [`crate::people_nearby_manager::PeopleNearbyManagerEnv`] over the
+/// `Td` fields — the collapsed constructor surface (built per call, never
+/// held across calls).
+pub(crate) struct PeopleNearbyEnv<'a> {
+    pub(crate) is_bot: bool,
+    pub(crate) global: &'a mut Global,
+}
+
+impl crate::people_nearby_manager::PeopleNearbyManagerEnv for PeopleNearbyEnv<'_> {
+    fn is_bot(&self) -> bool {
+        self.is_bot
+    }
+
+    fn pmc_erase(&mut self, key: &str) {
+        self.global.binlog_pmc().erase(key);
+    }
+}
+
+/// The [`crate::web_browser_manager::WebBrowserManagerEnv`] over the `Td`
+/// fields — built per call with the field-split borrows (the
+/// `NotificationEnv` convention), never held across calls.
+pub(crate) struct WebBrowserEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::web_browser_manager::WebBrowserManagerEnv for WebBrowserEnv<'_> {
+    fn is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
 }
 
 impl<'a> NotificationEnv<'a> {
@@ -4970,6 +7334,249 @@ impl crate::notification_manager::NotificationManagerEnv for NotificationEnv<'_>
 
     fn pmc_erase(&mut self, key: &str) {
         self.global.binlog_pmc().erase(key);
+    }
+}
+
+impl crate::photo::PhotoStoreEnv for crate::poll_manager::PollManagerEnvImpl<'_> {
+    fn store_file_id(&mut self, file_id: crate::files::FileId, out: &mut Vec<u8>) {
+        self.file_manager.lock().store_file(file_id, out);
+    }
+
+    fn parse_file_id(
+        &mut self,
+        parser: &mut crate::store_parse::Parser<'_>,
+    ) -> Result<crate::files::FileId, &'static str> {
+        self.file_manager.lock().parse_file(parser)
+    }
+}
+
+impl crate::poll_manager::PollStoreEnv for crate::poll_manager::PollManagerEnvImpl<'_> {
+    /// `store_message_content` — [blocked: M.9 integration]: no code path
+    /// on this line can set poll media, so the codec never runs.
+    fn store_poll_media(&mut self, _media_type: i32, _out: &mut Vec<u8>) {}
+
+    /// `parse_message_content` — [blocked: M.9 integration]: db records
+    /// carrying poll media fail the parse, deferring to the
+    /// message-content line.
+    fn parse_poll_media(
+        &mut self,
+        _parser: &mut crate::store_parse::Parser<'_>,
+    ) -> Result<i32, &'static str> {
+        Err("Poll media parse — [blocked: M.9 integration]")
+    }
+}
+
+impl crate::poll_manager::PollManagerEnv for crate::poll_manager::PollManagerEnvImpl<'_> {
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn use_message_database(&self) -> bool {
+        self.global.use_message_database()
+    }
+
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn server_time(&self) -> f64 {
+        self.global.server_time()
+    }
+
+    fn now(&self) -> f64 {
+        tdutils::time::now()
+    }
+
+    fn is_test_dc(&self) -> bool {
+        self.global.is_test_dc()
+    }
+
+    fn pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn binlog_add(&mut self, handler_type: i32, data: &[u8]) -> u64 {
+        self.global.td_db().binlog().add(handler_type, data)
+    }
+
+    fn binlog_rewrite(&mut self, log_event_id: u64, handler_type: i32, data: &[u8]) -> u64 {
+        self.global
+            .td_db()
+            .binlog()
+            .rewrite(log_event_id, handler_type, data)
+    }
+
+    fn binlog_erase(&mut self, log_event_id: u64) {
+        self.global.td_db().binlog().erase(log_event_id);
+    }
+
+    fn add_min_channel(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+        min_channel: crate::chat_manager::MinChannel,
+    ) {
+        self.chat_manager.add_min_channel(channel_id, min_channel);
+    }
+
+    fn get_min_channel(
+        &self,
+        channel_id: crate::chat_manager::ChannelId,
+    ) -> Option<crate::chat_manager::MinChannel> {
+        self.chat_manager.get_min_channel(channel_id).cloned()
+    }
+
+    fn channel_is_member(&self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        self.chat_manager.get_channel_status(channel_id).is_member()
+    }
+
+    /// `chat_manager_->get_channel_date` — the collapsed line answers 0;
+    /// the subscribers-only membership window rides the M.5 integration.
+    fn channel_date(&self, _channel_id: crate::chat_manager::ChannelId) -> i32 {
+        0
+    }
+
+    /// `dialog_manager_->have_dialog_info` — the user half is real; the
+    /// chat/channel halves are the M.6 stub inventory.
+    fn have_dialog_info(&self, dialog_id: crate::dialog_id::DialogId) -> bool {
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User => self
+                .user_manager
+                .have_accessible_user(dialog_id.get_user_id()),
+            DialogType::Chat | DialogType::Channel => false,
+            DialogType::SecretChat => self
+                .user_manager
+                .have_secret_chat(dialog_id.get_secret_chat_id()),
+            DialogType::None => false,
+        }
+    }
+
+    fn have_min_user(&self, user_id: crate::user_manager::UserId) -> bool {
+        self.user_manager.have_min_user(user_id)
+    }
+
+    fn get_my_id(&self) -> crate::user_manager::UserId {
+        self.user_manager.get_my_id()
+    }
+
+    fn get_my_dialog_id(&self) -> crate::dialog_id::DialogId {
+        crate::dialog_id::DialogId::from_user_id(self.user_manager.get_my_id())
+    }
+
+    fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_integer(name, default_value)
+        })
+    }
+
+    fn get_option_string(&self, name: &str) -> String {
+        self.options
+            .as_ref()
+            .map_or_else(String::new, |options| options.get_option_string(name, ""))
+    }
+
+    /// `messages_manager_->get_message_poll_id` — [blocked: M.10
+    /// integration]: the seam answers the not-found band.
+    fn get_message_poll_id(
+        &mut self,
+        _message_full_id: &crate::dialog_id::MessageFullId,
+        _ignore_has_poll: bool,
+    ) -> Result<crate::poll_manager::PollId, tdutils::status::Status> {
+        Err(tdutils::status::Status::error(400, "Chat not found"))
+    }
+
+    /// `messages_manager_->has_message_sender_user_id` — the M.10 seam.
+    fn has_message_sender_user_id(
+        &mut self,
+        _message_full_id: &crate::dialog_id::MessageFullId,
+    ) -> bool {
+        false
+    }
+
+    /// `messages_manager_->on_external_update_message_content` — the M.10
+    /// seam no-op (the notify fan-out rides the message plane).
+    fn on_external_update_message_content(
+        &mut self,
+        _message_full_id: crate::dialog_id::MessageFullId,
+    ) {
+    }
+
+    /// `messages_manager_->on_update_poll_has_unread_votes` — the M.10
+    /// seam no-op.
+    fn on_update_poll_has_unread_votes(
+        &mut self,
+        _message_full_id: crate::dialog_id::MessageFullId,
+        _has_unread_votes: bool,
+    ) {
+    }
+
+    /// `web_pages_manager_->register_poll_web_pages` — the M.17 seam
+    /// no-op (the WebPageId newtype lands with the web-pages line).
+    fn register_poll_web_pages(
+        &mut self,
+        _poll_id: crate::poll_manager::PollId,
+        _web_page_ids: Vec<i64>,
+    ) {
+    }
+
+    /// `get_min_message_sender_object` — the user half is real; the
+    /// chat/channel halves ride the M.6 line.
+    fn get_min_message_sender_object(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> Option<td_api::MessageSender> {
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User
+                if self
+                    .user_manager
+                    .have_accessible_user(dialog_id.get_user_id()) =>
+            {
+                Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser {
+                        user_id: dialog_id.get_user_id().get(),
+                    },
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// `get_poll_media_object` — [blocked: M.9 integration]: the
+    /// option/explanation media objects land with the message-content
+    /// line; `None` is the null media of the C++ call.
+    fn get_poll_media_object(&mut self, _media_type: Option<i32>) -> Option<td_api::PollMedia> {
+        None
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn get_formatted_text_with_users(
+        &mut self,
+        text: String,
+        entities: Vec<tdmtproto::telegram_api::MessageEntity>,
+        skip_media_timestamps: bool,
+        skip_trim: bool,
+        source: &str,
+    ) -> crate::message_entity::FormattedText {
+        crate::message_entity::get_formatted_text::<()>(
+            None,
+            text,
+            entities,
+            skip_media_timestamps,
+            skip_trim,
+            source,
+        )
     }
 }
 
@@ -5102,6 +7709,218 @@ impl crate::language_pack_manager::LanguagePackManagerEnv for LanguagePackEnv<'_
         tdutils::log_info!(
             "Send langpack.getDifference for language pack {language_pack}, language code {language_code}, from version {from_version} — [blocked: net]"
         );
+    }
+}
+
+/// The `G()`/manager slice the collapsed MessageQueryManager reads through
+/// (M.18) — the C++ manager reads the same surfaces off its `Td *td_`
+/// directly. The `send_update`s buffer into [`Td::message_query_updates`]
+/// and Td drains them; every net query tail and message-plane probe keeps
+/// its default seam body (the honest error bands in
+/// [`crate::message_query_manager::MessageQueryManagerEnv`]).
+pub(crate) struct MessageQueryEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    /// `None` once the option manager is torn down; the getters answer
+    /// their defaults, matching the C++ close ordering.
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) can_ignore_background_updates: bool,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) updates_manager: &'a mut UpdatesManager<TdSink>,
+}
+
+impl crate::message_query_manager::MessageQueryManagerEnv for MessageQueryEnv<'_> {
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    /// `Random::secure_int64` (td/utils/Random.h).
+    fn secure_random_i64(&self) -> i64 {
+        tdutils::random::secure_int64()
+    }
+
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn now(&self) -> f64 {
+        tdutils::time::now()
+    }
+
+    fn get_option_string(&self, name: &str, default_value: &str) -> String {
+        self.options.as_ref().map_or_else(
+            || default_value.to_owned(),
+            |options| options.get_option_string(name, default_value),
+        )
+    }
+
+    fn get_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
+        let global = &mut *self.global;
+        let options = self
+            .options
+            .as_deref_mut()
+            .expect("the option manager exists while the manager drives");
+        let mut user_env = UserEnv {
+            global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager
+            .get_user_id_object(&mut user_env, user_id, source)
+    }
+
+    fn have_user_force(&mut self, user_id: UserId, source: &str) -> bool {
+        let global = &mut *self.global;
+        let options = self
+            .options
+            .as_deref_mut()
+            .expect("the option manager exists while the manager drives");
+        let mut user_env = UserEnv {
+            global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager
+            .have_user_force(&mut user_env, user_id, source)
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    /// `updates_manager_->add_pending_pts_update` with the C++
+    /// `dummyUpdate` — routed to the real engine (M.7).
+    fn add_pending_pts_update(
+        &mut self,
+        pts: i32,
+        pts_count: i32,
+        receive_time: f64,
+        promise: tdutils::promise::Promise<()>,
+        source: &str,
+    ) {
+        let global = &mut *self.global;
+        let options = self
+            .options
+            .as_deref_mut()
+            .expect("the option manager exists while the updates engine drives");
+        let mut updates_env = TdUpdatesEnv {
+            global,
+            options,
+            auth_is_authorized: self.auth_is_authorized,
+            auth_is_bot: self.auth_is_bot,
+            my_id: self.user_manager.get_my_id().get(),
+            can_ignore_background_updates: self.can_ignore_background_updates,
+        };
+        self.updates_manager.add_pending_pts_update(
+            &mut updates_env,
+            PendingUpdate::Dummy,
+            pts,
+            pts_count,
+            receive_time,
+            promise,
+            source,
+        );
+    }
+}
+
+/// The [`crate::call_manager::CallManagerEnv`] over the `Td` fields —
+/// built per call with the field-split borrows (the `NotificationEnv`
+/// convention), never held across calls. The two call-notification seams
+/// keep their no-op trait defaults until the notification env plumbing
+/// joins the call plane (the M.7.12+ sink group).
+pub(crate) struct CallEnv<'a> {
+    pub(crate) user_env: UserEnv<'a>,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) notification_manager: &'a mut NotificationManager,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+    pub(crate) dh_config: &'a mut Option<DhConfig>,
+}
+
+impl crate::dh_cache::DhCacheEnv for CallEnv<'_> {
+    fn pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.user_env.global.binlog_pmc().get_raw(key)
+    }
+
+    fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.user_env.global.binlog_pmc().set_raw(key, value);
+    }
+}
+
+impl crate::call_actor::CallActorEnv for CallEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.user_env.global.close_flag()
+    }
+
+    fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
+        self.user_env
+            .options
+            .get_option_integer(name, default_value)
+    }
+
+    fn get_dh_config(&self) -> Option<DhConfig> {
+        self.dh_config.clone()
+    }
+
+    fn set_dh_config(&mut self, config: DhConfig) {
+        *self.dh_config = Some(config);
+    }
+
+    fn on_get_users(&mut self, users: Vec<tdmtproto::telegram_api::User>, source: &str) {
+        self.user_manager
+            .on_get_users(&mut self.user_env, users, source);
+    }
+
+    fn get_input_user(
+        &self,
+        user_id: UserId,
+    ) -> std::result::Result<tdmtproto::telegram_api::InputUser, tdutils::status::Status> {
+        self.user_manager.get_input_user(&self.user_env, user_id)
+    }
+
+    fn get_user_id_object(&mut self, user_id: UserId) -> i64 {
+        self.user_manager.get_user_id_object(
+            &mut self.user_env,
+            user_id,
+            "CallActor::flush_call_state",
+        )
+    }
+
+    fn add_call_notification(
+        &mut self,
+        dialog_id: crate::chat_manager::DialogId,
+        call_id: crate::call_id::CallId,
+    ) {
+        let _ = (dialog_id, call_id);
+        let _ = self.notification_manager;
+    }
+
+    fn remove_call_notification(
+        &mut self,
+        dialog_id: crate::chat_manager::DialogId,
+        call_id: crate::call_id::CallId,
+    ) {
+        let _ = (dialog_id, call_id);
+        let _ = self.notification_manager;
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+}
+
+impl crate::call_manager::CallManagerEnv for CallEnv<'_> {
+    fn close_status(&self) -> tdutils::status::Status {
+        if self.user_env.global.close_flag() {
+            crate::config_result::request_aborted_error()
+        } else {
+            tdutils::status::Status::ok()
+        }
     }
 }
 
@@ -5319,6 +8138,3068 @@ pub fn send_request(actor: &ActorOwn<Td>, request_id: u64, function: Function) {
             function,
         },
     );
+}
+
+/// The account-plane env over the `Td` fields (AccountManager,
+/// TermsOfServiceManager, SuggestedActionManager) — built per call with
+/// the field-split borrows (the `NotificationEnv` convention).
+pub(crate) struct AccountEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) device_token_manager: &'a mut crate::device_token_manager::DeviceTokenManager,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl AccountManagerEnv for AccountEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_integer(name, default_value)
+        })
+    }
+
+    fn get_option_string(&self, name: &str, default_value: &str) -> String {
+        self.options.as_ref().map_or_else(
+            || default_value.to_string(),
+            |options| options.get_option_string(name, default_value),
+        )
+    }
+
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn pmc_erase(&mut self, key: &str) {
+        self.global.binlog_pmc().erase(key);
+    }
+
+    fn binlog_add(&mut self, handler_type: i32, data: &[u8]) -> u64 {
+        self.global.td_db().binlog().add(handler_type, data)
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn on_get_users(&mut self, users: Vec<tdmtproto::telegram_api::User>, source: &str) {
+        let mut env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_mut()
+                .expect("account manager runs with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.on_get_users(&mut env, users, source);
+    }
+
+    fn get_user_id_object(&mut self, user_id: i64, source: &str) -> i64 {
+        let mut env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_mut()
+                .expect("account manager runs with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager
+            .get_user_id_object(&mut env, UserId::new(user_id), source)
+    }
+
+    fn set_option_boolean(&mut self, name: &str, value: bool) {
+        if let Some(options) = self.options.as_mut() {
+            options.set_option_boolean(name, value);
+        }
+    }
+
+    fn reregister_device(&mut self) {
+        // the device-token env plumbing joins with the account plane
+        // later (the M.13S continuation); the seam no-ops
+        let _ = &mut self.device_token_manager;
+    }
+}
+
+impl crate::terms_of_service_manager::TermsOfServiceManagerEnv for AccountEnv<'_> {
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+}
+
+impl crate::suggested_action_manager::SuggestedActionManagerEnv for AccountEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn pmc_erase(&mut self, key: &str) {
+        self.global.binlog_pmc().erase(key);
+    }
+
+    fn get_option_string(&self, name: &str, default_value: &str) -> String {
+        self.options.as_ref().map_or_else(
+            || default_value.to_string(),
+            |options| options.get_option_string(name, default_value),
+        )
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+}
+
+/// The community-plane env over the `Td` fields — built per call with the
+/// field-split borrows (the `NotificationEnv` convention).
+pub(crate) struct CommunityEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) dialog_manager: &'a mut DialogManager,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl CommunityManagerEnv for CommunityEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> std::result::Result<(), tdutils::status::Status> {
+        // `DialogManager::check_dialog_access(dialog_id, false, Read,
+        // "create_community")` — the full access-check plane is the M.6
+        // continuation; the seam answers valid dialogs only.
+        if dialog_id.is_valid() {
+            Ok(())
+        } else {
+            Err(tdutils::status::Status::error(400, "Chat not found"))
+        }
+    }
+
+    fn get_chat_id_object(&mut self, dialog_id: crate::dialog_id::DialogId) -> i64 {
+        let _ = self.dialog_manager;
+        dialog_id.get()
+    }
+}
+
+/// The statistics-plane env over the `Td` fields.
+pub(crate) struct StatisticsEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl StatisticsManagerEnv for StatisticsEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn get_channel_statistics_dc_id(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> std::result::Result<(), tdutils::status::Status> {
+        // `ChatManager::get_channel_statistics_dc_id` — the dc-id answer
+        // joins with the net step; the seam accepts valid dialogs.
+        if dialog_id.is_valid() {
+            Ok(())
+        } else {
+            Err(tdutils::status::Status::error(400, "Chat not found"))
+        }
+    }
+}
+
+/// The premium-plane env over the option manager.
+pub(crate) struct PremiumTdEnv<'a> {
+    pub(crate) options: Option<&'a mut OptionManager>,
+}
+
+impl PremiumEnv for PremiumTdEnv<'_> {
+    fn get_option_integer(&self, name: &str) -> i64 {
+        self.options
+            .as_ref()
+            .map_or(0, |options| options.get_option_integer(name, 0))
+    }
+
+    fn get_option_string(&self, name: &str, default_value: &str) -> String {
+        self.options.as_ref().map_or_else(
+            || default_value.to_string(),
+            |options| options.get_option_string(name, default_value),
+        )
+    }
+
+    fn send_update(&mut self, _update: td_api::Update) {}
+}
+
+/// The quick-reply env over the `Td` fields.
+pub(crate) struct QuickReplyEnv<'a> {
+    pub(crate) global: &'a mut Global,
+}
+
+impl QuickReplyManagerEnv for QuickReplyEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn send_update(&mut self, _update: td_api::Update) {}
+}
+
+/// The boost-plane env over the `Td` fields.
+pub(crate) struct BoostEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+}
+
+impl BoostManagerEnv for BoostEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_integer(name, default_value)
+        })
+    }
+
+    fn send_update(&mut self, _update: td_api::Update) {}
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> std::result::Result<(), tdutils::status::Status> {
+        if dialog_id.is_valid() {
+            Ok(())
+        } else {
+            Err(tdutils::status::Status::error(400, "Chat not found"))
+        }
+    }
+
+    fn get_channel_first_username(&mut self, channel_id: crate::chat_manager::ChannelId) -> String {
+        // `ChatManager::get_channel_first_username` — the M.5 surface; the
+        // seam answers the empty username.
+        let _ = (
+            self.chat_manager as &mut crate::chat_manager::ChatManager,
+            channel_id,
+        );
+        String::new()
+    }
+}
+
+/// The [`crate::autosave_manager::AutosaveManagerEnv`] over the `Td`
+/// fields — built per call with the field-split borrows (the
+/// `NotificationEnv` convention), never held across calls. The sqlite pmc
+/// surface routes to `TdDb::common_kv` (the C++ `get_sqlite_pmc` home);
+/// the calls are gated on `use_message_database` by the manager, matching
+/// the C++ branch that guards them.
+pub(crate) struct AutosaveEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::autosave_manager::AutosaveManagerEnv for AutosaveEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn use_message_database(&self) -> bool {
+        self.global.use_message_database()
+    }
+
+    fn sqlite_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.td_db().common_kv().get(key)
+    }
+
+    fn sqlite_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.td_db().common_kv().set(key, value);
+    }
+
+    fn binlog_pmc_erase(&mut self, key: &str) {
+        self.global.binlog_pmc().erase(key);
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    /// the simplified dialog seam until the M.5/M.7 dialog integration
+    /// (the BoostEnv convention)
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> Result<(), tdutils::status::Status> {
+        if dialog_id.is_valid() {
+            Ok(())
+        } else {
+            Err(tdutils::status::Status::error(400, "Chat not found"))
+        }
+    }
+
+    fn force_create_dialog(&mut self, _dialog_id: crate::dialog_id::DialogId) {
+        // `dialog_manager::force_create_dialog` — the M.6/M.7 cache seam;
+        // every dialog id is resolvable in the collapsed cache
+    }
+}
+
+/// The [`crate::attach_menu_manager::AttachMenuManagerEnv`] over the `Td`
+/// fields — built per call with the field-split borrows (the
+/// `NotificationEnv` convention), never held across calls; the file
+/// manager rides its `Arc` clone so the disjoint borrows hold.
+pub(crate) struct AttachMenuEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>>,
+    pub(crate) file_reference_manager: &'a mut crate::files::FileReferenceManager,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::attach_menu_manager::AttachMenuManagerEnv for AttachMenuEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn use_chat_info_database(&self) -> bool {
+        self.global.use_chat_info_database()
+    }
+
+    fn binlog_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn binlog_pmc_erase(&mut self, key: &str) {
+        self.global.binlog_pmc().erase(key);
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn get_input_user(
+        &mut self,
+        user_id: UserId,
+    ) -> Result<telegram_api::InputUser, tdutils::status::Status> {
+        let user_env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_mut()
+                .expect("attach-menu requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_input_user(&user_env, user_id)
+    }
+
+    fn get_bot_data(
+        &mut self,
+        user_id: UserId,
+    ) -> Result<crate::user_manager::BotData, tdutils::status::Status> {
+        self.user_manager.get_bot_data(user_id)
+    }
+
+    fn have_accessible_user(&self, user_id: UserId) -> bool {
+        self.user_manager.have_accessible_user(user_id)
+    }
+
+    fn get_user_id_object(&mut self, user_id: UserId) -> i64 {
+        let mut user_env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_mut()
+                .expect("attach-menu requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_user_id_object(
+            &mut user_env,
+            user_id,
+            "get_attachment_menu_bot_object",
+        )
+    }
+
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        let mut user_env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_mut()
+                .expect("attach-menu requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.on_get_users(&mut user_env, users, source)
+    }
+
+    fn get_attach_menu_bot_file_source_id(&mut self, user_id: UserId) -> FileSourceId {
+        // `FileReferenceManager::create_attach_menu_bot_file_source`
+        // (FileReferenceManager.cpp:282-286)
+        self.file_reference_manager
+            .intern(crate::files::FileSource::AttachMenuBot(user_id))
+    }
+
+    fn on_get_icon_document(
+        &mut self,
+        document: &telegram_api::document,
+        expected_sticker: bool,
+    ) -> FileId {
+        // the narrow `DocumentsManager::on_get_document` collapse: the
+        // General-vs-Sticker type derivation reads the document
+        // attributes; the remote location registers into the M.12 file
+        // plane with the C++ FromServer source
+        let has_sticker = document.attributes.iter().any(|attribute| {
+            matches!(
+                attribute,
+                telegram_api::DocumentAttribute::documentAttributeSticker(_)
+            )
+        });
+        if has_sticker != expected_sticker {
+            return FileId::new(0, 0);
+        }
+        let file_type = if has_sticker {
+            FileType::Sticker
+        } else {
+            FileType::Document
+        };
+        let dc_id = if DcId::is_valid_raw(document.dc_id) {
+            DcId::internal(document.dc_id)
+        } else {
+            DcId::invalid()
+        };
+        let location = crate::files::FullRemoteFileLocation::from_document(
+            file_type,
+            document.id,
+            document.access_hash,
+            dc_id,
+            String::from_utf8_lossy(&document.file_reference).into_owned(),
+        );
+        let remote_name = document
+            .attributes
+            .iter()
+            .find_map(|attribute| match attribute {
+                telegram_api::DocumentAttribute::documentAttributeFilename(name) => {
+                    Some(name.file_name.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| document.mime_type.clone());
+        let mut file_manager = self.file_manager.lock();
+        file_manager.register_remote(
+            location,
+            crate::files::FileLocationSource::FromServer,
+            crate::message_id::DialogId::new(0),
+            document.size,
+            document.size,
+            remote_name,
+        )
+    }
+
+    fn add_file_source(&mut self, file_id: FileId, source_id: FileSourceId) {
+        // the C++ `FileManager::add_file_source` hop routes into the
+        // FileReferenceManager, which owns the source registry
+        self.file_reference_manager
+            .add_file_source(file_id, source_id);
+    }
+
+    fn get_file_object(&mut self, file_id: FileId) -> td_api::File {
+        self.file_manager.lock().get_file_object(file_id)
+    }
+
+    fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>) {
+        self.file_manager.lock().store_file(file_id, out);
+    }
+
+    fn parse_file_id(
+        &mut self,
+        parser: &mut crate::store_parse::Parser,
+    ) -> Result<FileId, &'static str> {
+        self.file_manager.lock().parse_file(parser)
+    }
+}
+
+/// The [`crate::theme_manager::ThemeManagerEnv`] over the `Td` fields —
+/// built per call with the field-split borrows (the `NotificationEnv`
+/// convention), never held across calls; the file manager rides its `Arc`
+/// clone so the disjoint borrows hold.
+pub(crate) struct ThemeEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+    pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>>,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::theme_manager::ThemeManagerEnv for ThemeEnv<'_> {
+    fn is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn binlog_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn get_option_integer(&mut self, name: &str) -> i64 {
+        self.options
+            .as_mut()
+            .map(|options| options.get_option_integer(name, 0))
+            .unwrap_or(0)
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        let mut user_env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_mut()
+                .expect("theme queries run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.on_get_users(&mut user_env, users, source);
+    }
+
+    fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
+        let mut user_env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_mut()
+                .expect("theme queries run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.chat_manager
+            .on_get_chats(self.user_manager, &mut user_env, chats, source);
+    }
+
+    fn on_get_theme_background(
+        &mut self,
+        wallpaper: Option<telegram_api::WallPaper>,
+        is_no_file_pattern: bool,
+    ) -> Option<(
+        crate::theme_manager::BackgroundId,
+        crate::theme_manager::BackgroundType,
+    )> {
+        use crate::chat_manager::DcId;
+        use crate::files::{FileType, FullRemoteFileLocation};
+
+        let wallpaper = wallpaper?;
+        match wallpaper {
+            // the wallPaperNoFile half (BackgroundManager.cpp:1287-1310):
+            // the settings are required, the id must be valid and remote;
+            // the local-id counter is [blocked: M.16 Backgrounds]
+            telegram_api::WallPaper::wallPaperNoFile(wallpaper) => {
+                let settings = wallpaper.settings?;
+                let background_id = crate::theme_manager::BackgroundId::new(wallpaper.id);
+                if !background_id.is_valid() || background_id.is_local() {
+                    tdutils::log_error!("Receive an invalid no-file wallpaper id");
+                    return None;
+                }
+                let background_type = crate::theme_manager::BackgroundType::from_settings(
+                    true,
+                    is_no_file_pattern,
+                    Some(&settings),
+                );
+                Some((background_id, background_type))
+            }
+            // the wallPaper half (BackgroundManager.cpp:1312-1360): the id
+            // checks are inline, the document registers into the M.12 file
+            // plane with the C++ FromServer source (the
+            // DocumentsManager::on_get_document General/wallpaper collapse)
+            telegram_api::WallPaper::wallPaper(wallpaper) => {
+                let background_id = crate::theme_manager::BackgroundId::new(wallpaper.id);
+                if !background_id.is_valid() || background_id.is_local() {
+                    tdutils::log_error!("Receive an invalid wallpaper id");
+                    return None;
+                }
+                let is_pattern = wallpaper.pattern;
+                let Some(document) = wallpaper.document.as_ref() else {
+                    tdutils::log_error!("Receive a wallpaper without a document");
+                    return None;
+                };
+                let telegram_api::Document::document(document) = document else {
+                    tdutils::log_error!("Receive a wallpaper with documentEmpty");
+                    return None;
+                };
+                let dc_id = if DcId::is_valid_raw(document.dc_id) {
+                    DcId::internal(document.dc_id)
+                } else {
+                    DcId::invalid()
+                };
+                let location = FullRemoteFileLocation::from_document(
+                    FileType::Wallpaper,
+                    document.id,
+                    document.access_hash,
+                    dc_id,
+                    String::from_utf8_lossy(&document.file_reference).into_owned(),
+                );
+                let remote_name = document
+                    .attributes
+                    .iter()
+                    .find_map(|attribute| match attribute {
+                        telegram_api::DocumentAttribute::documentAttributeFilename(name) => {
+                            Some(name.file_name.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| document.mime_type.clone());
+                let mut file_manager = self.file_manager.lock();
+                let file_id = file_manager.register_remote(
+                    location,
+                    crate::files::FileLocationSource::FromServer,
+                    crate::message_id::DialogId::new(0),
+                    document.size,
+                    document.size,
+                    remote_name,
+                );
+                if !file_id.is_valid() {
+                    tdutils::log_error!("Receive a wallpaper with an invalid document");
+                    return None;
+                }
+                let background_type = crate::theme_manager::BackgroundType::from_settings(
+                    false,
+                    is_pattern,
+                    wallpaper.settings.as_ref(),
+                );
+                Some((background_id, background_type))
+            }
+        }
+    }
+
+    fn get_theme_background_object(
+        &mut self,
+        info: &crate::theme_manager::BackgroundInfo,
+    ) -> Option<td_api::Background> {
+        // the BackgroundManager object cache ([blocked: M.16 Backgrounds])
+        let _ = info;
+        None
+    }
+
+    fn store_background_row(
+        &mut self,
+        background_id: crate::theme_manager::BackgroundId,
+        out: &mut Vec<u8>,
+    ) -> bool {
+        // the full Background row store ([blocked: M.16 Backgrounds]) —
+        // the Td-side cache cannot answer yet, so a wallpaper-bearing
+        // theme stores background-less
+        let _ = (background_id, out);
+        false
+    }
+
+    fn parse_background_row(
+        &mut self,
+        parser: &mut crate::store_parse::Parser,
+    ) -> Result<crate::theme_manager::BackgroundId, &'static str> {
+        // the symmetric half of the store seam; with the store returning
+        // false the has_background flag keeps the row out of the stream
+        let _ = parser;
+        Result::Ok(crate::theme_manager::BackgroundId::new(0))
+    }
+
+    fn star_gift_object_for_theme(
+        &mut self,
+        gift: telegram_api::StarGift,
+    ) -> Option<td_api::UpgradedGift> {
+        // the StarGift value plane ([blocked: M.42 StarGift])
+        let _ = gift;
+        tdutils::log_info!("StarGift for the chat theme — [blocked: M.42 StarGift]");
+        None
+    }
+
+    fn send_get_chat_themes_query(&mut self, hash: i64) {
+        tdutils::log_info!("Send account.getChatThemes(hash = {hash}) — [blocked: net]");
+    }
+
+    fn send_get_peer_colors_query(&mut self, hash: i32) {
+        tdutils::log_info!("Send help.getPeerColors(hash = {hash}) — [blocked: net]");
+    }
+
+    fn send_get_peer_profile_colors_query(&mut self, hash: i32) {
+        tdutils::log_info!("Send help.getPeerProfileColors(hash = {hash}) — [blocked: net]");
+    }
+
+    fn send_get_unique_gift_chat_themes_query(&mut self, offset: &str, limit: i32) {
+        tdutils::log_info!(
+            "Send account.getUniqueGiftChatThemes(offset = {offset}, limit = {limit}) — [blocked: net]"
+        );
+    }
+}
+
+/// The `G()`/`td_` slice [`crate::star_gift_manager::StarGiftManager`]
+/// reads through (the C++ manager reads the same surfaces off its
+/// `Td *td_` directly; the collapsed manager runs inside a `&mut Td`
+/// borrow, so the env carries the disjoint field borrows). The
+/// StickersManager/StarManager/MessagesManager/PasswordManager/
+/// BusinessConnectionManager halves keep their trait defaults — those
+/// managers are their own tracks (see the star_gift_manager module
+/// header); the user/dialog halves below delegate to the real read
+/// surface with the M.6.15a chat stubs.
+pub(crate) struct StarGiftTdEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    /// `None` once the option manager is torn down; the getters answer
+    /// their defaults like the other envs.
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+    /// `dialog_manager_->get_my_dialog_id()` (the M.6.15a free-function
+    /// answer, snapshotted at construction).
+    pub(crate) my_dialog_id: crate::dialog_id::DialogId,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::star_gift_manager::StarGiftEnv for StarGiftTdEnv<'_> {
+    fn is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn get_option_integer(&mut self, name: &str) -> i64 {
+        self.options
+            .as_ref()
+            .map_or(0, |options| options.get_option_integer(name, 0))
+    }
+
+    fn get_option_boolean(&mut self, name: &str) -> bool {
+        self.options
+            .as_ref()
+            .is_some_and(|options| options.get_option_boolean(name, false))
+    }
+
+    fn get_option_string(&mut self, name: &str, default_value: &str) -> String {
+        self.options.as_ref().map_or_else(
+            || default_value.to_owned(),
+            |options| options.get_option_string(name, default_value),
+        )
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        let crate::td::StarGiftTdEnv {
+            global,
+            options,
+            auth_is_bot,
+            user_manager,
+            ..
+        } = self;
+        let Some(options) = options else {
+            return;
+        };
+        let mut env = UserEnv {
+            global,
+            options,
+            auth_is_bot: *auth_is_bot,
+        };
+        user_manager.on_get_users(&mut env, users, source);
+    }
+
+    fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
+        let crate::td::StarGiftTdEnv {
+            global,
+            options,
+            auth_is_bot,
+            user_manager,
+            chat_manager,
+            ..
+        } = self;
+        let Some(options) = options else {
+            return;
+        };
+        let mut env = UserEnv {
+            global,
+            options,
+            auth_is_bot: *auth_is_bot,
+        };
+        chat_manager.on_get_chats(user_manager, &mut env, chats, source);
+    }
+
+    fn have_user_force(&mut self, user_id: UserId, source: &str) -> bool {
+        let Some(options) = self.options.as_mut() else {
+            return false;
+        };
+        let mut env = UserEnv {
+            global: &mut *self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.have_user_force(&mut env, user_id, source)
+    }
+
+    fn get_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
+        let Some(options) = self.options.as_mut() else {
+            return user_id.get();
+        };
+        let mut env = UserEnv {
+            global: &mut *self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager
+            .get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn get_user_ids_object(&mut self, user_ids: &[UserId], _source: &str) -> Vec<i64> {
+        user_ids.iter().map(|user_id| user_id.get()).collect()
+    }
+
+    fn get_my_dialog_id(&self) -> crate::dialog_id::DialogId {
+        self.my_dialog_id
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        _source: &str,
+    ) -> std::result::Result<(), tdutils::status::Status> {
+        use crate::dialog_id::DialogType;
+        // the M.6.15a halves: the chat/channel/`have_dialog` lookups are
+        // the stub inventory, so only the user/secret-chat info can pass
+        let have = match dialog_id.get_type() {
+            DialogType::User => self
+                .user_manager
+                .have_accessible_user(dialog_id.get_user_id()),
+            DialogType::SecretChat => self
+                .user_manager
+                .have_secret_chat(dialog_id.get_secret_chat_id()),
+            _ => false,
+        };
+        if !have {
+            if !dialog_id.is_valid() {
+                return std::result::Result::Err(tdutils::status::Status::error(
+                    400,
+                    "Invalid chat identifier specified",
+                ));
+            }
+            return std::result::Result::Err(tdutils::status::Status::error(400, "Chat not found"));
+        }
+        // check_dialog_access_in_memory: the user half through the real
+        // input-peer check, the rest through the stub `false`
+        let have_input_peer = match dialog_id.get_type() {
+            DialogType::User => {
+                let global = &mut *self.global;
+                let Some(options) = self.options.as_mut() else {
+                    return std::result::Result::Err(tdutils::status::Status::error(
+                        400,
+                        "Can't access the chat",
+                    ));
+                };
+                let env = UserEnv {
+                    global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.user_manager.have_input_peer_user(
+                    &env,
+                    dialog_id.get_user_id(),
+                    crate::user_manager::AccessRights::Read,
+                )
+            }
+            _ => false,
+        };
+        if !have_input_peer {
+            return std::result::Result::Err(tdutils::status::Status::error(
+                400,
+                "Can't access the chat",
+            ));
+        }
+        std::result::Result::Ok(())
+    }
+
+    fn get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> Option<telegram_api::InputPeer> {
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User => {
+                let options = self.options.as_mut()?;
+                let env = UserEnv {
+                    global: &mut *self.global,
+                    options,
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.user_manager.get_input_peer_user(
+                    &env,
+                    dialog_id.get_user_id(),
+                    crate::user_manager::AccessRights::Read,
+                )
+            }
+            // the chat/secret-chat halves are the M.6.15a stubs
+            _ => None,
+        }
+    }
+
+    fn have_dialog_force(&mut self, dialog_id: crate::dialog_id::DialogId, _source: &str) -> bool {
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User => self
+                .user_manager
+                .have_accessible_user(dialog_id.get_user_id()),
+            DialogType::SecretChat => self
+                .user_manager
+                .have_secret_chat(dialog_id.get_secret_chat_id()),
+            _ => false,
+        }
+    }
+
+    fn get_chat_id_object(&mut self, dialog_id: crate::dialog_id::DialogId, _source: &str) -> i64 {
+        // the M.6.16 stub: the MessagesManager lookup answers the raw id
+        dialog_id.get()
+    }
+
+    // the user/chat gift-count updates and the channel-status read ride
+    // the UserManager-full/ChatManager planes (their own tracks); the
+    // force-create is the M.6 no-op stub
+
+    fn on_update_my_gift_count(&mut self, _delta: i32) {}
+
+    fn on_update_user_gift_count(&mut self, _user_id: UserId, _count: i32) {}
+
+    fn force_create_dialog(&mut self, _dialog_id: crate::dialog_id::DialogId, _source: &str) {}
+
+    fn is_broadcast_channel(&mut self, _dialog_id: crate::dialog_id::DialogId) -> bool {
+        false
+    }
+
+    fn can_channel_post_messages(&mut self, _channel_id: crate::chat_manager::ChannelId) -> bool {
+        false
+    }
+
+    fn on_update_channel_gift_count(
+        &mut self,
+        _channel_id: crate::chat_manager::ChannelId,
+        _count: i32,
+        _is_relax: bool,
+    ) {
+    }
+}
+
+/// The [`crate::payments::PaymentsEnv`] over the `Td` fields — built per
+/// request with the field-split borrows (the `NotificationEnv`
+/// convention), never held across calls. The UserManager reads are real;
+/// the DialogManager halves mirror the M.6 stub inventory (the chat/
+/// channel-backed reads stay the unloaded results until M.10), and the
+/// net/MessagesManager/StarManager/Files seams keep their trait defaults.
+pub(crate) struct PaymentsEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_bot: bool,
+    /// `dialog_manager::get_my_dialog_id(td)`, computed before the field
+    /// split (the free function needs the whole `Td`).
+    pub(crate) my_dialog_id: crate::dialog_id::DialogId,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+}
+
+impl crate::payments::PaymentsEnv for PaymentsEnv<'_> {
+    fn get_unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn get_option_integer(&mut self, name: &str) -> i64 {
+        self.options
+            .as_mut()
+            .map(|options| options.get_option_integer(name, 0))
+            .unwrap_or(0)
+    }
+
+    fn binlog_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn get_input_user(
+        &mut self,
+        user_id: UserId,
+    ) -> tdutils::status::Result<telegram_api::InputUser> {
+        let (env, user_manager) = self.split_user_env();
+        match user_manager.get_input_user(&env, user_id) {
+            Ok(input_user) => tdutils::status::Result::Ok(input_user),
+            Err(status) => tdutils::status::Result::Err(status),
+        }
+    }
+
+    fn get_input_users(
+        &mut self,
+        user_ids: &[UserId],
+    ) -> tdutils::status::Result<Vec<telegram_api::InputUser>> {
+        let (env, user_manager) = self.split_user_env();
+        match user_manager.get_input_users(&env, user_ids) {
+            Ok(input_users) => tdutils::status::Result::Ok(input_users),
+            Err(status) => tdutils::status::Result::Err(status),
+        }
+    }
+
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        let (mut env, user_manager) = self.split_user_env();
+        user_manager.on_get_users(&mut env, users, source);
+    }
+
+    fn get_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
+        let (mut env, user_manager) = self.split_user_env();
+        user_manager.get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn have_dialog_force(&mut self, dialog_id: crate::dialog_id::DialogId, _source: &str) -> bool {
+        // `DialogManager::have_dialog_force` → the M.6 stub inventory
+        // (dialog_manager::have_dialog_info): the chat/channel halves are
+        // the unloaded results until M.10
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User => self
+                .user_manager
+                .have_accessible_user(dialog_id.get_user_id()),
+            DialogType::SecretChat => self
+                .user_manager
+                .have_secret_chat(dialog_id.get_secret_chat_id()),
+            DialogType::Chat | DialogType::Channel | DialogType::None => false,
+        }
+    }
+
+    fn get_channel_status(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+    ) -> crate::chat_manager::DialogParticipantStatus {
+        self.chat_manager.get_channel_status(channel_id)
+    }
+
+    fn is_broadcast_channel(&mut self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        self.chat_manager.is_broadcast_channel(channel_id)
+    }
+
+    fn get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<telegram_api::InputPeer> {
+        // `DialogManager::get_input_peer` over the split fields (the M.6
+        // function re-derives the same `UserEnv`; its chat/channel halves
+        // are the stub inventory's `None` until M.10)
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User => {
+                let (env, user_manager) = self.split_user_env();
+                user_manager.get_input_peer_user(&env, dialog_id.get_user_id(), access_rights)
+            }
+            DialogType::Chat | DialogType::Channel | DialogType::SecretChat => None,
+            DialogType::None => Some(telegram_api::InputPeer::inputPeerEmpty(
+                telegram_api::inputPeerEmpty {},
+            )),
+        }
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        source: &str,
+    ) -> tdutils::status::Result<()> {
+        // `DialogManager::check_dialog_access(dialog_id, false, Read,
+        // source)` over the stub inventory (the in-memory halves the M.6
+        // inventory stubs to `true` for the accessible users)
+        if !self.have_dialog_force(dialog_id, source) {
+            if !dialog_id.is_valid() {
+                return tdutils::status::Result::from_status(tdutils::status::Status::error(
+                    400,
+                    "Invalid chat identifier specified",
+                ));
+            }
+            return tdutils::status::Result::from_status(tdutils::status::Status::error(
+                400,
+                "Chat not found",
+            ));
+        }
+        tdutils::status::Result::Ok(())
+    }
+
+    fn get_my_dialog_id(&self) -> crate::dialog_id::DialogId {
+        self.my_dialog_id
+    }
+}
+
+impl PaymentsEnv<'_> {
+    /// Field-split the env into the `UserEnv` plus the manager reference
+    /// (the `user_env!` shape; a `&mut self` helper cannot return both,
+    /// hence the manual destructuring at every call).
+    fn split_user_env(&mut self) -> (UserEnv<'_>, &mut UserManager) {
+        let Self {
+            global,
+            options,
+            auth_is_bot,
+            my_dialog_id: _,
+            user_manager,
+            chat_manager: _,
+        } = self;
+        (
+            UserEnv {
+                global,
+                options: options
+                    .as_mut()
+                    .expect("payment requests run with the initialized option manager"),
+                auth_is_bot: *auth_is_bot,
+            },
+            user_manager,
+        )
+    }
+}
+
+/// The [`crate::secure_value::SecureValueEnv`] +
+/// [`crate::secure_manager::SecureManagerEnv`] over the `Td` fields — built
+/// per call with the field-split borrows (the `NotificationEnv`
+/// convention), never held across calls; the M.12 file plane rides its
+/// `Arc` clone so the disjoint borrows hold.
+pub(crate) struct SecureEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    /// the user-only passport requests run after `init`
+    pub(crate) options: &'a mut OptionManager,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) file_manager: Arc<parking_lot::Mutex<FileManager>>,
+    pub(crate) file_load_manager: Arc<parking_lot::Mutex<FileLoadManager>>,
+    /// the snapshot of `Td::close_flag`
+    pub(crate) close_flag: bool,
+}
+
+impl crate::secure_value::SecureValueEnv for SecureEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.close_flag
+    }
+
+    fn unix_time(&mut self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn file_register_secure_encrypted(
+        &mut self,
+        id: i64,
+        access_hash: i64,
+        dc_id: DcId,
+        size: i64,
+        remote_name: String,
+    ) -> FileId {
+        self.file_manager.lock().register_remote(
+            crate::files::FullRemoteFileLocation::from_document(
+                FileType::SecureEncrypted,
+                id,
+                access_hash,
+                dc_id,
+                String::new(),
+            ),
+            crate::files::FileLocationSource::FromServer,
+            DialogId::default(),
+            size,
+            0,
+            remote_name,
+        )
+    }
+
+    fn file_register_secure_decrypted(
+        &mut self,
+        id: i64,
+        access_hash: i64,
+        dc_id: DcId,
+        expected_size: i64,
+        suggested_path: String,
+    ) -> FileId {
+        self.file_manager.lock().register_remote(
+            crate::files::FullRemoteFileLocation::from_document(
+                FileType::SecureDecrypted,
+                id,
+                access_hash,
+                dc_id,
+                String::new(),
+            ),
+            crate::files::FileLocationSource::FromServer,
+            DialogId::default(),
+            0,
+            expected_size,
+            suggested_path,
+        )
+    }
+
+    fn file_view(&mut self, file_id: FileId) -> Option<crate::secure_value::SecureFileView> {
+        let file_manager = self.file_manager.lock();
+        let view = file_manager.get_file_view(file_id)?;
+        let full_remote = view.get_full_remote_location();
+        Some(crate::secure_value::SecureFileView {
+            file_type: view.get_type(),
+            main_file_id: view.get_main_file_id(),
+            is_encrypted_secure: view.is_encrypted_secure(),
+            full_remote: full_remote.map(|location| crate::secure_value::SecureFullRemote {
+                id: location.get_id(),
+                access_hash: location.get_access_hash(),
+                dc_id: location.get_dc_id(),
+            }),
+            full_remote_is_web: full_remote.is_some_and(|location| location.is_web()),
+            encryption_key: view.encryption_key().clone(),
+            expected_size: view.expected_size(false),
+            suggested_path: view.suggested_path(),
+            size: view.size(),
+        })
+    }
+
+    fn file_set_encryption_key(&mut self, file_id: FileId, key: crate::files::FileEncryptionKey) {
+        self.file_manager.lock().set_encryption_key(file_id, key);
+    }
+
+    fn file_object(&mut self, file_id: FileId) -> td_api::File {
+        self.file_manager.lock().get_file_object(file_id)
+    }
+
+    fn file_get_input_file_id(
+        &mut self,
+        file: Option<&td_api::InputFile>,
+    ) -> tdutils::status::Result<FileId> {
+        match self.file_manager.lock().get_input_file_id(
+            FileType::SecureEncrypted,
+            file,
+            DialogId::default(),
+            false,
+            false,
+            false,
+            true,
+            false,
+            false,
+        ) {
+            Ok(file_id) => tdutils::status::Result::Ok(file_id),
+            Err(status) => tdutils::status::Result::Err(status),
+        }
+    }
+
+    fn file_merge(
+        &mut self,
+        to_file_id: FileId,
+        from_file_id: FileId,
+    ) -> tdutils::status::Result<()> {
+        match self.file_manager.lock().merge(to_file_id, from_file_id) {
+            Ok(()) => tdutils::status::Result::Ok(()),
+            Err(status) => tdutils::status::Result::Err(status),
+        }
+    }
+
+    fn file_copy_file_id(&mut self, file_id: FileId) -> FileId {
+        self.file_manager.lock().copy_file_id(
+            file_id,
+            FileType::SecureEncrypted,
+            DialogId::default(),
+            "SetSecureValue",
+        )
+    }
+
+    fn file_cancel_upload(&mut self, file_upload_id: crate::files::FileUploadId) {
+        let mut file_load_manager = self.file_load_manager.lock();
+        self.file_manager
+            .lock()
+            .cancel_upload(file_upload_id, &mut file_load_manager);
+    }
+
+    fn file_get_internal_upload_id(&mut self) -> i64 {
+        self.file_manager.lock().get_internal_upload_id()
+    }
+}
+
+impl crate::secure_manager::SecureManagerEnv for SecureEnv<'_> {
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        let mut user_env = UserEnv {
+            global: self.global,
+            options: self.options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.on_get_users(&mut user_env, users, source);
+    }
+
+    fn get_input_user(
+        &mut self,
+        user_id: UserId,
+    ) -> tdutils::status::Result<telegram_api::InputUser> {
+        let user_env = UserEnv {
+            global: self.global,
+            options: self.options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        match self.user_manager.get_input_user(&user_env, user_id) {
+            Ok(input_user) => tdutils::status::Result::Ok(input_user),
+            Err(status) => tdutils::status::Result::Err(status),
+        }
+    }
+}
+
+/// The [`crate::bot_info_manager::BotInfoManagerEnv`] over the `Td` fields
+/// — built per call with the field-split borrows (the `ThemeEnv`
+/// convention, M.41), never held across calls.
+pub(crate) struct BotInfoEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+}
+
+impl crate::bot_info_manager::BotInfoManagerEnv for BotInfoEnv<'_> {
+    fn is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn is_test_dc(&self) -> bool {
+        self.global.is_test_dc()
+    }
+
+    fn binlog_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn get_option_integer(&mut self, name: &str) -> i64 {
+        self.options
+            .as_deref()
+            .map(|options| options.get_option_integer(name, 0))
+            .unwrap_or(0)
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        // the C++ BotInfoManager never sends updates; the outbox lands in
+        // the Td's own send path if a future slice needs it
+        tdutils::log_info!("BotInfoManager update send — collapsed into the Td: {update:?}");
+    }
+
+    fn get_my_id(&self) -> crate::user_manager::UserId {
+        self.user_manager.get_my_id()
+    }
+
+    fn get_bot_data(
+        &self,
+        user_id: crate::user_manager::UserId,
+    ) -> std::result::Result<crate::user_manager::BotData, Status> {
+        self.user_manager.get_bot_data(user_id)
+    }
+
+    fn get_input_user(
+        &mut self,
+        user_id: crate::user_manager::UserId,
+    ) -> std::result::Result<telegram_api::InputUser, Status> {
+        let env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("bot requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_input_user(&env, user_id)
+    }
+
+    fn get_input_users_force(
+        &mut self,
+        user_ids: &[crate::user_manager::UserId],
+    ) -> Vec<telegram_api::InputUser> {
+        let env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("bot requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_input_users_force(&env, user_ids)
+    }
+
+    fn get_user_id_object(&mut self, user_id: crate::user_manager::UserId, source: &str) -> i64 {
+        let mut env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("bot requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager
+            .get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn get_user_ids_object(
+        &mut self,
+        user_ids: &[crate::user_manager::UserId],
+        source: &str,
+    ) -> Vec<i64> {
+        user_ids
+            .iter()
+            .map(|user_id| self.get_user_id_object(*user_id, source))
+            .collect()
+    }
+
+    fn get_users_object(
+        &mut self,
+        total_count: i32,
+        user_ids: &[crate::user_manager::UserId],
+    ) -> td_api::Users {
+        let mut env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("bot requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager
+            .get_users_object_of(&mut env, total_count, user_ids)
+    }
+
+    fn on_get_user(
+        &mut self,
+        user: telegram_api::User,
+        source: &str,
+    ) -> crate::user_manager::UserId {
+        let mut env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("bot requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.on_get_user(&mut env, user, source)
+    }
+
+    fn invalidate_user_full(&mut self, user_id: crate::user_manager::UserId) {
+        let mut env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("bot requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.invalidate_user_full(&mut env, user_id);
+    }
+
+    fn have_user_force(&mut self, user_id: crate::user_manager::UserId, source: &str) -> bool {
+        let mut env = UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("bot requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.have_user_force(&mut env, user_id, source)
+    }
+
+    fn reload_user_full(&mut self, user_id: crate::user_manager::UserId, promise: Promise<()>) {
+        // `UserManager::reload_user_full` (the users.getFullUser reload)
+        // is [blocked: net]; the forwarded promise dies here like the
+        // other net tails — the request stays unanswered until the net
+        // step lands
+        let _ = (user_id, promise);
+        tdutils::log_info!("UserManager::reload_user_full — [blocked: net]");
+    }
+
+    fn reload_user(&mut self, user_id: crate::user_manager::UserId, promise: Promise<()>) {
+        let _ = (user_id, promise);
+        tdutils::log_info!("UserManager::reload_user — [blocked: net]");
+    }
+
+    fn on_update_bot_has_preview_medias(
+        &mut self,
+        user_id: crate::user_manager::UserId,
+        has_preview_medias: bool,
+    ) {
+        let _ = (user_id, has_preview_medias);
+        tdutils::log_info!(
+            "UserManager::on_update_bot_has_preview_medias — [blocked: the user bot-info step]"
+        );
+    }
+
+    // The dialog seams: the env-local mirror of the M.6.15a free
+    // functions (they take `&mut Td`, which the field-split env cannot
+    // reach) — the same UserManager halves, with the Chat/Channel
+    // stub inventory.
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        allow_secret_chats: bool,
+        access_rights: crate::user_manager::AccessRights,
+        source: &str,
+    ) -> tdutils::status::Result<()> {
+        use crate::dialog_id::DialogType;
+        if !self.have_dialog_force(dialog_id, source) {
+            if !dialog_id.is_valid() {
+                return tdutils::status::Result::from_status(Status::error(
+                    400,
+                    "Invalid chat identifier specified",
+                ));
+            }
+            return tdutils::status::Result::from_status(Status::error(400, "Chat not found"));
+        }
+        if !self.have_input_peer(dialog_id, allow_secret_chats, access_rights) {
+            if dialog_id.get_type() == DialogType::SecretChat && !allow_secret_chats {
+                return tdutils::status::Result::from_status(Status::error(
+                    400,
+                    "Not supported in secret chats",
+                ));
+            }
+            if matches!(
+                access_rights,
+                crate::user_manager::AccessRights::Write | crate::user_manager::AccessRights::Edit
+            ) {
+                return tdutils::status::Result::from_status(Status::error(
+                    400,
+                    "Have no write access to the chat",
+                ));
+            }
+            return tdutils::status::Result::from_status(Status::error(
+                400,
+                "Can't access the chat",
+            ));
+        }
+        tdutils::status::Result::Ok(())
+    }
+
+    fn have_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        allow_secret_chats: bool,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> bool {
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User => {
+                let env = UserEnv {
+                    global: self.global,
+                    options: self
+                        .options
+                        .as_deref_mut()
+                        .expect("bot requests run with the initialized option manager"),
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.user_manager
+                    .have_input_peer_user(&env, dialog_id.get_user_id(), access_rights)
+            }
+            // the ChatManager peers are the stub inventory (M.6.15a)
+            DialogType::Chat | DialogType::Channel => false,
+            DialogType::SecretChat => {
+                if !allow_secret_chats {
+                    return false;
+                }
+                self.user_manager
+                    .have_input_encrypted_peer(dialog_id.get_secret_chat_id(), access_rights)
+            }
+            DialogType::None => false,
+        }
+    }
+
+    fn get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<telegram_api::InputPeer> {
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User => {
+                let env = UserEnv {
+                    global: self.global,
+                    options: self
+                        .options
+                        .as_deref_mut()
+                        .expect("bot requests run with the initialized option manager"),
+                    auth_is_bot: self.auth_is_bot,
+                };
+                self.user_manager
+                    .get_input_peer_user(&env, dialog_id.get_user_id(), access_rights)
+            }
+            // the ChatManager peers are the stub inventory (M.6.15a); the
+            // C++ inputPeerSecretChat construction rides
+            // ChatManager::get_simple_input_peer (stub inventory too)
+            DialogType::Chat | DialogType::Channel | DialogType::SecretChat => None,
+            DialogType::None => Some(telegram_api::InputPeer::inputPeerEmpty(
+                telegram_api::inputPeerEmpty {},
+            )),
+        }
+    }
+
+    fn is_broadcast_channel(&mut self, dialog_id: crate::dialog_id::DialogId) -> bool {
+        // the ChatManager channel read is the stub inventory
+        // (dialog_manager::is_broadcast_channel)
+        let _ = dialog_id;
+        false
+    }
+
+    fn have_dialog_force(&mut self, dialog_id: crate::dialog_id::DialogId, source: &str) -> bool {
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User => self.have_user_force(dialog_id.get_user_id(), source),
+            // the ChatManager peers are the stub inventory
+            DialogType::Chat | DialogType::Channel => false,
+            DialogType::SecretChat => self
+                .user_manager
+                .have_secret_chat(dialog_id.get_secret_chat_id()),
+            DialogType::None => false,
+        }
+    }
+}
+
+/// The `G()`/manager slice the four M.46 bot managers read through (the
+/// C++ managers read the same surfaces off their `Td *td_` directly):
+/// the whole `Td` rides the env, so the dialog/message free functions
+/// keep their `&mut Td` signatures (the NotificationEnv field-split is
+/// not enough here); the manager state itself is taken out of the `Td`
+/// for the call (see the request arms in [`crate::requests`]).
+pub(crate) struct BotEnv<'a> {
+    pub(crate) td: &'a mut Td,
+}
+
+/// The `tdutils::status::Result` → `std::result::Result` rewrap the
+/// env traits use (the manager modules return the std form).
+fn bot_dialog_result(result: tdutils::status::Result<()>) -> std::result::Result<(), Status> {
+    match result {
+        tdutils::status::Result::Ok(()) => Ok(()),
+        tdutils::status::Result::Err(status) => Err(status),
+    }
+}
+
+/// The disjoint `UserEnv` + manager borrow (the `chat_env_split`
+/// convention in requests.rs).
+fn bot_user_split(td: &mut Td) -> (UserEnv<'_>, &mut crate::user_manager::UserManager) {
+    let options = td
+        .option_manager
+        .as_mut()
+        .expect("bot requests run with the initialized option manager");
+    let env = UserEnv {
+        global: &mut td.global,
+        options,
+        auth_is_bot: td.auth_manager.is_bot(),
+    };
+    (env, &mut td.user_manager)
+}
+
+impl crate::photo::PhotoStoreEnv for BotEnv<'_> {
+    fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>) {
+        self.td.file_manager.lock().store_file(file_id, out);
+    }
+
+    fn parse_file_id(
+        &mut self,
+        parser: &mut crate::store_parse::Parser<'_>,
+    ) -> Result<FileId, &'static str> {
+        self.td.file_manager.lock().parse_file(parser)
+    }
+}
+
+impl crate::web_app::WebAppEnv for BotEnv<'_> {
+    // every WebAppEnv surface is a seam: the document classification is
+    // [blocked: Documents], the photo/animation object builders are the
+    // FileManager/AnimationsManager object seams
+}
+
+impl crate::message_entity::UserManagerLike for BotEnv<'_> {
+    fn resolve_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
+        let (mut env, user_manager) = bot_user_split(self.td);
+        user_manager.get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn ensure_input_user(&mut self, user_id: UserId) -> Result<(), Status> {
+        let (env, user_manager) = bot_user_split(self.td);
+        user_manager.get_input_user(&env, user_id).map(|_| ())
+    }
+
+    fn have_min_user(&self, user_id: UserId) -> bool {
+        self.td.user_manager.have_min_user(user_id)
+    }
+
+    fn get_input_user_force(&mut self, user_id: UserId) -> telegram_api::InputUser {
+        let (env, user_manager) = bot_user_split(self.td);
+        user_manager.get_input_user_force(&env, user_id)
+    }
+
+    fn is_user_bot(&self, user_id: UserId) -> bool {
+        self.td.user_manager.is_user_bot_of(user_id)
+    }
+}
+
+impl crate::game::GameEnv for BotEnv<'_> {}
+
+impl crate::web_app_manager::WebAppManagerEnv for BotEnv<'_> {
+    fn is_authorized(&self) -> bool {
+        self.td.auth_manager.is_authorized()
+    }
+
+    fn is_bot(&self) -> bool {
+        self.td.auth_manager.is_bot()
+    }
+
+    fn close_flag(&self) -> bool {
+        self.td.global.close_flag()
+    }
+
+    fn unix_time(&self) -> i32 {
+        self.td.global.unix_time()
+    }
+
+    fn get_input_user(&mut self, bot_user_id: UserId) -> Result<telegram_api::InputUser, Status> {
+        let (env, user_manager) = bot_user_split(self.td);
+        user_manager.get_input_user(&env, bot_user_id)
+    }
+
+    fn get_bot_data(
+        &mut self,
+        bot_user_id: UserId,
+    ) -> Result<crate::user_manager::BotData, Status> {
+        self.td.user_manager.get_bot_data(bot_user_id)
+    }
+
+    fn is_user_bot(&mut self, user_id: UserId) -> bool {
+        self.td.user_manager.is_user_bot_of(user_id)
+    }
+
+    fn on_get_user(&mut self, user: telegram_api::User, source: &str) -> UserId {
+        let (mut env, user_manager) = bot_user_split(self.td);
+        user_manager.on_get_user(&mut env, user, source)
+    }
+
+    fn get_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
+        let (mut env, user_manager) = bot_user_split(self.td);
+        user_manager.get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn have_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> bool {
+        crate::dialog_manager::have_input_peer(self.td, dialog_id, false, access_rights)
+    }
+
+    fn get_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+    ) -> Option<telegram_api::InputPeer> {
+        crate::dialog_manager::get_input_peer(self.td, dialog_id, access_rights)
+    }
+
+    fn is_monoforum_channel(&mut self, dialog_id: crate::dialog_id::DialogId) -> bool {
+        crate::dialog_manager::is_monoforum_channel(self.td, dialog_id)
+    }
+
+    fn is_admined_monoforum_channel(&mut self, dialog_id: crate::dialog_id::DialogId) -> bool {
+        crate::dialog_manager::is_admined_monoforum_channel(self.td, dialog_id)
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+        source: &str,
+    ) -> Result<(), Status> {
+        bot_dialog_result(crate::dialog_manager::check_dialog_access(
+            self.td,
+            dialog_id,
+            false,
+            access_rights,
+            source,
+        ))
+    }
+
+    fn on_get_dialog_error(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        status: &Status,
+        source: &str,
+    ) -> bool {
+        crate::dialog_manager::on_get_dialog_error(self.td, dialog_id, status, source)
+    }
+
+    fn have_dialog_force(&mut self, dialog_id: crate::dialog_id::DialogId, source: &str) -> bool {
+        crate::dialog_manager::have_dialog_force(self.td, dialog_id, source)
+    }
+
+    fn is_megagroup_channel(&mut self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        // `chat_manager_->is_megagroup_channel` — the unloaded-channel
+        // C++ result (the stub inventory)
+        let _ = channel_id;
+        false
+    }
+
+    fn create_web_app_file_source(&mut self, user_id: UserId, short_name: &str) -> FileSourceId {
+        self.td
+            .file_reference_manager
+            .intern(crate::files::FileSource::WebApp {
+                user_id,
+                short_name: short_name.to_owned(),
+            })
+    }
+
+    fn add_file_source(&mut self, file_id: FileId, file_source_id: FileSourceId, source: &str) {
+        let _ = source;
+        self.td
+            .file_reference_manager
+            .add_file_source(file_id, file_source_id);
+    }
+}
+
+impl crate::callback_queries_manager::CallbackQueriesManagerEnv for BotEnv<'_> {
+    fn is_bot(&self) -> bool {
+        self.td.auth_manager.is_bot()
+    }
+
+    fn close_flag(&mut self) -> bool {
+        self.td.global.close_flag()
+    }
+
+    fn have_min_user(&mut self, sender_user_id: UserId) -> bool {
+        self.td.user_manager.have_min_user(sender_user_id)
+    }
+
+    fn get_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
+        let (mut env, user_manager) = bot_user_split(self.td);
+        user_manager.get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.td.notification_updates.push(update);
+    }
+
+    fn force_create_dialog(&mut self, dialog_id: crate::dialog_id::DialogId, source: &str) {
+        crate::dialog_manager::force_create_dialog(self.td, dialog_id, source)
+    }
+
+    fn get_chat_id_object(&mut self, dialog_id: crate::dialog_id::DialogId, source: &str) -> i64 {
+        crate::dialog_manager::get_chat_id_object(dialog_id, source)
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        source: &str,
+    ) -> Result<(), Status> {
+        bot_dialog_result(crate::dialog_manager::check_dialog_access(
+            self.td,
+            dialog_id,
+            false,
+            crate::user_manager::AccessRights::Read,
+            source,
+        ))
+    }
+
+    fn check_dialog_access_in_memory(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> Result<(), Status> {
+        bot_dialog_result(crate::dialog_manager::check_dialog_access_in_memory(
+            self.td,
+            dialog_id,
+            false,
+            crate::user_manager::AccessRights::Read,
+        ))
+    }
+
+    fn on_get_dialog_error(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        status: &Status,
+        source: &str,
+    ) -> bool {
+        crate::dialog_manager::on_get_dialog_error(self.td, dialog_id, status, source)
+    }
+
+    fn have_message_force(
+        &mut self,
+        message_full_id: crate::message_id::MessageFullId,
+        source: &str,
+    ) -> bool {
+        let _ = (message_full_id, source);
+        tdutils::log_info!("MessagesManager::have_message_force — [blocked: M.10 Messages]");
+        false
+    }
+}
+
+impl crate::bot_recommendation_manager::BotRecommendationManagerEnv for BotEnv<'_> {
+    fn is_user_bot(&mut self, bot_user_id: UserId) -> bool {
+        self.td.user_manager.is_user_bot_of(bot_user_id)
+    }
+
+    fn get_input_user(&mut self, bot_user_id: UserId) -> Result<telegram_api::InputUser, Status> {
+        let (env, user_manager) = bot_user_split(self.td);
+        user_manager.get_input_user(&env, bot_user_id)
+    }
+
+    fn on_get_user(&mut self, user: telegram_api::User, source: &str) -> UserId {
+        let (mut env, user_manager) = bot_user_split(self.td);
+        user_manager.on_get_user(&mut env, user, source)
+    }
+
+    fn get_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
+        let (mut env, user_manager) = bot_user_split(self.td);
+        user_manager.get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn get_users_object(&mut self, total_count: i32, user_ids: &[UserId]) -> td_api::Users {
+        let (mut env, user_manager) = bot_user_split(self.td);
+        user_manager.get_users_object_of(&mut env, total_count, user_ids)
+    }
+
+    fn get_option_boolean(&mut self, name: &str) -> bool {
+        self.td
+            .option_manager
+            .as_ref()
+            .is_some_and(|options| options.get_option_boolean(name, false))
+    }
+
+    fn use_message_database(&mut self) -> bool {
+        self.td.global.use_message_database()
+    }
+
+    fn close_flag(&mut self) -> bool {
+        self.td.global.close_flag()
+    }
+
+    fn sqlite_pmc_get_raw(&mut self, key: &str) -> Vec<u8> {
+        self.td.global.td_db().common_kv().get(key.as_bytes())
+    }
+
+    fn sqlite_pmc_set_raw(&mut self, key: &str, value: &[u8]) {
+        self.td
+            .global
+            .td_db()
+            .common_kv()
+            .set(key.as_bytes(), value);
+    }
+
+    fn sqlite_pmc_erase(&mut self, key: &str) {
+        self.td.global.td_db().common_kv().erase(key.as_bytes());
+    }
+}
+
+impl crate::game_manager::GameManagerEnv for BotEnv<'_> {
+    fn is_bot(&self) -> bool {
+        self.td.auth_manager.is_bot()
+    }
+
+    fn get_input_user(&mut self, user_id: UserId) -> Result<telegram_api::InputUser, Status> {
+        let (env, user_manager) = bot_user_split(self.td);
+        user_manager.get_input_user(&env, user_id)
+    }
+
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        let (mut env, user_manager) = bot_user_split(self.td);
+        user_manager.on_get_users(&mut env, users, source)
+    }
+
+    fn get_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
+        let (mut env, user_manager) = bot_user_split(self.td);
+        user_manager.get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        access_rights: crate::user_manager::AccessRights,
+        source: &str,
+    ) -> Result<(), Status> {
+        bot_dialog_result(crate::dialog_manager::check_dialog_access(
+            self.td,
+            dialog_id,
+            false,
+            access_rights,
+            source,
+        ))
+    }
+
+    fn on_get_dialog_error(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        status: &Status,
+        source: &str,
+    ) {
+        crate::dialog_manager::on_get_dialog_error(self.td, dialog_id, status, source);
+    }
+
+    fn have_message_force(
+        &mut self,
+        message_full_id: crate::message_id::MessageFullId,
+        source: &str,
+    ) -> bool {
+        let _ = (message_full_id, source);
+        tdutils::log_info!("MessagesManager::have_message_force — [blocked: M.10 Messages]");
+        false
+    }
+
+    fn can_set_game_score(&mut self, message_full_id: crate::message_id::MessageFullId) -> bool {
+        let _ = message_full_id;
+        tdutils::log_info!("MessagesManager::can_set_game_score — [blocked: M.10 Messages]");
+        false
+    }
+
+    fn get_message_object(
+        &mut self,
+        message_full_id: crate::message_id::MessageFullId,
+        source: &str,
+    ) -> Option<td_api::Message> {
+        let _ = (message_full_id, source);
+        tdutils::log_info!("MessagesManager::get_message_object — [blocked: M.10 Messages]");
+        None
+    }
+
+    fn on_get_updates(&mut self, updates: telegram_api::Updates, promise: Promise<()>) {
+        let options = self
+            .td
+            .option_manager
+            .as_mut()
+            .expect("option manager exists after init");
+        let global = &mut self.td.global;
+        let mut env = TdUpdatesEnv {
+            global,
+            options,
+            auth_is_authorized: self.td.auth_manager.is_authorized(),
+            auth_is_bot: self.td.auth_manager.is_bot(),
+            my_id: self.td.user_manager.get_my_id().get(),
+            can_ignore_background_updates: self.td.can_ignore_background_updates,
+        };
+        self.td
+            .updates_manager
+            .on_get_updates(&mut env, updates, promise);
+    }
+}
+
+/// The `G()`/`td_` surface for the [`crate::story_manager::StoryManager`]
+/// (the M.47 conventions): field-split borrows off `Td`, the notification
+/// outbox for `send_update`, and the M.12 file manager behind its shared
+/// lock. The StoryDb seam answers `None` — the story tables are implemented
+/// standalone in [`crate::story_db`] over the tddb `SqliteDb` (the M.13S
+/// `notification_db.rs` precedent); the TdDb story-db plumbing lands at the
+/// db integration.
+pub(crate) struct StoryEnv<'a> {
+    pub global: &'a mut Global,
+    pub options: Option<&'a mut OptionManager>,
+    pub auth_is_authorized: bool,
+    pub auth_is_bot: bool,
+    pub user_manager: &'a mut UserManager,
+    pub chat_manager: &'a mut crate::chat_manager::ChatManager,
+    pub file_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>>,
+    pub updates: &'a mut Vec<td_api::Update>,
+}
+
+impl<'a> StoryEnv<'a> {
+    /// The `UserEnv` for the user-manager surfaces the story plane needs;
+    /// the caller halves land with the user-manager read surface.
+    #[allow(dead_code)]
+    fn user_env(&mut self) -> UserEnv<'_> {
+        UserEnv {
+            global: self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("story requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        }
+    }
+}
+
+impl<'a> crate::story_manager::StoryManagerEnv for StoryEnv<'a> {
+    fn is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn use_message_database(&self) -> bool {
+        self.global.use_message_database()
+    }
+
+    fn unix_time(&mut self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn binlog_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn binlog_pmc_erase(&mut self, key: &[u8]) {
+        // BinlogKeyValue::erase is spelled &str; the story keys are ASCII.
+        self.global
+            .binlog_pmc()
+            .erase(&String::from_utf8_lossy(key));
+    }
+
+    fn get_option_integer(&mut self, name: &str, default_value: i64) -> i64 {
+        match self.options.as_deref_mut() {
+            Some(options) => options.get_option_integer(name, default_value),
+            None => default_value,
+        }
+    }
+
+    fn get_option_boolean(&mut self, name: &str) -> bool {
+        match self.options.as_deref_mut() {
+            Some(options) => options.get_option_boolean(name, false),
+            None => false,
+        }
+    }
+
+    fn set_option_empty(&mut self, name: &str) {
+        if let Some(options) = self.options.as_deref_mut() {
+            options.set_option_empty(name);
+        }
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn on_get_users(&mut self, users: Vec<tdmtproto::telegram_api::User>, source: &str) {
+        // Field-split borrows: the UserEnv holds `global`/`options` while
+        // `user_manager` is borrowed separately (the E0499 split).
+        let StoryEnv {
+            global,
+            options,
+            auth_is_bot,
+            user_manager,
+            ..
+        } = self;
+        let mut user_env = UserEnv {
+            global,
+            options: options
+                .as_deref_mut()
+                .expect("story requests run with the initialized option manager"),
+            auth_is_bot: *auth_is_bot,
+        };
+        user_manager.on_get_users(&mut user_env, users, source);
+    }
+
+    fn on_get_chats(&mut self, chats: Vec<tdmtproto::telegram_api::Chat>, source: &str) {
+        let StoryEnv {
+            global,
+            options,
+            auth_is_bot,
+            user_manager,
+            chat_manager,
+            ..
+        } = self;
+        let mut user_env = UserEnv {
+            global,
+            options: options
+                .as_deref_mut()
+                .expect("story requests run with the initialized option manager"),
+            auth_is_bot: *auth_is_bot,
+        };
+        chat_manager.on_get_chats(user_manager, &mut user_env, chats, source);
+    }
+
+    fn force_create_dialog(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        _source: &str,
+        _force: bool,
+    ) {
+        // `DialogManager::force_create_dialog` — the M.6 stub is a no-op
+        let _ = dialog_id;
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        allow_secret_chats: bool,
+        need_write_access: bool,
+        source: &str,
+    ) -> tdutils::status::Result<()> {
+        if !self.have_dialog_force(dialog_id, source) {
+            if !dialog_id.is_valid() {
+                return tdutils::status::Result::from_status(Status::error(
+                    400,
+                    "Invalid chat identifier specified",
+                ));
+            }
+            return tdutils::status::Result::from_status(Status::error(400, "Chat not found"));
+        }
+        // `check_dialog_access_in_memory` over the env surfaces
+        if !self.have_input_peer(dialog_id, allow_secret_chats, need_write_access) {
+            if dialog_id.get_type() == crate::dialog_id::DialogType::SecretChat
+                && !allow_secret_chats
+            {
+                return tdutils::status::Result::from_status(Status::error(
+                    400,
+                    "Not supported in secret chats",
+                ));
+            }
+            if need_write_access {
+                return tdutils::status::Result::from_status(Status::error(
+                    400,
+                    "Have no write access to the chat",
+                ));
+            }
+            return tdutils::status::Result::from_status(Status::error(
+                400,
+                "Can't access the chat",
+            ));
+        }
+        tdutils::status::Result::Ok(())
+    }
+
+    fn have_dialog_force(&mut self, dialog_id: crate::dialog_id::DialogId, source: &str) -> bool {
+        let _ = source;
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::User => self
+                .user_manager
+                .have_accessible_user(dialog_id.get_user_id()),
+            crate::dialog_id::DialogType::Chat | crate::dialog_id::DialogType::Channel => false,
+            crate::dialog_id::DialogType::SecretChat => self
+                .user_manager
+                .have_secret_chat(dialog_id.get_secret_chat_id()),
+            crate::dialog_id::DialogType::None => false,
+        }
+    }
+
+    fn have_input_peer(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        allow_secret_chats: bool,
+        need_write: bool,
+    ) -> bool {
+        let access_rights = if need_write {
+            crate::user_manager::AccessRights::Write
+        } else {
+            crate::user_manager::AccessRights::Read
+        };
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::User => {
+                let StoryEnv {
+                    global,
+                    options,
+                    auth_is_bot,
+                    user_manager,
+                    ..
+                } = self;
+                let user_env = UserEnv {
+                    global,
+                    options: options
+                        .as_deref_mut()
+                        .expect("story requests run with the initialized option manager"),
+                    auth_is_bot: *auth_is_bot,
+                };
+                user_manager.have_input_peer_user(&user_env, dialog_id.get_user_id(), access_rights)
+            }
+            // ChatManager peers arrive with its read surface (stub inventory)
+            crate::dialog_id::DialogType::Chat | crate::dialog_id::DialogType::Channel => false,
+            crate::dialog_id::DialogType::SecretChat => {
+                allow_secret_chats
+                    && self
+                        .user_manager
+                        .have_input_encrypted_peer(dialog_id.get_secret_chat_id(), access_rights)
+            }
+            crate::dialog_id::DialogType::None => false,
+        }
+    }
+
+    fn get_my_dialog_id(&self) -> crate::dialog_id::DialogId {
+        crate::dialog_id::DialogId::from_user_id(self.user_manager.get_my_id())
+    }
+
+    fn get_chat_id_object(&mut self, dialog_id: crate::dialog_id::DialogId, source: &str) -> i64 {
+        crate::dialog_manager::get_chat_id_object(dialog_id, source)
+    }
+
+    fn is_group_dialog(&mut self, dialog_id: crate::dialog_id::DialogId) -> bool {
+        dialog_id.get_type() == crate::dialog_id::DialogType::Chat
+    }
+
+    fn get_my_id(&self) -> crate::user_manager::UserId {
+        self.user_manager.get_my_id()
+    }
+
+    fn have_min_user(&self, user_id: crate::user_manager::UserId) -> bool {
+        self.user_manager.have_min_user(user_id)
+    }
+
+    fn get_user_ids_object(
+        &mut self,
+        user_ids: &[crate::user_manager::UserId],
+        source: &str,
+    ) -> Vec<i64> {
+        let _ = source;
+        user_ids.iter().map(|user_id| user_id.get()).collect()
+    }
+
+    fn is_user_bot(&self, user_id: crate::user_manager::UserId) -> bool {
+        self.user_manager.is_user_bot_of(user_id)
+    }
+
+    fn is_user_premium(&self, user_id: crate::user_manager::UserId) -> bool {
+        self.user_manager.is_user_premium_of(user_id)
+    }
+
+    fn is_user_contact(&self, user_id: crate::user_manager::UserId) -> bool {
+        self.user_manager.is_user_contact_of(user_id, false)
+    }
+
+    fn get_user_stories_hidden(&self, user_id: crate::user_manager::UserId) -> bool {
+        self.user_manager.get_user_stories_hidden_of(user_id)
+    }
+
+    fn get_channel_status(&self, channel_id: i64) -> crate::chat_manager::DialogParticipantStatus {
+        self.chat_manager
+            .get_channel_status(crate::chat_manager::ChannelId::new(channel_id))
+    }
+
+    fn is_megagroup_channel(&self, channel_id: i64) -> bool {
+        // `get_channel_type(channel_id) == ChannelType::Megagroup`
+        // (StoryManager.cpp:4086).
+        self.chat_manager
+            .get_channel_type_by_id(crate::chat_manager::ChannelId::new(channel_id))
+            == crate::chat_manager::ChannelType::Megagroup
+    }
+
+    fn get_input_file_id(
+        &mut self,
+        file_type: crate::files::FileType,
+        file: Option<&td_api::InputFile>,
+        owner_dialog_id: crate::dialog_id::DialogId,
+        allow_zero: bool,
+        is_encrypted: bool,
+    ) -> tdutils::status::Result<crate::files::FileId> {
+        // files.rs rides the `message_id::DialogId` spelling; convert.
+        let owner_dialog_id = crate::message_id::DialogId::new(owner_dialog_id.get());
+        let mut file_manager = self.file_manager.lock();
+        tdutils::status::Result::from(file_manager.get_input_file_id(
+            file_type,
+            file,
+            owner_dialog_id,
+            allow_zero,
+            is_encrypted,
+            false,
+            false,
+            false,
+            false,
+        ))
+    }
+
+    fn copy_file_id(
+        &mut self,
+        file_id: crate::files::FileId,
+        file_type: crate::files::FileType,
+        owner_dialog_id: crate::dialog_id::DialogId,
+        source: &str,
+    ) -> crate::files::FileId {
+        let owner_dialog_id = crate::message_id::DialogId::new(owner_dialog_id.get());
+        let mut file_manager = self.file_manager.lock();
+        file_manager.copy_file_id(file_id, file_type, owner_dialog_id, source)
+    }
+
+    fn videos_store_video(&mut self, file_id: crate::files::FileId, out: &mut Vec<u8>) {
+        let file_manager = self.file_manager.lock();
+        file_manager.store_file(file_id, out);
+    }
+
+    fn videos_parse_video(
+        &mut self,
+        parser: &mut crate::store_parse::Parser,
+    ) -> std::result::Result<crate::files::FileId, &'static str> {
+        let mut file_manager = self.file_manager.lock();
+        file_manager.parse_file(parser)
+    }
+
+    fn videos_get_video_duration(&mut self, file_id: crate::files::FileId) -> i32 {
+        // `VideosManager::get_video_duration` reads the video record —
+        // [blocked: VideosManager]; the interim answer is the C++ "not a
+        // video" -1
+        let _ = file_id;
+        -1
+    }
+
+    fn story_db(&mut self) -> Option<&mut crate::story_db::StoryDb> {
+        // [blocked: TdDb story-db plumbing at integration] — the story
+        // tables live standalone in `crate::story_db` until then
+        None
+    }
+}
+
+/// The `G()`/`td_` slice the forum plane reads through (the M.49
+/// convention): field-split borrows off `Td`. The [blocked: net] query
+/// tails and the notification-settings/draft halves keep their trait
+/// defaults until their tracks land.
+pub(crate) struct ForumTopicTdEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) auth_is_bot: bool,
+    /// The chat-manager half for the forum checks — kept for the C++
+    /// field parity; the is_forum read lands with the chat plane.
+    #[allow(dead_code)]
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::forum_topic_manager::ForumTopicEnv for ForumTopicTdEnv<'_> {
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn unix_time(&mut self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+}
+
+/// The `G()`/`td_` slice the secret-chats plane reads through (the M.50
+/// convention): field-split borrows off `Td`. The [blocked: net] tails
+/// and the tde2e actor halves keep their trait defaults.
+pub(crate) struct SecretChatsTdEnv<'a> {
+    /// The C++ `G()` reads — kept for the field parity; the halves land
+    /// with the tde2e actor plane.
+    #[allow(dead_code)]
+    pub(crate) global: &'a mut Global,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) use_secret_chats: bool,
+    /// The user-manager half for the access-hash read — kept for the
+    /// C++ field parity.
+    #[allow(dead_code)]
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::secret_chats_manager::SecretChatsEnv for SecretChatsTdEnv<'_> {
+    fn is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn use_secret_chats(&self) -> bool {
+        self.use_secret_chats
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+}
+
+/// The `G()`/`td_` slice the group-call plane reads through (the M.51
+/// convention): field-split borrows off `Td`. Every query tail is a
+/// [blocked: net] seam (D4 signaling-only); the E2E-key functions are
+/// [blocked: tde2e].
+pub(crate) struct GroupCallTdEnv<'a> {
+    /// The C++ `G()` reads — kept for the field parity; the halves land
+    /// with the media-transport plane.
+    #[allow(dead_code)]
+    pub(crate) global: &'a mut Global,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::group_call_manager::GroupCallEnv for GroupCallTdEnv<'_> {
+    fn is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+}
+
+/// The `G()`/`td_` slice the referral plane reads through (the M.52
+/// convention): field-split borrows off `Td`. Every server leg is a
+/// [blocked: net] seam.
+pub(crate) struct ReferralTdEnv<'a> {
+    /// The C++ `G()` reads — kept for the field parity; the halves land
+    /// with the net step.
+    #[allow(dead_code)]
+    pub(crate) global: &'a mut Global,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::referral_program::ReferralProgramEnv for ReferralTdEnv<'_> {
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+}
+
+/// The `G()`/`td_` slice the business plane reads through (the M.48
+/// convention): field-split borrows off `Td`. The [blocked: net] query
+/// tails, the sticker/file-view halves and the messages-manager halves
+/// keep their trait defaults until their tracks land.
+pub(crate) struct BusinessTdEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) time_zone_manager: &'a mut TimeZoneManager,
+    pub(crate) user_manager: &'a mut UserManager,
+    /// The chat-manager half for the chat-link/recipient answer paths —
+    /// kept for the C++ field parity; the reads land with the chat plane.
+    #[allow(dead_code)]
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+}
+
+impl crate::business_manager::BusinessEnv for BusinessTdEnv<'_> {
+    // NOTE: the trait signatures use crate::dialog_id::DialogId (the
+    // canonical M.12 id space) while td.rs imports message_id::DialogId —
+    // qualify explicitly (the two-DialogIds convention).
+
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn get_time_zone_offset(&mut self, time_zone_id: &str) -> i32 {
+        let global = &mut *self.global;
+        let options = self
+            .options
+            .as_ref()
+            .expect("business requests run with the initialized option manager");
+        self.time_zone_manager
+            .get_time_zone_offset(global, options, time_zone_id)
+    }
+
+    fn get_option_integer(&mut self, name: &str, default_value: i64) -> i64 {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_integer(name, default_value)
+        })
+    }
+
+    fn force_create_dialog(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        source: &str,
+        force: bool,
+    ) {
+        // `DialogManager::force_create_dialog` — the master dialog plane
+        // stub is a no-op; the real force-create flips at the dialog step.
+        tdutils::log_info!(
+            "force_create_dialog({}, {source}, {force}) — the dialog-plane stub",
+            dialog_id.get()
+        );
+    }
+
+    fn get_chat_id_object(&mut self, dialog_id: crate::dialog_id::DialogId, source: &str) -> i64 {
+        crate::dialog_manager::get_chat_id_object(dialog_id, source)
+    }
+
+    fn get_input_users_force(
+        &mut self,
+        user_ids: &[crate::user_manager::UserId],
+    ) -> Vec<telegram_api::InputUser> {
+        let user_env = crate::user_manager::UserEnv {
+            global: &mut *self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("business requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_input_users_force(&user_env, user_ids)
+    }
+
+    fn get_user_id_object(&mut self, user_id: crate::user_manager::UserId, source: &str) -> i64 {
+        let mut user_env = crate::user_manager::UserEnv {
+            global: &mut *self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("business requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager
+            .get_user_id_object(&mut user_env, user_id, source)
+    }
+
+    fn get_input_user(
+        &mut self,
+        user_id: crate::user_manager::UserId,
+    ) -> std::result::Result<telegram_api::InputUser, tdutils::status::Status> {
+        let user_env = crate::user_manager::UserEnv {
+            global: &mut *self.global,
+            options: self
+                .options
+                .as_deref_mut()
+                .expect("business requests run with the initialized option manager"),
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_input_user(&user_env, user_id)
+    }
+}
+
+/// Field-split the `Td` for the WebPagesManager calls.
+pub(crate) fn web_pages_env_split(
+    td: &mut Td,
+) -> (
+    TdWebPagesEnv<'_>,
+    &mut crate::web_pages_manager::WebPagesManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        file_manager,
+        file_reference_manager,
+        web_pages_manager,
+        web_pages_timeouts,
+        ..
+    } = td;
+    (
+        TdWebPagesEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            file_manager: std::sync::Arc::clone(file_manager),
+            file_reference_manager,
+            web_pages_timeouts,
+        },
+        web_pages_manager,
+    )
+}
+
+/// The `G()`/manager slice of the collapsed WebPagesManager (M.17).
+pub(crate) struct TdWebPagesEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    /// `None` once the option manager is torn down; the getters answer
+    /// their defaults on the destroy path.
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<FileManager>>,
+    pub(crate) file_reference_manager: &'a mut crate::files::FileReferenceManager,
+    pub(crate) web_pages_timeouts: &'a mut std::collections::HashMap<i64, f64>,
+}
+
+impl crate::photo::PhotoStoreEnv for TdWebPagesEnv<'_> {
+    fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>) {
+        self.file_manager.lock().store_file(file_id, out);
+    }
+
+    fn parse_file_id(
+        &mut self,
+        parser: &mut crate::store_parse::Parser<'_>,
+    ) -> Result<FileId, &'static str> {
+        self.file_manager.lock().parse_file(parser)
+    }
+}
+
+impl crate::webpage::WebPageBlockEnv for TdWebPagesEnv<'_> {
+    fn get_document_object(&self, _file_id: FileId) -> Option<td_api::Document> {
+        None // [blocked: M.28 DocumentsManager object]
+    }
+
+    fn get_animation_object(&self, _file_id: FileId) -> Option<td_api::Animation> {
+        None // [blocked: M.20]
+    }
+
+    fn get_audio_object(&self, _file_id: FileId) -> Option<td_api::Audio> {
+        None // [blocked: M.28]
+    }
+
+    fn get_video_object(&self, _file_id: FileId) -> Option<td_api::Video> {
+        None // [blocked: M.28]
+    }
+
+    fn get_video_note_object(&self, _file_id: FileId) -> Option<td_api::VideoNote> {
+        None // [blocked: M.28]
+    }
+
+    fn get_voice_note_object(&self, _file_id: FileId) -> Option<td_api::VoiceNote> {
+        None // [blocked: M.28]
+    }
+
+    fn get_accent_color_id_object(
+        &self,
+        accent_color_id: crate::peer_color::AccentColorId,
+        fallback_accent_color_id: crate::peer_color::AccentColorId,
+    ) -> Option<i32> {
+        // ThemeManager::get_accent_color_id_object (ThemeManager.cpp:639):
+        // the is_built_in/light_colors_ server-data halves are [blocked:
+        // M.41 — the theme color sets], so the plain validity check stands
+        // in for the acceptance gate.
+        if accent_color_id.is_valid() {
+            return Some(accent_color_id.get());
+        }
+        if !fallback_accent_color_id.is_valid() {
+            return Some(5); // blue
+        }
+        Some(fallback_accent_color_id.get())
+    }
+
+    fn get_chat_photo_info_object(
+        &self,
+        _photo: &crate::photo::DialogPhoto,
+    ) -> Option<td_api::ChatPhotoInfo> {
+        None // [blocked: M.6]
+    }
+
+    fn get_instant_view_link(&self, url: &str, rhash: &str) -> String {
+        crate::link_manager::get_instant_view_link(
+            &TdStaticLinkEnv {
+                options: self.options.as_deref(),
+            },
+            url,
+            rhash,
+        )
+    }
+
+    fn get_instant_view_link_rhash(&self, real_url: &str) -> String {
+        crate::link_manager::get_instant_view_link_rhash(
+            &TdStaticLinkEnv {
+                options: self.options.as_deref(),
+            },
+            real_url,
+        )
+    }
+
+    fn get_instant_view_link_url(&self, real_url: &str) -> String {
+        crate::link_manager::get_instant_view_link_url(
+            &TdStaticLinkEnv {
+                options: self.options.as_deref(),
+            },
+            real_url,
+        )
+    }
+
+    fn as_input_document(
+        &mut self,
+        _file_id: FileId,
+    ) -> Option<(i64, telegram_api::InputDocument)> {
+        None // [blocked: M.12 file-reference plane]
+    }
+
+    fn as_input_photo(&mut self, _file_id: FileId) -> Option<(i64, telegram_api::InputPhoto)> {
+        None // [blocked: M.12]
+    }
+
+    fn ensure_input_user(&mut self, user_id: crate::user_manager::UserId) -> Result<(), Status> {
+        // Td::ensure_input_user — the get_input_user validation half.
+        let Some(options) = self.options.as_mut() else {
+            return Err(Status::error(400, "Have no access to the user"));
+        };
+        let env = UserEnv {
+            global: self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_input_user(&env, user_id).map(|_| ())
+    }
+
+    fn get_user_id_object(&mut self, user_id: crate::user_manager::UserId, source: &str) -> i64 {
+        let Some(options) = self.options.as_mut() else {
+            return user_id.get();
+        };
+        let mut env = UserEnv {
+            global: self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager
+            .get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn is_my_user_bot(&self) -> bool {
+        self.user_manager
+            .is_user_bot_of(self.user_manager.get_my_id())
+    }
+
+    fn on_get_page_block_channel(
+        &mut self,
+        channel: telegram_api::channel,
+    ) -> Option<crate::webpage::ChatLinkInfo> {
+        // WebPageId.cpp:5128 — the pageBlockChannel intake. The known-channel
+        // half (the on_get_chat store refresh + the get_channel_* accessors)
+        // is [blocked: M.5] and its force-get is [blocked: net], so both
+        // branches read the min-channel struct like the C++ unknown path;
+        // the photo's file registration is the documented Files-step no-op.
+        let channel_id = crate::chat_manager::ChannelId::new(channel.id);
+        if !channel_id.is_valid() {
+            tdutils::log_error!("Receive invalid channel id {}", channel.id);
+            return None;
+        }
+        let accent_color_id = channel
+            .color
+            .as_ref()
+            .map(crate::peer_color::PeerColor::from_telegram)
+            .map(|color| color.accent_color_id())
+            .unwrap_or_default();
+        Some(crate::webpage::ChatLinkInfo {
+            title: channel.title,
+            photo: crate::photo::DialogPhoto::get_dialog_photo(channel.photo),
+            username: channel.username,
+            accent_color_id,
+            channel_id,
+        })
+    }
+}
+
+impl crate::web_pages_manager::WebPagesManagerEnv for TdWebPagesEnv<'_> {
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn use_message_database(&self) -> bool {
+        self.global.use_message_database()
+    }
+
+    fn server_time(&self) -> f64 {
+        self.global.server_time()
+    }
+
+    fn sqlite_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        // G()->td_db()->get_sqlite_pmc() — the common_kv stand-in.
+        self.global.td_db().common_kv().get(key)
+    }
+
+    fn sqlite_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.td_db().common_kv().set(key, value);
+    }
+
+    fn sqlite_pmc_erase(&mut self, key: &[u8]) {
+        self.global.td_db().common_kv().erase(key);
+    }
+
+    fn binlog_add_web_page(&mut self, data: &[u8]) -> u64 {
+        self.global.td_db().binlog().add(
+            crate::web_pages_manager::LOG_EVENT_HANDLER_TYPE_WEB_PAGES,
+            data,
+        )
+    }
+
+    fn binlog_rewrite_web_page(&mut self, event_id: u64, data: &[u8]) {
+        self.global.td_db().binlog().rewrite(
+            event_id,
+            crate::web_pages_manager::LOG_EVENT_HANDLER_TYPE_WEB_PAGES,
+            data,
+        );
+    }
+
+    fn binlog_erase(&mut self, event_id: u64) {
+        self.global.td_db().binlog().erase(event_id);
+    }
+
+    fn add_pending_web_page_timeout(&mut self, web_page_id: i64, timeout_in: f64) {
+        let deadline = tdutils::time::now() + timeout_in;
+        self.web_pages_timeouts
+            .entry(web_page_id)
+            .and_modify(|old| {
+                if deadline < *old {
+                    *old = deadline;
+                }
+            })
+            .or_insert(deadline);
+    }
+
+    fn cancel_pending_web_page_timeout(&mut self, web_page_id: i64) {
+        self.web_pages_timeouts.remove(&web_page_id);
+    }
+
+    fn create_web_page_file_source(&mut self, url: &str) -> FileSourceId {
+        self.file_reference_manager.create_web_page_file_source(url)
+    }
+
+    fn change_files_source(
+        &mut self,
+        source_id: FileSourceId,
+        old_file_ids: &[FileId],
+        new_file_ids: &[FileId],
+        source: &str,
+    ) {
+        self.file_reference_manager.change_files_source(
+            source_id,
+            old_file_ids,
+            new_file_ids,
+            source,
+        );
+    }
+
+    fn delete_pending_message_web_page(&mut self, _message_full_id: MessageFullId) {
+        // [blocked: M.10]
+    }
+
+    fn on_external_update_message_content(
+        &mut self,
+        _message_full_id: MessageFullId,
+        _source: &str,
+    ) {
+        // [blocked: M.10]
+    }
+
+    fn delete_quick_reply_pending_message_web_page(
+        &mut self,
+        _message_full_id: QuickReplyMessageFullId,
+    ) {
+        // [blocked: Wave 3]
+    }
+
+    fn quick_reply_on_external_update_message_content(
+        &mut self,
+        _message_full_id: QuickReplyMessageFullId,
+        _source: &str,
+    ) {
+        // [blocked: Wave 3]
+    }
+
+    fn get_messages_from_server(&mut self, _message_full_ids: &[MessageFullId]) {
+        // [blocked: M.10/net]
+    }
+
+    fn reload_quick_reply_message(
+        &mut self,
+        _shortcut_id: QuickReplyShortcutId,
+        _message_id: crate::message_id::MessageId,
+    ) {
+        // [blocked: Wave 3]
+    }
+
+    fn force_create_dialog(&mut self, _dialog_id: crate::dialog_id::DialogId) {
+        // [blocked: M.6]
+    }
+
+    fn on_get_story(
+        &mut self,
+        _dialog_id: crate::dialog_id::DialogId,
+        _story: Box<telegram_api::StoryItem>,
+    ) -> Option<i32> {
+        None // [blocked: Wave 3]
+    }
+
+    fn get_chat_id_object(&self, dialog_id: crate::dialog_id::DialogId, _source: &str) -> i64 {
+        dialog_id.get_chat_id().get()
+    }
+
+    fn get_story_duration(&self, _story_full_id: StoryFullId) -> i32 {
+        -1 // [blocked: Wave 3]
+    }
+
+    fn on_get_sticker_document(&mut self, _document: Box<telegram_api::Document>) -> FileId {
+        FileId::default() // [blocked: M.15]
+    }
+
+    fn on_get_document(
+        &mut self,
+        _document: Box<telegram_api::Document>,
+        _owner_dialog_id: crate::dialog_id::DialogId,
+    ) -> Option<crate::document::Document> {
+        None // [blocked: M.28]
+    }
+
+    fn get_document_mime_type(&self, _file_id: FileId) -> String {
+        String::new() // [blocked: M.28]
+    }
+
+    fn get_message_link_media_timestamp(&self, _url: &str) -> i32 {
+        0 // [blocked: M.23]
+    }
+
+    fn get_background_type_object(
+        &self,
+        _url: &str,
+        _is_pattern: bool,
+    ) -> Option<td_api::BackgroundType> {
+        None // [blocked: M.23]
+    }
+
+    fn has_video_chat_invite_hash(&self, _url: &str) -> bool {
+        false // [blocked: M.23]
+    }
+
+    fn is_premium(&self) -> bool {
+        self.options
+            .as_ref()
+            .is_some_and(|options| options.get_option_boolean("is_premium", false))
+    }
+
+    fn send_get_web_page_preview_query(
+        &mut self,
+        _text: crate::message_entity::FormattedText,
+        _options: Box<crate::web_pages_manager::GetWebPagePreviewOptions>,
+        _promise: Promise<Option<td_api::LinkPreview>>,
+    ) {
+        // [blocked: net]
+    }
+
+    fn send_get_web_page_query(
+        &mut self,
+        _web_page_id: crate::webpage::WebPageId,
+        _url: String,
+        _hash: i32,
+        _promise: Promise<crate::webpage::WebPageId>,
+    ) {
+        // [blocked: net]
+    }
 }
 
 #[cfg(test)]
@@ -6172,6 +12053,146 @@ mod tests {
             tdactor::send_closure_later(actor, TdMessage::ConfigQueryResult { query, result });
         }
         let _ = scheduler.run_main(0.01);
+    }
+
+    /// The M.10.20 read-family flips through the real dispatcher: the
+    /// local lookups over an empty manager state (the null-result 404 and
+    /// the C++ "Chat not found" table).
+    #[test]
+    fn m10_20_read_family_arms() {
+        // the deep debug frames of the history walk carry the 32 KB
+        // td_api::Object — run the body on a big-stack thread
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(m10_20_read_family_arms_impl)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn m10_20_read_family_arms_impl() {
+        let callback = CollectCallback::default();
+        let dir = temp_db_dir("m10-20-reads");
+        let db_dir = dir.clone();
+        let mut td = Td::new(Box::new(CollectCallback {
+            responses: callback.responses.clone(),
+            errors: callback.errors.clone(),
+        }));
+        let Function::setTdlibParameters(parameters) = set_tdlib_parameters(db_dir, false) else {
+            unreachable!("setTdlibParameters helper");
+        };
+        td.on_set_tdlib_parameters(20, parameters);
+        assert_eq!(td.state, State::Run);
+        td.auth_manager.force_authorized_for_test();
+
+        // getMessageLocally: no dialog → the null-result 404
+        td.request(
+            101,
+            Function::getMessageLocally(td_api::getMessageLocally {
+                chat_id: 1,
+                message_id: 100,
+            }),
+        );
+        // the null-result 404 rides the response channel (the C++
+        // `Td::send_result(nullptr)` shape)
+        assert!(responses_of(&callback, 101).iter().any(|object| matches!(
+            object,
+            Object::error(e) if e.code == 404 && e.message == "Not Found"
+        )));
+
+        // getMessageLink: no dialog → the C++ 400
+        td.request(
+            102,
+            Function::getMessageLink(td_api::getMessageLink {
+                chat_id: 1,
+                message_id: 100,
+                media_timestamp: 0,
+                checklist_task_id: 0,
+                poll_option_id: String::new(),
+                for_album: false,
+                in_message_thread: false,
+            }),
+        );
+        let error = error_of(&callback, 102);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Chat not found");
+
+        // getMessageEmbeddingCode: the same local table
+        td.request(
+            103,
+            Function::getMessageEmbeddingCode(td_api::getMessageEmbeddingCode {
+                chat_id: 1,
+                message_id: 100,
+                for_album: false,
+            }),
+        );
+        let error = error_of(&callback, 103);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Chat not found");
+
+        // getChatHistory: the split-context adapter — the same local table
+        td.request(
+            104,
+            Function::getChatHistory(td_api::getChatHistory {
+                chat_id: 1,
+                from_message_id: 0,
+                offset: 0,
+                limit: 10,
+                only_local: false,
+            }),
+        );
+        let error = error_of(&callback, 104);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Chat not found");
+        // the manager survived the take/restore
+        assert!(td.messages_manager.dialogs.is_empty());
+
+        // getChatMessageByDate: same
+        td.request(
+            105,
+            Function::getChatMessageByDate(td_api::getChatMessageByDate {
+                chat_id: 1,
+                date: 1700000000,
+            }),
+        );
+        let error = error_of(&callback, 105);
+        assert_eq!(error.code, 400);
+        assert_eq!(error.message, "Chat not found");
+
+        // the write family: the same local table through the aliasing
+        // adapter (openChat/closeChat/viewMessages are user-gated,
+        // deleteMessages is not in the C++)
+        for (id, function) in [
+            (106, Function::openChat(td_api::openChat { chat_id: 1 })),
+            (107, Function::closeChat(td_api::closeChat { chat_id: 1 })),
+            (
+                108,
+                Function::viewMessages(td_api::viewMessages {
+                    chat_id: 1,
+                    message_ids: vec![100],
+                    source: None,
+                    force_read: false,
+                }),
+            ),
+            (
+                109,
+                Function::deleteMessages(td_api::deleteMessages {
+                    chat_id: 1,
+                    message_ids: vec![100],
+                    revoke: false,
+                }),
+            ),
+        ] {
+            td.request(id, function);
+            let error = error_of(&callback, id);
+            assert_eq!(error.code, 400);
+            assert_eq!(error.message, "Chat not found");
+        }
+        // the manager survived every take/restore
+        assert!(td.messages_manager.dialogs.is_empty());
+
+        td.close_impl(false);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The ConfigManager step gate, white-box: `setTdlibParameters` runs the

@@ -109,6 +109,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::birthdate::Birthdate;
+use crate::chat_manager::{ChannelType, RestrictedRights};
 use crate::contact::Contact;
 use crate::emoji_status::{CustomEmojiId, EmojiStatus};
 use crate::global::Global;
@@ -289,6 +290,21 @@ impl UserId {
     pub fn get(self) -> i64 {
         self.0
     }
+
+    /// `UserId::store` (UserId.h:53-55) — the raw id as int64.
+    pub fn store(self, out: &mut Vec<u8>) {
+        store_parse::store_i64(out, self.0);
+    }
+
+    /// `UserId::parse` (UserId.h:57-64) — int64 from
+    /// `Version::Support64BitIds` (33) on, int32 before.
+    pub fn parse_from(parser: &mut store_parse::Parser) -> Result<UserId, &'static str> {
+        if parser.version() >= store_parse::version::SUPPORT_64_BIT_IDS {
+            Ok(UserId(parser.i64_()?))
+        } else {
+            Ok(UserId(parser.i32_()? as i64))
+        }
+    }
 }
 
 /// `td::SecretChatId` (SecretChatId.h): 0 < id.
@@ -321,29 +337,9 @@ impl SecretChatId {
 /// file-source maps below) until the FileReferenceManager lands.
 pub use crate::files::{FileId, FileSourceId};
 
-/// `td::StoryId` (StoryId.h).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct StoryId(i32);
-
-impl StoryId {
-    pub const MAX_SERVER_STORY_ID: i32 = 1_999_999_999;
-
-    pub fn new(id: i32) -> StoryId {
-        StoryId(id)
-    }
-
-    pub fn get(self) -> i32 {
-        self.0
-    }
-
-    pub fn is_valid(self) -> bool {
-        self.0 > 0
-    }
-
-    pub fn is_server(self) -> bool {
-        self.0 > 0 && self.0 <= Self::MAX_SERVER_STORY_ID
-    }
-}
+/// `td::StoryId` (StoryId.h) — the M.4.13 stand-in moved to the M.47
+/// canonical module (`crate::story_ids`).
+pub use crate::story_ids::StoryId;
 
 /// `td::CommunityId` (CommunityId.h).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -2099,9 +2095,11 @@ pub struct UserManager {
     user_full_contact_price: BTreeMap<i64, i64>,
     /// `noforwards_request_ids_` / `noforwards_request_message_full_ids_`
     /// (UserManager.h:1379-1380) — the two directions of the
-    /// noforwards-request registry.
-    noforwards_request_ids: BTreeMap<MessageFullId, i32>,
-    noforwards_request_message_full_ids: BTreeMap<i32, MessageFullId>,
+    /// noforwards-request registry. Hash maps like the C++ FlatHashMaps:
+    /// lookups must never run `MessageId`'s scheduled/ordinary ordering
+    /// CHECK, which a key-sorted container would trip.
+    noforwards_request_ids: HashMap<MessageFullId, i32>,
+    noforwards_request_message_full_ids: HashMap<i32, MessageFullId>,
     /// `current_noforwards_request_id_` (UserManager.h:1254).
     current_noforwards_request_id: i32,
     /// `freeze_since_date_` / `freeze_until_date_` / `freeze_appeal_url_`
@@ -6753,9 +6751,81 @@ impl UserManager {
         self.get_user_title_of(c.user_id)
     }
 
-    // `get_user_default_permissions`/`get_secret_chat_default_permissions`
-    // (UserManager.cpp:5609-5627) carry `RestrictedRights` from
-    // `DialogParticipant.h` — they land with the ChatManager slice.
+    /// `UserManager::get_user_default_permissions`
+    /// (UserManager.cpp:5610-5618). The C++ `get_replies_bot_user_id`
+    /// instance method reads the test-DC flag through `G()`, so the port
+    /// takes it as a parameter. Lands with M.9.7 (its first consumer is
+    /// `can_send_message_content`), not the ChatManager slice.
+    pub fn get_user_default_permissions_of(
+        &self,
+        is_test_dc: bool,
+        user_id: UserId,
+    ) -> RestrictedRights {
+        let u = self.get_user(user_id);
+        if (u.is_none() && user_id != self.get_my_id())
+            || user_id == Self::get_replies_bot_user_id(is_test_dc)
+            || user_id == Self::get_verification_codes_bot_user_id()
+        {
+            return RestrictedRights::restrict_all();
+        }
+        RestrictedRights::from_bools(
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            false,
+            false,
+            true,
+            false,
+            false,
+            true,
+            true,
+            ChannelType::Unknown,
+        )
+    }
+
+    /// `UserManager::get_secret_chat_default_permissions`
+    /// (UserManager.cpp:5620-5627).
+    pub fn get_secret_chat_default_permissions_of(
+        &self,
+        secret_chat_id: SecretChatId,
+    ) -> RestrictedRights {
+        if self.get_secret_chat(secret_chat_id).is_none() {
+            return RestrictedRights::restrict_all();
+        }
+        RestrictedRights::from_bools(
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            true,
+            ChannelType::Unknown,
+        )
+    }
 
     /// `UserManager::get_user_emoji_status_object`
     /// (UserManager.cpp:5629-5635); `None` is the C++ `nullptr`.
@@ -15471,13 +15541,21 @@ mod tests {
         let deadline = *um.noforwards_request_timeouts.get(&1).unwrap();
         assert!(deadline > tdutils::time::now());
 
-        // a scheduled message never arms
+        // a scheduled message never arms — C++ checks is_scheduled() before
+        // any map access, and probing the ordered map with a scheduled key
+        // CHECK-fails there, so assert through the sizes instead
         let scheduled = MessageFullId::new(
             message_full_id.get_dialog_id(),
             crate::message_id::MessageId::new((1 << 21) | 4),
         );
         um.register_noforwards_request(&env, scheduled, unix_time - 10);
-        assert!(!um.noforwards_request_ids.contains_key(&scheduled));
+        assert_eq!(um.noforwards_request_ids.len(), 1);
+        assert_eq!(um.noforwards_request_message_full_ids.len(), 1);
+        assert_eq!(um.noforwards_request_timeouts.len(), 1);
+        assert_eq!(
+            um.noforwards_request_message_full_ids.get(&1),
+            Some(&message_full_id)
+        );
 
         // a message outside the window never arms
         let expired = channel_message_full_id(7, 2 << 20);

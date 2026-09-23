@@ -10,11 +10,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::chat_manager::MessageId;
 use crate::dialog_id::{
     DialogId, MessageFullId, MessageSearchFilter, NotificationId, ServerMessageId,
     call_message_search_filter_index, message_search_filter_index,
 };
+use crate::messages_manager::MessageId;
 use crate::store_parse::{self, Parser};
 
 use tdactor::{Actor, ActorOwn, actor_messages, create_actor_on_scheduler, send_closure_later};

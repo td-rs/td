@@ -1047,6 +1047,9 @@ impl SchedulerState {
             // the entry may outlive the actor (the same protocol as
             // `run_timeout`): skip dead actors before touching the slot
             if !id.is_alive() {
+                // The actor died with an armed timeout: `destroy_actor`
+                // bumped the generation (so the entry is stale) and freed
+                // the `ActorInfo` in place — pop it without the deref.
                 heap.pop();
                 continue;
             }
