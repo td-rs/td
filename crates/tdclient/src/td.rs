@@ -2308,6 +2308,9 @@ pub struct Td {
     /// `Td::saved_messages_manager_` (Td.cpp).
     pub(crate) saved_messages_manager:
         crate::saved_messages_manager::SavedMessagesManager,
+    /// `Td::dialog_filter_manager_` (Td.cpp).
+    pub(crate) dialog_filter_manager:
+        crate::dialog_filter_manager::DialogFilterManager,
     /// `Td::channel_recommendation_manager_` (Td.cpp:1278, M.27).
     pub(crate) channel_recommendation_manager:
         crate::channel_recommendation_manager::ChannelRecommendationManager,
@@ -2670,6 +2673,8 @@ impl Td {
                 crate::dialog_participant_manager::DialogParticipantManager::new(),
             saved_messages_manager:
                 crate::saved_messages_manager::SavedMessagesManager::new(),
+            dialog_filter_manager:
+                crate::dialog_filter_manager::DialogFilterManager::new(),
             channel_recommendation_manager:
                 crate::channel_recommendation_manager::ChannelRecommendationManager::new(),
             web_pages_manager: crate::web_pages_manager::WebPagesManager::new(),
@@ -15219,6 +15224,175 @@ impl crate::saved_messages_manager::SavedMessagesManagerEnv for TdSavedMessagesE
     fn send_get_monoforum_paid_message_revenue(&mut self, _dialog_id: crate::dialog_id::DialogId, _user_id: UserId) {}
     fn send_toggle_monoforum_nopaid_messages_exception(&mut self, _dialog_id: crate::dialog_id::DialogId, _user_id: UserId, _can_send_unpaid: bool, _refund_payments: bool) {}
     fn send_get_message_author(&mut self, _channel_id: crate::chat_manager::ChannelId, _message_id: crate::message_id::MessageId) {}
+}
+
+pub(crate) fn dialog_filter_env_split(
+    td: &mut Td,
+) -> (
+    TdDialogFilterEnv<'_>,
+    &mut crate::dialog_filter_manager::DialogFilterManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        chat_manager,
+        dialog_filter_manager,
+        ..
+    } = td;
+    (
+        TdDialogFilterEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            chat_manager,
+        },
+        dialog_filter_manager,
+    )
+}
+
+pub(crate) struct TdDialogFilterEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+    #[allow(dead_code)]
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+}
+
+impl crate::dialog_filter_manager::DialogFilterManagerEnv for TdDialogFilterEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+    fn now(&self) -> f64 {
+        tdutils::time::now()
+    }
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+    fn my_dialog_id(&self) -> crate::dialog_id::DialogId {
+        crate::dialog_id::DialogId::from_user_id(self.user_manager.get_my_id())
+    }
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+    fn is_premium(&self) -> bool {
+        self.options
+            .as_ref()
+            .map_or(false, |o| o.get_option_boolean("is_premium", false))
+    }
+    fn get_option_integer(&self, name: &str, default: i64) -> i64 {
+        self.options
+            .as_ref()
+            .map_or(default, |o| o.get_option_integer(name, default))
+    }
+    fn have_dialog_force(&mut self, dialog_id: crate::dialog_id::DialogId, _source: &str) -> bool {
+        dialog_id.is_valid()
+    }
+    fn have_dialog_access(&mut self, dialog_id: crate::dialog_id::DialogId) -> bool {
+        dialog_id.is_valid()
+    }
+    fn get_chats_object(
+        &mut self,
+        limit: i32,
+        dialog_ids: Vec<crate::dialog_id::DialogId>,
+        _source: &str,
+    ) -> td_api::Chats {
+        let mut chat_ids: Vec<i64> = dialog_ids.iter().map(|d| d.get()).collect();
+        if limit > 0 && chat_ids.len() > limit as usize {
+            chat_ids.truncate(limit as usize);
+        }
+        let total_count = dialog_ids.len() as i32;
+        td_api::Chats {
+            total_count,
+            chat_ids,
+        }
+    }
+    fn get_chat_ids_object(
+        &mut self,
+        dialog_ids: Vec<crate::dialog_id::DialogId>,
+        _source: &str,
+    ) -> Vec<i64> {
+        dialog_ids.iter().map(|d| d.get()).collect()
+    }
+    fn leave_dialog(
+        &mut self,
+        _dialog_id: crate::dialog_id::DialogId,
+        mut promise: tdutils::promise::Promise<()>,
+    ) {
+        promise.set_value(());
+    }
+
+    fn send_update_dialog_filter_on_server(
+        &mut self,
+        _dialog_filter_id: crate::dialog_filter_manager::DialogFilterId,
+    ) {
+    }
+    fn send_delete_dialog_filter_on_server(
+        &mut self,
+        _dialog_filter_id: crate::dialog_filter_manager::DialogFilterId,
+        _is_shareable: bool,
+    ) {
+    }
+    fn send_reorder_dialog_filters_on_server(
+        &mut self,
+        _dialog_filter_ids: Vec<crate::dialog_filter_manager::DialogFilterId>,
+        _main_dialog_list_position: i32,
+    ) {
+    }
+    fn send_toggle_are_tags_enabled_on_server(&mut self, _are_tags_enabled: bool) {}
+    fn send_get_leave_chatlist_suggestions(
+        &mut self,
+        _dialog_filter_id: crate::dialog_filter_manager::DialogFilterId,
+    ) {
+    }
+    fn send_create_dialog_filter_invite_link(
+        &mut self,
+        _dialog_filter_id: crate::dialog_filter_manager::DialogFilterId,
+        _name: String,
+        _dialog_ids: Vec<crate::dialog_id::DialogId>,
+    ) {
+    }
+    fn send_get_dialog_filter_invite_links(
+        &mut self,
+        _dialog_filter_id: crate::dialog_filter_manager::DialogFilterId,
+    ) {
+    }
+    fn send_edit_dialog_filter_invite_link(
+        &mut self,
+        _dialog_filter_id: crate::dialog_filter_manager::DialogFilterId,
+        _invite_link: String,
+        _name: String,
+        _dialog_ids: Vec<crate::dialog_id::DialogId>,
+    ) {
+    }
+    fn send_delete_dialog_filter_invite_link(
+        &mut self,
+        _dialog_filter_id: crate::dialog_filter_manager::DialogFilterId,
+        _invite_link: String,
+    ) {
+    }
+    fn send_check_dialog_filter_invite_link(&mut self, _invite_link: String) {}
+    fn send_add_dialog_filter_by_invite_link(
+        &mut self,
+        _invite_link: String,
+        _dialog_ids: Vec<crate::dialog_id::DialogId>,
+    ) {
+    }
+    fn send_get_dialog_filter_new_chats(
+        &mut self,
+        _dialog_filter_id: crate::dialog_filter_manager::DialogFilterId,
+    ) {
+    }
+    fn send_add_dialog_filter_new_chats(
+        &mut self,
+        _dialog_filter_id: crate::dialog_filter_manager::DialogFilterId,
+        _dialog_ids: Vec<crate::dialog_id::DialogId>,
+    ) {
+    }
+    fn send_get_recommended_dialog_filters(&mut self) {}
 }
 
 #[cfg(test)]

@@ -40,12 +40,12 @@ use crate::message_id::{MessageFullId, MessageId};
 use crate::messages_manager::DialogId as MmDialogId;
 use crate::notification::{NotificationGroupId, NotificationId, NotificationObjectId};
 use crate::notification_settings::{
-    ReactionNotificationSettings, get_notification_settings_scope,
-    get_scope_notification_settings_object,
+    get_notification_settings_scope, get_scope_notification_settings_object,
+    ReactionNotificationSettings,
 };
 use crate::notification_settings_manager::ScopeSettingsAnswer;
 use crate::star_gift_manager::{
-    StarGiftCollectionId, StarGiftId, StarGiftResalePrice, get_message_sender_dialog_id,
+    get_message_sender_dialog_id, StarGiftCollectionId, StarGiftId, StarGiftResalePrice,
 };
 use crate::suggested_action::SuggestedAction;
 use crate::td::AccountEnv;
@@ -11616,15 +11616,14 @@ fn run_saved_messages_requests(td: &mut Td, id: u64, function: Function) {
             if !check_is_user(td, id) {
                 return;
             }
-            let promise = td.deferred_promise(id, |v: Option<td_api::DirectMessagesChatTopic>| {
-                match v {
+            let promise =
+                td.deferred_promise(id, |v: Option<td_api::DirectMessagesChatTopic>| match v {
                     Some(topic) => Object::directMessagesChatTopic(topic),
                     None => Object::error(td_api::Error {
                         code: 404,
                         message: "Not Found".to_owned(),
                     }),
-                }
-            });
+                });
             let (mut env, manager) = crate::td::saved_messages_env_split(td);
             let dialog_id = crate::dialog_id::DialogId::new(request.chat_id);
             let topic_id = manager.get_topic_id(&env, dialog_id, request.topic_id);
@@ -11634,14 +11633,12 @@ fn run_saved_messages_requests(td: &mut Td, id: u64, function: Function) {
             if !check_is_user(td, id) {
                 return;
             }
-            let promise = td.deferred_promise(id, |v: Option<td_api::Messages>| {
-                match v {
-                    Some(msgs) => Object::messages(msgs),
-                    None => Object::error(td_api::Error {
-                        code: 404,
-                        message: "Not Found".to_owned(),
-                    }),
-                }
+            let promise = td.deferred_promise(id, |v: Option<td_api::Messages>| match v {
+                Some(msgs) => Object::messages(msgs),
+                None => Object::error(td_api::Error {
+                    code: 404,
+                    message: "Not Found".to_owned(),
+                }),
             });
             let (mut env, manager) = crate::td::saved_messages_env_split(td);
             let dialog_id = crate::dialog_id::DialogId::new(request.chat_id);
@@ -11660,19 +11657,23 @@ fn run_saved_messages_requests(td: &mut Td, id: u64, function: Function) {
             if !check_is_user(td, id) {
                 return;
             }
-            let promise = td.deferred_promise(id, |v: Option<td_api::Message>| {
-                match v {
-                    Some(msg) => Object::message(msg),
-                    None => Object::error(td_api::Error {
-                        code: 404,
-                        message: "Not Found".to_owned(),
-                    }),
-                }
+            let promise = td.deferred_promise(id, |v: Option<td_api::Message>| match v {
+                Some(msg) => Object::message(msg),
+                None => Object::error(td_api::Error {
+                    code: 404,
+                    message: "Not Found".to_owned(),
+                }),
             });
             let (mut env, manager) = crate::td::saved_messages_env_split(td);
             let dialog_id = crate::dialog_id::DialogId::new(request.chat_id);
             let topic_id = manager.get_topic_id(&env, dialog_id, request.topic_id);
-            manager.get_monoforum_topic_message_by_date(&mut env, dialog_id, topic_id, request.date, promise);
+            manager.get_monoforum_topic_message_by_date(
+                &mut env,
+                dialog_id,
+                topic_id,
+                request.date,
+                promise,
+            );
         }
         Function::deleteDirectMessagesChatTopicHistory(request) => {
             if !check_is_user(td, id) {
@@ -11741,14 +11742,12 @@ fn run_saved_messages_requests(td: &mut Td, id: u64, function: Function) {
             if !check_is_user(td, id) {
                 return;
             }
-            let promise = td.deferred_promise(id, |v: Option<td_api::StarCount>| {
-                match v {
-                    Some(sc) => Object::starCount(sc),
-                    None => Object::error(td_api::Error {
-                        code: 404,
-                        message: "Not Found".to_owned(),
-                    }),
-                }
+            let promise = td.deferred_promise(id, |v: Option<td_api::StarCount>| match v {
+                Some(sc) => Object::starCount(sc),
+                None => Object::error(td_api::Error {
+                    code: 404,
+                    message: "Not Found".to_owned(),
+                }),
             });
             let (mut env, manager) = crate::td::saved_messages_env_split(td);
             let dialog_id = crate::dialog_id::DialogId::new(request.chat_id);
@@ -11784,17 +11783,19 @@ fn run_saved_messages_requests(td: &mut Td, id: u64, function: Function) {
             if !check_is_user(td, id) {
                 return;
             }
-            let promise = td.deferred_promise(id, |v: Option<td_api::Messages>| {
-                match v {
-                    Some(msgs) => Object::messages(msgs),
-                    None => Object::error(td_api::Error {
-                        code: 404,
-                        message: "Not Found".to_owned(),
-                    }),
-                }
+            let promise = td.deferred_promise(id, |v: Option<td_api::Messages>| match v {
+                Some(msgs) => Object::messages(msgs),
+                None => Object::error(td_api::Error {
+                    code: 404,
+                    message: "Not Found".to_owned(),
+                }),
             });
             let (mut env, manager) = crate::td::saved_messages_env_split(td);
-            let topic_id = manager.get_topic_id(&env, crate::dialog_id::DialogId::default(), request.saved_messages_topic_id);
+            let topic_id = manager.get_topic_id(
+                &env,
+                crate::dialog_id::DialogId::default(),
+                request.saved_messages_topic_id,
+            );
             manager.get_saved_messages_topic_history(
                 &mut env,
                 topic_id,
@@ -11808,18 +11809,25 @@ fn run_saved_messages_requests(td: &mut Td, id: u64, function: Function) {
             if !check_is_user(td, id) {
                 return;
             }
-            let promise = td.deferred_promise(id, |v: Option<td_api::Message>| {
-                match v {
-                    Some(msg) => Object::message(msg),
-                    None => Object::error(td_api::Error {
-                        code: 404,
-                        message: "Not Found".to_owned(),
-                    }),
-                }
+            let promise = td.deferred_promise(id, |v: Option<td_api::Message>| match v {
+                Some(msg) => Object::message(msg),
+                None => Object::error(td_api::Error {
+                    code: 404,
+                    message: "Not Found".to_owned(),
+                }),
             });
             let (mut env, manager) = crate::td::saved_messages_env_split(td);
-            let topic_id = manager.get_topic_id(&env, crate::dialog_id::DialogId::default(), request.saved_messages_topic_id);
-            manager.get_saved_messages_topic_message_by_date(&mut env, topic_id, request.date, promise);
+            let topic_id = manager.get_topic_id(
+                &env,
+                crate::dialog_id::DialogId::default(),
+                request.saved_messages_topic_id,
+            );
+            manager.get_saved_messages_topic_message_by_date(
+                &mut env,
+                topic_id,
+                request.date,
+                promise,
+            );
         }
         Function::deleteSavedMessagesTopicHistory(request) => {
             if !check_is_user(td, id) {
@@ -11827,7 +11835,11 @@ fn run_saved_messages_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise = td.deferred_promise(id, |()| ok_object());
             let (mut env, manager) = crate::td::saved_messages_env_split(td);
-            let topic_id = manager.get_topic_id(&env, crate::dialog_id::DialogId::default(), request.saved_messages_topic_id);
+            let topic_id = manager.get_topic_id(
+                &env,
+                crate::dialog_id::DialogId::default(),
+                request.saved_messages_topic_id,
+            );
             manager.delete_saved_messages_topic_history(&mut env, topic_id, promise);
         }
         Function::deleteSavedMessagesTopicMessagesByDate(request) => {
@@ -11836,7 +11848,11 @@ fn run_saved_messages_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise = td.deferred_promise(id, |()| ok_object());
             let (mut env, manager) = crate::td::saved_messages_env_split(td);
-            let topic_id = manager.get_topic_id(&env, crate::dialog_id::DialogId::default(), request.saved_messages_topic_id);
+            let topic_id = manager.get_topic_id(
+                &env,
+                crate::dialog_id::DialogId::default(),
+                request.saved_messages_topic_id,
+            );
             manager.delete_saved_messages_topic_messages_by_date(
                 &mut env,
                 topic_id,
@@ -11851,8 +11867,17 @@ fn run_saved_messages_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise = td.deferred_promise(id, |()| ok_object());
             let (mut env, manager) = crate::td::saved_messages_env_split(td);
-            let topic_id = manager.get_topic_id(&env, crate::dialog_id::DialogId::default(), request.saved_messages_topic_id);
-            manager.toggle_saved_messages_topic_is_pinned(&mut env, topic_id, request.is_pinned, promise);
+            let topic_id = manager.get_topic_id(
+                &env,
+                crate::dialog_id::DialogId::default(),
+                request.saved_messages_topic_id,
+            );
+            manager.toggle_saved_messages_topic_is_pinned(
+                &mut env,
+                topic_id,
+                request.is_pinned,
+                promise,
+            );
         }
         Function::setPinnedSavedMessagesTopics(request) => {
             if !check_is_user(td, id) {
@@ -11871,14 +11896,12 @@ fn run_saved_messages_requests(td: &mut Td, id: u64, function: Function) {
             if !check_is_user(td, id) {
                 return;
             }
-            let promise = td.deferred_promise(id, |v: Option<td_api::User>| {
-                match v {
-                    Some(user) => Object::user(user),
-                    None => Object::error(td_api::Error {
-                        code: 404,
-                        message: "Not Found".to_owned(),
-                    }),
-                }
+            let promise = td.deferred_promise(id, |v: Option<td_api::User>| match v {
+                Some(user) => Object::user(user),
+                None => Object::error(td_api::Error {
+                    code: 404,
+                    message: "Not Found".to_owned(),
+                }),
             });
             let (mut env, manager) = crate::td::saved_messages_env_split(td);
             manager.get_monoforum_message_author(
@@ -11887,6 +11910,254 @@ fn run_saved_messages_requests(td: &mut Td, id: u64, function: Function) {
                     crate::dialog_id::DialogId::new(request.chat_id),
                     crate::message_id::MessageId::new(request.message_id),
                 ),
+                promise,
+            );
+        }
+        _ => run_dialog_filter_requests(td, id, function),
+    }
+}
+
+fn run_dialog_filter_requests(td: &mut Td, id: u64, function: Function) {
+    match function {
+        Function::getChatFolder(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, Object::chatFolder);
+            let (mut env, manager) = crate::td::dialog_filter_env_split(td);
+            manager.get_dialog_filter_request(
+                &mut env,
+                crate::dialog_filter_manager::DialogFilterId::new(request.chat_folder_id),
+                promise,
+            );
+        }
+        Function::getRecommendedChatFolders(_request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, Object::recommendedChatFolders);
+            let (mut env, manager) = crate::td::dialog_filter_env_split(td);
+            manager.get_recommended_dialog_filters(&mut env, promise);
+        }
+        Function::createChatFolder(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, Object::chatFolderInfo);
+            let (mut env, manager) = crate::td::dialog_filter_env_split(td);
+            manager.create_dialog_filter(&mut env, request.folder, promise);
+        }
+        Function::editChatFolder(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, Object::chatFolderInfo);
+            let (mut env, manager) = crate::td::dialog_filter_env_split(td);
+            manager.edit_dialog_filter(
+                &mut env,
+                crate::dialog_filter_manager::DialogFilterId::new(request.chat_folder_id),
+                request.folder,
+                promise,
+            );
+        }
+        Function::deleteChatFolder(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (mut env, manager) = crate::td::dialog_filter_env_split(td);
+            let leave_dialog_ids = request
+                .leave_chat_ids
+                .into_iter()
+                .map(crate::dialog_id::DialogId::new)
+                .collect();
+            manager.delete_dialog_filter(
+                &mut env,
+                crate::dialog_filter_manager::DialogFilterId::new(request.chat_folder_id),
+                leave_dialog_ids,
+                promise,
+            );
+        }
+        Function::getChatFolderChatsToLeave(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, Object::chats);
+            let (mut env, manager) = crate::td::dialog_filter_env_split(td);
+            manager.get_leave_dialog_filter_suggestions(
+                &mut env,
+                crate::dialog_filter_manager::DialogFilterId::new(request.chat_folder_id),
+                promise,
+            );
+        }
+        Function::reorderChatFolders(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (mut env, manager) = crate::td::dialog_filter_env_split(td);
+            let dialog_filter_ids = request
+                .chat_folder_ids
+                .into_iter()
+                .map(crate::dialog_filter_manager::DialogFilterId::new)
+                .collect();
+            manager.reorder_dialog_filters(
+                &mut env,
+                dialog_filter_ids,
+                request.main_chat_list_position,
+                promise,
+            );
+        }
+        Function::toggleChatFolderTags(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (mut env, manager) = crate::td::dialog_filter_env_split(td);
+            manager.toggle_dialog_filter_tags(&mut env, request.are_tags_enabled, promise);
+        }
+        Function::getChatsForChatFolderInviteLink(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, Object::chats);
+            let (mut env, manager) = crate::td::dialog_filter_env_split(td);
+            manager.get_dialogs_for_dialog_filter_invite_link(
+                &mut env,
+                crate::dialog_filter_manager::DialogFilterId::new(request.chat_folder_id),
+                promise,
+            );
+        }
+        Function::createChatFolderInviteLink(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(name) = crate::misc::clean_input_string(&request.name) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, Object::chatFolderInviteLink);
+            let (mut env, manager) = crate::td::dialog_filter_env_split(td);
+            let dialog_ids = request
+                .chat_ids
+                .into_iter()
+                .map(crate::dialog_id::DialogId::new)
+                .collect();
+            manager.create_dialog_filter_invite_link(
+                &mut env,
+                crate::dialog_filter_manager::DialogFilterId::new(request.chat_folder_id),
+                name,
+                dialog_ids,
+                promise,
+            );
+        }
+        Function::getChatFolderInviteLinks(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, Object::chatFolderInviteLinks);
+            let (mut env, manager) = crate::td::dialog_filter_env_split(td);
+            manager.get_dialog_filter_invite_links(
+                &mut env,
+                crate::dialog_filter_manager::DialogFilterId::new(request.chat_folder_id),
+                promise,
+            );
+        }
+        Function::editChatFolderInviteLink(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(invite_link) = crate::misc::clean_input_string(&request.invite_link) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let Some(name) = crate::misc::clean_input_string(&request.name) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, Object::chatFolderInviteLink);
+            let (mut env, manager) = crate::td::dialog_filter_env_split(td);
+            let dialog_ids = request
+                .chat_ids
+                .into_iter()
+                .map(crate::dialog_id::DialogId::new)
+                .collect();
+            manager.edit_dialog_filter_invite_link(
+                &mut env,
+                crate::dialog_filter_manager::DialogFilterId::new(request.chat_folder_id),
+                invite_link,
+                name,
+                dialog_ids,
+                promise,
+            );
+        }
+        Function::deleteChatFolderInviteLink(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(invite_link) = crate::misc::clean_input_string(&request.invite_link) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (mut env, manager) = crate::td::dialog_filter_env_split(td);
+            manager.delete_dialog_filter_invite_link(
+                &mut env,
+                crate::dialog_filter_manager::DialogFilterId::new(request.chat_folder_id),
+                invite_link,
+                promise,
+            );
+        }
+        Function::checkChatFolderInviteLink(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(invite_link) = crate::misc::clean_input_string(&request.invite_link) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, Object::chatFolderInviteLinkInfo);
+            let (mut env, manager) = crate::td::dialog_filter_env_split(td);
+            manager.check_dialog_filter_invite_link(&mut env, invite_link, promise);
+        }
+        Function::addChatFolderByInviteLink(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(invite_link) = crate::misc::clean_input_string(&request.invite_link) else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (mut env, manager) = crate::td::dialog_filter_env_split(td);
+            let dialog_ids = request
+                .chat_ids
+                .into_iter()
+                .map(crate::dialog_id::DialogId::new)
+                .collect();
+            manager.add_dialog_filter_by_invite_link(&mut env, invite_link, dialog_ids, promise);
+        }
+        Function::getChatFolderNewChats(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, Object::chats);
+            let (mut env, manager) = crate::td::dialog_filter_env_split(td);
+            manager.get_dialog_filter_new_chats(
+                &mut env,
+                crate::dialog_filter_manager::DialogFilterId::new(request.chat_folder_id),
+                promise,
+            );
+        }
+        Function::processChatFolderNewChats(request) => {
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise(id, |()| ok_object());
+            let (mut env, manager) = crate::td::dialog_filter_env_split(td);
+            let dialog_ids = request
+                .added_chat_ids
+                .into_iter()
+                .map(crate::dialog_id::DialogId::new)
+                .collect();
+            manager.add_dialog_filter_new_chats(
+                &mut env,
+                crate::dialog_filter_manager::DialogFilterId::new(request.chat_folder_id),
+                dialog_ids,
                 promise,
             );
         }
@@ -12697,13 +12968,14 @@ mod request_census_tests {
         // validation/decision tables exact; the query tails park at the
         // [blocked: net] seams). The M.saved slice flipped the 19
         // SavedMessagesManager arms (the 11 directMessagesChatTopic arms,
-        // the 7 savedMessagesTopic arms and getMessageAuthor).
-        assert_eq!(*counts.get("sync").unwrap_or(&0), 20, "sync count");
+        // the 7 savedMessagesTopic arms and getMessageAuthor). The M.filter
+        // slice flipped 17 DialogFilterManager arms and getChatFolderDefaultIconName (sync).
+        assert_eq!(*counts.get("sync").unwrap_or(&0), 21, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            624,
+            641,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 378, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 360, "interim count");
     }
 }

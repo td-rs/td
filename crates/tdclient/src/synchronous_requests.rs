@@ -95,11 +95,11 @@ pub fn is_synchronous_request(function: &Function) -> bool {
             | Function::getFileExtension(_)
             | Function::searchStringsByPrefix(_)
             | Function::getLanguagePackString(_)
+            | Function::getChatFolderDefaultIconName(_)
     ) || matches!(function, Function::getOption(g) if option_manager::is_synchronous_option(&g.name))
     // Not ported yet (need their managers): searchQuote,
     // checkQuickReplyShortcutName, getCountryFlagEmoji, cleanFileName,
-    // getPhoneNumberInfoSync, getChatFolderDefaultIconName,
-    // getPushReceiverId.
+    // getPhoneNumberInfoSync, getPushReceiverId.
 }
 
 /// `JsonValue.cpp:get_json_value_object`: `tdutils::JsonValue` → td_api.
@@ -203,6 +203,15 @@ pub fn run_request(function: Function) -> Object {
                 &request.language_pack_id,
                 &request.key,
             )
+        }
+        Function::getChatFolderDefaultIconName(request) => {
+            let folder = match request.folder {
+                Some(f) => f,
+                None => return make_error(400, "Chat folder must be non-empty"),
+            };
+            let icon_name =
+                crate::dialog_filter_manager::DialogFilter::get_default_icon_name(&folder);
+            Object::chatFolderIcon(td_api::ChatFolderIcon { name: icon_name })
         }
         Function::getJsonValue(request) => match get_json_value(&request.json) {
             Result::Ok(value) => json_value_object(value),
@@ -491,6 +500,9 @@ pub fn null_pointer_request_error(request: &JsonValue) -> Option<Function> {
         }
         "parseTextEntities" if null_or_absent("parse_mode") => {
             error("Parse mode must be non-empty")
+        }
+        "getChatFolderDefaultIconName" if null_or_absent("folder") => {
+            error("Chat folder must be non-empty")
         }
         _ => None,
     }
@@ -978,6 +990,55 @@ mod tests {
         assert_eq!(
             run_request(function).to_json(),
             r#"{"@type":"foundPositions","total_count":3,"positions":[0,1]}"#
+        );
+    }
+
+    #[test]
+    fn get_chat_folder_default_icon_name_resolves_icons() {
+        let mut folder = td_api::ChatFolder {
+            name: None,
+            icon: None,
+            color_id: -1,
+            is_shareable: false,
+            pinned_chat_ids: Vec::new(),
+            included_chat_ids: Vec::new(),
+            excluded_chat_ids: Vec::new(),
+            exclude_muted: false,
+            exclude_read: false,
+            exclude_archived: false,
+            include_contacts: true,
+            include_non_contacts: false,
+            include_bots: false,
+            include_groups: false,
+            include_channels: false,
+        };
+        let function =
+            Function::getChatFolderDefaultIconName(td_api::getChatFolderDefaultIconName {
+                folder: Some(folder.clone()),
+            });
+        assert_eq!(
+            run_request(function).to_json(),
+            r#"{"@type":"chatFolderIcon","name":"Private"}"#
+        );
+
+        folder.include_contacts = false;
+        folder.include_groups = true;
+        let function =
+            Function::getChatFolderDefaultIconName(td_api::getChatFolderDefaultIconName {
+                folder: Some(folder),
+            });
+        assert_eq!(
+            run_request(function).to_json(),
+            r#"{"@type":"chatFolderIcon","name":"Groups"}"#
+        );
+
+        let empty_function =
+            Function::getChatFolderDefaultIconName(td_api::getChatFolderDefaultIconName {
+                folder: None,
+            });
+        assert_eq!(
+            run_request(empty_function).to_json(),
+            r#"{"@type":"error","code":400,"message":"Chat folder must be non-empty"}"#
         );
     }
 }

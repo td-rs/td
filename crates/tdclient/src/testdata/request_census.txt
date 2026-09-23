@@ -3,7 +3,7 @@ acceptOauthRequest	dispatched
 acceptTermsOfService	dispatched
 activateStoryStealthMode	dispatched
 addBotMediaPreview	dispatched
-addChatFolderByInviteLink	interim
+addChatFolderByInviteLink	dispatched
 addChatMember	dispatched
 addChatMembers	dispatched
 addChatToList	interim
@@ -76,7 +76,7 @@ checkAuthenticationPasswordRecoveryCode	interim
 checkAuthenticationPremiumPurchase	interim
 checkAuthenticationWebToken	interim
 checkBotUsername	dispatched
-checkChatFolderInviteLink	interim
+checkChatFolderInviteLink	dispatched
 checkChatInviteLink	interim
 checkChatUsername	dispatched
 checkCreatedPublicChatsLimit	interim
@@ -122,8 +122,8 @@ createBasicGroupChat	interim
 createBot	dispatched
 createBusinessChatLink	dispatched
 createCall	dispatched
-createChatFolder	interim
-createChatFolderInviteLink	interim
+createChatFolder	dispatched
+createChatFolderInviteLink	dispatched
 createChatInviteLink	interim
 createChatSubscriptionInviteLink	interim
 createCommunity	dispatched
@@ -159,8 +159,8 @@ deleteBusinessMessages	dispatched
 deleteBusinessStory	dispatched
 deleteChat	dispatched
 deleteChatBackground	interim
-deleteChatFolder	interim
-deleteChatFolderInviteLink	interim
+deleteChatFolder	dispatched
+deleteChatFolderInviteLink	dispatched
 deleteChatHistory	dispatched
 deleteChatMessagesByDate	dispatched
 deleteChatMessagesBySender	dispatched
@@ -213,8 +213,8 @@ editBusinessMessageReplyMarkup	dispatched
 editBusinessMessageText	dispatched
 editBusinessStory	dispatched
 editCallbackQueryMessage	dispatched
-editChatFolder	interim
-editChatFolderInviteLink	interim
+editChatFolder	dispatched
+editChatFolderInviteLink	dispatched
 editChatInviteLink	interim
 editChatSubscriptionInviteLink	interim
 editChatWelcomeMessage	interim
@@ -300,12 +300,12 @@ getChatBoostLinkInfo	interim
 getChatBoostStatus	dispatched
 getChatBoosts	dispatched
 getChatEventLog	interim
-getChatFolder	interim
+getChatFolder	dispatched
 getChatFolderChatCount	interim
-getChatFolderChatsToLeave	interim
-getChatFolderDefaultIconName	interim
-getChatFolderInviteLinks	interim
-getChatFolderNewChats	interim
+getChatFolderChatsToLeave	dispatched
+getChatFolderDefaultIconName	sync
+getChatFolderInviteLinks	dispatched
+getChatFolderNewChats	dispatched
 getChatHistory	dispatched
 getChatInviteLink	interim
 getChatInviteLinkCounts	interim
@@ -334,7 +334,7 @@ getChatStatistics	dispatched
 getChatStoryAlbums	dispatched
 getChatStoryInteractions	dispatched
 getChats	dispatched
-getChatsForChatFolderInviteLink	interim
+getChatsForChatFolderInviteLink	dispatched
 getChatsToPostStories	dispatched
 getCloseFriends	dispatched
 getCollectibleItemInfo	dispatched
@@ -495,7 +495,7 @@ getRecentInlineBots	interim
 getRecentStickers	interim
 getRecentlyOpenedChats	dispatched
 getRecentlyVisitedTMeUrls	dispatched
-getRecommendedChatFolders	interim
+getRecommendedChatFolders	dispatched
 getRecommendedChats	dispatched
 getRecoveryEmailAddress	interim
 getRemoteFile	dispatched
@@ -623,7 +623,7 @@ pingProxy	interim
 placeGiftAuctionBid	dispatched
 postStory	dispatched
 preliminaryUploadFile	dispatched
-processChatFolderNewChats	interim
+processChatFolderNewChats	dispatched
 processChatHasProtectedContentDisableRequest	dispatched
 processChatJoinRequest	dispatched
 processChatJoinRequests	dispatched
@@ -679,7 +679,7 @@ removeWebBrowserSettingsException	dispatched
 reorderActiveUsernames	dispatched
 reorderBotActiveUsernames	interim
 reorderBotMediaPreviews	dispatched
-reorderChatFolders	interim
+reorderChatFolders	dispatched
 reorderGiftCollectionGifts	dispatched
 reorderGiftCollections	dispatched
 reorderInstalledStickerSets	interim
@@ -961,7 +961,7 @@ toggleBotIsAddedToAttachmentMenu	dispatched
 toggleBotUsernameIsActive	interim
 toggleBusinessConnectedBotChatIsPaused	dispatched
 toggleChatDefaultDisableNotification	interim
-toggleChatFolderTags	interim
+toggleChatFolderTags	dispatched
 toggleChatGiftNotifications	dispatched
 toggleChatHasProtectedContent	dispatched
 toggleChatIsMarkedAsUnread	interim
