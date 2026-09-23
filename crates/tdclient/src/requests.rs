@@ -859,6 +859,81 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
 
+        // --- the poll set (M.19): Requests.cpp:8088-8131. The arms validate +
+        // route to the PollManager; the net query tails park the promises
+        // unanswered offline, exactly like the C++ request without a network
+        // (the message-poll lookups answer the M.10 seam's not-found band) ---
+        Function::addPollOption(request) => {
+            // Requests.cpp:8088-8093
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, poll_manager) = crate::td::poll_env_split(td);
+            poll_manager.add_poll_option(
+                &mut env,
+                message_full_id(request.chat_id, request.message_id),
+                request.option,
+                promise,
+            );
+        }
+        Function::deletePollOption(request) => {
+            // Requests.cpp:8095-8100
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, poll_manager) = crate::td::poll_env_split(td);
+            poll_manager.delete_poll_option(
+                &mut env,
+                message_full_id(request.chat_id, request.message_id),
+                request.option_id,
+                promise,
+            );
+        }
+        Function::setPollAnswer(request) => {
+            // Requests.cpp:8102-8107
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, poll_manager) = crate::td::poll_env_split(td);
+            poll_manager.set_poll_answer(
+                &mut env,
+                message_full_id(request.chat_id, request.message_id),
+                request.option_ids,
+                promise,
+            );
+        }
+        Function::getPollVoters(request) => {
+            // Requests.cpp:8109-8114
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<crate::td_api::PollVoters, _>(id, Object::pollVoters);
+            let (mut env, poll_manager) = crate::td::poll_env_split(td);
+            poll_manager.get_poll_voters(
+                &mut env,
+                message_full_id(request.chat_id, request.message_id),
+                request.option_id,
+                request.offset,
+                request.limit,
+                promise,
+            );
+        }
+        Function::stopPoll(request) => {
+            // Requests.cpp:8123-8128 — no CHECK_IS_USER in the C++
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, poll_manager) = crate::td::poll_env_split(td);
+            poll_manager.stop_poll(
+                &mut env,
+                message_full_id(request.chat_id, request.message_id),
+                request.reply_markup,
+                promise,
+            );
+        }
+
         Function::addContact(request) => {
             // Requests.cpp:6611-6620 + `get_contact` (Contact.cpp:142-156):
             // the importedContact variant has no vcard and carries the
@@ -8954,6 +9029,15 @@ fn story_optional_to_object(value: Option<td_api::Story>) -> Object {
 }
 
 /// `CHECK_IS_USER` (Requests.cpp:1997-2000).
+/// The `DialogId(chat_id)` + `MessageId(message_id)` pair the poll arms
+/// route over (Requests.cpp:8088-8128).
+fn message_full_id(chat_id: i64, message_id: i64) -> crate::messages_manager::MessageFullId {
+    crate::messages_manager::MessageFullId::new(
+        crate::messages_manager::DialogId::new(chat_id),
+        crate::messages_manager::MessageId::new(message_id),
+    )
+}
+
 fn check_is_user(td: &mut Td, id: u64) -> bool {
     if td.auth_manager.is_bot() {
         td.send_error_impl(id, 400, "The method is not available to bots");
@@ -9259,9 +9343,9 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 19, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            452,
+            457,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 551, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 546, "interim count");
     }
 }

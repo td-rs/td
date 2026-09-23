@@ -22,7 +22,7 @@ addNetworkStatistics	interim
 addOffer	interim
 addPendingLiveStoryReaction	dispatched
 addPendingPaidMessageReaction	interim
-addPollOption	interim
+addPollOption	dispatched
 addProfileAudio	interim
 addProxy	interim
 addQuickReplyShortcutInlineQueryResultMessage	interim
@@ -181,7 +181,7 @@ deleteMessageEphemeralContent	interim
 deleteMessageReactionsFromSender	interim
 deleteMessages	dispatched
 deletePassportElement	dispatched
-deletePollOption	interim
+deletePollOption	dispatched
 deleteProfilePhoto	interim
 deleteQuickReplyShortcut	dispatched
 deleteQuickReplyShortcutMessages	dispatched
@@ -472,7 +472,7 @@ getPhoneNumberInfo	interim
 getPhoneNumberInfoSync	interim
 getPollOptionProperties	interim
 getPollVoteStatistics	interim
-getPollVoters	interim
+getPollVoters	dispatched
 getPreferredCountryLanguage	dispatched
 getPremiumFeatures	dispatched
 getPremiumGiftPaymentOptions	dispatched
@@ -892,7 +892,7 @@ setPinnedChats	interim
 setPinnedForumTopics	dispatched
 setPinnedGifts	dispatched
 setPinnedSavedMessagesTopics	interim
-setPollAnswer	interim
+setPollAnswer	dispatched
 setProfileAccentColor	interim
 setProfileAudioPosition	dispatched
 setProfilePhoto	interim
@@ -935,7 +935,7 @@ startLiveStory	dispatched
 startScheduledVideoChat	dispatched
 stopBusinessPoll	dispatched
 stopPendingMessage	interim
-stopPoll	interim
+stopPoll	dispatched
 suggestUserBirthdate	interim
 suggestUserProfilePhoto	interim
 summarizeMessage	interim

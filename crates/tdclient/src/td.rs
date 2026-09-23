@@ -2094,6 +2094,8 @@ pub struct Td {
     /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) animations_updates: Vec<td_api::Update>,
+    /// `Td::poll_manager_` (Td.cpp:1263-1265, M.19).
+    pub(crate) poll_manager: crate::poll_manager::PollManager,
     /// `Td::secret_chats_manager_` (`Td.cpp:1293`, M.50).
     pub(crate) secret_chats_manager: crate::secret_chats_manager::SecretChatsManager,
     /// `Td::group_call_manager_` (`Td.cpp:1294`, M.51).
@@ -2132,6 +2134,9 @@ pub struct Td {
     /// `pending_web_pages_timeout_` MultiTimeout; fired by
     /// `timeout_expired`).
     pub(crate) web_pages_timeouts: std::collections::HashMap<i64, f64>,
+    /// The poll manager's `send_update` outbox — drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) poll_updates: Vec<td_api::Update>,
     /// `Td::attach_menu_manager_` (`Td.cpp:1163`, the init_managers block;
     /// the M.40 Wave-3 slice).
     pub(crate) attach_menu_manager: crate::attach_menu_manager::AttachMenuManager,
@@ -2439,6 +2444,8 @@ impl Td {
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
             animations_manager: crate::animations_manager::AnimationsManager::new(),
             animations_updates: Vec::new(),
+            poll_manager: crate::poll_manager::PollManager::new(),
+            poll_updates: Vec::new(),
             secret_chats_manager: crate::secret_chats_manager::SecretChatsManager::new(true),
             group_call_manager: crate::group_call_manager::GroupCallManager::new(),
             referral_program_manager: crate::referral_program::ReferralProgramManager::new(),
@@ -4618,6 +4625,10 @@ impl Td {
         self.animations_manager.init(&mut env);
         let message_query_updates = std::mem::take(&mut self.message_query_updates);
         for update in message_query_updates {
+            self.send_update(update.into());
+        }
+        let poll_updates = std::mem::take(&mut self.poll_updates);
+        for update in poll_updates {
             self.send_update(update.into());
         }
         let account_updates = std::mem::take(&mut self.account_updates);
@@ -7261,6 +7272,12 @@ impl Actor for Td {
             };
             self.message_query_manager.tick_timeouts(&mut env);
         }
+        // The PollManager's three MultiTimeouts (M.19): the C++
+        // `on_*_poll_timeout_callback`s collapse into `tick_timeouts`.
+        {
+            let (mut env, poll_manager) = poll_env_split(self);
+            poll_manager.tick_timeouts(&mut env);
+        }
         let actions = self
             .config_manager
             .as_mut()
@@ -7321,6 +7338,39 @@ impl Actor for Td {
 
     // No `loop_`: the pending-query poll arrives with the net step (the
     // C++ `Td::loop` yields to drive the NetQueryDispatcher).
+}
+
+/// Field-split the `Td` for the PollManager calls: the env borrows the
+/// manager surfaces, the split returns the poll manager itself.
+pub(crate) fn poll_env_split(
+    td: &mut Td,
+) -> (
+    crate::poll_manager::PollManagerEnvImpl<'_>,
+    &mut crate::poll_manager::PollManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        chat_manager,
+        file_manager,
+        poll_manager,
+        poll_updates,
+        ..
+    } = td;
+    (
+        crate::poll_manager::PollManagerEnvImpl {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            chat_manager,
+            file_manager: std::sync::Arc::clone(file_manager),
+            updates: poll_updates,
+        },
+        poll_manager,
+    )
 }
 
 /// The `G()`/manager slice the collapsed NotificationManager reads through
@@ -7449,6 +7499,249 @@ impl crate::notification_manager::NotificationManagerEnv for NotificationEnv<'_>
 
     fn pmc_erase(&mut self, key: &str) {
         self.global.binlog_pmc().erase(key);
+    }
+}
+
+impl crate::photo::PhotoStoreEnv for crate::poll_manager::PollManagerEnvImpl<'_> {
+    fn store_file_id(&mut self, file_id: crate::files::FileId, out: &mut Vec<u8>) {
+        self.file_manager.lock().store_file(file_id, out);
+    }
+
+    fn parse_file_id(
+        &mut self,
+        parser: &mut crate::store_parse::Parser<'_>,
+    ) -> Result<crate::files::FileId, &'static str> {
+        self.file_manager.lock().parse_file(parser)
+    }
+}
+
+impl crate::poll_manager::PollStoreEnv for crate::poll_manager::PollManagerEnvImpl<'_> {
+    /// `store_message_content` — [blocked: M.9 integration]: no code path
+    /// on this line can set poll media, so the codec never runs.
+    fn store_poll_media(&mut self, _media_type: i32, _out: &mut Vec<u8>) {}
+
+    /// `parse_message_content` — [blocked: M.9 integration]: db records
+    /// carrying poll media fail the parse, deferring to the
+    /// message-content line.
+    fn parse_poll_media(
+        &mut self,
+        _parser: &mut crate::store_parse::Parser<'_>,
+    ) -> Result<i32, &'static str> {
+        Err("Poll media parse — [blocked: M.9 integration]")
+    }
+}
+
+impl crate::poll_manager::PollManagerEnv for crate::poll_manager::PollManagerEnvImpl<'_> {
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn use_message_database(&self) -> bool {
+        self.global.use_message_database()
+    }
+
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn server_time(&self) -> f64 {
+        self.global.server_time()
+    }
+
+    fn now(&self) -> f64 {
+        tdutils::time::now()
+    }
+
+    fn is_test_dc(&self) -> bool {
+        self.global.is_test_dc()
+    }
+
+    fn pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn binlog_add(&mut self, handler_type: i32, data: &[u8]) -> u64 {
+        self.global.td_db().binlog().add(handler_type, data)
+    }
+
+    fn binlog_rewrite(&mut self, log_event_id: u64, handler_type: i32, data: &[u8]) -> u64 {
+        self.global
+            .td_db()
+            .binlog()
+            .rewrite(log_event_id, handler_type, data)
+    }
+
+    fn binlog_erase(&mut self, log_event_id: u64) {
+        self.global.td_db().binlog().erase(log_event_id);
+    }
+
+    fn add_min_channel(
+        &mut self,
+        channel_id: crate::chat_manager::ChannelId,
+        min_channel: crate::chat_manager::MinChannel,
+    ) {
+        self.chat_manager.add_min_channel(channel_id, min_channel);
+    }
+
+    fn get_min_channel(
+        &self,
+        channel_id: crate::chat_manager::ChannelId,
+    ) -> Option<crate::chat_manager::MinChannel> {
+        self.chat_manager.get_min_channel(channel_id).cloned()
+    }
+
+    fn channel_is_member(&self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        self.chat_manager.get_channel_status(channel_id).is_member()
+    }
+
+    /// `chat_manager_->get_channel_date` — the collapsed line answers 0;
+    /// the subscribers-only membership window rides the M.5 integration.
+    fn channel_date(&self, _channel_id: crate::chat_manager::ChannelId) -> i32 {
+        0
+    }
+
+    /// `dialog_manager_->have_dialog_info` — the user half is real; the
+    /// chat/channel halves are the M.6 stub inventory.
+    fn have_dialog_info(&self, dialog_id: crate::dialog_id::DialogId) -> bool {
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User => self
+                .user_manager
+                .have_accessible_user(dialog_id.get_user_id()),
+            DialogType::Chat | DialogType::Channel => false,
+            DialogType::SecretChat => self
+                .user_manager
+                .have_secret_chat(dialog_id.get_secret_chat_id()),
+            DialogType::None => false,
+        }
+    }
+
+    fn have_min_user(&self, user_id: crate::user_manager::UserId) -> bool {
+        self.user_manager.have_min_user(user_id)
+    }
+
+    fn get_my_id(&self) -> crate::user_manager::UserId {
+        self.user_manager.get_my_id()
+    }
+
+    fn get_my_dialog_id(&self) -> crate::dialog_id::DialogId {
+        crate::dialog_id::DialogId::from_user_id(self.user_manager.get_my_id())
+    }
+
+    fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_integer(name, default_value)
+        })
+    }
+
+    fn get_option_string(&self, name: &str) -> String {
+        self.options
+            .as_ref()
+            .map_or_else(String::new, |options| options.get_option_string(name, ""))
+    }
+
+    /// `messages_manager_->get_message_poll_id` — [blocked: M.10
+    /// integration]: the seam answers the not-found band.
+    fn get_message_poll_id(
+        &mut self,
+        _message_full_id: &crate::dialog_id::MessageFullId,
+        _ignore_has_poll: bool,
+    ) -> Result<crate::poll_manager::PollId, tdutils::status::Status> {
+        Err(tdutils::status::Status::error(400, "Chat not found"))
+    }
+
+    /// `messages_manager_->has_message_sender_user_id` — the M.10 seam.
+    fn has_message_sender_user_id(
+        &mut self,
+        _message_full_id: &crate::dialog_id::MessageFullId,
+    ) -> bool {
+        false
+    }
+
+    /// `messages_manager_->on_external_update_message_content` — the M.10
+    /// seam no-op (the notify fan-out rides the message plane).
+    fn on_external_update_message_content(
+        &mut self,
+        _message_full_id: crate::dialog_id::MessageFullId,
+    ) {
+    }
+
+    /// `messages_manager_->on_update_poll_has_unread_votes` — the M.10
+    /// seam no-op.
+    fn on_update_poll_has_unread_votes(
+        &mut self,
+        _message_full_id: crate::dialog_id::MessageFullId,
+        _has_unread_votes: bool,
+    ) {
+    }
+
+    /// `web_pages_manager_->register_poll_web_pages` — the M.17 seam
+    /// no-op (the WebPageId newtype lands with the web-pages line).
+    fn register_poll_web_pages(
+        &mut self,
+        _poll_id: crate::poll_manager::PollId,
+        _web_page_ids: Vec<i64>,
+    ) {
+    }
+
+    /// `get_min_message_sender_object` — the user half is real; the
+    /// chat/channel halves ride the M.6 line.
+    fn get_min_message_sender_object(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> Option<td_api::MessageSender> {
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User
+                if self
+                    .user_manager
+                    .have_accessible_user(dialog_id.get_user_id()) =>
+            {
+                Some(td_api::MessageSender::messageSenderUser(
+                    td_api::messageSenderUser {
+                        user_id: dialog_id.get_user_id().get(),
+                    },
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    /// `get_poll_media_object` — [blocked: M.9 integration]: the
+    /// option/explanation media objects land with the message-content
+    /// line; `None` is the null media of the C++ call.
+    fn get_poll_media_object(&mut self, _media_type: Option<i32>) -> Option<td_api::PollMedia> {
+        None
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn get_formatted_text_with_users(
+        &mut self,
+        text: String,
+        entities: Vec<tdmtproto::telegram_api::MessageEntity>,
+        skip_media_timestamps: bool,
+        skip_trim: bool,
+        source: &str,
+    ) -> crate::message_entity::FormattedText {
+        crate::message_entity::get_formatted_text::<()>(
+            None,
+            text,
+            entities,
+            skip_media_timestamps,
+            skip_trim,
+            source,
+        )
     }
 }
 
