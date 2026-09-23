@@ -32,12 +32,12 @@ use crate::files::FileId;
 use crate::formatted_date::FormattedDate;
 use crate::inline_keyboard_button::{InlineKeyboardButton, InlineKeyboardButtonEnv};
 use crate::message_content_dup_type::MessageContentDupType;
-use crate::rich_button_style::RichButtonStyle;
 use crate::peer_color::AccentColorId;
 use crate::photo::{
     DialogPhoto, Photo, PhotoStoreEnv, get_dimensions, parse_dimensions, parse_photo,
     store_dimensions, store_photo,
 };
+use crate::rich_button_style::RichButtonStyle;
 use crate::store_parse::{Parser, store_flags, store_i32, store_i64, store_string, version};
 use crate::td_api;
 use crate::user_manager::UserId;
@@ -5804,13 +5804,13 @@ mod tests {
     use crate::formatted_date::FormattedDate;
     use crate::inline_keyboard_button::{InlineKeyboardButton, InlineKeyboardButtonType};
     use crate::keyboard_button_style::KeyboardButtonStyle;
-    use crate::rich_button_style::RichButtonStyle;
-    use crate::target_dialog_types::TargetDialogTypes;
     use crate::photo::{
         DialogPhoto, Dimensions, Photo, PhotoSize, parse_dialog_photo, parse_dimensions,
         parse_photo, store_dialog_photo, store_dimensions, store_photo,
     };
+    use crate::rich_button_style::RichButtonStyle;
     use crate::store_parse::{Parser, version};
+    use crate::target_dialog_types::TargetDialogTypes;
     use crate::td_api;
     use crate::user_manager::UserId;
 

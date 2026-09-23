@@ -23,6 +23,7 @@
 
 use crate::chat_manager::{ChannelId, ChatId};
 use crate::files::{FileId, FileSourceId};
+use crate::inline_keyboard_button::InlineKeyboardButtonEnv;
 use crate::message_content::{
     BackgroundInfo, InputGroupCallId, MessageContent, MessageContentType, SuggestedPostPrice,
     can_be_secret_message_content,
@@ -31,13 +32,12 @@ use crate::message_db::MessageDbAsyncInterface;
 use crate::message_entity::FormattedText;
 use crate::restriction_reason::RestrictionReason;
 use crate::store_parse::{Parser, store_flags, store_i32, store_i64, store_string};
-use crate::inline_keyboard_button::InlineKeyboardButtonEnv;
 // The M.10.2b internal ReplyMarkup plane now lives in its C++-shaped
 // modules (the M.22 unification); the manager-level converters below keep
 // their MessagesManager.cpp homes.
 use crate::reply_markup::{
-    get_reply_markup, get_reply_markup_from_telegram, get_reply_markup_object, parse_reply_markup,
-    store_reply_markup, ReplyMarkup, ReplyMarkupType,
+    ReplyMarkup, ReplyMarkupType, get_reply_markup, get_reply_markup_from_telegram,
+    get_reply_markup_object, parse_reply_markup, store_reply_markup,
 };
 use crate::td_api;
 use crate::user_manager::{SecretChatId, UserId};
@@ -8906,7 +8906,6 @@ pub fn get_message_sender(m: &Message) -> DialogId {
     }
 }
 
-
 /// `MessagesManager::get_dialog_reply_markup(DialogId,
 /// td_api::ReplyMarkup &&)` (MessagesManager.cpp:24319-24328) — the
 /// td_api intake body lives in [`crate::reply_markup::get_reply_markup`]
@@ -13245,7 +13244,10 @@ impl InlineKeyboardButtonEnv for MessageObjectButtonEnv<'_> {
         false
     }
 
-    fn get_input_user(&self, user_id: UserId) -> Result<tdmtproto::telegram_api::InputUser, tdutils::status::Status> {
+    fn get_input_user(
+        &self,
+        user_id: UserId,
+    ) -> Result<tdmtproto::telegram_api::InputUser, tdutils::status::Status> {
         let _ = user_id;
         Err(tdutils::status::Status::error(400, "User not found"))
     }
@@ -13256,7 +13258,9 @@ impl InlineKeyboardButtonEnv for MessageObjectButtonEnv<'_> {
     }
 
     fn get_user_id_object(&self, user_id: UserId, source: &str) -> i64 {
-        self.ctx.content_context().get_user_id_object(user_id, source)
+        self.ctx
+            .content_context()
+            .get_user_id_object(user_id, source)
     }
 }
 
@@ -29085,8 +29089,8 @@ mod tests {
                         has_username: true,
                         is_created: true,
                         restrict_user_administrator_rights: true,
-                            ..RequestedDialogType::default()
-                        })),
+                        ..RequestedDialogType::default()
+                    })),
                 },
                 KeyboardButton {
                     type_: KeyboardButtonType::Text,
@@ -29121,8 +29125,8 @@ mod tests {
                 }],
             }],
         });
-        let markup =
-            get_reply_markup_from_telegram(Some(wire), true, false, false).expect("inline keyboard");
+        let markup = get_reply_markup_from_telegram(Some(wire), true, false, false)
+            .expect("inline keyboard");
         assert_eq!(markup.r#type, ReplyMarkupType::InlineKeyboard);
         assert_eq!(markup.inline_keyboard.len(), 1);
         let button = &markup.inline_keyboard[0][0];

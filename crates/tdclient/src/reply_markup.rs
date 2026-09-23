@@ -44,7 +44,7 @@ impl ReplyMarkupType {
 /// `td::ReplyMarkup` (ReplyMarkup.h:26-56).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ReplyMarkup {
-    pub r#type:  ReplyMarkupType,
+    pub r#type: ReplyMarkupType,
     /// for ShowKeyboard, RemoveKeyboard, ForceReply
     pub is_personal: bool,
     /// for ShowKeyboard, InlineKeyboard
@@ -487,7 +487,7 @@ pub fn dup_reply_markup(
         return None;
     }
     let mut result = ReplyMarkup {
-        r#type:  reply_markup.r#type,
+        r#type: reply_markup.r#type,
         is_personal: reply_markup.is_personal,
         ..ReplyMarkup::default()
     };
@@ -741,7 +741,7 @@ mod tests {
     #[test]
     fn store_parse_round_trips() {
         let markup = ReplyMarkup {
-            r#type:  ReplyMarkupType::InlineKeyboard,
+            r#type: ReplyMarkupType::InlineKeyboard,
             force_reply: true,
             inline_keyboard: vec![
                 vec![inline_button("one", "c1")],
@@ -755,7 +755,7 @@ mod tests {
         assert_eq!(parse_reply_markup(&mut parser).unwrap(), markup);
 
         let markup = ReplyMarkup {
-            r#type:  ReplyMarkupType::ShowKeyboard,
+            r#type: ReplyMarkupType::ShowKeyboard,
             is_personal: true,
             is_persistent: true,
             need_resize_keyboard: true,
@@ -921,7 +921,7 @@ mod tests {
     #[test]
     fn object_builder_matches_the_intake() {
         let markup = ReplyMarkup {
-            r#type:  ReplyMarkupType::InlineKeyboard,
+            r#type: ReplyMarkupType::InlineKeyboard,
             force_reply: true,
             inline_keyboard: vec![vec![inline_button("btn", "c1")]],
             ..ReplyMarkup::default()
@@ -937,7 +937,7 @@ mod tests {
         }
 
         let markup = ReplyMarkup {
-            r#type:  ReplyMarkupType::RemoveKeyboard,
+            r#type: ReplyMarkupType::RemoveKeyboard,
             is_personal: true,
             ..ReplyMarkup::default()
         };
@@ -952,7 +952,7 @@ mod tests {
     #[test]
     fn dup_drops_for_copy_and_secret_chats() {
         let markup = Some(ReplyMarkup {
-            r#type:  ReplyMarkupType::InlineKeyboard,
+            r#type: ReplyMarkupType::InlineKeyboard,
             inline_keyboard: vec![vec![inline_button("a", "c1")]],
             ..ReplyMarkup::default()
         });
@@ -989,7 +989,7 @@ mod tests {
     fn print_renders_the_type() {
         let mut out = String::new();
         ReplyMarkup {
-            r#type:  ReplyMarkupType::ForceReply,
+            r#type: ReplyMarkupType::ForceReply,
             is_personal: true,
             placeholder: "ph".to_owned(),
             ..ReplyMarkup::default()

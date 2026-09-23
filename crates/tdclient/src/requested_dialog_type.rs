@@ -91,16 +91,16 @@ pub struct RequestedDialogType {
     pub(crate) request_username: bool,
     pub(crate) request_photo: bool,
 
-    pub(crate) restrict_is_forum: bool,                        // Group only
-    pub(crate) is_forum: bool,                                 // Group only
-    pub(crate) bot_is_participant: bool,                       // Group only
-    pub(crate) restrict_has_username: bool,                    // Group and Channel only
-    pub(crate) has_username: bool,                             // Group and Channel only
-    pub(crate) is_created: bool,                               // Group and Channel only
-    pub(crate) restrict_user_administrator_rights: bool,       // Group and Channel only
-    pub(crate) restrict_bot_administrator_rights: bool,        // Group and Channel only
+    pub(crate) restrict_is_forum: bool,     // Group only
+    pub(crate) is_forum: bool,              // Group only
+    pub(crate) bot_is_participant: bool,    // Group only
+    pub(crate) restrict_has_username: bool, // Group and Channel only
+    pub(crate) has_username: bool,          // Group and Channel only
+    pub(crate) is_created: bool,            // Group and Channel only
+    pub(crate) restrict_user_administrator_rights: bool, // Group and Channel only
+    pub(crate) restrict_bot_administrator_rights: bool, // Group and Channel only
     pub(crate) user_administrator_rights: AdministratorRights, // Group and Channel only
-    pub(crate) bot_administrator_rights: AdministratorRights,  // Group and Channel only
+    pub(crate) bot_administrator_rights: AdministratorRights, // Group and Channel only
 
     pub(crate) suggested_name: String,     // CreateBot only
     pub(crate) suggested_username: String, // CreateBot only

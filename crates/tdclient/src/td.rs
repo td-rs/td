@@ -5589,10 +5589,7 @@ impl Td {
                     // `send_update_message_edited` (MessagesManager.cpp:
                     // 5985-6014's emission half)
                     let edit_date = crate::messages_manager::get_message_shown_edit_date(m);
-                    let reply_markup = m
-                        .reply_markup
-                        .as_ref()
-                        .and_then(|reply_markup| {
+                    let reply_markup = m.reply_markup.as_ref().and_then(|reply_markup| {
                         crate::messages_manager::get_message_reply_markup_object(self, reply_markup)
                     });
                     self.send_update(Object::updateMessageEdited(td_api::updateMessageEdited {

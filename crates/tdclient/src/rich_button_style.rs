@@ -11,7 +11,6 @@ use crate::store_parse::{Parser, store_flags, store_i32};
 use crate::td_api;
 use tdmtproto::telegram_api;
 
-
 /// `RichButtonStyle::Type` (RichButtonStyle.h:24).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RichButtonStyleType {
