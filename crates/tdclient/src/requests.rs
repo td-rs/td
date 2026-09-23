@@ -52,6 +52,7 @@ use crate::td::AutosaveEnv;
 use crate::td::BoostEnv;
 use crate::td::CallEnv;
 use crate::td::CommunityEnv;
+use crate::td::LanguagePackEnv;
 use crate::td::MessageQueryEnv;
 use crate::td::NotificationEnv;
 use crate::td::PremiumTdEnv;
@@ -345,6 +346,169 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             // state blocks (connection/chat/background/...) accumulate here
             // as their managers land.
             td.send_result(id, Object::updates(td_api::Updates { updates }));
+        }
+
+        // --- the language pack set (M.24): Requests.cpp:8005-8073. The
+        // local halves (custom packs, loaded strings, only_local target
+        // info) answer here; the server halves park behind the
+        // [blocked: net] langpack.* query seams ---
+        Function::getLocalizationTargetInfo(request) => {
+            // Requests.cpp:8005-8009
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::LocalizationTargetInfo, _>(
+                id,
+                Object::localizationTargetInfo,
+            );
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+            };
+            td.language_pack_manager
+                .get_languages(&mut env, request.only_local, promise);
+        }
+        Function::getLanguagePackInfo(request) => {
+            // Requests.cpp:8011-8017; the net tail parks unanswered
+            // offline, like the C++ request without a network
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(language_pack_id) = crate::misc::clean_input_string(&request.language_pack_id)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise =
+                td.deferred_promise::<td_api::LanguagePackInfo, _>(id, Object::languagePackInfo);
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+            };
+            td.language_pack_manager
+                .search_language_info(&mut env, language_pack_id, promise);
+        }
+        Function::getLanguagePackStrings(request) => {
+            // Requests.cpp:8019-8028; the loaded-pack halves answer, the
+            // rest parks on langpack.getLangPack/langpack.getStrings
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(language_pack_id) = crate::misc::clean_input_string(&request.language_pack_id)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let mut keys = Vec::with_capacity(request.keys.len());
+            for key in &request.keys {
+                let Some(key) = crate::misc::clean_input_string(key) else {
+                    return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+                };
+                keys.push(key);
+            }
+            let promise = td.deferred_promise::<td_api::LanguagePackStrings, _>(
+                id,
+                Object::languagePackStrings,
+            );
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+            };
+            td.language_pack_manager.get_language_pack_strings(
+                &mut env,
+                language_pack_id,
+                keys,
+                promise,
+            );
+        }
+        Function::synchronizeLanguagePack(request) => {
+            // Requests.cpp:8030-8036; custom codes answer ok locally, the
+            // server codes park behind langpack.getDifference
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(language_pack_id) = crate::misc::clean_input_string(&request.language_pack_id)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+            };
+            td.language_pack_manager
+                .synchronize_language_pack(&mut env, language_pack_id, promise);
+        }
+        Function::addCustomServerLanguagePack(request) => {
+            // Requests.cpp:8038-8043; the local info-move machinery
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(language_pack_id) = crate::misc::clean_input_string(&request.language_pack_id)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            td.language_pack_manager
+                .add_custom_server_language(language_pack_id, promise);
+        }
+        Function::setCustomLanguagePack(request) => {
+            // Requests.cpp:8046-8051; the fully local custom pack plane
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+            };
+            td.language_pack_manager.set_custom_language(
+                &mut env,
+                request.info,
+                request.strings,
+                promise,
+            );
+        }
+        Function::editCustomLanguagePackInfo(request) => {
+            // Requests.cpp:8053-8057; the fully local custom info edit
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            td.language_pack_manager
+                .edit_custom_language_info(request.info, promise);
+        }
+        Function::setCustomLanguagePackString(request) => {
+            // Requests.cpp:8060-8066; the fully local string set
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(language_pack_id) = crate::misc::clean_input_string(&request.language_pack_id)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut env = LanguagePackEnv {
+                options: td.option_manager.as_mut(),
+                updates: &mut td.language_pack_updates,
+            };
+            td.language_pack_manager.set_custom_language_string(
+                &mut env,
+                language_pack_id,
+                request.new_string,
+                promise,
+            );
+        }
+        Function::deleteLanguagePack(request) => {
+            // Requests.cpp:8068-8073; the fully local delete
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(language_pack_id) = crate::misc::clean_input_string(&request.language_pack_id)
+            else {
+                return td.send_error_impl(id, 400, "Strings must be encoded in UTF-8");
+            };
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            td.language_pack_manager
+                .delete_language(language_pack_id, promise);
         }
 
         // --- options (Requests.cpp:8076-8090) ---
@@ -891,6 +1055,261 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 MmDialogId::new(request.opened_chat_id),
                 promise,
             );
+        }
+        // --- the inline set (M.21): Requests.cpp:4342-4386, 4917-4941,
+        // 8195-8233, 4737-4740. The managers validate; the net query tails park
+        // the promises unanswered offline, exactly like the C++ request without
+        // a network ---
+        Function::editInlineMessageText(request) => {
+            // Requests.cpp:4342-4348
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(inline_message_id) = clean_or_utf8_error(td, id, &request.inline_message_id)
+            else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, _, inline_message_manager) = crate::td::inline_env_split(td);
+            inline_message_manager.edit_inline_message_text(
+                &mut env,
+                &inline_message_id,
+                request.reply_markup,
+                request.input_message_content,
+                promise,
+            );
+        }
+        Function::editInlineMessageLiveLocation(request) => {
+            // Requests.cpp:4350-4356
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(inline_message_id) = clean_or_utf8_error(td, id, &request.inline_message_id)
+            else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, _, inline_message_manager) = crate::td::inline_env_split(td);
+            inline_message_manager.edit_inline_message_live_location(
+                &mut env,
+                &inline_message_id,
+                request.reply_markup,
+                request.location,
+                promise,
+            );
+        }
+        Function::editInlineMessageMedia(request) => {
+            // Requests.cpp:4358-4365
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(inline_message_id) = clean_or_utf8_error(td, id, &request.inline_message_id)
+            else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, _, inline_message_manager) = crate::td::inline_env_split(td);
+            inline_message_manager.edit_inline_message_media(
+                &mut env,
+                &inline_message_id,
+                request.reply_markup,
+                request.input_message_content,
+                promise,
+            );
+        }
+        Function::editInlineMessageCaption(request) => {
+            // Requests.cpp:4367-4374
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(inline_message_id) = clean_or_utf8_error(td, id, &request.inline_message_id)
+            else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, _, inline_message_manager) = crate::td::inline_env_split(td);
+            inline_message_manager.edit_inline_message_caption(
+                &mut env,
+                &inline_message_id,
+                request.reply_markup,
+                request.caption,
+                request.show_caption_above_media,
+                promise,
+            );
+        }
+        Function::editInlineMessageReplyMarkup(request) => {
+            // Requests.cpp:4376-4382
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(inline_message_id) = clean_or_utf8_error(td, id, &request.inline_message_id)
+            else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, _, inline_message_manager) = crate::td::inline_env_split(td);
+            inline_message_manager.edit_inline_message_reply_markup(
+                &mut env,
+                &inline_message_id,
+                request.reply_markup,
+                promise,
+            );
+        }
+        Function::setInlineGameScore(request) => {
+            // Requests.cpp:4919-4927
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(inline_message_id) = clean_or_utf8_error(td, id, &request.inline_message_id)
+            else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, _, inline_message_manager) = crate::td::inline_env_split(td);
+            inline_message_manager.set_inline_game_score(
+                &mut env,
+                &inline_message_id,
+                request.edit_message,
+                crate::user_manager::UserId::new(request.user_id),
+                request.score,
+                request.force,
+                promise,
+            );
+        }
+        Function::getInlineGameHighScores(request) => {
+            // Requests.cpp:4931-4938
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(inline_message_id) = clean_or_utf8_error(td, id, &request.inline_message_id)
+            else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<crate::td_api::GameHighScores, _>(id, Object::gameHighScores);
+            let (mut env, _, inline_message_manager) = crate::td::inline_env_split(td);
+            inline_message_manager.get_inline_game_high_scores(
+                &mut env,
+                &inline_message_id,
+                crate::user_manager::UserId::new(request.user_id),
+                promise,
+            );
+        }
+        Function::getInlineQueryResults(request) => {
+            // Requests.cpp:8195-8203
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let promise = td
+                .deferred_promise::<Option<crate::td_api::InlineQueryResults>, _>(id, |results| {
+                    Object::inlineQueryResults(results.unwrap_or_default())
+                });
+            let user_location =
+                crate::inline_queries_manager::location_from_td_api(request.user_location.as_ref());
+            let (mut env, inline_queries_manager, _) = crate::td::inline_env_split(td);
+            inline_queries_manager.send_inline_query(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                crate::messages_manager::DialogId::new(request.chat_id),
+                user_location,
+                &query,
+                &offset,
+                promise,
+            );
+        }
+        Function::answerInlineQuery(request) => {
+            // Requests.cpp:8205-8212
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let Some(next_offset) = clean_or_utf8_error(td, id, &request.next_offset) else {
+                return;
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, inline_queries_manager, _) = crate::td::inline_env_split(td);
+            inline_queries_manager.answer_inline_query(
+                &mut env,
+                request.inline_query_id,
+                request.is_personal,
+                request.button,
+                request.results,
+                request.cache_time,
+                next_offset,
+                promise,
+            );
+        }
+        Function::answerGuestQuery(request) => {
+            // Requests.cpp:8214-8220
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = td
+                .deferred_promise::<crate::td_api::InlineMessageId, _>(id, Object::inlineMessageId);
+            let (mut env, inline_queries_manager, _) = crate::td::inline_env_split(td);
+            inline_queries_manager.answer_guest_query(
+                &mut env,
+                request.guest_query_id,
+                request.result,
+                promise,
+            );
+        }
+        Function::savePreparedInlineMessage(request) => {
+            // Requests.cpp:8222-8227
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<crate::td_api::PreparedInlineMessageId, _>(
+                id,
+                Object::preparedInlineMessageId,
+            );
+            let (mut env, inline_queries_manager, _) = crate::td::inline_env_split(td);
+            inline_queries_manager.save_prepared_inline_message(
+                &mut env,
+                crate::user_manager::UserId::new(request.user_id),
+                request.result,
+                request.chat_types,
+                promise,
+            );
+        }
+        Function::getPreparedInlineMessage(request) => {
+            // Requests.cpp:8228-8234
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(prepared_message_id) =
+                clean_or_utf8_error(td, id, &request.prepared_message_id)
+            else {
+                return;
+            };
+            let promise = td.deferred_promise::<Option<crate::td_api::PreparedInlineMessage>, _>(
+                id,
+                |message| Object::preparedInlineMessage(message.unwrap_or_default()),
+            );
+            let (mut env, inline_queries_manager, _) = crate::td::inline_env_split(td);
+            inline_queries_manager.get_prepared_inline_message(
+                &mut env,
+                crate::user_manager::UserId::new(request.bot_user_id),
+                &prepared_message_id,
+                promise,
+            );
+        }
+        Function::getCurrentWeather(request) => {
+            // Requests.cpp:4737-4740
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise =
+                td.deferred_promise::<crate::td_api::CurrentWeather, _>(id, Object::currentWeather);
+            let user_location =
+                crate::inline_queries_manager::location_from_td_api(request.location.as_ref());
+            let (mut env, inline_queries_manager, _) = crate::td::inline_env_split(td);
+            inline_queries_manager.get_weather(&mut env, user_location, promise);
         }
 
         // --- the web-page set (M.17): Requests.cpp:5032-5042. The managers
@@ -3707,7 +4126,6 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
         }
 
         // Everything else waits for its manager step.
-        // Everything else waits for its manager step.
         _ => run_forum_topic_requests(td, id, function),
     }
 }
@@ -3943,7 +4361,6 @@ fn run_forum_topic_requests(td: &mut Td, id: u64, function: Function) {
             promise.set_value(());
         }
 
-        // Everything else waits for its manager step.
         // Everything else waits for its manager step.
         _ => run_story_requests(td, id, function),
     }
@@ -4907,7 +5324,6 @@ fn run_story_requests(td: &mut Td, id: u64, function: Function) {
             );
         }
 
-        // Everything else waits for its manager step.
         // Everything else waits for its manager step.
         // Everything else waits for its manager step; the M.42 star gift
         // group follows in its own frame (see the frame note above).
@@ -9410,29 +9826,34 @@ mod request_census_tests {
         // The scheme size from the S07 differential dump.
         assert_eq!(generated.len(), crate::td_api::SCHEME_FUNCTIONS);
 
-        // The flip-state ledger at the m13s↔master (4f716e8: M.7+M.11)
-        // merge: the m11 pins + M.13/M.13S's seven real dispatches
-        // (removeNotification, removeNotificationGroup, registerDevice and
-        // the four notification-settings arms; processPushNotification
-        // stays the 500 placeholder) + M.12.10's eighteen file-plane
-        // dispatches (getFile/getRemoteFile, the download/upload/
-        // generation arms, the DownloadManager list plane and the four
-        // storage-statistics arms) + M.20's three saved-animations arms
-        // (getSavedAnimations, addSavedAnimation, removeSavedAnimation).
-        // Fix per flip.
-        // The flip-state ledger — re-derived from the fixture at the wave-3
-        // integration (the per-track flip histories compose) + M.23's ten
-        // LinkManager dispatches (getDeepLinkInfo, getExternalLink,
-        // getExternalLinkInfo, getRecentlyVisitedTMeUrls, the two login-url
-        // arms and the four oauth arms) + M.20's three saved-animations
-        // arms (getSavedAnimations, addSavedAnimation,
-        // removeSavedAnimation). Fix per flip.
-        assert_eq!(*counts.get("sync").unwrap_or(&0), 19, "sync count");
+        // The flip-state ledger — re-derived from the fixture at each
+        // integration (the per-track flip histories compose): the m11 pins +
+        // M.13/M.13S's seven real dispatches (removeNotification,
+        // removeNotificationGroup, registerDevice and the four
+        // notification-settings arms; processPushNotification stays the 500
+        // placeholder) + M.12.10's eighteen file-plane dispatches
+        // (getFile/getRemoteFile, the download/upload/generation arms, the
+        // DownloadManager list plane and the four storage-statistics arms) +
+        // M.23's ten LinkManager dispatches (getDeepLinkInfo,
+        // getExternalLink, getExternalLinkInfo, getRecentlyVisitedTMeUrls,
+        // the two login-url arms and the four oauth arms) + M.20's three
+        // saved-animations arms (getSavedAnimations, addSavedAnimation,
+        // removeSavedAnimation) + M.24's nine language-pack dispatches
+        // (getLocalizationTargetInfo, getLanguagePackInfo,
+        // getLanguagePackStrings, synchronizeLanguagePack,
+        // addCustomServerLanguagePack, setCustomLanguagePack,
+        // editCustomLanguagePackInfo, setCustomLanguagePackString,
+        // deleteLanguagePack) and getLanguagePackString moving to the
+        // synchronous set + M.27's six top-dialog/recommendation dispatches
+        // (getTopChats, removeTopChat, getRecommendedChats,
+        // getChatSimilarChats, getChatSimilarChatCount,
+        // openChatSimilarChat). Fix per flip.
+        assert_eq!(*counts.get("sync").unwrap_or(&0), 20, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            463,
+            485,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 540, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 517, "interim count");
     }
 }

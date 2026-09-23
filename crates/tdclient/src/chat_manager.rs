@@ -3464,6 +3464,16 @@ impl Location {
         })
     }
 
+    /// `Location::get_latitude` (Location.h:62-64).
+    pub fn get_latitude(&self) -> f64 {
+        self.latitude_
+    }
+
+    /// `Location::get_longitude` (Location.h:66-68).
+    pub fn get_longitude(&self) -> f64 {
+        self.longitude_
+    }
+
     /// `Location::Location(td_api::location)` (Location.cpp:66-72) —
     /// the access hash is a Files-step stub (0), like the C++ nullptr Td.
     pub fn from_td_api_location(location: &td_api::Location) -> Location {

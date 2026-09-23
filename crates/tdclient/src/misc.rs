@@ -664,6 +664,116 @@ pub fn search_strings_by_prefix(
     )
 }
 
+/// `td::to_integer<int64>` (tdutils/td/utils/misc.h:157-183) — the signed
+/// decimal parse: an optional leading `-`, digits until the first
+/// non-digit, wrapping overflow exactly like the C++ (the two's-complement
+/// negation dance), 0 on an empty/minus-only input.
+pub fn to_integer_i64(str: &str) -> i64 {
+    let mut integer_value: u64 = 0;
+    let mut is_negative = false;
+    let bytes = str.as_bytes();
+    let mut begin = 0usize;
+    if !bytes.is_empty() && bytes[begin] == b'-' {
+        is_negative = true;
+        begin += 1;
+    }
+    while begin < bytes.len() && bytes[begin].is_ascii_digit() {
+        integer_value = integer_value
+            .wrapping_mul(10)
+            .wrapping_add(u64::from(bytes[begin] - b'0'));
+        begin += 1;
+    }
+    if integer_value > i64::MAX as u64 {
+        // Use ~x + 1 instead of -x to suppress the C++ MSVC warning the
+        // comment mentions; the wrap is the C++ behavior.
+        integer_value = (!integer_value).wrapping_add(1);
+        is_negative = !is_negative;
+        if integer_value > i64::MAX as u64 {
+            return i64::MIN;
+        }
+    }
+    if is_negative {
+        (integer_value as i64).wrapping_neg()
+    } else {
+        integer_value as i64
+    }
+}
+
+/// `td::to_double` (misc.h:220-224, `atof` semantics) — parse the leading
+/// `double` (optional whitespace/sign, digits with an optional fraction
+/// and exponent), stopping at the first invalid character; 0.0 when
+/// nothing parses.
+pub fn to_double(str: &str) -> f64 {
+    let trimmed = str.trim_start();
+    let bytes = trimmed.as_bytes();
+    let mut end = 0usize;
+    if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
+        end += 1;
+    }
+    let mut seen_digits = false;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+        seen_digits = true;
+    }
+    if end < bytes.len() && bytes[end] == b'.' {
+        end += 1;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+            seen_digits = true;
+        }
+    }
+    if !seen_digits {
+        return 0.0;
+    }
+    if end < bytes.len() && (bytes[end] == b'e' || bytes[end] == b'E') {
+        let mut exp_end = end + 1;
+        if exp_end < bytes.len() && (bytes[exp_end] == b'+' || bytes[exp_end] == b'-') {
+            exp_end += 1;
+        }
+        let exp_digits_start = exp_end;
+        while exp_end < bytes.len() && bytes[exp_end].is_ascii_digit() {
+            exp_end += 1;
+        }
+        if exp_end > exp_digits_start {
+            end = exp_end;
+        }
+    }
+    trimmed[..end].parse::<f64>().unwrap_or(0.0)
+}
+
+/// `td::is_base64url_characters` (base64.cpp:205-212, the `is_url`
+/// instantiation) — every byte is in the URL-safe base64 alphabet; padding
+/// is not allowed (unlike `is_base64url`).
+pub fn is_base64url_characters(input: &[u8]) -> bool {
+    input
+        .iter()
+        .all(|c| c.is_ascii_alphanumeric() || *c == b'-' || *c == b'_')
+}
+
+/// `td::add_to_top` (tdutils/td/utils/algorithm.h:115-134) — move `value`
+/// to the front of `v`, evicting the last element past `max_size`.
+pub fn add_to_top<T: PartialEq + Clone>(v: &mut Vec<T>, max_size: usize, value: T) {
+    let size = v.len();
+    let mut i = 0usize;
+    while i < size && v[i] != value {
+        i += 1;
+    }
+    if i == size {
+        if size < max_size || i == 0 {
+            // `i` stays at the pushed element's index
+            v.push(value.clone());
+        } else {
+            // the last element is evicted by the shift below
+            i -= 1;
+        }
+    }
+    while i > 0 {
+        v[i] = v[i - 1].clone();
+        i -= 1;
+    }
+    v[0] = value;
+}
+
 #[cfg(test)]
 mod search_strings_by_prefix_tests {
     use super::search_strings_by_prefix;
