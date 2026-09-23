@@ -2086,6 +2086,14 @@ pub struct Td {
     pub(crate) community_updates: Vec<td_api::Update>,
     /// `Td::device_token_manager_` (`Td.cpp:1345`, M.13S).
     pub(crate) device_token_manager: crate::device_token_manager::DeviceTokenManager,
+    /// `Td::language_pack_manager_` (`Td.cpp:1348`, M.24) — the
+    /// constructor + start_up work runs in [`Td::init_language_pack_manager`]
+    /// where the option manager exists.
+    pub(crate) language_pack_manager: crate::language_pack_manager::LanguagePackManager,
+    /// The language pack manager's `send_update` outbox — the collapsed
+    /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) language_pack_updates: Vec<td_api::Update>,
     /// `Td::animations_manager_` (`Td.cpp:1160`, M.20) — the constructor
     /// and start_up halves run in [`Td::init_animations_manager`] where
     /// the option manager exists.
@@ -2442,6 +2450,8 @@ impl Td {
             community_manager: CommunityManager::new(),
             community_updates: Vec::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
+            language_pack_manager: crate::language_pack_manager::LanguagePackManager::new(),
+            language_pack_updates: Vec::new(),
             animations_manager: crate::animations_manager::AnimationsManager::new(),
             animations_updates: Vec::new(),
             poll_manager: crate::poll_manager::PollManager::new(),
@@ -2662,6 +2672,11 @@ impl Td {
         // (Td.cpp:1160, the init_managers block) — the constructor erases
         // the legacy limit key and loads the saved `ans` record (M.20).
         self.init_animations_manager();
+
+        // `Td::init_pure_actor_managers` (Td.cpp:1348): the
+        // LanguagePackManager actor constructor + start_up halves read
+        // the restored options and open the language pack database (M.24).
+        self.init_language_pack_manager();
 
         // `Td::process_binlog_events` (Td.cpp:1034) — the on-server
         // notification settings log events replay into the settings
@@ -4603,6 +4618,10 @@ impl Td {
         for update in notification_updates {
             self.send_update(update.into());
         }
+        let language_pack_updates = std::mem::take(&mut self.language_pack_updates);
+        for update in language_pack_updates {
+            self.send_update(update.into());
+        }
         let animations_updates = std::mem::take(&mut self.animations_updates);
         for update in animations_updates {
             self.send_update(update.into());
@@ -4695,6 +4714,17 @@ impl Td {
         };
         self.notification_manager.init(&mut env);
         self.notification_settings_manager.init(&mut env);
+    }
+
+    /// `LanguagePackManager::LanguagePackManager` (LanguagePackManager.cpp:200-226)
+    /// plus `start_up` (cpp:228-250) — the collapsed actor start reads the
+    /// restored options and opens the language pack database (M.24).
+    fn init_language_pack_manager(&mut self) {
+        let mut env = LanguagePackEnv {
+            options: self.option_manager.as_mut(),
+            updates: &mut self.language_pack_updates,
+        };
+        self.language_pack_manager.init(&mut env);
     }
 
     /// `TermsOfServiceManager::init` (AuthManager.cpp:1549) — the
@@ -7780,6 +7810,100 @@ impl crate::device_token_manager::DeviceTokenManagerEnv for NotificationEnv<'_> 
 
     fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
         self.global.binlog_pmc().set_raw(key, value);
+    }
+}
+
+/// The option slice the collapsed LanguagePackManager reads through (the
+/// C++ manager reads the same surfaces off its `G()`; the pmc/binlog
+/// plane stays with the language pack database opened in
+/// [`Td::init_language_pack_manager`]). The `send_update`s buffer into
+/// [`Td::language_pack_updates`] and Td drains them — the collapsed
+/// `send_closure(G()->td(), &Td::send_update)` hop. The five net queries
+/// are the M.24 `[blocked: net]` seams: the C++ promises land in the
+/// query (or the manager's pending maps) and stay unanswered offline.
+pub(crate) struct LanguagePackEnv<'a> {
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::language_pack_manager::LanguagePackManagerEnv for LanguagePackEnv<'_> {
+    fn get_option_string(&self, name: &str, default_value: &str) -> String {
+        self.options.as_ref().map_or_else(
+            || default_value.to_owned(),
+            |options| options.get_option_string(name, default_value),
+        )
+    }
+
+    fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_integer(name, default_value)
+        })
+    }
+
+    fn set_option_empty(&mut self, name: &str) {
+        if let Some(options) = self.options.as_mut() {
+            options.set_option_empty(name);
+        }
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    /// `langpack_getLanguages` (LanguagePackManager.cpp:871-878).
+    fn send_get_languages_query(
+        &mut self,
+        language_pack: String,
+        _promise: tdutils::promise::Promise<td_api::LocalizationTargetInfo>,
+    ) {
+        tdutils::log_info!(
+            "Send langpack.getLanguages for language pack {language_pack} — [blocked: net]"
+        );
+    }
+
+    /// `langpack_getLanguage` (LanguagePackManager.cpp:887-897).
+    fn send_get_language_query(
+        &mut self,
+        language_pack: String,
+        language_code: String,
+        _promise: tdutils::promise::Promise<td_api::LanguagePackInfo>,
+    ) {
+        tdutils::log_info!(
+            "Send langpack.getLanguage for language pack {language_pack}, language code {language_code} — [blocked: net]"
+        );
+    }
+
+    /// `langpack_getLangPack` (LanguagePackManager.cpp:1148-1150).
+    fn send_get_lang_pack_query(&mut self, language_pack: String, language_code: String) {
+        tdutils::log_info!(
+            "Send langpack.getLangPack for language pack {language_pack}, language code {language_code} — [blocked: net]"
+        );
+    }
+
+    /// `langpack_getStrings` (LanguagePackManager.cpp:1159-1161).
+    fn send_get_strings_query(
+        &mut self,
+        language_pack: String,
+        language_code: String,
+        keys: Vec<String>,
+        _promise: tdutils::promise::Promise<td_api::LanguagePackStrings>,
+    ) {
+        tdutils::log_info!(
+            "Send langpack.getStrings for language pack {language_pack}, language code {language_code}, {} keys — [blocked: net]",
+            keys.len()
+        );
+    }
+
+    /// `langpack_getDifference` (LanguagePackManager.cpp:456-458).
+    fn send_get_difference_query(
+        &mut self,
+        language_pack: String,
+        language_code: String,
+        from_version: i32,
+    ) {
+        tdutils::log_info!(
+            "Send langpack.getDifference for language pack {language_pack}, language code {language_code}, from version {from_version} — [blocked: net]"
+        );
     }
 }
 

@@ -71,6 +71,7 @@ pub mod global;
 pub mod group_call_manager;
 pub mod inline_keyboard_button;
 pub mod join_chat_bot_result;
+pub mod language_pack_manager;
 pub mod link_manager;
 pub mod manager_option_states;
 pub mod message_content;
