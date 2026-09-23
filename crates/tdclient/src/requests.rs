@@ -985,7 +985,7 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
             sponsored_message_manager.get_dialog_sponsored_messages(
                 &mut env,
-                DialogId::new(request.chat_id),
+                crate::messages_manager::DialogId::new(request.chat_id),
                 promise,
             );
         }
@@ -998,8 +998,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
             sponsored_message_manager.click_sponsored_message(
                 &mut env,
-                DialogId::new(request.chat_id),
-                crate::chat_manager::MessageId::new(request.message_id),
+                crate::messages_manager::DialogId::new(request.chat_id),
+                crate::messages_manager::MessageId::new(request.message_id),
                 request.is_media_click,
                 request.from_fullscreen,
                 promise,
@@ -1017,8 +1017,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
             sponsored_message_manager.report_sponsored_message(
                 &mut env,
-                DialogId::new(request.chat_id),
-                crate::chat_manager::MessageId::new(request.message_id),
+                crate::messages_manager::DialogId::new(request.chat_id),
+                crate::messages_manager::MessageId::new(request.message_id),
                 &request.option_id,
                 promise,
             );
@@ -1088,9 +1088,9 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 id,
                 Object::videoMessageAdvertisements,
             );
-            let message_full_id = crate::dialog_id::MessageFullId::new(
-                DialogId::new(request.chat_id),
-                crate::chat_manager::MessageId::new(request.message_id),
+            let message_full_id = crate::messages_manager::MessageFullId::new(
+                crate::messages_manager::DialogId::new(request.chat_id),
+                crate::messages_manager::MessageId::new(request.message_id),
             );
             let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
             sponsored_message_manager.get_video_sponsored_messages(
@@ -1148,13 +1148,17 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
-            let dialog_id = DialogId::new(request.chat_id);
+            let dialog_id = crate::messages_manager::DialogId::new(request.chat_id);
             let (mut env, message_import_manager) = crate::td::message_import_env_split(td);
             message_import_manager.import_messages(
                 &mut env,
                 dialog_id,
                 request.message_file,
                 request.attached_files,
+                promise,
+            );
+        }
+
         // --- the inline set (M.21): Requests.cpp:4342-4386, 4917-4941,
         // 8195-8233, 4737-4740. The managers validate; the net query tails park
         // the promises unanswered offline, exactly like the C++ request without
@@ -9970,9 +9974,9 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 20, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            492,
+            491,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 510, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 511, "interim count");
     }
 }

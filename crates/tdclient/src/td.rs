@@ -7321,6 +7321,7 @@ impl Actor for Td {
         {
             let (mut promo_env, promo_data_manager) = promo_env_split(self);
             promo_data_manager.tick_timeouts(&mut promo_env);
+        }
         // The WebPagesManager pending-page timeouts (M.17): the
         // collapsed MultiTimeout fires each due id once.
         {
@@ -13919,6 +13920,7 @@ pub(crate) fn sponsored_env_split(
         auth_manager,
         user_manager,
         chat_manager,
+        file_manager,
         sponsored_message_manager,
         sponsored_updates,
         ..
@@ -13931,6 +13933,7 @@ pub(crate) fn sponsored_env_split(
             auth_is_bot: auth_manager.is_bot(),
             user_manager,
             chat_manager,
+            file_manager: file_manager.clone(),
             updates: sponsored_updates,
         },
         sponsored_message_manager,
@@ -13949,6 +13952,7 @@ pub(crate) fn message_import_env_split(
         auth_manager,
         user_manager,
         chat_manager,
+        file_manager,
         message_import_manager,
         sponsored_updates,
         ..
@@ -13961,6 +13965,7 @@ pub(crate) fn message_import_env_split(
             auth_is_bot: auth_manager.is_bot(),
             user_manager,
             chat_manager,
+            file_manager: file_manager.clone(),
             updates: sponsored_updates,
         },
         message_import_manager,
@@ -13979,6 +13984,7 @@ pub(crate) fn promo_env_split(
         auth_manager,
         user_manager,
         chat_manager,
+        file_manager,
         promo_data_manager,
         sponsored_updates,
         ..
@@ -13991,6 +13997,7 @@ pub(crate) fn promo_env_split(
             auth_is_bot: auth_manager.is_bot(),
             user_manager,
             chat_manager,
+            file_manager: file_manager.clone(),
             updates: sponsored_updates,
         },
         promo_data_manager,
@@ -14008,6 +14015,7 @@ pub(crate) struct TdSponsoredEnv<'a> {
     pub(crate) auth_is_bot: bool,
     pub(crate) user_manager: &'a mut UserManager,
     pub(crate) chat_manager: &'a mut ChatManager,
+    pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>>,
     pub(crate) updates: &'a mut Vec<td_api::Update>,
 }
 
@@ -14059,17 +14067,20 @@ impl crate::sponsored_message_manager::SponsoredMessageManagerEnv for TdSponsore
         &mut self,
         dialog_id: crate::dialog_id::DialogId,
         _source: &'static str,
-    ) -> Result<(), tdutils::status::Status> {
+    ) -> tdutils::status::Result<()> {
         if !have_dialog_info_of(self.user_manager, dialog_id) {
             if !dialog_id.is_valid() {
-                return Err(tdutils::status::Status::error(
+                return tdutils::status::Result::from_status(tdutils::status::Status::error(
                     400,
                     "Invalid chat identifier specified",
                 ));
             }
-            return Err(tdutils::status::Status::error(400, "Chat not found"));
+            return tdutils::status::Result::from_status(tdutils::status::Status::error(
+                400,
+                "Chat not found",
+            ));
         }
-        Ok(())
+        tdutils::status::Result::Ok(())
     }
 
     fn have_dialog_info(&self, dialog_id: crate::dialog_id::DialogId) -> bool {
@@ -14098,8 +14109,8 @@ impl crate::sponsored_message_manager::SponsoredMessageManagerEnv for TdSponsore
 
     fn get_accent_color_id_object(
         &self,
-        accent_color_id: AccentColorId,
-        fallback_accent_color_id: AccentColorId,
+        accent_color_id: crate::peer_color::AccentColorId,
+        fallback_accent_color_id: crate::peer_color::AccentColorId,
     ) -> i32 {
         if accent_color_id.is_valid() {
             accent_color_id.get()
@@ -14156,7 +14167,7 @@ impl crate::sponsored_message_manager::SponsoredMessageManagerEnv for TdSponsore
     fn send_get_sponsored_messages_query(
         &mut self,
         _dialog_id: crate::dialog_id::DialogId,
-        _message_id: MessageId,
+        _message_id: crate::messages_manager::MessageId,
     ) {
         // [blocked: net]
     }
@@ -14330,8 +14341,7 @@ impl crate::message_import_manager::MessageImportManagerEnv for TdSponsoredEnv<'
         message_file: &td_api::InputFile,
         dialog_id: crate::dialog_id::DialogId,
     ) -> Result<FileId, tdutils::status::Status> {
-        crate::files::get_input_file_id(
-            &mut self.global,
+        self.file_manager.lock().get_input_file_id(
             crate::files::FileType::Document,
             Some(message_file),
             dialog_id,

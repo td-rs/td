@@ -1,8 +1,9 @@
 //!
 //!
 
-use crate::chat_manager::{MessageId, MessageType};
-use crate::dialog_id::{DialogId, MessageFullId};
+use crate::messages_manager::MessageId;
+use crate::messages_manager::MessageType;
+use crate::messages_manager::{DialogId, MessageFullId};
 use crate::peer_color::{AccentColorId, PeerColor};
 use crate::photo::Photo;
 use crate::td_api;
@@ -255,7 +256,36 @@ pub trait SponsoredMessageManagerEnv {
 
 /// `SponsoredMessageManager` (SponsoredMessageManager.h:27-141) — the
 /// collapsed actor.
-#[derive(Debug)]
+impl std::fmt::Debug for DialogSponsoredMessages {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DialogSponsoredMessages")
+    }
+}
+
+impl std::fmt::Debug for SponsoredDialogs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SponsoredDialogs")
+    }
+}
+
+impl std::fmt::Debug for VideoSponsoredMessages {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("VideoSponsoredMessages")
+    }
+}
+
+impl std::fmt::Debug for PendingClickQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PendingClickQuery")
+    }
+}
+
+impl std::fmt::Debug for PendingReportQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PendingReportQuery")
+    }
+}
+
 pub struct SponsoredMessageManager {
     pub(crate) dialog_sponsored_messages:
         std::collections::HashMap<DialogId, DialogSponsoredMessages>,
@@ -557,7 +587,9 @@ impl SponsoredMessageManager {
         dialog_id: DialogId,
         promise: Promise<td_api::SponsoredMessages>,
     ) {
-        if let Err(status) = env.check_dialog_access(dialog_id, "get_dialog_sponsored_messages") {
+        if let tdutils::status::Result::Err(status) =
+            env.check_dialog_access(dialog_id, "get_dialog_sponsored_messages")
+        {
             let mut promise = promise;
             promise.set_error(status);
             return;
@@ -747,13 +779,15 @@ impl SponsoredMessageManager {
                 env.on_get_users(sponsored_messages.users, "on_get_dialog_sponsored_messages");
                 env.on_get_chats(sponsored_messages.chats, "on_get_dialog_sponsored_messages");
 
-                let messages = self.dialog_sponsored_messages.get_mut(&dialog_id).unwrap();
-                for wire_message in sponsored_messages.messages {
-                    let Some((message_info, message)) =
+                let parsed: Vec<(SponsoredContentInfo, SponsoredMessage)> = sponsored_messages
+                    .messages
+                    .into_iter()
+                    .filter_map(|wire_message| {
                         self.parse_sponsored_message(env, wire_message, false)
-                    else {
-                        continue;
-                    };
+                    })
+                    .collect();
+                let messages = self.dialog_sponsored_messages.get_mut(&dialog_id).unwrap();
+                for (message_info, message) in parsed {
                     let local_id = message.local_id;
                     debug_assert!(
                         messages
@@ -777,6 +811,7 @@ impl SponsoredMessageManager {
         messages.is_premium = env.get_option_boolean("is_premium", false);
         messages.sponsored_enabled = env.get_my_sponsored_enabled();
 
+        let messages = self.dialog_sponsored_messages.get(&dialog_id).unwrap();
         let object = self.get_sponsored_messages_object(env, dialog_id, messages);
         for promise in promises.iter_mut() {
             promise.set_value(object.clone());
@@ -1042,6 +1077,7 @@ impl SponsoredMessageManager {
         dialogs.is_premium = env.get_option_boolean("is_premium", false);
         dialogs.sponsored_enabled = env.get_my_sponsored_enabled();
 
+        let dialogs = self.search_sponsored_dialogs.get(query).unwrap();
         let object = self.get_sponsored_chats_object(env, dialogs);
         for promise in promises.iter_mut() {
             promise.set_value(object.clone());
@@ -1255,6 +1291,7 @@ impl SponsoredMessageManager {
         ads.is_premium = env.get_option_boolean("is_premium", false);
         ads.sponsored_enabled = env.get_my_sponsored_enabled();
 
+        let ads = self.video_sponsored_ads.get(&message_full_id).unwrap();
         let object = self.get_video_message_advertisements_object(env, ads);
         for promise in promises.iter_mut() {
             promise.set_value(object.clone());
@@ -1351,7 +1388,7 @@ impl SponsoredMessageManager {
             return;
         };
         let mut promise = query.promise;
-        let Ok(result) = result else {
+        let tdutils::status::Result::Ok(result) = result else {
             let status = match result {
                 tdutils::status::Result::Err(status) => status,
                 tdutils::status::Result::Ok(_) => unreachable!(),
@@ -1417,7 +1454,7 @@ impl SponsoredMessageManager {
     /// The `ClickSponsoredMessageQuery::on_result` tail
     /// (SponsoredMessageManager.cpp:105-111) — ok answers the parked
     /// promise, an error fails it.
-    pub fn on_click_sponsored_message_result(&mut self, result: Result<telegram_api::Bool>) {
+    pub fn on_click_sponsored_message_result(&mut self, result: Result<bool>) {
         let Some(query) = self.pending_click_queries.pop() else {
             return;
         };
@@ -1431,8 +1468,6 @@ impl SponsoredMessageManager {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use super::*;
     use std::cell::RefCell;
     use std::collections::HashSet;
@@ -1467,11 +1502,11 @@ mod tests {
             &mut self,
             dialog_id: DialogId,
             _source: &'static str,
-        ) -> Result<(), Status> {
+        ) -> Result<()> {
             if self.denied_dialogs.contains(&dialog_id.get()) {
-                return Err(Status::error(400, "Chat not found"));
+                return Result::Err(Status::error(400, "Chat not found"));
             }
-            Ok(())
+            Result::Ok(())
         }
 
         fn have_dialog_info(&self, _dialog_id: DialogId) -> bool {
@@ -1553,12 +1588,14 @@ mod tests {
         std::sync::Arc<std::sync::atomic::AtomicBool>,
         std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) {
-        struct FlagPromise<T> {
+        struct FlagPromise<T: Send> {
             value_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
             error_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            value: std::sync::Arc<parking_lot::Mutex<Option<T>>>,
         }
-        impl<T: Send + 'static> tdutils::promise::PromiseInterface<T> for FlagPromise<T> {
-            fn set_value(&mut self, _value: T) {
+        impl<T: Send> tdutils::promise::PromiseInterface<T> for FlagPromise<T> {
+            fn set_value(&mut self, value: T) {
+                *self.value.lock() = Some(value);
                 self.value_flag
                     .store(true, std::sync::atomic::Ordering::SeqCst);
             }
@@ -1573,6 +1610,7 @@ mod tests {
             Promise::from_interface(FlagPromise::<T> {
                 value_flag: value_flag.clone(),
                 error_flag: error_flag.clone(),
+                value: std::sync::Arc::new(parking_lot::Mutex::new(None)),
             }),
             value_flag,
             error_flag,
@@ -1612,8 +1650,18 @@ mod tests {
             viewed: RefCell::new(Vec::new()),
         };
         let mut manager = SponsoredMessageManager::new();
-        let (promise, _, _) = flag_promise::<()>();
-        manager.view_sponsored_message(&mut env, DialogId::new(1), MessageId::new(7), promise);
+        let mut cached = DialogSponsoredMessages::default();
+        cached.message_infos.insert(
+            7,
+            SponsoredContentInfo {
+                random_id: b"rid".to_vec(),
+                ..Default::default()
+            },
+        );
+        manager
+            .dialog_sponsored_messages
+            .insert(DialogId::new(1), cached);
+        manager.view_sponsored_message(&mut env, DialogId::new(1), MessageId::new(7));
         assert!(!env.viewed.borrow().is_empty());
     }
 

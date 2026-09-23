@@ -161,9 +161,7 @@ impl MessageImportManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use super::*;
-    use crate::chat_manager::{ChannelId, ChannelPermissions};
+    use crate::chat_manager::ChannelId;
     use crate::files::FileId;
     use std::cell::RefCell;
     use std::collections::HashSet;
