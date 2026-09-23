@@ -1,5 +1,7 @@
-//!
-//!
+//! The `SponsoredMessageManager` port (SponsoredMessageManager.{h,cpp})
+//! — the per-dialog sponsored-message/sponsored-dialog/video-ad caches,
+//! the view/click/report bookkeeping and the parked net query payloads
+//! (M.26).
 
 use crate::messages_manager::MessageId;
 use crate::messages_manager::MessageType;
@@ -153,8 +155,12 @@ pub(crate) struct VideoSponsoredMessages {
 /// A parked click promise (the C++ `ClickSponsoredMessageQuery`
 /// payload): the query random_id, the flag pair and the request promise.
 pub struct PendingClickQuery {
+    // the payload reads live on the [blocked: net] sender tails
+    #[allow(dead_code)]
     pub(crate) random_id: Vec<u8>,
+    #[allow(dead_code)]
     pub(crate) is_media_click: bool,
+    #[allow(dead_code)]
     pub(crate) from_fullscreen: bool,
     pub(crate) promise: Promise<()>,
 }
@@ -162,7 +168,10 @@ pub struct PendingClickQuery {
 /// A parked report promise (the C++ `ReportSponsoredMessageQuery`
 /// payload).
 pub struct PendingReportQuery {
+    // the payload reads live on the [blocked: net] sender tails
+    #[allow(dead_code)]
     pub(crate) random_id: Vec<u8>,
+    #[allow(dead_code)]
     pub(crate) option_id: Vec<u8>,
     pub(crate) promise: Promise<td_api::ReportSponsoredResult>,
 }
@@ -405,10 +414,10 @@ impl SponsoredMessageManager {
 
     /// `delete_cached_sponsored_messages` (SponsoredMessageManager.cpp:311-320).
     pub fn delete_cached_sponsored_messages(&mut self, dialog_id: DialogId) {
-        if let Some(messages) = self.dialog_sponsored_messages.get(&dialog_id) {
-            if messages.promises.is_empty() {
-                self.dialog_sponsored_messages.remove(&dialog_id);
-            }
+        if let Some(messages) = self.dialog_sponsored_messages.get(&dialog_id)
+            && messages.promises.is_empty()
+        {
+            self.dialog_sponsored_messages.remove(&dialog_id);
         }
     }
 
@@ -614,13 +623,13 @@ impl SponsoredMessageManager {
             promise.set_value(object);
             return;
         }
-        if let Some(messages) = self.dialog_sponsored_messages.get(&dialog_id) {
-            if messages.promises.is_empty() {
-                // drop cache
-                self.delete_cached_sponsored_messages_timeout
-                    .remove(&dialog_id.get());
-                self.dialog_sponsored_messages.remove(&dialog_id);
-            }
+        if let Some(messages) = self.dialog_sponsored_messages.get(&dialog_id)
+            && messages.promises.is_empty()
+        {
+            // drop cache
+            self.delete_cached_sponsored_messages_timeout
+                .remove(&dialog_id.get());
+            self.dialog_sponsored_messages.remove(&dialog_id);
         }
 
         let messages = self.dialog_sponsored_messages.entry(dialog_id).or_default();
@@ -964,17 +973,17 @@ impl SponsoredMessageManager {
             promise.set_value(object);
             return;
         }
-        if let Some(dialogs) = self.search_sponsored_dialogs.get(query) {
-            if dialogs.promises.is_empty() {
-                // drop cache
-                self.delete_cached_sponsored_dialogs_timeout
-                    .remove(&dialogs.local_id);
-                self.local_id_to_search_query.remove(&dialogs.local_id);
-                for dialog in &dialogs.dialogs {
-                    self.dialog_infos.remove(&dialog.local_id);
-                }
-                self.search_sponsored_dialogs.remove(query);
+        if let Some(dialogs) = self.search_sponsored_dialogs.get(query)
+            && dialogs.promises.is_empty()
+        {
+            // drop cache
+            self.delete_cached_sponsored_dialogs_timeout
+                .remove(&dialogs.local_id);
+            self.local_id_to_search_query.remove(&dialogs.local_id);
+            for dialog in &dialogs.dialogs {
+                self.dialog_infos.remove(&dialog.local_id);
             }
+            self.search_sponsored_dialogs.remove(query);
         }
 
         let is_first = {
@@ -1195,17 +1204,17 @@ impl SponsoredMessageManager {
             promise.set_value(object);
             return;
         }
-        if let Some(ads) = self.video_sponsored_ads.get(&message_full_id) {
-            if ads.promises.is_empty() {
-                // drop cache
-                self.delete_cached_sponsored_videos_timeout
-                    .remove(&ads.local_id);
-                self.local_id_to_message_full_id.remove(&ads.local_id);
-                for message in &ads.messages {
-                    self.video_ad_infos.remove(&message.local_id);
-                }
-                self.video_sponsored_ads.remove(&message_full_id);
+        if let Some(ads) = self.video_sponsored_ads.get(&message_full_id)
+            && ads.promises.is_empty()
+        {
+            // drop cache
+            self.delete_cached_sponsored_videos_timeout
+                .remove(&ads.local_id);
+            self.local_id_to_message_full_id.remove(&ads.local_id);
+            for message in &ads.messages {
+                self.video_ad_infos.remove(&message.local_id);
             }
+            self.video_sponsored_ads.remove(&message_full_id);
         }
 
         let is_first = {
@@ -1666,14 +1675,17 @@ mod tests {
     }
 
     #[test]
-    fn search_needs_a_minimal_query() {
+    fn search_answers_short_queries_offline() {
         let mut env = TestEnv {
             denied_dialogs: HashSet::new(),
             viewed: RefCell::new(Vec::new()),
         };
         let mut manager = SponsoredMessageManager::new();
-        let (promise, _, failed) = flag_promise::<td_api::SponsoredChats>();
+        let (promise, fulfilled, failed) = flag_promise::<td_api::SponsoredChats>();
         manager.get_search_sponsored_dialogs(&mut env, "abc", promise);
-        assert!(failed.load(std::sync::atomic::Ordering::SeqCst));
+        // the C++ guard (SponsoredMessageManager.cpp:631-633):
+        // query.size() < 4 answers the empty sponsoredChats object
+        assert!(fulfilled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!failed.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

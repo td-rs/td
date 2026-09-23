@@ -394,8 +394,6 @@ impl PromoDataManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use super::*;
     use std::collections::HashMap;
 
     /// The recorded-time env over the [`PromoDataManagerEnv`] surfaces.
@@ -710,7 +708,7 @@ mod tests {
         );
 
         // the dismissed birthday suggestion wins the option boolean
-        assert_eq!(env.options_boolean["dismiss_birthday_contact_today"], true);
+        assert!(env.options_boolean["dismiss_birthday_contact_today"]);
 
         // the suggestion table: SETUP_PASSWORD lands while no relogin
         // deadline is set, NEWCOMER_TICKS lands, unknown drops, and the

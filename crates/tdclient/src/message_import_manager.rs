@@ -1,4 +1,6 @@
-//!
+//! The `MessageImportManager` port (MessageImportManager.{h,cpp}) — the
+//! history-import eligibility checks, the confirmation text and the
+//! import intake over the input-file id seam (M.26).
 
 use crate::chat_manager::ChannelId;
 use crate::dialog_id::{DialogId, DialogType};
@@ -301,13 +303,16 @@ mod tests {
         assert!(status.message().contains("Not enough rights"));
 
         env.can_change.insert(10);
-        env.broadcast_channels.insert(10);
+        // the broadcast probe takes the dialog id (the C++
+        // dialog_manager_->is_broadcast_channel(dialog_id))
+        let broadcast_dialog = dialog_id.get();
+        env.broadcast_channels.insert(broadcast_dialog);
         let status = manager
             .can_import_messages(&mut env, dialog_id)
             .unwrap_err();
         assert!(status.message().contains("channels"));
 
-        env.broadcast_channels.remove(&10);
+        env.broadcast_channels.remove(&broadcast_dialog);
         assert!(manager.can_import_messages(&mut env, dialog_id).is_ok());
     }
 
@@ -339,12 +344,13 @@ mod tests {
 
     /// A minimal promise + flag factory (the tdutils Promise has no
     /// introspection surface).
-    fn flag_promise<T: Send + Default + 'static>() -> (
+    type FlagPromiseViews<T> = (
         Promise<T>,
         std::sync::Arc<std::sync::atomic::AtomicBool>,
         std::sync::Arc<std::sync::atomic::AtomicBool>,
         std::sync::Arc<parking_lot::Mutex<Option<T>>>,
-    ) {
+    );
+    fn flag_promise<T: Send + Default + 'static>() -> FlagPromiseViews<T> {
         struct FlagPromise<T> {
             value_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
             error_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
