@@ -245,8 +245,10 @@ impl TopDialogs {
 
     /// `parse(TopDialogs &, ParserT &)` (TopDialogManager.cpp:364-369).
     pub fn parse(parser: &mut Parser<'_>) -> Result<TopDialogs, &'static str> {
-        let mut result = TopDialogs::default();
-        result.rating_timestamp = parser.f64_()?;
+        let mut result = TopDialogs {
+            rating_timestamp: parser.f64_()?,
+            ..Default::default()
+        };
         let len = parser.i32_()?;
         if len < 0 {
             return Err("Invalid vector size");
@@ -1841,9 +1843,11 @@ mod tests {
         // through the load_dialogs seam (M.10) and clears the queue
         manager.on_get_top_peers(
             &mut env,
-            Ok(telegram_api::contacts_TopPeers::contacts_topPeersNotModified(
-                telegram_api::contacts_topPeersNotModified,
-            )),
+            Ok(
+                telegram_api::contacts_TopPeers::contacts_topPeersNotModified(
+                    telegram_api::contacts_topPeersNotModified,
+                ),
+            ),
         );
         assert_eq!(env.load_dialogs_calls.len(), 1);
         assert!(manager.pending_get_top_dialogs.is_empty());
@@ -2042,9 +2046,11 @@ mod tests {
         env.server_time += 241920.0;
         manager.on_get_top_peers(
             &mut env,
-            Ok(telegram_api::contacts_TopPeers::contacts_topPeersNotModified(
-                telegram_api::contacts_topPeersNotModified,
-            )),
+            Ok(
+                telegram_api::contacts_TopPeers::contacts_topPeersNotModified(
+                    telegram_api::contacts_topPeersNotModified,
+                ),
+            ),
         );
         let after =
             manager.by_category[TopDialogCategory::Correspondent.position()].dialogs[0].rating;
@@ -2064,9 +2070,11 @@ mod tests {
         // dirty categories after the db delay
         manager.on_get_top_peers(
             &mut env,
-            Ok(telegram_api::contacts_TopPeers::contacts_topPeersNotModified(
-                telegram_api::contacts_topPeersNotModified,
-            )),
+            Ok(
+                telegram_api::contacts_TopPeers::contacts_topPeersNotModified(
+                    telegram_api::contacts_topPeersNotModified,
+                ),
+            ),
         );
         env.now += DB_SYNC_DELAY as f64 + 1.0;
         manager.loop_(&mut env);
@@ -2123,7 +2131,8 @@ mod tests {
     #[test]
     fn init_sends_the_stored_toggle_query() {
         let mut env = FakeEnv::new();
-        env.pmc.insert("top_peers_enabled".to_owned(), b"1".to_vec());
+        env.pmc
+            .insert("top_peers_enabled".to_owned(), b"1".to_vec());
         let mut manager = TopDialogManager::new();
         manager.init(&mut env);
         assert_eq!(env.toggle_queries, vec![true]);
@@ -2153,7 +2162,7 @@ mod tests {
         let mut manager = TopDialogManager::new();
         manager.init(&mut env);
         assert!(!manager.is_enabled);
-        assert!(env.pmc.get("top_dialogs#group").is_none());
+        assert!(!env.pmc.contains_key("top_dialogs#group"));
         // disabled machine: get_top_dialogs answers the disabled band
         let slot: Slot<td_api::Chats> = Slot::new();
         manager.get_top_dialogs(

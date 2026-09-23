@@ -1,5 +1,3 @@
-//!
-
 use crate::chat_manager::ChannelId;
 use crate::dialog_id::{DialogId, DialogType};
 use crate::store_parse::{Parser, store_flags, store_i32};
@@ -182,7 +180,7 @@ impl ChannelRecommendationManager {
         let is_premium = env.get_option_boolean("is_premium", false);
         let have_all =
             recommended_dialogs.dialog_ids.len() as i32 == recommended_dialogs.total_count;
-        !(!have_all && is_premium)
+        have_all || !is_premium
     }
 
     /// `get_recommended_channels` (ChannelRecommendationManager.cpp:160-181).
@@ -307,14 +305,13 @@ impl ChannelRecommendationManager {
         if queries.len() == 1 {
             // The [blocked: net] reload; the count queries with
             // return_local answer -1 exactly like the C++ reload.
-            if return_local {
-                if let Some(promises) = self
+            if return_local
+                && let Some(promises) = self
                     .get_channel_recommendation_count_queries
                     .remove(&(true, channel_id))
-                {
-                    for mut promise in promises {
-                        promise.set_value(-1);
-                    }
+            {
+                for mut promise in promises {
+                    promise.set_value(-1);
                 }
             }
             env.reload_recommended_channels(channel_id);

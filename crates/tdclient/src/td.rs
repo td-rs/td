@@ -11874,6 +11874,374 @@ impl crate::inline_message_manager::InlineMessageManagerEnv for TdInlineEnv<'_> 
     }
 }
 
+/// Field-split the `Td` for the top-dialog/recommendation manager calls.
+pub(crate) fn top_dialog_env_split(
+    td: &mut Td,
+) -> (
+    TdTopDialogEnv<'_>,
+    &mut crate::top_dialog_manager::TopDialogManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        chat_manager,
+        top_dialog_manager,
+        ..
+    } = td;
+    (
+        TdTopDialogEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_authorized: auth_manager.is_authorized(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            chat_manager,
+        },
+        top_dialog_manager,
+    )
+}
+
+pub(crate) fn recommendation_env_split(
+    td: &mut Td,
+) -> (
+    TdTopDialogEnv<'_>,
+    &mut crate::channel_recommendation_manager::ChannelRecommendationManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        chat_manager,
+        channel_recommendation_manager,
+        ..
+    } = td;
+    (
+        TdTopDialogEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_authorized: auth_manager.is_authorized(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            chat_manager,
+        },
+        channel_recommendation_manager,
+    )
+}
+
+/// The `G()`/manager slice of the collapsed TopDialogManager +
+/// ChannelRecommendationManager pair (M.27).
+pub(crate) struct TdTopDialogEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    /// `None` once the option manager is torn down; the getters answer
+    /// their defaults on the destroy path.
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+}
+
+fn top_env_user_env<'a>(
+    global: &'a mut Global,
+    options: &'a mut OptionManager,
+    auth_is_bot: bool,
+) -> UserEnv<'a> {
+    UserEnv {
+        global,
+        options,
+        auth_is_bot,
+    }
+}
+
+impl crate::top_dialog_manager::TopDialogManagerEnv for TdTopDialogEnv<'_> {
+    fn now_cached(&self) -> f64 {
+        tdutils::time::now()
+    }
+
+    fn server_time(&self) -> f64 {
+        self.global.server_time()
+    }
+
+    fn clocks_system(&self) -> f64 {
+        tdutils::time::now()
+    }
+
+    fn auth_is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn get_option_boolean(&self, name: &str, default_value: bool) -> bool {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_boolean(name, default_value)
+        })
+    }
+
+    fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_integer(name, default_value)
+        })
+    }
+
+    fn set_option_boolean(&mut self, name: &str, value: bool) {
+        if let Some(options) = self.options.as_mut() {
+            options.set_option_boolean(name, value);
+        }
+    }
+
+    fn set_option_empty(&mut self, name: &str) {
+        if let Some(options) = self.options.as_mut() {
+            options.set_option_empty(name);
+        }
+    }
+
+    fn binlog_pmc_get_raw(&mut self, key: &str) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key.as_bytes())
+    }
+
+    fn binlog_pmc_set_raw(&mut self, key: &str, value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key.as_bytes(), value);
+    }
+
+    fn binlog_pmc_erase(&mut self, key: &str) {
+        self.global.binlog_pmc().erase(key);
+    }
+
+    fn binlog_pmc_erase_by_prefix(&mut self, prefix: &str) {
+        self.global.binlog_pmc().erase_by_prefix(prefix.as_bytes());
+    }
+
+    fn use_chat_info_database(&self) -> bool {
+        self.global.use_chat_info_database()
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        _source: &str,
+    ) -> Result<(), tdutils::status::Status> {
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::User => {
+                if self
+                    .user_manager
+                    .have_accessible_user(dialog_id.get_user_id())
+                {
+                    Ok(())
+                } else if dialog_id.is_valid() {
+                    Err(tdutils::status::Status::error(400, "Chat not found"))
+                } else {
+                    Err(tdutils::status::Status::error(
+                        400,
+                        "Invalid chat identifier specified",
+                    ))
+                }
+            }
+            crate::dialog_id::DialogType::SecretChat => {
+                if self
+                    .user_manager
+                    .have_secret_chat(dialog_id.get_secret_chat_id())
+                {
+                    Ok(())
+                } else {
+                    Err(tdutils::status::Status::error(400, "Chat not found"))
+                }
+            }
+            crate::dialog_id::DialogType::Chat | crate::dialog_id::DialogType::Channel => {
+                Err(tdutils::status::Status::error(400, "Chat not found"))
+            }
+            crate::dialog_id::DialogType::None => Err(tdutils::status::Status::error(
+                400,
+                "Invalid chat identifier specified",
+            )),
+        }
+    }
+
+    fn get_chats_object(
+        &mut self,
+        total_count: i32,
+        dialog_ids: &[crate::dialog_id::DialogId],
+        source: &str,
+    ) -> crate::td_api::Chats {
+        crate::dialog_manager::get_chats_object(total_count, dialog_ids, source)
+    }
+
+    fn is_user_deleted(&self, user_id: UserId) -> bool {
+        self.user_manager.is_user_deleted_of(user_id)
+    }
+
+    fn get_my_id(&self) -> UserId {
+        self.user_manager.get_my_id()
+    }
+
+    fn get_bot_data(
+        &self,
+        user_id: UserId,
+    ) -> Result<crate::user_manager::BotData, tdutils::status::Status> {
+        self.user_manager.get_bot_data(user_id)
+    }
+
+    fn on_need_dialog_stories_changed(&mut self, _dialog_id: crate::dialog_id::DialogId) {
+        // M.6 stub
+    }
+
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        let Some(options) = self.options.as_mut() else {
+            return;
+        };
+        let mut env = top_env_user_env(self.global, options, self.auth_is_bot);
+        self.user_manager.on_get_users(&mut env, users, source);
+    }
+
+    fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
+        let Some(options) = self.options.as_mut() else {
+            return;
+        };
+        let mut env = top_env_user_env(self.global, options, self.auth_is_bot);
+        self.chat_manager
+            .on_get_chats(self.user_manager, &mut env, chats, source);
+    }
+
+    fn load_dialogs(&mut self, _dialog_ids: Vec<crate::dialog_id::DialogId>) {
+        // M.6 stub
+    }
+
+    fn wait_first_sync(&mut self) {
+        // [blocked: StateManager]
+    }
+
+    fn send_toggle_top_peers_query(&mut self, _is_enabled: bool) {
+        // [blocked: net]
+    }
+
+    fn send_get_top_peers_query(&mut self, _hash: i64) {
+        // [blocked: net]
+    }
+
+    fn send_reset_top_peer_rating_query(
+        &mut self,
+        _category: crate::top_dialog_manager::TopDialogCategory,
+        _dialog_id: crate::dialog_id::DialogId,
+    ) {
+        // [blocked: net]
+    }
+}
+
+impl crate::channel_recommendation_manager::ChannelRecommendationManagerEnv for TdTopDialogEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn now(&self) -> f64 {
+        tdutils::time::now()
+    }
+
+    fn use_message_database(&self) -> bool {
+        self.global.use_message_database()
+    }
+
+    fn get_option_boolean(&self, name: &str, default_value: bool) -> bool {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_boolean(name, default_value)
+        })
+    }
+
+    fn channel_is_member(&self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        self.chat_manager.get_channel_status(channel_id).is_member()
+    }
+
+    fn have_input_peer_channel(&mut self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        let Some(options) = self.options.as_deref_mut() else {
+            return false;
+        };
+        let env = UserEnv {
+            global: self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.chat_manager.have_input_peer_channel_id(
+            &env,
+            channel_id,
+            crate::user_manager::AccessRights::Read,
+        )
+    }
+
+    fn is_broadcast_channel(&self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        self.chat_manager.get_channel_type_by_id(channel_id)
+            == crate::chat_manager::ChannelType::Broadcast
+    }
+
+    fn get_input_channel(&mut self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        let Some(options) = self.options.as_deref_mut() else {
+            return false;
+        };
+        let env = UserEnv {
+            global: self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.chat_manager
+            .get_input_channel(&env, channel_id)
+            .is_some()
+    }
+
+    fn have_dialog_force(&self, dialog_id: crate::dialog_id::DialogId) -> bool {
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::User => self
+                .user_manager
+                .have_accessible_user(dialog_id.get_user_id()),
+            crate::dialog_id::DialogType::Channel => self
+                .chat_manager
+                .get_channel(dialog_id.get_channel_id())
+                .is_some(),
+            crate::dialog_id::DialogType::Chat
+            | crate::dialog_id::DialogType::SecretChat
+            | crate::dialog_id::DialogType::None => false,
+        }
+    }
+
+    fn force_create_dialog(&mut self, _dialog_id: crate::dialog_id::DialogId) {
+        // M.6 stub
+    }
+
+    fn get_chats_object(
+        &mut self,
+        total_count: i32,
+        dialog_ids: &[crate::dialog_id::DialogId],
+    ) -> crate::td_api::Chats {
+        crate::dialog_manager::get_chats_object(total_count, dialog_ids, "recommendations")
+    }
+
+    fn sqlite_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.td_db().common_kv().get(key)
+    }
+
+    fn sqlite_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.td_db().common_kv().set(key, value);
+    }
+
+    fn sqlite_pmc_erase(&mut self, key: &[u8]) {
+        self.global.td_db().common_kv().erase(key);
+    }
+
+    fn reload_recommended_channels(&mut self, _channel_id: crate::chat_manager::ChannelId) {
+        // [blocked: net]
+    }
+
+    fn save_app_log(&mut self, _ref_channel_id: i64, _open_channel_id: i64, _promise: Promise<()>) {
+        // [blocked: net]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -13888,373 +14256,5 @@ mod tests {
             );
             assert!(matches!(responses_of(callback, 3)[0], Object::ok(_)));
         });
-    }
-}
-
-/// Field-split the `Td` for the top-dialog/recommendation manager calls.
-pub(crate) fn top_dialog_env_split(
-    td: &mut Td,
-) -> (
-    TdTopDialogEnv<'_>,
-    &mut crate::top_dialog_manager::TopDialogManager,
-) {
-    let crate::td::Td {
-        global,
-        option_manager,
-        auth_manager,
-        user_manager,
-        chat_manager,
-        top_dialog_manager,
-        ..
-    } = td;
-    (
-        TdTopDialogEnv {
-            global,
-            options: option_manager.as_mut(),
-            auth_is_authorized: auth_manager.is_authorized(),
-            auth_is_bot: auth_manager.is_bot(),
-            user_manager,
-            chat_manager,
-        },
-        top_dialog_manager,
-    )
-}
-
-pub(crate) fn recommendation_env_split(
-    td: &mut Td,
-) -> (
-    TdTopDialogEnv<'_>,
-    &mut crate::channel_recommendation_manager::ChannelRecommendationManager,
-) {
-    let crate::td::Td {
-        global,
-        option_manager,
-        auth_manager,
-        user_manager,
-        chat_manager,
-        channel_recommendation_manager,
-        ..
-    } = td;
-    (
-        TdTopDialogEnv {
-            global,
-            options: option_manager.as_mut(),
-            auth_is_authorized: auth_manager.is_authorized(),
-            auth_is_bot: auth_manager.is_bot(),
-            user_manager,
-            chat_manager,
-        },
-        channel_recommendation_manager,
-    )
-}
-
-/// The `G()`/manager slice of the collapsed TopDialogManager +
-/// ChannelRecommendationManager pair (M.27).
-pub(crate) struct TdTopDialogEnv<'a> {
-    pub(crate) global: &'a mut Global,
-    /// `None` once the option manager is torn down; the getters answer
-    /// their defaults on the destroy path.
-    pub(crate) options: Option<&'a mut OptionManager>,
-    pub(crate) auth_is_authorized: bool,
-    pub(crate) auth_is_bot: bool,
-    pub(crate) user_manager: &'a mut UserManager,
-    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
-}
-
-fn top_env_user_env<'a>(
-    global: &'a mut Global,
-    options: &'a mut OptionManager,
-    auth_is_bot: bool,
-) -> UserEnv<'a> {
-    UserEnv {
-        global,
-        options,
-        auth_is_bot,
-    }
-}
-
-impl crate::top_dialog_manager::TopDialogManagerEnv for TdTopDialogEnv<'_> {
-    fn now_cached(&self) -> f64 {
-        tdutils::time::now()
-    }
-
-    fn server_time(&self) -> f64 {
-        self.global.server_time()
-    }
-
-    fn clocks_system(&self) -> f64 {
-        tdutils::time::now()
-    }
-
-    fn auth_is_authorized(&self) -> bool {
-        self.auth_is_authorized
-    }
-
-    fn auth_is_bot(&self) -> bool {
-        self.auth_is_bot
-    }
-
-    fn close_flag(&self) -> bool {
-        self.global.close_flag()
-    }
-
-    fn get_option_boolean(&self, name: &str, default_value: bool) -> bool {
-        self.options.as_ref().map_or(default_value, |options| {
-            options.get_option_boolean(name, default_value)
-        })
-    }
-
-    fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
-        self.options.as_ref().map_or(default_value, |options| {
-            options.get_option_integer(name, default_value)
-        })
-    }
-
-    fn set_option_boolean(&mut self, name: &str, value: bool) {
-        if let Some(options) = self.options.as_mut() {
-            options.set_option_boolean(name, value);
-        }
-    }
-
-    fn set_option_empty(&mut self, name: &str) {
-        if let Some(options) = self.options.as_mut() {
-            options.set_option_empty(name);
-        }
-    }
-
-    fn binlog_pmc_get_raw(&mut self, key: &str) -> Vec<u8> {
-        self.global.binlog_pmc().get_raw(key.as_bytes())
-    }
-
-    fn binlog_pmc_set_raw(&mut self, key: &str, value: &[u8]) {
-        self.global.binlog_pmc().set_raw(key.as_bytes(), value);
-    }
-
-    fn binlog_pmc_erase(&mut self, key: &str) {
-        self.global.binlog_pmc().erase(key);
-    }
-
-    fn binlog_pmc_erase_by_prefix(&mut self, prefix: &str) {
-        self.global.binlog_pmc().erase_by_prefix(prefix.as_bytes());
-    }
-
-    fn use_chat_info_database(&self) -> bool {
-        self.global.use_chat_info_database()
-    }
-
-    fn check_dialog_access(
-        &mut self,
-        dialog_id: crate::dialog_id::DialogId,
-        _source: &str,
-    ) -> Result<(), tdutils::status::Status> {
-        match dialog_id.get_type() {
-            crate::dialog_id::DialogType::User => {
-                if self
-                    .user_manager
-                    .have_accessible_user(dialog_id.get_user_id())
-                {
-                    Ok(())
-                } else if dialog_id.is_valid() {
-                    Err(tdutils::status::Status::error(400, "Chat not found"))
-                } else {
-                    Err(tdutils::status::Status::error(
-                        400,
-                        "Invalid chat identifier specified",
-                    ))
-                }
-            }
-            crate::dialog_id::DialogType::SecretChat => {
-                if self
-                    .user_manager
-                    .have_secret_chat(dialog_id.get_secret_chat_id())
-                {
-                    Ok(())
-                } else {
-                    Err(tdutils::status::Status::error(400, "Chat not found"))
-                }
-            }
-            crate::dialog_id::DialogType::Chat | crate::dialog_id::DialogType::Channel => {
-                Err(tdutils::status::Status::error(400, "Chat not found"))
-            }
-            crate::dialog_id::DialogType::None => Err(tdutils::status::Status::error(
-                400,
-                "Invalid chat identifier specified",
-            )),
-        }
-    }
-
-    fn get_chats_object(
-        &mut self,
-        total_count: i32,
-        dialog_ids: &[crate::dialog_id::DialogId],
-        source: &str,
-    ) -> crate::td_api::Chats {
-        crate::dialog_manager::get_chats_object(total_count, dialog_ids, source)
-    }
-
-    fn is_user_deleted(&self, user_id: UserId) -> bool {
-        self.user_manager.is_user_deleted_of(user_id)
-    }
-
-    fn get_my_id(&self) -> UserId {
-        self.user_manager.get_my_id()
-    }
-
-    fn get_bot_data(
-        &self,
-        user_id: UserId,
-    ) -> Result<crate::user_manager::BotData, tdutils::status::Status> {
-        self.user_manager.get_bot_data(user_id)
-    }
-
-    fn on_need_dialog_stories_changed(&mut self, _dialog_id: crate::dialog_id::DialogId) {
-        // M.6 stub
-    }
-
-    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
-        let Some(options) = self.options.as_mut() else {
-            return;
-        };
-        let mut env = top_env_user_env(&mut self.global, options, self.auth_is_bot);
-        self.user_manager.on_get_users(&mut env, users, source);
-    }
-
-    fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &str) {
-        let Some(options) = self.options.as_mut() else {
-            return;
-        };
-        let mut env = top_env_user_env(&mut self.global, options, self.auth_is_bot);
-        self.chat_manager
-            .on_get_chats(self.user_manager, &mut env, chats, source);
-    }
-
-    fn load_dialogs(&mut self, _dialog_ids: Vec<crate::dialog_id::DialogId>) {
-        // M.6 stub
-    }
-
-    fn wait_first_sync(&mut self) {
-        // [blocked: StateManager]
-    }
-
-    fn send_toggle_top_peers_query(&mut self, _is_enabled: bool) {
-        // [blocked: net]
-    }
-
-    fn send_get_top_peers_query(&mut self, _hash: i64) {
-        // [blocked: net]
-    }
-
-    fn send_reset_top_peer_rating_query(
-        &mut self,
-        _category: crate::top_dialog_manager::TopDialogCategory,
-        _dialog_id: crate::dialog_id::DialogId,
-    ) {
-        // [blocked: net]
-    }
-}
-
-impl crate::channel_recommendation_manager::ChannelRecommendationManagerEnv for TdTopDialogEnv<'_> {
-    fn close_flag(&self) -> bool {
-        self.global.close_flag()
-    }
-
-    fn now(&self) -> f64 {
-        tdutils::time::now()
-    }
-
-    fn use_message_database(&self) -> bool {
-        self.global.use_message_database()
-    }
-
-    fn get_option_boolean(&self, name: &str, default_value: bool) -> bool {
-        self.options.as_ref().map_or(default_value, |options| {
-            options.get_option_boolean(name, default_value)
-        })
-    }
-
-    fn channel_is_member(&self, channel_id: crate::chat_manager::ChannelId) -> bool {
-        self.chat_manager.get_channel_status(channel_id).is_member()
-    }
-
-    fn have_input_peer_channel(&mut self, channel_id: crate::chat_manager::ChannelId) -> bool {
-        let Some(options) = self.options.as_deref_mut() else {
-            return false;
-        };
-        let env = UserEnv {
-            global: &mut self.global,
-            options,
-            auth_is_bot: self.auth_is_bot,
-        };
-        self.chat_manager.have_input_peer_channel_id(
-            &env,
-            channel_id,
-            crate::user_manager::AccessRights::Read,
-        )
-    }
-
-    fn is_broadcast_channel(&self, channel_id: crate::chat_manager::ChannelId) -> bool {
-        self.chat_manager.get_channel_type_by_id(channel_id)
-            == crate::chat_manager::ChannelType::Broadcast
-    }
-
-    fn get_input_channel(&mut self, channel_id: crate::chat_manager::ChannelId) -> bool {
-        let Some(options) = self.options.as_deref_mut() else {
-            return false;
-        };
-        let env = UserEnv {
-            global: &mut self.global,
-            options,
-            auth_is_bot: self.auth_is_bot,
-        };
-        self.chat_manager
-            .get_input_channel(&env, channel_id)
-            .is_some()
-    }
-
-    fn have_dialog_force(&self, dialog_id: crate::dialog_id::DialogId) -> bool {
-        match dialog_id.get_type() {
-            crate::dialog_id::DialogType::User => self
-                .user_manager
-                .have_accessible_user(dialog_id.get_user_id()),
-            crate::dialog_id::DialogType::Channel => self
-                .chat_manager
-                .get_channel(dialog_id.get_channel_id())
-                .is_some(),
-            crate::dialog_id::DialogType::Chat
-            | crate::dialog_id::DialogType::SecretChat
-            | crate::dialog_id::DialogType::None => false,
-        }
-    }
-
-    fn force_create_dialog(&mut self, _dialog_id: crate::dialog_id::DialogId) {
-        // M.6 stub
-    }
-
-    fn get_chats_object(
-        &mut self,
-        total_count: i32,
-        dialog_ids: &[crate::dialog_id::DialogId],
-    ) -> crate::td_api::Chats {
-        crate::dialog_manager::get_chats_object(total_count, dialog_ids, "recommendations")
-    }
-
-    fn sqlite_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
-        self.global.td_db().common_kv().get(key)
-    }
-
-    fn sqlite_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
-        self.global.td_db().common_kv().set(key, value);
-    }
-
-    fn sqlite_pmc_erase(&mut self, key: &[u8]) {
-        self.global.td_db().common_kv().erase(key);
-    }
-
-    fn reload_recommended_channels(&mut self, _channel_id: crate::chat_manager::ChannelId) {
-        // [blocked: net]
-    }
-
-    fn save_app_log(&mut self, _ref_channel_id: i64, _open_channel_id: i64, _promise: Promise<()>) {
-        // [blocked: net]
     }
 }
