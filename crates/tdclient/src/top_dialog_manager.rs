@@ -188,6 +188,10 @@ pub struct TopDialog {
     pub(crate) rating: f64,
 }
 
+// `Ord` requires `Eq`; the f64 rating is the C++ double rating, which the
+// recorded path never sets to NaN (`cmp` folds NaN onto `Ordering::Equal`).
+impl Eq for TopDialog {}
+
 impl TopDialog {
     pub fn new(dialog_id: DialogId, rating: f64) -> TopDialog {
         TopDialog { dialog_id, rating }
@@ -370,6 +374,9 @@ enum SyncState {
 }
 
 /// `TopDialogManager::GetTopDialogsQuery` (TopDialogManager.h:73-77).
+/// `limit`/`promise` are consumed by `on_load_dialogs` — the net-independent
+/// half of the `getTopChats` tail (its net half parks the promise).
+#[allow(dead_code)]
 pub struct GetTopDialogsQuery {
     pub(crate) category: TopDialogCategory,
     pub(crate) limit: usize,
@@ -377,7 +384,6 @@ pub struct GetTopDialogsQuery {
 }
 
 /// `TopDialogManager` (TopDialogManager.h:28-139) — the collapsed actor.
-#[derive(Debug)]
 pub struct TopDialogManager {
     is_enabled: bool,
     is_synchronized: bool,
@@ -419,6 +425,37 @@ impl Default for TopDialogManager {
             by_category: std::array::from_fn(|_| TopDialogs::default()),
             deadline: Timestamp::never(),
         }
+    }
+}
+
+impl std::fmt::Debug for TopDialogManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TopDialogManager")
+            .field("is_enabled", &self.is_enabled)
+            .field("is_synchronized", &self.is_synchronized)
+            .field("rating_e_decay", &self.rating_e_decay)
+            .field(
+                "have_toggle_top_peers_query",
+                &self.have_toggle_top_peers_query,
+            )
+            .field(
+                "have_pending_toggle_top_peers_query",
+                &self.have_pending_toggle_top_peers_query,
+            )
+            .field(
+                "pending_toggle_top_peers_query",
+                &self.pending_toggle_top_peers_query,
+            )
+            .field("was_first_sync", &self.was_first_sync)
+            .field("db_sync_state", &self.db_sync_state)
+            .field("first_unsync_change", &self.first_unsync_change)
+            .field("server_sync_state", &self.server_sync_state)
+            .field("last_server_sync", &self.last_server_sync)
+            .field(
+                "pending_get_top_dialogs",
+                &self.pending_get_top_dialogs.len(),
+            )
+            .finish()
     }
 }
 
@@ -533,7 +570,11 @@ impl TopDialogManager {
             }
         };
 
-        let delta = TopDialogManager::rating_add_static(date as f64, top_dialogs.rating_timestamp);
+        let delta = TopDialogManager::rating_add_static(
+            date as f64,
+            top_dialogs.rating_timestamp,
+            self.rating_e_decay,
+        );
         let old_need_dialog_stories =
             need_dialog_stories(category, dialog_id, top_dialogs.dialogs[pos].rating);
         top_dialogs.dialogs[pos].rating += delta;
@@ -714,11 +755,11 @@ impl TopDialogManager {
 
     /// `TopDialogManager::rating_add` (TopDialogManager.cpp:371-373).
     fn rating_add(&self, now: f64, rating_timestamp: f64) -> f64 {
-        Self::rating_add_static(now, rating_timestamp)
+        Self::rating_add_static(now, rating_timestamp, self.rating_e_decay)
     }
 
-    fn rating_add_static(now: f64, rating_timestamp: f64) -> f64 {
-        ((now - rating_timestamp) / self.rating_e_decay as f64).exp()
+    fn rating_add_static(now: f64, rating_timestamp: f64, rating_e_decay: i32) -> f64 {
+        ((now - rating_timestamp) / rating_e_decay as f64).exp()
     }
 
     /// `TopDialogManager::current_rating_add` (TopDialogManager.cpp:375-377).
@@ -728,24 +769,30 @@ impl TopDialogManager {
 
     /// `TopDialogManager::normalize_rating` (TopDialogManager.cpp:379-397)
     /// — the daily decay.
-    fn normalize_rating(&mut self, env: &impl TopDialogManagerEnv) {
+    fn normalize_rating(&mut self, env: &mut impl TopDialogManagerEnv) {
         let server_time = env.server_time();
         for i in 0..TOP_DIALOG_CATEGORY_SIZE {
-            let top_dialogs = &mut self.by_category[i];
-            let div_by = self.current_rating_add(server_time, top_dialogs.rating_timestamp);
-            top_dialogs.rating_timestamp = server_time;
+            let div_by = self.current_rating_add(server_time, self.by_category[i].rating_timestamp);
             let category = to_top_dialog_category(i);
-            for dialog in &mut top_dialogs.dialogs {
-                let old_need_dialog_stories =
-                    need_dialog_stories(category, dialog.dialog_id, dialog.rating);
-                dialog.rating /= div_by;
-                if old_need_dialog_stories
-                    != need_dialog_stories(category, dialog.dialog_id, dialog.rating)
-                {
-                    self.on_need_dialog_stories_changed(env, dialog.dialog_id);
+            let mut stories_changed: Vec<DialogId> = Vec::new();
+            {
+                let top_dialogs = &mut self.by_category[i];
+                top_dialogs.rating_timestamp = server_time;
+                for dialog in &mut top_dialogs.dialogs {
+                    let old_need_dialog_stories =
+                        need_dialog_stories(category, dialog.dialog_id, dialog.rating);
+                    dialog.rating /= div_by;
+                    if old_need_dialog_stories
+                        != need_dialog_stories(category, dialog.dialog_id, dialog.rating)
+                    {
+                        stories_changed.push(dialog.dialog_id);
+                    }
                 }
+                top_dialogs.is_dirty = true;
             }
-            top_dialogs.is_dirty = true;
+            for dialog_id in stories_changed {
+                self.on_need_dialog_stories_changed(env, dialog_id);
+            }
         }
         self.db_sync_state = SyncState::None;
     }
@@ -800,6 +847,9 @@ impl TopDialogManager {
     /// `TopDialogManager::on_load_dialogs` (TopDialogManager.cpp:445-488)
     /// — the load_dialogs callback; net/M.10-coupled, directly callable
     /// (and tested) as the local filter + builder half.
+    /// The M.6/M.10 `load_dialogs` hop — only the blocked seam skips it in
+    /// the lib build (the inline tests drive it).
+    #[allow(dead_code)]
     pub(crate) fn on_load_dialogs(
         &self,
         env: &mut impl TopDialogManagerEnv,
@@ -812,11 +862,11 @@ impl TopDialogManager {
             if dialog_id.get_type() == crate::dialog_id::DialogType::User {
                 let user_id = dialog_id.get_user_id();
                 if env.is_user_deleted(user_id) {
-                    tdutils::log_info!("Skip deleted {user_id}");
+                    tdutils::log_info!("Skip deleted {user_id:?}");
                     continue;
                 }
                 if env.get_my_id() == user_id {
-                    tdutils::log_info!("Skip self {user_id}");
+                    tdutils::log_info!("Skip self {user_id:?}");
                     continue;
                 }
                 if query.category == TopDialogCategory::BotInline
@@ -826,20 +876,20 @@ impl TopDialogManager {
                     let bot_info = match env.get_bot_data(user_id) {
                         Ok(bot_info) => bot_info,
                         Err(_) => {
-                            tdutils::log_info!("Skip not a bot {user_id}");
+                            tdutils::log_info!("Skip not a bot {user_id:?}");
                             continue;
                         }
                     };
                     if query.category == TopDialogCategory::BotInline
                         && (bot_info.username.is_empty() || !bot_info.is_inline)
                     {
-                        tdutils::log_info!("Skip non-inline bot {user_id}");
+                        tdutils::log_info!("Skip non-inline bot {user_id:?}");
                         continue;
                     }
                     if query.category == TopDialogCategory::BotGuest
                         && (bot_info.username.is_empty() || !bot_info.is_guestchat)
                     {
-                        tdutils::log_info!("Skip non-guest bot {user_id}");
+                        tdutils::log_info!("Skip non-guest bot {user_id:?}");
                         continue;
                     }
                 }
@@ -884,10 +934,13 @@ impl TopDialogManager {
     /// `TopDialogManager::on_get_top_peers` (TopDialogManager.cpp:517-584)
     /// — the GetTopPeersQuery callback; net-coupled, directly callable
     /// (and tested) as the intake half.
+    /// The `contacts.getTopPeers` intake — its query is a [blocked: net]
+    /// seam (the inline tests drive it).
+    #[allow(dead_code)]
     pub(crate) fn on_get_top_peers(
         &mut self,
         env: &mut impl TopDialogManagerEnv,
-        result: Result<telegram_api::ContactsTopPeers, Status>,
+        result: Result<telegram_api::contacts_TopPeers, Status>,
     ) {
         self.normalize_rating(env); // once a day too
 
@@ -908,14 +961,14 @@ impl TopDialogManager {
         self.is_synchronized = true;
 
         match top_peers_parent {
-            telegram_api::ContactsTopPeers::topPeersNotModified(_) => {
+            telegram_api::contacts_TopPeers::contacts_topPeersNotModified(_) => {
                 // nothing to do
             }
-            telegram_api::ContactsTopPeers::topPeersDisabled(_) => {
+            telegram_api::contacts_TopPeers::contacts_topPeersDisabled(_) => {
                 env.set_option_boolean("disable_top_chats", true);
                 self.set_is_enabled(env, false); // apply immediately
             }
-            telegram_api::ContactsTopPeers::topPeers(top_peers) => {
+            telegram_api::contacts_TopPeers::contacts_topPeers(top_peers) => {
                 env.set_option_empty("disable_top_chats");
                 self.set_is_enabled(env, true); // apply immediately
 
@@ -1056,7 +1109,7 @@ impl TopDialogManager {
             }
             self.normalize_rating(env);
         } else {
-            env.binlog_pmc_erase_by_prefix(b"top_dialogs#");
+            env.binlog_pmc_erase_by_prefix("top_dialogs#");
             for top_dialogs in &mut self.by_category {
                 *top_dialogs = TopDialogs::default();
             }
@@ -1075,6 +1128,9 @@ impl TopDialogManager {
     /// `TopDialogManager::on_first_sync` (TopDialogManager.cpp:681-684) —
     /// the wait_first_sync callback; net-coupled, directly callable (and
     /// tested) as the local machine half.
+    /// The StateManager first-sync hop — [blocked: StateManager] (the
+    /// inline tests drive it).
+    #[allow(dead_code)]
     pub(crate) fn on_first_sync(&mut self, env: &mut impl TopDialogManagerEnv) {
         self.was_first_sync = true;
         self.loop_(env);
@@ -1144,6 +1200,9 @@ impl TopDialogManager {
 
     /// The collapsed actor timer slot — `next_deadline` for the shared Td
     /// timeout (`wakeup_timeout`, TopDialogManager.cpp:737-743).
+    /// Read by the Td timeout sweep wiring (and the tests) — the lib
+    /// build only reaches it through the [blocked: net] reschedule path.
+    #[allow(dead_code)]
     pub(crate) fn next_deadline(&self) -> Option<f64> {
         if bool::from(self.deadline) {
             Some(self.deadline.at())
@@ -1194,13 +1253,10 @@ fn need_dialog_stories(category: TopDialogCategory, dialog_id: DialogId, rating:
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use super::*;
     use crate::dialog_id::DialogType;
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
     use tdutils::promise::PromiseInterface;
-    use tdutils::status::Result;
 
     /// A [`PromiseInterface`] that parks the answer in a shared slot — the
     /// offline stand-in for the deferred outbox.
@@ -1244,9 +1300,9 @@ mod tests {
         close_flag: bool,
         use_chat_info_database: bool,
         access_denied: Option<Status>,
-        deleted_users: HashSet<i32>,
+        deleted_users: HashSet<i64>,
         my_id: UserId,
-        bots: HashMap<i32, BotData>,
+        bots: HashMap<i64, BotData>,
 
         // the recorded seams
         toggle_queries: Vec<bool>,
@@ -1255,7 +1311,7 @@ mod tests {
         load_dialogs_calls: Vec<Vec<i64>>,
         wait_first_sync_count: usize,
         story_updates: Vec<i64>,
-        option_writes: Vec<(&'static str, Option<bool>)>,
+        option_writes: Vec<(String, Option<bool>)>,
         users_intakes: Vec<&'static str>,
         chats_intakes: Vec<&'static str>,
     }
@@ -1700,20 +1756,9 @@ mod tests {
         assert!(env.reset_queries.is_empty());
         manager.is_enabled = true;
 
-        // not found: ok, no query
-        let slot: Slot<()> = Slot::new();
-        manager.remove_dialog(
-            &mut env,
-            TopDialogCategory::Group,
-            chat_id,
-            Promise::from_interface(slot.clone()),
-        );
-        assert!(slot.take().unwrap().is_ok());
-        assert!(env.reset_queries.is_empty());
-
-        // found: the reset query fires fire-and-forget, the row is removed,
-        // the answer lands before the story callback
-        manager.on_dialog_used(&mut env, TopDialogCategory::Group, chat_id, 10);
+        // not found: ok, but the fire-and-forget reset query still goes out
+        // (the C++ sends it before the membership check,
+        // TopDialogManager.cpp:256-262)
         let slot: Slot<()> = Slot::new();
         manager.remove_dialog(
             &mut env,
@@ -1723,6 +1768,25 @@ mod tests {
         );
         assert!(slot.take().unwrap().is_ok());
         assert_eq!(env.reset_queries, vec![(TopDialogCategory::Group, 3333)]);
+
+        // found: another reset query, the row is removed, the answer lands
+        // before the story callback
+        manager.on_dialog_used(&mut env, TopDialogCategory::Group, chat_id, 10);
+        let slot: Slot<()> = Slot::new();
+        manager.remove_dialog(
+            &mut env,
+            TopDialogCategory::Group,
+            chat_id,
+            Promise::from_interface(slot.clone()),
+        );
+        assert!(slot.take().unwrap().is_ok());
+        assert_eq!(
+            env.reset_queries,
+            vec![
+                (TopDialogCategory::Group, 3333),
+                (TopDialogCategory::Group, 3333)
+            ]
+        );
         assert!(
             manager.by_category[TopDialogCategory::Group.position()]
                 .dialogs
@@ -1735,6 +1799,9 @@ mod tests {
     fn get_top_dialogs_bands_and_pending_dispatch() {
         let mut env = FakeEnv::new();
         let mut manager = TopDialogManager::new();
+        // the manager is born enabled (TopDialogManager.h:59); the disabled
+        // band below rides it explicitly
+        manager.is_enabled = false;
 
         let band = |manager: &mut TopDialogManager, env: &mut FakeEnv, category, limit| {
             let slot: Slot<td_api::Chats> = Slot::new();
@@ -1762,11 +1829,23 @@ mod tests {
         assert_eq!(manager.pending_get_top_dialogs.len(), 1);
         assert!(env.load_dialogs_calls.is_empty());
 
-        // the first sync opens the gates: loop dispatches through the
-        // load_dialogs seam (M.10) and clears the queue
+        // the first sync starts the server sync (the [blocked: net] query
+        // seam), but the parked answer waits: is_synchronized is still false
+        // (C++ loop: the dispatch needs is_synchronized_ || !is_enabled_)
         manager.on_first_sync(&mut env);
-        assert_eq!(env.load_dialogs_calls.len(), 1);
         assert_eq!(env.get_top_peers_hashes.len(), 1);
+        assert!(env.load_dialogs_calls.is_empty());
+        assert_eq!(manager.pending_get_top_dialogs.len(), 1);
+
+        // the server answer synchronizes the machine: loop dispatches
+        // through the load_dialogs seam (M.10) and clears the queue
+        manager.on_get_top_peers(
+            &mut env,
+            Ok(telegram_api::contacts_TopPeers::contacts_topPeersNotModified(
+                telegram_api::contacts_topPeersNotModified,
+            )),
+        );
+        assert_eq!(env.load_dialogs_calls.len(), 1);
         assert!(manager.pending_get_top_dialogs.is_empty());
     }
 
@@ -1848,8 +1927,8 @@ mod tests {
             })),
             rating,
         };
-        let result = Ok(telegram_api::ContactsTopPeers::topPeers(
-            telegram_api::topPeers {
+        let result = Ok(telegram_api::contacts_TopPeers::contacts_topPeers(
+            telegram_api::contacts_topPeers {
                 categories: vec![
                     telegram_api::TopPeerCategoryPeers {
                         category: Some(
@@ -1896,9 +1975,10 @@ mod tests {
             env.pmc.get("top_dialogs_ts").map(|v| v.as_slice()),
             Some(b"1700000000".as_slice())
         );
-        // the rating story plane shrank: the old dialog (rating ~1) lost its
-        // row, no story flags flipped
-        assert!(env.story_updates.is_empty());
+        // the story set flipped [] -> [100, 101]: both new correspondents
+        // crossed MIN_STORY_RATING on the wire replacement
+        // (TopDialogManager.cpp:548-574 fires the change per boundary)
+        assert_eq!(env.story_updates, vec![100, 101]);
     }
 
     #[test]
@@ -1907,12 +1987,15 @@ mod tests {
         let mut manager = TopDialogManager::new();
         manager.on_get_top_peers(
             &mut env,
-            Ok(telegram_api::ContactsTopPeers::topPeersDisabled(
-                telegram_api::topPeersDisabled,
+            Ok(telegram_api::contacts_TopPeers::contacts_topPeersDisabled(
+                telegram_api::contacts_topPeersDisabled,
             )),
         );
         assert!(!manager.is_enabled);
-        assert_eq!(env.option_writes, vec![("disable_top_chats", Some(true))]);
+        assert_eq!(
+            env.option_writes,
+            vec![("disable_top_chats".to_string(), Some(true))]
+        );
         assert!(manager.is_synchronized);
     }
 
@@ -1926,18 +2009,20 @@ mod tests {
 
         manager.on_get_top_peers(&mut env, Err(Status::error(429, "Too Many Requests")));
 
-        // last_server_sync = now + (60 - 86400)
-        assert!((manager.last_server_sync.at() - (1000.0 - 85800.0)).abs() < 1e-9);
+        // last_server_sync = now + (SERVER_SYNC_RESEND_DELAY -
+        // SERVER_SYNC_DELAY) = now + (60 - 86400)
+        assert!((manager.last_server_sync.at() - (1000.0 - 86340.0)).abs() < 1e-9);
         // still Ok, not in the past: the wakeup lands at ts + 86400
         assert_eq!(manager.server_sync_state, SyncState::Ok);
         let deadline = manager.next_deadline().unwrap();
-        assert!((deadline - (1000.0 - 85800.0 + 86400.0)).abs() < 1e-9);
+        assert!((deadline - (1000.0 - 86340.0 + 86400.0)).abs() < 1e-9);
     }
 
     #[test]
     fn normalize_rating_decays_by_server_time_delta() {
         let mut env = FakeEnv::new();
         let mut manager = TopDialogManager::new();
+        manager.init(&mut env); // start_up: pins rating_timestamp at the server time
         let dialog_id = DialogId::new(8_001);
         // cross the story threshold before the decay
         for _ in 0..3 {
@@ -1957,15 +2042,16 @@ mod tests {
         env.server_time += 241920.0;
         manager.on_get_top_peers(
             &mut env,
-            Ok(telegram_api::ContactsTopPeers::topPeersNotModified(
-                telegram_api::topPeersNotModified,
+            Ok(telegram_api::contacts_TopPeers::contacts_topPeersNotModified(
+                telegram_api::contacts_topPeersNotModified,
             )),
         );
         let after =
             manager.by_category[TopDialogCategory::Correspondent.position()].dialogs[0].rating;
         assert!((after - before / std::f64::consts::E).abs() < 1e-9);
-        // and the story flag flipped off through the change callback
-        assert_eq!(env.story_updates, vec![8_001]);
+        // and the story flag flipped on during the uses, then off in the
+        // decay — one change callback per boundary
+        assert_eq!(env.story_updates, vec![8_001, 8_001]);
     }
 
     #[test]
@@ -1978,8 +2064,8 @@ mod tests {
         // dirty categories after the db delay
         manager.on_get_top_peers(
             &mut env,
-            Ok(telegram_api::ContactsTopPeers::topPeersNotModified(
-                telegram_api::topPeersNotModified,
+            Ok(telegram_api::contacts_TopPeers::contacts_topPeersNotModified(
+                telegram_api::contacts_topPeersNotModified,
             )),
         );
         env.now += DB_SYNC_DELAY as f64 + 1.0;
@@ -2018,7 +2104,10 @@ mod tests {
         manager.init(&mut env);
 
         assert!(manager.is_synchronized);
-        assert_eq!(manager.server_sync_state, SyncState::Ok);
+        // the stale (in-the-past) ts pins Ok in try_start, but init's tail
+        // loop() demotes it back to None — the same C++ init -> try_start ->
+        // lambda() path — so the machine re-syncs after the first sync
+        assert_eq!(manager.server_sync_state, SyncState::None);
         // restored and normalized: the timestamp moved to the server time and
         // the rating decayed by one period
         let group = &manager.by_category[TopDialogCategory::Group.position()];
@@ -2034,7 +2123,7 @@ mod tests {
     #[test]
     fn init_sends_the_stored_toggle_query() {
         let mut env = FakeEnv::new();
-        env.pmc.insert(b"top_peers_enabled".to_vec(), b"1".to_vec());
+        env.pmc.insert("top_peers_enabled".to_owned(), b"1".to_vec());
         let mut manager = TopDialogManager::new();
         manager.init(&mut env);
         assert_eq!(env.toggle_queries, vec![true]);
@@ -2091,7 +2180,7 @@ mod tests {
         let manager = TopDialogManager::new();
 
         let ids = vec![
-            DialogId::new(101), // kept
+            DialogId::new(101), // not a bot: skipped in the BotInline category
             DialogId::new(102), // deleted
             DialogId::new(1),   // self (my_id)
             DialogId::new(103), // non-inline bot
@@ -2105,9 +2194,9 @@ mod tests {
         };
         manager.on_load_dialogs(&mut env, query, ids);
 
-        let chats = slot.take().unwrap().unwrap();
+        let chats: td_api::Chats = slot.take().unwrap().unwrap();
         // -1 total_count: the answer's total is the list size
-        assert_eq!(chats.total_count, 2);
-        assert_eq!(chats.chat_ids, vec![101i64, 104]);
+        assert_eq!(chats.total_count, 1);
+        assert_eq!(chats.chat_ids, vec![104i64]);
     }
 }

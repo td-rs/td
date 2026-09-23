@@ -127,93 +127,11 @@ impl TrialParameters {
     }
 }
 
-/// `td::AgeVerificationParameters` (AgeVerificationParameters.h) — the
-/// account age-verification state persisted in the binlog pmc under
-/// `age_verification` (AccountManager.cpp:843-845).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct AgeVerificationParameters {
-    need_verification: bool,
-    bot_username: String,
-    country: String,
-    min_age: i32,
-}
-
-impl AgeVerificationParameters {
-    /// The C++ constructor (AgeVerificationParameters.cpp:15-32) — the
-    /// invalid combinations are logged, the values are kept as received.
-    pub fn new(
-        need_verification: bool,
-        bot_username: String,
-        country: String,
-        min_age: i32,
-    ) -> AgeVerificationParameters {
-        if need_verification {
-            if bot_username.is_empty() || country.is_empty() || min_age <= 0 {
-                tdutils::log_error!(
-                    "Receive invalid age verification parameters: {min_age} {country} {bot_username}"
-                );
-            }
-        } else if !bot_username.is_empty() || !country.is_empty() || min_age != 0 {
-            tdutils::log_error!(
-                "Receive unneeded age verification parameters: {min_age} {country} {bot_username}"
-            );
-        }
-        AgeVerificationParameters {
-            need_verification,
-            bot_username,
-            country,
-            min_age,
-        }
-    }
-
-    /// `AgeVerificationParameters::need_verification`.
-    pub fn need_verification(&self) -> bool {
-        self.need_verification
-    }
-
-    /// `AgeVerificationParameters::get_age_verification_parameters_object`
-    /// (AgeVerificationParameters.cpp:34-40) — `nullptr` when no
-    /// verification is needed.
-    fn get_age_verification_parameters_object(&self) -> Option<td_api::AgeVerificationParameters> {
-        if !self.need_verification {
-            return None;
-        }
-        Some(td_api::AgeVerificationParameters {
-            min_age: self.min_age,
-            verification_bot_username: self.bot_username.clone(),
-            country: self.country.clone(),
-        })
-    }
-
-    /// `AgeVerificationParameters::store` (AgeVerificationParameters.hpp:18-25)
-    /// — the log-event flags word plus the two strings and the int32.
-    fn store(&self, out: &mut Vec<u8>) {
-        let mut flags = 0i32;
-        if self.need_verification {
-            flags |= 1;
-        }
-        store_i32(out, flags);
-        store_string(out, self.bot_username.as_bytes());
-        store_string(out, self.country.as_bytes());
-        store_i32(out, self.min_age);
-    }
-
-    /// `AgeVerificationParameters::parse` (AgeVerificationParameters.hpp:27-35).
-    fn parse(input: &[u8]) -> Result<AgeVerificationParameters, &'static str> {
-        let mut parser = Parser::new(input);
-        let flags = parser.i32_()?;
-        let bot_username = parser.string_()?;
-        let country = parser.string_()?;
-        let min_age = parser.i32_()?;
-        parser.fetch_end()?;
-        Ok(AgeVerificationParameters {
-            need_verification: flags & 1 != 0,
-            bot_username,
-            country,
-            min_age,
-        })
-    }
-}
+/// The `AgeVerificationParameters` port lives in
+/// [`crate::age_verification_parameters`] (promoted by M.33); the
+/// M.3.9.2 option-read receiver state keeps this re-export until the
+/// AccountManager lands.
+pub use crate::age_verification_parameters::AgeVerificationParameters;
 
 /// `td::GroupCallMessageLimit` (GroupCallMessageLimit.h) — one paid
 /// group-call message tier parsed from the `stars_groupcall_message_limits`
@@ -860,24 +778,6 @@ fn store_i64(out: &mut Vec<u8>, value: i64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
-/// `td::store(Slice)` — the TL string length framing (1 byte under
-/// 254, `254` + 3 LE bytes under 2^24, else `255` + 4 LE bytes + 3
-/// zero bytes) followed by the raw bytes.
-fn store_string(out: &mut Vec<u8>, bytes: &[u8]) {
-    let len = bytes.len();
-    if len < 254 {
-        out.push(len as u8);
-    } else if len < (1 << 24) {
-        out.push(254);
-        out.extend_from_slice(&(len as u32).to_le_bytes()[..3]);
-    } else {
-        out.push(255);
-        out.extend_from_slice(&(len as u32).to_le_bytes());
-        out.extend_from_slice(&[0, 0, 0]);
-    }
-    out.extend_from_slice(bytes);
-}
-
 /// The shared-stream log-event parser over the pmc blobs — the reads
 /// mirror `TlParser` (`fetch_int`, `fetch_long`, `fetch_string<Slice>`).
 struct Parser<'a> {
@@ -914,47 +814,6 @@ impl<'a> Parser<'a> {
         );
         self.pos += 8;
         Ok(value)
-    }
-
-    /// `parser.fetch_string<Slice>()` — the inverse of [`store_string`].
-    fn string_(&mut self) -> Result<String, &'static str> {
-        if self.pos >= self.input.len() {
-            return Err("Invalid string");
-        }
-        let first = self.input[self.pos];
-        self.pos += 1;
-        let len = match first {
-            0..=253 => first as usize,
-            254 => {
-                if self.pos + 3 > self.input.len() {
-                    return Err("Invalid string");
-                }
-                let len = self.input[self.pos] as usize
-                    | (self.input[self.pos + 1] as usize) << 8
-                    | (self.input[self.pos + 2] as usize) << 16;
-                self.pos += 3;
-                len
-            }
-            _ => {
-                if self.pos + 4 > self.input.len() {
-                    return Err("Invalid string");
-                }
-                let len = u32::from_le_bytes(
-                    self.input[self.pos..self.pos + 4]
-                        .try_into()
-                        .expect("length checked"),
-                ) as usize;
-                self.pos += 4;
-                self.pos += 3; // the 3 zero bytes
-                len
-            }
-        };
-        if self.pos + len > self.input.len() {
-            return Err("Invalid string");
-        }
-        let bytes = self.input[self.pos..self.pos + len].to_vec();
-        self.pos += len;
-        String::from_utf8(bytes).map_err(|_| "Invalid utf8 string")
     }
 
     /// `parser.fetch_end()` — the whole blob must be consumed.

@@ -12,7 +12,7 @@ use tdmtproto::telegram_api;
 
 /// `td::AccentColorId` — the profile/chat accent color wrapper (the port
 /// keeps it local until the AccentColors step promotes it).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct AccentColorId(i32);
 
 impl Default for AccentColorId {
@@ -36,6 +36,12 @@ impl AccentColorId {
 
     pub fn is_valid(self) -> bool {
         self.0 >= 0
+    }
+
+    /// `AccentColorId::is_built_in` (AccentColorId.h) — the first 7 ids
+    /// are the client-known built-in palette.
+    pub fn is_built_in(self) -> bool {
+        0 <= self.0 && self.0 < 7
     }
 
     pub fn get(self) -> i32 {

@@ -19,16 +19,56 @@
 /// `td/telegram/Version.h` — the entries the ported formats branch on.
 /// Keep in sync with the C++ enum; `Version::Next` is the one-past value.
 pub mod version {
+    pub const ADD_DURATION_TO_ANIMATION: i32 = 3;
+    pub const STORE_FILE_ID: i32 = 1;
     pub const ADD_KEY_HASH_TO_SECRET_CHAT: i32 = 2;
+    pub const FIX_STORE_GAME_WITHOUT_ANIMATION: i32 = 4;
     pub const ADD_ACCESS_HASH_TO_SECRET_CHAT: i32 = 5;
+    pub const SUPPORT_MINITHUMBNAILS: i32 = 20;
+    /// `Version::FixWebPageInstantViewDatabase` — the WebPageBlock
+    /// animation/video stores gate the file-id payloads on it.
+    pub const FIX_WEB_PAGE_INSTANT_VIEW_DATABASE: i32 = 9;
     pub const FIX_MIN_USERS: i32 = 10;
+    pub const FIX_PAGE_BLOCK_AUDIO_EMPTY_FILE: i32 = 11;
+    pub const SUPPORT_INSTANT_VIEW_2_0: i32 = 18;
+    pub const ADD_MESSAGE_INVOICE_PROVIDER_DATA: i32 = 12;
+    pub const ADD_CAPTION_ENTITIES: i32 = 13;
+    pub const ADD_VENUE_TYPE: i32 = 14;
+    pub const ADD_CONTACT_VCARD: i32 = 16;
+    pub const ADD_MESSAGE_UNSUPPORTED_VERSION: i32 = 17;
+    pub const ADD_VIDEO_CALLS_SUPPORT: i32 = 21;
     pub const ADD_PHOTO_SIZE_SOURCE: i32 = 22;
+    pub const ADD_ANIMATION_STICKERS: i32 = 26;
+    pub const ADD_DIALOG_PHOTO_HAS_ANIMATION: i32 = 27;
+    pub const ADD_PHOTO_PROGRESSIVE_SIZES: i32 = 28;
+    pub const ADD_DICE_EMOJI: i32 = 25;
+    pub const ADD_KEYBOARD_BUTTON_FLAGS: i32 = 35;
+    pub const ADD_LIVE_LOCATION_HEADING: i32 = 29;
+    pub const ADD_LIVE_LOCATION_PROXIMITY_ALERT_DISTANCE: i32 = 30;
     pub const SUPPORT_BANNED_CHANNELS: i32 = 31;
     pub const REMOVE_PHOTO_VOLUME_AND_LOCAL_ID: i32 = 32;
     pub const SUPPORT_64_BIT_IDS: i32 = 33;
+    pub const ADD_INVITE_LINKS_REQUIRING_APPROVAL: i32 = 34;
+    pub const ADD_AUDIO_FLAGS: i32 = 36;
+    pub const ADD_VOICE_NOTE_FLAGS: i32 = 39;
+    pub const ADD_MESSAGE_STICKER_FLAGS: i32 = 40;
+    pub const ADD_INPUT_INVOICE_FLAGS: i32 = 42;
+    pub const ADD_VIDEO_NOTE_FLAGS: i32 = 43;
+    pub const ADD_MESSAGE_CHAT_SET_TTL_FLAGS: i32 = 44;
+    pub const ADD_MESSAGE_MEDIA_SPOILER: i32 = 45;
     pub const MAKE_PARTICIPANT_FLAGS_64_BIT: i32 = 46;
+    /// `Version::AddStarGiftAttributeRarity` (Version.h:74).
+    pub const ADD_STAR_GIFT_ATTRIBUTE_RARITY: i32 = 58;
     pub const ADD_USER_FLAGS2: i32 = 48;
-    pub const ADD_CONTACT_VCARD: i32 = 16;
+    pub const ADD_PAGE_BLOCK_CHAT_LINK_FLAGS: i32 = 50;
+    pub const SUPPORT_RICH_MESSAGES: i32 = 60;
+    pub const ADD_MESSAGE_TEXT_FLAGS: i32 = 49;
+    pub const SUPPORT_REPLIES_IN_OTHER_CHATS: i32 = 51;
+    pub const SUPPORT_MULTIPLE_SHARED_USERS: i32 = 52;
+    pub const SUPPORT_STAR_GIVEAWAYS: i32 = 54;
+    pub const SUPPORT_BOT_TOPICS: i32 = 56;
+    pub const ADD_DICE_FLAGS: i32 = 57;
+    pub const ADD_POLL_CAPTION: i32 = 59;
     pub const SUPPORT_EPHEMERAL_MESSAGES: i32 = 61;
     /// `Version::Next` of tdlib 1.8.67 (`SupportEphemeralMessages` + 1).
     pub const NEXT: i32 = 62;
@@ -157,6 +197,19 @@ impl<'a> Parser<'a> {
             return Err("Wrong version");
         }
         Ok(parser)
+    }
+
+    /// A reader over a bare value with an explicit writer version — the
+    /// shape the content store/parse paths see once the M.10 event layer
+    /// frames a message blob. Tests use it to drive the legacy branches;
+    /// the M.10.2 event layer un-gates it.
+    #[cfg(test)]
+    pub(crate) fn new_with_version(data: &'a [u8], version: i32) -> Parser<'a> {
+        Parser {
+            data,
+            pos: 0,
+            version,
+        }
     }
 
     pub fn version(&self) -> i32 {

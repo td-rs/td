@@ -8,7 +8,9 @@ use tdutils::promise::Promise;
 use tdutils::status::Status;
 
 /// `ChannelRecommendationManager::CHANNEL_RECOMMENDATIONS_CACHE_TIME`
-/// (ChannelRecommendationManager.h:76).
+/// (ChannelRecommendationManager.h:76) — stamps the reload deadline that
+/// the `reload_recommended_channels` net tail consumes.
+#[allow(dead_code)] // the [blocked: net] reload tail is the only writer of the deadline it feeds
 const CHANNEL_RECOMMENDATIONS_CACHE_TIME: f64 = 24.0 * 60.0 * 60.0;
 
 /// The `Td *td` slice of the collapsed ChannelRecommendationManager.
@@ -23,12 +25,12 @@ pub trait ChannelRecommendationManagerEnv {
     fn channel_is_member(&self, channel_id: ChannelId) -> bool;
     /// `chat_manager_->have_input_peer_channel(channel_id,
     /// AccessRights::Read)`.
-    fn have_input_peer_channel(&self, channel_id: ChannelId) -> bool;
+    fn have_input_peer_channel(&mut self, channel_id: ChannelId) -> bool;
     /// `chat_manager_->is_broadcast_channel(channel_id)`.
     fn is_broadcast_channel(&self, channel_id: ChannelId) -> bool;
     /// `chat_manager_->get_input_channel(channel_id)` — `None` is the
     /// C++ nullptr.
-    fn get_input_channel(&self, channel_id: ChannelId) -> bool;
+    fn get_input_channel(&mut self, channel_id: ChannelId) -> bool;
 
     // -- DialogManager probes
     /// `dialog_manager_->have_dialog_force(dialog_id, source)`.
@@ -119,6 +121,7 @@ impl RecommendedDialogs {
 pub struct ChannelRecommendationManager {
     pub(crate) are_recommended_channels_inited: bool,
     pub(crate) recommended_channels: RecommendedDialogs,
+    #[allow(dead_code)] // filled by the [blocked: net] reload tail; read by the same intake
     pub(crate) channel_recommended_dialogs: HashMap<ChannelId, RecommendedDialogs>,
     pub(crate) get_recommended_channels_queries: Vec<Promise<crate::td_api::Chats>>,
     pub(crate) get_channel_recommendations_queries:
@@ -136,6 +139,7 @@ impl ChannelRecommendationManager {
         b"recommended_channels".to_vec()
     }
 
+    #[allow(dead_code)] // the getChatSimilarChats db-load half — lands with the net-backed reload
     fn get_channel_recommendations_database_key(channel_id: ChannelId) -> Vec<u8> {
         format!("channel_recommendations{}", channel_id.get()).into_bytes()
     }
@@ -144,7 +148,7 @@ impl ChannelRecommendationManager {
     /// (ChannelRecommendationManager.cpp:140-143).
     pub fn is_suitable_recommended_channel(
         &self,
-        env: &impl ChannelRecommendationManagerEnv,
+        env: &mut impl ChannelRecommendationManagerEnv,
         channel_id: ChannelId,
     ) -> bool {
         !env.channel_is_member(channel_id) && env.have_input_peer_channel(channel_id)
@@ -154,7 +158,7 @@ impl ChannelRecommendationManager {
     /// (ChannelRecommendationManager.cpp:133-138).
     fn is_suitable_recommended_dialog(
         &self,
-        env: &impl ChannelRecommendationManagerEnv,
+        env: &mut impl ChannelRecommendationManagerEnv,
         dialog_id: DialogId,
     ) -> bool {
         if dialog_id.get_type() != DialogType::Channel {
@@ -167,7 +171,7 @@ impl ChannelRecommendationManager {
     /// (ChannelRecommendationManager.cpp:145-158).
     fn are_suitable_recommended_dialogs(
         &self,
-        env: &impl ChannelRecommendationManagerEnv,
+        env: &mut impl ChannelRecommendationManagerEnv,
         recommended_dialogs: &RecommendedDialogs,
     ) -> bool {
         for &recommended_dialog_id in &recommended_dialogs.dialog_ids {
@@ -345,8 +349,6 @@ impl ChannelRecommendationManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use super::*;
     use std::cell::RefCell;
     use std::collections::HashSet;
 
@@ -380,7 +382,7 @@ mod tests {
             self.members.contains(&channel_id.get())
         }
 
-        fn have_input_peer_channel(&self, channel_id: ChannelId) -> bool {
+        fn have_input_peer_channel(&mut self, channel_id: ChannelId) -> bool {
             self.input_peer_channels.contains(&channel_id.get())
         }
 
@@ -388,7 +390,7 @@ mod tests {
             self.broadcasts.contains(&channel_id.get())
         }
 
-        fn get_input_channel(&self, channel_id: ChannelId) -> bool {
+        fn get_input_channel(&mut self, channel_id: ChannelId) -> bool {
             self.input_peer_channels.contains(&channel_id.get())
         }
 
@@ -445,6 +447,7 @@ mod tests {
         struct FlagPromise<T> {
             value_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
             error_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+            _phantom: std::marker::PhantomData<T>,
         }
         impl<T: Send + 'static> tdutils::promise::PromiseInterface<T> for FlagPromise<T> {
             fn set_value(&mut self, _value: T) {
@@ -462,6 +465,7 @@ mod tests {
             Promise::from_interface(FlagPromise::<T> {
                 value_flag: value_flag.clone(),
                 error_flag: error_flag.clone(),
+                _phantom: std::marker::PhantomData,
             }),
             value_flag,
             error_flag,
@@ -629,8 +633,8 @@ mod tests {
             opened: RefCell::new(Vec::new()),
         };
         let manager = ChannelRecommendationManager::new();
-        assert!(!manager.is_suitable_recommended_channel(&env, ChannelId::new(1)));
-        assert!(manager.is_suitable_recommended_channel(&env, ChannelId::new(2)));
-        assert!(!manager.is_suitable_recommended_channel(&env, ChannelId::new(3)));
+        assert!(!manager.is_suitable_recommended_channel(&mut env, ChannelId::new(1)));
+        assert!(manager.is_suitable_recommended_channel(&mut env, ChannelId::new(2)));
+        assert!(!manager.is_suitable_recommended_channel(&mut env, ChannelId::new(3)));
     }
 }
