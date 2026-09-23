@@ -888,11 +888,11 @@ impl DialogParticipantManager {
             return promise.set_error(Status::error(400, "Member list is inaccessible"));
         }
 
-        if self.have_channel_participant_cache(channel_id) {
-            if let Some(participant) = self.get_channel_participant_from_cache(channel_id, participant_dialog_id) {
-                let participant = participant.clone();
-                return self.finish_get_dialog_participant(env, participant, promise);
-            }
+        if self.have_channel_participant_cache(channel_id)
+            && let Some(participant) = self.get_channel_participant_from_cache(channel_id, participant_dialog_id)
+        {
+            let participant = participant.clone();
+            return self.finish_get_dialog_participant(env, participant, promise);
         }
 
         // `GetChannelParticipantQuery` [blocked: net] — the promise parks
@@ -1461,6 +1461,7 @@ impl DialogParticipantManager {
 
     /// `DialogParticipantManager::get_dialog_join_requests`
     /// (DialogParticipantManager.cpp:1333-1352).
+    #[allow(clippy::too_many_arguments)] // the C++ signature
     pub fn get_dialog_join_requests(
         &mut self,
         env: &mut impl DialogParticipantManagerEnv,

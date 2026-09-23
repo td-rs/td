@@ -14551,7 +14551,7 @@ impl crate::dialog_participant_manager::DialogParticipantManagerEnv for TdDialog
         self.global.td_db().common_kv().erase(key);
     }
 
-    fn set_online_member_count_timeout(&mut self, dialog_id: crate::chat_manager::DialogId, timeout: f64) {
+    fn set_online_member_count_timeout(&mut self, _: crate::chat_manager::DialogId, _: f64) {
         // the MultiTimeout set/cancel is folded into the deadline map the
         // Td tick scans; the sync-config re-arm mirrors the C++ re-arm
         // the deadline map the Td tick scans is the timeout store; the
