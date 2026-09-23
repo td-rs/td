@@ -603,6 +603,12 @@ pub trait UpdatesSink {
     fn on_update_config(&mut self) {}
     /// `ConfigManager::on_dc_options_update`.
     fn on_dc_options_update(&mut self, _dc_options: Vec<telegram_api::DcOption>) {}
+    /// `UpdatesManager::on_update(updateTranscribedAudio)` — the
+    /// TranscriptionManager intake landed with M.25
+    /// (`TranscriptionManager::on_update_transcribed_audio`); the sink
+    /// default parks the intake until the sink can reach the manager
+    /// (the live update flow arrives with the net step).
+    fn on_update_transcribed_audio(&mut self, _update: telegram_api::updateTranscribedAudio) {}
     /// `AuthManager::on_update_login_token` (the pre-auth short update).
     fn on_update_login_token(&mut self) {}
     /// `AuthManager::on_update_sent_code` (the pre-auth short update).
@@ -5321,14 +5327,14 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                     promise,
                 );
             }
-            PendingUpdate::Wire(telegram_api::Update::updateTranscribedAudio(_)) => {
-                // transcription_manager — Wave 2.
-                self.drop_unsupported(
-                    telegram_api::updateTranscribedAudio::ID,
-                    "updateTranscribedAudio",
-                    4972,
-                    promise,
-                );
+            PendingUpdate::Wire(telegram_api::Update::updateTranscribedAudio(update)) => {
+                // `UpdatesManager::on_update(updateTranscribedAudio)`
+                // (UpdatesManager.cpp:4972-4975) — the intake landed with
+                // M.25 (`TranscriptionManager::on_update_transcribed_audio`)
+                // and rides the sink (the ZST cannot reach the manager
+                // yet; the live flow arrives with the net step).
+                self.sink.on_update_transcribed_audio(update);
+                promise.set_value(());
             }
             PendingUpdate::Wire(telegram_api::Update::updateAutoSaveSettings(_)) => {
                 // autosave_manager reload — Wave 2.

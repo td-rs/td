@@ -629,7 +629,7 @@ processChatJoinRequest	interim
 processChatJoinRequests	interim
 processGiftPurchaseOffer	interim
 processPushNotification	interim
-rateSpeechRecognition	interim
+rateSpeechRecognition	dispatched
 readAllChatMentions	interim
 readAllChatPollVotes	interim
 readAllChatReactions	interim
@@ -641,7 +641,7 @@ readBusinessMessage	interim
 readChatList	interim
 readFilePart	interim
 readdQuickReplyShortcutMessages	interim
-recognizeSpeech	interim
+recognizeSpeech	dispatched
 recoverAuthenticationPassword	interim
 recoverPassword	interim
 refundStarPayment	interim

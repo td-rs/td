@@ -52,6 +52,7 @@ pub mod store_parse;
 pub mod synchronous_requests;
 pub mod td;
 pub mod time_zone_manager;
+pub mod transcription_manager;
 pub mod updates_manager;
 pub mod user_manager;
 pub mod usernames;

@@ -15,117 +15,24 @@
 //! ([`ManagerOptionStates::load`], the manager constructors'
 //! pmc reads in the C++ creation order).
 //!
+//! The `TranscriptionManager` half moved out with M.25
+//! (`crate::transcription_manager`): the trial-parameters state, the
+//! `speech_recognition_trial` pmc codec, the constructor restore and
+//! the update builder all moved verbatim; the
+//! [`ManagerUpdate::TrialParameters`] carrier stays for the
+//! ConfigManager fan-out, and the Td routes it to the manager.
+//!
 //! Divergences (all documented inline):
-//! - `TranscriptionManager::set_speech_recognition_trial_timeout` (the
-//!   weekly-reset timer firing at `next_reset_date`) is not ported —
-//!   the reset still happens lazily through
-//!   `TrialParameters::update_left_tries` on the next update or at
-//!   load, exactly like the C++ data flow, just not at the deadline.
 //! - `updateAgeVerificationParameters` with null `parameters` (the C++
 //!   sends it when verification stops being needed) cannot be
 //!   expressed: the generated td_api models the typed object field as
 //!   non-nullable. The update is skipped in that case.
-//! - `TranscriptionManager::get_current_state` (the trial update in
-//!   the authorized current-state bundle, TranscriptionManager.cpp:441)
-//!   lands with the Td current-state step.
 
 use tddb::binlog_key_value::BinlogKeyValue;
 use tdmtproto::telegram_api;
 
 use crate::config_manager::{get_json_value_int, get_json_value_long, get_json_value_string};
 use crate::td_api::{self, Object};
-
-/// `TranscriptionManager::TrialParameters` (TranscriptionManager.h:63) —
-/// the speech-recognition trial state persisted in the binlog pmc under
-/// `speech_recognition_trial` (TranscriptionManager.cpp:127-129).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TrialParameters {
-    weekly_number: i32,
-    duration_max: i32,
-    left_tries: i32,
-    next_reset_date: i32,
-}
-
-impl TrialParameters {
-    /// `TrialParameters::update_left_tries` (TranscriptionManager.cpp:24-32)
-    /// — a passed reset date restarts the weekly counter, otherwise the
-    /// left tries clamp at the weekly number.
-    fn update_left_tries(&mut self, unix_time: i32) {
-        if self.next_reset_date <= unix_time {
-            self.next_reset_date = 0;
-            self.left_tries = self.weekly_number;
-        } else if self.left_tries > self.weekly_number {
-            self.left_tries = self.weekly_number;
-        }
-    }
-
-    /// `TrialParameters::get_update_speech_recognition_trial_object`
-    /// (TranscriptionManager.cpp:213-217).
-    fn get_update_speech_recognition_trial_object(&self) -> td_api::Object {
-        Object::updateSpeechRecognitionTrial(td_api::updateSpeechRecognitionTrial {
-            max_media_duration: self.duration_max,
-            weekly_count: self.weekly_number,
-            left_count: self.left_tries,
-            next_reset_date: self.next_reset_date,
-        })
-    }
-
-    /// `TrialParameters::store` (TranscriptionManager.cpp:34-58) — the
-    /// log-event flags word plus the four conditional int32s.
-    fn store(&self, out: &mut Vec<u8>) {
-        let has_weekly_number = self.weekly_number != 0;
-        let has_duration_max = self.duration_max != 0;
-        let has_left_tries = self.left_tries != 0;
-        let has_next_reset_date = self.next_reset_date != 0;
-        let mut flags = 0i32;
-        if has_weekly_number {
-            flags |= 1;
-        }
-        if has_duration_max {
-            flags |= 2;
-        }
-        if has_left_tries {
-            flags |= 4;
-        }
-        if has_next_reset_date {
-            flags |= 8;
-        }
-        store_i32(out, flags);
-        if has_weekly_number {
-            store_i32(out, self.weekly_number);
-        }
-        if has_duration_max {
-            store_i32(out, self.duration_max);
-        }
-        if has_left_tries {
-            store_i32(out, self.left_tries);
-        }
-        if has_next_reset_date {
-            store_i32(out, self.next_reset_date);
-        }
-    }
-
-    /// `TrialParameters::parse` (TranscriptionManager.cpp:60-84).
-    fn parse(input: &[u8]) -> Result<TrialParameters, &'static str> {
-        let mut parser = Parser::new(input);
-        let flags = parser.i32_()?;
-        let mut result = TrialParameters::default();
-        if flags & 1 != 0 {
-            result.weekly_number = parser.i32_()?;
-        }
-        if flags & 2 != 0 {
-            result.duration_max = parser.i32_()?;
-        }
-        if flags & 4 != 0 {
-            result.left_tries = parser.i32_()?;
-        }
-        if flags & 8 != 0 {
-            result.next_reset_date = parser.i32_()?;
-        }
-        parser.fetch_end()?;
-        Ok(result)
-    }
-}
 
 /// `td::AgeVerificationParameters` (AgeVerificationParameters.h) — the
 /// account age-verification state persisted in the binlog pmc under
@@ -481,11 +388,10 @@ impl FreezeState {
     }
 }
 
-/// The four receiver states until their managers land — each intake
-/// returns the td update the C++ manager sends, if any.
+/// The remaining receiver states until their managers land — each
+/// intake returns the td update the C++ manager sends, if any.
 #[derive(Default)]
 pub struct ManagerOptionStates {
-    trial_parameters: TrialParameters,
     freeze_state: FreezeState,
     age_verification_parameters: AgeVerificationParameters,
     message_limits: GroupCallMessageLimits,
@@ -495,7 +401,8 @@ pub struct ManagerOptionStates {
 /// for the Td to apply (the C++ `send_closure` arguments).
 pub enum ManagerUpdate {
     /// `TranscriptionManager::on_update_trial_parameters`
-    /// (ConfigManager.cpp:2050-2052).
+    /// (ConfigManager.cpp:2050-2052) — routed to
+    /// `crate::transcription_manager` by the Td since M.25.
     TrialParameters {
         weekly_number: i32,
         duration_max: i32,
@@ -518,29 +425,17 @@ pub enum ManagerUpdate {
 
 impl ManagerOptionStates {
     /// Apply one fan-out; `Some(update)` is what the C++ manager would
-    /// have sent to the client.
+    /// have sent to the client. The trial fan-out is routed to the
+    /// transcription manager by the Td before this runs.
     pub fn on_manager_update(
         &mut self,
         pmc: &mut BinlogKeyValue,
         update: ManagerUpdate,
-        is_authorized: bool,
-        is_bot: bool,
-        unix_time: i32,
     ) -> Option<td_api::Object> {
         match update {
-            ManagerUpdate::TrialParameters {
-                weekly_number,
-                duration_max,
-                cooldown_until,
-            } => self.on_trial_parameters(
-                pmc,
-                weekly_number,
-                duration_max,
-                cooldown_until,
-                is_authorized,
-                is_bot,
-                unix_time,
-            ),
+            ManagerUpdate::TrialParameters { .. } => {
+                unreachable!("the Td routes the trial fan-out to the transcription manager")
+            }
             ManagerUpdate::FreezeState {
                 since_date,
                 until_date,
@@ -553,55 +448,6 @@ impl ManagerOptionStates {
                 self.on_group_call_message_limits(pmc, limits.as_deref())
             }
         }
-    }
-
-    /// `TranscriptionManager::on_update_trial_parameters` +
-    /// `set_trial_parameters` (TranscriptionManager.cpp:149-177).
-    #[allow(clippy::too_many_arguments)] // the C++ handler has the same shape
-    fn on_trial_parameters(
-        &mut self,
-        pmc: &mut BinlogKeyValue,
-        weekly_number: i32,
-        duration_max: i32,
-        cooldown_until: i32,
-        is_authorized: bool,
-        is_bot: bool,
-        unix_time: i32,
-    ) -> Option<td_api::Object> {
-        if !is_authorized {
-            return None;
-        }
-        assert!(!is_bot, "CHECK(!td_->auth_manager_->is_bot())");
-        let mut new_trial_parameters = TrialParameters {
-            weekly_number: weekly_number.max(0),
-            duration_max: duration_max.max(0),
-            next_reset_date: if cooldown_until > 0 {
-                cooldown_until
-            } else {
-                self.trial_parameters.next_reset_date
-            },
-            left_tries: self.trial_parameters.left_tries,
-        };
-        new_trial_parameters.update_left_tries(unix_time);
-        if new_trial_parameters == self.trial_parameters {
-            return None;
-        }
-        self.trial_parameters = new_trial_parameters;
-        let update = self
-            .trial_parameters
-            .get_update_speech_recognition_trial_object();
-        // `set_speech_recognition_trial_timeout` is not ported (the
-        // module docs) — the reset is lazy.
-        self.save_trial_parameters(pmc);
-        Some(update)
-    }
-
-    /// `TranscriptionManager::save_trial_parameters`
-    /// (TranscriptionManager.cpp:143-146).
-    fn save_trial_parameters(&self, pmc: &mut BinlogKeyValue) {
-        let mut blob = Vec::new();
-        self.trial_parameters.store(&mut blob);
-        pmc.set_raw(b"speech_recognition_trial", &blob);
     }
 
     /// `UserManager::on_update_freeze_state` (UserManager.cpp:4791-4807).
@@ -691,14 +537,15 @@ impl ManagerOptionStates {
 
     /// The manager constructors' pmc reads, in the C++ creation order
     /// (Td.cpp:1157 AccountManager, :1231 GroupCallManager, :1313
-    /// TranscriptionManager, :1322 UserManager) — each restored state
-    /// sends the same update the C++ constructor does.
+    /// TranscriptionManager — moved to `TranscriptionManager::init` with
+    /// M.25, :1322 UserManager) — each restored state sends the same
+    /// update the C++ constructor does.
     pub fn load(
         &mut self,
         pmc: &mut BinlogKeyValue,
-        is_authorized: bool,
+        _is_authorized: bool,
         is_bot: bool,
-        unix_time: i32,
+        _unix_time: i32,
     ) -> Vec<td_api::Object> {
         let mut updates = Vec::new();
         // AccountManager start_up (AccountManager.cpp:823-830).
@@ -725,30 +572,6 @@ impl ManagerOptionStates {
             updates.push(
                 self.message_limits
                     .get_update_group_call_message_levels_object(),
-            );
-        }
-        // TranscriptionManager constructor (TranscriptionManager.cpp:91-93,
-        // 125-147).
-        if is_authorized && !is_bot {
-            let blob = pmc.get_raw(b"speech_recognition_trial");
-            if !blob.is_empty() {
-                match TrialParameters::parse(&blob) {
-                    Ok(mut parameters) => {
-                        parameters.update_left_tries(unix_time);
-                        self.trial_parameters = parameters;
-                    }
-                    Err(error) => {
-                        tdutils::log_error!(
-                            "Failed to parse speech recognition trial parameters from binlog: {error}"
-                        );
-                        self.trial_parameters = TrialParameters::default();
-                        self.save_trial_parameters(pmc);
-                    }
-                }
-            }
-            updates.push(
-                self.trial_parameters
-                    .get_update_speech_recognition_trial_object(),
             );
         }
         // UserManager constructor (UserManager.cpp:2771-2787).
@@ -1027,57 +850,6 @@ mod tests {
     }
 
     #[test]
-    fn test_trial_parameters_round_trip() {
-        for parameters in [
-            TrialParameters::default(),
-            TrialParameters {
-                weekly_number: 10,
-                duration_max: 300,
-                left_tries: 7,
-                next_reset_date: 1735689600,
-            },
-            TrialParameters {
-                weekly_number: 5,
-                duration_max: 0,
-                left_tries: 5,
-                next_reset_date: 0,
-            },
-        ] {
-            let mut blob = Vec::new();
-            parameters.store(&mut blob);
-            assert_eq!(TrialParameters::parse(&blob), Ok(parameters));
-        }
-        // The all-zero form is exactly the 4-byte flags word.
-        let mut blob = Vec::new();
-        TrialParameters::default().store(&mut blob);
-        assert_eq!(blob, vec![0, 0, 0, 0]);
-    }
-
-    #[test]
-    fn test_trial_parameters_update_left_tries() {
-        let mut parameters = TrialParameters {
-            weekly_number: 3,
-            duration_max: 30,
-            left_tries: 1,
-            next_reset_date: 1000,
-        };
-        // A passed reset date restarts the weekly counter.
-        parameters.update_left_tries(1000);
-        assert_eq!(parameters.next_reset_date, 0);
-        assert_eq!(parameters.left_tries, 3);
-        // Otherwise the left tries clamp at the weekly number.
-        let mut parameters = TrialParameters {
-            weekly_number: 2,
-            duration_max: 30,
-            left_tries: 9,
-            next_reset_date: 1000,
-        };
-        parameters.update_left_tries(999);
-        assert_eq!(parameters.left_tries, 2);
-        assert_eq!(parameters.next_reset_date, 1000);
-    }
-
-    #[test]
     fn test_age_verification_parameters_round_trip() {
         for parameters in [
             AgeVerificationParameters::default(),
@@ -1219,53 +991,6 @@ mod tests {
     }
 
     #[test]
-    fn test_on_trial_parameters() {
-        let mut pmc = TempPmc::new("states-1");
-        let mut states = ManagerOptionStates::default();
-        // Unauthorized: dropped, like the C++ guard.
-        assert_eq!(
-            states.on_trial_parameters(&mut pmc.pmc, 10, 300, 2000, false, false, 1000),
-            None
-        );
-        // First application: clamps, left_tries restart, pmc write,
-        // update carried.
-        let update = states
-            .on_trial_parameters(&mut pmc.pmc, -1, 300, 2000, true, false, 1000)
-            .expect("changed");
-        let Object::updateSpeechRecognitionTrial(update) = update else {
-            panic!("speech recognition trial update");
-        };
-        assert_eq!(update.weekly_count, 0);
-        assert_eq!(update.max_media_duration, 300);
-        assert_eq!(update.left_count, 0);
-        assert_eq!(update.next_reset_date, 2000);
-        assert!(pmc.pmc.get_raw(b"speech_recognition_trial").len() > 4);
-        // Same values: no update.
-        assert_eq!(
-            states.on_trial_parameters(&mut pmc.pmc, -1, 300, 2000, true, false, 1000),
-            None
-        );
-        // A cooldown of 0 keeps the old reset date, and the carried left
-        // tries only clamp — they restart when the reset date passes.
-        let update = states
-            .on_trial_parameters(&mut pmc.pmc, 5, 300, 0, true, false, 1999)
-            .expect("changed");
-        let Object::updateSpeechRecognitionTrial(update) = update else {
-            panic!("speech recognition trial update");
-        };
-        assert_eq!(update.next_reset_date, 2000);
-        assert_eq!(update.left_count, 0);
-        let update = states
-            .on_trial_parameters(&mut pmc.pmc, 5, 300, 0, true, false, 2000)
-            .expect("changed");
-        let Object::updateSpeechRecognitionTrial(update) = update else {
-            panic!("speech recognition trial update");
-        };
-        assert_eq!(update.next_reset_date, 0);
-        assert_eq!(update.left_count, 5);
-    }
-
-    #[test]
     fn test_on_freeze_state() {
         let mut pmc = TempPmc::new("states-2");
         let mut states = ManagerOptionStates::default();
@@ -1371,7 +1096,8 @@ mod tests {
         ));
 
         // A full restore in the C++ creation order: age verification,
-        // group-call levels, trial, freeze.
+        // group-call levels, freeze (the trial read moved to the
+        // transcription manager with M.25).
         let mut pmc = TempPmc::new("states-6");
         let mut states = ManagerOptionStates::default();
         states.on_age_verification_parameters(
@@ -1379,11 +1105,10 @@ mod tests {
             AgeVerificationParameters::new(true, "bot".into(), "DE".into(), 18),
         );
         states.on_group_call_message_limits(&mut pmc.pmc, Some(&json_array(vec![])));
-        states.on_trial_parameters(&mut pmc.pmc, 5, 300, 2000, true, false, 1000);
         states.on_freeze_state(&mut pmc.pmc, 100, 200, "url".into());
         let mut restored = ManagerOptionStates::default();
         let updates = restored.load(&mut pmc.pmc, true, false, 2000);
-        assert_eq!(updates.len(), 4);
+        assert_eq!(updates.len(), 3);
         assert!(matches!(
             updates[0],
             Object::updateAgeVerificationParameters(_)
@@ -1392,29 +1117,18 @@ mod tests {
             updates[1],
             Object::updateGroupCallMessageLevels(_)
         ));
-        let Object::updateSpeechRecognitionTrial(ref trial) = updates[2] else {
-            panic!("speech recognition trial update");
-        };
-        // The passed reset date restarts the counter at load.
-        assert_eq!(trial.next_reset_date, 0);
-        assert_eq!(trial.left_count, 5);
-        assert!(matches!(updates[3], Object::updateFreezeState(_)));
+        assert!(matches!(updates[2], Object::updateFreezeState(_)));
 
-        // A corrupt trial blob resets to the default and re-saves; a
-        // corrupt levels blob falls back to the basic level.
-        pmc.pmc.set_raw(b"speech_recognition_trial", b"garbage");
+        // A corrupt levels blob falls back to the basic level; a stale
+        // trial blob in the pmc is the transcription manager's read.
         pmc.pmc.set_raw(b"group_call_message_limits", b"garbage");
         let mut restored = ManagerOptionStates::default();
         let updates = restored.load(&mut pmc.pmc, true, false, 1000);
-        assert_eq!(updates.len(), 4);
+        assert_eq!(updates.len(), 3);
         let Object::updateGroupCallMessageLevels(ref levels) = updates[1] else {
             panic!("group call message levels update");
         };
         assert_eq!(levels.levels.len(), 1);
-        assert_eq!(
-            TrialParameters::parse(&pmc.pmc.get_raw(b"speech_recognition_trial")),
-            Ok(TrialParameters::default())
-        );
     }
 
     #[test]

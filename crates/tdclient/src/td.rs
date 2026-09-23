@@ -270,6 +270,13 @@ pub struct Td {
     /// `Td::notification_settings_manager_` (`Td.cpp:1254`, M.13S).
     pub(crate) notification_settings_manager:
         crate::notification_settings_manager::NotificationSettingsManager,
+    /// `Td::transcription_manager_` (`Td.cpp:1313`, M.25) — the
+    /// speech-recognition query manager; the message-plane and
+    /// VoiceNotes/VideoNotes callers ride the env seams until M.10/M.28.
+    pub(crate) transcription_manager: crate::transcription_manager::TranscriptionManager,
+    /// The transcription manager's `send_update` outbox — drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) transcription_updates: Vec<td_api::Update>,
     /// `Td::device_token_manager_` (`Td.cpp:1345`, M.13S).
     pub(crate) device_token_manager: crate::device_token_manager::DeviceTokenManager,
     /// The notification manager's `send_update` outbox — the collapsed
@@ -581,6 +588,8 @@ impl Td {
             notification_manager: NotificationManager::default(),
             notification_settings_manager:
                 crate::notification_settings_manager::NotificationSettingsManager::new(),
+            transcription_manager: crate::transcription_manager::TranscriptionManager::default(),
+            transcription_updates: Vec::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
             notification_updates: Vec::new(),
             premium_required_contact_merger: None,
@@ -1019,12 +1028,12 @@ impl Td {
             self.auth_manager.is_authorized() && !self.auth_manager.is_bot(),
         );
 
-        // The M.3.9.2 stand-in for the four manager constructors' pmc
-        // reads (in the C++ creation order: AccountManager Td.cpp:1157,
-        // GroupCallManager :1231, TranscriptionManager :1313, UserManager
-        // :1322) — the states replay from the binlog pmc and send the
-        // same updates the C++ constructors do. Each read moves into its
-        // manager when that manager lands.
+        // The M.3.9.2 stand-in for the manager constructors' pmc reads (in
+        // the C++ creation order: AccountManager Td.cpp:1157,
+        // GroupCallManager :1231, UserManager :1322) — the states replay
+        // from the binlog pmc and send the same updates the C++
+        // constructors do. Each read moves into its manager when that
+        // manager lands.
         {
             let is_authorized = self.auth_manager.is_authorized();
             let is_bot = self.auth_manager.is_bot();
@@ -1037,6 +1046,26 @@ impl Td {
             for update in updates {
                 self.send_update(update);
             }
+        }
+
+        // `make_unique<TranscriptionManager>` + the constructor
+        // `load_trial_parameters` (Td.cpp:1313,
+        // TranscriptionManager.cpp:90-95/124-142) — the M.25 move-in from
+        // the M.3.9.2 stand-in. The read runs after the combined
+        // M.3.9.2 block, keeping the C++ creation order of the reads it
+        // covers (AccountManager :1157, GroupCallManager :1231, then
+        // TranscriptionManager :1313; the UserManager :1322 freeze
+        // restore collapses into the earlier `init_freeze_state`). The
+        // gate is inside (the C++ load guards is_authorized && !is_bot).
+        {
+            let mut env = NotificationEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+                auth_is_authorized: self.auth_manager.is_authorized(),
+                auth_is_bot: self.auth_manager.is_bot(),
+                updates: &mut self.transcription_updates,
+            };
+            self.transcription_manager.init(&mut env);
         }
 
         // `make_unique<LinkManager>` (Td.cpp:1239, the init_managers
@@ -1622,19 +1651,34 @@ impl Td {
         // the option broadcasts (the C++ actors deliver them around the
         // option writes; this fixed order is the port's determinism).
         if !actions.manager_updates.is_empty() {
-            let is_authorized = self.auth_manager.is_authorized();
-            let is_bot = self.auth_manager.is_bot();
-            let unix_time = self.global.unix_time();
             for update in actions.manager_updates {
-                let sent = {
-                    let pmc = self.global.binlog_pmc();
-                    self.manager_states.on_manager_update(
-                        pmc,
-                        update,
-                        is_authorized,
-                        is_bot,
-                        unix_time,
-                    )
+                // the TranscriptionManager half moved to its manager
+                // (M.25); the C++ ConfigManager.cpp:2050-2052 fan-out
+                let sent = match update {
+                    crate::manager_option_states::ManagerUpdate::TrialParameters {
+                        weekly_number,
+                        duration_max,
+                        cooldown_until,
+                    } => {
+                        let mut env = NotificationEnv {
+                            global: &mut self.global,
+                            options: self.option_manager.as_mut(),
+                            auth_is_authorized: self.auth_manager.is_authorized(),
+                            auth_is_bot: self.auth_manager.is_bot(),
+                            updates: &mut self.transcription_updates,
+                        };
+                        self.transcription_manager.on_update_trial_parameters(
+                            &mut env,
+                            weekly_number,
+                            duration_max,
+                            cooldown_until,
+                        );
+                        None
+                    }
+                    update => {
+                        let pmc = self.global.binlog_pmc();
+                        self.manager_states.on_manager_update(pmc, update)
+                    }
                 };
                 if let Some(update) = sent {
                     self.send_update(update);
@@ -2567,6 +2611,10 @@ impl Td {
         }
         let notification_updates = std::mem::take(&mut self.notification_updates);
         for update in notification_updates {
+            self.send_update(update.into());
+        }
+        let transcription_updates = std::mem::take(&mut self.transcription_updates);
+        for update in transcription_updates {
             self.send_update(update.into());
         }
     }
@@ -4978,6 +5026,102 @@ impl crate::device_token_manager::DeviceTokenManagerEnv for NotificationEnv<'_> 
 
     fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
         self.global.binlog_pmc().set_raw(key, value);
+    }
+}
+
+impl crate::transcription_manager::TranscriptionManagerEnv for NotificationEnv<'_> {
+    fn auth_is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn now(&self) -> f64 {
+        tdutils::time::now()
+    }
+
+    fn binlog_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    /// `messages_manager_->have_message_force` — [blocked: M.10]; no
+    /// message plane exists yet, so the probe answers the not-found band.
+    fn have_message_force(
+        &self,
+        _message_full_id: crate::dialog_id::MessageFullId,
+        _source: &str,
+    ) -> bool {
+        false
+    }
+
+    /// `messages_manager_->on_external_update_message_content` —
+    /// [blocked: M.10].
+    fn on_external_update_message_content(
+        &mut self,
+        message_full_id: crate::dialog_id::MessageFullId,
+        source: &str,
+    ) {
+        tdutils::log_info!(
+            "on_external_update_message_content {message_full_id:?} from {source} — [blocked: M.10]"
+        );
+    }
+
+    /// `messages_manager_->on_update_message_content` — [blocked: M.10].
+    fn on_update_message_content(&mut self, message_full_id: crate::dialog_id::MessageFullId) {
+        tdutils::log_info!("on_update_message_content {message_full_id:?} — [blocked: M.10]");
+    }
+
+    /// `VideoNotesManager::get_video_note_transcription_info` /
+    /// `VoiceNotesManager::get_voice_note_transcription_info` —
+    /// [blocked: M.28]; the content plane owns no infos yet.
+    fn with_transcription_info<
+        R,
+        F: FnOnce(&mut crate::transcription_manager::TranscriptionInfo) -> R,
+    >(
+        &mut self,
+        file_info: crate::transcription_manager::FileInfo,
+        _allow_creation: bool,
+        _f: F,
+    ) -> Option<R> {
+        tdutils::log_info!("Transcription info for {file_info:?} — [blocked: M.28]");
+        None
+    }
+
+    /// `TranscribeAudioQuery` — [blocked: net]; the query drops, the
+    /// parked promises stay unanswered like the C++ offline.
+    fn send_transcribe_audio_query(&mut self, message_full_id: crate::dialog_id::MessageFullId) {
+        tdutils::log_info!("Transcribe audio {message_full_id:?} — [blocked: net]");
+    }
+
+    /// `RateTranscribedAudioQuery` — [blocked: net].
+    fn send_rate_transcribed_audio_query(
+        &mut self,
+        message_full_id: crate::dialog_id::MessageFullId,
+        transcription_id: i64,
+        is_good: bool,
+        _promise: tdutils::promise::Promise<()>,
+    ) {
+        tdutils::log_info!(
+            "Rate transcribed audio {message_full_id:?} id {transcription_id} good {is_good} — [blocked: net]"
+        );
     }
 }
 

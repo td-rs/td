@@ -228,6 +228,21 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                     .get_current_state(&env, &mut updates);
             }
 
+            // TranscriptionManager::get_current_state (Requests.cpp:2239 —
+            // after the suggested-action block; the manager's own
+            // authorized/non-bot gate applies)
+            {
+                let env = NotificationEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_authorized: td.auth_manager.is_authorized(),
+                    auth_is_bot: td.auth_manager.is_bot(),
+                    updates: &mut td.transcription_updates,
+                };
+                td.transcription_manager
+                    .get_current_state(&env, &mut updates);
+            }
+
             // ConnectionStateManager and the remaining authorized-manager
             // state blocks (connection/chat/background/...) accumulate here
             // as their managers land.
@@ -1876,6 +1891,57 @@ fn run_dialog_requests(td: &mut Td, id: u64, function: Function) {
             }
         }
 
+        Function::recognizeSpeech(request) => {
+            // `Requests.cpp:2933-2938`: CHECK_IS_USER, then the
+            // transcription manager. The message probe is the
+            // [blocked: M.10] seam — it answers false while no message
+            // plane exists, so the C++ "Message not found" band is the
+            // offline answer.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let mut env = NotificationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.transcription_updates,
+            };
+            td.transcription_manager.recognize_speech(
+                &mut env,
+                crate::dialog_id::MessageFullId::new(
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::chat_manager::MessageId::new(request.message_id),
+                ),
+                promise,
+            );
+        }
+        Function::rateSpeechRecognition(request) => {
+            // `Requests.cpp:2940-2946`: CHECK_IS_USER, then the
+            // transcription manager (the same [blocked: M.10] probe band).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let mut env = NotificationEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.transcription_updates,
+            };
+            td.transcription_manager.rate_speech_recognition(
+                &mut env,
+                crate::dialog_id::MessageFullId::new(
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::chat_manager::MessageId::new(request.message_id),
+                ),
+                request.is_good,
+                promise,
+            );
+        }
+
         // Everything else waits for its manager step.
         _ => {
             td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
@@ -2176,13 +2242,15 @@ mod request_census_tests {
         // stays the 500 placeholder) + M.12.10's eighteen file-plane
         // dispatches (getFile/getRemoteFile, the download/upload/
         // generation arms, the DownloadManager list plane and the four
-        // storage-statistics arms). Fix per flip.
+        // storage-statistics arms) + M.25's two transcription dispatches
+        // (recognizeSpeech, rateSpeechRecognition — the [blocked: M.10]
+        // probe seam answers the C++ not-found band). Fix per flip.
         assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            110,
+            112,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 894, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 892, "interim count");
     }
 }

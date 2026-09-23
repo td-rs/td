@@ -3640,29 +3640,28 @@ mod tests {
             _ => panic!("age verification fan-out"),
         }
 
-        // Applying them drives the manager states and persists all four
-        // pmc keys.
+        // Applying them drives the manager states (the trial fan-out
+        // moved to the transcription manager with M.25, so three of the
+        // four land here) and persists the pmc keys.
         let mut states = crate::manager_option_states::ManagerOptionStates::default();
         let mut sent = Vec::new();
         for update in actions.manager_updates {
-            let update = { states.on_manager_update(&mut pmc.pmc, update, true, false, 1000) };
+            if let crate::manager_option_states::ManagerUpdate::TrialParameters { .. } = update {
+                continue;
+            }
+            let update = { states.on_manager_update(&mut pmc.pmc, update) };
             sent.extend(update);
         }
-        assert_eq!(sent.len(), 4);
+        assert_eq!(sent.len(), 3);
         assert!(matches!(
             sent[0],
             td_api::Object::updateGroupCallMessageLevels(_)
         ));
+        assert!(matches!(sent[1], td_api::Object::updateFreezeState(_)));
         assert!(matches!(
-            sent[1],
-            td_api::Object::updateSpeechRecognitionTrial(_)
-        ));
-        assert!(matches!(sent[2], td_api::Object::updateFreezeState(_)));
-        assert!(matches!(
-            sent[3],
+            sent[2],
             td_api::Object::updateAgeVerificationParameters(_)
         ));
-        assert!(pmc.get_raw(b"speech_recognition_trial").len() > 4);
         assert_eq!(pmc.get("freeze_state"), "100 200 https://example.org");
         assert!(pmc.get_raw(b"age_verification").len() > 4);
         assert!(pmc.get_raw(b"group_call_message_limits").len() > 8);
