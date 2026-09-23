@@ -19,10 +19,12 @@
 /// `td/telegram/Version.h` — the entries the ported formats branch on.
 /// Keep in sync with the C++ enum; `Version::Next` is the one-past value.
 pub mod version {
+    pub const ADD_DURATION_TO_ANIMATION: i32 = 3;
     pub const STORE_FILE_ID: i32 = 1;
     pub const ADD_KEY_HASH_TO_SECRET_CHAT: i32 = 2;
     pub const FIX_STORE_GAME_WITHOUT_ANIMATION: i32 = 4;
     pub const ADD_ACCESS_HASH_TO_SECRET_CHAT: i32 = 5;
+    pub const SUPPORT_MINITHUMBNAILS: i32 = 20;
     /// `Version::FixWebPageInstantViewDatabase` — the WebPageBlock
     /// animation/video stores gate the file-id payloads on it.
     pub const FIX_WEB_PAGE_INSTANT_VIEW_DATABASE: i32 = 9;
@@ -36,10 +38,11 @@ pub mod version {
     pub const ADD_MESSAGE_UNSUPPORTED_VERSION: i32 = 17;
     pub const ADD_VIDEO_CALLS_SUPPORT: i32 = 21;
     pub const ADD_PHOTO_SIZE_SOURCE: i32 = 22;
+    pub const ADD_ANIMATION_STICKERS: i32 = 26;
     pub const ADD_DIALOG_PHOTO_HAS_ANIMATION: i32 = 27;
+    pub const ADD_PHOTO_PROGRESSIVE_SIZES: i32 = 28;
     pub const ADD_DICE_EMOJI: i32 = 25;
     pub const ADD_KEYBOARD_BUTTON_FLAGS: i32 = 35;
-    pub const ADD_PHOTO_PROGRESSIVE_SIZES: i32 = 28;
     pub const ADD_LIVE_LOCATION_HEADING: i32 = 29;
     pub const ADD_LIVE_LOCATION_PROXIMITY_ALERT_DISTANCE: i32 = 30;
     pub const SUPPORT_BANNED_CHANNELS: i32 = 31;

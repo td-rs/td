@@ -753,6 +753,18 @@ pub trait UpdatesSink {
     // struct travels whole, exactly like `on_update_channel_too_long`.
 
     /// `MessagesManager::on_update_service_notification` (cpp:3834).
+    /// `LanguagePackManager::on_language_pack_too_long`
+    /// (UpdatesManager.cpp:4818-4823, M.24). The manager-local halves are
+    /// landed and tested on [`crate::language_pack_manager`]; this sink
+    /// impl routes into Td's `language_pack_manager` with the net step
+    /// (the same collapsed-sink convention as the MessagesManager
+    /// intakes).
+    fn on_update_lang_pack_too_long(&mut self, _lang_code: String) {}
+
+    /// `LanguagePackManager::on_update_language_pack`
+    /// (UpdatesManager.cpp:4824-4829, M.24).
+    fn on_update_lang_pack(&mut self, _difference: telegram_api::LangPackDifference) {}
+
     fn on_update_service_notification(&mut self, _update: telegram_api::updateServiceNotification) {
     }
     /// `MessagesManager::on_update_read_channel_inbox` (cpp:3844).
@@ -5294,23 +5306,19 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                     promise,
                 );
             }
-            PendingUpdate::Wire(telegram_api::Update::updateLangPackTooLong(_)) => {
-                // language_pack_manager — Wave 2.
-                self.drop_unsupported(
-                    telegram_api::updateLangPackTooLong::ID,
-                    "updateLangPackTooLong",
-                    4818,
-                    promise,
-                );
+            PendingUpdate::Wire(telegram_api::Update::updateLangPackTooLong(update)) => {
+                // UpdatesManager::on_update (cpp:4818-4823, M.24); the
+                // sink impl lands with the net step
+                self.sink.on_update_lang_pack_too_long(update.lang_code);
+                promise.set_value(());
             }
-            PendingUpdate::Wire(telegram_api::Update::updateLangPack(_)) => {
-                // language_pack_manager — Wave 2.
-                self.drop_unsupported(
-                    telegram_api::updateLangPack::ID,
-                    "updateLangPack",
-                    4824,
-                    promise,
-                );
+            PendingUpdate::Wire(telegram_api::Update::updateLangPack(update)) => {
+                // UpdatesManager::on_update (cpp:4824-4829, M.24); the
+                // sink impl lands with the net step
+                if let Some(difference) = update.difference {
+                    self.sink.on_update_lang_pack(difference);
+                }
+                promise.set_value(());
             }
             PendingUpdate::Wire(telegram_api::Update::updateMessagePoll(_)) => {
                 // poll_manager — Wave 2.
