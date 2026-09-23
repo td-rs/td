@@ -379,7 +379,10 @@ mod tests {
                     break;
                 }
             }
-            assert!(saw_wait_params, "startup state never reached waitTdlibParameters");
+            assert!(
+                saw_wait_params,
+                "startup state never reached waitTdlibParameters"
+            );
 
             let close = c"{\"@type\":\"close\"}";
             td_send(client_id, close.as_ptr());
@@ -411,7 +414,10 @@ mod tests {
                 }
             }
             td_json_client_destroy(client);
-            assert!(answered, "legacy client stopped answering after a manager close");
+            assert!(
+                answered,
+                "legacy client stopped answering after a manager close"
+            );
         }
     }
 
