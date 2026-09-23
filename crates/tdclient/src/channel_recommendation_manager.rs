@@ -549,7 +549,7 @@ mod tests {
             members: HashSet::new(),
             input_peer_channels: HashSet::from([3]),
             broadcasts: HashSet::new(),
-            dialogs: HashSet::from([3]),
+            dialogs: HashSet::from([channel_dialog(3).get()]),
             reloaded: RefCell::new(Vec::new()),
             opened: RefCell::new(Vec::new()),
         };
@@ -571,7 +571,7 @@ mod tests {
             members: HashSet::new(),
             input_peer_channels: HashSet::from([4]),
             broadcasts: HashSet::from([4]),
-            dialogs: HashSet::from([4]),
+            dialogs: HashSet::from([channel_dialog(4).get()]),
             reloaded: RefCell::new(Vec::new()),
             opened: RefCell::new(Vec::new()),
         };
@@ -596,7 +596,13 @@ mod tests {
             members: HashSet::new(),
             input_peer_channels: HashSet::new(),
             broadcasts: HashSet::new(),
-            dialogs: HashSet::from([5, 6]),
+            // the encoded dialog ids (the have_dialog_force probe) plus the
+            // user dialog, so the invalid-opened leg dies on the type check
+            dialogs: HashSet::from([
+                channel_dialog(5).get(),
+                channel_dialog(6).get(),
+                DialogId::from_user_id(crate::user_manager::UserId::new(6)).get(),
+            ]),
             reloaded: RefCell::new(Vec::new()),
             opened: RefCell::new(Vec::new()),
         };
