@@ -17,7 +17,7 @@
 
 use crate::chat_manager::ChannelId;
 use crate::dialog_id::{DialogId, MessageFullId, ServerMessageId};
-use crate::messages_manager::MessageId;
+use crate::messages_manager::{EphemeralMessageId, MessageId};
 use crate::store_parse::{self, Parser};
 use crate::td_api;
 use crate::user_manager::UserId;
@@ -198,6 +198,395 @@ pub trait MessageQueryManagerEnv {
     }
     /// `GetEmojiGameInfoQuery` (MessageQueryManager.cpp:1388-1414).
     fn send_get_emoji_game_info_query(&mut self, _promise: Promise<td_api::StakeDiceState>) {}
+
+    // -- the request-slice seams (the M.mp manager methods) -----------------
+    /// `messages_manager_->can_add_message_tasks` — the ToDoList-content
+    /// check reads the loaded `Message *`; the collapsed line answers
+    /// false (the not-loaded band, the M.10 message-storage integration).
+    fn can_add_message_tasks(&mut self, _message_full_id: MessageFullId, _task_count: i32) -> bool {
+        false
+    }
+    /// `messages_manager_->can_mark_message_tasks_as_done` — the same
+    /// `Message *`-dependent gate.
+    fn can_mark_message_tasks_as_done(&mut self, _message_full_id: MessageFullId) -> bool {
+        false
+    }
+    /// `messages_manager_->get_message_requested_dialog_type` — the
+    /// keyboardButtonSourceMessage resolution; the collapsed line answers
+    /// the not-loaded band (400 "Message not found").
+    fn get_message_requested_dialog_type(
+        &mut self,
+        _message_full_id: MessageFullId,
+        _button_id: i32,
+    ) -> Result<crate::requested_dialog_type::RequestedDialogType, tdutils::status::Status> {
+        Err(tdutils::status::Status::error(400, "Message not found"))
+    }
+    /// `dialog_manager_->have_dialog_force` — the M.6 dialog-plane probe.
+    fn have_dialog_force(&mut self, _dialog_id: DialogId, _source: &str) -> bool {
+        false
+    }
+    /// `user_manager_->have_accessible_user` — the share plane gate.
+    fn have_accessible_user(&mut self, _user_id: UserId) -> bool {
+        false
+    }
+    /// `user_manager_->get_input_user` — the personal-history pre-step.
+    fn get_input_user(
+        &mut self,
+        _user_id: UserId,
+    ) -> Result<telegram_api::InputUser, tdutils::status::Status> {
+        Err(tdutils::status::Status::error(400, "User not found"))
+    }
+    /// `messages_manager_->delete_local_dialog_messages_by_sender` — the
+    /// local per-sender delete walk over the (not yet collapsed-in)
+    /// dialog message store; a no-op default, the M.10 storage tail.
+    fn delete_local_dialog_messages_by_sender(
+        &mut self,
+        _dialog_id: DialogId,
+        _sender_dialog_id: DialogId,
+    ) {
+    }
+    /// `messages_manager_->delete_local_dialog_messages_by_date` — the
+    /// local by-date delete walk; the same storage tail.
+    fn delete_local_dialog_messages_by_date(
+        &mut self,
+        _dialog_id: DialogId,
+        _min_date: i32,
+        _max_date: i32,
+    ) {
+    }
+    /// `messages_manager_->on_delete_ephemeral_messages` — the local
+    /// ephemeral-message removal (real over the updates sink in `Td`).
+    fn on_delete_ephemeral_messages(
+        &mut self,
+        _dialog_id: DialogId,
+        _ephemeral_message_ids: Vec<EphemeralMessageId>,
+    ) {
+    }
+    /// `HashtagHints::hashtag_used` over `td_->hashtag_search_hints_` /
+    /// `td_->cashtag_search_hints_` — the pmc-backed hints actor; the
+    /// hints persistence is its own slice.
+    fn hashtag_used(&mut self, _is_cashtag: bool, _hashtag: String) {}
+    /// `td_->star_manager_->has_owned_star_count` — the StarManager seam
+    /// answers true (the search proceeds), matching the payments-plane
+    /// seam default.
+    fn has_owned_star_count(&mut self, _star_count: i64) -> bool {
+        true
+    }
+
+    // -- the `[blocked: net]` query tails of the request slice; each one
+    // -- owns the promise, which keeps the C++ request unanswered offline
+    /// `SearchMessagesGlobalQuery::send`
+    /// (MessageQueryManager.cpp:3182-3204 payload).
+    #[allow(clippy::too_many_arguments)]
+    fn send_search_messages_global_query(
+        &mut self,
+        _folder_id: crate::messages_manager::FolderId,
+        _ignore_folder_id: bool,
+        _query: String,
+        _offset_date: i32,
+        _offset_dialog_id: DialogId,
+        _offset_message_id: MessageId,
+        _limit: i32,
+        _filter: crate::messages_manager::MessageSearchFilter,
+        _chat_type_filter: Option<td_api::SearchMessagesChatTypeFilter>,
+        _min_date: i32,
+        _max_date: i32,
+        _promise: Promise<td_api::FoundMessages>,
+    ) {
+    }
+    /// `SearchSentMediaQuery::send` (MessageQueryManager.cpp:3428 payload).
+    fn send_search_sent_media_query(
+        &mut self,
+        _query: String,
+        _limit: i32,
+        _promise: Promise<td_api::FoundMessages>,
+    ) {
+    }
+    /// `CheckSearchPostsFloodQuery::send`
+    /// (MessageQueryManager.cpp:3439 payload).
+    fn send_check_search_posts_flood_query(
+        &mut self,
+        _query: String,
+        _promise: Promise<td_api::PublicPostSearchLimits>,
+    ) {
+    }
+    /// `SearchPublicPostsQuery::send`
+    /// (MessageQueryManager.cpp:3492 payload).
+    fn send_search_public_posts_query(
+        &mut self,
+        _query: String,
+        _offset: MessageSearchOffset,
+        _limit: i32,
+        _star_count: i64,
+        _promise: Promise<td_api::FoundPublicPosts>,
+    ) {
+    }
+    /// `SearchPostsQuery::send` (MessageQueryManager.cpp:3548 payload).
+    fn send_search_posts_query(
+        &mut self,
+        _hashtag: String,
+        _offset: MessageSearchOffset,
+        _limit: i32,
+        _promise: Promise<td_api::FoundMessages>,
+    ) {
+    }
+    /// `GetRecentLocationsQuery::send`
+    /// (MessageQueryManager.cpp:3605 payload).
+    fn send_get_recent_locations_query(
+        &mut self,
+        _dialog_id: DialogId,
+        _limit: i32,
+        _promise: Promise<td_api::Messages>,
+    ) {
+    }
+    /// `ReportMusicListenQuery::send`
+    /// (MessageQueryManager.cpp:3679 payload).
+    fn send_report_music_listen_query(
+        &mut self,
+        _input_document: telegram_api::InputDocument,
+        _duration: i32,
+        _promise: Promise<()>,
+    ) {
+    }
+    /// `SummarizeTextQuery::send` (MessageQueryManager.cpp:3953 payload).
+    fn send_summarize_text_query(
+        &mut self,
+        _dialog_id: DialogId,
+        _message_id: MessageId,
+        _to_language_code: String,
+        _tone: String,
+        _promise: Promise<td_api::FormattedText>,
+    ) {
+    }
+    /// `AppendToDoListQuery::send`
+    /// (MessageQueryManager.cpp:3970 payload).
+    fn send_append_to_do_list_query(
+        &mut self,
+        _dialog_id: DialogId,
+        _message_id: MessageId,
+        _items: Vec<crate::message_content::ToDoItem>,
+        _promise: Promise<()>,
+    ) {
+    }
+    /// `ToggleToDoCompletedQuery::send`
+    /// (MessageQueryManager.cpp:3982 payload).
+    fn send_toggle_to_do_completed_query(
+        &mut self,
+        _dialog_id: DialogId,
+        _message_id: MessageId,
+        _done_task_ids: Vec<i32>,
+        _not_done_task_ids: Vec<i32>,
+        _promise: Promise<()>,
+    ) {
+    }
+    /// `EditEphemeralMessageQuery::send`
+    /// (MessageQueryManager.cpp:4106-4129 payload) — the text/caption and
+    /// the media-upload completion funnel into the same query.
+    #[allow(clippy::too_many_arguments)]
+    fn send_edit_ephemeral_message_query(
+        &mut self,
+        _dialog_id: DialogId,
+        _receiver_user_id: UserId,
+        _ephemeral_message_id: EphemeralMessageId,
+        _has_input_caption: bool,
+        _input_caption: Option<crate::message_entity::FormattedText>,
+        _disable_web_page_preview: bool,
+        _invert_media: bool,
+        _reply_markup: Option<crate::reply_markup::ReplyMarkup>,
+        _promise: Promise<()>,
+    ) {
+    }
+    /// the media-content leg of `edit_ephemeral_message` — the
+    /// `create_upload_message_content_query` +
+    /// `edit_ephemeral_message_queries_` plane (M.12 upload + net); the
+    /// promise lands unanswered offline.
+    #[allow(clippy::too_many_arguments)]
+    fn start_edit_ephemeral_message_upload(
+        &mut self,
+        _dialog_id: DialogId,
+        _receiver_user_id: UserId,
+        _ephemeral_message_id: EphemeralMessageId,
+        _reply_markup: Option<crate::reply_markup::ReplyMarkup>,
+        _content: crate::message_content::MessageContent,
+        _invert_media: bool,
+        _promise: Promise<()>,
+    ) {
+    }
+    /// `DeleteParticipantReactionsQuery::send`
+    /// (MessageQueryManager.cpp:4800 payload).
+    fn send_delete_participant_reactions_query(
+        &mut self,
+        _dialog_id: DialogId,
+        _sender_dialog_id: DialogId,
+        _promise: Promise<()>,
+    ) {
+    }
+    /// `DeleteParticipantReactionQuery::send`
+    /// (MessageQueryManager.cpp:4817 payload).
+    fn send_delete_participant_reaction_query(
+        &mut self,
+        _dialog_id: DialogId,
+        _message_id: MessageId,
+        _sender_dialog_id: DialogId,
+        _promise: Promise<()>,
+    ) {
+    }
+    /// `GetPersonalChannelHistoryQuery::send`
+    /// (MessageQueryManager.cpp:4830 payload).
+    fn send_get_personal_channel_history_query(
+        &mut self,
+        _input_user: telegram_api::InputUser,
+        _limit: i32,
+        _promise: Promise<td_api::Messages>,
+    ) {
+    }
+    /// `SendBotRequestedPeerQuery::send`
+    /// (MessageQueryManager.cpp:3330 payload).
+    #[allow(clippy::too_many_arguments)]
+    fn send_send_bot_requested_peer_query(
+        &mut self,
+        _message_full_id: MessageFullId,
+        _bot_user_id: UserId,
+        _request_id: String,
+        _button_id: i32,
+        _shared_dialog_ids: Vec<DialogId>,
+        _promise: Promise<()>,
+    ) {
+    }
+    /// `DeleteEphemeralMessageQuery::send`
+    /// (MessageQueryManager.cpp:4735 payload).
+    fn send_delete_ephemeral_message_query(
+        &mut self,
+        _dialog_id: DialogId,
+        _receiver_dialog_id: DialogId,
+        _ephemeral_message_id: EphemeralMessageId,
+        _promise: Promise<()>,
+    ) {
+    }
+
+    // -- the parse pre-steps + remaining probes of the request slice -------
+    /// `G()->is_test_dc()` — the switch-inline-button URL band.
+    fn is_test_dc(&self) -> bool {
+        false
+    }
+    /// `td_->inline_queries_manager_->get_requested_dialog_type` — the
+    /// keyboardButtonSourceWebApp resolution over the prepared-button
+    /// map (real over the InlineQueriesManager in `Td`).
+    fn get_inline_requested_dialog_type(
+        &mut self,
+        _bot_user_id: UserId,
+        _request_id: &str,
+    ) -> Option<crate::requested_dialog_type::RequestedDialogType> {
+        None
+    }
+    /// `dialog_manager_->can_delete_all_dialog_messages_by_sender` — the
+    /// M.6 dialog-plane gate (real over the DialogManager in `Td`).
+    fn can_delete_all_dialog_messages_by_sender(
+        &mut self,
+        _dialog_id: DialogId,
+    ) -> Result<(), tdutils::status::Status> {
+        Err(tdutils::status::Status::error(400, "Chat not found"))
+    }
+    /// the `FileManager::get_file_view` decision table of
+    /// `report_music_listen` — `Some(as_input_document())` for the
+    /// reportable documents, `None` for the silent `Unit()` bands (real
+    /// over the FileManager in `Td`).
+    fn get_music_listen_input_document(
+        &mut self,
+        _file_id: crate::files::FileId,
+    ) -> Option<telegram_api::InputDocument> {
+        None
+    }
+    /// `process_input_message_text(td_, dialog_id, ...)` — the
+    /// `MessageContentContext` reads live on `Td`; unreachable while the
+    /// access/eligibility seams gate the same requests first, real over
+    /// the Td adapter.
+    fn parse_input_message_text(
+        &mut self,
+        _dialog_id: DialogId,
+        _input_message_content: td_api::InputMessageContent,
+    ) -> Result<crate::message_content::InputMessageText, tdutils::status::Status> {
+        Err(tdutils::status::Status::error(
+            500,
+            "The input parse is unreachable behind the offline seams",
+        ))
+    }
+    /// `get_input_message_content(td_, dialog_id, ...)` — the same class.
+    fn parse_input_message_content(
+        &mut self,
+        _dialog_id: DialogId,
+        _input_message_content: td_api::InputMessageContent,
+    ) -> Result<crate::message_content::InputMessageContent, tdutils::status::Status> {
+        Err(tdutils::status::Status::error(
+            500,
+            "The input parse is unreachable behind the offline seams",
+        ))
+    }
+    /// `get_formatted_text(td_, dialog_id, caption, is_bot, true, false,
+    /// false)` — the caption parse pre-step of
+    /// `edit_ephemeral_message_caption`.
+    fn parse_input_caption(
+        &mut self,
+        _dialog_id: DialogId,
+        _input_caption: Option<td_api::FormattedText>,
+    ) -> Result<crate::message_entity::FormattedText, tdutils::status::Status> {
+        Err(tdutils::status::Status::error(
+            500,
+            "The input parse is unreachable behind the offline seams",
+        ))
+    }
+    /// `ToDoItem::get_to_do_item(td_, dialog_id, task)` — the checklist
+    /// task parse pre-step of `add_to_do_list_tasks`.
+    fn parse_to_do_item(
+        &mut self,
+        _dialog_id: DialogId,
+        _task: td_api::InputChecklistTask,
+    ) -> Result<crate::message_content::ToDoItem, tdutils::status::Status> {
+        Err(tdutils::status::Status::error(
+            500,
+            "The input parse is unreachable behind the offline seams",
+        ))
+    }
+
+    // -- the `RequestedDialogTypeEnv` probes of `check_shared_dialog` —
+    // -- unreachable while the have_dialog_force/have_accessible_user
+    // -- seams gate the same loop first; conservative defaults
+    fn is_user_bot(&self, _user_id: UserId) -> bool {
+        false
+    }
+    fn is_user_premium(&self, _user_id: UserId) -> bool {
+        false
+    }
+    fn get_chat_is_active(&self, _chat_id: crate::chat_manager::ChatId) -> bool {
+        false
+    }
+    fn get_chat_status(
+        &self,
+        _chat_id: crate::chat_manager::ChatId,
+    ) -> crate::chat_manager::DialogParticipantStatus {
+        Default::default()
+    }
+    fn is_broadcast_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+    fn is_monoforum_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+    fn is_forum_channel(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
+    fn get_channel_first_username(&self, _channel_id: ChannelId) -> String {
+        String::new()
+    }
+    fn get_channel_status(
+        &self,
+        _channel_id: ChannelId,
+    ) -> crate::chat_manager::DialogParticipantStatus {
+        Default::default()
+    }
+    fn is_channel_public(&self, _channel_id: ChannelId) -> bool {
+        false
+    }
 }
 
 /// `MessageThreadInfo` (MessageThreadInfo.h) — the discussion-thread answer
@@ -1976,6 +2365,1046 @@ impl std::fmt::Debug for MessageQueryManager {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The M.mp request plane — `search_messages` and friends
+// (MessageQueryManager.cpp:3206-4298/4715-4835). The local validation and
+// decision tables are ported exactly; every `create_handler` query tail is
+// the `[blocked: net]` seam above and the promise lands unanswered offline.
+// ---------------------------------------------------------------------------
+
+/// `get_message_search_filter` (MessageSearchFilter.cpp:59-103) — the
+/// td_api filter table; `None` maps to `Empty`.
+pub fn get_message_search_filter(
+    filter: Option<&td_api::SearchMessagesFilter>,
+) -> crate::messages_manager::MessageSearchFilter {
+    use crate::messages_manager::MessageSearchFilter as F;
+    let Some(filter) = filter else {
+        return F::Empty;
+    };
+    match filter {
+        td_api::SearchMessagesFilter::searchMessagesFilterEmpty(_) => F::Empty,
+        td_api::SearchMessagesFilter::searchMessagesFilterAnimation(_) => F::Animation,
+        td_api::SearchMessagesFilter::searchMessagesFilterAudio(_) => F::Audio,
+        td_api::SearchMessagesFilter::searchMessagesFilterDocument(_) => F::Document,
+        td_api::SearchMessagesFilter::searchMessagesFilterPhoto(_) => F::Photo,
+        td_api::SearchMessagesFilter::searchMessagesFilterVideo(_) => F::Video,
+        td_api::SearchMessagesFilter::searchMessagesFilterVoiceNote(_) => F::VoiceNote,
+        td_api::SearchMessagesFilter::searchMessagesFilterPhotoAndVideo(_) => F::PhotoAndVideo,
+        td_api::SearchMessagesFilter::searchMessagesFilterUrl(_) => F::Url,
+        td_api::SearchMessagesFilter::searchMessagesFilterChatPhoto(_) => F::ChatPhoto,
+        td_api::SearchMessagesFilter::searchMessagesFilterVideoNote(_) => F::VideoNote,
+        td_api::SearchMessagesFilter::searchMessagesFilterVoiceAndVideoNote(_) => {
+            F::VoiceAndVideoNote
+        }
+        td_api::SearchMessagesFilter::searchMessagesFilterMention(_) => F::Mention,
+        td_api::SearchMessagesFilter::searchMessagesFilterUnreadMention(_) => F::UnreadMention,
+        td_api::SearchMessagesFilter::searchMessagesFilterFailedToSend(_) => F::FailedToSend,
+        td_api::SearchMessagesFilter::searchMessagesFilterPinned(_) => F::Pinned,
+        td_api::SearchMessagesFilter::searchMessagesFilterUnreadReaction(_) => F::UnreadReaction,
+        td_api::SearchMessagesFilter::searchMessagesFilterPoll(_) => F::Poll,
+        td_api::SearchMessagesFilter::searchMessagesFilterUnreadPollVote(_) => F::UnreadPollVote,
+        #[allow(unreachable_patterns)]
+        _ => {
+            tracing::error!("Receive unsupported search messages filter");
+            F::Empty
+        }
+    }
+}
+
+/// `MessagesManager::get_found_messages_object` over the empty
+/// `FoundMessages` — the local empty answer of the two search arms.
+fn get_empty_found_messages() -> td_api::FoundMessages {
+    td_api::FoundMessages {
+        total_count: 0,
+        messages: Vec::new(),
+        next_offset: String::new(),
+    }
+}
+
+/// The search-limit clamps shared by the search arms — `Ok(None)` on the
+/// 400 band, `Ok(Some(clamped))` otherwise
+/// (`limit <= 0` / `limit > MAX_SEARCH_MESSAGES`).
+fn fix_search_limit(mut limit: i32) -> Result<i32, tdutils::status::Status> {
+    if limit <= 0 {
+        return Err(tdutils::status::Status::error(
+            400,
+            "Parameter limit must be positive",
+        ));
+    }
+    if limit > MAX_SEARCH_MESSAGES {
+        limit = MAX_SEARCH_MESSAGES;
+    }
+    Ok(limit)
+}
+
+impl MessageQueryManager {
+    /// `search_messages` (MessageQueryManager.cpp:3333-3370).
+    #[allow(clippy::too_many_arguments)]
+    pub fn search_messages(
+        &mut self,
+        env: &mut impl MessageQueryManagerEnv,
+        dialog_list_id: crate::messages_manager::DialogListId,
+        ignore_folder_id: bool,
+        query: String,
+        offset_str: String,
+        limit: i32,
+        filter: crate::messages_manager::MessageSearchFilter,
+        dialog_type_filter: Option<td_api::SearchMessagesChatTypeFilter>,
+        min_date: i32,
+        max_date: i32,
+        mut promise: Promise<td_api::FoundMessages>,
+    ) {
+        if !dialog_list_id.is_folder() {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Wrong chat list specified",
+            ));
+            return;
+        }
+        let limit = match fix_search_limit(limit) {
+            Ok(limit) => limit,
+            Err(error) => {
+                promise.set_error(error);
+                return;
+            }
+        };
+        let offset = match crate::message_query_manager::MessageSearchOffset::from_offset_string(
+            &offset_str,
+        ) {
+            Ok(offset) => offset,
+            Err(error) => {
+                promise.set_error(error);
+                return;
+            }
+        };
+
+        // the C++ CHECK that the arm's `get_message_search_filter` mapping
+        // never routes the Call filters here
+        assert!(filter != crate::messages_manager::MessageSearchFilter::Call);
+        assert!(filter != crate::messages_manager::MessageSearchFilter::MissedCall);
+        if matches!(
+            filter,
+            crate::messages_manager::MessageSearchFilter::Mention
+                | crate::messages_manager::MessageSearchFilter::UnreadMention
+                | crate::messages_manager::MessageSearchFilter::UnreadReaction
+                | crate::messages_manager::MessageSearchFilter::UnreadPollVote
+                | crate::messages_manager::MessageSearchFilter::FailedToSend
+                | crate::messages_manager::MessageSearchFilter::Pinned
+        ) {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "The filter is not supported",
+            ));
+            return;
+        }
+
+        if query.is_empty() && filter == crate::messages_manager::MessageSearchFilter::Empty {
+            promise.set_value(get_empty_found_messages());
+            return;
+        }
+
+        env.send_search_messages_global_query(
+            dialog_list_id.get_folder_id(),
+            ignore_folder_id,
+            query,
+            offset.date,
+            offset.dialog_id,
+            offset.message_id,
+            limit,
+            filter,
+            dialog_type_filter,
+            min_date,
+            max_date,
+            promise,
+        );
+    }
+
+    /// `search_outgoing_document_messages`
+    /// (MessageQueryManager.cpp:3404-3414).
+    pub fn search_outgoing_document_messages(
+        &mut self,
+        env: &mut impl MessageQueryManagerEnv,
+        query: String,
+        limit: i32,
+        mut promise: Promise<td_api::FoundMessages>,
+    ) {
+        let limit = match fix_search_limit(limit) {
+            Ok(limit) => limit,
+            Err(error) => {
+                promise.set_error(error);
+                return;
+            }
+        };
+        env.send_search_sent_media_query(query, limit, promise);
+    }
+
+    /// `check_search_posts_flood` (MessageQueryManager.cpp:3437-3441).
+    pub fn check_search_posts_flood(
+        &mut self,
+        env: &mut impl MessageQueryManagerEnv,
+        query: String,
+        promise: Promise<td_api::PublicPostSearchLimits>,
+    ) {
+        env.send_check_search_posts_flood_query(query, promise);
+    }
+
+    /// `search_public_posts` (MessageQueryManager.cpp:3442-3468).
+    pub fn search_public_posts(
+        &mut self,
+        env: &mut impl MessageQueryManagerEnv,
+        query: String,
+        offset_str: String,
+        limit: i32,
+        star_count: i64,
+        mut promise: Promise<td_api::FoundPublicPosts>,
+    ) {
+        let limit = match fix_search_limit(limit) {
+            Ok(limit) => limit,
+            Err(error) => {
+                promise.set_error(error);
+                return;
+            }
+        };
+        if star_count < 0 {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Invalid number of Telegram Stars specified",
+            ));
+            return;
+        }
+        if !env.has_owned_star_count(star_count) {
+            promise.set_error(tdutils::status::Status::error(400, "BALANCE_TOO_LOW"));
+            return;
+        }
+        let offset = match crate::message_query_manager::MessageSearchOffset::from_offset_string(
+            &offset_str,
+        ) {
+            Ok(offset) => offset,
+            Err(error) => {
+                promise.set_error(error);
+                return;
+            }
+        };
+        env.send_search_public_posts_query(query, offset, limit, star_count, promise);
+    }
+
+    /// `search_hashtag_posts` (MessageQueryManager.cpp:3496-3535).
+    pub fn search_hashtag_posts(
+        &mut self,
+        env: &mut impl MessageQueryManagerEnv,
+        mut hashtag: String,
+        offset_str: String,
+        limit: i32,
+        mut promise: Promise<td_api::FoundMessages>,
+    ) {
+        let limit = match fix_search_limit(limit) {
+            Ok(limit) => limit,
+            Err(error) => {
+                promise.set_error(error);
+                return;
+            }
+        };
+        let offset = match crate::message_query_manager::MessageSearchOffset::from_offset_string(
+            &offset_str,
+        ) {
+            Ok(offset) => offset,
+            Err(error) => {
+                promise.set_error(error);
+                return;
+            }
+        };
+
+        let mut is_cashtag = false;
+        let first_byte = hashtag.as_bytes().first().copied();
+        if matches!(first_byte, Some(b'#') | Some(b'$')) {
+            is_cashtag = first_byte == Some(b'$');
+            hashtag.remove(0);
+        }
+        if hashtag.is_empty() {
+            promise.set_value(get_empty_found_messages());
+            return;
+        }
+        env.hashtag_used(is_cashtag, hashtag.clone());
+
+        let mut prefixed = if is_cashtag { "$" } else { "#" }.to_string();
+        prefixed.push_str(&hashtag);
+        env.send_search_posts_query(prefixed, offset, limit, promise);
+    }
+
+    /// `search_dialog_recent_location_messages`
+    /// (MessageQueryManager.cpp:3557-3582).
+    pub fn search_dialog_recent_location_messages(
+        &mut self,
+        env: &mut impl MessageQueryManagerEnv,
+        dialog_id: DialogId,
+        limit: i32,
+        mut promise: Promise<td_api::Messages>,
+    ) {
+        tracing::info!(
+            "Search recent location messages in {} with limit {}",
+            dialog_id,
+            limit
+        );
+        let limit = match fix_search_limit(limit) {
+            Ok(limit) => limit,
+            Err(error) => {
+                promise.set_error(error);
+                return;
+            }
+        };
+        if let Err(error) = env.check_dialog_access(
+            dialog_id,
+            true,
+            crate::user_manager::AccessRights::Read,
+            "search_dialog_recent_location_messages",
+        ) {
+            promise.set_error(error);
+            return;
+        }
+
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User | DialogType::Chat | DialogType::Channel => {
+                env.send_get_recent_locations_query(dialog_id, limit, promise);
+            }
+            DialogType::SecretChat => promise.set_value(
+                crate::messages_manager::get_messages_object(0, Vec::new(), false),
+            ),
+            _ => {
+                // the C++ UNREACHABLE behind the check_dialog_access gate
+                promise.set_error(tdutils::status::Status::error(
+                    500,
+                    "Message search is not supported",
+                ));
+            }
+        }
+    }
+
+    /// `report_music_listen` (MessageQueryManager.cpp:3630-3652).
+    pub fn report_music_listen(
+        &mut self,
+        env: &mut impl MessageQueryManagerEnv,
+        file_id: crate::files::FileId,
+        duration: i32,
+        mut promise: Promise<()>,
+    ) {
+        if duration < 0 {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Invalid duration specified",
+            ));
+            return;
+        }
+        if !file_id.is_valid() {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Invalid file identifier specified",
+            ));
+            return;
+        }
+        let Some(input_document) = env.get_music_listen_input_document(file_id) else {
+            // encrypted, non-document, web or missing remote location
+            promise.set_value(());
+            return;
+        };
+        if duration < 3 {
+            promise.set_value(());
+            return;
+        }
+        env.send_report_music_listen_query(input_document, duration, promise);
+    }
+
+    /// `summarize_message_text` (MessageQueryManager.cpp:3940-3955).
+    pub fn summarize_message_text(
+        &mut self,
+        env: &mut impl MessageQueryManagerEnv,
+        message_full_id: MessageFullId,
+        to_language_code: String,
+        mut tone: String,
+        mut promise: Promise<td_api::FormattedText>,
+    ) {
+        let dialog_id = message_full_id.get_dialog_id();
+        if let Err(error) = env.check_dialog_access(
+            dialog_id,
+            false,
+            crate::user_manager::AccessRights::Read,
+            "summarize_message_text",
+        ) {
+            promise.set_error(error);
+            return;
+        }
+        if !env.have_message_force(message_full_id, "summarize_message_text") {
+            promise.set_error(tdutils::status::Status::error(400, "Message not found"));
+            return;
+        }
+        if let tdutils::status::Result::Err(error) =
+            crate::translation_manager::TranslationManager::check_tone(&mut tone)
+        {
+            promise.set_error(error);
+            return;
+        }
+        let message_id = message_full_id.get_message_id();
+        if !message_id.is_server() {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Message can't be summarized",
+            ));
+            return;
+        }
+        env.send_summarize_text_query(dialog_id, message_id, to_language_code, tone, promise);
+    }
+
+    /// `add_to_do_list_tasks` (MessageQueryManager.cpp:3957-3974).
+    pub fn add_to_do_list_tasks(
+        &mut self,
+        env: &mut impl MessageQueryManagerEnv,
+        message_full_id: MessageFullId,
+        tasks: Vec<td_api::InputChecklistTask>,
+        mut promise: Promise<()>,
+    ) {
+        let dialog_id = message_full_id.get_dialog_id();
+        if !env.can_add_message_tasks(message_full_id, tasks.len().try_into().unwrap_or(i32::MAX)) {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Can't add the checklist tasks to the message",
+            ));
+            return;
+        }
+        let mut items = Vec::with_capacity(tasks.len());
+        for task in tasks {
+            match env.parse_to_do_item(dialog_id, task) {
+                Ok(item) => items.push(item),
+                Err(error) => {
+                    promise.set_error(error);
+                    return;
+                }
+            }
+        }
+        if items.is_empty() {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "The list of new tasks must be non-empty",
+            ));
+            return;
+        }
+        env.send_append_to_do_list_query(
+            dialog_id,
+            message_full_id.get_message_id(),
+            items,
+            promise,
+        );
+    }
+
+    /// `mark_to_do_list_tasks_as_done` (MessageQueryManager.cpp:3976-3985).
+    pub fn mark_to_do_list_tasks_as_done(
+        &mut self,
+        env: &mut impl MessageQueryManagerEnv,
+        message_full_id: MessageFullId,
+        done_task_ids: Vec<i32>,
+        not_done_task_ids: Vec<i32>,
+        mut promise: Promise<()>,
+    ) {
+        let dialog_id = message_full_id.get_dialog_id();
+        if !env.can_mark_message_tasks_as_done(message_full_id) {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Can't mark tasks as done in the message",
+            ));
+            return;
+        }
+        env.send_toggle_to_do_completed_query(
+            dialog_id,
+            message_full_id.get_message_id(),
+            done_task_ids,
+            not_done_task_ids,
+            promise,
+        );
+    }
+
+    /// `edit_ephemeral_message` (MessageQueryManager.cpp:4131-4179).
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_ephemeral_message(
+        &mut self,
+        env: &mut impl MessageQueryManagerEnv,
+        dialog_id: DialogId,
+        receiver_user_id: UserId,
+        ephemeral_message_id: EphemeralMessageId,
+        reply_markup: Option<td_api::ReplyMarkup>,
+        input_message_content: Option<td_api::InputMessageContent>,
+        mut promise: Promise<()>,
+    ) {
+        let is_bot = env.auth_is_bot();
+        assert!(is_bot);
+
+        if let Err(error) = env.check_dialog_access(
+            dialog_id,
+            false,
+            crate::user_manager::AccessRights::Write,
+            "edit_ephemeral_message",
+        ) {
+            promise.set_error(error);
+            return;
+        }
+        let new_reply_markup = match crate::reply_markup::get_inline_reply_markup(
+            reply_markup,
+            is_bot,
+            true,
+            env.is_test_dc(),
+        ) {
+            Ok(new_reply_markup) => new_reply_markup,
+            Err(error) => {
+                promise.set_error(error);
+                return;
+            }
+        };
+        let Some(input_message_content) = input_message_content else {
+            env.send_edit_ephemeral_message_query(
+                dialog_id,
+                receiver_user_id,
+                ephemeral_message_id,
+                false,
+                None,
+                false,
+                false,
+                new_reply_markup,
+                promise,
+            );
+            return;
+        };
+
+        if matches!(
+            &input_message_content,
+            td_api::InputMessageContent::inputMessageText(_)
+        ) {
+            let input_message_text =
+                match env.parse_input_message_text(dialog_id, input_message_content) {
+                    Ok(input_message_text) => input_message_text,
+                    Err(error) => {
+                        promise.set_error(error);
+                        return;
+                    }
+                };
+            env.send_edit_ephemeral_message_query(
+                dialog_id,
+                receiver_user_id,
+                ephemeral_message_id,
+                true,
+                Some(input_message_text.text),
+                input_message_text.disable_web_page_preview,
+                false,
+                new_reply_markup,
+                promise,
+            );
+            return;
+        }
+
+        let content = match env.parse_input_message_content(dialog_id, input_message_content) {
+            Ok(content) => content,
+            Err(error) => {
+                promise.set_error(error);
+                return;
+            }
+        };
+        let content_type = content.content.get_type();
+        if !crate::messages_manager::is_editable_media_message_content(content_type)
+            && content_type != crate::message_content::MessageContentType::RichText
+        {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Unsupported input message content type",
+            ));
+            return;
+        }
+        if !content.ttl.is_empty() {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Can't enable self-destruction for media",
+            ));
+            return;
+        }
+
+        env.start_edit_ephemeral_message_upload(
+            dialog_id,
+            receiver_user_id,
+            ephemeral_message_id,
+            new_reply_markup,
+            *content.content,
+            content.invert_media,
+            promise,
+        );
+    }
+
+    /// `edit_ephemeral_message_caption`
+    /// (MessageQueryManager.cpp:4181-4207).
+    #[allow(clippy::too_many_arguments)]
+    pub fn edit_ephemeral_message_caption(
+        &mut self,
+        env: &mut impl MessageQueryManagerEnv,
+        dialog_id: DialogId,
+        receiver_user_id: UserId,
+        ephemeral_message_id: EphemeralMessageId,
+        reply_markup: Option<td_api::ReplyMarkup>,
+        input_caption: Option<td_api::FormattedText>,
+        invert_media: bool,
+        mut promise: Promise<()>,
+    ) {
+        let is_bot = env.auth_is_bot();
+        assert!(is_bot);
+
+        if let Err(error) = env.check_dialog_access(
+            dialog_id,
+            false,
+            crate::user_manager::AccessRights::Write,
+            "edit_ephemeral_message_caption",
+        ) {
+            promise.set_error(error);
+            return;
+        }
+        let new_reply_markup = match crate::reply_markup::get_inline_reply_markup(
+            reply_markup,
+            is_bot,
+            true,
+            env.is_test_dc(),
+        ) {
+            Ok(new_reply_markup) => new_reply_markup,
+            Err(error) => {
+                promise.set_error(error);
+                return;
+            }
+        };
+        let caption = match env.parse_input_caption(dialog_id, input_caption) {
+            Ok(caption) => caption,
+            Err(error) => {
+                promise.set_error(error);
+                return;
+            }
+        };
+
+        env.send_edit_ephemeral_message_query(
+            dialog_id,
+            receiver_user_id,
+            ephemeral_message_id,
+            true,
+            Some(caption),
+            false,
+            invert_media,
+            new_reply_markup,
+            promise,
+        );
+    }
+
+    /// `delete_dialog_messages_by_sender`
+    /// (MessageQueryManager.cpp:4251-4265).
+    pub fn delete_dialog_messages_by_sender(
+        &mut self,
+        env: &mut impl MessageQueryManagerEnv,
+        dialog_id: DialogId,
+        sender_dialog_id: DialogId,
+        mut promise: Promise<()>,
+    ) {
+        assert!(!env.auth_is_bot());
+        if let Err(error) = env.check_dialog_access(
+            dialog_id,
+            true,
+            crate::user_manager::AccessRights::Write,
+            "delete_dialog_messages_by_sender",
+        ) {
+            promise.set_error(error);
+            return;
+        }
+        if let Err(error) = env.can_delete_all_dialog_messages_by_sender(dialog_id) {
+            promise.set_error(error);
+            return;
+        }
+        if !env.have_input_peer(
+            sender_dialog_id,
+            false,
+            crate::user_manager::AccessRights::Know,
+        ) {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Message sender not found",
+            ));
+            return;
+        }
+
+        env.delete_local_dialog_messages_by_sender(dialog_id, sender_dialog_id);
+
+        assert!(dialog_id.get_type() == crate::dialog_id::DialogType::Channel);
+        env.send_affected_history_query(
+            dialog_id,
+            AffectedHistoryQueryKind::DeleteAllChannelMessagesFromSender { sender_dialog_id },
+            true,
+            promise,
+        );
+    }
+
+    /// `delete_dialog_messages_by_date`
+    /// (MessageQueryManager.cpp:4267-4297).
+    pub fn delete_dialog_messages_by_date(
+        &mut self,
+        env: &mut impl MessageQueryManagerEnv,
+        dialog_id: DialogId,
+        min_date: i32,
+        max_date: i32,
+        revoke: bool,
+        mut promise: Promise<()>,
+    ) {
+        assert!(!env.auth_is_bot());
+        if let Err(error) = env.check_dialog_access(
+            dialog_id,
+            false,
+            crate::user_manager::AccessRights::Read,
+            "delete_dialog_messages_by_date",
+        ) {
+            promise.set_error(error);
+            return;
+        }
+        let (min_date, max_date) =
+            match Self::fix_delete_message_min_max_dates(env, min_date, max_date) {
+                Ok(fixed) => fixed,
+                Err(error) => {
+                    promise.set_error(error);
+                    return;
+                }
+            };
+        if max_date == 0 {
+            promise.set_value(());
+            return;
+        }
+
+        use crate::dialog_id::DialogType;
+        match dialog_id.get_type() {
+            DialogType::User => {}
+            DialogType::Chat => {
+                if revoke {
+                    promise.set_error(tdutils::status::Status::error(
+                        400,
+                        "Bulk message revocation is unsupported in basic group chats",
+                    ));
+                    return;
+                }
+            }
+            DialogType::Channel => {
+                promise.set_error(tdutils::status::Status::error(
+                    400,
+                    "Bulk message deletion is unsupported in supergroup chats",
+                ));
+                return;
+            }
+            _ => {
+                // the C++ UNREACHABLE — SecretChat/None are gated upstream
+                unreachable!("the C++ UNREACHABLE over the dialog type fired");
+            }
+        }
+
+        env.delete_local_dialog_messages_by_date(dialog_id, min_date, max_date);
+
+        env.send_affected_history_query(
+            dialog_id,
+            AffectedHistoryQueryKind::DeleteDialogMessagesByDate {
+                min_date,
+                max_date,
+                revoke,
+            },
+            true,
+            promise,
+        );
+    }
+
+    /// `delete_all_call_messages` (MessageQueryManager.cpp:4299-4302) —
+    /// straight into the affected-history loop.
+    pub fn delete_all_call_messages(
+        &mut self,
+        env: &mut impl MessageQueryManagerEnv,
+        revoke: bool,
+        promise: Promise<()>,
+    ) {
+        self.run_affected_history_query_until_complete(
+            env,
+            DialogId::default(),
+            AffectedHistoryQueryKind::DeleteAllCallMessages { revoke },
+            true,
+            promise,
+        );
+    }
+
+    /// `delete_ephemeral_message_on_server`
+    /// (MessageQueryManager.cpp:4715-4736).
+    pub fn delete_ephemeral_message_on_server(
+        &mut self,
+        env: &mut impl MessageQueryManagerEnv,
+        dialog_id: DialogId,
+        receiver_dialog_id: DialogId,
+        ephemeral_message_id: EphemeralMessageId,
+        promise: Promise<()>,
+    ) {
+        tracing::info!(
+            "Delete {:?} from {} in {} from server",
+            ephemeral_message_id,
+            receiver_dialog_id,
+            dialog_id
+        );
+
+        env.on_delete_ephemeral_messages(dialog_id, vec![ephemeral_message_id]);
+
+        env.send_delete_ephemeral_message_query(
+            dialog_id,
+            receiver_dialog_id,
+            ephemeral_message_id,
+            promise,
+        );
+    }
+
+    /// `delete_reactions_by_sender` (MessageQueryManager.cpp:4790-4801).
+    pub fn delete_reactions_by_sender(
+        &mut self,
+        env: &mut impl MessageQueryManagerEnv,
+        dialog_id: DialogId,
+        sender_dialog_id: DialogId,
+        mut promise: Promise<()>,
+    ) {
+        if let Err(error) = env.check_dialog_access(
+            dialog_id,
+            true,
+            crate::user_manager::AccessRights::Write,
+            "delete_reactions_by_sender",
+        ) {
+            promise.set_error(error);
+            return;
+        }
+        if !env.have_input_peer(
+            sender_dialog_id,
+            false,
+            crate::user_manager::AccessRights::Know,
+        ) {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Reaction sender not found",
+            ));
+            return;
+        }
+
+        env.send_delete_participant_reactions_query(dialog_id, sender_dialog_id, promise);
+    }
+
+    /// `delete_reaction_by_sender` (MessageQueryManager.cpp:4803-4818).
+    pub fn delete_reaction_by_sender(
+        &mut self,
+        env: &mut impl MessageQueryManagerEnv,
+        dialog_id: DialogId,
+        message_id: MessageId,
+        sender_dialog_id: DialogId,
+        mut promise: Promise<()>,
+    ) {
+        if let Err(error) = env.check_dialog_access(
+            dialog_id,
+            true,
+            crate::user_manager::AccessRights::Write,
+            "delete_reactions_by_sender",
+        ) {
+            promise.set_error(error);
+            return;
+        }
+        if !env.have_input_peer(
+            sender_dialog_id,
+            false,
+            crate::user_manager::AccessRights::Know,
+        ) {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Reaction sender not found",
+            ));
+            return;
+        }
+        if !message_id.is_server() {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Invalid message identifier specified",
+            ));
+            return;
+        }
+
+        env.send_delete_participant_reaction_query(
+            dialog_id,
+            message_id,
+            sender_dialog_id,
+            promise,
+        );
+    }
+
+    /// `get_personal_chat_history` (MessageQueryManager.cpp:4820-4829).
+    pub fn get_personal_chat_history(
+        &mut self,
+        env: &mut impl MessageQueryManagerEnv,
+        user_id: UserId,
+        limit: i32,
+        mut promise: Promise<td_api::Messages>,
+    ) {
+        let input_user = match env.get_input_user(user_id) {
+            Ok(input_user) => input_user,
+            Err(error) => {
+                promise.set_error(error);
+                return;
+            }
+        };
+        if limit <= 0 {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Limit must be positive",
+            ));
+            return;
+        }
+
+        env.send_get_personal_channel_history_query(input_user, limit, promise);
+    }
+
+    /// `share_dialogs_with_bot` (MessageQueryManager.cpp:3206-3271).
+    #[allow(clippy::too_many_arguments)]
+    pub fn share_dialogs_with_bot(
+        &mut self,
+        env: &mut impl MessageQueryManagerEnv,
+        source: Option<td_api::KeyboardButtonSource>,
+        button_id: i32,
+        shared_dialog_ids: Vec<DialogId>,
+        expect_user: bool,
+        only_check: bool,
+        mut promise: Promise<()>,
+    ) {
+        let Some(source) = source else {
+            promise.set_error(tdutils::status::Status::error(
+                400,
+                "Source must be non-empty",
+            ));
+            return;
+        };
+        let mut message_full_id = MessageFullId::default();
+        let mut bot_user_id = UserId::default();
+        let mut request_id = String::new();
+        let requested_dialog_type = match source {
+            td_api::KeyboardButtonSource::keyboardButtonSourceMessage(source) => {
+                message_full_id = MessageFullId::new(
+                    DialogId::new(source.chat_id),
+                    MessageId::new(source.message_id),
+                );
+                match env.get_message_requested_dialog_type(message_full_id, button_id) {
+                    Ok(requested_dialog_type) => requested_dialog_type,
+                    Err(error) => {
+                        promise.set_error(error);
+                        return;
+                    }
+                }
+            }
+            td_api::KeyboardButtonSource::keyboardButtonSourceWebApp(source) => {
+                bot_user_id = UserId::new(source.bot_user_id);
+                request_id = source.prepared_button_id;
+                match env.get_inline_requested_dialog_type(bot_user_id, &request_id) {
+                    Some(requested_dialog_type) => requested_dialog_type,
+                    None => {
+                        promise.set_error(tdutils::status::Status::error(400, "Button not found"));
+                        return;
+                    }
+                }
+            }
+            #[allow(unreachable_patterns)]
+            _ => {
+                // the C++ UNREACHABLE over the third source kind
+                unreachable!("the C++ UNREACHABLE over the keyboard button source fired");
+            }
+        };
+        if let Err(error) = requested_dialog_type.check_shared_dialog_count(shared_dialog_ids.len())
+        {
+            promise.set_error(error);
+            return;
+        }
+
+        for &shared_dialog_id in &shared_dialog_ids {
+            if shared_dialog_id.get_type() != crate::dialog_id::DialogType::User {
+                if !env.have_dialog_force(shared_dialog_id, "share_dialogs_with_bot") {
+                    promise.set_error(tdutils::status::Status::error(400, "Shared chat not found"));
+                    return;
+                }
+            } else {
+                if !expect_user {
+                    promise.set_error(tdutils::status::Status::error(400, "Wrong chat type"));
+                    return;
+                }
+                if !env.have_accessible_user(shared_dialog_id.get_user_id()) {
+                    promise.set_error(tdutils::status::Status::error(400, "Shared user not found"));
+                    return;
+                }
+            }
+            if let Err(error) = requested_dialog_type
+                .check_shared_dialog(&ShareDialogsContext { env }, shared_dialog_id)
+            {
+                promise.set_error(error);
+                return;
+            }
+        }
+        if only_check {
+            promise.set_value(());
+            return;
+        }
+
+        env.send_send_bot_requested_peer_query(
+            message_full_id,
+            bot_user_id,
+            request_id,
+            button_id,
+            shared_dialog_ids,
+            promise,
+        );
+    }
+}
+
+/// The `RequestedDialogTypeEnv` bridge for `check_shared_dialog` — the
+/// probes delegate to the env (the collapsed conservative bands; the
+/// `Td` impl reads the real UserManager/ChatManager).
+struct ShareDialogsContext<'a, E: MessageQueryManagerEnv + ?Sized> {
+    env: &'a mut E,
+}
+
+impl<E: MessageQueryManagerEnv + ?Sized> crate::requested_dialog_type::RequestedDialogTypeEnv
+    for ShareDialogsContext<'_, E>
+{
+    fn is_user_bot(&self, user_id: UserId) -> bool {
+        self.env.is_user_bot(user_id)
+    }
+    fn is_user_premium(&self, user_id: UserId) -> bool {
+        self.env.is_user_premium(user_id)
+    }
+    fn get_chat_is_active(&self, chat_id: crate::chat_manager::ChatId) -> bool {
+        self.env.get_chat_is_active(chat_id)
+    }
+    fn get_chat_status(
+        &self,
+        chat_id: crate::chat_manager::ChatId,
+    ) -> crate::chat_manager::DialogParticipantStatus {
+        self.env.get_chat_status(chat_id)
+    }
+    fn is_broadcast_channel(&self, channel_id: ChannelId) -> bool {
+        self.env.is_broadcast_channel(channel_id)
+    }
+    fn is_monoforum_channel(&self, channel_id: ChannelId) -> bool {
+        self.env.is_monoforum_channel(channel_id)
+    }
+    fn is_forum_channel(&self, channel_id: ChannelId) -> bool {
+        self.env.is_forum_channel(channel_id)
+    }
+    fn get_channel_first_username(&self, channel_id: ChannelId) -> String {
+        self.env.get_channel_first_username(channel_id)
+    }
+    fn get_channel_status(
+        &self,
+        channel_id: ChannelId,
+    ) -> crate::chat_manager::DialogParticipantStatus {
+        self.env.get_channel_status(channel_id)
+    }
+    fn is_channel_public(&self, channel_id: ChannelId) -> bool {
+        self.env.is_channel_public(channel_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2622,6 +4051,11 @@ mod tests {
         viewer_source_id: crate::files::FileSourceId,
         metrics: Vec<(DialogId, Vec<MetricRow>)>,
         reactions_sent: Vec<(DialogId, Vec<i64>)>,
+        music_listen_document: Option<telegram_api::InputDocument>,
+        input_user_ok: bool,
+        /// admits every dialog through the access gate (the M.mp tests
+        /// that exercise the post-gate bands)
+        access_all: bool,
     }
 
     impl MessageQueryManagerEnv for RecordingEnv {
@@ -2664,7 +4098,7 @@ mod tests {
             _access_rights: crate::user_manager::AccessRights,
             _source: &str,
         ) -> Result<(), tdutils::status::Status> {
-            if dialog_id == user_dialog(777) {
+            if self.access_all || dialog_id == user_dialog(777) {
                 Ok(())
             } else {
                 Err(tdutils::status::Status::error(400, "Chat not found"))
@@ -2764,6 +4198,82 @@ mod tests {
             _promise: Promise<()>,
         ) {
             self.sent_queries.push("AffectedHistoryQuery".to_owned());
+        }
+
+        fn get_input_user(
+            &mut self,
+            _user_id: UserId,
+        ) -> Result<telegram_api::InputUser, tdutils::status::Status> {
+            if self.input_user_ok {
+                Ok(telegram_api::InputUser::inputUserSelf(
+                    telegram_api::inputUserSelf {},
+                ))
+            } else {
+                Err(tdutils::status::Status::error(400, "User not found"))
+            }
+        }
+
+        fn get_music_listen_input_document(
+            &mut self,
+            _file_id: crate::files::FileId,
+        ) -> Option<telegram_api::InputDocument> {
+            self.music_listen_document.clone()
+        }
+
+        fn send_search_messages_global_query(
+            &mut self,
+            _folder_id: crate::messages_manager::FolderId,
+            _ignore_folder_id: bool,
+            _query: String,
+            _offset_date: i32,
+            _offset_dialog_id: DialogId,
+            _offset_message_id: MessageId,
+            _limit: i32,
+            _filter: crate::messages_manager::MessageSearchFilter,
+            _chat_type_filter: Option<td_api::SearchMessagesChatTypeFilter>,
+            _min_date: i32,
+            _max_date: i32,
+            _promise: Promise<td_api::FoundMessages>,
+        ) {
+            self.sent_queries
+                .push("SearchMessagesGlobalQuery".to_owned());
+        }
+
+        fn send_search_posts_query(
+            &mut self,
+            hashtag: String,
+            _offset: MessageSearchOffset,
+            _limit: i32,
+            _promise: Promise<td_api::FoundMessages>,
+        ) {
+            self.sent_queries
+                .push(format!("SearchPostsQuery({hashtag})"));
+        }
+
+        fn hashtag_used(&mut self, is_cashtag: bool, hashtag: String) {
+            self.sent_queries.push(format!(
+                "HashtagUsed({},{hashtag})",
+                if is_cashtag { "$" } else { "#" }
+            ));
+        }
+
+        fn send_get_personal_channel_history_query(
+            &mut self,
+            _input_user: telegram_api::InputUser,
+            _limit: i32,
+            _promise: Promise<td_api::Messages>,
+        ) {
+            self.sent_queries
+                .push("GetPersonalChannelHistoryQuery".to_owned());
+        }
+
+        fn send_report_music_listen_query(
+            &mut self,
+            _input_document: telegram_api::InputDocument,
+            _duration: i32,
+            _promise: Promise<()>,
+        ) {
+            self.sent_queries.push("ReportMusicListenQuery".to_owned());
         }
 
         fn send_get_messages_views_query(
@@ -3369,5 +4879,473 @@ mod tests {
         manager.finish_get_message_extended_media(user_dialog(777), &ids);
         manager.on_reload_message_fact_checks(&mut env, user_dialog(777), &ids, false);
         assert!(manager.being_reloaded_fact_checks.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // M.mp request-plane tests — the local validation bands and the
+    // search/decision tables over the recording env.
+    // ------------------------------------------------------------------
+
+    /// The result-capturing promise interface (the call_manager pattern).
+    type MmpCell<T> = std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<T>>>>;
+
+    struct MmpRecording<T>(MmpCell<T>);
+
+    impl<T: Send + 'static> tdutils::promise::PromiseInterface<T> for MmpRecording<T> {
+        fn set_value(&mut self, value: T) {
+            *self.0.lock().unwrap() = Some(tdutils::status::Result::Ok(value));
+        }
+
+        fn set_error(&mut self, error: tdutils::status::Status) {
+            *self.0.lock().unwrap() = Some(tdutils::status::Result::Err(error));
+        }
+    }
+
+    fn record<T: Send + 'static>() -> (Promise<T>, MmpCell<T>) {
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(None));
+        (
+            Promise::from_interface(MmpRecording(recorded.clone())),
+            recorded,
+        )
+    }
+
+    fn recorded_error<T: Send + 'static + std::fmt::Debug>(
+        cell: &std::sync::Arc<std::sync::Mutex<Option<tdutils::status::Result<T>>>>,
+    ) -> (i32, String) {
+        match &*cell.lock().unwrap() {
+            Some(tdutils::status::Result::Err(status)) => {
+                (status.code(), status.message().to_owned())
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_search_limit_clamp_follows_the_cpp() {
+        assert_eq!(
+            fix_search_limit(0).unwrap_err().message(),
+            "Parameter limit must be positive"
+        );
+        assert_eq!(
+            fix_search_limit(-5).unwrap_err().message(),
+            "Parameter limit must be positive"
+        );
+        assert_eq!(fix_search_limit(5).ok(), Some(5));
+        assert_eq!(fix_search_limit(1000).ok(), Some(MAX_SEARCH_MESSAGES));
+    }
+
+    #[test]
+    fn search_messages_bands_follow_the_cpp() {
+        let mut manager = MessageQueryManager::new();
+        let mut env = RecordingEnv::default();
+
+        // a non-folder chat list id is rejected
+        let (promise, cell) = record::<td_api::FoundMessages>();
+        manager.search_messages(
+            &mut env,
+            crate::messages_manager::DialogListId::from_filter(
+                crate::messages_manager::DialogFilterId::new(3),
+            ),
+            false,
+            "query".to_owned(),
+            String::new(),
+            10,
+            crate::messages_manager::MessageSearchFilter::Empty,
+            None,
+            0,
+            0,
+            promise,
+        );
+        assert_eq!(
+            recorded_error(&cell),
+            (400, "Wrong chat list specified".to_owned())
+        );
+
+        // limit must be positive
+        let (promise, cell) = record::<td_api::FoundMessages>();
+        manager.search_messages(
+            &mut env,
+            crate::messages_manager::DialogListId::from_folder(
+                crate::messages_manager::FolderId::main(),
+            ),
+            false,
+            "query".to_owned(),
+            String::new(),
+            0,
+            crate::messages_manager::MessageSearchFilter::Empty,
+            None,
+            0,
+            0,
+            promise,
+        );
+        assert_eq!(
+            recorded_error(&cell),
+            (400, "Parameter limit must be positive".to_owned())
+        );
+
+        // the unsupported filter band
+        let (promise, cell) = record::<td_api::FoundMessages>();
+        manager.search_messages(
+            &mut env,
+            crate::messages_manager::DialogListId::from_folder(
+                crate::messages_manager::FolderId::main(),
+            ),
+            false,
+            "query".to_owned(),
+            String::new(),
+            10,
+            crate::messages_manager::MessageSearchFilter::Mention,
+            None,
+            0,
+            0,
+            promise,
+        );
+        assert_eq!(
+            recorded_error(&cell),
+            (400, "The filter is not supported".to_owned())
+        );
+
+        // the empty query + Empty filter band answers with an empty list
+        let (promise, cell) = record::<td_api::FoundMessages>();
+        manager.search_messages(
+            &mut env,
+            crate::messages_manager::DialogListId::from_folder(
+                crate::messages_manager::FolderId::main(),
+            ),
+            false,
+            String::new(),
+            String::new(),
+            10,
+            crate::messages_manager::MessageSearchFilter::Empty,
+            None,
+            0,
+            0,
+            promise,
+        );
+        match &*cell.lock().unwrap() {
+            Some(tdutils::status::Result::Ok(found)) => {
+                assert_eq!(found.total_count, 0);
+                assert!(found.messages.is_empty());
+                assert!(found.next_offset.is_empty());
+            }
+            other => panic!("expected the empty answer, got {other:?}"),
+        }
+        assert!(env.recorded("SearchMessagesGlobalQuery").is_empty());
+
+        // otherwise the global query tail parks
+        let (promise, _) = record::<td_api::FoundMessages>();
+        manager.search_messages(
+            &mut env,
+            crate::messages_manager::DialogListId::from_folder(
+                crate::messages_manager::FolderId::main(),
+            ),
+            false,
+            "query".to_owned(),
+            String::new(),
+            10,
+            crate::messages_manager::MessageSearchFilter::Photo,
+            None,
+            0,
+            0,
+            promise,
+        );
+        assert_eq!(env.recorded("SearchMessagesGlobalQuery").len(), 1);
+    }
+
+    #[test]
+    fn search_hashtag_posts_splits_and_bands_follow_the_cpp() {
+        let mut manager = MessageQueryManager::new();
+        let mut env = RecordingEnv::default();
+
+        // limit must be positive
+        let (promise, cell) = record::<td_api::FoundMessages>();
+        manager.search_hashtag_posts(&mut env, "tag".to_owned(), String::new(), 0, promise);
+        assert_eq!(
+            recorded_error(&cell),
+            (400, "Parameter limit must be positive".to_owned())
+        );
+
+        // a bare "#" strips to empty and answers locally
+        let (promise, cell) = record::<td_api::FoundMessages>();
+        manager.search_hashtag_posts(&mut env, "#".to_owned(), String::new(), 5, promise);
+        match &*cell.lock().unwrap() {
+            Some(tdutils::status::Result::Ok(found)) => assert_eq!(found.total_count, 0),
+            other => panic!("expected the empty answer, got {other:?}"),
+        }
+
+        // the hashtag keeps its '#'; the cashtag swaps in '$'
+        let (promise, _) = record::<td_api::FoundMessages>();
+        manager.search_hashtag_posts(&mut env, "#tag".to_owned(), String::new(), 5, promise);
+        assert_eq!(env.recorded("SearchPostsQuery(#tag)").len(), 1);
+        assert_eq!(env.recorded("HashtagUsed(#,tag)").len(), 1);
+
+        let (promise, _) = record::<td_api::FoundMessages>();
+        manager.search_hashtag_posts(&mut env, "$tag".to_owned(), String::new(), 5, promise);
+        assert_eq!(env.recorded("SearchPostsQuery($tag)").len(), 1);
+        assert_eq!(env.recorded("HashtagUsed($,tag)").len(), 1);
+    }
+
+    #[test]
+    fn delete_dialog_messages_by_date_bands_follow_the_cpp() {
+        let mut manager = MessageQueryManager::new();
+        let mut env = RecordingEnv::default();
+        env.base.unix_time = 1_700_000_000;
+        env.access_all = true;
+
+        // an inverted window is rejected
+        let (promise, cell) = record::<()>();
+        manager.delete_dialog_messages_by_date(&mut env, user_dialog(777), 100, 50, false, promise);
+        assert_eq!(
+            recorded_error(&cell),
+            (400, "Wrong date interval specified".to_owned())
+        );
+
+        // a window below the launch date collapses to the ok band
+        let (promise, cell) = record::<()>();
+        manager.delete_dialog_messages_by_date(&mut env, user_dialog(777), 0, 100, false, promise);
+        assert!(cell.lock().unwrap().is_some());
+
+        // the channel band rejects the bulk deletion
+        let (promise, cell) = record::<()>();
+        manager.delete_dialog_messages_by_date(
+            &mut env,
+            DialogId::from_channel_id(crate::chat_manager::ChannelId::new(42)),
+            1_690_000_000,
+            1_699_000_000,
+            false,
+            promise,
+        );
+        assert_eq!(
+            recorded_error(&cell),
+            (
+                400,
+                "Bulk message deletion is unsupported in supergroup chats".to_owned()
+            )
+        );
+
+        // the basic-group band rejects the revoke
+        let (promise, cell) = record::<()>();
+        manager.delete_dialog_messages_by_date(
+            &mut env,
+            DialogId::from_chat_id(crate::chat_manager::ChatId::new(42)),
+            1_690_000_000,
+            1_699_000_000,
+            true,
+            promise,
+        );
+        assert_eq!(
+            recorded_error(&cell),
+            (
+                400,
+                "Bulk message revocation is unsupported in basic group chats".to_owned()
+            )
+        );
+
+        // a user dialog with a live window rides the affected-history loop
+        let (promise, _) = record::<()>();
+        manager.delete_dialog_messages_by_date(
+            &mut env,
+            user_dialog(777),
+            1_690_000_000,
+            1_699_000_000,
+            false,
+            promise,
+        );
+        assert_eq!(env.recorded("AffectedHistoryQuery").len(), 1);
+    }
+
+    #[test]
+    fn delete_reaction_by_sender_bands_follow_the_cpp() {
+        let mut manager = MessageQueryManager::new();
+        let mut env = RecordingEnv::default();
+
+        // the sender must be known (the input-peer gate)
+        let (promise, cell) = record::<()>();
+        manager.delete_reaction_by_sender(
+            &mut env,
+            user_dialog(777),
+            crate::messages_manager::MessageId::new(2000001),
+            DialogId::from_user_id(crate::user_manager::UserId::new(42)),
+            promise,
+        );
+        assert_eq!(
+            recorded_error(&cell),
+            (400, "Reaction sender not found".to_owned())
+        );
+
+        // a local message id is rejected after the gate opens
+        env.input_peer = true;
+        let (promise, cell) = record::<()>();
+        manager.delete_reaction_by_sender(
+            &mut env,
+            user_dialog(777),
+            crate::messages_manager::MessageId::new(1),
+            DialogId::from_user_id(crate::user_manager::UserId::new(42)),
+            promise,
+        );
+        assert_eq!(
+            recorded_error(&cell),
+            (400, "Invalid message identifier specified".to_owned())
+        );
+    }
+
+    #[test]
+    fn get_personal_chat_history_bands_follow_the_cpp() {
+        let mut manager = MessageQueryManager::new();
+        let mut env = RecordingEnv::default();
+
+        // the input-user probe fails first
+        let (promise, cell) = record::<td_api::Messages>();
+        manager.get_personal_chat_history(
+            &mut env,
+            crate::user_manager::UserId::new(42),
+            5,
+            promise,
+        );
+        assert_eq!(recorded_error(&cell), (400, "User not found".to_owned()));
+
+        // the limit band follows the C++ text
+        env.input_user_ok = true;
+        let (promise, cell) = record::<td_api::Messages>();
+        manager.get_personal_chat_history(
+            &mut env,
+            crate::user_manager::UserId::new(42),
+            0,
+            promise,
+        );
+        assert_eq!(
+            recorded_error(&cell),
+            (400, "Limit must be positive".to_owned())
+        );
+
+        // then the history query parks
+        let (promise, _) = record::<td_api::Messages>();
+        manager.get_personal_chat_history(
+            &mut env,
+            crate::user_manager::UserId::new(42),
+            5,
+            promise,
+        );
+        assert_eq!(env.recorded("GetPersonalChannelHistoryQuery").len(), 1);
+    }
+
+    #[test]
+    fn report_music_listen_bands_follow_the_cpp() {
+        let mut manager = MessageQueryManager::new();
+        let mut env = RecordingEnv::default();
+
+        // negative durations are rejected
+        let (promise, cell) = record::<()>();
+        manager.report_music_listen(&mut env, crate::files::FileId::new(5, 0), -1, promise);
+        assert_eq!(
+            recorded_error(&cell),
+            (400, "Invalid duration specified".to_owned())
+        );
+
+        // invalid file identifiers are rejected
+        let (promise, cell) = record::<()>();
+        manager.report_music_listen(&mut env, crate::files::FileId::new(0, 0), 10, promise);
+        assert_eq!(
+            recorded_error(&cell),
+            (400, "Invalid file identifier specified".to_owned())
+        );
+
+        // short listens and the missing-document band answer silently
+        let (promise, cell) = record::<()>();
+        manager.report_music_listen(&mut env, crate::files::FileId::new(5, 0), 1, promise);
+        assert!(cell.lock().unwrap().is_some());
+        assert!(env.recorded("ReportMusicListenQuery").is_empty());
+
+        // a reportable document rides the query tail
+        env.music_listen_document = Some(telegram_api::InputDocument::inputDocument(
+            telegram_api::inputDocument {
+                id: 5,
+                access_hash: 0,
+                file_reference: Vec::new(),
+            },
+        ));
+        let (promise, _) = record::<()>();
+        manager.report_music_listen(&mut env, crate::files::FileId::new(5, 0), 10, promise);
+        assert_eq!(env.recorded("ReportMusicListenQuery").len(), 1);
+    }
+
+    #[test]
+    fn share_dialogs_with_bot_bands_follow_the_cpp() {
+        let mut manager = MessageQueryManager::new();
+        let mut env = RecordingEnv::default();
+
+        // the source must be non-empty
+        let (promise, cell) = record::<()>();
+        manager.share_dialogs_with_bot(&mut env, None, 1, Vec::new(), true, false, promise);
+        assert_eq!(
+            recorded_error(&cell),
+            (400, "Source must be non-empty".to_owned())
+        );
+
+        // the message-source leg needs the message plane
+        let (promise, cell) = record::<()>();
+        manager.share_dialogs_with_bot(
+            &mut env,
+            Some(td_api::KeyboardButtonSource::keyboardButtonSourceMessage(
+                td_api::keyboardButtonSourceMessage {
+                    chat_id: -10020000000001,
+                    message_id: 2000001,
+                },
+            )),
+            1,
+            Vec::new(),
+            true,
+            false,
+            promise,
+        );
+        assert_eq!(recorded_error(&cell), (400, "Message not found".to_owned()));
+
+        // the web-app-source leg needs the prepared-button store
+        let (promise, cell) = record::<()>();
+        manager.share_dialogs_with_bot(
+            &mut env,
+            Some(td_api::KeyboardButtonSource::keyboardButtonSourceWebApp(
+                td_api::keyboardButtonSourceWebApp {
+                    bot_user_id: 42,
+                    prepared_button_id: "button".to_owned(),
+                },
+            )),
+            1,
+            Vec::new(),
+            true,
+            false,
+            promise,
+        );
+        assert_eq!(recorded_error(&cell), (400, "Button not found".to_owned()));
+    }
+
+    #[test]
+    fn the_message_search_filter_table_follows_the_cpp() {
+        use crate::messages_manager::MessageSearchFilter as F;
+        assert_eq!(get_message_search_filter(None), F::Empty);
+        assert_eq!(
+            get_message_search_filter(Some(
+                &td_api::SearchMessagesFilter::searchMessagesFilterAnimation(
+                    td_api::searchMessagesFilterAnimation {}
+                )
+            )),
+            F::Animation
+        );
+        assert_eq!(
+            get_message_search_filter(Some(
+                &td_api::SearchMessagesFilter::searchMessagesFilterVoiceAndVideoNote(
+                    td_api::searchMessagesFilterVoiceAndVideoNote {}
+                )
+            )),
+            F::VoiceAndVideoNote
+        );
+        assert_eq!(
+            get_message_search_filter(Some(
+                &td_api::SearchMessagesFilter::searchMessagesFilterUnreadPollVote(
+                    td_api::searchMessagesFilterUnreadPollVote {}
+                )
+            )),
+            F::UnreadPollVote
+        );
     }
 }
