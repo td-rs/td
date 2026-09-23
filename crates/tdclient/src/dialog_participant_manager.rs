@@ -8,15 +8,15 @@
 //! `[blocked: net]` env seams whose promises park exactly like the C++
 //! request without a network.
 
+use crate::chat_manager::DialogId;
+use crate::chat_manager::DialogType;
 use crate::chat_manager::{
     AdministratorRights, ChannelId, ChannelType, ChatId, DialogAdministrator, DialogParticipant,
     DialogParticipantStatus, RestrictedRights,
 };
-use crate::chat_manager::DialogType;
-use crate::chat_manager::DialogId;
 use crate::dialog_participant_filter::{ChannelParticipantFilter, DialogParticipantFilter};
 use crate::misc::get_vector_hash;
-use crate::store_parse::{store_i32, Parser};
+use crate::store_parse::{Parser, store_i32};
 use crate::td_api;
 use crate::user_manager::UserId;
 use std::collections::HashMap;
@@ -50,7 +50,9 @@ pub fn store_dialog_administrators(administrators: &[DialogAdministrator], out: 
 }
 
 /// the inverse of [`store_dialog_administrators`].
-pub fn parse_dialog_administrators(parser: &mut Parser<'_>) -> Result<Vec<DialogAdministrator>, &'static str> {
+pub fn parse_dialog_administrators(
+    parser: &mut Parser<'_>,
+) -> Result<Vec<DialogAdministrator>, &'static str> {
     let size = parser.i32_()?;
     if size < 0 {
         return Err("Wrong vector length");
@@ -203,8 +205,13 @@ pub trait DialogParticipantManagerEnv:
     fn have_dialog_info(&mut self, dialog_id: DialogId) -> bool;
     /// `dialog_manager_->check_dialog_access(dialog_id, false,
     /// AccessRights::Read/Write, source)`.
-    fn check_dialog_access_read(&mut self, dialog_id: DialogId, source: &str) -> Result<(), Status>;
-    fn check_dialog_access_write(&mut self, dialog_id: DialogId, source: &str) -> Result<(), Status>;
+    fn check_dialog_access_read(&mut self, dialog_id: DialogId, source: &str)
+    -> Result<(), Status>;
+    fn check_dialog_access_write(
+        &mut self,
+        dialog_id: DialogId,
+        source: &str,
+    ) -> Result<(), Status>;
     /// `dialog_manager_->is_monoforum_channel(dialog_id)`.
     fn is_monoforum_channel(&mut self, dialog_id: DialogId) -> bool;
     /// `dialog_manager_->get_dialog_status(dialog_id)`.
@@ -227,7 +234,11 @@ pub trait DialogParticipantManagerEnv:
     fn get_channel_permissions(&mut self, channel_id: ChannelId) -> DialogParticipantStatus;
     fn is_broadcast_channel(&mut self, channel_id: ChannelId) -> bool;
     /// `chat_manager_->get_chat_member_object(participant, source)`.
-    fn get_chat_member_object(&mut self, participant: &DialogParticipant, source: &str) -> td_api::ChatMember;
+    fn get_chat_member_object(
+        &mut self,
+        participant: &DialogParticipant,
+        source: &str,
+    ) -> td_api::ChatMember;
     /// `chat_manager_->get_chat_participants(chat_id)` — a snapshot clone,
     /// `None` is the C++ nullptr (the basic-group full info is absent).
     fn get_chat_participants(&mut self, chat_id: ChatId) -> Option<Vec<DialogParticipant>>;
@@ -253,7 +264,10 @@ pub trait DialogParticipantManagerEnv:
     /// `user_manager_->get_secret_chat_user_id(secret_chat_id)`.
     fn get_secret_chat_user_id(&mut self, dialog_id: DialogId) -> UserId;
     /// `DialogAdministrator::get_chat_administrator_object(user_manager)`.
-    fn chat_administrator_object(&mut self, administrator: &DialogAdministrator) -> td_api::ChatAdministrator;
+    fn chat_administrator_object(
+        &mut self,
+        administrator: &DialogAdministrator,
+    ) -> td_api::ChatAdministrator;
     /// `status.update_restrictions(G())` — the env carries the Global.
     fn status_update_restrictions(&mut self, status: &mut DialogParticipantStatus);
 
@@ -292,7 +306,11 @@ pub trait DialogParticipantManagerEnv:
     // -- the update out machine
     /// `send_update_chat_online_member_count` (the updateChatOnlineMemberCount
     /// out machine; the C++ guard is inlined at the call site).
-    fn send_update_chat_online_member_count(&mut self, dialog_id: DialogId, online_member_count: i32);
+    fn send_update_chat_online_member_count(
+        &mut self,
+        dialog_id: DialogId,
+        online_member_count: i32,
+    );
 
     // -- the [blocked: net] query seams. Each parks its promise — the
     // -- answers would come from the query callbacks, which never fire
@@ -311,7 +329,11 @@ pub trait DialogParticipantManagerEnv:
     );
     /// `GetChannelParticipantQuery::send(channel_id, participant_dialog_id,
     /// input_peer)`; the result re-enters `finish_get_channel_participant`.
-    fn get_channel_participant_query(&mut self, channel_id: ChannelId, participant_dialog_id: DialogId);
+    fn get_channel_participant_query(
+        &mut self,
+        channel_id: ChannelId,
+        participant_dialog_id: DialogId,
+    );
     /// `GetChatJoinRequestsQuery::send(...)`.
     fn get_chat_join_requests_query(
         &mut self,
@@ -325,7 +347,12 @@ pub trait DialogParticipantManagerEnv:
     /// `HideChatJoinRequestQuery::send(dialog_id, user_id, approve)`.
     fn hide_chat_join_request_query(&mut self, dialog_id: DialogId, user_id: UserId, approve: bool);
     /// `HideAllChatJoinRequestsQuery::send(dialog_id, invite_link, approve)`.
-    fn hide_all_chat_join_requests_query(&mut self, dialog_id: DialogId, invite_link: String, approve: bool);
+    fn hide_all_chat_join_requests_query(
+        &mut self,
+        dialog_id: DialogId,
+        invite_link: String,
+        approve: bool,
+    );
     /// `CanEditChatCreatorQuery::send()` — the STATUS error comes back into
     /// [`DialogParticipantManager::map_can_transfer_ownership_error`];
     /// offline it parks.
@@ -336,11 +363,21 @@ pub trait DialogParticipantManagerEnv:
     /// `EditChatCreatorQuery::send` — both halves [blocked: net/Secret].
     fn transfer_chat_ownership_seam(&mut self, dialog_id: DialogId, user_id: UserId);
     /// `EditChatParticipantRankQuery::send(dialog_id, user_id, rank)`.
-    fn edit_chat_participant_rank_query(&mut self, dialog_id: DialogId, user_id: UserId, rank: String);
+    fn edit_chat_participant_rank_query(
+        &mut self,
+        dialog_id: DialogId,
+        user_id: UserId,
+        rank: String,
+    );
     /// `RequestChatJoinWebViewQuery::send(query_id, parameters)`.
     fn request_chat_join_web_view_query(&mut self, query_id: i64);
     /// `SetJoinChatResultsQuery::send(query_id, result, url)`.
-    fn set_join_chat_results_query(&mut self, query_id: i64, result: td_api::ChatJoinRequestResult, url: String);
+    fn set_join_chat_results_query(
+        &mut self,
+        query_id: i64,
+        result: td_api::ChatJoinRequestResult,
+        url: String,
+    );
     /// the basic-group join/add wire send (`messages.addChatUser` and the
     /// invite-link acceptance pre-query) — the C++ decision machinery above
     /// the send stays local in the manager.
@@ -431,7 +468,12 @@ impl DialogParticipantManager {
             let update_time = info.update_time;
             let is_update_sent = info.is_update_sent;
             let _ = (update_time, is_update_sent);
-            self.set_dialog_online_member_count(env, dialog_id, online_member_count, is_from_server);
+            self.set_dialog_online_member_count(
+                env,
+                dialog_id,
+                online_member_count,
+                is_from_server,
+            );
         }
     }
 
@@ -449,8 +491,8 @@ impl DialogParticipantManager {
             .dialog_online_member_counts
             .entry(dialog_id.get())
             .or_default();
-        let need_update =
-            !info.is_update_sent || now > info.update_time + ONLINE_MEMBER_COUNT_CACHE_EXPIRE_TIME as f64;
+        let need_update = !info.is_update_sent
+            || now > info.update_time + ONLINE_MEMBER_COUNT_CACHE_EXPIRE_TIME as f64;
         if need_update {
             info.update_time = now;
             info.is_update_sent = false;
@@ -483,7 +525,11 @@ impl DialogParticipantManager {
         dialog_id: DialogId,
         is_from_server: bool,
     ) {
-        let Some(info) = self.dialog_online_member_counts.get(&dialog_id.get()).copied() else {
+        let Some(info) = self
+            .dialog_online_member_counts
+            .get(&dialog_id.get())
+            .copied()
+        else {
             return;
         };
         if env.now() > info.update_time + ONLINE_MEMBER_COUNT_CACHE_EXPIRE_TIME as f64 {
@@ -491,7 +537,12 @@ impl DialogParticipantManager {
             env.set_online_member_count_timeout(dialog_id, 0.0);
             self.dialog_online_member_counts.remove(&dialog_id.get());
         } else if info.is_update_sent {
-            self.set_dialog_online_member_count(env, dialog_id, info.online_member_count, is_from_server);
+            self.set_dialog_online_member_count(
+                env,
+                dialog_id,
+                info.online_member_count,
+                is_from_server,
+            );
         }
     }
 
@@ -537,16 +588,22 @@ impl DialogParticipantManager {
 
         match dialog_id.get_type() {
             DialogType::User | DialogType::SecretChat => {
-                return promise.take().unwrap().set_value(td_api::ChatAdministrators {
-                    administrators: Vec::new(),
-                });
+                return promise
+                    .take()
+                    .unwrap()
+                    .set_value(td_api::ChatAdministrators {
+                        administrators: Vec::new(),
+                    });
             }
             DialogType::Chat => {}
             DialogType::Channel => {
                 if env.is_monoforum_channel(dialog_id) {
-                    return promise.take().unwrap().set_value(td_api::ChatAdministrators {
-                        administrators: Vec::new(),
-                    });
+                    return promise
+                        .take()
+                        .unwrap()
+                        .set_value(td_api::ChatAdministrators {
+                            administrators: Vec::new(),
+                        });
                 }
             }
             DialogType::None => unreachable!(),
@@ -561,8 +618,14 @@ impl DialogParticipantManager {
         }
 
         if env.use_chat_info_database() {
-            let value = env.sqlite_pmc_get_raw(&Self::get_dialog_administrators_database_key(dialog_id));
-            return self.on_load_dialog_administrators_from_database(env, dialog_id, value, promise.take().unwrap());
+            let value =
+                env.sqlite_pmc_get_raw(&Self::get_dialog_administrators_database_key(dialog_id));
+            return self.on_load_dialog_administrators_from_database(
+                env,
+                dialog_id,
+                value,
+                promise.take().unwrap(),
+            );
         }
 
         self.reload_dialog_administrators(env, dialog_id, &[], promise.take());
@@ -591,7 +654,10 @@ impl DialogParticipantManager {
         // the `LoadUsersMultiPromiseActor` join: every administrator user
         // must load (the C++ `get_user(user_id, 3, ...)`); any failure is
         // the reload leg
-        if !administrators.iter().all(|administrator| env.have_min_user(administrator.get_user_id())) {
+        if !administrators
+            .iter()
+            .all(|administrator| env.have_min_user(administrator.get_user_id()))
+        {
             return self.reload_dialog_administrators(env, dialog_id, &[], Some(promise));
         }
         self.on_load_administrator_users_finished(env, dialog_id, administrators, promise);
@@ -641,7 +707,10 @@ impl DialogParticipantManager {
             if env.use_chat_info_database() && !from_database {
                 let mut out = Vec::new();
                 store_dialog_administrators(&administrators, &mut out);
-                env.sqlite_pmc_set_raw(&Self::get_dialog_administrators_database_key(dialog_id), &out);
+                env.sqlite_pmc_set_raw(
+                    &Self::get_dialog_administrators_database_key(dialog_id),
+                    &out,
+                );
             }
             self.dialog_administrators
                 .insert(dialog_id.get(), administrators);
@@ -734,7 +803,13 @@ impl DialogParticipantManager {
                             new_status.is_creator(),
                             true,
                         );
-                        self.on_update_dialog_administrators(env, dialog_id, administrators.clone(), true, false);
+                        self.on_update_dialog_administrators(
+                            env,
+                            dialog_id,
+                            administrators.clone(),
+                            true,
+                            false,
+                        );
                     }
                     break;
                 }
@@ -774,7 +849,13 @@ impl DialogParticipantManager {
             if administrator.get_user_id() == user_id {
                 if administrator.get_rank() != new_rank {
                     administrator.set_rank(new_rank);
-                    self.on_update_dialog_administrators(env, dialog_id, administrators, true, false);
+                    self.on_update_dialog_administrators(
+                        env,
+                        dialog_id,
+                        administrators,
+                        true,
+                        false,
+                    );
                 }
                 break;
             }
@@ -834,14 +915,21 @@ impl DialogParticipantManager {
                 }
             }
             DialogType::Channel => {
-                self.get_channel_participant(env, dialog_id.get_channel_id(), participant_dialog_id, promise);
+                self.get_channel_participant(
+                    env,
+                    dialog_id.get_channel_id(),
+                    participant_dialog_id,
+                    promise,
+                );
             }
             DialogType::SecretChat => {
                 let my_user_id = env.my_user_id();
                 let peer_user_id = env.get_secret_chat_user_id(dialog_id);
                 let participant = if participant_dialog_id == DialogId::from_user_id(my_user_id) {
                     DialogParticipant::private_member(my_user_id, peer_user_id)
-                } else if peer_user_id.is_valid() && participant_dialog_id == DialogId::from_user_id(peer_user_id) {
+                } else if peer_user_id.is_valid()
+                    && participant_dialog_id == DialogId::from_user_id(peer_user_id)
+                {
                     DialogParticipant::private_member(peer_user_id, my_user_id)
                 } else {
                     return promise.set_error(Status::error(400, "Member not found"));
@@ -867,7 +955,8 @@ impl DialogParticipantManager {
         {
             return promise.set_error(Status::error(400, "Member not found"));
         }
-        let object = env.get_chat_member_object(&dialog_participant, "finish_get_dialog_participant");
+        let object =
+            env.get_chat_member_object(&dialog_participant, "finish_get_dialog_participant");
         promise.set_value(object);
     }
 
@@ -884,12 +973,15 @@ impl DialogParticipantManager {
         if !env.have_input_peer_know(participant_dialog_id) {
             return promise.set_error(Status::error(400, "Member not found"));
         }
-        if env.is_broadcast_channel(channel_id) && !env.get_channel_status(channel_id).is_administrator() {
+        if env.is_broadcast_channel(channel_id)
+            && !env.get_channel_status(channel_id).is_administrator()
+        {
             return promise.set_error(Status::error(400, "Member list is inaccessible"));
         }
 
         if self.have_channel_participant_cache(channel_id)
-            && let Some(participant) = self.get_channel_participant_from_cache(channel_id, participant_dialog_id)
+            && let Some(participant) =
+                self.get_channel_participant_from_cache(channel_id, participant_dialog_id)
         {
             let participant = participant.clone();
             return self.finish_get_dialog_participant(env, participant, promise);
@@ -971,7 +1063,11 @@ impl DialogParticipantManager {
                 let user_id = dialog_id.get_user_id();
                 DialogParticipant::private_member(
                     user_id,
-                    if user_id == my_user_id { peer_user_id } else { my_user_id },
+                    if user_id == my_user_id {
+                        peer_user_id
+                    } else {
+                        my_user_id
+                    },
                 )
             })
             .collect();
@@ -1079,8 +1175,13 @@ impl DialogParticipantManager {
 
         match dialog_id.get_type() {
             DialogType::User => {
-                let participants =
-                    self.search_private_chat_participants(env, dialog_id.get_user_id(), query, limit, filter);
+                let participants = self.search_private_chat_participants(
+                    env,
+                    dialog_id.get_user_id(),
+                    query,
+                    limit,
+                    filter,
+                );
                 promise.set_value(env.chat_members_object(
                     participants.total_count,
                     participants.participants,
@@ -1088,7 +1189,14 @@ impl DialogParticipantManager {
                 ));
             }
             DialogType::Chat => {
-                self.search_chat_participants(env, dialog_id.get_chat_id(), query, limit, filter, promise);
+                self.search_chat_participants(
+                    env,
+                    dialog_id.get_chat_id(),
+                    query,
+                    limit,
+                    filter,
+                    promise,
+                );
             }
             DialogType::Channel => {
                 let channel_id = dialog_id.get_channel_id();
@@ -1144,7 +1252,9 @@ impl DialogParticipantManager {
             DialogType::User => promise.set_error(Status::error(400, "Can't join private chats")),
             DialogType::Chat => self.join_chat(env, dialog_id.get_chat_id(), promise),
             DialogType::Channel => self.join_channel(env, dialog_id.get_channel_id(), promise),
-            DialogType::SecretChat => promise.set_error(Status::error(400, "Can't join secret chats")),
+            DialogType::SecretChat => {
+                promise.set_error(Status::error(400, "Can't join secret chats"))
+            }
             DialogType::None => unreachable!(),
         }
     }
@@ -1196,7 +1306,9 @@ impl DialogParticipantManager {
             return promise.set_error(Status::error(400, "Chat not found"));
         }
         match dialog_id.get_type() {
-            DialogType::User => promise.set_error(Status::error(400, "Can't add members to a private chat")),
+            DialogType::User => {
+                promise.set_error(Status::error(400, "Can't add members to a private chat"))
+            }
             DialogType::Chat => {
                 env.join_or_add_chat_member_query(dialog_id.get_chat_id(), user_id);
             }
@@ -1223,13 +1335,18 @@ impl DialogParticipantManager {
             return promise.set_error(Status::error(400, "Chat not found"));
         }
         match dialog_id.get_type() {
-            DialogType::User => promise.set_error(Status::error(400, "Can't add members to a private chat")),
+            DialogType::User => {
+                promise.set_error(Status::error(400, "Can't add members to a private chat"))
+            }
             DialogType::Chat => {
                 if user_ids.len() == 1 {
                     env.join_or_add_chat_member_query(dialog_id.get_chat_id(), user_ids[0]);
                     return;
                 }
-                promise.set_error(Status::error(400, "Can't add many members at once to a basic group chat"))
+                promise.set_error(Status::error(
+                    400,
+                    "Can't add many members at once to a basic group chat",
+                ))
             }
             DialogType::Channel => {
                 for user_id in user_ids {
@@ -1257,16 +1374,22 @@ impl DialogParticipantManager {
             return promise.set_error(Status::error(400, "Chat not found"));
         }
         match dialog_id.get_type() {
-            DialogType::User => {
-                promise.set_error(Status::error(400, "Chat member status can't be changed in private chats"))
-            }
+            DialogType::User => promise.set_error(Status::error(
+                400,
+                "Chat member status can't be changed in private chats",
+            )),
             DialogType::Chat => {
-                let status = get_dialog_participant_status(env, Some(&chat_member_status), ChannelType::Unknown);
+                let status = get_dialog_participant_status(
+                    env,
+                    Some(&chat_member_status),
+                    ChannelType::Unknown,
+                );
                 if participant_dialog_id.get_type() != DialogType::User {
                     if status == DialogParticipantStatus::left() {
                         return promise.set_value(());
                     }
-                    return promise.set_error(Status::error(400, "Chats can't be members of basic groups"));
+                    return promise
+                        .set_error(Status::error(400, "Chats can't be members of basic groups"));
                 }
                 env.edit_chat_participant_query(
                     dialog_id.get_chat_id(),
@@ -1275,12 +1398,21 @@ impl DialogParticipantManager {
                 );
             }
             DialogType::Channel => {
-                let status = get_dialog_participant_status(env, Some(&chat_member_status), ChannelType::Unknown);
-                env.edit_channel_participant_query(dialog_id.get_channel_id(), participant_dialog_id, status);
+                let status = get_dialog_participant_status(
+                    env,
+                    Some(&chat_member_status),
+                    ChannelType::Unknown,
+                );
+                env.edit_channel_participant_query(
+                    dialog_id.get_channel_id(),
+                    participant_dialog_id,
+                    status,
+                );
             }
-            DialogType::SecretChat => {
-                promise.set_error(Status::error(400, "Chat member status can't be changed in secret chats"))
-            }
+            DialogType::SecretChat => promise.set_error(Status::error(
+                400,
+                "Chat member status can't be changed in secret chats",
+            )),
             DialogType::None => unreachable!(),
         }
     }
@@ -1295,13 +1427,15 @@ impl DialogParticipantManager {
         rank: String,
         mut promise: Promise<()>,
     ) {
-        if let Err(error) = env.check_dialog_access_read(dialog_id, "set_dialog_participant_rank 1") {
+        if let Err(error) = env.check_dialog_access_read(dialog_id, "set_dialog_participant_rank 1")
+        {
             return promise.set_error(error);
         }
         match dialog_id.get_type() {
-            DialogType::User => {
-                promise.set_error(Status::error(400, "Chat member tag can't be changed in private chats"))
-            }
+            DialogType::User => promise.set_error(Status::error(
+                400,
+                "Chat member tag can't be changed in private chats",
+            )),
             DialogType::Chat | DialogType::Channel => {
                 self.speculative_update_dialog_administrator_rank(env, dialog_id, user_id, &rank);
                 env.edit_chat_participant_rank_query(dialog_id, user_id, rank);
@@ -1325,10 +1459,13 @@ impl DialogParticipantManager {
             return promise.set_error(Status::error(400, "Chat not found"));
         }
         match dialog_id.get_type() {
-            DialogType::User => promise.set_error(Status::error(400, "Can't ban members in private chats")),
+            DialogType::User => {
+                promise.set_error(Status::error(400, "Can't ban members in private chats"))
+            }
             DialogType::Chat => {
                 if participant_dialog_id.get_type() != DialogType::User {
-                    return promise.set_error(Status::error(400, "Can't ban chats in basic groups"));
+                    return promise
+                        .set_error(Status::error(400, "Can't ban chats in basic groups"));
                 }
                 // `delete_chat_participant(chat_id, user_id, revoke_messages)`
                 // — the messages.deleteChatUser wire send is the seam
@@ -1346,7 +1483,9 @@ impl DialogParticipantManager {
                     DialogParticipantStatus::banned(banned_until_date, String::new()),
                 );
             }
-            DialogType::SecretChat => promise.set_error(Status::error(400, "Can't ban members in secret chats")),
+            DialogType::SecretChat => {
+                promise.set_error(Status::error(400, "Can't ban members in secret chats"))
+            }
             DialogType::None => unreachable!(),
         }
     }
@@ -1379,7 +1518,9 @@ impl DialogParticipantManager {
                 let my_dialog_id = env.my_dialog_id();
                 env.edit_channel_participant_query(channel_id, my_dialog_id, new_status);
             }
-            DialogType::SecretChat => promise.set_error(Status::error(400, "Can't leave secret chats")),
+            DialogType::SecretChat => {
+                promise.set_error(Status::error(400, "Can't leave secret chats"))
+            }
             DialogType::None => unreachable!(),
         }
     }
@@ -1405,7 +1546,10 @@ impl DialogParticipantManager {
                     return Err(Status::error(400, "Chat is deactivated"));
                 }
                 if !env.get_chat_status(chat_id).can_manage_invite_links() {
-                    return Err(Status::error(400, "Not enough rights to manage chat join requests"));
+                    return Err(Status::error(
+                        400,
+                        "Not enough rights to manage chat join requests",
+                    ));
                 }
                 Ok(())
             }
@@ -1414,7 +1558,10 @@ impl DialogParticipantManager {
                     .get_channel_status(dialog_id.get_channel_id())
                     .can_manage_invite_links()
                 {
-                    return Err(Status::error(400, "Not enough rights to manage chat join requests"));
+                    return Err(Status::error(
+                        400,
+                        "Not enough rights to manage chat join requests",
+                    ));
                 }
                 Ok(())
             }
@@ -1436,14 +1583,12 @@ impl DialogParticipantManager {
         } else {
             match dialog_id.get_type() {
                 DialogType::User | DialogType::SecretChat => true,
-                DialogType::Chat => {
-                    !env.get_chat_status(dialog_id.get_chat_id()).can_manage_invite_links()
-                }
-                DialogType::Channel => {
-                    !env
-                        .get_channel_permissions(dialog_id.get_channel_id())
-                        .can_manage_invite_links()
-                }
+                DialogType::Chat => !env
+                    .get_chat_status(dialog_id.get_chat_id())
+                    .can_manage_invite_links(),
+                DialogType::Channel => !env
+                    .get_channel_permissions(dialog_id.get_channel_id())
+                    .can_manage_invite_links(),
                 DialogType::None => unreachable!(),
             }
         };
@@ -1484,7 +1629,14 @@ impl DialogParticipantManager {
             None => (UserId::new(0), 0),
         };
 
-        env.get_chat_join_requests_query(dialog_id, invite_link, query, offset_date, offset_user_id, limit);
+        env.get_chat_join_requests_query(
+            dialog_id,
+            invite_link,
+            query,
+            offset_date,
+            offset_user_id,
+            limit,
+        );
     }
 
     /// `DialogParticipantManager::process_dialog_join_request`
@@ -1547,7 +1699,9 @@ impl DialogParticipantManager {
 
     /// `DialogParticipantManager::can_transfer_ownership`'s error mapping
     /// (DialogParticipantManager.cpp:3301-3330) — pure, C++-anchored.
-    pub fn map_can_transfer_ownership_error(error: &Status) -> Result<CanTransferOwnershipResult, Status> {
+    pub fn map_can_transfer_ownership_error(
+        error: &Status,
+    ) -> Result<CanTransferOwnershipResult, Status> {
         let message = error.message().to_string();
         if message == "PASSWORD_HASH_INVALID" {
             return Ok(CanTransferOwnershipResult::default());
@@ -1667,7 +1821,9 @@ impl DialogParticipantManager {
         dialog_id: DialogId,
         mut promise: Promise<td_api::User>,
     ) {
-        if let Err(error) = env.check_dialog_access_write(dialog_id, "get_future_creator_after_leave") {
+        if let Err(error) =
+            env.check_dialog_access_write(dialog_id, "get_future_creator_after_leave")
+        {
             return promise.set_error(error);
         }
         if !env.get_dialog_status(dialog_id).is_creator() {
@@ -1695,7 +1851,10 @@ impl DialogParticipantManager {
         allow_replace: bool,
     ) {
         let unix_time = env.unix_time();
-        let entry = self.channel_participants.entry(channel_id.get()).or_default();
+        let entry = self
+            .channel_participants
+            .entry(channel_id.get())
+            .or_default();
         match entry.get_mut(&dialog_participant.dialog_id_.get()) {
             Some(existing) => {
                 if !allow_replace {
@@ -1704,7 +1863,10 @@ impl DialogParticipantManager {
                 *existing = (dialog_participant, unix_time);
             }
             None => {
-                entry.insert(dialog_participant.dialog_id_.get(), (dialog_participant, unix_time));
+                entry.insert(
+                    dialog_participant.dialog_id_.get(),
+                    (dialog_participant, unix_time),
+                );
             }
         }
         if self.channel_participant_cache_deadlines.is_empty() {
@@ -1748,8 +1910,12 @@ impl DialogParticipantManager {
                 env.status_update_restrictions(&mut participant.status_);
             }
             None => {
-                let dialog_participant =
-                    DialogParticipant::new(participant_dialog_id, UserId::new(0), unix_time, dialog_participant_status);
+                let dialog_participant = DialogParticipant::new(
+                    participant_dialog_id,
+                    UserId::new(0),
+                    unix_time,
+                    dialog_participant_status,
+                );
                 entry.insert(participant_dialog_id.get(), (dialog_participant, unix_time));
             }
         }
@@ -1759,7 +1925,8 @@ impl DialogParticipantManager {
     /// (DialogParticipantManager.cpp:3190-3192).
     pub fn drop_channel_participant_cache(&mut self, channel_id: ChannelId) {
         self.channel_participants.remove(&channel_id.get());
-        self.channel_participant_cache_deadlines.remove(&channel_id.get());
+        self.channel_participant_cache_deadlines
+            .remove(&channel_id.get());
     }
 
     // -- the current-state plane ------------------------------------------
@@ -1809,27 +1976,54 @@ mod tests {
 
     #[test]
     fn can_transfer_ownership_error_mapping() {
-        let result = DialogParticipantManager::map_can_transfer_ownership_error(&Status::error(400, "PASSWORD_HASH_INVALID"))
-            .unwrap();
+        let result = DialogParticipantManager::map_can_transfer_ownership_error(&Status::error(
+            400,
+            "PASSWORD_HASH_INVALID",
+        ))
+        .unwrap();
         assert_eq!(result.result_type, CanTransferOwnershipResultType::Ok);
 
-        let result = DialogParticipantManager::map_can_transfer_ownership_error(&Status::error(400, "PASSWORD_MISSING"))
-            .unwrap();
-        assert_eq!(result.result_type, CanTransferOwnershipResultType::PasswordNeeded);
+        let result = DialogParticipantManager::map_can_transfer_ownership_error(&Status::error(
+            400,
+            "PASSWORD_MISSING",
+        ))
+        .unwrap();
+        assert_eq!(
+            result.result_type,
+            CanTransferOwnershipResultType::PasswordNeeded
+        );
         assert_eq!(result.retry_after, 0);
 
-        let result = DialogParticipantManager::map_can_transfer_ownership_error(&Status::error(400, "PASSWORD_TOO_FRESH_1234"))
-            .unwrap();
-        assert_eq!(result.result_type, CanTransferOwnershipResultType::PasswordTooFresh);
+        let result = DialogParticipantManager::map_can_transfer_ownership_error(&Status::error(
+            400,
+            "PASSWORD_TOO_FRESH_1234",
+        ))
+        .unwrap();
+        assert_eq!(
+            result.result_type,
+            CanTransferOwnershipResultType::PasswordTooFresh
+        );
         assert_eq!(result.retry_after, 1234);
 
-        let result = DialogParticipantManager::map_can_transfer_ownership_error(&Status::error(400, "SESSION_TOO_FRESH_-7"))
-            .unwrap();
-        assert_eq!(result.result_type, CanTransferOwnershipResultType::SessionTooFresh);
+        let result = DialogParticipantManager::map_can_transfer_ownership_error(&Status::error(
+            400,
+            "SESSION_TOO_FRESH_-7",
+        ))
+        .unwrap();
+        assert_eq!(
+            result.result_type,
+            CanTransferOwnershipResultType::SessionTooFresh
+        );
         // the C++ clamps a negative retry_after to 0
         assert_eq!(result.retry_after, 0);
 
-        assert!(DialogParticipantManager::map_can_transfer_ownership_error(&Status::error(429, "TELEGRAM_SERVER_ERROR")).is_err());
+        assert!(
+            DialogParticipantManager::map_can_transfer_ownership_error(&Status::error(
+                429,
+                "TELEGRAM_SERVER_ERROR"
+            ))
+            .is_err()
+        );
     }
 
     #[test]
@@ -1847,7 +2041,8 @@ mod tests {
                 retry_after: 33,
             },
         );
-        let td_api::CanTransferOwnershipResult::canTransferOwnershipResultPasswordTooFresh(inner) = object
+        let td_api::CanTransferOwnershipResult::canTransferOwnershipResultPasswordTooFresh(inner) =
+            object
         else {
             panic!("wrong variant");
         };

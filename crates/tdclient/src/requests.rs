@@ -35,6 +35,7 @@ use crate::call_protocol::CallProtocol;
 use crate::chat_manager::{ChannelId, DialogId, StickerSetId};
 use crate::community_id::CommunityId;
 use crate::contact::Contact;
+use crate::dialog_participant_manager::DialogParticipantManagerEnv;
 use crate::message_id::{MessageFullId, MessageId};
 use crate::messages_manager::DialogId as MmDialogId;
 use crate::notification::{NotificationGroupId, NotificationId, NotificationObjectId};
@@ -47,7 +48,6 @@ use crate::star_gift_manager::{
     StarGiftCollectionId, StarGiftId, StarGiftResalePrice, get_message_sender_dialog_id,
 };
 use crate::suggested_action::SuggestedAction;
-use crate::dialog_participant_manager::DialogParticipantManagerEnv;
 use crate::td::AccountEnv;
 use crate::td::AttachMenuEnv;
 use crate::td::AutosaveEnv;
@@ -59,6 +59,7 @@ use crate::td::MessageQueryEnv;
 use crate::td::NotificationEnv;
 use crate::td::PremiumTdEnv;
 use crate::td::QuickReplyEnv;
+use crate::td::ReactionEnv;
 use crate::td::StatisticsEnv;
 use crate::td::Td;
 use crate::td::TdAnimationsEnv;
@@ -254,9 +255,24 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 updates.extend(chat_updates);
             }
 
-            // DialogParticipantManager::get_current_state (the M.dp
-            // slice; the online-member-count updates after the chat block
-            // per the C++ order)
+            // ReactionManager::get_current_state (Requests.cpp:2219 —
+            // after stickers, before notification settings; the manager's
+            // own is_bot gate applies)
+            {
+                let env = ReactionEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_authorized: td.auth_manager.is_authorized(),
+                    auth_is_bot: td.auth_manager.is_bot(),
+                    updates: &mut td.reaction_updates,
+                    file_manager: std::sync::Arc::clone(&td.file_manager),
+                    user_manager: &td.user_manager,
+                };
+                td.reaction_manager.get_current_state(&env, &mut updates);
+            }
+
+            // DialogParticipantManager::get_current_state (Requests.cpp:2227
+            // — after the reaction block, before the notification manager)
             {
                 let (mut env, manager) = crate::td::dialog_participant_env_split(td);
                 manager.get_current_state(&mut env, &mut updates);
@@ -771,6 +787,169 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
                 Err(status) => send_error_status(td, id, status),
             }
         }
+
+        // --- the reactions set (M.16): Requests.cpp:3907-3916, 3930-3933,
+        // 4015-4039 and 5965-5967. The net tails stay [blocked: net]; the
+        // message-, chat- and story-scoped reaction arms route to
+        // MessagesManager/MessageQueryManager/Stories on their lines ---
+        Function::getEmojiReaction(request) => {
+            // Requests.cpp:3907-3911; the null object is the
+            // send_result(nullptr) 404 rewrite
+            let promise =
+                td.deferred_promise::<Option<td_api::EmojiReaction>, _>(
+                    id,
+                    |object| match object {
+                        Some(emoji_reaction) => Object::emojiReaction(emoji_reaction),
+                        None => Object::error(td_api::Error {
+                            code: 404,
+                            message: "Not Found".to_string(),
+                        }),
+                    },
+                );
+            let mut env = ReactionEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.reaction_updates,
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                user_manager: &td.user_manager,
+            };
+            td.reaction_manager
+                .get_emoji_reaction(&mut env, &request.emoji, promise);
+        }
+        Function::getCustomEmojiReactionAnimations(_) => {
+            // Requests.cpp:3913-3916 — StickersManager::get_custom_emoji_
+            // reaction_generic_animations owns this arm (M.15 integration)
+            td.send_error_impl(id, 500, NOT_IMPLEMENTED_YET);
+        }
+        Function::clearRecentReactions(_) => {
+            // Requests.cpp:3930-3933; an empty recent list answers here, a
+            // non-empty one parks behind the [blocked: net] query
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut env = ReactionEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.reaction_updates,
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                user_manager: &td.user_manager,
+            };
+            td.reaction_manager
+                .clear_recent_reactions(&mut env, promise);
+        }
+        Function::setDefaultReactionType(request) => {
+            // Requests.cpp:4015-4018
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut env = ReactionEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.reaction_updates,
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                user_manager: &td.user_manager,
+            };
+            td.reaction_manager.set_default_reaction(
+                &mut env,
+                crate::reaction_type::ReactionType::from_td_api(request.reaction_type),
+                promise,
+            );
+        }
+        Function::getStoryAvailableReactions(request) => {
+            // Requests.cpp:5965-5968 — the synchronous available-reactions
+            // builder
+            let available = {
+                let mut env = ReactionEnv {
+                    global: &mut td.global,
+                    options: td.option_manager.as_mut(),
+                    auth_is_authorized: td.auth_manager.is_authorized(),
+                    auth_is_bot: td.auth_manager.is_bot(),
+                    updates: &mut td.reaction_updates,
+                    file_manager: std::sync::Arc::clone(&td.file_manager),
+                    user_manager: &td.user_manager,
+                };
+                td.reaction_manager
+                    .get_available_reactions(&mut env, request.row_size)
+            };
+            td.send_result(id, Object::availableReactions(available));
+        }
+        Function::getMessageEffect(request) => {
+            // Requests.cpp:4036-4040; the null object is the
+            // send_result(nullptr) 404 rewrite
+            let promise =
+                td.deferred_promise::<Option<td_api::MessageEffect>, _>(
+                    id,
+                    |object| match object {
+                        Some(effect) => Object::messageEffect(effect),
+                        None => Object::error(td_api::Error {
+                            code: 404,
+                            message: "Not Found".to_string(),
+                        }),
+                    },
+                );
+            let mut env = ReactionEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.reaction_updates,
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                user_manager: &td.user_manager,
+            };
+            td.reaction_manager.get_message_effect(
+                &mut env,
+                crate::reaction_manager::MessageEffectId::new(request.effect_id),
+                promise,
+            );
+        }
+        Function::getSavedMessagesTags(request) => {
+            // Requests.cpp:4021-4030; the SavedMessagesManager topic
+            // translation is the Wave-3 seam — topic 0 is the default
+            // list, every other id takes the C++ invalid-marker 400
+            let saved_messages_topic_id = if request.saved_messages_topic_id == 0 {
+                crate::reaction_manager::SavedMessagesTopicId::default()
+            } else {
+                crate::reaction_manager::SavedMessagesTopicId::from_dialog_id(
+                    crate::dialog_id::DialogId::new(i64::MAX),
+                )
+            };
+            let promise =
+                td.deferred_promise::<td_api::SavedMessagesTags, _>(id, Object::savedMessagesTags);
+            let mut env = ReactionEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.reaction_updates,
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                user_manager: &td.user_manager,
+            };
+            td.reaction_manager
+                .get_saved_messages_tags(&mut env, saved_messages_topic_id, promise);
+        }
+        Function::setSavedMessagesTagLabel(request) => {
+            // Requests.cpp:4030-4036; the local tag machine runs here, the
+            // UpdateSavedReactionTagQuery tail stays [blocked: net]
+            let promise = td.deferred_promise::<(), _>(id, |()| ok_object());
+            let mut env = ReactionEnv {
+                global: &mut td.global,
+                options: td.option_manager.as_mut(),
+                auth_is_authorized: td.auth_manager.is_authorized(),
+                auth_is_bot: td.auth_manager.is_bot(),
+                updates: &mut td.reaction_updates,
+                file_manager: std::sync::Arc::clone(&td.file_manager),
+                user_manager: &td.user_manager,
+            };
+            td.reaction_manager.set_saved_messages_tag_title(
+                &mut env,
+                crate::reaction_type::ReactionType::from_td_api(request.tag),
+                &request.label,
+                promise,
+            );
+        }
+
         Function::resetAllNotificationSettings(_) => {
             // `Requests.cpp:7983-7987`: the local reset answers ok without
             // waiting for the (net-blocked) ResetNotifySettingsQuery
@@ -1342,8 +1521,11 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 file_reference_manager: &mut td.file_reference_manager,
                 updates: &mut td.attach_menu_updates,
             };
-            td.attach_menu_manager
-                .get_attach_menu_bot_request(&mut env, UserId::new(request.bot_user_id), promise);
+            td.attach_menu_manager.get_attach_menu_bot_request(
+                &mut env,
+                UserId::new(request.bot_user_id),
+                promise,
+            );
         }
         Function::toggleBotIsAddedToAttachmentMenu(request) => {
             // `Requests.cpp:1107-1113` — the ok answer parks behind the
@@ -1684,13 +1866,18 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise = td.deferred_promise(id, |v: td_api::ChatJoinResult| v.into());
             let (mut env, manager) = crate::td::dialog_participant_env_split(td);
-            manager.join_dialog(&mut env, crate::chat_manager::DialogId::new(request.chat_id), promise);
+            manager.join_dialog(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                promise,
+            );
         }
         Function::leaveChat(request) => {
             // Requests.cpp:6160-6177: the creator-of-channel early-ok and the
             // creator-status rewrite happen at the dispatcher
             let dialog_id = crate::chat_manager::DialogId::new(request.chat_id);
-            let mut new_status = td_api::ChatMemberStatus::chatMemberStatusLeft(td_api::chatMemberStatusLeft {});
+            let mut new_status =
+                td_api::ChatMemberStatus::chatMemberStatusLeft(td_api::chatMemberStatusLeft {});
             if dialog_id.get_type() == crate::chat_manager::DialogType::Channel && {
                 let (mut env, _) = crate::td::dialog_participant_env_split(td);
                 env.have_dialog_force(dialog_id, "leaveChat")
@@ -1712,7 +1899,13 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             let promise = td.deferred_promise(id, |()| ok_object());
             let (mut env, manager) = crate::td::dialog_participant_env_split(td);
             let my_dialog_id = env.my_dialog_id();
-            manager.set_dialog_participant_status(&mut env, dialog_id, my_dialog_id, new_status, promise);
+            manager.set_dialog_participant_status(
+                &mut env,
+                dialog_id,
+                my_dialog_id,
+                new_status,
+                promise,
+            );
         }
         Function::addChatMember(request) => {
             // Requests.cpp:6178-6184
@@ -1739,7 +1932,11 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             manager.add_dialog_participants(
                 &mut env,
                 crate::chat_manager::DialogId::new(request.chat_id),
-                request.user_ids.iter().map(|&user_id| crate::user_manager::UserId::new(user_id)).collect(),
+                request
+                    .user_ids
+                    .iter()
+                    .map(|&user_id| crate::user_manager::UserId::new(user_id))
+                    .collect(),
                 promise,
             );
         }
@@ -1756,7 +1953,9 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                     tdutils::status::Result::Ok(dialog_id) => {
                         crate::chat_manager::DialogId::new(dialog_id.get())
                     }
-                    tdutils::status::Result::Err(status) => return send_error_status(td, id, status),
+                    tdutils::status::Result::Err(status) => {
+                        return send_error_status(td, id, status);
+                    }
                 }
             };
             let promise = td.deferred_promise(id, |()| ok_object());
@@ -1797,7 +1996,9 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                     tdutils::status::Result::Ok(dialog_id) => {
                         crate::chat_manager::DialogId::new(dialog_id.get())
                     }
-                    tdutils::status::Result::Err(status) => return send_error_status(td, id, status),
+                    tdutils::status::Result::Err(status) => {
+                        return send_error_status(td, id, status);
+                    }
                 }
             };
             let promise = td.deferred_promise(id, |()| ok_object());
@@ -1850,7 +2051,11 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise = td.deferred_promise(id, |v: td_api::User| Object::user(v));
             let (mut env, manager) = crate::td::dialog_participant_env_split(td);
-            manager.get_future_creator_after_leave(&mut env, crate::chat_manager::DialogId::new(request.chat_id), promise);
+            manager.get_future_creator_after_leave(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                promise,
+            );
         }
         Function::getChatMember(request) => {
             // Requests.cpp:6244-6251
@@ -1865,12 +2070,19 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                     tdutils::status::Result::Ok(dialog_id) => {
                         crate::chat_manager::DialogId::new(dialog_id.get())
                     }
-                    tdutils::status::Result::Err(status) => return send_error_status(td, id, status),
+                    tdutils::status::Result::Err(status) => {
+                        return send_error_status(td, id, status);
+                    }
                 }
             };
             let promise = td.deferred_promise(id, |v: td_api::ChatMember| Object::chatMember(v));
             let (mut env, manager) = crate::td::dialog_participant_env_split(td);
-            manager.get_dialog_participant(&mut env, crate::chat_manager::DialogId::new(request.chat_id), participant_dialog_id, promise);
+            manager.get_dialog_participant(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                participant_dialog_id,
+                promise,
+            );
         }
         Function::searchChatMembers(request) => {
             // Requests.cpp:6252-6268
@@ -1884,13 +2096,26 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             );
             let promise = td.deferred_promise(id, |v: td_api::ChatMembers| Object::chatMembers(v));
             let (mut env, manager) = crate::td::dialog_participant_env_split(td);
-            manager.search_dialog_participants(&mut env, dialog_id, &query, request.limit, &filter, promise);
+            manager.search_dialog_participants(
+                &mut env,
+                dialog_id,
+                &query,
+                request.limit,
+                &filter,
+                promise,
+            );
         }
         Function::getChatAdministrators(request) => {
             // Requests.cpp:6269-6274
-            let promise = td.deferred_promise(id, |v: td_api::ChatAdministrators| Object::chatAdministrators(v));
+            let promise = td.deferred_promise(id, |v: td_api::ChatAdministrators| {
+                Object::chatAdministrators(v)
+            });
             let (mut env, manager) = crate::td::dialog_participant_env_split(td);
-            manager.get_dialog_administrators(&mut env, crate::chat_manager::DialogId::new(request.chat_id), promise);
+            manager.get_dialog_administrators(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                promise,
+            );
         }
         Function::getChatJoinRequests(request) => {
             // Requests.cpp:6346-6355
@@ -1903,7 +2128,9 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
                 return;
             };
-            let promise = td.deferred_promise(id, |v: td_api::ChatJoinRequests| Object::chatJoinRequests(v));
+            let promise = td.deferred_promise(id, |v: td_api::ChatJoinRequests| {
+                Object::chatJoinRequests(v)
+            });
             let (mut env, manager) = crate::td::dialog_participant_env_split(td);
             manager.get_dialog_join_requests(
                 &mut env,
@@ -1937,7 +2164,13 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             };
             let promise = td.deferred_promise(id, |()| ok_object());
             let (mut env, manager) = crate::td::dialog_participant_env_split(td);
-            manager.process_dialog_join_requests(&mut env, crate::chat_manager::DialogId::new(request.chat_id), invite_link, request.approve, promise);
+            manager.process_dialog_join_requests(
+                &mut env,
+                crate::chat_manager::DialogId::new(request.chat_id),
+                invite_link,
+                request.approve,
+                promise,
+            );
         }
         Function::getSupergroupMembers(request) => {
             // Requests.cpp:7393-7411
@@ -1948,7 +2181,14 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             );
             let promise = td.deferred_promise(id, |v: td_api::ChatMembers| Object::chatMembers(v));
             let (mut env, manager) = crate::td::dialog_participant_env_split(td);
-            manager.get_channel_participants(&mut env, channel_id, &filter, request.offset, request.limit, promise);
+            manager.get_channel_participants(
+                &mut env,
+                channel_id,
+                &filter,
+                request.offset,
+                request.limit,
+                promise,
+            );
         }
         Function::getGuardBotWebAppUrl(request) => {
             // Requests.cpp:8300-8306
@@ -1969,7 +2209,12 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             };
             let promise = td.deferred_promise(id, |()| ok_object());
             let (mut env, manager) = crate::td::dialog_participant_env_split(td);
-            manager.set_join_chat_result(&mut env, request.query_id, request.result.expect("the result is a required field"), url);
+            manager.set_join_chat_result(
+                &mut env,
+                request.query_id,
+                request.result.expect("the result is a required field"),
+                url,
+            );
             drop(promise);
         }
         Function::getChatSimilarChats(request) => {
@@ -6460,7 +6705,7 @@ fn run_story_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise = ok_promise!(td);
             let reaction_type =
-                crate::reaction_type::ReactionType::from_td_api(request.reaction_type.as_ref());
+                crate::reaction_type::ReactionType::from_td_api(request.reaction_type.clone());
             story_arm(td, |env, manager| {
                 manager.set_story_reaction(
                     env,
@@ -6514,7 +6759,7 @@ fn run_story_requests(td: &mut Td, id: u64, function: Function) {
             let promise =
                 td.deferred_promise::<td_api::StoryInteractions, _>(id, Object::storyInteractions);
             let reaction_type =
-                crate::reaction_type::ReactionType::from_td_api(request.reaction_type.as_ref());
+                crate::reaction_type::ReactionType::from_td_api(request.reaction_type.clone());
             story_arm(td, |env, manager| {
                 manager.get_dialog_story_interactions(
                     env,
@@ -11779,9 +12024,9 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 20, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            577,
+            584,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 425, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 418, "interim count");
     }
 }

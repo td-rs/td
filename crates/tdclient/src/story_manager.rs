@@ -142,7 +142,7 @@ impl MediaArea {
     pub fn has_reaction_type(&self, reaction_type: &ReactionType) -> bool {
         match &self.area.r#type {
             Some(td_api::StoryAreaType::storyAreaTypeSuggestedReaction(area)) => {
-                ReactionType::from_td_api(area.reaction_type.as_ref()) == *reaction_type
+                ReactionType::from_td_api(area.reaction_type.clone()) == *reaction_type
             }
             _ => false,
         }

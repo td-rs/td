@@ -3,11 +3,11 @@
 //! `SupergroupMembersFilter*` decision tables used by searchChatMembers and
 //! getSupergroupMembers.
 
+use crate::chat_manager::DialogId;
 use crate::chat_manager::DialogParticipant;
 use crate::chat_manager::DialogType;
-use crate::chat_manager::DialogId;
-use crate::user_manager::UserId;
 use crate::td_api;
+use crate::user_manager::UserId;
 
 /// The `MessageTopic` carried by the Mention filters — the generated
 /// `td_api::MessageTopic` value. Only the wire queries read it
@@ -308,7 +308,8 @@ mod tests {
             )),
         );
         assert_eq!(filter, DialogParticipantFilter::Contacts);
-        assert!(!filter.as_channel_participant_filter("").query.is_empty());
+        // the C++ Contacts arm stores the caller's query verbatim
+        assert_eq!(filter.as_channel_participant_filter("abc").query, "abc");
 
         let filter = DialogParticipantFilter::from_td_api(
             DialogId::new(0),
@@ -332,9 +333,7 @@ mod tests {
             Some(&td_api::ChatMembersFilter::chatMembersFilterMention(
                 td_api::chatMembersFilterMention {
                     topic_id: Some(td_api::MessageTopic::messageTopicForum(
-                        td_api::messageTopicForum {
-                            forum_topic_id: 7,
-                        },
+                        td_api::messageTopicForum { forum_topic_id: 7 },
                     )),
                 },
             )),
@@ -365,8 +364,12 @@ mod tests {
         assert!(DialogParticipantFilter::Members.is_dialog_participant_suitable(&env, &member));
         assert!(!DialogParticipantFilter::Members.is_dialog_participant_suitable(&env, &banned));
         assert!(DialogParticipantFilter::Banned.is_dialog_participant_suitable(&env, &banned));
-        assert!(DialogParticipantFilter::Mention { message_topic: None }
-            .is_dialog_participant_suitable(&env, &member));
+        assert!(
+            DialogParticipantFilter::Mention {
+                message_topic: None
+            }
+            .is_dialog_participant_suitable(&env, &member)
+        );
     }
 
     #[test]
@@ -377,19 +380,23 @@ mod tests {
 
         let filter = ChannelParticipantFilter::from_td_api(
             DialogId::new(0),
-            Some(&td_api::SupergroupMembersFilter::supergroupMembersFilterRecent(
-                td_api::supergroupMembersFilterRecent {},
-            )),
+            Some(
+                &td_api::SupergroupMembersFilter::supergroupMembersFilterRecent(
+                    td_api::supergroupMembersFilterRecent {},
+                ),
+            ),
         );
         assert!(filter.is_recent());
 
         let filter = ChannelParticipantFilter::from_td_api(
             DialogId::new(0),
-            Some(&td_api::SupergroupMembersFilter::supergroupMembersFilterSearch(
-                td_api::supergroupMembersFilterSearch {
-                    query: "x".to_owned(),
-                },
-            )),
+            Some(
+                &td_api::SupergroupMembersFilter::supergroupMembersFilterSearch(
+                    td_api::supergroupMembersFilterSearch {
+                        query: "x".to_owned(),
+                    },
+                ),
+            ),
         );
         assert!(filter.is_search());
         assert_eq!(filter.query, "x");

@@ -774,6 +774,17 @@ pub fn add_to_top<T: PartialEq + Clone>(v: &mut Vec<T>, max_size: usize, value: 
     v[0] = value;
 }
 
+/// `td::get_md5_string_hash` (misc.cpp:301-309) — the first 8 md5 bytes
+/// folded big-endian into one `u64`.
+pub fn get_md5_string_hash(s: &str) -> u64 {
+    let hash = tdutils::crypto::md5(s.as_bytes());
+    let mut result: u64 = 0;
+    for (i, byte) in hash.iter().take(8).enumerate() {
+        result += u64::from(*byte) << (56 - 8 * i);
+    }
+    result
+}
+
 #[cfg(test)]
 mod search_strings_by_prefix_tests {
     use super::search_strings_by_prefix;
