@@ -635,11 +635,16 @@ impl OptionManager {
             }
             'l' if !is_bot => {
                 set_string_option!("language_pack_database_path", |_| true);
-                // LanguagePackManager::check_language_code_name — TODO
-                // (Wave 2): accept any code for now.
-                set_string_option!("language_pack_id", |_| true);
-                // LanguagePackManager::check_language_pack_name — TODO.
-                set_string_option!("localization_target", |_| true);
+                // LanguagePackManager::check_language_code_name (M.24)
+                set_string_option!(
+                    "language_pack_id",
+                    crate::language_pack_manager::check_language_code_name
+                );
+                // LanguagePackManager::check_language_pack_name (M.24)
+                set_string_option!(
+                    "localization_target",
+                    crate::language_pack_manager::check_language_pack_name
+                );
             }
             'm' => {
                 set_integer_option!("message_unload_delay", 60, 86400);

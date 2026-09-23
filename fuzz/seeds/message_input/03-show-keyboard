@@ -1,0 +1,1 @@
+{"@type":"replyMarkupShowKeyboard","rows":[[{"text":"hi"},{"text":"","icon_custom_emoji_id":5},{"text":"ask","type":{"@type":"keyboardButtonTypeRequestPoll","force_quiz":true}},{"text":"w","type":{"@type":"keyboardButtonTypeWebApp","url":"https://t.me/app"}}]],"is_persistent":true,"resize_keyboard":true,"one_time":true,"is_personal":true,"input_field_placeholder":"ph"}

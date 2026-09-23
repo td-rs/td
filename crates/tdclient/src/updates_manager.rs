@@ -693,6 +693,26 @@ pub trait UpdatesSink {
     fn on_update_user_status(&mut self, user_id: i64, status: telegram_api::UserStatus) {
         let _ = (user_id, status);
     }
+    /// `WebBrowserManager::on_update_web_browser_settings` (M.31) — the
+    /// td-level sink routes to the web browser manager; the ZST stand-in
+    /// no-ops until the sink-state refactor.
+    fn on_update_web_browser_settings(&mut self, update: telegram_api::updateWebBrowserSettings) {
+        let _ = update;
+    }
+    /// `WebBrowserManager::on_update_web_browser_exception` (M.31).
+    fn on_update_web_browser_exception(&mut self, update: telegram_api::updateWebBrowserException) {
+        let _ = update;
+    }
+    /// `CallManager::update_call` (M.32) — the td-level sink routes the
+    /// updatePhoneCall intake to the call manager; the ZST stand-in
+    /// no-ops until the sink-state refactor.
+    fn on_update_phone_call(&mut self, update: telegram_api::updatePhoneCall) {
+        let _ = update;
+    }
+    /// `CallManager::update_call_signaling_data` (M.32).
+    fn on_update_phone_call_signaling_data(&mut self, call_id: i64, data: Vec<u8>) {
+        let _ = (call_id, data);
+    }
     /// `UserManager::on_update_user_name` (cpp:4369).
     fn on_update_user_name(&mut self, user_id: i64, first_name: String, last_name: String) {
         let _ = (user_id, first_name, last_name);
@@ -727,6 +747,18 @@ pub trait UpdatesSink {
     // struct travels whole, exactly like `on_update_channel_too_long`.
 
     /// `MessagesManager::on_update_service_notification` (cpp:3834).
+    /// `LanguagePackManager::on_language_pack_too_long`
+    /// (UpdatesManager.cpp:4818-4823, M.24). The manager-local halves are
+    /// landed and tested on [`crate::language_pack_manager`]; this sink
+    /// impl routes into Td's `language_pack_manager` with the net step
+    /// (the same collapsed-sink convention as the MessagesManager
+    /// intakes).
+    fn on_update_lang_pack_too_long(&mut self, _lang_code: String) {}
+
+    /// `LanguagePackManager::on_update_language_pack`
+    /// (UpdatesManager.cpp:4824-4829, M.24).
+    fn on_update_lang_pack(&mut self, _difference: telegram_api::LangPackDifference) {}
+
     fn on_update_service_notification(&mut self, _update: telegram_api::updateServiceNotification) {
     }
     /// `MessagesManager::on_update_read_channel_inbox` (cpp:3844).
@@ -2650,8 +2682,11 @@ impl<S: UpdatesSink> UpdatesManager<S> {
     /// `UpdatesManager::add_pending_pts_update` (cpp:3032) — the
     /// validation, the jump recovery, the postponement and the
     /// accumulated-pts bookkeeping with the fast path.
+    // `pub(crate)` — the M.18 affected-history loop routes the
+    // `on_get_affected_history` pts bookkeeping here (the C++ calls
+    // `updates_manager_->add_pending_pts_update` cross-manager).
     #[allow(clippy::too_many_arguments)]
-    fn add_pending_pts_update(
+    pub(crate) fn add_pending_pts_update(
         &mut self,
         env: &mut impl UpdatesManagerEnv,
         update: PendingUpdate,
@@ -5171,23 +5206,18 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                     promise,
                 );
             }
-            PendingUpdate::Wire(telegram_api::Update::updatePhoneCall(_)) => {
-                // call_manager — Wave 2.
-                self.drop_unsupported(
-                    telegram_api::updatePhoneCall::ID,
-                    "updatePhoneCall",
-                    4731,
-                    promise,
-                );
+            PendingUpdate::Wire(telegram_api::Update::updatePhoneCall(update)) => {
+                // CallManager::update_call — M.32; the td-level sink
+                // routes to the manager (the ZST stand-in no-ops until
+                // the sink-state refactor).
+                self.sink.on_update_phone_call(update);
+                promise.set_value(());
             }
-            PendingUpdate::Wire(telegram_api::Update::updatePhoneCallSignalingData(_)) => {
-                // call_manager — Wave 2.
-                self.drop_unsupported(
-                    telegram_api::updatePhoneCallSignalingData::ID,
-                    "updatePhoneCallSignalingData",
-                    4736,
-                    promise,
-                );
+            PendingUpdate::Wire(telegram_api::Update::updatePhoneCallSignalingData(update)) => {
+                // CallManager::update_call_signaling_data — M.32.
+                self.sink
+                    .on_update_phone_call_signaling_data(update.phone_call_id, update.data);
+                promise.set_value(());
             }
             PendingUpdate::Wire(telegram_api::Update::updateGroupCallConnection(_)) => {
                 // group_call_manager — Wave 2.
@@ -5270,23 +5300,19 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                     promise,
                 );
             }
-            PendingUpdate::Wire(telegram_api::Update::updateLangPackTooLong(_)) => {
-                // language_pack_manager — Wave 2.
-                self.drop_unsupported(
-                    telegram_api::updateLangPackTooLong::ID,
-                    "updateLangPackTooLong",
-                    4818,
-                    promise,
-                );
+            PendingUpdate::Wire(telegram_api::Update::updateLangPackTooLong(update)) => {
+                // UpdatesManager::on_update (cpp:4818-4823, M.24); the
+                // sink impl lands with the net step
+                self.sink.on_update_lang_pack_too_long(update.lang_code);
+                promise.set_value(());
             }
-            PendingUpdate::Wire(telegram_api::Update::updateLangPack(_)) => {
-                // language_pack_manager — Wave 2.
-                self.drop_unsupported(
-                    telegram_api::updateLangPack::ID,
-                    "updateLangPack",
-                    4824,
-                    promise,
-                );
+            PendingUpdate::Wire(telegram_api::Update::updateLangPack(update)) => {
+                // UpdatesManager::on_update (cpp:4824-4829, M.24); the
+                // sink impl lands with the net step
+                if let Some(difference) = update.difference {
+                    self.sink.on_update_lang_pack(difference);
+                }
+                promise.set_value(());
             }
             PendingUpdate::Wire(telegram_api::Update::updateMessagePoll(_)) => {
                 // poll_manager — Wave 2.
@@ -5460,23 +5486,17 @@ impl<S: UpdatesSink> UpdatesManager<S> {
                     promise,
                 );
             }
-            PendingUpdate::Wire(telegram_api::Update::updateWebBrowserSettings(_)) => {
-                // web_browser_manager — Wave 2.
-                self.drop_unsupported(
-                    telegram_api::updateWebBrowserSettings::ID,
-                    "updateWebBrowserSettings",
-                    5134,
-                    promise,
-                );
+            PendingUpdate::Wire(telegram_api::Update::updateWebBrowserSettings(update)) => {
+                // WebBrowserManager::on_update_web_browser_settings — M.31;
+                // the td-level sink routes to the manager (the ZST
+                // stand-in no-ops until the sink-state refactor).
+                self.sink.on_update_web_browser_settings(update);
+                promise.set_value(());
             }
-            PendingUpdate::Wire(telegram_api::Update::updateWebBrowserException(_)) => {
-                // web_browser_manager — Wave 2.
-                self.drop_unsupported(
-                    telegram_api::updateWebBrowserException::ID,
-                    "updateWebBrowserException",
-                    5139,
-                    promise,
-                );
+            PendingUpdate::Wire(telegram_api::Update::updateWebBrowserException(update)) => {
+                // WebBrowserManager::on_update_web_browser_exception — M.31.
+                self.sink.on_update_web_browser_exception(update);
+                promise.set_value(());
             }
 
             // ---- the C++ log-only overloads --------------------------
