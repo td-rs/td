@@ -38,6 +38,11 @@ impl AccentColorId {
         self.0 >= 0
     }
 
+    /// `is_built_in` (AccentColorId.h:45-47).
+    pub fn is_built_in(self) -> bool {
+        (0..7).contains(&self.0)
+    }
+
     pub fn get(self) -> i32 {
         self.0
     }

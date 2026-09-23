@@ -692,6 +692,195 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             };
             search_contacts_request(td, id, query, request.limit);
         }
+        // --- the sponsored set (M.26): Requests.cpp:2672-2742, 6590-6594. The
+        // managers validate; the net query tails park the promises unanswered
+        // offline, exactly like the C++ request without a network ---
+        Function::getChatSponsoredMessages(request) => {
+            // Requests.cpp:2672-2676
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<crate::td_api::SponsoredMessages, _>(
+                id,
+                Object::sponsoredMessages,
+            );
+            let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
+            sponsored_message_manager.get_dialog_sponsored_messages(
+                &mut env,
+                DialogId::new(request.chat_id),
+                promise,
+            );
+        }
+        Function::clickChatSponsoredMessage(request) => {
+            // Requests.cpp:2678-2684
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
+            sponsored_message_manager.click_sponsored_message(
+                &mut env,
+                DialogId::new(request.chat_id),
+                crate::chat_manager::MessageId::new(request.message_id),
+                request.is_media_click,
+                request.from_fullscreen,
+                promise,
+            );
+        }
+        Function::reportChatSponsoredMessage(request) => {
+            // Requests.cpp:2686-2691
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<crate::td_api::ReportSponsoredResult, _>(
+                id,
+                report_sponsored_result_to_object,
+            );
+            let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
+            sponsored_message_manager.report_sponsored_message(
+                &mut env,
+                DialogId::new(request.chat_id),
+                crate::chat_manager::MessageId::new(request.message_id),
+                &request.option_id,
+                promise,
+            );
+        }
+        Function::getSearchSponsoredChats(request) => {
+            // Requests.cpp:2693-2699
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<crate::td_api::SponsoredChats, _>(id, Object::sponsoredChats);
+            let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
+            sponsored_message_manager.get_search_sponsored_dialogs(&mut env, &query, promise);
+        }
+        Function::viewSponsoredChat(request) => {
+            // Requests.cpp:2700-2704
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
+            sponsored_message_manager.view_sponsored_dialog(
+                &mut env,
+                request.sponsored_chat_unique_id,
+                promise,
+            );
+        }
+        Function::openSponsoredChat(request) => {
+            // Requests.cpp:2706-2710
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
+            sponsored_message_manager.open_sponsored_dialog(
+                &mut env,
+                request.sponsored_chat_unique_id,
+                promise,
+            );
+        }
+        Function::reportSponsoredChat(request) => {
+            // Requests.cpp:2712-2717
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<crate::td_api::ReportSponsoredResult, _>(
+                id,
+                report_sponsored_result_to_object,
+            );
+            let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
+            sponsored_message_manager.report_sponsored_dialog(
+                &mut env,
+                request.sponsored_chat_unique_id,
+                &request.option_id,
+                promise,
+            );
+        }
+        Function::getVideoMessageAdvertisements(request) => {
+            // Requests.cpp:2719-2725
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<crate::td_api::VideoMessageAdvertisements, _>(
+                id,
+                Object::videoMessageAdvertisements,
+            );
+            let message_full_id = crate::dialog_id::MessageFullId::new(
+                DialogId::new(request.chat_id),
+                crate::chat_manager::MessageId::new(request.message_id),
+            );
+            let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
+            sponsored_message_manager.get_video_sponsored_messages(
+                &mut env,
+                message_full_id,
+                promise,
+            );
+        }
+        Function::viewVideoMessageAdvertisement(request) => {
+            // Requests.cpp:2727-2731
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
+            sponsored_message_manager.view_video_advertisement(
+                &mut env,
+                request.advertisement_unique_id,
+                promise,
+            );
+        }
+        Function::clickVideoMessageAdvertisement(request) => {
+            // Requests.cpp:2733-2737
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
+            sponsored_message_manager.click_video_advertisement(
+                &mut env,
+                request.advertisement_unique_id,
+                promise,
+            );
+        }
+        Function::reportVideoMessageAdvertisement(request) => {
+            // Requests.cpp:2739-2744
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<crate::td_api::ReportSponsoredResult, _>(
+                id,
+                report_sponsored_result_to_object,
+            );
+            let (mut env, sponsored_message_manager) = crate::td::sponsored_env_split(td);
+            sponsored_message_manager.report_video_advertisement(
+                &mut env,
+                request.advertisement_unique_id,
+                &request.option_id,
+                promise,
+            );
+        }
+        Function::importMessages(request) => {
+            // Requests.cpp:6590-6594
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let dialog_id = DialogId::new(request.chat_id);
+            let (mut env, message_import_manager) = crate::td::message_import_env_split(td);
+            message_import_manager.import_messages(
+                &mut env,
+                dialog_id,
+                request.message_file,
+                request.attached_files,
+                promise,
+            );
+        }
+
         Function::addContact(request) => {
             // Requests.cpp:6611-6620 + `get_contact` (Contact.cpp:142-156):
             // the importedContact variant has no vcard and carries the
@@ -2107,6 +2296,22 @@ pub(crate) fn option_value_to_object(value: td_api::OptionValue) -> Object {
 
 /// The `JsonValue` → `Object` rewrap (the Object umbrella flattens the
 /// JSON constructors, so the polymorphic type has no single variant).
+/// The `ReportSponsoredResult` → `Object` rewrap (the Object umbrella
+/// flattens the sponsored-result constructors, so the polymorphic type
+/// has no single variant).
+pub(crate) fn report_sponsored_result_to_object(value: td_api::ReportSponsoredResult) -> Object {
+    use td_api::ReportSponsoredResult as V;
+    match value {
+        V::reportSponsoredResultOk(v) => Object::reportSponsoredResultOk(v),
+        V::reportSponsoredResultFailed(v) => Object::reportSponsoredResultFailed(v),
+        V::reportSponsoredResultOptionRequired(v) => Object::reportSponsoredResultOptionRequired(v),
+        V::reportSponsoredResultAdsHidden(v) => Object::reportSponsoredResultAdsHidden(v),
+        V::reportSponsoredResultPremiumRequired(v) => {
+            Object::reportSponsoredResultPremiumRequired(v)
+        }
+    }
+}
+
 pub(crate) fn json_value_to_object(value: td_api::JsonValue) -> Object {
     use td_api::JsonValue as V;
     match value {
@@ -2180,9 +2385,9 @@ mod request_census_tests {
         assert_eq!(*counts.get("sync").unwrap_or(&0), 18, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            110,
+            123,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 894, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 881, "interim count");
     }
 }
