@@ -2305,6 +2305,9 @@ pub struct Td {
     /// `Td::dialog_participant_manager_` (Td.cpp, the M.dp slice).
     pub(crate) dialog_participant_manager:
         crate::dialog_participant_manager::DialogParticipantManager,
+    /// `Td::saved_messages_manager_` (Td.cpp).
+    pub(crate) saved_messages_manager:
+        crate::saved_messages_manager::SavedMessagesManager,
     /// `Td::channel_recommendation_manager_` (Td.cpp:1278, M.27).
     pub(crate) channel_recommendation_manager:
         crate::channel_recommendation_manager::ChannelRecommendationManager,
@@ -2665,6 +2668,8 @@ impl Td {
             top_dialog_manager: crate::top_dialog_manager::TopDialogManager::new(),
             dialog_participant_manager:
                 crate::dialog_participant_manager::DialogParticipantManager::new(),
+            saved_messages_manager:
+                crate::saved_messages_manager::SavedMessagesManager::new(),
             channel_recommendation_manager:
                 crate::channel_recommendation_manager::ChannelRecommendationManager::new(),
             web_pages_manager: crate::web_pages_manager::WebPagesManager::new(),
@@ -15104,6 +15109,116 @@ impl crate::dialog_participant_manager::DialogParticipantManagerEnv for TdDialog
     ) {
         // messages.deleteChatUser/editChatAdmin [blocked: net]
     }
+}
+
+pub(crate) fn saved_messages_env_split(
+    td: &mut Td,
+) -> (
+    TdSavedMessagesEnv<'_>,
+    &mut crate::saved_messages_manager::SavedMessagesManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        chat_manager,
+        saved_messages_manager,
+        ..
+    } = td;
+    (
+        TdSavedMessagesEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            chat_manager,
+        },
+        saved_messages_manager,
+    )
+}
+
+pub(crate) struct TdSavedMessagesEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) chat_manager: &'a mut crate::chat_manager::ChatManager,
+}
+
+impl crate::saved_messages_manager::SavedMessagesManagerEnv for TdSavedMessagesEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+    fn now(&self) -> f64 {
+        tdutils::time::now()
+    }
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+    fn my_user_id(&self) -> UserId {
+        self.user_manager.get_my_id()
+    }
+    fn my_dialog_id(&self) -> crate::dialog_id::DialogId {
+        crate::dialog_id::DialogId::from_user_id(self.user_manager.get_my_id())
+    }
+    fn is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+    fn is_admined_monoforum_channel(&mut self, dialog_id: crate::dialog_id::DialogId) -> bool {
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::Channel => {
+                let channel_id = dialog_id.get_channel_id();
+                self.chat_manager.get_channel_status(channel_id).is_administrator()
+            }
+            _ => false,
+        }
+    }
+    fn is_monoforum_channel(&mut self, dialog_id: crate::dialog_id::DialogId) -> bool {
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::Channel => true,
+            _ => false,
+        }
+    }
+    fn have_input_peer(&mut self, dialog_id: crate::dialog_id::DialogId) -> bool {
+        dialog_id.is_valid()
+    }
+    fn get_chat_id_object(&mut self, dialog_id: crate::dialog_id::DialogId, _source: &str) -> i64 {
+        dialog_id.get()
+    }
+    fn get_message_sender_object(&mut self, dialog_id: crate::dialog_id::DialogId, _source: &str) -> td_api::MessageSender {
+        match dialog_id.get_type() {
+            crate::dialog_id::DialogType::User => {
+                td_api::MessageSender::messageSenderUser(td_api::messageSenderUser {
+                    user_id: dialog_id.get_user_id().get(),
+                })
+            }
+            _ => {
+                td_api::MessageSender::messageSenderChat(td_api::messageSenderChat {
+                    chat_id: dialog_id.get(),
+                })
+            }
+        }
+    }
+    fn have_message_force(&mut self, _full_id: crate::message_id::MessageFullId, _source: &str) -> bool {
+        true
+    }
+    fn get_pinned_saved_messages_topic_limit(&self) -> i32 {
+        self.options.as_ref().map_or(5, |o| {
+            let limit = o.get_option_integer("pinned_saved_messages_topic_count_max", 5) as i32;
+            if limit <= 0 { 5 } else { limit }
+        })
+    }
+    fn send_get_saved_dialogs(&mut self, _dialog_id: crate::dialog_id::DialogId, _limit: i32) {}
+    fn send_get_pinned_saved_dialogs(&mut self, _limit: i32) {}
+    fn send_toggle_saved_dialog_pin(&mut self, _topic_id: crate::messages_manager::SavedMessagesTopicId, _is_pinned: bool) {}
+    fn send_reorder_pinned_saved_dialogs(&mut self, _topic_ids: Vec<crate::messages_manager::SavedMessagesTopicId>) {}
+    fn send_delete_saved_history(&mut self, _dialog_id: crate::dialog_id::DialogId, _topic_id: crate::messages_manager::SavedMessagesTopicId) {}
+    fn send_delete_saved_messages_by_date(&mut self, _dialog_id: crate::dialog_id::DialogId, _topic_id: crate::messages_manager::SavedMessagesTopicId, _min_date: i32, _max_date: i32) {}
+    fn send_get_saved_message_by_date(&mut self, _dialog_id: crate::dialog_id::DialogId, _topic_id: crate::messages_manager::SavedMessagesTopicId, _date: i32) {}
+    fn send_get_monoforum_paid_message_revenue(&mut self, _dialog_id: crate::dialog_id::DialogId, _user_id: UserId) {}
+    fn send_toggle_monoforum_nopaid_messages_exception(&mut self, _dialog_id: crate::dialog_id::DialogId, _user_id: UserId, _can_send_unpaid: bool, _refund_payments: bool) {}
+    fn send_get_message_author(&mut self, _channel_id: crate::chat_manager::ChannelId, _message_id: crate::message_id::MessageId) {}
 }
 
 #[cfg(test)]

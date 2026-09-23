@@ -657,7 +657,7 @@ impl DialogId {
     pub const ZERO_SECRET_CHAT_ID: i64 = -2_000_000_000_000;
     pub const ZERO_CHANNEL_ID: i64 = -1_000_000_000_000;
 
-    pub fn new(id: i64) -> DialogId {
+    pub const fn new(id: i64) -> DialogId {
         DialogId(id)
     }
 
