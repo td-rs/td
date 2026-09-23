@@ -1,13 +1,15 @@
 //! Port of `td/telegram/SynchronousRequests.{h,cpp}` + the td_api half of
 //! `td/telegram/JsonValue.cpp` (S68): the `td_execute` offline request set.
 //!
-//! The log- and JSON-related functions are complete here, and the M.8
-//! MessageEntity slice flips the five text-parse functions
+//! The log- and JSON-related functions are complete here, the M.8
+//! MessageEntity slice flipped the five text-parse functions
 //! (`getTextEntities`, `parseTextEntities`, `parseMarkdown`,
 //! `getMarkdownText` — the C++ `parseHtml` is the `parseTextEntities`
-//! HTML parse mode). The language-pack, phone-number and push-id functions
-//! still land with their managers (Wave 1/3); until then they report
-//! "The method can't be executed synchronously", like any other request.
+//! HTML parse mode), and M.24 flips `getLanguagePackString` (the
+//! `SynchronousRequests::do_request` tail over the language pack
+//! database). The phone-number and push-id functions still land with
+//! their managers (Wave 3); until then they report "The method can't be
+//! executed synchronously", like any other request.
 
 use std::sync::Mutex;
 
@@ -79,6 +81,7 @@ pub fn is_synchronous_request(function: &Function) -> bool {
             | Function::getMarkdownText(_)
             | Function::getJsonValue(_)
             | Function::getJsonString(_)
+            | Function::getThemeParametersJsonString(_)
             | Function::setLogStream(_)
             | Function::getLogStream(_)
             | Function::setLogVerbosityLevel(_)
@@ -91,11 +94,11 @@ pub fn is_synchronous_request(function: &Function) -> bool {
             | Function::getFileMimeType(_)
             | Function::getFileExtension(_)
             | Function::searchStringsByPrefix(_)
+            | Function::getLanguagePackString(_)
     ) || matches!(function, Function::getOption(g) if option_manager::is_synchronous_option(&g.name))
     // Not ported yet (need their managers): searchQuote,
     // checkQuickReplyShortcutName, getCountryFlagEmoji, cleanFileName,
-    // getLanguagePackString, getPhoneNumberInfoSync,
-    // getChatFolderDefaultIconName, getThemeParametersJsonString,
+    // getPhoneNumberInfoSync, getChatFolderDefaultIconName,
     // getPushReceiverId.
 }
 
@@ -190,6 +193,17 @@ pub fn run_request(function: Function) -> Object {
                 None => make_error(400, "The option can't be get synchronously"),
             }
         }
+        Function::getLanguagePackString(request) => {
+            // `SynchronousRequests::do_request` (SynchronousRequests.cpp:276-280)
+            // — the static LanguagePackManager lookup over the path-keyed
+            // language pack database (M.24)
+            crate::language_pack_manager::get_language_pack_string(
+                &request.language_pack_database_path,
+                &request.localization_target,
+                &request.language_pack_id,
+                &request.key,
+            )
+        }
         Function::getJsonValue(request) => match get_json_value(&request.json) {
             Result::Ok(value) => json_value_object(value),
             Result::Err(status) => make_error(400, status.message()),
@@ -198,6 +212,16 @@ pub fn run_request(function: Function) -> Object {
             let default_json = td_api::JsonValue::default();
             Object::text(td_api::Text {
                 text: get_json_string(request.json_value.as_deref().unwrap_or(&default_json)),
+            })
+        }
+        // `SynchronousRequests::do_request(getThemeParametersJsonString)`
+        // (SynchronousRequests.cpp:325-329) — the pure
+        // `ThemeManager::get_theme_parameters_json_string` static
+        Function::getThemeParametersJsonString(request) => {
+            let default_parameters = td_api::ThemeParameters::default();
+            let theme_parameters = request.theme.as_ref().unwrap_or(&default_parameters);
+            Object::text(td_api::Text {
+                text: crate::theme_manager::get_theme_parameters_json_string(theme_parameters),
             })
         }
         Function::setLogStream(request) => {

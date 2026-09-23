@@ -37,6 +37,19 @@ pub(crate) fn replace_offending_characters(s: &mut [u8]) {
     }
 }
 
+/// `td::get_vector_hash` (misc.cpp:311-320) — the xor/shift/add fold the
+/// multi-item hashes use (contacts, saved animations, ...).
+pub fn get_vector_hash(numbers: &[u64]) -> i64 {
+    let mut acc: u64 = 0;
+    for number in numbers {
+        acc ^= acc >> 21;
+        acc ^= acc << 35;
+        acc ^= acc >> 4;
+        acc = acc.wrapping_add(*number);
+    }
+    acc as i64
+}
+
 /// `td::clean_input_string` (misc.cpp:79-161): valid UTF-8 only; control
 /// characters 0-9, 11, 12 and 14-32 become spaces, `\r` is dropped, `\n`
 /// survives; the UTF-8 line/paragraph separators U+2028-U+202A and the
@@ -95,6 +108,51 @@ pub fn clean_input_string(s: &str) -> Option<String> {
     // The sanitizer never breaks UTF-8: removals are whole characters and
     // the clamp cuts at a first-code-unit boundary.
     Some(String::from_utf8(out).expect("clean_input_string preserves UTF-8"))
+}
+
+/// The `get_emoji_fingerprint` table (misc.cpp:324-373) — the C++
+/// `vector<Slice>` becomes the `&str` array (extracted from the source,
+/// 333 entries).
+const EMOJI_FINGERPRINTS: [&str; 333] = [
+    "😉", "😍", "😛", "😭", "😱", "😡", "😎", "😴", "😵", "😈", "😬", "😇", "😏", "👮", "👷", "💂",
+    "👶", "👨", "👩", "👴", "👵", "😻", "😽", "🙀", "👺", "🙈", "🙉", "🙊", "💀", "👽", "💩", "🔥",
+    "💥", "💤", "👂", "👀", "👃", "👅", "👄", "👍", "👎", "👌", "👊", "✌", "✋", "👐", "👆", "👇",
+    "👉", "👈", "🙏", "👏", "💪", "🚶", "🏃", "💃", "👫", "👪", "👬", "👭", "💅", "🎩", "👑", "👒",
+    "👟", "👞", "👠", "👕", "👗", "👖", "👙", "👜", "👓", "🎀", "💄", "💛", "💙", "💜", "💚", "💍",
+    "💎", "🐶", "🐺", "🐱", "🐭", "🐹", "🐰", "🐸", "🐯", "🐨", "🐻", "🐷", "🐮", "🐗", "🐴", "🐑",
+    "🐘", "🐼", "🐧", "🐥", "🐔", "🐍", "🐢", "🐛", "🐝", "🐜", "🐞", "🐌", "🐙", "🐚", "🐟", "🐬",
+    "🐋", "🐐", "🐊", "🐫", "🍀", "🌹", "🌻", "🍁", "🌾", "🍄", "🌵", "🌴", "🌳", "🌞", "🌚", "🌙",
+    "🌎", "🌋", "⚡", "☔", "❄", "⛄", "🌀", "🌈", "🌊", "🎓", "🎆", "🎃", "👻", "🎅", "🎄", "🎁",
+    "🎈", "🔮", "🎥", "📷", "💿", "💻", "☎", "📡", "📺", "📻", "🔉", "🔔", "⏳", "⏰", "⌚", "🔒",
+    "🔑", "🔎", "💡", "🔦", "🔌", "🔋", "🚿", "🚽", "🔧", "🔨", "🚪", "🚬", "💣", "🔫", "🔪", "💊",
+    "💉", "💰", "💵", "💳", "✉", "📫", "📦", "📅", "📁", "✂", "📌", "📎", "✒", "✏", "📐", "📚",
+    "🔬", "🔭", "🎨", "🎬", "🎤", "🎧", "🎵", "🎹", "🎻", "🎺", "🎸", "👾", "🎮", "🃏", "🎲", "🎯",
+    "🏈", "🏀", "⚽", "⚾", "🎾", "🎱", "🏉", "🎳", "🏁", "🏇", "🏆", "🏊", "🏄", "☕", "🍼", "🍺",
+    "🍷", "🍴", "🍕", "🍔", "🍟", "🍗", "🍱", "🍚", "🍜", "🍡", "🍳", "🍞", "🍩", "🍦", "🎂", "🍰",
+    "🍪", "🍫", "🍭", "🍯", "🍎", "🍏", "🍊", "🍋", "🍒", "🍇", "🍉", "🍓", "🍑", "🍌", "🍐", "🍍",
+    "🍆", "🍅", "🌽", "🏡", "🏥", "🏦", "⛪", "🏰", "⛺", "🏭", "🗻", "🗽", "🎠", "🎡", "⛲", "🎢",
+    "🚢", "🚤", "⚓", "🚀", "✈", "🚁", "🚂", "🚋", "🚎", "🚌", "🚙", "🚗", "🚕", "🚛", "🚨", "🚔",
+    "🚒", "🚑", "🚲", "🚠", "🚜", "🚦", "⚠", "🚧", "⛽", "🎰", "🗿", "🎪", "🎭", "🇯🇵", "🇰🇷", "🇩🇪",
+    "🇨🇳", "🇺🇸", "🇫🇷", "🇪🇸", "🇮🇹", "🇷🇺", "🇬🇧", "1⃣", "2⃣", "3⃣", "4⃣", "5⃣", "6⃣", "7⃣", "8⃣", "9⃣", "0⃣",
+    "🔟", "❗", "❓", "♥", "♦", "💯", "🔗", "🔱", "🔴", "🔵", "🔶", "🔷",
+];
+
+/// `get_emoji_fingerprint` (misc.cpp:323-378) — the emoji selected by the
+/// low 63 bits of the number.
+fn get_emoji_fingerprint(num: u64) -> String {
+    EMOJI_FINGERPRINTS[((num & 0x7FFF_FFFF_FFFF_FFFF) % EMOJI_FINGERPRINTS.len() as u64) as usize]
+        .to_string()
+}
+
+/// `get_emoji_fingerprints` (misc.cpp:380-387) — the four-emojis call
+/// fingerprint over the big-endian 64-bit words of a 32-byte buffer.
+pub fn get_emoji_fingerprints(buffer: &[u8; 32]) -> Vec<String> {
+    let mut result = Vec::with_capacity(4);
+    for i in 0..4 {
+        let num = u64::from_be_bytes(buffer[8 * i..8 * i + 8].try_into().unwrap());
+        result.push(get_emoji_fingerprint(num));
+    }
+    result
 }
 
 #[cfg(test)]
@@ -174,14 +232,52 @@ fn is_space(c: u8) -> bool {
     matches!(c, b' ' | b'\t' | b'\r' | b'\n' | 0 | 0x0b)
 }
 
+/// `td::validate_bot_language_code` (misc.cpp:395-406): empty or a
+/// two-letter a-z code.
+pub(crate) fn validate_bot_language_code(
+    language_code: &str,
+) -> std::result::Result<(), tdutils::status::Status> {
+    if language_code.is_empty() {
+        return Ok(());
+    }
+    let bytes = language_code.as_bytes();
+    if bytes.len() == 2 && bytes.iter().all(|c| c.is_ascii_lowercase()) {
+        return Ok(());
+    }
+    Err(tdutils::status::Status::error(
+        400,
+        "Invalid language code specified",
+    ))
+}
+
 /// `td::trim` (tdutils/misc.h:133) over the shared whitespace set; the
 /// ASCII gate keeps the byte-based C++ semantics (`is_space` is defined on
 /// bytes only, so no multi-byte character can be trimmed).
-fn trim(s: &str) -> &str {
+pub(crate) fn trim(s: &str) -> &str {
     s.trim_matches(|c: char| c.is_ascii() && is_space(c as u8))
 }
 
 /// `td::to_lower` (tdutils/misc.h:64-85) — ASCII-only.
+pub(crate) fn to_lower_ascii(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii_uppercase() {
+                (c as u8 + 32) as char
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
+/// `check_currency_amount` (misc.cpp:390-393) — the C++ `MAX_AMOUNT`
+/// gate of 9999'9999'9999.
+pub(crate) fn check_currency_amount(amount: i64) -> bool {
+    const MAX_AMOUNT: i64 = 999_999_999_999;
+    (-MAX_AMOUNT..=MAX_AMOUNT).contains(&amount)
+}
+
+#[allow(dead_code)] // the C++ to_lower twin; the ascii fast-path is the live one
 fn to_lower(s: &str) -> String {
     s.chars()
         .map(|c| {
@@ -415,7 +511,7 @@ pub fn is_allowed_username(username: &str) -> bool {
     if username.len() < 5 {
         return false;
     }
-    let username_lowered = to_lower(username);
+    let username_lowered = to_lower_ascii(username);
     for prefix in [
         "admin",
         "telegram",
@@ -451,9 +547,19 @@ pub fn get_valid_short_usernames() -> &'static [&'static str] {
 #[cfg(test)]
 mod misc_helper_tests {
     use super::{
-        clean_name, clean_username, get_valid_short_usernames, is_allowed_username,
-        is_valid_username, replace_with_spaces, strip_empty_characters,
+        check_currency_amount, clean_name, clean_username, get_valid_short_usernames,
+        is_allowed_username, is_valid_username, replace_with_spaces, strip_empty_characters,
     };
+
+    #[test]
+    fn currency_amount_bounds_match_the_cpp_limit() {
+        // misc.cpp:390-393 — inclusive ±9999'9999'9999.
+        assert!(check_currency_amount(0));
+        assert!(check_currency_amount(9999_9999_9999));
+        assert!(check_currency_amount(-9999_9999_9999));
+        assert!(!check_currency_amount(9999_9999_9999 + 1));
+        assert!(!check_currency_amount(-9999_9999_9999 - 1));
+    }
 
     #[test]
     fn clean_username_strips_dots_lowercases_and_trims() {
@@ -556,6 +662,116 @@ pub fn search_strings_by_prefix(
         total_count as i32,
         keys.into_iter().map(|key| key as i32).collect(),
     )
+}
+
+/// `td::to_integer<int64>` (tdutils/td/utils/misc.h:157-183) — the signed
+/// decimal parse: an optional leading `-`, digits until the first
+/// non-digit, wrapping overflow exactly like the C++ (the two's-complement
+/// negation dance), 0 on an empty/minus-only input.
+pub fn to_integer_i64(str: &str) -> i64 {
+    let mut integer_value: u64 = 0;
+    let mut is_negative = false;
+    let bytes = str.as_bytes();
+    let mut begin = 0usize;
+    if !bytes.is_empty() && bytes[begin] == b'-' {
+        is_negative = true;
+        begin += 1;
+    }
+    while begin < bytes.len() && bytes[begin].is_ascii_digit() {
+        integer_value = integer_value
+            .wrapping_mul(10)
+            .wrapping_add(u64::from(bytes[begin] - b'0'));
+        begin += 1;
+    }
+    if integer_value > i64::MAX as u64 {
+        // Use ~x + 1 instead of -x to suppress the C++ MSVC warning the
+        // comment mentions; the wrap is the C++ behavior.
+        integer_value = (!integer_value).wrapping_add(1);
+        is_negative = !is_negative;
+        if integer_value > i64::MAX as u64 {
+            return i64::MIN;
+        }
+    }
+    if is_negative {
+        (integer_value as i64).wrapping_neg()
+    } else {
+        integer_value as i64
+    }
+}
+
+/// `td::to_double` (misc.h:220-224, `atof` semantics) — parse the leading
+/// `double` (optional whitespace/sign, digits with an optional fraction
+/// and exponent), stopping at the first invalid character; 0.0 when
+/// nothing parses.
+pub fn to_double(str: &str) -> f64 {
+    let trimmed = str.trim_start();
+    let bytes = trimmed.as_bytes();
+    let mut end = 0usize;
+    if end < bytes.len() && (bytes[end] == b'+' || bytes[end] == b'-') {
+        end += 1;
+    }
+    let mut seen_digits = false;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+        seen_digits = true;
+    }
+    if end < bytes.len() && bytes[end] == b'.' {
+        end += 1;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+            seen_digits = true;
+        }
+    }
+    if !seen_digits {
+        return 0.0;
+    }
+    if end < bytes.len() && (bytes[end] == b'e' || bytes[end] == b'E') {
+        let mut exp_end = end + 1;
+        if exp_end < bytes.len() && (bytes[exp_end] == b'+' || bytes[exp_end] == b'-') {
+            exp_end += 1;
+        }
+        let exp_digits_start = exp_end;
+        while exp_end < bytes.len() && bytes[exp_end].is_ascii_digit() {
+            exp_end += 1;
+        }
+        if exp_end > exp_digits_start {
+            end = exp_end;
+        }
+    }
+    trimmed[..end].parse::<f64>().unwrap_or(0.0)
+}
+
+/// `td::is_base64url_characters` (base64.cpp:205-212, the `is_url`
+/// instantiation) — every byte is in the URL-safe base64 alphabet; padding
+/// is not allowed (unlike `is_base64url`).
+pub fn is_base64url_characters(input: &[u8]) -> bool {
+    input
+        .iter()
+        .all(|c| c.is_ascii_alphanumeric() || *c == b'-' || *c == b'_')
+}
+
+/// `td::add_to_top` (tdutils/td/utils/algorithm.h:115-134) — move `value`
+/// to the front of `v`, evicting the last element past `max_size`.
+pub fn add_to_top<T: PartialEq + Clone>(v: &mut Vec<T>, max_size: usize, value: T) {
+    let size = v.len();
+    let mut i = 0usize;
+    while i < size && v[i] != value {
+        i += 1;
+    }
+    if i == size {
+        if size < max_size || i == 0 {
+            // `i` stays at the pushed element's index
+            v.push(value.clone());
+        } else {
+            // the last element is evicted by the shift below
+            i -= 1;
+        }
+    }
+    while i > 0 {
+        v[i] = v[i - 1].clone();
+        i -= 1;
+    }
+    v[0] = value;
 }
 
 #[cfg(test)]

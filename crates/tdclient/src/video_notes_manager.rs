@@ -146,12 +146,12 @@ impl VideoNotesManager {
         if has_duration {
             crate::store_parse::store_i32(out, note.duration);
         }
-        photo::store_dimensions(note.dimensions, out);
+        note.dimensions.store(out);
         if has_minithumbnail {
             store_string(out, &note.minithumbnail);
         }
         if has_thumbnail {
-            photo::store_photo_size(&note.thumbnail, env, out);
+            note.thumbnail.store(env, out);
         }
         if has_waveform {
             store_string(out, &note.waveform);
@@ -185,14 +185,14 @@ impl VideoNotesManager {
             return Err("Transcribed video notes ride the M.25 transcription seam");
         }
         let duration = if has_duration { parser.i32_()? } else { 0 };
-        let dimensions = photo::parse_dimensions(parser)?;
+        let dimensions = Dimensions::parse_from(parser)?;
         let minithumbnail = if has_minithumbnail {
             parser.string()?
         } else {
             String::new()
         };
         let thumbnail = if has_thumbnail {
-            photo::parse_photo_size(env, parser)?
+            PhotoSize::parse_from(env, parser)?
         } else {
             PhotoSize::default()
         };

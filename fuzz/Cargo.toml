@@ -93,8 +93,17 @@ path = "fuzz_targets/emoji_status.rs"
 doc = false
 
 [[bin]]
+name = "message_content"
+path = "fuzz_targets/message_content.rs"
+
+[[bin]]
 name = "updates_container"
 path = "fuzz_targets/updates_container.rs"
+doc = false
+
+[[bin]]
+name = "message_input"
+path = "fuzz_targets/message_input.rs"
 doc = false
 
 # Panic = bug: the parsers must report errors, never crash (the tdlib

@@ -13,16 +13,17 @@
 //!   `ContactHash`/`ContactEqual` — the 3-tuple without vCard and user id.
 //!   Rust derives `PartialEq` for the 5-tuple and the dedup keys the
 //!   import map on the 3-tuple directly.
-//! - `get_input_phone_contact`/`get_input_media_contact`/
-//!   `get_secret_input_media_contact`/`get_contact_object` are the query
+//! - `get_input_phone_contact`/`get_contact_object` are the query
 //!   and Files halves — they arrive with the net step and the requests
-//!   wiring.
+//!   wiring. `get_input_media_contact`/`get_secret_input_media_contact`
+//!   landed with the M.9.6 upload/secret media bridges.
 //! - The td_api `importedContact` → `Contact` conversion (`get_contact`)
 //!   is the requests-wiring half (M.4.16); the constructors and
 //!   `validate` are here because the import machine manipulates
 //!   `Contact`s directly.
 
 use crate::store_parse;
+use crate::td_api;
 use crate::user_manager::UserId;
 use tdutils::status::Status;
 
@@ -94,6 +95,36 @@ impl Contact {
         self.user_id
     }
 
+    /// `Contact::get_input_media_contact` (Contact.cpp:81-83).
+    pub fn get_input_media_contact(&self) -> Option<tdmtproto::telegram_api::InputMedia> {
+        Some(tdmtproto::telegram_api::InputMedia::inputMediaContact(
+            tdmtproto::telegram_api::inputMediaContact {
+                phone_number: self.phone_number.clone(),
+                first_name: self.first_name.clone(),
+                last_name: self.last_name.clone(),
+                vcard: self.vcard.clone(),
+            },
+        ))
+    }
+
+    /// `Contact::get_secret_input_media_contact` (Contact.cpp:85-88) — the
+    /// `SecretInputMedia` wrapper lands with the M.9.6 plane; the contact
+    /// half answers the decrypted media directly.
+    pub fn get_secret_input_media_contact(
+        &self,
+    ) -> Option<tdmtproto::secret_api::DecryptedMessageMedia> {
+        Some(
+            tdmtproto::secret_api::DecryptedMessageMedia::decryptedMessageMediaContact(
+                tdmtproto::secret_api::decryptedMessageMediaContact {
+                    phone_number: self.phone_number.as_bytes().to_vec(),
+                    first_name: self.first_name.as_bytes().to_vec(),
+                    last_name: self.last_name.as_bytes().to_vec(),
+                    user_id: 0,
+                },
+            ),
+        )
+    }
+
     pub fn get_phone_number(&self) -> &str {
         &self.phone_number
     }
@@ -104,6 +135,24 @@ impl Contact {
 
     pub fn get_last_name(&self) -> &str {
         &self.last_name
+    }
+
+    /// `Contact::get_vcard` (Contact.h:83).
+    pub fn get_vcard(&self) -> &str {
+        &self.vcard
+    }
+
+    /// `Contact::get_contact_object` (Contact.cpp:142-149) — the td_api
+    /// builder (the M.21 InlineQueriesManager intake is the consumer that
+    /// needs it before the net step).
+    pub fn get_contact_object(&self) -> td_api::Contact {
+        td_api::Contact {
+            phone_number: self.phone_number.clone(),
+            first_name: self.first_name.clone(),
+            last_name: self.last_name.clone(),
+            vcard: self.vcard.clone(),
+            user_id: self.user_id.get(),
+        }
     }
 
     /// `Contact::store` (Contact.h:87-108) — the flag block gates the

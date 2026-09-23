@@ -211,13 +211,13 @@ impl VideosManager {
         crate::store_parse::store_i32(out, video.duration);
         store_dimensions(out, &video.dimensions);
         store_string(out, &video.minithumbnail);
-        photo::store_photo_size(&video.thumbnail, env, out);
+        video.thumbnail.store(env, out);
         env.store_file_id(file_id, out);
         if video.has_stickers {
             store_file_ids(env, out, &video.sticker_file_ids);
         }
         if has_animated_thumbnail {
-            photo::store_animation_size(&video.animated_thumbnail, env, out);
+            video.animated_thumbnail.store(env, out);
         }
         if has_preload_prefix_size {
             crate::store_parse::store_i32(out, video.preload_prefix_size);
@@ -259,7 +259,7 @@ impl VideosManager {
             } else {
                 String::new()
             };
-        let thumbnail = photo::parse_photo_size(env, parser)?;
+        let thumbnail = PhotoSize::parse_from(env, parser)?;
         let file_id = env.parse_file_id(parser)?;
         let sticker_file_ids = if has_stickers {
             parse_file_ids(env, parser)?
@@ -267,7 +267,7 @@ impl VideosManager {
             Vec::new()
         };
         let animated_thumbnail = if has_animated_thumbnail {
-            photo::parse_animation_size(env, parser)?
+            AnimationSize::parse_from(env, parser)?
         } else {
             AnimationSize::default()
         };
@@ -316,11 +316,11 @@ impl VideosManager {
 /// `store(Dimensions)` / `parse(Dimensions)` — the photo module's pair
 /// (PhotoSize.hpp).
 fn store_dimensions(out: &mut Vec<u8>, dimensions: &Dimensions) {
-    photo::store_dimensions(*dimensions, out);
+    dimensions.store(out);
 }
 
 fn parse_dimensions(parser: &mut Parser<'_>) -> Result<Dimensions, &'static str> {
-    photo::parse_dimensions(parser)
+    Dimensions::parse_from(parser)
 }
 
 fn store_file_ids(env: &mut impl VideosManagerEnv, out: &mut Vec<u8>, file_ids: &[FileId]) {

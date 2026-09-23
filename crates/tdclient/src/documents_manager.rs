@@ -1341,10 +1341,10 @@ impl DocumentsManager {
             store_string(out, &document.minithumbnail);
         }
         if has_thumbnail {
-            photo::store_photo_size(&document.thumbnail, env, out);
+            document.thumbnail.store(env, out);
         }
         if has_dimensions {
-            photo::store_dimensions(document.dimensions, out);
+            document.dimensions.store(out);
         }
         env.store_file_id(file_id, out);
     }
@@ -1408,13 +1408,13 @@ impl DocumentsManager {
             }
         }
         if has_thumbnail {
-            match photo::parse_photo_size(env, parser) {
+            match PhotoSize::parse_from(env, parser) {
                 Ok(value) => document.thumbnail = value,
                 Err(_) => return FileId::default(),
             }
         }
         if has_dimensions {
-            match photo::parse_dimensions(parser) {
+            match Dimensions::parse_from(parser) {
                 Ok(value) => document.dimensions = value,
                 Err(_) => return FileId::default(),
             }

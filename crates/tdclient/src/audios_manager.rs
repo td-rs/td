@@ -228,7 +228,7 @@ impl AudiosManager {
             store_string(out, &audio.minithumbnail);
         }
         if has_thumbnail {
-            photo::store_photo_size(&audio.thumbnail, env, out);
+            audio.thumbnail.store(env, out);
         }
         if has_date {
             crate::store_parse::store_i32(out, audio.date);
@@ -311,7 +311,7 @@ impl AudiosManager {
             String::new()
         };
         let thumbnail = if has_thumbnail {
-            photo::parse_photo_size(env, parser)?
+            PhotoSize::parse_from(env, parser)?
         } else {
             PhotoSize::default()
         };
