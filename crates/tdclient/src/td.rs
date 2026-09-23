@@ -2086,6 +2086,14 @@ pub struct Td {
     pub(crate) community_updates: Vec<td_api::Update>,
     /// `Td::device_token_manager_` (`Td.cpp:1345`, M.13S).
     pub(crate) device_token_manager: crate::device_token_manager::DeviceTokenManager,
+    /// `Td::animations_manager_` (`Td.cpp:1160`, M.20) — the constructor
+    /// and start_up halves run in [`Td::init_animations_manager`] where
+    /// the option manager exists.
+    pub(crate) animations_manager: crate::animations_manager::AnimationsManager,
+    /// The animations manager's `send_update` outbox — the collapsed
+    /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) animations_updates: Vec<td_api::Update>,
     /// `Td::poll_manager_` (Td.cpp:1263-1265, M.19).
     pub(crate) poll_manager: crate::poll_manager::PollManager,
     /// `Td::secret_chats_manager_` (`Td.cpp:1293`, M.50).
@@ -2434,6 +2442,8 @@ impl Td {
             community_manager: CommunityManager::new(),
             community_updates: Vec::new(),
             device_token_manager: crate::device_token_manager::DeviceTokenManager::new(),
+            animations_manager: crate::animations_manager::AnimationsManager::new(),
+            animations_updates: Vec::new(),
             poll_manager: crate::poll_manager::PollManager::new(),
             poll_updates: Vec::new(),
             secret_chats_manager: crate::secret_chats_manager::SecretChatsManager::new(true),
@@ -2647,6 +2657,11 @@ impl Td {
         // the pmc token load runs at Td start, auth-independently; the
         // sync loop is the [blocked: net] seam.
         self.load_device_token_states();
+
+        // `AnimationsManager::AnimationsManager` + `start_up`
+        // (Td.cpp:1160, the init_managers block) — the constructor erases
+        // the legacy limit key and loads the saved `ans` record (M.20).
+        self.init_animations_manager();
 
         // `Td::process_binlog_events` (Td.cpp:1034) — the on-server
         // notification settings log events replay into the settings
@@ -3576,6 +3591,27 @@ impl Td {
     /// queued by the manager's option writes go out before the answers,
     /// like the C++ `send_update` calls during the handlers.
     pub(crate) fn apply_config_actions(&mut self, actions: ConfigActions) {
+        // The `OptionManager::option_changed` animations fan-outs
+        // (OptionManager.cpp:603-608, 734-736): the search-parameter and
+        // saved-animations-limit options are config-applied only, and the
+        // manager re-reads + dedupes them per call, so the unconditional
+        // per-apply fire is observationally the C++ changed-only path.
+        {
+            let mut env = TdAnimationsEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+                auth_is_bot: self.auth_manager.is_bot(),
+                file_manager: Arc::clone(&self.file_manager),
+                file_reference_manager: &mut self.file_reference_manager,
+                updates: &mut self.animations_updates,
+            };
+            self.animations_manager
+                .on_update_animation_search_emojis(&mut env);
+            self.animations_manager
+                .on_update_animation_search_provider(&mut env);
+            self.animations_manager
+                .on_update_saved_animations_limit(&mut env);
+        }
         if actions.refresh_premium_options
             && let Some(option_manager) = self.option_manager.as_mut()
         {
@@ -4567,6 +4603,26 @@ impl Td {
         for update in notification_updates {
             self.send_update(update.into());
         }
+        let animations_updates = std::mem::take(&mut self.animations_updates);
+        for update in animations_updates {
+            self.send_update(update.into());
+        }
+    }
+
+    /// `AnimationsManager::AnimationsManager`
+    /// (AnimationsManager.cpp:127-147) plus the `start_up` halves — the
+    /// collapsed actor start reads the options and the `ans` pmc record
+    /// (M.20).
+    fn init_animations_manager(&mut self) {
+        let mut env = TdAnimationsEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            file_manager: Arc::clone(&self.file_manager),
+            file_reference_manager: &mut self.file_reference_manager,
+            updates: &mut self.animations_updates,
+        };
+        self.animations_manager.init(&mut env);
         let message_query_updates = std::mem::take(&mut self.message_query_updates);
         for update in message_query_updates {
             self.send_update(update.into());
@@ -6338,13 +6394,154 @@ impl FileManagerWorker for TdFileWorker {
     }
 }
 
-// ── the LinkManager environment (M.23) ──
+// ── the AnimationsManager environment (M.20) ──
 //
-// The C++ LinkManager reads `G()` (options, close flag, the binlog pmc)
-// and sends its queries from the collapsed actor's `create_handler`s;
-// the env carries the same surfaces and the `[blocked: net]` query
-// seams. The dialog-manager half of `bot_start_autostart`
-// (LinkManager.cpp:641-646) stays behind the trait default.
+// The C++ AnimationsManager reads `G()` (options, close flag, the binlog
+// + sqlite pmcs, the FileManager) and sends its queries from the
+// collapsed actor's `create_handler`s; the env carries the same surfaces
+// and the `[blocked: net]` query seams.
+
+/// The per-call [`crate::animations_manager::AnimationsManagerEnv`] over
+/// the Td fields — built per call with the field-split borrows, never
+/// held across calls.
+pub(crate) struct TdAnimationsEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>>,
+    pub(crate) file_reference_manager: &'a mut crate::files::FileReferenceManager,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::photo::DialogPhotoStoreEnv for TdAnimationsEnv<'_> {
+    fn store_file_id(&mut self, file_id: FileId, out: &mut Vec<u8>) {
+        self.file_manager.lock().store_file(file_id, out);
+    }
+
+    fn parse_file_id(
+        &mut self,
+        parser: &mut crate::store_parse::Parser<'_>,
+    ) -> Result<FileId, &'static str> {
+        self.file_manager.lock().parse_file(parser)
+    }
+}
+
+impl crate::animations_manager::AnimationsManagerEnv for TdAnimationsEnv<'_> {
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn get_option_string(&self, name: &str, default_value: &str) -> String {
+        self.options.as_ref().map_or_else(
+            || default_value.to_owned(),
+            |options| options.get_option_string(name, default_value),
+        )
+    }
+
+    fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_integer(name, default_value)
+        })
+    }
+
+    fn binlog_pmc_erase(&mut self, key: &str) {
+        self.global.binlog_pmc().erase(key);
+    }
+
+    fn use_sqlite_pmc(&self) -> bool {
+        self.global.use_sqlite_pmc()
+    }
+
+    fn sqlite_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        // The C++ sqlite pmc `get` is async; the collapsed line inlines
+        // the callback (the common kv plays the pmc role on this line).
+        self.global.td_db().common_kv().get(key)
+    }
+
+    fn sqlite_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.td_db().common_kv().set(key, value);
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn file_manager(&self) -> std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>> {
+        std::sync::Arc::clone(&self.file_manager)
+    }
+
+    fn create_saved_animations_file_source(&mut self) -> crate::files::FileSourceId {
+        self.file_reference_manager
+            .intern(crate::files::FileSource::SavedAnimations)
+    }
+
+    fn change_files_source(
+        &mut self,
+        file_source_id: crate::files::FileSourceId,
+        old_file_ids: &[FileId],
+        new_file_ids: &[FileId],
+        _source: &str,
+    ) {
+        // `FileManager::change_files_source` over the main-file-id sets.
+        let file_manager = self.file_manager.lock();
+        let main_file_ids = |file_manager: &crate::files::FileManager,
+                             file_ids: &[FileId]|
+         -> std::collections::HashSet<FileId> {
+            file_ids
+                .iter()
+                .map(|file_id| {
+                    file_manager
+                        .get_file_view(*file_id)
+                        .map(|view| view.get_main_file_id())
+                        .unwrap_or_default()
+                })
+                .collect()
+        };
+        let old_main = main_file_ids(&file_manager, old_file_ids);
+        let mut new_main = main_file_ids(&file_manager, new_file_ids);
+        for file_id in old_main {
+            if !new_main.remove(&file_id) {
+                self.file_reference_manager
+                    .remove_file_source(file_id, file_source_id);
+            }
+        }
+        for file_id in new_main {
+            self.file_reference_manager
+                .add_file_source(file_id, file_source_id);
+        }
+    }
+
+    fn on_get_document_animation(&mut self, _document: telegram_api::document) -> Option<FileId> {
+        // `td_->documents_manager_->on_get_document` — the
+        // [blocked: M.28] intake seam; answers None until the document
+        // plane lands, which the caller handles like the C++
+        // non-animation case.
+        None
+    }
+
+    fn send_get_saved_gifs_query(&mut self, is_repair: bool, hash: i64) {
+        tdutils::log_info!(
+            "Send GetSavedGifsQuery(is_repair = {is_repair}, hash = {hash}) — [blocked: net]"
+        );
+    }
+
+    fn send_save_gif_query_net(
+        &mut self,
+        file_id: FileId,
+        unsave: bool,
+        _input_document: telegram_api::InputDocument,
+        _promise: Promise<()>,
+    ) {
+        tdutils::log_info!(
+            "Send SaveGifQuery(file_id = {}, unsave = {unsave}) — [blocked: net]",
+            file_id.get()
+        );
+    }
+}
 
 /// The `&self` option slice for the `LinkManager` statics
 /// (`get_instant_view_link*`, LinkManager.h:115-119) — they read

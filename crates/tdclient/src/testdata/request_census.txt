@@ -30,7 +30,7 @@ addQuickReplyShortcutMessage	interim
 addQuickReplyShortcutMessageAlbum	interim
 addRecentSticker	interim
 addRecentlyFoundChat	dispatched
-addSavedAnimation	interim
+addSavedAnimation	dispatched
 addSavedNotificationSound	interim
 addStickerToSet	interim
 addStoryAlbumStories	dispatched
@@ -500,7 +500,7 @@ getRecommendedChats	interim
 getRecoveryEmailAddress	interim
 getRemoteFile	dispatched
 getRepliedMessage	interim
-getSavedAnimations	interim
+getSavedAnimations	dispatched
 getSavedMessagesTags	interim
 getSavedMessagesTopicHistory	interim
 getSavedMessagesTopicMessageByDate	interim
@@ -668,7 +668,7 @@ removeProxy	interim
 removeRecentHashtag	interim
 removeRecentSticker	interim
 removeRecentlyFoundChat	dispatched
-removeSavedAnimation	interim
+removeSavedAnimation	dispatched
 removeSavedNotificationSound	interim
 removeSearchedForTag	interim
 removeStickerFromSet	interim
