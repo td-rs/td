@@ -29,6 +29,13 @@ pub mod version {
     pub const MAKE_PARTICIPANT_FLAGS_64_BIT: i32 = 46;
     pub const ADD_USER_FLAGS2: i32 = 48;
     pub const ADD_CONTACT_VCARD: i32 = 16;
+    pub const SUPPORT_MINITHUMBNAILS: i32 = 20;
+    pub const ADD_DIALOG_PHOTO_HAS_ANIMATION: i32 = 27;
+    pub const ADD_PHOTO_PROGRESSIVE_SIZES: i32 = 28;
+    pub const ADD_AUDIO_FLAGS: i32 = 36;
+    pub const ADD_VOICE_NOTE_FLAGS: i32 = 39;
+    pub const ADD_VIDEO_NOTE_FLAGS: i32 = 43;
+    pub const ADD_DOCUMENT_FLAGS: i32 = 47;
     pub const SUPPORT_EPHEMERAL_MESSAGES: i32 = 61;
     /// `Version::Next` of tdlib 1.8.67 (`SupportEphemeralMessages` + 1).
     pub const NEXT: i32 = 62;

@@ -7,6 +7,7 @@
 //! ([`synchronous_requests`]); the full ClientManager port is S70, the
 //! Options manager S69.
 
+pub mod audios_manager;
 pub mod auth_manager;
 pub mod birthdate;
 pub mod chat_manager;
@@ -24,6 +25,7 @@ pub mod dialog_db;
 pub mod dialog_id;
 pub mod dialog_manager;
 pub mod document;
+pub mod documents_manager;
 pub mod emoji_status;
 pub mod files;
 pub mod formatted_date;
@@ -55,6 +57,9 @@ pub mod time_zone_manager;
 pub mod updates_manager;
 pub mod user_manager;
 pub mod usernames;
+pub mod video_notes_manager;
+pub mod videos_manager;
+pub mod voice_notes_manager;
 
 // Generated code keeps C++-identical case-preserved names (`aiComposeTone`)
 // in types, fields and the JSON dispatch helpers alike.

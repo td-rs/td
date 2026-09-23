@@ -1,23 +1,47 @@
-//! Placeholder `Document` shim for the NotificationManager slice (M.13.1a).
-//!
-//! The full `Document.{h,cpp}` port arrives with the MessageContent slice
-//! (M.9); this shim carries only what the notification model reads —
-//! `is_empty()` and `file_id` (`NotificationType.cpp` uses
-//! `document.is_empty()` for file ids and `document.file_id` for the push
-//! media lookups). It is replaced by the real port at integration, at which
-//! point `NotificationType::get_file_ids` grows the full file-id set.
+//! `Document.{h,cpp}` — grown from the NotificationManager shim
+//! (M.13.1a): the shim carried only `is_empty()`/`file_id` for the push
+//! media lookups; the media-metadata slice (M.28) resolves the intake
+//! side and grows the record with the append-only `Type` enum and the
+//! constructors `on_get_document` produces. `Document::Type` is
+//! append-only by contract (the C++ header comment pins the order);
+//! `get_file_ids`/`append_file_ids` (Document.cpp:26-52 — the
+//! per-type sibling-manager fan-out) stay with the M.9 MessageContent
+//! integration, they need every sibling manager live at once.
 
 use crate::user_manager::FileId;
 
-/// `td::Document` (Document.h) — see the module doc: a minimal stand-in.
+/// `Document::Type` (Document.h:18) — append-only; the order is the
+/// stored int32.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum DocumentType {
+    #[default]
+    Unknown,
+    Animation,
+    Audio,
+    General,
+    Sticker,
+    Video,
+    VideoNote,
+    VoiceNote,
+}
+
+/// `td::Document` (Document.h:16-36).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Document {
+    pub r#type: DocumentType,
     pub file_id: FileId,
 }
 
 impl Document {
-    /// `Document::is_empty` (Document.h) — an empty document has no file id.
+    /// `Document::Document(Type, FileId)` (Document.h:24-26).
+    pub fn new(r#type: DocumentType, file_id: FileId) -> Document {
+        Document { r#type, file_id }
+    }
+
+    /// `Document::is_empty` (Document.h:28-30) — an empty document has no
+    /// type. The M.13.1a shim keyed this on the file id alone (its only
+    /// carried field); the C++ keys it on the type.
     pub fn is_empty(&self) -> bool {
-        !self.file_id.is_valid()
+        self.r#type == DocumentType::Unknown
     }
 }
