@@ -2122,6 +2122,20 @@ pub struct Td {
     /// `Td::notification_settings_manager_` (`Td.cpp:1254`, M.13S).
     pub(crate) notification_settings_manager:
         crate::notification_settings_manager::NotificationSettingsManager,
+    /// `Td::transcription_manager_` (`Td.cpp:1313`, M.25) — the
+    /// speech-recognition query manager; the message-plane and
+    /// VoiceNotes/VideoNotes callers ride the env seams until M.10/M.28.
+    pub(crate) transcription_manager: crate::transcription_manager::TranscriptionManager,
+    /// The transcription manager's `send_update` outbox — drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) transcription_updates: Vec<td_api::Update>,
+    /// `Td::translation_manager_` (`Td.cpp:1316`, M.25) — the
+    /// AI-compose/translation query manager; created with Td like the
+    /// C++ `init_managers`.
+    pub(crate) translation_manager: crate::translation_manager::TranslationManager,
+    /// The translation manager's `send_update` outbox — drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) translation_updates: Vec<td_api::Update>,
     /// `Td::account_manager_` (`make_unique` at `Td.cpp:1231`, the
     /// `init_managers` block).
     pub(crate) account_manager: AccountManager,
@@ -2232,6 +2246,15 @@ pub struct Td {
     /// `send_closure(G()->td(), &Td::send_update, ...)` hop; drained by
     /// [`Td::flush_user_updates`].
     pub(crate) notification_updates: Vec<td_api::Update>,
+    /// `Td::sponsored_message_manager_` (Td.cpp:1249, M.26).
+    pub(crate) sponsored_message_manager: crate::sponsored_message_manager::SponsoredMessageManager,
+    /// `Td::promo_data_manager_` (Td.cpp:1246, M.26).
+    pub(crate) promo_data_manager: crate::promo_data_manager::PromoDataManager,
+    /// `Td::message_import_manager_` (Td.cpp:1242, M.26).
+    pub(crate) message_import_manager: crate::message_import_manager::MessageImportManager,
+    /// The sponsored/promo managers' `send_update` outbox — drained by
+    /// [`Td::flush_user_updates`].
+    pub(crate) sponsored_updates: Vec<td_api::Update>,
     /// `Td::top_dialog_manager_` (Td.cpp:1276, M.27).
     pub(crate) top_dialog_manager: crate::top_dialog_manager::TopDialogManager,
     /// `Td::channel_recommendation_manager_` (Td.cpp:1278, M.27).
@@ -2534,6 +2557,10 @@ impl Td {
             notification_manager: NotificationManager::default(),
             notification_settings_manager:
                 crate::notification_settings_manager::NotificationSettingsManager::new(),
+            transcription_manager: crate::transcription_manager::TranscriptionManager::default(),
+            transcription_updates: Vec::new(),
+            translation_manager: crate::translation_manager::TranslationManager::default(),
+            translation_updates: Vec::new(),
             account_manager: AccountManager::new(),
             terms_of_service_manager: crate::terms_of_service_manager::TermsOfServiceManager::new(),
             suggested_action_manager: crate::suggested_action_manager::SuggestedActionManager::new(
@@ -2577,6 +2604,11 @@ impl Td {
             call_updates: Vec::new(),
             call_dh_config: None,
             notification_updates: Vec::new(),
+            sponsored_message_manager:
+                crate::sponsored_message_manager::SponsoredMessageManager::new(),
+            promo_data_manager: crate::promo_data_manager::PromoDataManager::new(),
+            message_import_manager: crate::message_import_manager::MessageImportManager::new(),
+            sponsored_updates: Vec::new(),
             top_dialog_manager: crate::top_dialog_manager::TopDialogManager::new(),
             channel_recommendation_manager:
                 crate::channel_recommendation_manager::ChannelRecommendationManager::new(),
@@ -3035,12 +3067,12 @@ impl Td {
             self.auth_manager.is_authorized() && !self.auth_manager.is_bot(),
         );
 
-        // The M.3.9.2 stand-in for the four manager constructors' pmc
-        // reads (in the C++ creation order: AccountManager Td.cpp:1157,
-        // GroupCallManager :1231, TranscriptionManager :1313, UserManager
-        // :1322) — the states replay from the binlog pmc and send the
-        // same updates the C++ constructors do. Each read moves into its
-        // manager when that manager lands.
+        // The M.3.9.2 stand-in for the manager constructors' pmc reads (in
+        // the C++ creation order: AccountManager Td.cpp:1157,
+        // GroupCallManager :1231, UserManager :1322) — the states replay
+        // from the binlog pmc and send the same updates the C++
+        // constructors do. Each read moves into its manager when that
+        // manager lands.
         {
             let is_authorized = self.auth_manager.is_authorized();
             let is_bot = self.auth_manager.is_bot();
@@ -3053,6 +3085,45 @@ impl Td {
             for update in updates {
                 self.send_update(update);
             }
+        }
+
+        // `make_unique<TranscriptionManager>` + the constructor
+        // `load_trial_parameters` (Td.cpp:1313,
+        // TranscriptionManager.cpp:90-95/124-142) — the M.25 move-in from
+        // the M.3.9.2 stand-in. The read runs after the combined
+        // M.3.9.2 block, keeping the C++ creation order of the reads it
+        // covers (AccountManager :1157, GroupCallManager :1231, then
+        // TranscriptionManager :1313; the UserManager :1322 freeze
+        // restore collapses into the earlier `init_freeze_state`). The
+        // gate is inside (the C++ load guards is_authorized && !is_bot).
+        {
+            let mut env = NotificationEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+                auth_is_authorized: self.auth_manager.is_authorized(),
+                auth_is_bot: self.auth_manager.is_bot(),
+                updates: &mut self.transcription_updates,
+            };
+            self.transcription_manager.init(&mut env);
+        }
+
+        // `make_unique<TranslationManager>` + the constructor
+        // `ai_compose_tones` restore (Td.cpp:1316,
+        // TranslationManager.cpp:573-592) — the M.25 partner manager;
+        // the read runs right after the transcription manager's, in the
+        // C++ creation order (:1313 → :1316). The gate is inside
+        // (start_up guards is_authorized && !is_bot); the empty-cache
+        // reload is the [blocked: net] tail.
+        {
+            let mut env = TranslationEnv {
+                global: &mut self.global,
+                options: self.option_manager.as_mut(),
+                auth_is_authorized: self.auth_manager.is_authorized(),
+                auth_is_bot: self.auth_manager.is_bot(),
+                updates: &mut self.translation_updates,
+                users: &mut self.user_manager,
+            };
+            self.translation_manager.init(&mut env);
         }
 
         // `make_unique<LinkManager>` (Td.cpp:1239, the init_managers
@@ -3751,19 +3822,34 @@ impl Td {
         // the option broadcasts (the C++ actors deliver them around the
         // option writes; this fixed order is the port's determinism).
         if !actions.manager_updates.is_empty() {
-            let is_authorized = self.auth_manager.is_authorized();
-            let is_bot = self.auth_manager.is_bot();
-            let unix_time = self.global.unix_time();
             for update in actions.manager_updates {
-                let sent = {
-                    let pmc = self.global.binlog_pmc();
-                    self.manager_states.on_manager_update(
-                        pmc,
-                        update,
-                        is_authorized,
-                        is_bot,
-                        unix_time,
-                    )
+                // the TranscriptionManager half moved to its manager
+                // (M.25); the C++ ConfigManager.cpp:2050-2052 fan-out
+                let sent = match update {
+                    crate::manager_option_states::ManagerUpdate::TrialParameters {
+                        weekly_number,
+                        duration_max,
+                        cooldown_until,
+                    } => {
+                        let mut env = NotificationEnv {
+                            global: &mut self.global,
+                            options: self.option_manager.as_mut(),
+                            auth_is_authorized: self.auth_manager.is_authorized(),
+                            auth_is_bot: self.auth_manager.is_bot(),
+                            updates: &mut self.transcription_updates,
+                        };
+                        self.transcription_manager.on_update_trial_parameters(
+                            &mut env,
+                            weekly_number,
+                            duration_max,
+                            cooldown_until,
+                        );
+                        None
+                    }
+                    update => {
+                        let pmc = self.global.binlog_pmc();
+                        self.manager_states.on_manager_update(pmc, update)
+                    }
                 };
                 if let Some(update) = sent {
                     self.send_update(update);
@@ -4730,6 +4816,10 @@ impl Td {
         for update in notification_updates {
             self.send_update(update.into());
         }
+        let sponsored_updates = std::mem::take(&mut self.sponsored_updates);
+        for update in sponsored_updates {
+            self.send_update(update.into());
+        }
         let language_pack_updates = std::mem::take(&mut self.language_pack_updates);
         for update in language_pack_updates {
             self.send_update(update.into());
@@ -4815,6 +4905,14 @@ impl Td {
         for update in call_updates {
             self.send_update(update.into());
         }
+        let transcription_updates = std::mem::take(&mut self.transcription_updates);
+        for update in transcription_updates {
+            self.send_update(update.into());
+        }
+        let translation_updates = std::mem::take(&mut self.translation_updates);
+        for update in translation_updates {
+            self.send_update(update.into());
+        }
     }
 
     /// `td_->notification_manager_->init()` +
@@ -4830,6 +4928,13 @@ impl Td {
         };
         self.notification_manager.init(&mut env);
         self.notification_settings_manager.init(&mut env);
+
+        // `td_->promo_data_manager_->init()` (PromoDataManager.cpp:105-107,
+        // the Td.cpp:1246 constructor position) — idempotent.
+        {
+            let (mut promo_env, promo_data_manager) = promo_env_split(self);
+            promo_data_manager.init(&mut promo_env);
+        }
 
         // `td_->top_dialog_manager_->init()` (TopDialogManager.cpp:161,
         // the Td.cpp:1276 constructor position) — idempotent.
@@ -4973,6 +5078,24 @@ impl Td {
             updates: &mut self.web_browser_updates,
         };
         self.web_browser_manager.on_authorization_success(&mut env);
+    }
+
+    /// `TranslationManager::on_authorization_success`
+    /// (TranslationManager.cpp:598-603, called from AuthManager.cpp:1554)
+    /// — the live auth-success moment; runs before the web-browser
+    /// manager's, in the C++ AuthData order. The binlog-restore paths
+    /// don't call this (the C++ fires it only from on_get_authorization;
+    /// the constructor restore already sent the styles update).
+    fn on_translation_authorization_success(&mut self) {
+        let mut env = TranslationEnv {
+            global: &mut self.global,
+            options: self.option_manager.as_mut(),
+            auth_is_authorized: self.auth_manager.is_authorized(),
+            auth_is_bot: self.auth_manager.is_bot(),
+            updates: &mut self.translation_updates,
+            users: &mut self.user_manager,
+        };
+        self.translation_manager.on_authorization_success(&mut env);
     }
 
     /// `DeviceTokenManager::start_up` (DeviceTokenManager.cpp:329) — the
@@ -5432,6 +5555,7 @@ impl Td {
         // C++ fires it after every manager init above — the notification
         // and web browser managers are the ones on this tree
         self.init_notification_manager();
+        self.on_translation_authorization_success();
         self.on_web_browser_authorization_success();
         self.init_theme_manager();
         self.init_story_manager();
@@ -7850,6 +7974,18 @@ impl Actor for Td {
             self.notification_settings_manager.tick_timeouts(&mut env);
             self.device_token_manager.tick_timeouts(&mut env);
         }
+        // The SponsoredMessageManager + PromoDataManager timeout sweeps
+        // (M.26): the C++ MultiTimeout callbacks collapse into
+        // `tick_timeouts`.
+        {
+            let (mut sponsored_env, sponsored_message_manager) = sponsored_env_split(self);
+            sponsored_message_manager.tick_timeouts(&mut sponsored_env);
+        }
+        {
+            let (mut promo_env, promo_data_manager) = promo_env_split(self);
+            promo_data_manager.tick_timeouts(&mut promo_env);
+        }
+
         // The TopDialogManager timeout sweep (M.27).
         {
             let (mut env, top_dialog_manager) = top_dialog_env_split(self);
@@ -8402,6 +8538,371 @@ impl crate::device_token_manager::DeviceTokenManagerEnv for NotificationEnv<'_> 
 
     fn pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
         self.global.binlog_pmc().set_raw(key, value);
+    }
+}
+
+impl crate::transcription_manager::TranscriptionManagerEnv for NotificationEnv<'_> {
+    fn auth_is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn now(&self) -> f64 {
+        tdutils::time::now()
+    }
+
+    fn binlog_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    /// `messages_manager_->have_message_force` — [blocked: M.10]; no
+    /// message plane exists yet, so the probe answers the not-found band.
+    fn have_message_force(
+        &self,
+        _message_full_id: crate::dialog_id::MessageFullId,
+        _source: &str,
+    ) -> bool {
+        false
+    }
+
+    /// `messages_manager_->on_external_update_message_content` —
+    /// [blocked: M.10].
+    fn on_external_update_message_content(
+        &mut self,
+        message_full_id: crate::dialog_id::MessageFullId,
+        source: &str,
+    ) {
+        tdutils::log_info!(
+            "on_external_update_message_content {message_full_id:?} from {source} — [blocked: M.10]"
+        );
+    }
+
+    /// `messages_manager_->on_update_message_content` — [blocked: M.10].
+    fn on_update_message_content(&mut self, message_full_id: crate::dialog_id::MessageFullId) {
+        tdutils::log_info!("on_update_message_content {message_full_id:?} — [blocked: M.10]");
+    }
+
+    /// `VideoNotesManager::get_video_note_transcription_info` /
+    /// `VoiceNotesManager::get_voice_note_transcription_info` —
+    /// [blocked: M.28]; the content plane owns no infos yet.
+    fn with_transcription_info<
+        R,
+        F: FnOnce(&mut crate::transcription_manager::TranscriptionInfo) -> R,
+    >(
+        &mut self,
+        file_info: crate::transcription_manager::FileInfo,
+        _allow_creation: bool,
+        _f: F,
+    ) -> Option<R> {
+        tdutils::log_info!("Transcription info for {file_info:?} — [blocked: M.28]");
+        None
+    }
+
+    /// `TranscribeAudioQuery` — [blocked: net]; the query drops, the
+    /// parked promises stay unanswered like the C++ offline.
+    fn send_transcribe_audio_query(&mut self, message_full_id: crate::dialog_id::MessageFullId) {
+        tdutils::log_info!("Transcribe audio {message_full_id:?} — [blocked: net]");
+    }
+
+    /// `RateTranscribedAudioQuery` — [blocked: net].
+    fn send_rate_transcribed_audio_query(
+        &mut self,
+        message_full_id: crate::dialog_id::MessageFullId,
+        transcription_id: i64,
+        is_good: bool,
+        _promise: tdutils::promise::Promise<()>,
+    ) {
+        tdutils::log_info!(
+            "Rate transcribed audio {message_full_id:?} id {transcription_id} good {is_good} — [blocked: net]"
+        );
+    }
+}
+
+/// The [`crate::translation_manager::TranslationManagerEnv`] over the `Td`
+/// fields — built per call (the `NotificationEnv` convention), never held
+/// across calls. The user plane rides the same split-`UserEnv` borrow as
+/// the bot arms (`bot_user_split`), because the manager's entity scan
+/// also needs the [`crate::message_entity::UserManagerLike`] surface.
+pub(crate) struct TranslationEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    /// `None` once the option manager is torn down; the getters answer
+    /// their defaults, matching the C++ close ordering.
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+    pub(crate) users: &'a mut UserManager,
+}
+
+impl TranslationEnv<'_> {
+    /// The disjoint `UserEnv` + manager borrow (the `bot_user_split`
+    /// convention in requests.rs).
+    fn user_env_split(&mut self) -> (UserEnv<'_>, &mut UserManager) {
+        let options = self
+            .options
+            .as_deref_mut()
+            .expect("translation calls run with the initialized option manager");
+        let env = UserEnv {
+            global: &mut *self.global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        (env, &mut *self.users)
+    }
+}
+
+impl crate::translation_manager::TranslationManagerEnv for TranslationEnv<'_> {
+    fn auth_is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn binlog_pmc_get_raw(&mut self, key: &[u8]) -> Vec<u8> {
+        self.global.binlog_pmc().get_raw(key)
+    }
+
+    fn binlog_pmc_set_raw(&mut self, key: &[u8], value: &[u8]) {
+        self.global.binlog_pmc().set_raw(key, value);
+    }
+
+    fn send_update(&mut self, update: td_api::Update) {
+        self.updates.push(update);
+    }
+
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &str) {
+        let (mut env, user_manager) = self.user_env_split();
+        user_manager.on_get_users(&mut env, users, source);
+    }
+
+    fn get_user_id_object(&mut self, user_id: i64, source: &str) -> i64 {
+        let (mut env, users) = self.user_env_split();
+        users.get_user_id_object(&mut env, UserId::new(user_id), source)
+    }
+
+    /// `Dependencies::add` × N + `Dependencies::resolve_force` —
+    /// [blocked: the Dependencies owner]; like the
+    /// `BotRecommendationManagerEnv` default, the collapse trusts the
+    /// synchronous user cache (the tones answer re-intakes the authors
+    /// through `on_get_users` once the net step lands).
+    fn resolve_user_dependencies(&mut self, user_ids: &[i64], source: &str) -> bool {
+        let _ = (user_ids, source);
+        true
+    }
+
+    fn get_me(&mut self) {
+        let (mut env, users) = self.user_env_split();
+        users.get_me(&mut env);
+    }
+
+    /// `TranslateTextQuery::send` — [blocked: net]; the promise drops,
+    /// which keeps the C++ request unanswered offline.
+    fn send_translate_text_query(
+        &mut self,
+        texts: Vec<FormattedText>,
+        to_language_code: String,
+        tone: String,
+        skip_bot_commands: bool,
+        max_media_timestamp: i32,
+        _promise: tdutils::promise::Promise<td_api::FormattedText>,
+    ) {
+        let _ = (
+            texts,
+            to_language_code,
+            tone,
+            skip_bot_commands,
+            max_media_timestamp,
+        );
+        tdutils::log_info!("Translate text — [blocked: net]");
+    }
+
+    /// `ComposeMessageWithAiQuery::send` — [blocked: net].
+    fn send_compose_message_with_ai_query(
+        &mut self,
+        text: FormattedText,
+        translate_to_language_code: String,
+        input_tone: Option<telegram_api::InputAiComposeTone>,
+        emojify: bool,
+        _promise: tdutils::promise::Promise<td_api::FormattedText>,
+    ) {
+        let _ = (text, translate_to_language_code, input_tone, emojify);
+        tdutils::log_info!("Compose message with AI — [blocked: net]");
+    }
+
+    /// `ProofreadMessageWithAiQuery::send` — [blocked: net].
+    fn send_proofread_message_with_ai_query(
+        &mut self,
+        text: FormattedText,
+        _promise: tdutils::promise::Promise<td_api::FixedText>,
+    ) {
+        let _ = text;
+        tdutils::log_info!("Proofread message with AI — [blocked: net]");
+    }
+
+    /// `GetAiComposeTonesQuery::send` — [blocked: net].
+    fn send_get_ai_compose_tones_query(
+        &mut self,
+        hash: i64,
+        _promise: tdutils::promise::Promise<()>,
+    ) {
+        let _ = hash;
+        tdutils::log_info!("Get AI-compose tones hash {hash} — [blocked: net]");
+    }
+
+    /// `CreateToneQuery::send` — [blocked: net].
+    fn send_create_tone_query(
+        &mut self,
+        title: String,
+        custom_emoji_id: i64,
+        prompt: String,
+        show_creator: bool,
+        _promise: tdutils::promise::Promise<td_api::TextCompositionStyle>,
+    ) {
+        let _ = (title, custom_emoji_id, prompt, show_creator);
+        tdutils::log_info!("Create AI-compose tone — [blocked: net]");
+    }
+
+    /// `UpdateToneQuery::send` — [blocked: net].
+    fn send_update_tone_query(
+        &mut self,
+        input_tone: telegram_api::InputAiComposeTone,
+        title: String,
+        custom_emoji_id: i64,
+        prompt: String,
+        show_creator: bool,
+        _promise: tdutils::promise::Promise<td_api::TextCompositionStyle>,
+    ) {
+        let _ = (input_tone, title, custom_emoji_id, prompt, show_creator);
+        tdutils::log_info!("Update AI-compose tone — [blocked: net]");
+    }
+
+    /// `DeleteToneQuery::send` — [blocked: net].
+    fn send_delete_tone_query(
+        &mut self,
+        input_tone: telegram_api::InputAiComposeTone,
+        _promise: tdutils::promise::Promise<()>,
+    ) {
+        let _ = input_tone;
+        tdutils::log_info!("Delete AI-compose tone — [blocked: net]");
+    }
+
+    /// `GetToneQuery::send` — [blocked: net].
+    fn send_get_tone_query(
+        &mut self,
+        input_tone: telegram_api::InputAiComposeTone,
+        _promise: tdutils::promise::Promise<td_api::TextCompositionStyle>,
+    ) {
+        let _ = input_tone;
+        tdutils::log_info!("Get AI-compose tone — [blocked: net]");
+    }
+
+    /// `GetToneExampleQuery::send` — [blocked: net].
+    fn send_get_tone_example_query(
+        &mut self,
+        input_tone: telegram_api::InputAiComposeTone,
+        num: i32,
+        _promise: tdutils::promise::Promise<td_api::TextCompositionStyleExample>,
+    ) {
+        let _ = (input_tone, num);
+        tdutils::log_info!("Get AI-compose tone example — [blocked: net]");
+    }
+
+    /// `SaveToneQuery::send` — [blocked: net].
+    fn send_save_tone_query(
+        &mut self,
+        input_tone: telegram_api::InputAiComposeTone,
+        unsave: bool,
+        _promise: tdutils::promise::Promise<()>,
+    ) {
+        let _ = (input_tone, unsave);
+        tdutils::log_info!("Save AI-compose tone — [blocked: net]");
+    }
+
+    /// `TranslateRichMessageQuery::send` — [blocked: net] over the
+    /// [blocked: RichMessage] value plane; the promise drops unanswered.
+    fn send_translate_rich_message_query(
+        &mut self,
+        message: td_api::InputRichMessage,
+        to_language_code: String,
+        tone: String,
+        _promise: tdutils::promise::Promise<td_api::RichMessage>,
+    ) {
+        let _ = (message, to_language_code, tone);
+        tdutils::log_info!("Translate rich message — [blocked: RichMessage]");
+    }
+
+    /// `do_compose_rich_message_with_ai` +
+    /// `ComposeRichMessageWithAiQuery::send` — [blocked: net] over the
+    /// [blocked: RichMessage] value plane; the promise drops unanswered.
+    fn send_compose_rich_message_with_ai_query(
+        &mut self,
+        has_message: bool,
+        message: Option<td_api::InputRichMessage>,
+        translate_to_language_code: String,
+        input_tone: Option<telegram_api::InputAiComposeTone>,
+        emojify: bool,
+        proofread: bool,
+        _promise: tdutils::promise::Promise<td_api::RichMessage>,
+    ) {
+        let _ = (
+            has_message,
+            message,
+            translate_to_language_code,
+            input_tone,
+            emojify,
+            proofread,
+        );
+        tdutils::log_info!("Compose rich message with AI — [blocked: RichMessage]");
+    }
+}
+
+impl crate::message_entity::UserManagerLike for TranslationEnv<'_> {
+    fn resolve_user_id_object(&mut self, user_id: UserId, source: &str) -> i64 {
+        let (mut env, users) = self.user_env_split();
+        users.get_user_id_object(&mut env, user_id, source)
+    }
+
+    fn ensure_input_user(&mut self, user_id: UserId) -> Result<(), Status> {
+        let (env, users) = self.user_env_split();
+        users.get_input_user(&env, user_id).map(|_| ())
+    }
+
+    fn have_min_user(&self, user_id: UserId) -> bool {
+        self.users.have_min_user(user_id)
+    }
+
+    fn get_input_user_force(&mut self, user_id: UserId) -> telegram_api::InputUser {
+        let (env, users) = self.user_env_split();
+        users.get_input_user_force(&env, user_id)
+    }
+
+    fn is_user_bot(&self, user_id: UserId) -> bool {
+        self.users.is_user_bot_of(user_id)
     }
 }
 
@@ -12753,6 +13254,482 @@ impl crate::inline_message_manager::InlineMessageManagerEnv for TdInlineEnv<'_> 
     }
 }
 
+/// Field-split the `Td` for the sponsored/promo/import manager calls.
+pub(crate) fn sponsored_env_split(
+    td: &mut Td,
+) -> (
+    TdSponsoredEnv<'_>,
+    &mut crate::sponsored_message_manager::SponsoredMessageManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        chat_manager,
+        file_manager,
+        sponsored_message_manager,
+        sponsored_updates,
+        ..
+    } = td;
+    (
+        TdSponsoredEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_authorized: auth_manager.is_authorized(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            chat_manager,
+            file_manager: file_manager.clone(),
+            updates: sponsored_updates,
+        },
+        sponsored_message_manager,
+    )
+}
+
+pub(crate) fn message_import_env_split(
+    td: &mut Td,
+) -> (
+    TdSponsoredEnv<'_>,
+    &mut crate::message_import_manager::MessageImportManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        chat_manager,
+        file_manager,
+        message_import_manager,
+        sponsored_updates,
+        ..
+    } = td;
+    (
+        TdSponsoredEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_authorized: auth_manager.is_authorized(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            chat_manager,
+            file_manager: file_manager.clone(),
+            updates: sponsored_updates,
+        },
+        message_import_manager,
+    )
+}
+
+pub(crate) fn promo_env_split(
+    td: &mut Td,
+) -> (
+    TdSponsoredEnv<'_>,
+    &mut crate::promo_data_manager::PromoDataManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        chat_manager,
+        file_manager,
+        promo_data_manager,
+        sponsored_updates,
+        ..
+    } = td;
+    (
+        TdSponsoredEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_authorized: auth_manager.is_authorized(),
+            auth_is_bot: auth_manager.is_bot(),
+            user_manager,
+            chat_manager,
+            file_manager: file_manager.clone(),
+            updates: sponsored_updates,
+        },
+        promo_data_manager,
+    )
+}
+
+/// The `G()`/manager slice of the collapsed SponsoredMessageManager +
+/// PromoDataManager + MessageImportManager trio (M.26).
+pub(crate) struct TdSponsoredEnv<'a> {
+    pub(crate) global: &'a mut Global,
+    /// `None` once the option manager is torn down; the getters answer
+    /// their defaults on the destroy path.
+    pub(crate) options: Option<&'a mut OptionManager>,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) user_manager: &'a mut UserManager,
+    pub(crate) chat_manager: &'a mut ChatManager,
+    pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<crate::files::FileManager>>,
+    // the shared sponsored outbox (drained by flush_user_updates); the
+    // promo/sponsored update fan-outs are the [blocked: net] intakes
+    #[allow(dead_code)]
+    pub(crate) updates: &'a mut Vec<td_api::Update>,
+}
+
+impl crate::sponsored_message_manager::SponsoredMessageManagerEnv for TdSponsoredEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn now(&self) -> f64 {
+        tdutils::time::now()
+    }
+
+    fn get_option_boolean(&self, name: &str, default_value: bool) -> bool {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_boolean(name, default_value)
+        })
+    }
+
+    fn get_my_sponsored_enabled(&self) -> bool {
+        self.user_manager.get_my_sponsored_enabled()
+    }
+
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &'static str) {
+        let options = self.options.as_mut();
+        if let Some(options) = options {
+            let mut env = UserEnv {
+                global: &mut *self.global,
+                options,
+                auth_is_bot: self.auth_is_bot,
+            };
+            self.user_manager.on_get_users(&mut env, users, source);
+        }
+    }
+
+    fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &'static str) {
+        let options = self.options.as_mut();
+        if let Some(options) = options {
+            let mut env = UserEnv {
+                global: &mut *self.global,
+                options,
+                auth_is_bot: self.auth_is_bot,
+            };
+            self.chat_manager
+                .on_get_chats(self.user_manager, &mut env, chats, source);
+        }
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        _source: &'static str,
+    ) -> tdutils::status::Result<()> {
+        if !have_dialog_info_of(self.user_manager, dialog_id) {
+            if !dialog_id.is_valid() {
+                return tdutils::status::Result::from_status(tdutils::status::Status::error(
+                    400,
+                    "Invalid chat identifier specified",
+                ));
+            }
+            return tdutils::status::Result::from_status(tdutils::status::Status::error(
+                400,
+                "Chat not found",
+            ));
+        }
+        tdutils::status::Result::Ok(())
+    }
+
+    fn have_dialog_info(&self, dialog_id: crate::dialog_id::DialogId) -> bool {
+        have_dialog_info_of(self.user_manager, dialog_id)
+    }
+
+    fn force_create_dialog(
+        &mut self,
+        _dialog_id: crate::dialog_id::DialogId,
+        _source: &'static str,
+    ) {
+        // M.6 stub: messages_manager_->force_create_dialog
+    }
+
+    fn get_chat_id_object(
+        &self,
+        dialog_id: crate::dialog_id::DialogId,
+        _source: &'static str,
+    ) -> i64 {
+        dialog_id.get_chat_id().get()
+    }
+
+    fn can_get_message_video_advertisements(&self, _message_full_id: MessageFullId) -> bool {
+        false // the M.10 message-plane probe answers the not-found band
+    }
+
+    fn get_accent_color_id_object(
+        &self,
+        accent_color_id: crate::peer_color::AccentColorId,
+        fallback_accent_color_id: crate::peer_color::AccentColorId,
+    ) -> i32 {
+        if accent_color_id.is_valid() {
+            accent_color_id.get()
+        } else {
+            fallback_accent_color_id.get()
+        }
+    }
+
+    fn get_sponsored_message_text(
+        &mut self,
+        sponsored_message: &telegram_api::SponsoredMessage,
+    ) -> String {
+        sponsored_message.message.clone()
+    }
+
+    fn get_sponsored_message_content(
+        &mut self,
+        text: String,
+        media: Option<Box<telegram_api::MessageMedia>>,
+    ) -> crate::sponsored_message_manager::SponsoredContent {
+        let content_type = match media {
+            Some(media) => match *media {
+                telegram_api::MessageMedia::messageMediaPhoto(_) => {
+                    crate::sponsored_message_manager::SponsoredContentType::Photo
+                }
+                telegram_api::MessageMedia::messageMediaDocument(_) => {
+                    crate::sponsored_message_manager::SponsoredContentType::Animation
+                }
+                _ => crate::sponsored_message_manager::SponsoredContentType::Unsupported,
+            },
+            None => crate::sponsored_message_manager::SponsoredContentType::Text,
+        };
+        crate::sponsored_message_manager::SponsoredContent::new(content_type, text, false)
+    }
+
+    fn get_message_content_object(
+        &self,
+        _content: &crate::sponsored_message_manager::SponsoredContent,
+    ) -> Option<td_api::MessageContent> {
+        None // the degraded builder (null content)
+    }
+
+    fn get_sponsored_photo(&mut self, photo: Option<telegram_api::Photo>) -> crate::photo::Photo {
+        match photo {
+            Some(_photo) => crate::photo::Photo::default(),
+            None => crate::photo::Photo::default(),
+        }
+    }
+
+    fn get_photo_object(&self, _photo: &crate::photo::Photo) -> Option<td_api::Photo> {
+        None
+    }
+
+    fn send_get_sponsored_messages_query(
+        &mut self,
+        _dialog_id: crate::dialog_id::DialogId,
+        _message_id: crate::messages_manager::MessageId,
+    ) {
+        // [blocked: net]
+    }
+
+    fn send_get_sponsored_peers_query(&mut self, _query: &str) {
+        // [blocked: net]
+    }
+
+    fn send_view_sponsored_message_query(&mut self, _random_id: &[u8]) {
+        // [blocked: net]
+    }
+
+    fn send_click_sponsored_message_query(
+        &mut self,
+        _query: crate::sponsored_message_manager::PendingClickQuery,
+    ) {
+        // [blocked: net]
+    }
+
+    fn send_report_sponsored_message_query(
+        &mut self,
+        _query: crate::sponsored_message_manager::PendingReportQuery,
+    ) {
+        // [blocked: net]
+    }
+}
+
+/// The field-level `dialog_manager_->have_dialog_info` (the user half is
+/// real; the chat/channel halves are the M.6 stub inventory).
+fn have_dialog_info_of(user_manager: &UserManager, dialog_id: crate::dialog_id::DialogId) -> bool {
+    match dialog_id.get_type() {
+        crate::dialog_id::DialogType::User => {
+            user_manager.have_accessible_user(dialog_id.get_user_id())
+        }
+        crate::dialog_id::DialogType::Chat | crate::dialog_id::DialogType::Channel => false,
+        crate::dialog_id::DialogType::SecretChat => {
+            user_manager.have_secret_chat(dialog_id.get_secret_chat_id())
+        }
+        crate::dialog_id::DialogType::None => false,
+    }
+}
+
+impl crate::promo_data_manager::PromoDataManagerEnv for TdSponsoredEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn auth_is_authorized(&self) -> bool {
+        self.auth_is_authorized
+    }
+
+    fn auth_is_bot(&self) -> bool {
+        self.auth_is_bot
+    }
+
+    fn now(&self) -> f64 {
+        tdutils::time::now()
+    }
+
+    fn unix_time(&self) -> i32 {
+        self.global.unix_time()
+    }
+
+    fn get_option_integer(&self, name: &str, default_value: i64) -> i64 {
+        self.options.as_ref().map_or(default_value, |options| {
+            options.get_option_integer(name, default_value)
+        })
+    }
+
+    fn set_option_boolean(&mut self, name: &str, value: bool) {
+        if let Some(options) = self.options.as_mut() {
+            options.set_option_boolean(name, value);
+        }
+    }
+
+    fn set_option_empty(&mut self, name: &str) {
+        if let Some(options) = self.options.as_mut() {
+            options.set_option_empty(name);
+        }
+    }
+
+    fn on_get_users(&mut self, users: Vec<telegram_api::User>, source: &'static str) {
+        let options = self.options.as_mut();
+        if let Some(options) = options {
+            let mut env = UserEnv {
+                global: &mut *self.global,
+                options,
+                auth_is_bot: self.auth_is_bot,
+            };
+            self.user_manager.on_get_users(&mut env, users, source);
+        }
+    }
+
+    fn on_get_chats(&mut self, chats: Vec<telegram_api::Chat>, source: &'static str) {
+        let options = self.options.as_mut();
+        if let Some(options) = options {
+            let mut env = UserEnv {
+                global: &mut *self.global,
+                options,
+                auth_is_bot: self.auth_is_bot,
+            };
+            self.chat_manager
+                .on_get_chats(self.user_manager, &mut env, chats, source);
+        }
+    }
+
+    fn set_sponsored_dialog(
+        &mut self,
+        _dialog_id: crate::dialog_id::DialogId,
+        _source: crate::promo_data_manager::DialogSource,
+    ) {
+        // M.6 stub: dialog_manager_->set_dialog_source
+    }
+
+    fn update_suggested_actions(
+        &mut self,
+        _actions: &[crate::promo_data_manager::SuggestedAction],
+    ) {
+        // M.5 stub: dialog_manager_->update_suggested_actions
+    }
+
+    fn send_get_promo_data_query(&mut self) {
+        // [blocked: net]
+    }
+
+    fn send_hide_promo_data_query(&mut self, _dialog_id: crate::dialog_id::DialogId) {
+        // [blocked: net]
+    }
+}
+
+impl crate::message_import_manager::MessageImportManagerEnv for TdSponsoredEnv<'_> {
+    fn close_flag(&self) -> bool {
+        self.global.close_flag()
+    }
+
+    fn check_dialog_access(
+        &mut self,
+        dialog_id: crate::dialog_id::DialogId,
+        _source: &str,
+    ) -> Result<(), tdutils::status::Status> {
+        if !have_dialog_info_of(self.user_manager, dialog_id) {
+            if !dialog_id.is_valid() {
+                return Err(tdutils::status::Status::error(
+                    400,
+                    "Invalid chat identifier specified",
+                ));
+            }
+            return Err(tdutils::status::Status::error(400, "Chat not found"));
+        }
+        Ok(())
+    }
+
+    fn is_user_contact(&self, user_id: UserId) -> bool {
+        self.user_manager.is_user_contact_of(user_id, true)
+    }
+
+    fn is_broadcast_channel(&self, dialog_id: crate::dialog_id::DialogId) -> bool {
+        self.chat_manager
+            .get_channel_type_by_id(dialog_id.get_channel_id())
+            == crate::chat_manager::ChannelType::Broadcast
+    }
+
+    fn can_change_info_and_settings(&self, channel_id: crate::chat_manager::ChannelId) -> bool {
+        self.chat_manager
+            .get_channel_permissions_id(&*self.global, channel_id)
+            .can_change_info_and_settings()
+    }
+
+    fn get_input_file_id(
+        &mut self,
+        message_file: &td_api::InputFile,
+        dialog_id: crate::dialog_id::DialogId,
+    ) -> Result<FileId, tdutils::status::Status> {
+        self.file_manager.lock().get_input_file_id(
+            crate::files::FileType::Document,
+            Some(message_file),
+            dialog_id,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+        )
+    }
+
+    fn send_check_history_import_query(
+        &mut self,
+        _message_file_head: String,
+        _promise: Promise<td_api::MessageFileType>,
+    ) {
+        // [blocked: net]
+    }
+
+    fn send_check_history_import_peer_query(
+        &mut self,
+        _dialog_id: crate::dialog_id::DialogId,
+        _promise: Promise<String>,
+    ) {
+        // [blocked: net]
+    }
+
+    fn start_history_import(
+        &mut self,
+        _dialog_id: crate::dialog_id::DialogId,
+        _file_id: FileId,
+        _attached_files: Vec<td_api::InputFile>,
+        _promise: Promise<()>,
+    ) {
+        // [blocked: Files upload] + [blocked: net]
+    }
+}
 /// Field-split the `Td` for the top-dialog/recommendation manager calls.
 pub(crate) fn top_dialog_env_split(
     td: &mut Td,

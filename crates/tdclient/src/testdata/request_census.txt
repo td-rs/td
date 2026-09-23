@@ -100,9 +100,9 @@ clearRecentStickers	interim
 clearRecentlyFoundChats	dispatched
 clearSearchedForTags	interim
 clickAnimatedEmojiMessage	interim
-clickChatSponsoredMessage	interim
+clickChatSponsoredMessage	dispatched
 clickPremiumSubscriptionButton	dispatched
-clickVideoMessageAdvertisement	interim
+clickVideoMessageAdvertisement	dispatched
 close	dispatched
 closeChat	dispatched
 closeGiftAuction	dispatched
@@ -111,8 +111,8 @@ closeStory	dispatched
 closeWebApp	dispatched
 commitPendingLiveStoryReactions	dispatched
 commitPendingPaidMessageReactions	interim
-composeRichMessageWithAi	interim
-composeTextWithAi	interim
+composeRichMessageWithAi	dispatched
+composeTextWithAi	dispatched
 confirmBusinessConnectedBot	dispatched
 confirmQrCodeAuthentication	dispatched
 confirmSession	dispatched
@@ -136,7 +136,7 @@ createNewSecretChat	dispatched
 createNewStickerSet	interim
 createNewSupergroupChat	interim
 createPrivateChat	interim
-createRichMessageWithAi	interim
+createRichMessageWithAi	dispatched
 createSecretChat	interim
 createStoryAlbum	dispatched
 createSupergroupChat	interim
@@ -247,8 +247,8 @@ endGroupCall	dispatched
 endGroupCallRecording	dispatched
 endGroupCallScreenSharing	dispatched
 finishFileGeneration	dispatched
-fixRichMessageWithAi	interim
-fixTextWithAi	interim
+fixRichMessageWithAi	dispatched
+fixTextWithAi	dispatched
 forwardMessages	interim
 getAccountTtl	dispatched
 getActiveSessions	dispatched
@@ -329,7 +329,7 @@ getChatScheduledMessages	interim
 getChatSimilarChatCount	dispatched
 getChatSimilarChats	dispatched
 getChatSparseMessagePositions	interim
-getChatSponsoredMessages	interim
+getChatSponsoredMessages	dispatched
 getChatStatistics	dispatched
 getChatStoryAlbums	dispatched
 getChatStoryInteractions	dispatched
@@ -508,7 +508,7 @@ getSavedNotificationSound	interim
 getSavedNotificationSounds	interim
 getSavedOrderInfo	dispatched
 getScopeNotificationSettings	dispatched
-getSearchSponsoredChats	interim
+getSearchSponsoredChats	dispatched
 getSearchedForTags	interim
 getSecretChat	dispatched
 getStakeDiceState	interim
@@ -572,7 +572,7 @@ getUserSupportInfo	interim
 getVideoChatAvailableParticipants	dispatched
 getVideoChatInviteLink	dispatched
 getVideoChatRtmpUrl	dispatched
-getVideoMessageAdvertisements	interim
+getVideoMessageAdvertisements	dispatched
 getWebAppLinkUrl	dispatched
 getWebAppPlaceholder	dispatched
 getWebAppUrl	interim
@@ -581,7 +581,7 @@ giftPremiumWithStars	dispatched
 hideContactCloseBirthdays	dispatched
 hideSuggestedAction	dispatched
 importContacts	dispatched
-importMessages	interim
+importMessages	dispatched
 increaseGiftAuctionBid	dispatched
 inviteGroupCallParticipant	dispatched
 inviteVideoChatParticipants	dispatched
@@ -612,7 +612,7 @@ openChat	dispatched
 openChatSimilarChat	dispatched
 openGiftAuction	dispatched
 openMessageContent	interim
-openSponsoredChat	interim
+openSponsoredChat	dispatched
 openStory	dispatched
 openWebApp	dispatched
 optimizeStorage	dispatched
@@ -629,7 +629,7 @@ processChatJoinRequest	interim
 processChatJoinRequests	interim
 processGiftPurchaseOffer	dispatched
 processPushNotification	interim
-rateSpeechRecognition	interim
+rateSpeechRecognition	dispatched
 readAllChatMentions	interim
 readAllChatPollVotes	interim
 readAllChatReactions	interim
@@ -641,7 +641,7 @@ readBusinessMessage	dispatched
 readChatList	interim
 readFilePart	interim
 readdQuickReplyShortcutMessages	interim
-recognizeSpeech	interim
+recognizeSpeech	dispatched
 recoverAuthenticationPassword	interim
 recoverPassword	interim
 refundStarPayment	interim
@@ -694,14 +694,14 @@ replaceVideoChatRtmpUrl	dispatched
 reportAuthenticationCodeMissing	interim
 reportChat	dispatched
 reportChatPhoto	interim
-reportChatSponsoredMessage	interim
+reportChatSponsoredMessage	dispatched
 reportMessageReactions	interim
 reportPhoneNumberCodeMissing	interim
-reportSponsoredChat	interim
+reportSponsoredChat	dispatched
 reportStory	dispatched
 reportSupergroupAntiSpamFalsePositive	interim
 reportSupergroupSpam	interim
-reportVideoMessageAdvertisement	interim
+reportVideoMessageAdvertisement	dispatched
 requestAuthenticationPasswordRecovery	interim
 requestPasswordRecovery	interim
 requestQrCodeAuthentication	interim
@@ -1004,8 +1004,8 @@ transferChatOwnership	interim
 transferGift	dispatched
 translateMessageRichMessage	interim
 translateMessageText	interim
-translateRichMessage	interim
-translateText	interim
+translateRichMessage	dispatched
+translateText	dispatched
 unpinAllChatMessages	interim
 unpinAllDirectMessagesChatTopicMessages	interim
 unpinAllForumTopicMessages	interim
@@ -1016,7 +1016,7 @@ uploadStickerFile	interim
 validateOrderInfo	dispatched
 viewMessages	dispatched
 viewPremiumFeature	dispatched
-viewSponsoredChat	interim
+viewSponsoredChat	dispatched
 viewTrendingStickerSets	interim
-viewVideoMessageAdvertisement	interim
+viewVideoMessageAdvertisement	dispatched
 writeGeneratedFilePart	dispatched
