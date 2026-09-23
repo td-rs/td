@@ -11410,7 +11410,7 @@ pub fn add_message_dependencies(
             &mut community_sink,
         );
     }
-    crate::reply_markup::add_reply_markup_dependencies(dependencies, &m.reply_markup);
+    crate::reply_markup::add_reply_markup_dependencies(dependencies, m.reply_markup.as_deref());
     // `m->ephemeral_message` (MessagesManager.cpp:21533-21535) and
     // `m->thread_draft_message` (21536) are always empty on the intake path
     // — they are set by the send/database slices that own them.

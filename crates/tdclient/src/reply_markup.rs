@@ -652,11 +652,13 @@ pub fn get_reply_markup_object(
     }
 }
 
-/// `add_reply_markup_dependencies` (ReplyMarkup.cpp:513-522) — the
-/// inline-button halves only (the C++ inline-button `add_dependencies`).
+/// `add_reply_markup_dependencies(Dependencies &, const
+/// unique_ptr<ReplyMarkup> &)` (ReplyMarkup.cpp:513-522) — the
+/// inline-button halves only (the C++ inline-button `add_dependencies`);
+/// the nullable `unique_ptr` maps to `Option<&ReplyMarkup>`.
 pub fn add_reply_markup_dependencies(
     dependencies: &mut dyn crate::inline_keyboard_button::DependenciesSink,
-    reply_markup: &Option<ReplyMarkup>,
+    reply_markup: Option<&ReplyMarkup>,
 ) {
     let Some(reply_markup) = reply_markup else {
         return;
