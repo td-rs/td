@@ -8193,17 +8193,8 @@ impl Actor for Td {
         // `send_message_view_metrics_timeout_callback` and the reload
         // SleepActor collapse into `tick_timeouts`.
         {
-            let mut env = MessageQueryEnv {
-                global: &mut self.global,
-                options: self.option_manager.as_mut(),
-                auth_is_authorized: self.auth_manager.is_authorized(),
-                auth_is_bot: self.auth_manager.is_bot(),
-                can_ignore_background_updates: self.can_ignore_background_updates,
-                updates: &mut self.message_query_updates,
-                user_manager: &mut self.user_manager,
-                updates_manager: &mut self.updates_manager,
-            };
-            self.message_query_manager.tick_timeouts(&mut env);
+            let (mut env, mq_manager) = message_query_env_split(self);
+            mq_manager.tick_timeouts(&mut env);
         }
         // The PollManager's three MultiTimeouts (M.19): the C++
         // `on_*_poll_timeout_callback`s collapse into `tick_timeouts`.
@@ -9425,6 +9416,9 @@ pub(crate) struct MessageQueryEnv<'a> {
     pub(crate) updates: &'a mut Vec<td_api::Update>,
     pub(crate) user_manager: &'a mut UserManager,
     pub(crate) updates_manager: &'a mut UpdatesManager<TdSink>,
+    /// `td_->file_manager_` — the `report_music_listen` file-view read
+    /// (the shared registry behind the mutex, cloned per split).
+    pub(crate) file_manager: std::sync::Arc<parking_lot::Mutex<FileManager>>,
 }
 
 impl crate::message_query_manager::MessageQueryManagerEnv for MessageQueryEnv<'_> {
@@ -9522,6 +9516,56 @@ impl crate::message_query_manager::MessageQueryManagerEnv for MessageQueryEnv<'_
             promise,
             source,
         );
+    }
+
+    /// `user_manager_->get_input_user` — real over the UserManager
+    /// (the getPersonalChatHistory pre-step).
+    fn get_input_user(
+        &mut self,
+        user_id: UserId,
+    ) -> std::result::Result<telegram_api::InputUser, tdutils::status::Status> {
+        let global = &mut *self.global;
+        let options = self
+            .options
+            .as_deref_mut()
+            .expect("the option manager exists while the manager drives");
+        let user_env = UserEnv {
+            global,
+            options,
+            auth_is_bot: self.auth_is_bot,
+        };
+        self.user_manager.get_input_user(&user_env, user_id)
+    }
+
+    /// `user_manager_->is_bot(user_id)` / `is_premium(user_id)` — the
+    /// check_shared_dialog user probes.
+    fn is_user_bot(&self, user_id: UserId) -> bool {
+        self.user_manager.is_user_bot_of(user_id)
+    }
+
+    fn is_user_premium(&self, user_id: UserId) -> bool {
+        self.user_manager.is_user_premium_of(user_id)
+    }
+
+    /// the `report_music_listen` file-view decision table over the real
+    /// FileManager registry: `Some(as_input_document())` for the
+    /// reportable documents, `None` for the silent `Unit()` bands.
+    fn get_music_listen_input_document(
+        &mut self,
+        file_id: crate::files::FileId,
+    ) -> Option<telegram_api::InputDocument> {
+        let file_manager = self.file_manager.lock();
+        let file_view = file_manager.get_file_view(file_id)?;
+        if file_view.is_encrypted() {
+            return None;
+        }
+        let main_remote_location = file_view.get_main_remote_location()?;
+        if main_remote_location.is_web() || !main_remote_location.is_document() {
+            return None;
+        }
+        Some(telegram_api::InputDocument::inputDocument(
+            main_remote_location.as_input_document(),
+        ))
     }
 }
 
@@ -14538,6 +14582,42 @@ pub(crate) fn dialog_participant_env_split(
             chat_manager,
         },
         dialog_participant_manager,
+    )
+}
+
+/// The field-split over [`Td`] for the MessageQueryManager request arms
+/// (the M.mp slice): the [`MessageQueryEnv`] plus the manager itself.
+pub(crate) fn message_query_env_split(
+    td: &mut Td,
+) -> (
+    MessageQueryEnv<'_>,
+    &mut crate::message_query_manager::MessageQueryManager,
+) {
+    let crate::td::Td {
+        global,
+        option_manager,
+        auth_manager,
+        user_manager,
+        updates_manager,
+        file_manager,
+        message_query_manager,
+        message_query_updates,
+        can_ignore_background_updates,
+        ..
+    } = td;
+    (
+        MessageQueryEnv {
+            global,
+            options: option_manager.as_mut(),
+            auth_is_authorized: auth_manager.is_authorized(),
+            auth_is_bot: auth_manager.is_bot(),
+            can_ignore_background_updates: *can_ignore_background_updates,
+            updates: message_query_updates,
+            user_manager,
+            updates_manager,
+            file_manager: std::sync::Arc::clone(file_manager),
+        },
+        message_query_manager,
     )
 }
 

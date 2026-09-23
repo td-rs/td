@@ -55,7 +55,6 @@ use crate::td::BoostEnv;
 use crate::td::CallEnv;
 use crate::td::CommunityEnv;
 use crate::td::LanguagePackEnv;
-use crate::td::MessageQueryEnv;
 use crate::td::NotificationEnv;
 use crate::td::PremiumTdEnv;
 use crate::td::QuickReplyEnv;
@@ -358,18 +357,8 @@ pub(crate) fn run_request(td: &mut Td, id: u64, function: Function) {
             // gate applies; the emoji-game update carries the 60-second
             // freshness window.
             if !td.auth_manager.is_bot() {
-                let env = MessageQueryEnv {
-                    global: &mut td.global,
-                    options: td.option_manager.as_mut(),
-                    auth_is_authorized: td.auth_manager.is_authorized(),
-                    auth_is_bot: false,
-                    can_ignore_background_updates: td.can_ignore_background_updates,
-                    updates: &mut td.message_query_updates,
-                    user_manager: &mut td.user_manager,
-                    updates_manager: &mut td.updates_manager,
-                };
-                td.message_query_manager
-                    .get_current_state(&env, &mut updates);
+                let (env, mq_manager) = crate::td::message_query_env_split(td);
+                mq_manager.get_current_state(&env, &mut updates);
             }
 
             // TranslationManager::get_current_state (Requests.cpp:2257 —
@@ -1699,17 +1688,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise =
                 td.deferred_promise::<td_api::MessageSenders, _>(id, Object::messageSenders);
-            let mut env = MessageQueryEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                can_ignore_background_updates: td.can_ignore_background_updates,
-                updates: &mut td.message_query_updates,
-                user_manager: &mut td.user_manager,
-                updates_manager: &mut td.updates_manager,
-            };
-            td.message_query_manager.get_paid_message_reaction_senders(
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.get_paid_message_reaction_senders(
                 &mut env,
                 crate::dialog_id::DialogId::new(request.chat_id),
                 promise,
@@ -1727,18 +1707,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 crate::dialog_id::DialogId::new(request.chat_id),
                 crate::messages_manager::MessageId::new(request.message_id),
             );
-            let mut env = MessageQueryEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                can_ignore_background_updates: td.can_ignore_background_updates,
-                updates: &mut td.message_query_updates,
-                user_manager: &mut td.user_manager,
-                updates_manager: &mut td.updates_manager,
-            };
-            td.message_query_manager
-                .get_message_viewers(&mut env, message_full_id, promise);
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.get_message_viewers(&mut env, message_full_id, promise);
         }
         Function::getStakeDiceState(_) => {
             // `Requests.cpp:3088-3093` — the state parks behind the emoji
@@ -1748,18 +1718,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
             }
             let promise =
                 td.deferred_promise::<td_api::StakeDiceState, _>(id, Object::stakeDiceState);
-            let mut env = MessageQueryEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                can_ignore_background_updates: td.can_ignore_background_updates,
-                updates: &mut td.message_query_updates,
-                user_manager: &mut td.user_manager,
-                updates_manager: &mut td.updates_manager,
-            };
-            td.message_query_manager
-                .get_emoji_game_info(&mut env, promise);
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.get_emoji_game_info(&mut env, promise);
         }
         Function::sendMessageViewMetrics(request) => {
             // `Requests.cpp:2920-2931` — the ok promise parks behind the
@@ -1768,17 +1728,8 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 return;
             }
             let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
-            let mut env = MessageQueryEnv {
-                global: &mut td.global,
-                options: td.option_manager.as_mut(),
-                auth_is_authorized: td.auth_manager.is_authorized(),
-                auth_is_bot: td.auth_manager.is_bot(),
-                can_ignore_background_updates: td.can_ignore_background_updates,
-                updates: &mut td.message_query_updates,
-                user_manager: &mut td.user_manager,
-                updates_manager: &mut td.updates_manager,
-            };
-            td.message_query_manager.send_message_view_metrics(
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.send_message_view_metrics(
                 &mut env,
                 crate::dialog_id::DialogId::new(request.chat_id),
                 crate::messages_manager::MessageId::new(request.message_id),
@@ -1786,6 +1737,416 @@ fn run_user_requests(td: &mut Td, id: u64, function: Function) {
                 request.active_time_in_view_ms,
                 request.height_to_viewport_ratio_per_mille,
                 request.seen_range_ratio_per_mille,
+                promise,
+            );
+        }
+        Function::searchMessages(request) => {
+            // Requests.cpp:3702-3714 — the global search; the empty
+            // query + Empty-filter band answers locally, the rest parks
+            // at the [blocked: net] query seam.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<td_api::FoundMessages, _>(id, Object::foundMessages);
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.search_messages(
+                &mut env,
+                crate::messages_manager::DialogListId::from_chat_list(request.chat_list.as_ref()),
+                request.chat_list.is_none(),
+                query,
+                offset,
+                request.limit,
+                crate::message_query_manager::get_message_search_filter(request.filter.as_ref()),
+                request.chat_type_filter,
+                request.min_date,
+                request.max_date,
+                promise,
+            );
+        }
+        Function::searchOutgoingDocumentMessages(request) => {
+            // Requests.cpp:3731-3737 — the sent-media search parks at the
+            // [blocked: net] query seam.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<td_api::FoundMessages, _>(id, Object::foundMessages);
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.search_outgoing_document_messages(&mut env, query, request.limit, promise);
+        }
+        Function::getPublicPostSearchLimits(request) => {
+            // Requests.cpp:3738-3743 — the flood check parks at the
+            // [blocked: net] query seam.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let promise = td.deferred_promise::<td_api::PublicPostSearchLimits, _>(
+                id,
+                Object::publicPostSearchLimits,
+            );
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.check_search_posts_flood(&mut env, query, promise);
+        }
+        Function::searchPublicPosts(request) => {
+            // Requests.cpp:3745-3752 — the star-count gate + the flood
+            // offset; the search parks at the [blocked: net] query seam.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(query) = clean_or_utf8_error(td, id, &request.query) else {
+                return;
+            };
+            let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<td_api::FoundPublicPosts, _>(id, Object::foundPublicPosts);
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.search_public_posts(
+                &mut env,
+                query,
+                offset,
+                request.limit,
+                request.star_count,
+                promise,
+            );
+        }
+        Function::searchPublicMessagesByTag(request) => {
+            // Requests.cpp:3754-3761 — the hashtag/cashtag split + the
+            // hints note; the search parks at the [blocked: net] seam.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(tag) = clean_or_utf8_error(td, id, &request.tag) else {
+                return;
+            };
+            let Some(offset) = clean_or_utf8_error(td, id, &request.offset) else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<td_api::FoundMessages, _>(id, Object::foundMessages);
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.search_hashtag_posts(&mut env, tag, offset, request.limit, promise);
+        }
+        Function::searchChatRecentLocationMessages(request) => {
+            // Requests.cpp:3833-3838 — the secret-chat band answers
+            // locally, the rest parks at the [blocked: net] query seam.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Messages, _>(id, Object::messages);
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.search_dialog_recent_location_messages(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                request.limit,
+                promise,
+            );
+        }
+        Function::deleteAllCallMessages(request) => {
+            // Requests.cpp:3827-3831 — the affected-history loop.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.delete_all_call_messages(&mut env, request.revoke, promise);
+        }
+        Function::deleteMessageReactionsFromSender(request) => {
+            // Requests.cpp:3992-3997 — the sender probe then the
+            // participant-reaction delete ([blocked: net]).
+            let sender_dialog_id = {
+                let (_manager, mut env) = bot_env_split(td);
+                match crate::message_sender::get_message_sender_dialog_id(
+                    &mut env,
+                    request.sender_id.as_ref(),
+                    false,
+                    false,
+                ) {
+                    tdutils::status::Result::Ok(dialog_id) => dialog_id,
+                    tdutils::status::Result::Err(status) => {
+                        return send_error_status(td, id, status);
+                    }
+                }
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.delete_reaction_by_sender(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                crate::messages_manager::MessageId::new(request.message_id),
+                sender_dialog_id,
+                promise,
+            );
+        }
+        Function::deleteAllRecentMessageReactionsFromSender(request) => {
+            // Requests.cpp:3985-3990 — the sender probe then the
+            // participant-reactions delete ([blocked: net]).
+            let sender_dialog_id = {
+                let (_manager, mut env) = bot_env_split(td);
+                match crate::message_sender::get_message_sender_dialog_id(
+                    &mut env,
+                    request.sender_id.as_ref(),
+                    false,
+                    false,
+                ) {
+                    tdutils::status::Result::Ok(dialog_id) => dialog_id,
+                    tdutils::status::Result::Err(status) => {
+                        return send_error_status(td, id, status);
+                    }
+                }
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.delete_reactions_by_sender(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                sender_dialog_id,
+                promise,
+            );
+        }
+        Function::deleteEphemeralMessage(request) => {
+            // Requests.cpp:4145-4150 — the local ephemeral removal + the
+            // server delete ([blocked: net]).
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.delete_ephemeral_message_on_server(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                crate::dialog_id::DialogId::new(request.receiver_user_id),
+                crate::messages_manager::EphemeralMessageId::new(request.ephemeral_message_id),
+                promise,
+            );
+        }
+        Function::deleteChatMessagesBySender(request) => {
+            // Requests.cpp:4153-4159 — the sender probe, the local
+            // per-sender delete, then the channel affected-history loop.
+            if !check_is_user(td, id) {
+                return;
+            }
+            let sender_dialog_id = {
+                let (_manager, mut env) = bot_env_split(td);
+                match crate::message_sender::get_message_sender_dialog_id(
+                    &mut env,
+                    request.sender_id.as_ref(),
+                    false,
+                    false,
+                ) {
+                    tdutils::status::Result::Ok(dialog_id) => dialog_id,
+                    tdutils::status::Result::Err(status) => {
+                        return send_error_status(td, id, status);
+                    }
+                }
+            };
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.delete_dialog_messages_by_sender(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                sender_dialog_id,
+                promise,
+            );
+        }
+        Function::deleteChatMessagesByDate(request) => {
+            // Requests.cpp:4161-4166 — the date-window fix, the local
+            // by-date delete, then the server loop ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.delete_dialog_messages_by_date(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                request.min_date,
+                request.max_date,
+                request.revoke,
+                promise,
+            );
+        }
+        Function::editEphemeralMessage(request) => {
+            // Requests.cpp:4385-4392 — the bot-side ephemeral edit; the
+            // query parks at the [blocked: net] seam.
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.edit_ephemeral_message(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                crate::user_manager::UserId::new(request.receiver_user_id),
+                crate::messages_manager::EphemeralMessageId::new(request.ephemeral_message_id),
+                request.reply_markup,
+                request.input_message_content.map(|content| *content),
+                promise,
+            );
+        }
+        Function::editEphemeralMessageCaption(request) => {
+            // Requests.cpp:4393-4401 — the caption variant of the same
+            // query ([blocked: net]).
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.edit_ephemeral_message_caption(
+                &mut env,
+                crate::dialog_id::DialogId::new(request.chat_id),
+                crate::user_manager::UserId::new(request.receiver_user_id),
+                crate::messages_manager::EphemeralMessageId::new(request.ephemeral_message_id),
+                request.reply_markup,
+                request.caption,
+                request.show_caption_above_media,
+                promise,
+            );
+        }
+        Function::getPersonalChatHistory(request) => {
+            // Requests.cpp:6718-6722 — the personal-channel history read
+            // parks at the [blocked: net] query seam.
+            if !check_is_bot(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<td_api::Messages, _>(id, Object::messages);
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.get_personal_chat_history(
+                &mut env,
+                crate::user_manager::UserId::new(request.user_id),
+                request.limit,
+                promise,
+            );
+        }
+        Function::listenToAudio(request) => {
+            // Requests.cpp:3559-3564 — the file-view decision table, then
+            // the report ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.report_music_listen(
+                &mut env,
+                crate::files::FileId::new(request.audio_file_id, 0),
+                request.duration,
+                promise,
+            );
+        }
+        Function::summarizeMessage(request) => {
+            // Requests.cpp:2883-2889 — the message probe + the tone
+            // check, then the summarize query ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let Some(translate_to_language_code) =
+                clean_or_utf8_error(td, id, &request.translate_to_language_code)
+            else {
+                return;
+            };
+            let promise =
+                td.deferred_promise::<td_api::FormattedText, _>(id, Object::formattedText);
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.summarize_message_text(
+                &mut env,
+                crate::dialog_id::MessageFullId::new(
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::messages_manager::MessageId::new(request.message_id),
+                ),
+                translate_to_language_code,
+                request.tone,
+                promise,
+            );
+        }
+        Function::addChecklistTasks(request) => {
+            // Requests.cpp:8129-8135 — the checklist eligibility gate,
+            // then the append query ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.add_to_do_list_tasks(
+                &mut env,
+                crate::dialog_id::MessageFullId::new(
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::messages_manager::MessageId::new(request.message_id),
+                ),
+                request.tasks,
+                promise,
+            );
+        }
+        Function::markChecklistTasksAsDone(request) => {
+            // Requests.cpp:8136-8143 — the checklist eligibility gate,
+            // then the toggle query ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.mark_to_do_list_tasks_as_done(
+                &mut env,
+                crate::dialog_id::MessageFullId::new(
+                    crate::dialog_id::DialogId::new(request.chat_id),
+                    crate::messages_manager::MessageId::new(request.message_id),
+                ),
+                request.marked_as_done_task_ids,
+                request.marked_as_not_done_task_ids,
+                promise,
+            );
+        }
+        Function::shareUsersWithBot(request) => {
+            // Requests.cpp:8179-8185 — the shared-user validation, then
+            // the bot peer send ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            let shared_dialog_ids: Vec<crate::dialog_id::DialogId> = request
+                .shared_user_ids
+                .iter()
+                .map(|&user_id| crate::dialog_id::DialogId::new(user_id))
+                .collect();
+            mq_manager.share_dialogs_with_bot(
+                &mut env,
+                request.source,
+                request.button_id,
+                shared_dialog_ids,
+                true,
+                request.only_check,
+                promise,
+            );
+        }
+        Function::shareChatWithBot(request) => {
+            // Requests.cpp:8187-8193 — the shared-chat validation, then
+            // the bot peer send ([blocked: net]).
+            if !check_is_user(td, id) {
+                return;
+            }
+            let promise = td.deferred_promise::<(), _>(id, |_| ok_object());
+            let (mut env, mq_manager) = crate::td::message_query_env_split(td);
+            mq_manager.share_dialogs_with_bot(
+                &mut env,
+                request.source,
+                request.button_id,
+                vec![crate::dialog_id::DialogId::new(request.shared_chat_id)],
+                false,
+                request.only_check,
                 promise,
             );
         }
@@ -12020,13 +12381,27 @@ mod request_census_tests {
         // getChatAdministrators, getChatJoinRequests,
         // processChatJoinRequest(s), getSupergroupMembers,
         // getGuardBotWebAppUrl, answerChatJoinRequestQuery) over the
-        // collapsed dialog_participant_manager plane.
+        // collapsed dialog_participant_manager plane. The M.mp
+        // slice flipped the twenty-one MessageQueryManager arms
+        // (searchMessages, searchOutgoingDocumentMessages,
+        // getPublicPostSearchLimits, searchPublicPosts,
+        // searchPublicMessagesByTag, searchChatRecentLocationMessages,
+        // deleteAllCallMessages, deleteMessageReactionsFromSender,
+        // deleteAllRecentMessageReactionsFromSender,
+        // deleteEphemeralMessage, deleteChatMessagesBySender,
+        // deleteChatMessagesByDate, editEphemeralMessage,
+        // editEphemeralMessageCaption, getPersonalChatHistory,
+        // listenToAudio, summarizeMessage, addChecklistTasks,
+        // markChecklistTasksAsDone, shareUsersWithBot, shareChatWithBot)
+        // over the collapsed message_query_manager plane (the local
+        // validation/decision tables exact; the query tails park at the
+        // [blocked: net] seams).
         assert_eq!(*counts.get("sync").unwrap_or(&0), 20, "sync count");
         assert_eq!(
             *counts.get("dispatched").unwrap_or(&0),
-            584,
+            605,
             "dispatched count"
         );
-        assert_eq!(*counts.get("interim").unwrap_or(&0), 418, "interim count");
+        assert_eq!(*counts.get("interim").unwrap_or(&0), 397, "interim count");
     }
 }
