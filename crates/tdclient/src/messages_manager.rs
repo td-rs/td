@@ -21,7 +21,7 @@
 //! - `VLOG(notifications)` traces are dropped; `LOG(ERROR)` warnings are kept
 //!   via `log_error!`.
 
-use crate::chat_manager::{ChannelId, ChannelType, ChatId};
+use crate::chat_manager::{ChannelId, ChatId};
 use crate::files::{FileId, FileSourceId};
 use crate::message_content::{
     BackgroundInfo, InputGroupCallId, MessageContent, MessageContentType, SuggestedPostPrice,
@@ -31,6 +31,14 @@ use crate::message_db::MessageDbAsyncInterface;
 use crate::message_entity::FormattedText;
 use crate::restriction_reason::RestrictionReason;
 use crate::store_parse::{Parser, store_flags, store_i32, store_i64, store_string};
+use crate::inline_keyboard_button::InlineKeyboardButtonEnv;
+// The M.10.2b internal ReplyMarkup plane now lives in its C++-shaped
+// modules (the M.22 unification); the manager-level converters below keep
+// their MessagesManager.cpp homes.
+use crate::reply_markup::{
+    get_reply_markup, get_reply_markup_from_telegram, get_reply_markup_object, parse_reply_markup,
+    store_reply_markup, ReplyMarkup, ReplyMarkupType,
+};
 use crate::td_api;
 use crate::user_manager::{SecretChatId, UserId};
 use std::collections::{HashMap, HashSet};
@@ -4462,1900 +4470,6 @@ impl MessageReactions {
 }
 
 // ---------------------------------------------------------------------------
-// M.10.2b — the internal ReplyMarkup plane (ReplyMarkup.h, KeyboardButton.h,
-// InlineKeyboardButton.h, KeyboardButtonStyle.h, RequestedDialogType.h) with
-// the store/parse formats (the matching .hpp files) and the
-// telegram_api→internal converters (`get_reply_markup(telegram_api...)`,
-// ReplyMarkup.cpp:37-135). The internal model is what `Message::reply_markup`
-// holds (the M.10.1b stand-in re-points here); the td_api input/object
-// converters land with the send path (M.10.8) and `get_message_object`
-// (M.10.4).
-// ---------------------------------------------------------------------------
-
-/// `KeyboardButtonStyle::Type` (KeyboardButtonStyle.h:19).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(i32)]
-pub enum KeyboardButtonStyleType {
-    #[default]
-    Default = 0,
-    Primary = 1,
-    Danger = 2,
-    Success = 3,
-}
-
-/// `td::KeyboardButtonStyle` (KeyboardButtonStyle.h).
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct KeyboardButtonStyle {
-    pub r#type: KeyboardButtonStyleType,
-    pub icon_custom_emoji_id: crate::emoji_status::CustomEmojiId,
-}
-
-impl KeyboardButtonStyle {
-    /// `KeyboardButtonStyle::KeyboardButtonStyle(telegram_api::keyboardButtonStyle &&)`
-    /// (KeyboardButtonStyle.cpp:37-45).
-    pub fn from_telegram(style: Option<&telegram_api::KeyboardButtonStyle>) -> KeyboardButtonStyle {
-        let Some(style) = style else {
-            return KeyboardButtonStyle::default();
-        };
-        let r#type = if style.bg_primary {
-            KeyboardButtonStyleType::Primary
-        } else if style.bg_danger {
-            KeyboardButtonStyleType::Danger
-        } else if style.bg_success {
-            KeyboardButtonStyleType::Success
-        } else {
-            KeyboardButtonStyleType::Default
-        };
-        KeyboardButtonStyle {
-            r#type,
-            icon_custom_emoji_id: crate::emoji_status::CustomEmojiId::new(style.icon),
-        }
-    }
-
-    /// `KeyboardButtonStyle::is_default` (KeyboardButtonStyle.h).
-    pub fn is_default(&self) -> bool {
-        self.r#type == KeyboardButtonStyleType::Default && !self.icon_custom_emoji_id.is_valid()
-    }
-
-    /// `KeyboardButtonStyle::get_icon_custom_emoji_id` (KeyboardButtonStyle.h).
-    pub fn get_icon_custom_emoji_id(&self) -> crate::emoji_status::CustomEmojiId {
-        self.icon_custom_emoji_id
-    }
-
-    /// `KeyboardButtonStyle::get_button_style_object`
-    /// (KeyboardButtonStyle.cpp:51-65).
-    pub fn get_button_style_object(&self) -> Option<td_api::ButtonStyle> {
-        match self.r#type {
-            KeyboardButtonStyleType::Default => Some(td_api::ButtonStyle::buttonStyleDefault(
-                td_api::buttonStyleDefault,
-            )),
-            KeyboardButtonStyleType::Primary => Some(td_api::ButtonStyle::buttonStylePrimary(
-                td_api::buttonStylePrimary,
-            )),
-            KeyboardButtonStyleType::Danger => Some(td_api::ButtonStyle::buttonStyleDanger(
-                td_api::buttonStyleDanger,
-            )),
-            KeyboardButtonStyleType::Success => Some(td_api::ButtonStyle::buttonStyleSuccess(
-                td_api::buttonStyleSuccess,
-            )),
-        }
-    }
-
-    /// `KeyboardButtonStyle::store` (KeyboardButtonStyle.hpp:14-31).
-    pub fn store(&self, out: &mut Vec<u8>) {
-        let has_type = self.r#type != KeyboardButtonStyleType::Default;
-        let has_icon_custom_emoji_id = self.icon_custom_emoji_id.is_valid();
-        store_flags(out, [has_type, has_icon_custom_emoji_id]);
-        if has_type {
-            store_i32(out, self.r#type as i32);
-        }
-        if has_icon_custom_emoji_id {
-            store_i64(out, self.icon_custom_emoji_id.get());
-        }
-    }
-
-    /// `KeyboardButtonStyle::parse` (KeyboardButtonStyle.hpp:33-49).
-    pub fn parse_from(parser: &mut Parser) -> Result<KeyboardButtonStyle, &'static str> {
-        let [has_type, has_icon_custom_emoji_id] = parser.parse_flags::<2>()?;
-        let r#type = if has_type {
-            match parser.i32_()? {
-                0 => KeyboardButtonStyleType::Default,
-                1 => KeyboardButtonStyleType::Primary,
-                2 => KeyboardButtonStyleType::Danger,
-                3 => KeyboardButtonStyleType::Success,
-                _ => return Err("Wrong keyboard button style type"),
-            }
-        } else {
-            KeyboardButtonStyleType::Default
-        };
-        let icon_custom_emoji_id = if has_icon_custom_emoji_id {
-            crate::emoji_status::CustomEmojiId::new(parser.i64_()?)
-        } else {
-            crate::emoji_status::CustomEmojiId::default()
-        };
-        Ok(KeyboardButtonStyle {
-            r#type,
-            icon_custom_emoji_id,
-        })
-    }
-}
-
-/// `RequestedDialogType::Type` (RequestedDialogType.h:22).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(i32)]
-pub enum RequestedDialogTypeType {
-    #[default]
-    User = 0,
-    Group = 1,
-    Channel = 2,
-    CreateBot = 3,
-}
-
-/// `td::RequestedDialogType` (RequestedDialogType.h:19-100).
-#[derive(Clone, Debug, PartialEq)]
-pub struct RequestedDialogType {
-    pub r#type: RequestedDialogTypeType,
-    pub button_id: i32,
-    pub max_quantity: i32,
-    pub restrict_is_bot: bool,
-    pub is_bot: bool,
-    pub restrict_is_premium: bool,
-    pub is_premium: bool,
-    pub request_name: bool,
-    pub request_username: bool,
-    pub request_photo: bool,
-    pub restrict_is_forum: bool,
-    pub is_forum: bool,
-    pub bot_is_participant: bool,
-    pub restrict_has_username: bool,
-    pub has_username: bool,
-    pub is_created: bool,
-    pub restrict_user_administrator_rights: bool,
-    pub restrict_bot_administrator_rights: bool,
-    pub user_administrator_rights: crate::chat_manager::AdministratorRights,
-    pub bot_administrator_rights: crate::chat_manager::AdministratorRights,
-    pub suggested_name: String,
-    pub suggested_username: String,
-}
-
-impl Default for RequestedDialogType {
-    /// The C++ field initializers (RequestedDialogType.h:23-45); the
-    /// AdministratorRights store/parse lands beside this type in
-    /// chat_manager.
-    fn default() -> RequestedDialogType {
-        RequestedDialogType {
-            r#type: RequestedDialogTypeType::User,
-            button_id: 0,
-            max_quantity: 1,
-            restrict_is_bot: false,
-            is_bot: false,
-            restrict_is_premium: false,
-            is_premium: false,
-            request_name: false,
-            request_username: false,
-            request_photo: false,
-            restrict_is_forum: false,
-            is_forum: false,
-            bot_is_participant: false,
-            restrict_has_username: false,
-            has_username: false,
-            is_created: false,
-            restrict_user_administrator_rights: false,
-            restrict_bot_administrator_rights: false,
-            user_administrator_rights: crate::chat_manager::AdministratorRights::default(),
-            bot_administrator_rights: crate::chat_manager::AdministratorRights::default(),
-            suggested_name: String::new(),
-            suggested_username: String::new(),
-        }
-    }
-}
-
-impl RequestedDialogType {
-    /// `RequestedDialogType::RequestedDialogType(telegram_api::RequestPeerType &&, ...)`
-    /// (RequestedDialogType.cpp:26-84).
-    pub fn from_telegram(
-        peer_type: telegram_api::RequestPeerType,
-        button_id: i32,
-        max_quantity: i32,
-    ) -> RequestedDialogType {
-        let mut result = RequestedDialogType {
-            button_id,
-            max_quantity: max_quantity.max(1),
-            ..RequestedDialogType::default()
-        };
-        match peer_type {
-            telegram_api::RequestPeerType::requestPeerTypeUser(t) => {
-                result.r#type = RequestedDialogTypeType::User;
-                result.restrict_is_bot = t.flags & 1 != 0;
-                result.is_bot = t.bot;
-                result.restrict_is_premium = t.flags & 2 != 0;
-                result.is_premium = t.premium;
-            }
-            telegram_api::RequestPeerType::requestPeerTypeChat(t) => {
-                result.r#type = RequestedDialogTypeType::Group;
-                result.restrict_is_forum = t.flags & 16 != 0;
-                result.is_forum = t.forum;
-                result.bot_is_participant = t.bot_participant;
-                result.restrict_has_username = t.flags & 8 != 0;
-                result.has_username = t.has_username;
-                result.is_created = t.creator;
-                result.restrict_user_administrator_rights =
-                    !result.is_created && t.user_admin_rights.is_some();
-                result.restrict_bot_administrator_rights = t.bot_admin_rights.is_some();
-                result.user_administrator_rights =
-                    crate::chat_manager::AdministratorRights::from_chat_admin_rights(
-                        t.user_admin_rights.as_ref(),
-                        ChannelType::Megagroup,
-                    );
-                result.bot_administrator_rights =
-                    crate::chat_manager::AdministratorRights::from_chat_admin_rights(
-                        t.bot_admin_rights.as_ref(),
-                        ChannelType::Megagroup,
-                    );
-            }
-            telegram_api::RequestPeerType::requestPeerTypeBroadcast(t) => {
-                result.r#type = RequestedDialogTypeType::Channel;
-                result.restrict_has_username = t.flags & 8 != 0;
-                result.has_username = t.has_username;
-                result.is_created = t.creator;
-                result.restrict_user_administrator_rights =
-                    !result.is_created && t.user_admin_rights.is_some();
-                result.restrict_bot_administrator_rights = t.bot_admin_rights.is_some();
-                result.user_administrator_rights =
-                    crate::chat_manager::AdministratorRights::from_chat_admin_rights(
-                        t.user_admin_rights.as_ref(),
-                        ChannelType::Broadcast,
-                    );
-                result.bot_administrator_rights =
-                    crate::chat_manager::AdministratorRights::from_chat_admin_rights(
-                        t.bot_admin_rights.as_ref(),
-                        ChannelType::Broadcast,
-                    );
-            }
-            telegram_api::RequestPeerType::requestPeerTypeCreateBot(t) => {
-                if t.bot_managed {
-                    result.r#type = RequestedDialogTypeType::CreateBot;
-                    result.suggested_name = t.suggested_name;
-                    result.suggested_username = t.suggested_username;
-                } else {
-                    log_error!("Receive request to create an unmanaged bot");
-                    result.r#type = RequestedDialogTypeType::User;
-                    result.restrict_is_bot = true;
-                    result.is_bot = true;
-                }
-            }
-        }
-        result
-    }
-
-    /// `RequestedDialogType::store` (RequestedDialogType.hpp:17-57).
-    pub fn store(&self, out: &mut Vec<u8>) {
-        let has_max_quantity = self.max_quantity != 1;
-        let has_suggested_name = !self.suggested_name.is_empty();
-        let has_suggested_username = !self.suggested_username.is_empty();
-        store_flags(
-            out,
-            [
-                self.restrict_is_bot,
-                self.is_bot,
-                self.restrict_is_premium,
-                self.is_premium,
-                self.restrict_is_forum,
-                self.is_forum,
-                self.bot_is_participant,
-                self.restrict_has_username,
-                self.has_username,
-                self.is_created,
-                self.restrict_user_administrator_rights,
-                self.restrict_bot_administrator_rights,
-                has_max_quantity,
-                has_suggested_name,
-                has_suggested_username,
-            ],
-        );
-        store_i32(out, self.r#type as i32);
-        store_i32(out, self.button_id);
-        if self.restrict_user_administrator_rights {
-            self.user_administrator_rights.store(out);
-        }
-        if self.restrict_bot_administrator_rights {
-            self.bot_administrator_rights.store(out);
-        }
-        if has_max_quantity {
-            store_i32(out, self.max_quantity);
-        }
-        if has_suggested_name {
-            store_string(out, &self.suggested_name);
-        }
-        if has_suggested_username {
-            store_string(out, &self.suggested_username);
-        }
-    }
-
-    /// `RequestedDialogType::parse` (RequestedDialogType.hpp:59-113).
-    pub fn parse_from(parser: &mut Parser) -> Result<RequestedDialogType, &'static str> {
-        let [
-            restrict_is_bot,
-            is_bot,
-            restrict_is_premium,
-            is_premium,
-            restrict_is_forum,
-            is_forum,
-            bot_is_participant,
-            restrict_has_username,
-            has_username,
-            is_created,
-            restrict_user_administrator_rights,
-            restrict_bot_administrator_rights,
-            has_max_quantity,
-            has_suggested_name,
-            has_suggested_username,
-        ] = parser.parse_flags::<15>()?;
-        let r#type = match parser.i32_()? {
-            0 => RequestedDialogTypeType::User,
-            1 => RequestedDialogTypeType::Group,
-            2 => RequestedDialogTypeType::Channel,
-            3 => RequestedDialogTypeType::CreateBot,
-            _ => return Err("Wrong requested dialog type"),
-        };
-        let button_id = parser.i32_()?;
-        let user_administrator_rights = if restrict_user_administrator_rights {
-            crate::chat_manager::AdministratorRights::parse_impl(parser)?
-        } else {
-            crate::chat_manager::AdministratorRights::default()
-        };
-        let bot_administrator_rights = if restrict_bot_administrator_rights {
-            crate::chat_manager::AdministratorRights::parse_impl(parser)?
-        } else {
-            crate::chat_manager::AdministratorRights::default()
-        };
-        let max_quantity = if has_max_quantity { parser.i32_()? } else { 1 };
-        let suggested_name = if has_suggested_name {
-            parser.string()?
-        } else {
-            String::new()
-        };
-        let suggested_username = if has_suggested_username {
-            parser.string()?
-        } else {
-            String::new()
-        };
-        Ok(RequestedDialogType {
-            r#type,
-            button_id,
-            max_quantity,
-            restrict_is_bot,
-            is_bot,
-            restrict_is_premium,
-            is_premium,
-            request_name: false,
-            request_username: false,
-            request_photo: false,
-            restrict_is_forum,
-            is_forum,
-            bot_is_participant,
-            restrict_has_username,
-            has_username,
-            is_created,
-            restrict_user_administrator_rights,
-            restrict_bot_administrator_rights,
-            user_administrator_rights,
-            bot_administrator_rights,
-            suggested_name,
-            suggested_username,
-        })
-    }
-
-    /// `RequestedDialogType::get_keyboard_button_type_object`
-    /// (RequestedDialogType.cpp:128-147).
-    pub fn get_keyboard_button_type_object(&self) -> td_api::KeyboardButtonType {
-        match self.r#type {
-            RequestedDialogTypeType::User => {
-                td_api::KeyboardButtonType::keyboardButtonTypeRequestUsers(
-                    td_api::keyboardButtonTypeRequestUsers {
-                        id: self.button_id,
-                        restrict_user_is_bot: self.restrict_is_bot,
-                        user_is_bot: self.is_bot,
-                        restrict_user_is_premium: self.restrict_is_premium,
-                        user_is_premium: self.is_premium,
-                        max_quantity: self.max_quantity,
-                        request_name: self.request_name,
-                        request_username: self.request_username,
-                        request_photo: self.request_photo,
-                    },
-                )
-            }
-            RequestedDialogTypeType::CreateBot => {
-                td_api::KeyboardButtonType::keyboardButtonTypeRequestManagedBot(
-                    td_api::keyboardButtonTypeRequestManagedBot {
-                        id: self.button_id,
-                        suggested_name: self.suggested_name.clone(),
-                        suggested_username: self.suggested_username.clone(),
-                    },
-                )
-            }
-            RequestedDialogTypeType::Group | RequestedDialogTypeType::Channel => {
-                let user_administrator_rights = if self.restrict_user_administrator_rights {
-                    Some(
-                        self.user_administrator_rights
-                            .get_chat_administrator_rights_object(),
-                    )
-                } else {
-                    None
-                };
-                let bot_administrator_rights = if self.restrict_bot_administrator_rights {
-                    Some(
-                        self.bot_administrator_rights
-                            .get_chat_administrator_rights_object(),
-                    )
-                } else {
-                    None
-                };
-                td_api::KeyboardButtonType::keyboardButtonTypeRequestChat(
-                    td_api::keyboardButtonTypeRequestChat {
-                        id: self.button_id,
-                        chat_is_channel: self.r#type == RequestedDialogTypeType::Channel,
-                        restrict_chat_is_forum: self.restrict_is_forum,
-                        chat_is_forum: self.is_forum,
-                        restrict_chat_has_username: self.restrict_has_username,
-                        chat_has_username: self.has_username,
-                        chat_is_created: self.is_created,
-                        user_administrator_rights,
-                        bot_administrator_rights,
-                        bot_is_member: self.bot_is_participant,
-                        request_title: self.request_name,
-                        request_username: self.request_username,
-                        request_photo: self.request_photo,
-                    },
-                )
-            }
-        }
-    }
-
-    /// `RequestedDialogType::get_button_id` (RequestedDialogType.h).
-    pub fn get_button_id(&self) -> i32 {
-        self.button_id
-    }
-}
-
-/// `td::TargetDialogTypes` (TargetDialogTypes.h) — the SwitchInline button
-/// target mask; `InlineKeyboardButton::id` carries it in the SwitchInline
-/// arm.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TargetDialogTypes(i64);
-
-impl TargetDialogTypes {
-    const USERS_MASK: i64 = 1;
-    const BOTS_MASK: i64 = 2;
-    const CHATS_MASK: i64 = 4;
-    const BROADCASTS_MASK: i64 = 8;
-    const FULL_MASK: i64 =
-        Self::USERS_MASK | Self::BOTS_MASK | Self::CHATS_MASK | Self::BROADCASTS_MASK;
-
-    /// `TargetDialogTypes::TargetDialogTypes(int64 mask)`.
-    pub fn from_mask(mask: i64) -> TargetDialogTypes {
-        TargetDialogTypes(mask)
-    }
-
-    /// `TargetDialogTypes::get_mask`.
-    pub fn get_mask(self) -> i64 {
-        self.0
-    }
-
-    /// `TargetDialogTypes::get_full_mask`.
-    pub fn get_full_mask(self) -> i64 {
-        if self.0 == 0 { Self::FULL_MASK } else { self.0 }
-    }
-
-    /// `TargetDialogTypes::get_target_chat_types_object`
-    /// (TargetDialogTypes.cpp:81-85).
-    pub fn get_target_chat_types_object(self) -> td_api::TargetChatTypes {
-        let mask = self.get_full_mask();
-        td_api::TargetChatTypes {
-            allow_user_chats: (mask & Self::USERS_MASK) != 0,
-            allow_bot_chats: (mask & Self::BOTS_MASK) != 0,
-            allow_group_chats: (mask & Self::CHATS_MASK) != 0,
-            allow_channel_chats: (mask & Self::BROADCASTS_MASK) != 0,
-        }
-    }
-}
-
-/// `KeyboardButton::Type` (KeyboardButton.h:25-35) — append only.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(i32)]
-pub enum KeyboardButtonType {
-    #[default]
-    Text = 0,
-    RequestPhoneNumber = 1,
-    RequestLocation = 2,
-    RequestPoll = 3,
-    RequestPollQuiz = 4,
-    RequestPollRegular = 5,
-    WebView = 6,
-    RequestDialog = 7,
-}
-
-/// `td::KeyboardButton` (KeyboardButton.h:23-52).
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct KeyboardButton {
-    pub r#type: KeyboardButtonType,
-    pub style: KeyboardButtonStyle,
-    pub text: String,
-    /// WebView only
-    pub url: String,
-    /// RequestDialog only
-    pub requested_dialog_type: Option<RequestedDialogType>,
-}
-
-impl KeyboardButton {
-    /// `KeyboardButton::KeyboardButton(telegram_api::keyboardButton &&)`
-    /// (KeyboardButton.cpp:22-79).
-    pub fn from_telegram(keyboard_button: telegram_api::KeyboardButton) -> KeyboardButton {
-        let mut result = KeyboardButton::default();
-        let Some(button_type) = keyboard_button.r#type else {
-            log_error!("Unsupported keyboard button");
-            result.style = KeyboardButtonStyle::from_telegram(keyboard_button.style.as_ref());
-            result.text = keyboard_button.text;
-            return result;
-        };
-        match button_type {
-            telegram_api::ButtonType::buttonTypeDefault(_) => {
-                result.r#type = KeyboardButtonType::Text;
-            }
-            telegram_api::ButtonType::buttonTypeRequestPhone(_) => {
-                result.r#type = KeyboardButtonType::RequestPhoneNumber;
-            }
-            telegram_api::ButtonType::buttonTypeRequestGeoLocation(_) => {
-                result.r#type = KeyboardButtonType::RequestLocation;
-            }
-            telegram_api::ButtonType::buttonTypeRequestPoll(t) => {
-                if t.flags & 1 != 0 {
-                    result.r#type = if t.quiz {
-                        KeyboardButtonType::RequestPollQuiz
-                    } else {
-                        KeyboardButtonType::RequestPollRegular
-                    };
-                } else {
-                    result.r#type = KeyboardButtonType::RequestPoll;
-                }
-            }
-            telegram_api::ButtonType::buttonTypeSimpleWebView(t) => {
-                match crate::link_manager::check_link(&t.url, false, false) {
-                    Ok(url) => {
-                        result.r#type = KeyboardButtonType::WebView;
-                        result.url = url;
-                    }
-                    Err(error) => {
-                        log_error!("Keyboard Web App {}", error.message());
-                    }
-                }
-            }
-            telegram_api::ButtonType::buttonTypeRequestPeer(t) => {
-                result.r#type = KeyboardButtonType::RequestDialog;
-                if let Some(peer_type) = t.peer_type {
-                    result.requested_dialog_type = Some(RequestedDialogType::from_telegram(
-                        peer_type,
-                        t.button_id,
-                        t.max_quantity,
-                    ));
-                }
-            }
-            telegram_api::ButtonType::inputButtonTypeRequestPeer(_) => {
-                log_error!("Unsupported keyboard button");
-            }
-        }
-        result.style = KeyboardButtonStyle::from_telegram(keyboard_button.style.as_ref());
-        result.text = keyboard_button.text;
-        result
-    }
-
-    /// `KeyboardButton::is_empty` (KeyboardButton.h:45-47).
-    pub fn is_empty(&self) -> bool {
-        self.text.is_empty()
-            && (self.r#type == KeyboardButtonType::Text
-                || !self.style.icon_custom_emoji_id.is_valid())
-    }
-
-    /// `KeyboardButton::store` (KeyboardButton.hpp:17-40).
-    pub fn store(&self, out: &mut Vec<u8>) {
-        let has_url = !self.url.is_empty();
-        let has_requested_dialog_type = self.requested_dialog_type.is_some();
-        let has_style = !self.style.is_default();
-        store_flags(out, [has_url, has_requested_dialog_type, has_style]);
-        store_i32(out, self.r#type as i32);
-        store_string(out, &self.text);
-        if has_url {
-            store_string(out, &self.url);
-        }
-        if has_requested_dialog_type {
-            self.requested_dialog_type.as_ref().unwrap().store(out);
-        }
-        if has_style {
-            self.style.store(out);
-        }
-    }
-
-    /// `KeyboardButton::parse` (KeyboardButton.hpp:42-80) — the
-    /// pre-`AddKeyboardButtonFlags` (35) legacy layout stores type/text/url
-    /// unconditionally.
-    pub fn parse_from(parser: &mut Parser) -> Result<KeyboardButton, &'static str> {
-        let mut result = KeyboardButton::default();
-        let has_url;
-        let has_requested_dialog_type;
-        let has_style;
-        if parser.version() >= crate::store_parse::version::ADD_KEYBOARD_BUTTON_FLAGS {
-            let [has_url_, has_requested_dialog_type_, has_style_] = parser.parse_flags::<3>()?;
-            has_url = has_url_;
-            has_requested_dialog_type = has_requested_dialog_type_;
-            has_style = has_style_;
-        } else {
-            has_url = false;
-            has_requested_dialog_type = false;
-            has_style = false;
-        }
-        result.r#type = match parser.i32_()? {
-            0 => KeyboardButtonType::Text,
-            1 => KeyboardButtonType::RequestPhoneNumber,
-            2 => KeyboardButtonType::RequestLocation,
-            3 => KeyboardButtonType::RequestPoll,
-            4 => KeyboardButtonType::RequestPollQuiz,
-            5 => KeyboardButtonType::RequestPollRegular,
-            6 => KeyboardButtonType::WebView,
-            7 => KeyboardButtonType::RequestDialog,
-            _ => return Err("Wrong keyboard button type"),
-        };
-        result.text = parser.string()?;
-        if has_url {
-            result.url = parser.string()?;
-        }
-        if has_requested_dialog_type {
-            result.requested_dialog_type = Some(RequestedDialogType::parse_from(parser)?);
-        }
-        if has_style {
-            result.style = KeyboardButtonStyle::parse_from(parser)?;
-        }
-        Ok(result)
-    }
-
-    /// `KeyboardButton::get_keyboard_button_object`
-    /// (KeyboardButton.cpp:216-249).
-    pub fn get_keyboard_button_object(&self) -> td_api::KeyboardButton {
-        let type_object = match self.r#type {
-            KeyboardButtonType::Text => {
-                td_api::KeyboardButtonType::keyboardButtonTypeText(td_api::keyboardButtonTypeText)
-            }
-            KeyboardButtonType::RequestPhoneNumber => {
-                td_api::KeyboardButtonType::keyboardButtonTypeRequestPhoneNumber(
-                    td_api::keyboardButtonTypeRequestPhoneNumber,
-                )
-            }
-            KeyboardButtonType::RequestLocation => {
-                td_api::KeyboardButtonType::keyboardButtonTypeRequestLocation(
-                    td_api::keyboardButtonTypeRequestLocation,
-                )
-            }
-            KeyboardButtonType::RequestPoll => {
-                td_api::KeyboardButtonType::keyboardButtonTypeRequestPoll(
-                    td_api::keyboardButtonTypeRequestPoll {
-                        force_regular: false,
-                        force_quiz: false,
-                    },
-                )
-            }
-            KeyboardButtonType::RequestPollQuiz => {
-                td_api::KeyboardButtonType::keyboardButtonTypeRequestPoll(
-                    td_api::keyboardButtonTypeRequestPoll {
-                        force_regular: false,
-                        force_quiz: true,
-                    },
-                )
-            }
-            KeyboardButtonType::RequestPollRegular => {
-                td_api::KeyboardButtonType::keyboardButtonTypeRequestPoll(
-                    td_api::keyboardButtonTypeRequestPoll {
-                        force_regular: true,
-                        force_quiz: false,
-                    },
-                )
-            }
-            KeyboardButtonType::WebView => td_api::KeyboardButtonType::keyboardButtonTypeWebApp(
-                td_api::keyboardButtonTypeWebApp {
-                    url: format!("{}#kb", self.url),
-                },
-            ),
-            KeyboardButtonType::RequestDialog => self
-                .requested_dialog_type
-                .as_ref()
-                .expect("RequestDialog button without a type")
-                .get_keyboard_button_type_object(),
-        };
-        td_api::KeyboardButton {
-            text: self.text.clone(),
-            icon_custom_emoji_id: self.style.get_icon_custom_emoji_id().get(),
-            style: self.style.get_button_style_object(),
-            r#type: Some(type_object),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// M.10.21 — the td_api reply-markup plane (the `sendMessage` flip):
-// `KeyboardButtonStyle(td_api::ButtonStyle &&, int64)`
-// (KeyboardButtonStyle.cpp:19-38), `KeyboardButton::get_keyboard_button`
-// (KeyboardButton.cpp:82-152), the `RequestedDialogType(td_api ...)` ctors
-// (RequestedDialogType.cpp:19-66), `get_inline_keyboard_button`
-// (InlineKeyboardButton.cpp:227-387) and `get_reply_markup(td_api ...)`
-// (ReplyMarkup.cpp:201-321).
-// ---------------------------------------------------------------------------
-
-impl KeyboardButtonStyle {
-    /// `KeyboardButtonStyle::KeyboardButtonStyle(td_api::ButtonStyle &&,
-    /// int64)` (KeyboardButtonStyle.cpp:19-38).
-    pub fn from_td_api(
-        style: Option<td_api::ButtonStyle>,
-        icon_custom_emoji_id: i64,
-    ) -> KeyboardButtonStyle {
-        let mut result = KeyboardButtonStyle {
-            icon_custom_emoji_id: crate::emoji_status::CustomEmojiId::new(icon_custom_emoji_id),
-            ..KeyboardButtonStyle::default()
-        };
-        match style {
-            None => {}
-            Some(td_api::ButtonStyle::buttonStylePrimary(_)) => {
-                result.r#type = KeyboardButtonStyleType::Primary;
-            }
-            Some(td_api::ButtonStyle::buttonStyleDanger(_)) => {
-                result.r#type = KeyboardButtonStyleType::Danger;
-            }
-            Some(td_api::ButtonStyle::buttonStyleSuccess(_)) => {
-                result.r#type = KeyboardButtonStyleType::Success;
-            }
-            // `buttonStyleDefault` and `buttonStyleLink` (never allowed)
-            // keep the Default type.
-            Some(td_api::ButtonStyle::buttonStyleDefault(_))
-            | Some(td_api::ButtonStyle::buttonStyleLink(_)) => {}
-        }
-        result
-    }
-}
-
-impl KeyboardButton {
-    /// `KeyboardButton::get_keyboard_button(td_api::keyboardButton &&, bool)`
-    /// (KeyboardButton.cpp:82-152).
-    pub fn get_keyboard_button(
-        button: td_api::KeyboardButton,
-        request_buttons_allowed: bool,
-    ) -> Result<KeyboardButton, Status> {
-        if crate::misc::clean_input_string(&button.text).is_none() {
-            return Err(Status::error(
-                400,
-                "Keyboard button text must be encoded in UTF-8",
-            ));
-        }
-        if button.text.is_empty() {
-            return Err(Status::error(400, "Keyboard button text must be non-empty"));
-        }
-
-        let mut current_button = KeyboardButton {
-            text: button.text,
-            style: KeyboardButtonStyle::from_td_api(button.style, button.icon_custom_emoji_id),
-            ..KeyboardButton::default()
-        };
-
-        match button.r#type {
-            None | Some(td_api::KeyboardButtonType::keyboardButtonTypeText(_)) => {
-                current_button.r#type = KeyboardButtonType::Text;
-            }
-            Some(td_api::KeyboardButtonType::keyboardButtonTypeRequestPhoneNumber(_)) => {
-                if !request_buttons_allowed {
-                    return Err(Status::error(
-                        400,
-                        "Phone number can be requested in private chats only",
-                    ));
-                }
-                current_button.r#type = KeyboardButtonType::RequestPhoneNumber;
-            }
-            Some(td_api::KeyboardButtonType::keyboardButtonTypeRequestLocation(_)) => {
-                if !request_buttons_allowed {
-                    return Err(Status::error(
-                        400,
-                        "Location can be requested in private chats only",
-                    ));
-                }
-                current_button.r#type = KeyboardButtonType::RequestLocation;
-            }
-            Some(td_api::KeyboardButtonType::keyboardButtonTypeRequestPoll(request_poll)) => {
-                if !request_buttons_allowed {
-                    return Err(Status::error(
-                        400,
-                        "Poll can be requested in private chats only",
-                    ));
-                }
-                if request_poll.force_quiz && request_poll.force_regular {
-                    return Err(Status::error(
-                        400,
-                        "Can't force quiz mode and regular poll simultaneously",
-                    ));
-                }
-                current_button.r#type = if request_poll.force_quiz {
-                    KeyboardButtonType::RequestPollQuiz
-                } else if request_poll.force_regular {
-                    KeyboardButtonType::RequestPollRegular
-                } else {
-                    KeyboardButtonType::RequestPoll
-                };
-            }
-            Some(td_api::KeyboardButtonType::keyboardButtonTypeWebApp(button_type)) => {
-                if !request_buttons_allowed {
-                    return Err(Status::error(
-                        400,
-                        "Web App buttons can be used in private chats only",
-                    ));
-                }
-                let user_id = crate::link_manager::get_link_user_id(&button_type.url);
-                if user_id.is_valid() {
-                    return Err(Status::error(
-                        400,
-                        "Link to a user can't be used in Web App URL buttons",
-                    ));
-                }
-                // `check_link(url, true, !G()->is_test_dc())` — the test-dc
-                // read is the config seam; the production dc answers https
-                let url = crate::link_manager::check_link(&button_type.url, true, true).map_err(
-                    |status| {
-                        Status::error(
-                            400,
-                            &format!("Keyboard button Web App {}", status.message()),
-                        )
-                    },
-                )?;
-                current_button.r#type = KeyboardButtonType::WebView;
-                current_button.url = url;
-            }
-            Some(td_api::KeyboardButtonType::keyboardButtonTypeRequestUsers(button_type)) => {
-                if !request_buttons_allowed {
-                    return Err(Status::error(
-                        400,
-                        "Users can be requested in private chats only",
-                    ));
-                }
-                current_button.r#type = KeyboardButtonType::RequestDialog;
-                current_button.requested_dialog_type =
-                    Some(RequestedDialogType::from_td_api_request_users(button_type));
-            }
-            Some(td_api::KeyboardButtonType::keyboardButtonTypeRequestChat(button_type)) => {
-                if !request_buttons_allowed {
-                    return Err(Status::error(
-                        400,
-                        "Chats can be requested in private chats only",
-                    ));
-                }
-                current_button.r#type = KeyboardButtonType::RequestDialog;
-                current_button.requested_dialog_type =
-                    Some(RequestedDialogType::from_td_api_request_chat(button_type));
-            }
-            Some(td_api::KeyboardButtonType::keyboardButtonTypeRequestManagedBot(button_type)) => {
-                if !request_buttons_allowed {
-                    return Err(Status::error(
-                        400,
-                        "Managed bots can be requested in private chats only",
-                    ));
-                }
-                current_button.r#type = KeyboardButtonType::RequestDialog;
-                current_button.requested_dialog_type = Some(
-                    RequestedDialogType::from_td_api_request_managed_bot(button_type),
-                );
-            }
-        }
-        Ok(current_button)
-    }
-}
-
-impl RequestedDialogType {
-    /// `RequestedDialogType(td_api::keyboardButtonTypeRequestUsers &&)`
-    /// (RequestedDialogType.cpp:19-31).
-    pub fn from_td_api_request_users(
-        request_users: td_api::keyboardButtonTypeRequestUsers,
-    ) -> RequestedDialogType {
-        RequestedDialogType {
-            r#type: RequestedDialogTypeType::User,
-            button_id: request_users.id,
-            max_quantity: request_users.max_quantity.max(1),
-            restrict_is_bot: request_users.restrict_user_is_bot,
-            is_bot: request_users.user_is_bot,
-            restrict_is_premium: request_users.restrict_user_is_premium,
-            is_premium: request_users.user_is_premium,
-            request_name: request_users.request_name,
-            request_username: request_users.request_username,
-            request_photo: request_users.request_photo,
-            ..RequestedDialogType::default()
-        }
-    }
-
-    /// `RequestedDialogType(td_api::keyboardButtonTypeRequestChat &&)`
-    /// (RequestedDialogType.cpp:33-51).
-    pub fn from_td_api_request_chat(
-        request_dialog: td_api::keyboardButtonTypeRequestChat,
-    ) -> RequestedDialogType {
-        let channel_type = if request_dialog.chat_is_channel {
-            crate::chat_manager::ChannelType::Broadcast
-        } else {
-            crate::chat_manager::ChannelType::Megagroup
-        };
-        RequestedDialogType {
-            r#type: if request_dialog.chat_is_channel {
-                RequestedDialogTypeType::Channel
-            } else {
-                RequestedDialogTypeType::Group
-            },
-            button_id: request_dialog.id,
-            restrict_is_forum: request_dialog.restrict_chat_is_forum,
-            is_forum: request_dialog.chat_is_forum,
-            bot_is_participant: request_dialog.bot_is_member,
-            restrict_has_username: request_dialog.restrict_chat_has_username,
-            has_username: request_dialog.chat_has_username,
-            is_created: request_dialog.chat_is_created,
-            restrict_user_administrator_rights: request_dialog.user_administrator_rights.is_some(),
-            restrict_bot_administrator_rights: request_dialog.bot_administrator_rights.is_some(),
-            user_administrator_rights:
-                crate::chat_manager::AdministratorRights::from_chat_administrator_rights(
-                    request_dialog.user_administrator_rights.as_ref(),
-                    channel_type,
-                ),
-            bot_administrator_rights:
-                crate::chat_manager::AdministratorRights::from_chat_administrator_rights(
-                    request_dialog.bot_administrator_rights.as_ref(),
-                    channel_type,
-                ),
-            request_name: request_dialog.request_title,
-            request_username: request_dialog.request_username,
-            request_photo: request_dialog.request_photo,
-            ..RequestedDialogType::default()
-        }
-    }
-
-    /// `RequestedDialogType(td_api::keyboardButtonTypeRequestManagedBot &&)`
-    /// (RequestedDialogType.cpp:53-66).
-    pub fn from_td_api_request_managed_bot(
-        request: td_api::keyboardButtonTypeRequestManagedBot,
-    ) -> RequestedDialogType {
-        RequestedDialogType {
-            r#type: RequestedDialogTypeType::CreateBot,
-            button_id: request.id,
-            suggested_name: crate::misc::clean_input_string(&request.suggested_name)
-                .unwrap_or_default(),
-            suggested_username: crate::misc::clean_input_string(&request.suggested_username)
-                .unwrap_or_default(),
-            ..RequestedDialogType::default()
-        }
-    }
-}
-
-impl TargetDialogTypes {
-    /// `TargetDialogTypes::get_target_dialog_types(const
-    /// td_api::targetChatTypes &)` (TargetDialogTypes.cpp:37-57).
-    pub fn get_target_dialog_types(
-        types: Option<&td_api::TargetChatTypes>,
-    ) -> Result<TargetDialogTypes, Status> {
-        let mut mask = 0;
-        if let Some(types) = types {
-            if types.allow_user_chats {
-                mask |= Self::USERS_MASK;
-            }
-            if types.allow_bot_chats {
-                mask |= Self::BOTS_MASK;
-            }
-            if types.allow_group_chats {
-                mask |= Self::CHATS_MASK;
-            }
-            if types.allow_channel_chats {
-                mask |= Self::BROADCASTS_MASK;
-            }
-        }
-        if mask == 0 {
-            return Err(Status::error(400, "At least one chat type must be allowed"));
-        }
-        Ok(TargetDialogTypes(mask))
-    }
-}
-
-/// `get_inline_keyboard_button(td_api::inlineKeyboardButton &&, bool)`
-/// (InlineKeyboardButton.cpp:227-387).
-pub fn get_inline_keyboard_button(
-    button: td_api::InlineKeyboardButton,
-    switch_inline_buttons_allowed: bool,
-) -> Result<InlineKeyboardButton, Status> {
-    if crate::misc::clean_input_string(&button.text).is_none() {
-        return Err(Status::error(
-            400,
-            "Inline keyboard button text must be encoded in UTF-8",
-        ));
-    }
-    if button.text.is_empty() {
-        return Err(Status::error(
-            400,
-            "Inline keyboard button text must be non-empty",
-        ));
-    }
-    let Some(button_type) = button.r#type else {
-        return Err(Status::error(
-            400,
-            "Inline keyboard button type must be non-empty",
-        ));
-    };
-
-    let mut current_button = InlineKeyboardButton {
-        text: button.text,
-        style: KeyboardButtonStyle::from_td_api(button.style, button.icon_custom_emoji_id),
-        ..InlineKeyboardButton::default()
-    };
-
-    match button_type {
-        td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeUrl(button_type) => {
-            let user_id = crate::link_manager::get_link_user_id(&button_type.url);
-            if user_id.is_valid() {
-                current_button.r#type = InlineKeyboardButtonType::User;
-                current_button.user_id = user_id;
-                return Ok(current_button);
-            }
-            let url = crate::link_manager::check_link(&button_type.url, false, false).map_err(
-                |status| {
-                    Status::error(400, &format!("Inline keyboard button {}", status.message()))
-                },
-            )?;
-            current_button.r#type = InlineKeyboardButtonType::Url;
-            current_button.data = url;
-        }
-        td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeCallback(button_type) => {
-            current_button.r#type = InlineKeyboardButtonType::Callback;
-            // the C++ keeps the raw callback bytes in a std::string
-            current_button.data = String::from_utf8_lossy(&button_type.data).into_owned();
-        }
-        td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeCallbackGame(_) => {
-            current_button.r#type = InlineKeyboardButtonType::CallbackGame;
-        }
-        td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeCallbackWithPassword(_) => {
-            return Err(Status::error(
-                400,
-                "Can't use CallbackWithPassword inline button",
-            ));
-        }
-        td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeSwitchInline(button_type) => {
-            let Some(target_chat) = button_type.target_chat else {
-                return Err(Status::error(400, "Target chat must be non-empty"));
-            };
-            match *target_chat {
-                td_api::TargetChat::targetChatChosen(chosen) => {
-                    let types = TargetDialogTypes::get_target_dialog_types(chosen.types.as_ref())?;
-                    current_button.id = types.get_mask();
-                    current_button.r#type = InlineKeyboardButtonType::SwitchInline;
-                }
-                td_api::TargetChat::targetChatCurrent(_) => {
-                    current_button.r#type = InlineKeyboardButtonType::SwitchInlineCurrentDialog;
-                }
-                td_api::TargetChat::targetChatInternalLink(_) => {
-                    return Err(Status::error(400, "Unsupported target chat specified"));
-                }
-            }
-            if !switch_inline_buttons_allowed {
-                let button_name = if current_button.r#type == InlineKeyboardButtonType::SwitchInline
-                {
-                    "switch_inline_query"
-                } else {
-                    "switch_inline_query_current_chat"
-                };
-                return Err(Status::error(
-                    400,
-                    &format!(
-                        "Can't use {} button in a channel chat, because users will not be able to use the button without knowing bot's username",
-                        button_name
-                    ),
-                ));
-            }
-            current_button.data =
-                crate::misc::clean_input_string(&button_type.query).ok_or_else(|| {
-                    Status::error(
-                        400,
-                        "Inline keyboard button switch inline query must be encoded in UTF-8",
-                    )
-                })?;
-        }
-        td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeBuy(_) => {
-            current_button.r#type = InlineKeyboardButtonType::Buy;
-        }
-        td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeLoginUrl(button_type) => {
-            let user_id = crate::link_manager::get_link_user_id(&button_type.url);
-            if user_id.is_valid() {
-                return Err(Status::error(
-                    400,
-                    "Link to a user can't be used in login URL buttons",
-                ));
-            }
-            // `check_link(url, true, !G()->is_test_dc())` — the test-dc read
-            // is the config seam; the production dc answers https
-            let url = crate::link_manager::check_link(&button_type.url, true, true).map_err(
-                |status| {
-                    Status::error(
-                        400,
-                        &format!("Inline keyboard button login {}", status.message()),
-                    )
-                },
-            )?;
-            current_button.r#type = InlineKeyboardButtonType::UrlAuth;
-            current_button.data = url;
-            current_button.forward_text =
-                crate::misc::clean_input_string(&button_type.forward_text).ok_or_else(|| {
-                    Status::error(
-                        400,
-                        "Inline keyboard button forward text must be encoded in UTF-8",
-                    )
-                })?;
-            current_button.id = button_type.id;
-            if current_button.id == i64::MIN {
-                return Err(Status::error(400, "Invalid bot_user_id specified"));
-            }
-            let bot_user_id = UserId::new(if current_button.id >= 0 {
-                current_button.id
-            } else {
-                -current_button.id - 1
-            });
-            if !bot_user_id.is_valid() && bot_user_id != UserId::default() {
-                return Err(Status::error(400, "Invalid bot_user_id specified"));
-            }
-        }
-        td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeUser(button_type) => {
-            current_button.r#type = InlineKeyboardButtonType::User;
-            current_button.user_id = UserId::new(button_type.user_id);
-            if !current_button.user_id.is_valid() {
-                return Err(Status::error(400, "Invalid user_id specified"));
-            }
-        }
-        td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeWebApp(button_type) => {
-            let user_id = crate::link_manager::get_link_user_id(&button_type.url);
-            if user_id.is_valid() {
-                return Err(Status::error(
-                    400,
-                    "Link to a user can't be used in Web App URL buttons",
-                ));
-            }
-            let url = crate::link_manager::check_link(&button_type.url, true, true).map_err(
-                |status| {
-                    Status::error(
-                        400,
-                        &format!("Inline keyboard button Web App {}", status.message()),
-                    )
-                },
-            )?;
-            current_button.r#type = InlineKeyboardButtonType::WebView;
-            current_button.data = url;
-        }
-        td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeCopyText(button_type) => {
-            current_button.r#type = InlineKeyboardButtonType::Copy;
-            current_button.data =
-                crate::misc::clean_input_string(&button_type.text).ok_or_else(|| {
-                    Status::error(
-                        400,
-                        "Inline keyboard button copied text must be encoded in UTF-8",
-                    )
-                })?;
-        }
-        td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeDisabled(_) => {
-            current_button.r#type = InlineKeyboardButtonType::Disabled;
-        }
-    }
-
-    Ok(current_button)
-}
-
-impl ReplyMarkup {
-    /// `get_reply_markup(td_api::ReplyMarkup &&, bool, bool, bool, bool,
-    /// bool)` (ReplyMarkup.cpp:201-321) — the input-side converter behind
-    /// `get_dialog_reply_markup`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_td_api(
-        reply_markup: Option<td_api::ReplyMarkup>,
-        is_bot: bool,
-        only_inline_keyboard: bool,
-        request_buttons_allowed: bool,
-        switch_inline_buttons_allowed: bool,
-        allow_personal: bool,
-    ) -> Result<Option<ReplyMarkup>, Status> {
-        let Some(reply_markup) = reply_markup else {
-            return Ok(None);
-        };
-        if !is_bot {
-            return Ok(None);
-        }
-
-        if only_inline_keyboard
-            && !matches!(
-                reply_markup,
-                td_api::ReplyMarkup::replyMarkupInlineKeyboard(_)
-            )
-        {
-            return Err(Status::error(400, "Inline keyboard expected"));
-        }
-
-        let mut markup = ReplyMarkup::default();
-        match reply_markup {
-            td_api::ReplyMarkup::replyMarkupShowKeyboard(show_keyboard_markup) => {
-                markup.r#type = ReplyMarkupType::ShowKeyboard;
-                markup.is_persistent = show_keyboard_markup.is_persistent;
-                markup.need_resize_keyboard = show_keyboard_markup.resize_keyboard;
-                markup.is_one_time_keyboard = show_keyboard_markup.one_time;
-                markup.is_personal = show_keyboard_markup.is_personal && allow_personal;
-                markup.force_reply = show_keyboard_markup.force_reply;
-                markup.placeholder = show_keyboard_markup.input_field_placeholder;
-
-                let mut total_button_count = 0;
-                for row in show_keyboard_markup.rows {
-                    let mut row_buttons = Vec::with_capacity(row.len());
-                    let mut row_button_count = 0;
-                    for button in row {
-                        if button.text.is_empty() && button.icon_custom_emoji_id == 0 {
-                            continue;
-                        }
-                        let current_button =
-                            KeyboardButton::get_keyboard_button(button, request_buttons_allowed)?;
-                        row_buttons.push(current_button);
-                        row_button_count += 1;
-                        total_button_count += 1;
-                        if row_button_count >= 12 || total_button_count >= 300 {
-                            break;
-                        }
-                    }
-                    if !row_buttons.is_empty() {
-                        markup.keyboard.push(row_buttons);
-                    }
-                    if total_button_count >= 300 {
-                        break;
-                    }
-                }
-                if markup.keyboard.is_empty() {
-                    return Ok(None);
-                }
-            }
-            td_api::ReplyMarkup::replyMarkupInlineKeyboard(inline_keyboard_markup) => {
-                markup.r#type = ReplyMarkupType::InlineKeyboard;
-
-                let mut total_button_count = 0;
-                for row in inline_keyboard_markup.rows {
-                    let mut row_buttons = Vec::with_capacity(row.len());
-                    let mut row_button_count = 0;
-                    for button in row {
-                        if button.text.is_empty() && button.icon_custom_emoji_id == 0 {
-                            continue;
-                        }
-                        let current_button =
-                            get_inline_keyboard_button(button, switch_inline_buttons_allowed)?;
-                        row_buttons.push(current_button);
-                        row_button_count += 1;
-                        total_button_count += 1;
-                        if row_button_count >= 12 || total_button_count >= 300 {
-                            break;
-                        }
-                    }
-                    if !row_buttons.is_empty() {
-                        markup.inline_keyboard.push(row_buttons);
-                    }
-                    if total_button_count >= 300 {
-                        break;
-                    }
-                }
-                if markup.inline_keyboard.is_empty() {
-                    return Ok(None);
-                }
-                markup.force_reply = inline_keyboard_markup.force_reply;
-            }
-            td_api::ReplyMarkup::replyMarkupRemoveKeyboard(remove_keyboard_markup) => {
-                markup.r#type = ReplyMarkupType::RemoveKeyboard;
-                markup.is_personal = remove_keyboard_markup.is_personal && allow_personal;
-            }
-            td_api::ReplyMarkup::replyMarkupForceReply(force_reply_markup) => {
-                markup.r#type = ReplyMarkupType::ForceReply;
-                markup.is_personal = force_reply_markup.is_personal && allow_personal;
-                markup.placeholder = force_reply_markup.input_field_placeholder;
-            }
-        }
-        Ok(Some(markup))
-    }
-}
-
-/// `MessagesManager::get_dialog_reply_markup(DialogId,
-/// td_api::ReplyMarkup &&)` (MessagesManager.cpp:24319-24328).
-pub fn get_dialog_reply_markup(
-    ctx: &dyn SendMessageContext,
-    dialog_id: DialogId,
-    reply_markup: Option<td_api::ReplyMarkup>,
-) -> Result<Option<ReplyMarkup>, (i32, String)> {
-    let dialog_type = dialog_id.get_type();
-    let is_anonymous = ctx.is_anonymous_administrator(dialog_id).is_some();
-    let only_inline_keyboard = is_anonymous && !ctx.is_admined_monoforum_channel(dialog_id);
-    let request_buttons_allowed = dialog_type == DialogType::User;
-    let switch_inline_buttons_allowed = !is_anonymous;
-    let allow_personal = dialog_type != DialogType::User;
-    ReplyMarkup::from_td_api(
-        reply_markup,
-        ctx.is_bot(),
-        only_inline_keyboard,
-        request_buttons_allowed,
-        switch_inline_buttons_allowed,
-        allow_personal,
-    )
-    .map_err(|status| (status.code(), status.message().to_owned()))
-}
-
-/// `InlineKeyboardButton::Type` (InlineKeyboardButton.h:23-38) — append only.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(i32)]
-pub enum InlineKeyboardButtonType {
-    Url = 0,
-    Callback = 1,
-    CallbackGame = 2,
-    SwitchInline = 3,
-    SwitchInlineCurrentDialog = 4,
-    Buy = 5,
-    UrlAuth = 6,
-    CallbackWithPassword = 7,
-    User = 8,
-    WebView = 9,
-    Copy = 10,
-    #[default]
-    Disabled = 11,
-}
-
-/// `td::InlineKeyboardButton` (InlineKeyboardButton.h:21-58).
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct InlineKeyboardButton {
-    pub r#type: InlineKeyboardButtonType,
-    /// UrlAuth: button id; SwitchInline: target dialog types mask
-    pub id: i64,
-    /// User only
-    pub user_id: UserId,
-    pub style: KeyboardButtonStyle,
-    pub text: String,
-    /// UrlAuth only
-    pub forward_text: String,
-    pub data: String,
-}
-
-impl InlineKeyboardButton {
-    /// `get_inline_keyboard_button(telegram_api::keyboardInlineButton &&)`
-    /// (InlineKeyboardButton.cpp:126-204). Invalid links/users leave the
-    /// button Disabled like the C++ `break`-out-of-switch.
-    pub fn from_telegram(
-        keyboard_button: telegram_api::KeyboardInlineButton,
-    ) -> InlineKeyboardButton {
-        let mut button = InlineKeyboardButton::default();
-        let Some(button_type) = keyboard_button.r#type else {
-            log_error!("Unsupported inline keyboard button");
-            button.style = KeyboardButtonStyle::from_telegram(keyboard_button.style.as_ref());
-            button.text = keyboard_button.text;
-            return button;
-        };
-        match button_type {
-            telegram_api::InlineButtonType::inlineButtonTypeUrl(t) => {
-                match crate::link_manager::check_link(&t.url, false, false) {
-                    Ok(url) => {
-                        button.r#type = InlineKeyboardButtonType::Url;
-                        button.data = url;
-                    }
-                    Err(error) => log_error!("Inline keyboard {}", error.message()),
-                }
-            }
-            telegram_api::InlineButtonType::inlineButtonTypeCallback(t) => {
-                button.r#type = if t.requires_password {
-                    InlineKeyboardButtonType::CallbackWithPassword
-                } else {
-                    InlineKeyboardButtonType::Callback
-                };
-                button.data = String::from_utf8_lossy(&t.data).into_owned();
-            }
-            telegram_api::InlineButtonType::inlineButtonTypeGame(_) => {
-                button.r#type = InlineKeyboardButtonType::CallbackGame;
-            }
-            telegram_api::InlineButtonType::inlineButtonTypeSwitchInline(t) => {
-                if t.same_peer {
-                    button.r#type = InlineKeyboardButtonType::SwitchInlineCurrentDialog;
-                } else {
-                    button.r#type = InlineKeyboardButtonType::SwitchInline;
-                    button.id = get_inline_query_peer_types_mask(&t.peer_types);
-                }
-                button.data = t.query;
-            }
-            telegram_api::InlineButtonType::inlineButtonTypeBuy(_) => {
-                button.r#type = InlineKeyboardButtonType::Buy;
-            }
-            telegram_api::InlineButtonType::inlineButtonTypeUrlAuth(t) => {
-                match crate::link_manager::check_link(&t.url, false, false) {
-                    Ok(url) => {
-                        button.r#type = InlineKeyboardButtonType::UrlAuth;
-                        button.id = t.button_id as i64;
-                        button.forward_text = t.fwd_text;
-                        button.data = url;
-                    }
-                    Err(error) => log_error!("Inline keyboard Login {}", error.message()),
-                }
-            }
-            telegram_api::InlineButtonType::inlineButtonTypeUserProfile(t) => {
-                let user_id = UserId::new(t.user_id);
-                if !user_id.is_valid() {
-                    log_error!("Receive {} in inline keyboard", user_id.get());
-                } else {
-                    button.r#type = InlineKeyboardButtonType::User;
-                    button.user_id = user_id;
-                }
-            }
-            telegram_api::InlineButtonType::inlineButtonTypeWebView(t) => {
-                match crate::link_manager::check_link(&t.url, false, false) {
-                    Ok(url) => {
-                        button.r#type = InlineKeyboardButtonType::WebView;
-                        button.data = url;
-                    }
-                    Err(error) => log_error!("Inline keyboard Web App {}", error.message()),
-                }
-            }
-            telegram_api::InlineButtonType::inlineButtonTypeCopy(t) => {
-                button.r#type = InlineKeyboardButtonType::Copy;
-                button.data = t.copy_text;
-            }
-            telegram_api::InlineButtonType::inlineButtonTypeDisabled(_) => {
-                button.r#type = InlineKeyboardButtonType::Disabled;
-            }
-            telegram_api::InlineButtonType::inputInlineButtonTypeUrlAuth(_)
-            | telegram_api::InlineButtonType::inputInlineButtonTypeUserProfile(_) => {
-                log_error!("Unsupported inline keyboard button");
-            }
-        }
-        button.style = KeyboardButtonStyle::from_telegram(keyboard_button.style.as_ref());
-        button.text = keyboard_button.text;
-        button
-    }
-
-    /// `InlineKeyboardButton::store` (InlineKeyboardButton.hpp:17-51).
-    pub fn store(&self, out: &mut Vec<u8>) {
-        let has_id = self.id != 0;
-        let has_user_id = self.user_id.is_valid();
-        let has_forward_text = !self.forward_text.is_empty();
-        let has_data = !self.data.is_empty();
-        let has_style = !self.style.is_default();
-        store_flags(
-            out,
-            [has_id, has_user_id, has_forward_text, has_data, has_style],
-        );
-        store_i32(out, self.r#type as i32);
-        if has_id {
-            store_i64(out, self.id);
-        }
-        if has_user_id {
-            self.user_id.store(out);
-        }
-        store_string(out, &self.text);
-        if has_forward_text {
-            store_string(out, &self.forward_text);
-        }
-        if has_data {
-            store_string(out, &self.data);
-        }
-        if has_style {
-            self.style.store(out);
-        }
-    }
-
-    /// `InlineKeyboardButton::parse` (InlineKeyboardButton.hpp:53-98) — with
-    /// the pre-`AddKeyboardButtonFlags` legacy layout.
-    pub fn parse_from(parser: &mut Parser) -> Result<InlineKeyboardButton, &'static str> {
-        let mut button = InlineKeyboardButton::default();
-        if parser.version() >= crate::store_parse::version::ADD_KEYBOARD_BUTTON_FLAGS {
-            let [has_id, has_user_id, has_forward_text, has_data, has_style] =
-                parser.parse_flags::<5>()?;
-            button.r#type = parse_inline_keyboard_button_type(parser)?;
-            if has_id {
-                button.id = parser.i64_()?;
-            }
-            if has_user_id {
-                button.user_id = UserId::parse_from(parser)?;
-            }
-            button.text = parser.string()?;
-            if has_forward_text {
-                button.forward_text = parser.string()?;
-            }
-            if has_data {
-                button.data = parser.string()?;
-            }
-            if has_style {
-                button.style = KeyboardButtonStyle::parse_from(parser)?;
-            }
-        } else {
-            button.r#type = parse_inline_keyboard_button_type(parser)?;
-            if button.r#type == InlineKeyboardButtonType::UrlAuth {
-                if parser.version() >= crate::store_parse::version::SUPPORT_64_BIT_IDS {
-                    button.id = parser.i64_()?;
-                } else {
-                    button.id = parser.i32_()? as i64;
-                }
-            }
-            button.text = parser.string()?;
-            button.data = parser.string()?;
-        }
-        Ok(button)
-    }
-}
-
-fn parse_inline_keyboard_button_type(
-    parser: &mut Parser,
-) -> Result<InlineKeyboardButtonType, &'static str> {
-    Ok(match parser.i32_()? {
-        0 => InlineKeyboardButtonType::Url,
-        1 => InlineKeyboardButtonType::Callback,
-        2 => InlineKeyboardButtonType::CallbackGame,
-        3 => InlineKeyboardButtonType::SwitchInline,
-        4 => InlineKeyboardButtonType::SwitchInlineCurrentDialog,
-        5 => InlineKeyboardButtonType::Buy,
-        6 => InlineKeyboardButtonType::UrlAuth,
-        7 => InlineKeyboardButtonType::CallbackWithPassword,
-        8 => InlineKeyboardButtonType::User,
-        9 => InlineKeyboardButtonType::WebView,
-        10 => InlineKeyboardButtonType::Copy,
-        11 => InlineKeyboardButtonType::Disabled,
-        _ => return Err("Wrong inline keyboard button type"),
-    })
-}
-
-/// `TargetDialogTypes(vector<InlineQueryPeerType> &&)` (TargetDialogTypes.cpp:14-35)
-/// — the USERS/BOTS/CHATS/BROADCASTS bit mask.
-pub fn get_inline_query_peer_types_mask(peer_types: &[telegram_api::InlineQueryPeerType]) -> i64 {
-    const USERS_MASK: i64 = 1;
-    const BOTS_MASK: i64 = 2;
-    const CHATS_MASK: i64 = 4;
-    const BROADCASTS_MASK: i64 = 8;
-    let mut mask = 0i64;
-    for peer_type in peer_types {
-        mask |= match peer_type {
-            telegram_api::InlineQueryPeerType::inlineQueryPeerTypePM(_) => USERS_MASK,
-            telegram_api::InlineQueryPeerType::inlineQueryPeerTypeBotPM(_) => BOTS_MASK,
-            telegram_api::InlineQueryPeerType::inlineQueryPeerTypeChat(_)
-            | telegram_api::InlineQueryPeerType::inlineQueryPeerTypeMegagroup(_) => CHATS_MASK,
-            telegram_api::InlineQueryPeerType::inlineQueryPeerTypeBroadcast(_) => BROADCASTS_MASK,
-            telegram_api::InlineQueryPeerType::inlineQueryPeerTypeSameBotPM(_) => {
-                log_error!("Receive inlineQueryPeerTypeSameBotPM");
-                0
-            }
-        };
-    }
-    mask
-}
-
-/// `ReplyMarkup::Type` (ReplyMarkup.h:27) — append only.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[repr(i32)]
-pub enum ReplyMarkupType {
-    InlineKeyboard = 0,
-    ShowKeyboard = 1,
-    RemoveKeyboard = 2,
-    #[default]
-    ForceReply = 3,
-}
-
-/// `td::ReplyMarkup` (ReplyMarkup.h:25-49) — the internal reply markup a
-/// `Message` holds. The M.10.1b stand-in typed this as the generated
-/// `telegram_api::ReplyMarkup`; M.10.2b re-points `Message::reply_markup`
-/// here and keeps the wire conversion in [`ReplyMarkup::from_telegram`].
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct ReplyMarkup {
-    pub r#type: ReplyMarkupType,
-    /// for ShowKeyboard, RemoveKeyboard, ForceReply
-    pub is_personal: bool,
-    /// for ShowKeyboard, InlineKeyboard
-    pub force_reply: bool,
-    /// for ShowKeyboard
-    pub is_persistent: bool,
-    /// for ShowKeyboard
-    pub need_resize_keyboard: bool,
-    /// for ShowKeyboard
-    pub is_one_time_keyboard: bool,
-    /// for ShowKeyboard
-    pub keyboard: Vec<Vec<KeyboardButton>>,
-    /// for ShowKeyboard, ForceReply
-    pub placeholder: String,
-    /// for InlineKeyboard
-    pub inline_keyboard: Vec<Vec<InlineKeyboardButton>>,
-}
-
-impl ReplyMarkup {
-    /// `get_reply_markup(telegram_api::ReplyMarkup &&, ...)` (ReplyMarkup.cpp:37-135).
-    pub fn from_telegram(
-        reply_markup: telegram_api::ReplyMarkup,
-        only_inline_keyboard: bool,
-        is_bot: bool,
-        message_contains_mention: bool,
-    ) -> Option<ReplyMarkup> {
-        let mut result = ReplyMarkup::default();
-        match reply_markup {
-            telegram_api::ReplyMarkup::replyInlineMarkup(inline_markup) => {
-                result.r#type = ReplyMarkupType::InlineKeyboard;
-                for row in &inline_markup.rows {
-                    let mut buttons = Vec::new();
-                    for button in &row.buttons {
-                        let button = InlineKeyboardButton::from_telegram(button.clone());
-                        if !button.text.is_empty() || button.style.icon_custom_emoji_id.is_valid() {
-                            buttons.push(button);
-                        }
-                    }
-                    if !buttons.is_empty() {
-                        result.inline_keyboard.push(buttons);
-                    }
-                }
-                if result.inline_keyboard.is_empty() {
-                    return None;
-                }
-                result.force_reply = inline_markup.force_reply;
-            }
-            telegram_api::ReplyMarkup::replyKeyboardMarkup(keyboard_markup) => {
-                if only_inline_keyboard {
-                    log_error!("Inline keyboard expected");
-                    return None;
-                }
-                result.r#type = ReplyMarkupType::ShowKeyboard;
-                result.is_persistent = keyboard_markup.persistent;
-                result.need_resize_keyboard = keyboard_markup.resize;
-                result.is_one_time_keyboard = keyboard_markup.single_use;
-                result.is_personal = keyboard_markup.selective;
-                result.force_reply = keyboard_markup.force_reply;
-                result.placeholder = keyboard_markup.placeholder;
-                for row in &keyboard_markup.rows {
-                    let mut buttons = Vec::new();
-                    for button in &row.buttons {
-                        let button = KeyboardButton::from_telegram(button.clone());
-                        if !button.is_empty() {
-                            buttons.push(button);
-                        }
-                    }
-                    if !buttons.is_empty() {
-                        result.keyboard.push(buttons);
-                    }
-                }
-                if result.keyboard.is_empty() {
-                    return None;
-                }
-            }
-            telegram_api::ReplyMarkup::replyKeyboardHide(hide_keyboard_markup) => {
-                if only_inline_keyboard {
-                    log_error!("Inline keyboard expected");
-                    return None;
-                }
-                result.r#type = ReplyMarkupType::RemoveKeyboard;
-                result.is_personal = hide_keyboard_markup.selective;
-            }
-            telegram_api::ReplyMarkup::replyKeyboardForceReply(force_reply_markup) => {
-                if only_inline_keyboard {
-                    log_error!("Inline keyboard expected");
-                    return None;
-                }
-                result.r#type = ReplyMarkupType::ForceReply;
-                result.is_personal = force_reply_markup.selective;
-                result.placeholder = force_reply_markup.placeholder;
-            }
-        }
-
-        if !is_bot && result.r#type != ReplyMarkupType::InlineKeyboard {
-            // incoming keyboard
-            if result.is_personal {
-                if !message_contains_mention {
-                    result.is_personal = false;
-                    result.force_reply = false;
-                }
-            } else {
-                result.is_personal = true;
-            }
-        }
-
-        Some(result)
-    }
-
-    /// `store(const ReplyMarkup &, ...)` (ReplyMarkup.hpp:17-42).
-    pub fn store(&self, out: &mut Vec<u8>) {
-        let has_keyboard = !self.keyboard.is_empty();
-        let has_inline_keyboard = !self.inline_keyboard.is_empty();
-        let has_placeholder = !self.placeholder.is_empty();
-        store_flags(
-            out,
-            [
-                self.is_personal,
-                self.need_resize_keyboard,
-                self.is_one_time_keyboard,
-                has_keyboard,
-                has_inline_keyboard,
-                has_placeholder,
-                self.is_persistent,
-                self.force_reply,
-            ],
-        );
-        store_i32(out, self.r#type as i32);
-        if has_keyboard {
-            store_button_rows(out, &self.keyboard);
-        }
-        if has_inline_keyboard {
-            store_inline_button_rows(out, &self.inline_keyboard);
-        }
-        if has_placeholder {
-            store_string(out, &self.placeholder);
-        }
-    }
-
-    /// `parse(ReplyMarkup &, ...)` (ReplyMarkup.hpp:44-69).
-    pub fn parse_from(parser: &mut Parser) -> Result<ReplyMarkup, &'static str> {
-        let [
-            is_personal,
-            need_resize_keyboard,
-            is_one_time_keyboard,
-            has_keyboard,
-            has_inline_keyboard,
-            has_placeholder,
-            is_persistent,
-            force_reply,
-        ] = parser.parse_flags::<8>()?;
-        let r#type = match parser.i32_()? {
-            0 => ReplyMarkupType::InlineKeyboard,
-            1 => ReplyMarkupType::ShowKeyboard,
-            2 => ReplyMarkupType::RemoveKeyboard,
-            3 => ReplyMarkupType::ForceReply,
-            _ => return Err("Wrong reply markup type"),
-        };
-        let keyboard = if has_keyboard {
-            parse_button_rows(parser)?
-        } else {
-            Vec::new()
-        };
-        let inline_keyboard = if has_inline_keyboard {
-            parse_inline_button_rows(parser)?
-        } else {
-            Vec::new()
-        };
-        let placeholder = if has_placeholder {
-            parser.string()?
-        } else {
-            String::new()
-        };
-        Ok(ReplyMarkup {
-            r#type,
-            is_personal,
-            force_reply,
-            is_persistent,
-            need_resize_keyboard,
-            is_one_time_keyboard,
-            keyboard,
-            placeholder,
-            inline_keyboard,
-        })
-    }
-
-    /// `ReplyMarkup::get_reply_markup_object`
-    /// (ReplyMarkup.cpp:425-470). The `UserManager *` of the C++ is the
-    /// context; the nullptr-user_manager call sites of the C++ (none in
-    /// the object plane) pass a context answering the id-object defaults.
-    pub fn get_reply_markup_object(
-        &self,
-        ctx: &dyn MessageObjectContext,
-    ) -> Option<td_api::ReplyMarkup> {
-        match self.r#type {
-            ReplyMarkupType::InlineKeyboard => {
-                let rows = self
-                    .inline_keyboard
-                    .iter()
-                    .map(|row| {
-                        row.iter()
-                            .map(|button| get_inline_keyboard_button_object(ctx, button))
-                            .collect()
-                    })
-                    .collect();
-                Some(td_api::ReplyMarkup::replyMarkupInlineKeyboard(
-                    td_api::replyMarkupInlineKeyboard {
-                        rows,
-                        force_reply: self.force_reply,
-                    },
-                ))
-            }
-            ReplyMarkupType::ShowKeyboard => {
-                let rows = self
-                    .keyboard
-                    .iter()
-                    .map(|row| {
-                        row.iter()
-                            .map(|button| button.get_keyboard_button_object())
-                            .collect()
-                    })
-                    .collect();
-                Some(td_api::ReplyMarkup::replyMarkupShowKeyboard(
-                    td_api::replyMarkupShowKeyboard {
-                        rows,
-                        is_persistent: self.is_persistent,
-                        resize_keyboard: self.need_resize_keyboard,
-                        one_time: self.is_one_time_keyboard,
-                        is_personal: self.is_personal,
-                        force_reply: self.force_reply,
-                        input_field_placeholder: self.placeholder.clone(),
-                    },
-                ))
-            }
-            ReplyMarkupType::RemoveKeyboard => Some(
-                td_api::ReplyMarkup::replyMarkupRemoveKeyboard(td_api::replyMarkupRemoveKeyboard {
-                    is_personal: self.is_personal,
-                }),
-            ),
-            ReplyMarkupType::ForceReply => Some(td_api::ReplyMarkup::replyMarkupForceReply(
-                td_api::replyMarkupForceReply {
-                    is_personal: self.is_personal,
-                    input_field_placeholder: self.placeholder.clone(),
-                },
-            )),
-        }
-    }
-}
-
-fn store_button_rows(out: &mut Vec<u8>, rows: &[Vec<KeyboardButton>]) {
-    store_vec_header(out, rows.len());
-    for row in rows {
-        store_vec_header(out, row.len());
-        for button in row {
-            button.store(out);
-        }
-    }
-}
-
-fn parse_button_rows(parser: &mut Parser) -> Result<Vec<Vec<KeyboardButton>>, &'static str> {
-    let rows_count = parser.i32_()?;
-    if rows_count < 0 || rows_count as usize > parser.left_len() {
-        return Err("Wrong vector length");
-    }
-    let mut rows = Vec::with_capacity(rows_count as usize);
-    for _ in 0..rows_count {
-        let buttons_count = parser.i32_()?;
-        if buttons_count < 0 || buttons_count as usize > parser.left_len() {
-            return Err("Wrong vector length");
-        }
-        let mut buttons = Vec::with_capacity(buttons_count as usize);
-        for _ in 0..buttons_count {
-            buttons.push(KeyboardButton::parse_from(parser)?);
-        }
-        rows.push(buttons);
-    }
-    Ok(rows)
-}
-
-fn store_inline_button_rows(out: &mut Vec<u8>, rows: &[Vec<InlineKeyboardButton>]) {
-    store_vec_header(out, rows.len());
-    for row in rows {
-        store_vec_header(out, row.len());
-        for button in row {
-            button.store(out);
-        }
-    }
-}
-
-fn parse_inline_button_rows(
-    parser: &mut Parser,
-) -> Result<Vec<Vec<InlineKeyboardButton>>, &'static str> {
-    let rows_count = parser.i32_()?;
-    if rows_count < 0 || rows_count as usize > parser.left_len() {
-        return Err("Wrong vector length");
-    }
-    let mut rows = Vec::with_capacity(rows_count as usize);
-    for _ in 0..rows_count {
-        let buttons_count = parser.i32_()?;
-        if buttons_count < 0 || buttons_count as usize > parser.left_len() {
-            return Err("Wrong vector length");
-        }
-        let mut buttons = Vec::with_capacity(buttons_count as usize);
-        for _ in 0..buttons_count {
-            buttons.push(InlineKeyboardButton::parse_from(parser)?);
-        }
-        rows.push(buttons);
-    }
-    Ok(rows)
-}
-
-// ---------------------------------------------------------------------------
 // M.10.1b batch 2 — the Message/Dialog struct plane (MessagesManager.h
 // 1118-1269 and 1308-1492), with the companions those structs pull in:
 // SuggestedPost.h, MessageForwardInfo.h (LastForwardedMessageInfo),
@@ -9575,7 +7689,7 @@ impl Message {
             out,
         );
         if has_reply_markup {
-            self.reply_markup.as_ref().unwrap().store(out);
+            store_reply_markup(self.reply_markup.as_ref().unwrap(), out);
         }
         if has_ttl_period {
             store_i32(out, self.ttl_period);
@@ -10090,7 +8204,7 @@ impl Message {
             parser, storage,
         )?);
         if has_reply_markup {
-            m.reply_markup = Some(Box::new(ReplyMarkup::parse_from(parser)?));
+            m.reply_markup = Some(Box::new(parse_reply_markup(parser)?));
         }
         if has_ttl_period {
             m.ttl_period = parser.i32_()?;
@@ -10792,6 +8906,28 @@ pub fn get_message_sender(m: &Message) -> DialogId {
     }
 }
 
+
+/// `MessagesManager::get_dialog_reply_markup(DialogId,
+/// td_api::ReplyMarkup &&)` (MessagesManager.cpp:24319-24328) — the
+/// td_api intake body lives in [`crate::reply_markup::get_reply_markup`]
+/// (the M.22 unification); the manager keeps the context-driven wrapper.
+pub fn get_dialog_reply_markup(
+    ctx: &dyn SendMessageContext,
+    dialog_id: DialogId,
+    reply_markup: Option<td_api::ReplyMarkup>,
+) -> Result<Option<ReplyMarkup>, (i32, String)> {
+    let is_anonymous = ctx.is_anonymous_administrator(dialog_id).is_some();
+    get_reply_markup(
+        reply_markup,
+        dialog_id.get_type(),
+        ctx.is_admined_monoforum_channel(dialog_id),
+        ctx.is_bot(),
+        is_anonymous,
+        ctx.is_test_dc(),
+    )
+    .map_err(|status| (status.code(), status.message().to_owned()))
+}
+
 /// `MessagesManager::get_message_search_text` (MessagesManager.cpp:8138-8143)
 /// — [blocked: M.9.17] `get_message_content_search_text` lands with the
 /// lifecycle tail; the empty string is the recorded stand-in.
@@ -11218,8 +9354,10 @@ impl crate::message_content::MessageContentStorage for MessageDbStorageBridge {
         reply_markup: &tdmtproto::telegram_api::ReplyMarkup,
         out: &mut Vec<u8>,
     ) {
-        if let Some(markup) = ReplyMarkup::from_telegram(reply_markup.clone(), false, true, false) {
-            markup.store(out);
+        if let Some(markup) =
+            get_reply_markup_from_telegram(Some(reply_markup.clone()), true, false, false)
+        {
+            store_reply_markup(&markup, out);
         }
     }
 
@@ -12439,6 +10577,16 @@ pub struct Dependencies {
     dialog_ids: std::collections::BTreeSet<DialogId>,
 }
 
+/// The M.22 unification: the real `Dependencies` walks the reply-markup
+/// buttons through the [`crate::inline_keyboard_button::DependenciesSink`]
+/// seam (the C++ passes the same `Dependencies &` to
+/// `InlineKeyboardButton::add_dependencies`).
+impl crate::inline_keyboard_button::DependenciesSink for Dependencies {
+    fn add_user(&mut self, user_id: UserId) {
+        Dependencies::add_user(self, user_id);
+    }
+}
+
 impl Dependencies {
     /// `Dependencies::add(UserId)` (Dependencies.cpp:22-26).
     pub fn add_user(&mut self, user_id: UserId) {
@@ -13263,7 +11411,7 @@ pub fn add_message_dependencies(
             &mut community_sink,
         );
     }
-    add_reply_markup_dependencies(dependencies, m.reply_markup.as_deref());
+    crate::reply_markup::add_reply_markup_dependencies(dependencies, &m.reply_markup);
     // `m->ephemeral_message` (MessagesManager.cpp:21533-21535) and
     // `m->thread_draft_message` (21536) are always empty on the intake path
     // — they are set by the send/database slices that own them.
@@ -13290,22 +11438,6 @@ fn add_fact_check_dependencies(dependencies: &mut Dependencies, fact_check: &Fac
     for entity in &fact_check.text.entities {
         if entity.user_id.is_valid() {
             dependencies.add_user(entity.user_id);
-        }
-    }
-}
-
-/// `add_reply_markup_dependencies` (ReplyMarkup.cpp:513-523) +
-/// `InlineKeyboardButton::add_dependencies` (InlineKeyboardButton.cpp:38-41).
-fn add_reply_markup_dependencies(
-    dependencies: &mut Dependencies,
-    reply_markup: Option<&ReplyMarkup>,
-) {
-    let Some(reply_markup) = reply_markup else {
-        return;
-    };
-    for row in &reply_markup.inline_keyboard {
-        for button in row {
-            dependencies.add_user(button.user_id);
         }
     }
 }
@@ -13734,7 +11866,7 @@ pub fn create_message(
         .reply_markup
         .take()
         .and_then(|reply_markup| {
-            ReplyMarkup::from_telegram(reply_markup, false, is_bot, mention_markup)
+            get_reply_markup_from_telegram(Some(reply_markup), is_bot, false, mention_markup)
         })
         .map(Box::new);
     if message.reply_markup.is_some() && is_expired {
@@ -15101,118 +13233,44 @@ pub fn get_min_message_senders_object(
 
 /// `get_inline_keyboard_button_object(UserManager *, const
 /// InlineKeyboardButton &)` (InlineKeyboardButton.cpp:470-526).
-fn get_inline_keyboard_button_object(
-    ctx: &dyn MessageObjectContext,
-    keyboard_button: &InlineKeyboardButton,
-) -> td_api::InlineKeyboardButton {
-    let type_object = match keyboard_button.r#type {
-        InlineKeyboardButtonType::Url => {
-            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeUrl(
-                td_api::inlineKeyboardButtonTypeUrl {
-                    url: keyboard_button.data.clone(),
-                },
-            )
-        }
-        InlineKeyboardButtonType::Callback => {
-            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeCallback(
-                td_api::inlineKeyboardButtonTypeCallback {
-                    data: keyboard_button.data.clone().into_bytes(),
-                },
-            )
-        }
-        InlineKeyboardButtonType::CallbackGame => {
-            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeCallbackGame(
-                td_api::inlineKeyboardButtonTypeCallbackGame,
-            )
-        }
-        InlineKeyboardButtonType::SwitchInline => {
-            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeSwitchInline(
-                td_api::inlineKeyboardButtonTypeSwitchInline {
-                    query: keyboard_button.data.clone(),
-                    target_chat: Some(Box::new(td_api::TargetChat::targetChatChosen(
-                        td_api::targetChatChosen {
-                            types: Some(
-                                TargetDialogTypes::from_mask(keyboard_button.id)
-                                    .get_target_chat_types_object(),
-                            ),
-                        },
-                    ))),
-                },
-            )
-        }
-        InlineKeyboardButtonType::SwitchInlineCurrentDialog => {
-            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeSwitchInline(
-                td_api::inlineKeyboardButtonTypeSwitchInline {
-                    query: keyboard_button.data.clone(),
-                    target_chat: Some(Box::new(td_api::TargetChat::targetChatCurrent(
-                        td_api::targetChatCurrent,
-                    ))),
-                },
-            )
-        }
-        InlineKeyboardButtonType::Buy => {
-            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeBuy(
-                td_api::inlineKeyboardButtonTypeBuy,
-            )
-        }
-        InlineKeyboardButtonType::UrlAuth => {
-            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeLoginUrl(
-                td_api::inlineKeyboardButtonTypeLoginUrl {
-                    url: keyboard_button.data.clone(),
-                    id: keyboard_button.id,
-                    forward_text: keyboard_button.forward_text.clone(),
-                },
-            )
-        }
-        InlineKeyboardButtonType::CallbackWithPassword => {
-            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeCallbackWithPassword(
-                td_api::inlineKeyboardButtonTypeCallbackWithPassword {
-                    data: keyboard_button.data.clone().into_bytes(),
-                },
-            )
-        }
-        InlineKeyboardButtonType::User => {
-            let need_user = !ctx
-                .content_context()
-                .is_user_bot(ctx.content_context().get_my_id());
-            let user_id = if need_user {
-                ctx.content_context().get_user_id_object(
-                    keyboard_button.user_id,
-                    "get_inline_keyboard_button_object",
-                )
-            } else {
-                keyboard_button.user_id.get()
-            };
-            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeUser(
-                td_api::inlineKeyboardButtonTypeUser { user_id },
-            )
-        }
-        InlineKeyboardButtonType::WebView => {
-            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeWebApp(
-                td_api::inlineKeyboardButtonTypeWebApp {
-                    url: keyboard_button.data.clone(),
-                },
-            )
-        }
-        InlineKeyboardButtonType::Copy => {
-            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeCopyText(
-                td_api::inlineKeyboardButtonTypeCopyText {
-                    text: keyboard_button.data.clone(),
-                },
-            )
-        }
-        InlineKeyboardButtonType::Disabled => {
-            td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeDisabled(
-                td_api::inlineKeyboardButtonTypeDisabled,
-            )
-        }
-    };
-    td_api::InlineKeyboardButton {
-        text: keyboard_button.text.clone(),
-        icon_custom_emoji_id: keyboard_button.style.get_icon_custom_emoji_id().get(),
-        style: keyboard_button.style.get_button_style_object(),
-        r#type: Some(type_object),
+/// The `UserManager *` of the C++ object builder, over the message
+/// content context (the M.22 unification: the button build itself is
+/// [`InlineKeyboardButton::get_inline_keyboard_button_object`]).
+struct MessageObjectButtonEnv<'a> {
+    ctx: &'a dyn MessageObjectContext,
+}
+
+impl InlineKeyboardButtonEnv for MessageObjectButtonEnv<'_> {
+    fn is_test_dc(&self) -> bool {
+        false
     }
+
+    fn get_input_user(&self, user_id: UserId) -> Result<tdmtproto::telegram_api::InputUser, tdutils::status::Status> {
+        let _ = user_id;
+        Err(tdutils::status::Status::error(400, "User not found"))
+    }
+
+    fn is_my_user_bot(&self) -> bool {
+        let content_context = self.ctx.content_context();
+        content_context.is_user_bot(content_context.get_my_id())
+    }
+
+    fn get_user_id_object(&self, user_id: UserId, source: &str) -> i64 {
+        self.ctx.content_context().get_user_id_object(user_id, source)
+    }
+}
+
+/// The `get_message_object` reply-markup builder over a message object
+/// context — the manager-level `get_reply_markup_object` the C++
+/// MessagesManager callers reach through the `UserManager *`.
+pub(crate) fn get_message_reply_markup_object(
+    ctx: &dyn MessageObjectContext,
+    reply_markup: &ReplyMarkup,
+) -> Option<td_api::ReplyMarkup> {
+    Some(get_reply_markup_object(
+        Some(&MessageObjectButtonEnv { ctx }),
+        reply_markup,
+    ))
 }
 
 /// `MessageSendOptions::get_message_scheduling_state_object`
@@ -15979,7 +14037,7 @@ fn get_ephemeral_message_content_object(
         reply_markup: m
             .reply_markup
             .as_deref()
-            .and_then(|reply_markup| reply_markup.get_reply_markup_object(ctx)),
+            .and_then(|reply_markup| get_message_reply_markup_object(ctx, reply_markup)),
     })
 }
 
@@ -16122,7 +14180,7 @@ pub fn get_message_object(
     let reply_markup = m
         .reply_markup
         .as_deref()
-        .and_then(|reply_markup| reply_markup.get_reply_markup_object(ctx));
+        .and_then(|reply_markup| get_message_reply_markup_object(ctx, reply_markup));
     let content = get_message_message_content_object(manager, ctx, dialog_id, m);
     let self_destruct_type = m.ttl.get_message_self_destruct_type_object();
     let contains_unread_poll_votes = has_unread_poll_votes(reactions_ctx, m);
@@ -28903,6 +26961,11 @@ pub fn remove_message_file_sources(
 
 #[cfg(test)]
 mod tests {
+    use crate::inline_keyboard_button::{InlineKeyboardButton, InlineKeyboardButtonType};
+    use crate::keyboard_button::{KeyboardButton, KeyboardButtonType};
+    use crate::keyboard_button_style::{KeyboardButtonStyle, KeyboardButtonStyleType};
+    use crate::requested_dialog_type::{RequestedDialogType, RequestedDialogTypeType};
+
     #[test]
     fn story_ids_semantics_and_roundtrip() {
         assert!(!StoryId::new(0).is_valid());
@@ -30849,7 +28912,7 @@ mod tests {
             r#type: ReplyMarkupType::InlineKeyboard,
             force_reply: true,
             inline_keyboard: vec![vec![InlineKeyboardButton {
-                r#type: InlineKeyboardButtonType::Callback,
+                type_: InlineKeyboardButtonType::Callback,
                 data: "payload".to_string(),
                 text: "click".to_string(),
                 ..InlineKeyboardButton::default()
@@ -31007,26 +29070,26 @@ mod tests {
             is_one_time_keyboard: true,
             keyboard: vec![vec![
                 KeyboardButton {
-                    r#type: KeyboardButtonType::RequestDialog,
+                    type_: KeyboardButtonType::RequestDialog,
                     style: KeyboardButtonStyle {
-                        r#type: crate::messages_manager::KeyboardButtonStyleType::Primary,
+                        type_: KeyboardButtonStyleType::Primary,
                         icon_custom_emoji_id: crate::emoji_status::CustomEmojiId::new(7),
                     },
                     text: "pick".to_string(),
                     url: String::new(),
-                    requested_dialog_type: Some(RequestedDialogType {
-                        r#type: RequestedDialogTypeType::Group,
+                    requested_dialog_type: Some(Box::new(RequestedDialogType {
+                        type_: RequestedDialogTypeType::Group,
                         button_id: 3,
                         max_quantity: 1,
                         restrict_has_username: true,
                         has_username: true,
                         is_created: true,
                         restrict_user_administrator_rights: true,
-                        ..RequestedDialogType::default()
-                    }),
+                            ..RequestedDialogType::default()
+                        })),
                 },
                 KeyboardButton {
-                    r#type: KeyboardButtonType::Text,
+                    type_: KeyboardButtonType::Text,
                     text: "plain".to_string(),
                     ..KeyboardButton::default()
                 },
@@ -31035,9 +29098,9 @@ mod tests {
             inline_keyboard: Vec::new(),
         };
         let mut bytes = Vec::new();
-        markup.store(&mut bytes);
+        store_reply_markup(&markup, &mut bytes);
         let mut parser = Parser::new(&bytes);
-        assert_eq!(ReplyMarkup::parse_from(&mut parser).unwrap(), markup);
+        assert_eq!(parse_reply_markup(&mut parser).unwrap(), markup);
     }
 
     #[test]
@@ -31058,11 +29121,12 @@ mod tests {
                 }],
             }],
         });
-        let markup = ReplyMarkup::from_telegram(wire, false, true, false).expect("inline keyboard");
+        let markup =
+            get_reply_markup_from_telegram(Some(wire), true, false, false).expect("inline keyboard");
         assert_eq!(markup.r#type, ReplyMarkupType::InlineKeyboard);
         assert_eq!(markup.inline_keyboard.len(), 1);
         let button = &markup.inline_keyboard[0][0];
-        assert_eq!(button.r#type, InlineKeyboardButtonType::Url);
+        assert_eq!(button.type_, InlineKeyboardButtonType::Url);
         assert_eq!(button.text, "open");
         assert_eq!(button.data, "https://telegram.org/"); // check_link adds the trailing slash
     }
@@ -31894,7 +29958,7 @@ mod tests {
             is_personal: true,
             placeholder: "poll?".to_owned(),
             keyboard: vec![vec![KeyboardButton {
-                r#type: KeyboardButtonType::RequestPollQuiz,
+                type_: KeyboardButtonType::RequestPollQuiz,
                 style: KeyboardButtonStyle::default(),
                 text: "ask".to_owned(),
                 url: String::new(),
@@ -31902,7 +29966,7 @@ mod tests {
             }]],
             ..ReplyMarkup::default()
         };
-        match markup.get_reply_markup_object(&ctx).unwrap() {
+        match get_message_reply_markup_object(&ctx, &markup).unwrap() {
             td_api::ReplyMarkup::replyMarkupShowKeyboard(o) => {
                 assert!(o.is_personal);
                 assert_eq!(o.input_field_placeholder, "poll?");
@@ -31921,7 +29985,7 @@ mod tests {
         let markup = ReplyMarkup {
             r#type: ReplyMarkupType::InlineKeyboard,
             inline_keyboard: vec![vec![InlineKeyboardButton {
-                r#type: InlineKeyboardButtonType::SwitchInline,
+                type_: InlineKeyboardButtonType::SwitchInline,
                 id: 0,
                 text: "start".to_owned(),
                 data: "query".to_owned(),
@@ -31929,7 +29993,7 @@ mod tests {
             }]],
             ..ReplyMarkup::default()
         };
-        match markup.get_reply_markup_object(&ctx).unwrap() {
+        match get_message_reply_markup_object(&ctx, &markup).unwrap() {
             td_api::ReplyMarkup::replyMarkupInlineKeyboard(o) => {
                 match o.rows[0][0].r#type.as_ref().unwrap() {
                     td_api::InlineKeyboardButtonType::inlineKeyboardButtonTypeSwitchInline(t) => {

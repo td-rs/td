@@ -5506,7 +5506,9 @@ impl Td {
                     let reply_markup = m
                         .reply_markup
                         .as_ref()
-                        .and_then(|reply_markup| reply_markup.get_reply_markup_object(self));
+                        .and_then(|reply_markup| {
+                        crate::messages_manager::get_message_reply_markup_object(self, reply_markup)
+                    });
                     self.send_update(Object::updateMessageEdited(td_api::updateMessageEdited {
                         chat_id: dialog_id.get(),
                         message_id: message_id.get(),
