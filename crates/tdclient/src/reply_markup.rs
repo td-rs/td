@@ -1,4 +1,7 @@
-//!
+//! Port of `td/telegram/ReplyMarkup.{h,cpp,hpp}` — the shared reply-markup
+//! model (the internal `Message::reply_markup` plane), its three conversion
+//! directions (wire intake, td_api intake/output), the db store/parse and
+//! the duplication/dependency walks.
 
 use crate::dialog_id::{DialogId, DialogType};
 use crate::inline_keyboard_button::InlineKeyboardButton;
@@ -181,10 +184,10 @@ impl ReplyMarkup {
         for row in &self.keyboard {
             for button in row {
                 let requested_dialog_type = button.get_requested_dialog_type();
-                if let Some(requested_dialog_type) = requested_dialog_type {
-                    if requested_dialog_type.get_button_id() == button_id {
-                        return Some(requested_dialog_type);
-                    }
+                if let Some(requested_dialog_type) = requested_dialog_type
+                    && requested_dialog_type.get_button_id() == button_id
+                {
+                    return Some(requested_dialog_type);
                 }
             }
         }
@@ -240,7 +243,7 @@ pub fn get_reply_markup_from_telegram(
                 let mut buttons = Vec::with_capacity(row.buttons.len());
                 for button in row.buttons {
                     buttons.push(InlineKeyboardButton::from_telegram(button));
-                    if buttons.last().map_or(false, |button| {
+                    if buttons.last().is_some_and(|button| {
                         button.text.is_empty()
                             && !button.style.get_icon_custom_emoji_id().is_valid()
                     }) {
@@ -269,7 +272,7 @@ pub fn get_reply_markup_from_telegram(
                 let mut buttons = Vec::with_capacity(row.buttons.len());
                 for button in row.buttons {
                     buttons.push(KeyboardButton::from_telegram(button));
-                    if buttons.last().map_or(false, KeyboardButton::is_empty) {
+                    if buttons.last().is_some_and(KeyboardButton::is_empty) {
                         buttons.pop();
                     }
                 }
@@ -728,16 +731,18 @@ mod tests {
     use crate::message_content_dup_type::MessageContentDupType;
 
     fn inline_button(text: &str, data: &str) -> InlineKeyboardButton {
-        let mut button = InlineKeyboardButton::default();
-        button.text = text.to_owned();
-        button.data = data.to_owned();
-        button
+        InlineKeyboardButton {
+            text: text.to_owned(),
+            data: data.to_owned(),
+            ..InlineKeyboardButton::default()
+        }
     }
 
     fn keyboard_button(text: &str) -> KeyboardButton {
-        let mut button = KeyboardButton::default();
-        button.text = text.to_owned();
-        button
+        KeyboardButton {
+            text: text.to_owned(),
+            ..KeyboardButton::default()
+        }
     }
 
     #[test]
