@@ -170,6 +170,14 @@ pub(crate) struct TdSink {
     pub(crate) reads_inbox: Vec<(tdmtproto::telegram_api::Peer, i32, i32)>,
     /// `updateReadHistoryOutbox` — (peer, max_id).
     pub(crate) reads_outbox: Vec<(tdmtproto::telegram_api::Peer, i32)>,
+    /// `updateReadChannelOutbox` — (channel_id, max_id); the C++
+    /// `on_update_read_channel_outbox` handler is the same
+    /// `read_history_outbox` core over the channel dialog.
+    pub(crate) channel_reads_outbox: Vec<(i64, i32)>,
+    /// `updateDialogUnreadMark` — the dialog arm of the C++
+    /// `on_update_dialog_is_marked_as_unread` intake; the drain resolves
+    /// the peer and runs `set_dialog_is_marked_as_unread`.
+    pub(crate) marked_unread: Vec<tdmtproto::telegram_api::updateDialogUnreadMark>,
 }
 
 impl UpdatesSink for TdSink {
@@ -202,6 +210,17 @@ impl UpdatesSink for TdSink {
                     self.edits.push((message, update.pts));
                 }
             }
+            PendingUpdate::Wire(telegram_api::Update::updateEditChannelMessage(update)) => {
+                // the channel twin of `updateEditMessage` — the same
+                // channel-pts machine applies it (the C++
+                // `add_pending_channel_update` routing)
+                if let Some(message) = update.message {
+                    self.edits.push((message, update.pts));
+                }
+            }
+            PendingUpdate::Wire(telegram_api::Update::updateDeleteChannelMessages(update)) => {
+                self.deletions.push(update.messages);
+            }
             PendingUpdate::Wire(telegram_api::Update::updateReadHistoryInbox(update)) => {
                 if let Some(peer) = update.peer {
                     self.reads_inbox
@@ -213,10 +232,16 @@ impl UpdatesSink for TdSink {
                     self.reads_outbox.push((peer, update.max_id));
                 }
             }
+            PendingUpdate::Wire(telegram_api::Update::updateReadChannelOutbox(update)) => {
+                self.channel_reads_outbox.push((update.channel_id, update.max_id));
+            }
             // `updateReadMessagesContents` (read_message_content_from_updates,
-            // MessagesManager.cpp:9325) rides the TTL content-read plane and
-            // `updatePinnedMessages` the M.10.14 pinned tail — both collect
-            // nothing until their slices land.
+            // MessagesManager.cpp:9325) rides the TTL content-read plane,
+            // `updatePinnedMessages`/`updatePinnedChannelMessages` the
+            // M.10.14 pinned tail, and `updateReadChannelInbox` the
+            // `on_read_channel_inbox` pts/reconcile machine
+            // (MessagesManager.cpp:3688) — all collect nothing until
+            // their slices land.
             _ => {}
         }
     }
@@ -232,6 +257,23 @@ impl UpdatesSink for TdSink {
         _source: &str,
     ) {
         self.process_pts_update(update);
+    }
+    /// `MessagesManager::on_update_dialog_is_marked_as_unread` — the
+    /// marked-as-unread intake (UpdatesManager.cpp:4096-4106): the
+    /// saved-messages topic arm rides the SavedMessagesManager plane
+    /// (documented drop), the dialog arm runs the ported
+    /// `set_dialog_is_marked_as_unread` core (the db-load leg of
+    /// `get_dialog_force` stays the dialog-db receive seam inside it).
+    fn on_update_dialog_is_marked_as_unread(
+        &mut self,
+        update: tdmtproto::telegram_api::updateDialogUnreadMark,
+    ) {
+        // the saved-messages topic arm (`saved_peer_id`) rides the
+        // SavedMessagesManager plane — documented drop until it lands
+        if update.saved_peer_id.is_some() {
+            return;
+        }
+        self.marked_unread.push(update);
     }
 }
 
@@ -2364,10 +2406,10 @@ pub(crate) enum RecovererFetch {
 pub(crate) struct TdUpdatesEnv<'a> {
     pub(crate) global: &'a mut Global,
     pub(crate) options: &'a mut OptionManager,
-    auth_is_authorized: bool,
-    auth_is_bot: bool,
-    my_id: i64,
-    can_ignore_background_updates: bool,
+    pub(crate) auth_is_authorized: bool,
+    pub(crate) auth_is_bot: bool,
+    pub(crate) my_id: i64,
+    pub(crate) can_ignore_background_updates: bool,
 }
 
 impl UpdatesManagerEnv for TdUpdatesEnv<'_> {
@@ -5724,6 +5766,50 @@ impl Td {
         for (peer, max_id) in &sink.reads_outbox {
             self.apply_read_history_outbox(peer, *max_id);
         }
+        for (channel_id, max_id) in &sink.channel_reads_outbox {
+            self.apply_read_channel_history_outbox(*channel_id, *max_id);
+        }
+        for update in &sink.marked_unread {
+            self.apply_dialog_is_marked_as_unread(update);
+        }
+    }
+
+    /// The receive path for the dialog arm of `updateDialogUnreadMark` —
+    /// `MessagesManager::on_update_dialog_is_marked_as_unread`
+    /// (UpdatesManager.cpp:4096-4106): the ported
+    /// `set_dialog_is_marked_as_unread` core; the db-load leg of
+    /// `get_dialog_force` stays the dialog-db receive seam inside it.
+    fn apply_dialog_is_marked_as_unread(
+        &mut self,
+        update: &tdmtproto::telegram_api::updateDialogUnreadMark,
+    ) {
+        let Some(peer) = update.peer.as_ref().and_then(|dialog_peer| match dialog_peer {
+            tdmtproto::telegram_api::DialogPeer::dialogPeer(dialog_peer) => {
+                dialog_peer.peer.as_ref()
+            }
+            _ => None,
+        }) else {
+            return;
+        };
+        let dialog_id = crate::messages_manager::DialogId::from_peer(peer);
+        if !dialog_id.is_valid() {
+            return;
+        }
+        // SAFETY: the alias trio derives from `td_ptr` and the callee uses
+        // them strictly one at a time (the split_context_alias contract).
+        let td_ptr = std::ptr::from_mut(self);
+        let state: &mut dyn crate::messages_manager::ReadStateContext =
+            unsafe { crate::td::split_context_alias(td_ptr) };
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let ctx: &dyn crate::messages_manager::MessageObjectContext = unsafe { &*td_ptr };
+        crate::messages_manager::set_dialog_is_marked_as_unread(
+            manager,
+            ctx,
+            state,
+            dialog_id,
+            update.unread,
+        );
     }
 
     /// The receive path for `updateDeleteMessages` (the M.10.6 delete
@@ -5916,6 +6002,37 @@ impl Td {
             last_read_inbox_message_id,
             -1,
             "updateReadHistoryInbox",
+        );
+    }
+
+    /// The receive path for `updateReadChannelOutbox` — the C++
+    /// `on_update_read_channel_outbox` handler
+    /// (MessagesManager.cpp:3676-3683): the same `read_history_outbox`
+    /// core over the channel dialog.
+    fn apply_read_channel_history_outbox(&mut self, channel_id: i64, max_id: i32) {
+        let dialog_id = crate::messages_manager::DialogId::from_channel_id(
+            crate::chat_manager::ChannelId::new(channel_id),
+        );
+        if !dialog_id.is_valid() {
+            return;
+        }
+        let max_message_id = crate::messages_manager::MessageId::from_server_message_id(
+            crate::messages_manager::ServerMessageId::new(max_id),
+        );
+        // SAFETY: as apply_read_history_inbox.
+        let td_ptr = std::ptr::from_mut(self);
+        let state: &mut dyn crate::messages_manager::ReadStateContext =
+            unsafe { crate::td::split_context_alias(td_ptr) };
+        let manager: &mut crate::messages_manager::MessagesManager =
+            unsafe { &mut (*td_ptr).messages_manager };
+        let ctx: &dyn crate::messages_manager::MessageObjectContext = unsafe { &*td_ptr };
+        crate::messages_manager::read_history_outbox(
+            manager,
+            ctx,
+            state,
+            dialog_id,
+            max_message_id,
+            0,
         );
     }
 
