@@ -7256,7 +7256,7 @@ impl ChatManager {
 
     /// `get_chat_participants` (ChatManager.cpp:6375-6381).
     #[allow(dead_code)] // read-surface callers land with M.5.36/M.5.47
-    fn get_chat_participants(&self, chat_id: ChatId) -> Option<&Vec<DialogParticipant>> {
+    pub(crate) fn get_chat_participants(&self, chat_id: ChatId) -> Option<&Vec<DialogParticipant>> {
         self.get_chat_full(chat_id).map(|f| &f.participants)
     }
 

@@ -8,6 +8,14 @@
 [advisories]
 yanked = "deny"
 
+# RUSTSEC-2023-0071 (Marvin Attack, rsa < 0.9): no upstream patch exists.
+# The repo never decrypts with this key path — the rsa crate rides the
+# M.44 SecureManager plane for PUBLIC-KEY encryption only (the Telegram
+# SRP/password flows), which the advisory does not cover. Signed off by
+# the owner decision record 2026-09-23 (RUST_REWRITE_REMAINING.md,
+# owner items); revisit when rsa ships the constant-time rework.
+ignore = ["RUSTSEC-2023-0071"]
+
 [bans]
 multiple-versions = "warn"
 
