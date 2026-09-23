@@ -10,7 +10,7 @@ addChatToList	interim
 addChatWelcomeMessage	interim
 addChecklistTasks	interim
 addContact	dispatched
-addCustomServerLanguagePack	interim
+addCustomServerLanguagePack	dispatched
 addFavoriteSticker	interim
 addFileToDownloads	interim
 addGiftCollectionGifts	dispatched
@@ -30,7 +30,7 @@ addQuickReplyShortcutMessage	interim
 addQuickReplyShortcutMessageAlbum	interim
 addRecentSticker	interim
 addRecentlyFoundChat	dispatched
-addSavedAnimation	interim
+addSavedAnimation	dispatched
 addSavedNotificationSound	interim
 addStickerToSet	interim
 addStoryAlbumStories	dispatched
@@ -176,7 +176,7 @@ deleteForumTopic	dispatched
 deleteGiftCollection	dispatched
 deleteGroupCallMessages	dispatched
 deleteGroupCallMessagesBySender	dispatched
-deleteLanguagePack	interim
+deleteLanguagePack	dispatched
 deleteMessageEphemeralContent	interim
 deleteMessageReactionsFromSender	interim
 deleteMessages	dispatched
@@ -218,7 +218,7 @@ editChatFolderInviteLink	interim
 editChatInviteLink	interim
 editChatSubscriptionInviteLink	interim
 editChatWelcomeMessage	interim
-editCustomLanguagePackInfo	interim
+editCustomLanguagePackInfo	dispatched
 editEphemeralMessage	interim
 editEphemeralMessageCaption	interim
 editForumTopic	dispatched
@@ -410,16 +410,16 @@ getInternalLinkType	interim
 getJsonString	sync
 getJsonValue	sync
 getKeywordEmojis	interim
-getLanguagePackInfo	interim
-getLanguagePackString	interim
-getLanguagePackStrings	interim
+getLanguagePackInfo	dispatched
+getLanguagePackString	sync
+getLanguagePackStrings	dispatched
 getLinkPreview	dispatched
 getLinkWebBrowserType	dispatched
 getLiveStoryAvailableMessageSenders	dispatched
 getLiveStoryRtmpUrl	dispatched
 getLiveStoryStreamer	dispatched
 getLiveStoryTopDonors	dispatched
-getLocalizationTargetInfo	interim
+getLocalizationTargetInfo	dispatched
 getLogStream	sync
 getLogTagVerbosityLevel	sync
 getLogTags	sync
@@ -500,7 +500,7 @@ getRecommendedChats	interim
 getRecoveryEmailAddress	interim
 getRemoteFile	dispatched
 getRepliedMessage	interim
-getSavedAnimations	interim
+getSavedAnimations	dispatched
 getSavedMessagesTags	interim
 getSavedMessagesTopicHistory	interim
 getSavedMessagesTopicMessageByDate	interim
@@ -668,7 +668,7 @@ removeProxy	interim
 removeRecentHashtag	interim
 removeRecentSticker	interim
 removeRecentlyFoundChat	dispatched
-removeSavedAnimation	interim
+removeSavedAnimation	dispatched
 removeSavedNotificationSound	interim
 removeSearchedForTag	interim
 removeStickerFromSet	interim
@@ -846,8 +846,8 @@ setCloseFriends	dispatched
 setCommands	dispatched
 setCommunityName	dispatched
 setCustomEmojiStickerSetThumbnail	interim
-setCustomLanguagePack	interim
-setCustomLanguagePackString	interim
+setCustomLanguagePack	dispatched
+setCustomLanguagePackString	dispatched
 setDatabaseEncryptionKey	interim
 setDefaultBackground	interim
 setDefaultChannelAdministratorRights	dispatched
@@ -939,7 +939,7 @@ stopPoll	dispatched
 suggestUserBirthdate	interim
 suggestUserProfilePhoto	interim
 summarizeMessage	interim
-synchronizeLanguagePack	interim
+synchronizeLanguagePack	dispatched
 terminateAllOtherSessions	dispatched
 terminateSession	dispatched
 testCallBytes	dispatched

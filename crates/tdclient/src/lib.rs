@@ -10,6 +10,7 @@
 pub mod account_manager;
 pub mod active_story_state;
 pub mod age_verification_parameters;
+pub mod animations_manager;
 pub mod attach_menu_manager;
 pub mod auth_manager;
 pub mod autosave_manager;
@@ -72,6 +73,7 @@ pub mod inline_keyboard_button;
 pub mod join_chat_bot_result;
 pub mod keyboard_button;
 pub mod keyboard_button_style;
+pub mod language_pack_manager;
 pub mod link_manager;
 pub mod manager_option_states;
 pub mod message_content;
